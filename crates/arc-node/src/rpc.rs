@@ -496,6 +496,15 @@ pub struct NodeState {
     /// or coordinator role only). Each entry is announced as an independent
     /// replica so the coordinator treats multi-range nodes naturally.
     pub shard_infos: Vec<ShardInfo>,
+    /// The same ranges announced under the GGUF interleaved-RoPE profile and
+    /// served from `interleaved_rope_qk`. Empty unless this holder verifies
+    /// that profile (`--community-verify-profiles`).
+    pub interleaved_rope_shard_infos: Vec<ShardInfo>,
+    /// The interleaved-RoPE Q/K rows of this holder's resident layers.
+    interleaved_rope_qk: Option<Arc<arc_inference::cached_integer_model::InterleavedRopeQk>>,
+    /// `--community-verify-profiles`: the legacy profile only, unless the
+    /// operator adds the interleaved-RoPE profile.
+    community_verify_profiles: CommunityVerifyProfiles,
     /// Per-request KV cache for sharded inference. Key: request_id (Hash256 hex).
     /// Each entry is an Arc<Mutex<KVCache>> so handlers can clone the Arc and
     /// release the DashMap shard lock immediately.
@@ -724,6 +733,186 @@ pub struct ShardInfo {
     pub socket_addr: String,
     /// Friendly node name (NYC, LAX, ...).
     pub node_name: String,
+}
+
+/// `--community-verify-profiles` short name of today's live community reward
+/// profile (`CANONICAL_REWARD_INFERENCE_PROFILE`, split-half RoPE).
+pub const COMMUNITY_PROFILE_LEGACY_SPLIT_HALF: &str = "legacy-split-half";
+/// `--community-verify-profiles` short name of the GGUF interleaved-RoPE
+/// profile (`GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE`).
+pub const COMMUNITY_PROFILE_ROPE_INTERLEAVED_V1: &str = "rope-interleaved-v1";
+
+/// The community reward profiles this validator verifies
+/// (`--community-verify-profiles`, stage 1 of the live-profile switch).
+/// The legacy profile is always verified. The interleaved-RoPE profile is
+/// opt-in; with it off, every check below is exactly the legacy-only check.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommunityVerifyProfiles {
+    interleaved_rope: bool,
+}
+
+impl CommunityVerifyProfiles {
+    /// Parse a comma-separated list of short profile names. The legacy
+    /// profile must stay listed: live jobs use it, and retiring it is a later
+    /// decision that needs the issue side first.
+    pub fn parse(list: &str) -> Result<Self, String> {
+        let mut legacy = false;
+        let mut interleaved_rope = false;
+        for name in list
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            match name {
+                COMMUNITY_PROFILE_LEGACY_SPLIT_HALF => legacy = true,
+                COMMUNITY_PROFILE_ROPE_INTERLEAVED_V1 => interleaved_rope = true,
+                other => {
+                    return Err(format!(
+                        "unknown community profile {other:?}; expected \
+                         {COMMUNITY_PROFILE_LEGACY_SPLIT_HALF} or {COMMUNITY_PROFILE_ROPE_INTERLEAVED_V1}"
+                    ));
+                }
+            }
+        }
+        if !legacy {
+            return Err(format!(
+                "the verify profiles must include {COMMUNITY_PROFILE_LEGACY_SPLIT_HALF}: live community jobs use it"
+            ));
+        }
+        Ok(Self { interleaved_rope })
+    }
+
+    /// Whether the interleaved-RoPE profile is verified here.
+    pub fn interleaved_rope(&self) -> bool {
+        self.interleaved_rope
+    }
+
+    /// The exact profile id when this validator verifies `profile`.
+    fn verified(&self, profile: &str) -> Option<&'static str> {
+        use arc_inference::cached_integer_model::{
+            CANONICAL_REWARD_INFERENCE_PROFILE, GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
+        };
+        if profile == CANONICAL_REWARD_INFERENCE_PROFILE {
+            Some(CANONICAL_REWARD_INFERENCE_PROFILE)
+        } else if self.interleaved_rope && profile == GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE {
+            Some(GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE)
+        } else {
+            None
+        }
+    }
+}
+
+/// What `serve` needs for `--community-verify-profiles`. The default is the
+/// legacy profile only, with no Q/K copy and no extra announcements.
+#[derive(Default)]
+pub struct CommunityProfileServing {
+    pub verify: CommunityVerifyProfiles,
+    /// The interleaved-RoPE Q/K rows of this shard holder's resident layers.
+    pub interleaved_rope_qk: Option<Arc<arc_inference::cached_integer_model::InterleavedRopeQk>>,
+    /// This holder's ranges announced under the interleaved-RoPE profile.
+    pub interleaved_rope_shard_infos: Vec<ShardInfo>,
+}
+
+/// Shard-registry key for one announcement. Every profile except the
+/// interleaved-RoPE one keeps the historical `socket#start-end` key, so the
+/// registry is unchanged until a holder announces that profile. Its entries
+/// then sit beside the same holder's legacy entries instead of replacing them.
+fn shard_registry_key(shard: &ShardInfo) -> String {
+    let key = format!(
+        "{}#{}-{}",
+        shard.socket_addr, shard.start_layer, shard.end_layer
+    );
+    if shard.execution_profile
+        == arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
+    {
+        format!("{key}#{}", shard.execution_profile)
+    } else {
+        key
+    }
+}
+
+/// Per-request KV-cache key on a shard holder. The legacy profile keeps the
+/// caller's request id. The interleaved-RoPE profile caches different K rows,
+/// so it gets its own entry, and one request can never mix the two.
+fn shard_kv_cache_key(request_id: &str, execution_profile: &str) -> String {
+    if execution_profile
+        == arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
+    {
+        format!("{request_id}#{execution_profile}")
+    } else {
+        request_id.to_string()
+    }
+}
+
+/// Bytes a shard holder keeps resident for its layer weights, in the
+/// `I8Weights::memory_bytes` accounting the node has always announced. It
+/// includes the interleaved-RoPE Q/K copy when one is loaded.
+pub fn shard_resident_weight_bytes(
+    model: &arc_inference::cached_integer_model::CachedIntegerModel,
+    interleaved_rope_qk: Option<&arc_inference::cached_integer_model::InterleavedRopeQk>,
+) -> usize {
+    let layers: usize = model
+        .layers
+        .iter()
+        .filter(|layer| layer.is_loaded())
+        .map(|layer| {
+            layer.wq.memory_bytes()
+                + layer.wk.memory_bytes()
+                + layer.wv.memory_bytes()
+                + layer.wo.memory_bytes()
+                + layer.w_gate.memory_bytes()
+                + layer.w_up.memory_bytes()
+                + layer.w_down.memory_bytes()
+        })
+        .sum();
+    layers + interleaved_rope_qk.map_or(0, |copy| copy.memory_bytes())
+}
+
+/// Announcements for this node's held ranges: the legacy list, as before,
+/// and the same ranges under the interleaved-RoPE profile when its Q/K copy
+/// is resident. Memory counts the copy, so each entry reports what this
+/// holder keeps resident for that range.
+pub fn shard_announcements(
+    model: &arc_inference::cached_integer_model::CachedIntegerModel,
+    ranges: &[(usize, usize)],
+    artifact_id: Hash256,
+    socket_addr: &str,
+    node_name: &str,
+    interleaved_rope_qk: Option<&arc_inference::cached_integer_model::InterleavedRopeQk>,
+) -> (Vec<ShardInfo>, Vec<ShardInfo>) {
+    let total_layers = model.config.n_layers;
+    let layers_held_total: usize = ranges.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+    let memory_mb_total = shard_resident_weight_bytes(model, interleaved_rope_qk) / (1024 * 1024);
+    let per_layer_mb = memory_mb_total / layers_held_total.max(1);
+    let full_model_mb = per_layer_mb * total_layers;
+    let model_display_name = format!(
+        "arc-{}L-{}d-{}h-{}v",
+        model.config.n_layers, model.config.d_model, model.config.n_heads, model.config.vocab_size
+    );
+    let announce = |execution_profile: &str| -> Vec<ShardInfo> {
+        ranges
+            .iter()
+            .map(|&(start, end)| ShardInfo {
+                start_layer: start,
+                end_layer: end,
+                total_layers,
+                model_id: format!("0x{}", hex::encode(artifact_id.0)),
+                model_name: model_display_name.clone(),
+                execution_profile: execution_profile.to_string(),
+                memory_mb: per_layer_mb * (end - start),
+                full_model_mb,
+                socket_addr: socket_addr.to_string(),
+                node_name: node_name.to_string(),
+            })
+            .collect()
+    };
+    let legacy = announce(model.effective_precision_label());
+    let interleaved_rope = if interleaved_rope_qk.is_some() {
+        announce(arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE)
+    } else {
+        Vec::new()
+    };
+    (legacy, interleaved_rope)
 }
 
 /// A community worker: an arc-node running with --community-mode that
@@ -1613,6 +1802,9 @@ pub fn build_node_state(
             COMMUNITY_APPROVAL_QUEUE_CAP,
         )),
         shard_infos: Vec::new(),
+        interleaved_rope_shard_infos: Vec::new(),
+        interleaved_rope_qk: None,
+        community_verify_profiles: CommunityVerifyProfiles::default(),
         shard_kv_caches: Arc::new(dashmap::DashMap::new()),
         shard_kv_cache_metadata: Arc::new(dashmap::DashMap::new()),
         shard_kv_cache_gate: Arc::new(parking_lot::Mutex::new(())),
@@ -2089,6 +2281,9 @@ pub async fn serve(
     // Twin execution v0 and generated community demand
     // (docs/twin-execution.md). Every switch defaults to off.
     community_twin: crate::twin::TwinConfig,
+    // --community-verify-profiles (stage 1 of the live-profile switch).
+    // The default verifies, serves and announces the legacy profile only.
+    community_profiles: CommunityProfileServing,
 ) -> anyhow::Result<()> {
     if community_rewards_v1_enabled && state.community_rewards_v1_activation_height().is_none() {
         anyhow::bail!(
@@ -2147,14 +2342,28 @@ pub async fn serve(
     node.community_work_results = Some(Arc::new(dashmap::DashMap::new()));
 
     node.shard_infos = shard_infos.clone();
+    let CommunityProfileServing {
+        verify: community_verify_profiles,
+        interleaved_rope_qk,
+        interleaved_rope_shard_infos,
+    } = community_profiles;
+    node.community_verify_profiles = community_verify_profiles;
+    node.interleaved_rope_qk = interleaved_rope_qk;
+    node.interleaved_rope_shard_infos = interleaved_rope_shard_infos.clone();
+    if community_verify_profiles.interleaved_rope() {
+        tracing::info!(
+            interleaved_rope_ranges = interleaved_rope_shard_infos.len(),
+            "verifying the interleaved-RoPE community profile beside the legacy one (--community-verify-profiles)"
+        );
+    }
     node.seed_rpc_addrs = Arc::new(seed_rpc_addrs);
     node.community_rpc_bases = Arc::new(community_rpc_bases);
     // Seed the local registry with every range this node holds so /shards
     // reports the full picture the moment RPC comes up. The registry is
     // keyed by (socket_addr + range) so two entries with the same socket but
     // different ranges coexist.
-    for si in &shard_infos {
-        let key = format!("{}#{}-{}", si.socket_addr, si.start_layer, si.end_layer);
+    for si in shard_infos.iter().chain(&interleaved_rope_shard_infos) {
+        let key = shard_registry_key(si);
         node.shard_registry.insert(
             key,
             (
@@ -2169,7 +2378,11 @@ pub async fn serve(
         // for TCP development listeners and sealed production Unix listeners.
         // Remote registries still accept only signed direct-holder announces.
         let refresh_registry = node.shard_registry.clone();
-        let refresh_infos = shard_infos.clone();
+        let refresh_infos: Vec<ShardInfo> = shard_infos
+            .iter()
+            .chain(&interleaved_rope_shard_infos)
+            .cloned()
+            .collect();
         let refresh_validator = node.validator_address;
         let mut refresh_shutdown = node.runtime_shutdown.clone();
         spawn_node_runtime_task(&node, async move {
@@ -2181,10 +2394,7 @@ pub async fn serve(
                 }
                 let now = std::time::Instant::now();
                 for shard in &refresh_infos {
-                    let key = format!(
-                        "{}#{}-{}",
-                        shard.socket_addr, shard.start_layer, shard.end_layer
-                    );
+                    let key = shard_registry_key(shard);
                     refresh_registry.insert(
                         key,
                         (
@@ -9721,7 +9931,15 @@ async fn inference_forward_shard_authenticated(
         "No model loaded".to_string(),
     ))?;
     let local_execution_profile = model.effective_precision_label();
-    if req.execution_profile != local_execution_profile {
+    // A holder that verifies the interleaved-RoPE profile also serves it, from
+    // its Q/K copy and its legacy model's other weights.
+    let interleaved_rope_qk = node.interleaved_rope_qk.clone().filter(|_| {
+        req.execution_profile
+            == arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
+            && local_execution_profile
+                == arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE
+    });
+    if req.execution_profile != local_execution_profile && interleaved_rope_qk.is_none() {
         return Err((
             StatusCode::CONFLICT,
             format!(
@@ -9791,6 +10009,7 @@ async fn inference_forward_shard_authenticated(
     let shard = node
         .shard_infos
         .iter()
+        .chain(&node.interleaved_rope_shard_infos)
         .find(|s| {
             s.start_layer == req.start_layer
                 && s.end_layer == req.end_layer
@@ -9865,8 +10084,9 @@ async fn inference_forward_shard_authenticated(
 
     // Get-or-create per-request KV cache
     let n_layers = model.config.n_layers;
+    let kv_cache_key = shard_kv_cache_key(&req.request_id, &req.execution_profile);
     let (cache_arc, cache_reservation) =
-        reserve_shard_kv_cache(&node, &req.request_id, signer, n_layers)?;
+        reserve_shard_kv_cache(&node, &kv_cache_key, signer, n_layers)?;
 
     // Run the shard's forward pass (blocking - uses spawn_blocking to free runtime)
     let model_clone = model.clone();
@@ -9876,6 +10096,7 @@ async fn inference_forward_shard_authenticated(
     let position = req.position;
     let generated_tokens = req.generated_tokens.clone();
     let node_name = shard.node_name.clone();
+    let interleaved_rope_for_compute = interleaved_rope_qk.clone();
 
     let t0 = std::time::Instant::now();
     let pool_node = node.clone();
@@ -9910,14 +10131,25 @@ async fn inference_forward_shard_authenticated(
                 };
                 let kv_mutex_wait_us = elapsed_micros(kv_mutex_wait_started);
                 let forward_started = Instant::now();
-                let result = model_clone.forward_shard_token_with_history(
-                    input,
-                    &mut cache,
-                    start_layer,
-                    end_layer,
-                    position,
-                    &generated_tokens,
-                );
+                let result = match interleaved_rope_for_compute.as_deref() {
+                    Some(copy) => model_clone.forward_shard_token_with_history_interleaved_rope(
+                        input,
+                        &mut cache,
+                        start_layer,
+                        end_layer,
+                        position,
+                        &generated_tokens,
+                        copy,
+                    ),
+                    None => model_clone.forward_shard_token_with_history(
+                        input,
+                        &mut cache,
+                        start_layer,
+                        end_layer,
+                        position,
+                        &generated_tokens,
+                    ),
+                };
                 let forward_us = elapsed_micros(forward_started);
                 (
                     result,
@@ -9949,9 +10181,10 @@ async fn inference_forward_shard_authenticated(
             arc_inference::cached_integer_model::ShardForwardError::KvCacheOutOfSync { .. } => {
                 StatusCode::CONFLICT
             }
-            arc_inference::cached_integer_model::ShardForwardError::LayerNotLoaded { .. } => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            arc_inference::cached_integer_model::ShardForwardError::LayerNotLoaded { .. }
+            | arc_inference::cached_integer_model::ShardForwardError::InterleavedRopeUnavailable {
+                ..
+            } => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::BAD_REQUEST,
         };
         tracing::warn!(
@@ -9973,8 +10206,8 @@ async fn inference_forward_shard_authenticated(
     // Optionally evict cache after the last token
     if req.last_token {
         let _gate = node.shard_kv_cache_gate.lock();
-        node.shard_kv_caches.remove(&req_id);
-        node.shard_kv_cache_metadata.remove(&req_id);
+        node.shard_kv_caches.remove(&kv_cache_key);
+        node.shard_kv_cache_metadata.remove(&kv_cache_key);
     }
 
     let layers_processed = end_layer - start_layer;
@@ -10059,18 +10292,27 @@ async fn inference_cleanup_shard_authenticated(
 
     let removed = {
         let _gate = node.shard_kv_cache_gate.lock();
-        if let Some(metadata) = node.shard_kv_cache_metadata.get(&req.request_id)
-            && metadata.signer != signer
-        {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "request_id is owned by a different authenticated validator".to_string(),
-            ));
+        // A request's interleaved-RoPE cache, if any, sits under its own key.
+        let interleaved_rope_key = shard_kv_cache_key(
+            &req.request_id,
+            arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
+        );
+        for key in [&req.request_id, &interleaved_rope_key] {
+            if let Some(metadata) = node.shard_kv_cache_metadata.get(key)
+                && metadata.signer != signer
+            {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "request_id is owned by a different authenticated validator".to_string(),
+                ));
+            }
         }
 
         let removed = node.shard_kv_caches.remove(&req.request_id).is_some();
         node.shard_kv_cache_metadata.remove(&req.request_id);
-        removed
+        let removed_interleaved_rope = node.shard_kv_caches.remove(&interleaved_rope_key).is_some();
+        node.shard_kv_cache_metadata.remove(&interleaved_rope_key);
+        removed || removed_interleaved_rope
     };
     Ok(Json(json!({
         "ok": true,
@@ -12986,11 +13228,9 @@ async fn announce_shard(
     // produces one entry per range - otherwise the DashMap insert clobbers
     // prior announces and only the most recent range survives. The
     // coordinator's BTreeMap grouping already keys on (start, end) so a
-    // per-range entry is exactly what we need.
-    let key = format!(
-        "{}#{}-{}",
-        req.shard.socket_addr, req.shard.start_layer, req.shard.end_layer
-    );
+    // per-range entry is exactly what we need. An interleaved-RoPE
+    // announcement keeps its own entry beside the holder's legacy one.
+    let key = shard_registry_key(&req.shard);
     // Also register in multi-model ShardRegistry for multi-model routing
     let assignment = arc_inference::distributed::ShardAssignment {
         node_address: announcing_validator,
@@ -13982,6 +14222,7 @@ struct CommunityResultVerification {
     tokens_generated: usize,
     range_count: usize,
     range_position_quorum_count: usize,
+    execution_profile: &'static str,
 }
 
 #[derive(Debug)]
@@ -14010,8 +14251,7 @@ impl From<&CommunityResultVerification> for CommunityVerificationSummary {
             method: "authenticated_shard_quorum_2_of_3_per_range",
             profile_bound: true,
             quorum_verified: true,
-            execution_profile:
-                arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
+            execution_profile: verified.execution_profile,
             output_hash: format!("0x{}", verified.output_hash.to_hex()),
             tokens_generated: verified.tokens_generated,
             ranges: verified.range_count,
@@ -14101,6 +14341,34 @@ fn compare_community_result_with_tokens(
         );
     }
     Ok(actual_hash)
+}
+
+/// The worker profile a job's verification requires: the job's own profile
+/// when this validator verifies it (`--community-verify-profiles`), and the
+/// legacy profile otherwise, exactly as before.
+fn validate_community_reward_profile_for_job(
+    node: &NodeState,
+    work_item: &WorkItem,
+    result: &WorkResult,
+) -> Result<(), String> {
+    match node
+        .community_verify_profiles
+        .verified(&work_item.execution_profile)
+    {
+        Some(expected)
+            if expected
+                != arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE =>
+        {
+            if result.engine != expected {
+                return Err(format!(
+                    "community worker execution profile {:?} differs from required {:?}",
+                    result.engine, expected
+                ));
+            }
+            Ok(())
+        }
+        _ => validate_community_reward_profile(result),
+    }
 }
 
 fn validate_community_reward_profile(result: &WorkResult) -> Result<(), String> {
@@ -14248,7 +14516,8 @@ async fn verify_community_result_with_quorum(
     work_item: &WorkItem,
     result: &WorkResult,
 ) -> Result<CommunityResultVerification, CommunityResultVerificationError> {
-    validate_community_reward_profile(result).map_err(CommunityResultVerificationError::Invalid)?;
+    validate_community_reward_profile_for_job(node, work_item, result)
+        .map_err(CommunityResultVerificationError::Invalid)?;
     let recomputed = recompute_community_output_with_quorum(node, work_item).await?;
     let output_hash = compare_community_result_with_tokens(
         result,
@@ -14262,6 +14531,7 @@ async fn verify_community_result_with_quorum(
         tokens_generated: recomputed.generated.len(),
         range_count: recomputed.range_count,
         range_position_quorum_count: recomputed.range_position_quorum_count,
+        execution_profile: recomputed.execution_profile,
     })
 }
 
@@ -14274,6 +14544,8 @@ struct CommunityCanonicalRecompute {
     output_hash: Hash256,
     range_count: usize,
     range_position_quorum_count: usize,
+    /// The profile the validator shards executed: the assignment's own.
+    execution_profile: &'static str,
 }
 
 /// Recompute an assignment through three authenticated, distinct
@@ -14284,12 +14556,17 @@ async fn recompute_community_output_with_quorum(
     work_item: &WorkItem,
 ) -> Result<CommunityCanonicalRecompute, CommunityResultVerificationError> {
     let canonical = arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE;
-    if work_item.execution_profile != canonical {
+    // The legacy profile, or the interleaved-RoPE one when this validator
+    // verifies it; the shards then run the assignment's own profile.
+    let Some(required) = node
+        .community_verify_profiles
+        .verified(&work_item.execution_profile)
+    else {
         return Err(CommunityResultVerificationError::Unavailable(format!(
             "community assignment execution profile {:?} differs from required {:?}",
             work_item.execution_profile, canonical
         )));
-    }
+    };
     let model = node
         .inference_model
         .as_ref()
@@ -14320,7 +14597,7 @@ async fn recompute_community_output_with_quorum(
             if let Some(pipeline) = node.community_verification_pipeline_override.clone() {
                 pipeline
             } else {
-                assemble_profile_bound_pipeline_for(node, Some(canonical))
+                assemble_profile_bound_pipeline_for(node, Some(required))
                     .map(|selection| selection.hops)
                     .map_err(|e| {
                         CommunityResultVerificationError::Unavailable(format!(
@@ -14331,7 +14608,7 @@ async fn recompute_community_output_with_quorum(
         }
         #[cfg(not(test))]
         {
-            assemble_profile_bound_pipeline_for(node, Some(canonical))
+            assemble_profile_bound_pipeline_for(node, Some(required))
                 .map(|selection| selection.hops)
                 .map_err(|e| {
                     CommunityResultVerificationError::Unavailable(format!(
@@ -14342,10 +14619,10 @@ async fn recompute_community_output_with_quorum(
     };
     let pipeline_profile = pipeline_execution_profile(&pipeline)
         .map_err(CommunityResultVerificationError::Unavailable)?;
-    if pipeline_profile != canonical {
+    if pipeline_profile != required {
         return Err(CommunityResultVerificationError::Unavailable(format!(
             "reward verification pipeline uses {:?}, required {:?}",
-            pipeline_profile, canonical
+            pipeline_profile, required
         )));
     }
     for (range, replicas) in &pipeline {
@@ -14420,6 +14697,7 @@ async fn recompute_community_output_with_quorum(
         output_text,
         range_count: pipeline.len(),
         range_position_quorum_count,
+        execution_profile: required,
     })
 }
 
@@ -14436,7 +14714,11 @@ fn validate_reward_approval_payload(
         return Err("community reward protocol is not active".to_string());
     }
     let canonical = arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE;
-    if payload.execution_profile != canonical {
+    if node
+        .community_verify_profiles
+        .verified(&payload.execution_profile)
+        .is_none()
+    {
         return Err(format!(
             "community reward approval execution profile {:?} differs from required {:?}",
             payload.execution_profile, canonical
@@ -14640,10 +14922,11 @@ fn validate_reward_approval_payload(
         ms_per_token: 0,
         // This is the worker execution profile committed by the candidate,
         // not a label for the validator-side verification procedure.  Remote
-        // approvers must reconstruct the same canonical profile that the
-        // coordinator already checked; the verifier independently proves the
-        // output through authenticated validator shards below.
-        engine: arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+        // approvers must reconstruct the same profile that the coordinator
+        // already checked, which this validator verifies (checked above); the
+        // verifier independently proves the output through authenticated
+        // validator shards below.
+        engine: payload.execution_profile.clone(),
         error: None,
         signed_attestation_hex: None,
     };
@@ -20966,6 +21249,637 @@ mod tests {
         let _ = std::fs::remove_dir_all(temporary);
     }
 
+    /// Six recovered validators with community rewards active, built exactly
+    /// as the remote-approval test builds them. Returns the validator keys,
+    /// the recovered state and the temporary directory to remove.
+    fn recovered_six_validator_state() -> (
+        Vec<arc_crypto::KeyPair>,
+        Arc<arc_state::StateDB>,
+        std::path::PathBuf,
+    ) {
+        use arc_state::recovery::{
+            ArcCheckpoint, RecoveryExportSpec, RecoveryImport, RecoveryNetworkPolicy,
+            RecoveryValidator,
+        };
+        use arc_types::transaction::JoinValidatorBody;
+
+        let validator_keys: Vec<_> = (0..6)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let legacy_keys: Vec<_> = (0..8)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let treasury = arc_types::transaction::inference_reward_treasury_address();
+        let reward_amount = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
+        let mut prefunded = vec![
+            (treasury, reward_amount * 2),
+            (worker.address(), 0),
+            (arc_state::recovery::recovery_stake_reserve_address(), 0),
+        ];
+        prefunded.extend(legacy_keys.iter().map(|key| (key.address(), 5_000_000)));
+        let source = arc_state::StateDB::with_genesis(&prefunded);
+        let joins = legacy_keys
+            .iter()
+            .map(|key| {
+                let mut transaction = Transaction {
+                    tx_type: TxType::JoinValidator,
+                    from: key.address(),
+                    nonce: 0,
+                    body: TxBody::JoinValidator(JoinValidatorBody {
+                        pubkey: key.public_key_bytes().try_into().unwrap(),
+                        initial_stake: 5_000_000,
+                    }),
+                    fee: 0,
+                    gas_limit: 0,
+                    hash: Hash256::ZERO,
+                    signature: arc_crypto::Signature::null(),
+                    sig_verified: false,
+                };
+                transaction.sign(key).unwrap();
+                transaction
+            })
+            .collect::<Vec<_>>();
+        let (_, join_receipts) = source
+            .execute_block(&joins, legacy_keys[0].address())
+            .unwrap();
+        assert!(join_receipts.iter().all(|receipt| receipt.success));
+        // Production legacy validator weight lives in the validator map while
+        // the explicit system reserve carries its fungible backing. Recreate
+        // that unambiguous decomposition instead of exporting overloaded
+        // per-account staked_balance fields.
+        for key in &legacy_keys {
+            let mut account = source.get_account(&key.address()).unwrap();
+            account.staked_balance = 0;
+            source.update_account(&key.address(), account);
+        }
+        let reserve_address = arc_state::recovery::recovery_stake_reserve_address();
+        let mut reserve = source.get_account(&reserve_address).unwrap();
+        reserve.balance = 40_000_000;
+        source.update_account(&reserve_address, reserve);
+        source
+            .execute_block(&[], legacy_keys[0].address())
+            .expect("reserve decomposition must have a canonical source boundary");
+
+        let target_validators = validator_keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| RecoveryValidator {
+                address: key.address(),
+                public_key: key.public_key_bytes().try_into().unwrap(),
+                stake: 6_666_666 + u64::from(index < 4),
+            })
+            .collect::<Vec<_>>();
+        let genesis_hash = arc_crypto::hash_bytes(b"dual-profile-verification-genesis");
+        let mut checkpoint = ArcCheckpoint::export_unsigned(
+            &source,
+            RecoveryExportSpec {
+                chain_id: "arc-dual-profile-test".to_string(),
+                genesis_hash,
+                source_consensus_round: 1,
+                recovery_epoch: 7,
+                validator_set_id: 9,
+                validators: target_validators.clone(),
+                community_rewards_v1_activation_height: Some(0),
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap();
+        for key in validator_keys.iter().take(5) {
+            checkpoint.add_signature(key).unwrap();
+        }
+        let approved_manifest_hash = checkpoint.manifest_hash();
+        let temporary = std::env::temp_dir().join(format!(
+            "arc-dual-profile-verification-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&temporary).unwrap();
+        let checkpoint_path = temporary.join("approved.arcchkpt");
+        checkpoint.write_to(&checkpoint_path).unwrap();
+        let data_dir = temporary.join("recovered");
+        let policy = RecoveryNetworkPolicy {
+            chain_id: "arc-dual-profile-test".to_string(),
+            genesis_hash,
+            recovery_epoch: 7,
+            validator_set_id: 9,
+            validators: target_validators
+                .iter()
+                .map(|validator| (validator.address, validator.stake))
+                .collect(),
+            community_rewards_v1_activation_height: Some(0),
+        };
+        let recovered = Arc::new(
+            arc_state::StateDB::with_genesis_persistent_recovery(
+                &[],
+                &data_dir,
+                policy,
+                Some(RecoveryImport {
+                    checkpoint_path,
+                    approved_manifest_hash,
+                }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(recovered.active_validators().len(), 6);
+        (validator_keys, recovered, temporary)
+    }
+
+    /// The reward fixture with real RoPE angles (the base fixture rotates
+    /// nothing, which makes the two profiles agree) and Q/K rows scaled by
+    /// `qk_gain`, so attention follows the rotated keys.
+    fn dual_profile_test_model(
+        qk_gain: i64,
+    ) -> arc_inference::cached_integer_model::CachedIntegerModel {
+        let mut model = test_reward_inference_model();
+        let (rope_cos, rope_sin) = arc_inference::cached_integer_model::compute_rope_tables(
+            model.config.d_head,
+            model.config.max_seq,
+            2.0,
+        );
+        model.config.rope_cos = rope_cos;
+        model.config.rope_sin = rope_sin;
+        for layer in &mut model.layers {
+            for scale in layer.wq.scales.iter_mut().chain(layer.wk.scales.iter_mut()) {
+                *scale *= qk_gain;
+            }
+        }
+        model
+    }
+
+    /// A legacy model, its interleaved-RoPE twin and a small job on which the
+    /// two profiles generate different tokens.
+    fn profile_divergent_job() -> (
+        arc_inference::cached_integer_model::CachedIntegerModel,
+        arc_inference::cached_integer_model::CachedIntegerModel,
+        &'static str,
+        u32,
+    ) {
+        for qk_gain in [1, 8, 40] {
+            let legacy = dual_profile_test_model(qk_gain);
+            let mut interleaved = dual_profile_test_model(qk_gain);
+            interleaved
+                .canonicalize_gguf_interleaved_rope_rows()
+                .unwrap();
+            for input in [
+                "ARC",
+                "probe",
+                "ok",
+                "yes",
+                "done",
+                "ARC probe",
+                "ok yes",
+                "done ARC",
+            ] {
+                let prompt = legacy.encode(input);
+                for max_tokens in 1..=6u32 {
+                    if legacy.generate(&prompt, max_tokens, &[]).0
+                        != interleaved.generate(&prompt, max_tokens, &[]).0
+                    {
+                        return (legacy, interleaved, input, max_tokens);
+                    }
+                }
+            }
+        }
+        panic!("no small job tells the two profiles apart");
+    }
+
+    #[test]
+    fn community_verify_profiles_default_to_legacy_and_parse_only_known_lists() {
+        use arc_inference::cached_integer_model::{
+            CANONICAL_REWARD_INFERENCE_PROFILE, GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
+        };
+        let legacy_only = CommunityVerifyProfiles::default();
+        assert_eq!(
+            CommunityVerifyProfiles::parse("legacy-split-half").unwrap(),
+            legacy_only
+        );
+        assert!(!legacy_only.interleaved_rope());
+        assert_eq!(
+            legacy_only.verified(CANONICAL_REWARD_INFERENCE_PROFILE),
+            Some(CANONICAL_REWARD_INFERENCE_PROFILE)
+        );
+        assert_eq!(
+            legacy_only.verified(GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE),
+            None
+        );
+
+        let both =
+            CommunityVerifyProfiles::parse(" legacy-split-half , rope-interleaved-v1 ").unwrap();
+        assert!(both.interleaved_rope());
+        assert_eq!(
+            both.verified(GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE),
+            Some(GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE)
+        );
+        assert_eq!(
+            both.verified("INT16 integer (per-row, cross-platform deterministic)"),
+            None
+        );
+
+        // Legacy cannot be dropped in this stage, and unknown names are refused.
+        assert!(CommunityVerifyProfiles::parse("rope-interleaved-v1").is_err());
+        assert!(CommunityVerifyProfiles::parse("").is_err());
+        assert!(CommunityVerifyProfiles::parse("legacy-split-half,rope-v2").is_err());
+    }
+
+    #[test]
+    fn shard_registry_and_kv_keys_change_only_for_the_interleaved_rope_profile() {
+        use arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE;
+        let legacy = ShardInfo {
+            start_layer: 0,
+            end_layer: 16,
+            total_layers: 32,
+            model_id: format!("0x{}", Hash256([3; 32]).to_hex()),
+            model_name: "arc-32L".to_string(),
+            execution_profile: canonical_profile(),
+            memory_mb: 1,
+            full_model_mb: 2,
+            socket_addr: "https://198.51.100.7:9090".to_string(),
+            node_name: "holder".to_string(),
+        };
+        // The historical key, byte for byte.
+        assert_eq!(
+            shard_registry_key(&legacy),
+            "https://198.51.100.7:9090#0-16"
+        );
+        let interleaved = ShardInfo {
+            execution_profile: GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE.to_string(),
+            ..legacy.clone()
+        };
+        assert_eq!(
+            shard_registry_key(&interleaved),
+            format!("https://198.51.100.7:9090#0-16#{GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE}")
+        );
+        let other = ShardInfo {
+            execution_profile: "INT16 integer (per-row, cross-platform deterministic)".to_string(),
+            ..legacy.clone()
+        };
+        assert_eq!(shard_registry_key(&other), shard_registry_key(&legacy));
+
+        assert_eq!(
+            shard_kv_cache_key("request-7", &canonical_profile()),
+            "request-7"
+        );
+        assert_ne!(
+            shard_kv_cache_key("request-7", GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE),
+            "request-7"
+        );
+    }
+
+    #[test]
+    fn shard_announcements_count_the_interleaved_rope_copy() {
+        use arc_inference::cached_integer_model::{
+            GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, InterleavedRopeQk,
+        };
+        let model = dual_profile_test_model(1);
+        let artifact = Hash256([9; 32]);
+        let (legacy, interleaved) = shard_announcements(
+            &model,
+            &[(0, 1)],
+            artifact,
+            "https://holder:9090",
+            "holder",
+            None,
+        );
+        // Without the copy: the legacy entries main announces, and nothing else.
+        assert!(interleaved.is_empty());
+        assert_eq!(legacy.len(), 1);
+        let entry = &legacy[0];
+        assert_eq!(entry.execution_profile, canonical_profile());
+        assert_eq!(entry.model_id, format!("0x{}", artifact.to_hex()));
+        assert_eq!(entry.model_name, "arc-1L-4d-1h-8v");
+        assert_eq!(
+            entry.memory_mb,
+            shard_resident_weight_bytes(&model, None) / (1024 * 1024)
+        );
+        assert_eq!(
+            (entry.socket_addr.as_str(), entry.node_name.as_str()),
+            ("https://holder:9090", "holder")
+        );
+
+        // With the copy: the same ranges under both profiles, and the resident
+        // weights include the second Q/K copy.
+        let copy = InterleavedRopeQk::from_resident_layers(&model).unwrap();
+        assert!(copy.memory_bytes() > 0);
+        assert_eq!(
+            shard_resident_weight_bytes(&model, Some(&copy)),
+            shard_resident_weight_bytes(&model, None) + copy.memory_bytes()
+        );
+        let (legacy, interleaved) = shard_announcements(
+            &model,
+            &[(0, 1)],
+            artifact,
+            "https://holder:9090",
+            "holder",
+            Some(&copy),
+        );
+        assert_eq!(legacy[0].execution_profile, canonical_profile());
+        assert_eq!(
+            interleaved[0].execution_profile,
+            GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
+        );
+        assert_eq!(
+            (interleaved[0].start_layer, interleaved[0].end_layer),
+            (0, 1)
+        );
+        assert_eq!(
+            interleaved[0].memory_mb,
+            shard_resident_weight_bytes(&model, Some(&copy)) / (1024 * 1024)
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_both_profiles_accepts_each_profile_and_rejects_a_mismatched_output() {
+        use arc_inference::cached_integer_model::{
+            CANONICAL_REWARD_INFERENCE_PROFILE, GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
+            InterleavedRopeQk,
+        };
+
+        let (legacy_model, interleaved_model, input, max_tokens) = profile_divergent_job();
+        let (validator_keys, recovered, temporary) = recovered_six_validator_state();
+        let active = recovered.active_validators();
+        let model_id = arc_crypto::hash_bytes(b"dual-profile-exact-model");
+        let model = Arc::new(legacy_model);
+        let copy = Arc::new(InterleavedRopeQk::from_resident_layers(&model).unwrap());
+        let verify_both =
+            CommunityVerifyProfiles::parse("legacy-split-half,rope-interleaved-v1").unwrap();
+
+        // Three validator shard holders, each serving the one-layer range
+        // under both profiles from one legacy model plus the Q/K copy.
+        let mut shard_nodes = Vec::new();
+        let mut shard_handles = Vec::new();
+        let mut legacy_replicas = Vec::new();
+        let mut interleaved_replicas = Vec::new();
+        for (index, key) in validator_keys.iter().take(3).enumerate() {
+            let mut node = fake_node_with_workers(Vec::new());
+            node.state = recovered.clone();
+            node.validator_address = key.address();
+            node.validator_keypair = Some(Arc::new(key.clone()));
+            node.inference_model = Some(model.clone());
+            node.model_artifact_id = Some(model_id);
+            *node.dag_validators.write() = active.clone();
+            let legacy_info = ShardInfo {
+                start_layer: 0,
+                end_layer: 1,
+                total_layers: 1,
+                model_id: format!("0x{}", model_id.to_hex()),
+                model_name: model_display_name(&model),
+                execution_profile: canonical_profile(),
+                memory_mb: 1,
+                full_model_mb: 1,
+                socket_addr: String::new(),
+                node_name: format!("shard-{index}"),
+            };
+            let interleaved_info = ShardInfo {
+                execution_profile: GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE.to_string(),
+                ..legacy_info.clone()
+            };
+            node.shard_infos = vec![legacy_info.clone()];
+            node.interleaved_rope_shard_infos = vec![interleaved_info.clone()];
+            node.interleaved_rope_qk = Some(copy.clone());
+            node.community_verify_profiles = verify_both;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let app = Router::new()
+                .route("/network/info", get(network_info))
+                .route("/inference/forward_shard", post(inference_forward_shard))
+                .route("/inference/cleanup_shard", post(inference_cleanup_shard))
+                .with_state(node.clone());
+            shard_handles.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+            legacy_replicas.push(ShardInfo {
+                socket_addr: origin.clone(),
+                ..legacy_info
+            });
+            interleaved_replicas.push(ShardInfo {
+                socket_addr: origin,
+                ..interleaved_info
+            });
+            shard_nodes.push(node);
+        }
+        let legacy_pipeline = vec![((0, 1), legacy_replicas)];
+        let interleaved_pipeline = vec![((0, 1), interleaved_replicas)];
+
+        let mut coordinator = fake_node_with_workers(Vec::new());
+        coordinator.state = recovered.clone();
+        coordinator.validator_address = validator_keys[3].address();
+        coordinator.validator_keypair = Some(Arc::new(validator_keys[3].clone()));
+        coordinator.inference_model = Some(model.clone());
+        coordinator.model_artifact_id = Some(model_id);
+        *coordinator.dag_validators.write() = active.clone();
+        coordinator.community_verify_profiles = verify_both;
+
+        // What a legacy worker and an interleaved-RoPE worker return.
+        let prompt = model.encode(input);
+        let job = |profile: &str| WorkItem {
+            job_id: arc_crypto::hash_bytes(profile.as_bytes()).to_hex(),
+            input: input.to_string(),
+            max_tokens,
+            model_id: Some(format!("0x{}", model_id.to_hex())),
+            execution_profile: profile.to_string(),
+            transaction_domain: None,
+            expected_worker_id: None,
+            submitted_at_unix_ms: 1,
+            expires_at_unix_ms: u64::MAX,
+        };
+        let completion =
+            |work_item: &WorkItem,
+             engine: &str,
+             generator: &arc_inference::cached_integer_model::CachedIntegerModel| {
+                let (tokens, output_hash) = generator.generate(&prompt, max_tokens, &[]);
+                WorkResult {
+                    job_id: work_item.job_id.clone(),
+                    worker_id: "dual-profile-worker".to_string(),
+                    success: true,
+                    declined: false,
+                    output: model.decode(&tokens),
+                    output_hash: format!("0x{}", output_hash.to_hex()),
+                    tokens_generated: tokens.len() as u64,
+                    total_ms: 1,
+                    ms_per_token: 1,
+                    engine: engine.to_string(),
+                    error: None,
+                    signed_attestation_hex: None,
+                }
+            };
+        let legacy_job = job(CANONICAL_REWARD_INFERENCE_PROFILE);
+        let interleaved_job = job(GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE);
+        let legacy_generator: &arc_inference::cached_integer_model::CachedIntegerModel = &model;
+        let legacy_result = completion(
+            &legacy_job,
+            CANONICAL_REWARD_INFERENCE_PROFILE,
+            legacy_generator,
+        );
+        let interleaved_result = completion(
+            &interleaved_job,
+            GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
+            &interleaved_model,
+        );
+        assert_ne!(legacy_result.output_hash, interleaved_result.output_hash);
+
+        // A legacy job verifies through the legacy shards; the other
+        // profile's output for the same job is refused as invalid.
+        coordinator.community_verification_pipeline_override = Some(legacy_pipeline.clone());
+        let verified =
+            verify_community_result_with_quorum(&coordinator, &legacy_job, &legacy_result)
+                .await
+                .expect("a legacy job verifies under verify-both");
+        assert_eq!(
+            CommunityVerificationSummary::from(&verified).execution_profile,
+            CANONICAL_REWARD_INFERENCE_PROFILE
+        );
+        let legacy_job_with_interleaved_output = WorkResult {
+            engine: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+            job_id: legacy_job.job_id.clone(),
+            ..interleaved_result.clone()
+        };
+        assert!(matches!(
+            verify_community_result_with_quorum(
+                &coordinator,
+                &legacy_job,
+                &legacy_job_with_interleaved_output
+            )
+            .await,
+            Err(CommunityResultVerificationError::Invalid(_))
+        ));
+
+        // An interleaved-RoPE job verifies through the same holders' copy.
+        coordinator.community_verification_pipeline_override = Some(interleaved_pipeline.clone());
+        let verified = verify_community_result_with_quorum(
+            &coordinator,
+            &interleaved_job,
+            &interleaved_result,
+        )
+        .await
+        .expect("an interleaved-RoPE job verifies under verify-both");
+        assert_eq!(
+            CommunityVerificationSummary::from(&verified).execution_profile,
+            GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
+        );
+        assert_eq!(
+            verified.output_hash.to_hex(),
+            interleaved_result.output_hash[2..]
+        );
+        let interleaved_job_with_legacy_output = WorkResult {
+            engine: GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE.to_string(),
+            job_id: interleaved_job.job_id.clone(),
+            ..legacy_result.clone()
+        };
+        assert!(matches!(
+            verify_community_result_with_quorum(
+                &coordinator,
+                &interleaved_job,
+                &interleaved_job_with_legacy_output
+            )
+            .await,
+            Err(CommunityResultVerificationError::Invalid(_))
+        ));
+
+        // With the setting off, everything answers exactly as on main.
+        let mut legacy_only = coordinator.clone();
+        legacy_only.community_verify_profiles = CommunityVerifyProfiles::default();
+        let Err(CommunityResultVerificationError::Invalid(reason)) =
+            verify_community_result_with_quorum(
+                &legacy_only,
+                &interleaved_job,
+                &interleaved_result,
+            )
+            .await
+        else {
+            panic!("legacy-only verification refuses the interleaved-RoPE engine");
+        };
+        assert_eq!(
+            reason,
+            format!(
+                "community worker execution profile {:?} differs from required {:?}",
+                GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, CANONICAL_REWARD_INFERENCE_PROFILE
+            )
+        );
+        let interleaved_job_with_legacy_engine = WorkResult {
+            engine: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+            ..interleaved_result.clone()
+        };
+        let Err(CommunityResultVerificationError::Unavailable(reason)) =
+            verify_community_result_with_quorum(
+                &legacy_only,
+                &interleaved_job,
+                &interleaved_job_with_legacy_engine,
+            )
+            .await
+        else {
+            panic!("legacy-only verification refuses an interleaved-RoPE assignment");
+        };
+        assert_eq!(
+            reason,
+            format!(
+                "community assignment execution profile {:?} differs from required {:?}",
+                GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, CANONICAL_REWARD_INFERENCE_PROFILE
+            )
+        );
+
+        let mut payload = test_verified_settlement_payload(Hash256([5; 32]), 100);
+        payload.execution_profile = GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE.to_string();
+        legacy_only.community_rewards_v1_enabled = true;
+        assert_eq!(
+            validate_reward_approval_payload(&legacy_only, &payload).unwrap_err(),
+            format!(
+                "community reward approval execution profile {:?} differs from required {:?}",
+                GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, CANONICAL_REWARD_INFERENCE_PROFILE
+            )
+        );
+        coordinator.community_rewards_v1_enabled = true;
+        let later_error = validate_reward_approval_payload(&coordinator, &payload)
+            .expect_err("this payload's other fields are synthetic");
+        assert!(
+            !later_error.contains("approval execution profile"),
+            "{later_error}"
+        );
+
+        // A holder without the copy refuses the profile with main's answer.
+        let mut plain_holder = shard_nodes[0].clone();
+        plain_holder.interleaved_rope_qk = None;
+        plain_holder.interleaved_rope_shard_infos.clear();
+        plain_holder.community_verify_profiles = CommunityVerifyProfiles::default();
+        let request = ForwardShardRequest {
+            request_id: "plain-holder".to_string(),
+            model_id: format!("0x{}", model_id.to_hex()),
+            execution_profile: GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE.to_string(),
+            token: Some(3),
+            hidden: None,
+            hidden_hash: None,
+            position: 0,
+            start_layer: 0,
+            end_layer: 1,
+            expected_hidden_len: model.config.d_model,
+            expect_terminal: true,
+            generated_tokens: Vec::new(),
+            last_token: false,
+        };
+        let Err((status, message)) = inference_forward_shard_authenticated(
+            plain_holder,
+            request,
+            validator_keys[3].address(),
+        )
+        .await
+        else {
+            panic!("a holder without the copy refuses the interleaved-RoPE profile");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            message,
+            format!(
+                "execution profile mismatch: requested {:?}, this shard executes {:?}",
+                GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, CANONICAL_REWARD_INFERENCE_PROFILE
+            )
+        );
+
+        for handle in shard_handles {
+            handle.abort();
+        }
+        drop(shard_nodes);
+        let _ = std::fs::remove_dir_all(temporary);
+    }
+
     #[tokio::test]
     async fn work_queue_round_trip_after_serve_wiring() {
         // Smoke test: build_node_state alone leaves the queue None
@@ -21278,6 +22192,9 @@ mod tests {
                 COMMUNITY_APPROVAL_QUEUE_CAP,
             )),
             shard_infos: Vec::new(),
+            interleaved_rope_shard_infos: Vec::new(),
+            interleaved_rope_qk: None,
+            community_verify_profiles: CommunityVerifyProfiles::default(),
             shard_kv_caches: Arc::new(dashmap::DashMap::new()),
             shard_kv_cache_metadata: Arc::new(dashmap::DashMap::new()),
             shard_kv_cache_gate: Arc::new(parking_lot::Mutex::new(())),

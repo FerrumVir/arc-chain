@@ -671,10 +671,9 @@ impl CachedIntegerModel {
     /// This only supports the canonical per-row I8 path. Optional precision
     /// copies would need the same row permutation, so callers must load via
     /// `load_cached_model_canonical_i8_interleaved_rope` rather than mutate a
-    /// general-purpose model after optional profiles are materialized.
-    pub(crate) fn canonicalize_gguf_interleaved_rope_rows(
-        &mut self,
-    ) -> Result<(), crate::InferenceError> {
+    /// general-purpose model after optional profiles are materialized; this
+    /// method refuses any model that still carries one.
+    pub fn canonicalize_gguf_interleaved_rope_rows(&mut self) -> Result<(), crate::InferenceError> {
         if self.config.arithmetic_profile != ArithmeticProfile::LegacySplitHalfV0 {
             return Err(crate::InferenceError::Runtime(
                 "GGUF interleaved-RoPE canonicalization was requested twice".into(),
@@ -849,7 +848,10 @@ impl CachedIntegerModel {
         } else if self.q4_layers.is_some() {
             Q4_INFERENCE_PROFILE
         } else {
-            CANONICAL_REWARD_INFERENCE_PROFILE
+            // Per-row INT8 runs whichever Q/K layout is resident. A model
+            // converted to the GGUF interleaved-RoPE rows must not be
+            // announced or labelled as the legacy split-half profile.
+            self.arithmetic_profile()
         }
     }
 
@@ -2669,6 +2671,117 @@ fn permute_interleaved_rows_to_split_half(
     Ok(())
 }
 
+/// A second, read-only copy of the Q and K projections of every resident
+/// layer, in the GGUF interleaved-RoPE row order
+/// (`GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE`).
+///
+/// The two community reward profiles differ only in these rows. V, O, the
+/// feed-forward matrices, norms, embeddings and the LM head are identical.
+/// A validator shard holder that verifies both profiles therefore keeps its
+/// legacy model plus this copy, not a second model. The rows come from the
+/// same permutation as
+/// [`CachedIntegerModel::canonicalize_gguf_interleaved_rope_rows`], so
+/// running a layer range with them is exactly that range of the corrected
+/// whole model.
+pub struct InterleavedRopeQk {
+    layers: Vec<Option<(I8Weights, I8Weights)>>,
+}
+
+impl InterleavedRopeQk {
+    /// Copy and permute the Q/K rows of every resident layer of a legacy,
+    /// canonical per-row INT8 model. Layer slots the model does not hold get
+    /// no copy, so a range-loaded shard holder pays only for its own layers.
+    pub fn from_resident_layers(model: &CachedIntegerModel) -> Result<Self, crate::InferenceError> {
+        if model.config.arithmetic_profile != ArithmeticProfile::LegacySplitHalfV0 {
+            return Err(crate::InferenceError::Runtime(
+                "an interleaved-RoPE Q/K copy is built from the legacy split-half model".into(),
+            ));
+        }
+        if !model.has_canonical_i8_profile() {
+            return Err(crate::InferenceError::Runtime(
+                "an interleaved-RoPE Q/K copy requires the canonical per-row INT8 profile".into(),
+            ));
+        }
+        let copy = |weights: &I8Weights| I8Weights {
+            data: weights.data.clone(),
+            scales: weights.scales.clone(),
+            n_rows: weights.n_rows,
+            n_cols: weights.n_cols,
+        };
+        let mut layers = Vec::with_capacity(model.layers.len());
+        for layer in &model.layers {
+            if !layer.is_loaded() {
+                layers.push(None);
+                continue;
+            }
+            let mut wq = copy(&layer.wq);
+            let mut wk = copy(&layer.wk);
+            permute_interleaved_rows_to_split_half(
+                &mut wq,
+                model.config.n_heads,
+                model.config.d_head,
+                "wq",
+            )?;
+            permute_interleaved_rows_to_split_half(
+                &mut wk,
+                model.config.n_kv_heads,
+                model.config.d_head,
+                "wk",
+            )?;
+            layers.push(Some((wq, wk)));
+        }
+        if layers.iter().all(Option::is_none) {
+            return Err(crate::InferenceError::Runtime(
+                "an interleaved-RoPE Q/K copy needs at least one resident layer".into(),
+            ));
+        }
+        Ok(Self { layers })
+    }
+
+    /// Whether the copy holds every layer of `[start, end)`.
+    pub fn covers(&self, start: usize, end: usize) -> bool {
+        start < end
+            && end <= self.layers.len()
+            && self.layers[start..end].iter().all(Option::is_some)
+    }
+
+    /// Resident layers that carry a copy.
+    pub fn layer_count(&self) -> usize {
+        self.layers.iter().filter(|layer| layer.is_some()).count()
+    }
+
+    /// Size in the [`I8Weights::memory_bytes`] accounting, which the node
+    /// uses for its own logged and announced shard memory.
+    pub fn memory_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .flatten()
+            .map(|(wq, wk)| wq.memory_bytes() + wk.memory_bytes())
+            .sum()
+    }
+
+    /// Exact bytes of the copied INT8 rows plus their per-row Q16 scales:
+    /// 33,619,968 per Llama-2-7B layer (two 4096 x 4096 matrices).
+    pub fn weight_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .flatten()
+            .map(|(wq, wk)| {
+                wq.data.len()
+                    + wk.data.len()
+                    + (wq.scales.len() + wk.scales.len()) * std::mem::size_of::<i64>()
+            })
+            .sum()
+    }
+
+    fn layer(&self, layer: usize) -> Option<(&I8Weights, &I8Weights)> {
+        self.layers
+            .get(layer)
+            .and_then(Option::as_ref)
+            .map(|(wq, wk)| (wq, wk))
+    }
+}
+
 /// SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
 /// Uses the integer exp LUT for sigmoid computation.
 pub fn silu_i64(x: i64) -> i64 {
@@ -4155,6 +4268,55 @@ impl CachedIntegerModel {
         position: usize,
         generated_tokens: &[u32],
     ) -> Result<ShardOutput, ShardForwardError> {
+        self.forward_shard_token_with_qk(
+            input,
+            cache,
+            start_layer,
+            end_layer,
+            position,
+            generated_tokens,
+            None,
+        )
+    }
+
+    /// [`Self::forward_shard_token_with_history`] under the GGUF
+    /// interleaved-RoPE profile. Every layer takes its Q and K projections
+    /// from `interleaved_qk`; every other weight is this legacy model's own.
+    /// A request must use one profile for all of its positions, because the
+    /// two profiles cache different K rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_shard_token_with_history_interleaved_rope(
+        &self,
+        input: ShardInput,
+        cache: &mut KVCache,
+        start_layer: usize,
+        end_layer: usize,
+        position: usize,
+        generated_tokens: &[u32],
+        interleaved_qk: &InterleavedRopeQk,
+    ) -> Result<ShardOutput, ShardForwardError> {
+        self.forward_shard_token_with_qk(
+            input,
+            cache,
+            start_layer,
+            end_layer,
+            position,
+            generated_tokens,
+            Some(interleaved_qk),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_shard_token_with_qk(
+        &self,
+        input: ShardInput,
+        cache: &mut KVCache,
+        start_layer: usize,
+        end_layer: usize,
+        position: usize,
+        generated_tokens: &[u32],
+        interleaved_qk: Option<&InterleavedRopeQk>,
+    ) -> Result<ShardOutput, ShardForwardError> {
         let cfg = &self.config;
         let d = cfg.d_model;
         let is_first = start_layer == 0;
@@ -4202,6 +4364,21 @@ impl CachedIntegerModel {
         for layer_idx in start_layer..end {
             if !self.layers[layer_idx].is_loaded() {
                 return Err(ShardForwardError::LayerNotLoaded { layer: layer_idx });
+            }
+        }
+
+        // The interleaved-RoPE copy replaces only canonical per-row INT8 Q/K
+        // rows of a legacy model, and must hold every layer in the range.
+        if let Some(copy) = interleaved_qk {
+            if !self.has_canonical_i8_profile()
+                || self.config.arithmetic_profile != ArithmeticProfile::LegacySplitHalfV0
+            {
+                return Err(ShardForwardError::InterleavedRopeUnavailable { layer: start_layer });
+            }
+            for layer_idx in start_layer..end {
+                if copy.layer(layer_idx).is_none() {
+                    return Err(ShardForwardError::InterleavedRopeUnavailable { layer: layer_idx });
+                }
             }
         }
 
@@ -4281,9 +4458,19 @@ impl CachedIntegerModel {
             let normed = layernorm(&hidden, &layer.attn_norm);
             let normed_q = QuantizedInput::from_i64(&normed);
 
-            // Q/K/V projections - I16 if loaded, else I8
-            dispatch!(wq, wq, &normed_q, &normed, d, &mut q);
-            dispatch!(wk, wk, &normed_q, &normed, d, &mut k_buf);
+            // Q/K/V projections - I16 if loaded, else I8. Under the
+            // interleaved-RoPE profile the Q and K rows come from the copy,
+            // which the preflight above restricts to canonical per-row I8.
+            match interleaved_qk.and_then(|copy| copy.layer(layer_idx)) {
+                Some((wq, wk)) => {
+                    matmul_fast_preq(wq, &normed_q, &normed, d, &mut q);
+                    matmul_fast_preq(wk, &normed_q, &normed, d, &mut k_buf);
+                }
+                None => {
+                    dispatch!(wq, wq, &normed_q, &normed, d, &mut q);
+                    dispatch!(wk, wk, &normed_q, &normed, d, &mut k_buf);
+                }
+            }
             dispatch!(wv, wv, &normed_q, &normed, d, &mut v_buf);
 
             // RoPE on Q and K
@@ -4464,6 +4651,9 @@ pub enum ShardForwardError {
     BadHiddenDim { got: usize, expected: usize },
     /// Position is past the model's precomputed RoPE tables.
     PositionOutOfRange { position: usize, max_seq: usize },
+    /// The interleaved-RoPE profile was requested, but this node holds no
+    /// interleaved-RoPE Q/K rows for this layer, or its model cannot use them.
+    InterleavedRopeUnavailable { layer: usize },
 }
 
 impl ShardForwardError {
@@ -4475,6 +4665,7 @@ impl ShardForwardError {
             ShardForwardError::LayerNotLoaded { .. } => "layer_not_loaded",
             ShardForwardError::BadHiddenDim { .. } => "bad_hidden_dim",
             ShardForwardError::PositionOutOfRange { .. } => "position_out_of_range",
+            ShardForwardError::InterleavedRopeUnavailable { .. } => "interleaved_rope_unavailable",
         }
     }
 }
@@ -4508,6 +4699,11 @@ impl std::fmt::Display for ShardForwardError {
                 f,
                 "position_out_of_range: position {} is past the model's {}-position RoPE table",
                 position, max_seq
+            ),
+            ShardForwardError::InterleavedRopeUnavailable { layer } => write!(
+                f,
+                "interleaved_rope_unavailable: no interleaved-RoPE Q/K rows are resident for layer {}",
+                layer
             ),
         }
     }
@@ -6734,6 +6930,163 @@ mod tests {
                 .sum()
         };
         assert_eq!(dot(&reference, &reference_k), dot(&split, &split_k));
+    }
+
+    fn shard_output_fingerprint(output: ShardOutput) -> (Vec<i64>, Option<(u32, Hash256)>) {
+        match output {
+            ShardOutput::Hidden(hidden) => (hidden, None),
+            ShardOutput::Token { id, logits_hash } => (Vec::new(), Some((id, logits_hash))),
+        }
+    }
+
+    #[test]
+    fn interleaved_rope_qk_copy_runs_ranges_exactly_like_the_corrected_whole_model() {
+        let legacy = build_test_model(20, 32, 2, 64, 4);
+        let mut corrected = build_test_model(20, 32, 2, 64, 4);
+        corrected.canonicalize_gguf_interleaved_rope_rows().unwrap();
+        let copy = InterleavedRopeQk::from_resident_layers(&legacy).unwrap();
+        assert_eq!(copy.layer_count(), 4);
+        assert!(copy.covers(0, 4));
+
+        let n_layers = legacy.config.n_layers;
+        let split = 2;
+        let mut corrected_cache = KVCache::new(n_layers);
+        let mut copy_cache = KVCache::new(n_layers);
+        let mut legacy_cache = KVCache::new(n_layers);
+        let mut profiles_differ = false;
+        for (position, token) in [1u32, 5, 7, 3, 9].into_iter().enumerate() {
+            // The corrected whole model over one range...
+            let whole = corrected
+                .forward_shard_token(
+                    ShardInput::Token(token),
+                    &mut corrected_cache,
+                    0,
+                    n_layers,
+                    position,
+                )
+                .unwrap();
+            // ...equals the legacy model with the copy, split in two ranges.
+            let first = legacy
+                .forward_shard_token_with_history_interleaved_rope(
+                    ShardInput::Token(token),
+                    &mut copy_cache,
+                    0,
+                    split,
+                    position,
+                    &[],
+                    &copy,
+                )
+                .unwrap();
+            let ShardOutput::Hidden(hidden) = first else {
+                panic!("a nonterminal range returns a hidden state");
+            };
+            let ranged = legacy
+                .forward_shard_token_with_history_interleaved_rope(
+                    ShardInput::Hidden(hidden),
+                    &mut copy_cache,
+                    split,
+                    n_layers,
+                    position,
+                    &[],
+                    &copy,
+                )
+                .unwrap();
+            let whole = shard_output_fingerprint(whole);
+            assert_eq!(
+                whole,
+                shard_output_fingerprint(ranged),
+                "position {position}"
+            );
+            // The legacy path itself is unchanged and computes a different profile.
+            let legacy_output = legacy
+                .forward_shard_token(
+                    ShardInput::Token(token),
+                    &mut legacy_cache,
+                    0,
+                    n_layers,
+                    position,
+                )
+                .unwrap();
+            profiles_differ |= shard_output_fingerprint(legacy_output) != whole;
+        }
+        assert!(
+            profiles_differ,
+            "this model must tell the two profiles apart"
+        );
+    }
+
+    #[test]
+    fn interleaved_rope_qk_copy_covers_and_accounts_for_resident_layers_only() {
+        let mut model = build_test_model(20, 32, 2, 64, 4);
+        // A range-loaded shard holder: layer 0 belongs to another replica.
+        model.layers[0] = CachedLayer::placeholder();
+        let copy = InterleavedRopeQk::from_resident_layers(&model).unwrap();
+        assert_eq!(copy.layer_count(), 3);
+        assert!(!copy.covers(0, 4));
+        assert!(copy.covers(1, 4));
+        assert!(!copy.covers(2, 2));
+        let resident = &model.layers[1..];
+        assert_eq!(
+            copy.memory_bytes(),
+            resident
+                .iter()
+                .map(|layer| layer.wq.memory_bytes() + layer.wk.memory_bytes())
+                .sum::<usize>()
+        );
+        assert_eq!(
+            copy.weight_bytes(),
+            resident
+                .iter()
+                .map(|layer| {
+                    layer.wq.data.len()
+                        + layer.wk.data.len()
+                        + 8 * (layer.wq.scales.len() + layer.wk.scales.len())
+                })
+                .sum::<usize>()
+        );
+
+        // The copy refuses a range it does not hold, without touching the cache.
+        let mut cache = KVCache::new(model.config.n_layers);
+        let error = model
+            .forward_shard_token_with_history_interleaved_rope(
+                ShardInput::Hidden(vec![0; model.config.d_model]),
+                &mut cache,
+                1,
+                4,
+                0,
+                &[],
+                &InterleavedRopeQk {
+                    layers: vec![None, None, None, None],
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ShardForwardError::InterleavedRopeUnavailable { layer: 1 }
+        );
+        assert_eq!(error.kind(), "interleaved_rope_unavailable");
+        assert!(cache.k_data.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn precision_label_names_the_resident_rope_profile_and_the_copy_needs_legacy_i8() {
+        let mut model = build_test_model(16, 8, 2, 16, 1);
+        assert_eq!(
+            model.effective_precision_label(),
+            CANONICAL_REWARD_INFERENCE_PROFILE
+        );
+        assert!(InterleavedRopeQk::from_resident_layers(&model).is_ok());
+        model.canonicalize_gguf_interleaved_rope_rows().unwrap();
+        assert_eq!(
+            model.effective_precision_label(),
+            GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
+        );
+        // A corrected model, or one with optional precision copies, cannot
+        // seed the copy.
+        assert!(InterleavedRopeQk::from_resident_layers(&model).is_err());
+        let mut promoted = build_test_model(16, 8, 2, 16, 1);
+        promoted.enable_i16();
+        assert!(InterleavedRopeQk::from_resident_layers(&promoted).is_err());
     }
 
     #[test]

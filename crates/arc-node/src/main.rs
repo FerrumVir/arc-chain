@@ -494,6 +494,22 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     enable_community_rewards_v1: bool,
 
+    /// Validator: the community reward profiles this validator verifies, as a
+    /// comma-separated list. `legacy-split-half` is today's live profile and
+    /// must stay listed. Adding `rope-interleaved-v1` (the GGUF
+    /// interleaved-RoPE profile) makes a shard holder keep a second copy of
+    /// the Q and K rows of its layers (about 0.5 GB for 15-17 Llama-2-7B
+    /// layers) and serve and announce its ranges under that profile too, and
+    /// makes this validator verify and approve jobs of that profile. Nothing
+    /// issues such jobs yet. Removing it again is the rollback; no binary
+    /// change is needed.
+    #[arg(
+        long,
+        env = "COMMUNITY_VERIFY_PROFILES",
+        default_value = "legacy-split-half"
+    )]
+    community_verify_profiles: String,
+
     /// Coordinator: dispatch each community inference job to two community
     /// workers with distinct node keys and compare their outputs (twin
     /// execution v0). Validators recompute only on a mismatch, a spot check,
@@ -8069,6 +8085,9 @@ async fn run_arc_node() -> Result<()> {
     }
 
     let is_shard_holder = !held_ranges.is_empty();
+    let community_verify_profiles =
+        rpc::CommunityVerifyProfiles::parse(&cli.community_verify_profiles)
+            .map_err(|error| anyhow::anyhow!("--community-verify-profiles: {error}"))?;
     ensure!(
         !(is_shard_holder && cli.enable_i16),
         "--enable-i16 is local/nonreward-only and cannot be combined with validator shard ranges; protocol-v3 shard execution is pinned to canonical per-row INT8"
@@ -8801,60 +8820,55 @@ async fn run_arc_node() -> Result<()> {
             "Configured shard ranges are not fully loaded; this node will not announce or serve them"
         );
     }
-    let shard_infos_for_broadcast: Vec<rpc::ShardInfo> =
-        match (&held_ranges, &inference_model, model_artifact_id) {
-            (ranges, Some(model), Some(artifact_id))
-                if !ranges.is_empty() && shard_ranges_are_loaded =>
-            {
-                let total_layers = model.config.n_layers;
-                let layers_held_total: usize =
-                    ranges.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
-                let memory_mb_total: usize = model
-                    .layers
-                    .iter()
-                    .filter(|l| l.is_loaded())
-                    .map(|l| {
-                        l.wq.memory_bytes()
-                            + l.wk.memory_bytes()
-                            + l.wv.memory_bytes()
-                            + l.wo.memory_bytes()
-                            + l.w_gate.memory_bytes()
-                            + l.w_up.memory_bytes()
-                            + l.w_down.memory_bytes()
-                    })
-                    .sum::<usize>()
-                    / (1024 * 1024);
-                let per_layer_mb = memory_mb_total / layers_held_total.max(1);
-                let full_model_mb = per_layer_mb * total_layers;
-                let model_display_name = format!(
-                    "arc-{}L-{}d-{}h-{}v",
-                    model.config.n_layers,
-                    model.config.d_model,
-                    model.config.n_heads,
-                    model.config.vocab_size
+    // --community-verify-profiles rope-interleaved-v1: a shard holder keeps
+    // the interleaved-RoPE Q/K rows of its resident layers beside its legacy
+    // model, so it can serve both profiles. Fail closed if the operator asked
+    // for it and it cannot be built.
+    let interleaved_rope_qk: Option<Arc<arc_inference::cached_integer_model::InterleavedRopeQk>> =
+        match (
+            &inference_model,
+            community_verify_profiles.interleaved_rope(),
+        ) {
+            (Some(model), true) if is_shard_holder && shard_ranges_are_loaded => {
+                let copy = arc_inference::cached_integer_model::InterleavedRopeQk::from_resident_layers(
+                model,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "--community-verify-profiles rope-interleaved-v1: cannot build the interleaved-RoPE Q/K copy: {error}"
+                )
+            })?;
+                tracing::info!(
+                    layers = copy.layer_count(),
+                    weight_mb = copy.weight_bytes() / (1024 * 1024),
+                    accounted_mb = copy.memory_bytes() / (1024 * 1024),
+                    "Loaded the interleaved-RoPE Q/K copy of this node's shard layers (--community-verify-profiles)"
                 );
-                let socket_addr = advertised_shard_rpc_origin(&cli, &rpc_addr)?;
-                ranges
-                    .iter()
-                    .map(|&(start, end)| rpc::ShardInfo {
-                        start_layer: start,
-                        end_layer: end,
-                        total_layers,
-                        model_id: format!("0x{}", hex::encode(artifact_id.0)),
-                        model_name: model_display_name.clone(),
-                        execution_profile: model.effective_precision_label().to_string(),
-                        memory_mb: per_layer_mb * (end - start),
-                        full_model_mb,
-                        socket_addr: socket_addr.clone(),
-                        // NOT validator_seed: this ShardInfo is POSTed to every seed
-                        // every 15s and served publicly by GET /shards, and the
-                        // desktop's seed is the wallet's BIP-39 phrase.
-                        node_name: public_node_name(&cli),
-                    })
-                    .collect()
+                Some(Arc::new(copy))
             }
-            _ => Vec::new(),
+            _ => None,
         };
+    let (shard_infos_for_broadcast, interleaved_rope_shard_infos): (
+        Vec<rpc::ShardInfo>,
+        Vec<rpc::ShardInfo>,
+    ) = match (&held_ranges, &inference_model, model_artifact_id) {
+        (ranges, Some(model), Some(artifact_id))
+            if !ranges.is_empty() && shard_ranges_are_loaded =>
+        {
+            // NOT validator_seed for the node name: these announcements are
+            // POSTed to every seed every 15s and served publicly by GET
+            // /shards, and the desktop's seed is the wallet's BIP-39 phrase.
+            rpc::shard_announcements(
+                model,
+                ranges,
+                artifact_id,
+                &advertised_shard_rpc_origin(&cli, &rpc_addr)?,
+                &public_node_name(&cli),
+                interleaved_rope_qk.as_deref(),
+            )
+        }
+        _ => (Vec::new(), Vec::new()),
+    };
     let shard_infos = shard_infos_for_broadcast.clone();
 
     // Announce each held range directly to every explicit validator HTTP
@@ -8862,7 +8876,11 @@ async fn run_arc_node() -> Result<()> {
     // and recovery domain; no raw or re-signed third-party announcement is
     // emitted. Direct holder announcements are the only topology authority.
     if !shard_infos_for_broadcast.is_empty() {
-        let sis = shard_infos_for_broadcast.clone();
+        let sis: Vec<rpc::ShardInfo> = shard_infos_for_broadcast
+            .iter()
+            .chain(&interleaved_rope_shard_infos)
+            .cloned()
+            .collect();
         // RPC origins are explicit TLS/gateway configuration. Never infer an
         // HTTP port from a P2P bootstrap address.
         let announcement_targets = coordinator_rpc_bases.clone();
@@ -9994,6 +10012,11 @@ async fn run_arc_node() -> Result<()> {
             spot_check_per_mille: cli.community_twin_spot_check_per_mille,
             demand_interval_secs: cli.community_demand_interval_secs,
         },
+        rpc::CommunityProfileServing {
+            verify: community_verify_profiles,
+            interleaved_rope_qk,
+            interleaved_rope_shard_infos,
+        },
     )
     .await;
 
@@ -10198,6 +10221,27 @@ mod tests {
         assert_eq!(
             from_genesis.certificate_domain(),
             Some(arc_consensus::ConsensusDomain::new(genesis, 0, 7))
+        );
+    }
+
+    #[test]
+    fn community_verify_profiles_are_legacy_only_unless_requested() {
+        let default = Cli::try_parse_from(["arc-node"]).unwrap();
+        assert_eq!(default.community_verify_profiles, "legacy-split-half");
+        assert_eq!(
+            rpc::CommunityVerifyProfiles::parse(&default.community_verify_profiles).unwrap(),
+            rpc::CommunityVerifyProfiles::default()
+        );
+        let both = Cli::try_parse_from([
+            "arc-node",
+            "--community-verify-profiles",
+            "legacy-split-half,rope-interleaved-v1",
+        ])
+        .unwrap();
+        assert!(
+            rpc::CommunityVerifyProfiles::parse(&both.community_verify_profiles)
+                .unwrap()
+                .interleaved_rope()
         );
     }
 
@@ -11150,6 +11194,7 @@ mod tests {
                     Some(coordinator_shutdown_rx),
                     Arc::new(arc_net::transport::TransportWirePolicy::default()),
                     arc_node::twin::TwinConfig::default(),
+                    rpc::CommunityProfileServing::default(),
                 )
                 .await
                 .unwrap();
