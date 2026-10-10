@@ -1574,13 +1574,25 @@ fn run_batched(
     }
 }
 
+/// Up to this many tokens left in a tile, the base kernels run the one-row
+/// kernel per token instead of a four-token tile. A tile computes four lanes
+/// whatever it holds, and bench run 38056837714 (Llama-2-7B) measured a
+/// two-row tile at 2.0x (SDOT, Neoverse-N2) to 2.6x (AVX2) the one-row
+/// pass, against 2.1x to 2.8x for a full four-row tile, so one or two rows
+/// cost no more one at a time, and a third row is cheaper in the tile.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const ONE_ROW_KERNEL_UP_TO: usize = 2;
+
 /// The base kernels (`SDOT`, AVX2): four tokens per weight load.
 ///
 /// Tiling. `row_block` keeps a block of weight rows inside L1 (~128 KiB),
 /// and tokens are processed four at a time so ONE weight vector load feeds
 /// four accumulator chains. DRAM weight traffic therefore falls from
 /// once-per-token to once-per-matmul, which is the entire point of batching;
-/// the per-(row, token) arithmetic is untouched.
+/// the per-(row, token) arithmetic is untouched. A tile of at most
+/// [`ONE_ROW_KERNEL_UP_TO`] tokens runs the one-row kernel per token instead,
+/// still reading each weight row once for all of them; it computes the same
+/// values.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn run_quads(job: BatchJob<'_>, limbs: &[i8], out: SendPtr) {
     let BatchJob {
@@ -1600,6 +1612,27 @@ fn run_quads(job: BatchJob<'_>, limbs: &[i8], out: SendPtr) {
         let mut t = 0usize;
         while t < n_tokens {
             let quad = (n_tokens - t).min(4);
+            if quad <= ONE_ROW_KERNEL_UP_TO {
+                for (offset, &sc) in scales[r0..r1].iter().enumerate() {
+                    let i = r0 + offset;
+                    for q in 0..quad {
+                        let planes =
+                            &limbs[(t + q) * LIMB_COUNT * in_size..][..LIMB_COUNT * in_size];
+                        // SAFETY: `i < n_rows`, `data` holds `n_rows * in_size`
+                        // bytes, and `planes` is token `t + q`'s whole digit
+                        // scratch. Each rayon task owns a disjoint row range,
+                        // so no two tasks write the same output element. The
+                        // kernel's CPU feature was checked by
+                        // `kernel.available()`.
+                        let acc = unsafe {
+                            dot_limbs_dotprod(data.as_ptr().add(i * in_size), planes, in_size, used)
+                        };
+                        unsafe { *out.get().add((t + q) * n_rows + i) = (acc * sc) >> FRAC_BITS };
+                    }
+                }
+                t += quad;
+                continue;
+            }
             // Short final quad repeats the first token's planes so the
             // inner kernel stays branch-free; those lanes are discarded.
             let plane_of = |q: usize| {

@@ -1155,6 +1155,12 @@ pub(crate) fn matmul_i8_into_batched(
     let n_rows = weights.n_rows;
     // Same L1-resident row block and 4-token tile as the vectorised path, so
     // the scalar batched baseline is a fair comparison rather than a straw man.
+    // The scalar kernel is compute-bound per row, so a short tile of one to
+    // three tokens runs the one-row dot (`dot_i8_i64`, as `matmul_i8_into`
+    // does) per token instead: a four-token tile would compute four lanes for
+    // them. Bench run 38056837714 measured a four-row tile at 3.6x to 3.9x
+    // the one-row pass, so two or three rows cost no more one at a time. The
+    // values are the same either way.
     let row_block = (131_072 / in_size.max(1)).clamp(1, n_rows);
     let n_blocks = n_rows.div_ceil(row_block);
     let out = BatchOutPtr(output.as_mut_ptr());
@@ -1164,6 +1170,27 @@ pub(crate) fn matmul_i8_into_batched(
         let mut t = 0usize;
         while t < n_tokens {
             let quad = (n_tokens - t).min(4);
+            if quad < 4 {
+                for (offset, &sc) in scales[r0..r1].iter().enumerate() {
+                    let i = r0 + offset;
+                    for q in 0..quad {
+                        // SAFETY: `i < n_rows` and `data` holds n_rows*in_size;
+                        // `t + q < n_tokens` and `inputs` holds
+                        // n_tokens*in_size. Each task owns a disjoint row
+                        // range, so writes never alias.
+                        let acc = unsafe {
+                            dot_i8_i64(
+                                data.as_ptr().add(i * in_size),
+                                inputs.as_ptr().add((t + q) * in_size),
+                                in_size,
+                            )
+                        };
+                        unsafe { *out.get().add((t + q) * n_rows + i) = (acc * sc) >> FRAC_BITS };
+                    }
+                }
+                t += quad;
+                continue;
+            }
             let src = |q: usize| {
                 let tok = t + q.min(quad - 1);
                 // SAFETY: `tok < n_tokens` and `inputs` holds n_tokens*in_size.
