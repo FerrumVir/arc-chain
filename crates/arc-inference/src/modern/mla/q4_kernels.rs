@@ -3,8 +3,9 @@
 //! An expert projection of k tokens needs, for every row r, token t and
 //! 32-column group g, the group dot `sum_{j in g} q_rj x_tj` that the scalar
 //! reference forms exactly in i64. The group scales and the single floor are
-//! then applied by the reference's own epilogue (`ops::Q4RowScales`), so the
-//! output is byte-identical by construction whenever the dots are.
+//! then applied by the reference's own epilogue
+//! (`ops::Q4RowSummary::finish`), so the output is byte-identical by
+//! construction whenever the dots are.
 //!
 //! The kernels form those dots exactly with 8-bit dot-product instructions,
 //! using the limb scheme of `canonical_simd` (#190):
@@ -49,10 +50,10 @@
 //! Selection. The kernels run only behind the existing opt-in
 //! (`canonical_simd::fast_canonical_kernel_enabled`, `ARC_FAST_CANONICAL_KERNEL`).
 //! The default is [`best_q4_kernel`]: SMMLA, then SDOT, on arm64; AVX2 on
-//! x86-64, which the bench measured faster than both VNNI kernels at these
-//! shapes. `ARC_MLA_Q4_KERNEL=<label>`, `=scalar` or [`set_q4_kernel_pin`] pins
-//! one for tests and benchmarks, and a pinned kernel the CPU lacks falls back
-//! to the default.
+//! x86-64, which no VNNI kernel has measured clearly faster at these shapes.
+//! `ARC_MLA_Q4_KERNEL=<label>`, `=scalar` or [`set_q4_kernel_pin`] pins one
+//! for tests and benchmarks, and a pinned kernel the CPU lacks falls back to
+//! the default.
 //! [`q4_kernel_runs`] counts the projections each kernel, and the scalar
 //! reference, computed.
 
@@ -163,13 +164,16 @@ pub fn available_q4_kernels() -> Vec<Q4Kernel> {
         .collect()
 }
 
-/// The kernel used when nothing is pinned. On arm64, SMMLA, then SDOT. On
-/// x86-64, AVX2 before the VNNI kernels: at one K2.6-shaped MoE layer, AVX2
-/// was the fastest on every hosted x86-64 CPU the bench measured. A one-row
-/// AVX-512 VNNI pass took 24% longer on an EPYC 9V45 (CI run 38057646072)
-/// and 23% longer on a Xeon Platinum 8370C (CI run 38058847095); AVX-VNNI
-/// took 3% longer on the EPYC 9V45. With one token the entities (its digit
-/// planes) fill 3 of a VNNI vector's 8 or 16 lanes.
+/// The kernel used when nothing is pinned: on arm64, SMMLA, then SDOT; on
+/// x86-64, AVX2, then the VNNI kernels. One K2.6-shaped MoE layer, in CI:
+/// * With entities in the lanes, a one-row AVX-512 VNNI pass took 24% longer
+///   than AVX2 on an EPYC 9V45 (run 38057646072) and 23% longer on a Xeon
+///   Platinum 8370C (run 38058847095). AVX-VNNI took 3% longer on the 9V45.
+/// * With rows in the lanes, AVX-512 VNNI and AVX2 are within 2% on an
+///   EPYC 9V74 (run 38060375415): 44.2 and 43.6 ms one-row, 39.1 and 39.5 ms
+///   per row at 16 rows. AVX-VNNI was not measured.
+///
+/// No VNNI kernel has measured clearly faster, so AVX2 stays first.
 pub fn best_q4_kernel() -> Option<Q4Kernel> {
     [
         Q4Kernel::Avx2,
