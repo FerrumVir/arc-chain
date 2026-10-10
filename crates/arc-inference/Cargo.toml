@@ -157,3 +157,7 @@ required-features = ["candle"]
 [[example]]
 name = "low_residency_conformance"
 required-features = ["candle"]
+
+[[example]]
+name = "draft_agreement_arc"
+required-features = ["candle"]

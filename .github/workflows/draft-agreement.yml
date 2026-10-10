@@ -1,0 +1,275 @@
+name: Draft agreement experiment (scratch)
+
+# Scratch experiment on a scratch branch, never for merge. How often does a
+# fast non-exact engine running the SAME pinned 7B model agree token for token
+# with ARC's exact engine? ARC generates on the worker path (both profiles);
+# llama.cpp (pinned release b11534, built from source, CPU, greedy, no
+# sampler) is then teacher-forced on ARC's exact context, and its argmax at
+# every generated position is scored against ARC's token. Lower-bit GGUFs of
+# the same model (Q3_K_M, Q2_K), pinned by SHA-256 at the same revision, are
+# scored the same way. All numbers are CI measurements on shared 4-vCPU
+# runners. Runs only on a push to this scratch branch; a newer push cancels
+# an older run. Models are downloaded each run and never uploaded.
+on:
+  push:
+    branches: [scratch/draft-agreement]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: draft-agreement-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # #182's pinned target (speculative-bench.yml): the same bytes as arc-node's
+  # TESTNET_MODEL_SHA256.
+  MODEL_URL: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf
+  MODEL_SHA256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa
+  MODEL_BYTES: "4081004224"
+  MODEL_FILE: .draft-agreement/llama-2-7b-chat.Q4_K_M.gguf
+  # The same Hugging Face revision, for the drafter GGUFs.
+  GGUF_BASE: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb
+  LLAMA_CPP_REPO: https://github.com/ggml-org/llama.cpp
+  # Release b11534.
+  LLAMA_CPP_COMMIT: 50e3e3e480c80b9ee0ea067e475602d540dc62c8
+  MAX_NEW_TOKENS: "256"
+
+jobs:
+  arc:
+    name: ARC exact / ${{ matrix.profile }} / ${{ matrix.category }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 200
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [interleaved, legacy]
+        category: [chat, code, math, longform, copy]
+    env:
+      PROFILE: ${{ matrix.profile }}
+      CATEGORY: ${{ matrix.category }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Record runner facts
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/draft-agreement"
+          mkdir -p "$out"
+          {
+            echo "leg: ARC / $PROFILE / $CATEGORY"
+            echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            lscpu
+            free -b
+            df -h .
+          } 2>&1 | tee "$out/runner-arc-$PROFILE-$CATEGORY.txt"
+
+      - name: Download and verify the pinned model (#182's fetch)
+        run: |
+          set -euo pipefail
+          fetch() {
+            local url="$1" file="$2" bytes="$3" sha="$4"
+            mkdir -p "$(dirname "$file")"
+            curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+              --retry-max-time 900 --connect-timeout 20 --max-time 1800 \
+              --proto '=https' --proto-redir '=https' --tlsv1.2 \
+              --output "$file.partial" "$url"
+            mv "$file.partial" "$file"
+            local size actual
+            size="$(wc -c < "$file" | tr -d ' ')"
+            if [ "$size" != "$bytes" ]; then
+              echo "::error::$file is $size bytes, expected $bytes"
+              exit 1
+            fi
+            actual="$(sha256sum "$file" | cut -d ' ' -f 1)"
+            if [ "$actual" != "$sha" ]; then
+              echo "::error::$file SHA-256 is $actual, expected $sha"
+              exit 1
+            fi
+            echo "verified $file: sha256 $actual, $size bytes"
+          }
+          fetch "$MODEL_URL" "$MODEL_FILE" "$MODEL_BYTES" "$MODEL_SHA256"
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+
+      - name: Build the ARC driver (release, Candle GGUF loader)
+        run: cargo build --locked --release -p arc-inference --features candle --example draft_agreement_arc
+
+      - name: Generate with ARC's exact engine (worker path)
+        timeout-minutes: 170
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/draft-agreement"
+          mkdir -p "$out"
+          target/release/examples/draft_agreement_arc \
+            --model "$GITHUB_WORKSPACE/$MODEL_FILE" \
+            --prompts experiments/draft-agreement/prompts.json \
+            --profile "$PROFILE" \
+            --category "$CATEGORY" \
+            --max-new-tokens "$MAX_NEW_TOKENS" \
+            --kernel simd \
+            --out "$out/arc-$PROFILE-$CATEGORY.json" 2>&1 | tee "$out/arc-$PROFILE-$CATEGORY.log"
+
+      - name: Upload this leg's results (never the model)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arc-${{ matrix.profile }}-${{ matrix.category }}
+          path: ${{ runner.temp }}/draft-agreement/
+          if-no-files-found: error
+          retention-days: 30
+
+  llama:
+    name: llama.cpp teacher / ${{ matrix.quant }} / ${{ matrix.profile }}
+    needs: arc
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [interleaved, legacy]
+        quant: [Q4_K_M, Q3_K_M, Q2_K]
+        include:
+          - {quant: Q4_K_M, bytes: "4081004224", sha256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa}
+          - {quant: Q3_K_M, bytes: "3298004672", sha256: 87e0f473c491a1535c8ee84a113cd2ea0edba59d8bf0f1c30a89b5319e77451e}
+          - {quant: Q2_K, bytes: "2825940672", sha256: c0dd304d761e8e05d082cc2902d7624a7f87858fdfaa4ef098330ffe767ff0d3}
+    env:
+      PROFILE: ${{ matrix.profile }}
+      QUANT: ${{ matrix.quant }}
+      QUANT_BYTES: ${{ matrix.bytes }}
+      QUANT_SHA256: ${{ matrix.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Record runner facts
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/draft-agreement"
+          mkdir -p "$out"
+          {
+            echo "leg: llama.cpp / $QUANT / $PROFILE"
+            echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            lscpu
+            free -b
+            cmake --version | head -1
+            c++ --version | head -1
+          } 2>&1 | tee "$out/runner-teacher-$QUANT-$PROFILE.txt"
+
+      - name: Download and verify the pinned GGUF (#182's fetch, same revision)
+        run: |
+          set -euo pipefail
+          fetch() {
+            local url="$1" file="$2" bytes="$3" sha="$4"
+            mkdir -p "$(dirname "$file")"
+            curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+              --retry-max-time 900 --connect-timeout 20 --max-time 1800 \
+              --proto '=https' --proto-redir '=https' --tlsv1.2 \
+              --output "$file.partial" "$url"
+            mv "$file.partial" "$file"
+            local size actual
+            size="$(wc -c < "$file" | tr -d ' ')"
+            if [ "$size" != "$bytes" ]; then
+              echo "::error::$file is $size bytes, expected $bytes"
+              exit 1
+            fi
+            actual="$(sha256sum "$file" | cut -d ' ' -f 1)"
+            if [ "$actual" != "$sha" ]; then
+              echo "::error::$file SHA-256 is $actual, expected $sha"
+              exit 1
+            fi
+            echo "verified $file: sha256 $actual, $size bytes"
+          }
+          fetch "$GGUF_BASE/llama-2-7b-chat.$QUANT.gguf" ".draft-agreement/llama-2-7b-chat.$QUANT.gguf" "$QUANT_BYTES" "$QUANT_SHA256"
+
+      - name: Fetch llama.cpp at the pinned commit
+        run: |
+          set -euo pipefail
+          dir=experiments/draft-agreement/llama.cpp
+          git init -q "$dir"
+          git -C "$dir" fetch -q --depth 1 "$LLAMA_CPP_REPO" "$LLAMA_CPP_COMMIT"
+          git -C "$dir" checkout -q FETCH_HEAD
+          got="$(git -C "$dir" rev-parse HEAD)"
+          if [ "$got" != "$LLAMA_CPP_COMMIT" ]; then
+            echo "::error::llama.cpp is at $got, expected $LLAMA_CPP_COMMIT"
+            exit 1
+          fi
+          echo "llama.cpp at $got"
+
+      - name: Build the teacher driver (CPU, Release)
+        run: |
+          set -euo pipefail
+          cmake -S experiments/draft-agreement -B build-teacher -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-teacher --target teacher -j "$(nproc)"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: arc-${{ matrix.profile }}-*
+          path: arc-out
+
+      - name: Teacher-force llama.cpp on ARC's tokens
+        timeout-minutes: 120
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/draft-agreement"
+          mkdir -p "$out"
+          python3 experiments/draft-agreement/analyze.py teacher-input \
+            --arc arc-out --profile "$PROFILE" --out "$out/input-$PROFILE.txt"
+          bin="$(find build-teacher -type f -name teacher -perm -u+x | head -n 1)"
+          "$bin" ".draft-agreement/llama-2-7b-chat.$QUANT.gguf" "$out/input-$PROFILE.txt" \
+            "$out/teacher-$QUANT-$PROFILE.jsonl" 2>&1 | tee "$out/teacher-$QUANT-$PROFILE.log"
+
+      - name: Upload this leg's results (never the model)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: teacher-${{ matrix.quant }}-${{ matrix.profile }}
+          path: ${{ runner.temp }}/draft-agreement/
+          if-no-files-found: error
+          retention-days: 30
+
+  report:
+    name: Agreement report
+    needs: [arc, llama]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: arc-*
+          path: all/arc
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: teacher-*
+          path: all/teacher
+
+      - name: Score agreement
+        run: |
+          set -euo pipefail
+          mkdir -p report
+          python3 experiments/draft-agreement/analyze.py report --arc all/arc --teacher all/teacher \
+            --out-md report/report.md --out-json report/report.json --run-id "$GITHUB_RUN_ID"
+          cat report/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: draft-agreement-report
+          path: report/
+          if-no-files-found: error
+          retention-days: 30
