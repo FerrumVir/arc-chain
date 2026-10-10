@@ -4805,10 +4805,11 @@ impl CachedIntegerModel {
     /// the caller selects each row's token with that row's generated history,
     /// and [`Self::rollback_rows`] drops the rows of rejected drafts.
     ///
-    /// When it pays. The batched kernel works on quads of four rows, so a call
-    /// costs about one quad's work per started quad, and its per-row saving
-    /// over one-row calls is a sawtooth in k. Measured on Llama-2-7B (bench run
-    /// 37998031423, `examples/stage_rows_bench.rs`, 4-vCPU runners):
+    /// When it pays. The base batched kernels (SDOT, AVX2) work on quads of
+    /// four rows, so a call costs about one quad's work per started quad, and
+    /// its per-row saving over one-row calls is a sawtooth in k. Measured on
+    /// Llama-2-7B (bench run 37998031423, `examples/stage_rows_bench.rs`,
+    /// 4-vCPU runners):
     ///
     /// - with the vectorised kernel a call pays from three rows: 0.89 of the
     ///   one-row cost per row on AVX2 and 0.73 on NEON at k = 3, falling to
@@ -4817,6 +4818,19 @@ impl CachedIntegerModel {
     ///   and k = 8, and every other k costs more;
     /// - one or two rows never pay, so send those through
     ///   [`Self::forward_shard_token`].
+    ///
+    /// CPUs with matrix extensions run cheaper multi-row kernels
+    /// ([`crate::canonical_simd::BatchedKernel`]). Measured the same way for
+    /// k = 1 to 64 (bench run 38025683929), per row against one-row calls:
+    ///
+    /// - SMMLA (i8mm, Neoverse-N2): 0.31 at k = 2, 0.15 at k = 8 and 0.13 to
+    ///   0.14 from k = 16 to 64. One row runs SDOT and does not pay;
+    /// - AVX-512 VNNI (AMD EPYC 9V45): 0.51 at k = 1, 0.28 at k = 2, 0.15 at
+    ///   k = 8 and 0.13 to 0.14 from k = 16 to 64;
+    /// - AVX-VNNI on the same CPU: 0.57 at k = 1, 0.31 at k = 2 and 0.17 to
+    ///   0.18 from k = 8 to 64.
+    ///
+    /// With these kernels a call pays from two rows, and from one with VNNI.
     ///
     /// Canonical per-row I8 only: any other profile is refused, so the caller
     /// falls back to one-row calls. A refusal leaves `cache` unchanged.

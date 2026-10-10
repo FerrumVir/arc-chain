@@ -1,4 +1,5 @@
-//! Bit-exact vectorised canonical INT8 projection (ARM64 NEON / x86-64 AVX2).
+//! Bit-exact vectorised canonical INT8 projection (ARM64 NEON / x86-64 AVX2),
+//! with SMMLA and VNNI kernels for multi-row calls.
 //!
 //! This module does **not** define a new arithmetic profile. It computes the
 //! same integer value as the scalar kernel for every input it accepts, and
