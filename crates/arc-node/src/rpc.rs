@@ -27764,6 +27764,7 @@ mod tests {
                     Some(coordinator_shutdown_rx),
                     Arc::new(arc_net::transport::TransportWirePolicy::default()),
                     crate::twin::TwinConfig::default(),
+                    CommunityProfileServing::default(),
                 )
                 .await
                 .unwrap();
@@ -27851,6 +27852,7 @@ mod tests {
                 Some(shutdown_rx),
                 Arc::new(arc_net::transport::TransportWirePolicy::default()),
                 crate::twin::TwinConfig::default(),
+                CommunityProfileServing::default(),
             )
             .await
         });
