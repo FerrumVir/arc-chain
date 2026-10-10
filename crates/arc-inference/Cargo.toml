@@ -8,6 +8,10 @@ license.workspace = true
 [features]
 default = []
 int16 = []
+# Exact canonical per-row INT8 GEMV on Apple GPUs (src/metal_gemv.rs). Opt-in:
+# even when compiled in it runs only with ARC_METAL_EXACT_GEMV=1 and inside a
+# MetalModel residency scope. Apple Silicon macOS only.
+metal-exact = ["arc-gpu/metal-exact"]
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
 # Patent-pending integer/ASIC inference paths (ternary, INT8/INT16-ASIC, mining
 # datapath, etc). Source files for these modules are intentionally NOT in the

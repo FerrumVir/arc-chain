@@ -1,0 +1,163 @@
+name: Metal exact GEMV (hosted macOS)
+
+# GitHub-hosted Apple Silicon runners are virtual machines that expose a
+# paravirtual Metal GPU. The exact-gemv job runs the canonical INT8 GEMV kernel
+# (crates/arc-gpu/src/metal_exact.rs) and the one-command-buffer-per-token
+# decoder (metal_decoder.rs, arc-inference metal_forward.rs), with its
+# multi-row passes, against the CPU engine and the golden KATs, then
+# benchmarks the Llama-2-7B shapes. The probe
+# job, run by hand only, reports what the device is (name, limits, an integer
+# kernel checked against the CPU, read bandwidth). Every timing either job
+# prints is a virtualized-runner measurement, not a measurement of Apple GPU
+# hardware.
+#
+# Optional and never a required check. Everything it tests is opt-in (the
+# `metal-exact` feature) and off by default. It runs for pull requests into
+# any branch, so stacked pull requests are checked too.
+#
+# macOS runners also serve the release and proof sequences, so this workflow
+# takes at most one of them per push: it runs only when the exact Metal path
+# or the CPU reference it must match changes (other changes can run it by hand
+# with workflow_dispatch, on any branch), and a newer push cancels an older run
+# that is still queued or running.
+
+on:
+  pull_request:
+    # The exact files, so changes to other Metal kernels (for example the
+    # INT16 ones, which have their own workflow) do not start this job too.
+    # The GPU path's files come first, then the CPU reference it must equal
+    # integer for integer, and its golden KATs. No branch filter: stacked
+    # pull requests are checked too.
+    paths:
+      - .github/workflows/metal-exact-gemv.yml
+      - crates/arc-gpu/src/metal_exact.rs
+      - crates/arc-gpu/src/metal_exact_gemv.metal
+      - crates/arc-gpu/src/metal_exact_decoder.metal
+      - crates/arc-gpu/src/metal_decoder.rs
+      - crates/arc-inference/src/metal_gemv.rs
+      - crates/arc-inference/src/metal_forward.rs
+      - crates/arc-inference/src/cached_integer_model.rs
+      - crates/arc-inference/src/integer_lut.rs
+      - crates/arc-inference/src/canonical_simd.rs
+      - crates/arc-inference/src/golden_vectors.rs
+      - crates/arc-inference/tests/fixtures/integer_inference_kat.json
+      - crates/arc-inference/tests/fixtures/integer_operator_kat.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  probe:
+    name: Metal probe (macos-15, hosted)
+    # By hand only: the exact-gemv job reports the device and bandwidth too.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Runner hardware as the VM reports it
+        run: |
+          sw_vers
+          sysctl -n machdep.cpu.brand_string
+          sysctl hw.memsize hw.ncpu
+          system_profiler SPDisplaysDataType
+      - name: Metal device, integer kernel and bandwidth probe
+        run: |
+          set -euo pipefail
+          xcrun swiftc -O scripts/ci/metal-probe/main.swift -o "$RUNNER_TEMP/metal-probe"
+          "$RUNNER_TEMP/metal-probe" | tee "$RUNNER_TEMP/metal-probe.txt"
+      - name: Probe summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/metal-probe.txt" ]; then
+            {
+              echo '### Metal probe (virtualized-runner measurement)'
+              echo '<pre>'
+              cat "$RUNNER_TEMP/metal-probe.txt"
+              echo '</pre>'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  exact-gemv:
+    name: Exact Metal GEMV (macos-15, hosted)
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: metal-exact-gemv
+      - name: Show the GPU under test
+        run: system_profiler SPDisplaysDataType
+      # CI's own rustfmt and build gates run only for pull requests into main;
+      # repeat the cheap ones here so a stacked pull request is checked too.
+      - name: rustfmt (workspace)
+        run: ./scripts/rustfmt-workspace.sh --check
+      - name: Default features still build (Metal code compiled out)
+        run: cargo check -p arc-gpu -p arc-inference --all-targets --locked
+      # No other workflow lints aarch64 or macOS-only code, so existing
+      # diagnostics there are only reported. Any diagnostic in the new Metal
+      # GEMV files fails the job in the last step, after the tests have run,
+      # so one run reports both.
+      - name: Clippy on the Metal GEMV code
+        run: |
+          set -euo pipefail
+          cargo clippy -p arc-gpu -p arc-inference --all-targets --locked \
+            --features arc-gpu/metal-exact,arc-inference/metal-exact \
+            --message-format=short 2>&1 | tee "$RUNNER_TEMP/clippy.txt"
+          if grep -E '^crates/(arc-gpu/src/metal_(exact|decoder)|arc-inference/src/(metal_gemv|metal_forward|golden_vectors))\.rs:' "$RUNNER_TEMP/clippy.txt" > "$RUNNER_TEMP/clippy-metal.txt"; then
+            echo '::warning::clippy reported diagnostics in the Metal GEMV code; the last step fails the job'
+          fi
+      - name: Kernel unit tests and device self-test
+        if: ${{ !cancelled() }}
+        run: cargo test --release --locked -p arc-gpu --features metal-exact --lib metal_exact -- --test-threads=1 --nocapture
+      - name: Byte-identical tests against the CPU engine and the golden KATs
+        if: ${{ !cancelled() }}
+        run: cargo test --release --locked -p arc-inference --features metal-exact --lib -- --test-threads=1 --nocapture metal_gemv metal_forward golden_cached_integer_kat_holds
+      - name: Every arc-inference library test with the feature compiled in (switch off)
+        if: ${{ !cancelled() }}
+        run: cargo test --release --locked -p arc-inference --features metal-exact --lib
+      - name: Benchmark the 7B projection shapes (virtualized-runner measurement)
+        if: ${{ !cancelled() }}
+        env:
+          ARC_METAL_BENCH_MD: ${{ runner.temp }}/metal-bench.md
+        run: cargo test --release --locked -p arc-inference --features metal-exact --lib metal_gemv::bench -- --ignored --nocapture --test-threads=1
+      - name: Benchmark a 7B token, the KV-mirror cost and multi-row passes (virtualized-runner measurement)
+        if: ${{ !cancelled() }}
+        env:
+          ARC_METAL_TOKEN_BENCH_MD: ${{ runner.temp }}/metal-token-bench.md
+          ARC_METAL_KV_BENCH_MD: ${{ runner.temp }}/metal-kv-bench.md
+          ARC_METAL_ROWS_BENCH_MD: ${{ runner.temp }}/metal-rows-bench.md
+        run: cargo test --release --locked -p arc-inference --features metal-exact --lib metal_forward::bench -- --ignored --nocapture --test-threads=1
+      - name: Benchmark summary
+        if: always()
+        run: |
+          for summary in "$RUNNER_TEMP/metal-bench.md" "$RUNNER_TEMP/metal-token-bench.md" "$RUNNER_TEMP/metal-kv-bench.md" "$RUNNER_TEMP/metal-rows-bench.md"; do
+            if [ -f "$summary" ]; then
+              cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+      - name: No clippy diagnostics in the Metal GEMV code
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -s "$RUNNER_TEMP/clippy-metal.txt" ]; then
+            cat "$RUNNER_TEMP/clippy-metal.txt"
+            echo '::error::clippy reported diagnostics in the Metal GEMV code'
+            exit 1
+          fi

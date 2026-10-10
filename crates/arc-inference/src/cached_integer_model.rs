@@ -1021,6 +1021,18 @@ fn matmul_i8_view_into(
         );
         return;
     }
+    // Opt-in exact Metal GEMV: compiled only with the `metal-exact` feature,
+    // and used only when ARC_METAL_EXACT_GEMV=1 (or set_metal_exact_gemv) is on
+    // AND the call runs inside a MetalModel residency scope that uploaded this
+    // matrix. It computes the same integers as the scalar kernel below or
+    // refuses without writing, leaving the paths below unchanged. See
+    // `crate::metal_gemv`.
+    #[cfg(all(feature = "metal-exact", target_os = "macos", target_arch = "aarch64"))]
+    if crate::metal_gemv::metal_exact_gemv_requested()
+        && crate::metal_gemv::try_project(weights, input, in_size, output)
+    {
+        return;
+    }
     // Opt-in bit-exact vectorised path. Default OFF, so the scalar datapath
     // below is unchanged unless a caller explicitly enables it. The fast path
     // refuses any input it cannot prove exact and returns false, leaving the
