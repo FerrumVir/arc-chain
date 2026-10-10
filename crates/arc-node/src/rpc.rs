@@ -21422,20 +21422,27 @@ mod tests {
         model
     }
 
-    /// A legacy model, its interleaved-RoPE twin and a small job on which the
-    /// two profiles generate different tokens.
-    fn profile_divergent_job() -> (
+    /// The end-to-end test's model pair for one seed: the legacy model and its
+    /// interleaved-RoPE twin.
+    fn dual_profile_models(
+        seed: u64,
+    ) -> (
         arc_inference::cached_integer_model::CachedIntegerModel,
         arc_inference::cached_integer_model::CachedIntegerModel,
-        &'static str,
-        u32,
     ) {
+        let legacy = dual_profile_test_model(seed);
+        let mut interleaved = dual_profile_test_model(seed);
+        interleaved
+            .canonicalize_gguf_interleaved_rope_rows()
+            .unwrap();
+        (legacy, interleaved)
+    }
+
+    /// The first seed, input and token count, in a fixed order, on which the
+    /// two profiles generate different tokens.
+    fn first_profile_divergent_job() -> Option<(u64, &'static str, u32)> {
         for seed in 1..=64u64 {
-            let legacy = dual_profile_test_model(seed);
-            let mut interleaved = dual_profile_test_model(seed);
-            interleaved
-                .canonicalize_gguf_interleaved_rope_rows()
-                .unwrap();
+            let (legacy, interleaved) = dual_profile_models(seed);
             for input in [
                 "ARC",
                 "probe",
@@ -21451,13 +21458,19 @@ mod tests {
                     if legacy.generate(&prompt, max_tokens, &[]).0
                         != interleaved.generate(&prompt, max_tokens, &[]).0
                     {
-                        return (legacy, interleaved, input, max_tokens);
+                        return Some((seed, input, max_tokens));
                     }
                 }
             }
         }
-        panic!("no small job tells the two profiles apart");
+        None
     }
+
+    /// The job the end-to-end test verifies: a `dual_profile_test_model` seed,
+    /// an input and a token count on which the two profiles diverge. Unset
+    /// until a CI run of `first_profile_divergent_job` logs one; the test then
+    /// uses the search's job.
+    const PINNED_PROFILE_DIVERGENT_JOB: Option<(u64, &str, u32)> = None;
 
     #[test]
     fn community_verify_profiles_default_to_legacy_and_parse_only_known_lists() {
@@ -21610,7 +21623,30 @@ mod tests {
             InterleavedRopeQk,
         };
 
-        let (legacy_model, interleaved_model, input, max_tokens) = profile_divergent_job();
+        let (seed, input, max_tokens) = PINNED_PROFILE_DIVERGENT_JOB
+            .or_else(first_profile_divergent_job)
+            .expect("some small job tells the two profiles apart");
+        let (legacy_model, interleaved_model) = dual_profile_models(seed);
+        let divergence_prompt = legacy_model.encode(input);
+        let (legacy_tokens, _) = legacy_model.generate(&divergence_prompt, max_tokens, &[]);
+        let (interleaved_tokens, _) =
+            interleaved_model.generate(&divergence_prompt, max_tokens, &[]);
+        assert_ne!(
+            legacy_tokens,
+            interleaved_tokens,
+            "the pinned job no longer tells the profiles apart; the first one that does is {:?}",
+            first_profile_divergent_job()
+        );
+        // Written straight to stderr, past the test harness's output capture,
+        // so the CI log shows which job this test verified.
+        let divergence = format!(
+            "dual-profile divergence: seed {seed}, input {input:?}, max_tokens {max_tokens}; \
+             legacy tokens {legacy_tokens:?} text {:?}; \
+             interleaved-RoPE tokens {interleaved_tokens:?} text {:?}\n",
+            legacy_model.decode(&legacy_tokens),
+            interleaved_model.decode(&interleaved_tokens),
+        );
+        std::io::Write::write_all(&mut std::io::stderr(), divergence.as_bytes()).unwrap();
         let (validator_keys, recovered, temporary) = recovered_six_validator_state();
         let active = recovered.active_validators();
         let model_id = arc_crypto::hash_bytes(b"dual-profile-exact-model");
