@@ -189,12 +189,16 @@ pub struct Q4View<'a> {
     pub scales: &'a [u16],
 }
 
-impl Q4View<'_> {
-    fn row(&self, r: usize, x: &[i64]) -> Result<i64, ModernError> {
-        let groups = self.cols / Q4_GROUP;
-        let packed = &self.q4[r * self.cols / 2..(r + 1) * self.cols / 2];
-        let scales = &self.scales[r * groups..(r + 1) * groups];
-        let mut parts = Vec::with_capacity(groups);
+/// One row's group scales, parsed once (spec §13.2): `(mantissa, exponent)`
+/// per group, and the largest exponent of a nonzero scale.
+pub(crate) struct Q4RowScales {
+    parts: Vec<(u32, i32)>,
+    top: Option<i32>,
+}
+
+impl Q4RowScales {
+    pub(crate) fn parse(scales: &[u16]) -> Result<Self, ModernError> {
+        let mut parts = Vec::with_capacity(scales.len());
         let mut top: Option<i32> = None;
         for &bits in scales {
             let (_, m, e) = bf16_parts(bits)?;
@@ -203,21 +207,22 @@ impl Q4View<'_> {
             }
             parts.push((m, e));
         }
-        let Some(top) = top else {
+        Ok(Self { parts, top })
+    }
+
+    /// The row's output from its group dots: `dot(g)` must be the exact
+    /// `sum_{j in g} q_j x_j`, and is read only for the groups that
+    /// contribute (a nonzero scale within 40 binades of the largest).
+    pub(crate) fn combine(&self, mut dot: impl FnMut(usize) -> i64) -> Result<i64, ModernError> {
+        let Some(top) = self.top else {
             return Ok(0);
         };
         let mut total: i128 = 0;
-        for (g, &(m, e)) in parts.iter().enumerate() {
+        for (g, &(m, e)) in self.parts.iter().enumerate() {
             if m == 0 || e < top - Q4_SCALE_SPAN {
                 continue;
             }
-            // |q| <= 8 and 8 * sum |x| < 2^63 bound every partial sum.
-            let first = g * Q4_GROUP;
-            let mut acc = 0i64;
-            for (offset, &xj) in x[first..first + Q4_GROUP].iter().enumerate() {
-                acc += q4_value(packed, first + offset) * xj;
-            }
-            total += (i128::from(m) * i128::from(acc)) << (e - top + Q4_SCALE_SPAN);
+            total += (i128::from(m) * i128::from(dot(g))) << (e - top + Q4_SCALE_SPAN);
         }
         let exponent = top - Q4_SCALE_SPAN;
         let value = if exponent < 0 {
@@ -235,6 +240,100 @@ impl Q4View<'_> {
     }
 }
 
+/// The exact dot of group `g` of a packed row with `x`: |q| <= 8 and
+/// 8 * sum |x| < 2^63 bound every partial sum.
+fn q4_group_dot(packed: &[u8], g: usize, x: &[i64]) -> i64 {
+    let first = g * Q4_GROUP;
+    let mut acc = 0i64;
+    for (offset, &xj) in x[first..first + Q4_GROUP].iter().enumerate() {
+        acc += q4_value(packed, first + offset) * xj;
+    }
+    acc
+}
+
+impl Q4View<'_> {
+    /// `res[r * k + t] = (W x_t)_r` for the k vectors `xs` (spec §13.2), each
+    /// weight row read once for all of them: the scalar reference, or, with
+    /// the opt-in on, an exact INT4 kernel (`q4_kernels`) forming the same
+    /// group dots. The group scales and the floor are the reference's in
+    /// both, so the bytes are the same.
+    pub fn project_into(&self, xs: &[&[i64]], res: &mut [i64]) -> Result<(), ModernError> {
+        let k = xs.len();
+        let bad = xs.iter().find(|x| x.len() != self.cols);
+        if k == 0
+            || self.rows == 0
+            || self.cols == 0
+            || !self.cols.is_multiple_of(Q4_GROUP)
+            || self.q4.len() != self.rows * self.cols / 2
+            || self.scales.len() != self.rows * self.cols / Q4_GROUP
+            || bad.is_some()
+            || res.len() != self.rows * k
+        {
+            return Err(invalid(format!(
+                "INT4 projection shape: matrix {}x{}, input {}, output {}",
+                self.rows,
+                self.cols,
+                bad.or(xs.first()).map_or(0, |x| x.len()),
+                res.len() / k.max(1)
+            )));
+        }
+        for x in xs {
+            let mass: u128 = x.iter().map(|v| u128::from(v.unsigned_abs())).sum();
+            if mass * 8 >= 1u128 << 63 {
+                return Err(domain(
+                    "INT4 projection input magnitude (8 * sum |x| >= 2^63)",
+                ));
+            }
+        }
+        let groups = self.cols / Q4_GROUP;
+        if let Some(kernel) = super::q4_kernels::selected_q4_kernel() {
+            if let Some(digits) = super::q4_kernels::Digits::split(xs) {
+                super::q4_kernels::record_run(Some(kernel));
+                return super::q4_kernels::project_tokens(
+                    kernel,
+                    self,
+                    &digits,
+                    res,
+                    |r, dots, out| {
+                        let scales =
+                            Q4RowScales::parse(&self.scales[r * groups..(r + 1) * groups])?;
+                        for (t, slot) in out.iter_mut().enumerate() {
+                            *slot = scales.combine(|g| dots[t * groups + g])?;
+                        }
+                        Ok(())
+                    },
+                );
+            }
+            super::q4_kernels::record_refusal();
+        }
+        super::q4_kernels::record_run(None);
+        let half = self.cols / 2;
+        res.par_chunks_mut(16 * k)
+            .enumerate()
+            .try_for_each(|(chunk_index, chunk)| {
+                for (offset, row_out) in chunk.chunks_mut(k).enumerate() {
+                    let r = chunk_index * 16 + offset;
+                    let packed = &self.q4[r * half..(r + 1) * half];
+                    let scales = Q4RowScales::parse(&self.scales[r * groups..(r + 1) * groups])?;
+                    for (slot, x) in row_out.iter_mut().zip(xs) {
+                        *slot = scales.combine(|g| q4_group_dot(packed, g, x))?;
+                    }
+                }
+                Ok(())
+            })
+    }
+
+    /// `W x_t` for every vector of `xs`, one output vector per input.
+    pub fn project_rows(&self, xs: &[&[i64]]) -> Result<Vec<Vec<i64>>, ModernError> {
+        let k = xs.len();
+        let mut res = vec![0i64; self.rows * k];
+        self.project_into(xs, &mut res)?;
+        Ok((0..k)
+            .map(|t| res.iter().skip(t).step_by(k.max(1)).copied().collect())
+            .collect())
+    }
+}
+
 impl Project for Q4View<'_> {
     fn out_rows(&self) -> usize {
         self.rows
@@ -242,37 +341,29 @@ impl Project for Q4View<'_> {
 
     /// `out = W x` with exact group scales and one floor (spec §13.2).
     fn project(&self, x: &[i64], out: &mut [i64]) -> Result<(), ModernError> {
-        if self.rows == 0
-            || self.cols == 0
-            || !self.cols.is_multiple_of(Q4_GROUP)
-            || self.q4.len() != self.rows * self.cols / 2
-            || self.scales.len() != self.rows * self.cols / Q4_GROUP
-            || x.len() != self.cols
-            || out.len() != self.rows
-        {
-            return Err(invalid(format!(
-                "INT4 projection shape: matrix {}x{}, input {}, output {}",
-                self.rows,
-                self.cols,
-                x.len(),
-                out.len()
-            )));
-        }
-        let mass: u128 = x.iter().map(|v| u128::from(v.unsigned_abs())).sum();
-        if mass * 8 >= 1u128 << 63 {
-            return Err(domain(
-                "INT4 projection input magnitude (8 * sum |x| >= 2^63)",
-            ));
-        }
-        out.par_chunks_mut(16)
-            .enumerate()
-            .try_for_each(|(chunk_index, chunk)| {
-                for (offset, slot) in chunk.iter_mut().enumerate() {
-                    *slot = self.row(chunk_index * 16 + offset, x)?;
-                }
-                Ok(())
-            })
+        self.project_into(&[x], out)
     }
+}
+
+/// [`gated_ffn`] of INT4 rows for every vector of `xs`, each weight row read
+/// once for all of them; the same values, vector by vector.
+pub fn gated_ffn_q4_rows(
+    gate: &Q4View<'_>,
+    up: &Q4View<'_>,
+    down: &Q4View<'_>,
+    xs: &[&[i64]],
+) -> Result<Vec<Vec<i64>>, ModernError> {
+    let gates = gate.project_rows(xs)?;
+    let ups = up.project_rows(xs)?;
+    let mut activations = Vec::with_capacity(xs.len());
+    for (mut g, u) in gates.into_iter().zip(&ups) {
+        for (gi, &ui) in g.iter_mut().zip(u) {
+            *gi = gated_silu(*gi, ui)?;
+        }
+        activations.push(g);
+    }
+    let inputs: Vec<&[i64]> = activations.iter().map(Vec::as_slice).collect();
+    down.project_rows(&inputs)
 }
 
 /// Quantise one group of 32 BF16 values to INT4 with a BF16 scale (spec

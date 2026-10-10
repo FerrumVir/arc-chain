@@ -1,0 +1,195 @@
+name: MLA INT4 expert kernels
+
+# Exactness gate for the opt-in INT4 routed-expert kernels of the MLA + MoE
+# profile (crates/arc-inference/src/modern/mla/q4_kernels.rs): NEON SDOT and
+# SMMLA (i8mm) on arm64, AVX2, AVX-VNNI and AVX-512 VNNI on x86-64; and for
+# the multi-row MoE verification pass (model.rs `forward_rows`,
+# `moe_forward_rows`). Every kernel the runner's CPU has must give the scalar
+# reference's bytes:
+#   - the kernel unit tests (every shape, token count and input class);
+#   - the four pinned INT16 goldens with each kernel pinned;
+#   - k-row passes against single-row passes on the tiny INT8/INT4 models and
+#     the INT16 fixtures, k = 1, 2, 3, 4, 8, 16;
+#   - on Linux, in release mode, one K2.6-shaped MoE layer at real widths
+#     (384 experts, top-8), k = 1, 2, 4, 8, 16.
+#
+# Each leg first logs the CPU and its flags and checks that the process
+# detects every kernel the flags allow. A kernel the runner's CPU lacks is not
+# exercised on that runner, and the log says so. Hosted x86-64 hosts vary
+# (AMD EPYC 7763 has no AVX-512; EPYC 9V74 and 9V45 have AVX-512 VNNI), so two
+# Linux x86-64 legs run. The repository-wide workflows run only for pull
+# requests into main, so this one also carries rustfmt and clippy. macOS
+# runners serve the release sequence and are not used.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/mla-q4-kernels.yml
+      - crates/arc-inference/src/modern/mla/**
+      - crates/arc-inference/src/canonical_simd.rs
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Release optimisation without fat LTO: the same code, a shorter build.
+  # Integer results cannot depend on optimisation settings.
+  CARGO_PROFILE_RELEASE_LTO: "off"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+jobs:
+  lint:
+    name: lint (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Keep this dated toolchain aligned with rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: mla-q4-lint-${{ matrix.runner }}
+      - name: rustfmt (arc-inference)
+        if: runner.arch == 'X64'
+        run: cargo fmt -p arc-inference -- --check
+      # Same feature set as the shipped node and the INT16 hot-path workflow.
+      - name: clippy, every target with candle, warnings denied (x86-64)
+        if: runner.arch == 'X64'
+        run: cargo clippy -p arc-inference --all-targets --features candle --locked -- -D warnings
+      - name: clippy on the files this pull request changes (arm64)
+        if: runner.arch == 'ARM64'
+        run: |
+          set -euo pipefail
+          # The x86-64 job denies every warning; the arm64-only kernels are
+          # linted here. A compile error, or any diagnostic in the files
+          # below, fails this step; other diagnostics are listed.
+          status=0
+          cargo clippy -p arc-inference --all-targets --features candle --locked \
+            --message-format=short 2>&1 | tee "$RUNNER_TEMP/clippy.txt" || status=$?
+          own='^crates/arc-inference/src/modern/mla/(q4_kernels|ops|model|mod)[.]rs:'
+          if grep -E "$own" "$RUNNER_TEMP/clippy.txt"; then
+            echo "::error::clippy reports the diagnostics above in files this pull request changes"
+            exit 1
+          fi
+          exit "$status"
+
+  kernels:
+    name: kernels (${{ matrix.leg }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {leg: linux-x86-64-a, runner: ubuntu-24.04}
+          - {leg: linux-x86-64-b, runner: ubuntu-24.04}
+          - {leg: linux-arm64, runner: ubuntu-24.04-arm}
+          - {leg: windows-x86-64, runner: windows-latest}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Record the CPU and the kernels its flags allow
+        run: |
+          set -euo pipefail
+          expect=""
+          flags=""
+          has() {
+            case "$flags" in
+              *" $1 "*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          case "$RUNNER_OS" in
+            Linux)
+              lscpu
+              free -g
+              if [ "$RUNNER_ARCH" = X64 ]; then
+                flags=" $(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2) "
+                for flag in avx2 avx512f avx512_vnni avx_vnni; do
+                  if has "$flag"; then echo "flag $flag: yes"; else echo "flag $flag: no"; fi
+                done
+                if has avx2; then expect="$expect avx2-q4"; fi
+                if has avx2 && has avx_vnni; then expect="$expect avx-vnni-q4"; fi
+                if has avx512f && has avx512_vnni; then expect="$expect avx512-vnni-q4"; fi
+              else
+                flags=" $(grep -m1 '^Features' /proc/cpuinfo | cut -d: -f2) "
+                for flag in asimddp i8mm; do
+                  if has "$flag"; then echo "flag $flag: yes"; else echo "flag $flag: no"; fi
+                done
+                if has asimddp; then expect="$expect neon-sdot-q4"; fi
+                if has i8mm; then expect="$expect neon-i8mm-q4"; fi
+              fi
+              ;;
+            Windows)
+              powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors"
+              echo "Windows reports no CPU flag list here; the detection report in the next step is the record."
+              ;;
+          esac
+          expect="${expect# }"
+          echo "INT4 kernels the OS's CPU flags allow: ${expect:-not checked on this OS}"
+          echo "ARC_EXPECT_Q4_KERNELS=$expect" >> "$GITHUB_ENV"
+      # Keep this dated toolchain aligned with rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: mla-q4-${{ matrix.leg }}
+      - name: Detected INT4 kernels
+        run: |
+          set -euo pipefail
+          # The test runs in crates/arc-inference, so the list lands there.
+          ARC_Q4_KERNELS_OUT=q4-kernels.txt \
+            cargo test -p arc-inference --lib --locked q4_kernel_report -- --nocapture
+          detected=" $(tr '\n' ' ' < crates/arc-inference/q4-kernels.txt) "
+          echo "INT4 kernels this process detects:$detected"
+          for kernel in $ARC_EXPECT_Q4_KERNELS; do
+            case "$detected" in
+              *" $kernel "*) ;;
+              *) echo "::error::the CPU flags allow $kernel but the process does not detect it"; exit 1 ;;
+            esac
+          done
+      - name: MLA profile tests (every kernel against scalar, goldens per pinned kernel, multi-row passes)
+        run: |
+          set -euo pipefail
+          cargo test -p arc-inference --lib --locked modern::mla -- --nocapture 2>&1 | tee mla-tests.log
+          {
+            echo "### MLA profile tests on $RUNNER_OS $RUNNER_ARCH (${{ matrix.leg }})"
+            echo
+            echo '```'
+            grep -E '^(INT4 kernels|golden int16|test result)' mla-tests.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: One K2.6-shaped MoE layer, multi-row against single rows (release, Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          cargo test -p arc-inference --lib --release --locked \
+            modern::mla::model::tests::k26_moe_layer_rows_equal_single_rows \
+            -- --ignored --exact --nocapture --test-threads=1 2>&1 | tee k26.log
+          {
+            echo "### K2.6-shaped MoE layer on ${{ matrix.leg }}"
+            echo
+            echo '```'
+            grep -E '^(k26 |test result)' k26.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -7,6 +7,7 @@
 //! routers and tables are copied into memory. Every value the forward pass
 //! produces is a pure function of the package bytes and the inputs.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::ops::Range;
 use std::path::Path;
@@ -17,8 +18,8 @@ use rayon::prelude::*;
 use super::boundary::activation_hash;
 use super::config::{ExpertFormat, MlaConfig};
 use super::ops::{
-    LatentCache, Q4_GROUP, Q4View, QView, combine, gated_ffn, mla_attend, rope_interleaved,
-    router_logits, routing_weights, select_experts, selection_keys,
+    LatentCache, Q4_GROUP, Q4View, QView, combine, gated_ffn, gated_ffn_q4_rows, mla_attend,
+    rope_interleaved, router_logits, routing_weights, select_experts, selection_keys,
 };
 use super::package::{self, StageHeader, StageSpec};
 use super::precision::{I16Weights, Schedule, holds_int16_min};
@@ -454,6 +455,127 @@ where
     }
 }
 
+/// What [`StageModel::forward_rows`] computed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowsOutput {
+    /// Each row's output boundary vector, in row order.
+    pub hidden: Vec<Vec<i64>>,
+    /// Each row's logits, for the last stage.
+    pub logits: Option<Vec<Vec<i64>>>,
+    /// Per MoE layer of the stage, in layer order: how many distinct routed
+    /// experts the pass's rows chose, each read once for all of them.
+    pub expert_union: Vec<usize>,
+}
+
+/// One row's selected experts and their Q32 routing weights (spec §5.3–§5.5).
+fn moe_route(
+    c: &MlaConfig,
+    m: &MoeWeights,
+    x: &[i64],
+) -> Result<(Vec<usize>, Vec<i64>), ModernError> {
+    let mut logits = vec![0i64; c.n_routed_experts];
+    router_logits(&m.router_q, &m.router_k, x, &mut logits)?;
+    let (sigma, keys) = selection_keys(&logits, &m.bias)?;
+    let chosen = select_experts(&keys, c.n_experts_per_tok, c.n_group, c.topk_group)?;
+    let chosen_sigma: Vec<i64> = chosen.iter().map(|&e| sigma[e]).collect();
+    let weights = routing_weights(&chosen_sigma, c.routed_scaling_q32, c.norm_topk_prob);
+    Ok((chosen, weights))
+}
+
+/// The shared experts' output for one row (spec §5.6).
+fn shared_ffn(data: &[u8], m: &MoeWeights, x: &[i64]) -> Result<Vec<i64>, ModernError> {
+    let [gate, up, down] = &m.shared;
+    gated_ffn(gate.view(data, 0), up.view(data, 0), down.view(data, 0), x)
+}
+
+/// The MoE layer for one row (spec §5.3–§5.6).
+fn moe_forward(
+    c: &MlaConfig,
+    data: &[u8],
+    m: &MoeWeights,
+    x: &[i64],
+) -> Result<Vec<i64>, ModernError> {
+    let (chosen, weights) = moe_route(c, m, x)?;
+    // Experts run one after another: each expert projection is already
+    // parallel over its rows, and INT8 experts may use the opt-in limb
+    // kernel, whose thread-local scratch a projection nested inside
+    // another rayon task could re-enter through work stealing.
+    let outputs = match &m.experts {
+        ExpertStacks::Int8([gate, up, down]) => chosen
+            .iter()
+            .map(|&e| gated_ffn(gate.view(data, e), up.view(data, e), down.view(data, e), x))
+            .collect::<Result<Vec<_>, _>>()?,
+        ExpertStacks::Int4([gate, up, down]) => chosen
+            .iter()
+            .map(|&e| gated_ffn(gate.view(data, e), up.view(data, e), down.view(data, e), x))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let shared = shared_ffn(data, m, x)?;
+    let mut out = vec![0i64; c.d_model];
+    combine(&weights, &outputs, &shared, &mut out)?;
+    Ok(out)
+}
+
+/// [`moe_forward`] for every row of `xs`, with each routed expert's weights
+/// read once for all the rows that chose it. Rows are routed exactly as
+/// alone; the experts then run in ascending order, each over its rows
+/// (INT4 stacks in one multi-vector projection per matrix, INT8 stacks row by
+/// row), and each row's combine runs on its own experts in its own selection
+/// order, so every row's bytes are those of [`moe_forward`]. Returns the rows'
+/// outputs and how many distinct experts they chose.
+fn moe_forward_rows(
+    c: &MlaConfig,
+    data: &[u8],
+    m: &MoeWeights,
+    xs: &[Vec<i64>],
+) -> Result<(Vec<Vec<i64>>, usize), ModernError> {
+    let routes = xs
+        .iter()
+        .map(|x| moe_route(c, m, x))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut rows_of: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (row, (chosen, _)) in routes.iter().enumerate() {
+        for &e in chosen {
+            rows_of.entry(e).or_default().push(row);
+        }
+    }
+    let mut expert_outputs: BTreeMap<(usize, usize), Vec<i64>> = BTreeMap::new();
+    for (&e, rows) in &rows_of {
+        let inputs: Vec<&[i64]> = rows.iter().map(|&row| xs[row].as_slice()).collect();
+        let ys = match &m.experts {
+            ExpertStacks::Int8([gate, up, down]) => inputs
+                .iter()
+                .map(|x| gated_ffn(gate.view(data, e), up.view(data, e), down.view(data, e), x))
+                .collect::<Result<Vec<_>, _>>()?,
+            ExpertStacks::Int4([gate, up, down]) => gated_ffn_q4_rows(
+                &gate.view(data, e),
+                &up.view(data, e),
+                &down.view(data, e),
+                &inputs,
+            )?,
+        };
+        for (&row, y) in rows.iter().zip(ys) {
+            expert_outputs.insert((row, e), y);
+        }
+    }
+    let mut out = Vec::with_capacity(xs.len());
+    for (row, (x, (chosen, weights))) in xs.iter().zip(&routes).enumerate() {
+        let outputs = chosen
+            .iter()
+            .map(|&e| {
+                expert_outputs
+                    .remove(&(row, e))
+                    .ok_or_else(|| invalid("a selected expert produced no output"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let shared = shared_ffn(data, m, x)?;
+        let mut y = vec![0i64; c.d_model];
+        combine(weights, &outputs, &shared, &mut y)?;
+        out.push(y);
+    }
+    Ok((out, rows_of.len()))
+}
+
 /// Tokens, digests and timings of one generation (spec §7).
 #[derive(Debug, Clone)]
 pub struct MlaGeneration {
@@ -671,29 +793,7 @@ impl StageModel {
         if cache.latent.len() != self.layers.len() {
             return Err(invalid("the cache belongs to another stage"));
         }
-        let mut h = match (input, &self.embed) {
-            (StageInput::Token(token), Some(embed)) => {
-                embed.view(data, 0).embed_row(token as usize)?
-            }
-            (StageInput::Hidden(values), None) => {
-                if values.len() != c.d_model {
-                    return Err(invalid("boundary vector width"));
-                }
-                if values
-                    .iter()
-                    .any(|v| u128::from(v.unsigned_abs()) > ACTIVATION_LIMIT)
-                {
-                    return Err(ModernError::Domain("boundary value beyond 2^62".into()));
-                }
-                values.to_vec()
-            }
-            (StageInput::Token(_), None) => {
-                return Err(invalid("only the first stage takes token ids"));
-            }
-            (StageInput::Hidden(_), Some(_)) => {
-                return Err(invalid("the first stage takes token ids"));
-            }
-        };
+        let mut h = self.stage_input(input)?;
         let mut hashes = Vec::new();
         let tracing = trace.is_some();
         if tracing {
@@ -724,8 +824,57 @@ impl StageModel {
         Ok((h, logits))
     }
 
+    /// The vector entering the stage at one position: a token's embedding
+    /// row (the first stage) or the boundary values (every later stage).
+    fn stage_input(&self, input: StageInput<'_>) -> Result<Vec<i64>, ModernError> {
+        let c = self.config();
+        let data = self.bytes.as_slice();
+        match (input, &self.embed) {
+            (StageInput::Token(token), Some(embed)) => {
+                embed.view(data, 0).embed_row(token as usize)
+            }
+            (StageInput::Hidden(values), None) => {
+                if values.len() != c.d_model {
+                    return Err(invalid("boundary vector width"));
+                }
+                if values
+                    .iter()
+                    .any(|v| u128::from(v.unsigned_abs()) > ACTIVATION_LIMIT)
+                {
+                    return Err(ModernError::Domain("boundary value beyond 2^62".into()));
+                }
+                Ok(values.to_vec())
+            }
+            (StageInput::Token(_), None) => Err(invalid("only the first stage takes token ids")),
+            (StageInput::Hidden(_), Some(_)) => Err(invalid("the first stage takes token ids")),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn layer_forward(
+        &self,
+        w: &LayerWeights,
+        local: usize,
+        h: &mut [i64],
+        position: usize,
+        cos: &[i32],
+        sin: &[i32],
+        cache: &mut StageCache,
+    ) -> Result<(), ModernError> {
+        self.attention_block(w, local, h, position, cos, sin, cache)?;
+        let x = rms_norm(h, &w.ffn_norm, self.config().rms_eps_q32)?;
+        let out = match &w.ffn {
+            FfnWeights::Dense(dense) => self.dense_ffn(dense, &x)?,
+            FfnWeights::Moe(moe) => moe_forward(self.config(), self.bytes.as_slice(), moe, &x)?,
+        };
+        add_residual(h, &out)
+    }
+
+    /// The attention half of a layer at one position: appends the position's
+    /// latent and RoPE key to the layer's cache and adds the attention output
+    /// to `h` (spec §5.2).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_block(
         &self,
         w: &LayerWeights,
         local: usize,
@@ -783,52 +932,96 @@ impl StageModel {
         })?;
         let mut y = vec![0i64; c.d_model];
         w.wo.view(data, 0).project(&heads, &mut y)?;
-        add_residual(h, &y)?;
-        // Dense FFN or mixture of experts (spec §5.3–§5.6).
-        let x = rms_norm(h, &w.ffn_norm, eps)?;
-        let out = match &w.ffn {
-            FfnWeights::Dense(dense) => {
-                let [gate, up, down] = &**dense;
-                gated_ffn(gate.view(data, 0), up.view(data, 0), down.view(data, 0), &x)?
-            }
-            FfnWeights::Moe(moe) => self.moe_forward(moe, &x)?,
-        };
-        add_residual(h, &out)
+        add_residual(h, &y)
     }
 
-    fn moe_forward(&self, m: &MoeWeights, x: &[i64]) -> Result<Vec<i64>, ModernError> {
+    /// A dense FFN layer's output for one normed input (spec §5.6).
+    fn dense_ffn(&self, dense: &[MatRef; 3], x: &[i64]) -> Result<Vec<i64>, ModernError> {
+        let data = self.bytes.as_slice();
+        let [gate, up, down] = dense;
+        gated_ffn(gate.view(data, 0), up.view(data, 0), down.view(data, 0), x)
+    }
+
+    /// `inputs.len()` consecutive positions through the stage in one pass,
+    /// the verification pass of speculative decoding. The result equals that
+    /// many [`Self::forward`] calls in order, value for value: the same
+    /// boundary vectors, logits and cache. The layers run in order with every
+    /// row at each: attention row by row in position order (row r attends to
+    /// the cache and rows 0 to r), then the FFN; in an MoE layer each routed
+    /// expert's weights are read once for all the rows that chose it
+    /// (`moe_forward_rows`), and the combine runs per row in its fixed order.
+    ///
+    /// On error the cache may hold a partial pass and must be discarded.
+    pub fn forward_rows(
+        &self,
+        inputs: &[StageInput<'_>],
+        cache: &mut StageCache,
+    ) -> Result<RowsOutput, ModernError> {
         let c = self.config();
         let data = self.bytes.as_slice();
-        let mut logits = vec![0i64; c.n_routed_experts];
-        router_logits(&m.router_q, &m.router_k, x, &mut logits)?;
-        let (sigma, keys) = selection_keys(&logits, &m.bias)?;
-        let chosen = select_experts(&keys, c.n_experts_per_tok, c.n_group, c.topk_group)?;
-        let chosen_sigma: Vec<i64> = chosen.iter().map(|&e| sigma[e]).collect();
-        let weights = routing_weights(&chosen_sigma, c.routed_scaling_q32, c.norm_topk_prob);
-        // Experts run one after another: each expert projection is already
-        // parallel over its rows, and INT8 experts may use the opt-in limb
-        // kernel, whose thread-local scratch a projection nested inside
-        // another rayon task could re-enter through work stealing.
-        let outputs = match &m.experts {
-            ExpertStacks::Int8([gate, up, down]) => chosen
-                .iter()
-                .map(|&e| gated_ffn(gate.view(data, e), up.view(data, e), down.view(data, e), x))
-                .collect::<Result<Vec<_>, _>>()?,
-            ExpertStacks::Int4([gate, up, down]) => chosen
-                .iter()
-                .map(|&e| gated_ffn(gate.view(data, e), up.view(data, e), down.view(data, e), x))
-                .collect::<Result<Vec<_>, _>>()?,
+        let start = cache.positions;
+        if inputs.is_empty() {
+            return Err(invalid("a multi-row pass needs at least one row"));
+        }
+        if start + inputs.len() > c.max_seq {
+            return Err(ModernError::Domain(format!(
+                "position {} is outside the {}-position context",
+                start.max(c.max_seq),
+                c.max_seq
+            )));
+        }
+        if cache.latent.len() != self.layers.len() {
+            return Err(invalid("the cache belongs to another stage"));
+        }
+        let mut hs = inputs
+            .iter()
+            .map(|&input| self.stage_input(input))
+            .collect::<Result<Vec<_>, _>>()?;
+        let half = c.qk_rope_dim / 2;
+        let mut expert_union = Vec::new();
+        for (local, layer) in self.layers.iter().enumerate() {
+            let mut xs = Vec::with_capacity(hs.len());
+            for (row, h) in hs.iter_mut().enumerate() {
+                let position = start + row;
+                let cos = &self.rope_cos[position * half..(position + 1) * half];
+                let sin = &self.rope_sin[position * half..(position + 1) * half];
+                self.attention_block(layer, local, h, position, cos, sin, cache)?;
+                xs.push(rms_norm(h, &layer.ffn_norm, c.rms_eps_q32)?);
+            }
+            let outs = match &layer.ffn {
+                FfnWeights::Dense(dense) => xs
+                    .iter()
+                    .map(|x| self.dense_ffn(dense, x))
+                    .collect::<Result<Vec<_>, _>>()?,
+                FfnWeights::Moe(moe) => {
+                    let (outs, experts) = moe_forward_rows(c, data, moe, &xs)?;
+                    expert_union.push(experts);
+                    outs
+                }
+            };
+            for (h, out) in hs.iter_mut().zip(&outs) {
+                add_residual(h, out)?;
+            }
+        }
+        cache.positions = start + inputs.len();
+        let logits = match &self.head {
+            Some(head) => Some(
+                hs.iter()
+                    .map(|h| {
+                        let x = rms_norm(h, &head.final_norm, c.rms_eps_q32)?;
+                        let mut logits = vec![0i64; c.vocab_size];
+                        head.lm_head.view(data, 0).project(&x, &mut logits)?;
+                        Ok(logits)
+                    })
+                    .collect::<Result<Vec<_>, ModernError>>()?,
+            ),
+            None => None,
         };
-        let [s_gate, s_up, s_down] = &m.shared;
-        let shared = gated_ffn(
-            s_gate.view(data, 0),
-            s_up.view(data, 0),
-            s_down.view(data, 0),
-            x,
-        )?;
-        let mut out = vec![0i64; c.d_model];
-        combine(&weights, &outputs, &shared, &mut out)?;
-        Ok(out)
+        Ok(RowsOutput {
+            hidden: hs,
+            logits,
+            expert_union,
+        })
     }
 
     fn traced_step(
@@ -1358,7 +1551,7 @@ pub(crate) mod tests {
         let FfnWeights::Moe(moe) = &layer.ffn else {
             panic!("layer 1 is an MoE layer");
         };
-        let single = model.moe_forward(moe, &x).unwrap();
+        let single = moe_forward(model.config(), model.bytes(), moe, &x).unwrap();
         let mut logits = vec![0i64; c.n_routed_experts];
         router_logits(&moe.router_q, &moe.router_k, &x, &mut logits).unwrap();
         let (sigma, keys) = selection_keys(&logits, &moe.bias).unwrap();
@@ -1610,7 +1803,7 @@ pub(crate) mod tests {
                             assert_eq!(keys[chosen[2]], keys[chosen[2] + 1], "{at}");
                         }
                         assert_eq!(
-                            model.moe_forward(moe, &x).unwrap(),
+                            moe_forward(model.config(), model.bytes(), moe, &x).unwrap(),
                             routed_by_hand(&model, moe, &x, &chosen, &sigma),
                             "{at}"
                         );
@@ -2330,6 +2523,446 @@ pub(crate) mod tests {
                     "{schedule:?}, {threads} threads"
                 );
             }
+        }
+    }
+
+    /// The hash a generation's goldens pin: its tokens, every logits hash and
+    /// every boundary digest.
+    fn generation_hash(run: &MlaGeneration) -> String {
+        let mut h = blake3::Hasher::new();
+        for t in &run.tokens {
+            h.update(&t.to_le_bytes());
+        }
+        for d in run.logits_hashes.iter().chain(&run.boundary_digests) {
+            h.update(d);
+        }
+        h.finalize().to_hex().to_string()
+    }
+
+    /// The four pinned INT16 goldens hold with the scalar reference and with
+    /// each INT4 kernel this CPU has pinned for the routed experts, and the
+    /// pinned kernel is the one that ran in the MoE fixtures.
+    #[test]
+    fn int16_goldens_hold_with_each_q4_kernel_pinned() {
+        use super::super::q4_kernels::q4_kernel_runs;
+        use super::super::q4_kernels::tests::{KernelRestore, pin_label, pins, use_pin};
+        let pinned: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../docs/protocol/reference/int16-fixture-goldens.json"
+        ))
+        .unwrap();
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let _restore = KernelRestore;
+        let request = GenerationRequest {
+            prompt: &[3, 17, 5, 49, 0],
+            max_tokens: 8,
+            eos: &[],
+            selection: Selection::Rp64Argmax,
+        };
+        for (name, c) in int16_fixtures() {
+            let model = StageModel::from_owned(tiny_package(&c, StageSpec::full(&c))).unwrap();
+            let moe = c.n_layers > c.first_k_dense;
+            for pin in pins() {
+                let counter = use_pin(pin);
+                let before = q4_kernel_runs(counter);
+                let hash = generation_hash(&model.generate(&request).unwrap());
+                println!("golden {name} with {}: {hash}", pin_label(pin));
+                assert_eq!(pinned[name][1], hash, "{name}: {}", pin_label(pin));
+                if moe {
+                    assert!(
+                        q4_kernel_runs(counter) > before,
+                        "{name}: {} did not run",
+                        pin_label(pin)
+                    );
+                }
+            }
+        }
+    }
+
+    /// k-row passes equal single-row passes value for value: boundary
+    /// vectors, logits, the cache and its positions, for k = 1, 2, 3, 4, 8 and
+    /// 16, after a two-row prefix, on the tiny INT8 and INT4 models and the
+    /// four INT16 fixtures, with the scalar reference and each INT4 kernel.
+    #[test]
+    fn forward_rows_equal_single_row_passes() {
+        use super::super::q4_kernels::tests::{KernelRestore, pin_label, pins, use_pin};
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let _restore = KernelRestore;
+        let tokens: [u32; 20] = [
+            3, 17, 5, 49, 0, 22, 8, 41, 2, 7, 7, 30, 11, 45, 9, 1, 13, 29, 4, 6,
+        ];
+        let mut configs: Vec<(String, MlaConfig)> = FORMATS
+            .iter()
+            .map(|&(lora, format)| {
+                (
+                    format!("lora {lora}, {format:?}"),
+                    tiny_config_with(lora, format),
+                )
+            })
+            .collect();
+        configs.extend(
+            int16_fixtures()
+                .into_iter()
+                .map(|(name, c)| (name.to_string(), c)),
+        );
+        for (name, c) in configs {
+            assert!(tokens.len() <= c.max_seq, "{name}");
+            let model = StageModel::from_owned(tiny_package(&c, StageSpec::full(&c))).unwrap();
+            let moe_layers = (0..c.n_layers).filter(|&l| c.is_moe(l)).count();
+            crate::canonical_simd::set_fast_canonical_kernel(false);
+            let mut cache = model.new_cache();
+            let single: Vec<(Vec<i64>, Option<Vec<i64>>)> = tokens
+                .iter()
+                .map(|&t| {
+                    model
+                        .forward(StageInput::Token(t), &mut cache, None)
+                        .unwrap()
+                })
+                .collect();
+            let digest = cache.digest();
+            for pin in pins() {
+                use_pin(pin);
+                for k in [1usize, 2, 3, 4, 8, 16] {
+                    let at = format!("{name}, {}, k = {k}", pin_label(pin));
+                    let mut cache = model.new_cache();
+                    for &t in &tokens[..2] {
+                        model
+                            .forward(StageInput::Token(t), &mut cache, None)
+                            .unwrap();
+                    }
+                    let mut start = 2;
+                    while start < tokens.len() {
+                        let end = (start + k).min(tokens.len());
+                        let inputs: Vec<StageInput<'_>> = tokens[start..end]
+                            .iter()
+                            .map(|&t| StageInput::Token(t))
+                            .collect();
+                        let pass = model.forward_rows(&inputs, &mut cache).unwrap();
+                        assert_eq!(pass.hidden.len(), end - start, "{at}");
+                        assert_eq!(pass.expert_union.len(), moe_layers, "{at}");
+                        let logits = pass.logits.as_ref().expect("the whole model has a head");
+                        for (row, (h, l)) in pass.hidden.iter().zip(logits).enumerate() {
+                            let (want_h, want_l) = &single[start + row];
+                            assert_eq!(h, want_h, "{at}: row {}", start + row);
+                            assert_eq!(Some(l), want_l.as_ref(), "{at}: row {}", start + row);
+                        }
+                        assert_eq!(cache.positions(), end, "{at}");
+                        start = end;
+                    }
+                    assert_eq!(cache.digest(), digest, "{at}");
+                }
+            }
+        }
+    }
+
+    /// A pass that does not fit the context is refused, and so is a pass
+    /// with no rows; a pass fills the context exactly.
+    #[test]
+    fn forward_rows_refuses_what_single_rows_refuse() {
+        let c = tiny_config_with(false, ExpertFormat::Int4G32);
+        let model = StageModel::from_owned(tiny_package(&c, StageSpec::full(&c))).unwrap();
+        let mut cache = model.new_cache();
+        assert!(model.forward_rows(&[], &mut cache).is_err());
+        let rows: Vec<StageInput<'_>> = (0..=c.max_seq)
+            .map(|t| StageInput::Token(t as u32 % 50))
+            .collect();
+        let err = model.forward_rows(&rows, &mut cache).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "out of the profile's domain: position {} is outside the {}-position context",
+                c.max_seq, c.max_seq
+            )
+        );
+        assert_eq!(cache.positions(), 0);
+        let pass = model.forward_rows(&rows[..c.max_seq], &mut cache).unwrap();
+        assert_eq!(pass.hidden.len(), c.max_seq);
+        assert!(model.forward_rows(&rows[..1], &mut cache).is_err());
+    }
+
+    /// Kimi K2.6's MoE layer shape (`docs/protocol/reference/kimi-k26/config.json`):
+    /// hidden width 7,168, expert width 2,048, 384 routed experts with 8 per
+    /// token, one shared expert, one routing group, routing scale 2.827,
+    /// normalised weights.
+    fn k26_moe_config() -> MlaConfig {
+        let mut c = tiny_config_with(false, ExpertFormat::Int4G32);
+        c.d_model = 7168;
+        c.moe_d_ff = 2048;
+        c.n_routed_experts = 384;
+        c.n_experts_per_tok = 8;
+        c.n_shared_experts = 1;
+        c.n_group = 1;
+        c.topk_group = 1;
+        c.norm_topk_prob = true;
+        c.routed_scaling_q32 = super::super::ops::f32_to_q32(2.827f32.to_bits()).unwrap();
+        c
+    }
+
+    /// One K2.6-shaped MoE layer with random weights.
+    struct K26Layer {
+        c: MlaConfig,
+        bytes: Vec<u8>,
+        moe: MoeWeights,
+    }
+
+    const K26_SEED: u64 = 0x0026_C0DE_0000_0001;
+
+    /// `count` random FFN inputs of a K2.6 MoE layer: RMS-normed scale, every
+    /// value in [-2^17, 2^17].
+    fn k26_inputs(count: usize) -> Vec<Vec<i64>> {
+        use super::super::q4_kernels::tests::Rng;
+        let mut rng = Rng(K26_SEED ^ 0x1111);
+        (0..count)
+            .map(|_| {
+                (0..7168)
+                    .map(|_| (rng.next() % (1 << 18)) as i64 - (1 << 17))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// One K2.6-shaped MoE layer with random weights, whose routed experts
+    /// get values only where `rows` route. The three expert stacks (9.5 GB)
+    /// are allocated zeroed, and the pages of experts no row chooses are never
+    /// written; the router, its bias and the shared expert are drawn, every
+    /// row is routed, and only the chosen experts' values and scales are then
+    /// drawn. Unchosen experts never contribute, so for these rows this is a
+    /// complete random layer, at about 25 MB per chosen expert.
+    fn k26_layer(rows: &[Vec<i64>]) -> K26Layer {
+        use super::super::q4_kernels::tests::Rng;
+        let c = k26_moe_config();
+        let (d, f, experts) = (c.d_model, c.moe_d_ff, c.n_routed_experts);
+        let mut rng = Rng(K26_SEED);
+        let shared_bytes = 3 * f * d;
+        let stack = experts * f * d / 2;
+        let mut bytes = vec![0u8; shared_bytes + 3 * stack];
+        for b in &mut bytes[..shared_bytes] {
+            *b = ((rng.next() % 255) as i64 - 127) as i8 as u8;
+        }
+        let mut dyadic = |start: usize, rows: usize, cols: usize| MatRef {
+            rows,
+            cols,
+            q: start..start + rows * cols,
+            wide: false,
+            mu: (0..rows)
+                .map(|_| ((1u64 << 30) + rng.next() % (1 << 30)) as i32)
+                .collect(),
+            k: (0..rows).map(|_| 42 + (rng.next() % 2) as u8).collect(),
+        };
+        let shared = [
+            dyadic(0, f, d),
+            dyadic(f * d, f, d),
+            dyadic(2 * f * d, d, f),
+        ];
+        let stacked = |which: usize, rows: usize, cols: usize| Q4Ref {
+            rows,
+            cols,
+            q4: shared_bytes + which * stack..shared_bytes + (which + 1) * stack,
+            scales: vec![0u16; experts * rows * cols / Q4_GROUP],
+        };
+        let mut moe = MoeWeights {
+            router_q: (0..experts * d)
+                .map(|_| ((rng.next() % 65_535) as i64 - 32_767) as i16)
+                .collect(),
+            router_k: (0..experts).map(|_| 21 + (rng.next() % 3) as u8).collect(),
+            bias: (0..experts)
+                .map(|_| (rng.next() % (1 << 30)) as i64 - (1 << 29))
+                .collect(),
+            shared,
+            experts: ExpertStacks::Int4([stacked(0, f, d), stacked(1, f, d), stacked(2, d, f)]),
+        };
+        let mut chosen = std::collections::BTreeSet::new();
+        for x in rows {
+            chosen.extend(moe_route(&c, &moe, x).unwrap().0);
+        }
+        let ExpertStacks::Int4(stacks) = &mut moe.experts else {
+            unreachable!("the layer has INT4 experts");
+        };
+        for (which, stack_ref) in stacks.iter_mut().enumerate() {
+            let per = stack_ref.rows * stack_ref.cols / 2;
+            let groups = stack_ref.rows * stack_ref.cols / Q4_GROUP;
+            for &e in &chosen {
+                let mut rng = Rng(K26_SEED ^ ((e * 3 + which) as u64).wrapping_mul(0x9E37_79B9));
+                let start = stack_ref.q4.start + e * per;
+                for word in bytes[start..start + per].chunks_exact_mut(8) {
+                    word.copy_from_slice(&rng.next().to_le_bytes());
+                }
+                // Positive BF16 scales of 2^-10 to 2^-8: activations of order one.
+                for scale in &mut stack_ref.scales[e * groups..(e + 1) * groups] {
+                    *scale = (((117 + rng.next() % 3) << 7) | (rng.next() % 128)) as u16;
+                }
+            }
+        }
+        K26Layer { c, bytes, moe }
+    }
+
+    /// One K2.6-shaped MoE layer at real widths (384 experts, top-8): k-row
+    /// passes, k = 1, 2, 4, 8 and 16, equal single-row passes byte for byte,
+    /// with the scalar reference and with each INT4 kernel this CPU has; and
+    /// every kernel's single rows equal the scalar reference's. Release
+    /// mode, Linux (the zeroed 9.5 GB stack relies on lazily committed pages).
+    #[test]
+    #[ignore = "K2.6-width MoE layer: run in release with --ignored (Linux, about 3 GB)"]
+    fn k26_moe_layer_rows_equal_single_rows() {
+        use super::super::q4_kernels::tests::{KernelRestore, pin_label, pins, use_pin};
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let _restore = KernelRestore;
+        let rows = k26_inputs(16);
+        let layer = k26_layer(&rows);
+        let (c, data, moe) = (&layer.c, layer.bytes.as_slice(), &layer.moe);
+        use_pin(super::super::q4_kernels::Q4Pin::Scalar);
+        let reference: Vec<Vec<i64>> = rows
+            .iter()
+            .map(|x| moe_forward(c, data, moe, x).unwrap())
+            .collect();
+        for pin in pins() {
+            use_pin(pin);
+            let label = pin_label(pin);
+            for (row, x) in rows.iter().enumerate() {
+                assert_eq!(
+                    moe_forward(c, data, moe, x).unwrap(),
+                    reference[row],
+                    "{label}: row {row}"
+                );
+            }
+            for k in [1usize, 2, 4, 8, 16] {
+                let (outs, union) = moe_forward_rows(c, data, moe, &rows[..k]).unwrap();
+                assert_eq!(outs, reference[..k], "{label}: k = {k}");
+                println!(
+                    "k26 {label}: k = {k}, expert union {union} of {} choices",
+                    8 * k
+                );
+            }
+        }
+    }
+
+    /// CI-runner benchmark of one K2.6-shaped MoE layer: the per-token time
+    /// of single-row passes, and the per-row cost of k-row passes against k,
+    /// for the scalar reference (opt-in off), and each INT4 kernel this CPU
+    /// has (opt-in on, shared expert on the INT8 limb kernel). Every
+    /// measured pass is also checked against the scalar bytes.
+    #[test]
+    #[ignore = "benchmark: run in release with --ignored --nocapture"]
+    fn k26_moe_layer_benchmark() {
+        use super::super::q4_kernels::Q4Pin;
+        use super::super::q4_kernels::tests::{KernelRestore, pin_label, pins, use_pin};
+        const REPEATS: usize = 3;
+        let median = |mut samples: Vec<f64>| {
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        };
+        let _guard = crate::canonical_simd::kernel_switch_guard();
+        let _restore = KernelRestore;
+        let rows = k26_inputs(16);
+        let build = Instant::now();
+        let layer = k26_layer(&rows);
+        let build_seconds = build.elapsed().as_secs_f64();
+        let (c, data, moe) = (&layer.c, layer.bytes.as_slice(), &layer.moe);
+        use_pin(Q4Pin::Scalar);
+        crate::canonical_simd::set_fast_canonical_kernel(false);
+        let reference: Vec<Vec<i64>> = rows
+            .iter()
+            .map(|x| moe_forward(c, data, moe, x).unwrap())
+            .collect();
+        let ks = [1usize, 2, 4, 8, 16];
+        let mut table = Vec::new();
+        let mut unions = Vec::new();
+        for pin in pins() {
+            let label = pin_label(pin);
+            use_pin(pin);
+            if pin == Q4Pin::Scalar {
+                // The whole layer scalar: the shared expert too.
+                crate::canonical_simd::set_fast_canonical_kernel(false);
+            }
+            let single = median(
+                (0..REPEATS)
+                    .map(|_| {
+                        let start = Instant::now();
+                        for (row, x) in rows.iter().enumerate() {
+                            assert_eq!(moe_forward(c, data, moe, x).unwrap(), reference[row]);
+                        }
+                        start.elapsed().as_secs_f64() / rows.len() as f64
+                    })
+                    .collect(),
+            );
+            let mut per_row = Vec::new();
+            unions.clear();
+            for &k in &ks {
+                let mut union = 0;
+                let seconds = median(
+                    (0..REPEATS)
+                        .map(|_| {
+                            let start = Instant::now();
+                            let (outs, experts) =
+                                moe_forward_rows(c, data, moe, &rows[..k]).unwrap();
+                            let seconds = start.elapsed().as_secs_f64();
+                            assert_eq!(outs, reference[..k], "{label}: k = {k}");
+                            union = experts;
+                            seconds
+                        })
+                        .collect(),
+                );
+                per_row.push(seconds / k as f64);
+                unions.push(union);
+            }
+            table.push((label, single, per_row));
+        }
+        let ms = |s: f64| s * 1e3;
+        let mut md = String::new();
+        md.push_str("### One K2.6-shaped MoE layer on CPU: INT4 routed-expert kernels\n\n");
+        md.push_str(
+            "CI-runner measurement on a shared hosted runner, not product speed. One synthetic \
+             MoE layer at Kimi K2.6 widths (hidden 7,168, expert width 2,048, 384 routed \
+             experts, 8 per token, one shared expert), random weights, 16 random rows; times are \
+             medians of 3 runs, and every run's bytes are checked against the scalar \
+             reference.\n\n",
+        );
+        md.push_str(&format!(
+            "Layer built in {build_seconds:.1} s (only routed experts that the rows choose get values).\n\n"
+        ));
+        md.push_str("| Kernel | Single-row pass, ms per token |");
+        for k in ks {
+            md.push_str(&format!(" k = {k}, ms per row |"));
+        }
+        md.push_str("\n|---|---|");
+        md.push_str(&"---|".repeat(ks.len()));
+        md.push('\n');
+        for (label, single, per_row) in &table {
+            md.push_str(&format!("| {label} | {:.1} |", ms(*single)));
+            for &cost in per_row {
+                md.push_str(&format!(
+                    " {:.1} ({:.2}x) |",
+                    ms(cost),
+                    cost / single.max(f64::MIN_POSITIVE)
+                ));
+            }
+            md.push('\n');
+        }
+        md.push_str("\nDistinct routed experts per pass (each read once for all its rows):");
+        for (&k, &union) in ks.iter().zip(&unions) {
+            md.push_str(&format!(" k = {k}: {union} of {} choices;", 8 * k));
+        }
+        md.push_str(
+            "\n\nThe bracketed figure is the k-row cost per row as a fraction of the same \
+             kernel's single-row pass.\n",
+        );
+        println!("{md}");
+        let json = serde_json::json!({
+            "label": "CI-runner measurement",
+            "build_seconds": build_seconds,
+            "ks": ks,
+            "expert_union": unions,
+            "kernels": table
+                .iter()
+                .map(|(label, single, per_row)| serde_json::json!({
+                    "kernel": label,
+                    "single_row_ms_per_token": ms(*single),
+                    "multi_row_ms_per_row": per_row.iter().map(|&s| ms(s)).collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>(),
+        });
+        println!("MLA_Q4_BENCH {json}");
+        if let Ok(path) = std::env::var("ARC_MLA_Q4_BENCH_MD") {
+            std::fs::write(path, md).unwrap();
         }
     }
 }
