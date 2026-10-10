@@ -16,8 +16,10 @@
 //!    one KV cache per stage holder, one row per call (`forward_shard_token`)
 //!    or k rows per call (`forward_shard_rows`), with rejected rows rolled
 //!    back on every holder (`rollback_rows`);
-//! 7. rayon pools of 1, 2 and N threads, with the scalar and the vectorised
-//!    projection kernels.
+//! 7. rayon pools of 1, 2 and N threads, with the scalar projection kernel
+//!    and with the vectorised kernels: every multi-row kernel the runner's
+//!    CPU has (`neon-sdot-limb` and `neon-i8mm-limb` on arm64; `avx2-limb`,
+//!    `avx-vnni-limb` and `avx512-vnni-limb` on x86-64), each its own leg.
 //!
 //! Every mode is compared on each position's raw logits, the residual stream
 //! leaving every layer (the per-layer boundary hash), every K and V row, and
@@ -39,7 +41,7 @@ use crate::cached_integer_model::{
     GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, I8Weights, KVCache, ShardInput, ShardOutput,
     ShardRowsError, ShardRowsInput, ShardRowsOutput, select_next_token_with_repetition_penalty,
 };
-use crate::canonical_simd;
+use crate::canonical_simd::{self, BatchedKernel};
 use arc_crypto::hash_bytes;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::collections::BTreeMap;
@@ -80,8 +82,9 @@ fn build_model(fixture: &GoldenFixture, profile: Profile) -> CachedIntegerModel 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kernel {
     Scalar,
-    /// The exact limb kernel: AVX2 on x86-64, NEON dotprod on arm64.
-    Vectorised,
+    /// The exact limb kernels: one-row projections run AVX2 on x86-64 and
+    /// NEON dotprod on arm64, and multi-row projections run this kernel.
+    Vectorised(BatchedKernel),
 }
 
 /// One execution environment: a projection kernel and a rayon pool size.
@@ -103,12 +106,13 @@ fn thread_counts() -> [usize; 3] {
     [1, 2, cores.max(4)]
 }
 
-/// Exclusive use of the process-wide kernel switch for one test, restored on
-/// drop. Holding the lock also keeps this suite's batched prefills out of the
-/// prefill census that tests in `cached_integer_model` assert on.
+/// Exclusive use of the process-wide kernel switches for one test, restored
+/// on drop. Holding the lock also keeps this suite's batched prefills out of
+/// the prefill census that tests in `cached_integer_model` assert on.
 struct KernelSwitch {
     _lock: MutexGuard<'static, ()>,
     previous: bool,
+    previous_batched: Option<BatchedKernel>,
     pools: BTreeMap<usize, ThreadPool>,
 }
 
@@ -118,6 +122,7 @@ impl KernelSwitch {
         // The first read applies any environment default, so the explicit
         // choices `run` makes afterwards are the ones that hold.
         let previous = canonical_simd::fast_canonical_kernel_enabled();
+        let previous_batched = canonical_simd::batched_kernel_preference();
         let pools = thread_counts()
             .into_iter()
             .map(|threads| {
@@ -131,6 +136,7 @@ impl KernelSwitch {
         let switch = Self {
             _lock: lock,
             previous,
+            previous_batched,
             pools,
         };
         // Printed under --nocapture so CI logs show which legs really ran.
@@ -138,17 +144,21 @@ impl KernelSwitch {
         switch
     }
 
-    /// Every leg this machine can run. The vectorised kernel runs only where
-    /// the CPU has it; elsewhere the scalar kernel is the only kernel in use.
+    /// Every leg this machine can run. The vectorised kernels run only where
+    /// the CPU has them, one leg per multi-row kernel; elsewhere the scalar
+    /// kernel is the only kernel in use.
     fn legs(&self) -> Vec<Leg> {
-        let kernels: &[Kernel] = if canonical_simd::dotprod_available() {
-            &[Kernel::Scalar, Kernel::Vectorised]
-        } else {
-            &[Kernel::Scalar]
-        };
+        let mut kernels = vec![Kernel::Scalar];
+        if canonical_simd::dotprod_available() {
+            kernels.extend(
+                canonical_simd::available_batched_kernels()
+                    .into_iter()
+                    .map(Kernel::Vectorised),
+            );
+        }
         kernels
-            .iter()
-            .flat_map(|&kernel| {
+            .into_iter()
+            .flat_map(|kernel| {
                 self.pools
                     .keys()
                     .map(move |&threads| Leg { kernel, threads })
@@ -156,22 +166,41 @@ impl KernelSwitch {
             .collect()
     }
 
-    /// Runs `work` on the leg's pool with the leg's kernel selected.
+    /// Runs `work` on the leg's pool with the leg's kernels selected.
     fn run<R: Send>(&self, leg: Leg, work: impl FnOnce() -> R + Send) -> R {
-        let vectorised = leg.kernel == Kernel::Vectorised;
-        canonical_simd::set_fast_canonical_kernel(vectorised);
+        let batched = match leg.kernel {
+            Kernel::Scalar => None,
+            Kernel::Vectorised(kernel) => Some(kernel),
+        };
+        canonical_simd::set_fast_canonical_kernel(batched.is_some());
+        canonical_simd::set_batched_kernel_preference(batched);
         assert_eq!(
             canonical_simd::fast_canonical_kernel_enabled(),
-            vectorised,
+            batched.is_some(),
             "the kernel switch did not take effect for {leg:?}"
         );
+        if batched.is_some() {
+            assert_eq!(
+                canonical_simd::selected_batched_kernel(),
+                batched,
+                "the multi-row kernel switch did not take effect for {leg:?}"
+            );
+        }
         self.pools[&leg.threads].install(work)
     }
 }
 
 impl Drop for KernelSwitch {
     fn drop(&mut self) {
+        // Printed under --nocapture: how many multi-row projections each
+        // kernel has run in this process so far, so CI logs show the
+        // kernels really ran.
+        println!(
+            "golden_modes multi-row projections by kernel so far: {}",
+            canonical_simd::batched_kernel_run_report()
+        );
         canonical_simd::set_fast_canonical_kernel(self.previous);
+        canonical_simd::set_batched_kernel_preference(self.previous_batched);
     }
 }
 

@@ -1,0 +1,152 @@
+name: CPU matrix-kernel bench
+
+# CI-runner measurement of what a k-row stage call costs per row against k
+# one-row calls (examples/stage_rows_bench.rs), on the live network model:
+# Llama-2-7B-Chat Q4_K_M, pinned by SHA-256 exactly as #182's speculative
+# bench pins it, loaded as the canonical legacy INT8 profile. k runs over 1,
+# 2, 4, 8, 16, 32 and 64, with the scalar kernel and with every multi-row
+# kernel the runner's CPU has (SDOT and SMMLA on arm64; AVX2, AVX-VNNI and
+# AVX-512 VNNI on x86-64). One machine runs every stage, so one 2-stage split
+# is measured; #185 found 2 and 4 stages cost the same per row.
+#
+# Every run is also an exactness check on the real model: the k-row and
+# one-row calls must hand on bit-identical rows and logits, and the pinned
+# kernel must be the one that ran, or the driver exits non-zero. Timings are
+# CI-runner measurements on shared 4-vCPU hosted runners, not production
+# figures. Hosted x86-64 hosts vary (AMD EPYC 7763 has no AVX-512; EPYC 9V74
+# has AVX-512 VNNI), so two x86-64 legs run, and each records its CPU.
+#
+# Cost control: a leg downloads about 4 GB and an x86-64 leg takes about an
+# hour, so the bench runs only when this file or the bench driver changes in
+# a pull request (bump BENCH_REVISION to measure again), or by hand once this
+# file is on the default branch. The model is never uploaded or cached.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/cpu-matrix-bench.yml
+      - crates/arc-inference/examples/stage_rows_bench.rs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  BENCH_REVISION: "1"
+  # The same bytes as arc-node's TESTNET_MODEL_SHA256 and #182's bench.
+  MODEL_URL: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf
+  MODEL_SHA256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa
+  MODEL_BYTES: "4081004224"
+  MODEL_FILE: .cpu-matrix-bench/llama-2-7b-chat.Q4_K_M.gguf
+
+jobs:
+  bench:
+    name: 7B rows bench (${{ matrix.leg }})
+    concurrency:
+      group: cpu-matrix-bench-${{ github.event.pull_request.number || github.ref }}-${{ matrix.leg }}
+      cancel-in-progress: true
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {leg: linux-x86-64-a, runner: ubuntu-24.04}
+          - {leg: linux-x86-64-b, runner: ubuntu-24.04}
+          - {leg: linux-arm64, runner: ubuntu-24.04-arm}
+    env:
+      LEG: ${{ matrix.leg }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Record runner facts
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/cpu-matrix-bench"
+          mkdir -p "$out"
+          {
+            echo "leg: $LEG, bench revision $BENCH_REVISION"
+            echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            lscpu
+            grep -m1 -E '^(flags|Features)' /proc/cpuinfo
+            free -b
+            df -h .
+          } 2>&1 | tee "$out/runner.txt"
+
+      - name: Download and verify the pinned model
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$MODEL_FILE")"
+          curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+            --retry-max-time 900 --connect-timeout 20 --max-time 1800 \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --output "$MODEL_FILE.partial" "$MODEL_URL"
+          mv "$MODEL_FILE.partial" "$MODEL_FILE"
+          size="$(wc -c < "$MODEL_FILE" | tr -d ' ')"
+          if [ "$size" != "$MODEL_BYTES" ]; then
+            echo "::error::$MODEL_FILE is $size bytes, expected $MODEL_BYTES"
+            exit 1
+          fi
+          actual="$(sha256sum "$MODEL_FILE" | cut -d ' ' -f 1)"
+          if [ "$actual" != "$MODEL_SHA256" ]; then
+            echo "::error::$MODEL_FILE SHA-256 is $actual, expected $MODEL_SHA256"
+            exit 1
+          fi
+          echo "verified $MODEL_FILE: sha256 $actual, $size bytes"
+
+      # Keep this dated toolchain aligned with rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+
+      - name: Build the bench driver (release, Candle GGUF loader)
+        run: cargo build --locked --release -p arc-inference --features candle --example stage_rows_bench
+
+      - name: Measure k-row against one-row stage calls
+        timeout-minutes: 120
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/cpu-matrix-bench"
+          mkdir -p "$out"
+          status=0
+          target/release/examples/stage_rows_bench \
+            --model "$GITHUB_WORKSPACE/$MODEL_FILE" \
+            --kernel all \
+            --splits 2 \
+            --ks 1,2,4,8,16,32,64 \
+            --context 32 \
+            --repeats 3 \
+            --out "$out/result.json" \
+            --summary "$out/summary.md" 2>&1 | tee "$out/bench.log" || status=$?
+          if [ -f "$out/summary.md" ]; then
+            cpu="$(lscpu | sed -n 's/^Model name: *//p' | head -n 1 || true)"
+            {
+              echo "CI-runner measurement, $LEG: ${cpu:-CPU model not reported}, $(nproc) vCPU."
+              echo
+              cat "$out/summary.md"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"
+
+      - name: Record memory after the run
+        if: always()
+        run: |
+          out="$RUNNER_TEMP/cpu-matrix-bench"
+          mkdir -p "$out"
+          {
+            free -b
+            grep -E '^(pswpin|pswpout|pgmajfault) ' /proc/vmstat || true
+          } 2>&1 | tee "$out/runner-after.txt"
+
+      - name: Upload this leg's results (never the model)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cpu-matrix-bench-${{ matrix.leg }}
+          path: ${{ runner.temp }}/cpu-matrix-bench/
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true

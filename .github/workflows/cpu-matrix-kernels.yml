@@ -1,0 +1,179 @@
+name: CPU matrix kernels
+
+# Exactness gate for the multi-row (batched) CPU kernels in
+# crates/arc-inference/src/canonical_simd.rs: NEON SDOT and SMMLA (i8mm) on
+# arm64; AVX2, AVX-VNNI and AVX-512 VNNI on x86-64. Every kernel the runner's
+# CPU has must give outputs byte-identical to the scalar kernel in the unit
+# tests, the golden vectors, the execution-mode suite (one leg per kernel) and
+# the batched-prefill conformance tests (once per kernel, pinned).
+#
+# Each leg first logs the CPU model and flags, the features the process
+# detects and the kernels it can run, and checks that detection agrees with
+# the flags the OS reports. A kernel the runner's CPU lacks is not exercised
+# on that runner, and the log says so. Hosted x86-64 hosts vary (AMD EPYC
+# 7763 has no AVX-512; EPYC 9V74 has AVX-512 VNNI), so two Linux x86-64 legs
+# run. ci.yml and golden-vectors.yml run only for pull requests into main, so
+# this workflow also carries rustfmt and clippy for the code it covers.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/cpu-matrix-kernels.yml
+      - crates/arc-inference/src/canonical_simd.rs
+      - crates/arc-inference/src/canonical_prefill.rs
+      - crates/arc-inference/src/cached_integer_model.rs
+      - crates/arc-inference/src/golden_vectors.rs
+      - crates/arc-inference/src/golden_vectors/**
+      - crates/arc-inference/examples/stage_rows_bench.rs
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  lint:
+    name: lint (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Keep this dated toolchain aligned with rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: cpu-matrix-lint-${{ matrix.runner }}
+      - name: rustfmt
+        if: runner.arch == 'X64'
+        run: ./scripts/rustfmt-workspace.sh --check
+      - name: clippy, every Candle target, warnings denied (x86-64)
+        if: runner.arch == 'X64'
+        run: cargo clippy -p arc-inference --all-targets --features candle --locked -- -D warnings
+      - name: clippy on the files this pull request changes (arm64)
+        if: runner.arch == 'ARM64'
+        run: |
+          set -euo pipefail
+          # ci.yml lints on x86-64 only, so arm64-only code elsewhere in the
+          # crate has never been linted. A compile error, or any diagnostic in
+          # the files below, fails this step; other diagnostics are listed.
+          status=0
+          cargo clippy -p arc-inference --all-targets --features candle --locked \
+            --message-format=short 2>&1 | tee "$RUNNER_TEMP/clippy.txt" || status=$?
+          own='^crates/arc-inference/(src/canonical_simd[.]rs|src/golden_vectors/execution_modes[.]rs|examples/stage_rows_bench[.]rs):'
+          if grep -E "$own" "$RUNNER_TEMP/clippy.txt"; then
+            echo "::error::clippy reports the diagnostics above in files this pull request changes"
+            exit 1
+          fi
+          exit "$status"
+
+  kernels:
+    name: kernels (${{ matrix.leg }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {leg: linux-x86-64-a, runner: ubuntu-24.04}
+          - {leg: linux-x86-64-b, runner: ubuntu-24.04}
+          - {leg: linux-arm64, runner: ubuntu-24.04-arm}
+          - {leg: windows-x86-64, runner: windows-latest}
+          - {leg: macos-arm64, runner: macos-15}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Record the CPU and the kernels its flags allow
+        run: |
+          set -euo pipefail
+          expect=""
+          flags=""
+          has() {
+            case "$flags" in
+              *" $1 "*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          case "$RUNNER_OS" in
+            Linux)
+              lscpu
+              if [ "$RUNNER_ARCH" = X64 ]; then
+                flags=" $(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2) "
+                for flag in avx2 avx512f avx512bw avx512vl avx512_vnni avx_vnni amx_int8; do
+                  if has "$flag"; then echo "flag $flag: yes"; else echo "flag $flag: no"; fi
+                done
+                if has avx2; then expect="$expect avx2-limb"; fi
+                if has avx2 && has avx_vnni; then expect="$expect avx-vnni-limb"; fi
+                if has avx2 && has avx512f && has avx512_vnni; then expect="$expect avx512-vnni-limb"; fi
+              else
+                flags=" $(grep -m1 '^Features' /proc/cpuinfo | cut -d: -f2) "
+                for flag in asimddp i8mm sve sve2 svei8mm bf16; do
+                  if has "$flag"; then echo "flag $flag: yes"; else echo "flag $flag: no"; fi
+                done
+                if has asimddp; then expect="$expect neon-sdot-limb"; fi
+                if has asimddp && has i8mm; then expect="$expect neon-i8mm-limb"; fi
+              fi
+              ;;
+            macOS)
+              sysctl -n machdep.cpu.brand_string || true
+              dotprod="$(sysctl -n hw.optional.arm.FEAT_DotProd 2>/dev/null || echo 0)"
+              i8mm="$(sysctl -n hw.optional.arm.FEAT_I8MM 2>/dev/null || echo 0)"
+              echo "FEAT_DotProd: $dotprod, FEAT_I8MM: $i8mm"
+              if [ "$dotprod" = 1 ]; then expect="$expect neon-sdot-limb"; fi
+              if [ "$dotprod" = 1 ] && [ "$i8mm" = 1 ]; then expect="$expect neon-i8mm-limb"; fi
+              ;;
+            Windows)
+              powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors"
+              echo "Windows reports no CPU flag list here; the detection report in the next step is the record."
+              ;;
+          esac
+          expect="${expect# }"
+          echo "kernels the OS's CPU flags allow: ${expect:-not checked on this OS}"
+          echo "ARC_EXPECT_BATCHED_KERNELS=$expect" >> "$GITHUB_ENV"
+      # Keep this dated toolchain aligned with rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: cpu-matrix-${{ matrix.leg }}
+      - name: Detected CPU features and multi-row kernels
+        run: |
+          set -euo pipefail
+          # The test runs in crates/arc-inference, so the list lands there.
+          ARC_BATCHED_KERNELS_OUT=batched-kernels.txt \
+            cargo test -p arc-inference --lib --locked batched_kernel_report -- --nocapture
+          echo "multi-row kernels on this runner: $(tr '\n' ' ' < crates/arc-inference/batched-kernels.txt)"
+      - name: Every other arc-inference library test
+        run: cargo test -p arc-inference --lib --locked -- --skip golden
+      - name: Golden vectors and the execution-mode suite, one leg per kernel
+        run: cargo test -p arc-inference --lib --locked golden -- --nocapture
+      - name: Batched prefill conformance with each multi-row kernel pinned
+        run: |
+          set -euo pipefail
+          # The list has no trailing newline, hence the `|| [ -n ... ]`.
+          while IFS= read -r kernel || [ -n "$kernel" ]; do
+            if [ -z "$kernel" ]; then continue; fi
+            echo "::group::batched prefill on $kernel"
+            ARC_CANONICAL_BATCHED_KERNEL="$kernel" \
+              cargo test -p arc-inference --lib --locked batched_prefill -- --nocapture < /dev/null
+            echo "::endgroup::"
+          done < crates/arc-inference/batched-kernels.txt
