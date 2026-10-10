@@ -979,12 +979,17 @@ fn lanes_sum_256(v: std::arch::x86_64::__m256i) -> i64 {
 /// The planes hold `c + 128` as unsigned bytes, so each plane's sum has
 /// `128 * sums[r]` subtracted, which undoes the offset (module docs).
 ///
+/// With `fresh`, the row sums are computed here and stored in `sums`: during
+/// the first plane's pass, `vpdpbusd` against bytes of 1 adds four weights to
+/// a lane, so the weights stream from memory once. Each such lane is bounded
+/// by `512 * len / 64`. Without `fresh`, `sums` already holds them.
+///
 /// # Safety
 /// AVX-512F and AVX-512 VNNI available. Each row pointer is valid for `len`
 /// reads; each token pointer for `(used - 1) * in_size + len` reads of offset
 /// digits, plane `l` starting at `l * in_size`. `len` is a multiple of 64 and
-/// at most `MAX_COLS_FOR_I32`, and `sums[r]` is the sum of row `r`'s first
-/// `len` weights.
+/// at most `MAX_COLS_FOR_I32`. Without `fresh`, `sums[r]` is the sum of row
+/// `r`'s first `len` weights.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512vnni")]
 unsafe fn vnni512_tile<const T: usize>(
@@ -993,20 +998,29 @@ unsafe fn vnni512_tile<const T: usize>(
     in_size: usize,
     len: usize,
     used: usize,
-    sums: &[i64; 4],
+    sums: &mut [i64; 4],
+    fresh: bool,
 ) -> [[i64; T]; 4] {
     // SAFETY: wrapped for `unsafe_op_in_unsafe_fn`. Every load reads 64
     // bytes at column `j` with `j + 64 <= len`, inside the ranges above.
     unsafe {
         use std::arch::x86_64::*;
+        let ones = _mm512_set1_epi8(1);
+        let mut row_sums = [_mm512_setzero_si512(); 4];
         let mut total = [[0i64; T]; 4];
         for l in 0..used {
+            let summing = fresh && l == 0;
             let mut acc = [[_mm512_setzero_si512(); T]; 4];
             let mut j = 0usize;
             while j + 64 <= len {
                 let mut weights = [_mm512_setzero_si512(); 4];
                 for (weights, row) in weights.iter_mut().zip(rows) {
                     *weights = _mm512_loadu_si512(row.add(j).cast());
+                }
+                if summing {
+                    for r in 0..4 {
+                        row_sums[r] = _mm512_dpbusd_epi32(row_sums[r], ones, weights[r]);
+                    }
                 }
                 for (t, token) in tokens.iter().enumerate() {
                     let digits = _mm512_loadu_si512(token.add(l * in_size + j).cast());
@@ -1016,8 +1030,13 @@ unsafe fn vnni512_tile<const T: usize>(
                 }
                 j += 64;
             }
+            if summing {
+                for (sum, lanes) in sums.iter_mut().zip(row_sums) {
+                    *sum = lanes_sum_512(lanes);
+                }
+            }
             let place = 1i64 << (8 * l);
-            for ((total, acc), &sum) in total.iter_mut().zip(&acc).zip(sums) {
+            for ((total, acc), &sum) in total.iter_mut().zip(&acc).zip(sums.iter()) {
                 for (total, &acc) in total.iter_mut().zip(acc) {
                     *total += (lanes_sum_512(acc) - 128 * sum) * place;
                 }
@@ -1040,20 +1059,29 @@ unsafe fn vnni256_tile<const T: usize>(
     in_size: usize,
     len: usize,
     used: usize,
-    sums: &[i64; 2],
+    sums: &mut [i64; 2],
+    fresh: bool,
 ) -> [[i64; T]; 2] {
     // SAFETY: wrapped for `unsafe_op_in_unsafe_fn`. Every load reads 32
     // bytes at column `j` with `j + 32 <= len`, inside the ranges above.
     unsafe {
         use std::arch::x86_64::*;
+        let ones = _mm256_set1_epi8(1);
+        let mut row_sums = [_mm256_setzero_si256(); 2];
         let mut total = [[0i64; T]; 2];
         for l in 0..used {
+            let summing = fresh && l == 0;
             let mut acc = [[_mm256_setzero_si256(); T]; 2];
             let mut j = 0usize;
             while j + 32 <= len {
                 let mut weights = [_mm256_setzero_si256(); 2];
                 for (weights, row) in weights.iter_mut().zip(rows) {
                     *weights = _mm256_loadu_si256(row.add(j).cast());
+                }
+                if summing {
+                    for r in 0..2 {
+                        row_sums[r] = _mm256_dpbusd_avx_epi32(row_sums[r], ones, weights[r]);
+                    }
                 }
                 for (t, token) in tokens.iter().enumerate() {
                     let digits = _mm256_loadu_si256(token.add(l * in_size + j).cast());
@@ -1063,8 +1091,13 @@ unsafe fn vnni256_tile<const T: usize>(
                 }
                 j += 32;
             }
+            if summing {
+                for (sum, lanes) in sums.iter_mut().zip(row_sums) {
+                    *sum = lanes_sum_256(lanes);
+                }
+            }
             let place = 1i64 << (8 * l);
-            for ((total, acc), &sum) in total.iter_mut().zip(&acc).zip(sums) {
+            for ((total, acc), &sum) in total.iter_mut().zip(&acc).zip(sums.iter()) {
                 for (total, &acc) in total.iter_mut().zip(acc) {
                     *total += (lanes_sum_256(acc) - 128 * sum) * place;
                 }
@@ -1414,7 +1447,7 @@ fn run_batched(
     match kernel {
         BatchedKernel::Avx512Vnni => {
             offset_digits(job, limbs);
-            run_vnni::<4, _>(job, limbs, 64, out, |rows, tokens, len, sums| {
+            run_vnni::<4, _>(job, limbs, 64, out, |rows, tokens, len, sums, fresh| {
                 // SAFETY: AVX-512F and AVX-512 VNNI were detected by
                 // `kernel.available()`. `run_vnni` passes row pointers valid
                 // for `in_size >= len` bytes and token pointers valid for
@@ -1422,14 +1455,28 @@ fn run_batched(
                 // of 64 and at most `MAX_COLS_FOR_I32`.
                 unsafe {
                     match *tokens {
-                        [a] => widen(vnni512_tile(rows, &[a], in_size, len, used, sums)),
-                        [a, b] => widen(vnni512_tile(rows, &[a, b], in_size, len, used, sums)),
-                        [a, b, c] => {
-                            widen(vnni512_tile(rows, &[a, b, c], in_size, len, used, sums))
+                        [a] => widen(vnni512_tile(rows, &[a], in_size, len, used, sums, fresh)),
+                        [a, b] => {
+                            widen(vnni512_tile(rows, &[a, b], in_size, len, used, sums, fresh))
                         }
-                        [a, b, c, d] => {
-                            widen(vnni512_tile(rows, &[a, b, c, d], in_size, len, used, sums))
-                        }
+                        [a, b, c] => widen(vnni512_tile(
+                            rows,
+                            &[a, b, c],
+                            in_size,
+                            len,
+                            used,
+                            sums,
+                            fresh,
+                        )),
+                        [a, b, c, d] => widen(vnni512_tile(
+                            rows,
+                            &[a, b, c, d],
+                            in_size,
+                            len,
+                            used,
+                            sums,
+                            fresh,
+                        )),
                         _ => unreachable!("a token tile holds one to four tokens"),
                     }
                 }
@@ -1438,20 +1485,34 @@ fn run_batched(
         }
         BatchedKernel::AvxVnni => {
             offset_digits(job, limbs);
-            run_vnni::<2, _>(job, limbs, 32, out, |rows, tokens, len, sums| {
+            run_vnni::<2, _>(job, limbs, 32, out, |rows, tokens, len, sums, fresh| {
                 // SAFETY: AVX2 and AVX-VNNI were detected by
                 // `kernel.available()`; pointers and `len` as above, with
                 // `len` a multiple of 32.
                 unsafe {
                     match *tokens {
-                        [a] => widen(vnni256_tile(rows, &[a], in_size, len, used, sums)),
-                        [a, b] => widen(vnni256_tile(rows, &[a, b], in_size, len, used, sums)),
-                        [a, b, c] => {
-                            widen(vnni256_tile(rows, &[a, b, c], in_size, len, used, sums))
+                        [a] => widen(vnni256_tile(rows, &[a], in_size, len, used, sums, fresh)),
+                        [a, b] => {
+                            widen(vnni256_tile(rows, &[a, b], in_size, len, used, sums, fresh))
                         }
-                        [a, b, c, d] => {
-                            widen(vnni256_tile(rows, &[a, b, c, d], in_size, len, used, sums))
-                        }
+                        [a, b, c] => widen(vnni256_tile(
+                            rows,
+                            &[a, b, c],
+                            in_size,
+                            len,
+                            used,
+                            sums,
+                            fresh,
+                        )),
+                        [a, b, c, d] => widen(vnni256_tile(
+                            rows,
+                            &[a, b, c, d],
+                            in_size,
+                            len,
+                            used,
+                            sums,
+                            fresh,
+                        )),
                         _ => unreachable!("a token tile holds one to four tokens"),
                     }
                 }
@@ -1641,12 +1702,14 @@ fn offset_digits(job: BatchJob<'_>, limbs: &mut [i8]) {
 /// VNNI driver: tiles of `R` rows by up to four tokens. `step` is the
 /// columns per instruction (64 or 32); columns past the last whole step are
 /// summed in i64 by [`tail_dot`]. `tile` returns, per row and token, the
-/// exact plane-weighted dot of the covered columns. A short final row tile
-/// repeats its last row, whose lanes are never written.
+/// exact plane-weighted dot of the covered columns; on a row tile's first
+/// token tile (`fresh`) it also fills the rows' weight sums, which the later
+/// token tiles reuse. A short final row tile repeats its last row, whose
+/// lanes are never written.
 #[cfg(target_arch = "x86_64")]
 fn run_vnni<const R: usize, F>(job: BatchJob<'_>, planes: &[i8], step: usize, out: SendPtr, tile: F)
 where
-    F: Fn(&[*const i8; R], &[*const i8], usize, &[i64; R]) -> [[i64; 4]; R] + Sync,
+    F: Fn(&[*const i8; R], &[*const i8], usize, &mut [i64; R], bool) -> [[i64; 4]; R] + Sync,
 {
     let BatchJob {
         data,
@@ -1669,21 +1732,16 @@ where
             let row_of = |k: usize| r + k.min(real - 1);
             let rows: [*const i8; R] =
                 std::array::from_fn(|k| data[row_of(k) * in_size..].as_ptr());
-            // The offset correction needs each row's sum over the covered
-            // columns, once per row, in i64.
-            let sums: [i64; R] = std::array::from_fn(|k| {
-                data[row_of(k) * in_size..][..len]
-                    .iter()
-                    .map(|&w| i64::from(w))
-                    .sum()
-            });
+            // The offset correction's weight sums, filled by the first token
+            // tile.
+            let mut sums = [0i64; R];
             let mut t = 0usize;
             while t < n_tokens {
                 let count = (n_tokens - t).min(4);
                 let tokens: [*const i8; 4] = std::array::from_fn(|q| {
                     planes[(t + q.min(count - 1)) * LIMB_COUNT * in_size..].as_ptr()
                 });
-                let totals = tile(&rows, &tokens[..count], len, &sums);
+                let totals = tile(&rows, &tokens[..count], len, &mut sums, t == 0);
                 for (k, by_token) in totals.iter().enumerate().take(real) {
                     let i = r + k;
                     for (q, &dot) in by_token.iter().enumerate().take(count) {

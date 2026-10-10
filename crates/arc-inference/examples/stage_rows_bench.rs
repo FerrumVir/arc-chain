@@ -29,7 +29,7 @@
 //!
 //! usage: stage_rows_bench --model GGUF [--kernel all|scalar|simd|best|LABEL,...]
 //!        [--splits 2,4] [--context N] [--repeats N] [--ks 1,2,4,8,16,32,64]
-//!        [--out FILE.json] [--summary FILE.md]
+//!        [--cpu NAME] [--out FILE.json] [--summary FILE.md]
 
 use arc_crypto::{Hash256, hash_bytes};
 use arc_inference::cached_integer_model::{
@@ -50,6 +50,7 @@ struct Args {
     context: usize,
     repeats: usize,
     ks: Vec<usize>,
+    cpu: Option<String>,
     out: Option<String>,
     summary: Option<String>,
 }
@@ -126,8 +127,12 @@ fn kernels_that_ran(before: [u64; 5], after: [u64; 5]) -> Vec<&'static str> {
         .collect()
 }
 
-/// The CPU model, from `/proc/cpuinfo` where there is one.
-fn cpu_model() -> String {
+/// The CPU model: `--cpu` if given, else `/proc/cpuinfo`'s model name, else
+/// Windows' `PROCESSOR_IDENTIFIER`.
+fn cpu_model(given: Option<&str>) -> String {
+    if let Some(name) = given {
+        return name.to_string();
+    }
     std::fs::read_to_string("/proc/cpuinfo")
         .ok()
         .and_then(|info| {
@@ -136,6 +141,7 @@ fn cpu_model() -> String {
                 .and_then(|line| line.split(':').nth(1))
                 .map(|name| name.trim().to_string())
         })
+        .or_else(|| std::env::var("PROCESSOR_IDENTIFIER").ok())
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -147,6 +153,7 @@ fn parse_args() -> Result<Args, String> {
         context: 32,
         repeats: 3,
         ks: vec![1, 2, 4, 8, 16, 32, 64],
+        cpu: None,
         out: None,
         summary: None,
     };
@@ -170,6 +177,7 @@ fn parse_args() -> Result<Args, String> {
                     .map(parse_count)
                     .collect::<Result<Vec<_>, _>>()?
             }
+            "--cpu" => args.cpu = Some(value()?),
             "--out" => args.out = Some(value()?),
             "--summary" => args.summary = Some(value()?),
             other => return Err(format!("unknown argument {other}")),
@@ -319,7 +327,7 @@ fn main() -> Result<(), String> {
             (format!("{stages} stages"), ends)
         })
         .collect();
-    let cpu = cpu_model();
+    let cpu = cpu_model(args.cpu.as_deref());
     let features = canonical_simd::detected_cpu_features();
     println!("cpu: {cpu}; detected features: {features:?}");
 

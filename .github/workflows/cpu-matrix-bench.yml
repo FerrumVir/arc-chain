@@ -13,8 +13,10 @@ name: CPU matrix-kernel bench
 # one-row calls must hand on bit-identical rows and logits, and the pinned
 # kernel must be the one that ran, or the driver exits non-zero. Timings are
 # CI-runner measurements on shared 4-vCPU hosted runners, not production
-# figures. Hosted x86-64 hosts vary (AMD EPYC 7763 has no AVX-512; EPYC 9V74
-# has AVX-512 VNNI), so two x86-64 legs run, and each records its CPU.
+# figures. Hosted x86-64 hosts vary, and each leg records its CPU: the Linux
+# hosts were AMD EPYC 7763 (AVX2 only) in this workflow's first run, and the
+# Windows host an AMD EPYC 9V45 with AVX-512 VNNI and AVX-VNNI, so x86-64 runs
+# on one Linux and one Windows leg.
 #
 # Cost control: a leg downloads about 4 GB and an x86-64 leg takes about an
 # hour, so the bench runs only when this file or the bench driver changes in
@@ -33,7 +35,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  BENCH_REVISION: "1"
+  BENCH_REVISION: "2"
   # The same bytes as arc-node's TESTNET_MODEL_SHA256 and #182's bench.
   MODEL_URL: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf
   MODEL_SHA256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa
@@ -52,11 +54,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {leg: linux-x86-64-a, runner: ubuntu-24.04}
-          - {leg: linux-x86-64-b, runner: ubuntu-24.04}
+          - {leg: linux-x86-64, runner: ubuntu-24.04}
+          - {leg: windows-x86-64, runner: windows-latest}
           - {leg: linux-arm64, runner: ubuntu-24.04-arm}
     env:
       LEG: ${{ matrix.leg }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -70,9 +75,13 @@ jobs:
           {
             echo "leg: $LEG, bench revision $BENCH_REVISION"
             echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
-            lscpu
-            grep -m1 -E '^(flags|Features)' /proc/cpuinfo
-            free -b
+            if [ "$RUNNER_OS" = Linux ]; then
+              lscpu
+              grep -m1 -E '^(flags|Features)' /proc/cpuinfo
+              free -b
+            else
+              powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed; Get-CimInstance Win32_ComputerSystem | Format-List TotalPhysicalMemory"
+            fi
             df -h .
           } 2>&1 | tee "$out/runner.txt"
 
@@ -111,9 +120,15 @@ jobs:
           set -euo pipefail
           out="$RUNNER_TEMP/cpu-matrix-bench"
           mkdir -p "$out"
+          if [ "$RUNNER_OS" = Linux ]; then
+            cpu="$(lscpu | sed -n 's/^Model name: *//p' | head -n 1 || true)"
+          else
+            cpu="$(powershell -NoProfile -Command "(Get-CimInstance Win32_Processor).Name" | tr -d '\r' | sed 's/ *$//' || true)"
+          fi
           status=0
           target/release/examples/stage_rows_bench \
             --model "$GITHUB_WORKSPACE/$MODEL_FILE" \
+            --cpu "${cpu:-unknown}" \
             --kernel all \
             --splits 2 \
             --ks 1,2,4,8,16,32,64 \
@@ -122,7 +137,6 @@ jobs:
             --out "$out/result.json" \
             --summary "$out/summary.md" 2>&1 | tee "$out/bench.log" || status=$?
           if [ -f "$out/summary.md" ]; then
-            cpu="$(lscpu | sed -n 's/^Model name: *//p' | head -n 1 || true)"
             {
               echo "CI-runner measurement, $LEG: ${cpu:-CPU model not reported}, $(nproc) vCPU."
               echo
@@ -137,8 +151,12 @@ jobs:
           out="$RUNNER_TEMP/cpu-matrix-bench"
           mkdir -p "$out"
           {
-            free -b
-            grep -E '^(pswpin|pswpout|pgmajfault) ' /proc/vmstat || true
+            if [ "$RUNNER_OS" = Linux ]; then
+              free -b
+              grep -E '^(pswpin|pswpout|pgmajfault) ' /proc/vmstat || true
+            else
+              powershell -NoProfile -Command "Get-CimInstance Win32_OperatingSystem | Format-List FreePhysicalMemory,TotalVisibleMemorySize"
+            fi
           } 2>&1 | tee "$out/runner-after.txt"
 
       - name: Upload this leg's results (never the model)
