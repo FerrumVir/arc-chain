@@ -38,8 +38,9 @@ use super::{
 };
 use crate::cached_integer_model::{
     CANONICAL_REWARD_INFERENCE_PROFILE, CachedIntegerModel,
-    GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, I8Weights, KVCache, ShardInput, ShardOutput,
-    ShardRowsError, ShardRowsInput, ShardRowsOutput, select_next_token_with_repetition_penalty,
+    GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, I8Weights, KVCache, MultiRowsError, SeqRows,
+    ShardInput, ShardOutput, ShardRowsError, ShardRowsInput, ShardRowsOutput,
+    select_next_token_with_repetition_penalty,
 };
 use crate::canonical_simd::{self, BatchedKernel};
 use arc_crypto::hash_bytes;
@@ -2358,4 +2359,438 @@ fn golden_modes_stage_rows_respect_the_row_budget() {
         kv_to_bytes(&untouched),
         kv_to_bytes(&KVCache::new(n_layers))
     );
+}
+
+// ── E4: batch invariance across sequences ───────────────────────────────────
+
+/// A deterministic xorshift generator for E4's schedules.
+struct Draw(u64);
+
+impl Draw {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    /// Uniform in `0..n`, for `n > 0`.
+    fn below(&mut self, n: usize) -> usize {
+        usize::try_from(self.next() % u64::try_from(n).expect("n fits u64"))
+            .expect("a value below n fits usize")
+    }
+
+    fn shuffle<T>(&mut self, items: &mut [T]) {
+        for i in (1..items.len()).rev() {
+            let j = self.below(i + 1);
+            items.swap(i, j);
+        }
+    }
+}
+
+/// E4's sequences: one of every length from 1 to the context window, each
+/// with its own tokens, so a batch mixes prompt lengths and positions.
+fn e4_sequences(fixture: &GoldenFixture) -> Vec<Vec<u32>> {
+    let vocab = fixture.vocab_size;
+    (1..=fixture.max_seq)
+        .map(|len| {
+            (0..len)
+                .map(|i| u32::try_from((len * 7 + i * 5 + 3) % vocab).expect("token fits u32"))
+                .collect()
+        })
+        .collect()
+}
+
+/// The largest batch E4 draws, in rows.
+const E4_MAX_BATCH: usize = 64;
+
+/// One sequence's state in an E4 schedule.
+struct E4Sequence {
+    cache: KVCache,
+    logits: BTreeMap<usize, Vec<i64>>,
+}
+
+/// Runs `batch` (sequence index, rows) as one whole-model
+/// `forward_rows_multi` call in the given order and records every sequence's
+/// logits by position.
+fn e4_call(
+    model: &CachedIntegerModel,
+    sequences: &[Vec<u32>],
+    states: &mut [E4Sequence],
+    batch: &[(usize, usize)],
+    label: &str,
+) {
+    let mut taken: Vec<(usize, KVCache)> = batch
+        .iter()
+        .map(|&(sequence, _)| {
+            let cache = std::mem::replace(&mut states[sequence].cache, empty_kv(model));
+            (sequence, cache)
+        })
+        .collect();
+    let mut rows: Vec<SeqRows<'_>> = taken
+        .iter_mut()
+        .zip(batch)
+        .map(|((sequence, cache), &(_, count))| {
+            let position = cache.seq_len;
+            SeqRows {
+                cache,
+                position,
+                input: ShardRowsInput::Tokens(
+                    sequences[*sequence][position..position + count].to_vec(),
+                ),
+            }
+        })
+        .collect();
+    let outputs = model
+        .forward_rows_multi(&mut rows, 0, model.config.n_layers)
+        .unwrap_or_else(|error| panic!("{label}: batch {batch:?} refused: {error}"));
+    drop(rows);
+    assert_eq!(
+        outputs.len(),
+        batch.len(),
+        "{label}: one output per sequence"
+    );
+    for ((sequence, cache), output) in taken.into_iter().zip(outputs) {
+        let ShardRowsOutput::Logits(logit_rows) = output else {
+            panic!("{label}: a whole-model call returned hidden rows");
+        };
+        let first = cache.seq_len - logit_rows.len();
+        for (offset, logits) in logit_rows.into_iter().enumerate() {
+            let previous = states[sequence].logits.insert(first + offset, logits);
+            assert!(
+                previous.is_none(),
+                "{label}: sequence {sequence} returned position {} twice",
+                first + offset
+            );
+        }
+        states[sequence].cache = cache;
+    }
+}
+
+/// Holds every sequence's logits and K/V to its own token-by-token run.
+fn e4_assert(references: &[Reference], states: &[E4Sequence], label: &str) {
+    for (sequence, (reference, state)) in references.iter().zip(states).enumerate() {
+        let positions = state.cache.seq_len;
+        let mode = format!("{label}, sequence {sequence}");
+        assert_eq!(state.logits.len(), positions, "{mode}: logit rows");
+        for (position, logits) in &state.logits {
+            let expected = &reference.trace.logits[position];
+            assert!(
+                logits == expected,
+                "{mode} DIFFERS from the sequence run alone: logits at position {position} \
+                 (digest {}, expected {})",
+                hash_i64(logits),
+                hash_i64(expected)
+            );
+        }
+        reference.assert_kv(&state.cache, positions, &mode);
+    }
+}
+
+/// Rows sequence `s` still has to run.
+fn e4_left(sequences: &[Vec<u32>], states: &[E4Sequence], s: usize) -> usize {
+    sequences[s].len() - states[s].cache.seq_len
+}
+
+/// Feeds every sequence to its end through `forward_rows_multi` calls the
+/// seeded schedule draws, until `sizes` is used up. Each call takes the next
+/// batch size from `sizes` (rows in total), shares it between a random subset
+/// of the unfinished sequences in a random order, at least one row each, and
+/// is checked against the references once its schedule finishes. A size is
+/// used up only when a call carried exactly that many rows; a call cut short
+/// at the end of a schedule takes it again in the next. Returns how many
+/// schedules ran.
+fn e4_sweep(
+    model: &CachedIntegerModel,
+    sequences: &[Vec<u32>],
+    references: &[Reference],
+    seed: u64,
+    sizes: &[usize],
+    label: &str,
+) -> usize {
+    let mut draw = Draw(seed);
+    let mut next_size = 0usize;
+    let mut schedules = 0usize;
+    while next_size < sizes.len() {
+        schedules += 1;
+        let mut states: Vec<E4Sequence> = sequences
+            .iter()
+            .map(|_| E4Sequence {
+                cache: empty_kv(model),
+                logits: BTreeMap::new(),
+            })
+            .collect();
+        loop {
+            let mut open: Vec<usize> = (0..sequences.len())
+                .filter(|&s| e4_left(sequences, &states, s) > 0)
+                .collect();
+            if open.is_empty() {
+                break;
+            }
+            draw.shuffle(&mut open);
+            let wanted = sizes[next_size.min(sizes.len() - 1)];
+            // Enough sequences to hold `wanted` rows, then possibly more.
+            let mut members = 0usize;
+            let mut capacity = 0usize;
+            while members < open.len() && members < wanted && capacity < wanted {
+                capacity += e4_left(sequences, &states, open[members]);
+                members += 1;
+            }
+            let extra = draw.below(open.len().min(wanted) - members + 1);
+            for &s in &open[members..members + extra] {
+                capacity += e4_left(sequences, &states, s);
+            }
+            members += extra;
+            let total = wanted.min(capacity);
+            let mut counts = vec![1usize; members];
+            let mut left = total - members;
+            while left > 0 {
+                let i = draw.below(members);
+                if counts[i] < e4_left(sequences, &states, open[i]) {
+                    counts[i] += 1;
+                    left -= 1;
+                }
+            }
+            let batch: Vec<(usize, usize)> = open[..members].iter().copied().zip(counts).collect();
+            e4_call(model, sequences, &mut states, &batch, label);
+            if total == wanted && next_size < sizes.len() {
+                next_size += 1;
+            }
+        }
+        e4_assert(
+            references,
+            &states,
+            &format!("{label}, schedule {schedules}"),
+        );
+    }
+    schedules
+}
+
+/// E4, batch invariance. Rows of different sequences share every weight read
+/// in `forward_rows_multi`; each sequence must still get exactly the logits
+/// and K/V rows of its own token-by-token run, whatever its neighbours, their
+/// order and the batch size. Sixteen sequences, one of every prompt length
+/// from 1 to the context window, run to their ends again and again, in calls
+/// whose batch sizes cover every size from 1 to 64 rows at least once per leg
+/// (in a seeded order), on every leg (kernel and thread count) and both
+/// profiles.
+#[test]
+fn golden_modes_multi_sequence_batches_match_each_sequence_alone() {
+    let switch = KernelSwitch::hold();
+    let fixture = fixture();
+    let sequences = e4_sequences(&fixture);
+    for profile in PROFILES {
+        let model = build_model(&fixture, profile);
+        let references: Vec<Reference> = switch.run(BASE_LEG, || {
+            sequences
+                .iter()
+                .map(|tokens| Reference::new(&model, tokens))
+                .collect()
+        });
+        for (index, leg) in switch.legs().into_iter().enumerate() {
+            let seed =
+                0x9E37_79B9_7F4A_7C15 ^ (u64::try_from(index).expect("leg index fits u64") << 32);
+            let mut sizes: Vec<usize> = (1..=E4_MAX_BATCH).collect();
+            Draw(seed ^ 0xA5A5).shuffle(&mut sizes);
+            let label = format!("E4 {profile:?} {leg:?}");
+            let schedules = switch.run(leg, || {
+                e4_sweep(&model, &sequences, &references, seed, &sizes, &label)
+            });
+            if leg == BASE_LEG {
+                println!(
+                    "{label}: every batch size 1..={E4_MAX_BATCH} ran, over {schedules} schedules"
+                );
+            }
+        }
+    }
+}
+
+/// E4, interruption. One sequence runs part of its rows beside two
+/// neighbours, is interrupted (its K/V shipped as bytes, dropped, and
+/// restored on another model instance), resumes beside two other neighbours,
+/// and finishes alone. Every sequence must still equal its own token-by-token
+/// run, on every leg and both profiles.
+#[test]
+fn golden_modes_multi_sequence_interrupted_sequence_resumes_with_new_neighbours() {
+    let switch = KernelSwitch::hold();
+    let fixture = fixture();
+    let sequences = e4_sequences(&fixture);
+    // The longest sequence, and four neighbours of other lengths.
+    let resumed = sequences.len() - 1;
+    let (b, c, d, e) = (3, 8, 5, 12);
+    for profile in PROFILES {
+        let first = build_model(&fixture, profile);
+        let second = build_model(&fixture, profile);
+        let references: Vec<Reference> = switch.run(BASE_LEG, || {
+            sequences
+                .iter()
+                .map(|tokens| Reference::new(&first, tokens))
+                .collect()
+        });
+        for leg in switch.legs() {
+            let label = format!("E4 interruption {profile:?} {leg:?}");
+            switch.run(leg, || {
+                let mut states: Vec<E4Sequence> = sequences
+                    .iter()
+                    .map(|_| E4Sequence {
+                        cache: empty_kv(&first),
+                        logits: BTreeMap::new(),
+                    })
+                    .collect();
+                // Six rows beside B and C, in a mixed order.
+                e4_call(
+                    &first,
+                    &sequences,
+                    &mut states,
+                    &[(c, 5), (resumed, 6), (b, 4)],
+                    &label,
+                );
+                // Interrupted: only the K/V image survives.
+                let image = kv_to_bytes(&states[resumed].cache);
+                states[resumed].cache = kv_from_bytes(&image);
+                // Resumed on another instance, beside D and E.
+                e4_call(
+                    &second,
+                    &sequences,
+                    &mut states,
+                    &[(d, 6), (resumed, 6), (e, 7)],
+                    &label,
+                );
+                e4_call(
+                    &second,
+                    &sequences,
+                    &mut states,
+                    &[(e, 6), (resumed, 3)],
+                    &label,
+                );
+                // Finished alone.
+                e4_call(&second, &sequences, &mut states, &[(resumed, 1)], &label);
+                assert_eq!(states[resumed].cache.seq_len, sequences[resumed].len());
+                for s in [resumed, b, c, d, e] {
+                    e4_assert(
+                        std::slice::from_ref(&references[s]),
+                        std::slice::from_ref(&states[s]),
+                        &format!("{label}, sequence {s}"),
+                    );
+                }
+            });
+        }
+    }
+}
+
+/// A multi-sequence call that refuses changes no cache: one bad sequence
+/// refuses the whole call and is named, and so does a batch over the row cap
+/// or an empty batch.
+#[test]
+fn golden_modes_multi_sequence_refusal_changes_no_cache() {
+    use crate::canonical_simd::MAX_BATCH_TOKENS;
+
+    fn image(caches: &[KVCache]) -> Vec<Vec<u8>> {
+        caches.iter().map(kv_to_bytes).collect()
+    }
+
+    let model = build_model(&fixture(), Profile::LegacySplitHalf);
+    let n_layers = model.config.n_layers;
+
+    // Two good sequences and one whose cache is out of sync with its position.
+    let mut good = empty_kv(&model);
+    feed(
+        &model,
+        Schedule::TokenByToken,
+        &[3, 4],
+        &mut good,
+        &mut Trace::default(),
+    );
+    let mut caches = [clone_kv(&good), empty_kv(&model), clone_kv(&good)];
+    let before = image(&caches);
+    {
+        let [first, second, third] = &mut caches[..] else {
+            unreachable!("three caches")
+        };
+        let mut batch = [
+            SeqRows {
+                cache: first,
+                position: 2,
+                input: ShardRowsInput::Tokens(vec![5, 6]),
+            },
+            SeqRows {
+                cache: second,
+                position: 0,
+                input: ShardRowsInput::Tokens(vec![7]),
+            },
+            SeqRows {
+                cache: third,
+                position: 1,
+                input: ShardRowsInput::Tokens(vec![8]),
+            },
+        ];
+        let refused = model.forward_rows_multi(&mut batch, 0, n_layers);
+        assert!(
+            matches!(
+                refused,
+                Err(MultiRowsError::Sequence {
+                    index: 2,
+                    error: ShardRowsError::Shard(_)
+                })
+            ),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(image(&caches), before, "a refused batch changed a cache");
+
+    // Hidden rows sent to the stage that holds the embedding.
+    {
+        let [first, second, _] = &mut caches[..] else {
+            unreachable!("three caches")
+        };
+        let mut batch = [
+            SeqRows {
+                cache: first,
+                position: 2,
+                input: ShardRowsInput::Tokens(vec![5]),
+            },
+            SeqRows {
+                cache: second,
+                position: 0,
+                input: ShardRowsInput::Hidden(vec![vec![0; model.config.d_model]]),
+            },
+        ];
+        assert_eq!(
+            model.forward_rows_multi(&mut batch, 0, n_layers),
+            Err(MultiRowsError::Sequence {
+                index: 1,
+                error: ShardRowsError::WrongInput { start_layer: 0 }
+            })
+        );
+    }
+    assert_eq!(image(&caches), before, "a refused batch changed a cache");
+
+    // An empty batch.
+    assert_eq!(
+        model.forward_rows_multi(&mut [], 0, n_layers),
+        Err(MultiRowsError::Batch(ShardRowsError::NoRows))
+    );
+
+    // More rows in total than the cap, though every sequence fits alone.
+    let per_sequence = model.config.max_seq;
+    let count = MAX_BATCH_TOKENS / per_sequence + 1;
+    let mut many: Vec<KVCache> = (0..count).map(|_| empty_kv(&model)).collect();
+    let many_before = image(&many);
+    let mut batch: Vec<SeqRows<'_>> = many
+        .iter_mut()
+        .map(|cache| SeqRows {
+            cache,
+            position: 0,
+            input: ShardRowsInput::Tokens(vec![1; per_sequence]),
+        })
+        .collect();
+    assert_eq!(
+        model.forward_rows_multi(&mut batch, 0, n_layers),
+        Err(MultiRowsError::Batch(ShardRowsError::TooManyRows {
+            rows: count * per_sequence,
+            max_rows: model.max_shard_rows(n_layers)
+        }))
+    );
+    drop(batch);
+    assert_eq!(image(&many), many_before, "a refused batch changed a cache");
 }
