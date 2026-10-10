@@ -10,11 +10,18 @@ name: Drafter and exact verifier bench
 # the time splits between the drafter and the verifier. Timings are CI
 # measurements on shared 4-vCPU runners, not production figures.
 #
-# Cost control: it runs when a pull request changes the drafter, the
-# verifier or this bench, and a newer push cancels an older run. Models are
-# downloaded each run and never cached or uploaded.
+# Cost control: a run downloads about 21 GB from Hugging Face over four
+# runners, so it never runs on a push. It runs when started by hand
+# (workflow_dispatch, once this file is on the default branch), or once at the
+# moment the `draft-verify-bench` label is added to a pull request that
+# changes the drafter, the verifier or this bench. One label event is one
+# run: later pushes do not re-run it, and measuring again means removing and
+# re-adding the label. An unrelated label event cancels nothing. Models are
+# downloaded each run and never cached or uploaded. The golden-vector tests in
+# ci.yml and golden-vectors.yml cover draft_verify.rs on every push.
 on:
   pull_request:
+    types: [labeled]
     paths:
       - .github/workflows/draft-verify-bench.yml
       - crates/arc-inference/examples/draft_verify_bench.rs
@@ -24,10 +31,6 @@ on:
 
 permissions:
   contents: read
-
-concurrency:
-  group: draft-verify-bench-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -52,6 +55,14 @@ env:
 jobs:
   bench:
     name: 7B drafter + verifier / ${{ matrix.runner }} / ${{ matrix.profile }}
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'draft-verify-bench'
+    # Per leg, so a skipped run (no label, or another label added) never
+    # takes the slot of a run that is measuring.
+    concurrency:
+      group: draft-verify-bench-${{ github.event.pull_request.number || github.ref }}-${{ matrix.runner }}-${{ matrix.profile }}
+      cancel-in-progress: true
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     strategy:
