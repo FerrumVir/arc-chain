@@ -12,6 +12,12 @@ vendor/third_party/glib-0.18.5/** text eol=lf
 vendor/third_party/glib-0.18.5/LICENSE whitespace=-blank-at-eof
 vendor/shared-buffer/** text eol=lf
 vendor/wasmer-compiler/** text eol=lf
+
+# Preserve immutable reference source/config hashes on all platforms.
+scripts/arc_quality/layer_probe/reference/* -text
+
+tools/quality-layer-probe/reference/model.rs -text
+
 # The legacy bridge verifies these real v0.8.11 release-manifest bytes with the
 # release key in its unit tests. Any CRLF conversion would break the signature.
 crates/arc-legacy-bridge/fixtures/** -text

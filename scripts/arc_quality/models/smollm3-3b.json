@@ -1,0 +1,17 @@
+{
+  "schema": "arc.quality-model.v1",
+  "name": "SmolLM3-3B",
+  "engine": {
+    "cli": "arc-modern golden",
+    "profile": "arc.hf-llama.i8-dyadic-row.q16.v1",
+    "source_manifest": "docs/protocol/packages/smollm3-3b.source.json",
+    "package_manifest": "docs/protocol/packages/smollm3-3b.integer-package.json"
+  },
+  "cases": {"today": "06 October 2026", "thinking": false, "eos": [128012], "selection": "argmax"},
+  "reference": {
+    "kind": "hf",
+    "weights": "HuggingFaceTB/SmolLM3-3B BF16 safetensors at the source manifest's revision",
+    "dtype": "bfloat16",
+    "prompt_ids": "taken from the ARC run (--prompt-ids-from), so both engines see identical token ids"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "revision": "7eb5002f6aadc958aed6a9177b7ed26bb94011bb",
+  "config_url": "https://huggingface.co/moonshotai/Kimi-K2.6/resolve/7eb5002f6aadc958aed6a9177b7ed26bb94011bb/config.json",
+  "config_sha256": "85825ca6e18cbe539eb83ee09eedfb3f4222265929f06e9f535a6d9364f55899",
+  "reference_url": "https://huggingface.co/moonshotai/Kimi-K2.6/resolve/7eb5002f6aadc958aed6a9177b7ed26bb94011bb/modeling_deepseek.py",
+  "reference_sha256": "1fd8d198ff6ad69a5aec6fd85bf489d91ae2c432560b1e8ba7e34f710463c80a",
+  "reference_lines": "245-339 (YaRN frequencies and magnitude ratio), 693-699 (softmax scale)",
+  "retrieved_utc_date": "2026-10-07",
+  "vectors": "ARC-generated high-precision formula-derived reference vectors; not published PyTorch outputs or weight-forward results",
+  "generator": "scripts/arc_mla/yarn_reference.py, Decimal precision 90 and analytic Taylor sin/cos",
+  "source_manifest": "source.json copied unchanged from reviewed ARC-72 source pin; only metadata, no weights fetched"
+}

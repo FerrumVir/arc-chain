@@ -57,6 +57,11 @@ run_unittest "arc_ops: backup/verify/restore"            arc_ops.tests.test_back
 run_unittest "arc_ops: operational checks (R7)"          arc_ops.tests.test_check
 run_unittest "arc_ops: conservation audit (P7)"          arc_ops.tests.test_conservation
 run_unittest "arc_ops: receipt reconciliation (P9)"     arc_ops.tests.test_receipts
+# The code-grading tests run a few fixed Python snippets in a child
+# interpreter (pass, fail, timeout); no model-written code and no network.
+run_unittest "arc_quality: graders and extraction"      arc_quality.tests.test_benchmarks
+run_unittest "arc_quality: paired statistics"           arc_quality.tests.test_stats
+run_unittest "arc_quality: prepare/score/compare"       arc_quality.tests.test_pipeline
 
 # scripts/release/tests is not a package (no __init__.py): test_sbom.py and
 # test_verify_local_artifacts.py load their module by file path via importlib,

@@ -1,0 +1,19 @@
+[package]
+name = "arc-quality-layer-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+arc-inference = { git = "https://github.com/FerrumVir/arc-chain.git", rev = "be0438e4aa0eb32d5fbdf81d26cc5b5dd0db6690" }
+serde_json = "1"
+sha2 = "0.10"
+
+rayon = "1"
+memmap2 = "0.9"
+blake3 = "1"
+
+[build-dependencies]
+sha2 = "0.10"

@@ -1,0 +1,15 @@
+{
+  "get_weather": {"description": "Current weather for a city.", "parameters": {"city": "string, city name", "unit": "string, one of \"celsius\" or \"fahrenheit\""}},
+  "get_time": {"description": "Current local time in a city.", "parameters": {"city": "string, city name"}},
+  "convert_currency": {"description": "Convert an amount between currencies.", "parameters": {"amount": "number", "from": "string, ISO 4217 code such as \"USD\"", "to": "string, ISO 4217 code"}},
+  "send_email": {"description": "Send an email.", "parameters": {"to": "string, address", "subject": "string", "body": "string"}},
+  "create_event": {"description": "Create a calendar event.", "parameters": {"title": "string", "date": "string, YYYY-MM-DD", "time": "string, HH:MM (24-hour)", "duration_minutes": "integer"}},
+  "search_files": {"description": "Search file names.", "parameters": {"query": "string"}},
+  "read_file": {"description": "Read a file.", "parameters": {"path": "string, absolute path"}},
+  "calculate": {"description": "Evaluate an arithmetic expression.", "parameters": {"expression": "string, e.g. \"2 * (3 + 4)\" or \"sqrt(2)\""}},
+  "run_shell": {"description": "Run a shell command in the repository.", "parameters": {"command": "string"}},
+  "git_create_branch": {"description": "Create a git branch.", "parameters": {"name": "string", "base": "string, the branch to start from"}},
+  "create_issue": {"description": "Create an issue in the tracker.", "parameters": {"title": "string", "priority": "string, one of \"low\", \"medium\", \"high\""}},
+  "translate_text": {"description": "Translate text.", "parameters": {"text": "string", "target_language": "string, language name in English"}},
+  "get_stock_price": {"description": "Latest price for a stock ticker.", "parameters": {"ticker": "string"}}
+}

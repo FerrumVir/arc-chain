@@ -1,0 +1,15 @@
+{
+  "schema": "arc.quality-policy.v1",
+  "status": "PROPOSED, not approved by TJ",
+  "note": "Margins are in accuracy points (percentage points), ARC minus reference, same items, greedy decoding. A group PASSES when the lower end of the 95% confidence interval of the paired difference is at or above -margin; it FAILS when the upper end is below -margin (ARC is worse by more than the margin with 95% confidence); otherwise it is INCONCLUSIVE (too few items to decide). A run below a group's certification size can only ever be a smoke result. See docs/quality/kimi-quality-harness.md.",
+  "confidence": 0.95,
+  "groups": {
+    "mmlu_pro": {"members": ["mmlu_pro"], "margin_points": 1.5, "certification_items": 2000},
+    "gsm8k": {"members": ["gsm8k"], "margin_points": 2.0, "certification_items": 1319},
+    "code": {"members": ["humaneval", "mbpp"], "margin_points": 3.0, "certification_items": 421},
+    "toolcall": {"members": ["toolcall"], "margin_points": 3.0, "certification_items": 400}
+  },
+  "pooled": {"max_shortfall_points": 0.5},
+  "logit_track": {"max_ppl_delta_percent": 1.0},
+  "noise_floor": {"max_disagreement_ratio": 1.5, "slack_points": 1.0}
+}
