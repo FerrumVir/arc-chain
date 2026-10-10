@@ -187,57 +187,232 @@ pub struct Q4View<'a> {
     pub q4: &'a [u8],
     /// `rows * cols / 32` BF16 bit patterns (non-negative, finite).
     pub scales: &'a [u16],
+    /// The rows' scale summaries ([`Q4ScaleTable::build`] of `scales`), when
+    /// the owner keeps one; otherwise each projection builds its own.
+    pub table: Option<&'a Q4ScaleTable>,
 }
 
-/// One row's group scales, parsed once (spec §13.2): `(mantissa, exponent)`
-/// per group, and the largest exponent of a nonzero scale.
-pub(crate) struct Q4RowScales {
-    parts: Vec<(u32, i32)>,
-    top: Option<i32>,
+/// The mantissa and exponent of a BF16 group scale (`m * 2^e`), its sign
+/// ignored: `convert::bf16_parts` for every finite pattern.
+#[inline]
+fn scale_parts(bits: u16) -> (i64, i32) {
+    let field = i32::from((bits >> 7) & 0xFF);
+    let mantissa = i64::from(bits & 0x7F);
+    if field == 0 {
+        (mantissa, -133)
+    } else {
+        (128 + mantissa, field - 134)
+    }
 }
 
-impl Q4RowScales {
-    pub(crate) fn parse(scales: &[u16]) -> Result<Self, ModernError> {
-        let mut parts = Vec::with_capacity(scales.len());
+/// What a row's scales make of its output (spec §13.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Q4RowKind {
+    /// A scale is infinite or NaN: the projection is refused.
+    Invalid,
+    /// Every scale is zero: the output is 0.
+    Zero,
+    /// At least one nonzero scale.
+    Scaled,
+}
+
+/// One row's group scales, summarised once per matrix for its epilogue
+/// (spec §13.2). A group contributes when its scale is nonzero and within 40
+/// binades of the row's largest nonzero scale; `emin` is the smallest
+/// contributing exponent, and `w = sum over contributing groups of m_g *
+/// 2^(e_g - emin)` (saturated) bounds the row's scaled sum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Q4RowSummary {
+    w: u64,
+    emin: i16,
+    kind: Q4RowKind,
+}
+
+impl Q4RowSummary {
+    fn of(scales: &[u16]) -> Self {
+        let mut summary = Self {
+            w: 0,
+            emin: 0,
+            kind: Q4RowKind::Zero,
+        };
         let mut top: Option<i32> = None;
         for &bits in scales {
-            let (_, m, e) = bf16_parts(bits)?;
+            if (bits >> 7) & 0xFF == 0xFF {
+                summary.kind = Q4RowKind::Invalid;
+                return summary;
+            }
+            let (m, e) = scale_parts(bits);
             if m > 0 {
                 top = Some(top.map_or(e, |t| t.max(e)));
             }
-            parts.push((m, e));
         }
-        Ok(Self { parts, top })
+        let Some(top) = top else {
+            return summary;
+        };
+        let contributing = || {
+            scales
+                .iter()
+                .map(|&bits| scale_parts(bits))
+                .filter(move |&(m, e)| m > 0 && e >= top - Q4_SCALE_SPAN)
+        };
+        let emin = contributing().map(|(_, e)| e).min().unwrap_or(top);
+        let w: u128 = contributing().map(|(m, e)| (m as u128) << (e - emin)).sum();
+        // Exponents lie in [-133, 120], so they fit i16.
+        summary.w = u64::try_from(w).unwrap_or(u64::MAX);
+        summary.emin = emin as i16;
+        summary.kind = Q4RowKind::Scaled;
+        summary
     }
 
-    /// The row's output from its group dots: `dot(g)` must be the exact
-    /// `sum_{j in g} q_j x_j`, and is read only for the groups that
-    /// contribute (a nonzero scale within 40 binades of the largest).
-    pub(crate) fn combine(&self, mut dot: impl FnMut(usize) -> i64) -> Result<i64, ModernError> {
-        let Some(top) = self.top else {
-            return Ok(0);
-        };
-        let mut total: i128 = 0;
-        for (g, &(m, e)) in self.parts.iter().enumerate() {
-            if m == 0 || e < top - Q4_SCALE_SPAN {
-                continue;
-            }
-            total += (i128::from(m) * i128::from(dot(g))) << (e - top + Q4_SCALE_SPAN);
+    /// The row's output from its group dots (spec §13.2): `floor(T *
+    /// 2^emin)` with `T = sum over contributing groups of m_g * dot_g *
+    /// 2^(e_g - emin)`. That is exactly the reference's `floor(total *
+    /// 2^(top - 40))`, because `total = 2^(emin - top + 40) * T` and
+    /// `emin >= top - 40`; the refusals are the reference's too (an infinite
+    /// or NaN scale, and any output beyond 2^62, with its messages).
+    ///
+    /// `dot(g)` must be the exact `sum_{j in g} q_j x_j` and is read once
+    /// per contributing group; `dot_bound` must bound every `|dot(g)|`.
+    /// When `w * dot_bound` fits i64, every partial sum does, and `T` is
+    /// formed in i64; otherwise in i128.
+    pub(crate) fn finish(
+        &self,
+        scales: &[u16],
+        dot_bound: u64,
+        mut dot: impl FnMut(usize) -> i64,
+    ) -> Result<i64, ModernError> {
+        match self.kind {
+            Q4RowKind::Invalid => return Err(invalid("BF16 infinity or NaN")),
+            Q4RowKind::Zero => return Ok(0),
+            Q4RowKind::Scaled => {}
         }
-        let exponent = top - Q4_SCALE_SPAN;
-        let value = if exponent < 0 {
-            floor_shift(total, (-exponent) as u32)
+        let emin = i32::from(self.emin);
+        let total: i128 = if u128::from(self.w) * u128::from(dot_bound) <= i64::MAX as u128 {
+            let mut total = 0i64;
+            for (g, &bits) in scales.iter().enumerate() {
+                let (m, e) = scale_parts(bits);
+                if m > 0 && e >= emin {
+                    total += m * dot(g) * (1i64 << (e - emin));
+                }
+            }
+            i128::from(total)
+        } else {
+            let mut total = 0i128;
+            for (g, &bits) in scales.iter().enumerate() {
+                let (m, e) = scale_parts(bits);
+                if m > 0 && e >= emin {
+                    total += (i128::from(m) * i128::from(dot(g))) << (e - emin);
+                }
+            }
+            total
+        };
+        let value = if emin < 0 {
+            floor_shift(total, emin.unsigned_abs())
         } else if total == 0 {
             0
-        } else if exponent > 62 {
+        } else if emin > 62 {
             return Err(domain("INT4 projection output beyond 2^62"));
         } else {
             total
-                .checked_mul(1i128 << exponent)
+                .checked_mul(1i128 << emin)
                 .ok_or_else(|| domain("INT4 projection output beyond 2^62"))?
         };
         to_activation(value, "INT4 projection output beyond 2^62")
     }
+}
+
+/// Every row's [`Q4RowSummary`] of one INT4 matrix: built once per matrix
+/// (the stage keeps one per routed expert, `model::Q4Ref`), 16 bytes per row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Q4ScaleTable {
+    rows: Vec<Q4RowSummary>,
+}
+
+impl Q4ScaleTable {
+    /// The summaries of `rows` rows of `groups` scales each.
+    pub fn build(scales: &[u16], rows: usize, groups: usize) -> Self {
+        Self {
+            rows: scales
+                .chunks_exact(groups.max(1))
+                .take(rows)
+                .map(Q4RowSummary::of)
+                .collect(),
+        }
+    }
+
+    /// Rows summarised.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether the table has no rows.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Memory the table holds.
+    pub fn bytes(&self) -> usize {
+        self.rows.len() * std::mem::size_of::<Q4RowSummary>()
+    }
+}
+
+/// `8 * max_g sum_{j in g} |x_j|`: a bound on every group dot of an INT4 row
+/// with `x` (|q| <= 8), which [`Q4RowSummary::finish`] uses to prove an
+/// i64 sum. Inputs that passed the projection's magnitude check keep it
+/// below 2^63.
+fn q4_dot_bound(x: &[i64]) -> u64 {
+    x.chunks(Q4_GROUP)
+        .map(|group| {
+            group
+                .iter()
+                .map(|v| u128::from(v.unsigned_abs()))
+                .sum::<u128>()
+        })
+        .max()
+        .map_or(0, |sum| u64::try_from(sum * 8).unwrap_or(u64::MAX))
+}
+
+/// The epilogue as #174 wrote it (spec §13.2), kept verbatim as the oracle of
+/// [`Q4RowSummary::finish`]; only the group dot became a closure.
+#[cfg(test)]
+pub(crate) fn epilogue_reference_v1(
+    scales: &[u16],
+    mut dot: impl FnMut(usize) -> i64,
+) -> Result<i64, ModernError> {
+    let mut parts = Vec::with_capacity(scales.len());
+    let mut top: Option<i32> = None;
+    for &bits in scales {
+        let (_, m, e) = bf16_parts(bits)?;
+        if m > 0 {
+            top = Some(top.map_or(e, |t| t.max(e)));
+        }
+        parts.push((m, e));
+    }
+    let Some(top) = top else {
+        return Ok(0);
+    };
+    let mut total: i128 = 0;
+    for (g, &(m, e)) in parts.iter().enumerate() {
+        if m == 0 || e < top - Q4_SCALE_SPAN {
+            continue;
+        }
+        // |q| <= 8 and 8 * sum |x| < 2^63 bound every partial sum.
+        let acc = dot(g);
+        total += (i128::from(m) * i128::from(acc)) << (e - top + Q4_SCALE_SPAN);
+    }
+    let exponent = top - Q4_SCALE_SPAN;
+    let value = if exponent < 0 {
+        floor_shift(total, (-exponent) as u32)
+    } else if total == 0 {
+        0
+    } else if exponent > 62 {
+        return Err(domain("INT4 projection output beyond 2^62"));
+    } else {
+        total
+            .checked_mul(1i128 << exponent)
+            .ok_or_else(|| domain("INT4 projection output beyond 2^62"))?
+    };
+    to_activation(value, "INT4 projection output beyond 2^62")
 }
 
 /// The exact dot of group `g` of a packed row with `x`: |q| <= 8 and
@@ -286,6 +461,16 @@ impl Q4View<'_> {
             }
         }
         let groups = self.cols / Q4_GROUP;
+        let built;
+        let table = match self.table {
+            Some(table) if table.len() == self.rows => table,
+            Some(_) => return Err(invalid("INT4 scale table does not match its matrix")),
+            None => {
+                built = Q4ScaleTable::build(self.scales, self.rows, groups);
+                &built
+            }
+        };
+        let bounds: Vec<u64> = xs.iter().copied().map(q4_dot_bound).collect();
         if let Some(kernel) = super::q4_kernels::selected_q4_kernel() {
             if let Some(digits) = super::q4_kernels::Digits::split(xs) {
                 super::q4_kernels::record_run(Some(kernel));
@@ -295,10 +480,10 @@ impl Q4View<'_> {
                     &digits,
                     res,
                     |r, dots, out| {
-                        let scales =
-                            Q4RowScales::parse(&self.scales[r * groups..(r + 1) * groups])?;
+                        let scales = &self.scales[r * groups..(r + 1) * groups];
                         for (t, slot) in out.iter_mut().enumerate() {
-                            *slot = scales.combine(|g| dots[t * groups + g])?;
+                            *slot = table.rows[r]
+                                .finish(scales, bounds[t], |g| dots[t * groups + g])?;
                         }
                         Ok(())
                     },
@@ -314,9 +499,10 @@ impl Q4View<'_> {
                 for (offset, row_out) in chunk.chunks_mut(k).enumerate() {
                     let r = chunk_index * 16 + offset;
                     let packed = &self.q4[r * half..(r + 1) * half];
-                    let scales = Q4RowScales::parse(&self.scales[r * groups..(r + 1) * groups])?;
-                    for (slot, x) in row_out.iter_mut().zip(xs) {
-                        *slot = scales.combine(|g| q4_group_dot(packed, g, x))?;
+                    let scales = &self.scales[r * groups..(r + 1) * groups];
+                    for ((slot, x), &bound) in row_out.iter_mut().zip(xs).zip(&bounds) {
+                        *slot =
+                            table.rows[r].finish(scales, bound, |g| q4_group_dot(packed, g, x))?;
                     }
                 }
                 Ok(())
@@ -1140,6 +1326,7 @@ mod tests {
             cols: 64,
             q4: &packed,
             scales: &scales,
+            table: None,
         };
         let x: Vec<i64> = (1..=64).collect();
         let mut out = [0i64; 1];
@@ -1156,6 +1343,7 @@ mod tests {
             cols: 32,
             q4: &packed,
             scales: &scales,
+            table: None,
         };
         let mut x = vec![0i64; 32];
         x[0] = -1;
@@ -1165,11 +1353,147 @@ mod tests {
         let zero = [0u16];
         let view = Q4View {
             scales: &zero,
+            table: None,
             ..view
         };
         view.project(&x, &mut out).unwrap();
         assert_eq!(out, [0]);
         assert!(view.project(&x[..31], &mut out).is_err());
+    }
+
+    /// The rewritten INT4 epilogue ([`Q4RowSummary::finish`]) against #174's,
+    /// kept verbatim as `epilogue_reference_v1`: random rows over the whole
+    /// group-count range at K2.6 widths (1 to 224 groups, and 64 for the
+    /// down projection), extreme BF16 scales (subnormal, the lowest and
+    /// highest binades, signed, zero, infinite and NaN), both edges of the
+    /// 40-binade cut, zero, negative and extreme dots, and dot bounds on both
+    /// sides of the i64 / i128 switch. Values and refusals must be equal.
+    #[test]
+    fn the_int4_epilogue_equals_its_v1_oracle() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^ (z >> 31)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+        let mut rng = Rng(0x0E91_7065_0000_0001);
+        let bits = |sign: u64, field: i64, mantissa: u64| -> u16 {
+            ((sign << 15) | ((field as u64) << 7) | (mantissa & 0x7F)) as u16
+        };
+        let (mut narrow, mut wide, mut cut_in, mut cut_out, mut refused) = (0, 0, 0, 0, 0);
+        for case in 0..40_000u64 {
+            let groups = match case % 4 {
+                0 => 1 + rng.below(224) as usize,
+                1 => 224,
+                2 => 64,
+                _ => 1 + rng.below(8) as usize,
+            };
+            // The largest exponent field, from the extremes and the middle.
+            let top = match rng.below(8) {
+                0 => 1 + rng.below(3) as i64,
+                1 => 252 + rng.below(3) as i64,
+                2 => 40 + rng.below(4) as i64,
+                _ => 1 + rng.below(254) as i64,
+            };
+            let mut scales: Vec<u16> = (0..groups)
+                .map(|_| {
+                    let sign = rng.below(2);
+                    match rng.below(16) {
+                        0 => bits(sign, 0, 0),
+                        1 => bits(sign, 0, rng.next()),
+                        2 => bits(sign, top, rng.next()),
+                        3 => bits(sign, (top - 40).max(0), rng.next()),
+                        4 => bits(sign, (top - 41).max(0), rng.next()),
+                        _ => bits(sign, (top - rng.below(46) as i64).max(0), rng.next()),
+                    }
+                })
+                .collect();
+            scales[rng.below(groups as u64) as usize] = bits(rng.below(2), top, rng.next());
+            if rng.below(100) == 0 {
+                scales[rng.below(groups as u64) as usize] = bits(0, 255, rng.next());
+            }
+            let dot_bits = match rng.below(4) {
+                0 => 1,
+                1 => 20,
+                2 => 41,
+                _ => 63,
+            };
+            let mut dots: Vec<i64> = (0..groups)
+                .map(|_| match rng.below(8) {
+                    0 => 0,
+                    1 => -1,
+                    2 => 1,
+                    _ => {
+                        let magnitude = (rng.next() >> (64 - dot_bits)) as i64;
+                        if rng.below(2) == 0 {
+                            magnitude
+                        } else {
+                            -magnitude
+                        }
+                    }
+                })
+                .collect();
+            let summary = Q4RowSummary::of(&scales);
+            let fields: Vec<i64> = scales.iter().map(|&b| i64::from((b >> 7) & 0xFF)).collect();
+            if fields.contains(&(top - 40)) && top >= 41 {
+                cut_in += 1;
+            }
+            if fields.contains(&(top - 41)) && top >= 42 {
+                cut_out += 1;
+            }
+            let check = |dots: &[i64], bound: u64| {
+                let want = epilogue_reference_v1(&scales, |g| dots[g]).map_err(|e| e.to_string());
+                let got = summary
+                    .finish(&scales, bound, |g| dots[g])
+                    .map_err(|e| e.to_string());
+                assert_eq!(
+                    got, want,
+                    "scales {scales:04x?}, dots {dots:?}, bound {bound}"
+                );
+                got.is_err()
+            };
+            let largest = dots.iter().map(|d| d.unsigned_abs()).max().unwrap_or(0);
+            for bound in [largest, largest.saturating_mul(3)] {
+                if check(&dots, bound) {
+                    refused += 1;
+                }
+                if u128::from(summary.w) * u128::from(bound) <= i64::MAX as u128 {
+                    narrow += 1;
+                } else {
+                    wide += 1;
+                }
+            }
+            // Both sides of the switch: every dot at the largest bound that
+            // still proves an i64 sum, all of one sign, then one more.
+            if summary.w > 0 && summary.kind == Q4RowKind::Scaled {
+                let edge = (i64::MAX as u64) / summary.w;
+                let sign = if rng.below(2) == 0 { 1 } else { -1 };
+                for bound in [edge, edge + 1] {
+                    let magnitude = i64::try_from(bound).unwrap_or(i64::MAX);
+                    dots.iter_mut().for_each(|d| *d = sign * magnitude);
+                    check(&dots, bound);
+                    if u128::from(summary.w) * u128::from(bound) <= i64::MAX as u128 {
+                        narrow += 1;
+                    } else {
+                        wide += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "INT4 epilogue against v1: {narrow} i64 sums, {wide} i128 sums, \
+             {cut_in} rows with a group on the 40-binade edge, {cut_out} with one just past it, \
+             {refused} refusals"
+        );
+        assert!(narrow > 10_000 && wide > 10_000 && cut_in > 1_000 && cut_out > 1_000);
+        assert!(refused > 100);
     }
 
     #[test]

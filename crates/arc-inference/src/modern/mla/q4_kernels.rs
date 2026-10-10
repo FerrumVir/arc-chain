@@ -1088,6 +1088,7 @@ pub(crate) mod tests {
                 cols,
                 q4: &packed,
                 scales: &scales,
+                table: None,
             };
             for k in [1, 2, 3, 5, 8, 16, 17] {
                 for bits in [8, 20, 30] {
@@ -1132,6 +1133,7 @@ pub(crate) mod tests {
             cols: 64,
             q4: &packed,
             scales: &scales,
+            table: None,
         };
         let mut xs = activations(&mut rng, 64, 3, 20);
         xs[1][17] = LIMB_MAX + 1;

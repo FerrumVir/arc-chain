@@ -498,6 +498,7 @@ fn cmd_golden(args: &Args) -> Result<(), ModernError> {
             "decode_seconds": decode_total,
             "decode_tok_s": rate(forwards_total as f64, decode_total),
             "int8_weights": model.weight_count(),
+            "q4_scale_table_bytes": model.q4_scale_table_bytes(),
         },
     });
     write_json(&args.path("--out")?, &run)?;
@@ -714,6 +715,7 @@ fn cmd_stage(args: &Args) -> Result<(), ModernError> {
             "positions_per_s": positions_per_s,
             "layers": stage.end_layer - stage.first_layer,
             "int8_weights": model.weight_count(),
+            "q4_scale_table_bytes": model.q4_scale_table_bytes(),
         },
     });
     write_json(&args.path("--report")?, &report)?;

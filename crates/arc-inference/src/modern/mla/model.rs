@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -18,8 +19,8 @@ use rayon::prelude::*;
 use super::boundary::activation_hash;
 use super::config::{ExpertFormat, MlaConfig};
 use super::ops::{
-    LatentCache, Q4_GROUP, Q4View, QView, combine, gated_ffn, gated_ffn_q4_rows, mla_attend,
-    rope_interleaved, router_logits, routing_weights, select_experts, selection_keys,
+    LatentCache, Q4_GROUP, Q4ScaleTable, Q4View, QView, combine, gated_ffn, gated_ffn_q4_rows,
+    mla_attend, rope_interleaved, router_logits, routing_weights, select_experts, selection_keys,
 };
 use super::package::{self, StageHeader, StageSpec};
 use super::precision::{I16Weights, Schedule, holds_int16_min};
@@ -97,19 +98,46 @@ struct Q4Ref {
     cols: usize,
     q4: Range<usize>,
     scales: Vec<u16>,
+    /// Each matrix's scale summaries, built on its first projection and kept
+    /// (16 bytes per row; [`StageModel::q4_scale_table_bytes`]).
+    tables: Vec<OnceLock<Q4ScaleTable>>,
 }
 
 impl Q4Ref {
+    fn new(rows: usize, cols: usize, q4: Range<usize>, scales: Vec<u16>, count: usize) -> Self {
+        Self {
+            rows,
+            cols,
+            q4,
+            scales,
+            tables: (0..count).map(|_| OnceLock::new()).collect(),
+        }
+    }
+
     fn view<'a>(&'a self, bytes: &'a [u8], index: usize) -> Q4View<'a> {
         let size = self.rows * self.cols / 2;
         let groups = self.rows * self.cols / Q4_GROUP;
         let start = self.q4.start + index * size;
+        let scales = &self.scales[index * groups..(index + 1) * groups];
         Q4View {
             rows: self.rows,
             cols: self.cols,
             q4: &bytes[start..start + size],
-            scales: &self.scales[index * groups..(index + 1) * groups],
+            scales,
+            table: Some(
+                self.tables[index]
+                    .get_or_init(|| Q4ScaleTable::build(scales, self.rows, self.cols / Q4_GROUP)),
+            ),
         }
+    }
+
+    /// Memory of the scale summaries built so far.
+    fn table_bytes(&self) -> usize {
+        self.tables
+            .iter()
+            .filter_map(OnceLock::get)
+            .map(Q4ScaleTable::bytes)
+            .sum()
     }
 }
 
@@ -223,12 +251,7 @@ impl Loader<'_> {
                 "{name}: group scale {bad:#06x} is negative, infinite or NaN"
             )));
         }
-        Ok(Q4Ref {
-            rows,
-            cols,
-            q4,
-            scales,
-        })
+        Ok(Q4Ref::new(rows, cols, q4, scales, count))
     }
 
     fn i16s(&self, name: &str) -> Result<Vec<i16>, ModernError> {
@@ -748,6 +771,33 @@ impl StageModel {
     /// Digests of the segments this stage executes (spec §4.7).
     pub fn segments(&self) -> Vec<package::SegmentDigest> {
         package::segment_digests_where(self.bytes(), &self.header, |s| self.executes_segment(s))
+    }
+
+    /// Memory held by the INT4 experts' scale summaries: 16 bytes per row of
+    /// every expert matrix projected so far (each is built on first use and
+    /// kept), part of the stage's resident memory beside its weights and
+    /// scales. The largest it can reach is [`Self::q4_scale_table_bound`].
+    pub fn q4_scale_table_bytes(&self) -> usize {
+        self.q4_stacks().map(Q4Ref::table_bytes).sum()
+    }
+
+    /// The scale summaries' memory once every expert matrix has been used.
+    pub fn q4_scale_table_bound(&self) -> usize {
+        self.q4_stacks()
+            .map(|stack| {
+                stack.tables.len() * stack.rows * std::mem::size_of::<super::ops::Q4RowSummary>()
+            })
+            .sum()
+    }
+
+    fn q4_stacks(&self) -> impl Iterator<Item = &Q4Ref> {
+        self.layers.iter().flat_map(|layer| match &layer.ffn {
+            FfnWeights::Moe(moe) => match &moe.experts {
+                ExpertStacks::Int4(stacks) => stacks.iter().collect::<Vec<_>>(),
+                ExpertStacks::Int8(_) => Vec::new(),
+            },
+            FfnWeights::Dense(_) => Vec::new(),
+        })
     }
 
     /// INT8 weights this stage executes.
@@ -2654,6 +2704,40 @@ pub(crate) mod tests {
         }
     }
 
+    /// The INT4 scale summaries are built on an expert matrix's first
+    /// projection, kept, and counted: 16 bytes per row, at most every row of
+    /// every expert matrix of the stage.
+    #[test]
+    fn int4_scale_tables_are_built_once_per_matrix_and_counted() {
+        assert_eq!(std::mem::size_of::<super::super::ops::Q4RowSummary>(), 16);
+        let c = tiny_config_with(false, ExpertFormat::Int4G32);
+        let model = StageModel::from_owned(tiny_package(&c, StageSpec::full(&c))).unwrap();
+        let moe_layers = (0..c.n_layers).filter(|&l| c.is_moe(l)).count();
+        let rows_per_expert = 2 * c.moe_d_ff + c.d_model;
+        assert_eq!(
+            model.q4_scale_table_bound(),
+            moe_layers * c.n_routed_experts * rows_per_expert * 16
+        );
+        assert_eq!(model.q4_scale_table_bytes(), 0);
+        let mut cache = model.new_cache();
+        model
+            .forward(StageInput::Token(3), &mut cache, None)
+            .unwrap();
+        let first = model.q4_scale_table_bytes();
+        // One token runs n_experts_per_tok experts in each MoE layer.
+        assert_eq!(
+            first,
+            moe_layers * c.n_experts_per_tok * rows_per_expert * 16
+        );
+        for token in [17, 5, 49, 0, 22, 8] {
+            model
+                .forward(StageInput::Token(token), &mut cache, None)
+                .unwrap();
+        }
+        let later = model.q4_scale_table_bytes();
+        assert!(first <= later && later <= model.q4_scale_table_bound());
+    }
+
     /// A pass that does not fit the context is refused, and so is a pass
     /// with no rows; a pass fills the context exactly.
     #[test]
@@ -2753,11 +2837,14 @@ pub(crate) mod tests {
             dyadic(f * d, f, d),
             dyadic(2 * f * d, d, f),
         ];
-        let stacked = |which: usize, rows: usize, cols: usize| Q4Ref {
-            rows,
-            cols,
-            q4: shared_bytes + which * stack..shared_bytes + (which + 1) * stack,
-            scales: vec![0u16; experts * rows * cols / Q4_GROUP],
+        let stacked = |which: usize, rows: usize, cols: usize| {
+            Q4Ref::new(
+                rows,
+                cols,
+                shared_bytes + which * stack..shared_bytes + (which + 1) * stack,
+                vec![0u16; experts * rows * cols / Q4_GROUP],
+                experts,
+            )
         };
         let mut moe = MoeWeights {
             router_q: (0..experts * d)
