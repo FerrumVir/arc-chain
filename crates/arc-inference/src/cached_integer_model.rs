@@ -1153,14 +1153,25 @@ pub(crate) fn matmul_i8_into_batched(
     let data = &weights.data;
     let scales = &weights.scales;
     let n_rows = weights.n_rows;
+    // The scalar kernel is compute-bound per row, so a four-token tile costs
+    // four rows of work whatever it holds: bench run 38056837714 measured it
+    // at 3.6x to 3.9x the one-row pass. One to three tokens therefore run the
+    // one-row path itself, token by token, exactly as `forward_one_token`
+    // runs it; the values are the same either way.
+    if n_tokens < 4 {
+        for (input, out) in inputs
+            .chunks_exact(in_size)
+            .zip(output.chunks_exact_mut(weights.n_rows))
+        {
+            matmul_i8_into(weights, input, in_size, out);
+        }
+        return;
+    }
     // Same L1-resident row block and 4-token tile as the vectorised path, so
     // the scalar batched baseline is a fair comparison rather than a straw man.
-    // The scalar kernel is compute-bound per row, so a short tile of one to
-    // three tokens runs the one-row dot (`dot_i8_i64`, as `matmul_i8_into`
-    // does) per token instead: a four-token tile would compute four lanes for
-    // them. Bench run 38056837714 measured a four-row tile at 3.6x to 3.9x
-    // the one-row pass, so two or three rows cost no more one at a time. The
-    // values are the same either way.
+    // One to three tokens left after the whole tiles run the one-row dot
+    // (`dot_i8_i64`, as `matmul_i8_into` does) per token, which computes no
+    // discarded lanes.
     let row_block = (131_072 / in_size.max(1)).clamp(1, n_rows);
     let n_blocks = n_rows.div_ceil(row_block);
     let out = BatchOutPtr(output.as_mut_ptr());

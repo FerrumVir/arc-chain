@@ -7,7 +7,7 @@
 //! profile). Every sequence has its own prompt (the lengths differ, so the
 //! sequences sit at different positions) and its own K/V cache. For each
 //! kernel and each number S of concurrent sequences, the driver runs `--steps`
-//! greedy decode steps from the prefilled prompts:
+//! decode steps from the prefilled prompts:
 //!
 //! * S = 1 is one user decoding as a worker does, one `forward_one_token` call
 //!   per step;
@@ -17,12 +17,16 @@
 //! The report is the median time of a decode step and the aggregate decoded
 //! tokens per second, S over that median.
 //!
-//! Exactness on the real model. First every sequence runs alone through the
-//! worker's one-row path, its prompt and then its greedy steps. The prompts
-//! are then prefilled together in multi-sequence calls, and every sequence's
-//! last prompt logits must match its run alone. Every timed run must then give
-//! every sequence the same tokens and the same logits (by hash) at every step
-//! as its run alone. Otherwise the driver exits non-zero.
+//! Every sequence follows the worker's own generation (`try_generate`): the
+//! BOS and the prompt, then the last prompt token once more, and each step
+//! picks the next token with the worker's selection,
+//! `select_next_token_with_repetition_penalty`, over the sequence's own
+//! generated history.
+//!
+//! Exactness on the real model. Every sequence first runs alone through
+//! `try_generate`, the worker's own call. Every timed run must give every
+//! sequence the same tokens and output hash, for every kernel and every S;
+//! otherwise the driver exits non-zero.
 //!
 //! Kernels: `scalar`, or a multi-row kernel by its label (`neon-sdot-limb`,
 //! `neon-i8mm-limb`, `avx2-limb`, `avx-vnni-limb`, `avx512-vnni-limb`); `simd`
@@ -37,10 +41,9 @@
 use arc_crypto::{Hash256, hash_bytes};
 use arc_inference::cached_integer_model::{
     CANONICAL_REWARD_INFERENCE_PROFILE, CachedIntegerModel, KVCache, SeqRows, ShardRowsInput,
-    ShardRowsOutput, load_cached_model_canonical_i8,
+    ShardRowsOutput, load_cached_model_canonical_i8, select_next_token_with_repetition_penalty,
 };
 use arc_inference::canonical_simd::{self, BatchedKernel};
-use arc_inference::integer_lut::argmax_i64;
 use serde_json::{Value, json};
 use std::time::Instant;
 
@@ -177,54 +180,42 @@ fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
-fn hash_logits(logits: &[i64]) -> Hash256 {
-    let bytes: Vec<u8> = logits
+/// One sequence's generation: its tokens and output hash, as `try_generate`
+/// returns them.
+#[derive(Clone, PartialEq, Eq)]
+struct Generated {
+    tokens: Vec<u32>,
+    hash: Hash256,
+}
+
+/// The output hash `try_generate` returns: BLAKE3 of the little-endian tokens.
+fn output_hash(tokens: &[u32]) -> Hash256 {
+    let bytes: Vec<u8> = tokens
         .iter()
-        .flat_map(|value| value.to_le_bytes())
+        .flat_map(|token| token.to_le_bytes())
         .collect();
     hash_bytes(&bytes)
 }
 
-fn greedy(logits: &[i64]) -> u32 {
-    u32::try_from(argmax_i64(logits)).expect("a token id fits u32")
+/// One sequence alone, through the worker's own call.
+fn generate_alone(
+    model: &CachedIntegerModel,
+    prompt: &[u32],
+    steps: usize,
+) -> Result<Generated, String> {
+    let budget = u32::try_from(steps).map_err(|_| "--steps does not fit u32".to_string())?;
+    let (tokens, hash) = model
+        .try_generate(prompt, budget, &[])
+        .map_err(|error| format!("try_generate: {error}"))?;
+    Ok(Generated { tokens, hash })
 }
 
-/// One sequence's decode: its last prompt logits, then each greedy step's
-/// token and the logits that step's forward returned.
-#[derive(Clone, PartialEq, Eq)]
-struct Decoded {
-    prompt_logits: Hash256,
-    tokens: Vec<u32>,
-    step_logits: Vec<Hash256>,
-}
-
-/// One sequence alone through the worker's one-row path.
-fn decode_alone(model: &CachedIntegerModel, prompt: &[u32], steps: usize) -> Decoded {
-    let mut cache = KVCache::new(model.config.n_layers);
-    let mut logits = Vec::new();
-    for &token in prompt {
-        logits = model.forward_one_token(token, &mut cache);
-    }
-    let prompt_logits = hash_logits(&logits);
-    let mut tokens = Vec::with_capacity(steps);
-    let mut step_logits = Vec::with_capacity(steps);
-    for _ in 0..steps {
-        let next = greedy(&logits);
-        tokens.push(next);
-        logits = model.forward_one_token(next, &mut cache);
-        step_logits.push(hash_logits(&logits));
-    }
-    Decoded {
-        prompt_logits,
-        tokens,
-        step_logits,
-    }
-}
-
-/// A prefilled sequence: its cache and its last prompt logits.
+/// A sequence after its BOS and prompt: its cache, and the token its first
+/// step feeds, which is the last prompt token again, as `try_generate` feeds
+/// it.
 struct Prefilled {
     cache: KVCache,
-    logits: Vec<i64>,
+    first_feed: u32,
 }
 
 fn clone_cache(cache: &KVCache) -> KVCache {
@@ -235,88 +226,88 @@ fn clone_cache(cache: &KVCache) -> KVCache {
     }
 }
 
-/// Prefills every prompt in multi-sequence calls of at most the stage's row
-/// cap, so the prompts themselves share weight reads too.
+/// Runs every sequence's BOS and prompt in multi-sequence calls of at most
+/// the stage's row cap, so the prompts share weight reads too.
 fn prefill_all(model: &CachedIntegerModel, prompts: &[Vec<u32>]) -> Result<Vec<Prefilled>, String> {
     let n_layers = model.config.n_layers;
     let cap = model.max_shard_rows(n_layers);
+    let fed: Vec<Vec<u32>> = prompts
+        .iter()
+        .map(|prompt| {
+            let mut tokens = vec![model.config.bos_token];
+            tokens.extend_from_slice(prompt);
+            tokens
+        })
+        .collect();
     let mut done: Vec<Prefilled> = Vec::with_capacity(prompts.len());
     let mut start = 0usize;
-    while start < prompts.len() {
+    while start < fed.len() {
         let mut end = start;
         let mut rows = 0usize;
-        while end < prompts.len() && rows + prompts[end].len() <= cap {
-            rows += prompts[end].len();
+        while end < fed.len() && rows + fed[end].len() <= cap {
+            rows += fed[end].len();
             end += 1;
         }
         if end == start {
             return Err(format!(
                 "a {}-token prompt exceeds the {cap}-row cap",
-                prompts[start].len()
+                fed[start].len()
             ));
         }
         let mut caches: Vec<KVCache> = (start..end).map(|_| KVCache::new(n_layers)).collect();
         let mut batch: Vec<SeqRows<'_>> = caches
             .iter_mut()
-            .zip(&prompts[start..end])
-            .map(|(cache, prompt)| SeqRows {
+            .zip(&fed[start..end])
+            .map(|(cache, tokens)| SeqRows {
                 cache,
                 position: 0,
-                input: ShardRowsInput::Tokens(prompt.clone()),
+                input: ShardRowsInput::Tokens(tokens.clone()),
             })
             .collect();
-        let outputs = model
+        model
             .forward_rows_multi(&mut batch, 0, n_layers)
             .map_err(|error| format!("prefill: {error}"))?;
         drop(batch);
-        for (cache, output) in caches.into_iter().zip(outputs) {
-            let ShardRowsOutput::Logits(mut rows) = output else {
-                return Err("a whole-model call returned hidden rows".into());
-            };
-            let logits = rows.pop().ok_or("a prefill returned no logits")?;
-            done.push(Prefilled { cache, logits });
+        for (cache, prompt) in caches.into_iter().zip(&prompts[start..end]) {
+            let first_feed = *prompt.last().ok_or("an empty prompt")?;
+            done.push(Prefilled { cache, first_feed });
         }
         start = end;
     }
     Ok(done)
 }
 
-/// Runs `steps` greedy decode steps of the first `count` prefilled
-/// sequences, all in one call per step (one `forward_one_token` per step for a
-/// single sequence), and returns each sequence's decode and each step's time.
+/// Runs `steps` decode steps of the first `count` prefilled sequences, all in
+/// one call per step (one `forward_one_token` per step for a single
+/// sequence), each sequence selecting its next token with the worker's
+/// selection over its own history. Returns each sequence's generation and
+/// each step's forward time.
 fn decode_together(
     model: &CachedIntegerModel,
     prefilled: &[Prefilled],
     count: usize,
     steps: usize,
-) -> Result<(Vec<Decoded>, Vec<f64>), String> {
+) -> Result<(Vec<Generated>, Vec<f64>), String> {
     let n_layers = model.config.n_layers;
     let mut caches: Vec<KVCache> = prefilled[..count]
         .iter()
         .map(|sequence| clone_cache(&sequence.cache))
         .collect();
-    let mut logits: Vec<Vec<i64>> = prefilled[..count]
-        .iter()
-        .map(|sequence| sequence.logits.clone())
-        .collect();
-    let mut decoded: Vec<Decoded> = logits
-        .iter()
-        .map(|row| Decoded {
-            prompt_logits: hash_logits(row),
-            tokens: Vec::with_capacity(steps),
-            step_logits: Vec::with_capacity(steps),
-        })
-        .collect();
+    let mut generated: Vec<Vec<u32>> = vec![Vec::with_capacity(steps); count];
     let mut seconds = Vec::with_capacity(steps);
     for _ in 0..steps {
-        let next: Vec<u32> = logits.iter().map(|row| greedy(row)).collect();
+        let feed: Vec<u32> = generated
+            .iter()
+            .zip(&prefilled[..count])
+            .map(|(tokens, sequence)| tokens.last().copied().unwrap_or(sequence.first_feed))
+            .collect();
         let started = Instant::now();
-        if count == 1 {
-            logits[0] = model.forward_one_token(next[0], &mut caches[0]);
+        let mut logits: Vec<Vec<i64>> = if count == 1 {
+            vec![model.forward_one_token(feed[0], &mut caches[0])]
         } else {
             let mut batch: Vec<SeqRows<'_>> = caches
                 .iter_mut()
-                .zip(&next)
+                .zip(&feed)
                 .map(|(cache, &token)| {
                     let position = cache.seq_len;
                     SeqRows {
@@ -330,19 +321,28 @@ fn decode_together(
                 .forward_rows_multi(&mut batch, 0, n_layers)
                 .map_err(|error| format!("decode: {error}"))?;
             drop(batch);
-            for (row, output) in logits.iter_mut().zip(outputs) {
-                let ShardRowsOutput::Logits(mut rows) = output else {
+            let mut rows = Vec::with_capacity(count);
+            for output in outputs {
+                let ShardRowsOutput::Logits(mut row) = output else {
                     return Err("a whole-model call returned hidden rows".into());
                 };
-                *row = rows.pop().ok_or("a decode step returned no logits")?;
+                rows.push(row.pop().ok_or("a decode step returned no logits")?);
             }
-        }
+            rows
+        };
         seconds.push(started.elapsed().as_secs_f64());
-        for ((sequence, &token), row) in decoded.iter_mut().zip(&next).zip(&logits) {
-            sequence.tokens.push(token);
-            sequence.step_logits.push(hash_logits(row));
+        for (tokens, row) in generated.iter_mut().zip(logits.iter_mut()) {
+            let next = select_next_token_with_repetition_penalty(row, tokens);
+            tokens.push(next);
         }
     }
+    let decoded = generated
+        .into_iter()
+        .map(|tokens| Generated {
+            hash: output_hash(&tokens),
+            tokens,
+        })
+        .collect();
     Ok((decoded, seconds))
 }
 
@@ -365,7 +365,7 @@ fn main() -> Result<(), String> {
     if vocab < 4 {
         return Err(format!("a {vocab}-token vocabulary is too small"));
     }
-    if args.prompt + 3 + args.steps > model.config.max_seq {
+    if 1 + args.prompt + 3 + args.steps > model.config.max_seq {
         return Err("--prompt plus --steps exceeds the context window".into());
     }
     println!(
@@ -390,25 +390,18 @@ fn main() -> Result<(), String> {
         })
         .collect();
 
-    // Every sequence alone, with the widest kernel, as the reference.
+    // Every sequence alone through the worker's own call, with the widest
+    // kernel, as the reference.
     canonical_simd::set_fast_canonical_kernel(true);
     canonical_simd::set_batched_kernel_preference(None);
     let alone_started = Instant::now();
-    let alone: Vec<Decoded> = prompts
+    let alone: Vec<Generated> = prompts
         .iter()
-        .map(|prompt| decode_alone(&model, prompt, args.steps))
-        .collect();
+        .map(|prompt| generate_alone(&model, prompt, args.steps))
+        .collect::<Result<_, _>>()?;
     let prefilled = prefill_all(&model, &prompts)?;
-    for (sequence, (reference, state)) in alone.iter().zip(&prefilled).enumerate() {
-        if hash_logits(&state.logits) != reference.prompt_logits {
-            return Err(format!(
-                "sequence {sequence}: the multi-sequence prefill's last prompt logits differ \
-                 from the sequence run alone"
-            ));
-        }
-    }
     println!(
-        "reference: {most} sequences alone and prefilled together in {:.1} s",
+        "reference: {most} sequences alone (try_generate) and prefilled together in {:.1} s",
         alone_started.elapsed().as_secs_f64()
     );
 
@@ -429,8 +422,8 @@ fn main() -> Result<(), String> {
             for (sequence, (got, reference)) in decoded.iter().zip(&alone).enumerate() {
                 if got != reference {
                     return Err(format!(
-                        "{kernel}, {count} sequences: sequence {sequence} decoded other tokens \
-                         or other logits than when it ran alone"
+                        "{kernel}, {count} sequences: sequence {sequence} generated other tokens \
+                         or another output hash than its own try_generate"
                     ));
                 }
             }

@@ -2492,6 +2492,38 @@ fn e4_left(sequences: &[Vec<u32>], states: &[E4Sequence], s: usize) -> usize {
     sequences[s].len() - states[s].cache.seq_len
 }
 
+/// Draws one call's batch: `wanted` rows in total (fewer if the sequences
+/// with rows left hold fewer), shared between a random subset of them in a
+/// random order, at least one row each. `left[s]` is how many rows sequence
+/// `s` still has; at least one must have some.
+fn e4_draw_batch(draw: &mut Draw, left: &[usize], wanted: usize) -> Vec<(usize, usize)> {
+    let mut open: Vec<usize> = (0..left.len()).filter(|&s| left[s] > 0).collect();
+    draw.shuffle(&mut open);
+    // Enough sequences to hold `wanted` rows, then possibly more.
+    let mut members = 0usize;
+    let mut capacity = 0usize;
+    while members < open.len() && members < wanted && capacity < wanted {
+        capacity += left[open[members]];
+        members += 1;
+    }
+    let extra = draw.below(open.len().min(wanted) - members + 1);
+    for &s in &open[members..members + extra] {
+        capacity += left[s];
+    }
+    members += extra;
+    let total = wanted.min(capacity);
+    let mut counts = vec![1usize; members];
+    let mut spare = total - members;
+    while spare > 0 {
+        let i = draw.below(members);
+        if counts[i] < left[open[i]] {
+            counts[i] += 1;
+            spare -= 1;
+        }
+    }
+    open[..members].iter().copied().zip(counts).collect()
+}
+
 /// Feeds every sequence to its end through `forward_rows_multi` calls the
 /// seeded schedule draws, until `sizes` is used up. Each call takes the next
 /// batch size from `sizes` (rows in total), shares it between a random subset
@@ -2521,37 +2553,15 @@ fn e4_sweep(
             })
             .collect();
         loop {
-            let mut open: Vec<usize> = (0..sequences.len())
-                .filter(|&s| e4_left(sequences, &states, s) > 0)
+            let left: Vec<usize> = (0..sequences.len())
+                .map(|s| e4_left(sequences, &states, s))
                 .collect();
-            if open.is_empty() {
+            if left.iter().all(|&rows| rows == 0) {
                 break;
             }
-            draw.shuffle(&mut open);
             let wanted = sizes[next_size.min(sizes.len() - 1)];
-            // Enough sequences to hold `wanted` rows, then possibly more.
-            let mut members = 0usize;
-            let mut capacity = 0usize;
-            while members < open.len() && members < wanted && capacity < wanted {
-                capacity += e4_left(sequences, &states, open[members]);
-                members += 1;
-            }
-            let extra = draw.below(open.len().min(wanted) - members + 1);
-            for &s in &open[members..members + extra] {
-                capacity += e4_left(sequences, &states, s);
-            }
-            members += extra;
-            let total = wanted.min(capacity);
-            let mut counts = vec![1usize; members];
-            let mut left = total - members;
-            while left > 0 {
-                let i = draw.below(members);
-                if counts[i] < e4_left(sequences, &states, open[i]) {
-                    counts[i] += 1;
-                    left -= 1;
-                }
-            }
-            let batch: Vec<(usize, usize)> = open[..members].iter().copied().zip(counts).collect();
+            let batch = e4_draw_batch(&mut draw, &left, wanted);
+            let total: usize = batch.iter().map(|&(_, rows)| rows).sum();
             e4_call(model, sequences, &mut states, &batch, label);
             if total == wanted && next_size < sizes.len() {
                 next_size += 1;
@@ -2793,4 +2803,333 @@ fn golden_modes_multi_sequence_refusal_changes_no_cache() {
     );
     drop(batch);
     assert_eq!(image(&many), many_before, "a refused batch changed a cache");
+}
+
+/// One sequence's state in an E4 stage run: a K/V holder per stage, its
+/// terminal logits and the hidden rows its stage boundaries handed on.
+struct E4StageSequence {
+    holders: Vec<KVCache>,
+    logits: BTreeMap<usize, Vec<i64>>,
+    /// BLAKE3 of the hidden row leaving a stage, keyed by
+    /// (position, the stage's last layer), as the reference's boundaries are.
+    boundaries: BTreeMap<(usize, usize), String>,
+}
+
+/// Runs `batch` (sequence, rows) through every stage of `ends`, one
+/// `forward_rows_multi` call per stage over that stage's layer range: token
+/// ids into the first stage, then each stage's hidden rows into the next, as
+/// separate stage holders exchange them.
+fn e4_stage_call(
+    model: &CachedIntegerModel,
+    ends: &[usize],
+    sequences: &[Vec<u32>],
+    states: &mut [E4StageSequence],
+    batch: &[(usize, usize)],
+    label: &str,
+) {
+    let n_layers = model.config.n_layers;
+    let positions: Vec<usize> = batch
+        .iter()
+        .map(|&(sequence, _)| states[sequence].holders[0].seq_len)
+        .collect();
+    let mut carried: Option<Vec<Vec<Vec<i64>>>> = None;
+    let mut start = 0;
+    for (stage, &end) in ends.iter().enumerate() {
+        let mut taken: Vec<KVCache> = batch
+            .iter()
+            .map(|&(sequence, _)| {
+                std::mem::replace(&mut states[sequence].holders[stage], empty_kv(model))
+            })
+            .collect();
+        let inputs: Vec<ShardRowsInput> = match carried.take() {
+            None => batch
+                .iter()
+                .zip(&positions)
+                .map(|(&(sequence, count), &position)| {
+                    ShardRowsInput::Tokens(sequences[sequence][position..position + count].to_vec())
+                })
+                .collect(),
+            Some(hidden) => hidden.into_iter().map(ShardRowsInput::Hidden).collect(),
+        };
+        let mut rows: Vec<SeqRows<'_>> = taken
+            .iter_mut()
+            .zip(&positions)
+            .zip(inputs)
+            .map(|((cache, &position), input)| SeqRows {
+                cache,
+                position,
+                input,
+            })
+            .collect();
+        let outputs = model
+            .forward_rows_multi(&mut rows, start, end)
+            .unwrap_or_else(|error| {
+                panic!("{label}: stage [{start}, {end}) refused batch {batch:?}: {error}")
+            });
+        drop(rows);
+        for (&(sequence, _), cache) in batch.iter().zip(taken) {
+            states[sequence].holders[stage] = cache;
+        }
+        if end == n_layers {
+            for ((&(sequence, _), &position), output) in batch.iter().zip(&positions).zip(outputs) {
+                let ShardRowsOutput::Logits(logit_rows) = output else {
+                    panic!("{label}: the last stage returned hidden rows");
+                };
+                for (offset, logits) in logit_rows.into_iter().enumerate() {
+                    let previous = states[sequence].logits.insert(position + offset, logits);
+                    assert!(previous.is_none(), "{label}: logits returned twice");
+                }
+            }
+            return;
+        }
+        let mut hidden = Vec::with_capacity(batch.len());
+        for ((&(sequence, _), &position), output) in batch.iter().zip(&positions).zip(outputs) {
+            let ShardRowsOutput::Hidden(stage_rows) = output else {
+                panic!("{label}: stage [{start}, {end}) returned logits");
+            };
+            for (offset, row) in stage_rows.iter().enumerate() {
+                let previous = states[sequence]
+                    .boundaries
+                    .insert((position + offset, end - 1), hash_i64(row));
+                assert!(previous.is_none(), "{label}: a boundary was reported twice");
+            }
+            hidden.push(stage_rows);
+        }
+        carried = Some(hidden);
+        start = end;
+    }
+    panic!("{label}: the last stage of {ends:?} returned hidden rows");
+}
+
+/// Runs every sequence to its end through the stages of `ends` in seeded
+/// multi-sequence batches of 1 to 32 rows, then holds every sequence to its
+/// token-by-token run: its logits, the hidden row at every stage boundary,
+/// and its K/V rows across all stage holders.
+fn e4_stage_run(
+    model: &CachedIntegerModel,
+    ends: &[usize],
+    sequences: &[Vec<u32>],
+    references: &[Reference],
+    seed: u64,
+    label: &str,
+) {
+    let mut draw = Draw(seed);
+    let mut states: Vec<E4StageSequence> = sequences
+        .iter()
+        .map(|_| E4StageSequence {
+            holders: stage_holders(model, ends),
+            logits: BTreeMap::new(),
+            boundaries: BTreeMap::new(),
+        })
+        .collect();
+    loop {
+        let left: Vec<usize> = sequences
+            .iter()
+            .zip(&states)
+            .map(|(tokens, state)| tokens.len() - state.holders[0].seq_len)
+            .collect();
+        if left.iter().all(|&rows| rows == 0) {
+            break;
+        }
+        let wanted = 1 + draw.below(E4_MAX_BATCH / 2);
+        let batch = e4_draw_batch(&mut draw, &left, wanted);
+        e4_stage_call(model, ends, sequences, &mut states, &batch, label);
+    }
+    let cuts = &ends[..ends.len() - 1];
+    for (sequence, (reference, state)) in references.iter().zip(&states).enumerate() {
+        let positions = state.holders[0].seq_len;
+        let mode = format!("{label}, sequence {sequence}");
+        assert_eq!(state.logits.len(), positions, "{mode}: logit rows");
+        for (position, logits) in &state.logits {
+            assert!(
+                logits == &reference.trace.logits[position],
+                "{mode} DIFFERS from the sequence run alone: logits at position {position}"
+            );
+        }
+        for position in 0..positions {
+            for &end in cuts {
+                let layer = end - 1;
+                let actual = state.boundaries.get(&(position, layer)).unwrap_or_else(|| {
+                    panic!("{mode}: no boundary at position {position}, layer {layer}")
+                });
+                assert!(
+                    actual == &reference.trace.boundaries[&(position, layer)],
+                    "{mode} DIFFERS from the sequence run alone: the hidden row leaving \
+                     layer {layer} at position {position}"
+                );
+            }
+        }
+        reference.assert_kv(&merge_holders(ends, &state.holders), positions, &mode);
+    }
+}
+
+/// E4 over stage splits: the same random multi-sequence batches, but through
+/// stage holders that each keep every sequence's K/V for their own layers,
+/// with hidden rows carried between stages, on every 2-way and 4-way split.
+/// Every sequence's logits, every stage-boundary row and every K/V row must
+/// equal its token-by-token run, on every leg and both profiles.
+#[test]
+fn golden_modes_multi_sequence_stage_splits_match_each_sequence_alone() {
+    let switch = KernelSwitch::hold();
+    let fixture = fixture();
+    let sequences = e4_sequences(&fixture);
+    for profile in PROFILES {
+        let model = build_model(&fixture, profile);
+        let references: Vec<Reference> = switch.run(BASE_LEG, || {
+            sequences
+                .iter()
+                .map(|tokens| Reference::new(&model, tokens))
+                .collect()
+        });
+        let splits: Vec<Vec<usize>> = stage_splits(model.config.n_layers)
+            .into_iter()
+            .filter(|ends| ends.len() == 2 || ends.len() == 4)
+            .collect();
+        for (index, leg) in switch.legs().into_iter().enumerate() {
+            for ends in &splits {
+                let seed = 0xD1B5_4A32_D192_ED03
+                    ^ (u64::try_from(index).expect("leg index fits u64") << 32)
+                    ^ u64::try_from(ends[0] * 8 + ends.len()).expect("split fits u64");
+                let label = format!("E4 stages {ends:?} {profile:?} {leg:?}");
+                switch.run(leg, || {
+                    e4_stage_run(&model, ends, &sequences, &references, seed, &label)
+                });
+            }
+        }
+    }
+}
+
+/// The worker's `try_generate` for several sequences at once: the BOS and
+/// every prompt in one `forward_rows_multi` call, then one call per step
+/// carrying every unfinished sequence's last token (the last prompt token
+/// again at the first step, as `try_generate` feeds it). Each sequence picks
+/// its next token from its own row with the worker's selection,
+/// `select_next_token_with_repetition_penalty` over its own generated
+/// history, and leaves the batch when its budget is spent.
+fn generate_together(
+    model: &CachedIntegerModel,
+    prompts: &[Vec<u32>],
+    budgets: &[usize],
+) -> Vec<(Vec<u32>, String)> {
+    let n_layers = model.config.n_layers;
+    let bos = model.config.bos_token;
+    let mut caches: Vec<KVCache> = prompts.iter().map(|_| empty_kv(model)).collect();
+    {
+        let mut batch: Vec<SeqRows<'_>> = caches
+            .iter_mut()
+            .zip(prompts)
+            .map(|(cache, prompt)| {
+                let mut tokens = vec![bos];
+                tokens.extend_from_slice(prompt);
+                SeqRows {
+                    cache,
+                    position: 0,
+                    input: ShardRowsInput::Tokens(tokens),
+                }
+            })
+            .collect();
+        model
+            .forward_rows_multi(&mut batch, 0, n_layers)
+            .expect("the prompts are accepted");
+    }
+    let mut generated: Vec<Vec<u32>> = prompts.iter().map(|_| Vec::new()).collect();
+    loop {
+        let active: Vec<usize> = (0..prompts.len())
+            .filter(|&s| generated[s].len() < budgets[s])
+            .collect();
+        if active.is_empty() {
+            break;
+        }
+        let mut taken: Vec<KVCache> = active
+            .iter()
+            .map(|&s| std::mem::replace(&mut caches[s], empty_kv(model)))
+            .collect();
+        let mut batch: Vec<SeqRows<'_>> = taken
+            .iter_mut()
+            .zip(&active)
+            .map(|(cache, &s)| {
+                let last = generated[s]
+                    .last()
+                    .copied()
+                    .unwrap_or_else(|| *prompts[s].last().expect("a non-empty prompt"));
+                let position = cache.seq_len;
+                SeqRows {
+                    cache,
+                    position,
+                    input: ShardRowsInput::Tokens(vec![last]),
+                }
+            })
+            .collect();
+        let outputs = model
+            .forward_rows_multi(&mut batch, 0, n_layers)
+            .expect("a decode step is accepted");
+        drop(batch);
+        for ((&s, cache), output) in active.iter().zip(taken).zip(outputs) {
+            let ShardRowsOutput::Logits(mut rows) = output else {
+                panic!("a whole-model call returned hidden rows");
+            };
+            let logits = rows.pop().expect("one logits row per sequence");
+            let next = select(&logits, &generated[s]);
+            generated[s].push(next);
+            caches[s] = cache;
+        }
+    }
+    generated
+        .into_iter()
+        .map(|tokens| {
+            let hash = output_hash(&tokens);
+            (tokens, hash)
+        })
+        .collect()
+}
+
+/// Batched decode with the worker's selection: five sequences with prompts of
+/// different lengths and different budgets decode together, each picking its
+/// tokens with the repetition penalty over its own history, and each must
+/// return exactly the tokens and output hash of its own `try_generate`, on
+/// every leg and both profiles.
+#[test]
+fn golden_modes_multi_sequence_decode_selects_like_try_generate() {
+    let switch = KernelSwitch::hold();
+    let fixture = fixture();
+    let vocab = fixture.vocab_size;
+    let prompts: Vec<Vec<u32>> = (2..=6usize)
+        .map(|len| {
+            (0..len)
+                .map(|i| u32::try_from((len * 11 + i * 3 + 1) % vocab).expect("token fits u32"))
+                .collect()
+        })
+        .collect();
+    // BOS, the prompt and every step's forward must fit the context window.
+    let budgets: Vec<usize> = prompts
+        .iter()
+        .map(|prompt| fixture.max_seq - 1 - prompt.len() - prompt.len() % 3)
+        .collect();
+    for profile in PROFILES {
+        let model = build_model(&fixture, profile);
+        let expected: Vec<(Vec<u32>, String)> = switch.run(BASE_LEG, || {
+            prompts
+                .iter()
+                .zip(&budgets)
+                .map(|(prompt, &budget)| {
+                    production_generate(
+                        &model,
+                        Generation::Worker,
+                        prompt,
+                        u32::try_from(budget).expect("budget fits u32"),
+                    )
+                })
+                .collect()
+        });
+        for leg in switch.legs() {
+            let got = switch.run(leg, || generate_together(&model, &prompts, &budgets));
+            for (sequence, (got, want)) in got.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    got, want,
+                    "{profile:?} {leg:?}: sequence {sequence} decoded together differs from \
+                     its own try_generate"
+                );
+            }
+        }
+    }
 }

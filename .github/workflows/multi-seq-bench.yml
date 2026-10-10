@@ -8,12 +8,12 @@ name: Multi-sequence bench
 # prompt and K/V cache, every decode step is one forward_rows_multi call
 # carrying the next row of every sequence (one forward_one_token call for a
 # single sequence), with the scalar kernel and every multi-row kernel the
-# runner's CPU has.
+# runner's CPU has. Every sequence generates as the worker's try_generate
+# does, selecting each token with the repetition penalty over its own history.
 #
 # Every run is also an exactness check on the real model: every sequence must
-# decode the same tokens and logits (by hash), at every step and with every
-# kernel and neighbour count, as when it runs alone through the worker's
-# one-row path, or the driver exits non-zero. Timings are CI-runner
+# return the same tokens and output hash, with every kernel and neighbour
+# count, as its own try_generate, or the driver exits non-zero. Timings are CI-runner
 # measurements on shared 4-vCPU hosted runners, not production figures.
 # Hosted x86-64 hosts vary from run to run (AMD EPYC 7763 with AVX2 only, EPYC
 # 9V74 with AVX-512 VNNI, EPYC 9V45 and Intel Xeon Platinum 8573C with both
@@ -47,10 +47,10 @@ env:
   MODEL_SHA256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa
   MODEL_BYTES: "4081004224"
   MODEL_FILE: .multi-seq-bench/llama-2-7b-chat.Q4_K_M.gguf
-  # Concurrent sequences to measure. The full sweep, 1,2,4,8,16,32, is bench
-  # run 38056837714; this list re-measures the small batches whose routing
-  # changed (two and three rows on the scalar, SDOT and AVX2 kernels).
-  SEQUENCES: "1,2,3,4"
+  # Concurrent sequences to measure. Bench run 38056837714 measured 1 to 32
+  # before small batches ran on the one-row kernels; run 38059431216
+  # re-measured 1 to 4 after it.
+  SEQUENCES: "1,2,3,4,8,16,32"
 
 jobs:
   bench:
