@@ -1939,6 +1939,7 @@ async fn resolve_twin_group(node: &NodeState, group_id: &str) {
                 tokens_generated: canonical.generated.len(),
                 range_count: canonical.range_count,
                 range_position_quorum_count: canonical.range_position_quorum_count,
+                execution_profile: canonical.execution_profile,
             },
         )),
         _ => None,
