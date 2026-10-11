@@ -1,8 +1,9 @@
 //! Opt-in batched multi-token prefill for the canonical per-row I8 profile.
 //!
 //! This is a **separate** switch from [`crate::canonical_simd`], so the effect
-//! of batching can be isolated from the effect of the vectorised kernel. Both
-//! default to OFF. Four combinations are therefore measurable independently:
+//! of batching can be isolated from the effect of the vectorised kernel.
+//! Batching defaults to OFF; the kernel's default depends on the target (see
+//! `canonical_simd`). Four combinations are therefore measurable independently:
 //! scalar/token-at-a-time, scalar/batched, SIMD/token-at-a-time, SIMD/batched.
 //!
 //! # Why batching cannot change a value

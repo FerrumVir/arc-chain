@@ -8206,6 +8206,14 @@ async fn run_arc_node() -> Result<()> {
                         mb_held,
                         model.config.vocab_size
                     );
+                    // Both kernels compute identical values; this records
+                    // which one runs, for operators comparing job times.
+                    tracing::info!(
+                        kernel = arc_inference::canonical_simd::effective_kernel_name(),
+                        source = arc_inference::canonical_simd::kernel_choice_source(),
+                        "Canonical INT8 projection kernel selected \
+                         (ARC_CANONICAL_KERNEL=scalar forces the scalar reference)"
+                    );
                     Some(Arc::new(model))
                 }
                 Err(e) => {
@@ -8924,6 +8932,13 @@ async fn run_arc_node() -> Result<()> {
         tracing::info!("╚═══════════════════════════════════════╝");
     }
 
+    // The node's dedicated inference pool. The community worker loop below
+    // starts before the RPC server, so it holds this handle and `rpc::serve`
+    // attaches the same one: --threads, [inference] threads and the desktop's
+    // live POST /node/threads then size community jobs too. Unset, jobs run
+    // on rayon's global pool as before.
+    let compute_pool = rpc::ComputePool::default();
+
     if community_networking {
         let worker_id = format!("0x{}", hex::encode(validator_address.0));
         // Every validator serves this label on its public scoreboard. It is a
@@ -9236,6 +9251,7 @@ async fn run_arc_node() -> Result<()> {
             let status_w = worker_status.clone();
             let reregister_w = reregister.clone();
             let prevent_sleep_during_jobs = cli.prevent_sleep_during_jobs;
+            let compute_pool_w = compute_pool.clone();
 
             runtime_tasks.push(tokio::spawn(async move {
                 use arc_node::community_worker::{JobOutcome, KeepAwake, WorkerState};
@@ -9685,6 +9701,7 @@ async fn run_arc_node() -> Result<()> {
                             continue;
                         }
                         let worker_execution_for_compute = worker_execution_permit.clone();
+                        let compute_pool_for_job = compute_pool_w.clone();
                         status_w.set_state(WorkerState::Computing);
                         let inference = tokio::task::spawn_blocking(move || {
                             let _worker_execution_permit = worker_execution_for_compute;
@@ -9692,29 +9709,37 @@ async fn run_arc_node() -> Result<()> {
                             // Windows request is per thread). Inert unless
                             // --prevent-sleep-during-jobs was given.
                             let _keep_awake = KeepAwake::begin(prevent_sleep_during_jobs);
-                            // The fallible model API is authoritative at this
-                            // untrusted boundary. It performs checked context
-                            // admission immediately before allocating KV state;
-                            // even a tokenizer-expanded prompt can only become
-                            // a typed worker failure, never an indexing panic.
-                            let (generated, hash) = inference_model
-                                .try_generate(
-                                    &inference_tokens,
-                                    max_tokens,
-                                    &inference_model.config.eos_tokens,
-                                )
-                                .map_err(|error| {
-                                    let helper_admitted = community_generation_fits_context(
-                                        inference_tokens.len(),
+                            // Compute on the node's configured inference pool
+                            // (--threads, [inference] threads or POST
+                            // /node/threads); with none set, on rayon's global
+                            // pool as before. This thread waits for the job,
+                            // so the keep-awake request above stays in force.
+                            compute_pool_for_job.install(|| {
+                                // The fallible model API is authoritative at
+                                // this untrusted boundary. It performs checked
+                                // context admission immediately before
+                                // allocating KV state; even a tokenizer-expanded
+                                // prompt can only become a typed worker failure,
+                                // never an indexing panic.
+                                let (generated, hash) = inference_model
+                                    .try_generate(
+                                        &inference_tokens,
                                         max_tokens,
-                                        inference_model.config.max_seq,
-                                    );
-                                    format!(
-                                        "{error}; worker_context_helper_admitted={helper_admitted}"
+                                        &inference_model.config.eos_tokens,
                                     )
-                                })?;
-                            let output_text = inference_model.decode(&generated);
-                            Ok::<_, String>((generated, hash, output_text))
+                                    .map_err(|error| {
+                                        let helper_admitted = community_generation_fits_context(
+                                            inference_tokens.len(),
+                                            max_tokens,
+                                            inference_model.config.max_seq,
+                                        );
+                                        format!(
+                                            "{error}; worker_context_helper_admitted={helper_admitted}"
+                                        )
+                                    })?;
+                                let output_text = inference_model.decode(&generated);
+                                Ok::<_, String>((generated, hash, output_text))
+                            })
                         })
                         .await;
                         status_w.set_state(WorkerState::Polling);
@@ -9981,6 +10006,7 @@ async fn run_arc_node() -> Result<()> {
         coordinator_seed_rpcs,
         community_rpc_bases,
         compute_threads,
+        compute_pool,
         genesis_chain_identity,
         cli.enable_community_rewards_v1,
         native_serving,
@@ -11143,6 +11169,7 @@ mod tests {
                     Vec::new(),
                     vec![holder_origin],
                     0,
+                    rpc::ComputePool::default(),
                     None,
                     false,
                     None,
