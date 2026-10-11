@@ -15,7 +15,9 @@ name: CPU matrix kernels
 # on that runner, and the log says so. Hosted x86-64 hosts vary (AMD EPYC
 # 7763 has no AVX-512; EPYC 9V74 has AVX-512 VNNI), so two Linux x86-64 legs
 # run. ci.yml and golden-vectors.yml run only for pull requests into main, so
-# this workflow also carries rustfmt and clippy for the code it covers.
+# this workflow also carries rustfmt and clippy for the code it covers, and a
+# node job that lints arc-node and tests the kernel report it logs at model
+# load and serves from GET /node/threads and /node/info.
 on:
   pull_request:
     paths:
@@ -191,3 +193,29 @@ jobs:
               cargo test -p arc-inference --lib --locked batched_prefill -- --nocapture < /dev/null
             echo "::endgroup::"
           done < crates/arc-inference/batched-kernels.txt
+
+  node:
+    # arc-node logs the selected kernels at model load and serves them from
+    # GET /node/threads and /node/info. ci.yml lints and tests arc-node only
+    # for pull requests into main, so this job does it for this one.
+    name: node kernel report (linux-x86-64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Keep this dated toolchain aligned with rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: cpu-matrix-node
+      - name: clippy, arc-node, warnings denied
+        run: cargo clippy -p arc-node --all-targets --locked -- -D warnings
+      - name: The node's status names the kernels its projections run
+        run: >-
+          cargo test -p arc-node --lib --locked
+          node_status_names_the_kernels_projections_run -- --nocapture

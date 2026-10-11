@@ -8198,6 +8198,24 @@ async fn run_arc_node() -> Result<()> {
                             std::env::consts::ARCH
                         );
                     }
+                    // The CPU kernel each kind of canonical INT8 projection
+                    // runs, and what became of an ARC_CANONICAL_BATCHED_KERNEL
+                    // pin. GET /node/threads reports the same, with each
+                    // kernel's projection count since start.
+                    let kernels = arc_inference::canonical_simd::kernel_report();
+                    if model.has_canonical_i8_profile() {
+                        tracing::info!(
+                            one_token = kernels.one_token_label(),
+                            batched = kernels.batched_label(),
+                            pin_status = kernels.pin_status.label(),
+                            "Canonical INT8 projection kernels: {kernels}"
+                        );
+                    } else {
+                        tracing::info!(
+                            "Canonical INT8 projection kernels: {kernels}. This model is not on \
+                             the canonical per-row INT8 profile, so none of its projections run them"
+                        );
+                    }
                     tracing::info!(
                         "Model loaded in {:.1}s - {} layers held / {} total, {} MB shard weights, vocab {}",
                         elapsed.as_secs_f64(),

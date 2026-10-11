@@ -2907,6 +2907,9 @@ struct NodeInfoResponse {
     height: u64,
     version: String,
     mempool_size: usize,
+    /// The canonical INT8 projection kernels this process runs, as
+    /// `GET /node/threads` reports them under `kernels`.
+    kernels: Value,
 }
 
 async fn node_info(AxumState(node): AxumState<NodeState>) -> Json<NodeInfoResponse> {
@@ -2917,6 +2920,7 @@ async fn node_info(AxumState(node): AxumState<NodeState>) -> Json<NodeInfoRespon
         height: node.state.height(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         mempool_size: node.mempool.len(),
+        kernels: kernel_report_json(&node),
     })
 }
 
@@ -18497,7 +18501,7 @@ async fn node_contribution(AxumState(node): AxumState<NodeState>) -> Json<Value>
 /// Report the width of the pool that runs local inference compute.
 async fn get_node_threads(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let dedicated = node.compute_threads.load(Ordering::Relaxed);
-    Json(json!({
+    let mut body = json!({
         "threads": if dedicated > 0 { dedicated as usize } else { rayon_global_width() },
         "dedicated_pool": dedicated > 0,
         "dedicated_threads": dedicated,
@@ -18505,7 +18509,9 @@ async fn get_node_threads(AxumState(node): AxumState<NodeState>) -> Json<Value> 
         "rayon_num_threads_env": std::env::var("RAYON_NUM_THREADS").ok(),
         "available_parallelism": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
         "note": "POST {\"threads\": n} to rebuild the pool live; n=0 returns to rayon's global pool",
-    }))
+    });
+    insert_kernel_report(&mut body, &node);
+    Json(body)
 }
 
 #[derive(Deserialize)]
@@ -18541,6 +18547,70 @@ async fn set_node_threads(
         "threads": if applied > 0 { applied } else { rayon_global_width() },
         "dedicated_pool": applied > 0,
     })))
+}
+
+/// The canonical INT8 projection kernels this process runs, for node status.
+///
+/// `one_token` is the kernel that computes a one-token decode step's
+/// projections, and `batched` the kernel that computes multi-row projections
+/// (prefill chunks, verified rows, batched sequences). `pin_status` says what
+/// became of an `ARC_CANONICAL_BATCHED_KERNEL` pin: `unpinned`, `honoured`,
+/// `fell-back` (this CPU lacks `pin_missing_cpu_features`), `inactive` (the
+/// vector kernels are off) or `unrecognised`. The run counts are each
+/// kernel's projections since start, the record of what actually ran.
+/// `serves_loaded_model` is false when the loaded model is not on the
+/// canonical per-row INT8 profile, so none of its projections run these
+/// kernels.
+fn kernel_report_json(node: &NodeState) -> Value {
+    use arc_inference::canonical_simd::{self, BatchedKernel};
+    let report = canonical_simd::kernel_report();
+    let runs = |count: fn(BatchedKernel) -> u64| -> serde_json::Map<String, Value> {
+        BatchedKernel::ALL
+            .into_iter()
+            .filter(|kernel| kernel.available() || count(*kernel) > 0)
+            .map(|kernel| (kernel.label().to_string(), Value::from(count(kernel))))
+            .collect()
+    };
+    let one_token_runs = runs(canonical_simd::one_row_kernel_runs);
+    let batched_runs = runs(canonical_simd::batched_kernel_runs);
+    let cpu_features: serde_json::Map<String, Value> = canonical_simd::detected_cpu_features()
+        .into_iter()
+        .map(|(feature, detected)| (feature.to_string(), Value::Bool(detected)))
+        .collect();
+    let available_kernels: Vec<&str> = canonical_simd::available_batched_kernels()
+        .into_iter()
+        .map(BatchedKernel::label)
+        .collect();
+    let serves_loaded_model = node
+        .inference_model
+        .as_ref()
+        .map(|model| model.has_canonical_i8_profile());
+    json!({
+        "one_token": report.one_token_label(),
+        "batched": report.batched_label(),
+        "vector_kernels_on": report.vector_enabled,
+        "pin": report.pin.map(BatchedKernel::label),
+        "pin_status": report.pin_status.label(),
+        "pin_missing_cpu_features": report.pin_missing_cpu_features,
+        "canonical_batched_kernel_env": report.pin_env,
+        "cpu_features": cpu_features,
+        "available_kernels": available_kernels,
+        "one_token_runs": one_token_runs,
+        "batched_runs": batched_runs,
+        "serves_loaded_model": serves_loaded_model,
+    })
+}
+
+/// Add the kernel report to a node status object: `canonical_kernel`, the
+/// kernel that computes a one-token step, and `kernels`, the whole of
+/// [`kernel_report_json`]. Written last, so the kernel that runs replaces any
+/// value either key already holds.
+fn insert_kernel_report(body: &mut Value, node: &NodeState) {
+    let kernels = kernel_report_json(node);
+    if let Some(object) = body.as_object_mut() {
+        object.insert("canonical_kernel".to_string(), kernels["one_token"].clone());
+        object.insert("kernels".to_string(), kernels);
+    }
 }
 
 #[cfg(test)]
@@ -28078,6 +28148,27 @@ mod tests {
         )
         .expect_err("an unapproved signature cannot satisfy reward verification");
         assert!(error.contains("unapproved signer"), "{error}");
+    }
+
+    // ── canonical INT8 kernels ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn node_status_names_the_kernels_projections_run() {
+        let node = fake_node_with_workers(vec![]);
+        let report = arc_inference::canonical_simd::kernel_report();
+        let Json(threads) = get_node_threads(AxumState(node.clone())).await;
+        // `canonical_kernel` is the kernel a one-token step runs: a VNNI or
+        // SMMLA kernel whenever one is selected, not the base kernel.
+        assert_eq!(threads["canonical_kernel"], report.one_token_label());
+        let kernels = &threads["kernels"];
+        assert_eq!(kernels["one_token"], report.one_token_label());
+        assert_eq!(kernels["batched"], report.batched_label());
+        assert_eq!(kernels["pin_status"], report.pin_status.label());
+        assert!(kernels["one_token_runs"].is_object(), "{kernels}");
+        assert!(kernels["batched_runs"].is_object(), "{kernels}");
+        let Json(info) = node_info(AxumState(node)).await;
+        let info = serde_json::to_value(&info).expect("node info serialises");
+        assert_eq!(&info["kernels"]["one_token"], &kernels["one_token"]);
     }
 
     // ── compute pool ────────────────────────────────────────────────────

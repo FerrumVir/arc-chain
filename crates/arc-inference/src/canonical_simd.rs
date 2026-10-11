@@ -122,8 +122,10 @@
 //! [`fast_canonical_kernel_enabled`] is true (`ARC_FAST_CANONICAL_KERNEL=1`
 //! or [`set_fast_canonical_kernel`]). `ARC_CANONICAL_BATCHED_KERNEL=<label>`
 //! or [`set_batched_kernel_preference`] picks among the kernels the CPU has,
-//! for tests and benchmarks; a kernel the CPU lacks falls back to the best
-//! one it has. [`batched_kernel_runs`] counts which kernel actually ran.
+//! for one-row and multi-row projections alike; a kernel the CPU lacks falls
+//! back to the best one it has. [`kernel_report`] names the kernel each kind
+//! of projection runs and what became of a pin, and [`one_row_kernel_runs`]
+//! and [`batched_kernel_runs`] count which kernel actually ran.
 //!
 //! Conformance evidence, including sanitiser runs and the boundary suite, is in
 //! `Desktop/Arc Chain V2/claude-reviews/stage-b-kernel-conformance.c`.
@@ -416,6 +418,49 @@ impl BatchedKernel {
             _ => false,
         }
     }
+
+    /// The CPU features this kernel needs, named as [`detected_cpu_features`]
+    /// names them. [`Self::available`] checks exactly these.
+    pub const fn required_cpu_features(self) -> &'static [&'static str] {
+        match self {
+            Self::NeonSdot => &["dotprod"],
+            Self::NeonI8mm => &["dotprod", "i8mm"],
+            Self::Avx2 => &["avx2"],
+            Self::AvxVnni => &["avx2", "avxvnni"],
+            Self::Avx512Vnni => &["avx2", "avx512f", "avx512vnni"],
+        }
+    }
+
+    /// The features in [`Self::required_cpu_features`] that this process does
+    /// not detect: empty exactly when the kernel is [available](Self::available).
+    pub fn missing_cpu_features(self) -> Vec<&'static str> {
+        let detected = detected_cpu_features();
+        self.required_cpu_features()
+            .iter()
+            .copied()
+            .filter(|feature| !detected.contains(&(*feature, true)))
+            .collect()
+    }
+}
+
+/// This architecture's base kernel. It computes a one-row projection in its
+/// one-row form (`dot_limbs_dotprod`) whenever the selected kernel does not
+/// [serve one row](BatchedKernel::serves_one_row), and has the same label.
+const BASE_KERNEL: BatchedKernel = if cfg!(target_arch = "x86_64") {
+    BatchedKernel::Avx2
+} else {
+    BatchedKernel::NeonSdot
+};
+
+/// The kernel that computes a one-row projection while `selected` is the
+/// selected kernel: a matrix-extension kernel computes it itself, and
+/// otherwise the base kernel's one-row form does.
+const fn one_row_kernel(selected: BatchedKernel) -> BatchedKernel {
+    if selected.serves_one_row() {
+        selected
+    } else {
+        BASE_KERNEL
+    }
 }
 
 /// Every batched kernel this CPU can run, in declaration order.
@@ -442,23 +487,35 @@ pub fn best_batched_kernel() -> Option<BatchedKernel> {
 /// `0` is automatic selection; otherwise the preferred kernel's index + 1.
 static BATCHED_PREFERENCE: AtomicU8 = AtomicU8::new(0);
 
+/// The variable that pins one kernel for one-row and multi-row projections:
+/// a kernel's [label](BatchedKernel::label), or `auto`. It is read once, at
+/// first use.
+pub const BATCHED_KERNEL_ENV: &str = "ARC_CANONICAL_BATCHED_KERNEL";
+
 /// `ARC_CANONICAL_BATCHED_KERNEL=<label>` sets the initial preference once.
-/// An explicit [`set_batched_kernel_preference`] call always wins.
-fn apply_batched_kernel_env() {
-    static ENV_INIT: OnceLock<()> = OnceLock::new();
-    ENV_INIT.get_or_init(|| {
-        let Ok(value) = std::env::var("ARC_CANONICAL_BATCHED_KERNEL") else {
-            return;
-        };
-        let value = value.trim();
-        match BatchedKernel::from_label(value) {
-            Some(kernel) => BATCHED_PREFERENCE.store(kernel as u8 + 1, Ordering::Relaxed),
-            None if value.is_empty() || value == "auto" => {}
-            None => eprintln!(
-                "ARC_CANONICAL_BATCHED_KERNEL={value:?} names no batched kernel; selecting automatically"
-            ),
-        }
-    });
+/// An explicit [`set_batched_kernel_preference`] call always wins. Returns
+/// the variable's value as read, trimmed, when it was set.
+fn apply_batched_kernel_env() -> Option<&'static str> {
+    static ENV_VALUE: OnceLock<Option<String>> = OnceLock::new();
+    ENV_VALUE
+        .get_or_init(|| {
+            let value = std::env::var(BATCHED_KERNEL_ENV).ok()?.trim().to_owned();
+            match BatchedKernel::from_label(&value) {
+                Some(kernel) => BATCHED_PREFERENCE.store(kernel as u8 + 1, Ordering::Relaxed),
+                None if value.is_empty() || value == "auto" => {}
+                None => eprintln!(
+                    "ARC_CANONICAL_BATCHED_KERNEL={value:?} names no batched kernel; selecting automatically"
+                ),
+            }
+            Some(value)
+        })
+        .as_deref()
+}
+
+/// Whether an `ARC_CANONICAL_BATCHED_KERNEL` value names no kernel, and is
+/// not `auto` or empty either.
+fn names_no_kernel(value: &str) -> bool {
+    !value.is_empty() && value != "auto" && BatchedKernel::from_label(value).is_none()
 }
 
 /// Prefer one batched kernel, or `None` for automatic selection.
@@ -490,7 +547,33 @@ pub fn selected_batched_kernel() -> Option<BatchedKernel> {
 }
 
 static BATCHED_RUNS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static ONE_ROW_RUNS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static LAST_BATCHED: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's projections by kernel, one-row then batched, counted
+    /// where the process-wide counters are. The test harness runs tests in
+    /// parallel threads of one process, so a test reads its own calls here.
+    static THREAD_KERNEL_RUNS: std::cell::Cell<[[u64; 5]; 2]> =
+        const { std::cell::Cell::new([[0; 5]; 2]) };
+}
+
+#[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn count_kernel_on_this_thread(path: usize, kernel: BatchedKernel) {
+    THREAD_KERNEL_RUNS.with(|cell| {
+        let mut runs = cell.get();
+        runs[path][kernel as usize] += 1;
+        cell.set(runs);
+    });
+}
+
+/// Return this thread's projections by kernel, `[one-row, batched]`, and
+/// reset them.
+#[cfg(test)]
+fn take_thread_kernel_runs() -> [[u64; 5]; 2] {
+    THREAD_KERNEL_RUNS.with(|cell| cell.replace([[0; 5]; 2]))
+}
 
 /// Always counted: one relaxed increment per projection call, so a log or a
 /// bench can show which kernel really ran.
@@ -498,6 +581,17 @@ static LAST_BATCHED: AtomicU8 = AtomicU8::new(0);
 fn record_batched_run(kernel: BatchedKernel) {
     BATCHED_RUNS[kernel as usize].fetch_add(1, Ordering::Relaxed);
     LAST_BATCHED.store(kernel as u8 + 1, Ordering::Relaxed);
+    #[cfg(test)]
+    count_kernel_on_this_thread(1, kernel);
+}
+
+/// Counted like [`record_batched_run`]: one relaxed increment per one-row
+/// projection, against the kernel that computed it.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn record_one_row_run(kernel: BatchedKernel) {
+    ONE_ROW_RUNS[kernel as usize].fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    count_kernel_on_this_thread(0, kernel);
 }
 
 /// How many projections `kernel` has computed in this process through
@@ -505,6 +599,15 @@ fn record_batched_run(kernel: BatchedKernel) {
 /// that [serves one row](BatchedKernel::serves_one_row).
 pub fn batched_kernel_runs(kernel: BatchedKernel) -> u64 {
     BATCHED_RUNS[kernel as usize].load(Ordering::Relaxed)
+}
+
+/// How many one-row projections ([`matmul_i8_canonical_rows_fast`], which
+/// every one-token decode step takes) `kernel` has computed in this process.
+/// A base kernel computes them in its one-row form; a matrix-extension
+/// kernel computes them as one-token batched calls, which
+/// [`batched_kernel_runs`] counts as well.
+pub fn one_row_kernel_runs(kernel: BatchedKernel) -> u64 {
+    ONE_ROW_RUNS[kernel as usize].load(Ordering::Relaxed)
 }
 
 /// The kernel of the most recent accepted batched projection, if any.
@@ -553,6 +656,143 @@ pub fn detected_cpu_features() -> Vec<(&'static str, bool)> {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         Vec::new()
+    }
+}
+
+/// The scalar reference kernel's label in reports, as the determinism proof
+/// names it.
+pub const SCALAR_KERNEL_LABEL: &str = "scalar-i8xi64";
+
+/// What became of a kernel pin ([`BATCHED_KERNEL_ENV`] or
+/// [`set_batched_kernel_preference`]), as [`KernelReport`] states it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinStatus {
+    /// No pin is set: the widest kernel this CPU has is selected.
+    Unpinned,
+    /// The pinned kernel is selected, for one-row and multi-row projections.
+    Honoured,
+    /// This CPU lacks a feature the pinned kernel needs, so the widest kernel
+    /// it has is selected instead.
+    FellBack,
+    /// The vector kernels are off, so every projection runs the scalar kernel
+    /// and the pin selects nothing.
+    Inactive,
+    /// [`BATCHED_KERNEL_ENV`] names no kernel, so selection is automatic.
+    Unrecognised,
+}
+
+impl PinStatus {
+    /// The status's name in logs and node status.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unpinned => "unpinned",
+            Self::Honoured => "honoured",
+            Self::FellBack => "fell-back",
+            Self::Inactive => "inactive",
+            Self::Unrecognised => "unrecognised",
+        }
+    }
+}
+
+/// The kernels canonical INT8 projections run, as selected now, and what
+/// became of a pin. arc-node logs it when it loads a model and serves it from
+/// `GET /node/threads`. A kernel of `None` is the scalar kernel
+/// ([`SCALAR_KERNEL_LABEL`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelReport {
+    /// Whether the vector kernels are on ([`fast_canonical_kernel_enabled`]).
+    pub vector_enabled: bool,
+    /// The kernel that computes a one-row projection, as every one-token
+    /// decode step does ([`matmul_i8_canonical_rows_fast`]).
+    pub one_token: Option<BatchedKernel>,
+    /// The kernel that computes a multi-row projection
+    /// ([`matmul_i8_batched_fast`]): prefill chunks, verified rows and
+    /// batched sequences.
+    pub batched: Option<BatchedKernel>,
+    /// The pinned kernel, when a pin is set.
+    pub pin: Option<BatchedKernel>,
+    /// [`BATCHED_KERNEL_ENV`] as read at first use, trimmed, when it is set.
+    pub pin_env: Option<&'static str>,
+    /// Whether the pin took effect.
+    pub pin_status: PinStatus,
+    /// The features the pinned kernel needs that this CPU lacks; empty when
+    /// it has them all or no pin is set.
+    pub pin_missing_cpu_features: Vec<&'static str>,
+}
+
+impl KernelReport {
+    /// The label of [`Self::one_token`].
+    pub fn one_token_label(&self) -> &'static str {
+        kernel_label(self.one_token)
+    }
+
+    /// The label of [`Self::batched`].
+    pub fn batched_label(&self) -> &'static str {
+        kernel_label(self.batched)
+    }
+}
+
+/// A kernel's label; `None` is the scalar kernel.
+fn kernel_label(kernel: Option<BatchedKernel>) -> &'static str {
+    kernel.map_or(SCALAR_KERNEL_LABEL, BatchedKernel::label)
+}
+
+impl std::fmt::Display for KernelReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "one-token {}, batched {}",
+            self.one_token_label(),
+            self.batched_label()
+        )?;
+        let pin = kernel_label(self.pin);
+        match self.pin_status {
+            PinStatus::Unpinned => f.write_str("; no pin"),
+            PinStatus::Honoured => write!(f, "; pin {pin} honoured"),
+            PinStatus::FellBack => write!(
+                f,
+                "; pin {pin} fell back, this CPU lacks {}",
+                self.pin_missing_cpu_features.join(", ")
+            ),
+            PinStatus::Inactive => write!(f, "; pin {pin} inactive, the vector kernels are off"),
+            PinStatus::Unrecognised => write!(
+                f,
+                "; ARC_CANONICAL_BATCHED_KERNEL={:?} names no kernel",
+                self.pin_env.unwrap_or_default()
+            ),
+        }
+    }
+}
+
+/// The kernels canonical INT8 projections run right now; see [`KernelReport`].
+///
+/// One-row and multi-row projections take the same selection
+/// ([`selected_batched_kernel`]), so a pin holds for both: a
+/// matrix-extension kernel computes both, and with a base kernel selected a
+/// one-row projection runs that kernel's one-row form, which has the same
+/// label. With the vector kernels off, both run the scalar kernel. The
+/// dyadic profile in `crate::modern` is not covered: its one-row dots always
+/// run the base kernel.
+pub fn kernel_report() -> KernelReport {
+    let pin_env = apply_batched_kernel_env();
+    let pin = batched_kernel_preference();
+    let vector_enabled = fast_canonical_kernel_enabled();
+    let selected = selected_batched_kernel().filter(|_| vector_enabled);
+    let pin_status = match pin {
+        Some(_) if !vector_enabled => PinStatus::Inactive,
+        Some(kernel) if kernel.available() => PinStatus::Honoured,
+        Some(_) => PinStatus::FellBack,
+        None if pin_env.is_some_and(names_no_kernel) => PinStatus::Unrecognised,
+        None => PinStatus::Unpinned,
+    };
+    KernelReport {
+        vector_enabled,
+        one_token: selected.map(one_row_kernel),
+        batched: selected,
+        pin,
+        pin_env,
+        pin_status,
+        pin_missing_cpu_features: pin.map_or_else(Vec::new, BatchedKernel::missing_cpu_features),
     }
 }
 
@@ -1164,7 +1404,11 @@ pub(crate) fn matmul_i8_canonical_rows_fast_view(
         // call: the same checks, digits and epilogue, so the same bytes, and
         // it records its own attempt and outcome.
         if let Some(kernel) = selected_batched_kernel().filter(|k| k.serves_one_row()) {
-            return matmul_i8_batched_view(kernel, weights, input, 1, in_size, output);
+            let accepted = matmul_i8_batched_view(kernel, weights, input, 1, in_size, output);
+            if accepted {
+                record_one_row_run(kernel);
+            }
+            return accepted;
         }
         record_attempt();
         if !dotprod_available() {
@@ -1226,6 +1470,7 @@ pub(crate) fn matmul_i8_canonical_rows_fast_view(
                     }
                 });
             record_accept();
+            record_one_row_run(BASE_KERNEL);
             true
         })
     }
@@ -2322,9 +2567,13 @@ mod tests {
     /// really has. `ARC_BATCHED_KERNELS_OUT` receives the available labels,
     /// one per line, for the workflow's per-kernel runs. When the workflow
     /// derives `ARC_EXPECT_BATCHED_KERNELS` from the OS's CPU flags, every
-    /// kernel those flags allow must also be detected here.
+    /// kernel those flags allow must also be detected here. Under
+    /// `ARC_CANONICAL_BATCHED_KERNEL` the node's kernel report must show the
+    /// pin, and both kinds of projection on the pinned kernel.
     #[test]
     fn batched_kernel_report() {
+        // Held so that no other test changes the selection while it is read.
+        let _guard = kernel_switch_guard();
         let available: Vec<&str> = available_batched_kernels()
             .into_iter()
             .map(BatchedKernel::label)
@@ -2356,6 +2605,20 @@ mod tests {
                     kernel.available(),
                     "the OS reports the CPU flags for {label}, but it was not detected"
                 );
+            }
+        }
+        // What the node logs and serves. The workflow's pinned runs set
+        // ARC_CANONICAL_BATCHED_KERNEL to each kernel this CPU has, avx2-limb
+        // and neon-sdot-limb included, so with the vector kernels on, the pin
+        // must hold for one-token and multi-row projections alike.
+        let report = kernel_report();
+        println!("kernel report: {report}");
+        if let Some(pinned) = report.pin_env.and_then(BatchedKernel::from_label) {
+            assert_eq!(report.pin, Some(pinned), "{report}");
+            if report.vector_enabled && pinned.available() {
+                assert_eq!(report.pin_status, PinStatus::Honoured, "{report}");
+                assert_eq!(report.one_token, Some(pinned), "{report}");
+                assert_eq!(report.batched, Some(pinned), "{report}");
             }
         }
     }
@@ -2590,5 +2853,205 @@ mod tests {
             }
         }
         set_batched_kernel_preference(previous);
+    }
+
+    /// The one kernel that computed every projection counted in `runs`, or
+    /// `None` when none did. Two kernels in one count fail the test.
+    fn the_kernel_that_ran(runs: [u64; 5], case: &str) -> Option<BatchedKernel> {
+        let ran: Vec<BatchedKernel> = BatchedKernel::ALL
+            .into_iter()
+            .filter(|kernel| runs[*kernel as usize] > 0)
+            .collect();
+        assert!(ran.len() <= 1, "{case}: more than one kernel ran: {runs:?}");
+        ran.first().copied()
+    }
+
+    /// What the node reports is what runs. With every kernel pinned
+    /// (`avx2-limb` included), with no pin, and with the vector kernels off,
+    /// one projection goes through each entry point decode and prefill take,
+    /// and the kernel the counters record must be the one the report names.
+    #[test]
+    fn kernel_report_names_the_kernels_the_counters_show_ran() {
+        let _guard = kernel_switch_guard();
+        let previous_vector = fast_canonical_kernel_enabled();
+        let previous_pin = batched_kernel_preference();
+        let (rows, cols, tokens) = (9usize, 200usize, 3usize);
+        let w = weights_from(rows, cols, |r, c| (r * 37 + c * 11) as u8 as i8);
+        let inputs: Vec<i64> = (0..(tokens * cols) as i64)
+            .map(|i| i * 7_919 - 600_000)
+            .collect();
+        let want = scalar_batched(&w, &inputs, tokens, cols);
+        let pins: Vec<Option<BatchedKernel>> = std::iter::once(None)
+            .chain(BatchedKernel::ALL.map(Some))
+            .collect();
+        for vector in [true, false] {
+            for &pin in &pins {
+                set_fast_canonical_kernel(vector);
+                set_batched_kernel_preference(pin);
+                let report = kernel_report();
+                let case = format!(
+                    "vector kernels {vector}, pin {:?}: {report}",
+                    pin.map(BatchedKernel::label)
+                );
+                // The selection rules: the pinned kernel if this CPU has it,
+                // otherwise the widest kernel it has, and the scalar kernel
+                // when the vector kernels are off. One-row and multi-row
+                // projections take the same selection.
+                let on = vector && dotprod_available();
+                let expected = if on {
+                    pin.filter(|kernel| kernel.available())
+                        .or_else(best_batched_kernel)
+                } else {
+                    None
+                };
+                assert_eq!(report.vector_enabled, on, "{case}");
+                assert_eq!(report.one_token, expected, "{case}");
+                assert_eq!(report.batched, expected, "{case}");
+                assert_eq!(report.pin, pin, "{case}");
+                match pin {
+                    None => assert!(
+                        matches!(
+                            report.pin_status,
+                            PinStatus::Unpinned | PinStatus::Unrecognised
+                        ),
+                        "{case}"
+                    ),
+                    Some(kernel) => {
+                        let status = if !on {
+                            PinStatus::Inactive
+                        } else if kernel.available() {
+                            PinStatus::Honoured
+                        } else {
+                            PinStatus::FellBack
+                        };
+                        assert_eq!(report.pin_status, status, "{case}");
+                        assert_eq!(
+                            report.pin_missing_cpu_features.is_empty(),
+                            kernel.available(),
+                            "{case}"
+                        );
+                    }
+                }
+
+                // One row through `matmul_i8_into`, the call every projection
+                // of a one-token decode step makes.
+                let _ = take_thread_kernel_runs();
+                let one_row_before = expected.map(one_row_kernel_runs);
+                let mut got = vec![SENTINEL; rows];
+                crate::cached_integer_model::matmul_i8_into(&w, &inputs[..cols], cols, &mut got);
+                assert_eq!(got.as_slice(), &want[..rows], "{case}: one row");
+                let [one_row, _] = take_thread_kernel_runs();
+                assert_eq!(
+                    the_kernel_that_ran(one_row, &case),
+                    report.one_token,
+                    "{case}: one row"
+                );
+                if let (Some(kernel), Some(before)) = (expected, one_row_before) {
+                    assert!(one_row_kernel_runs(kernel) > before, "{case}: one row");
+                }
+
+                // `tokens` rows through `matmul_i8_into_batched`, the call
+                // prefill chunks and verified rows make.
+                let batched_before = expected.map(batched_kernel_runs);
+                let mut got = vec![SENTINEL; tokens * rows];
+                crate::cached_integer_model::matmul_i8_into_batched(
+                    &w, &inputs, tokens, cols, &mut got,
+                );
+                assert_eq!(got, want, "{case}: {tokens} rows");
+                let [_, batched] = take_thread_kernel_runs();
+                assert_eq!(
+                    the_kernel_that_ran(batched, &case),
+                    report.batched,
+                    "{case}: {tokens} rows"
+                );
+                if let (Some(kernel), Some(before)) = (expected, batched_before) {
+                    assert!(
+                        batched_kernel_runs(kernel) > before,
+                        "{case}: {tokens} rows"
+                    );
+                }
+            }
+        }
+        set_batched_kernel_preference(previous_pin);
+        set_fast_canonical_kernel(previous_vector);
+    }
+
+    #[test]
+    fn a_kernel_is_available_exactly_when_no_feature_it_needs_is_missing() {
+        for kernel in BatchedKernel::ALL {
+            let missing = kernel.missing_cpu_features();
+            assert_eq!(missing.is_empty(), kernel.available(), "{}", kernel.label());
+            for feature in &missing {
+                assert!(kernel.required_cpu_features().contains(feature));
+            }
+        }
+    }
+
+    #[test]
+    fn kernel_report_reads_as_one_line_per_pin_status() {
+        let unpinned = KernelReport {
+            vector_enabled: true,
+            one_token: Some(BatchedKernel::Avx512Vnni),
+            batched: Some(BatchedKernel::Avx512Vnni),
+            pin: None,
+            pin_env: None,
+            pin_status: PinStatus::Unpinned,
+            pin_missing_cpu_features: Vec::new(),
+        };
+        let honoured = KernelReport {
+            one_token: Some(BatchedKernel::Avx2),
+            batched: Some(BatchedKernel::Avx2),
+            pin: Some(BatchedKernel::Avx2),
+            pin_env: Some("avx2-limb"),
+            pin_status: PinStatus::Honoured,
+            ..unpinned.clone()
+        };
+        let fell_back = KernelReport {
+            pin: Some(BatchedKernel::Avx512Vnni),
+            pin_env: Some("avx512-vnni-limb"),
+            pin_status: PinStatus::FellBack,
+            pin_missing_cpu_features: vec!["avx512f", "avx512vnni"],
+            ..honoured.clone()
+        };
+        let inactive = KernelReport {
+            vector_enabled: false,
+            one_token: None,
+            batched: None,
+            pin_status: PinStatus::Inactive,
+            ..honoured.clone()
+        };
+        let unrecognised = KernelReport {
+            pin_env: Some("vnni"),
+            pin_status: PinStatus::Unrecognised,
+            ..unpinned.clone()
+        };
+        let lines = [
+            (
+                unpinned,
+                "one-token avx512-vnni-limb, batched avx512-vnni-limb; no pin",
+            ),
+            (
+                honoured,
+                "one-token avx2-limb, batched avx2-limb; pin avx2-limb honoured",
+            ),
+            (
+                fell_back,
+                "one-token avx2-limb, batched avx2-limb; pin avx512-vnni-limb fell back, \
+                 this CPU lacks avx512f, avx512vnni",
+            ),
+            (
+                inactive,
+                "one-token scalar-i8xi64, batched scalar-i8xi64; pin avx2-limb inactive, \
+                 the vector kernels are off",
+            ),
+            (
+                unrecognised,
+                "one-token avx512-vnni-limb, batched avx512-vnni-limb; \
+                 ARC_CANONICAL_BATCHED_KERNEL=\"vnni\" names no kernel",
+            ),
+        ];
+        for (report, line) in lines {
+            assert_eq!(report.to_string(), line);
+        }
     }
 }

@@ -981,7 +981,12 @@ unsafe fn dot_i8_i64(row: *const i8, input: *const i64, len: usize) -> i64 {
 
 /// Write matmul result into pre-allocated output buffer (zero-alloc).
 /// Parallel with 512-row chunks to minimize rayon scheduling overhead.
-fn matmul_i8_into(weights: &I8Weights, input: &[i64], in_size: usize, output: &mut [i64]) {
+pub(crate) fn matmul_i8_into(
+    weights: &I8Weights,
+    input: &[i64],
+    in_size: usize,
+    output: &mut [i64],
+) {
     matmul_i8_view_into(I8WeightsView::from(weights), input, in_size, output);
 }
 
