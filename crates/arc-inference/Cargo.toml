@@ -154,3 +154,7 @@ required-features = ["candle"]
 [[example]]
 name = "low_residency_conformance"
 required-features = ["candle"]
+
+[[example]]
+name = "stage_rows_bench"
+required-features = ["candle"]
