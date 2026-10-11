@@ -194,6 +194,15 @@ pub const COMMUNITY_SUBMIT_REQUEST_TIMEOUT_SECS: u64 = 2_700;
 pub const PUBLIC_INFERENCE_REQUEST_TIMEOUT_SECS: u64 = 4_000;
 const COMMUNITY_LATE_SUBMIT_GRACE_SECS: u64 = 5 * 60;
 const VERIFIED_SETTLEMENT_CAP: usize = 256;
+/// `--community-release-on-verification` answers before the reward approvals
+/// only while fewer unpaid settlements than this are journaled: 192, three
+/// quarters of `VERIFIED_SETTLEMENT_CAP`. At or above it every job settles
+/// inline again, so each one holds one of the two public permits through its
+/// approvals and intake slows to the approval rate, as with the switch off.
+/// The 64 entries left absorb what is already in flight when the mark is
+/// crossed and the paths that always journal inline (twin legs, recovery
+/// probes), well before the cap at which no mode can journal a reward.
+const VERIFIED_SETTLEMENT_RELEASE_HIGH_WATER: u64 = VERIFIED_SETTLEMENT_CAP as u64 * 3 / 4;
 
 /// Authenticated community-mutation wire contract. V3 nodes deliberately do
 /// not accept the legacy unsigned bodies.
@@ -418,6 +427,21 @@ pub struct NodeState {
     /// requires the genesis-committed activation height in `StateDB`; both
     /// gates must be open before this node reports rewards enabled.
     pub community_rewards_v1_enabled: bool,
+    /// Coordinator switch `--community-release-on-verification`, off by
+    /// default. When set, a verified single-worker community job takes one of
+    /// two paths once its authenticated 2-of-3 recomputation passes:
+    /// - Its settlement is journaled and the answer goes to the waiting
+    ///   `/inference/run` caller at once; the five-of-six reward approvals
+    ///   then run on the existing settlement retry loop.
+    /// - The journal is at `VERIFIED_SETTLEMENT_RELEASE_HIGH_WATER`, the
+    ///   reward is beyond this coordinator's budget once its unpaid journaled
+    ///   rewards count, or the settlement could not be journaled: the job
+    ///   settles inline before the answer, exactly as with the switch off.
+    pub community_release_on_verification: bool,
+    /// Whether the last check under `--community-release-on-verification`
+    /// found the journal at its high-water mark, so each crossing is logged
+    /// once instead of once per job.
+    community_release_above_high_water: Arc<std::sync::atomic::AtomicBool>,
     pub stake: u64,
     pub tier: StakeTier,
     pub boot_time: Instant,
@@ -496,6 +520,15 @@ pub struct NodeState {
     /// or coordinator role only). Each entry is announced as an independent
     /// replica so the coordinator treats multi-range nodes naturally.
     pub shard_infos: Vec<ShardInfo>,
+    /// The same ranges announced under the GGUF interleaved-RoPE profile and
+    /// served from `interleaved_rope_qk`. Empty unless this holder verifies
+    /// that profile (`--community-verify-profiles`).
+    pub interleaved_rope_shard_infos: Vec<ShardInfo>,
+    /// The interleaved-RoPE Q/K rows of this holder's resident layers.
+    interleaved_rope_qk: Option<Arc<arc_inference::cached_integer_model::InterleavedRopeQk>>,
+    /// `--community-verify-profiles`: the legacy profile only, unless the
+    /// operator adds the interleaved-RoPE profile.
+    community_verify_profiles: CommunityVerifyProfiles,
     /// Per-request KV cache for sharded inference. Key: request_id (Hash256 hex).
     /// Each entry is an Arc<Mutex<KVCache>> so handlers can clone the Arc and
     /// release the DashMap shard lock immediately.
@@ -724,6 +757,186 @@ pub struct ShardInfo {
     pub socket_addr: String,
     /// Friendly node name (NYC, LAX, ...).
     pub node_name: String,
+}
+
+/// `--community-verify-profiles` short name of today's live community reward
+/// profile (`CANONICAL_REWARD_INFERENCE_PROFILE`, split-half RoPE).
+pub const COMMUNITY_PROFILE_LEGACY_SPLIT_HALF: &str = "legacy-split-half";
+/// `--community-verify-profiles` short name of the GGUF interleaved-RoPE
+/// profile (`GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE`).
+pub const COMMUNITY_PROFILE_ROPE_INTERLEAVED_V1: &str = "rope-interleaved-v1";
+
+/// The community reward profiles this validator verifies
+/// (`--community-verify-profiles`, stage 1 of the live-profile switch).
+/// The legacy profile is always verified. The interleaved-RoPE profile is
+/// opt-in; with it off, every check below is exactly the legacy-only check.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CommunityVerifyProfiles {
+    interleaved_rope: bool,
+}
+
+impl CommunityVerifyProfiles {
+    /// Parse a comma-separated list of short profile names. The legacy
+    /// profile must stay listed: live jobs use it, and retiring it is a later
+    /// decision that needs the issue side first.
+    pub fn parse(list: &str) -> Result<Self, String> {
+        let mut legacy = false;
+        let mut interleaved_rope = false;
+        for name in list
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            match name {
+                COMMUNITY_PROFILE_LEGACY_SPLIT_HALF => legacy = true,
+                COMMUNITY_PROFILE_ROPE_INTERLEAVED_V1 => interleaved_rope = true,
+                other => {
+                    return Err(format!(
+                        "unknown community profile {other:?}; expected \
+                         {COMMUNITY_PROFILE_LEGACY_SPLIT_HALF} or {COMMUNITY_PROFILE_ROPE_INTERLEAVED_V1}"
+                    ));
+                }
+            }
+        }
+        if !legacy {
+            return Err(format!(
+                "the verify profiles must include {COMMUNITY_PROFILE_LEGACY_SPLIT_HALF}: live community jobs use it"
+            ));
+        }
+        Ok(Self { interleaved_rope })
+    }
+
+    /// Whether the interleaved-RoPE profile is verified here.
+    pub fn interleaved_rope(&self) -> bool {
+        self.interleaved_rope
+    }
+
+    /// The exact profile id when this validator verifies `profile`.
+    fn verified(&self, profile: &str) -> Option<&'static str> {
+        use arc_inference::cached_integer_model::{
+            CANONICAL_REWARD_INFERENCE_PROFILE, GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
+        };
+        if profile == CANONICAL_REWARD_INFERENCE_PROFILE {
+            Some(CANONICAL_REWARD_INFERENCE_PROFILE)
+        } else if self.interleaved_rope && profile == GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE {
+            Some(GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE)
+        } else {
+            None
+        }
+    }
+}
+
+/// What `serve` needs for `--community-verify-profiles`. The default is the
+/// legacy profile only, with no Q/K copy and no extra announcements.
+#[derive(Default)]
+pub struct CommunityProfileServing {
+    pub verify: CommunityVerifyProfiles,
+    /// The interleaved-RoPE Q/K rows of this shard holder's resident layers.
+    pub interleaved_rope_qk: Option<Arc<arc_inference::cached_integer_model::InterleavedRopeQk>>,
+    /// This holder's ranges announced under the interleaved-RoPE profile.
+    pub interleaved_rope_shard_infos: Vec<ShardInfo>,
+}
+
+/// Shard-registry key for one announcement. Every profile except the
+/// interleaved-RoPE one keeps the historical `socket#start-end` key, so the
+/// registry is unchanged until a holder announces that profile. Its entries
+/// then sit beside the same holder's legacy entries instead of replacing them.
+fn shard_registry_key(shard: &ShardInfo) -> String {
+    let key = format!(
+        "{}#{}-{}",
+        shard.socket_addr, shard.start_layer, shard.end_layer
+    );
+    if shard.execution_profile
+        == arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
+    {
+        format!("{key}#{}", shard.execution_profile)
+    } else {
+        key
+    }
+}
+
+/// Per-request KV-cache key on a shard holder. The legacy profile keeps the
+/// caller's request id. The interleaved-RoPE profile caches different K rows,
+/// so it gets its own entry, and one request can never mix the two.
+fn shard_kv_cache_key(request_id: &str, execution_profile: &str) -> String {
+    if execution_profile
+        == arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
+    {
+        format!("{request_id}#{execution_profile}")
+    } else {
+        request_id.to_string()
+    }
+}
+
+/// Bytes a shard holder keeps resident for its layer weights, in the
+/// `I8Weights::memory_bytes` accounting the node has always announced. It
+/// includes the interleaved-RoPE Q/K copy when one is loaded.
+pub fn shard_resident_weight_bytes(
+    model: &arc_inference::cached_integer_model::CachedIntegerModel,
+    interleaved_rope_qk: Option<&arc_inference::cached_integer_model::InterleavedRopeQk>,
+) -> usize {
+    let layers: usize = model
+        .layers
+        .iter()
+        .filter(|layer| layer.is_loaded())
+        .map(|layer| {
+            layer.wq.memory_bytes()
+                + layer.wk.memory_bytes()
+                + layer.wv.memory_bytes()
+                + layer.wo.memory_bytes()
+                + layer.w_gate.memory_bytes()
+                + layer.w_up.memory_bytes()
+                + layer.w_down.memory_bytes()
+        })
+        .sum();
+    layers + interleaved_rope_qk.map_or(0, |copy| copy.memory_bytes())
+}
+
+/// Announcements for this node's held ranges: the legacy list, as before,
+/// and the same ranges under the interleaved-RoPE profile when its Q/K copy
+/// is resident. Memory counts the copy, so each entry reports what this
+/// holder keeps resident for that range.
+pub fn shard_announcements(
+    model: &arc_inference::cached_integer_model::CachedIntegerModel,
+    ranges: &[(usize, usize)],
+    artifact_id: Hash256,
+    socket_addr: &str,
+    node_name: &str,
+    interleaved_rope_qk: Option<&arc_inference::cached_integer_model::InterleavedRopeQk>,
+) -> (Vec<ShardInfo>, Vec<ShardInfo>) {
+    let total_layers = model.config.n_layers;
+    let layers_held_total: usize = ranges.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+    let memory_mb_total = shard_resident_weight_bytes(model, interleaved_rope_qk) / (1024 * 1024);
+    let per_layer_mb = memory_mb_total / layers_held_total.max(1);
+    let full_model_mb = per_layer_mb * total_layers;
+    let model_display_name = format!(
+        "arc-{}L-{}d-{}h-{}v",
+        model.config.n_layers, model.config.d_model, model.config.n_heads, model.config.vocab_size
+    );
+    let announce = |execution_profile: &str| -> Vec<ShardInfo> {
+        ranges
+            .iter()
+            .map(|&(start, end)| ShardInfo {
+                start_layer: start,
+                end_layer: end,
+                total_layers,
+                model_id: format!("0x{}", hex::encode(artifact_id.0)),
+                model_name: model_display_name.clone(),
+                execution_profile: execution_profile.to_string(),
+                memory_mb: per_layer_mb * (end - start),
+                full_model_mb,
+                socket_addr: socket_addr.to_string(),
+                node_name: node_name.to_string(),
+            })
+            .collect()
+    };
+    let legacy = announce(model.effective_precision_label());
+    let interleaved_rope = if interleaved_rope_qk.is_some() {
+        announce(arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE)
+    } else {
+        Vec::new()
+    };
+    (legacy, interleaved_rope)
 }
 
 /// A community worker: an arc-node running with --community-mode that
@@ -1121,6 +1334,43 @@ where
     }
 }
 
+/// The node's dedicated inference pool, as a handle that work started before
+/// the RPC server can hold.
+///
+/// main.rs spawns the community worker loop before `serve` builds the
+/// `NodeState`, so the loop cannot reach `node.compute_pool`. It holds this
+/// handle instead, and `serve` attaches the same handle to the node. As a
+/// result, `--threads`, `[inference] threads` and `POST /node/threads` size the
+/// pool that community jobs run on. With none of them set, `install` runs the
+/// job on the calling thread with rayon's global pool, exactly as before.
+#[derive(Clone, Default)]
+pub struct ComputePool {
+    pool: Arc<parking_lot::RwLock<Option<Arc<rayon::ThreadPool>>>>,
+    threads: Arc<AtomicU32>,
+}
+
+impl ComputePool {
+    /// Run `f` on the dedicated pool when one is configured, else on the
+    /// calling thread, where rayon work goes to its global pool.
+    pub fn install<R, F>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R + Send,
+        R: Send,
+    {
+        let pool = self.pool.read().clone();
+        match pool {
+            Some(pool) => pool.install(f),
+            None => f(),
+        }
+    }
+
+    /// Make `node`'s pool controls and local compute use this same pool.
+    fn attach(&self, node: &mut NodeState) {
+        node.compute_pool = self.pool.clone();
+        node.compute_threads = self.threads.clone();
+    }
+}
+
 /// Build (or rebuild) the dedicated compute pool at `threads` width.
 ///
 /// `threads == 0` drops the dedicated pool and returns the node to rayon's
@@ -1242,6 +1492,51 @@ impl std::fmt::Display for PipelineError {
             ),
         }
     }
+}
+
+impl PipelineError {
+    /// The error for a public response: the same text without shard node
+    /// names or socket addresses. Callers log the full `Display` text.
+    fn public_message(&self) -> String {
+        match self {
+            PipelineError::MissingValidatorIdentity { .. } => {
+                "Shard identity unavailable or malformed for a pipeline replica".to_string()
+            }
+            PipelineError::Gap { expected, got, .. } => format!(
+                "Pipeline gap: expected layer {expected} next, got shard [{}, {})",
+                got.0, got.1
+            ),
+            other => other.to_string(),
+        }
+    }
+}
+
+/// What a public caller sees when the validator shard pipeline fails while it
+/// runs. The error names shard holders, their socket addresses and request
+/// URLs, so its detail goes to this node's log only.
+const SHARD_PIPELINE_FAILED: &str = "the validator shard pipeline could not complete this request; the detail is in this node's log";
+
+fn public_pipeline_run_error(request_id: &str, error: String) -> (StatusCode, Json<ApiError>) {
+    tracing::warn!(%request_id, %error, "validator shard pipeline failed");
+    api_error(StatusCode::BAD_GATEWAY, SHARD_PIPELINE_FAILED)
+}
+
+/// The worker's answer when its result could not be verified yet. The
+/// verifier's reason goes to this coordinator's log.
+const COMMUNITY_VERIFICATION_UNAVAILABLE: &str = "community result could not complete independent verification and remains retryable; the detail is in the coordinator's log";
+
+/// The public text for a pipeline that could not be assembled. The full
+/// error, with shard node names and socket addresses, goes to this node's log.
+fn public_pipeline_assembly_reason(error: PipelineError) -> String {
+    tracing::warn!(%error, "validator shard pipeline could not be assembled");
+    error.public_message()
+}
+
+fn public_pipeline_assembly_error(error: PipelineError) -> (StatusCode, Json<ApiError>) {
+    api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        public_pipeline_assembly_reason(error),
+    )
 }
 
 /// Signed shard announcements retain the authenticated validator identity in
@@ -1577,6 +1872,8 @@ pub fn build_node_state(
         validator_address,
         validator_keypair,
         community_rewards_v1_enabled: false,
+        community_release_on_verification: false,
+        community_release_above_high_water: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         stake,
         tier,
         boot_time,
@@ -1613,6 +1910,9 @@ pub fn build_node_state(
             COMMUNITY_APPROVAL_QUEUE_CAP,
         )),
         shard_infos: Vec::new(),
+        interleaved_rope_shard_infos: Vec::new(),
+        interleaved_rope_qk: None,
+        community_verify_profiles: CommunityVerifyProfiles::default(),
         shard_kv_caches: Arc::new(dashmap::DashMap::new()),
         shard_kv_cache_metadata: Arc::new(dashmap::DashMap::new()),
         shard_kv_cache_gate: Arc::new(parking_lot::Mutex::new(())),
@@ -2071,6 +2371,10 @@ pub async fn serve(
     community_rpc_bases: Vec<String>,
     // compute_threads: dedicated inference-pool width; 0 = rayon's global pool.
     compute_threads: usize,
+    // compute_pool: the pool handle the community worker loop already holds.
+    //   The node's pool controls (`compute_threads`, POST /node/threads) size
+    //   this same pool, so they apply to community jobs too.
+    compute_pool: ComputePool,
     // chain_identity: the genesis file's declared chain name / chain_id, when
     //   the node was started with --genesis. Surfaced by GET /network/info so
     //   the desktop never has to guess which chain it is talking to.
@@ -2089,6 +2393,12 @@ pub async fn serve(
     // Twin execution v0 and generated community demand
     // (docs/twin-execution.md). Every switch defaults to off.
     community_twin: crate::twin::TwinConfig,
+    // Answer a verified single-worker community job before its reward
+    // approvals (`--community-release-on-verification`). Defaults to off.
+    community_release_on_verification: bool,
+    // --community-verify-profiles (stage 1 of the live-profile switch).
+    // The default verifies, serves and announces the legacy profile only.
+    community_profiles: CommunityProfileServing,
 ) -> anyhow::Result<()> {
     if community_rewards_v1_enabled && state.community_rewards_v1_activation_height().is_none() {
         anyhow::bail!(
@@ -2108,6 +2418,8 @@ pub async fn serve(
         candle_model_id,
         model_artifact_id,
     );
+    // Before anything clones the node: every clone must share this pool.
+    compute_pool.attach(&mut node);
     node.runtime_shutdown = shutdown.clone();
     node.transport_wire_policy = transport_wire_policy;
     node.chain_identity = chain_identity;
@@ -2120,6 +2432,12 @@ pub async fn serve(
         tracing::info!(
             spot_check_per_mille = node.community_twin.config.spot_check_per_mille,
             "community twin execution enabled: each community job runs on two independent workers"
+        );
+    }
+    node.community_release_on_verification = community_release_on_verification;
+    if community_release_on_verification {
+        tracing::info!(
+            "community release on verification enabled: verified answers are returned before reward approvals, which continue on the settlement retry path"
         );
     }
     if let Some(dv) = dag_validators {
@@ -2147,14 +2465,28 @@ pub async fn serve(
     node.community_work_results = Some(Arc::new(dashmap::DashMap::new()));
 
     node.shard_infos = shard_infos.clone();
+    let CommunityProfileServing {
+        verify: community_verify_profiles,
+        interleaved_rope_qk,
+        interleaved_rope_shard_infos,
+    } = community_profiles;
+    node.community_verify_profiles = community_verify_profiles;
+    node.interleaved_rope_qk = interleaved_rope_qk;
+    node.interleaved_rope_shard_infos = interleaved_rope_shard_infos.clone();
+    if community_verify_profiles.interleaved_rope() {
+        tracing::info!(
+            interleaved_rope_ranges = interleaved_rope_shard_infos.len(),
+            "verifying the interleaved-RoPE community profile beside the legacy one (--community-verify-profiles)"
+        );
+    }
     node.seed_rpc_addrs = Arc::new(seed_rpc_addrs);
     node.community_rpc_bases = Arc::new(community_rpc_bases);
     // Seed the local registry with every range this node holds so /shards
     // reports the full picture the moment RPC comes up. The registry is
     // keyed by (socket_addr + range) so two entries with the same socket but
     // different ranges coexist.
-    for si in &shard_infos {
-        let key = format!("{}#{}-{}", si.socket_addr, si.start_layer, si.end_layer);
+    for si in shard_infos.iter().chain(&interleaved_rope_shard_infos) {
+        let key = shard_registry_key(si);
         node.shard_registry.insert(
             key,
             (
@@ -2169,7 +2501,11 @@ pub async fn serve(
         // for TCP development listeners and sealed production Unix listeners.
         // Remote registries still accept only signed direct-holder announces.
         let refresh_registry = node.shard_registry.clone();
-        let refresh_infos = shard_infos.clone();
+        let refresh_infos: Vec<ShardInfo> = shard_infos
+            .iter()
+            .chain(&interleaved_rope_shard_infos)
+            .cloned()
+            .collect();
         let refresh_validator = node.validator_address;
         let mut refresh_shutdown = node.runtime_shutdown.clone();
         spawn_node_runtime_task(&node, async move {
@@ -2181,10 +2517,7 @@ pub async fn serve(
                 }
                 let now = std::time::Instant::now();
                 for shard in &refresh_infos {
-                    let key = format!(
-                        "{}#{}-{}",
-                        shard.socket_addr, shard.start_layer, shard.end_layer
-                    );
+                    let key = shard_registry_key(shard);
                     refresh_registry.insert(
                         key,
                         (
@@ -2907,6 +3240,9 @@ struct NodeInfoResponse {
     height: u64,
     version: String,
     mempool_size: usize,
+    /// The canonical INT8 projection kernels this process runs, as
+    /// `GET /node/threads` reports them under `kernels`.
+    kernels: Value,
 }
 
 async fn node_info(AxumState(node): AxumState<NodeState>) -> Json<NodeInfoResponse> {
@@ -2917,6 +3253,7 @@ async fn node_info(AxumState(node): AxumState<NodeState>) -> Json<NodeInfoRespon
         height: node.state.height(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         mempool_size: node.mempool.len(),
+        kernels: kernel_report_json(&node),
     })
 }
 
@@ -7713,6 +8050,7 @@ async fn inference_run(
                 result,
                 verification,
                 settlement,
+                answer_release,
             }) => {
                 let total_ms = dispatched_at.elapsed().as_millis() as u64;
                 let input_hash = arc_crypto::hash_bytes(input_text.as_bytes());
@@ -7734,7 +8072,7 @@ async fn inference_run(
                         "settlement": &settlement,
                     }),
                 );
-                return Ok(Json(json!({
+                let mut response = json!({
                     "success": true,
                     "recovery_probe_id": recovery_probe_id.map(|value| format!("0x{}", value.to_hex())),
                     "routed_via": format!("community:{}", result.worker_id),
@@ -7764,7 +8102,14 @@ async fn inference_run(
                     },
                     "verification": verification,
                     "settlement": settlement,
-                })));
+                });
+                // Present only when `--community-release-on-verification`
+                // answered before the reward approvals; absent otherwise, so
+                // the default response is unchanged.
+                if let Some(answer_release) = answer_release {
+                    response["answer_release"] = answer_release;
+                }
+                return Ok(Json(response));
             }
             Err(e) => {
                 if let (Some(probe_id), Some(expected_job)) =
@@ -9721,7 +10066,15 @@ async fn inference_forward_shard_authenticated(
         "No model loaded".to_string(),
     ))?;
     let local_execution_profile = model.effective_precision_label();
-    if req.execution_profile != local_execution_profile {
+    // A holder that verifies the interleaved-RoPE profile also serves it, from
+    // its Q/K copy and its legacy model's other weights.
+    let interleaved_rope_qk = node.interleaved_rope_qk.clone().filter(|_| {
+        req.execution_profile
+            == arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
+            && local_execution_profile
+                == arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE
+    });
+    if req.execution_profile != local_execution_profile && interleaved_rope_qk.is_none() {
         return Err((
             StatusCode::CONFLICT,
             format!(
@@ -9791,6 +10144,7 @@ async fn inference_forward_shard_authenticated(
     let shard = node
         .shard_infos
         .iter()
+        .chain(&node.interleaved_rope_shard_infos)
         .find(|s| {
             s.start_layer == req.start_layer
                 && s.end_layer == req.end_layer
@@ -9865,8 +10219,9 @@ async fn inference_forward_shard_authenticated(
 
     // Get-or-create per-request KV cache
     let n_layers = model.config.n_layers;
+    let kv_cache_key = shard_kv_cache_key(&req.request_id, &req.execution_profile);
     let (cache_arc, cache_reservation) =
-        reserve_shard_kv_cache(&node, &req.request_id, signer, n_layers)?;
+        reserve_shard_kv_cache(&node, &kv_cache_key, signer, n_layers)?;
 
     // Run the shard's forward pass (blocking - uses spawn_blocking to free runtime)
     let model_clone = model.clone();
@@ -9876,6 +10231,7 @@ async fn inference_forward_shard_authenticated(
     let position = req.position;
     let generated_tokens = req.generated_tokens.clone();
     let node_name = shard.node_name.clone();
+    let interleaved_rope_for_compute = interleaved_rope_qk.clone();
 
     let t0 = std::time::Instant::now();
     let pool_node = node.clone();
@@ -9910,14 +10266,25 @@ async fn inference_forward_shard_authenticated(
                 };
                 let kv_mutex_wait_us = elapsed_micros(kv_mutex_wait_started);
                 let forward_started = Instant::now();
-                let result = model_clone.forward_shard_token_with_history(
-                    input,
-                    &mut cache,
-                    start_layer,
-                    end_layer,
-                    position,
-                    &generated_tokens,
-                );
+                let result = match interleaved_rope_for_compute.as_deref() {
+                    Some(copy) => model_clone.forward_shard_token_with_history_interleaved_rope(
+                        input,
+                        &mut cache,
+                        start_layer,
+                        end_layer,
+                        position,
+                        &generated_tokens,
+                        copy,
+                    ),
+                    None => model_clone.forward_shard_token_with_history(
+                        input,
+                        &mut cache,
+                        start_layer,
+                        end_layer,
+                        position,
+                        &generated_tokens,
+                    ),
+                };
                 let forward_us = elapsed_micros(forward_started);
                 (
                     result,
@@ -9949,9 +10316,10 @@ async fn inference_forward_shard_authenticated(
             arc_inference::cached_integer_model::ShardForwardError::KvCacheOutOfSync { .. } => {
                 StatusCode::CONFLICT
             }
-            arc_inference::cached_integer_model::ShardForwardError::LayerNotLoaded { .. } => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            arc_inference::cached_integer_model::ShardForwardError::LayerNotLoaded { .. }
+            | arc_inference::cached_integer_model::ShardForwardError::InterleavedRopeUnavailable {
+                ..
+            } => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::BAD_REQUEST,
         };
         tracing::warn!(
@@ -9973,8 +10341,8 @@ async fn inference_forward_shard_authenticated(
     // Optionally evict cache after the last token
     if req.last_token {
         let _gate = node.shard_kv_cache_gate.lock();
-        node.shard_kv_caches.remove(&req_id);
-        node.shard_kv_cache_metadata.remove(&req_id);
+        node.shard_kv_caches.remove(&kv_cache_key);
+        node.shard_kv_cache_metadata.remove(&kv_cache_key);
     }
 
     let layers_processed = end_layer - start_layer;
@@ -10059,18 +10427,27 @@ async fn inference_cleanup_shard_authenticated(
 
     let removed = {
         let _gate = node.shard_kv_cache_gate.lock();
-        if let Some(metadata) = node.shard_kv_cache_metadata.get(&req.request_id)
-            && metadata.signer != signer
-        {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "request_id is owned by a different authenticated validator".to_string(),
-            ));
+        // A request's interleaved-RoPE cache, if any, sits under its own key.
+        let interleaved_rope_key = shard_kv_cache_key(
+            &req.request_id,
+            arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
+        );
+        for key in [&req.request_id, &interleaved_rope_key] {
+            if let Some(metadata) = node.shard_kv_cache_metadata.get(key)
+                && metadata.signer != signer
+            {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "request_id is owned by a different authenticated validator".to_string(),
+                ));
+            }
         }
 
         let removed = node.shard_kv_caches.remove(&req.request_id).is_some();
         node.shard_kv_cache_metadata.remove(&req.request_id);
-        removed
+        let removed_interleaved_rope = node.shard_kv_caches.remove(&interleaved_rope_key).is_some();
+        node.shard_kv_cache_metadata.remove(&interleaved_rope_key);
+        removed || removed_interleaved_rope
     };
     Ok(Json(json!({
         "ok": true,
@@ -11930,8 +12307,8 @@ async fn inference_run_sharded(
         )
     })?;
 
-    let selection = assemble_profile_bound_pipeline_for(&node, None)
-        .map_err(|e| api_error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+    let selection =
+        assemble_profile_bound_pipeline_for(&node, None).map_err(public_pipeline_assembly_error)?;
     let execution_profile = selection.execution_profile;
     let pipeline = selection.hops;
     let assurance = free_inference_assurance(true, false);
@@ -12083,7 +12460,7 @@ async fn inference_run_sharded(
     // leak them until TTL. Await the bounded parallel cleanup so no handler
     // can detach coordinator-owned tasks.
     cleanup_shards(&node, &pipeline, &request_id).await;
-    let run = run_result.map_err(|e| api_error(StatusCode::BAD_GATEWAY, e))?;
+    let run = run_result.map_err(|error| public_pipeline_run_error(&request_id, error))?;
 
     let total_ms = overall_start.elapsed().as_millis() as u64;
     let generated = run.generated;
@@ -12481,8 +12858,8 @@ async fn inference_run_consensus(
         )
     })?;
 
-    let selection = assemble_profile_bound_pipeline_for(&node, None)
-        .map_err(|e| api_error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
+    let selection =
+        assemble_profile_bound_pipeline_for(&node, None).map_err(public_pipeline_assembly_error)?;
     let execution_profile = selection.execution_profile;
     let pipeline = selection.hops;
     let model_id = node.model_artifact_id.ok_or_else(|| {
@@ -12526,7 +12903,7 @@ async fn inference_run_consensus(
     .await;
 
     cleanup_shards(&node, &pipeline, &request_id).await;
-    let run = run_result.map_err(|e| api_error(StatusCode::BAD_GATEWAY, e))?;
+    let run = run_result.map_err(|error| public_pipeline_run_error(&request_id, error))?;
 
     let total_ms = overall_start.elapsed().as_millis() as u64;
     let generated = run.generated;
@@ -12986,11 +13363,9 @@ async fn announce_shard(
     // produces one entry per range - otherwise the DashMap insert clobbers
     // prior announces and only the most recent range survives. The
     // coordinator's BTreeMap grouping already keys on (start, end) so a
-    // per-range entry is exactly what we need.
-    let key = format!(
-        "{}#{}-{}",
-        req.shard.socket_addr, req.shard.start_layer, req.shard.end_layer
-    );
+    // per-range entry is exactly what we need. An interleaved-RoPE
+    // announcement keeps its own entry beside the holder's legacy one.
+    let key = shard_registry_key(&req.shard);
     // Also register in multi-model ShardRegistry for multi-model routing
     let assignment = arc_inference::distributed::ShardAssignment {
         node_address: announcing_validator,
@@ -13789,6 +14164,10 @@ struct CommunityDispatchOutcome {
     result: WorkResult,
     verification: Option<CommunityVerificationSummary>,
     settlement: Option<Value>,
+    /// `answer_release_value`, set only when `--community-release-on-verification`
+    /// sent this verified answer before the reward approvals. `settlement` is
+    /// then the journaled `verified_pending_approval` state.
+    answer_release: Option<Value>,
 }
 
 /// RAII reservation for a worker's concurrent long-polls. If a request is
@@ -13982,6 +14361,7 @@ struct CommunityResultVerification {
     tokens_generated: usize,
     range_count: usize,
     range_position_quorum_count: usize,
+    execution_profile: &'static str,
 }
 
 #[derive(Debug)]
@@ -14010,8 +14390,7 @@ impl From<&CommunityResultVerification> for CommunityVerificationSummary {
             method: "authenticated_shard_quorum_2_of_3_per_range",
             profile_bound: true,
             quorum_verified: true,
-            execution_profile:
-                arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
+            execution_profile: verified.execution_profile,
             output_hash: format!("0x{}", verified.output_hash.to_hex()),
             tokens_generated: verified.tokens_generated,
             ranges: verified.range_count,
@@ -14101,6 +14480,34 @@ fn compare_community_result_with_tokens(
         );
     }
     Ok(actual_hash)
+}
+
+/// The worker profile a job's verification requires: the job's own profile
+/// when this validator verifies it (`--community-verify-profiles`), and the
+/// legacy profile otherwise, exactly as before.
+fn validate_community_reward_profile_for_job(
+    node: &NodeState,
+    work_item: &WorkItem,
+    result: &WorkResult,
+) -> Result<(), String> {
+    match node
+        .community_verify_profiles
+        .verified(&work_item.execution_profile)
+    {
+        Some(expected)
+            if expected
+                != arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE =>
+        {
+            if result.engine != expected {
+                return Err(format!(
+                    "community worker execution profile {:?} differs from required {:?}",
+                    result.engine, expected
+                ));
+            }
+            Ok(())
+        }
+        _ => validate_community_reward_profile(result),
+    }
 }
 
 fn validate_community_reward_profile(result: &WorkResult) -> Result<(), String> {
@@ -14248,7 +14655,8 @@ async fn verify_community_result_with_quorum(
     work_item: &WorkItem,
     result: &WorkResult,
 ) -> Result<CommunityResultVerification, CommunityResultVerificationError> {
-    validate_community_reward_profile(result).map_err(CommunityResultVerificationError::Invalid)?;
+    validate_community_reward_profile_for_job(node, work_item, result)
+        .map_err(CommunityResultVerificationError::Invalid)?;
     let recomputed = recompute_community_output_with_quorum(node, work_item).await?;
     let output_hash = compare_community_result_with_tokens(
         result,
@@ -14262,6 +14670,7 @@ async fn verify_community_result_with_quorum(
         tokens_generated: recomputed.generated.len(),
         range_count: recomputed.range_count,
         range_position_quorum_count: recomputed.range_position_quorum_count,
+        execution_profile: recomputed.execution_profile,
     })
 }
 
@@ -14274,6 +14683,8 @@ struct CommunityCanonicalRecompute {
     output_hash: Hash256,
     range_count: usize,
     range_position_quorum_count: usize,
+    /// The profile the validator shards executed: the assignment's own.
+    execution_profile: &'static str,
 }
 
 /// Recompute an assignment through three authenticated, distinct
@@ -14284,12 +14695,17 @@ async fn recompute_community_output_with_quorum(
     work_item: &WorkItem,
 ) -> Result<CommunityCanonicalRecompute, CommunityResultVerificationError> {
     let canonical = arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE;
-    if work_item.execution_profile != canonical {
+    // The legacy profile, or the interleaved-RoPE one when this validator
+    // verifies it; the shards then run the assignment's own profile.
+    let Some(required) = node
+        .community_verify_profiles
+        .verified(&work_item.execution_profile)
+    else {
         return Err(CommunityResultVerificationError::Unavailable(format!(
             "community assignment execution profile {:?} differs from required {:?}",
             work_item.execution_profile, canonical
         )));
-    }
+    };
     let model = node
         .inference_model
         .as_ref()
@@ -14320,7 +14736,7 @@ async fn recompute_community_output_with_quorum(
             if let Some(pipeline) = node.community_verification_pipeline_override.clone() {
                 pipeline
             } else {
-                assemble_profile_bound_pipeline_for(node, Some(canonical))
+                assemble_profile_bound_pipeline_for(node, Some(required))
                     .map(|selection| selection.hops)
                     .map_err(|e| {
                         CommunityResultVerificationError::Unavailable(format!(
@@ -14331,7 +14747,7 @@ async fn recompute_community_output_with_quorum(
         }
         #[cfg(not(test))]
         {
-            assemble_profile_bound_pipeline_for(node, Some(canonical))
+            assemble_profile_bound_pipeline_for(node, Some(required))
                 .map(|selection| selection.hops)
                 .map_err(|e| {
                     CommunityResultVerificationError::Unavailable(format!(
@@ -14342,10 +14758,10 @@ async fn recompute_community_output_with_quorum(
     };
     let pipeline_profile = pipeline_execution_profile(&pipeline)
         .map_err(CommunityResultVerificationError::Unavailable)?;
-    if pipeline_profile != canonical {
+    if pipeline_profile != required {
         return Err(CommunityResultVerificationError::Unavailable(format!(
             "reward verification pipeline uses {:?}, required {:?}",
-            pipeline_profile, canonical
+            pipeline_profile, required
         )));
     }
     for (range, replicas) in &pipeline {
@@ -14420,6 +14836,7 @@ async fn recompute_community_output_with_quorum(
         output_text,
         range_count: pipeline.len(),
         range_position_quorum_count,
+        execution_profile: required,
     })
 }
 
@@ -14436,7 +14853,11 @@ fn validate_reward_approval_payload(
         return Err("community reward protocol is not active".to_string());
     }
     let canonical = arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE;
-    if payload.execution_profile != canonical {
+    if node
+        .community_verify_profiles
+        .verified(&payload.execution_profile)
+        .is_none()
+    {
         return Err(format!(
             "community reward approval execution profile {:?} differs from required {:?}",
             payload.execution_profile, canonical
@@ -14640,10 +15061,11 @@ fn validate_reward_approval_payload(
         ms_per_token: 0,
         // This is the worker execution profile committed by the candidate,
         // not a label for the validator-side verification procedure.  Remote
-        // approvers must reconstruct the same canonical profile that the
-        // coordinator already checked; the verifier independently proves the
-        // output through authenticated validator shards below.
-        engine: arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+        // approvers must reconstruct the same profile that the coordinator
+        // already checked, which this validator verifies (checked above); the
+        // verifier independently proves the output through authenticated
+        // validator shards below.
+        engine: payload.execution_profile.clone(),
         error: None,
         signed_attestation_hex: None,
     };
@@ -15429,13 +15851,27 @@ fn replay_verified_settlement_journal(node: &NodeState) -> Result<Vec<Hash256>, 
     Ok(replayed)
 }
 
+/// What callers see when `retain_verified_settlement` cannot prune or write
+/// its journal. Its errors become the public `reason` of a
+/// `reward_approval_quorum_unavailable` settlement in the `/inference/run`
+/// and `/community/submit_work` responses, and a journal error can name this
+/// server's filesystem paths, so the detail goes to the log only.
+const SETTLEMENT_JOURNAL_UNAVAILABLE: &str =
+    "this coordinator could not journal the verified settlement; the detail is in its log";
+
+fn public_settlement_journal_error(job_id: Hash256, error: String) -> String {
+    tracing::error!(job_id = %job_id, %error, "could not journal a verified settlement");
+    SETTLEMENT_JOURNAL_UNAVAILABLE.to_string()
+}
+
 fn retain_verified_settlement(
     node: &NodeState,
     payload: CommunityRewardApprovalPayload,
 ) -> Result<(), String> {
     let _gate = node.community_verified_settlements_gate.lock();
     let now = now_unix_ms();
-    prune_verified_settlements_locked(node)?;
+    prune_verified_settlements_locked(node)
+        .map_err(|error| public_settlement_journal_error(payload.reward.job_id, error))?;
     if let Some(existing) = node
         .community_verified_settlements
         .get(&payload.reward.job_id)
@@ -15445,7 +15881,8 @@ fn retain_verified_settlement(
                 "verified settlement job already exists with different semantics".to_string(),
             );
         }
-        persist_verified_settlement_journal(node, &payload, existing.verified_at_unix_ms)?;
+        persist_verified_settlement_journal(node, &payload, existing.verified_at_unix_ms)
+            .map_err(|error| public_settlement_journal_error(payload.reward.job_id, error))?;
         return Ok(());
     }
     if node.community_verified_settlements.len() >= VERIFIED_SETTLEMENT_CAP {
@@ -15455,7 +15892,8 @@ fn retain_verified_settlement(
     }
     // Durability precedes visibility: after this returns, a crash at any later
     // await can replay the exact independently verified payload.
-    persist_verified_settlement_journal(node, &payload, now)?;
+    persist_verified_settlement_journal(node, &payload, now)
+        .map_err(|error| public_settlement_journal_error(payload.reward.job_id, error))?;
     node.community_verified_settlements.insert(
         payload.reward.job_id,
         VerifiedCommunitySettlement {
@@ -15758,14 +16196,18 @@ fn schedule_verified_settlement_retry(node: &NodeState, job_id: Hash256) {
     });
 }
 
-async fn submit_verified_community_reward(
+/// Build the exact job-bound reward candidate for an independently verified
+/// result and make it crash-durable in the verified-settlement journal.
+/// Both settlement timings below share this step, so they journal identical
+/// payloads and fail closed on identical preconditions.
+fn retain_verified_community_reward(
     node: &NodeState,
     work_item: &WorkItem,
     assignment_epoch: Hash256,
     job_nonce: u64,
     result: &WorkResult,
     worker_attestation: &arc_types::Transaction,
-) -> Result<Value, String> {
+) -> Result<Hash256, String> {
     use arc_types::transaction::{CommunityInferenceRewardBody, WorkerInferenceCertificate};
 
     reward_approval_prerequisites(node).map_err(str::to_string)?;
@@ -15842,6 +16284,25 @@ async fn submit_verified_community_reward(
         execution_profile: work_item.execution_profile.clone(),
     };
     retain_verified_settlement(node, payload)?;
+    Ok(job_id)
+}
+
+async fn submit_verified_community_reward(
+    node: &NodeState,
+    work_item: &WorkItem,
+    assignment_epoch: Hash256,
+    job_nonce: u64,
+    result: &WorkResult,
+    worker_attestation: &arc_types::Transaction,
+) -> Result<Value, String> {
+    let job_id = retain_verified_community_reward(
+        node,
+        work_item,
+        assignment_epoch,
+        job_nonce,
+        result,
+        worker_attestation,
+    )?;
     match attempt_verified_community_reward(node, job_id).await {
         Ok(settlement) => {
             schedule_verified_settlement_retry(node, job_id);
@@ -15858,6 +16319,247 @@ async fn submit_verified_community_reward(
                 .ok_or_else(|| "verified settlement retry state disappeared".to_string())
         }
     }
+}
+
+/// Whether `--community-release-on-verification` answers this assignment
+/// before its reward approvals. Recovery probes keep the inline settlement:
+/// their caller is rollout tooling that reads the settlement evidence from
+/// the same response.
+fn release_answer_before_settlement(node: &NodeState, assignment_epoch: &Hash256) -> bool {
+    node.community_release_on_verification
+        && !arc_types::transaction::CommunityInferenceRewardBody::is_recovery_probe_assignment(
+            assignment_epoch,
+        )
+}
+
+/// What `--community-release-on-verification` did with one verified job.
+enum EarlyRelease {
+    /// Journaled and handed to the retry loop: answer now, settlement pending.
+    Released {
+        settlement: Value,
+        answer_release: Value,
+    },
+    /// Settle inline before answering, exactly as with the switch off. The
+    /// journal is at its high-water mark, the reward is beyond this
+    /// coordinator's budget once its unpaid journaled rewards count, or the
+    /// journal could not take this job (`journal_error`, logged by the caller
+    /// once the inline settlement has finished).
+    Inline { journal_error: Option<String> },
+    /// The journal entry vanished between the write and the release; reported
+    /// exactly as `submit_verified_community_reward` reports it.
+    Failed(String),
+}
+
+/// This coordinator's journaled settlements that have neither expired nor
+/// been paid. A paid reward leaves its job marker account in state, so this
+/// costs one account lookup per entry rather than a transaction-index scan.
+#[derive(Clone, Copy, Debug, Default)]
+struct UnpaidSettlements {
+    total: u64,
+    for_worker: u64,
+}
+
+fn unpaid_verified_settlements(node: &NodeState, worker: Hash256) -> UnpaidSettlements {
+    use arc_types::transaction::CommunityInferenceRewardBody;
+
+    let height = node.state.height();
+    let protocol_v3 = node.state.active_protocol_version().major == 3;
+    let mut unpaid = UnpaidSettlements::default();
+    for entry in node.community_verified_settlements.iter() {
+        let reward = &entry.value().payload.reward;
+        if reward.expires_at_height < height {
+            continue;
+        }
+        let job_marker = if protocol_v3 {
+            CommunityInferenceRewardBody::v3_marker_address(&reward.chain_domain, &reward.job_id)
+        } else {
+            CommunityInferenceRewardBody::marker_address(&reward.chain_domain, &reward.job_id)
+        };
+        if node.state.get_account(&job_marker).is_some() {
+            continue;
+        }
+        unpaid.total += 1;
+        if reward.worker == worker {
+            unpaid.for_worker += 1;
+        }
+    }
+    unpaid
+}
+
+/// `require_community_reward_issuance_capacity`, counting this coordinator's
+/// unpaid journaled rewards as already issued, since they draw on the same
+/// treasury and epoch budgets. `--community-release-on-verification` answers
+/// before the approvals only when this passes. Otherwise the job settles
+/// inline, as with the switch off: it is still journaled, and may still be
+/// paid if a pending reward fails or from a later epoch. Rewards journaled
+/// on other coordinators are not visible here.
+fn require_issuance_capacity_counting_unpaid(
+    node: &NodeState,
+    worker: Hash256,
+    unpaid: UnpaidSettlements,
+) -> Result<(), String> {
+    let pending = unpaid.total;
+    let budget = prospective_community_reward_budget(node, worker, node.validator_address);
+    if community_reward_treasury_remaining(node).is_none_or(|remaining| remaining <= pending) {
+        return Err(format!(
+            "promotional reward treasury cannot fund another full reward after this coordinator's {pending} unpaid journaled rewards"
+        ));
+    }
+    if budget.remaining_this_epoch <= pending {
+        return Err(format!(
+            "community reward epoch budget is exhausted, counting this coordinator's {pending} unpaid journaled rewards"
+        ));
+    }
+    if budget.coordinator_remaining_this_epoch <= pending {
+        return Err(format!(
+            "community reward coordinator epoch budget is exhausted, counting its {pending} unpaid journaled rewards"
+        ));
+    }
+    if budget.worker_remaining_this_epoch <= unpaid.for_worker {
+        return Err(format!(
+            "community reward worker epoch budget is exhausted, counting this worker's {} unpaid journaled rewards",
+            unpaid.for_worker
+        ));
+    }
+    Ok(())
+}
+
+/// Whether an inline settlement's error is the reward budget refusing the job:
+/// the issuance check the inline path runs first still refuses it with the
+/// same words. Once this coordinator's epoch budget is spent that is the
+/// normal outcome for the rest of the epoch, as with the switch off, so it is
+/// logged at info rather than as a failure.
+fn inline_refusal_is_budget_policy(node: &NodeState, worker_id: &str, reason: &str) -> bool {
+    parse_hash256_hex(worker_id, "worker_id").is_ok_and(|worker| {
+        require_community_reward_issuance_capacity(node, worker, node.validator_address)
+            .is_err_and(|refusal| refusal == reason)
+    })
+}
+
+/// `--community-release-on-verification`: decide how to settle one verified
+/// job without ever doing worse than the switch-off ordering. Every outcome
+/// other than an early release is the switch-off path itself.
+/// - At the journal's high-water mark, settle inline (backpressure).
+/// - If the reward is beyond the budgets once this coordinator's unpaid
+///   journaled rewards count, settle inline.
+/// - Otherwise journal the job exactly as `submit_verified_community_reward`
+///   does and leave the five-of-six approvals to the existing settlement
+///   retry loop. If the journal write fails, settle inline.
+///
+/// Nothing here awaits, so the journal entry, the single retry task and the
+/// reported pending state are established together. The mark and the budget
+/// are read without a lock across handlers, so verifications finishing at the
+/// same moment can all pass before any of them journals; the overshoot is
+/// bounded by the coordinator's concurrent verifications.
+fn release_verified_community_reward(
+    node: &NodeState,
+    work_item: &WorkItem,
+    assignment_epoch: Hash256,
+    job_nonce: u64,
+    result: &WorkResult,
+    worker_attestation: &arc_types::Transaction,
+) -> EarlyRelease {
+    // The inline path reports a malformed identity with its own error.
+    let Ok(worker) = parse_hash256_hex(&result.worker_id, "worker_id") else {
+        return EarlyRelease::Inline {
+            journal_error: None,
+        };
+    };
+    let unpaid = unpaid_verified_settlements(node, worker);
+    let above_high_water = unpaid.total >= VERIFIED_SETTLEMENT_RELEASE_HIGH_WATER;
+    let was_above_high_water = node
+        .community_release_above_high_water
+        .swap(above_high_water, Ordering::Relaxed);
+    if above_high_water {
+        if !was_above_high_water {
+            tracing::warn!(
+                unpaid = unpaid.total,
+                high_water = VERIFIED_SETTLEMENT_RELEASE_HIGH_WATER,
+                cap = VERIFIED_SETTLEMENT_CAP,
+                "verified-settlement journal reached its high-water mark; answering after reward approvals until it drains"
+            );
+        }
+        return EarlyRelease::Inline {
+            journal_error: None,
+        };
+    }
+    if was_above_high_water {
+        tracing::info!(
+            unpaid = unpaid.total,
+            high_water = VERIFIED_SETTLEMENT_RELEASE_HIGH_WATER,
+            "verified-settlement journal is below its high-water mark again; answering on verification"
+        );
+    }
+    if let Err(reason) = require_issuance_capacity_counting_unpaid(node, worker, unpaid) {
+        tracing::info!(
+            job_id = %work_item.job_id,
+            %reason,
+            "verified community reward is beyond this coordinator's budget once its unpaid journaled rewards count; settling it inline before answering"
+        );
+        return EarlyRelease::Inline {
+            journal_error: None,
+        };
+    }
+    let job_id = match retain_verified_community_reward(
+        node,
+        work_item,
+        assignment_epoch,
+        job_nonce,
+        result,
+        worker_attestation,
+    ) {
+        Ok(job_id) => job_id,
+        Err(error) => {
+            return EarlyRelease::Inline {
+                journal_error: Some(error),
+            };
+        }
+    };
+    schedule_verified_settlement_retry(node, job_id);
+    let Some((settlement, expires_at_height)) = node
+        .community_verified_settlements
+        .get(&job_id)
+        .map(|record| {
+            (
+                pending_settlement_value(node, &record),
+                record.payload.reward.expires_at_height,
+            )
+        })
+    else {
+        tracing::error!(
+            job_id = %job_id,
+            "journaled settlement disappeared before release on verification"
+        );
+        return EarlyRelease::Failed("verified settlement retry state disappeared".to_string());
+    };
+    tracing::info!(
+        job_id = %job_id,
+        "released a verified community answer before reward settlement; approvals continue on the settlement retry path"
+    );
+    EarlyRelease::Released {
+        settlement,
+        answer_release: answer_release_value(node, job_id, expires_at_height),
+    }
+}
+
+/// Response marker for an answer released by `--community-release-on-verification`.
+/// The authenticated 2-of-3 recomputation has passed. The five-of-six reward
+/// approvals and the 0x25 transaction are still outstanding. Only the
+/// journaling `coordinator` knows the job before it is mined, so the status
+/// URL is relative to the origin that answered `/inference/run`; it reports
+/// `verified_pending_approval`, then `pending_mined_receipt`, then the mined
+/// receipt. Pending ends at `expires_at_height`, after which an unpaid job is
+/// pruned and the URL returns 404.
+fn answer_release_value(node: &NodeState, job_id: Hash256, expires_at_height: u64) -> Value {
+    json!({
+        "schema": "arc.community.answer-release.v1",
+        "mode": "on_verification",
+        "verification": "passed",
+        "settlement": "pending",
+        "settlement_status_url": format!("/community/reward_job/0x{}", job_id.to_hex()),
+        "coordinator": format!("0x{}", node.validator_address.to_hex()),
+        "expires_at_height": expires_at_height,
+    })
 }
 
 fn default_true() -> bool {
@@ -16484,6 +17186,7 @@ pub async fn community_submit_work(
                     result: rejected,
                     verification: None,
                     settlement: None,
+                    answer_release: None,
                 });
                 return Err((
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -16497,11 +17200,11 @@ pub async fn community_submit_work(
                     reason = %error,
                     "community result verification unavailable; preserving assignment without penalty"
                 );
+                // The reason can name validator shard holders, their socket
+                // addresses and request URLs; it is logged above, not returned.
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
-                    format!(
-                        "community result could not complete independent verification and remains retryable: {error}"
-                    ),
+                    COMMUNITY_VERIFICATION_UNAVAILABLE.to_string(),
                 ));
             }
         }
@@ -16528,6 +17231,9 @@ pub async fn community_submit_work(
         job_id: job_id.clone(),
     };
 
+    // Set only when `--community-release-on-verification` answers the caller
+    // before the reward approvals (`release_answer_before_settlement`).
+    let mut answer_release = None;
     let settlement_outcome = if let Some(worker_attestation) = verified_attestation {
         let worker_attestation_hash = format!("0x{}", worker_attestation.hash.to_hex());
         if !community_rewards_v1_protocol_active(&node) {
@@ -16540,16 +17246,85 @@ pub async fn community_submit_work(
             settlement["worker_attestation_hash"] = Value::String(worker_attestation_hash);
             Some(settlement)
         } else {
-            match submit_verified_community_reward(
-                &node,
-                &work_item,
-                pending.assignment_epoch,
-                pending.job_nonce,
-                &result,
-                &worker_attestation,
-            )
-            .await
-            {
+            // Default: collect the five-of-six approvals here, before the
+            // caller is answered. With the switch on, the result above has
+            // already passed its 2-of-3 recomputation, and
+            // `release_verified_community_reward` decides: journal it and
+            // answer now (the retry loop collects the approvals), or settle
+            // inline exactly as by default.
+            let submitted = if release_answer_before_settlement(&node, &pending.assignment_epoch) {
+                match release_verified_community_reward(
+                    &node,
+                    &work_item,
+                    pending.assignment_epoch,
+                    pending.job_nonce,
+                    &result,
+                    &worker_attestation,
+                ) {
+                    EarlyRelease::Released {
+                        settlement,
+                        answer_release: release,
+                    } => {
+                        answer_release = Some(release);
+                        Ok(settlement)
+                    }
+                    EarlyRelease::Failed(reason) => Err(reason),
+                    EarlyRelease::Inline { journal_error } => {
+                        // The default path for this job, byte for byte.
+                        let inline = submit_verified_community_reward(
+                            &node,
+                            &work_item,
+                            pending.assignment_epoch,
+                            pending.job_nonce,
+                            &result,
+                            &worker_attestation,
+                        )
+                        .await;
+                        // One line per job that missed release on verification
+                        // through an error or a budget refusal, worded by how
+                        // it ended.
+                        match (&inline, &journal_error) {
+                            (Err(reason), _)
+                                if inline_refusal_is_budget_policy(
+                                    &node,
+                                    &result.worker_id,
+                                    reason,
+                                ) =>
+                            {
+                                tracing::info!(
+                                    job_id = %job_id,
+                                    %reason,
+                                    "verified community reward was refused by the reward budget; the answer goes out without a reward, as with the switch off"
+                                )
+                            }
+                            (Err(reason), _) => tracing::error!(
+                                job_id = %job_id,
+                                %reason,
+                                ?journal_error,
+                                "verified community reward was not settled; the answer goes out without a journaled reward"
+                            ),
+                            (Ok(_), Some(error)) => tracing::warn!(
+                                job_id = %job_id,
+                                %error,
+                                "release on verification could not journal this verified reward; it was settled inline instead"
+                            ),
+                            (Ok(_), None) => {}
+                        }
+                        inline
+                    }
+                }
+            } else {
+                submit_verified_community_reward(
+                    &node,
+                    &work_item,
+                    pending.assignment_epoch,
+                    pending.job_nonce,
+                    &result,
+                    &worker_attestation,
+                )
+                .await
+            };
+            match submitted {
                 Ok(mut settlement) => {
                     settlement["worker_attestation_hash"] = Value::String(worker_attestation_hash);
                     Some(settlement)
@@ -16591,6 +17366,7 @@ pub async fn community_submit_work(
         result: result.clone(),
         verification: verification_summary.clone(),
         settlement: settlement_outcome.clone(),
+        answer_release: answer_release.clone(),
     };
     let dispatcher_connected = pending.sender.send(dispatch_outcome).is_ok();
 
@@ -16611,13 +17387,17 @@ pub async fn community_submit_work(
         }
     }
 
-    Ok(Json(json!({
+    let mut response = json!({
         "ok": true,
         "job_id": job_id,
         "dispatcher_connected": dispatcher_connected,
         "verification": verification_summary,
         "settlement": settlement_outcome,
-    })))
+    });
+    if let Some(answer_release) = answer_release {
+        response["answer_release"] = answer_release;
+    }
+    Ok(Json(response))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -17334,17 +18114,22 @@ async fn get_model_shards(
                 "execution_profiles": execution_profiles,
             })))
         }
-        Err(error) => Ok(Json(json!({
-            "model_id": model_id_hex,
-            "pipeline": [],
-            "shard_count": 0,
-            "total_layers": total_layers,
-            "fully_covered": false,
-            "profile_bound": false,
-            "execution_profile": Value::Null,
-            "execution_profiles": execution_profiles,
-            "planning_error": error.to_string(),
-        }))),
+        Err(error) => {
+            // A read-only view: the full error, with holder names and socket
+            // addresses, goes to the debug log rather than the caller.
+            tracing::debug!(%error, "model shard pipeline could not be planned");
+            Ok(Json(json!({
+                "model_id": model_id_hex,
+                "pipeline": [],
+                "shard_count": 0,
+                "total_layers": total_layers,
+                "fully_covered": false,
+                "profile_bound": false,
+                "execution_profile": Value::Null,
+                "execution_profiles": execution_profiles,
+                "planning_error": error.public_message(),
+            })))
+        }
     }
 }
 
@@ -17905,7 +18690,7 @@ async fn inference_auto(
             "error": "No inference path available",
             "sharded_pipeline": false,
             // Say WHY the pipeline was rejected instead of just "false".
-            "sharded_pipeline_error": pipeline_check.err().map(|e| e.to_string()),
+            "sharded_pipeline_error": pipeline_check.err().map(public_pipeline_assembly_reason),
             "local_model": false,
             "community_workers": 0,
             "help": "Either: (1) load a model with --model, (2) have shard-holding nodes announce to this coordinator, or (3) start community workers with models"
@@ -18494,18 +19279,23 @@ async fn node_contribution(AxumState(node): AxumState<NodeState>) -> Json<Value>
 
 /// GET /node/threads
 ///
-/// Report the width of the pool that runs local inference compute.
+/// Report the width of the pool that runs local inference compute, and the
+/// canonical INT8 projection kernel that compute uses.
 async fn get_node_threads(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let dedicated = node.compute_threads.load(Ordering::Relaxed);
-    Json(json!({
+    let mut body = json!({
         "threads": if dedicated > 0 { dedicated as usize } else { rayon_global_width() },
         "dedicated_pool": dedicated > 0,
         "dedicated_threads": dedicated,
         "rayon_global_threads": rayon_global_width(),
         "rayon_num_threads_env": std::env::var("RAYON_NUM_THREADS").ok(),
         "available_parallelism": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        "canonical_kernel": arc_inference::canonical_simd::effective_kernel_name(),
+        "canonical_kernel_source": arc_inference::canonical_simd::kernel_choice_source(),
         "note": "POST {\"threads\": n} to rebuild the pool live; n=0 returns to rayon's global pool",
-    }))
+    });
+    insert_kernel_report(&mut body, &node);
+    Json(body)
 }
 
 #[derive(Deserialize)]
@@ -18541,6 +19331,70 @@ async fn set_node_threads(
         "threads": if applied > 0 { applied } else { rayon_global_width() },
         "dedicated_pool": applied > 0,
     })))
+}
+
+/// The canonical INT8 projection kernels this process runs, for node status.
+///
+/// `one_token` is the kernel that computes a one-token decode step's
+/// projections, and `batched` the kernel that computes multi-row projections
+/// (prefill chunks, verified rows, batched sequences). `pin_status` says what
+/// became of an `ARC_CANONICAL_BATCHED_KERNEL` pin: `unpinned`, `honoured`,
+/// `fell-back` (this CPU lacks `pin_missing_cpu_features`), `inactive` (the
+/// vector kernels are off) or `unrecognised`. The run counts are each
+/// kernel's projections since start, the record of what actually ran.
+/// `serves_loaded_model` is false when the loaded model is not on the
+/// canonical per-row INT8 profile, so none of its projections run these
+/// kernels.
+fn kernel_report_json(node: &NodeState) -> Value {
+    use arc_inference::canonical_simd::{self, BatchedKernel};
+    let report = canonical_simd::kernel_report();
+    let runs = |count: fn(BatchedKernel) -> u64| -> serde_json::Map<String, Value> {
+        BatchedKernel::ALL
+            .into_iter()
+            .filter(|kernel| kernel.available() || count(*kernel) > 0)
+            .map(|kernel| (kernel.label().to_string(), Value::from(count(kernel))))
+            .collect()
+    };
+    let one_token_runs = runs(canonical_simd::one_row_kernel_runs);
+    let batched_runs = runs(canonical_simd::batched_kernel_runs);
+    let cpu_features: serde_json::Map<String, Value> = canonical_simd::detected_cpu_features()
+        .into_iter()
+        .map(|(feature, detected)| (feature.to_string(), Value::Bool(detected)))
+        .collect();
+    let available_kernels: Vec<&str> = canonical_simd::available_batched_kernels()
+        .into_iter()
+        .map(BatchedKernel::label)
+        .collect();
+    let serves_loaded_model = node
+        .inference_model
+        .as_ref()
+        .map(|model| model.has_canonical_i8_profile());
+    json!({
+        "one_token": report.one_token_label(),
+        "batched": report.batched_label(),
+        "vector_kernels_on": report.vector_enabled,
+        "pin": report.pin.map(BatchedKernel::label),
+        "pin_status": report.pin_status.label(),
+        "pin_missing_cpu_features": report.pin_missing_cpu_features,
+        "canonical_batched_kernel_env": report.pin_env,
+        "cpu_features": cpu_features,
+        "available_kernels": available_kernels,
+        "one_token_runs": one_token_runs,
+        "batched_runs": batched_runs,
+        "serves_loaded_model": serves_loaded_model,
+    })
+}
+
+/// Add the kernel report to a node status object: `canonical_kernel`, the
+/// kernel that computes a one-token step, and `kernels`, the whole of
+/// [`kernel_report_json`]. Written last, so the kernel that runs replaces any
+/// value either key already holds.
+fn insert_kernel_report(body: &mut Value, node: &NodeState) {
+    let kernels = kernel_report_json(node);
+    if let Some(object) = body.as_object_mut() {
+        object.insert("canonical_kernel".to_string(), kernels["one_token"].clone());
+        object.insert("kernels".to_string(), kernels);
+    }
 }
 
 #[cfg(test)]
@@ -19900,6 +20754,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(temporary);
     }
 
+    /// The `tracing` output of one test, captured on the test's own thread.
+    #[derive(Clone, Default)]
+    struct ServerLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for ServerLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ServerLogs {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .with_writer(move || writer.clone())
+                    .finish(),
+            )
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    #[test]
+    fn verified_settlement_journal_failures_reach_callers_without_server_paths() {
+        let logs = ServerLogs::default();
+        let _logging = logs.install();
+        let temporary = std::env::temp_dir().join(format!(
+            "arc-rpc-settlement-redaction-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temporary).unwrap();
+        // A regular file where the journal's parent directory should be: the
+        // journal error names this path.
+        let not_a_directory = temporary.join("not-a-directory");
+        std::fs::write(&not_a_directory, b"not a directory").unwrap();
+        let mut node = fake_node_with_workers(Vec::new());
+        node.community_settlement_journal_dir =
+            Some(Arc::new(not_a_directory.join("community-settlements")));
+        let job_id = Hash256([41; 32]);
+
+        let error =
+            retain_verified_settlement(&node, test_verified_settlement_payload(job_id, 100))
+                .unwrap_err();
+        assert_eq!(error, SETTLEMENT_JOURNAL_UNAVAILABLE);
+        assert!(!node.community_verified_settlements.contains_key(&job_id));
+        let logged = logs.text();
+        // The log line names the job, so operators can tie it to the job.
+        assert!(logged.contains(&job_id.to_hex()), "{logged}");
+        assert!(
+            logged.contains("could not journal a verified settlement"),
+            "{logged}"
+        );
+        assert!(logged.contains("not a real directory"), "{logged}");
+
+        // Without a journal directory the caller gets the same text.
+        node.community_settlement_journal_dir = None;
+        let error =
+            retain_verified_settlement(&node, test_verified_settlement_payload(job_id, 100))
+                .unwrap_err();
+        assert_eq!(error, SETTLEMENT_JOURNAL_UNAVAILABLE);
+        assert!(logs.text().contains("persistent state directory"));
+        let _ = std::fs::remove_dir_all(temporary);
+    }
+
     #[test]
     fn verified_settlement_journal_prunes_only_after_protocol_expiry() {
         let temporary = std::env::temp_dir().join(format!(
@@ -20966,6 +21894,1953 @@ mod tests {
         let _ = std::fs::remove_dir_all(temporary);
     }
 
+    // ── Release on verification (`--community-release-on-verification`) ────
+    //
+    // These tests send one free prompt through the real `/inference/run`
+    // dispatcher and the real claim and submit handlers. The coordinator's
+    // check is a genuine authenticated 2-of-3 recomputation on three loopback
+    // shard holders, and the reward approvals go over HTTP to five loopback
+    // approvers whose approval endpoint can be held or failed. The chain and
+    // shard setup mirrors
+    // `remote_approval_endpoint_recomputes_canonical_worker_and_collects_five_payloads`.
+
+    type InferenceRunOutput = Result<Json<Value>, (StatusCode, Json<ApiError>)>;
+    type SubmitWorkOutput = Result<Json<Value>, (StatusCode, String)>;
+
+    /// One remote approver behind test switches. Each approval request is
+    /// counted on arrival, held until the gate has permits, and refused with
+    /// 503 while `fail` is set; otherwise it reaches the real endpoint.
+    #[derive(Clone)]
+    struct GatedApprover {
+        node: NodeState,
+        gate: Arc<tokio::sync::Semaphore>,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn gated_approver_network_info(
+        AxumState(approver): AxumState<GatedApprover>,
+    ) -> Json<Value> {
+        network_info(AxumState(approver.node)).await
+    }
+
+    async fn gated_reward_approve(
+        AxumState(approver): AxumState<GatedApprover>,
+        Json(signed): Json<CommunitySignedRequest<CommunityRewardApprovalPayload>>,
+    ) -> Result<Json<arc_types::transaction::CommunityRewardValidatorApproval>, (StatusCode, String)>
+    {
+        approver.requests.fetch_add(1, Ordering::SeqCst);
+        // An open gate hands each permit straight back when this returns.
+        let admitted = approver.gate.acquire().await.is_ok();
+        if !admitted || approver.fail.load(Ordering::SeqCst) {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "test approver is unavailable".to_string(),
+            ));
+        }
+        community_reward_approve_signed(AxumState(approver.node), Json(signed)).await
+    }
+
+    async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            while !condition() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "timed out waiting for {what}");
+    }
+
+    /// The `tracing` output of one test. `#[tokio::test]` runs the test and
+    /// every task it spawns on one thread, so a thread-local subscriber sees
+    /// the handlers' and the retry loop's log lines.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::INFO)
+                    .with_writer(move || writer.clone())
+                    .finish(),
+            )
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    struct ReleaseOnVerificationFixture {
+        coordinator: NodeState,
+        worker: arc_crypto::KeyPair,
+        worker_id: String,
+        model: Arc<arc_inference::cached_integer_model::CachedIntegerModel>,
+        model_id: Hash256,
+        transaction_domain: Hash256,
+        approval_gate: Arc<tokio::sync::Semaphore>,
+        approvals_fail: Arc<std::sync::atomic::AtomicBool>,
+        approval_requests: Arc<std::sync::atomic::AtomicUsize>,
+        servers: Vec<tokio::task::JoinHandle<()>>,
+        temporary: std::path::PathBuf,
+        /// Keeps the coordinator's lifecycle channel open, so its retry tasks
+        /// live in `runtime_tasks`, where a test can abort them like a crash.
+        _shutdown: tokio::sync::watch::Sender<bool>,
+    }
+
+    /// One `/inference/run` call in flight and the worker's submit for it.
+    struct ReleaseOnVerificationJob {
+        run: tokio::task::JoinHandle<InferenceRunOutput>,
+        submit: tokio::task::JoinHandle<SubmitWorkOutput>,
+        result: WorkResult,
+        job_hash: Hash256,
+        attestation_hash: Hash256,
+    }
+
+    impl ReleaseOnVerificationFixture {
+        async fn build(release_on_verification: bool) -> Self {
+            use arc_state::recovery::{
+                ArcCheckpoint, RecoveryExportSpec, RecoveryImport, RecoveryNetworkPolicy,
+                RecoveryValidator,
+            };
+            use arc_types::transaction::JoinValidatorBody;
+
+            let validator_keys: Vec<_> = (0..6)
+                .map(|_| arc_crypto::KeyPair::generate_ed25519())
+                .collect();
+            let legacy_keys: Vec<_> = (0..8)
+                .map(|_| arc_crypto::KeyPair::generate_ed25519())
+                .collect();
+            let worker = arc_crypto::KeyPair::generate_ed25519();
+            let treasury = arc_types::transaction::inference_reward_treasury_address();
+            let reward_amount = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
+            // Enough for more rewards than one epoch's coordinator budget, so
+            // the epoch budgets, not the treasury, bind in these tests.
+            let mut prefunded = vec![
+                (treasury, reward_amount * 64),
+                (worker.address(), 0),
+                (arc_state::recovery::recovery_stake_reserve_address(), 0),
+            ];
+            prefunded.extend(legacy_keys.iter().map(|key| (key.address(), 5_000_000)));
+            let source = arc_state::StateDB::with_genesis(&prefunded);
+            let joins = legacy_keys
+                .iter()
+                .map(|key| {
+                    let mut transaction = Transaction {
+                        tx_type: TxType::JoinValidator,
+                        from: key.address(),
+                        nonce: 0,
+                        body: TxBody::JoinValidator(JoinValidatorBody {
+                            pubkey: key.public_key_bytes().try_into().unwrap(),
+                            initial_stake: 5_000_000,
+                        }),
+                        fee: 0,
+                        gas_limit: 0,
+                        hash: Hash256::ZERO,
+                        signature: arc_crypto::Signature::null(),
+                        sig_verified: false,
+                    };
+                    transaction.sign(key).unwrap();
+                    transaction
+                })
+                .collect::<Vec<_>>();
+            let (_, join_receipts) = source
+                .execute_block(&joins, legacy_keys[0].address())
+                .unwrap();
+            assert!(join_receipts.iter().all(|receipt| receipt.success));
+            for key in &legacy_keys {
+                let mut account = source.get_account(&key.address()).unwrap();
+                account.staked_balance = 0;
+                source.update_account(&key.address(), account);
+            }
+            let reserve_address = arc_state::recovery::recovery_stake_reserve_address();
+            let mut reserve = source.get_account(&reserve_address).unwrap();
+            reserve.balance = 40_000_000;
+            source.update_account(&reserve_address, reserve);
+            source
+                .execute_block(&[], legacy_keys[0].address())
+                .expect("reserve decomposition must have a canonical source boundary");
+
+            let target_validators = validator_keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| RecoveryValidator {
+                    address: key.address(),
+                    public_key: key.public_key_bytes().try_into().unwrap(),
+                    stake: 6_666_666 + u64::from(index < 4),
+                })
+                .collect::<Vec<_>>();
+            let genesis_hash = arc_crypto::hash_bytes(b"release-on-verification-genesis");
+            let mut checkpoint = ArcCheckpoint::export_unsigned(
+                &source,
+                RecoveryExportSpec {
+                    chain_id: "arc-release-on-verification-test".to_string(),
+                    genesis_hash,
+                    source_consensus_round: 1,
+                    recovery_epoch: 7,
+                    validator_set_id: 9,
+                    validators: target_validators.clone(),
+                    community_rewards_v1_activation_height: Some(0),
+                    created_at_unix_ms: 1,
+                },
+            )
+            .unwrap();
+            for key in validator_keys.iter().take(5) {
+                checkpoint.add_signature(key).unwrap();
+            }
+            let approved_manifest_hash = checkpoint.manifest_hash();
+            // Short names keep the settlement journal's temporary files well
+            // inside the Windows path limit.
+            let temporary = std::env::temp_dir().join(format!("arc-rov-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&temporary).unwrap();
+            let checkpoint_path = temporary.join("approved.arcchkpt");
+            checkpoint.write_to(&checkpoint_path).unwrap();
+            let data_dir = temporary.join("state");
+            let policy = RecoveryNetworkPolicy {
+                chain_id: "arc-release-on-verification-test".to_string(),
+                genesis_hash,
+                recovery_epoch: 7,
+                validator_set_id: 9,
+                validators: target_validators
+                    .iter()
+                    .map(|validator| (validator.address, validator.stake))
+                    .collect(),
+                community_rewards_v1_activation_height: Some(0),
+            };
+            let recovered = Arc::new(
+                arc_state::StateDB::with_genesis_persistent_recovery(
+                    &[],
+                    &data_dir,
+                    policy,
+                    Some(RecoveryImport {
+                        checkpoint_path,
+                        approved_manifest_hash,
+                    }),
+                )
+                .unwrap(),
+            );
+            let active = recovered.active_validators();
+            assert_eq!(active.len(), 6);
+            let transaction_domain = recovered.recovery_context().unwrap().domain_hash();
+
+            // Three validator shard holders for the authenticated 2-of-3 check.
+            let model_id = arc_crypto::hash_bytes(b"release-on-verification-exact-model");
+            let model = Arc::new(test_reward_inference_model());
+            let model_name = model_display_name(&model);
+            let mut servers = Vec::new();
+            let mut replicas = Vec::new();
+            for (index, key) in validator_keys.iter().take(3).enumerate() {
+                let mut node = fake_node_with_workers(Vec::new());
+                node.state = recovered.clone();
+                node.validator_address = key.address();
+                node.validator_keypair = Some(Arc::new(key.clone()));
+                node.inference_model = Some(model.clone());
+                node.model_artifact_id = Some(model_id);
+                *node.dag_validators.write() = active.clone();
+                let shard = ShardInfo {
+                    start_layer: 0,
+                    end_layer: 1,
+                    total_layers: 1,
+                    model_id: format!("0x{}", model_id.to_hex()),
+                    model_name: model_name.clone(),
+                    execution_profile: canonical_profile(),
+                    memory_mb: 1,
+                    full_model_mb: 1,
+                    socket_addr: String::new(),
+                    node_name: format!("shard-{index}"),
+                };
+                node.shard_infos = vec![shard.clone()];
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let origin = format!("http://{}", listener.local_addr().unwrap());
+                let app = Router::new()
+                    .route("/network/info", get(network_info))
+                    .route("/inference/forward_shard", post(inference_forward_shard))
+                    .route("/inference/cleanup_shard", post(inference_cleanup_shard))
+                    .with_state(node);
+                servers.push(tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                }));
+                replicas.push(ShardInfo {
+                    socket_addr: origin,
+                    ..shard
+                });
+            }
+            let pipeline = vec![((0, 1), replicas)];
+
+            // Five remote approvers, each recomputing before it signs.
+            let approval_gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let approvals_fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let approval_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut approver_origins = Vec::new();
+            for key in validator_keys.iter().skip(1) {
+                let mut approver = fake_node_with_workers(Vec::new());
+                approver.state = recovered.clone();
+                approver.validator_address = key.address();
+                approver.validator_keypair = Some(Arc::new(key.clone()));
+                approver.community_rewards_v1_enabled = true;
+                approver.inference_model = Some(model.clone());
+                approver.model_artifact_id = Some(model_id);
+                approver.community_rpc_bases = Arc::new(
+                    (1..=5)
+                        .map(|index| format!("http://127.0.0.{index}:1"))
+                        .collect(),
+                );
+                *approver.dag_validators.write() = active.clone();
+                approver.community_verification_pipeline_override = Some(pipeline.clone());
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                approver_origins.push(format!("http://{}", listener.local_addr().unwrap()));
+                let app = Router::new()
+                    .route("/network/info", get(gated_approver_network_info))
+                    .route(COMMUNITY_REWARD_APPROVE_PATH, post(gated_reward_approve))
+                    .with_state(GatedApprover {
+                        node: approver,
+                        gate: approval_gate.clone(),
+                        fail: approvals_fail.clone(),
+                        requests: approval_requests.clone(),
+                    });
+                servers.push(tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                }));
+            }
+
+            // The coordinator is the sixth validator, with rewards active.
+            let worker_id = format!("0x{}", worker.address().to_hex());
+            let registered = CommunityWorker {
+                worker_id: worker_id.clone(),
+                name: "release-on-verification-worker".to_string(),
+                capabilities: vec!["inference".to_string()],
+                model: Some(model_name),
+                model_id: Some(format!("0x{}", model_id.to_hex())),
+                execution_profile: Some(canonical_profile()),
+                platform: "test".to_string(),
+                registered_at: 0,
+                work_completed: 0,
+                success_count: 0,
+                failure_count: 0,
+                sum_total_ms_success: 0,
+                last_total_ms: 0,
+            };
+            let mut coordinator =
+                fake_node_with_workers(vec![(registered, std::time::Instant::now())]);
+            coordinator.state = recovered.clone();
+            coordinator.validator_address = validator_keys[0].address();
+            coordinator.validator_keypair = Some(Arc::new(validator_keys[0].clone()));
+            coordinator.community_rewards_v1_enabled = true;
+            coordinator.community_release_on_verification = release_on_verification;
+            coordinator.inference_model = Some(model.clone());
+            coordinator.model_artifact_id = Some(model_id);
+            coordinator.community_rpc_bases = Arc::new(approver_origins);
+            coordinator.community_settlement_journal_dir = recovered
+                .persistence_dir()
+                .map(|directory| Arc::new(directory.join("community-settlements")));
+            *coordinator.dag_validators.write() = active;
+            coordinator.community_verification_pipeline_override = Some(pipeline);
+            let (shutdown, shutdown_receiver) = tokio::sync::watch::channel(false);
+            coordinator.runtime_shutdown = Some(shutdown_receiver);
+            assert!(
+                community_reward_issuance_ready_for(&coordinator, worker.address()),
+                "fixture coordinator must be able to issue a reward"
+            );
+
+            Self {
+                coordinator,
+                worker,
+                worker_id,
+                model,
+                model_id,
+                transaction_domain,
+                approval_gate,
+                approvals_fail,
+                approval_requests,
+                servers,
+                temporary,
+                _shutdown: shutdown,
+            }
+        }
+
+        /// A new coordinator process on the same chain, keys, validator set
+        /// and journal directory, with empty in-memory maps: what a restart
+        /// leaves behind.
+        fn restarted_coordinator(&self) -> NodeState {
+            let registered = self
+                .coordinator
+                .community_workers
+                .get(&self.worker_id)
+                .map(|entry| entry.value().0.clone())
+                .unwrap();
+            let mut node = fake_node_with_workers(vec![(registered, std::time::Instant::now())]);
+            node.state = self.coordinator.state.clone();
+            node.validator_address = self.coordinator.validator_address;
+            node.validator_keypair = self.coordinator.validator_keypair.clone();
+            node.community_rewards_v1_enabled = true;
+            node.community_release_on_verification =
+                self.coordinator.community_release_on_verification;
+            node.inference_model = self.coordinator.inference_model.clone();
+            node.model_artifact_id = self.coordinator.model_artifact_id;
+            node.community_rpc_bases = self.coordinator.community_rpc_bases.clone();
+            node.community_settlement_journal_dir =
+                self.coordinator.community_settlement_journal_dir.clone();
+            node.community_verification_pipeline_override = self
+                .coordinator
+                .community_verification_pipeline_override
+                .clone();
+            let validators = self.coordinator.dag_validators.read().clone();
+            *node.dag_validators.write() = validators;
+            node
+        }
+
+        /// Journal `count` unpaid, unexpired settlements for `worker` on this
+        /// coordinator, as earlier verified jobs would have left them.
+        fn journal_unpaid_settlements(&self, count: u64, worker: Hash256) {
+            let expires_at_height =
+                self.coordinator.state.height() + COMMUNITY_REWARD_EXPIRY_BLOCKS;
+            for index in 0..count {
+                let job_id =
+                    arc_crypto::hash_bytes(format!("earlier-verified-job-{index}").as_bytes());
+                let mut payload = test_verified_settlement_payload(job_id, expires_at_height);
+                payload.coordinator_id =
+                    format!("0x{}", self.coordinator.validator_address.to_hex());
+                payload.reward.coordinator = self.coordinator.validator_address;
+                payload.reward.worker = worker;
+                self.coordinator.community_verified_settlements.insert(
+                    job_id,
+                    VerifiedCommunitySettlement {
+                        payload,
+                        verified_at_unix_ms: 1,
+                        attempts: 0,
+                        retry_running: false,
+                        last_error: None,
+                    },
+                );
+            }
+        }
+
+        fn open_approvals(&self) {
+            self.approval_gate.add_permits(1024);
+        }
+
+        fn approval_request_count(&self) -> usize {
+            self.approval_requests.load(Ordering::SeqCst)
+        }
+
+        fn reward_submitted(&self, job_hash: Hash256) -> bool {
+            self.coordinator
+                .community_reward_submissions
+                .contains_key(&job_hash)
+        }
+
+        /// Send one free prompt to `/inference/run`, claim the queued job as
+        /// the registered worker, compute it with the same deterministic
+        /// model, and submit the signed result.
+        async fn start_job(&self) -> ReleaseOnVerificationJob {
+            let input = "ARC";
+            let run = tokio::spawn(inference_run(
+                AxumState(self.coordinator.clone()),
+                Some(Json(json!({"input": input, "max_tokens": 1}))),
+            ));
+            let queued = self
+                .coordinator
+                .community_work_results
+                .as_ref()
+                .unwrap()
+                .clone();
+            wait_until("the dispatcher to queue the job", || !queued.is_empty()).await;
+            let Json(claimed) = community_claim_work(
+                AxumState(self.coordinator.clone()),
+                Json(ClaimWorkRequest {
+                    worker_id: self.worker_id.clone(),
+                    capabilities: vec!["inference".to_string()],
+                    model_id: format!("0x{}", self.model_id.to_hex()),
+                    execution_profile: canonical_profile(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(claimed["status"], "work");
+            assert_eq!(claimed["input"], input);
+            assert_eq!(
+                claimed["transaction_domain"],
+                format!("0x{}", self.transaction_domain.to_hex())
+            );
+            let job_id = claimed["job_id"].as_str().unwrap().to_string();
+
+            let prompt = self.model.encode(input);
+            let (output_tokens, output_hash) = self.model.generate(&prompt, 1, &[]);
+            let mut attestation = Transaction {
+                tx_type: TxType::InferenceAttestation,
+                from: self.worker.address(),
+                nonce: 0,
+                body: TxBody::InferenceAttestation(
+                    arc_types::transaction::InferenceAttestationBody {
+                        model_id: self.model_id,
+                        input_hash: arc_crypto::hash_bytes(input.as_bytes()),
+                        output_hash,
+                        challenge_period: 100,
+                        bond: 0,
+                        beneficiary: None,
+                    },
+                ),
+                fee: 0,
+                gas_limit: 0,
+                hash: Hash256::ZERO,
+                signature: arc_crypto::Signature::null(),
+                sig_verified: false,
+            };
+            attestation
+                .sign_in_domain(&self.worker, &self.transaction_domain)
+                .unwrap();
+            let result = WorkResult {
+                job_id: job_id.clone(),
+                worker_id: self.worker_id.clone(),
+                success: true,
+                declined: false,
+                output: self.model.decode(&output_tokens),
+                output_hash: format!("0x{}", output_hash.to_hex()),
+                tokens_generated: output_tokens.len() as u64,
+                total_ms: 1,
+                ms_per_token: 1,
+                engine: canonical_profile(),
+                error: None,
+                signed_attestation_hex: Some(format!(
+                    "0x{}",
+                    hex::encode(bincode::serialize(&attestation).unwrap())
+                )),
+            };
+            let submit = tokio::spawn(community_submit_work(
+                AxumState(self.coordinator.clone()),
+                Json(result.clone()),
+            ));
+            ReleaseOnVerificationJob {
+                run,
+                submit,
+                job_hash: parse_hash256_hex(&job_id, "job_id").unwrap(),
+                result,
+                attestation_hash: attestation.hash,
+            }
+        }
+    }
+
+    impl Drop for ReleaseOnVerificationFixture {
+        fn drop(&mut self) {
+            for server in &self.servers {
+                server.abort();
+            }
+            let _ = std::fs::remove_dir_all(&self.temporary);
+        }
+    }
+
+    async fn released_answer(run: tokio::task::JoinHandle<InferenceRunOutput>) -> Value {
+        let Json(response) = tokio::time::timeout(std::time::Duration::from_secs(120), run)
+            .await
+            .expect("the /inference/run caller was answered")
+            .unwrap()
+            .unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn release_on_verification_answers_before_approvals_and_the_reward_still_settles() {
+        let fixture = ReleaseOnVerificationFixture::build(true).await;
+        let job = fixture.start_job().await;
+
+        // Every approver is held closed, yet the caller gets the verified answer.
+        let response = released_answer(job.run).await;
+        assert_eq!(response["success"], true);
+        assert_eq!(
+            response["routed_via"],
+            format!("community:{}", fixture.worker_id)
+        );
+        assert_eq!(response["inference"]["output"], job.result.output);
+        assert_eq!(response["inference"]["output_hash"], job.result.output_hash);
+        assert_eq!(response["verification"]["quorum_verified"], true);
+        assert_eq!(
+            response["settlement"]["status"],
+            "verified_pending_approval"
+        );
+        assert_eq!(response["settlement"]["submitted"], false);
+        assert_eq!(response["settlement"]["retry_running"], true);
+        assert!(response["settlement"]["tx_hash"].is_null());
+        // The response contract documented in docs/twin-execution.md section 13.
+        assert_exact_reward_receipt_fields(
+            &response["answer_release"],
+            &[
+                "schema",
+                "mode",
+                "verification",
+                "settlement",
+                "settlement_status_url",
+                "coordinator",
+                "expires_at_height",
+            ],
+        );
+        assert_eq!(
+            response["answer_release"]["schema"],
+            "arc.community.answer-release.v1"
+        );
+        assert_eq!(response["answer_release"]["mode"], "on_verification");
+        assert_eq!(response["answer_release"]["verification"], "passed");
+        assert_eq!(response["answer_release"]["settlement"], "pending");
+        assert_eq!(
+            response["answer_release"]["settlement_status_url"],
+            format!("/community/reward_job/0x{}", job.job_hash.to_hex())
+        );
+        // Where to ask, and when "pending" ends.
+        assert_eq!(
+            response["answer_release"]["coordinator"],
+            format!("0x{}", fixture.coordinator.validator_address.to_hex())
+        );
+        let expires_at_height = fixture
+            .coordinator
+            .community_verified_settlements
+            .get(&job.job_hash)
+            .map(|record| record.payload.reward.expires_at_height)
+            .unwrap();
+        assert!(expires_at_height > fixture.coordinator.state.height());
+        assert_eq!(
+            response["answer_release"]["expires_at_height"],
+            expires_at_height
+        );
+        let Json(submitted) = job.submit.await.unwrap().unwrap();
+        assert_eq!(submitted["dispatcher_connected"], true);
+        assert_eq!(submitted["settlement"], response["settlement"]);
+        assert_eq!(submitted["answer_release"], response["answer_release"]);
+
+        // The approvals start afterwards on the retry path. Nothing reaches the
+        // mempool until five of six validators have signed.
+        wait_until("all five approvers to be asked", || {
+            fixture.approval_request_count() >= 5
+        })
+        .await;
+        assert_eq!(fixture.coordinator.mempool.len(), 0);
+        fixture.open_approvals();
+        wait_until("the reward transaction to reach the mempool", || {
+            fixture.reward_submitted(job.job_hash)
+        })
+        .await;
+        let submission = fixture
+            .coordinator
+            .community_reward_submissions
+            .get(&job.job_hash)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            submission.approvals,
+            arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED
+        );
+        assert_eq!(submission.worker, fixture.worker.address());
+        assert!(fixture.coordinator.mempool.contains(&submission.tx_hash));
+        assert_eq!(fixture.coordinator.mempool.len(), 1);
+        let Json(status) = community_reward_job(
+            AxumState(fixture.coordinator.clone()),
+            axum::extract::Path(format!("0x{}", job.job_hash.to_hex())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status["status"], "pending_mined_receipt");
+        assert_eq!(
+            status["tx_hash"],
+            format!("0x{}", submission.tx_hash.to_hex())
+        );
+    }
+
+    #[tokio::test]
+    async fn release_on_verification_retries_a_failed_settlement_without_changing_the_answer() {
+        let fixture = ReleaseOnVerificationFixture::build(true).await;
+        fixture.approvals_fail.store(true, Ordering::SeqCst);
+        fixture.open_approvals();
+        let job = fixture.start_job().await;
+        let response = released_answer(job.run).await;
+        assert_eq!(response["inference"]["output_hash"], job.result.output_hash);
+        assert_eq!(response["answer_release"]["settlement"], "pending");
+        let Json(submitted) = job.submit.await.unwrap().unwrap();
+        assert_eq!(submitted["answer_release"], response["answer_release"]);
+
+        // The first approval round fails after the answer was released ...
+        wait_until("the first settlement attempt to fail", || {
+            fixture
+                .coordinator
+                .community_verified_settlements
+                .get(&job.job_hash)
+                .is_some_and(|record| record.last_error.is_some())
+        })
+        .await;
+        let failed = fixture
+            .coordinator
+            .community_verified_settlements
+            .get(&job.job_hash)
+            .unwrap()
+            .clone();
+        assert!(failed.attempts >= 1);
+        assert!(failed.retry_running);
+        let error = failed.last_error.unwrap_or_default();
+        assert!(error.contains("5 of 6 required"), "{error}");
+        assert!(!fixture.reward_submitted(job.job_hash));
+        assert_eq!(fixture.coordinator.mempool.len(), 0);
+        // ... and leaves the released answer exactly as it was.
+        let retained = fixture
+            .coordinator
+            .inference_results
+            .get(&job.result.job_id)
+            .unwrap()
+            .clone();
+        assert_eq!(retained["output_hash"], job.result.output_hash);
+        assert_eq!(retained["verification"]["quorum_verified"], true);
+
+        // The existing retry loop settles the job once approvals recover.
+        fixture.approvals_fail.store(false, Ordering::SeqCst);
+        wait_until("the retried reward to reach the mempool", || {
+            fixture.reward_submitted(job.job_hash)
+        })
+        .await;
+        assert_eq!(fixture.coordinator.mempool.len(), 1);
+        let settled = fixture
+            .coordinator
+            .community_verified_settlements
+            .get(&job.job_hash)
+            .unwrap()
+            .clone();
+        assert!(settled.attempts >= 2);
+        let unchanged = fixture
+            .coordinator
+            .inference_results
+            .get(&job.result.job_id)
+            .unwrap()
+            .clone();
+        assert_eq!(unchanged, retained);
+    }
+
+    #[tokio::test]
+    async fn release_on_verification_settles_exactly_one_reward_for_the_job() {
+        let fixture = ReleaseOnVerificationFixture::build(true).await;
+        fixture.open_approvals();
+        let job = fixture.start_job().await;
+        let response = released_answer(job.run).await;
+        assert_eq!(response["answer_release"]["settlement"], "pending");
+        let Json(submitted) = job.submit.await.unwrap().unwrap();
+        assert_eq!(
+            submitted["settlement"]["status"],
+            "verified_pending_approval"
+        );
+        wait_until("the reward transaction to reach the mempool", || {
+            fixture.reward_submitted(job.job_hash)
+        })
+        .await;
+        let submission = fixture
+            .coordinator
+            .community_reward_submissions
+            .get(&job.job_hash)
+            .unwrap()
+            .clone();
+        let tx_hash = format!("0x{}", submission.tx_hash.to_hex());
+
+        // A worker retry of the same submit replays the one pending reward ...
+        let Json(replay) = community_submit_work(
+            AxumState(fixture.coordinator.clone()),
+            Json(job.result.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replay["settlement"]["status"], "pending_mined_receipt");
+        assert_eq!(replay["settlement"]["tx_hash"], tx_hash);
+        // ... and so does the retry loop's next pass.
+        let next_pass = attempt_verified_community_reward(&fixture.coordinator, job.job_hash)
+            .await
+            .unwrap();
+        assert_eq!(next_pass["status"], "pending_mined_receipt");
+        assert_eq!(next_pass["tx_hash"], tx_hash);
+
+        // One journaled settlement, one reward transaction, one completion.
+        assert_eq!(fixture.coordinator.community_verified_settlements.len(), 1);
+        assert_eq!(fixture.coordinator.community_reward_submissions.len(), 1);
+        assert_eq!(fixture.coordinator.mempool.len(), 1);
+        let (completed, successes) = fixture
+            .coordinator
+            .community_workers
+            .get(&fixture.worker_id)
+            .map(|entry| {
+                (
+                    entry.value().0.work_completed,
+                    entry.value().0.success_count,
+                )
+            })
+            .unwrap();
+        assert_eq!((completed, successes), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn release_on_verification_off_keeps_the_answer_behind_the_approvals() {
+        let fixture = ReleaseOnVerificationFixture::build(false).await;
+        let job = fixture.start_job().await;
+
+        // Verification has passed and every approver has been asked, but by
+        // default the caller is still waiting for the approvals.
+        wait_until("all five approvers to be asked", || {
+            fixture.approval_request_count() >= 5
+        })
+        .await;
+        assert!(!job.run.is_finished());
+        assert!(!job.submit.is_finished());
+        assert_eq!(fixture.coordinator.mempool.len(), 0);
+
+        fixture.open_approvals();
+        let response = released_answer(job.run).await;
+        assert_eq!(response["settlement"]["status"], "pending_mined_receipt");
+        assert_eq!(response["settlement"]["submitted"], true);
+        assert!(response.get("answer_release").is_none());
+        let Json(submitted) = job.submit.await.unwrap().unwrap();
+        assert_eq!(submitted["settlement"], response["settlement"]);
+        assert!(submitted.get("answer_release").is_none());
+        assert_eq!(fixture.coordinator.mempool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn release_on_verification_is_opt_in_and_skips_recovery_probes() {
+        let mut node = fake_node_with_workers(Vec::new());
+        let ordinary = Hash256([7; 32]);
+        let prefix = arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX;
+        let mut probe_id = [5u8; 32];
+        probe_id[..prefix.len()].copy_from_slice(&prefix);
+        let probe = Hash256(probe_id);
+        assert!(
+            arc_types::transaction::CommunityInferenceRewardBody::is_recovery_probe_assignment(
+                &probe
+            )
+        );
+        assert!(!release_answer_before_settlement(&node, &ordinary));
+        assert!(!release_answer_before_settlement(&node, &probe));
+        node.community_release_on_verification = true;
+        assert!(release_answer_before_settlement(&node, &ordinary));
+        assert!(!release_answer_before_settlement(&node, &probe));
+    }
+
+    #[tokio::test]
+    async fn release_on_verification_reward_settles_after_a_restart_that_follows_the_answer() {
+        let fixture = ReleaseOnVerificationFixture::build(true).await;
+        let job = fixture.start_job().await;
+        let response = released_answer(job.run).await;
+        assert_eq!(response["answer_release"]["settlement"], "pending");
+        let Json(submitted) = job.submit.await.unwrap().unwrap();
+        assert_eq!(submitted["answer_release"], response["answer_release"]);
+
+        // The process stops right after answering; its retry task dies with it.
+        fixture.coordinator.runtime_tasks.lock().abort_all();
+        let restarted = fixture.restarted_coordinator();
+        assert!(restarted.community_verified_settlements.is_empty());
+        let replayed = replay_verified_settlement_journal(&restarted).unwrap();
+        assert_eq!(replayed, [job.job_hash]);
+        let record = restarted
+            .community_verified_settlements
+            .get(&job.job_hash)
+            .unwrap()
+            .clone();
+        assert_eq!(record.attempts, 0);
+        assert!(!record.retry_running);
+        assert_eq!(
+            record.last_error.as_deref(),
+            Some("replayed after node restart")
+        );
+        assert_eq!(
+            format!("0x{}", record.payload.reward.output_hash.to_hex()),
+            job.result.output_hash
+        );
+        assert_eq!(
+            response["answer_release"]["expires_at_height"],
+            record.payload.reward.expires_at_height
+        );
+
+        // `serve` schedules every replayed entry; the restarted process alone
+        // then collects the approvals and submits the reward.
+        schedule_verified_settlement_retry(&restarted, job.job_hash);
+        fixture.open_approvals();
+        wait_until("the replayed reward to reach the restarted mempool", || {
+            restarted
+                .community_reward_submissions
+                .contains_key(&job.job_hash)
+        })
+        .await;
+        assert_eq!(restarted.mempool.len(), 1);
+        assert_eq!(fixture.coordinator.mempool.len(), 0);
+        let Json(status) = community_reward_job(
+            AxumState(restarted.clone()),
+            axum::extract::Path(format!("0x{}", job.job_hash.to_hex())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status["status"], "pending_mined_receipt");
+    }
+
+    #[tokio::test]
+    async fn release_on_verification_settles_inline_above_the_journal_high_water_mark() {
+        let logs = CapturedLogs::default();
+        let _logging = logs.install();
+        let fixture = ReleaseOnVerificationFixture::build(true).await;
+        fixture.journal_unpaid_settlements(
+            VERIFIED_SETTLEMENT_RELEASE_HIGH_WATER,
+            arc_crypto::hash_bytes(b"another worker"),
+        );
+        let job = fixture.start_job().await;
+
+        // Verification has passed and every approver has been asked, yet the
+        // caller still waits for the approvals, as with the switch off.
+        wait_until("all five approvers to be asked", || {
+            fixture.approval_request_count() >= 5
+        })
+        .await;
+        assert!(!job.run.is_finished());
+        assert!(!job.submit.is_finished());
+        let logged = logs.text();
+        assert!(logged.contains("reached its high-water mark"), "{logged}");
+
+        fixture.open_approvals();
+        let response = released_answer(job.run).await;
+        assert!(response.get("answer_release").is_none());
+        assert_eq!(response["settlement"]["status"], "pending_mined_receipt");
+        let Json(submitted) = job.submit.await.unwrap().unwrap();
+        assert!(submitted.get("answer_release").is_none());
+        assert_eq!(submitted["settlement"], response["settlement"]);
+        assert_eq!(fixture.coordinator.mempool.len(), 1);
+    }
+
+    /// With the switch on and the journal unable to take the job, the job
+    /// settles inline, exactly as with the switch off. Here the inline journal
+    /// write fails as well, so the answer carries the default path's
+    /// `reward_approval_quorum_unavailable` settlement, no approver is asked,
+    /// and the failure is logged with its cause.
+    async fn assert_journal_failure_settles_inline(
+        fixture: &ReleaseOnVerificationFixture,
+        logs: &CapturedLogs,
+        cause: &str,
+    ) {
+        fixture.open_approvals();
+        let job = fixture.start_job().await;
+        let response = released_answer(job.run).await;
+        assert_eq!(response["inference"]["output_hash"], job.result.output_hash);
+        assert!(response.get("answer_release").is_none());
+        assert_eq!(
+            response["settlement"]["status"],
+            "reward_approval_quorum_unavailable"
+        );
+        assert_eq!(response["settlement"]["submitted"], false);
+        // The cause is checked in the log below, not in this public reason:
+        // #189 replaces a journal error's detail there with a fixed text.
+        assert!(
+            response["settlement"]["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty())
+        );
+        let Json(submitted) = job.submit.await.unwrap().unwrap();
+        assert!(submitted.get("answer_release").is_none());
+        assert_eq!(submitted["settlement"], response["settlement"]);
+        assert!(
+            !fixture
+                .coordinator
+                .community_verified_settlements
+                .contains_key(&job.job_hash)
+        );
+        assert_eq!(fixture.approval_request_count(), 0);
+        assert_eq!(fixture.coordinator.mempool.len(), 0);
+        // One error line for the job, naming the cause.
+        let logged = logs.text();
+        assert_eq!(
+            logged
+                .matches("verified community reward was not settled")
+                .count(),
+            1,
+            "{logged}"
+        );
+        assert!(logged.contains(cause), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn release_on_verification_full_journal_settles_inline_and_logs() {
+        let logs = CapturedLogs::default();
+        let _logging = logs.install();
+        let fixture = ReleaseOnVerificationFixture::build(true).await;
+        fixture.journal_unpaid_settlements(
+            VERIFIED_SETTLEMENT_CAP as u64,
+            arc_crypto::hash_bytes(b"another worker"),
+        );
+        assert_journal_failure_settles_inline(&fixture, &logs, "reviewed capacity 256").await;
+        let logged = logs.text();
+        assert!(logged.contains("reached its high-water mark"), "{logged}");
+        // The mark sent it inline before any release attempt touched the journal.
+        assert!(logged.contains("journal_error=None"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn release_on_verification_journal_io_error_settles_inline_and_logs() {
+        let logs = CapturedLogs::default();
+        let _logging = logs.install();
+        let mut fixture = ReleaseOnVerificationFixture::build(true).await;
+        // A regular file where the journal's parent directory should be.
+        let not_a_directory = fixture.temporary.join("not-a-directory");
+        std::fs::write(&not_a_directory, b"not a directory").unwrap();
+        fixture.coordinator.community_settlement_journal_dir =
+            Some(Arc::new(not_a_directory.join("community-settlements")));
+        assert_journal_failure_settles_inline(&fixture, &logs, "not a real directory").await;
+        // The release attempt's journal error is carried into that one line.
+        let logged = logs.text();
+        assert!(logged.contains("journal_error=Some("), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn release_on_verification_missing_journal_directory_settles_inline_and_logs() {
+        let logs = CapturedLogs::default();
+        let _logging = logs.install();
+        let mut fixture = ReleaseOnVerificationFixture::build(true).await;
+        fixture.coordinator.community_settlement_journal_dir = None;
+        assert_journal_failure_settles_inline(&fixture, &logs, "persistent state directory").await;
+        // The release attempt's journal error is carried into that one line.
+        let logged = logs.text();
+        assert!(logged.contains("journal_error=Some("), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn release_on_verification_resubmit_and_status_reads_start_no_second_attempt() {
+        let fixture = ReleaseOnVerificationFixture::build(true).await;
+        let job = fixture.start_job().await;
+        let response = released_answer(job.run).await;
+        assert_eq!(response["answer_release"]["settlement"], "pending");
+        let Json(submitted) = job.submit.await.unwrap().unwrap();
+        assert_eq!(
+            submitted["settlement"]["status"],
+            "verified_pending_approval"
+        );
+
+        // The retry loop's first attempt is waiting on all five approvers.
+        wait_until("all five approvers to be asked", || {
+            fixture.approval_request_count() >= 5
+        })
+        .await;
+        // A worker retry and a status read during that window ...
+        let Json(replay) = community_submit_work(
+            AxumState(fixture.coordinator.clone()),
+            Json(job.result.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay["idempotent_replay"], true);
+        assert_eq!(replay["settlement"]["status"], "verified_pending_approval");
+        assert_eq!(replay["settlement"]["retry_running"], true);
+        let Json(status) = community_reward_job(
+            AxumState(fixture.coordinator.clone()),
+            axum::extract::Path(format!("0x{}", job.job_hash.to_hex())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status["status"], "verified_pending_approval");
+        // ... start no second attempt, even after a retry backoff of 1-2 s.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(fixture.approval_request_count(), 5);
+        let record = fixture
+            .coordinator
+            .community_verified_settlements
+            .get(&job.job_hash)
+            .unwrap()
+            .clone();
+        assert_eq!(record.attempts, 1);
+        assert!(record.retry_running);
+
+        fixture.open_approvals();
+        wait_until("the reward transaction to reach the mempool", || {
+            fixture.reward_submitted(job.job_hash)
+        })
+        .await;
+        assert_eq!(fixture.coordinator.mempool.len(), 1);
+        assert_eq!(fixture.approval_request_count(), 5);
+    }
+
+    /// What main (`b26f9739`) returns for one community job that settled
+    /// inline and reached the mempool: the `/inference/run` body and the
+    /// worker's submit body, field for field. Only the elapsed `dispatch_ms`
+    /// and the verifier's range-position count are taken from `answer`.
+    fn main_inline_bodies(
+        fixture: &ReleaseOnVerificationFixture,
+        job_hash: Hash256,
+        result: &WorkResult,
+        attestation_hash: Hash256,
+        answer: &Value,
+    ) -> (Value, Value) {
+        let submission = fixture
+            .coordinator
+            .community_reward_submissions
+            .get(&job_hash)
+            .unwrap()
+            .clone();
+        let mut settlement =
+            pending_mined_receipt_value(&fixture.coordinator, job_hash, &submission);
+        settlement["worker_attestation_hash"] =
+            Value::String(format!("0x{}", attestation_hash.to_hex()));
+        let verification = json!({
+            "method": "authenticated_shard_quorum_2_of_3_per_range",
+            "profile_bound": true,
+            "quorum_verified": true,
+            "execution_profile": canonical_profile(),
+            "output_hash": result.output_hash,
+            "tokens_generated": result.tokens_generated,
+            "ranges": 1,
+            "range_position_quorums": answer["verification"]["range_position_quorums"],
+            "signatures_required_per_quorum": COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED,
+            "replicas_contacted_per_quorum": COMMUNITY_VERIFICATION_REPLICAS,
+        });
+        let input_hash = arc_crypto::hash_bytes(b"ARC");
+        let expected_answer = json!({
+            "success": true,
+            "recovery_probe_id": Value::Null,
+            "routed_via": format!("community:{}", result.worker_id),
+            "inference": {
+                "model": "community-served",
+                "model_hash": format!("0x{}", fixture.model_id.to_hex()),
+                "input": "ARC",
+                "input_hash": format!("0x{}", hex::encode(input_hash.0)),
+                "output": result.output,
+                "output_hash": result.output_hash,
+                "tokens_generated": result.tokens_generated,
+                "inference_ms": result.total_ms,
+                "ms_per_token": result.ms_per_token,
+                "encode_ms": 0,
+                "deterministic": result.engine.contains("integer"),
+                "engine": result.engine,
+                "dispatch_ms": answer["inference"]["dispatch_ms"],
+            },
+            "attestation": {
+                "status": "worker_certificate_handled_by_settlement",
+                "request_overrides_applied": false,
+                "note": "bond and challenge_period request fields apply only to the local fallback; community certificates use the protocol-fixed shape reported by settlement",
+            },
+            "worker": {
+                "worker_id": result.worker_id,
+                "live_workers_at_dispatch": 1,
+            },
+            "verification": verification,
+            "settlement": settlement,
+        });
+        let expected_submit = json!({
+            "ok": true,
+            "job_id": result.job_id,
+            "dispatcher_connected": true,
+            "verification": verification,
+            "settlement": settlement,
+        });
+        assert!(answer["inference"]["dispatch_ms"].is_u64());
+        assert!(
+            answer["verification"]["range_position_quorums"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+        (expected_answer, expected_submit)
+    }
+
+    /// Equal as values and byte for byte as serialized JSON.
+    fn assert_same_body(actual: &Value, expected: &Value) {
+        assert_eq!(actual, expected);
+        assert_eq!(
+            serde_json::to_string(actual).unwrap(),
+            serde_json::to_string(expected).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn release_on_verification_settles_a_reward_beyond_the_unpaid_budget_like_switch_off() {
+        let logs = CapturedLogs::default();
+        let _logging = logs.install();
+        let fixture = ReleaseOnVerificationFixture::build(true).await;
+        fixture.open_approvals();
+        let worker = fixture.worker.address();
+        let budget = prospective_community_reward_budget(
+            &fixture.coordinator,
+            worker,
+            fixture.coordinator.validator_address,
+        );
+        assert!(budget.worker_remaining_this_epoch >= 2);
+        // All but one of this worker's epoch budget is promised to rewards
+        // that are journaled but not yet paid.
+        fixture.journal_unpaid_settlements(budget.worker_remaining_this_epoch - 1, worker);
+
+        // The last slot is still released early.
+        let first = fixture.start_job().await;
+        let response = released_answer(first.run).await;
+        assert_eq!(response["answer_release"]["settlement"], "pending");
+        let Json(submitted) = first.submit.await.unwrap().unwrap();
+        assert_eq!(submitted["answer_release"], response["answer_release"]);
+
+        // The next reward is beyond the budget once unpaid rewards count. It
+        // is neither refused nor released early: it settles inline, so the
+        // caller and the worker get exactly what the switch-off path returns,
+        // and the reward is journaled and submitted as it would be there.
+        let second = fixture.start_job().await;
+        let answer = released_answer(second.run).await;
+        let Json(submitted) = second.submit.await.unwrap().unwrap();
+        let (expected_answer, expected_submit) = main_inline_bodies(
+            &fixture,
+            second.job_hash,
+            &second.result,
+            second.attestation_hash,
+            &answer,
+        );
+        assert_same_body(&answer, &expected_answer);
+        assert_same_body(&submitted, &expected_submit);
+        assert_eq!(answer["settlement"]["status"], "pending_mined_receipt");
+        assert!(
+            fixture
+                .coordinator
+                .community_verified_settlements
+                .contains_key(&second.job_hash)
+        );
+        assert!(fixture.reward_submitted(second.job_hash));
+        let logged = logs.text();
+        assert!(
+            logged.contains(
+                "beyond this coordinator's budget once its unpaid journaled rewards count"
+            ),
+            "{logged}"
+        );
+    }
+
+    #[test]
+    fn release_on_verification_logs_a_budget_refusal_as_policy() {
+        // The empty test chain has no funded treasury, so the issuance check
+        // the inline path runs first refuses every reward.
+        let node = fake_node_with_workers(Vec::new());
+        let worker = Hash256([7; 32]);
+        let refusal =
+            require_community_reward_issuance_capacity(&node, worker, node.validator_address)
+                .unwrap_err();
+        assert!(inline_refusal_is_budget_policy(
+            &node,
+            &worker.to_hex(),
+            &refusal
+        ));
+        // Any other inline error is still a failure.
+        assert!(!inline_refusal_is_budget_policy(
+            &node,
+            &worker.to_hex(),
+            "verified settlement journal reached its reviewed capacity 256"
+        ));
+        assert!(!inline_refusal_is_budget_policy(
+            &node,
+            "not-a-worker-id",
+            &refusal
+        ));
+    }
+
+    #[tokio::test]
+    async fn release_on_verification_off_responses_match_main_field_for_field() {
+        let fixture = ReleaseOnVerificationFixture::build(false).await;
+        fixture.open_approvals();
+        let job = fixture.start_job().await;
+        let answer = released_answer(job.run).await;
+        let Json(submitted) = job.submit.await.unwrap().unwrap();
+        let (expected_answer, expected_submit) = main_inline_bodies(
+            &fixture,
+            job.job_hash,
+            &job.result,
+            job.attestation_hash,
+            &answer,
+        );
+        assert_same_body(&answer, &expected_answer);
+        assert_same_body(&submitted, &expected_submit);
+    }
+
+    /// Six recovered validators with community rewards active, built exactly
+    /// as the remote-approval test builds them. Returns the validator keys,
+    /// the recovered state and the temporary directory to remove.
+    fn recovered_six_validator_state() -> (
+        Vec<arc_crypto::KeyPair>,
+        Arc<arc_state::StateDB>,
+        std::path::PathBuf,
+    ) {
+        use arc_state::recovery::{
+            ArcCheckpoint, RecoveryExportSpec, RecoveryImport, RecoveryNetworkPolicy,
+            RecoveryValidator,
+        };
+        use arc_types::transaction::JoinValidatorBody;
+
+        let validator_keys: Vec<_> = (0..6)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let legacy_keys: Vec<_> = (0..8)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let treasury = arc_types::transaction::inference_reward_treasury_address();
+        let reward_amount = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
+        let mut prefunded = vec![
+            (treasury, reward_amount * 2),
+            (worker.address(), 0),
+            (arc_state::recovery::recovery_stake_reserve_address(), 0),
+        ];
+        prefunded.extend(legacy_keys.iter().map(|key| (key.address(), 5_000_000)));
+        let source = arc_state::StateDB::with_genesis(&prefunded);
+        let joins = legacy_keys
+            .iter()
+            .map(|key| {
+                let mut transaction = Transaction {
+                    tx_type: TxType::JoinValidator,
+                    from: key.address(),
+                    nonce: 0,
+                    body: TxBody::JoinValidator(JoinValidatorBody {
+                        pubkey: key.public_key_bytes().try_into().unwrap(),
+                        initial_stake: 5_000_000,
+                    }),
+                    fee: 0,
+                    gas_limit: 0,
+                    hash: Hash256::ZERO,
+                    signature: arc_crypto::Signature::null(),
+                    sig_verified: false,
+                };
+                transaction.sign(key).unwrap();
+                transaction
+            })
+            .collect::<Vec<_>>();
+        let (_, join_receipts) = source
+            .execute_block(&joins, legacy_keys[0].address())
+            .unwrap();
+        assert!(join_receipts.iter().all(|receipt| receipt.success));
+        // Production legacy validator weight lives in the validator map while
+        // the explicit system reserve carries its fungible backing. Recreate
+        // that unambiguous decomposition instead of exporting overloaded
+        // per-account staked_balance fields.
+        for key in &legacy_keys {
+            let mut account = source.get_account(&key.address()).unwrap();
+            account.staked_balance = 0;
+            source.update_account(&key.address(), account);
+        }
+        let reserve_address = arc_state::recovery::recovery_stake_reserve_address();
+        let mut reserve = source.get_account(&reserve_address).unwrap();
+        reserve.balance = 40_000_000;
+        source.update_account(&reserve_address, reserve);
+        source
+            .execute_block(&[], legacy_keys[0].address())
+            .expect("reserve decomposition must have a canonical source boundary");
+
+        let target_validators = validator_keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| RecoveryValidator {
+                address: key.address(),
+                public_key: key.public_key_bytes().try_into().unwrap(),
+                stake: 6_666_666 + u64::from(index < 4),
+            })
+            .collect::<Vec<_>>();
+        let genesis_hash = arc_crypto::hash_bytes(b"dual-profile-verification-genesis");
+        let mut checkpoint = ArcCheckpoint::export_unsigned(
+            &source,
+            RecoveryExportSpec {
+                chain_id: "arc-dual-profile-test".to_string(),
+                genesis_hash,
+                source_consensus_round: 1,
+                recovery_epoch: 7,
+                validator_set_id: 9,
+                validators: target_validators.clone(),
+                community_rewards_v1_activation_height: Some(0),
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap();
+        for key in validator_keys.iter().take(5) {
+            checkpoint.add_signature(key).unwrap();
+        }
+        let approved_manifest_hash = checkpoint.manifest_hash();
+        let temporary = std::env::temp_dir().join(format!(
+            "arc-dual-profile-verification-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&temporary).unwrap();
+        let checkpoint_path = temporary.join("approved.arcchkpt");
+        checkpoint.write_to(&checkpoint_path).unwrap();
+        let data_dir = temporary.join("recovered");
+        let policy = RecoveryNetworkPolicy {
+            chain_id: "arc-dual-profile-test".to_string(),
+            genesis_hash,
+            recovery_epoch: 7,
+            validator_set_id: 9,
+            validators: target_validators
+                .iter()
+                .map(|validator| (validator.address, validator.stake))
+                .collect(),
+            community_rewards_v1_activation_height: Some(0),
+        };
+        let recovered = Arc::new(
+            arc_state::StateDB::with_genesis_persistent_recovery(
+                &[],
+                &data_dir,
+                policy,
+                Some(RecoveryImport {
+                    checkpoint_path,
+                    approved_manifest_hash,
+                }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(recovered.active_validators().len(), 6);
+        (validator_keys, recovered, temporary)
+    }
+
+    /// The reward fixture with real RoPE angles and pseudo-random attention
+    /// weights. The base fixture rotates nothing and its Q and K rows are
+    /// near copies of each other; even with real angles, the two profiles
+    /// generated the same tokens on it for every small job tried.
+    fn dual_profile_test_model(
+        seed: u64,
+    ) -> arc_inference::cached_integer_model::CachedIntegerModel {
+        use arc_inference::cached_integer_model::I8Weights;
+        let mut model = test_reward_inference_model();
+        let (rope_cos, rope_sin) = arc_inference::cached_integer_model::compute_rope_tables(
+            model.config.d_head,
+            model.config.max_seq,
+            2.0,
+        );
+        model.config.rope_cos = rope_cos;
+        model.config.rope_sin = rope_sin;
+        let mut state = seed;
+        let mut random = |rows: usize, cols: usize| {
+            let values: Vec<f32> = (0..rows * cols)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+                })
+                .collect();
+            I8Weights::quantize_f32(&values, rows, cols)
+        };
+        let d = model.config.d_model;
+        for layer in &mut model.layers {
+            layer.wq = random(d, d);
+            layer.wk = random(d, d);
+            layer.wv = random(d, d);
+            layer.wo = random(d, d);
+        }
+        model
+    }
+
+    /// The end-to-end test's model pair for one seed: the legacy model and its
+    /// interleaved-RoPE twin.
+    fn dual_profile_models(
+        seed: u64,
+    ) -> (
+        arc_inference::cached_integer_model::CachedIntegerModel,
+        arc_inference::cached_integer_model::CachedIntegerModel,
+    ) {
+        let legacy = dual_profile_test_model(seed);
+        let mut interleaved = dual_profile_test_model(seed);
+        interleaved
+            .canonicalize_gguf_interleaved_rope_rows()
+            .unwrap();
+        (legacy, interleaved)
+    }
+
+    /// The first seed, input and token count, in a fixed order, on which the
+    /// two profiles generate different tokens.
+    fn first_profile_divergent_job() -> Option<(u64, &'static str, u32)> {
+        for seed in 1..=64u64 {
+            let (legacy, interleaved) = dual_profile_models(seed);
+            for input in [
+                "ARC",
+                "probe",
+                "ok",
+                "yes",
+                "done",
+                "ARC probe",
+                "ok yes",
+                "done ARC",
+            ] {
+                let prompt = legacy.encode(input);
+                for max_tokens in 1..=8u32 {
+                    if legacy.generate(&prompt, max_tokens, &[]).0
+                        != interleaved.generate(&prompt, max_tokens, &[]).0
+                    {
+                        return Some((seed, input, max_tokens));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The job the end-to-end test verifies: a `dual_profile_test_model` seed,
+    /// an input and a token count on which the two profiles diverge. It is
+    /// the search's first job, as CI logged it identically on Linux, macOS and
+    /// Windows (`13ed973e`): legacy generates [1, 4] ("<s>probe") and the
+    /// interleaved-RoPE profile [1, 3] ("<s> ARC").
+    const PINNED_PROFILE_DIVERGENT_JOB: Option<(u64, &str, u32)> = Some((1, "ARC", 2));
+
+    #[test]
+    fn community_verify_profiles_default_to_legacy_and_parse_only_known_lists() {
+        use arc_inference::cached_integer_model::{
+            CANONICAL_REWARD_INFERENCE_PROFILE, GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
+        };
+        let legacy_only = CommunityVerifyProfiles::default();
+        assert_eq!(
+            CommunityVerifyProfiles::parse("legacy-split-half").unwrap(),
+            legacy_only
+        );
+        assert!(!legacy_only.interleaved_rope());
+        assert_eq!(
+            legacy_only.verified(CANONICAL_REWARD_INFERENCE_PROFILE),
+            Some(CANONICAL_REWARD_INFERENCE_PROFILE)
+        );
+        assert_eq!(
+            legacy_only.verified(GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE),
+            None
+        );
+
+        let both =
+            CommunityVerifyProfiles::parse(" legacy-split-half , rope-interleaved-v1 ").unwrap();
+        assert!(both.interleaved_rope());
+        assert_eq!(
+            both.verified(GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE),
+            Some(GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE)
+        );
+        assert_eq!(
+            both.verified("INT16 integer (per-row, cross-platform deterministic)"),
+            None
+        );
+
+        // Legacy cannot be dropped in this stage, and unknown names are refused.
+        assert!(CommunityVerifyProfiles::parse("rope-interleaved-v1").is_err());
+        assert!(CommunityVerifyProfiles::parse("").is_err());
+        assert!(CommunityVerifyProfiles::parse("legacy-split-half,rope-v2").is_err());
+    }
+
+    #[test]
+    fn shard_registry_and_kv_keys_change_only_for_the_interleaved_rope_profile() {
+        use arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE;
+        let legacy = ShardInfo {
+            start_layer: 0,
+            end_layer: 16,
+            total_layers: 32,
+            model_id: format!("0x{}", Hash256([3; 32]).to_hex()),
+            model_name: "arc-32L".to_string(),
+            execution_profile: canonical_profile(),
+            memory_mb: 1,
+            full_model_mb: 2,
+            socket_addr: "https://198.51.100.7:9090".to_string(),
+            node_name: "holder".to_string(),
+        };
+        // The historical key, byte for byte.
+        assert_eq!(
+            shard_registry_key(&legacy),
+            "https://198.51.100.7:9090#0-16"
+        );
+        let interleaved = ShardInfo {
+            execution_profile: GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE.to_string(),
+            ..legacy.clone()
+        };
+        assert_eq!(
+            shard_registry_key(&interleaved),
+            format!("https://198.51.100.7:9090#0-16#{GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE}")
+        );
+        let other = ShardInfo {
+            execution_profile: "INT16 integer (per-row, cross-platform deterministic)".to_string(),
+            ..legacy.clone()
+        };
+        assert_eq!(shard_registry_key(&other), shard_registry_key(&legacy));
+
+        assert_eq!(
+            shard_kv_cache_key("request-7", &canonical_profile()),
+            "request-7"
+        );
+        assert_ne!(
+            shard_kv_cache_key("request-7", GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE),
+            "request-7"
+        );
+    }
+
+    #[test]
+    fn shard_announcements_count_the_interleaved_rope_copy() {
+        use arc_inference::cached_integer_model::{
+            GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, InterleavedRopeQk,
+        };
+        let model = dual_profile_test_model(1);
+        let artifact = Hash256([9; 32]);
+        let (legacy, interleaved) = shard_announcements(
+            &model,
+            &[(0, 1)],
+            artifact,
+            "https://holder:9090",
+            "holder",
+            None,
+        );
+        // Without the copy: the legacy entries main announces, and nothing else.
+        assert!(interleaved.is_empty());
+        assert_eq!(legacy.len(), 1);
+        let entry = &legacy[0];
+        assert_eq!(entry.execution_profile, canonical_profile());
+        assert_eq!(entry.model_id, format!("0x{}", artifact.to_hex()));
+        assert_eq!(entry.model_name, "arc-1L-4d-1h-8v");
+        assert_eq!(
+            entry.memory_mb,
+            shard_resident_weight_bytes(&model, None) / (1024 * 1024)
+        );
+        assert_eq!(
+            (entry.socket_addr.as_str(), entry.node_name.as_str()),
+            ("https://holder:9090", "holder")
+        );
+
+        // With the copy: the same ranges under both profiles, and the resident
+        // weights include the second Q/K copy.
+        let copy = InterleavedRopeQk::from_resident_layers(&model).unwrap();
+        assert!(copy.memory_bytes() > 0);
+        assert_eq!(
+            shard_resident_weight_bytes(&model, Some(&copy)),
+            shard_resident_weight_bytes(&model, None) + copy.memory_bytes()
+        );
+        let (legacy, interleaved) = shard_announcements(
+            &model,
+            &[(0, 1)],
+            artifact,
+            "https://holder:9090",
+            "holder",
+            Some(&copy),
+        );
+        assert_eq!(legacy[0].execution_profile, canonical_profile());
+        assert_eq!(
+            interleaved[0].execution_profile,
+            GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
+        );
+        assert_eq!(
+            (interleaved[0].start_layer, interleaved[0].end_layer),
+            (0, 1)
+        );
+        assert_eq!(
+            interleaved[0].memory_mb,
+            shard_resident_weight_bytes(&model, Some(&copy)) / (1024 * 1024)
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_both_profiles_accepts_each_profile_and_rejects_a_mismatched_output() {
+        use arc_inference::cached_integer_model::{
+            CANONICAL_REWARD_INFERENCE_PROFILE, GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
+            InterleavedRopeQk,
+        };
+
+        let (seed, input, max_tokens) = PINNED_PROFILE_DIVERGENT_JOB
+            .or_else(first_profile_divergent_job)
+            .expect("some small job tells the two profiles apart");
+        let (legacy_model, interleaved_model) = dual_profile_models(seed);
+        let divergence_prompt = legacy_model.encode(input);
+        let (legacy_tokens, _) = legacy_model.generate(&divergence_prompt, max_tokens, &[]);
+        let (interleaved_tokens, _) =
+            interleaved_model.generate(&divergence_prompt, max_tokens, &[]);
+        assert_ne!(
+            legacy_tokens,
+            interleaved_tokens,
+            "the pinned job no longer tells the profiles apart; the first one that does is {:?}",
+            first_profile_divergent_job()
+        );
+        // Written straight to stderr, past the test harness's output capture,
+        // so the CI log shows which job this test verified.
+        let divergence = format!(
+            "dual-profile divergence: seed {seed}, input {input:?}, max_tokens {max_tokens}; \
+             legacy tokens {legacy_tokens:?} text {:?}; \
+             interleaved-RoPE tokens {interleaved_tokens:?} text {:?}\n",
+            legacy_model.decode(&legacy_tokens),
+            interleaved_model.decode(&interleaved_tokens),
+        );
+        std::io::Write::write_all(&mut std::io::stderr(), divergence.as_bytes()).unwrap();
+        let (validator_keys, recovered, temporary) = recovered_six_validator_state();
+        let active = recovered.active_validators();
+        let model_id = arc_crypto::hash_bytes(b"dual-profile-exact-model");
+        let model = Arc::new(legacy_model);
+        let copy = Arc::new(InterleavedRopeQk::from_resident_layers(&model).unwrap());
+        let verify_both =
+            CommunityVerifyProfiles::parse("legacy-split-half,rope-interleaved-v1").unwrap();
+
+        // Three validator shard holders, each serving the one-layer range
+        // under both profiles from one legacy model plus the Q/K copy.
+        let mut shard_nodes = Vec::new();
+        let mut shard_handles = Vec::new();
+        let mut legacy_replicas = Vec::new();
+        let mut interleaved_replicas = Vec::new();
+        for (index, key) in validator_keys.iter().take(3).enumerate() {
+            let mut node = fake_node_with_workers(Vec::new());
+            node.state = recovered.clone();
+            node.validator_address = key.address();
+            node.validator_keypair = Some(Arc::new(key.clone()));
+            node.inference_model = Some(model.clone());
+            node.model_artifact_id = Some(model_id);
+            *node.dag_validators.write() = active.clone();
+            let legacy_info = ShardInfo {
+                start_layer: 0,
+                end_layer: 1,
+                total_layers: 1,
+                model_id: format!("0x{}", model_id.to_hex()),
+                model_name: model_display_name(&model),
+                execution_profile: canonical_profile(),
+                memory_mb: 1,
+                full_model_mb: 1,
+                socket_addr: String::new(),
+                node_name: format!("shard-{index}"),
+            };
+            let interleaved_info = ShardInfo {
+                execution_profile: GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE.to_string(),
+                ..legacy_info.clone()
+            };
+            node.shard_infos = vec![legacy_info.clone()];
+            node.interleaved_rope_shard_infos = vec![interleaved_info.clone()];
+            node.interleaved_rope_qk = Some(copy.clone());
+            node.community_verify_profiles = verify_both;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let app = Router::new()
+                .route("/network/info", get(network_info))
+                .route("/inference/forward_shard", post(inference_forward_shard))
+                .route("/inference/cleanup_shard", post(inference_cleanup_shard))
+                .with_state(node.clone());
+            shard_handles.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+            legacy_replicas.push(ShardInfo {
+                socket_addr: origin.clone(),
+                ..legacy_info
+            });
+            interleaved_replicas.push(ShardInfo {
+                socket_addr: origin,
+                ..interleaved_info
+            });
+            shard_nodes.push(node);
+        }
+        let legacy_pipeline = vec![((0, 1), legacy_replicas)];
+        let interleaved_pipeline = vec![((0, 1), interleaved_replicas)];
+
+        let mut coordinator = fake_node_with_workers(Vec::new());
+        coordinator.state = recovered.clone();
+        coordinator.validator_address = validator_keys[3].address();
+        coordinator.validator_keypair = Some(Arc::new(validator_keys[3].clone()));
+        coordinator.inference_model = Some(model.clone());
+        coordinator.model_artifact_id = Some(model_id);
+        *coordinator.dag_validators.write() = active.clone();
+        coordinator.community_verify_profiles = verify_both;
+
+        // What a legacy worker and an interleaved-RoPE worker return.
+        let prompt = model.encode(input);
+        let job = |profile: &str| WorkItem {
+            job_id: arc_crypto::hash_bytes(profile.as_bytes()).to_hex(),
+            input: input.to_string(),
+            max_tokens,
+            model_id: Some(format!("0x{}", model_id.to_hex())),
+            execution_profile: profile.to_string(),
+            transaction_domain: None,
+            expected_worker_id: None,
+            submitted_at_unix_ms: 1,
+            expires_at_unix_ms: u64::MAX,
+        };
+        let completion =
+            |work_item: &WorkItem,
+             engine: &str,
+             generator: &arc_inference::cached_integer_model::CachedIntegerModel| {
+                let (tokens, output_hash) = generator.generate(&prompt, max_tokens, &[]);
+                WorkResult {
+                    job_id: work_item.job_id.clone(),
+                    worker_id: "dual-profile-worker".to_string(),
+                    success: true,
+                    declined: false,
+                    output: model.decode(&tokens),
+                    output_hash: format!("0x{}", output_hash.to_hex()),
+                    tokens_generated: tokens.len() as u64,
+                    total_ms: 1,
+                    ms_per_token: 1,
+                    engine: engine.to_string(),
+                    error: None,
+                    signed_attestation_hex: None,
+                }
+            };
+        let legacy_job = job(CANONICAL_REWARD_INFERENCE_PROFILE);
+        let interleaved_job = job(GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE);
+        let legacy_generator: &arc_inference::cached_integer_model::CachedIntegerModel = &model;
+        let legacy_result = completion(
+            &legacy_job,
+            CANONICAL_REWARD_INFERENCE_PROFILE,
+            legacy_generator,
+        );
+        let interleaved_result = completion(
+            &interleaved_job,
+            GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
+            &interleaved_model,
+        );
+        assert_ne!(legacy_result.output_hash, interleaved_result.output_hash);
+
+        // A legacy job verifies through the legacy shards; the other
+        // profile's output for the same job is refused as invalid.
+        coordinator.community_verification_pipeline_override = Some(legacy_pipeline.clone());
+        let verified =
+            verify_community_result_with_quorum(&coordinator, &legacy_job, &legacy_result)
+                .await
+                .expect("a legacy job verifies under verify-both");
+        assert_eq!(
+            CommunityVerificationSummary::from(&verified).execution_profile,
+            CANONICAL_REWARD_INFERENCE_PROFILE
+        );
+        let legacy_job_with_interleaved_output = WorkResult {
+            engine: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+            job_id: legacy_job.job_id.clone(),
+            ..interleaved_result.clone()
+        };
+        assert!(matches!(
+            verify_community_result_with_quorum(
+                &coordinator,
+                &legacy_job,
+                &legacy_job_with_interleaved_output
+            )
+            .await,
+            Err(CommunityResultVerificationError::Invalid(_))
+        ));
+
+        // An interleaved-RoPE job verifies through the same holders' copy.
+        coordinator.community_verification_pipeline_override = Some(interleaved_pipeline.clone());
+        let verified = verify_community_result_with_quorum(
+            &coordinator,
+            &interleaved_job,
+            &interleaved_result,
+        )
+        .await
+        .expect("an interleaved-RoPE job verifies under verify-both");
+        assert_eq!(
+            CommunityVerificationSummary::from(&verified).execution_profile,
+            GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
+        );
+        assert_eq!(
+            verified.output_hash.to_hex(),
+            interleaved_result.output_hash[2..]
+        );
+        let interleaved_job_with_legacy_output = WorkResult {
+            engine: GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE.to_string(),
+            job_id: interleaved_job.job_id.clone(),
+            ..legacy_result.clone()
+        };
+        assert!(matches!(
+            verify_community_result_with_quorum(
+                &coordinator,
+                &interleaved_job,
+                &interleaved_job_with_legacy_output
+            )
+            .await,
+            Err(CommunityResultVerificationError::Invalid(_))
+        ));
+
+        // With the setting off, everything answers exactly as on main.
+        let mut legacy_only = coordinator.clone();
+        legacy_only.community_verify_profiles = CommunityVerifyProfiles::default();
+        let Err(CommunityResultVerificationError::Invalid(reason)) =
+            verify_community_result_with_quorum(
+                &legacy_only,
+                &interleaved_job,
+                &interleaved_result,
+            )
+            .await
+        else {
+            panic!("legacy-only verification refuses the interleaved-RoPE engine");
+        };
+        assert_eq!(
+            reason,
+            format!(
+                "community worker execution profile {:?} differs from required {:?}",
+                GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, CANONICAL_REWARD_INFERENCE_PROFILE
+            )
+        );
+        let interleaved_job_with_legacy_engine = WorkResult {
+            engine: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+            ..interleaved_result.clone()
+        };
+        let Err(CommunityResultVerificationError::Unavailable(reason)) =
+            verify_community_result_with_quorum(
+                &legacy_only,
+                &interleaved_job,
+                &interleaved_job_with_legacy_engine,
+            )
+            .await
+        else {
+            panic!("legacy-only verification refuses an interleaved-RoPE assignment");
+        };
+        assert_eq!(
+            reason,
+            format!(
+                "community assignment execution profile {:?} differs from required {:?}",
+                GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, CANONICAL_REWARD_INFERENCE_PROFILE
+            )
+        );
+
+        let mut payload = test_verified_settlement_payload(Hash256([5; 32]), 100);
+        payload.execution_profile = GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE.to_string();
+        legacy_only.community_rewards_v1_enabled = true;
+        assert_eq!(
+            validate_reward_approval_payload(&legacy_only, &payload).unwrap_err(),
+            format!(
+                "community reward approval execution profile {:?} differs from required {:?}",
+                GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, CANONICAL_REWARD_INFERENCE_PROFILE
+            )
+        );
+        coordinator.community_rewards_v1_enabled = true;
+        let later_error = validate_reward_approval_payload(&coordinator, &payload)
+            .expect_err("this payload's other fields are synthetic");
+        assert!(
+            !later_error.contains("approval execution profile"),
+            "{later_error}"
+        );
+
+        // A holder without the copy refuses the profile with main's answer.
+        let mut plain_holder = shard_nodes[0].clone();
+        plain_holder.interleaved_rope_qk = None;
+        plain_holder.interleaved_rope_shard_infos.clear();
+        plain_holder.community_verify_profiles = CommunityVerifyProfiles::default();
+        let request = ForwardShardRequest {
+            request_id: "plain-holder".to_string(),
+            model_id: format!("0x{}", model_id.to_hex()),
+            execution_profile: GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE.to_string(),
+            token: Some(3),
+            hidden: None,
+            hidden_hash: None,
+            position: 0,
+            start_layer: 0,
+            end_layer: 1,
+            expected_hidden_len: model.config.d_model,
+            expect_terminal: true,
+            generated_tokens: Vec::new(),
+            last_token: false,
+        };
+        let Err((status, message)) = inference_forward_shard_authenticated(
+            plain_holder,
+            request,
+            validator_keys[3].address(),
+        )
+        .await
+        else {
+            panic!("a holder without the copy refuses the interleaved-RoPE profile");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            message,
+            format!(
+                "execution profile mismatch: requested {:?}, this shard executes {:?}",
+                GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, CANONICAL_REWARD_INFERENCE_PROFILE
+            )
+        );
+
+        for handle in shard_handles {
+            handle.abort();
+        }
+        drop(shard_nodes);
+        let _ = std::fs::remove_dir_all(temporary);
+    }
+
     #[tokio::test]
     async fn work_queue_round_trip_after_serve_wiring() {
         // Smoke test: build_node_state alone leaves the queue None
@@ -21240,6 +24115,8 @@ mod tests {
             validator_address: Hash256::ZERO,
             validator_keypair: None,
             community_rewards_v1_enabled: false,
+            community_release_on_verification: false,
+            community_release_above_high_water: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stake: 0,
             tier: StakeTier::Spark,
             boot_time: Instant::now(),
@@ -21278,6 +24155,9 @@ mod tests {
                 COMMUNITY_APPROVAL_QUEUE_CAP,
             )),
             shard_infos: Vec::new(),
+            interleaved_rope_shard_infos: Vec::new(),
+            interleaved_rope_qk: None,
+            community_verify_profiles: CommunityVerifyProfiles::default(),
             shard_kv_caches: Arc::new(dashmap::DashMap::new()),
             shard_kv_cache_metadata: Arc::new(dashmap::DashMap::new()),
             shard_kv_cache_gate: Arc::new(parking_lot::Mutex::new(())),
@@ -22813,6 +25693,7 @@ mod tests {
                         replicas_contacted_per_quorum: 3,
                     }),
                     settlement: Some(json!({"status": "test_settlement"})),
+                    answer_release: None,
                 });
             }
         });
@@ -23126,6 +26007,7 @@ mod tests {
                             Hash256([7; 32]).to_hex()
                         ),
                     })),
+                    answer_release: None,
                 });
             }
         });
@@ -23192,6 +26074,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inference_auto_reports_no_path_without_shard_holders() {
+        let logs = ServerLogs::default();
+        let _logging = logs.install();
+        let node = fake_node_with_workers(Vec::new());
+        announce_unsigned_test_shard(&node);
+
+        let (status, Json(body)) = inference_auto(
+            AxumState(node),
+            Json(json!({"input": "route this", "max_tokens": 8})),
+        )
+        .await
+        .expect_err("no inference path is available");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let detail: Value = serde_json::from_str(&body.error).unwrap();
+        assert_eq!(detail["error"], "No inference path available");
+        assert_eq!(
+            detail["sharded_pipeline_error"],
+            "Shard identity unavailable or malformed for a pipeline replica"
+        );
+        assert!(!body.error.contains("198.51.100.7"), "{}", body.error);
+        assert!(!body.error.contains("unsigned-holder"), "{}", body.error);
+        let logged = logs.text();
+        assert!(logged.contains("198.51.100.7:9090"), "{logged}");
+    }
+
+    #[tokio::test]
     async fn inference_auto_dispatches_to_a_community_worker_without_a_local_model() {
         let node = fake_node_with_workers(vec![(
             worker("w1", &["inference"]),
@@ -23246,6 +26154,7 @@ mod tests {
                         "w1",
                         "test fixture could not collect the 0x25 approval quorum",
                     )),
+                    answer_release: None,
                 });
             }
         });
@@ -23317,6 +26226,7 @@ mod tests {
                     },
                     verification: None,
                     settlement: None,
+                    answer_release: None,
                 });
             }
         });
@@ -24276,10 +27186,14 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_verifier_preserves_assignment_without_worker_penalty() {
+        let logs = ServerLogs::default();
+        let _logging = logs.install();
         let worker_key = KeyPair::generate_ed25519();
         let worker_id = worker_key.address().to_hex();
         let node =
             fake_node_with_workers(vec![(worker(&worker_id, &["inference"]), Instant::now())]);
+        // The verifier's reason names this holder and its address.
+        announce_unsigned_test_shard(&node);
         let item = WorkItem {
             job_id: arc_crypto::hash_bytes(b"retryable-verifier-outage").to_hex(),
             input: "hello".to_string(),
@@ -24303,6 +27217,10 @@ mod tests {
             .expect_err("missing authenticated shard topology is retryable unavailability");
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.1.contains("remains retryable"));
+        // The worker gets a fixed text; the coordinator's log keeps the reason.
+        assert_eq!(error.1, COMMUNITY_VERIFICATION_UNAVAILABLE);
+        let logged = logs.text();
+        assert!(logged.contains("198.51.100.7:9090"), "{logged}");
         let pending = node
             .community_work_results
             .as_ref()
@@ -26171,6 +29089,30 @@ mod tests {
     // pin the behaviour that used to differ between them. Each case below
     // corresponds to a failure observed on the live network.
 
+    /// A fresh announcement of the test model, by a holder without a
+    /// validator identity, so pipeline assembly names the holder and its
+    /// documentation-range address in its error.
+    fn announce_unsigned_test_shard(node: &NodeState) {
+        node.shard_registry.insert(
+            "unsigned-holder".to_string(),
+            (
+                ShardInfo {
+                    start_layer: 0,
+                    end_layer: 1,
+                    total_layers: 1,
+                    model_id: test_model_id(),
+                    model_name: "redaction-test-model".to_string(),
+                    execution_profile: canonical_profile(),
+                    memory_mb: 1,
+                    full_model_mb: 1,
+                    socket_addr: "198.51.100.7:9090".to_string(),
+                    node_name: "unsigned-holder".to_string(),
+                },
+                std::time::Instant::now(),
+            ),
+        );
+    }
+
     fn shard(node: &str, addr: &str, start: usize, end: usize) -> ShardInfo {
         ShardInfo {
             start_layer: start,
@@ -26840,6 +29782,7 @@ mod tests {
                     vec![poison_origin],
                     Vec::new(),
                     0,
+                    ComputePool::default(),
                     None,
                     false,
                     None,
@@ -26847,6 +29790,8 @@ mod tests {
                     Some(coordinator_shutdown_rx),
                     Arc::new(arc_net::transport::TransportWirePolicy::default()),
                     crate::twin::TwinConfig::default(),
+                    false,
+                    CommunityProfileServing::default(),
                 )
                 .await
                 .unwrap();
@@ -26927,6 +29872,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 0,
+                ComputePool::default(),
                 None,
                 false,
                 None,
@@ -26934,6 +29880,8 @@ mod tests {
                 Some(shutdown_rx),
                 Arc::new(arc_net::transport::TransportWirePolicy::default()),
                 crate::twin::TwinConfig::default(),
+                false,
+                CommunityProfileServing::default(),
             )
             .await
         });
@@ -27444,6 +30392,82 @@ mod tests {
                 total: 32
             }
         );
+    }
+
+    #[test]
+    fn pipeline_errors_reach_callers_without_shard_holders() {
+        let shards: Vec<ShardInfo> = live_topology()
+            .into_iter()
+            .filter(|s| s.start_layer != 12)
+            .collect();
+        let gap = assemble_pipeline(shards, &no_stats()).expect_err("layers 12..17 are missing");
+        assert!(matches!(gap, PipelineError::Gap { .. }), "{gap:?}");
+        // The log line keeps the holder and its address; callers do not.
+        assert!(gap.to_string().contains(":9090"), "{gap}");
+        assert_eq!(
+            gap.public_message(),
+            "Pipeline gap: expected layer 12 next, got shard [17, 22)"
+        );
+
+        let unsigned = vec![shard("unsigned-holder", "198.51.100.7:9090", 0, 32)];
+        let identity = assemble_pipeline_with_identity_policy(unsigned, &no_stats(), true)
+            .expect_err("an unsigned announcement has no validator identity");
+        assert!(
+            identity.to_string().contains("198.51.100.7:9090"),
+            "{identity}"
+        );
+        assert_eq!(
+            identity.public_message(),
+            "Shard identity unavailable or malformed for a pipeline replica"
+        );
+
+        // Variants that name no holder keep their text.
+        for error in [
+            PipelineError::ModelIdentityUnavailable,
+            PipelineError::NoShards,
+            PipelineError::Incomplete {
+                covered: 27,
+                total: 32,
+            },
+        ] {
+            assert_eq!(error.public_message(), error.to_string());
+        }
+
+        // A pipeline that fails while it runs reaches the caller as one fixed
+        // text, and this node's log keeps the request URL.
+        let logs = ServerLogs::default();
+        let _logging = logs.install();
+        let (status, Json(body)) = public_pipeline_run_error(
+            "free-request-7",
+            "send: error sending request for url (http://198.51.100.7:9090/inference/forward_shard)"
+                .to_string(),
+        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body.error, SHARD_PIPELINE_FAILED);
+        let logged = logs.text();
+        assert!(
+            logged.contains("http://198.51.100.7:9090/inference/forward_shard"),
+            "{logged}"
+        );
+        assert!(logged.contains("free-request-7"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn model_shards_planning_error_omits_shard_holders() {
+        let node = fake_node_with_workers(Vec::new());
+        announce_unsigned_test_shard(&node);
+        let params = HashMap::from([("model_id".to_string(), test_model_id())]);
+
+        let Ok(Json(body)) = get_model_shards(AxumState(node), Query(params)).await else {
+            panic!("the test model is announced");
+        };
+        assert_eq!(
+            body["planning_error"],
+            "Shard identity unavailable or malformed for a pipeline replica"
+        );
+        let text = body.to_string();
+        assert!(!text.contains("198.51.100.7"), "{text}");
+        assert!(!text.contains("unsigned-holder"), "{text}");
     }
 
     #[test]
@@ -28080,6 +31104,27 @@ mod tests {
         assert!(error.contains("unapproved signer"), "{error}");
     }
 
+    // ── canonical INT8 kernels ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn node_status_names_the_kernels_projections_run() {
+        let node = fake_node_with_workers(vec![]);
+        let report = arc_inference::canonical_simd::kernel_report();
+        let Json(threads) = get_node_threads(AxumState(node.clone())).await;
+        // `canonical_kernel` is the kernel a one-token step runs: a VNNI or
+        // SMMLA kernel whenever one is selected, not the base kernel.
+        assert_eq!(threads["canonical_kernel"], report.one_token_label());
+        let kernels = &threads["kernels"];
+        assert_eq!(kernels["one_token"], report.one_token_label());
+        assert_eq!(kernels["batched"], report.batched_label());
+        assert_eq!(kernels["pin_status"], report.pin_status.label());
+        assert!(kernels["one_token_runs"].is_object(), "{kernels}");
+        assert!(kernels["batched_runs"].is_object(), "{kernels}");
+        let Json(info) = node_info(AxumState(node)).await;
+        let info = serde_json::to_value(&info).expect("node info serialises");
+        assert_eq!(&info["kernels"]["one_token"], &kernels["one_token"]);
+    }
+
     // ── compute pool ────────────────────────────────────────────────────
 
     #[test]
@@ -28114,6 +31159,37 @@ mod tests {
     fn compute_pool_rejects_absurd_widths() {
         let node = fake_node_with_workers(vec![]);
         assert!(set_compute_threads(&node, 100_000).is_err());
+    }
+
+    #[test]
+    fn community_jobs_run_on_the_pool_the_thread_setting_sizes() {
+        // main.rs gives the community worker loop this handle before `serve`
+        // exists; `serve` attaches the same handle to the node.
+        let worker_pool = ComputePool::default();
+        let mut node = fake_node_with_workers(vec![]);
+        worker_pool.attach(&mut node);
+
+        // Unset: no behaviour change. The job runs on the calling thread and
+        // its rayon work on the global pool, as before.
+        let global = rayon::current_num_threads();
+        assert_eq!(worker_pool.install(rayon::current_num_threads), global);
+
+        // --threads 3 / [inference] threads = 3 (serve calls this at start-up).
+        set_compute_threads(&node, 3).expect("3-thread pool");
+        assert_eq!(worker_pool.install(rayon::current_num_threads), 3);
+
+        // The desktop's live core setting: POST /node/threads.
+        set_compute_threads(&node, 2).expect("resize live");
+        assert_eq!(worker_pool.install(rayon::current_num_threads), 2);
+        assert_eq!(
+            install_on_compute_pool(&node, rayon::current_num_threads),
+            2,
+            "local RPC compute and community jobs share one pool"
+        );
+
+        // threads = 0 returns community jobs to rayon's global pool.
+        set_compute_threads(&node, 0).expect("back to global");
+        assert_eq!(worker_pool.install(rayon::current_num_threads), global);
     }
 }
 

@@ -24,9 +24,10 @@ fn summarize(label: &str, logits: &[i64]) {
 }
 
 fn main() {
-    let path = "/Users/tjdunham/.arc-models/llama-2-7b.gguf";
+    let home = std::env::var("HOME").expect("HOME is set");
+    let path = format!("{home}/.arc-models/llama-2-7b.gguf");
     eprintln!("Loading...");
-    let mut model = load_cached_model(path).expect("load");
+    let mut model = load_cached_model(&path).expect("load");
     eprintln!("Loaded.\n");
 
     summarize("I16 layers + I16 output", &forward_token(&model, 5000));

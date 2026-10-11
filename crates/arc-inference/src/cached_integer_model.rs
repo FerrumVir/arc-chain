@@ -671,10 +671,9 @@ impl CachedIntegerModel {
     /// This only supports the canonical per-row I8 path. Optional precision
     /// copies would need the same row permutation, so callers must load via
     /// `load_cached_model_canonical_i8_interleaved_rope` rather than mutate a
-    /// general-purpose model after optional profiles are materialized.
-    pub(crate) fn canonicalize_gguf_interleaved_rope_rows(
-        &mut self,
-    ) -> Result<(), crate::InferenceError> {
+    /// general-purpose model after optional profiles are materialized; this
+    /// method refuses any model that still carries one.
+    pub fn canonicalize_gguf_interleaved_rope_rows(&mut self) -> Result<(), crate::InferenceError> {
         if self.config.arithmetic_profile != ArithmeticProfile::LegacySplitHalfV0 {
             return Err(crate::InferenceError::Runtime(
                 "GGUF interleaved-RoPE canonicalization was requested twice".into(),
@@ -849,7 +848,10 @@ impl CachedIntegerModel {
         } else if self.q4_layers.is_some() {
             Q4_INFERENCE_PROFILE
         } else {
-            CANONICAL_REWARD_INFERENCE_PROFILE
+            // Per-row INT8 runs whichever Q/K layout is resident. A model
+            // converted to the GGUF interleaved-RoPE rows must not be
+            // announced or labelled as the legacy split-half profile.
+            self.arithmetic_profile()
         }
     }
 
@@ -981,7 +983,12 @@ unsafe fn dot_i8_i64(row: *const i8, input: *const i64, len: usize) -> i64 {
 
 /// Write matmul result into pre-allocated output buffer (zero-alloc).
 /// Parallel with 512-row chunks to minimize rayon scheduling overhead.
-fn matmul_i8_into(weights: &I8Weights, input: &[i64], in_size: usize, output: &mut [i64]) {
+pub(crate) fn matmul_i8_into(
+    weights: &I8Weights,
+    input: &[i64],
+    in_size: usize,
+    output: &mut [i64],
+) {
     matmul_i8_view_into(I8WeightsView::from(weights), input, in_size, output);
 }
 
@@ -1007,10 +1014,11 @@ fn matmul_i8_view_into(
         weights.scales.len(),
         "matmul output/scales mismatch"
     );
-    // Opt-in bit-exact vectorised path. Default OFF, so the scalar datapath
-    // below is unchanged unless a caller explicitly enables it. The fast path
-    // refuses any input it cannot prove exact and returns false, leaving the
-    // scalar kernel to run. See `crate::canonical_simd`.
+    // Bit-exact vectorised path: on by default where the CPU has it (AVX2 on
+    // x86-64, NEON dotprod on arm64), and forced either way by the
+    // `ARC_CANONICAL_KERNEL` override. The fast path refuses any input it
+    // cannot prove exact and returns false, leaving the scalar kernel below to
+    // run. See `crate::canonical_simd`.
     if crate::canonical_simd::fast_canonical_kernel_enabled()
         && crate::canonical_simd::matmul_i8_canonical_rows_fast_view(
             weights, input, in_size, output,
@@ -1153,8 +1161,25 @@ pub(crate) fn matmul_i8_into_batched(
     let data = &weights.data;
     let scales = &weights.scales;
     let n_rows = weights.n_rows;
+    // The scalar kernel is compute-bound per row, so a four-token tile costs
+    // four rows of work whatever it holds: bench run 38056837714 measured it
+    // at 3.6x to 3.9x the one-row pass. One to three tokens therefore run the
+    // one-row path itself, token by token, exactly as `forward_one_token`
+    // runs it; the values are the same either way.
+    if n_tokens < 4 {
+        for (input, out) in inputs
+            .chunks_exact(in_size)
+            .zip(output.chunks_exact_mut(weights.n_rows))
+        {
+            matmul_i8_into(weights, input, in_size, out);
+        }
+        return;
+    }
     // Same L1-resident row block and 4-token tile as the vectorised path, so
     // the scalar batched baseline is a fair comparison rather than a straw man.
+    // One to three tokens left after the whole tiles run the one-row dot
+    // (`dot_i8_i64`, as `matmul_i8_into` does) per token, which computes no
+    // discarded lanes.
     let row_block = (131_072 / in_size.max(1)).clamp(1, n_rows);
     let n_blocks = n_rows.div_ceil(row_block);
     let out = BatchOutPtr(output.as_mut_ptr());
@@ -1164,6 +1189,27 @@ pub(crate) fn matmul_i8_into_batched(
         let mut t = 0usize;
         while t < n_tokens {
             let quad = (n_tokens - t).min(4);
+            if quad < 4 {
+                for (offset, &sc) in scales[r0..r1].iter().enumerate() {
+                    let i = r0 + offset;
+                    for q in 0..quad {
+                        // SAFETY: `i < n_rows` and `data` holds n_rows*in_size;
+                        // `t + q < n_tokens` and `inputs` holds
+                        // n_tokens*in_size. Each task owns a disjoint row
+                        // range, so writes never alias.
+                        let acc = unsafe {
+                            dot_i8_i64(
+                                data.as_ptr().add(i * in_size),
+                                inputs.as_ptr().add((t + q) * in_size),
+                                in_size,
+                            )
+                        };
+                        unsafe { *out.get().add((t + q) * n_rows + i) = (acc * sc) >> FRAC_BITS };
+                    }
+                }
+                t += quad;
+                continue;
+            }
             let src = |q: usize| {
                 let tok = t + q.min(quad - 1);
                 // SAFETY: `tok < n_tokens` and `inputs` holds n_tokens*in_size.
@@ -1184,6 +1230,10 @@ pub(crate) fn matmul_i8_into_batched(
         }
     });
 }
+
+/// Elements per task of the batched layer's SiLU products: large enough to
+/// amortize a task, small enough that one 11,008-wide row spans every thread.
+const SILU_CHUNK: usize = 2048;
 
 /// Disjoint-range output pointer for the batched matmul. See the identical
 /// wrapper in `canonical_simd` for why a field accessor is used.
@@ -2669,6 +2719,117 @@ fn permute_interleaved_rows_to_split_half(
     Ok(())
 }
 
+/// A second, read-only copy of the Q and K projections of every resident
+/// layer, in the GGUF interleaved-RoPE row order
+/// (`GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE`).
+///
+/// The two community reward profiles differ only in these rows. V, O, the
+/// feed-forward matrices, norms, embeddings and the LM head are identical.
+/// A validator shard holder that verifies both profiles therefore keeps its
+/// legacy model plus this copy, not a second model. The rows come from the
+/// same permutation as
+/// [`CachedIntegerModel::canonicalize_gguf_interleaved_rope_rows`], so
+/// running a layer range with them is exactly that range of the corrected
+/// whole model.
+pub struct InterleavedRopeQk {
+    layers: Vec<Option<(I8Weights, I8Weights)>>,
+}
+
+impl InterleavedRopeQk {
+    /// Copy and permute the Q/K rows of every resident layer of a legacy,
+    /// canonical per-row INT8 model. Layer slots the model does not hold get
+    /// no copy, so a range-loaded shard holder pays only for its own layers.
+    pub fn from_resident_layers(model: &CachedIntegerModel) -> Result<Self, crate::InferenceError> {
+        if model.config.arithmetic_profile != ArithmeticProfile::LegacySplitHalfV0 {
+            return Err(crate::InferenceError::Runtime(
+                "an interleaved-RoPE Q/K copy is built from the legacy split-half model".into(),
+            ));
+        }
+        if !model.has_canonical_i8_profile() {
+            return Err(crate::InferenceError::Runtime(
+                "an interleaved-RoPE Q/K copy requires the canonical per-row INT8 profile".into(),
+            ));
+        }
+        let copy = |weights: &I8Weights| I8Weights {
+            data: weights.data.clone(),
+            scales: weights.scales.clone(),
+            n_rows: weights.n_rows,
+            n_cols: weights.n_cols,
+        };
+        let mut layers = Vec::with_capacity(model.layers.len());
+        for layer in &model.layers {
+            if !layer.is_loaded() {
+                layers.push(None);
+                continue;
+            }
+            let mut wq = copy(&layer.wq);
+            let mut wk = copy(&layer.wk);
+            permute_interleaved_rows_to_split_half(
+                &mut wq,
+                model.config.n_heads,
+                model.config.d_head,
+                "wq",
+            )?;
+            permute_interleaved_rows_to_split_half(
+                &mut wk,
+                model.config.n_kv_heads,
+                model.config.d_head,
+                "wk",
+            )?;
+            layers.push(Some((wq, wk)));
+        }
+        if layers.iter().all(Option::is_none) {
+            return Err(crate::InferenceError::Runtime(
+                "an interleaved-RoPE Q/K copy needs at least one resident layer".into(),
+            ));
+        }
+        Ok(Self { layers })
+    }
+
+    /// Whether the copy holds every layer of `[start, end)`.
+    pub fn covers(&self, start: usize, end: usize) -> bool {
+        start < end
+            && end <= self.layers.len()
+            && self.layers[start..end].iter().all(Option::is_some)
+    }
+
+    /// Resident layers that carry a copy.
+    pub fn layer_count(&self) -> usize {
+        self.layers.iter().filter(|layer| layer.is_some()).count()
+    }
+
+    /// Size in the [`I8Weights::memory_bytes`] accounting, which the node
+    /// uses for its own logged and announced shard memory.
+    pub fn memory_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .flatten()
+            .map(|(wq, wk)| wq.memory_bytes() + wk.memory_bytes())
+            .sum()
+    }
+
+    /// Exact bytes of the copied INT8 rows plus their per-row Q16 scales:
+    /// 33,619,968 per Llama-2-7B layer (two 4096 x 4096 matrices).
+    pub fn weight_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .flatten()
+            .map(|(wq, wk)| {
+                wq.data.len()
+                    + wk.data.len()
+                    + (wq.scales.len() + wk.scales.len()) * std::mem::size_of::<i64>()
+            })
+            .sum()
+    }
+
+    fn layer(&self, layer: usize) -> Option<(&I8Weights, &I8Weights)> {
+        self.layers
+            .get(layer)
+            .and_then(Option::as_ref)
+            .map(|(wq, wk)| (wq, wk))
+    }
+}
+
 /// SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
 /// Uses the integer exp LUT for sigmoid computation.
 pub fn silu_i64(x: i64) -> i64 {
@@ -3300,6 +3461,27 @@ impl CachedIntegerModel {
     /// Uses pre-allocated buffers (q/k/v/attn_out/gate/up/gated/ff_out).
     /// When Q4 weights are enabled (via enable_q4), uses 4-bit matmul on x86_64.
     pub fn forward_one_token(&self, token: u32, cache: &mut KVCache) -> Vec<i64> {
+        self.forward_one_token_observed(token, cache, |_, _, _| {})
+    }
+
+    /// [`Self::forward_one_token`], also reporting every layer boundary.
+    ///
+    /// After layer `l` has added its attention and FFN residuals,
+    /// `on_layer(position, l, hidden)` receives the residual stream that the
+    /// next layer (after the last layer, the final norm) reads. These are the
+    /// per-layer boundaries a commitment or a teacher-forced re-check compares.
+    /// The observer only reads: the logits, the KV cache and every intermediate
+    /// value are exactly those of `forward_one_token`, which calls this with an
+    /// empty observer.
+    pub fn forward_one_token_observed<F>(
+        &self,
+        token: u32,
+        cache: &mut KVCache,
+        mut on_layer: F,
+    ) -> Vec<i64>
+    where
+        F: FnMut(usize, usize, &[i64]),
+    {
         let cfg = &self.config;
         let d = cfg.d_model;
         let pos = cache.seq_len;
@@ -3540,6 +3722,7 @@ impl CachedIntegerModel {
             for i in 0..d {
                 hidden[i] += ff_out[i];
             }
+            on_layer(pos, layer_idx, &hidden);
         }
 
         cache.seq_len = pos + 1;
@@ -3605,6 +3788,32 @@ impl CachedIntegerModel {
         chunk_size: usize,
         all_positions: bool,
     ) -> Option<Vec<Vec<i64>>> {
+        self.prefill_canonical_i8_batched_observed(
+            tokens,
+            cache,
+            chunk_size,
+            all_positions,
+            |_, _, _| {},
+        )
+    }
+
+    /// [`Self::prefill_canonical_i8_batched`], also reporting every layer
+    /// boundary of every prefilled position, with the same arguments as
+    /// [`Self::forward_one_token_observed`]. Within a chunk the reports arrive
+    /// layer by layer, so index them by (position, layer) rather than by call
+    /// order. Nothing is reported when the prefill refuses. The observer only
+    /// reads, so the returned logits and the cache are unchanged by it.
+    pub fn prefill_canonical_i8_batched_observed<F>(
+        &self,
+        tokens: &[u32],
+        cache: &mut KVCache,
+        chunk_size: usize,
+        all_positions: bool,
+        mut on_layer: F,
+    ) -> Option<Vec<Vec<i64>>>
+    where
+        F: FnMut(usize, usize, &[i64]),
+    {
         use crate::canonical_prefill::{PrefillRefusal, record_chunk, record_prefill_refusal};
         let cfg = &self.config;
         let (d, dkv, dff, dh) = (cfg.d_model, cfg.d_kv, cfg.d_ff, cfg.d_head);
@@ -3672,104 +3881,14 @@ impl CachedIntegerModel {
                 hidden[ti * d..(ti + 1) * d]
                     .copy_from_slice(&self.embedding_q16[idx * d..(idx + 1) * d]);
             }
-            let mut normed = vec![0i64; t_n * d];
-            let mut q = vec![0i64; t_n * d];
-            let mut k = vec![0i64; t_n * dkv];
-            let mut v = vec![0i64; t_n * dkv];
-            let mut attn = vec![0i64; t_n * d];
-            let mut proj = vec![0i64; t_n * d];
-            let mut gate = vec![0i64; t_n * dff];
-            let mut up = vec![0i64; t_n * dff];
-            let mut ffo = vec![0i64; t_n * d];
-
-            for (li, layer) in self.layers.iter().enumerate() {
-                for ti in 0..t_n {
-                    normed[ti * d..(ti + 1) * d].copy_from_slice(&layernorm(
-                        &hidden[ti * d..(ti + 1) * d],
-                        &layer.attn_norm,
-                    ));
-                }
-                matmul_i8_into_batched(&layer.wq, &normed, t_n, d, &mut q);
-                matmul_i8_into_batched(&layer.wk, &normed, t_n, d, &mut k);
-                matmul_i8_into_batched(&layer.wv, &normed, t_n, d, &mut v);
-
-                // RoPE at each token's absolute position, then K/V appended in
-                // position order. Pushing the whole chunk before attention is
-                // safe because each token attends over `pos + 1` entries only.
-                for ti in 0..t_n {
-                    let pos = base + done + ti;
-                    for h in 0..cfg.n_heads {
-                        apply_rope(
-                            &mut q[ti * d + h * dh..ti * d + (h + 1) * dh],
-                            pos,
-                            dh,
-                            &cfg.rope_cos,
-                            &cfg.rope_sin,
-                        );
-                    }
-                    for h in 0..cfg.n_kv_heads {
-                        apply_rope(
-                            &mut k[ti * dkv + h * dh..ti * dkv + (h + 1) * dh],
-                            pos,
-                            dh,
-                            &cfg.rope_cos,
-                            &cfg.rope_sin,
-                        );
-                    }
-                    cache.push_k(li, &k[ti * dkv..(ti + 1) * dkv]);
-                    cache.push_v(li, &v[ti * dkv..(ti + 1) * dkv]);
-                }
-
-                {
-                    let kd = &cache.k_data[li];
-                    let vd = &cache.v_data[li];
-                    let heads = cfg.n_heads;
-                    let results: Vec<Vec<i64>> = (0..t_n * heads)
-                        .into_par_iter()
-                        .map(|x| {
-                            let ti = x / heads;
-                            let h = x % heads;
-                            let pos = base + done + ti;
-                            let kv_h = h * cfg.n_kv_heads / heads;
-                            flash_attention_i64(
-                                &q[ti * d + h * dh..ti * d + (h + 1) * dh],
-                                kd,
-                                vd,
-                                dkv,
-                                kv_h,
-                                dh,
-                                pos + 1,
-                                cfg.attn_scale,
-                            )
-                        })
-                        .collect();
-                    for (x, r) in results.iter().enumerate() {
-                        let ti = x / heads;
-                        let h = x % heads;
-                        attn[ti * d + h * dh..ti * d + (h + 1) * dh].copy_from_slice(r);
-                    }
-                }
-
-                matmul_i8_into_batched(&layer.wo, &attn, t_n, d, &mut proj);
-                for i in 0..t_n * d {
-                    hidden[i] += proj[i];
-                }
-                for ti in 0..t_n {
-                    normed[ti * d..(ti + 1) * d].copy_from_slice(&layernorm(
-                        &hidden[ti * d..(ti + 1) * d],
-                        &layer.ffn_norm,
-                    ));
-                }
-                matmul_i8_into_batched(&layer.w_gate, &normed, t_n, d, &mut gate);
-                matmul_i8_into_batched(&layer.w_up, &normed, t_n, d, &mut up);
-                for j in 0..t_n * dff {
-                    gate[j] = (silu_i64(gate[j]) * up[j]) >> FRAC_BITS;
-                }
-                matmul_i8_into_batched(&layer.w_down, &gate, t_n, dff, &mut ffo);
-                for i in 0..t_n * d {
-                    hidden[i] += ffo[i];
-                }
-            }
+            self.forward_layers_batched(
+                &mut hidden,
+                t_n,
+                base + done,
+                0..cfg.n_layers,
+                cache,
+                &mut on_layer,
+            );
             cache.seq_len = base + done + t_n;
 
             let want: Vec<usize> = if all_positions {
@@ -3798,6 +3917,209 @@ impl CachedIntegerModel {
             done += t_n;
         }
         Some(out)
+    }
+
+    /// The canonical batched layer pass over `layers` for one sequence, shared
+    /// by [`Self::prefill_canonical_i8_batched_observed`] (every layer). It is
+    /// [`Self::forward_layers_multi`] with one sequence.
+    ///
+    /// `hidden` holds `t_n` token-major rows entering the first layer of the
+    /// range at positions `first_position..first_position + t_n`; on return it
+    /// holds the rows leaving the last layer. `on_layer` observes the rows
+    /// leaving every layer, by position. The caller checks the shapes and sets
+    /// `cache.seq_len`.
+    fn forward_layers_batched<F>(
+        &self,
+        hidden: &mut [i64],
+        t_n: usize,
+        first_position: usize,
+        layers: std::ops::Range<usize>,
+        cache: &mut KVCache,
+        on_layer: &mut F,
+    ) where
+        F: FnMut(usize, usize, &[i64]),
+    {
+        let spans = [SeqSpan {
+            first_row: 0,
+            rows: t_n,
+            first_position,
+        }];
+        let mut caches = [cache];
+        self.forward_layers_multi(
+            hidden,
+            &spans,
+            layers,
+            &mut caches,
+            &mut |_: usize, position: usize, layer: usize, row: &[i64]| {
+                on_layer(position, layer, row)
+            },
+        );
+    }
+
+    /// The canonical batched layer pass over `layers` for rows of several
+    /// sequences, shared by the batched prefill (one sequence) and
+    /// [`Self::forward_rows_multi`].
+    ///
+    /// `hidden` holds the token-major rows entering the first layer of the
+    /// range, sequence by sequence as `spans` lays them out, and on return the
+    /// rows leaving the last layer. Each projection reads its weights once for
+    /// all rows. Each layer appends every sequence's K and V rows to that
+    /// sequence's own cache (`caches[s]` for `spans[s]`) in position order
+    /// before its attention runs, and every row attends over its own
+    /// sequence's cache, `position + 1` entries, so no row sees another
+    /// sequence or a later row. `on_layer` observes the rows leaving every
+    /// layer as `(sequence, position, layer, row)`. The caller checks the
+    /// shapes and sets each `seq_len`.
+    ///
+    /// The work between the projections runs on every thread of the pool.
+    /// Rows are independent: each row's norms, RoPE and residual adds, and
+    /// each element's SiLU product, run the same code in the same order as
+    /// one row at a time, on whichever thread holds them, so spreading them
+    /// across threads cannot change a value. The K/V appends and `on_layer`
+    /// stay sequential.
+    fn forward_layers_multi<F>(
+        &self,
+        hidden: &mut [i64],
+        spans: &[SeqSpan],
+        layers: std::ops::Range<usize>,
+        caches: &mut [&mut KVCache],
+        on_layer: &mut F,
+    ) where
+        F: FnMut(usize, usize, usize, &[i64]),
+    {
+        let cfg = &self.config;
+        let (d, dkv, dff, dh) = (cfg.d_model, cfg.d_kv, cfg.d_ff, cfg.d_head);
+        // Each row's sequence and absolute position.
+        let row_sequence: Vec<usize> = spans
+            .iter()
+            .enumerate()
+            .flat_map(|(sequence, span)| std::iter::repeat_n(sequence, span.rows))
+            .collect();
+        let row_position: Vec<usize> = spans
+            .iter()
+            .flat_map(|span| span.first_position..span.first_position + span.rows)
+            .collect();
+        let t_n = row_position.len();
+        let mut normed = vec![0i64; t_n * d];
+        let mut q = vec![0i64; t_n * d];
+        let mut k = vec![0i64; t_n * dkv];
+        let mut v = vec![0i64; t_n * dkv];
+        let mut attn = vec![0i64; t_n * d];
+        let mut proj = vec![0i64; t_n * d];
+        let mut gate = vec![0i64; t_n * dff];
+        let mut up = vec![0i64; t_n * dff];
+        let mut ffo = vec![0i64; t_n * d];
+
+        for li in layers {
+            let layer = &self.layers[li];
+            normed
+                .par_chunks_mut(d)
+                .zip(hidden.par_chunks(d))
+                .for_each(|(out, row)| out.copy_from_slice(&layernorm(row, &layer.attn_norm)));
+            matmul_i8_into_batched(&layer.wq, &normed, t_n, d, &mut q);
+            matmul_i8_into_batched(&layer.wk, &normed, t_n, d, &mut k);
+            matmul_i8_into_batched(&layer.wv, &normed, t_n, d, &mut v);
+
+            // RoPE at each row's own absolute position, then each sequence's
+            // K/V appended to its own cache in position order. Pushing every
+            // row before attention is safe because each row attends over its
+            // own sequence's `pos + 1` entries only.
+            q.par_chunks_mut(d)
+                .zip(k.par_chunks_mut(dkv))
+                .zip(row_position.par_iter())
+                .for_each(|((q_row, k_row), &pos)| {
+                    for h in 0..cfg.n_heads {
+                        apply_rope(
+                            &mut q_row[h * dh..(h + 1) * dh],
+                            pos,
+                            dh,
+                            &cfg.rope_cos,
+                            &cfg.rope_sin,
+                        );
+                    }
+                    for h in 0..cfg.n_kv_heads {
+                        apply_rope(
+                            &mut k_row[h * dh..(h + 1) * dh],
+                            pos,
+                            dh,
+                            &cfg.rope_cos,
+                            &cfg.rope_sin,
+                        );
+                    }
+                });
+            for (span, cache) in spans.iter().zip(caches.iter_mut()) {
+                let rows = span.first_row..span.first_row + span.rows;
+                for (k_row, v_row) in k[rows.start * dkv..rows.end * dkv]
+                    .chunks_exact(dkv)
+                    .zip(v[rows.start * dkv..rows.end * dkv].chunks_exact(dkv))
+                {
+                    cache.push_k(li, k_row);
+                    cache.push_v(li, v_row);
+                }
+            }
+
+            {
+                let kv: Vec<(&[i64], &[i64])> = caches
+                    .iter()
+                    .map(|cache| (cache.k_data[li].as_slice(), cache.v_data[li].as_slice()))
+                    .collect();
+                let heads = cfg.n_heads;
+                let results: Vec<Vec<i64>> = (0..t_n * heads)
+                    .into_par_iter()
+                    .map(|x| {
+                        let ti = x / heads;
+                        let h = x % heads;
+                        let (kd, vd) = kv[row_sequence[ti]];
+                        let pos = row_position[ti];
+                        let kv_h = h * cfg.n_kv_heads / heads;
+                        flash_attention_i64(
+                            &q[ti * d + h * dh..ti * d + (h + 1) * dh],
+                            kd,
+                            vd,
+                            dkv,
+                            kv_h,
+                            dh,
+                            pos + 1,
+                            cfg.attn_scale,
+                        )
+                    })
+                    .collect();
+                for (x, r) in results.iter().enumerate() {
+                    let ti = x / heads;
+                    let h = x % heads;
+                    attn[ti * d + h * dh..ti * d + (h + 1) * dh].copy_from_slice(r);
+                }
+            }
+
+            matmul_i8_into_batched(&layer.wo, &attn, t_n, d, &mut proj);
+            hidden
+                .par_iter_mut()
+                .zip(proj.par_iter())
+                .for_each(|(h, p)| *h += p);
+            normed
+                .par_chunks_mut(d)
+                .zip(hidden.par_chunks(d))
+                .for_each(|(out, row)| out.copy_from_slice(&layernorm(row, &layer.ffn_norm)));
+            matmul_i8_into_batched(&layer.w_gate, &normed, t_n, d, &mut gate);
+            matmul_i8_into_batched(&layer.w_up, &normed, t_n, d, &mut up);
+            // Element-wise, so any chunking is exact; fixed-size chunks
+            // spread even a single row across threads.
+            gate.par_chunks_mut(SILU_CHUNK)
+                .zip(up.par_chunks(SILU_CHUNK))
+                .for_each(|(gate, up)| {
+                    for (g, &u) in gate.iter_mut().zip(up) {
+                        *g = (silu_i64(*g) * u) >> FRAC_BITS;
+                    }
+                });
+            matmul_i8_into_batched(&layer.w_down, &gate, t_n, dff, &mut ffo);
+            hidden
+                .par_iter_mut()
+                .zip(ffo.par_iter())
+                .for_each(|(h, f)| *h += f);
+            for (ti, row) in hidden.chunks_exact(d).enumerate() {
+                on_layer(row_sequence[ti], row_position[ti], li, row);
+            }
+        }
     }
 
     /// Canonical-I8 whole-token forward whose projections are supplied by a
@@ -4155,6 +4477,55 @@ impl CachedIntegerModel {
         position: usize,
         generated_tokens: &[u32],
     ) -> Result<ShardOutput, ShardForwardError> {
+        self.forward_shard_token_with_qk(
+            input,
+            cache,
+            start_layer,
+            end_layer,
+            position,
+            generated_tokens,
+            None,
+        )
+    }
+
+    /// [`Self::forward_shard_token_with_history`] under the GGUF
+    /// interleaved-RoPE profile. Every layer takes its Q and K projections
+    /// from `interleaved_qk`; every other weight is this legacy model's own.
+    /// A request must use one profile for all of its positions, because the
+    /// two profiles cache different K rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_shard_token_with_history_interleaved_rope(
+        &self,
+        input: ShardInput,
+        cache: &mut KVCache,
+        start_layer: usize,
+        end_layer: usize,
+        position: usize,
+        generated_tokens: &[u32],
+        interleaved_qk: &InterleavedRopeQk,
+    ) -> Result<ShardOutput, ShardForwardError> {
+        self.forward_shard_token_with_qk(
+            input,
+            cache,
+            start_layer,
+            end_layer,
+            position,
+            generated_tokens,
+            Some(interleaved_qk),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_shard_token_with_qk(
+        &self,
+        input: ShardInput,
+        cache: &mut KVCache,
+        start_layer: usize,
+        end_layer: usize,
+        position: usize,
+        generated_tokens: &[u32],
+        interleaved_qk: Option<&InterleavedRopeQk>,
+    ) -> Result<ShardOutput, ShardForwardError> {
         let cfg = &self.config;
         let d = cfg.d_model;
         let is_first = start_layer == 0;
@@ -4202,6 +4573,21 @@ impl CachedIntegerModel {
         for layer_idx in start_layer..end {
             if !self.layers[layer_idx].is_loaded() {
                 return Err(ShardForwardError::LayerNotLoaded { layer: layer_idx });
+            }
+        }
+
+        // The interleaved-RoPE copy replaces only canonical per-row INT8 Q/K
+        // rows of a legacy model, and must hold every layer in the range.
+        if let Some(copy) = interleaved_qk {
+            if !self.has_canonical_i8_profile()
+                || self.config.arithmetic_profile != ArithmeticProfile::LegacySplitHalfV0
+            {
+                return Err(ShardForwardError::InterleavedRopeUnavailable { layer: start_layer });
+            }
+            for layer_idx in start_layer..end {
+                if copy.layer(layer_idx).is_none() {
+                    return Err(ShardForwardError::InterleavedRopeUnavailable { layer: layer_idx });
+                }
             }
         }
 
@@ -4281,9 +4667,19 @@ impl CachedIntegerModel {
             let normed = layernorm(&hidden, &layer.attn_norm);
             let normed_q = QuantizedInput::from_i64(&normed);
 
-            // Q/K/V projections - I16 if loaded, else I8
-            dispatch!(wq, wq, &normed_q, &normed, d, &mut q);
-            dispatch!(wk, wk, &normed_q, &normed, d, &mut k_buf);
+            // Q/K/V projections - I16 if loaded, else I8. Under the
+            // interleaved-RoPE profile the Q and K rows come from the copy,
+            // which the preflight above restricts to canonical per-row I8.
+            match interleaved_qk.and_then(|copy| copy.layer(layer_idx)) {
+                Some((wq, wk)) => {
+                    matmul_fast_preq(wq, &normed_q, &normed, d, &mut q);
+                    matmul_fast_preq(wk, &normed_q, &normed, d, &mut k_buf);
+                }
+                None => {
+                    dispatch!(wq, wq, &normed_q, &normed, d, &mut q);
+                    dispatch!(wk, wk, &normed_q, &normed, d, &mut k_buf);
+                }
+            }
             dispatch!(wv, wv, &normed_q, &normed, d, &mut v_buf);
 
             // RoPE on Q and K
@@ -4464,6 +4860,9 @@ pub enum ShardForwardError {
     BadHiddenDim { got: usize, expected: usize },
     /// Position is past the model's precomputed RoPE tables.
     PositionOutOfRange { position: usize, max_seq: usize },
+    /// The interleaved-RoPE profile was requested, but this node holds no
+    /// interleaved-RoPE Q/K rows for this layer, or its model cannot use them.
+    InterleavedRopeUnavailable { layer: usize },
 }
 
 impl ShardForwardError {
@@ -4475,6 +4874,7 @@ impl ShardForwardError {
             ShardForwardError::LayerNotLoaded { .. } => "layer_not_loaded",
             ShardForwardError::BadHiddenDim { .. } => "bad_hidden_dim",
             ShardForwardError::PositionOutOfRange { .. } => "position_out_of_range",
+            ShardForwardError::InterleavedRopeUnavailable { .. } => "interleaved_rope_unavailable",
         }
     }
 }
@@ -4509,11 +4909,646 @@ impl std::fmt::Display for ShardForwardError {
                 "position_out_of_range: position {} is past the model's {}-position RoPE table",
                 position, max_seq
             ),
+            ShardForwardError::InterleavedRopeUnavailable { layer } => write!(
+                f,
+                "interleaved_rope_unavailable: no interleaved-RoPE Q/K rows are resident for layer {}",
+                layer
+            ),
         }
     }
 }
 
 impl std::error::Error for ShardForwardError {}
+
+// ─── Multi-row stage calls ────────────────────────────────────────────────────
+
+/// The rows a stage holder runs in one call: consecutive positions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShardRowsInput {
+    /// Token ids, for the stage that holds the embedding (`start_layer == 0`).
+    Tokens(Vec<u32>),
+    /// Hidden states from the previous stage, `d_model` values per row.
+    Hidden(Vec<Vec<i64>>),
+}
+
+/// What a stage holder returns for the rows of one call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShardRowsOutput {
+    /// The residual stream leaving the stage, one row per input row.
+    Hidden(Vec<Vec<i64>>),
+    /// Raw logits of every row, before any repetition penalty, from the stage
+    /// that holds the output head. The caller selects each row's token with
+    /// that row's own generated history, as a teacher-forced re-check does.
+    Logits(Vec<Vec<i64>>),
+}
+
+/// Why a multi-row stage call or a rollback refused. A refusal leaves the
+/// cache exactly as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShardRowsError {
+    /// A check that [`CachedIntegerModel::forward_shard_token`] also makes:
+    /// KV continuity and residency on every layer, the hidden width, and the
+    /// RoPE table, which the last row must fit.
+    Shard(ShardForwardError),
+    /// The call carried no rows.
+    NoRows,
+    /// `[start_layer, end_layer)` is empty, or runs past the model or the cache.
+    BadLayerRange {
+        start_layer: usize,
+        end_layer: usize,
+        n_layers: usize,
+    },
+    /// Token ids sent to a stage without the embedding, or hidden rows sent
+    /// to the stage that holds it.
+    WrongInput { start_layer: usize },
+    /// A token id this node holds no embedding row for.
+    TokenNotEmbedded { token: u32 },
+    /// The model is not the canonical per-row I8 profile, which is what the
+    /// batched layer pass computes; the caller uses one-row calls instead.
+    NotCanonicalProfile,
+    /// A model dimension is zero, so no row can run.
+    BadShape,
+    /// The stage ends at the last layer but does not hold the final norm and
+    /// output head.
+    HeadNotLoaded,
+    /// The call carries more rows than [`CachedIntegerModel::max_shard_rows`]
+    /// allows: its own allocations would exceed the prefill's scratch budget.
+    TooManyRows { rows: usize, max_rows: usize },
+    /// A rollback asked to keep more positions than the cache holds.
+    RollbackGrows {
+        keep: usize,
+        cached_positions: usize,
+    },
+    /// A layer's K and V lengths are not both whole rows for the position
+    /// count: a partial row, or K and V of different lengths.
+    RaggedCache {
+        layer: usize,
+        keys: usize,
+        values: usize,
+        expected: usize,
+    },
+    /// The cache has a different number of K layers and V layers.
+    CacheLayersDisagree { k_layers: usize, v_layers: usize },
+}
+
+impl ShardRowsError {
+    /// Stable machine-readable tag, in the style of [`ShardForwardError::kind`].
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ShardRowsError::Shard(error) => error.kind(),
+            ShardRowsError::NoRows => "no_rows",
+            ShardRowsError::BadLayerRange { .. } => "bad_layer_range",
+            ShardRowsError::WrongInput { .. } => "wrong_input",
+            ShardRowsError::TokenNotEmbedded { .. } => "token_not_embedded",
+            ShardRowsError::NotCanonicalProfile => "not_canonical_profile",
+            ShardRowsError::BadShape => "bad_shape",
+            ShardRowsError::HeadNotLoaded => "head_not_loaded",
+            ShardRowsError::TooManyRows { .. } => "too_many_rows",
+            ShardRowsError::RollbackGrows { .. } => "rollback_grows",
+            ShardRowsError::RaggedCache { .. } => "ragged_cache",
+            ShardRowsError::CacheLayersDisagree { .. } => "cache_layers_disagree",
+        }
+    }
+}
+
+impl From<ShardForwardError> for ShardRowsError {
+    fn from(error: ShardForwardError) -> Self {
+        ShardRowsError::Shard(error)
+    }
+}
+
+impl std::fmt::Display for ShardRowsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShardRowsError::Shard(error) => write!(f, "{error}"),
+            ShardRowsError::NoRows => write!(f, "no_rows: a multi-row call needs at least one row"),
+            ShardRowsError::BadLayerRange {
+                start_layer,
+                end_layer,
+                n_layers,
+            } => write!(
+                f,
+                "bad_layer_range: [{start_layer}, {end_layer}) is not a stage of a \
+                 {n_layers}-layer model and its cache"
+            ),
+            ShardRowsError::WrongInput { start_layer } => write!(
+                f,
+                "wrong_input: the stage starting at layer {start_layer} takes {}",
+                if *start_layer == 0 {
+                    "token ids"
+                } else {
+                    "hidden rows"
+                }
+            ),
+            ShardRowsError::TokenNotEmbedded { token } => {
+                write!(f, "token_not_embedded: no embedding row for token {token}")
+            }
+            ShardRowsError::NotCanonicalProfile => write!(
+                f,
+                "not_canonical_profile: multi-row stage calls run the canonical per-row I8 profile only"
+            ),
+            ShardRowsError::BadShape => write!(f, "bad_shape: a model dimension is zero"),
+            ShardRowsError::HeadNotLoaded => write!(
+                f,
+                "head_not_loaded: the last stage does not hold the final norm and output head"
+            ),
+            ShardRowsError::RollbackGrows {
+                keep,
+                cached_positions,
+            } => write!(
+                f,
+                "rollback_grows: cannot keep {keep} positions of a cache holding {cached_positions}"
+            ),
+            ShardRowsError::TooManyRows { rows, max_rows } => write!(
+                f,
+                "too_many_rows: {rows} rows in one call, but this stage takes at most {max_rows}"
+            ),
+            ShardRowsError::RaggedCache {
+                layer,
+                keys,
+                values,
+                expected,
+            } => write!(
+                f,
+                "ragged_cache: layer {layer} holds {keys} K and {values} V values where its \
+                 position count needs {expected} of each"
+            ),
+            ShardRowsError::CacheLayersDisagree { k_layers, v_layers } => write!(
+                f,
+                "cache_layers_disagree: the cache has {k_layers} K layers and {v_layers} V layers"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ShardRowsError {}
+
+/// One sequence's rows in a [`CachedIntegerModel::forward_rows_multi`] call:
+/// its own K/V cache on the stage, the absolute position of its first row,
+/// and the rows themselves, exactly as one
+/// [`CachedIntegerModel::forward_shard_rows`] call takes them.
+pub struct SeqRows<'a> {
+    /// This sequence's K/V cache. Every layer of the stage must hold exactly
+    /// `position` whole rows.
+    pub cache: &'a mut KVCache,
+    /// The absolute position of the first row.
+    pub position: usize,
+    /// Token ids on the stage that holds the embedding, hidden rows after it.
+    pub input: ShardRowsInput,
+}
+
+impl SeqRows<'_> {
+    /// How many rows this sequence brings.
+    pub fn rows(&self) -> usize {
+        match &self.input {
+            ShardRowsInput::Tokens(tokens) => tokens.len(),
+            ShardRowsInput::Hidden(states) => states.len(),
+        }
+    }
+}
+
+/// Why [`CachedIntegerModel::forward_rows_multi`] refused. A refusal leaves
+/// every cache in the batch unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultiRowsError {
+    /// The call as a whole: an empty batch, the model or the stage, or more
+    /// rows in total than [`CachedIntegerModel::max_shard_rows`] allows.
+    Batch(ShardRowsError),
+    /// One sequence's rows or cache, by its index in the batch.
+    Sequence { index: usize, error: ShardRowsError },
+}
+
+impl MultiRowsError {
+    /// The underlying refusal, without the sequence that caused it.
+    pub fn into_rows_error(self) -> ShardRowsError {
+        match self {
+            MultiRowsError::Batch(error) | MultiRowsError::Sequence { error, .. } => error,
+        }
+    }
+
+    /// Stable machine-readable tag: the underlying [`ShardRowsError::kind`].
+    pub fn kind(&self) -> &'static str {
+        match self {
+            MultiRowsError::Batch(error) | MultiRowsError::Sequence { error, .. } => error.kind(),
+        }
+    }
+}
+
+impl std::fmt::Display for MultiRowsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MultiRowsError::Batch(error) => write!(f, "{error}"),
+            MultiRowsError::Sequence { index, error } => write!(f, "sequence {index}: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for MultiRowsError {}
+
+/// One sequence's contiguous rows inside a multi-sequence layer pass.
+#[derive(Clone, Copy, Debug)]
+struct SeqSpan {
+    /// Index of the sequence's first row among the pass's rows.
+    first_row: usize,
+    rows: usize,
+    /// Absolute position of the sequence's first row.
+    first_position: usize,
+}
+
+impl CachedIntegerModel {
+    /// The most rows one [`Self::forward_shard_rows`] call takes on a stage
+    /// ending at `end_layer`, so that the call's own allocations stay within
+    /// the prefill's scratch budget
+    /// ([`crate::canonical_prefill::MAX_PREFILL_SCRATCH_BYTES`]). Per row
+    /// that is the prefill's activation and digit scratch
+    /// ([`crate::canonical_prefill::prefill_chunk_scratch_bytes`], which
+    /// includes the SMMLA kernel's paired copy of the digits) plus the rows
+    /// the call returns. On the stage that holds the head, those are the
+    /// final norm and the logits, which it holds twice (computed and
+    /// returned). The prefill's [`crate::canonical_simd::MAX_BATCH_TOKENS`]
+    /// ceiling applies too. At Llama-2-7B width this is 480 rows on an inner
+    /// stage and 250 on the last.
+    pub fn max_shard_rows(&self, end_layer: usize) -> usize {
+        let cfg = &self.config;
+        let scratch = crate::canonical_prefill::prefill_chunk_scratch_bytes(
+            1,
+            cfg.d_model,
+            cfg.d_kv,
+            cfg.d_ff,
+        );
+        let returned = if end_layer == cfg.n_layers {
+            cfg.d_model
+                .saturating_add(cfg.vocab_size.saturating_mul(2))
+                .saturating_mul(8)
+        } else {
+            cfg.d_model.saturating_mul(8)
+        };
+        let per_row = scratch.saturating_add(returned).max(1);
+        (crate::canonical_prefill::MAX_PREFILL_SCRATCH_BYTES / per_row)
+            .clamp(1, crate::canonical_simd::MAX_BATCH_TOKENS)
+    }
+
+    /// Runs `k` consecutive positions through this stage's layers
+    /// `[start_layer, end_layer)` in one pass over its weights.
+    ///
+    /// The multi-row twin of [`Self::forward_shard_token`]. Rows at positions
+    /// `position..position + k` produce exactly the hidden states, logits and
+    /// K/V rows that `k` one-row calls would, because every layer runs
+    /// [`Self::forward_layers_batched`], the routine the batched prefill runs,
+    /// over the stage's range, and each projection reads the stage's weights
+    /// once for all `k` rows. The stage that holds the head returns raw logits;
+    /// the caller selects each row's token with that row's generated history,
+    /// and [`Self::rollback_rows`] drops the rows of rejected drafts. It is
+    /// [`Self::forward_rows_multi`] with one sequence.
+    ///
+    /// When it pays. The base batched kernels (SDOT, AVX2) work on quads of
+    /// four rows, so a call costs about one quad's work per started quad, and
+    /// its per-row saving over one-row calls is a sawtooth in k. Measured on
+    /// Llama-2-7B (bench run 37998031423, `examples/stage_rows_bench.rs`,
+    /// 4-vCPU runners):
+    ///
+    /// - with the vectorised kernel a call pays from three rows: 0.89 of the
+    ///   one-row cost per row on AVX2 and 0.73 on NEON at k = 3, falling to
+    ///   0.67 and 0.48 at k = 8. Five rows on AVX2 (1.05) are the exception;
+    /// - with the scalar kernel only whole quads pay, about 0.92 at k = 4
+    ///   and k = 8, and every other k costs more;
+    /// - one or two rows never pay, so send those through
+    ///   [`Self::forward_shard_token`].
+    ///
+    /// CPUs with matrix extensions run cheaper kernels
+    /// ([`crate::canonical_simd::BatchedKernel`]), for one-row calls too.
+    /// Measured the same way for k = 1 to 64 (bench run 38030963937), with
+    /// each kernel's own one-row calls as the baseline:
+    ///
+    /// - SMMLA (i8mm, Neoverse-N2): a one-row call takes about 150 ms against
+    ///   345 ms on SDOT. Per row, a k-row call costs 0.72 of it at k = 2, 0.31
+    ///   at k = 8 and 0.28 from k = 16 to 64 (42 to 46 ms from k = 8);
+    /// - AVX-512 VNNI (Intel Xeon Platinum 8573C): a one-row call takes about
+    ///   295 ms against 680 ms on AVX2; 0.59 at k = 2, 0.28 at k = 8 and 0.22
+    ///   to 0.27 from k = 16 to 64 (66 to 84 ms from k = 8);
+    /// - AVX-VNNI on the same CPU: about 320 ms per one-row call; 0.56 at
+    ///   k = 2, 0.30 at k = 8 and 0.23 to 0.27 from k = 16 to 64.
+    ///
+    /// With these kernels a call pays from two rows.
+    ///
+    /// Canonical per-row I8 only: any other profile is refused, so the caller
+    /// falls back to one-row calls. A refusal leaves `cache` unchanged.
+    pub fn forward_shard_rows(
+        &self,
+        input: ShardRowsInput,
+        cache: &mut KVCache,
+        start_layer: usize,
+        end_layer: usize,
+        position: usize,
+    ) -> Result<ShardRowsOutput, ShardRowsError> {
+        let mut batch = [SeqRows {
+            cache,
+            position,
+            input,
+        }];
+        let mut outputs = self
+            .forward_rows_multi(&mut batch, start_layer, end_layer)
+            .map_err(MultiRowsError::into_rows_error)?;
+        outputs.pop().ok_or(ShardRowsError::NoRows)
+    }
+
+    /// Runs the rows of several sequences through this stage's layers
+    /// `[start_layer, end_layer)` in one pass over its weights.
+    ///
+    /// Each [`SeqRows`] brings one sequence's own K/V cache and its next rows,
+    /// at positions `position..position + k`. Every projection reads the
+    /// stage's weights once for all rows of all sequences. Each row attends
+    /// only over its own sequence's cache, at its own position, and each
+    /// sequence's K/V rows go to its own cache in position order. No step
+    /// combines values across rows: norms, RoPE, attention and activations are
+    /// per row, and the batched projection computes each row's dot products on
+    /// their own (a kernel that refuses one row's operands sends the whole
+    /// call to the scalar kernel, which computes the same values). So each
+    /// sequence gets exactly the hidden rows, logits and K/V rows it would get
+    /// alone, whatever its neighbours and their order. The E4 batch-invariance
+    /// tests hold this to the token-by-token run on every kernel and thread
+    /// count.
+    ///
+    /// Returns one output per sequence, in batch order: hidden rows, or raw
+    /// logits on the stage that holds the head. The checks are those of
+    /// [`Self::forward_shard_rows`], per sequence, and the rows of all
+    /// sequences together are held to [`Self::max_shard_rows`]. A refusal
+    /// names the sequence when one sequence caused it, and leaves every cache
+    /// unchanged.
+    pub fn forward_rows_multi(
+        &self,
+        batch: &mut [SeqRows<'_>],
+        start_layer: usize,
+        end_layer: usize,
+    ) -> Result<Vec<ShardRowsOutput>, MultiRowsError> {
+        let cfg = &self.config;
+        let d = cfg.d_model;
+        if batch.is_empty() {
+            return Err(MultiRowsError::Batch(ShardRowsError::NoRows));
+        }
+        if let Some(index) = batch.iter().position(|seq| seq.rows() == 0) {
+            return Err(MultiRowsError::Sequence {
+                index,
+                error: ShardRowsError::NoRows,
+            });
+        }
+        if !self.has_canonical_i8_profile() {
+            return Err(MultiRowsError::Batch(ShardRowsError::NotCanonicalProfile));
+        }
+        if d == 0
+            || cfg.d_head == 0
+            || cfg.n_heads == 0
+            || cfg.n_kv_heads == 0
+            || cfg.d_kv == 0
+            || cfg.vocab_size == 0
+        {
+            return Err(MultiRowsError::Batch(ShardRowsError::BadShape));
+        }
+        let bad_range = ShardRowsError::BadLayerRange {
+            start_layer,
+            end_layer,
+            n_layers: cfg.n_layers,
+        };
+        if start_layer >= end_layer || end_layer > cfg.n_layers || end_layer > self.layers.len() {
+            return Err(MultiRowsError::Batch(bad_range));
+        }
+        if let Some(index) = batch.iter().position(|seq| {
+            end_layer > seq.cache.k_data.len() || end_layer > seq.cache.v_data.len()
+        }) {
+            return Err(MultiRowsError::Sequence {
+                index,
+                error: bad_range,
+            });
+        }
+        let rows: usize = batch.iter().map(SeqRows::rows).sum();
+        let max_rows = self.max_shard_rows(end_layer);
+        if rows > max_rows {
+            return Err(MultiRowsError::Batch(ShardRowsError::TooManyRows {
+                rows,
+                max_rows,
+            }));
+        }
+        for (index, seq) in batch.iter().enumerate() {
+            self.check_rows_fit(
+                &*seq.cache,
+                seq.position,
+                seq.rows(),
+                start_layer,
+                end_layer,
+            )
+            .map_err(|error| MultiRowsError::Sequence { index, error })?;
+        }
+        for layer in start_layer..end_layer {
+            if !self.layers[layer].is_loaded() {
+                return Err(MultiRowsError::Batch(
+                    ShardForwardError::LayerNotLoaded { layer }.into(),
+                ));
+            }
+        }
+        let terminal = end_layer == cfg.n_layers;
+        if terminal
+            && (self.final_norm.len() != d
+                || self.output_weight.n_rows != cfg.vocab_size
+                || self.output_weight.n_cols != d
+                || self.output_weight.scales.len() != cfg.vocab_size
+                || self.output_weight.data.len() != cfg.vocab_size * d)
+        {
+            return Err(MultiRowsError::Batch(ShardRowsError::HeadNotLoaded));
+        }
+
+        // Every sequence's rows, one after another in batch order.
+        let mut hidden = Vec::with_capacity(rows * d);
+        let mut spans = Vec::with_capacity(batch.len());
+        for (index, seq) in batch.iter().enumerate() {
+            spans.push(SeqSpan {
+                first_row: hidden.len() / d,
+                rows: seq.rows(),
+                first_position: seq.position,
+            });
+            self.append_input_rows(&seq.input, start_layer, &mut hidden)
+                .map_err(|error| MultiRowsError::Sequence { index, error })?;
+        }
+
+        // Nothing has been refused, so the caches change from here on.
+        let mut caches: Vec<&mut KVCache> = batch.iter_mut().map(|seq| &mut *seq.cache).collect();
+        let mut ignore = |_: usize, _: usize, _: usize, _: &[i64]| {};
+        self.forward_layers_multi(
+            &mut hidden,
+            &spans,
+            start_layer..end_layer,
+            &mut caches,
+            &mut ignore,
+        );
+        for (span, cache) in spans.iter().zip(caches.iter_mut()) {
+            cache.seq_len = span.first_position + span.rows;
+        }
+
+        if !terminal {
+            return Ok(spans
+                .iter()
+                .map(|span| {
+                    ShardRowsOutput::Hidden(
+                        hidden[span.first_row * d..(span.first_row + span.rows) * d]
+                            .chunks_exact(d)
+                            .map(<[i64]>::to_vec)
+                            .collect(),
+                    )
+                })
+                .collect());
+        }
+        let mut normed = vec![0i64; rows * d];
+        normed
+            .par_chunks_mut(d)
+            .zip(hidden.par_chunks(d))
+            .for_each(|(out, row)| out.copy_from_slice(&layernorm(row, &self.final_norm)));
+        let vocab = cfg.vocab_size;
+        let mut logits = vec![0i64; rows * vocab];
+        matmul_i8_into_batched(&self.output_weight, &normed, rows, d, &mut logits);
+        Ok(spans
+            .iter()
+            .map(|span| {
+                ShardRowsOutput::Logits(
+                    logits[span.first_row * vocab..(span.first_row + span.rows) * vocab]
+                        .chunks_exact(vocab)
+                        .map(<[i64]>::to_vec)
+                        .collect(),
+                )
+            })
+            .collect())
+    }
+
+    /// The per-sequence checks of a multi-row call: every row must fit the
+    /// RoPE table, as each one-row call requires, and every layer of the
+    /// stage must hold exactly `position` whole K rows and as many V rows.
+    /// Whole rows for another position are the one-row call's out-of-sync
+    /// refusal; a partial row or a K/V mismatch is a torn cache.
+    fn check_rows_fit(
+        &self,
+        cache: &KVCache,
+        position: usize,
+        rows: usize,
+        start_layer: usize,
+        end_layer: usize,
+    ) -> Result<(), ShardRowsError> {
+        let cfg = &self.config;
+        let last = position.saturating_add(rows - 1);
+        if last >= cfg.max_seq {
+            return Err(ShardForwardError::PositionOutOfRange {
+                position: last,
+                max_seq: cfg.max_seq,
+            }
+            .into());
+        }
+        let expected = position.saturating_mul(cfg.d_kv);
+        for layer in start_layer..end_layer {
+            let (keys, values) = (cache.k_data[layer].len(), cache.v_data[layer].len());
+            if keys == expected && values == expected {
+                continue;
+            }
+            if keys == values && keys.is_multiple_of(cfg.d_kv) {
+                return Err(ShardForwardError::KvCacheOutOfSync {
+                    layer,
+                    expected_positions: position,
+                    cached_positions: keys / cfg.d_kv,
+                }
+                .into());
+            }
+            return Err(ShardRowsError::RaggedCache {
+                layer,
+                keys,
+                values,
+                expected,
+            });
+        }
+        Ok(())
+    }
+
+    /// Appends one sequence's input rows to `hidden`: embedding rows for
+    /// token ids on the stage that holds the embedding, hidden rows after it.
+    fn append_input_rows(
+        &self,
+        input: &ShardRowsInput,
+        start_layer: usize,
+        hidden: &mut Vec<i64>,
+    ) -> Result<(), ShardRowsError> {
+        let cfg = &self.config;
+        let d = cfg.d_model;
+        match input {
+            ShardRowsInput::Tokens(tokens) => {
+                if start_layer != 0 {
+                    return Err(ShardRowsError::WrongInput { start_layer });
+                }
+                for &token in tokens {
+                    // The same clamp as `forward_shard_token`.
+                    let idx = (token as usize).min(cfg.vocab_size - 1);
+                    let row = self
+                        .embedding_q16
+                        .get(idx * d..(idx + 1) * d)
+                        .ok_or(ShardRowsError::TokenNotEmbedded { token })?;
+                    hidden.extend_from_slice(row);
+                }
+            }
+            ShardRowsInput::Hidden(states) => {
+                if start_layer == 0 {
+                    return Err(ShardRowsError::WrongInput { start_layer });
+                }
+                for state in states {
+                    if state.len() != d {
+                        return Err(ShardForwardError::BadHiddenDim {
+                            got: state.len(),
+                            expected: d,
+                        }
+                        .into());
+                    }
+                    hidden.extend_from_slice(state);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Keeps the first `keep` positions of a stage holder's `cache` and drops
+    /// the rest in place, as #181's `Frame::Rollback { keep }` does on every
+    /// stage: the K/V rows of rejected drafts go and every earlier row stays
+    /// byte for byte. Keeping as many positions as the cache holds is a no-op.
+    /// Keeping more is refused, and so is a cache whose layers disagree with
+    /// its position count. Layers the stage does not hold stay empty.
+    pub fn rollback_rows(&self, cache: &mut KVCache, keep: usize) -> Result<(), ShardRowsError> {
+        let held = cache.seq_len;
+        if keep > held {
+            return Err(ShardRowsError::RollbackGrows {
+                keep,
+                cached_positions: held,
+            });
+        }
+        let width = self.config.d_kv;
+        let expected = held.saturating_mul(width);
+        if cache.k_data.len() != cache.v_data.len() {
+            return Err(ShardRowsError::CacheLayersDisagree {
+                k_layers: cache.k_data.len(),
+                v_layers: cache.v_data.len(),
+            });
+        }
+        for (layer, (keys, values)) in cache.k_data.iter().zip(&cache.v_data).enumerate() {
+            // A layer the stage does not hold is empty; any other layer holds
+            // exactly `held` whole rows of K and of V.
+            let (keys, values) = (keys.len(), values.len());
+            if (keys, values) != (0, 0) && (keys, values) != (expected, expected) {
+                return Err(ShardRowsError::RaggedCache {
+                    layer,
+                    keys,
+                    values,
+                    expected,
+                });
+            }
+        }
+        for rows in cache.k_data.iter_mut().chain(cache.v_data.iter_mut()) {
+            rows.truncate(keep * width);
+        }
+        cache.seq_len = keep;
+        Ok(())
+    }
+}
 
 // ─── RoPE Tables ──────────────────────────────────────────────────────────────
 
@@ -6734,6 +7769,163 @@ mod tests {
                 .sum()
         };
         assert_eq!(dot(&reference, &reference_k), dot(&split, &split_k));
+    }
+
+    fn shard_output_fingerprint(output: ShardOutput) -> (Vec<i64>, Option<(u32, Hash256)>) {
+        match output {
+            ShardOutput::Hidden(hidden) => (hidden, None),
+            ShardOutput::Token { id, logits_hash } => (Vec::new(), Some((id, logits_hash))),
+        }
+    }
+
+    #[test]
+    fn interleaved_rope_qk_copy_runs_ranges_exactly_like_the_corrected_whole_model() {
+        let legacy = build_test_model(20, 32, 2, 64, 4);
+        let mut corrected = build_test_model(20, 32, 2, 64, 4);
+        corrected.canonicalize_gguf_interleaved_rope_rows().unwrap();
+        let copy = InterleavedRopeQk::from_resident_layers(&legacy).unwrap();
+        assert_eq!(copy.layer_count(), 4);
+        assert!(copy.covers(0, 4));
+
+        let n_layers = legacy.config.n_layers;
+        let split = 2;
+        let mut corrected_cache = KVCache::new(n_layers);
+        let mut copy_cache = KVCache::new(n_layers);
+        let mut legacy_cache = KVCache::new(n_layers);
+        let mut profiles_differ = false;
+        for (position, token) in [1u32, 5, 7, 3, 9].into_iter().enumerate() {
+            // The corrected whole model over one range...
+            let whole = corrected
+                .forward_shard_token(
+                    ShardInput::Token(token),
+                    &mut corrected_cache,
+                    0,
+                    n_layers,
+                    position,
+                )
+                .unwrap();
+            // ...equals the legacy model with the copy, split in two ranges.
+            let first = legacy
+                .forward_shard_token_with_history_interleaved_rope(
+                    ShardInput::Token(token),
+                    &mut copy_cache,
+                    0,
+                    split,
+                    position,
+                    &[],
+                    &copy,
+                )
+                .unwrap();
+            let ShardOutput::Hidden(hidden) = first else {
+                panic!("a nonterminal range returns a hidden state");
+            };
+            let ranged = legacy
+                .forward_shard_token_with_history_interleaved_rope(
+                    ShardInput::Hidden(hidden),
+                    &mut copy_cache,
+                    split,
+                    n_layers,
+                    position,
+                    &[],
+                    &copy,
+                )
+                .unwrap();
+            let whole = shard_output_fingerprint(whole);
+            assert_eq!(
+                whole,
+                shard_output_fingerprint(ranged),
+                "position {position}"
+            );
+            // The legacy path itself is unchanged and computes a different profile.
+            let legacy_output = legacy
+                .forward_shard_token(
+                    ShardInput::Token(token),
+                    &mut legacy_cache,
+                    0,
+                    n_layers,
+                    position,
+                )
+                .unwrap();
+            profiles_differ |= shard_output_fingerprint(legacy_output) != whole;
+        }
+        assert!(
+            profiles_differ,
+            "this model must tell the two profiles apart"
+        );
+    }
+
+    #[test]
+    fn interleaved_rope_qk_copy_covers_and_accounts_for_resident_layers_only() {
+        let mut model = build_test_model(20, 32, 2, 64, 4);
+        // A range-loaded shard holder: layer 0 belongs to another replica.
+        model.layers[0] = CachedLayer::placeholder();
+        let copy = InterleavedRopeQk::from_resident_layers(&model).unwrap();
+        assert_eq!(copy.layer_count(), 3);
+        assert!(!copy.covers(0, 4));
+        assert!(copy.covers(1, 4));
+        assert!(!copy.covers(2, 2));
+        let resident = &model.layers[1..];
+        assert_eq!(
+            copy.memory_bytes(),
+            resident
+                .iter()
+                .map(|layer| layer.wq.memory_bytes() + layer.wk.memory_bytes())
+                .sum::<usize>()
+        );
+        assert_eq!(
+            copy.weight_bytes(),
+            resident
+                .iter()
+                .map(|layer| {
+                    layer.wq.data.len()
+                        + layer.wk.data.len()
+                        + 8 * (layer.wq.scales.len() + layer.wk.scales.len())
+                })
+                .sum::<usize>()
+        );
+
+        // The copy refuses a range it does not hold, without touching the cache.
+        let mut cache = KVCache::new(model.config.n_layers);
+        let error = model
+            .forward_shard_token_with_history_interleaved_rope(
+                ShardInput::Hidden(vec![0; model.config.d_model]),
+                &mut cache,
+                1,
+                4,
+                0,
+                &[],
+                &InterleavedRopeQk {
+                    layers: vec![None, None, None, None],
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ShardForwardError::InterleavedRopeUnavailable { layer: 1 }
+        );
+        assert_eq!(error.kind(), "interleaved_rope_unavailable");
+        assert!(cache.k_data.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn precision_label_names_the_resident_rope_profile_and_the_copy_needs_legacy_i8() {
+        let mut model = build_test_model(16, 8, 2, 16, 1);
+        assert_eq!(
+            model.effective_precision_label(),
+            CANONICAL_REWARD_INFERENCE_PROFILE
+        );
+        assert!(InterleavedRopeQk::from_resident_layers(&model).is_ok());
+        model.canonicalize_gguf_interleaved_rope_rows().unwrap();
+        assert_eq!(
+            model.effective_precision_label(),
+            GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
+        );
+        // A corrected model, or one with optional precision copies, cannot
+        // seed the copy.
+        assert!(InterleavedRopeQk::from_resident_layers(&model).is_err());
+        let mut promoted = build_test_model(16, 8, 2, 16, 1);
+        promoted.enable_i16();
+        assert!(InterleavedRopeQk::from_resident_layers(&promoted).is_err());
     }
 
     #[test]

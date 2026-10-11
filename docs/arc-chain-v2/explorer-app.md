@@ -1,6 +1,6 @@
 # ARC explorer / node desktop readiness audit
 
-Audit target: `/Users/excaulibur/work/arc-chain-readiness-20260919`, `main` at
+Audit target: `~/work/arc-chain-readiness-20260919`, `main` at
 `f616705` (2026-09-18). All HTTP checks were read-only; no transaction or
 mutation endpoints were called.
 
@@ -34,8 +34,8 @@ route is absent from source. The existing UI already fell back to `/info` and
 `/stats` for height, which is why browser refresh succeeded.
 
 I added a read-only `requestLatestBlock` fallback in
-`[explorer/app.js](/Users/excaulibur/work/arc-chain-readiness-20260919/explorer/app.js:140)`
-and `[dashboard/app.js](/Users/excaulibur/work/arc-chain-readiness-20260919/dashboard/app.js:91)`:
+[explorer/app.js](../../explorer/app.js#L140)
+and [dashboard/app.js](../../dashboard/app.js#L91):
 fallback is attempted only for HTTP 404, derives a safe height from status
 endpoints, fetches `/block/{height}`, and rejects a height mismatch. Timeout,
 TLS, auth, and other failures remain failures. The explorer contract now has

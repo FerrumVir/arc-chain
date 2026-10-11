@@ -18,6 +18,58 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.12 - Release-preparation snapshot (2026-10-11)
+
+> **Candidate note:** This entry records the v0.8.12 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.12.
+
+- Workers and validators now run the exact fast INT8 kernel by default:
+  AVX2 on x86-64 and NEON dot-product on arm64 (an x86-64 process that
+  Rosetta 2 translates on Apple Silicon stays on the scalar kernel). The
+  switch is process-wide, so community-worker generation, shard holders and
+  validator recomputes all use it. It computes exactly the values of the
+  scalar kernel and refuses any input it cannot compute exactly to the
+  scalar kernel before writing a byte (#173). To go back to the scalar
+  kernel set `ARC_CANONICAL_KERNEL=scalar` (or `ARC_FAST_CANONICAL_KERNEL=0`,
+  the older name, which is still honoured); `simd` and `auto` are also
+  accepted, and an unrecognised value selects scalar and logs a warning.
+- Behind the fast kernel a node uses the widest exact kernel its CPU has:
+  AVX-512 VNNI, then AVX-VNNI, then AVX2 on x86-64, and SMMLA (i8mm), then
+  SDOT on arm64. They serve one-token decode and multi-row projections with
+  the same checks and the same results (#190). Set
+  `ARC_CANONICAL_BATCHED_KERNEL` to `neon-sdot-limb`, `neon-i8mm-limb`,
+  `avx2-limb`, `avx-vnni-limb` or `avx512-vnni-limb` to pin one kernel; a
+  pinned kernel the CPU lacks falls back to the best one it has. The node
+  logs its kernels when it loads a model and reports them, with the pin
+  status and each kernel's projection count, under `kernels` in
+  `GET /node/threads` and `GET /node/info`.
+- Community jobs run on the node's configured inference thread pool, so
+  `--threads`, `[inference] threads` and `POST /node/threads` apply to them.
+  With no setting nothing changes (#173).
+- Public error responses carry generic reasons for journal and
+  shard-pipeline failures: no server paths, shard holder names, socket
+  addresses or request URLs. The detail goes to the node's own log with the
+  job or request it belongs to (#189).
+- Personal data is removed from the repository's tree: a retired
+  volatile-state capture, local account names in documentation paths,
+  scripts and probe examples, and third-party addresses in an archived note
+  (#187). Nothing changes at run time.
+- A stage holder can verify several rows in one pass (#185), and several
+  sequences can be batched exactly (#193). Neither is used by the node yet.
+  An execution-mode equivalence suite checks one-pass, chunked,
+  restored-prefix and speculative runs against pinned references (#179).
+- Off by default: `--community-release-on-verification` lets a coordinator
+  answer a verified community prompt before the reward approvals are
+  collected (#180), and `--community-verify-profiles` lets a validator also
+  verify the interleaved-RoPE profile, defaulting to `legacy-split-half` as
+  today (#194). With both off, dispatch, verification and rewards behave as
+  in v0.8.11.
+- The TypeScript SDK `npm audit` failure in CI is fixed (#172) and a SIGPIPE
+  flake in the release contract test is fixed (#184). New CI-only workflows
+  run the CPU kernel tests and benchmarks (`kernel-bench`,
+  `cpu-matrix-kernels`, and the label-gated `cpu-matrix-bench` and
+  `multi-seq-bench`).
+
 ## v0.8.11 - Release-preparation snapshot (2026-10-06)
 
 > **Candidate note:** This entry records the v0.8.11 release-preparation

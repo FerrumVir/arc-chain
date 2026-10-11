@@ -1,8 +1,9 @@
 //! Opt-in batched multi-token prefill for the canonical per-row I8 profile.
 //!
 //! This is a **separate** switch from [`crate::canonical_simd`], so the effect
-//! of batching can be isolated from the effect of the vectorised kernel. Both
-//! default to OFF. Four combinations are therefore measurable independently:
+//! of batching can be isolated from the effect of the vectorised kernel.
+//! Batching defaults to OFF; the kernel's default depends on the target (see
+//! `canonical_simd`). Four combinations are therefore measurable independently:
 //! scalar/token-at-a-time, scalar/batched, SIMD/token-at-a-time, SIMD/batched.
 //!
 //! # Why batching cannot change a value
@@ -76,10 +77,12 @@ pub fn batching_is_profitable(n_tokens: usize) -> bool {
 /// Transient bytes one batched prefill chunk allocates for `n_tokens`.
 ///
 /// Counts the ten per-chunk i64 activation buffers the prefill itself holds
-/// (`6 * d_model + 2 * d_kv + 2 * d_ff` elements per token) plus the digit
-/// planes the vectorised kernel splits activations into for the widest
-/// projection (`LIMB_COUNT * d_ff` bytes per token, from `w_down`). It excludes
-/// the model weights and the KV cache, which are not per-chunk.
+/// (`6 * d_model + 2 * d_kv + 2 * d_ff` elements per token), the digit planes
+/// the vectorised kernel splits activations into for the widest projection
+/// (`LIMB_COUNT * d_ff` bytes per token, from `w_down`), and the SMMLA
+/// kernel's copy of those planes re-laid in pairs, which is at most the same
+/// bytes again. It excludes the model weights and the KV cache, which are not
+/// per-chunk.
 pub fn prefill_chunk_scratch_bytes(
     n_tokens: usize,
     d_model: usize,
@@ -97,7 +100,12 @@ pub fn prefill_chunk_scratch_bytes(
     let limb_planes = n_tokens
         .saturating_mul(crate::canonical_simd::LIMB_COUNT)
         .saturating_mul(d_ff);
-    activations.saturating_add(limb_planes)
+    // `canonical_simd::run_i8mm` re-lays them as token pairs, and an odd last
+    // token as pairs of its own planes: never more than one more copy.
+    let pair_copy = limb_planes;
+    activations
+        .saturating_add(limb_planes)
+        .saturating_add(pair_copy)
 }
 
 /// Largest chunk whose scratch fits [`MAX_PREFILL_SCRATCH_BYTES`], at least 1.

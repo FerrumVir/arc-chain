@@ -158,9 +158,9 @@
    Compiling bit-vec v0.6.3
    Compiling bit-set v0.5.3
    Compiling chrono v0.4.45
-   Compiling arc-bincode v0.8.0 (/Users/excaulibur/work/arc-chain-readiness-20260919/crates/arc-bincode)
+   Compiling arc-bincode v0.8.0 (~/work/arc-chain-readiness-20260919/crates/arc-bincode)
    Compiling uuid v1.25.0
-   Compiling arc-crypto v0.8.0 (/Users/excaulibur/work/arc-chain-readiness-20260919/crates/arc-crypto)
+   Compiling arc-crypto v0.8.0 (~/work/arc-chain-readiness-20260919/crates/arc-crypto)
    Compiling candle-core v0.8.4
    Compiling static_assertions v1.1.0
    Compiling hashbrown v0.14.5
@@ -168,7 +168,7 @@
    Compiling serde_plain v1.0.2
    Compiling regex-automata v0.4.18
    Compiling pollster v0.4.0
-   Compiling arc-types v0.8.0 (/Users/excaulibur/work/arc-chain-readiness-20260919/crates/arc-types)
+   Compiling arc-types v0.8.0 (~/work/arc-chain-readiness-20260919/crates/arc-types)
    Compiling wgpu-hal v25.0.2
    Compiling fancy-regex v0.13.0
    Compiling candle-nn v0.8.4
@@ -176,10 +176,10 @@
    Compiling wgpu-core-deps-apple v25.0.0
    Compiling wgpu-core v25.0.2
    Compiling wgpu v25.0.2
-   Compiling arc-gpu v0.8.0 (/Users/excaulibur/work/arc-chain-readiness-20260919/crates/arc-gpu)
-   Compiling arc-inference v0.8.0 (/Users/excaulibur/work/arc-chain-readiness-20260919/crates/arc-inference)
+   Compiling arc-gpu v0.8.0 (~/work/arc-chain-readiness-20260919/crates/arc-gpu)
+   Compiling arc-inference v0.8.0 (~/work/arc-chain-readiness-20260919/crates/arc-inference)
     Finished `release` profile [optimized] target(s) in 2m 09s
-     Running `target/release/examples/validate_canonical_artifact --model /Users/excaulibur/.arc/models/standard.gguf --max-tokens 8`
+     Running `target/release/examples/validate_canonical_artifact --model ~/.arc/models/standard.gguf --max-tokens 8`
 time: command terminated abnormally
       558.58 real        50.58 user       184.87 sys
           5440274432  maximum resident set size
