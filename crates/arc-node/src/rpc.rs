@@ -21467,10 +21467,11 @@ mod tests {
     }
 
     /// The job the end-to-end test verifies: a `dual_profile_test_model` seed,
-    /// an input and a token count on which the two profiles diverge. Unset
-    /// until a CI run of `first_profile_divergent_job` logs one; the test then
-    /// uses the search's job.
-    const PINNED_PROFILE_DIVERGENT_JOB: Option<(u64, &str, u32)> = None;
+    /// an input and a token count on which the two profiles diverge. It is
+    /// the search's first job, as CI logged it identically on Linux, macOS and
+    /// Windows (`13ed973e`): legacy generates [1, 4] ("<s>probe") and the
+    /// interleaved-RoPE profile [1, 3] ("<s> ARC").
+    const PINNED_PROFILE_DIVERGENT_JOB: Option<(u64, &str, u32)> = Some((1, "ARC", 2));
 
     #[test]
     fn community_verify_profiles_default_to_legacy_and_parse_only_known_lists() {
