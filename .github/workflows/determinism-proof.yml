@@ -24,6 +24,12 @@ name: Determinism proof
 # Cost control: a pull request runs this only when it changes the proof's own
 # files AND carries the `determinism-proof` label, so ordinary CI never runs it.
 # workflow_dispatch works once this file is on the default branch.
+#
+# v0.8.12 candidate (branch rc/v0.8.12-candidate only; this part is test tooling and is not for main): adding the
+# `determinism-proof` label to the candidate's draft pull request starts this workflow and
+# determinism-proof-legacy-profile.yml together. The Apple Silicon legs are not part of the candidate's interleaved run;
+# the legacy-profile workflow runs the Apple Silicon NEON leg on the live (legacy split-half) profile. The last step of the
+# compare job requires every cell to equal the v0.8.11 hash d2c8c82b3a82beb166559b78ad26a748cbd6395c2cf13e8f012b03f90fa92872.
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
@@ -73,27 +79,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macos-15 is Apple Silicon with 7 GB of RAM, less than the ~7.3 GiB
-        # resident INT8 model, so it swaps: the smoke run measured ~57 s per
-        # forward there, against ~1 s on the x86 runners. Each of its kernels
-        # therefore runs as six parallel prompt shards (at most ~155 forwards,
-        # ~2.5 h each). Every prompt starts from an empty KV cache, and the
-        # compare job joins the shard transcripts into the exact bytes a single
-        # run writes. The driver checks its deadline between prompts, so the
-        # deadline leaves a 30-minute margin inside the run step's timeout.
+        # Apple Silicon (macos-15, 7 GB, swap-bound, six prompt shards per kernel) is not part of the candidate's
+        # interleaved run: it takes hours and the macOS pool is shared. determinism-proof-legacy-profile.yml runs the
+        # Apple Silicon NEON leg on the live profile.
         include:
-          - {runner: macos-15, kernel: scalar, shard: "0/6", shard_tag: 1of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
-          - {runner: macos-15, kernel: scalar, shard: "1/6", shard_tag: 2of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
-          - {runner: macos-15, kernel: scalar, shard: "2/6", shard_tag: 3of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
-          - {runner: macos-15, kernel: scalar, shard: "3/6", shard_tag: 4of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
-          - {runner: macos-15, kernel: scalar, shard: "4/6", shard_tag: 5of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
-          - {runner: macos-15, kernel: scalar, shard: "5/6", shard_tag: 6of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
-          - {runner: macos-15, kernel: simd, shard: "0/6", shard_tag: 1of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
-          - {runner: macos-15, kernel: simd, shard: "1/6", shard_tag: 2of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
-          - {runner: macos-15, kernel: simd, shard: "2/6", shard_tag: 3of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
-          - {runner: macos-15, kernel: simd, shard: "3/6", shard_tag: 4of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
-          - {runner: macos-15, kernel: simd, shard: "4/6", shard_tag: 5of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
-          - {runner: macos-15, kernel: simd, shard: "5/6", shard_tag: 6of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
           - {runner: macos-15-intel, kernel: scalar, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
           - {runner: macos-15-intel, kernel: simd, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
           - {runner: ubuntu-24.04, kernel: scalar, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
@@ -320,7 +309,6 @@ jobs:
           python3 scripts/determinism-proof/compare_results.py \
             --results-dir "$RUNNER_TEMP/legs" \
             --manifest docs/protocol/packages/llama-2-7b-q4km.manifest.json \
-            --expect macos-15:scalar --expect macos-15:simd \
             --expect macos-15-intel:scalar --expect macos-15-intel:simd \
             --expect ubuntu-24.04:scalar --expect ubuntu-24.04:simd \
             --expect windows-latest:scalar --expect windows-latest:simd \
@@ -332,6 +320,63 @@ jobs:
             --expect-if-available windows-latest:avx512-vnni-limb \
             --out-dir "$RUNNER_TEMP/evidence" \
             --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Require the v0.8.11 hash in every cell
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          temp = os.environ["RUNNER_TEMP"]
+          evidence = json.load(open(os.path.join(temp, "evidence", "evidence.json"), encoding="utf-8"))
+          expected = "d2c8c82b3a82beb166559b78ad26a748cbd6395c2cf13e8f012b03f90fa92872"
+          required = [
+              "macos-15-intel:scalar",
+              "macos-15-intel:simd",
+              "ubuntu-24.04:scalar",
+              "ubuntu-24.04:simd",
+              "windows-latest:scalar",
+              "windows-latest:simd",
+              "ubuntu-24.04-arm:scalar",
+              "ubuntu-24.04-arm:simd",
+              "ubuntu-24.04-arm:neon-i8mm-limb",
+          ]
+          problems = []
+          header = evidence.get("transcript_header") or {}
+
+          if evidence.get("verdict") != "PASS":
+              problems.append("compare verdict is %r, not PASS" % evidence.get("verdict"))
+          if evidence.get("reference_combined_sha256") != expected:
+              problems.append("reference hash %s is not the v0.8.11 hash %s" % (evidence.get("reference_combined_sha256"), expected))
+          pairs = {(p["runner"] + ":" + p["kernel"]): p for p in evidence.get("pairs") or []}
+          for key in required:
+              if key not in pairs:
+                  problems.append("required cell %s is missing" % key)
+          rows = []
+          for key, pair in sorted(pairs.items()):
+              ok = bool(pair.get("identical")) and not pair.get("problems") and pair.get("combined_sha256") == expected
+              if not ok:
+                  problems.append("%s: identical=%s hash=%s problems=%s" % (key, pair.get("identical"), pair.get("combined_sha256"), pair.get("problems")))
+              census = pair.get("projection_census") or {}
+              rows.append("| %s | %s | %s | %s | `%s` | %s | %s |" % (pair.get("runner"), pair.get("kernel"), pair.get("kernel_effective"), pair.get("cpu_model"), (pair.get("combined_sha256") or "none")[:16], "yes" if ok else "**NO**", "%s of %s" % (census.get("accepted"), census.get("attempted"))))
+          not_covered = evidence.get("not_covered") or []
+          summary = [
+              "## Candidate, interleaved profile: %s" % ("ALL %d CELLS EQUAL THE v0.8.11 HASH" % len(pairs) if not problems else "NOT PASS"),
+              "",
+              "Required hash (v0.8.11): `%s`; reference of this run: `%s`" % (expected, evidence.get("reference_combined_sha256")),
+              "Apple Silicon is not in this run (see the legacy-profile workflow).",
+              "",
+              "| Runner | Kernel | Effective kernel | CPU | Combined SHA-256 (first 16) | Equal | SIMD projections accepted |",
+              "|---|---|---|---|---|---|---|",
+          ] + rows + [""]
+          if not_covered:
+              summary.append("Not covered because the runner's CPU lacks the instructions: " + "; ".join("%s on %s (%s)" % (n.get("kernel"), n.get("platform"), n.get("cpu_model")) for n in not_covered))
+          summary += ["- problem: " + p for p in problems]
+          out = "\n".join(summary) + "\n"
+          print(out)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write(out)
+          sys.exit(0 if not problems else 1)
+          PY
 
       - name: Upload the cross-platform evidence
         if: always()

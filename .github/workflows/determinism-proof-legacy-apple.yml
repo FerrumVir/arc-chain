@@ -1,0 +1,351 @@
+name: Determinism proof (legacy split-half profile, Apple Silicon, candidate)
+
+# v0.8.12 candidate, test tooling only (branch rc/v0.8.12-candidate; not for main). Runs the SAME driver, SAME 16 prompts x
+# 32 new tokens, SAME pinned Llama-2-7B-Chat Q4_K_M, SAME scripts and SAME comparison script as determinism-proof.yml, with
+# --profile legacy: the CANONICAL_REWARD_INFERENCE_PROFILE ("INT8 integer (per-row, cross-platform deterministic)") that validator shard holders and
+# --full-integer-worker community workers execute. Same trigger as determinism-proof.yml: the `determinism-proof` label on a
+# pull request that changes the proof's files. The last step of the compare job requires every cell to equal the v0.8.11
+# live-profile hash 4464b4b1a3df705622ffc6c47e39ef92646823843f49a470c84e457225459bca.
+#
+# Cell: Apple Silicon macOS (macos-15, virtual M1, 7 GB) with the NEON kernel only (no scalar leg), in six prompt shards: the
+# runner has less RAM than the ~7.3 GiB resident INT8 model, so it swaps (~1 token a minute). The compare job joins the shards into the
+# exact bytes a single run writes and requires them to equal the v0.8.11 hash.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - .github/workflows/determinism-proof.yml
+      - crates/arc-inference/examples/determinism_proof.rs
+      - scripts/determinism-proof/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per commit: a newer commit's run does not cancel or wait behind an
+# older run's long macOS legs. Duplicate triggers for the same commit queue.
+concurrency:
+  group: determinism-proof-legacy-apple-${{ github.event.pull_request.number || github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Workload. Empty PROOF_PROMPT_LIMIT means every prompt in prompts.json. The
+  # published expected hash is for all 16 prompts x 32 new tokens.
+  PROOF_PROMPT_LIMIT: ""
+  PROOF_MAX_NEW_TOKENS: "32"
+  PROOF_PROFILE: legacy
+  # Pinned model: the same bytes as arc-node's TESTNET_MODEL_SHA256 and
+  # docs/protocol/packages/llama-2-7b-q4km.manifest.json.
+  MODEL_URL: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf
+  MODEL_SHA256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa
+  MODEL_BYTES: "4081004224"
+  MODEL_FILE: .determinism-proof-model/llama-2-7b-chat.Q4_K_M.gguf
+  # The model is downloaded on every run and is not kept in the Actions cache.
+  # On 2026-10-06 the repository cache already held 10.05 GB of ordinary CI
+  # caches against its 10 GB budget, so a 4 GB entry would evict them and slow
+  # normal CI. Caching would also need actions/cache added to the reviewed
+  # GitHub-action allowlist in tests/release/static_contract_test.sh.
+
+jobs:
+  run:
+    name: ${{ matrix.runner }} / ${{ matrix.kernel }} / legacy profile / shard ${{ matrix.shard }}
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'determinism-proof') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'determinism-proof'))
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.job_timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Apple Silicon (macos-15) has 7 GB of RAM, less than the ~7.3 GiB resident INT8 model, so it swaps (~1 token a minute):
+        # its NEON kernel runs as six parallel prompt shards (at most ~155 forwards, ~2.5 h each). Every prompt starts from an empty KV
+        # cache, and the compare job joins the shard transcripts into the exact bytes a single run writes.
+        include:
+          - {runner: macos-15, kernel: simd, shard: "0/6", shard_tag: 1of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "1/6", shard_tag: 2of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "2/6", shard_tag: 3of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "3/6", shard_tag: 4of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "4/6", shard_tag: 5of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+          - {runner: macos-15, kernel: simd, shard: "5/6", shard_tag: 6of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
+    env:
+      RUNNER_LABEL: ${{ matrix.runner }}
+      KERNEL: ${{ matrix.kernel }}
+      SHARD: ${{ matrix.shard }}
+      DEADLINE_SECONDS: ${{ matrix.deadline_seconds }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Record runner facts
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/determinism-proof"
+          mkdir -p "$out"
+          {
+            echo "leg: $RUNNER_LABEL / $KERNEL / profile $PROOF_PROFILE / shard $SHARD"
+            echo "runner: $RUNNER_OS $RUNNER_ARCH image ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            case "$RUNNER_OS" in
+              macOS)
+                sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+                sysctl vm.swapusage
+                vm_stat
+                ;;
+              Linux)
+                lscpu
+                free -b
+                ;;
+              Windows)
+                powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors; Get-CimInstance Win32_ComputerSystem | Format-List TotalPhysicalMemory"
+                ;;
+            esac
+            df -h .
+          } 2>&1 | tee "$out/runner-before.txt"
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+
+      - name: Build the proof driver (release, Candle GGUF loader)
+        shell: bash
+        run: cargo build --locked --release -p arc-inference --features candle --example determinism_proof
+
+      # Loads nothing: exit 0 if this CPU can run the leg's kernel, 4 if not
+      # (with a run JSON that records it), so a VNNI leg on a host without
+      # VNNI skips the download and the proof.
+      - name: Check this CPU can run the kernel
+        id: probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/determinism-proof"
+          mkdir -p "$out"
+          status=0
+          target/release/examples/determinism_proof --check-kernel --kernel "$KERNEL" \
+            --run-json "$out/run-$KERNEL.json" || status=$?
+          case "$status" in
+            0) echo "available=true" >> "$GITHUB_OUTPUT" ;;
+            4)
+              echo "available=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::This runner's CPU cannot run $KERNEL; the leg records that and skips the proof."
+              ;;
+            *) exit "$status" ;;
+          esac
+
+      - name: Download and verify the pinned model
+        if: steps.probe.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$MODEL_FILE")"
+          if [ ! -f "$MODEL_FILE" ]; then
+            curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+              --retry-max-time 900 --connect-timeout 20 --max-time 1800 \
+              --proto '=https' --proto-redir '=https' --tlsv1.2 \
+              --output "$MODEL_FILE.partial" "$MODEL_URL"
+            mv "$MODEL_FILE.partial" "$MODEL_FILE"
+          fi
+          size="$(wc -c < "$MODEL_FILE" | tr -d ' ')"
+          if [ "$size" != "$MODEL_BYTES" ]; then
+            echo "::error::model is $size bytes, expected $MODEL_BYTES"
+            exit 1
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual="$(sha256sum "$MODEL_FILE" | cut -d ' ' -f 1)"
+          else
+            actual="$(shasum -a 256 "$MODEL_FILE" | cut -d ' ' -f 1)"
+          fi
+          if [ "$actual" != "$MODEL_SHA256" ]; then
+            echo "::error::model SHA-256 is $actual, expected $MODEL_SHA256"
+            exit 1
+          fi
+          echo "model verified: sha256 $actual, $size bytes"
+
+      - name: Reduce background memory use (macOS)
+        if: runner.os == 'macOS' && steps.probe.outputs.available == 'true'
+        shell: bash
+        run: |
+          sudo mdutil -a -i off || true
+          sudo purge || true
+          sysctl vm.swapusage
+
+      - name: Run the proof with the bash script (macOS, Linux)
+        if: runner.os != 'Windows' && steps.probe.outputs.available == 'true'
+        shell: bash
+        timeout-minutes: ${{ matrix.run_timeout }}
+        run: |
+          set -euo pipefail
+          args=(
+            --kernel "$KERNEL"
+            --model "$GITHUB_WORKSPACE/$MODEL_FILE"
+            --out-dir "$RUNNER_TEMP/determinism-proof"
+            --max-new-tokens "$PROOF_MAX_NEW_TOKENS"
+            --deadline-seconds "$DEADLINE_SECONDS"
+            --profile "$PROOF_PROFILE"
+          )
+          if [ -n "$PROOF_PROMPT_LIMIT" ]; then
+            args+=(--prompt-limit "$PROOF_PROMPT_LIMIT")
+          fi
+          if [ "$SHARD" != "0/1" ]; then
+            args+=(--shard "$SHARD")
+          fi
+          bash scripts/determinism-proof/run-proof.sh "${args[@]}"
+
+      - name: Run the proof with the PowerShell script (Windows)
+        if: runner.os == 'Windows' && steps.probe.outputs.available == 'true'
+        shell: pwsh
+        timeout-minutes: ${{ matrix.run_timeout }}
+        run: |
+          $params = @{
+            Kernel = $env:KERNEL
+            Model = (Join-Path $env:GITHUB_WORKSPACE $env:MODEL_FILE)
+            OutDir = (Join-Path $env:RUNNER_TEMP 'determinism-proof')
+            MaxNewTokens = [int]$env:PROOF_MAX_NEW_TOKENS
+            DeadlineSeconds = [int]$env:DEADLINE_SECONDS
+            ProofProfile = $env:PROOF_PROFILE
+          }
+          if ($env:PROOF_PROMPT_LIMIT) { $params.PromptLimit = [int]$env:PROOF_PROMPT_LIMIT }
+          if ($env:SHARD -ne '0/1') { $params.Shard = $env:SHARD }
+          & ./scripts/determinism-proof/run-proof.ps1 @params
+
+      - name: Record memory after the run
+        if: always()
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/determinism-proof"
+          mkdir -p "$out"
+          {
+            case "$RUNNER_OS" in
+              macOS)
+                sysctl vm.swapusage
+                vm_stat
+                ;;
+              Linux)
+                free -b
+                grep -E '^(pswpin|pswpout|pgmajfault) ' /proc/vmstat || true
+                ;;
+              Windows)
+                echo "not recorded on Windows"
+                ;;
+            esac
+          } 2>&1 | tee "$out/runner-after.txt"
+
+      - name: Assemble this leg's result
+        if: always()
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then py=python; else py=python3; fi
+          "$py" scripts/determinism-proof/assemble_result.py \
+            --out-dir "$RUNNER_TEMP/determinism-proof" \
+            --runner-label "$RUNNER_LABEL" --kernel "$KERNEL" --shard "$SHARD"
+
+      - name: Upload this leg's evidence (never the model)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: determinism-proof-leg-${{ matrix.runner }}-${{ matrix.kernel }}-${{ matrix.shard_tag }}
+          path: ${{ runner.temp }}/determinism-proof/
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
+
+  compare:
+    name: compare Apple Silicon (legacy profile)
+    needs: run
+    if: >-
+      always() &&
+      (github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'determinism-proof') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'determinism-proof')))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download every leg's evidence
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: determinism-proof-leg-*
+          path: ${{ runner.temp }}/legs
+
+      - name: Compare combined hashes across platforms and kernels
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 scripts/determinism-proof/compare_results.py \
+            --results-dir "$RUNNER_TEMP/legs" \
+            --manifest docs/protocol/packages/llama-2-7b-q4km.manifest.json \
+            --expect macos-15:simd \
+            --out-dir "$RUNNER_TEMP/evidence" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Require the v0.8.11 hash in every cell
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          temp = os.environ["RUNNER_TEMP"]
+          evidence = json.load(open(os.path.join(temp, "evidence", "evidence.json"), encoding="utf-8"))
+          expected = "4464b4b1a3df705622ffc6c47e39ef92646823843f49a470c84e457225459bca"
+          required = [
+              "macos-15:simd",
+          ]
+          problems = []
+          legacy = 'INT8 integer (per-row, cross-platform deterministic)'
+          header = evidence.get("transcript_header") or {}
+          if header.get("execution_profile") != legacy:
+              problems.append("execution_profile in the transcript header is %r, not the legacy profile" % header.get("execution_profile"))
+
+          if evidence.get("verdict") != "PASS":
+              problems.append("compare verdict is %r, not PASS" % evidence.get("verdict"))
+          if evidence.get("reference_combined_sha256") != expected:
+              problems.append("reference hash %s is not the v0.8.11 hash %s" % (evidence.get("reference_combined_sha256"), expected))
+          pairs = {(p["runner"] + ":" + p["kernel"]): p for p in evidence.get("pairs") or []}
+          for key in required:
+              if key not in pairs:
+                  problems.append("required cell %s is missing" % key)
+          rows = []
+          for key, pair in sorted(pairs.items()):
+              ok = bool(pair.get("identical")) and not pair.get("problems") and pair.get("combined_sha256") == expected
+              if not ok:
+                  problems.append("%s: identical=%s hash=%s problems=%s" % (key, pair.get("identical"), pair.get("combined_sha256"), pair.get("problems")))
+              census = pair.get("projection_census") or {}
+              rows.append("| %s | %s | %s | %s | `%s` | %s | %s |" % (pair.get("runner"), pair.get("kernel"), pair.get("kernel_effective"), pair.get("cpu_model"), (pair.get("combined_sha256") or "none")[:16], "yes" if ok else "**NO**", "%s of %s" % (census.get("accepted"), census.get("attempted"))))
+          not_covered = evidence.get("not_covered") or []
+          summary = [
+              "## Candidate, legacy split-half profile, Apple Silicon: %s" % ("ALL %d CELLS EQUAL THE v0.8.11 HASH" % len(pairs) if not problems else "NOT PASS"),
+              "",
+              "Required hash (v0.8.11): `%s`; reference of this run: `%s`" % (expected, evidence.get("reference_combined_sha256")),
+              "Apple Silicon runs the NEON kernel only (no scalar leg); its joined transcript must equal the v0.8.11 hash.",
+              "",
+              "| Runner | Kernel | Effective kernel | CPU | Combined SHA-256 (first 16) | Equal | SIMD projections accepted |",
+              "|---|---|---|---|---|---|---|",
+          ] + rows + [""]
+          if not_covered:
+              summary.append("Not covered because the runner's CPU lacks the instructions: " + "; ".join("%s on %s (%s)" % (n.get("kernel"), n.get("platform"), n.get("cpu_model")) for n in not_covered))
+          summary += ["- problem: " + p for p in problems]
+          out = "\n".join(summary) + "\n"
+          print(out)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write(out)
+          sys.exit(0 if not problems else 1)
+          PY
+
+      - name: Upload the cross-platform evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: determinism-proof-evidence
+          path: |
+            ${{ runner.temp }}/evidence/
+            ${{ runner.temp }}/legs/
+          if-no-files-found: warn
+          retention-days: 90
+          overwrite: true
