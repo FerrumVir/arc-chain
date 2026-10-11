@@ -494,6 +494,17 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     enable_community_rewards_v1: bool,
 
+    /// Coordinator: answer the waiting `/inference/run` caller as soon as the
+    /// validators' 2-of-3 recomputation verifies a single-worker community
+    /// result and its settlement is journaled, then collect the five-of-six
+    /// reward approvals on the existing settlement retry path. Approvals,
+    /// retries and the 0x25 reward are unchanged. At the journal's high-water
+    /// mark, beyond the epoch budgets once unpaid journaled rewards count, or
+    /// when the journal write fails, a job settles exactly as with the switch
+    /// off. Off by default; see docs/twin-execution.md, section 13.
+    #[arg(long, default_value_t = false)]
+    community_release_on_verification: bool,
+
     /// Validator: the community reward profiles this validator verifies, as a
     /// comma-separated list. `legacy-split-half` is today's live profile and
     /// must stay listed. Adding `rope-interleaved-v1` (the GGUF
@@ -10012,6 +10023,7 @@ async fn run_arc_node() -> Result<()> {
             spot_check_per_mille: cli.community_twin_spot_check_per_mille,
             demand_interval_secs: cli.community_demand_interval_secs,
         },
+        cli.community_release_on_verification,
         rpc::CommunityProfileServing {
             verify: community_verify_profiles,
             interleaved_rope_qk,
@@ -10320,6 +10332,20 @@ mod tests {
         ])
         .unwrap();
         assert!(configured.enable_native_inference_requests);
+    }
+
+    #[test]
+    fn community_release_on_verification_is_off_unless_requested() {
+        assert!(
+            !Cli::try_parse_from(["arc-node"])
+                .unwrap()
+                .community_release_on_verification
+        );
+        assert!(
+            Cli::try_parse_from(["arc-node", "--community-release-on-verification"])
+                .unwrap()
+                .community_release_on_verification
+        );
     }
 
     #[test]
@@ -11194,6 +11220,7 @@ mod tests {
                     Some(coordinator_shutdown_rx),
                     Arc::new(arc_net::transport::TransportWirePolicy::default()),
                     arc_node::twin::TwinConfig::default(),
+                    false,
                     rpc::CommunityProfileServing::default(),
                 )
                 .await
