@@ -10,7 +10,7 @@
 # Usage:
 #   scripts/determinism-proof/run-proof.sh [--kernel KERNEL] [--model PATH]
 #       [--out-dir DIR] [--max-new-tokens N] [--prompt-limit N]
-#       [--shard K/COUNT] [--deadline-seconds S]
+#       [--shard K/COUNT] [--deadline-seconds S] [--profile interleaved|legacy]
 #
 # KERNEL is scalar (the default), simd (NEON dotprod or AVX2), or a
 # matrix-extension kernel this CPU has: neon-i8mm-limb, avx-vnni-limb or
@@ -30,6 +30,7 @@ SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)"
 REPO_ROOT="$(CDPATH='' cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 
 kernel=scalar
+profile=interleaved
 model="${ARC_PROOF_MODEL:-}"
 out_dir="${ARC_PROOF_OUT_DIR:-$REPO_ROOT/target/determinism-proof}"
 max_new_tokens="$DEFAULT_MAX_NEW_TOKENS"
@@ -44,6 +45,7 @@ usage() {
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --kernel) kernel="${2:?--kernel needs a value}"; shift 2 ;;
+    --profile) profile="${2:?--profile needs a value}"; shift 2 ;;
     --model) model="${2:?--model needs a value}"; shift 2 ;;
     --out-dir) out_dir="${2:?--out-dir needs a value}"; shift 2 ;;
     --max-new-tokens) max_new_tokens="${2:?--max-new-tokens needs a value}"; shift 2 ;;
@@ -61,6 +63,10 @@ case "$kernel" in
     echo "--kernel must be scalar, simd, neon-i8mm-limb, avx-vnni-limb or avx512-vnni-limb" >&2
     exit 2
     ;;
+esac
+case "$profile" in
+  interleaved | legacy) ;;
+  *) echo "--profile must be interleaved or legacy" >&2; exit 2 ;;
 esac
 
 sha256_of() {
@@ -108,6 +114,7 @@ driver_args=(
   --model "$model"
   --prompts "$SCRIPT_DIR/prompts.json"
   --kernel "$kernel"
+  --profile "$profile"
   --max-new-tokens "$max_new_tokens"
   --transcript "$transcript"
   --run-json "$run_json"
@@ -131,7 +138,7 @@ echo
 echo "transcript:        $transcript"
 echo "combined SHA-256:  $combined"
 expected_file="$SCRIPT_DIR/expected-sha256.txt"
-if [ -n "$prompt_limit$shard" ] || [ "$max_new_tokens" != "$DEFAULT_MAX_NEW_TOKENS" ]; then
+if [ -n "$prompt_limit$shard" ] || [ "$max_new_tokens" != "$DEFAULT_MAX_NEW_TOKENS" ] || [ "$profile" != interleaved ]; then
   echo "Non-default workload: compare with another machine that used the same options."
 elif [ -f "$expected_file" ]; then
   expected="$(grep -m 1 -E '^[0-9a-f]{64}$' "$expected_file" || true)"
