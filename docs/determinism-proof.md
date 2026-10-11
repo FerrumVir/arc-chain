@@ -17,8 +17,8 @@ produces an identical transcript.
 | Generation | `arc.whole-model-generation.greedy.v1`: one internal BOS forward, token-at-a-time prefill, argmax with ties to the lowest token ID, stop after EOS or the token budget |
 | Prompts | 16 fixed, harmless prompts in [`scripts/determinism-proof/prompts.json`](../scripts/determinism-proof/prompts.json), tokenized by the GGUF SentencePiece tokenizer (`arc.gguf-llama.spm-score-merge.v1`) |
 | Budget | 32 new tokens per prompt |
-| Platforms | GitHub-hosted runners `macos-15` (Apple Silicon), `macos-15-intel` (Intel x86_64), `ubuntu-24.04` (x86_64) and `windows-latest` (x86_64) |
-| Kernels | The default scalar per-row INT8 projection kernel, and the opt-in SIMD "limb" kernel (`ARC_FAST_CANONICAL_KERNEL`): NEON dotprod on arm64, AVX2 on x86_64. Each runs in its own job. |
+| Platforms | GitHub-hosted runners `macos-15` (Apple Silicon), `macos-15-intel` (Intel x86_64), `ubuntu-24.04` (x86_64), `ubuntu-24.04-arm` (arm64) and `windows-latest` (x86_64) |
+| Kernels | The default scalar per-row INT8 projection kernel, and the opt-in SIMD "limb" kernel (`ARC_FAST_CANONICAL_KERNEL`): NEON dotprod on arm64, AVX2 on x86_64. Under the same opt-in, the matrix-extension kernels: SMMLA (`neon-i8mm-limb`) on the arm64 Linux runner, and AVX-VNNI (`avx-vnni-limb`) and AVX-512 VNNI (`avx512-vnni-limb`) on the x86_64 Linux and Windows runners whose CPU has them. Each runs in its own job. |
 
 The driver is
 [`crates/arc-inference/examples/determinism_proof.rs`](../crates/arc-inference/examples/determinism_proof.rs).
@@ -139,7 +139,8 @@ are identical in every case, so none of this affects the determinism result.
 ## How CI runs it
 
 [`.github/workflows/determinism-proof.yml`](../.github/workflows/determinism-proof.yml)
-runs both kernels on all four platforms: eight platform/kernel pairs. Each job
+runs both kernels on all five platforms, ten platform/kernel pairs, plus the
+matrix-extension kernels described below. Each job
 downloads the model from the pinned URL, checks its size and SHA-256, builds
 the driver in release mode and runs it through the same script a developer
 would use (bash on macOS and Linux, PowerShell on Windows). The Apple Silicon
@@ -151,13 +152,25 @@ transcripts into exactly the bytes a single run writes. The final job is green
 only if:
 
 - every job completed;
-- all eight platform/kernel combined hashes are identical;
+- every platform/kernel combined hash is identical;
 - in every SIMD job, the vectorised kernel accepted every projection it was
   offered (none fell back to the scalar kernel), and in every scalar job it was
   offered none;
 - every job loaded the pinned model bytes, and the engine API cross-check
   (run by the job that holds the first prompt) passed for every platform and
   kernel.
+
+The matrix-extension kernels run in jobs of their own, pinned with
+`--kernel neon-i8mm-limb`, `avx-vnni-limb` or `avx512-vnni-limb`. This proof
+prefills and decodes one token at a time, so each of those kernels computes
+every projection of its job, and the final job also requires that its
+per-kernel counter shows it did, with no other batched kernel involved.
+GitHub's x86_64 runners vary between hosts with and without VNNI, so a VNNI
+job first asks the driver whether its CPU can run the kernel
+(`determinism_proof --check-kernel --kernel K`, which loads nothing). On a
+host without it the job records that and skips the proof, and the final job
+lists the pair as not covered by that run instead of failing. The SMMLA job
+is required: the arm64 runner (Neoverse-N2) has always had i8mm.
 
 The final job writes the hash matrix to the job summary and uploads the
 evidence: every transcript, every per-runner JSON and a combined
@@ -188,6 +201,9 @@ git fetch --depth 1 origin "$ARC_SOURCE_REV"
 git checkout --detach FETCH_HEAD
 scripts/determinism-proof/run-proof.sh            # default scalar kernel
 scripts/determinism-proof/run-proof.sh --kernel simd
+# Matrix-extension kernels, where this CPU has them:
+scripts/determinism-proof/run-proof.sh --kernel neon-i8mm-limb    # Arm with i8mm
+scripts/determinism-proof/run-proof.sh --kernel avx512-vnni-limb  # x86 with AVX-512 VNNI
 ```
 
 Windows (PowerShell, with the MSVC build tools installed):
@@ -221,8 +237,9 @@ computer.
   Q4, ternary) are not covered.
 - **Greedy decoding.** Production generation v2 adds an integer repetition
   penalty on top of the same forward pass; this test uses raw argmax.
-- **Four runner types.** Other CPUs (for example RISC-V or 32-bit targets) are
-  untested. The SIMD kernel is NEON dotprod on arm64 and AVX2 on x86_64; on
+- **Five runner types.** Other CPUs (for example RISC-V or 32-bit targets) are
+  untested, and VNNI is covered only on the runs whose x86_64 hosts had it. The
+  SIMD kernel is NEON dotprod on arm64 and AVX2 on x86_64; on
   arm64 the attention dot product also uses an exact NEON path in both jobs.
   "Apple Silicon" is one GitHub-hosted virtual Apple M1 runner with 7 GB of
   memory; other Apple chips are untested.

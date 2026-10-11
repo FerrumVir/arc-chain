@@ -9,8 +9,18 @@
 //! SHA-256, which the caller computes with an independent tool.
 //!
 //! Nothing machine-specific (OS, CPU, kernel choice, timing) is written to the
-//! transcript. That goes to the separate run JSON, so the scalar kernel and the
-//! opt-in SIMD kernel must also produce the identical transcript.
+//! transcript. That goes to the separate run JSON, so the scalar kernel, the
+//! opt-in SIMD kernel and the matrix-extension kernels must also produce the
+//! identical transcript.
+//!
+//! Kernels: `scalar`; `simd`, the architecture's base limb kernel (NEON
+//! dotprod or AVX2), pinned so that it keeps that meaning on CPUs with matrix
+//! extensions; and a pinned matrix-extension kernel by its label,
+//! `neon-i8mm-limb`, `avx-vnni-limb` or `avx512-vnni-limb`, which serves the
+//! one-token projections this proof's token-at-a-time loop makes.
+//! `--check-kernel --kernel K [--run-json OUT.json]` loads nothing: it exits 0
+//! if this CPU and build can run K, and otherwise writes a run JSON saying so
+//! and exits 4, so a CI leg on a host without the instructions can be skipped.
 //!
 //! The generation loop is the engine's own greedy v2 loop
 //! (`try_generate_v2_greedy`): one internal BOS forward, token-at-a-time
@@ -19,10 +29,11 @@
 //! that public API as a cross-check unless `--no-engine-crosscheck` is given.
 //!
 //! ```text
-//! determinism_proof --model GGUF --prompts PROMPTS.json --kernel scalar|simd
+//! determinism_proof --model GGUF --prompts PROMPTS.json --kernel KERNEL
 //!     --max-new-tokens N --transcript OUT.txt --run-json OUT.json
 //!     [--prompt-limit N] [--shard K/COUNT] [--deadline-seconds S]
 //!     [--no-engine-crosscheck]
+//! determinism_proof --check-kernel --kernel KERNEL [--run-json OUT.json]
 //! ```
 //!
 //! `--shard K/COUNT` runs only the K-th of COUNT contiguous slices of the
@@ -37,7 +48,7 @@ use arc_inference::cached_integer_model::{
     load_cached_model_canonical_i8_interleaved_rope,
 };
 use arc_inference::canonical_prefill;
-use arc_inference::canonical_simd;
+use arc_inference::canonical_simd::{self, BatchedKernel};
 use arc_inference::integer_lut::argmax_i64;
 use arc_inference::llama_spm_tokenizer::LlamaGgufSpmTokenizer;
 use arc_inference::tensor_parallel::hash_i64;
@@ -49,20 +60,64 @@ const TRANSCRIPT_SCHEMA: &str = "arc-determinism-proof-transcript-v1";
 const RUN_SCHEMA: &str = "arc-determinism-proof-run-v1";
 const PROMPT_SCHEMA: &str = "arc-determinism-proof-prompts-v1";
 const USAGE: &str = "usage: determinism_proof --model GGUF --prompts PROMPTS.json \
-    --kernel scalar|simd --max-new-tokens N --transcript OUT.txt --run-json OUT.json \
-    [--prompt-limit N] [--shard K/COUNT] [--deadline-seconds S] [--no-engine-crosscheck]";
+    --kernel KERNEL --max-new-tokens N --transcript OUT.txt --run-json OUT.json \
+    [--prompt-limit N] [--shard K/COUNT] [--deadline-seconds S] [--no-engine-crosscheck]\n\
+    or: determinism_proof --check-kernel --kernel KERNEL [--run-json OUT.json]\n\
+    KERNEL: scalar, simd, neon-i8mm-limb, avx-vnni-limb or avx512-vnni-limb";
+/// Exit status of `--check-kernel` when this CPU cannot run the kernel.
+const UNAVAILABLE_EXIT: i32 = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kernel {
     Scalar,
+    /// The architecture's base limb kernel: NEON dotprod or AVX2.
     Simd,
+    /// A matrix-extension kernel that serves one-token projections.
+    Extension(BatchedKernel),
 }
 
 impl Kernel {
+    fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "scalar" => Ok(Kernel::Scalar),
+            "simd" => Ok(Kernel::Simd),
+            label => match BatchedKernel::from_label(label) {
+                Some(kernel) if kernel.serves_one_row() => Ok(Kernel::Extension(kernel)),
+                _ => Err(format!(
+                    "--kernel must be scalar, simd, neon-i8mm-limb, avx-vnni-limb or \
+                     avx512-vnni-limb, not {name}"
+                )),
+            },
+        }
+    }
+
     fn requested_label(self) -> &'static str {
         match self {
             Kernel::Scalar => "scalar",
             Kernel::Simd => "simd",
+            Kernel::Extension(kernel) => kernel.label(),
+        }
+    }
+
+    /// The batched-kernel preference this request pins. `simd` pins the base
+    /// kernel, so that on a CPU with matrix extensions it still runs NEON
+    /// dotprod or AVX2 rather than the widest kernel.
+    fn preference(self) -> Option<BatchedKernel> {
+        match self {
+            Kernel::Scalar => None,
+            Kernel::Simd => [BatchedKernel::NeonSdot, BatchedKernel::Avx2]
+                .into_iter()
+                .find(|kernel| kernel.available()),
+            Kernel::Extension(kernel) => Some(kernel),
+        }
+    }
+
+    /// Whether this CPU and build can run the kernel.
+    fn available(self) -> bool {
+        match self {
+            Kernel::Scalar => true,
+            Kernel::Simd => canonical_simd::dotprod_available(),
+            Kernel::Extension(kernel) => kernel.available(),
         }
     }
 
@@ -70,11 +125,104 @@ impl Kernel {
     fn effective_label(self) -> &'static str {
         match self {
             Kernel::Scalar => "scalar-i8xi64",
-            Kernel::Simd if cfg!(target_arch = "aarch64") => "neon-sdot-limb",
-            Kernel::Simd if cfg!(target_arch = "x86_64") => "avx2-limb",
-            Kernel::Simd => "unavailable",
+            _ if !self.available() => "unavailable",
+            Kernel::Simd => self
+                .preference()
+                .map_or("unavailable", BatchedKernel::label),
+            Kernel::Extension(kernel) => kernel.label(),
         }
     }
+}
+
+/// The CPU features the limb kernels depend on, as this process detects them.
+fn cpu_features() -> Value {
+    Value::Object(
+        canonical_simd::detected_cpu_features()
+            .into_iter()
+            .map(|(name, present)| (name.to_string(), Value::Bool(present)))
+            .collect(),
+    )
+}
+
+/// Projections each matrix-extension or batched kernel computed, by label.
+fn projections_by_kernel() -> Value {
+    Value::Object(
+        BatchedKernel::ALL
+            .into_iter()
+            .map(|kernel| {
+                (
+                    kernel.label().to_string(),
+                    json!(canonical_simd::batched_kernel_runs(kernel)),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// `--check-kernel`: exit 0 if this CPU and build can run `--kernel`, else
+/// write a run JSON that records it (when `--run-json` is given) and exit
+/// [`UNAVAILABLE_EXIT`]. Loads no model.
+fn check_kernel() -> Result<(), String> {
+    let mut kernel = None;
+    let mut run_json = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--check-kernel" => {}
+            "--kernel" => {
+                let name = args
+                    .next()
+                    .ok_or_else(|| format!("--kernel needs a value\n{USAGE}"))?;
+                kernel = Some(Kernel::parse(&name)?);
+            }
+            "--run-json" => {
+                run_json = Some(
+                    args.next()
+                        .ok_or_else(|| format!("--run-json needs a value\n{USAGE}"))?,
+                );
+            }
+            other => {
+                return Err(format!(
+                    "--check-kernel takes only --kernel and --run-json, not {other}\n{USAGE}"
+                ));
+            }
+        }
+    }
+    let kernel = kernel.ok_or_else(|| format!("--check-kernel needs --kernel\n{USAGE}"))?;
+    let available = kernel.available();
+    eprintln!(
+        "determinism_proof: kernel {} on this {} CPU: {}; detected {}",
+        kernel.requested_label(),
+        std::env::consts::ARCH,
+        if available {
+            "available"
+        } else {
+            "unavailable"
+        },
+        cpu_features()
+    );
+    if available {
+        return Ok(());
+    }
+    if let Some(path) = run_json {
+        let run = json!({
+            "schema": RUN_SCHEMA,
+            "complete": false,
+            "kernel": {
+                "requested": kernel.requested_label(),
+                "effective": "unavailable",
+                "available": false,
+                "cpu_features": cpu_features(),
+            },
+            "platform": {
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+            },
+        });
+        let rendered = serde_json::to_string_pretty(&run).map_err(|error| error.to_string())?;
+        std::fs::write(&path, rendered + "\n").map_err(|error| format!("write {path}: {error}"))?;
+    }
+    std::process::exit(UNAVAILABLE_EXIT);
 }
 
 struct Args {
@@ -113,13 +261,7 @@ fn parse_args() -> Result<Args, String> {
         match flag.as_str() {
             "--model" => model = Some(value),
             "--prompts" => prompts = Some(value),
-            "--kernel" => {
-                kernel = Some(match value.as_str() {
-                    "scalar" => Kernel::Scalar,
-                    "simd" => Kernel::Simd,
-                    other => return Err(format!("--kernel must be scalar or simd, not {other}")),
-                })
-            }
+            "--kernel" => kernel = Some(Kernel::parse(&value)?),
             "--max-new-tokens" => {
                 let parsed: u32 = value
                     .parse()
@@ -549,6 +691,9 @@ fn rate(count: usize, seconds: f64) -> Value {
 }
 
 fn main() -> Result<(), String> {
+    if std::env::args().any(|arg| arg == "--check-kernel") {
+        return check_kernel();
+    }
     let args = parse_args()?;
     let started = Instant::now();
     let mut prompts = load_prompts(&args.prompts)?;
@@ -574,18 +719,25 @@ fn main() -> Result<(), String> {
     // Force each switch's one-time environment initialisation before setting
     // it, so an inherited ARC_FAST_CANONICAL_KERNEL or ARC_BATCHED_PREFILL
     // cannot change the path after this point.
-    let want_simd = args.kernel == Kernel::Simd;
+    let want_simd = args.kernel != Kernel::Scalar;
     let _ = canonical_simd::fast_canonical_kernel_enabled();
+    let _ = canonical_simd::batched_kernel_preference();
     canonical_simd::set_fast_canonical_kernel(want_simd);
-    if want_simd && !canonical_simd::dotprod_available() {
+    canonical_simd::set_batched_kernel_preference(args.kernel.preference());
+    if !args.kernel.available() {
         return Err(format!(
-            "--kernel simd requested, but this {} CPU/build has no exact SIMD backend \
-             (NEON dotprod on aarch64, AVX2 on x86_64)",
-            std::env::consts::ARCH
+            "--kernel {} requested, but this {} CPU/build cannot run it (detected {}); \
+             --check-kernel tells this before a run",
+            args.kernel.requested_label(),
+            std::env::consts::ARCH,
+            cpu_features()
         ));
     }
     if canonical_simd::fast_canonical_kernel_enabled() != want_simd {
         return Err("the canonical kernel switch did not take effect".into());
+    }
+    if want_simd && canonical_simd::selected_batched_kernel() != args.kernel.preference() {
+        return Err("the kernel pin did not take effect".into());
     }
     let _ = canonical_prefill::batched_prefill_enabled();
     canonical_prefill::set_batched_prefill_enabled(false);
@@ -816,8 +968,12 @@ fn main() -> Result<(), String> {
         "kernel": {
             "requested": args.kernel.requested_label(),
             "effective": args.kernel.effective_label(),
+            "available": true,
             "simd_available": canonical_simd::dotprod_available(),
             "fast_kernel_enabled": canonical_simd::fast_canonical_kernel_enabled(),
+            "kernel_pinned": canonical_simd::batched_kernel_preference().map(BatchedKernel::label),
+            "projections_by_kernel": projections_by_kernel(),
+            "cpu_features": cpu_features(),
             "batched_prefill_enabled": canonical_prefill::batched_prefill_enabled(),
             "projection_census": serde_json::to_value(census).unwrap_or(Value::Null),
             "attention_dot": if cfg!(target_arch = "aarch64") {
@@ -835,6 +991,7 @@ fn main() -> Result<(), String> {
         },
         "environment": {
             "ARC_FAST_CANONICAL_KERNEL": env("ARC_FAST_CANONICAL_KERNEL"),
+            "ARC_CANONICAL_BATCHED_KERNEL": env("ARC_CANONICAL_BATCHED_KERNEL"),
             "ARC_BATCHED_PREFILL": env("ARC_BATCHED_PREFILL"),
             "RAYON_NUM_THREADS": env("RAYON_NUM_THREADS"),
         },

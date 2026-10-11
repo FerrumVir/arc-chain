@@ -19,7 +19,7 @@ powershell -ExecutionPolicy Bypass -File scripts\determinism-proof\run-proof.ps1
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('scalar', 'simd')]
+    [ValidateSet('scalar', 'simd', 'neon-i8mm-limb', 'avx-vnni-limb', 'avx512-vnni-limb')]
     [string]$Kernel = 'scalar',
     [string]$Model = $env:ARC_PROOF_MODEL,
     [string]$OutDir = $env:ARC_PROOF_OUT_DIR,

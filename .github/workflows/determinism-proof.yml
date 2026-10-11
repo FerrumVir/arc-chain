@@ -2,10 +2,18 @@ name: Determinism proof
 
 # Public, reproducible evidence that ARC's canonical per-row INT8 engine gives
 # byte-identical output for a real 7B model (Llama-2-7B-Chat Q4_K_M, pinned by
-# SHA-256) on four CPU platforms: Apple Silicon macOS, Intel macOS, Linux
-# x86_64 and Windows x86_64. Each platform runs the default scalar projection
-# kernel and the opt-in SIMD limb kernel (NEON dotprod on arm64, AVX2 on
-# x86_64) in separate jobs.
+# SHA-256) on five CPU platforms: Apple Silicon macOS, Intel macOS, Linux
+# x86_64, Linux arm64 and Windows x86_64. Each platform runs the default scalar
+# projection kernel and the opt-in SIMD limb kernel (NEON dotprod on arm64,
+# AVX2 on x86_64) in separate jobs.
+#
+# The matrix-extension kernels run in their own jobs too: SMMLA (i8mm) on the
+# Linux arm64 runner (Neoverse-N2), and AVX-VNNI and AVX-512 VNNI on the Linux
+# and Windows x86_64 runners. Hosted x86_64 runners vary between hosts with and
+# without VNNI, so each of those legs first asks the driver whether this CPU
+# can run its kernel (--check-kernel). A leg that cannot records that and
+# skips the proof, and the compare job lists it as not covered by the run.
+# The i8mm leg is required: the arm64 runner has always had i8mm.
 #
 # Every leg writes a platform-independent transcript: the BLAKE3 of the exact
 # logits and K/V rows at every forward position plus every generated token ID.
@@ -92,6 +100,16 @@ jobs:
           - {runner: ubuntu-24.04, kernel: simd, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
           - {runner: windows-latest, kernel: scalar, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
           - {runner: windows-latest, kernel: simd, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+          # Linux arm64 (Neoverse-N2): scalar, NEON dotprod and SMMLA (i8mm).
+          - {runner: ubuntu-24.04-arm, kernel: scalar, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+          - {runner: ubuntu-24.04-arm, kernel: simd, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+          - {runner: ubuntu-24.04-arm, kernel: neon-i8mm-limb, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+          # VNNI where the drawn x86_64 host has it (EPYC 9V74: AVX-512 VNNI;
+          # EPYC 9V45 and Xeon Platinum 8573C: both; EPYC 7763: neither).
+          - {runner: ubuntu-24.04, kernel: avx-vnni-limb, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+          - {runner: ubuntu-24.04, kernel: avx512-vnni-limb, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+          - {runner: windows-latest, kernel: avx-vnni-limb, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
+          - {runner: windows-latest, kernel: avx512-vnni-limb, shard: "0/1", shard_tag: 1of1, job_timeout: 240, run_timeout: 190, deadline_seconds: 10200}
     env:
       RUNNER_LABEL: ${{ matrix.runner }}
       KERNEL: ${{ matrix.kernel }}
@@ -128,7 +146,38 @@ jobs:
             df -h .
           } 2>&1 | tee "$out/runner-before.txt"
 
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+
+      - name: Build the proof driver (release, Candle GGUF loader)
+        shell: bash
+        run: cargo build --locked --release -p arc-inference --features candle --example determinism_proof
+
+      # Loads nothing: exit 0 if this CPU can run the leg's kernel, 4 if not
+      # (with a run JSON that records it), so a VNNI leg on a host without
+      # VNNI skips the download and the proof.
+      - name: Check this CPU can run the kernel
+        id: probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/determinism-proof"
+          mkdir -p "$out"
+          status=0
+          target/release/examples/determinism_proof --check-kernel --kernel "$KERNEL" \
+            --run-json "$out/run-$KERNEL.json" || status=$?
+          case "$status" in
+            0) echo "available=true" >> "$GITHUB_OUTPUT" ;;
+            4)
+              echo "available=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::This runner's CPU cannot run $KERNEL; the leg records that and skips the proof."
+              ;;
+            *) exit "$status" ;;
+          esac
+
       - name: Download and verify the pinned model
+        if: steps.probe.outputs.available == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -156,16 +205,8 @@ jobs:
           fi
           echo "model verified: sha256 $actual, $size bytes"
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
-        with:
-          toolchain: nightly-2026-03-16
-
-      - name: Build the proof driver (release, Candle GGUF loader)
-        shell: bash
-        run: cargo build --locked --release -p arc-inference --features candle --example determinism_proof
-
       - name: Reduce background memory use (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && steps.probe.outputs.available == 'true'
         shell: bash
         run: |
           sudo mdutil -a -i off || true
@@ -173,7 +214,7 @@ jobs:
           sysctl vm.swapusage
 
       - name: Run the proof with the bash script (macOS, Linux)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && steps.probe.outputs.available == 'true'
         shell: bash
         timeout-minutes: ${{ matrix.run_timeout }}
         run: |
@@ -194,7 +235,7 @@ jobs:
           bash scripts/determinism-proof/run-proof.sh "${args[@]}"
 
       - name: Run the proof with the PowerShell script (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && steps.probe.outputs.available == 'true'
         shell: pwsh
         timeout-minutes: ${{ matrix.run_timeout }}
         run: |
@@ -283,6 +324,12 @@ jobs:
             --expect macos-15-intel:scalar --expect macos-15-intel:simd \
             --expect ubuntu-24.04:scalar --expect ubuntu-24.04:simd \
             --expect windows-latest:scalar --expect windows-latest:simd \
+            --expect ubuntu-24.04-arm:scalar --expect ubuntu-24.04-arm:simd \
+            --expect ubuntu-24.04-arm:neon-i8mm-limb \
+            --expect-if-available ubuntu-24.04:avx-vnni-limb \
+            --expect-if-available ubuntu-24.04:avx512-vnni-limb \
+            --expect-if-available windows-latest:avx-vnni-limb \
+            --expect-if-available windows-latest:avx512-vnni-limb \
             --out-dir "$RUNNER_TEMP/evidence" \
             --summary "$GITHUB_STEP_SUMMARY"
 

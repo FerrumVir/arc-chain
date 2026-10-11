@@ -117,7 +117,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--runner-label", required=True)
-    parser.add_argument("--kernel", required=True, choices=("scalar", "simd"))
+    parser.add_argument(
+        "--kernel",
+        required=True,
+        choices=("scalar", "simd", "neon-i8mm-limb", "avx-vnni-limb", "avx512-vnni-limb"),
+    )
     parser.add_argument("--shard", default="0/1")
     args = parser.parse_args()
 
@@ -134,6 +138,48 @@ def main() -> int:
             run = json.loads(run_path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:
             problems.append(f"driver run JSON unreadable: {error}")
+
+    # A leg whose CPU cannot run the requested kernel: the driver's
+    # --check-kernel probe wrote a run JSON that says so, and the proof itself
+    # was skipped. Record that, not a failure; compare_results.py decides
+    # whether this pair had to run.
+    if run is not None and (run.get("kernel") or {}).get("available") is False:
+        result = {
+            "schema": SCHEMA,
+            "status": "unavailable",
+            "problems": [],
+            "runner_label": args.runner_label,
+            "kernel": args.kernel,
+            "shard": args.shard,
+            "summary": {
+                "os": os.environ.get("RUNNER_OS") or platform.system(),
+                "cpu_model": cpu_model(),
+                "kernel_requested": args.kernel,
+                "kernel_path": "unavailable",
+                "cpu_features": (run.get("kernel") or {}).get("cpu_features"),
+            },
+            "transcript": None,
+            "host": {
+                "cpu_model": cpu_model(),
+                "memory_bytes": memory_bytes(),
+                "platform": platform.platform(),
+                "machine": platform.machine(),
+                "python": platform.python_version(),
+            },
+            "github": {key: os.environ.get(key) for key in GITHUB_KEYS},
+            "run": run,
+        }
+        (out_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        line = (
+            f"{args.runner_label} / {args.kernel} / shard {args.shard}: unavailable on "
+            f"this runner's CPU ({result['host']['cpu_model'] or 'unknown'}); skipped"
+        )
+        print(line)
+        summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary_path:
+            with open(summary_path, "a", encoding="utf-8") as handle:
+                handle.write(f"- {line}\n")
+        return 0
 
     transcript = None
     transcript_path = only(out_dir, "transcript-*.txt")

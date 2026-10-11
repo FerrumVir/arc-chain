@@ -3,12 +3,20 @@
 
 Green only if every expected runner/kernel pair completed and the SHA-256 of
 its full transcript (shards joined in order) is identical across all pairs,
-every SIMD pair shows the vectorised kernel accepted every projection it was
-offered (and every scalar pair offered none), every pair's engine API
-cross-check passed, and every pair loaded the pinned model bytes. Writes a
-markdown hash matrix (also appended to the GitHub job summary) and an evidence
-JSON. On a mismatch it names the first transcript line where the pairs
-diverge and what that line measures.
+every vectorised pair shows its kernel accepted every projection it was
+offered (and every scalar pair offered none), every matrix-extension pair
+shows that kernel computed the projections and no other batched kernel did,
+every pair's engine API cross-check passed, and every pair loaded the pinned
+model bytes.
+
+Pairs given with --expect-if-available run only where the runner's CPU has
+the kernel's instructions, and hosted runners vary. Such a pair that reports
+"unavailable" is listed as not covered by this run and does not decide the
+verdict; if it ran, it is held to every rule above.
+
+Writes a markdown hash matrix (also appended to the GitHub job summary) and an
+evidence JSON. On a mismatch it names the first transcript line where the
+pairs diverge and what that line measures.
 """
 
 from __future__ import annotations
@@ -26,9 +34,11 @@ PLATFORMS = {
     "macos-15": "macOS 15, Apple Silicon (arm64)",
     "macos-15-intel": "macOS 15, Intel (x86_64)",
     "ubuntu-24.04": "Linux, Ubuntu 24.04 (x86_64)",
+    "ubuntu-24.04-arm": "Linux, Ubuntu 24.04 (arm64)",
     "ubuntu-latest": "Linux, Ubuntu (x86_64)",
     "windows-latest": "Windows Server (x86_64)",
 }
+EXTENSION_KERNELS = ("neon-i8mm-limb", "avx-vnni-limb", "avx512-vnni-limb")
 REFUSAL_KEYS = (
     "refused_unavailable",
     "refused_shape",
@@ -143,6 +153,14 @@ def census(runs: list[dict]) -> dict:
     return total
 
 
+def projections_by_kernel(runs: list[dict]) -> dict[str, int]:
+    total: dict[str, int] = collections.Counter()
+    for run in runs:
+        for label, count in (((run.get("kernel") or {}).get("projections_by_kernel")) or {}).items():
+            total[label] += int(count)
+    return dict(total)
+
+
 def first_divergence(reference: bytes, other: bytes) -> dict | None:
     left = reference.decode("utf-8").split("\n")
     right = other.decode("utf-8").split("\n")
@@ -206,6 +224,12 @@ def main() -> int:
     parser.add_argument(
         "--expect", action="append", required=True, help="runner:kernel, repeatable"
     )
+    parser.add_argument(
+        "--expect-if-available",
+        action="append",
+        default=[],
+        help="runner:kernel that must agree if the runner's CPU could run it, repeatable",
+    )
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--summary", type=Path, help="markdown file to append to")
     args = parser.parse_args()
@@ -214,30 +238,53 @@ def main() -> int:
     pinned_blake3 = manifest["artifact"]["blake3"]
     pinned_sha256 = manifest["artifact"]["sha256"]
     pinned_bytes = manifest["artifact"]["bytes"]
-    expected = [tuple(item.split(":", 1)) for item in args.expect]
+    expected = [(*item.split(":", 1), False) for item in args.expect]
+    expected += [(*item.split(":", 1), True) for item in args.expect_if_available]
     groups = load_results(args.results_dir)
 
     pairs = []
-    for runner, kernel in expected:
+    not_covered = []
+    for runner, kernel, optional in expected:
         group = groups.get((runner, kernel), [])
+        if group and all(result.get("status") == "unavailable" for result in group):
+            host = group[0].get("host") or {}
+            entry = {
+                "runner": runner,
+                "platform": PLATFORMS.get(runner, runner),
+                "kernel": kernel,
+                "cpu_model": host.get("cpu_model"),
+                "required": not optional,
+            }
+            if optional:
+                not_covered.append(entry)
+                continue
         runs = [result["run"] for result in group if isinstance(result.get("run"), dict)]
         problems: list[str] = []
         data = None
         if not group:
             problems.append("no result uploaded")
+        elif all(result.get("status") == "unavailable" for result in group):
+            problems.append("this runner's CPU cannot run the kernel, and the pair is required")
         else:
             data, assemble_problems = assemble(group)
             problems.extend(assemble_problems)
         counts = census(runs)
-        if kernel == "simd":
+        served = projections_by_kernel(runs)
+        if kernel != "scalar":
             census_ok = counts["attempted"] > 0 and counts["accepted"] == counts["attempted"]
             census_ok = census_ok and counts["refused"] == 0
             if runs and not census_ok:
-                problems.append(f"SIMD kernel did not accept every projection: {counts}")
+                problems.append(f"{kernel} kernel did not accept every projection: {counts}")
         else:
             census_ok = counts["attempted"] == 0
             if runs and not census_ok:
                 problems.append(f"scalar leg offered projections to the SIMD kernel: {counts}")
+        if kernel in EXTENSION_KERNELS and runs:
+            others = {label: n for label, n in served.items() if label != kernel and n}
+            if served.get(kernel, 0) == 0 or others:
+                problems.append(
+                    f"{kernel} did not compute the projections alone: {served or 'no counts'}"
+                )
         for run in runs:
             model = run.get("model") or {}
             if model.get("file_blake3") != pinned_blake3 or model.get("file_bytes") != pinned_bytes:
@@ -272,6 +319,7 @@ def main() -> int:
                 "max_rss_bytes": max((run.get("max_rss_bytes") or 0 for run in runs), default=0)
                 or None,
                 "projection_census": counts,
+                "projections_by_kernel": served,
                 "engine_crosscheck": crosschecks[0] if crosschecks else None,
                 "problems": problems,
                 "_data": data,
@@ -303,6 +351,19 @@ def main() -> int:
         f"**{identical_count} of {len(pairs)}** platform/kernel runs completed and produced a "
         "byte-identical transcript.",
         "",
+    ]
+    if not_covered:
+        lines += [
+            "Not covered by this run, because the runner's CPU lacked the kernel's "
+            "instructions: "
+            + "; ".join(
+                f"{entry['kernel']} on {entry['platform']} ({entry['cpu_model'] or 'CPU not reported'})"
+                for entry in not_covered
+            )
+            + ".",
+            "",
+        ]
+    lines += [
         f"Combined SHA-256 (reference): `{reference or 'none'}`",
         "",
         "| Platform (GitHub runner) | CPU reported by the runner | RAM | Kernel | "
@@ -311,7 +372,13 @@ def main() -> int:
     ]
     for pair in pairs:
         counts = pair["projection_census"]
-        if pair["kernel"] == "simd":
+        if pair["kernel"] in EXTENSION_KERNELS:
+            served = pair["projections_by_kernel"].get(pair["kernel"], 0)
+            accepted = (
+                f"{counts['accepted']:,} of {counts['attempted']:,}; "
+                f"{served:,} computed by `{pair['kernel']}`"
+            )
+        elif pair["kernel"] == "simd":
             accepted = f"{counts['accepted']:,} of {counts['attempted']:,}"
         else:
             accepted = f"not used ({counts['attempted']:,} offered)"
@@ -411,6 +478,7 @@ def main() -> int:
         "model": {"sha256": pinned_sha256, "blake3": pinned_blake3, "bytes": pinned_bytes},
         "transcript_header": header_fields,
         "pairs": [{key: value for key, value in pair.items() if key != "_data"} for pair in pairs],
+        "not_covered": not_covered,
     }
     (args.out_dir / "evidence.json").write_text(
         json.dumps(evidence, indent=2) + "\n", encoding="utf-8"
