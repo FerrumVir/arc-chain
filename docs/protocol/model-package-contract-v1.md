@@ -65,7 +65,7 @@ field.
 
 ## 4. The canonical artifact
 
-`/Users/excaulibur/.arc/models/standard.gguf` (LLaMA v2 7B, GGUF v2):
+`~/.arc/models/standard.gguf` (LLaMA v2 7B, GGUF v2):
 
 | Fact | Value |
 |---|---|

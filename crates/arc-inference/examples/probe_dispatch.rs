@@ -5,9 +5,10 @@
 use arc_inference::cached_integer_model::{KVCache, load_cached_model};
 
 fn main() {
-    let path = "/Users/tjdunham/.arc-models/llama-2-7b.gguf";
+    let home = std::env::var("HOME").expect("HOME is set");
+    let path = format!("{home}/.arc-models/llama-2-7b.gguf");
     eprintln!("Loading...");
-    let mut model = load_cached_model(path).expect("load");
+    let mut model = load_cached_model(&path).expect("load");
     eprintln!(
         "block_i8_layers: {}",
         model.block_i8_layers.as_ref().map(|v| v.len()).unwrap_or(0)
