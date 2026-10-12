@@ -1,0 +1,40 @@
+name: Bridge canary (scratch branch, throwaway)
+
+# THROWAWAY. Lives only on the scratch branch bridge-canary-v0713 and is never merged. A workflow file that is not on the default branch cannot be
+# dispatched, so the trigger is a push to this one branch and the run is described by bridge-canary/config.json (the 8 Oct lab did the same).
+# One real v0.7.11 headless install, on a hosted ubuntu runner with systemd, consumes two published bridge releases in turn through
+# scripts/legacy-bridge/canary-consume.sh. live_network "blocked" rejects every live-network address for the whole run; "allowed" is accepted only
+# with a recorded authorization in the config and then lets the node join the live network as a stake-0 observer (compute off, no model).
+on:
+  push:
+    branches: [bridge-canary-v0713]
+    paths:
+      - bridge-canary/**
+      - .github/workflows/bridge-canary.yml
+
+concurrency:
+  group: bridge-canary
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: headless canary (real v0.7.11 install consumes two published bridge releases)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run the canary
+        run: bash bridge-canary/headless-canary.sh bridge-canary/config.json evidence
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bridge-canary-evidence
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 30
