@@ -33,7 +33,7 @@ pub struct Store {
 }
 
 impl Store {
-    fn file(dir: &Path) -> PathBuf {
+    pub(crate) fn file(dir: &Path) -> PathBuf {
         dir.join("store.json")
     }
 

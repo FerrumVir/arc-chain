@@ -1058,6 +1058,17 @@
   }
 }
 
+/* Scrolls a step that is taller than the window (the app allows 960x640),
+   so its action is never cut off. It is a sibling of .onboarding::before,
+   whose drifting gradient therefore stays clipped and never adds scroll. */
+.onboarding-scroll {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
 .onboarding-inner {
   position: relative;
   width: 100%;

@@ -61,12 +61,18 @@ async function runInferenceSmart(prompt: string, maxTokens: number, onRoute: (ro
   }
 }
 
+// "direct" is also the route when the app skips its own node on purpose: the
+// session reads the chain from a remote validator, so the native local route
+// refuses before sending (commands.rs run_inference_local_inner). It must not
+// say the node was asked, or claim a time the code does not promise.
 const ROUTE_WAITING: Record<DispatchRoute, string> = {
   local: "Waiting for your node",
-  direct: "Your node can't take it; waiting for a coordinator",
+  direct: "Waiting for the ARC network",
   consensus: "Waiting for a network consensus run",
 };
-const ROUTE_SHORT: Record<DispatchRoute, string> = { local: "your node", direct: "a coordinator", consensus: "network consensus" };
+const ROUTE_SHORT: Record<DispatchRoute, string> = { local: "your node", direct: "the ARC network", consensus: "network consensus" };
+const NETWORK_WAIT =
+  "Your prompt goes to the ARC network, where a community worker normally answers it and validators check the answer. This can take several minutes.";
 
 /** One short line for screen readers about the newest turn, instead of reading whole answers aloud. */
 function announce(turns: ChatTurn[]): string {
@@ -162,9 +168,11 @@ export function Inference() {
         <div className="chat-header-actions">
           <InfoPopover title="How this works">
             <p>
-              Your prompt goes to your own node first, at <code>POST /inference/run</code> on <code>127.0.0.1</code>. If your node isn&rsquo;t running or
-              has no compatible model loaded, it falls back to a reachable coordinator&rsquo;s community-first <code>/inference/run</code> route. Either
-              way the answer says where the compute ran and what the coordinator actually verified.
+              Your prompt goes to the ARC validator this app reads the chain from (one for the whole session), at its <code>/inference/run</code>{" "}
+              route. That validator gives it to a community worker when one is free and has validators check the answer before it comes back; with no
+              worker free, the validators compute it themselves. This can take several minutes. Your own node takes the prompt only when it is the
+              app&rsquo;s chain source, or when no validator could be reached. Either way the answer says where the compute ran and what the
+              coordinator actually verified.
             </p>
             <p>1. Attempts the prompt on the selected execution path. A trace shows shard hops only when the coordinator reports one.</p>
             <p>
@@ -325,7 +333,8 @@ function EmptyThread() {
       <h2 className="chat-empty-title">Ask the network.</h2>
       <ul className="chat-empty-points">
         <li>
-          <strong>Who served it.</strong> Your own node first; a named coordinator or community worker when yours can&rsquo;t.
+          <strong>Who served it.</strong> A named community worker or validator on the ARC network, or your own node when it is the app&rsquo;s chain
+          source.
         </li>
         <li>
           <strong>Whether it was checked.</strong> Marked checked only when another computer re-ran it and the agreement is authenticated.
@@ -353,7 +362,7 @@ function Pending({ turn }: { turn: ChatTurn }) {
   const seconds = useSeconds(turn.sentAt, true);
   const where = turn.route ? ROUTE_WAITING[turn.route] : "Sending";
   return (
-    <div className="answer answer-pending" aria-busy="true">
+    <div className="answer answer-pending" aria-busy="true" data-testid="inference-pending">
       <header className="answer-head">
         <span className="answer-mark" aria-hidden="true" />
         <span className="answer-by">{turn.detached ? "You stopped waiting" : where}</span>
@@ -374,8 +383,8 @@ function Pending({ turn }: { turn: ChatTurn }) {
       />
       <p className="pending-note">
         {turn.detached
-          ? "The request was already sent and can't be recalled. If the node still answers, the answer will appear here."
-          : "A sent request can't be recalled. You can stop waiting (below); if the node still answers, the answer will appear here."}
+          ? "The request was already sent and can't be recalled. If an answer still arrives, it will appear here."
+          : `${turn.route === "direct" ? `${NETWORK_WAIT} ` : ""}A sent request can't be recalled. You can stop waiting (below); if an answer still arrives, it will appear here.`}
       </p>
     </div>
   );
