@@ -14,7 +14,7 @@
 # It prints the plan and changes nothing unless --apply is given.
 #
 # Usage:
-#   bash canary-consume.sh --tag v0.7.12 --expect-sha256 <hex> [--apply] [--arc-dir ~/.arc]
+#   bash canary-consume.sh --tag v0.7.13 --expect-sha256 <hex> [--apply] [--arc-dir ~/.arc]
 set -Eeuo pipefail
 
 repo="FerrumVir/arc-chain"

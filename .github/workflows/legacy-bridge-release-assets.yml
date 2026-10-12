@@ -34,10 +34,11 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # A branch push exercises the pipeline against the current release as a
-  # stand-in; its handoff is always marked not eligible for "Latest".
-  # v0.8.11 is the stand-in. The real desktop_tag is the first release
-  # containing this question (legacy_upgrade::hold_at_startup); v0.8.11 does not.
-  DESKTOP_TAG: ${{ inputs.desktop_tag || 'v0.8.11' }}
+  # stand-in; only a workflow_dispatch run on main with an explicit
+  # desktop_tag yields a handoff that is ever published. v0.8.12 is the
+  # stand-in and the first release containing the first-launch question
+  # (legacy_upgrade::hold_at_startup); v0.8.11 does not.
+  DESKTOP_TAG: ${{ inputs.desktop_tag || 'v0.8.12' }}
 
 jobs:
   pins:

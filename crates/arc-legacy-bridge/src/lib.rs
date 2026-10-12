@@ -4,8 +4,8 @@
 //! `arc-auto-update.sh` timer, and the older `scripts/auto-update.sh` daemon)
 //! only ever replace `bin/arc-node` with GitHub's `latest` asset and restart it
 //! with their unchanged v0.7 command line. They verify nothing. This crate is
-//! the program they receive under the legacy asset names in the v0.7.12
-//! bridge release. It never runs v0.7 code and never touches v0.7 state.
+//! the program they receive under the legacy asset names in the v0.7.x
+//! bridge releases. It never runs v0.7 code and never touches v0.7 state.
 //!
 //! On every start it:
 //!
