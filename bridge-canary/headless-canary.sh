@@ -298,9 +298,10 @@ consume 1
 assert_bridged 1
 
 # --------------------------------------------------------------------------- the public scoreboard (live runs only)
+scoreboard_result=NOT_RUN
 if [ "$live_network" = allowed ]; then
     log "Public scoreboard: the node has to appear on all six coordinators (read-only GET /workers/scoreboard?worker_id=; /community/list is never called)"
-    if ! python3 - "$first_address" "$registration_wait" "$evidence" "$repo_root/crates/arc-legacy-bridge/pins/active.json" <<'PY'
+    if python3 - "$first_address" "$registration_wait" "$evidence" "$repo_root/crates/arc-legacy-bridge/pins/active.json" <<'PY'
 import json, sys, time, urllib.request
 address, wait, evidence, pins_path = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 origins = json.load(open(pins_path, encoding="utf-8"))["community_rpc_origins"]
@@ -335,7 +336,10 @@ print(f"scoreboard: {len(seen)} of {len(origins)} coordinators list {want}")
 sys.exit(0 if len(seen) == len(origins) else 1)
 PY
     then
-        fail "the node did not appear under its privacy-safe name on all six coordinators"
+        scoreboard_result=PASS
+    else
+        scoreboard_result=FAIL
+        printf 'SCOREBOARD CHECK FAILED: the node did not appear under its privacy-safe name on all six coordinators (see scoreboard.jsonl)\n' | tee -a "$evidence/steps.txt"
     fi
 fi
 
@@ -354,11 +358,14 @@ if [ "$steps_count" = 3 ]; then
     fi
 fi
 
-python3 - "$evidence" "$rollback_rehearsal" <<'PY'
+verdict=CANARY_PASS
+[ "$scoreboard_result" != FAIL ] || verdict=CANARY_FAIL
+python3 - "$evidence" "$rollback_rehearsal" "$scoreboard_result" "$verdict" <<'PY'
 import json, sys
-evidence, rehearsal = sys.argv[1], sys.argv[2]
-result = {"schema": "arc.bridge-canary.result.v1", "verdict": "CANARY_PASS", "rollback_rehearsal": rehearsal, "steps": open(f"{evidence}/steps.txt", encoding="utf-8").read().splitlines()}
+evidence, rehearsal, scoreboard, verdict = sys.argv[1:5]
+result = {"schema": "arc.bridge-canary.result.v1", "verdict": verdict, "rollback_rehearsal": rehearsal, "scoreboard": scoreboard, "steps": open(f"{evidence}/steps.txt", encoding="utf-8").read().splitlines()}
 open(f"{evidence}/canary-result.json", "w", encoding="utf-8").write(json.dumps(result, indent=1) + "\n")
 print(json.dumps(result, indent=1))
 PY
-log "PASS: CANARY_PASS ($(step 0 tag) then $(step 1 tag)); rollback rehearsal: $rollback_rehearsal"
+[ "$verdict" = CANARY_PASS ] || fail "$verdict: scoreboard $scoreboard_result (steps 1 and 2 passed; the rollback rehearsal is $rollback_rehearsal)"
+log "PASS: CANARY_PASS ($(step 0 tag) then $(step 1 tag)); scoreboard: $scoreboard_result; rollback rehearsal: $rollback_rehearsal"
