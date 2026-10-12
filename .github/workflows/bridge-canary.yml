@@ -35,6 +35,19 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bridge-canary-evidence
-          path: evidence/
+          path: |
+            evidence/
+            !evidence/fake-github/releases/**
           if-no-files-found: warn
           retention-days: 30
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### Bridge canary'
+            echo
+            echo '```'
+            cat evidence/steps.txt 2>/dev/null || echo 'no steps recorded'
+            echo '```'
+            if [ -f evidence/canary-result.json ]; then jq -r '"verdict: \(.verdict), rollback rehearsal: \(.rollback_rehearsal)"' evidence/canary-result.json; fi
+          } >> "$GITHUB_STEP_SUMMARY"

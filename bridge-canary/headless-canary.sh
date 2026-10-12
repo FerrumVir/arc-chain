@@ -7,6 +7,8 @@
 #   2. canary-consume.sh --tag <step 1 tag>: the launcher of the previous bridge release bridges the install (v0.7.12 -> arc-node v0.8.11).
 #   3. canary-consume.sh --tag <step 2 tag>: the new launcher replaces it (v0.7.13 -> arc-node v0.8.12). This is the case that matters for
 #      installs that already bridged: same identity, same fresh data directory, same archive; only the pinned node changes.
+#   3b. Optional third step (the rollback rehearsal): the previous launcher is consumed again, as an updater would after Latest is moved back. It cannot fail the run
+#      (the verdict for steps 1 and 2 stands) but its result is recorded as rollback_rehearsal PASS / FAIL.
 #   4. After each step the same assertions as the repository's headless acceptance: pinned binary running at stake 0 in a fresh bridge
 #      directory, no consensus participation, no model, privacy-safe community registration flags, the v0.7 data byte-identical to the
 #      moment systemd stopped v0.7 (ExecStartPre hook), archive "unchanged", no seed in anything the bridge wrote.
@@ -49,8 +51,9 @@ if [ "$live_network" = allowed ]; then
     [ -n "$authorization" ] || fail "live_network allowed needs the recorded authorization text in the config"
     [ "$registration_wait" -gt 0 ] || fail "a live run must wait for the scoreboard (registration_wait_s > 0)"
 fi
-jq -e '.steps | length == 2' "$config" >/dev/null || fail "exactly two steps are required"
-for i in 0 1; do
+steps_count="$(jq -er '.steps | length' "$config")"
+case "$steps_count" in 2 | 3) ;; *) fail "two steps are required, and an optional third one: the rollback rehearsal" ;; esac
+for i in $(seq 0 $((steps_count - 1))); do
     jq -e --argjson i "$i" '.steps[$i] | (.tag | test("^v0\\.7\\.[0-9]+$")) and (.launcher_sha256 | test("^[0-9a-f]{64}$")) and (.node_tag | test("^v0\\.8\\.[0-9]+$"))
         and (.node_version == (.node_tag | ltrimstr("v"))) and (.node_sha256 | test("^[0-9a-f]{64}$"))' "$config" >/dev/null || fail "step $i of the config is malformed"
 done
@@ -268,7 +271,7 @@ assert_bridged() {
         [ "$address" = "$first_address" ] || fail "the new launcher changed the node identity ($address != $first_address)"
         [ "$node_dir" = "$first_node_dir" ] || fail "the new launcher moved the node directory"
         [ "$(jq -r .archive_generation "$state_json")" = "$first_generation" ] || fail "the archive generation changed although the v0.7 data did not"
-        [ "$(sha "$arc_dir/bin/arc-node.prev")" = "$(step 0 launcher_sha256)" ] || fail "arc-node.prev is not the previous launcher"
+        [ "$(sha "$arc_dir/bin/arc-node.prev")" = "$(step $((index - 1)) launcher_sha256)" ] || fail "arc-node.prev is not the previous launcher"
     fi
     printf 'step %s ok: %s -> %s, address %s\n' "$((index + 1))" "$tag" "$node_tag" "$address" | tee -a "$evidence/steps.txt"
 }
@@ -336,11 +339,26 @@ PY
     fi
 fi
 
-python3 - "$evidence" <<'PY'
+rollback_rehearsal=NOT_RUN
+if [ "$steps_count" = 3 ]; then
+    log "Rollback rehearsal: Latest goes back to $(step 2 tag) ($(step 2 node_tag)); an install that already took $(step 1 tag) follows it. Same data, same identity."
+    set +e
+    ( set -e; consume 2; assert_bridged 2 )
+    rehearsal_status=$?
+    set -e
+    if [ "$rehearsal_status" -eq 0 ]; then
+        rollback_rehearsal=PASS
+    else
+        rollback_rehearsal=FAIL
+        printf 'ROLLBACK REHEARSAL FAILED (exit %s): going back to %s on data written by %s is NOT safe\n' "$rehearsal_status" "$(step 2 tag)" "$(step 1 tag)" | tee -a "$evidence/steps.txt"
+    fi
+fi
+
+python3 - "$evidence" "$rollback_rehearsal" <<'PY'
 import json, sys
-evidence = sys.argv[1]
-result = {"schema": "arc.bridge-canary.result.v1", "verdict": "CANARY_PASS", "steps": open(f"{evidence}/steps.txt", encoding="utf-8").read().splitlines()}
+evidence, rehearsal = sys.argv[1], sys.argv[2]
+result = {"schema": "arc.bridge-canary.result.v1", "verdict": "CANARY_PASS", "rollback_rehearsal": rehearsal, "steps": open(f"{evidence}/steps.txt", encoding="utf-8").read().splitlines()}
 open(f"{evidence}/canary-result.json", "w", encoding="utf-8").write(json.dumps(result, indent=1) + "\n")
 print(json.dumps(result, indent=1))
 PY
-log "PASS: CANARY_PASS ($(step 0 tag) then $(step 1 tag))"
+log "PASS: CANARY_PASS ($(step 0 tag) then $(step 1 tag)); rollback rehearsal: $rollback_rehearsal"
