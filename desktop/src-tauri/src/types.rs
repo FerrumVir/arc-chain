@@ -185,6 +185,24 @@ pub struct NodeStatus {
     /// without a second IPC round trip.
     #[serde(default)]
     pub cpu_cores: Option<u32>,
+    /// Set when the running node was started without its configured model
+    /// because the pre-start check found the file missing or unreadable. The
+    /// node runs as an observer, so local compute is off until the file is
+    /// back. `None` when a model is in use, none is configured, or the node
+    /// is stopped.
+    #[serde(default)]
+    pub model_unavailable: Option<ModelUnavailableReason>,
+}
+
+/// Why the configured model file could not be used for this launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelUnavailableReason {
+    /// Nothing exists at the configured path.
+    NotFound,
+    /// Something may exist at the path, but it cannot be opened and read as
+    /// a regular file (for example, a permissions problem).
+    Unreadable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

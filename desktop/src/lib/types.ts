@@ -56,7 +56,17 @@ export interface NodeStatus {
   workerThreads?: number | null;
   /** Logical cores on this machine (upper bound for the slider). */
   cpuCores?: number | null;
+  /**
+   * Set when the running node was started without its configured model
+   * because the file is missing (`notFound`) or cannot be read
+   * (`unreadable`). The node runs as an observer, so local compute is off
+   * until the file is back. Absent on older desktop builds.
+   */
+  modelUnavailable?: ModelUnavailableReason | null;
 }
+
+/** Why the configured model file could not be used for this launch. */
+export type ModelUnavailableReason = "notFound" | "unreadable";
 
 export interface ConfirmedRewardReceipt {
   txHash: string;

@@ -115,3 +115,83 @@ test.describe("First launch after a v0.7 upgrade", () => {
     await expect(page.getByTestId("compute-consent-toggle")).not.toBeChecked();
   });
 });
+
+// Community PR #132: when the configured model file is missing or unreadable,
+// the native side starts the node as an observer without it and reports why.
+// The app says local compute is off, calmly, and leads to the re-download.
+test.describe("Model file unavailable", () => {
+  const runningStatus = {
+    running: true,
+    pid: 42_731,
+    health: "live",
+    version: "0.8.12",
+    peers: 8,
+    round: 43_821,
+    committed: 43_820,
+    height: 43_820,
+    uptimeSeconds: 120,
+    address: "99".repeat(32),
+    rpcPort: 9090,
+    lastError: null,
+    coordinatorUrl: null,
+    chainHost: "http://140.82.16.112:9090",
+    // Caught up, so no start-up stage is drawn above the banners.
+    chainHeight: 43_830,
+    chainRound: 43_831,
+    chainBlockAgeSeconds: 4,
+    workerThreads: null,
+    cpuCores: 24,
+  };
+
+  test.beforeEach(async ({ page }) => {
+    await seedOnboarded(page);
+  });
+
+  test("a missing model says compute is off and leads to the re-download", async ({
+    page,
+  }) => {
+    await seedMockOverrides(page, {
+      node_status: { ...runningStatus, modelUnavailable: "notFound" },
+    });
+    await page.goto("/");
+    const banner = page.getByTestId("model-unavailable-banner");
+    await expect(banner).toBeVisible();
+    await expect(banner).toHaveAttribute("role", "status");
+    await expect(banner).toContainText("Model file not found");
+    await expect(banner).toContainText("local compute is off");
+    await expect(banner).toContainText("re-download the model in Settings");
+    // A calm status, not the crash banner.
+    await expect(page.getByTestId("crash-banner")).toHaveCount(0);
+
+    await banner.getByTestId("btn-model-unavailable-settings").click();
+    await expect(page.getByTestId("settings-screen")).toBeVisible();
+    await page.getByTestId("compute-consent-toggle").click();
+    await expect(page.getByTestId("compute-consent-toggle")).toBeChecked();
+    const unavailable = page.getByTestId("compute-consent-model-unavailable");
+    await expect(unavailable).toContainText("model file was not found");
+    await unavailable.getByTestId("btn-redownload-model").click();
+    await expect(page.getByTestId("compute-consent-error")).toHaveCount(0);
+  });
+
+  test("an unreadable model is reported as unreadable, not missing", async ({
+    page,
+  }) => {
+    await seedMockOverrides(page, {
+      node_status: { ...runningStatus, modelUnavailable: "unreadable" },
+    });
+    await page.goto("/");
+    const banner = page.getByTestId("model-unavailable-banner");
+    await expect(banner).toContainText("Model file can't be read");
+    await expect(banner).toContainText("permissions");
+    await expect(banner).not.toContainText("not found");
+  });
+
+  test("no banner while the configured model is in use", async ({ page }) => {
+    await seedMockOverrides(page, {
+      node_status: { ...runningStatus, modelUnavailable: null },
+    });
+    await page.goto("/");
+    await expect(page.getByTestId("dashboard")).toBeVisible();
+    await expect(page.getByTestId("model-unavailable-banner")).toHaveCount(0);
+  });
+});

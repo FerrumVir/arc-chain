@@ -505,6 +505,14 @@ function ComputeConsent() {
   });
   const ineligible = tier === "none";
   const [progress, setProgress] = useState<ModelDownloadProgress | null>(null);
+  // The running node reports when it had to start without its model (the
+  // file is missing or unreadable). Same query as the core slider below.
+  const { data: status } = useQuery({
+    queryKey: ["status"],
+    queryFn: api.nodeStatus,
+    refetchInterval: 3000,
+  });
+  const modelUnavailable = status?.modelUnavailable ?? null;
 
   const toggle = useMutation({
     mutationKey: COMPUTE_CONTRIBUTION_MUTATION_KEY,
@@ -512,13 +520,23 @@ function ComputeConsent() {
     onMutate: () => setProgress(null),
     onSuccess: (saved) => setConfig(saved),
   });
+  // Re-run the existing download flow for a model file that has gone
+  // missing: it reuses a verified copy if one is on disk, otherwise
+  // downloads it, then restarts a running node with it.
+  const redownload = useMutation({
+    mutationKey: COMPUTE_CONTRIBUTION_MUTATION_KEY,
+    mutationFn: () => api.promoteConsentedInstall(),
+    onMutate: () => setProgress(null),
+    onSuccess: (saved) => setConfig(saved),
+  });
   const awake = useMutation({
     mutationFn: (next: boolean) => api.setPreventSleepDuringJobs(next),
     onSuccess: (saved) => setConfig(saved),
   });
+  const downloading = toggle.isPending || redownload.isPending;
 
   useEffect(() => {
-    if (!isTauri || !toggle.isPending) return;
+    if (!isTauri || !downloading) return;
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     (async () => {
@@ -534,7 +552,7 @@ function ComputeConsent() {
       cancelled = true;
       unlisten?.();
     };
-  }, [toggle.isPending]);
+  }, [downloading]);
 
   return (
     <div className="field" data-testid="compute-consent">
@@ -547,7 +565,7 @@ function ComputeConsent() {
           id="compute-consent-toggle"
           type="checkbox"
           checked={enabled}
-          disabled={toggle.isPending || (!enabled && ineligible)}
+          disabled={downloading || (!enabled && ineligible)}
           onChange={(e) => toggle.mutate(e.target.checked)}
           data-testid="compute-consent-toggle"
         />
@@ -566,25 +584,53 @@ function ComputeConsent() {
           model. It stays an observer, which still relays and verifies.
         </span>
       )}
-      {toggle.isPending && (
+      {enabled && modelUnavailable && !downloading && (
+        <div
+          role="status"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "flex-start",
+            gap: "var(--space-2)",
+          }}
+          data-testid="compute-consent-model-unavailable"
+        >
+          <span className="field-hint">
+            {modelUnavailable === "notFound"
+              ? "The model file was not found, so local compute is off and your node is running as an observer. Restore the file, or re-download the model."
+              : "The model file can't be read, so local compute is off and your node is running as an observer. Check the file's permissions, or re-download the model."}
+          </span>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => redownload.mutate()}
+            data-testid="btn-redownload-model"
+          >
+            Re-download model
+          </button>
+        </div>
+      )}
+      {downloading && (
         <p
           style={{ marginTop: "var(--space-2)", fontSize: "var(--text-sm)", color: "var(--text-muted)" }}
           data-testid="compute-consent-progress"
         >
           {progress
             ? modelDownloadStatus(progress)
-            : enabled
-              ? "Switching to observer mode…"
-              : "Preparing worker mode…"}
+            : redownload.isPending
+              ? "Checking for the model…"
+              : enabled
+                ? "Switching to observer mode…"
+                : "Preparing worker mode…"}
         </p>
       )}
-      {toggle.error && (
+      {(toggle.error || redownload.error) && (
         <p
           role="alert"
           style={{ marginTop: "var(--space-2)", fontSize: "var(--text-sm)", color: "var(--danger)" }}
           data-testid="compute-consent-error"
         >
-          {String(toggle.error)}
+          {String(toggle.error ?? redownload.error)}
         </p>
       )}
 

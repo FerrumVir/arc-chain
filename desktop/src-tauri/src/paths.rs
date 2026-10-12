@@ -16,7 +16,7 @@
 //!    address of the arc-node child this app spawned; chain reads go
 //!    somewhere else entirely (see `commands::chain_host`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Home directory resolved by Tauri's `PathResolver` during `setup()`. Used
@@ -62,6 +62,31 @@ pub fn expand_tilde(s: &str) -> PathBuf {
         return home_dir();
     }
     PathBuf::from(s)
+}
+
+/// Show `path` with a leading home directory shortened to `~`, the inverse
+/// of [`expand_tilde`]. Use it for any path written to the Logs screen:
+/// people paste that screen into public bug reports, and a full home path
+/// usually carries their account name.
+pub fn display_with_home_redacted(path: &Path) -> String {
+    redact_home_in(path, &home_dir())
+}
+
+fn redact_home_in(path: &Path, home: &Path) -> String {
+    // A relative fallback home (".") must never match, or every relative
+    // path would be shown as if it were under the home directory.
+    if home.is_absolute() {
+        // `strip_prefix` compares whole components, so a sibling such as
+        // `/home/alice2` is not shortened against a home of `/home/alice`.
+        if let Ok(rest) = path.strip_prefix(home) {
+            return if rest.as_os_str().is_empty() {
+                "~".to_owned()
+            } else {
+                format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display())
+            };
+        }
+    }
+    path.display().to_string()
 }
 
 /// `~/.arc` — the root the node's data dir, managed binary and models all
@@ -114,5 +139,56 @@ mod tests {
     #[test]
     fn local_host_is_loopback() {
         assert_eq!(local_host(9090), "http://127.0.0.1:9090");
+    }
+
+    #[test]
+    fn redaction_shortens_the_home_directory_to_a_tilde() {
+        // An absolute fixture home on every platform, with no real account.
+        let home = std::env::temp_dir()
+            .join("arc-home-fixture")
+            .join("operator");
+        let model = home.join(".arc").join("models").join("standard.gguf");
+        let shown = redact_home_in(&model, &home);
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(shown, format!("~{sep}.arc{sep}models{sep}standard.gguf"));
+        assert!(!shown.contains("operator"), "{shown}");
+        assert_eq!(redact_home_in(&home, &home), "~");
+    }
+
+    #[test]
+    fn redaction_leaves_paths_outside_the_home_directory_alone() {
+        let root = std::env::temp_dir().join("arc-home-fixture");
+        let home = root.join("operator");
+        // A sibling whose name merely starts with the home directory's name.
+        let sibling = root.join("operator2").join("model.gguf");
+        assert_eq!(
+            redact_home_in(&sibling, &home),
+            sibling.display().to_string()
+        );
+        let elsewhere = root.join("shared-models").join("model.gguf");
+        assert_eq!(
+            redact_home_in(&elsewhere, &home),
+            elsewhere.display().to_string()
+        );
+        // A relative fallback home never matches a relative path.
+        let relative = PathBuf::from("models").join("model.gguf");
+        assert_eq!(
+            redact_home_in(&relative, Path::new(".")),
+            relative.display().to_string()
+        );
+    }
+
+    #[test]
+    fn redaction_uses_the_resolved_home_directory() {
+        let model = home_dir().join(".arc").join("models").join("standard.gguf");
+        let shown = display_with_home_redacted(&model);
+        // Meaningful only for a real home below the filesystem root.
+        if home_dir().is_absolute() && home_dir().parent().is_some() {
+            assert!(shown.starts_with('~'), "{shown}");
+            assert!(
+                !shown.contains(&home_dir().display().to_string()),
+                "the home directory must not appear: {shown}"
+            );
+        }
     }
 }
