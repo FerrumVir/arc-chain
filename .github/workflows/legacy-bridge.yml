@@ -1,6 +1,6 @@
 name: Legacy v0.7 bridge
 
-# Builds the v0.7.12 bridge launcher (crates/arc-legacy-bridge) and proves,
+# Builds the v0.7.13 bridge launcher (crates/arc-legacy-bridge) and proves,
 # against the released v0.7 updater code paths, that a stranded v0.7.11
 # desktop or headless install becomes a stake-zero v0.8 node in a fresh data
 # directory while its v0.7 data stays byte-identical. See
@@ -67,7 +67,7 @@ jobs:
         run: cargo fmt -p arc-legacy-bridge -- --check
       - name: clippy (deny warnings)
         run: cargo clippy -p arc-legacy-bridge --all-targets --locked -- -D warnings
-      - name: Unit tests (real v0.8.11 signed manifest, local HTTP server)
+      - name: Unit tests (real v0.8.12 signed manifest, local HTTP server)
         run: cargo test -p arc-legacy-bridge --locked
 
   scripts:
@@ -215,11 +215,11 @@ jobs:
           mkdir -p "$out"
           pubkey="$(git show v0.7.11:desktop/src-tauri/tauri.conf.json | jq -er '.plugins.updater.pubkey')"
           # The bridge release republishes a qualified v0.8 desktop release's
-          # latest.json byte for byte. v0.8.11 stands in until the release
-          # with the first-launch consent dialog is published; this only
-          # proves the v0.7 key accepts a v0.8 bundle.
+          # latest.json byte for byte. v0.8.12, the first release with the
+          # first-launch consent dialog, is that release; this proves the
+          # v0.7 key accepts its four bundles.
           curl -fsSL --retry 3 -o "$out/latest.json" \
-            https://github.com/FerrumVir/arc-chain/releases/download/v0.8.11/latest.json
+            https://github.com/FerrumVir/arc-chain/releases/download/v0.8.12/latest.json
           python3 - "$out/latest.json" <<'PY'
           import json, sys
           manifest = json.load(open(sys.argv[1], encoding="utf-8"))

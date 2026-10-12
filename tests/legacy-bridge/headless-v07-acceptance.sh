@@ -7,7 +7,7 @@
 #      pinned v0.7.7 release binary (the last v0.7 release that shipped
 #      headless binaries) as a systemd service, exactly as in the field.
 #      The v0.7 node runs and writes genuine v0.7 state.
-#   2. The fake-github curl shim makes "Latest" the bridge release (v0.7.12).
+#   2. The fake-github curl shim makes "Latest" the bridge release (v<bridge_version>).
 #      The installer-generated arc-auto-update.sh then runs as the real
 #      arc-updater.service: it downloads the bridge, keeps arc-node.prev,
 #      restarts arc-node.service, and applies its own 30-second health check.

@@ -208,8 +208,8 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
-    const MANIFEST: &[u8] = include_bytes!("../fixtures/v0.8.11/SHA256SUMS");
-    const SIGNATURE: &str = include_str!("../fixtures/v0.8.11/SHA256SUMS.sig");
+    const MANIFEST: &[u8] = include_bytes!("../fixtures/v0.8.12/SHA256SUMS");
+    const SIGNATURE: &str = include_str!("../fixtures/v0.8.12/SHA256SUMS.sig");
     const RELEASE_KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPs2NAiDRXit9EM96A2GdXZgRqvXtl0lvryEAEAEjQfY";
     const NAMESPACE: &str = "arc-release-manifest-v1";
@@ -219,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn real_v0811_release_manifest_signature_verifies() {
+    fn real_v0812_release_manifest_signature_verifies() {
         verify(SIGNATURE, MANIFEST, NAMESPACE, &release_key()).unwrap();
     }
 
