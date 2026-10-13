@@ -148,6 +148,11 @@ struct ManagedLaunchPlan {
     binary: ExactLaunchFile,
     seeds: ExactLaunchFile,
     genesis: ExactLaunchFile,
+    /// The configured model this launch left out because the pre-start check
+    /// found it missing or unreadable. A crash retry or updater resume of the
+    /// plan checks it again, so the status stays accurate and a model that is
+    /// back is used again without a manual Stop and Start.
+    dropped_model: Option<String>,
 }
 
 impl ManagedLaunchPlan {
@@ -164,6 +169,7 @@ impl ManagedLaunchPlan {
             binary: ExactLaunchFile::capture(binary, "executable")?,
             seeds: ExactLaunchFile::capture(seeds, "seed identity")?,
             genesis: ExactLaunchFile::capture(genesis, "genesis identity")?,
+            dropped_model: None,
         })
     }
 
@@ -1911,6 +1917,22 @@ impl NodeManager {
             anyhow::bail!("managed arc-node is already running");
         }
 
+        // A crash retry or updater resume relaunches the config its plan
+        // recorded. When that launch left out an unavailable model, start again
+        // from the configured model: the consent rule and the pre-start check
+        // below then keep the status accurate, and use the model if it is back.
+        let config_with_dropped_model;
+        let config = match resume_plan.and_then(|plan| plan.dropped_model.as_deref()) {
+            Some(model) if config.model_path.is_none() => {
+                config_with_dropped_model = NodeConfig {
+                    model_path: Some(model.to_owned()),
+                    ..config.clone()
+                };
+                &config_with_dropped_model
+            }
+            _ => config,
+        };
+
         // Defense in depth for the consent switch (PR #138, ARC-48 F1): the
         // worker flags, `--model`, the keep-awake flag, the recorded launch
         // plan and the spawn log all follow one effective config. A stored
@@ -1936,7 +1958,9 @@ impl NodeManager {
         // `--model`, the keep-awake flag, the spawn log and the recorded
         // launch plan all follow the same observer config. Only this launch
         // changes: the saved config (store.json) is left as it is.
+        let configured_model = effective.model_path.clone();
         let model_preflight = drop_unavailable_model(&mut effective);
+        let dropped_model = model_preflight.as_ref().and(configured_model);
         if let Some(preflight) = model_preflight.as_ref() {
             push_log(&self.logs, "warn", preflight.log_message()).await;
         }
@@ -2230,8 +2254,9 @@ impl NodeManager {
         // Capture every launch identity before arming the shutdown receipt or
         // spawning. Nothing after a successful spawn may fail before the
         // Child handle and its exact restart plan are installed in `self`.
-        let launch_plan =
+        let mut launch_plan =
             ManagedLaunchPlan::capture(config, &validator_keyfile, &binary, &stable_resources)?;
+        launch_plan.dropped_model = dropped_model;
 
         push_log(
             &self.logs,
@@ -4448,11 +4473,17 @@ async fn stop_detached_arc_node(
         if let Err(error) =
             write_desktop_shutdown_request(&target.shutdown_control, target.identity.pid.as_u32())
         {
-            if recorded_node_state(target) != RecordedNodeState::Gone {
-                return Err(error.context(format!(
-                    "failed to deliver authenticated graceful stop to managed detached arc-node pid {}; refusing force fallback",
-                    target.identity.pid
-                )));
+            match recorded_node_state(target) {
+                RecordedNodeState::Gone => {}
+                RecordedNodeState::DataDirectoryHeld => {
+                    return Err(error.context(data_directory_still_held(target)));
+                }
+                RecordedNodeState::LiveAndOurs | RecordedNodeState::Unproven => {
+                    return Err(error.context(format!(
+                        "failed to deliver authenticated graceful stop to managed detached arc-node pid {}; refusing force fallback",
+                        target.identity.pid
+                    )));
+                }
             }
             tracing::warn!(
                 pid = %target.identity.pid,
@@ -4488,17 +4519,23 @@ async fn stop_detached_arc_node(
         // The node exited without proving its final WAL barrier. That is not
         // a stop failure when the recorded process is provably gone: leave
         // its receipt armed for the recovery launch instead.
-        if recorded_node_state(target) != RecordedNodeState::Gone {
-            #[cfg(windows)]
-            anyhow::ensure!(
-                exited_cleanly,
-                "managed detached arc-node pid {} exited with code {exit_code}; final WAL durability was not proven",
-                target.identity.pid
-            );
-            anyhow::bail!(
-                "managed detached arc-node pid {} exited without publishing its authenticated clean shutdown ACK",
-                target.identity.pid
-            );
+        match recorded_node_state(target) {
+            RecordedNodeState::Gone => {}
+            RecordedNodeState::DataDirectoryHeld => {
+                return Err(anyhow::Error::msg(data_directory_still_held(target)));
+            }
+            RecordedNodeState::LiveAndOurs | RecordedNodeState::Unproven => {
+                #[cfg(windows)]
+                anyhow::ensure!(
+                    exited_cleanly,
+                    "managed detached arc-node pid {} exited with code {exit_code}; final WAL durability was not proven",
+                    target.identity.pid
+                );
+                anyhow::bail!(
+                    "managed detached arc-node pid {} exited without publishing its authenticated clean shutdown ACK",
+                    target.identity.pid
+                );
+            }
         }
         tracing::warn!(
             pid = %target.identity.pid,
@@ -4572,6 +4609,10 @@ enum RecordedNodeState {
     /// executable cannot be read. That proves nothing either way, so it is
     /// treated like a live process: never skipped and never signalled.
     Unproven,
+    /// The recorded process no longer answers, but a node still holds the
+    /// data directory's lock. Never treated as gone: no recovery node could
+    /// start beside it, and the second look may have misjudged a live node.
+    DataDirectoryHeld,
 }
 
 /// One process-table lookup of a recorded PID.
@@ -4620,10 +4661,29 @@ fn observe_recorded_node(identity: &DetachedProcessIdentity) -> RecordedNodeStat
     classify_recorded_node(identity, observed.as_ref())
 }
 
+/// What a fresh look proves about a recorded detached node. "Gone" is
+/// trusted only while no node holds the data directory (review of #200, C1).
+/// On Unix the second look can misjudge a live node: its binary replaced or
+/// removed between the looks, a wall-clock step, or a transient `/proc`
+/// read. arc-node's exclusive data-directory lock is the backstop, so it is
+/// checked before the verdict, with a precise refusal while it is held.
+fn recorded_node_state(target: &ManagedDetachedProcess) -> RecordedNodeState {
+    match recorded_process_state(target) {
+        RecordedNodeState::Gone => {
+            match node_data_directory_held(&target.shutdown_control.data_dir) {
+                Ok(false) => RecordedNodeState::Gone,
+                Ok(true) => RecordedNodeState::DataDirectoryHeld,
+                Err(_) => RecordedNodeState::Unproven,
+            }
+        }
+        state => state,
+    }
+}
+
 /// Windows asks the retained process handle. It pins the exact process
 /// object, so a reused PID can never answer for the recorded node.
 #[cfg(windows)]
-fn recorded_node_state(target: &ManagedDetachedProcess) -> RecordedNodeState {
+fn recorded_process_state(target: &ManagedDetachedProcess) -> RecordedNodeState {
     match target.handle.is_live() {
         Ok(true) => RecordedNodeState::LiveAndOurs,
         Ok(false) => RecordedNodeState::Gone,
@@ -4632,8 +4692,42 @@ fn recorded_node_state(target: &ManagedDetachedProcess) -> RecordedNodeState {
 }
 
 #[cfg(not(windows))]
-fn recorded_node_state(target: &ManagedDetachedProcess) -> RecordedNodeState {
+fn recorded_process_state(target: &ManagedDetachedProcess) -> RecordedNodeState {
     observe_recorded_node(&target.identity)
+}
+
+/// Whether a node still holds `data_dir`. arc-node takes an exclusive lock
+/// on `<data_dir>/.arc-node.lock` before it touches any state and keeps it
+/// until it exits, so a held lock means a node is running there, whatever a
+/// process-table lookup says. Like the check after detached-process
+/// reconciliation, this opens only an existing lock file (a missing one
+/// means no node has run there) and releases the lock at once.
+fn node_data_directory_held(data_dir: &Path) -> std::io::Result<bool> {
+    let node_lock_path = data_dir.join(".arc-node.lock");
+    let node_lock = match arc_crypto::secret_file::open_private_read_write(&node_lock_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match node_lock.try_lock_exclusive() {
+        Ok(()) => {
+            fs2::FileExt::unlock(&node_lock)?;
+            Ok(false)
+        }
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The refusal for a recorded node whose data directory is still held.
+fn data_directory_still_held(target: &ManagedDetachedProcess) -> String {
+    format!(
+        "a node still holds the data directory {}, although managed detached arc-node pid {} no longer matches its recorded launch identity; refusing to treat it as exited or to start a recovery node beside it",
+        paths::display_with_home_redacted(&target.shutdown_control.data_dir),
+        target.identity.pid
+    )
 }
 
 #[cfg(windows)]
@@ -7173,31 +7267,30 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// End to end through the detached reconciliation run at startup. A
-    /// recorded node exits before its stop request can be delivered. It must
-    /// be skipped (nothing is left to stop), never signalled, and its receipt
-    /// must stay armed so the caller continues with durability recovery.
+    /// Stage a stand-in for a detached desktop node bound to `dir`: the exact
+    /// desktop argv shape, a receipt armed for the image the scan will see,
+    /// an undeliverable stop request, and an early exit (code 1) that never
+    /// reads a request. bash runs the script in place, so the process keeps
+    /// this argv and image. A reaper thread collects the exit, as the OS does
+    /// for a detached process whose desktop has gone.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn a_recorded_detached_node_that_is_already_gone_is_skipped_for_recovery() {
-        let dir = resource_test_dir("detached-gone");
-        arc_crypto::secret_file::secure_private_directory_tree(&dir).unwrap();
+    fn spawn_gone_detached_stand_in(
+        dir: &Path,
+    ) -> std::thread::JoinHandle<std::io::Result<std::process::ExitStatus>> {
+        arc_crypto::secret_file::secure_private_directory_tree(dir).unwrap();
         let genesis = dir.join("receipt-genesis.toml");
         arc_crypto::secret_file::durably_publish_new_private(
             &genesis,
             b"[chain]\nname='desktop-stop-test'\n",
         )
         .unwrap();
-        let mut control = prepare_desktop_shutdown_control(&dir).unwrap();
-        // A stand-in for a detached desktop node: the exact desktop argv
-        // shape, and an early exit that never reads a stop request. bash runs
-        // the script in place, so the process keeps this argv and image.
+        let mut control = prepare_desktop_shutdown_control(dir).unwrap();
         let mut node = std::process::Command::new("/bin/bash")
             .arg("-c")
             .arg("sleep 3; exit 1")
             .arg("arc-node")
             .arg("--data-dir")
-            .arg(&dir)
+            .arg(dir)
             .arg("--desktop-shutdown-token-file")
             .arg(&control.token_file)
             .arg("--genesis")
@@ -7205,7 +7298,6 @@ mod tests {
             .spawn()
             .expect("spawn disposable detached stand-in");
         let pid = sysinfo::Pid::from_u32(node.id());
-        // Bind the receipt to the executable image the scan will see.
         let mut system = sysinfo::System::new();
         refresh_process_command_metadata(&mut system);
         let executable = system
@@ -7215,9 +7307,18 @@ mod tests {
             .expect("stand-in executable is visible");
         control.arm_receipt(&executable, &genesis).unwrap();
         leave_undeliverable_stop_request(&control);
-        // Reap the stand-in as soon as it exits, as the OS does for a
-        // detached process whose desktop has gone.
-        let reaper = std::thread::spawn(move || node.wait());
+        std::thread::spawn(move || node.wait())
+    }
+
+    /// End to end through the detached reconciliation run at startup. A
+    /// recorded node exits before its stop request can be delivered. It must
+    /// be skipped (nothing is left to stop), never signalled, and its receipt
+    /// must stay armed so the caller continues with durability recovery.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_recorded_detached_node_that_is_already_gone_is_skipped_for_recovery() {
+        let dir = resource_test_dir("detached-gone");
+        let reaper = spawn_gone_detached_stand_in(&dir);
 
         let summary = stop_detached_arc_node(None, Some(&dir))
             .await
@@ -7236,6 +7337,310 @@ mod tests {
             "the receipt stays armed, so the caller reports ManagedDurabilityRecoveryRequired"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Review of #200, C1. A second look can call a live node gone on Unix
+    /// (its binary replaced, a clock step, a transient read). While a node
+    /// still holds the data directory's lock, the verdict is a precise
+    /// refusal, never "already exited" and never a recovery beside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_gone_verdict_is_refused_while_a_node_still_holds_the_data_directory() {
+        let dir = resource_test_dir("detached-gone-lock-held");
+        let reaper = spawn_gone_detached_stand_in(&dir);
+        // The lock a live arc-node holds for its whole life.
+        let node_lock_path = dir.join(".arc-node.lock");
+        arc_crypto::secret_file::durably_publish_new_private(
+            &node_lock_path,
+            b"schema=arc.node.data-lock.v1\npid=1\n",
+        )
+        .unwrap();
+        let node_lock = arc_crypto::secret_file::open_private_read_write(&node_lock_path).unwrap();
+        node_lock.try_lock_exclusive().unwrap();
+
+        let error = stop_detached_arc_node(None, Some(&dir))
+            .await
+            .expect_err("a held data directory is never treated as gone");
+        let message = error.to_string();
+        assert!(
+            message.contains("a node still holds the data directory"),
+            "{message}"
+        );
+        assert!(!message.contains("already exited"), "{message}");
+        let status = reaper.join().unwrap().unwrap();
+        assert_eq!(status.code(), Some(1), "nothing signalled the stand-in");
+        assert!(arc_crypto::secret_file::desktop_shutdown_receipt_exists(&dir).unwrap());
+
+        fs2::FileExt::unlock(&node_lock).unwrap();
+        drop(node_lock);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_data_directory_lock_probe_reports_only_a_held_lock() {
+        let dir = resource_test_dir("node-lock-probe");
+        arc_crypto::secret_file::secure_private_directory_tree(&dir).unwrap();
+        let node_lock_path = dir.join(".arc-node.lock");
+        // No node has run here: nothing holds it, and the probe creates nothing.
+        assert!(!node_data_directory_held(&dir).unwrap());
+        assert!(!node_lock_path.exists());
+
+        arc_crypto::secret_file::durably_publish_new_private(
+            &node_lock_path,
+            b"schema=arc.node.data-lock.v1\npid=1\n",
+        )
+        .unwrap();
+        assert!(!node_data_directory_held(&dir).unwrap());
+        let node_lock = arc_crypto::secret_file::open_private_read_write(&node_lock_path).unwrap();
+        node_lock.try_lock_exclusive().unwrap();
+        assert!(node_data_directory_held(&dir).unwrap());
+        fs2::FileExt::unlock(&node_lock).unwrap();
+        drop(node_lock);
+        assert!(!node_data_directory_held(&dir).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Review of #200, C3. On Windows the "gone" check asks the retained
+    /// process handle, which pins the exact process object, and a held data
+    /// directory still blocks the verdict.
+    #[cfg(windows)]
+    #[test]
+    fn a_recorded_windows_node_is_gone_only_when_its_retained_handle_says_so() {
+        let dir = resource_test_dir("windows-handle-gone");
+        std::fs::create_dir_all(&dir).unwrap();
+        let control = prepare_desktop_shutdown_control(&dir).unwrap();
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn disposable Windows process");
+        let pid = sysinfo::Pid::from_u32(child.id());
+        let result = (|| -> anyhow::Result<()> {
+            let mut system = sysinfo::System::new();
+            refresh_process_command_metadata(&mut system);
+            let process = system
+                .process(pid)
+                .ok_or_else(|| anyhow::anyhow!("spawned process is not listed"))?;
+            let identity = DetachedProcessIdentity {
+                pid,
+                start_time: process.start_time(),
+                executable: process.exe().map(Path::to_path_buf).unwrap_or_default(),
+            };
+            let handle = WindowsProcessHandle::open(pid.as_u32(), identity.start_time)?;
+            let target = ManagedDetachedProcess {
+                identity,
+                shutdown_control: control,
+                handle,
+            };
+            anyhow::ensure!(
+                recorded_node_state(&target) == RecordedNodeState::LiveAndOurs,
+                "a live process behind its retained handle is ours"
+            );
+
+            child.kill()?;
+            child.wait()?;
+            anyhow::ensure!(
+                recorded_node_state(&target) == RecordedNodeState::Gone,
+                "an exited process behind its retained handle is gone"
+            );
+
+            let node_lock_path = target.shutdown_control.data_dir.join(".arc-node.lock");
+            arc_crypto::secret_file::durably_publish_new_private(
+                &node_lock_path,
+                b"schema=arc.node.data-lock.v1\npid=1\n",
+            )?;
+            let node_lock = arc_crypto::secret_file::open_private_read_write(&node_lock_path)?;
+            node_lock.try_lock_exclusive()?;
+            anyhow::ensure!(
+                recorded_node_state(&target) == RecordedNodeState::DataDirectoryHeld,
+                "a held data directory blocks the gone verdict"
+            );
+            fs2::FileExt::unlock(&node_lock)?;
+            drop(node_lock);
+            anyhow::ensure!(recorded_node_state(&target) == RecordedNodeState::Gone);
+            Ok(())
+        })();
+        if child.try_wait().unwrap().is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        result.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The argv the fixture recorded for its `start`-th launch. A launch
+    /// returns once the child is spawned, so wait for the fixture to finish
+    /// writing the line.
+    #[cfg(unix)]
+    async fn fixture_argv(data: &Path, start: u32) -> String {
+        let path = data.join(format!("fixture-argv-{start}"));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(argv) = std::fs::read_to_string(&path) {
+                    if argv.ends_with('\n') {
+                        return argv;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the fixture records each launch's argv")
+    }
+
+    /// Review of #200, F2. A crash retry or updater resume relaunches its
+    /// saved plan. When that launch left out an unavailable model, the status
+    /// survives the relaunch, and a model that is back is picked up without a
+    /// manual Stop and Start.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_model_is_checked_again_by_every_relaunch_of_its_plan() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = resource_test_dir("dropped-model-relaunch");
+        let data = root.join("data-v3");
+        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        let configured = data.to_string_lossy().into_owned();
+        let binary = root.join("arc-node-fixture");
+        let validator_key = root.join("validator.json");
+        let seeds = root.join("testnet-seeds.txt");
+        let genesis = root.join("genesis.toml");
+        let model = root.join("standard.gguf");
+        let model_path = model.to_string_lossy().into_owned();
+        // Like `updater_resume_fixture`, plus the worker flags. Each start's
+        // argv is recorded. Start 2, the quarantined recovery launch, exits
+        // after its stop request is published.
+        std::fs::write(
+            &binary,
+            b"#!/bin/sh\nif [ \"${1-}\" = --help ]; then\n  printf '%s\\n' '--validator-key-file --desktop-shutdown-token-file --desktop-lifecycle-nonce --community-rpc-url --full-integer-worker'\n  exit 0\nfi\nall=\"$*\"\ndata_dir=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --data-dir ]; then data_dir=\"$2\"; shift 2; else shift; fi\ndone\nstarts=0\nif [ -f \"$data_dir/fixture-starts\" ]; then starts=$(cat \"$data_dir/fixture-starts\"); fi\nstarts=$((starts + 1))\nprintf '%s' \"$starts\" > \"$data_dir/fixture-starts\"\nprintf '%s\\n' \"$all\" > \"$data_dir/fixture-argv-$starts\"\nif [ \"$starts\" -eq 2 ]; then while [ ! -f \"$data_dir/.arc-desktop-control/request\" ]; do sleep 0.01; done; sleep 0.1; exit 0; fi\nexec sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&validator_key, b"exact validator identity").unwrap();
+        std::fs::write(&seeds, b"seed.example:9001\n").unwrap();
+        std::fs::write(&genesis, b"[chain]\nname='arc-testnet'\n").unwrap();
+        let stored = NodeConfig {
+            role: "worker".into(),
+            model_path: Some(model_path.clone()),
+            compute_consent: Some(true),
+            data_dir: configured.clone(),
+            rpc_port: 29_190,
+            p2p_port: 29_191,
+            worker_threads: None,
+            ..NodeConfig::default()
+        };
+        // The launch that found the model missing recorded an observer plan.
+        let mut plan = ManagedLaunchPlan::capture(
+            &NodeConfig {
+                model_path: None,
+                ..stored.clone()
+            },
+            &validator_key,
+            &binary,
+            &TestnetResources {
+                seeds_file: Some(seeds),
+                genesis_file: Some(genesis),
+            },
+        )
+        .unwrap();
+        plan.dropped_model = Some(model_path.clone());
+        let receipt_binary = plan.binary.path.clone();
+        let receipt_genesis = plan.genesis.path.clone();
+        let mut manager = NodeManager::new();
+        manager.configure_managed_data_dir(&configured).unwrap();
+        manager.update_lifecycle_lock = Some(acquire_managed_lifecycle_lock(&configured).unwrap());
+        manager.update_restart_plan = Some(plan);
+        manager.update_restart_was_desired = true;
+
+        // An updater resume while the model is still missing: still an
+        // observer, and still reported.
+        manager.abort_update_relaunch().await.unwrap();
+        assert_eq!(
+            manager.active_model_unavailable,
+            Some(ModelUnavailableReason::NotFound)
+        );
+        let first = fixture_argv(&data, 1).await;
+        assert!(!first.contains("--model"), "{first}");
+        assert!(!first.contains("--community-mode"), "{first}");
+        assert_eq!(
+            manager
+                .active_launch_plan
+                .as_ref()
+                .unwrap()
+                .dropped_model
+                .as_deref(),
+            Some(model_path.as_str())
+        );
+
+        // The model is back, then the node crashes. The automatic retry
+        // relaunches the same plan and uses the model again.
+        std::fs::write(&model, b"GGUF").unwrap();
+        let child = manager.child.as_mut().unwrap();
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        manager.supervise_managed_node().await;
+        assert!(manager.child.is_none());
+        assert_eq!(manager.active_model_unavailable, None);
+        manager.crash_restart_policy.retry_at = Some(Instant::now());
+        // The killed launch left its receipt armed, so the retry first runs
+        // the quarantined recovery launch. Simulate arc-node's authenticated
+        // WAL ACK for it, as the exact-plan crash retry test does.
+        let mut control = prepare_desktop_shutdown_control(Path::new(&configured)).unwrap();
+        control
+            .bind_receipt_identity(&receipt_binary, &receipt_genesis)
+            .unwrap();
+        let request = control.request_file.clone();
+        let data_dir = control.data_dir.clone();
+        let token = control.token_bytes().unwrap();
+        let nonce = control.receipt_nonce.unwrap();
+        let executable = control.receipt_executable.clone().unwrap();
+        let receipt_genesis = control.receipt_genesis.clone().unwrap();
+        let ack_task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !request.is_file() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("recovery stop must publish its authenticated request");
+            arc_crypto::secret_file::acknowledge_desktop_shutdown_receipt(
+                &data_dir,
+                &token,
+                &nonce,
+                &executable,
+                &receipt_genesis,
+            )
+            .unwrap();
+        });
+        manager.supervise_managed_node().await;
+        ack_task.await.unwrap();
+        assert!(
+            manager.pid().is_some(),
+            "the automatic retry must spawn the node"
+        );
+        assert_eq!(manager.active_model_unavailable, None);
+        let relaunched = manager.active_launch_plan.as_ref().unwrap();
+        assert_eq!(
+            relaunched.config.model_path.as_deref(),
+            Some(model_path.as_str())
+        );
+        assert_eq!(relaunched.dropped_model, None);
+        let third = fixture_argv(&data, 3).await;
+        assert!(third.contains(&format!("--model {model_path}")), "{third}");
+        assert!(
+            third.contains("--community-mode --full-integer-worker"),
+            "{third}"
+        );
+
+        let mut child = manager.child.take().unwrap();
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        manager.clear_desired_running();
+        manager.shutdown_control = None;
+        manager.lifecycle_lock = None;
+        manager.active_launch_plan = None;
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
