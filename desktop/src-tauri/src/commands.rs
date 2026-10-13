@@ -971,8 +971,17 @@ pub(crate) async fn promote_consented_install_inner(
     match promotion_need(&config, ram_gb) {
         PromotionNeed::NoConsent => return Err(COMPUTE_CONSENT_REQUIRED.to_string()),
         PromotionNeed::Ineligible => return Err(COMPUTE_INELIGIBLE.to_string()),
-        PromotionNeed::Ready => return Ok(config),
-        PromotionNeed::Promote => {}
+        // A worker whose model file is missing or unreadable is not ready:
+        // the node runs as an observer until the file is back (community PR
+        // #132). This explicit request re-downloads it. The startup hook acts
+        // only on `Promote`, so it never downloads on its own.
+        PromotionNeed::Ready
+            if crate::node_manager::configured_model_unavailable(&config).is_none() =>
+        {
+            return Ok(config)
+        }
+        PromotionNeed::Ready if tier == "none" => return Err(COMPUTE_INELIGIBLE.to_string()),
+        PromotionNeed::Ready | PromotionNeed::Promote => {}
     }
     let model_path = match existing_model_for_tier(tier.to_string()).await? {
         Some(path) => path,
@@ -1126,18 +1135,19 @@ pub async fn reset_peer_state(
 /// returned, but in clearly separate `chain*` fields.
 #[tauri::command]
 pub async fn node_status(state: State<'_, AppState>) -> CmdResult<NodeStatus> {
-    let (port, pid, crash, worker_threads) = {
+    let (port, pid, crash, worker_threads, model_unavailable) = {
         let mut node = state.node.lock().await;
         let pid = if node.is_running() { node.pid() } else { None };
         let port = node.rpc_port;
         let worker_threads = node.active_worker_threads;
+        let model_unavailable = node.active_model_unavailable;
         let crash = node
             .crash_info
             .lock()
             .await
             .as_ref()
             .map(|c| c.message.clone());
-        (port, pid, crash, worker_threads)
+        (port, pid, crash, worker_threads, model_unavailable)
     };
     let address = {
         let store = state.store.lock().await;
@@ -1156,6 +1166,7 @@ pub async fn node_status(state: State<'_, AppState>) -> CmdResult<NodeStatus> {
     status.chain_block_age_seconds = chain_choice.as_ref().map(|c| c.block_age_seconds());
     status.worker_threads = worker_threads;
     status.cpu_cores = Some(cached_hardware().cpu_cores);
+    status.model_unavailable = model_unavailable;
     Ok(status)
 }
 

@@ -25,6 +25,7 @@ import type { ArchChainPhase } from "../lib/aqueduct/archchain";
 import { CrashBanner } from "../components/CrashBanner";
 import { EmptyState } from "../components/EmptyState";
 import { InfoPopover } from "../components/InfoPopover";
+import { ModelUnavailableBanner } from "../components/ModelUnavailableBanner";
 import { NumberTicker } from "../components/NumberTicker";
 import { ObserverUpgradeBanner } from "../components/ObserverUpgradeBanner";
 import { WorkerJobsCard } from "../components/WorkerJobs";
@@ -207,7 +208,7 @@ export function Dashboard() {
     startMutation.isPending && status?.pid == null
       ? "survey"
       : isStarting
-        ? config?.modelPath
+        ? config?.modelPath && !status?.modelUnavailable
           ? "model"
           : "rpc"
         : findingPeers && !peerWaitOver && !status?.coordinatorUrl
@@ -413,6 +414,10 @@ export function Dashboard() {
 
       {isCrashed && status?.lastError && (
         <CrashBanner message={status.lastError} />
+      )}
+
+      {status?.modelUnavailable && (
+        <ModelUnavailableBanner reason={status.modelUnavailable} />
       )}
 
       {(startMutation.error || stopMutation.error || restartMutation.error) && (

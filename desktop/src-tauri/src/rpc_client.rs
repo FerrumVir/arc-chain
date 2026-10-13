@@ -185,6 +185,8 @@ pub async fn fetch_status(
         chain_block_age_seconds: None,
         worker_threads: None,
         cpu_cores: None,
+        // Filled in by the command layer from the running launch.
+        model_unavailable: None,
     }
 }
 
