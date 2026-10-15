@@ -229,6 +229,18 @@ impl GgufEngine {
         input_tokens: &[u32],
         max_tokens: u32,
     ) -> Result<InferenceResult, InferenceError> {
+        self.generate_observed(model_id, input_tokens, max_tokens, || {})
+    }
+
+    /// Observe accepted tokens; the callback cannot change token selection.
+    #[cfg(feature = "candle")]
+    pub fn generate_observed(
+        &self,
+        model_id: &Hash256,
+        input_tokens: &[u32],
+        max_tokens: u32,
+        mut on_token: impl FnMut(),
+    ) -> Result<InferenceResult, InferenceError> {
         use candle_core::{Device, Tensor};
 
         Self::preflight_generation(input_tokens.len(), max_tokens)?;
@@ -293,6 +305,7 @@ impl GgufEngine {
                 .map_err(|e| InferenceError::Runtime(format!("Scalar: {e}")))?;
 
             generated_tokens.push(next_token);
+            on_token();
             all_tokens.push(next_token);
 
             let elapsed_ms = start.elapsed().as_millis() as u64;
