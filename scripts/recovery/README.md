@@ -3833,15 +3833,22 @@ before mutation and again after cutover.
 The public GET allowlist carried verbatim in the manifest is `/health`,
 `/info`, `/network/info`, `/stats`, `/validators`, `/block/latest`, `/blocks`,
 `/inference/readiness`, `/inference/attestations`, `/economics/rewards`, `/faucet/status`,
-`/community/reward_policy`, `/workers/scoreboard`, `/shards`,
-`/models`, and `/models/shards`. Strict parameterized public reads cover only
-blocks, transactions, accounts, worker earnings, reward receipts, and reward
-jobs in the shapes documented in the repository README.
+`/community/reward_policy`, `/community/twin_stats`, `/community/twin_receipts`,
+`/workers/scoreboard`, `/shards`, `/models`, and `/models/shards`. Strict
+parameterized public reads cover only blocks, transactions, accounts, worker
+earnings, reward receipts, reward jobs, and twin receipts
+(`/community/twin/{job_id}`) in the shapes documented in the repository README.
+The twin routes are read-only views of the coordinator's bounded twin store; they
+are allowlisted ahead of the operator switches and are empty while every switch
+is off (`docs/twin-execution.md`).
 
 The public POST allowlist is exactly `/inference/run`,
 `/inference/run_consensus`, `/community/register`, `/community/heartbeat`,
-`/community/claim_work`, `/community/submit_work`, `/tx/submit`,
-`/tx/submit_signed`, `/tx/submit_batch`, and `/faucet/claim`. `/tx/submit` is
+`/community/claim_work`, `/community/submit_work`, `/community/region`,
+`/tx/submit`, `/tx/submit_signed`, `/tx/submit_batch`, and `/faucet/claim`.
+`/community/region` is a worker's signed round-trip report (same signed-request
+envelope and 1 MB body class as register/heartbeat); it only stores a coarse
+region label and dispatches nothing. `/tx/submit` is
 the flat signed transfer contract and `/tx/submit_batch` is its batch form,
 used across the supported SDKs. Batches have a hard 64-item maximum and share
 the atomic 10 tx/s per-sender admission policy with single submissions. The
