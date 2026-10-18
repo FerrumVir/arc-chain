@@ -1,4 +1,5 @@
 use crate::node_manager::{managed_binary_path, TestnetResources};
+use crate::start_fence::StartAccess;
 use crate::types::*;
 use crate::{hardware, identity, paths, rpc_client, store::Store, AppState, CommunityReceiptRoute};
 use fs2::FileExt as _;
@@ -431,12 +432,39 @@ impl From<&str> for StartupFailure {
     }
 }
 
+/// Which start transaction a caller runs, and so which access it has to the
+/// native start fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartTransaction {
+    /// WebView Start/Retry and auto-start. Runs the recovery launch first if
+    /// a shutdown receipt is armed, then starts the current node.
+    Start,
+    /// Launch-time reconciliation only. Runs the quarantined recovery launch
+    /// of the receipt-bound node and stops it. It must pass the launch-time
+    /// fence, because that fence is waiting for this step to finish.
+    StartupRecoveryOnly,
+}
+
+impl StartTransaction {
+    fn fence_access(self) -> StartAccess {
+        match self {
+            Self::Start => StartAccess::Ordinary,
+            Self::StartupRecoveryOnly => StartAccess::StartupRecovery,
+        }
+    }
+
+    fn starts_current_node(self) -> bool {
+        matches!(self, Self::Start)
+    }
+}
+
 async fn start_node_transaction(
     app: &AppHandle,
     state: &AppState,
-    start_after_recovery: bool,
+    transaction: StartTransaction,
 ) -> Result<(), StartupFailure> {
-    require_data_migration_ready(state).await?;
+    require_start_fence(state, transaction.fence_access()).await?;
+    let start_after_recovery = transaction.starts_current_node();
     let (config, mut recovery_phrase, persisted_address) = {
         let store = state.store.lock().await;
         let config = store.config.clone().unwrap_or_default();
@@ -531,7 +559,7 @@ async fn start_node_transaction(
 
 pub async fn start_node_inner(app: &AppHandle, state: &AppState) -> Result<(), String> {
     state.startup_retry_cancel.send_replace(());
-    start_node_transaction(app, state, true)
+    start_node_transaction(app, state, StartTransaction::Start)
         .await
         .map_err(|failure| failure.to_string())
 }
@@ -553,30 +581,28 @@ pub(crate) async fn autostart_node_inner(
             ));
         }
     }
-    start_node_transaction(app, state, true).await
+    start_node_transaction(app, state, StartTransaction::Start).await
 }
 
+/// Launch-time reconciliation's recovery launch. `lib.rs` calls this only
+/// while it holds the launch-time fence, which this transaction may pass.
 pub(crate) async fn recover_managed_shutdown_inner(
     app: &AppHandle,
     state: &AppState,
 ) -> Result<(), String> {
-    start_node_transaction(app, state, false)
+    start_node_transaction(app, state, StartTransaction::StartupRecoveryOnly)
         .await
         .map_err(|failure| failure.to_string())
 }
 
-fn data_migration_start_gate(reason: Option<&str>) -> Result<(), String> {
-    match reason {
-        None => Ok(()),
-        Some(reason) => Err(format!(
-            "ARC refused to start the node because chain-data migration is not safely resolved: {reason}. Restart ARC after repairing the reported path or permissions; do not point v0.8 at the preserved legacy directory."
-        )),
-    }
+async fn require_start_fence(state: &AppState, access: StartAccess) -> Result<(), String> {
+    let fence = state.data_migration_error.lock().await.clone();
+    crate::start_fence::check(fence.as_ref(), access)
 }
 
+/// The fence check for every WebView entrypoint and auto-start.
 async fn require_data_migration_ready(state: &AppState) -> Result<(), String> {
-    let reason = state.data_migration_error.lock().await.clone();
-    data_migration_start_gate(reason.as_deref())
+    require_start_fence(state, StartAccess::Ordinary).await
 }
 
 #[tauri::command]
@@ -5803,12 +5829,17 @@ mod release_binary_tests {
 
     #[test]
     fn unresolved_data_migration_blocks_manual_start_and_restart() {
-        assert!(data_migration_start_gate(None).is_ok());
-        let error = data_migration_start_gate(Some("legacy data directory is a symbolic link"))
-            .expect_err("an unresolved native migration fence must block every start path");
-        assert!(error.contains("refused to start"));
-        assert!(error.contains("migration is not safely resolved"));
-        assert!(error.contains("preserved legacy directory"));
+        use crate::start_fence::{check, StartFence};
+        assert!(check(None, StartAccess::Ordinary).is_ok());
+        let fence = StartFence::Refused("legacy data directory is a symbolic link".into());
+        // A real refusal blocks startup's own recovery launch too.
+        for access in [StartAccess::Ordinary, StartAccess::StartupRecovery] {
+            let error = check(Some(&fence), access)
+                .expect_err("an unresolved native migration fence must block every start path");
+            assert!(error.contains("refused to start"));
+            assert!(error.contains("migration is not safely resolved"));
+            assert!(error.contains("preserved legacy directory"));
+        }
     }
 
     #[test]
@@ -6628,5 +6659,144 @@ mod compute_contribution_tests {
         assert_eq!(persisted.model_path, None);
         assert_eq!(persisted.prevent_sleep_during_jobs, Some(true));
         assert!(!launches_as_worker(&persisted));
+    }
+}
+
+#[cfg(test)]
+mod start_fence_tests {
+    //! The launch-time start fence through `AppState`: the v0.8.12 deadlock,
+    //! where startup's recovery launch refused itself, and the transitions
+    //! that replace it.
+    use super::{require_data_migration_ready, require_start_fence, StartTransaction};
+    use crate::start_fence::{after_startup_reconciliation, at_launch, StartAccess, StartFence};
+    use crate::AppState;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn state_with(fence: Option<StartFence>) -> AppState {
+        AppState {
+            node: Arc::new(Mutex::new(crate::node_manager::NodeManager::new())),
+            store: Arc::new(Mutex::new(crate::store::Store::default())),
+            data_dir: Arc::new(Mutex::new(PathBuf::new())),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            tier1_routes: Arc::new(Mutex::new(HashMap::new())),
+            community_receipt_routes: Arc::new(Mutex::new(HashMap::new())),
+            community_chain_host: Arc::new(Mutex::new(None)),
+            community_inference_write: Arc::new(Mutex::new(())),
+            chain_host: Arc::new(Mutex::new(None)),
+            wallet_write: Arc::new(Mutex::new(())),
+            auto_update_requests: Arc::new(Mutex::new(None)),
+            has_tray: Arc::new(AtomicBool::new(false)),
+            data_migration_error: Arc::new(Mutex::new(fence)),
+            startup_retry_cancel: tokio::sync::watch::channel(()).0,
+        }
+    }
+
+    fn body_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start_at = source.find(start).expect("start marker");
+        let tail = &source[start_at..];
+        &tail[..tail.find(end).expect("end marker")]
+    }
+
+    /// The stuck state users hit. Startup holds the launch-time fence while
+    /// its recovery launch runs. That launch used to check the fence the
+    /// way a WebView click does, so it was refused with the fence's own
+    /// "in progress" text, and startup then kept that refusal as
+    /// "managed-node durability recovery failed: ..." on every launch.
+    #[tokio::test]
+    async fn startup_recovery_is_not_refused_by_its_own_launch_fence() {
+        let state = state_with(Some(at_launch(None)));
+
+        // What the recovery launch got before this fix (ordinary access).
+        let before = require_start_fence(&state, StartAccess::Ordinary)
+            .await
+            .unwrap_err();
+        assert!(before.contains("startup reconciliation is still in progress"));
+
+        // The recovery-only transaction now passes its own launch fence.
+        assert_eq!(
+            require_start_fence(&state, StartTransaction::StartupRecoveryOnly.fence_access()).await,
+            Ok(())
+        );
+        // WebView Start/Retry, auto-start and every other entrypoint still wait.
+        assert!(
+            require_start_fence(&state, StartTransaction::Start.fence_access())
+                .await
+                .is_err()
+        );
+        assert!(require_data_migration_ready(&state).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn start_succeeds_once_startup_reconciliation_completes() {
+        let state = state_with(Some(at_launch(None)));
+        assert!(require_data_migration_ready(&state).await.is_err());
+
+        *state.data_migration_error.lock().await = after_startup_reconciliation(Ok(()));
+
+        assert_eq!(require_data_migration_ready(&state).await, Ok(()));
+        assert_eq!(
+            require_start_fence(&state, StartTransaction::Start.fence_access()).await,
+            Ok(())
+        );
+    }
+
+    /// A recovery that really fails stays fail-closed for every caller, and
+    /// reports its own reason instead of a nested copy of the launch fence.
+    #[tokio::test]
+    async fn a_failed_startup_recovery_refuses_every_caller_with_its_reason() {
+        let state = state_with(Some(at_launch(None)));
+        *state.data_migration_error.lock().await = after_startup_reconciliation(Err(
+            "managed-node durability recovery failed: recovery node exited before its WAL barrier"
+                .into(),
+        ));
+        for access in [StartAccess::Ordinary, StartAccess::StartupRecovery] {
+            let error = require_start_fence(&state, access).await.unwrap_err();
+            assert!(error.contains("recovery node exited before its WAL barrier"));
+            assert!(!error.contains("still in progress"));
+            assert_eq!(error.matches("ARC refused to start the node").count(), 1);
+        }
+    }
+
+    /// The fence cannot tell callers apart, so pin which transaction each
+    /// entrypoint runs: only launch reconciliation may pass its own fence.
+    #[test]
+    fn only_launch_reconciliation_runs_the_recovery_only_transaction() {
+        let source = include_str!("commands.rs");
+        let recovery = body_between(
+            source,
+            "pub(crate) async fn recover_managed_shutdown_inner(",
+            "async fn require_start_fence(",
+        );
+        assert!(recovery.contains("StartTransaction::StartupRecoveryOnly"));
+        for (name, start, end) in [
+            (
+                "start_node_inner",
+                "pub async fn start_node_inner(",
+                "pub(crate) async fn autostart_node_inner(",
+            ),
+            (
+                "autostart_node_inner",
+                "pub(crate) async fn autostart_node_inner(",
+                "/// Launch-time reconciliation's recovery launch.",
+            ),
+        ] {
+            let body = body_between(source, start, end);
+            assert!(body.contains("StartTransaction::Start)"), "{name}");
+            assert!(!body.contains("StartupRecoveryOnly"), "{name}");
+        }
+        let gate = body_between(
+            source,
+            "async fn require_data_migration_ready(",
+            "#[tauri::command]",
+        );
+        assert!(gate.contains("StartAccess::Ordinary"));
+        assert!(!gate.contains("StartupRecovery"));
     }
 }

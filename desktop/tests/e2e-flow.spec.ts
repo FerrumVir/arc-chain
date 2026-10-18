@@ -499,6 +499,10 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     path.resolve(REPO_DESKTOP, "src-tauri", "src", "commands.rs"),
     "utf8",
   );
+  const startFence = fs.readFileSync(
+    path.resolve(REPO_DESKTOP, "src-tauri", "src", "start_fence.rs"),
+    "utf8",
+  );
   const updater = fs.readFileSync(
     path.resolve(REPO_DESKTOP, "src", "lib", "updater.ts"),
     "utf8",
@@ -604,7 +608,7 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     expect(transactionBegin).toBeGreaterThanOrEqual(0);
     expect(transactionEnd).toBeGreaterThan(transactionBegin);
     const migrationGate = startTransaction.indexOf(
-      "require_data_migration_ready(state).await?",
+      "require_start_fence(state, transaction.fence_access()).await?",
     );
     const lockAcquire = startTransaction.indexOf(
       "acquire_managed_lifecycle_lock(&lock_data_dir)",
@@ -614,7 +618,9 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     );
     expect(migrationGate).toBeGreaterThanOrEqual(0);
     expect(
-      startTransaction.match(/require_data_migration_ready\(state\)\.await\?/g),
+      startTransaction.match(
+        /require_start_fence\(state, transaction\.fence_access\(\)\)\.await\?/g,
+      ),
     ).toHaveLength(1);
     expect(lockAcquire).toBeGreaterThan(migrationGate);
     expect(writerSpawns.length).toBeGreaterThan(0);
@@ -625,8 +631,21 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     expect(startTransaction).toContain(
       "store.config.clone().unwrap_or_default()",
     );
-    expect(startWrapper).toContain(
-      "start_node_transaction(app, state, true).await",
+    // WebView Start/Retry and auto-start run the ordinary transaction, which
+    // waits behind the launch-time fence. Only launch reconciliation's own
+    // recovery launch may pass that fence (StartupRecoveryOnly).
+    expect(
+      startWrapper.match(
+        /start_node_transaction\(app, state, StartTransaction::Start\)/g,
+      ),
+    ).toHaveLength(2);
+    expect(startWrapper).not.toContain("StartupRecoveryOnly");
+    expect(commands).toContain("Self::Start => StartAccess::Ordinary");
+    expect(commands).toContain(
+      "require_start_fence(state, StartAccess::Ordinary).await",
+    );
+    expect(commands).toContain(
+      "start_node_transaction(app, state, StartTransaction::StartupRecoveryOnly)",
     );
     expect(startWrapper).not.toContain("node.start(");
     expect(restart).toContain("require_data_migration_ready(&state).await?");
@@ -646,7 +665,9 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     expect(commands).toContain("preserve_authoritative_data_dir(&mut config");
     expect(commands).toContain("start_node_inner(&app, &state).await");
     expect(commands).not.toContain("start_node_inner(&app, &state, &config)");
-    expect(commands).toContain("ARC refused to start the node");
+    expect(startFence).toContain("ARC refused to start the node");
+    // A real refusal blocks every caller, startup's recovery launch included.
+    expect(startFence).toContain("(Some(StartFence::Refused(reason)), _) => Err(");
   });
 
   test("auto-start: autostart plugin registered with --minimized arg", () => {
