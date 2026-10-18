@@ -131,19 +131,6 @@ pub struct CommunityReceiptRoute {
     pub receipt_url: String,
 }
 
-fn configured_http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        // A signed transaction is bound to the elected origin. Never allow a
-        // gateway redirect to move that POST to another scheme or host.
-        .redirect(reqwest::redirect::Policy::none())
-        // Interactive launches may use an explicitly configured proxy, but
-        // reqwest must never replay a wallet or inference write by itself.
-        .retry(reqwest::retry::never())
-        .build()
-        .map_err(|error| format!("build redirect-fenced desktop HTTP client: {error}"))
-}
-
 /// Launch-time reconciliation of the managed node an earlier desktop process
 /// left behind, run while the launch-time start fence is held.
 ///
@@ -238,6 +225,19 @@ async fn reconcile_previous_managed_node(
         );
     }
     Ok(())
+}
+
+fn configured_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        // A signed transaction is bound to the elected origin. Never allow a
+        // gateway redirect to move that POST to another scheme or host.
+        .redirect(reqwest::redirect::Policy::none())
+        // Interactive launches may use an explicitly configured proxy, but
+        // reqwest must never replay a wallet or inference write by itself.
+        .retry(reqwest::retry::never())
+        .build()
+        .map_err(|error| format!("build redirect-fenced desktop HTTP client: {error}"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -898,7 +898,7 @@ mod startup_reconciliation_tests {
             .expect("reconciliation function");
         let body = &source[start..];
         let body = &body[..body
-            .find("#[cfg_attr(mobile, tauri::mobile_entry_point)]")
+            .find("fn configured_http_client()")
             .expect("end of reconciliation function")];
 
         // Needles are assembled at run time so this test's own text never
