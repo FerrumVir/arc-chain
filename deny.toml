@@ -75,6 +75,32 @@ ignore = [
     "RUSTSEC-2025-0081", # unic-char-property; remove with Tauri urlpattern
     "RUSTSEC-2025-0098", # unic-ucd-version; remove with Tauri urlpattern
     "RUSTSEC-2025-0100", # unic-ucd-ident; remove with Tauri urlpattern
+    # 2026-10-18 ARC release engineering, risk accepted by the repository
+    # owner (FerrumVir) on 2026-10-18: these zip advisories cover archive extraction only
+    # (`ZipArchive::extract`, `ZipStreamReader::extract`: SUID/SGID bits and
+    # symlinks that escape the destination). candle-core 0.8.4 opens archives
+    # and reads or writes entries (npy.rs, pickle.rs) but never extracts.
+    # tauri-plugin-updater 2.10.1 extracts only on Windows, only a zip-format
+    # update, and only after `download()` has verified the update's minisign
+    # signature. ARC publishes signed `-setup.exe` updater artifacts
+    # (`createUpdaterArtifacts = true`), never zips, so an exploit needs the
+    # release signing key. No release accepts the patched zip >= 9.0.0:
+    # candle-core 0.11.0 requires zip ^8.6 and tauri-plugin-updater 2.14.0
+    # requires zip ^4. Remove all three once both crates accept zip >= 9 and
+    # the lockfiles move to it, no later than the v0.9.0 dependency review.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    # 2026-10-18 ARC release engineering, risk accepted by the repository
+    # owner (FerrumVir) on 2026-10-18: ruzstd 0.5.0 can be driven out of memory by a crafted zstd
+    # input. It is reached only through object 0.32's default `compression`
+    # feature in the vendored wasmer-compiler 6.1.0, which only writes object
+    # files and never reads or decompresses one; no ARC crate reads object
+    # files. The fix (ruzstd >= 0.9.1) needs object >= 0.40, and wasmer-compiler
+    # 6.x requires object ^0.32. Remove when the vendored wasmer-compiler moves
+    # to object >= 0.40 or drops object's default features, no later than the
+    # v0.9.0 dependency review.
+    "RUSTSEC-2026-0344",
 ]
 
 # ------------------------------------------------------------- licenses ----
