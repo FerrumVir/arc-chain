@@ -101,6 +101,19 @@ ignore = [
     # to object >= 0.40 or drops object's default features, no later than the
     # v0.9.0 dependency review.
     "RUSTSEC-2026-0344",
+    # 2026-10-18 ARC release engineering, risk accepted by the repository
+    # owner (FerrumVir) on 2026-10-18: these
+    # notices report that upstream merged the standalone zvariant,
+    # zvariant_derive and zbus_names crates into zbus 6.0.0. They are
+    # maintenance status, not known vulnerabilities. The desktop reaches them
+    # only through tauri-plugin-opener 2.5.4, which uses zbus 5.19 on Linux
+    # and the BSDs only, and no release of tauri-plugin-opener (2.7.2,
+    # 3.0.0-alpha.3) accepts zbus 6. Remove each entry when
+    # tauri-plugin-opener moves to zbus >= 6 and the desktop lockfile
+    # follows, no later than the v0.9.0 desktop dependency review.
+    "RUSTSEC-2026-0370", # zvariant; remove with tauri-plugin-opener zbus 6
+    "RUSTSEC-2026-0371", # zbus_names; remove with tauri-plugin-opener zbus 6
+    "RUSTSEC-2026-0372", # zvariant_derive; remove with tauri-plugin-opener zbus 6
 ]
 
 # ------------------------------------------------------------- licenses ----
