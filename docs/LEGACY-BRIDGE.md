@@ -8,8 +8,10 @@ and v0.7.10/v0.7.11 desktops could not even start their node.
 
 The legacy bridge is a series of v0.7.x releases built for exactly those
 updaters. v0.7.12 carried the launchers only and pinned arc-node v0.8.11;
-v0.7.13 pins arc-node v0.8.12 and also carries the v0.8.12 desktop
-`latest.json`. Once the owner marks a bridge release "Latest", every v0.7
+v0.7.13 pinned arc-node v0.8.12 and also carried the v0.8.12 desktop
+`latest.json`. v0.7.14 pins arc-node v0.8.13 and carries the v0.8.13 desktop
+`latest.json`, which fixes the desktop's start deadlock after an unclean node
+exit (#202). Once the owner marks a bridge release "Latest", every v0.7
 install moves itself onto the current network. Each install runs the pinned,
 signature-verified v0.8 node at stake 0, in a fresh data directory, with
 compute off until its owner opts in. The v0.7 data stays where it is,
@@ -89,7 +91,7 @@ that path.
 | `latest.json` | A byte-for-byte copy of a qualified v0.8 desktop release's `latest.json`. Its URLs and signatures point at that exact immutable v0.8 release. |
 | `SHA256SUMS` | Digests of the above, for people. v0.7 updaters verify nothing. |
 
-The tag is `v0.7.13`:
+The tag is `v0.7.14`:
 
 - every v0.8 consumer ignores releases below 0.8.0, so the bridge can be
   "Latest" without entering the v0.8 channel;
@@ -154,8 +156,8 @@ line. The launcher sits in that slot permanently and on every start:
    named a file, not a choice about the new network. A pin whose node build
    would publish the computer's hostname (`main.rs:8749-8826` at `v0.8.10`,
    fixed by PR #134) runs with `--no-community` and no compute. The pinned
-   v0.8.12 carries that fix (as does v0.8.11), so its nodes register under a
-   privacy-safe public name.
+   v0.8.13 carries that fix (as do v0.8.11 and v0.8.12), so its nodes register
+   under a privacy-safe public name.
 9. **Starts the node exactly as `install.sh:4578-4595` would.**
    - **Network and stake:** `--rpc 127.0.0.1:<v0.7 port> --p2p-port <v0.7 port>`
      with the release's seeds and genesis, and `--stake 0 --min-stake 0
@@ -176,8 +178,8 @@ line. The launcher sits in that slot permanently and on every start:
      node runs in a kill-on-close job object, so the v0.7 desktop's "stop"
      still stops it.
 
-A stake-0 v0.8.12 node never joins consensus
-(`chain_participation_allowed`, `main.rs:5942` at `v0.8.12`). Its `/health`
+A stake-0 v0.8.13 node never joins consensus
+(`chain_participation_allowed`, `main.rs:5942` at `v0.8.13`). Its `/health`
 reports `chain_participation_enabled: false` and `/node/info` reports
 `stake: 0`. The acceptance asserts both.
 
@@ -287,8 +289,8 @@ public testnet. The jobs read only public release assets.
 
 | Job | What it proves |
 |---|---|
-| bridge unit tests (Linux, Windows) | The real v0.8.12 `SHA256SUMS` signature verifies with the release key, and any byte change, wrong key or namespace fails. Every pin equals the signed manifest. Downloads resume after a cut and reject tampered or oversized bodies against a local HTTP server. Exact v0.7 command lines are accepted, validator stakes refused, and seeds never retained. The observer and worker command lines are correct. Auto-discovery hazards are refused. Archive generations and the stat-only manifest work. |
-| headless acceptance (systemd, real updater) | The **unmodified v0.7.11 `install-community-node.sh`** installs the pinned v0.7.7 binary under systemd, and v0.7.7 writes real state. Its own **`arc-auto-update.sh`, run as `arc-updater.service`**, consumes a simulated v0.7.13 Latest and passes its 30-second health check. The service's process is the pinned v0.8.12 binary with `--stake 0 --min-stake 0`, a fresh data directory, `--community-mode` with the six pinned origins (the runner rejects every live-network address, so nothing registers) and no `--model`; `bridge-state.json` reports `community_registration` as the pin says. `/node/info` reports stake 0 and `/health` reports `chain_participation_enabled: false`. The v0.7 data is byte-identical to the moment systemd stopped v0.7, captured by an `ExecStartPre` hook. No seed appears anywhere the bridge wrote. A second updater run is a no-op, restarts reuse the cache, and a corrupted cache self-heals. Compute and validator command lines are refused. Rollback runs v0.7.7 again on its untouched data, and reinstall bridges again with the same identity. |
+| bridge unit tests (Linux, Windows) | The real v0.8.13 `SHA256SUMS` signature verifies with the release key, and any byte change, wrong key or namespace fails. Every pin equals the signed manifest. Downloads resume after a cut and reject tampered or oversized bodies against a local HTTP server. Exact v0.7 command lines are accepted, validator stakes refused, and seeds never retained. The observer and worker command lines are correct. Auto-discovery hazards are refused. Archive generations and the stat-only manifest work. |
+| headless acceptance (systemd, real updater) | The **unmodified v0.7.11 `install-community-node.sh`** installs the pinned v0.7.7 binary under systemd, and v0.7.7 writes real state. Its own **`arc-auto-update.sh`, run as `arc-updater.service`**, consumes a simulated v0.7.14 Latest and passes its 30-second health check. The service's process is the pinned v0.8.13 binary with `--stake 0 --min-stake 0`, a fresh data directory, `--community-mode` with the six pinned origins (the runner rejects every live-network address, so nothing registers) and no `--model`; `bridge-state.json` reports `community_registration` as the pin says. `/node/info` reports stake 0 and `/health` reports `chain_participation_enabled: false`. The v0.7 data is byte-identical to the moment systemd stopped v0.7, captured by an `ExecStartPre` hook. No seed appears anywhere the bridge wrote. A second updater run is a no-op, restarts reuse the cache, and a corrupted cache self-heals. Compute and validator command lines are refused. Rollback runs v0.7.7 again on its untouched data, and reinstall bridges again with the same identity. |
 | desktop acceptance (Linux, Windows) | A line-for-line harness of the v0.7.11 app's `ensure_binary` and `NodeManager::start`, checked against the tag's source, reproduces today's stranding (HTTP 404 from the desktop-only Latest). With the bridge as Latest, the next start installs the launcher and runs the pinned node at stake 0 in a fresh directory, with the v0.7 `~/.arc` state byte-identical. Stopping the app's child stops the node (job object on Windows), and a restart reuses the verified cache. |
 | Tauri updater check (Linux job) | The v0.8 desktop `latest.json` and all four platform bundles verify with the key embedded in v0.7.11, with a version above 0.7.11. A v0.7 desktop will install it. |
 | `legacy-bridge-release-assets.yml` | `pin-release.py --check` re-derives every pin from the live release and its owner signature. The workflow builds the five launchers, verifies the desktop `latest.json`, and assembles the owner handoff with an `eligible_for_latest` verdict. |
@@ -300,27 +302,28 @@ None is automated.
 
 ### Stage 0: prerequisites (merges and a normal v0.8 release)
 
-The bridge pins arc-node v0.8.12 (`pins/active.json` and `fixtures/v0.8.12`,
-regenerated with `pin-release.py --tag v0.8.12 --bridge-version 0.7.13 --write`
-plus the release's `SHA256SUMS` and `SHA256SUMS.sig`) and uses the v0.8.12
+The bridge pins arc-node v0.8.13 (`pins/active.json` and `fixtures/v0.8.13`,
+regenerated with `pin-release.py --tag v0.8.13 --bridge-version 0.7.14 --write`
+plus the release's `SHA256SUMS` and `SHA256SUMS.sig`) and uses the v0.8.13
 desktop `latest.json` as its CI stand-in. The real `desktop_tag` for the
-handoff is the first release that contains the first-launch question (step 4):
-v0.8.12.
+handoff (step 4) is v0.8.13: it contains the first-launch question, and it
+fixes the desktop start deadlock after an unclean node exit that v0.8.12 has
+(#202).
 
 1. Merge PRs #134 (privacy-safe worker names), #135, #138 (consent switch)
    and #159 (the bridge). (All four are on main.)
 2. Cut the next v0.8 release through the normal `release.yml` pipeline. It
    stays non-latest automatically.
 3. Re-pin the bridge's node to it, in a reviewed PR:
-   `python3 scripts/legacy-bridge/pin-release.py --tag v0.8.12 --bridge-version 0.7.13 --write`.
+   `python3 scripts/legacy-bridge/pin-release.py --tag v0.8.13 --bridge-version 0.7.14 --write`.
    The generator refuses unless the release is immutable, bot-published and
    owner-signed. It sets `worker_names_privacy_safe` from the tag's source.
-   v0.8.12 carries #134, so it qualifies for the headless node.
+   v0.8.13 carries #134, so it qualifies for the headless node.
 4. Run **Legacy bridge release handoff** (`workflow_dispatch`) with
-   `desktop_tag` set to the **first release that contains the
-   first-launch question** (`legacy_upgrade::hold_at_startup`): v0.8.12.
-   v0.8.11 does not contain it, and a v0.8.11 desktop opens a v0.7 worker
-   config as a worker without asking
+   `desktop_tag` set to a **release that contains the first-launch
+   question** (`legacy_upgrade::hold_at_startup`): v0.8.13. v0.8.12 was the
+   first such release. v0.8.11 does not contain it, and a v0.8.11 desktop
+   opens a v0.7 worker config as a worker without asking
    (#138 counts a pre-question worker with a model as opted in). Proceed only
    if `legacy-bridge-provenance.json` says `"eligible_for_latest": true`,
    which requires the pinned node to keep hostnames private and the desktop
@@ -333,23 +336,23 @@ v0.7 desktop trusts, so their Check for updates would install it.
 ### Stage 1: canary as a non-latest tagged release
 
 1. Create the protected tag on the merge commit that produced the handoff:
-   `git tag v0.7.13 <commit> && git push origin v0.7.13`. The push also starts
+   `git tag v0.7.14 <commit> && git push origin v0.7.14`. The push also starts
    `release.yml`, which stops at its first step because the workspace version
-   is not 0.7.13. That failed run creates nothing and is expected.
+   is not 0.7.14. That failed run creates nothing and is expected.
 2. From the downloaded `legacy-bridge-release-handoff` artifact directory,
    publish it **not** as Latest, uploading exactly the handoff files:
 
    ```bash
-   gh release create v0.7.13 --repo FerrumVir/arc-chain --verify-tag --latest=false \
-     --title v0.7.13 --notes-file RELEASE-NOTES.md v0.7.13/*
+   gh release create v0.7.14 --repo FerrumVir/arc-chain --verify-tag --latest=false \
+     --title v0.7.14 --notes-file RELEASE-NOTES.md v0.7.14/*
    ```
 
-   The release title must be exactly `v0.7.13`.
+   The release title must be exactly `v0.7.14`.
 3. Confirm Latest did not move. This must still print the previous bridge
-   release, `v0.7.12`:
+   release, `v0.7.13`:
    `gh api repos/FerrumVir/arc-chain/releases/latest --jq .tag_name`.
 4. Compare the uploaded digests with the handoff `SHA256SUMS`:
-   `gh api repos/FerrumVir/arc-chain/releases/tags/v0.7.13 --jq '.assets[] | "\(.digest) \(.name)"'`.
+   `gh api repos/FerrumVir/arc-chain/releases/tags/v0.7.14 --jq '.assets[] | "\(.digest) \(.name)"'`.
 
 ### Stage 2: manual opt-in test on one machine
 
@@ -357,8 +360,8 @@ v0.7 desktop trusts, so their Check for updates would install it.
   prints the plan, then apply it:
 
   ```bash
-  bash scripts/legacy-bridge/canary-consume.sh --tag v0.7.13 --expect-sha256 <digest from SHA256SUMS>
-  bash scripts/legacy-bridge/canary-consume.sh --tag v0.7.13 --expect-sha256 <digest> --apply
+  bash scripts/legacy-bridge/canary-consume.sh --tag v0.7.14 --expect-sha256 <digest from SHA256SUMS>
+  bash scripts/legacy-bridge/canary-consume.sh --tag v0.7.14 --expect-sha256 <digest> --apply
   ```
 
   These are exactly the v0.7 updater's steps, plus a digest check.
@@ -382,8 +385,8 @@ v0.7 desktop trusts, so their Check for updates would install it.
 ### Stage 3: mark Latest (TJ's explicit go)
 
 ```bash
-gh release edit v0.7.13 --repo FerrumVir/arc-chain --latest
-gh api repos/FerrumVir/arc-chain/releases/latest --jq .tag_name   # v0.7.13
+gh release edit v0.7.14 --repo FerrumVir/arc-chain --latest
+gh api repos/FerrumVir/arc-chain/releases/latest --jq .tag_name   # v0.7.14
 ```
 
 From then on:
@@ -397,7 +400,7 @@ bridge.
 
 ### Monitoring (first 72 hours, then weekly)
 
-- **Downloads:** `gh api repos/FerrumVir/arc-chain/releases/tags/v0.7.13
+- **Downloads:** `gh api repos/FerrumVir/arc-chain/releases/tags/v0.7.14
   --jq '.assets[] | "\(.download_count) \(.name)"'`. Launcher downloads show
   updaters arriving; desktop launcher counts repeat because a v0.7 app
   re-fetches at every node start until it is updated. `latest.json`
@@ -410,11 +413,12 @@ bridge.
 
 ### Rollback
 
-- **Stop new bridges:** `gh release edit v0.7.12 --repo FerrumVir/arc-chain
+- **Stop new bridges:** `gh release edit v0.7.13 --repo FerrumVir/arc-chain
   --latest` returns "Latest" to the previous bridge release. Its launcher pins
-  arc-node v0.8.11 and it carries no `latest.json`, so the desktop update path
-  answers 404 again. Headless nodes that already installed the newer launcher
-  install this one at their next daily run and keep their identity and data.
+  arc-node v0.8.12, and its `latest.json` is the v0.8.12 desktop's, which has
+  the start deadlock after an unclean node exit. Headless nodes that already
+  installed the newer launcher install this one at their next daily run and
+  keep their identity and data.
   `gh release edit v0.7.11 --repo FerrumVir/arc-chain --latest` stops all
   bridging instead: already-bridged headless nodes keep running the pinned v0.8
   node, because v0.7.11 has no node assets for their updater to fetch, and
@@ -425,7 +429,8 @@ bridge.
 - **Per node:** `--legacy-bridge-rollback` (headless), or reinstall the v0.7
   app (desktop).
 - **Never** mark a v0.8 release Latest, publish a handoff whose
-  `eligible_for_latest` is false as Latest, or delete the v0.7.11 or v0.7.12 release.
+  `eligible_for_latest` is false as Latest, or delete the v0.7.11, v0.7.12 or
+  v0.7.13 release.
 
 ## Known limits
 

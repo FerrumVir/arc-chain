@@ -1,10 +1,10 @@
 [package]
 name = "arc-legacy-bridge"
 description = "One-time launcher that moves a stranded v0.7 ARC install onto a pinned, signature-verified v0.8 stake-zero node"
-# The bridge ships as GitHub release v0.7.13 under the legacy `arc-node-<platform>`
+# The bridge ships as GitHub release v0.7.14 under the legacy `arc-node-<platform>`
 # asset names, so its own version is the v0.7 line, not the workspace version.
 # `pins::tests::bridge_version_matches_crate_version` keeps the two in step.
-version = "0.7.13"
+version = "0.7.14"
 edition.workspace = true
 license.workspace = true
 publish = false
