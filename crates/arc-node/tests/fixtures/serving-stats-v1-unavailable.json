@@ -1,0 +1,22 @@
+[
+  {
+    "capacity_rejected": false,
+    "status": 503,
+    "body": {
+      "schema": "arc.community.model-stats.v1",
+      "available": false,
+      "models": [],
+      "window_secs": 60
+    }
+  },
+  {
+    "capacity_rejected": true,
+    "status": 503,
+    "body": {
+      "schema": "arc.community.model-stats.v1",
+      "available": false,
+      "models": [],
+      "window_secs": 60
+    }
+  }
+]
