@@ -18,6 +18,50 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.13 - Release-preparation snapshot (2026-10-18)
+
+> **Candidate note:** This entry records the v0.8.13 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.13.
+
+> **If your desktop is stuck at "Couldn't start arc-node":** an install
+> that shows "managed-node durability recovery failed … startup
+> reconciliation is still in progress" cannot reach this release through
+> the in-app updater, because update preparation waits behind the same
+> check. Quit ARC from its menu-bar or tray icon (**Quit ARC Node**),
+> download v0.8.13 from its GitHub release page, and install it over the
+> current app (on Windows, run the installer; on Linux, replace the
+> AppImage). Its first launch finishes the interrupted shutdown, and the
+> node then starts as usual. Nothing needs to be deleted: the wallet and
+> the node's data stay where they are.
+
+- The desktop starts its node again after the previous node stopped
+  without ARC stopping it: a crash, a forced quit, or the computer
+  restarting, logging out or losing power while the node ran. On the next
+  launch ARC runs one recovery start of that exact node, so the node can
+  replay its data and acknowledge a clean shutdown. From v0.8.0 to v0.8.12,
+  ARC's own launch-time check refused that recovery start. Start, Retry,
+  setup and in-app updates then failed on every launch (#202).
+- Real refusals still block every start, the recovery start included: a
+  legacy-data migration that is not durable, an invalid shutdown receipt,
+  or a recovery that fails. ARC never moves the node's data directory and
+  never points v0.8 at preserved v0.7 data (#202).
+- While the launch-time check runs, Start and Retry say to try again in a
+  few seconds instead of giving repair instructions. An invalid shutdown
+  receipt is reported as itself, instead of leaving "still in progress" on
+  screen for the rest of the session (#202).
+- rustls is 0.23.46 in the node and desktop lockfiles, for
+  RUSTSEC-2026-0346, -0347, -0348 and -0349 (#202).
+- `deny.toml` records owner-accepted exceptions for RUSTSEC-2026-0367,
+  -0368 and -0369 (zip) and RUSTSEC-2026-0344 (ruzstd). No release of the
+  crates that pull them in accepts the patched versions yet (#202).
+- `deny.toml` also records owner-accepted exceptions for the
+  RUSTSEC-2026-0370, -0371 and -0372 maintenance notices (zvariant,
+  zbus_names and zvariant_derive). Upstream merged those crates into
+  zbus 6. The desktop reaches them only through tauri-plugin-opener on
+  Linux and the BSDs, and no tauri-plugin-opener release accepts zbus 6
+  yet. For every exception the file gives the reasons and the removal
+  conditions, no later than the v0.9.0 dependency review (#202).
+
 ## v0.8.12 - Release-preparation snapshot (2026-10-11)
 
 > **Candidate note:** This entry records the v0.8.12 release-preparation

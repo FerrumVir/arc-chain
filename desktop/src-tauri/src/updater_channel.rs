@@ -466,7 +466,7 @@ mod tests {
 
     #[test]
     fn ignores_untrusted_or_unpublished_releases() {
-        let trusted = release("0.8.12");
+        let trusted = release("0.8.13");
         for mutate in [
             |release: &mut GithubRelease| release.draft = true,
             |release: &mut GithubRelease| release.prerelease = true,
@@ -478,26 +478,26 @@ mod tests {
             let selected = select_release(&[untrusted, trusted.clone()])
                 .unwrap()
                 .unwrap();
-            assert_eq!(selected.tag, "v0.8.12");
+            assert_eq!(selected.tag, "v0.8.13");
         }
     }
 
     #[test]
     fn rejects_tampered_required_asset_metadata() {
-        let mut bad_digest = release("0.8.12");
+        let mut bad_digest = release("0.8.13");
         bad_digest.assets[0].digest = Some("sha256:not-a-digest".into());
         assert!(select_release(&[bad_digest]).is_err());
 
-        let mut wrong_uploader = release("0.8.12");
+        let mut wrong_uploader = release("0.8.13");
         wrong_uploader.assets[0].uploader = Some(actor("attacker"));
         assert!(select_release(&[wrong_uploader]).is_err());
 
-        let mut moving_url = release("0.8.12");
+        let mut moving_url = release("0.8.13");
         moving_url.assets[0].browser_download_url =
             "https://github.com/FerrumVir/arc-chain/releases/latest/download/latest.json".into();
         assert!(select_release(&[moving_url]).is_err());
 
-        let mut duplicate = release("0.8.12");
+        let mut duplicate = release("0.8.13");
         duplicate.assets.push(duplicate.assets[0].clone());
         assert!(select_release(&[duplicate]).is_err());
     }
@@ -505,18 +505,18 @@ mod tests {
     #[test]
     fn rejects_non_strict_tags_and_ambiguous_versions() {
         for tag in [
-            "0.8.12",
+            "0.8.13",
             "v0.8",
-            "v00.8.12",
-            "v0.8.012",
-            "v0.8.12-rc.1",
-            "v0.8.12+build",
-            "v0.8.12/latest",
+            "v00.8.13",
+            "v0.8.013",
+            "v0.8.13-rc.1",
+            "v0.8.13+build",
+            "v0.8.13/latest",
         ] {
             assert_eq!(strict_release_version(tag), None, "accepted {tag}");
         }
 
-        let first = release("0.8.12");
+        let first = release("0.8.13");
         let mut duplicate = first.clone();
         duplicate.id += 100;
         assert!(select_release(&[first, duplicate]).is_err());
@@ -536,19 +536,19 @@ mod tests {
     #[test]
     fn manifest_must_bind_version_target_and_exact_tag_payload() {
         let selected =
-            validate_channel_release(&release("0.8.12"), Version::new(0, 8, 12)).unwrap();
-        let exact = release_asset_url("v0.8.12", "arc-desktop-windows-x86_64-setup.exe");
-        validate_manifest_binding("0.8.12", "windows-x86_64", &exact, &selected).unwrap();
+            validate_channel_release(&release("0.8.13"), Version::new(0, 8, 13)).unwrap();
+        let exact = release_asset_url("v0.8.13", "arc-desktop-windows-x86_64-setup.exe");
+        validate_manifest_binding("0.8.13", "windows-x86_64", &exact, &selected).unwrap();
 
         assert!(validate_manifest_binding("9.9.9", "windows-x86_64", &exact, &selected).is_err());
         assert!(validate_manifest_binding(
-            "0.8.12",
+            "0.8.13",
             "windows-x86_64",
             "https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/arc-desktop-windows-x86_64-setup.exe",
             &selected
         )
         .is_err());
-        assert!(validate_manifest_binding("0.8.12", "windows-aarch64", &exact, &selected).is_err());
+        assert!(validate_manifest_binding("0.8.13", "windows-aarch64", &exact, &selected).is_err());
     }
 
     // ---- R3/U7: signing-path FIXTURE tests --------------------------------
@@ -579,19 +579,19 @@ mod tests {
         // existing "unsupported target string" case above: both platforms
         // here are individually valid, only the pairing is wrong.
         let selected =
-            validate_channel_release(&release("0.8.12"), Version::new(0, 8, 12)).unwrap();
-        let windows_payload = release_asset_url("v0.8.12", "arc-desktop-windows-x86_64-setup.exe");
+            validate_channel_release(&release("0.8.13"), Version::new(0, 8, 13)).unwrap();
+        let windows_payload = release_asset_url("v0.8.13", "arc-desktop-windows-x86_64-setup.exe");
         assert!(
-            validate_manifest_binding("0.8.12", "darwin-aarch64", &windows_payload, &selected)
+            validate_manifest_binding("0.8.13", "darwin-aarch64", &windows_payload, &selected)
                 .is_err()
         );
 
         // The matching platform/payload pairing for the same FIXTURE release
         // still succeeds, proving the refusal above is specifically about
         // the cross-platform mismatch and not some other field.
-        let darwin_payload = release_asset_url("v0.8.12", "arc-desktop-macos-arm64.app.tar.gz");
+        let darwin_payload = release_asset_url("v0.8.13", "arc-desktop-macos-arm64.app.tar.gz");
         assert!(
-            validate_manifest_binding("0.8.12", "darwin-aarch64", &darwin_payload, &selected)
+            validate_manifest_binding("0.8.13", "darwin-aarch64", &darwin_payload, &selected)
                 .is_ok()
         );
     }
@@ -600,26 +600,26 @@ mod tests {
     fn rejects_fixture_releases_with_malformed_identity_metadata() {
         // FIXTURE: a release id of 0. GitHub never issues id 0, so this
         // stands in for a release record that was never really created.
-        let mut zero_id = release("0.8.12");
+        let mut zero_id = release("0.8.13");
         zero_id.id = 0;
         assert!(select_release(&[zero_id]).is_err());
 
         // FIXTURE: the release's own `name` does not match the
         // "ARC Chain <tag>" contract this module enforces - a tampered or
         // spoofed release title.
-        let mut wrong_name = release("0.8.12");
-        wrong_name.name = "Definitely Not ARC Chain v0.8.12".into();
+        let mut wrong_name = release("0.8.13");
+        wrong_name.name = "Definitely Not ARC Chain v0.8.13".into();
         assert!(select_release(&[wrong_name]).is_err());
 
         // FIXTURE: a commit binding that is not a full lowercase 40-hex-char
         // SHA - here, truncated.
-        let mut short_commit = release("0.8.12");
+        let mut short_commit = release("0.8.13");
         short_commit.target_commitish = "abc123".into();
         assert!(select_release(&[short_commit]).is_err());
 
         // FIXTURE: the right length, wrong case - GitHub's own API never
         // returns an uppercase commit SHA, so this is refused too.
-        let mut uppercase_commit = release("0.8.12");
+        let mut uppercase_commit = release("0.8.13");
         uppercase_commit.target_commitish = COMMIT.to_uppercase();
         assert!(select_release(&[uppercase_commit]).is_err());
     }
@@ -632,9 +632,9 @@ mod tests {
         // metadata instead of silently defaulting a safety-relevant field.
         let missing_immutable = r#"{
             "id": 1,
-            "tag_name": "v0.8.12",
+            "tag_name": "v0.8.13",
             "target_commitish": "0123456789abcdef0123456789abcdef01234567",
-            "name": "ARC Chain v0.8.12",
+            "name": "ARC Chain v0.8.13",
             "draft": false,
             "prerelease": false,
             "assets": []
