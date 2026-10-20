@@ -7,7 +7,7 @@ name: Bridge canary (scratch branch, throwaway)
 # with a recorded authorization in the config and then lets the node join the live network as a stake-0 observer (compute off, no model).
 on:
   push:
-    branches: [bridge-canary-v0713]
+    branches: [bridge-canary-v0714]
     paths:
       - bridge-canary/**
       - .github/workflows/bridge-canary.yml

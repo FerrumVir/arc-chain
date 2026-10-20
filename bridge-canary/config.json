@@ -1,16 +1,9 @@
 {
   "schema": "arc.bridge-canary.config.v1",
   "live_network": "allowed",
-  "authorization": "Recorded authorization of 2026-10-12 from the release coordinator, given under the release owner's written sign-off for the legacy bridge release: this GitHub-hosted runner may join the live network as a stake-0 observer (community mode, compute off, no model) for the duration of this canary only. The node is stopped at the end of the run.",
+  "authorization": "Recorded authorization of 2026-10-20 from the release coordinator, given under the release owner's written go for bridge release v0.7.14: this GitHub-hosted runner may join the live network as a stake-0 observer (community mode, compute off, no model) for the duration of this canary only. The node is stopped at the end of the run.",
   "registration_wait_s": 420,
   "steps": [
-    {
-      "tag": "v0.7.12",
-      "launcher_sha256": "41d92a475db819eb190b6409ac82cb3258a557980c193decc629896718a3f69e",
-      "node_tag": "v0.8.11",
-      "node_version": "0.8.11",
-      "node_sha256": "54d4d0708ae41d32958110cce9961851911c9b72ca269756cd49dfbc731e061b"
-    },
     {
       "tag": "v0.7.13",
       "launcher_sha256": "b090cf9f0a5dcd3e29b5140b206ca5a4e0892980e5a913bde7bd2947eccf481d",
@@ -19,11 +12,18 @@
       "node_sha256": "b2afa6126ee0871be275bc33f019400b4068aa387be77f8c0d2a3152a19766c6"
     },
     {
-      "tag": "v0.7.12",
-      "launcher_sha256": "41d92a475db819eb190b6409ac82cb3258a557980c193decc629896718a3f69e",
-      "node_tag": "v0.8.11",
-      "node_version": "0.8.11",
-      "node_sha256": "54d4d0708ae41d32958110cce9961851911c9b72ca269756cd49dfbc731e061b"
+      "tag": "v0.7.14",
+      "launcher_sha256": "813cc6545dc3dfcc47fd697c8bcc5acfd21e99339f45e8547c31c735a752f29c",
+      "node_tag": "v0.8.13",
+      "node_version": "0.8.13",
+      "node_sha256": "d4b19c031cf5423a8ca5ce6ddf2f3f3819b08b00032b33d00e94bf7937523f99"
+    },
+    {
+      "tag": "v0.7.13",
+      "launcher_sha256": "b090cf9f0a5dcd3e29b5140b206ca5a4e0892980e5a913bde7bd2947eccf481d",
+      "node_tag": "v0.8.12",
+      "node_version": "0.8.12",
+      "node_sha256": "b2afa6126ee0871be275bc33f019400b4068aa387be77f8c0d2a3152a19766c6"
     }
   ]
 }
