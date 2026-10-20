@@ -33,9 +33,48 @@ test.describe("start failure wording", () => {
     expect(view.title).toBe(PLAIN_COPY.startFailure.blocked.title);
     expect(view.body).toBe(PLAIN_COPY.startFailure.blocked.body);
     expect(view.action).toBe("restart-arc");
+    expect(view.detailsOpen).toBe(false);
     for (const jargon of ["migration", "reconciliation", "WAL", "legacy directory"]) {
       expect(`${view.title} ${view.body}`).not.toContain(jargon);
     }
+  });
+
+  test("a repair says so, keeps the native text open, and offers the next step", () => {
+    // A launch refusal holds until ARC restarts, so the step after the
+    // repair is a restart.
+    const migration = `${NATIVE_REFUSAL_PREFIX}legacy-data migration preflight failed: refusing protocol-v3 migration through symbolic-link data directory /Users/me/.arc. ${NATIVE_REFUSAL_ADVICE}`;
+    const refused = describeStartFailure(migration, { updateAvailable: true });
+    expect(refused.kind).toBe("needs-repair");
+    expect(refused.detailsOpen).toBe(true);
+    expect(refused.action).toBe("restart-arc");
+    expect(refused.body).toBe(PLAIN_COPY.startFailure.needsRepair.bodyThenRestart);
+    expect(`${refused.title} ${refused.body}`).not.toMatch(/cleanly|last session/);
+
+    // Outside a launch refusal a restart can't help; another try can, once
+    // the repair is made.
+    for (const raw of [
+      "another ARC desktop currently owns the managed node lifecycle for /Users/me/.arc/data-v3: Resource temporarily unavailable (os error 35)",
+      "managed data-directory parent /Volumes/arc must already exist; the installer or operator must create it before node start",
+      "cannot durably secure desktop node data directory /Users/me/.arc/data-v3: Permission denied (os error 13)",
+    ]) {
+      const view = describeStartFailure(raw, { updateAvailable: true });
+      expect(view.kind, raw).toBe("needs-repair");
+      expect(view.action, raw).toBe("try-again");
+      expect(view.body, raw).toBe(PLAIN_COPY.startFailure.needsRepair.bodyThenRetry);
+      expect(view.detailsOpen, raw).toBe(true);
+    }
+  });
+
+  test("the advice every refusal carries does not make it a repair", () => {
+    // The advice names paths and permissions; only the reason decides.
+    expect(classifyStartFailure(V0812_FIELD_ERROR)).toBe("blocked");
+    expect(
+      classifyStartFailure(
+        `${NATIVE_REFUSAL_PREFIX}managed-node durability recovery failed: recovery node exited before its WAL barrier. ${NATIVE_REFUSAL_ADVICE}`,
+      ),
+    ).toBe("blocked");
+    // "WAL" is a word, not the start of "wallet".
+    expect(classifyStartFailure("wallet operation failed")).toBe("unknown");
   });
 
   test("a ready update is the primary action, since it installs while blocked", () => {
@@ -94,14 +133,20 @@ test.describe("start failure wording", () => {
     ).toBe("unknown");
   });
 
-  test("an unrecognised failure still gets a plain sentence and an action", () => {
+  test("an unrecognised failure keeps its text open and never offers a restart", () => {
     const view = describeStartFailure("something nobody anticipated", {
       updateAvailable: false,
     });
     expect(view.kind).toBe("unknown");
     expect(view.title).toBe(PLAIN_COPY.startFailure.unknown.title);
-    expect(view.action).toBe("restart-arc");
+    expect(view.action).toBe("try-again");
+    expect(view.detailsOpen).toBe(true);
     expect(view.details).toBe("something nobody anticipated");
+    // A newer release may carry the fix for a failure nobody anticipated.
+    expect(
+      describeStartFailure("something nobody anticipated", { updateAvailable: true })
+        .action,
+    ).toBe("install-update");
   });
 
   test("the native wording it recognises is the wording the Rust side writes", () => {

@@ -266,15 +266,14 @@ fn apply_webview_config_save(store: &mut Store, mut config: NodeConfig, save: Co
     // data-move feature needs its own verified native transaction instead
     // of widening this IPC surface.
     preserve_authoritative_data_dir(&mut config, store.config.as_ref());
-    // Native-owned, like `data_dir`. A first save comes from a WebView built
-    // with the v0.8.14 default, so it already has it.
-    config.auto_install_default_applied = store
-        .config
-        .as_ref()
-        .is_none_or(|persisted| persisted.auto_install_default_applied);
     match save {
         ConfigSave::Onboarding => {
-            preserve_unsent_contribution_choices(&mut config, store.config.as_ref())
+            preserve_unsent_contribution_choices(&mut config, store.config.as_ref());
+            // The wizard never asks about unattended installs, so a re-run
+            // ("Reset onboarding") keeps the stored answer, like keep-awake.
+            if let Some(persisted) = store.config.as_ref() {
+                config.auto_install_updates = persisted.auto_install_updates;
+            }
         }
         ConfigSave::Preferences => {
             preserve_native_contribution_state(&mut config, store.config.as_ref())
@@ -652,15 +651,26 @@ pub async fn stop_node(state: State<'_, AppState>) -> CmdResult<()> {
 ///
 /// When no node runs and none may start (a start refusal, or a receipt whose
 /// recovery could not finish), there is nothing to stop. The update then takes
-/// the fenced boundary, so the release that fixes the refusal can install.
+/// the fenced boundary, so the release that fixes the refusal can install. A
+/// legacy v0.7 refusal, or a lease that can't be taken, still fails closed.
 #[tauri::command]
 pub async fn prepare_update_relaunch(state: State<'_, AppState>) -> CmdResult<()> {
-    state.cancel_startup_retry();
+    // A wait for launch reconciliation returns here, before anything is
+    // cancelled, so pressing Install while ARC recovers keeps auto-start.
     let boundary = app_update_boundary(&state).await?;
+    if boundary == AppUpdateBoundary::Ordinary {
+        state.cancel_startup_retry();
+    }
     let mut node = state.node.lock().await;
     let fenced = boundary == AppUpdateBoundary::Fenced || node.ordinary_update_boundary_is_fenced();
     let result = if fenced {
-        node.prepare_fenced_update_relaunch()
+        // Nothing runs to stop, so only a lease actually taken cancels
+        // auto-start.
+        let prepared = node.prepare_fenced_update_relaunch();
+        if prepared.is_ok() {
+            state.cancel_startup_retry();
+        }
+        prepared
     } else {
         node.prepare_update_relaunch().await
     };
@@ -722,14 +732,15 @@ pub async fn try_prepare_auto_update_relaunch(
     if boundary == AppUpdateBoundary::Fenced || node.ordinary_update_boundary_is_fenced() {
         // No node runs or may start, so there is no worker to drain and
         // nothing to resume. Without this the unattended update waited for a
-        // running node that the refusal it could fix never lets start.
-        state.cancel_startup_retry();
-        return node
-            .prepare_fenced_update_relaunch()
-            .map(|()| PrepareResult::Prepared)
-            .map_err(|error| {
-                format!("automatic update preparation requires a safe abort: {error}")
-            });
+        // running node that the refusal it could fix never lets start. Only a
+        // lease actually taken cancels auto-start.
+        let prepared = node.prepare_fenced_update_relaunch();
+        if prepared.is_ok() {
+            state.cancel_startup_retry();
+        }
+        return prepared.map(|()| PrepareResult::Prepared).map_err(|error| {
+            format!("automatic update preparation requires a safe abort: {error}")
+        });
     }
     if node.pid().is_some() {
         state.cancel_startup_retry();
@@ -6700,48 +6711,40 @@ mod compute_contribution_tests {
         assert!(!launches_as_worker(&persisted));
     }
 
-    /// A WebView never sends the unattended-install marker, so a save keeps
-    /// the stored one. Otherwise the next launch would apply the v0.8.14
-    /// default again and undo the user's "off".
+    /// The wizard never asks about unattended installs. A first run takes
+    /// the default; "Reset onboarding" keeps the stored answer, so it can't
+    /// turn an "off" back on. Only Settings changes it.
     #[test]
-    fn a_settings_save_keeps_an_unattended_install_opt_out() {
+    fn a_rerun_wizard_keeps_the_unattended_install_answer() {
         let mut store = Store::default();
         apply_webview_config_save(
             &mut store,
             config("observer", None, Some(false)),
             ConfigSave::Onboarding,
         );
-        assert!(store.config.as_ref().unwrap().auto_install_default_applied);
+        assert!(store.config.as_ref().unwrap().auto_install_updates);
 
         let off = NodeConfig {
             auto_install_updates: false,
-            auto_install_default_applied: false,
             ..config("observer", None, Some(false))
         };
         apply_webview_config_save(&mut store, off, ConfigSave::Preferences);
-        let mut persisted = store.config.clone().unwrap();
-        assert!(!persisted.auto_install_updates);
-        assert!(persisted.auto_install_default_applied);
-        assert!(!crate::auto_update::apply_unattended_install_default(
-            &mut persisted
-        ));
-        assert!(!persisted.auto_install_updates);
+        assert!(!store.config.as_ref().unwrap().auto_install_updates);
 
-        // A store from before v0.8.14 still gets its one-time default.
-        let mut older = Store {
-            config: Some(NodeConfig {
-                auto_install_updates: false,
-                auto_install_default_applied: false,
-                ..NodeConfig::default()
-            }),
-            ..Store::default()
-        };
+        // The re-run wizard submits the WebView default, which is on.
         apply_webview_config_save(
-            &mut older,
-            config("observer", None, Some(false)),
+            &mut store,
+            config("worker", Some("/m.gguf"), Some(true)),
+            ConfigSave::Onboarding,
+        );
+        assert!(!store.config.as_ref().unwrap().auto_install_updates);
+
+        apply_webview_config_save(
+            &mut store,
+            config("worker", Some("/m.gguf"), Some(true)),
             ConfigSave::Preferences,
         );
-        assert!(!older.config.as_ref().unwrap().auto_install_default_applied);
+        assert!(store.config.as_ref().unwrap().auto_install_updates);
     }
 }
 
@@ -6945,6 +6948,12 @@ mod start_fence_tests {
             assert!(body.contains("app_update_boundary(&state)"), "{name}");
             assert!(body.contains("prepare_fenced_update_relaunch()"), "{name}");
             assert!(!body.contains("require_data_migration_ready"), "{name}");
+            // A wait for launch reconciliation cancels nothing, and the fenced
+            // path cancels auto-start only once its lease is taken.
+            let boundary_at = body.find("app_update_boundary(&state)").unwrap();
+            let first_cancel = body.find("state.cancel_startup_retry()").unwrap();
+            assert!(boundary_at < first_cancel, "{name}");
+            assert!(body.contains("if prepared.is_ok() {"), "{name}");
         }
         for (name, start, end) in [
             (

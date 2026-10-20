@@ -22,7 +22,9 @@
 //! so a desktop stuck behind one could be fixed only by a manual install. The
 //! app update now passes a refusal (`app_update_boundary`): it replaces only
 //! the desktop bundle, and the new version runs its own launch-time
-//! reconciliation before it starts arc-node or replaces its binary.
+//! reconciliation before it starts arc-node or replaces its binary. A legacy
+//! v0.7 refusal, or a lifecycle lease that can't be taken, still leaves the
+//! manual install.
 //!
 //! This module depends on `std` only, so its tests also run standalone with
 //! `rustc --edition 2021 --test src/start_fence.rs`.
@@ -69,7 +71,8 @@ pub enum AppUpdateBoundary {
     /// rejected install can resume it.
     Ordinary,
     /// A refusal holds, so no node runs or may start. Nothing is stopped or
-    /// resumed; the update only takes the lifecycle lease for its install.
+    /// resumed; the update only takes the lifecycle owner lease for its
+    /// install.
     Fenced,
 }
 
@@ -119,8 +122,10 @@ fn refusal_message(reason: &str) -> String {
 /// replaced, until the previous session's data is safe. The app update does
 /// neither: it replaces only the desktop bundle. The receipt binds the exact
 /// node executable and genesis bytes, and the new version recovers with
-/// exactly those before it starts or replaces anything. So a refusal never
-/// blocks the update that may carry its fix. While launch-time
+/// exactly those before it starts or replaces anything. So the refusal
+/// itself does not block the update that may carry its fix; the fenced
+/// boundary can still fail closed on its own lease (see
+/// `NodeManager::prepare_fenced_update_relaunch`). While launch-time
 /// reconciliation still owns the node the update waits like every caller;
 /// the node's own stop limits bound that wait.
 pub fn app_update_boundary(fence: Option<&StartFence>) -> Result<AppUpdateBoundary, String> {

@@ -1195,6 +1195,176 @@ test.describe("UpdateController", () => {
     controller.dispose();
   });
 
+  test("turning unattended installs off ends an automatic wait for the last session", async () => {
+    const timers = new FakeTimers();
+    const order: string[] = [];
+    const abort = deferred<void>();
+    let prepareAttempts = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => ({
+          version: "0.8.14",
+          download: async () => {
+            order.push("download");
+          },
+          install: async () => {
+            order.push("install");
+          },
+        }),
+        tryPrepareAutoUpdateRelaunch: async () => {
+          order.push("try-prepare");
+          prepareAttempts += 1;
+          throw new Error(RECONCILING);
+        },
+        prepareRelaunch: async () => {
+          order.push("manual-prepare");
+        },
+        beginHandoff: async () => {},
+        // The native abort waits for the recovery launch to release the node.
+        abortRelaunch: () => {
+          order.push("abort");
+          return abort.promise;
+        },
+        relaunch: async () => {},
+      },
+      { startupDelayMs: 10, intervalMs: 24 * 60 * 60 * 1_000, retryDelaysMs: [] },
+      timers,
+    );
+
+    controller.setAutoChecksEnabled(true);
+    controller.setAutoInstallEnabled(true);
+    await timers.advanceBy(10);
+    expect(order).toEqual(["download", "try-prepare", "abort"]);
+    // Already says why while the abort waits.
+    expect(controller.getSnapshot().message).toContain("last session");
+    abort.resolve();
+    await timers.advanceBy(0);
+    expect(controller.getSnapshot().message).toContain("last session");
+
+    controller.setAutoInstallEnabled(false);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      message: "Version 0.8.14 is available.",
+      canInstall: true,
+    });
+    await timers.advanceBy(UPDATE_RECONCILIATION_RETRY_MS * 2);
+    expect(prepareAttempts).toBe(1);
+    controller.dispose();
+  });
+
+  test("an Install press during an automatic wait survives unattended installs turning off", async () => {
+    const timers = new FakeTimers();
+    const order: string[] = [];
+    let manualAttempts = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => ({
+          version: "0.8.14",
+          download: async () => {
+            order.push("download");
+          },
+          install: async () => {
+            order.push("install");
+          },
+        }),
+        tryPrepareAutoUpdateRelaunch: async () => {
+          order.push("try-prepare");
+          throw new Error(RECONCILING);
+        },
+        prepareRelaunch: async () => {
+          order.push("prepare");
+          manualAttempts += 1;
+          if (manualAttempts === 1) throw new Error(RECONCILING);
+        },
+        beginHandoff: async () => {
+          order.push("handoff");
+        },
+        abortRelaunch: async () => {
+          order.push("abort");
+        },
+        relaunch: async () => {
+          order.push("relaunch");
+        },
+      },
+      { startupDelayMs: 10, intervalMs: 24 * 60 * 60 * 1_000, retryDelaysMs: [] },
+      timers,
+    );
+
+    controller.setAutoChecksEnabled(true);
+    controller.setAutoInstallEnabled(true);
+    await timers.advanceBy(10);
+    await timers.advanceBy(0);
+    expect(order).toEqual(["download", "try-prepare", "abort"]);
+
+    await controller.installAvailableUpdate();
+    expect(order).toEqual(["download", "try-prepare", "abort", "prepare"]);
+    controller.setAutoInstallEnabled(false);
+    expect(controller.getSnapshot().message).toContain("last session");
+
+    await timers.advanceBy(UPDATE_RECONCILIATION_RETRY_MS);
+    await timers.advanceBy(0);
+    expect(order).toEqual([
+      "download",
+      "try-prepare",
+      "abort",
+      "prepare",
+      "prepare",
+      "handoff",
+      "install",
+      "relaunch",
+    ]);
+    controller.dispose();
+  });
+
+  test("a newer release or dispose ends a wait for the last session", async () => {
+    const timers = new FakeTimers();
+    let checks = 0;
+    let prepareAttempts = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => {
+          checks += 1;
+          return {
+            version: checks === 1 ? "0.8.14" : "0.8.15",
+            download: async () => {},
+            install: async () => {},
+          };
+        },
+        prepareRelaunch: async () => {
+          prepareAttempts += 1;
+          throw new Error(RECONCILING);
+        },
+        beginHandoff: async () => {},
+        abortRelaunch: async () => {},
+        relaunch: async () => {},
+      },
+      { startupDelayMs: 10, intervalMs: 24 * 60 * 60 * 1_000 },
+      timers,
+    );
+
+    await controller.checkForUpdates("manual");
+    await controller.installAvailableUpdate();
+    expect(prepareAttempts).toBe(1);
+
+    // The waiting 0.8.14 install never runs once 0.8.15 replaces it.
+    await controller.checkForUpdates("manual");
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      version: "0.8.15",
+    });
+    await timers.advanceBy(UPDATE_RECONCILIATION_RETRY_MS * 2);
+    expect(prepareAttempts).toBe(1);
+
+    await controller.installAvailableUpdate();
+    expect(prepareAttempts).toBe(2);
+    controller.dispose();
+    await timers.advanceBy(UPDATE_RECONCILIATION_RETRY_MS * 2);
+    expect(prepareAttempts).toBe(2);
+  });
+
   test("a refusal from native preparation is still reported as an error", async () => {
     const controller = createUpdateController({
       supported: true,

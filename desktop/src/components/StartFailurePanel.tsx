@@ -11,8 +11,10 @@ const COPIED_RESET_MS = 2_500;
 /**
  * A node that would not start, in one plain sentence with one action. The
  * native error chain stays one click away for support, behind "Show details",
- * instead of being the message. Through v0.8.13 that chain was the message,
- * and a stuck desktop showed a paragraph that repeated itself.
+ * instead of being the message; when that text is the actionable part (a
+ * repair, or an error nobody anticipated) it starts open. Through v0.8.13 the
+ * chain was the message, and a stuck desktop showed a paragraph that repeated
+ * itself.
  *
  * `onTryAgain` is for screens without their own retry button.
  */
@@ -29,7 +31,10 @@ export function StartFailurePanel({
   const updateAvailable = update.phase === "available" && update.canInstall;
   const installing = update.phase === "downloading" || update.phase === "ready";
   const view = describeStartFailure(error, { updateAvailable });
-  const [open, setOpen] = useState(false);
+  // A toggle applies to the error it was made on; a new error starts from
+  // its own default.
+  const [toggled, setToggled] = useState<{ error: string; open: boolean } | null>(null);
+  const open = toggled?.error === error ? toggled.open : view.detailsOpen;
   const [copied, setCopied] = useState<"idle" | "copied" | "failed">("idle");
   const detailsId = useId();
 
@@ -47,16 +52,18 @@ export function StartFailurePanel({
   };
 
   const copyDetails = () => {
-    navigator.clipboard.writeText(view.details).then(
-      () => setCopied("copied"),
-      () => setCopied("failed"),
-    );
+    // Without a clipboard API the call throws before returning a promise.
+    void Promise.resolve()
+      .then(() => navigator.clipboard.writeText(view.details))
+      .then(
+        () => setCopied("copied"),
+        () => setCopied("failed"),
+      );
   };
 
   const waiting = view.kind === "reconciling";
   return (
     <div
-      role={waiting ? "status" : "alert"}
       data-testid={testId}
       data-failure-kind={view.kind}
       style={{
@@ -81,13 +88,17 @@ export function StartFailurePanel({
           />
         )}
         <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontWeight: 600, marginBottom: 4 }} data-testid="start-failure-title">
-            {view.title}
-          </div>
-          <div style={{ color: "var(--text-muted)" }}>
-            {view.body}
-            {view.action === "install-update" &&
-              ` ${PLAIN_COPY.startFailure.updateReady}`}
+          {/* Only the sentence is announced. Buttons, details and progress
+              below change without re-reading it. */}
+          <div role={waiting ? "status" : "alert"}>
+            <div style={{ fontWeight: 600, marginBottom: 4 }} data-testid="start-failure-title">
+              {view.title}
+            </div>
+            <div style={{ color: "var(--text-muted)" }}>
+              {view.body}
+              {view.action === "install-update" &&
+                ` ${PLAIN_COPY.startFailure.updateReady}`}
+            </div>
           </div>
 
           <div
@@ -136,7 +147,7 @@ export function StartFailurePanel({
             <button
               type="button"
               className="btn btn-ghost btn-sm"
-              onClick={() => setOpen((value) => !value)}
+              onClick={() => setToggled({ error, open: !open })}
               aria-expanded={open}
               aria-controls={detailsId}
               data-testid="btn-start-failure-details"
@@ -158,11 +169,17 @@ export function StartFailurePanel({
             </button>
           </div>
 
+          {/* The copy result, announced on its own. */}
+          <span className="sr-only" aria-live="polite">
+            {copied === "copied"
+              ? PLAIN_COPY.actions.copied
+              : copied === "failed"
+                ? PLAIN_COPY.actions.copyFailed
+                : ""}
+          </span>
+
           {installing && update.message && (
-            <div
-              style={{ marginTop: "var(--space-2)", color: "var(--text-muted)" }}
-              role="status"
-            >
+            <div style={{ marginTop: "var(--space-2)", color: "var(--text-muted)" }}>
               {update.message}
             </div>
           )}

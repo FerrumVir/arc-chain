@@ -88,15 +88,18 @@ test.describe("Onboarding wizard", () => {
     await page.evaluate(() => {
       (window as unknown as { rejectSetupDownload: () => void }).rejectSetupDownload();
     });
-    // A plain sentence first; the native text is one click away.
+    // A plain sentence, with the native text left open: for a failure the
+    // panel does not recognise, that text is what says what went wrong.
     const failure = page.getByTestId("launch-error");
     await expect(failure.getByTestId("start-failure-title")).toBeVisible();
-    await expect(failure.getByTestId("start-failure-details")).toBeHidden();
-    await failure.getByTestId("btn-start-failure-details").click();
     await expect(failure.getByTestId("start-failure-details")).toHaveText(
       "release checksum manifest returned HTTP 404",
     );
+    // No restart is offered where it can't help; the wizard's Retry stays.
+    await expect(failure.getByTestId("btn-start-failure-restart")).toHaveCount(0);
     await expect(page.getByRole("button", { name: /retry/i })).toBeEnabled();
+    await failure.getByTestId("btn-start-failure-details").click();
+    await expect(failure.getByTestId("start-failure-details")).toBeHidden();
     await expect(page.getByTestId("dashboard")).toHaveCount(0);
   });
 

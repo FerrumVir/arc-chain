@@ -193,6 +193,11 @@ export function Onboarding() {
       // plain `saveConfig` keeps the stored contribution state once a config
       // exists (commands.rs), so a re-run wizard has to go this way.
       await api.completeOnboarding(config);
+      // The native save keeps answers the wizard never asks, such as
+      // unattended installs after "Reset onboarding". Take back what it
+      // stored so Settings and the updater see the same values.
+      const stored = await api.loadConfig().catch(() => null);
+      if (stored) setStoreConfig(stored);
 
       // 4. Start the node + wait for either real peers OR a coordinator
       //    fallback (Lite mode survives residential UDP blocks).

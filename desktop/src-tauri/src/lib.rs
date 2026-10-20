@@ -138,14 +138,16 @@ pub struct CommunityReceiptRoute {
 /// including one listening on a fallback port. It runs even when auto-start
 /// is off or migration persistence failed: those states forbid starting a
 /// node but must not leave the pre-update child alive. A stop failure is a
-/// hard updater/startup boundary; do not race two versions against one data
+/// hard startup boundary; do not race two versions against one data
 /// directory. When the previous node exited without acknowledging its final
 /// WAL barrier, it then runs the one quarantined recovery launch that clears
 /// that receipt.
 ///
-/// Every `Err` is the reason the caller keeps node start, binary replacement
-/// and updates refused until ARC restarts. No path leaves the fence to the
-/// caller's guesswork: the caller resolves it from this result alone.
+/// Every `Err` is the reason the caller keeps node start and binary
+/// replacement refused until ARC restarts. The signed app update still takes
+/// the fenced boundary past it (`start_fence::app_update_boundary`), except
+/// behind a legacy v0.7 refusal. No path leaves the fence to the caller's
+/// guesswork: the caller resolves it from this result alone.
 async fn reconcile_previous_managed_node(
     handle: &tauri::AppHandle,
     state: &AppState,
@@ -160,7 +162,7 @@ async fn reconcile_previous_managed_node(
         if let Err(error) = node.configure_managed_data_dir(&start_config.data_dir) {
             tracing::error!(
                 %error,
-                "managed-node durability receipt is invalid; blocking startup/update"
+                "managed-node durability receipt is invalid; blocking node start"
             );
             return Err(format!(
                 "managed-node startup reconciliation failed: {error}"
@@ -216,7 +218,7 @@ async fn reconcile_previous_managed_node(
         if let Err(error) = commands::recover_managed_shutdown_inner(handle, state).await {
             tracing::error!(
                 %error,
-                "quarantined managed-node replay/WAL recovery failed; blocking startup/update"
+                "quarantined managed-node replay/WAL recovery failed; blocking node start"
             );
             return Err(format!("managed-node durability recovery failed: {error}"));
         }
@@ -468,16 +470,12 @@ pub fn run() {
             if let Some(error) = startup_hold.persist_error {
                 tracing::error!(%error, "could not persist the held observer config");
             }
-            if loaded_store
-                .config
-                .as_mut()
-                .is_some_and(auto_update::apply_unattended_install_default)
+            // This launch keeps the default in memory even if persisting it
+            // fails; the next launch applies it again.
+            if let Err(error) =
+                auto_update::apply_unattended_install_default(&mut loaded_store, &resolved)
             {
-                if let Err(error) = loaded_store.save_to(&resolved) {
-                    // This launch still installs unattended; the next one
-                    // applies the default again and retries the save.
-                    tracing::error!(%error, "could not persist the unattended-update default");
-                }
+                tracing::error!(%error, "could not persist the unattended-update default");
             }
             let autostart_desired = loaded_store
                 .config

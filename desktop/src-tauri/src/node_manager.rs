@@ -2743,13 +2743,18 @@ impl NodeManager {
 
     /// The updater boundary when no node runs and none may start: behind a
     /// start refusal, or an unresolved shutdown receipt. There is nothing to
-    /// drain and nothing to resume, so this takes only the lifecycle lease
-    /// that keeps another desktop from starting a writer while the signed
-    /// bundle is replaced. It never stops, starts or replaces arc-node, and
-    /// never reads or clears the receipt: the new version's launch-time
+    /// drain and nothing to resume, so this takes only the lifecycle owner
+    /// lease that keeps another desktop from starting a writer while the
+    /// signed bundle is replaced. It never stops, starts or replaces arc-node,
+    /// and never reads or clears the receipt: the new version's launch-time
     /// reconciliation recovers with the receipt-bound executable and genesis
     /// before it starts or replaces anything, exactly as after a manual
     /// install.
+    ///
+    /// It still fails closed where the lease itself can't be taken: an
+    /// unresolved legacy v0.7 reconciliation, a data directory that was never
+    /// configured, a linked path, or another desktop holding the lease. Those
+    /// stay on the manual-install path, as in v0.8.13.
     pub fn prepare_fenced_update_relaunch(&mut self) -> anyhow::Result<()> {
         if self.update_lifecycle_lock.is_some() {
             anyhow::bail!("a signed desktop update already owns the managed-node lifecycle fence");
@@ -2770,7 +2775,15 @@ impl NodeManager {
             !self.desired_running,
             "cannot prepare an update while exact-plan crash recovery is pending; let recovery run or explicitly stop the node first"
         );
-        let lifecycle_lock = match self.lifecycle_lock.take() {
+        // The Stop path's v0.8.13 guard. A refused v0.7 migration can leave
+        // the config pointing at the preserved directory, and taking a lease
+        // there would create lock files in it and tighten its mode.
+        if let Some(error) = self.legacy_windows_stop_error.as_deref() {
+            anyhow::bail!(
+                "legacy desktop node reconciliation is unresolved; refusing the update boundary: {error}"
+            );
+        }
+        let mut lifecycle_lock = match self.lifecycle_lock.take() {
             Some(lock) => lock,
             None => {
                 let data_dir = self.managed_data_dir.as_deref().ok_or_else(|| {
@@ -2779,6 +2792,13 @@ impl NodeManager {
                 acquire_managed_lifecycle_lock_for_reconciliation(&data_dir.to_string_lossy())?
             }
         };
+        // Keep only the owner lease, as the ordinary boundary's refreshed lock
+        // does. The provisional lease also holds the blocking namespace lock,
+        // which is meant for short holds: kept for the whole install, every
+        // other acquirer (an in-process Start, another desktop's launch
+        // reconciliation) would wait on it instead of failing at the owner
+        // lock.
+        lifecycle_lock.namespace_guard = None;
         self.update_restart_was_desired = false;
         self.update_fenced = true;
         self.update_lifecycle_lock = Some(lifecycle_lock);
@@ -3022,6 +3042,8 @@ impl NodeManager {
             // The fenced boundary stopped nothing, so there is nothing to
             // resume or re-prove. Releasing the lease restores the exact
             // prior state, its refusal and unresolved receipt included.
+            // The handoff check at the top of this function must stay first.
+            debug_assert!(!self.update_handoff_started);
             self.update_lifecycle_lock = None;
             self.update_fenced = false;
             return Ok(());
@@ -5887,10 +5909,19 @@ mod tests {
         assert!(manager.ordinary_update_boundary_is_fenced());
 
         manager.prepare_fenced_update_relaunch().unwrap();
-        assert!(manager.update_lifecycle_lock.is_some());
+        // Only the owner lease is held for the install, never the blocking
+        // namespace lock: a second desktop, or a Start in this one, fails at
+        // the owner lock instead of waiting for the install to finish.
+        assert!(manager
+            .update_lifecycle_lock
+            .as_ref()
+            .is_some_and(|lock| lock.namespace_guard.is_none()));
+        // Non-blocking: the namespace lock is free for the whole install.
+        drop(arc_crypto::secret_file::try_acquire_private_directory_namespace_lock(&data).unwrap());
+        let contender = contend_for_lifecycle_lock(&configured);
         assert!(
-            acquire_managed_lifecycle_lock(&configured).is_err(),
-            "no second GUI may start a writer while the bundle is replaced"
+            contender.contains("another ARC desktop currently owns the managed node lifecycle"),
+            "{contender}"
         );
         assert!(manager.prepare_fenced_update_relaunch().is_err());
         assert!(manager.prepare_update_relaunch().await.is_err());
@@ -5903,6 +5934,18 @@ mod tests {
         assert!(manager.update_lifecycle_lock.is_none());
         assert!(manager.child.is_none());
         assert!(managed_shutdown_recovery_required(&configured).unwrap());
+
+        // A lease this manager already holds becomes the update lease.
+        manager.lifecycle_lock = Some(acquire_managed_lifecycle_lock(&configured).unwrap());
+        manager.prepare_fenced_update_relaunch().unwrap();
+        assert!(manager.lifecycle_lock.is_none());
+        let contender = contend_for_lifecycle_lock(&configured);
+        assert!(
+            contender.contains("another ARC desktop currently owns the managed node lifecycle"),
+            "{contender}"
+        );
+        manager.abort_update_relaunch().await.unwrap();
+        assert!(manager.update_lifecycle_lock.is_none());
 
         // An accepted install is one-way, as on the ordinary boundary.
         manager.prepare_fenced_update_relaunch().unwrap();
@@ -5934,6 +5977,57 @@ mod tests {
         assert!(manager.prepare_fenced_update_relaunch().is_err());
         assert!(manager.update_lifecycle_lock.is_none());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// v0.8.13's legacy guard stays. A refused v0.7 migration can leave the
+    /// config pointing at the preserved directory; the fenced boundary must
+    /// not create lock files in it or tighten its mode. That refusal stays on
+    /// the manual-install path.
+    #[test]
+    fn fenced_update_boundary_keeps_the_legacy_reconciliation_refusal() {
+        let root = resource_test_dir("fenced-update-legacy");
+        arc_crypto::secret_file::secure_private_directory_tree(&root).unwrap();
+        let preserved = root.join("arc-v07");
+        std::fs::create_dir(&preserved).unwrap();
+        let permissions = std::fs::metadata(&preserved).unwrap().permissions();
+        let configured = preserved.to_string_lossy().into_owned();
+        let mut manager = NodeManager::new();
+        manager.configure_managed_data_dir(&configured).unwrap();
+        manager.block_legacy_windows_reconciliation(
+            "legacy-data migration preflight failed: legacy data directory is a symbolic link",
+        );
+
+        let error = manager
+            .prepare_fenced_update_relaunch()
+            .expect_err("a legacy refusal must keep the update off the preserved directory");
+        assert!(error
+            .to_string()
+            .contains("legacy desktop node reconciliation is unresolved"));
+        assert!(manager.update_lifecycle_lock.is_none());
+        assert!(!preserved.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME).exists());
+        assert_eq!(
+            std::fs::metadata(&preserved).unwrap().permissions(),
+            permissions
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A contender's whole acquisition, bounded so a regression fails here
+    /// instead of hanging the suite: it must fail at the owner lock, never
+    /// wait on a lock the update holds for the whole install.
+    fn contend_for_lifecycle_lock(configured: &str) -> String {
+        let configured = configured.to_owned();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = acquire_managed_lifecycle_lock(&configured)
+                .err()
+                .map(|error| error.to_string());
+            let _ = sender.send(outcome);
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a contender must fail at the owner lock, not wait for the install")
+            .expect("a contender must not get the lease while an update holds it")
     }
 
     #[test]
