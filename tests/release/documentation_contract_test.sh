@@ -549,7 +549,7 @@ factual_candidate_copy_matches_source_and_release_gates() {
         -name '*.spec.ts' | wc -l | tr -d ' ')"
     assert_equals 25 "$desktop_spec_files" \
         'documented Playwright file inventory drifted from the current tree' || return 1
-    require_literal "$DESKTOP_README" '311 tests in' \
+    require_literal "$DESKTOP_README" '312 tests in' \
         'desktop README does not carry the audited Playwright test inventory' || return 1
     require_literal "$DESKTOP_README" '25 files.' \
         'desktop README does not carry the audited Playwright file inventory' || return 1
@@ -566,7 +566,7 @@ factual_candidate_copy_matches_source_and_release_gates() {
             CI='' ./node_modules/.bin/playwright test --list 2>/dev/null \
                 | sed -n 's/^Total: //p' | tail -n 1
         )"
-        assert_equals '311 tests in 25 files' "$playwright_inventory" \
+        assert_equals '312 tests in 25 files' "$playwright_inventory" \
             'desktop README Playwright inventory differs from playwright --list' || return 1
     fi
 

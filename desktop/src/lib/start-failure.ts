@@ -14,10 +14,11 @@ export const NATIVE_RECONCILING = "startup reconciliation is still in progress";
 
 // Something on this computer needs fixing, and the native text says what: a
 // path, a permission, a migration preflight, another desktop holding the
-// node. Checked before the durability phrases, since a permission error
-// during recovery is still a repair.
+// node, an arc-node too old for this desktop. Checked before the durability
+// phrases: a permission error during recovery is still a repair, and the
+// outdated-binary text mentions the WAL barrier it cannot prove.
 const REPAIR_PATTERN =
-  /migration preflight|could not be persisted|legacy desktop node reconciliation|legacy node reconciliation context|permission|symbolic[- ]link|not a directory|not a regular|must already exist|another ARC desktop|read-only file system|no space left/i;
+  /migration preflight|could not be persisted|legacy desktop node reconciliation|legacy node reconciliation context|permission|symbolic[- ]link|not a directory|not a regular|must already exist|another ARC desktop|read-only file system|no space left|update (?:the managed node|arc-node) before/i;
 // The previous session did not close cleanly and ARC could not finish
 // closing it.
 const DURABILITY_PATTERN =

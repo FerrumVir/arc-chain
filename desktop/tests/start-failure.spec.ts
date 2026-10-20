@@ -75,6 +75,14 @@ test.describe("start failure wording", () => {
     ).toBe("blocked");
     // "WAL" is a word, not the start of "wallet".
     expect(classifyStartFailure("wallet operation failed")).toBe("unknown");
+    // An arc-node too old for this desktop names the WAL barrier it cannot
+    // prove. That is not an unclean last session.
+    const outdated = describeStartFailure(
+      "arc-node at /Users/me/.arc/bin/arc-node lacks the authenticated durable desktop shutdown protocol; update the managed node before starting so Stop, Update, and rollback can prove its final WAL barrier",
+      { updateAvailable: false },
+    );
+    expect(outdated.kind).toBe("needs-repair");
+    expect(outdated.detailsOpen).toBe(true);
   });
 
   test("a ready update is the primary action, since it installs while blocked", () => {

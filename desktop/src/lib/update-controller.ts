@@ -562,7 +562,10 @@ export class UpdateController {
             this.setSnapshot({
               ...this.snapshot,
               phase: "available",
-              message: `Automatic installation of ${version} was deferred because native worker safety could not be confirmed. Install it manually from Settings if you choose.`,
+              // A legacy v0.7 refusal also refuses the Settings install.
+              message: /legacy desktop node reconciliation is unresolved/.test(detail)
+                ? PLAIN_COPY.updates.manualInstallOnly(version)
+                : `Automatic installation of ${version} was deferred because native worker safety could not be confirmed. Install it manually from Settings if you choose.`,
               error: detail,
               canInstall: true,
               restartRequired: false,

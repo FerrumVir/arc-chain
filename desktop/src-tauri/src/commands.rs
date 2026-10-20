@@ -297,7 +297,7 @@ async fn save_webview_config(
             .as_ref()
             .is_some_and(|config| config.auto_start);
         let dir = state.data_dir.lock().await.clone();
-        store.save_to(&dir).map_err(map_err)?;
+        persist_webview_config(&store, &dir).map_err(map_err)?;
     }
     if !auto_start {
         state.cancel_startup_retry();
@@ -314,6 +314,18 @@ async fn save_webview_config(
             let _ = autostart.disable();
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Save a WebView-submitted config. A saved config is the user's answer, so
+/// the one-time unattended-install default is then recorded as applied too:
+/// if the launch failed to record it, a Settings "off" made since must not be
+/// turned back on at the next launch. That step is best-effort.
+fn persist_webview_config(store: &Store, dir: &Path) -> anyhow::Result<()> {
+    store.save_to(dir)?;
+    if let Err(error) = crate::auto_update::record_unattended_install_default(dir) {
+        tracing::warn!(%error, "could not record the unattended-update default after a config save");
     }
     Ok(())
 }
@@ -6745,6 +6757,28 @@ mod compute_contribution_tests {
             ConfigSave::Preferences,
         );
         assert!(store.config.as_ref().unwrap().auto_install_updates);
+    }
+
+    /// The launch could not save the one-time default, so it recorded no
+    /// marker. A Settings "off" saved afterwards is the user's answer and must
+    /// survive the next launch.
+    #[test]
+    fn a_saved_settings_answer_is_never_overridden_by_the_one_time_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::default();
+        let off = NodeConfig {
+            auto_install_updates: false,
+            ..config("observer", None, Some(false))
+        };
+        apply_webview_config_save(&mut store, off, ConfigSave::Preferences);
+        persist_webview_config(&store, dir.path()).unwrap();
+
+        let mut relaunched = Store::load_from(dir.path());
+        assert!(
+            !crate::auto_update::apply_unattended_install_default(&mut relaunched, dir.path())
+                .unwrap()
+        );
+        assert!(!relaunched.config.unwrap().auto_install_updates);
     }
 }
 

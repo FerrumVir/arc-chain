@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { PLAIN_COPY } from "../src/lib/plain-copy";
 import {
   createUpdateController,
   UPDATE_RECONCILIATION_RETRY_MS,
@@ -1363,6 +1364,42 @@ test.describe("UpdateController", () => {
     controller.dispose();
     await timers.advanceBy(UPDATE_RECONCILIATION_RETRY_MS * 2);
     expect(prepareAttempts).toBe(2);
+  });
+
+  test("a legacy refusal points at the manual install, not at Settings", async () => {
+    const timers = new FakeTimers();
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => ({
+          version: "0.8.14",
+          download: async () => {},
+          install: async () => {},
+        }),
+        // The Settings install is refused the same way, so it can't be the advice.
+        tryPrepareAutoUpdateRelaunch: async () => {
+          throw new Error(
+            "automatic update preparation requires a safe abort: legacy desktop node reconciliation is unresolved; refusing the update boundary: legacy-data migration preflight failed",
+          );
+        },
+        prepareRelaunch: async () => {},
+        beginHandoff: async () => {},
+        abortRelaunch: async () => {},
+        relaunch: async () => {},
+      },
+      { startupDelayMs: 10, intervalMs: 24 * 60 * 60 * 1_000, retryDelaysMs: [] },
+      timers,
+    );
+
+    controller.setAutoChecksEnabled(true);
+    controller.setAutoInstallEnabled(true);
+    await timers.advanceBy(10);
+    await timers.advanceBy(0);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      message: PLAIN_COPY.updates.manualInstallOnly("0.8.14"),
+    });
+    controller.dispose();
   });
 
   test("a refusal from native preparation is still reported as an error", async () => {

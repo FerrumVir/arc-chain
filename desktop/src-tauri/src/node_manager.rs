@@ -2722,10 +2722,10 @@ impl NodeManager {
     }
 
     /// Whether the ordinary updater boundary is closed only by an unresolved
-    /// shutdown receipt while no owned node runs and no crash retry is
-    /// pending: a crash whose recovery could not finish. Stop refuses that
-    /// receipt by design, so the signed app update that may carry the fix
-    /// takes the fenced boundary instead.
+    /// shutdown receipt while no node runs (none owned here, none holding the
+    /// data directory) and no crash retry is pending: a crash whose recovery
+    /// could not finish. Stop refuses that receipt by design, so the signed
+    /// app update that may carry the fix takes the fenced boundary instead.
     pub fn ordinary_update_boundary_is_fenced(&self) -> bool {
         if self.child.is_some() || self.desired_running {
             return false;
@@ -2734,6 +2734,13 @@ impl NodeManager {
             return false;
         };
         if !data_dir.exists() {
+            return false;
+        }
+        // A node left running by another desktop process that has since
+        // exited also shows an armed receipt and no child here, but it is a
+        // live writer with jobs to drain: the ordinary path stops it, and an
+        // unattended update defers. The probe never waits.
+        if matches!(node_data_directory_held(data_dir), Ok(true)) {
             return false;
         }
         // An unreadable receipt closes the node as firmly as an armed one.
@@ -5957,7 +5964,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_clear_receipt_or_a_pending_crash_retry_keeps_the_ordinary_boundary() {
+    async fn a_clear_receipt_a_live_writer_or_a_pending_crash_retry_keeps_the_ordinary_boundary() {
         let root = resource_test_dir("ordinary-update-boundary");
         let data = root.join("data-v3");
         arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
@@ -5969,6 +5976,23 @@ mod tests {
         let (_control, _genesis) =
             receipt_control_for_executable(&data, &std::env::current_exe().unwrap());
         assert!(manager.ordinary_update_boundary_is_fenced());
+
+        // A healthy node orphaned by another desktop process: its receipt is
+        // armed while it runs, and it holds the data lock. It has jobs to
+        // drain, so the update must not take the fenced boundary past it.
+        let node_lock_path = data.join(".arc-node.lock");
+        arc_crypto::secret_file::durably_publish_new_private(
+            &node_lock_path,
+            b"schema=arc.node.data-lock.v1\npid=1\n",
+        )
+        .unwrap();
+        let node_lock = arc_crypto::secret_file::open_private_read_write(&node_lock_path).unwrap();
+        node_lock.try_lock_exclusive().unwrap();
+        assert!(!manager.ordinary_update_boundary_is_fenced());
+        fs2::FileExt::unlock(&node_lock).unwrap();
+        drop(node_lock);
+        assert!(manager.ordinary_update_boundary_is_fenced());
+
         manager.desired_running = true;
         assert!(
             !manager.ordinary_update_boundary_is_fenced(),

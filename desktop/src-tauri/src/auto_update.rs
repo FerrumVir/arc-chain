@@ -77,11 +77,19 @@ pub fn apply_unattended_install_default(
         // now keeps a later "off" from being undone on the next launch.
         crate::store::secure_store_directory(store_dir)?;
     }
+    record_unattended_install_default(store_dir)?;
+    Ok(changed)
+}
+
+/// Mark the default as applied without touching the config. A saved config
+/// is the user's answer, so the default must never apply over it, even when
+/// the launch that should have recorded the marker failed to save.
+pub fn record_unattended_install_default(store_dir: &Path) -> anyhow::Result<()> {
     arc_crypto::secret_file::durably_publish_new_private(
-        &marker,
+        &store_dir.join(UNATTENDED_INSTALL_DEFAULT_MARKER),
         b"arc.desktop.unattended-install-default.v1\n",
     )?;
-    Ok(changed)
+    Ok(())
 }
 
 #[cfg(test)]

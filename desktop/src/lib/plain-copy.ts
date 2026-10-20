@@ -49,6 +49,8 @@ export const PLAIN_COPY = {
   updates: {
     waitingForLastSession: (version: string) =>
       `Version ${version} installs as soon as ARC finishes closing your node's last session.`,
+    manualInstallOnly: (version: string) =>
+      `Version ${version} can't install from inside ARC on this computer. Download it from the release page and install it by hand.`,
     autoInstallDescription:
       "On by default. ARC downloads updates in the background and installs them when no jobs are running, then restarts. Updates can install even when your node can't start.",
   },
