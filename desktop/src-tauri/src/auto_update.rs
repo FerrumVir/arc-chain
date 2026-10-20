@@ -41,6 +41,20 @@ impl PrepareResult {
     }
 }
 
+/// Give a store written before v0.8.14 the unattended-install default, once.
+/// Through v0.8.13 installs waited for a click, and a desktop that never got
+/// one stayed on a release with a known fix. Afterwards the Settings switch
+/// is the user's alone. Returns whether the config changed, so the caller
+/// persists only then.
+pub fn apply_unattended_install_default(config: &mut crate::types::NodeConfig) -> bool {
+    if config.auto_install_default_applied {
+        return false;
+    }
+    config.auto_install_updates = true;
+    config.auto_install_default_applied = true;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,12 +76,42 @@ mod tests {
     }
 
     #[test]
-    fn legacy_check_consent_does_not_opt_into_installation() {
+    fn new_installs_install_signed_updates_unattended() {
         let config = crate::types::NodeConfig::default();
-        let mut stored = serde_json::to_value(config).unwrap();
-        stored.as_object_mut().unwrap().remove("autoInstallUpdates");
-        let migrated: crate::types::NodeConfig = serde_json::from_value(stored).unwrap();
-        assert!(migrated.auto_update);
-        assert!(!migrated.auto_install_updates);
+        assert!(config.auto_update);
+        assert!(config.auto_install_updates);
+        assert!(config.auto_install_default_applied);
+    }
+
+    /// Stores from v0.8.13 and earlier hold the old default, written out or
+    /// missing. They get the new default once; a later "off" sticks.
+    #[test]
+    fn older_stores_get_unattended_installs_once_and_keep_a_later_opt_out() {
+        let config = crate::types::NodeConfig::default();
+        let mut written = serde_json::to_value(config).unwrap();
+        written
+            .as_object_mut()
+            .unwrap()
+            .remove("autoInstallDefaultApplied");
+        written["autoInstallUpdates"] = false.into();
+        let mut missing = written.clone();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("autoInstallUpdates");
+
+        for stored in [written, missing] {
+            let mut migrated: crate::types::NodeConfig = serde_json::from_value(stored).unwrap();
+            assert!(!migrated.auto_install_updates);
+            assert!(apply_unattended_install_default(&mut migrated));
+            assert!(migrated.auto_update);
+            assert!(migrated.auto_install_updates);
+
+            migrated.auto_install_updates = false;
+            let mut relaunched: crate::types::NodeConfig =
+                serde_json::from_value(serde_json::to_value(&migrated).unwrap()).unwrap();
+            assert!(!apply_unattended_install_default(&mut relaunched));
+            assert!(!relaunched.auto_install_updates);
+        }
     }
 }

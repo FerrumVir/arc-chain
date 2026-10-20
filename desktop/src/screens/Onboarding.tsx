@@ -16,6 +16,7 @@ import { useAppStore } from "../lib/store";
 import { api, isTauri } from "../lib/tauri";
 import { modelDownloadStatus } from "../lib/format";
 import { LogoMark, Tagline } from "../components/Logo";
+import { StartFailurePanel } from "../components/StartFailurePanel";
 import {
   DEFAULT_NODE_CONFIG,
   type Identity,
@@ -847,31 +848,9 @@ export function Onboarding() {
                   </div>
                 )}
 
+                {/* The wizard's own Retry button below is the try-again action. */}
                 {launchError && (
-                  <div
-                    data-testid="launch-error"
-                    style={{
-                      padding: "var(--space-4)",
-                      background: "rgba(248, 113, 113, 0.08)",
-                      border: "1px solid rgba(248, 113, 113, 0.3)",
-                      borderRadius: "var(--radius-md)",
-                      marginBottom: "var(--space-4)",
-                      color: "var(--text)",
-                      fontSize: "var(--text-sm)",
-                    }}
-                  >
-                    <div style={{ fontWeight: 600, marginBottom: 4 }}>
-                      Couldn't start arc-node
-                    </div>
-                    <div
-                      style={{
-                        color: "var(--text-muted)",
-                        whiteSpace: "pre-wrap",
-                      }}
-                    >
-                      {launchError}
-                    </div>
-                  </div>
+                  <StartFailurePanel error={launchError} testId="launch-error" />
                 )}
 
                 {!launching && (

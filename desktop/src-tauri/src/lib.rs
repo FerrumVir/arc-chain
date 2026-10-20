@@ -468,6 +468,17 @@ pub fn run() {
             if let Some(error) = startup_hold.persist_error {
                 tracing::error!(%error, "could not persist the held observer config");
             }
+            if loaded_store
+                .config
+                .as_mut()
+                .is_some_and(auto_update::apply_unattended_install_default)
+            {
+                if let Err(error) = loaded_store.save_to(&resolved) {
+                    // This launch still installs unattended; the next one
+                    // applies the default again and retries the save.
+                    tracing::error!(%error, "could not persist the unattended-update default");
+                }
+            }
             let autostart_desired = loaded_store
                 .config
                 .as_ref()

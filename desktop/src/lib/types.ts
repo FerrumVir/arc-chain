@@ -163,7 +163,10 @@ export interface NodeConfig {
   autoStart: boolean;
   /** Automatically check signed app releases. */
   autoUpdate: boolean;
-  /** Install signed app releases unattended, after native worker quiescence. */
+  /**
+   * Install signed app releases unattended, after native worker quiescence.
+   * On by default from v0.8.14; native code turns it on once for older stores.
+   */
   autoInstallUpdates: boolean;
   dataDir: string;
   /** Cores the node may use. null = every logical core. */
@@ -205,7 +208,7 @@ export const DEFAULT_NODE_CONFIG: NodeConfig = {
   p2pPort: 9091,
   autoStart: true,
   autoUpdate: true,
-  autoInstallUpdates: false,
+  autoInstallUpdates: true,
   dataDir: "~/.arc/data-v3",
   workerThreads: null,
 };

@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
-import { clearState } from "./helpers";
+import { PLAIN_COPY } from "../src/lib/plain-copy";
+import { clearState, walkToLaunch } from "./helpers";
 
 test.describe("Onboarding wizard", () => {
   test.beforeEach(async ({ page }) => {
@@ -87,8 +88,51 @@ test.describe("Onboarding wizard", () => {
     await page.evaluate(() => {
       (window as unknown as { rejectSetupDownload: () => void }).rejectSetupDownload();
     });
-    await expect(page.getByText("release checksum manifest returned HTTP 404", { exact: true })).toBeVisible();
+    // A plain sentence first; the native text is one click away.
+    const failure = page.getByTestId("launch-error");
+    await expect(failure.getByTestId("start-failure-title")).toBeVisible();
+    await expect(failure.getByTestId("start-failure-details")).toBeHidden();
+    await failure.getByTestId("btn-start-failure-details").click();
+    await expect(failure.getByTestId("start-failure-details")).toHaveText(
+      "release checksum manifest returned HTTP 404",
+    );
     await expect(page.getByRole("button", { name: /retry/i })).toBeEnabled();
+    await expect(page.getByTestId("dashboard")).toHaveCount(0);
+  });
+
+  test("a node that will not start says so plainly and offers one action", async ({
+    page,
+  }) => {
+    // The refusal v0.8.12 desktops showed in the field, nested framing and all.
+    const refusal =
+      "ARC refused to start the node because chain-data migration is not safely resolved: managed-node durability recovery failed: ARC refused to start the node because chain-data migration is not safely resolved: managed-node startup reconciliation is still in progress; binary replacement and node start are temporarily blocked. Restart ARC after repairing the reported path or permissions; do not point v0.8 at the preserved legacy directory.. Restart ARC after repairing the reported path or permissions; do not point v0.8 at the preserved legacy directory.";
+    await page.addInitScript((message) => {
+      (window as unknown as { __ARC_MOCK__: Record<string, unknown> }).__ARC_MOCK__ = {
+        // A thenable rejects only when the mock returns it, like the native
+        // command's string error.
+        start_node: {
+          then: (_resolve: unknown, reject: (reason: unknown) => void) => reject(message),
+        },
+      };
+    }, refusal);
+    await page.goto("/");
+    await walkToLaunch(page);
+    await page.getByTestId("btn-launch").click();
+
+    const failure = page.getByTestId("launch-error");
+    await expect(failure.getByTestId("start-failure-title")).toHaveText(
+      PLAIN_COPY.startFailure.blocked.title,
+    );
+    await expect(failure.getByTestId("btn-start-failure-restart")).toBeVisible();
+    await expect(failure.getByTestId("start-failure-details")).toBeHidden();
+
+    await failure.getByTestId("btn-start-failure-details").click();
+    const details = failure.getByTestId("start-failure-details");
+    await expect(details).toBeVisible();
+    const text = (await details.textContent()) ?? "";
+    expect(text.split("ARC refused to start the node")).toHaveLength(2);
+    expect(text.split("Restart ARC after repairing")).toHaveLength(2);
+    await expect(failure.getByTestId("btn-start-failure-copy")).toBeVisible();
     await expect(page.getByTestId("dashboard")).toHaveCount(0);
   });
 

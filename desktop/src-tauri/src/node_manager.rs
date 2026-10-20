@@ -1229,6 +1229,11 @@ pub struct NodeManager {
     /// One-way native boundary set immediately before the updater installer is
     /// invoked. Once set, abort is forbidden even if install() rejects.
     update_handoff_started: bool,
+    /// Set while the updater boundary was taken with no node running behind a
+    /// start refusal or an unresolved shutdown receipt. Nothing was stopped,
+    /// so an abort resumes nothing and leaves the refusal and receipt as they
+    /// were.
+    update_fenced: bool,
     /// Exact compute-drain request retained across IPC cancellation. Abort
     /// must resume it before releasing app-side request ownership.
     auto_quiescence: Option<arc_crypto::secret_file::DesktopWorkerQuiescenceRequest>,
@@ -1537,6 +1542,7 @@ impl NodeManager {
             active_launch_plan: None,
             update_restart_plan: None,
             update_handoff_started: false,
+            update_fenced: false,
             auto_quiescence: None,
             managed_data_dir: None,
             durability_failure: None,
@@ -2715,6 +2721,70 @@ impl NodeManager {
         Ok(())
     }
 
+    /// Whether the ordinary updater boundary is closed only by an unresolved
+    /// shutdown receipt while no owned node runs and no crash retry is
+    /// pending: a crash whose recovery could not finish. Stop refuses that
+    /// receipt by design, so the signed app update that may carry the fix
+    /// takes the fenced boundary instead.
+    pub fn ordinary_update_boundary_is_fenced(&self) -> bool {
+        if self.child.is_some() || self.desired_running {
+            return false;
+        }
+        let Some(data_dir) = self.managed_data_dir.as_deref() else {
+            return false;
+        };
+        if !data_dir.exists() {
+            return false;
+        }
+        // An unreadable receipt closes the node as firmly as an armed one.
+        arc_crypto::secret_file::desktop_shutdown_lifecycle_state(data_dir)
+            .map_or(true, |state| !state.is_clear())
+    }
+
+    /// The updater boundary when no node runs and none may start: behind a
+    /// start refusal, or an unresolved shutdown receipt. There is nothing to
+    /// drain and nothing to resume, so this takes only the lifecycle lease
+    /// that keeps another desktop from starting a writer while the signed
+    /// bundle is replaced. It never stops, starts or replaces arc-node, and
+    /// never reads or clears the receipt: the new version's launch-time
+    /// reconciliation recovers with the receipt-bound executable and genesis
+    /// before it starts or replaces anything, exactly as after a manual
+    /// install.
+    pub fn prepare_fenced_update_relaunch(&mut self) -> anyhow::Result<()> {
+        if self.update_lifecycle_lock.is_some() {
+            anyhow::bail!("a signed desktop update already owns the managed-node lifecycle fence");
+        }
+        anyhow::ensure!(
+            !self.update_handoff_started && self.update_restart_plan.is_none(),
+            "a prior desktop update lifecycle transaction is unresolved"
+        );
+        anyhow::ensure!(
+            self.auto_quiescence.is_none(),
+            "a previous worker drain requires abort"
+        );
+        anyhow::ensure!(
+            self.child.is_none(),
+            "the managed node is still running; quit ARC from the tray and reopen it before updating"
+        );
+        anyhow::ensure!(
+            !self.desired_running,
+            "cannot prepare an update while exact-plan crash recovery is pending; let recovery run or explicitly stop the node first"
+        );
+        let lifecycle_lock = match self.lifecycle_lock.take() {
+            Some(lock) => lock,
+            None => {
+                let data_dir = self.managed_data_dir.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("managed node data directory is not configured")
+                })?;
+                acquire_managed_lifecycle_lock_for_reconciliation(&data_dir.to_string_lossy())?
+            }
+        };
+        self.update_restart_was_desired = false;
+        self.update_fenced = true;
+        self.update_lifecycle_lock = Some(lifecycle_lock);
+        Ok(())
+    }
+
     /// Pause actual worker execution before an unattended lifecycle stop.
     /// Older nodes ignore the separate control file and are deferred, never
     /// mistaken for idle by looking at a public health response.
@@ -2946,6 +3016,14 @@ impl NodeManager {
         );
         self.resume_auto_update_worker().await?;
         if self.update_lifecycle_lock.is_none() {
+            return Ok(());
+        }
+        if self.update_fenced {
+            // The fenced boundary stopped nothing, so there is nothing to
+            // resume or re-prove. Releasing the lease restores the exact
+            // prior state, its refusal and unresolved receipt included.
+            self.update_lifecycle_lock = None;
+            self.update_fenced = false;
             return Ok(());
         }
         anyhow::ensure!(
@@ -5781,6 +5859,80 @@ mod tests {
         // Process exit is the only release after handoff.
         drop(manager);
         drop(acquire_managed_lifecycle_lock(&configured).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The state behind the stuck reports: the previous node never
+    /// acknowledged its final WAL barrier, and no node runs. Stop and the
+    /// ordinary update boundary refuse that receipt by design. The fenced
+    /// boundary lets the signed app update through without stopping,
+    /// starting or clearing anything.
+    #[tokio::test]
+    async fn fenced_update_boundary_passes_an_unresolved_receipt_and_leaves_it_armed() {
+        let root = resource_test_dir("fenced-update-boundary");
+        let data = root.join("data-v3");
+        let (_control, _genesis) =
+            receipt_control_for_executable(&data, &std::env::current_exe().unwrap());
+        let configured = data.to_string_lossy().into_owned();
+        let mut manager = NodeManager::new();
+        manager.configure_managed_data_dir(&configured).unwrap();
+        assert!(managed_shutdown_recovery_required(&configured).unwrap());
+
+        let error = manager
+            .prepare_update_relaunch()
+            .await
+            .expect_err("the ordinary boundary still refuses an unresolved receipt");
+        assert!(is_managed_durability_recovery_required(&error));
+        assert!(manager.update_lifecycle_lock.is_none());
+        assert!(manager.ordinary_update_boundary_is_fenced());
+
+        manager.prepare_fenced_update_relaunch().unwrap();
+        assert!(manager.update_lifecycle_lock.is_some());
+        assert!(
+            acquire_managed_lifecycle_lock(&configured).is_err(),
+            "no second GUI may start a writer while the bundle is replaced"
+        );
+        assert!(manager.prepare_fenced_update_relaunch().is_err());
+        assert!(manager.prepare_update_relaunch().await.is_err());
+        assert!(manager.child.is_none());
+        assert!(managed_shutdown_recovery_required(&configured).unwrap());
+
+        // A rejected install releases only the lease. The receipt stays armed
+        // for the new version's own recovery launch.
+        manager.abort_update_relaunch().await.unwrap();
+        assert!(manager.update_lifecycle_lock.is_none());
+        assert!(manager.child.is_none());
+        assert!(managed_shutdown_recovery_required(&configured).unwrap());
+
+        // An accepted install is one-way, as on the ordinary boundary.
+        manager.prepare_fenced_update_relaunch().unwrap();
+        manager.begin_update_handoff().unwrap();
+        assert!(manager.abort_update_relaunch().await.is_err());
+        assert!(manager.update_lifecycle_lock.is_some());
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_clear_receipt_or_a_pending_crash_retry_keeps_the_ordinary_boundary() {
+        let root = resource_test_dir("ordinary-update-boundary");
+        let data = root.join("data-v3");
+        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        let configured = data.to_string_lossy().into_owned();
+        let mut manager = NodeManager::new();
+        manager.configure_managed_data_dir(&configured).unwrap();
+        assert!(!manager.ordinary_update_boundary_is_fenced());
+
+        let (_control, _genesis) =
+            receipt_control_for_executable(&data, &std::env::current_exe().unwrap());
+        assert!(manager.ordinary_update_boundary_is_fenced());
+        manager.desired_running = true;
+        assert!(
+            !manager.ordinary_update_boundary_is_fenced(),
+            "a pending crash retry keeps its own deferral"
+        );
+        assert!(manager.prepare_fenced_update_relaunch().is_err());
+        assert!(manager.update_lifecycle_lock.is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 

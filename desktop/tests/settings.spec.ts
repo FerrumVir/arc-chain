@@ -92,11 +92,13 @@ test.describe("Settings", () => {
     await expect(page.getByTestId("btn-check-update")).toBeEnabled();
   });
 
-  test("unattended installs are a separate opt-in and default off", async ({
+  test("unattended installs default on and can be turned off", async ({
     page,
   }) => {
     // Persisted desktop preferences from older releases have no separate
-    // auto-install bit. Missing values must hydrate as disabled.
+    // auto-install bit. From v0.8.14 a missing value hydrates as the new
+    // default (native code also turns it on once for older stores), so a
+    // fix reaches the desktop without a click.
     await page.addInitScript(() => {
       const raw = localStorage.getItem("arc-desktop-state-v1");
       if (!raw) return;
@@ -107,28 +109,29 @@ test.describe("Settings", () => {
     await page.goto("/");
     await page.getByTestId("nav-settings").click();
     const autoInstall = page.getByTestId("toggle-autoinstall-updates");
-    await expect(autoInstall).not.toBeChecked();
+    await expect(autoInstall).toBeChecked();
     await expect(page.getByTestId("update-policy")).toContainText(
-      "Background checks never install an update",
+      "may install and restart ARC automatically",
     );
 
-    await autoInstall.check();
+    // Turning it off still sticks, and checking stays on.
+    await autoInstall.uncheck();
     await expect(page.getByTestId("update-policy")).toContainText(
       "Save settings to apply automatic update preferences",
     );
     await page.getByTestId("btn-save-settings").click();
     await expect(page.getByTestId("btn-save-settings")).toContainText("Saved");
     await expect(page.getByTestId("update-policy")).toContainText(
-      "may install and restart ARC automatically",
+      "Background checks never install an update",
     );
 
     const persistedAutoInstall = await page.evaluate(() => {
       const raw = localStorage.getItem("arc-desktop-state-v1");
       return raw ? JSON.parse(raw).config?.autoInstallUpdates : null;
     });
-    expect(persistedAutoInstall).toBe(true);
+    expect(persistedAutoInstall).toBe(false);
     await expect(page.getByTestId("toggle-autoupdate")).toBeChecked();
-    await expect(autoInstall).toBeChecked();
+    await expect(autoInstall).not.toBeChecked();
   });
 
   test("p2p port is its own field, not RPC + 1", async ({ page }) => {

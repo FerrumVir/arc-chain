@@ -1,5 +1,5 @@
 use crate::node_manager::{managed_binary_path, TestnetResources};
-use crate::start_fence::StartAccess;
+use crate::start_fence::{AppUpdateBoundary, StartAccess};
 use crate::types::*;
 use crate::{hardware, identity, paths, rpc_client, store::Store, AppState, CommunityReceiptRoute};
 use fs2::FileExt as _;
@@ -266,6 +266,12 @@ fn apply_webview_config_save(store: &mut Store, mut config: NodeConfig, save: Co
     // data-move feature needs its own verified native transaction instead
     // of widening this IPC surface.
     preserve_authoritative_data_dir(&mut config, store.config.as_ref());
+    // Native-owned, like `data_dir`. A first save comes from a WebView built
+    // with the v0.8.14 default, so it already has it.
+    config.auto_install_default_applied = store
+        .config
+        .as_ref()
+        .is_none_or(|persisted| persisted.auto_install_default_applied);
     match save {
         ConfigSave::Onboarding => {
             preserve_unsent_contribution_choices(&mut config, store.config.as_ref())
@@ -600,6 +606,16 @@ async fn require_start_fence(state: &AppState, access: StartAccess) -> Result<()
     crate::start_fence::check(fence.as_ref(), access)
 }
 
+/// Which boundary the desktop's own signed app update takes. A start refusal
+/// closes node starts and binary replacement, never the update that may carry
+/// its fix (`start_fence::app_update_boundary`). The fence leaves the
+/// in-progress state at most once, and a refusal holds until ARC restarts,
+/// so the boundary read here cannot go stale before the node lock is taken.
+async fn app_update_boundary(state: &AppState) -> Result<AppUpdateBoundary, String> {
+    let fence = state.data_migration_error.lock().await.clone();
+    crate::start_fence::app_update_boundary(fence.as_ref())
+}
+
 /// The fence check for every WebView entrypoint and auto-start.
 async fn require_data_migration_ready(state: &AppState) -> Result<(), String> {
     require_start_fence(state, StartAccess::Ordinary).await
@@ -633,24 +649,35 @@ pub async fn stop_node(state: State<'_, AppState>) -> CmdResult<()> {
 /// desktop can see a healthy old node and silently keep using an incompatible
 /// protocol. A failed stop blocks download/install instead of pretending the
 /// boundary is safe.
+///
+/// When no node runs and none may start (a start refusal, or a receipt whose
+/// recovery could not finish), there is nothing to stop. The update then takes
+/// the fenced boundary, so the release that fixes the refusal can install.
 #[tauri::command]
 pub async fn prepare_update_relaunch(state: State<'_, AppState>) -> CmdResult<()> {
     state.cancel_startup_retry();
-    require_data_migration_ready(&state).await?;
+    let boundary = app_update_boundary(&state).await?;
     let mut node = state.node.lock().await;
-    node.prepare_update_relaunch()
-        .await
+    let fenced = boundary == AppUpdateBoundary::Fenced || node.ordinary_update_boundary_is_fenced();
+    let result = if fenced {
+        node.prepare_fenced_update_relaunch()
+    } else {
+        node.prepare_update_relaunch().await
+    };
+    result
         .map_err(|error| format!("could not establish the native update lifecycle fence: {error}"))
 }
 
 /// Unattended updates require separate saved consent, idle app-side writes,
-/// and an authenticated compute drain from the exact managed child.
+/// and an authenticated compute drain from the exact managed child. When no
+/// node runs and none may start, there is no child to drain, and the update
+/// takes the fenced boundary.
 #[tauri::command]
 pub async fn try_prepare_auto_update_relaunch(
     state: State<'_, AppState>,
 ) -> CmdResult<crate::auto_update::PrepareResult> {
     use crate::auto_update::{PrepareResult, RequestFence};
-    require_data_migration_ready(&state).await?;
+    let boundary = app_update_boundary(&state).await?;
     if !update_install_policy().await?.can_install {
         return Ok(PrepareResult::busy(
             "This installation is updated by its package manager",
@@ -692,6 +719,18 @@ pub async fn try_prepare_auto_update_relaunch(
             0,
         ));
     };
+    if boundary == AppUpdateBoundary::Fenced || node.ordinary_update_boundary_is_fenced() {
+        // No node runs or may start, so there is no worker to drain and
+        // nothing to resume. Without this the unattended update waited for a
+        // running node that the refusal it could fix never lets start.
+        state.cancel_startup_retry();
+        return node
+            .prepare_fenced_update_relaunch()
+            .map(|()| PrepareResult::Prepared)
+            .map_err(|error| {
+                format!("automatic update preparation requires a safe abort: {error}")
+            });
+    }
     if node.pid().is_some() {
         state.cancel_startup_retry();
     }
@@ -6660,6 +6699,50 @@ mod compute_contribution_tests {
         assert_eq!(persisted.prevent_sleep_during_jobs, Some(true));
         assert!(!launches_as_worker(&persisted));
     }
+
+    /// A WebView never sends the unattended-install marker, so a save keeps
+    /// the stored one. Otherwise the next launch would apply the v0.8.14
+    /// default again and undo the user's "off".
+    #[test]
+    fn a_settings_save_keeps_an_unattended_install_opt_out() {
+        let mut store = Store::default();
+        apply_webview_config_save(
+            &mut store,
+            config("observer", None, Some(false)),
+            ConfigSave::Onboarding,
+        );
+        assert!(store.config.as_ref().unwrap().auto_install_default_applied);
+
+        let off = NodeConfig {
+            auto_install_updates: false,
+            auto_install_default_applied: false,
+            ..config("observer", None, Some(false))
+        };
+        apply_webview_config_save(&mut store, off, ConfigSave::Preferences);
+        let mut persisted = store.config.clone().unwrap();
+        assert!(!persisted.auto_install_updates);
+        assert!(persisted.auto_install_default_applied);
+        assert!(!crate::auto_update::apply_unattended_install_default(
+            &mut persisted
+        ));
+        assert!(!persisted.auto_install_updates);
+
+        // A store from before v0.8.14 still gets its one-time default.
+        let mut older = Store {
+            config: Some(NodeConfig {
+                auto_install_updates: false,
+                auto_install_default_applied: false,
+                ..NodeConfig::default()
+            }),
+            ..Store::default()
+        };
+        apply_webview_config_save(
+            &mut older,
+            config("observer", None, Some(false)),
+            ConfigSave::Preferences,
+        );
+        assert!(!older.config.as_ref().unwrap().auto_install_default_applied);
+    }
 }
 
 #[cfg(test)]
@@ -6667,8 +6750,12 @@ mod start_fence_tests {
     //! The launch-time start fence through `AppState`: the v0.8.12 deadlock,
     //! where startup's recovery launch refused itself, and the transitions
     //! that replace it.
-    use super::{require_data_migration_ready, require_start_fence, StartTransaction};
-    use crate::start_fence::{after_startup_reconciliation, at_launch, StartAccess, StartFence};
+    use super::{
+        app_update_boundary, require_data_migration_ready, require_start_fence, StartTransaction,
+    };
+    use crate::start_fence::{
+        after_startup_reconciliation, at_launch, AppUpdateBoundary, StartAccess, StartFence,
+    };
     use crate::AppState;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -6798,5 +6885,82 @@ mod start_fence_tests {
         );
         assert!(gate.contains("StartAccess::Ordinary"));
         assert!(!gate.contains("StartupRecovery"));
+    }
+
+    /// The trap behind the stuck reports: a refusal closed the app update
+    /// too, so the release with the fix could not install. The update now
+    /// takes the fenced boundary while Start, auto-start, Restart and Ensure
+    /// binary keep refusing.
+    #[tokio::test]
+    async fn a_refusal_lets_the_app_update_through_and_keeps_node_starts_closed() {
+        let state = state_with(Some(at_launch(None)));
+        *state.data_migration_error.lock().await = after_startup_reconciliation(Err(
+            "managed-node durability recovery failed: recovery node exited before its WAL barrier"
+                .into(),
+        ));
+        assert_eq!(
+            app_update_boundary(&state).await,
+            Ok(AppUpdateBoundary::Fenced)
+        );
+        assert!(require_data_migration_ready(&state).await.is_err());
+        assert!(
+            require_start_fence(&state, StartTransaction::Start.fence_access())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_app_update_waits_for_startup_reconciliation_then_opens() {
+        let state = state_with(Some(at_launch(None)));
+        let error = app_update_boundary(&state).await.unwrap_err();
+        assert!(error.contains("startup reconciliation is still in progress"));
+
+        *state.data_migration_error.lock().await = after_startup_reconciliation(Ok(()));
+        assert_eq!(
+            app_update_boundary(&state).await,
+            Ok(AppUpdateBoundary::Ordinary)
+        );
+    }
+
+    /// Pin which rule each entrypoint uses: the two app-update entrypoints
+    /// pass a refusal, and nothing that starts arc-node or replaces its
+    /// binary does.
+    #[test]
+    fn only_the_app_update_entrypoints_pass_a_refusal() {
+        let source = include_str!("commands.rs");
+        for (name, start, end) in [
+            (
+                "prepare_update_relaunch",
+                "pub async fn prepare_update_relaunch(",
+                "/// Unattended updates require",
+            ),
+            (
+                "try_prepare_auto_update_relaunch",
+                "pub async fn try_prepare_auto_update_relaunch(",
+                "/// Seal the one-way native updater boundary",
+            ),
+        ] {
+            let body = body_between(source, start, end);
+            assert!(body.contains("app_update_boundary(&state)"), "{name}");
+            assert!(body.contains("prepare_fenced_update_relaunch()"), "{name}");
+            assert!(!body.contains("require_data_migration_ready"), "{name}");
+        }
+        for (name, start, end) in [
+            (
+                "ensure_binary",
+                "pub async fn ensure_binary(",
+                "fn installed(",
+            ),
+            (
+                "restart_node",
+                "pub async fn restart_node(",
+                "pub(crate) async fn restart_node_inner(",
+            ),
+        ] {
+            let body = body_between(source, start, end);
+            assert!(body.contains("require_data_migration_ready"), "{name}");
+            assert!(!body.contains("app_update_boundary"), "{name}");
+        }
     }
 }

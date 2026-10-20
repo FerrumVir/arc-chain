@@ -1,8 +1,12 @@
 import type { AutoUpdatePrepareResult } from "./types";
+import { PLAIN_COPY } from "./plain-copy";
+import { isStartupReconciliationInProgress } from "./start-failure";
 
 export const UPDATE_STARTUP_DELAY_MS = 5_000;
 export const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1_000;
 export const UPDATE_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 15 * 60_000] as const;
+/** How often a verified update retries while launch reconciliation runs. */
+export const UPDATE_RECONCILIATION_RETRY_MS = 60_000;
 
 export type UpdatePhase =
   | "idle"
@@ -136,6 +140,7 @@ export class UpdateController {
   private intervalTimer: unknown | null = null;
   private retryTimer: unknown | null = null;
   private autoInstallRetryTimer: unknown | null = null;
+  private reconciliationRetryTimer: unknown | null = null;
   private automaticFailureCount = 0;
   private autoInstallDeferralCount = 0;
   private autoChecksEnabled = false;
@@ -265,6 +270,7 @@ export class UpdateController {
         this.candidate = next;
         if (previous && previous !== next) {
           this.clearAutoInstallRetryTimer();
+          this.clearReconciliationRetryTimer();
           this.autoInstallDeferralCount = 0;
           if (this.downloadedCandidate === previous) {
             this.downloadedCandidate = null;
@@ -517,6 +523,9 @@ export class UpdateController {
               });
               return this.snapshot;
             }
+            if (isStartupReconciliationInProgress(detail)) {
+              return this.waitForLastSession(candidate, version, true);
+            }
             this.setSnapshot({
               ...this.snapshot,
               phase: "available",
@@ -666,6 +675,9 @@ export class UpdateController {
           });
           return this.snapshot;
         }
+        if (isStartupReconciliationInProgress(detail)) {
+          return this.waitForLastSession(candidate, version, false);
+        }
         this.setSnapshot({
           ...this.snapshot,
           phase: "error",
@@ -689,6 +701,7 @@ export class UpdateController {
   dispose(): void {
     this.setAutoInstallEnabled(false);
     this.clearTimers();
+    this.clearReconciliationRetryTimer();
     this.autoChecksEnabled = false;
     const candidate = this.candidate;
     this.candidate = null;
@@ -722,6 +735,47 @@ export class UpdateController {
       this.timers.clearTimeout(this.autoInstallRetryTimer);
       this.autoInstallRetryTimer = null;
     }
+  }
+
+  // Not part of clearTimers: a settings save re-enables background checks,
+  // and must not drop an install the user already asked for.
+  private clearReconciliationRetryTimer(): void {
+    if (this.reconciliationRetryTimer !== null) {
+      this.timers.clearTimeout(this.reconciliationRetryTimer);
+      this.reconciliationRetryTimer = null;
+    }
+  }
+
+  /**
+   * Launch-time reconciliation still owns the node, possibly mid-way through
+   * a WAL replay. Never interrupt it: keep the verified candidate and try the
+   * same install again on a fixed cadence. Once reconciliation ends, native
+   * preparation either stops the node as usual or, behind a start refusal,
+   * takes the fenced boundary, so the wait ends in the install.
+   */
+  private waitForLastSession(
+    candidate: UpdateCandidate,
+    version: string,
+    automatic: boolean,
+  ): UpdateSnapshot {
+    this.setSnapshot({
+      ...this.snapshot,
+      phase: "available",
+      version,
+      message: PLAIN_COPY.updates.waitingForLastSession(version),
+      error: null,
+      canInstall: true,
+      restartRequired: false,
+    });
+    if (this.reconciliationRetryTimer === null) {
+      this.reconciliationRetryTimer = this.timers.setTimeout(() => {
+        this.reconciliationRetryTimer = null;
+        if (this.candidate !== candidate) return;
+        if (automatic) void this.installAutomatically(candidate);
+        else void this.startInstall(null);
+      }, UPDATE_RECONCILIATION_RETRY_MS);
+    }
+    return this.snapshot;
   }
 
   private isAutoInstallCurrent(generation: number | null): boolean {
