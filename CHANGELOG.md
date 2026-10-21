@@ -59,6 +59,10 @@ All notable changes to ARC Chain are tracked here. This project follows
   verification could accept distrusted intermediates), and webpki-roots and
   webpki-root-certs 1.0.10 (RUSTSEC-2026-0381, -0383, bundled roots that
   trusted distrusted emSign intermediates), in the node, CLI and desktop.
+- Security: the desktop's build tool vite moves to 8.2.4
+  (GHSA-698v-4r3x-3vcv, GHSA-r825-w8mm-5pxw, GHSA-587h-7wmj-h5pm, in the
+  editor launcher of vite's development server, which is not part of the
+  shipped app) (#207).
 
 ## v0.8.13 - Release-preparation snapshot (2026-10-18)
 
