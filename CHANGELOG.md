@@ -29,10 +29,13 @@ All notable changes to ARC Chain are tracked here. This project follows
   from inside the app. The update replaces only the app: it never starts,
   stops or replaces arc-node, never touches the node's shutdown receipt,
   and waits while the launch-time check is still running. Node starts,
-  the recovery start and node-binary replacement stay refused (#205).
+  the recovery start and node-binary replacement stay refused. A refused
+  v0.7 data migration still needs a manual install (#205).
 - Signed app updates install automatically by default. Desktops from
-  v0.8.13 and earlier are switched on once; Settings can turn it off again,
-  and that choice is kept. This takes effect from v0.8.14 on: v0.8.12 and
+  v0.8.13 and earlier are switched on once, including where it had been
+  turned off; Settings can turn it off again, and that choice is kept. Linux
+  .deb and .rpm installs still update through their package manager. This
+  takes effect from v0.8.14 on: v0.8.12 and
   v0.8.13 desktops still need one click (Settings → Install) or a manual
   install to reach it (#205).
 - A node that can't start is reported as one plain sentence with one
@@ -51,6 +54,10 @@ All notable changes to ARC Chain are tracked here. This project follows
   phrase step and the choice to run AI jobs are unchanged (#205).
 - The legacy bridge pins arc-node v0.8.13 (bridge release v0.7.14), so v0.7
   installs that update move to v0.8.13 instead of v0.8.12 (#204).
+- Security: rustls-webpki 0.103.16 (RUSTSEC-2026-0382, certificate
+  verification could accept distrusted intermediates), and webpki-roots and
+  webpki-root-certs 1.0.10 (RUSTSEC-2026-0381, -0383, bundled roots that
+  trusted distrusted emSign intermediates), in the node, CLI and desktop.
 
 ## v0.8.13 - Release-preparation snapshot (2026-10-18)
 
