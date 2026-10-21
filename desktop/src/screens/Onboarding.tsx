@@ -17,6 +17,7 @@ import { api, isTauri } from "../lib/tauri";
 import { modelDownloadStatus } from "../lib/format";
 import { LogoMark, Tagline } from "../components/Logo";
 import { StartFailurePanel } from "../components/StartFailurePanel";
+import { PLAIN_COPY } from "../lib/plain-copy";
 import {
   DEFAULT_NODE_CONFIG,
   type Identity,
@@ -77,6 +78,12 @@ export function Onboarding() {
   const [modelProgress, setModelProgress] =
     useState<ModelDownloadProgress | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
+  // The wizard's answers, and whether native code has saved them. "Continue
+  // to ARC" after a failed start saves them first if needed, so ARC opens on
+  // Home next time too.
+  const [pendingConfig, setPendingConfig] = useState<NodeConfig | null>(null);
+  const [setupSaved, setSetupSaved] = useState(false);
+  const [continuing, setContinuing] = useState(false);
 
   // Connecting stage: elapsed time + which seed was reached
   const [connectElapsed, setConnectElapsed] = useState(0);
@@ -86,6 +93,7 @@ export function Onboarding() {
   const setOnboarded = useAppStore((s) => s.setOnboarded);
   const setStoreIdentity = useAppStore((s) => s.setIdentity);
   const setStoreConfig = useAppStore((s) => s.setConfig);
+  const setRoute = useAppStore((s) => s.setRoute);
 
   const stepIndex = STEPS.indexOf(step);
   const next = () => setStep(STEPS[Math.min(stepIndex + 1, STEPS.length - 1)]);
@@ -155,6 +163,15 @@ export function Onboarding() {
 
     const tier = selectedTier ?? recommendedTier;
     const wantsModel = tier !== "skip";
+    // Saved by "Continue to ARC" if the start fails before the native save.
+    // A "yes" to running jobs is kept even without the model yet: native code
+    // finishes a consented install when the node next starts.
+    setPendingConfig({
+      ...DEFAULT_NODE_CONFIG,
+      role: "observer",
+      modelPath: null,
+      computeConsent: wantsModel,
+    });
 
     try {
       // 1. Download the exact production-compatible 7B artifact if selected;
@@ -185,6 +202,7 @@ export function Onboarding() {
         computeConsent: modelPath !== null,
       };
       setStoreConfig(config);
+      setPendingConfig(config);
 
       // 3. Download the arc-node binary if it isn't already there.
       setLaunchStage("downloading");
@@ -193,6 +211,7 @@ export function Onboarding() {
       // plain `saveConfig` keeps the stored contribution state once a config
       // exists (commands.rs), so a re-run wizard has to go this way.
       await api.completeOnboarding(config);
+      setSetupSaved(true);
       // The native save keeps answers the wizard never asks, such as
       // unattended installs after "Reset onboarding". Take back what it
       // stored so Settings and the updater see the same values.
@@ -220,6 +239,7 @@ export function Onboarding() {
         // The finish line used to be skipped: onboarding ended in the same tick the confirmation would have shown.
         await new Promise((resolve) => setTimeout(resolve, CONNECTED_PAUSE_MS));
       }
+      setRoute("inference");
       setOnboarded(true);
     } catch (err) {
       if (connectTimerRef.current) {
@@ -237,6 +257,27 @@ export function Onboarding() {
       setLaunchStage("idle");
     }
   };
+
+  // Setup never traps: the chat and wallet work without the node, and the
+  // strip on Home carries the node's fix. The answers are saved first if the
+  // failure came before the native save.
+  const continueToArc = async () => {
+    setContinuing(true);
+    if (!setupSaved && pendingConfig) {
+      try {
+        await api.completeOnboarding(pendingConfig);
+        const stored = await api.loadConfig().catch(() => null);
+        setStoreConfig(stored ?? pendingConfig);
+      } catch {
+        setStoreConfig(pendingConfig);
+      }
+    }
+    setRoute("inference");
+    setOnboarded(true);
+  };
+
+  const launchTier = tiers.find((tier) => tier.id === (selectedTier ?? recommendedTier));
+  const launchModelSize = launchTier ? formatBytes(launchTier.sizeBytes) : null;
 
   return (
     <div className="onboarding" data-testid="onboarding">
@@ -271,11 +312,8 @@ export function Onboarding() {
                   <LogoMark size={84} radius={20} variant="gradient" />
                   <Tagline size="md" />
                 </div>
-                <h1 className="onboarding-title">Welcome to Arc</h1>
-                <p className="onboarding-subtitle">
-                  Run a node on your machine. Offer compatible compute. Verify
-                  every result and reward from the selected chain host.
-                </p>
+                <h1 className="onboarding-title">{PLAIN_COPY.setup.welcomeTitle}</h1>
+                <p className="onboarding-subtitle">{PLAIN_COPY.home.promise}</p>
 
                 <div
                   style={{
@@ -298,7 +336,7 @@ export function Onboarding() {
                     {
                       icon: Network,
                       title: "Ready when you are",
-                      desc: "It can start on app launch. Automatic update checks are read-only; you confirm every download and install. Work arrives only when assigned.",
+                      desc: PLAIN_COPY.setup.alwaysReady,
                     },
                   ].map(({ icon: Icon, title, desc }) => (
                     <div
@@ -788,7 +826,7 @@ export function Onboarding() {
                 </div>
                 <h1 className="onboarding-title">
                   {!launching
-                    ? "Ready to set up"
+                    ? PLAIN_COPY.setup.readyTitle
                     : launchStage === "model"
                       ? "Downloading model"
                       : launchStage === "downloading"
@@ -800,10 +838,14 @@ export function Onboarding() {
                             : "Finishing up"}
                 </h1>
                 <p className="onboarding-subtitle" data-testid="launch-summary">
-                  {!launching &&
-                    (selectedTier === "skip"
-                      ? "We'll download the node binary and start an observer/router without local model execution. You can request testnet credit explicitly from Wallet after setup. Setup does not guarantee peers, work, or rewards."
-                      : "We'll fetch the selected model, download the node binary, and start the process. You can request testnet credit explicitly from Wallet after setup. Setup does not guarantee peers, work, or rewards.")}
+                  {!launching && (
+                    <>
+                      {selectedTier === "skip"
+                        ? PLAIN_COPY.setup.readyWithoutModel
+                        : PLAIN_COPY.setup.readyWithModel(launchModelSize)}{" "}
+                      <em data-testid="launch-testnet-note">{PLAIN_COPY.setup.testnet}</em>
+                    </>
+                  )}
                   {launching && launchStage === "model" && modelProgress && (
                     <span data-testid="model-download-status">
                       {modelDownloadStatus(modelProgress)}
@@ -853,9 +895,22 @@ export function Onboarding() {
                   </div>
                 )}
 
-                {/* The wizard's own Retry button below is the try-again action. */}
+                {/* The buttons below carry the actions: Continue to ARC first,
+                    Try again second. The strip on Home carries the node's fix. */}
                 {launchError && (
-                  <StartFailurePanel error={launchError} testId="launch-error" />
+                  <>
+                    <StartFailurePanel
+                      error={launchError}
+                      testId="launch-error"
+                      showAction={false}
+                    />
+                    <p
+                      className="onboarding-subtitle"
+                      data-testid="launch-continue-hint"
+                    >
+                      {PLAIN_COPY.setup.failedHint}
+                    </p>
+                  </>
                 )}
 
                 {!launching && (
@@ -863,14 +918,35 @@ export function Onboarding() {
                     <button className="btn btn-ghost" onClick={back}>
                       Back
                     </button>
-                    <button
-                      className="btn btn-primary btn-lg"
-                      onClick={finish}
-                      data-testid="btn-launch"
-                    >
-                      {launchError ? "Retry" : "Set up this node"}{" "}
-                      <Sparkles size={16} />
-                    </button>
+                    {launchError ? (
+                      <>
+                        <button
+                          className="btn btn-secondary"
+                          onClick={finish}
+                          disabled={continuing}
+                          data-testid="btn-launch"
+                        >
+                          {PLAIN_COPY.actions.tryAgain}
+                        </button>
+                        <button
+                          className="btn btn-primary btn-lg"
+                          onClick={() => void continueToArc()}
+                          disabled={continuing}
+                          aria-busy={continuing || undefined}
+                          data-testid="btn-continue-to-arc"
+                        >
+                          {PLAIN_COPY.actions.continueToArc}
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        className="btn btn-primary btn-lg"
+                        onClick={finish}
+                        data-testid="btn-launch"
+                      >
+                        {PLAIN_COPY.setup.startButton} <Sparkles size={16} />
+                      </button>
+                    )}
                   </div>
                 )}
               </div>

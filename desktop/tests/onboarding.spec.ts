@@ -7,7 +7,7 @@ test.describe("Onboarding wizard", () => {
     await clearState(page);
   });
 
-  test("walks through all four steps and lands on dashboard", async ({
+  test("walks through all four steps and lands on Home", async ({
     page,
   }) => {
     await page.goto("/");
@@ -42,12 +42,18 @@ test.describe("Onboarding wizard", () => {
 
     // Launch
     await expect(page.getByTestId("step-launch")).toBeVisible();
-    await expect(page.getByRole("button", { name: /set up this node/i })).toBeVisible();
+    await expect(page.getByRole("button", { name: /start my node/i })).toBeVisible();
+    await expect(page.getByTestId("launch-testnet-note")).toHaveText(
+      PLAIN_COPY.setup.testnet,
+    );
     await page.getByTestId("btn-launch").click();
 
-    // Lands on dashboard (mock mode resolves startNode + faucetClaim fast)
-    await expect(page.getByTestId("dashboard")).toBeVisible({ timeout: 15_000 });
-    await expect(page.getByRole("heading", { name: /dashboard/i })).toBeVisible();
+    // Lands on Home: Ask ARC, with the node's one-line strip.
+    await expect(page.getByTestId("inference-screen")).toBeVisible({ timeout: 15_000 });
+    await expect(
+      page.getByRole("heading", { name: PLAIN_COPY.home.title, level: 1 }),
+    ).toBeVisible();
+    await expect(page.getByTestId("node-strip")).toBeVisible();
   });
 
   test("progress dots update per step (4 dots, one per wizard step)", async ({
@@ -95,15 +101,18 @@ test.describe("Onboarding wizard", () => {
     await expect(failure.getByTestId("start-failure-details")).toHaveText(
       "release checksum manifest returned HTTP 404",
     );
-    // No restart is offered where it can't help; the wizard's Retry stays.
+    // Setup never traps: Continue to ARC leads, Try again follows.
     await expect(failure.getByTestId("btn-start-failure-restart")).toHaveCount(0);
-    await expect(page.getByRole("button", { name: /retry/i })).toBeEnabled();
+    await expect(page.getByTestId("btn-continue-to-arc")).toHaveText(
+      PLAIN_COPY.actions.continueToArc,
+    );
+    await expect(page.getByRole("button", { name: /try again/i })).toBeEnabled();
     await failure.getByTestId("btn-start-failure-details").click();
     await expect(failure.getByTestId("start-failure-details")).toBeHidden();
     await expect(page.getByTestId("dashboard")).toHaveCount(0);
   });
 
-  test("a node that will not start says so plainly and offers one action", async ({
+  test("a node that will not start lets setup finish on Home, where the strip has the fix", async ({
     page,
   }) => {
     // The refusal v0.8.12 desktops showed in the field, nested framing and all.
@@ -116,6 +125,8 @@ test.describe("Onboarding wizard", () => {
         start_node: {
           then: (_resolve: unknown, reject: (reason: unknown) => void) => reject(message),
         },
+        // The start fence still refuses on Home, as it would natively.
+        node_start_block: message,
       };
     }, refusal);
     await page.goto("/");
@@ -126,8 +137,12 @@ test.describe("Onboarding wizard", () => {
     await expect(failure.getByTestId("start-failure-title")).toHaveText(
       PLAIN_COPY.startFailure.blocked.title,
     );
-    await expect(failure.getByTestId("btn-start-failure-restart")).toBeVisible();
+    // The panel offers no fix of its own here: setup's buttons lead.
+    await expect(failure.getByTestId("btn-start-failure-restart")).toHaveCount(0);
     await expect(failure.getByTestId("start-failure-details")).toBeHidden();
+    await expect(page.getByTestId("launch-continue-hint")).toHaveText(
+      PLAIN_COPY.setup.failedHint,
+    );
 
     await failure.getByTestId("btn-start-failure-details").click();
     const details = failure.getByTestId("start-failure-details");
@@ -137,6 +152,19 @@ test.describe("Onboarding wizard", () => {
     expect(text.split("Restart ARC after repairing")).toHaveLength(2);
     await expect(failure.getByTestId("btn-start-failure-copy")).toBeVisible();
     await expect(page.getByTestId("dashboard")).toHaveCount(0);
+
+    // Continue to ARC: Home opens without a running node, and the strip
+    // carries the node's one fix.
+    await page.getByTestId("btn-continue-to-arc").click();
+    await expect(page.getByTestId("inference-screen")).toBeVisible();
+    const strip = page.getByTestId("node-strip");
+    await expect(strip.getByTestId("node-strip-sentence")).toHaveText(
+      PLAIN_COPY.startFailure.blocked.title,
+    );
+    await expect(strip.getByTestId("node-strip-action")).toHaveText(
+      PLAIN_COPY.actions.restartArc,
+    );
+    await expect(page.getByTestId("inference-prompt")).toBeEnabled();
   });
 
   test("back button returns to prior step", async ({ page }) => {
@@ -167,7 +195,7 @@ test.describe("Onboarding wizard", () => {
     page,
   }) => {
     await page.goto("/");
-    await expect(page.getByText(/confirm every download and install/i)).toBeVisible();
+    await expect(page.getByText(/keeps itself up to date/i)).toBeVisible();
     await expect(page.getByText(/you start earning/i)).toHaveCount(0);
     await page.getByTestId("btn-continue-welcome").click();
     await page.getByTestId("btn-reveal-seed").click();
@@ -191,8 +219,8 @@ test.describe("Onboarding wizard", () => {
     await page.getByTestId("btn-continue-model").click();
 
     const summary = page.getByTestId("launch-summary");
-    await expect(summary).toContainText("observer/router");
-    await expect(summary).toContainText("without local model execution");
-    await expect(summary).not.toContainText("fetch the selected model");
+    await expect(summary).toContainText(PLAIN_COPY.setup.readyWithoutModel);
+    await expect(summary).toContainText("doesn't run AI jobs");
+    await expect(summary).not.toContainText("downloads its AI model");
   });
 });

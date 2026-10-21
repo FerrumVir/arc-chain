@@ -770,6 +770,7 @@ pub fn run() {
             commands::restart_node,
             commands::reset_peer_state,
             commands::node_status,
+            commands::node_start_block,
             commands::fetch_earnings,
             commands::fetch_attestations,
             commands::fetch_logs,

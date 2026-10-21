@@ -45,6 +45,47 @@ export const PLAIN_COPY = {
     copyDetails: "Copy details",
     copied: "Copied",
     copyFailed: "Couldn't copy",
+    startNode: "Start node",
+    startAgain: "Start again",
+    updateArc: "Update ARC",
+    continueToArc: "Continue to ARC",
+  },
+  /** Home: the chat, renamed, and the screen ARC opens on. */
+  home: {
+    navLabel: "Ask ARC",
+    title: "Ask ARC",
+    /** The proposal's line B: true today. */
+    promise: "Ask AI, and see who answered and whether another computer checked it.",
+    composerLabel: "Ask ARC",
+    placeholder: "Ask ARC anything…",
+    ask: "Ask",
+    emptyTitle: "Ask ARC anything.",
+  },
+  /** The one-line node strip on Home: one sentence, at most one button. */
+  nodeStrip: {
+    checking: "Checking your node…",
+    running: "Your node is running.",
+    starting: "Your node is starting. Loading the AI model can take a few minutes.",
+    downloadingModel: (amount: string) =>
+      `Your node is getting ready: downloading the AI model (${amount}).`,
+    off: "Your node is off.",
+    crashed: "Your node stopped unexpectedly.",
+    updateAvailable: "A new version of ARC is ready.",
+    updating: "Updating ARC. It will restart by itself in a moment.",
+  },
+  setup: {
+    welcomeTitle: "Welcome to ARC",
+    alwaysReady:
+      "It can start when ARC opens, and ARC keeps itself up to date. Work arrives only when assigned.",
+    readyTitle: "Ready to start",
+    readyWithModel: (size: string | null) =>
+      `ARC downloads its AI model${size ? ` (${size})` : ""} and starts your node. This takes a few minutes.`,
+    readyWithoutModel:
+      "ARC starts your node. It helps run the network but doesn't run AI jobs.",
+    testnet:
+      "Testnet: jobs and rewards aren't guaranteed, and testnet ARC has no monetary value.",
+    startButton: "Start my node",
+    failedHint: "Your node didn't start, but you can still use ARC. Home shows how to fix it.",
   },
   updates: {
     waitingForLastSession: (version: string) =>

@@ -1258,6 +1258,19 @@ pub async fn node_status(state: State<'_, AppState>) -> CmdResult<NodeStatus> {
     Ok(status)
 }
 
+/// What a Start would be told by the start fence right now, or None when node
+/// starts are open. Home shows a blocked or recovering node from this before
+/// anyone presses Start. It reads only the fence, never the node mutex, so it
+/// answers during a long launch-time recovery too.
+#[tauri::command]
+pub async fn node_start_block(state: State<'_, AppState>) -> CmdResult<Option<String>> {
+    Ok(start_block(&state).await)
+}
+
+async fn start_block(state: &AppState) -> Option<String> {
+    require_data_migration_ready(state).await.err()
+}
+
 #[tauri::command]
 pub async fn clear_crash(state: State<'_, AppState>) -> CmdResult<()> {
     state.node.lock().await.clear_crash().await;
@@ -1847,6 +1860,23 @@ fn inference_pre_dispatch_unavailable(detail: impl std::fmt::Display) -> String 
     format!("{INFERENCE_PRE_DISPATCH_UNAVAILABLE}: {detail}")
 }
 
+/// The local node's RPC port, without waiting on the node mutex. A launch
+/// recovery or a stop holds that mutex for minutes, and the chat and its
+/// network fallback must not wait behind it. While it is held the configured
+/// port stands in: the local node is not serving then anyway.
+async fn local_rpc_port(state: &AppState) -> u16 {
+    if let Ok(node) = state.node.try_lock() {
+        return node.rpc_port;
+    }
+    state
+        .store
+        .lock()
+        .await
+        .config
+        .as_ref()
+        .map_or(NodeConfig::default().rpc_port, |config| config.rpc_port)
+}
+
 fn inference_post_outcome_ambiguous(detail: impl std::fmt::Display) -> String {
     format!(
         "{INFERENCE_POST_OUTCOME_AMBIGUOUS}: an inference POST was attempted and may have created an assignment or reward; do not retry another route ({detail})"
@@ -1885,7 +1915,7 @@ async fn coordinator_candidates(state: &AppState) -> Vec<String> {
         return ordered;
     }
 
-    let port = state.node.lock().await.rpc_port;
+    let port = local_rpc_port(state).await;
     let local = paths::local_host(port);
     if health_ok(&state.http, &local, COORDINATOR_HEALTH_TIMEOUT).await {
         ordered.push(local);
@@ -1949,7 +1979,7 @@ async fn pin_community_receipt_route(
     let Some(settlement) = result.settlement.as_ref() else {
         return;
     };
-    let local_host = paths::local_host(state.node.lock().await.rpc_port);
+    let local_host = paths::local_host(local_rpc_port(state).await);
     if !settlement.submitted
         || settlement.tx_type != "0x25"
         || !matches!(
@@ -2055,7 +2085,7 @@ pub(crate) async fn fetch_community_reward_receipt_inner(
     worker: &str,
     receipt_url: &str,
 ) -> CmdResult<InferenceSettlement> {
-    let local_host = paths::local_host(state.node.lock().await.rpc_port);
+    let local_host = paths::local_host(local_rpc_port(state).await);
     if !community_receipt_source_is_pinned(source_host, &local_host) {
         return Err(RECEIPT_SOURCE_REJECTED.to_string());
     }
@@ -2113,7 +2143,14 @@ async fn run_inference_local_inner(
     chat_template: bool,
 ) -> CmdResult<InferenceResult> {
     let _write_guard = state.community_inference_write.lock().await;
-    let port = state.node.lock().await.rpc_port;
+    // A launch recovery or a stop holds the node mutex for minutes. Nothing
+    // has been sent yet, so skip the local node and let the network answer.
+    let port = match state.node.try_lock() {
+        Ok(node) => node.rpc_port,
+        Err(_) => return Err(inference_pre_dispatch_unavailable(
+            "the local node is busy starting, stopping or recovering; local inference was skipped",
+        )),
+    };
     let host = paths::local_host(port);
     if let Some(origin) = established_chain_origin(state).await {
         if origin != host {
@@ -2201,7 +2238,7 @@ async fn run_inference_via_coordinator_inner(
     }
     let client = inference_client(prompt, max_tokens, proxy_policy)
         .map_err(inference_pre_dispatch_unavailable)?;
-    let local_prefix = paths::local_host(state.node.lock().await.rpc_port);
+    let local_prefix = paths::local_host(local_rpc_port(state).await);
     // `/run_consensus` is itself a write/compute operation.  Health probes
     // may inspect as many candidates as needed, but after choosing the first
     // reachable origin the app sends exactly one POST and never migrates the
@@ -2841,7 +2878,7 @@ async fn run_inference_via_coordinator_direct_inner(
     })?;
     let client = inference_client(prompt, max_tokens, proxy_policy)
         .map_err(inference_pre_dispatch_unavailable)?;
-    let local_prefix = paths::local_host(state.node.lock().await.rpc_port);
+    let local_prefix = paths::local_host(local_rpc_port(state).await);
     let mut result = rpc_client::run_inference_remote(
         &client,
         &host,
@@ -6788,11 +6825,14 @@ mod start_fence_tests {
     //! where startup's recovery launch refused itself, and the transitions
     //! that replace it.
     use super::{
-        app_update_boundary, require_data_migration_ready, require_start_fence, StartTransaction,
+        app_update_boundary, local_rpc_port, require_data_migration_ready, require_start_fence,
+        run_inference_local_inner, start_block, StartTransaction,
+        INFERENCE_PRE_DISPATCH_UNAVAILABLE,
     };
     use crate::start_fence::{
         after_startup_reconciliation, at_launch, AppUpdateBoundary, StartAccess, StartFence,
     };
+    use crate::types::NodeConfig;
     use crate::AppState;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -6945,6 +6985,34 @@ mod start_fence_tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// Home reads what a Start would be told, and its chat skips the local
+    /// node, without waiting on the node mutex that a launch recovery or a
+    /// stop holds for minutes.
+    #[tokio::test]
+    async fn home_never_waits_on_the_node_mutex() {
+        let state = state_with(Some(at_launch(None)));
+        let _lifecycle_step = state.node.lock().await;
+
+        let waiting = start_block(&state).await.expect("reconciliation is a wait");
+        assert!(waiting.contains("startup reconciliation is still in progress"));
+        *state.data_migration_error.lock().await = after_startup_reconciliation(Err(
+            "managed-node durability recovery failed: recovery node exited before its WAL barrier"
+                .into(),
+        ));
+        let refused = start_block(&state).await.expect("a refusal blocks starts");
+        assert!(refused.contains("ARC refused to start the node"));
+
+        let skipped = run_inference_local_inner(&state, "The largest planet is", 1, true)
+            .await
+            .err()
+            .expect("a busy node mutex skips the local node");
+        assert!(skipped.starts_with(INFERENCE_PRE_DISPATCH_UNAVAILABLE));
+        assert_eq!(local_rpc_port(&state).await, NodeConfig::default().rpc_port);
+
+        *state.data_migration_error.lock().await = None;
+        assert_eq!(start_block(&state).await, None);
     }
 
     #[tokio::test]

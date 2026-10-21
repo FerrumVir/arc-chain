@@ -14,12 +14,14 @@ import { api } from "../lib/tauri";
 import { PulseDot } from "./PulseDot";
 import { Tagline, Wordmark } from "./Logo";
 import { formatUptime } from "../lib/format";
+import { PLAIN_COPY } from "../lib/plain-copy";
 import type { Route } from "../lib/store";
 
+// Home first: the chat answers whatever state the node is in.
 const NAV: Array<{ id: Route; label: string; icon: typeof LayoutDashboard }> = [
+  { id: "inference", label: PLAIN_COPY.home.navLabel, icon: Sparkles },
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { id: "wallet", label: "Wallet", icon: Wallet },
-  { id: "inference", label: "Inference", icon: Sparkles },
   { id: "earnings", label: "Earnings", icon: Coins },
   { id: "network", label: "Network", icon: Activity },
   { id: "logs", label: "Logs", icon: ScrollText },

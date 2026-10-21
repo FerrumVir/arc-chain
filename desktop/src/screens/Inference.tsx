@@ -2,6 +2,8 @@ import { Loader2, SquarePen, Send, CircleStop } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { InfoPopover } from "../components/InfoPopover";
 import { NativePaidRequests } from "../components/NativePaidRequests";
+import { NodeStatusStrip } from "../components/NodeStatusStrip";
+import { PLAIN_COPY } from "../lib/plain-copy";
 import { Answer } from "../components/chat/Answer";
 import { StageTrack, timeOf } from "../components/chat/Stages";
 import { ChatAqueduct, type AnswerFacts } from "../components/chat/ChatAqueduct";
@@ -156,7 +158,7 @@ export function Inference() {
     <div className="main-inner chat-screen" data-testid="inference-screen">
       <div className="page-header chat-header">
         <div>
-          <h1 className="page-title">Inference</h1>
+          <h1 className="page-title">{PLAIN_COPY.home.title}</h1>
           <p className="page-subtitle">Every answer shows who served it, whether a second computer checked it, and what reached the chain.</p>
         </div>
         <div className="chat-header-actions">
@@ -185,6 +187,10 @@ export function Inference() {
           </button>
         </div>
       </div>
+
+      {/* Home: the node's state and its one fix. The chat below answers from
+          the network whatever this says. */}
+      <NodeStatusStrip />
 
       <ChatAqueduct turns={turns} facts={facts} onPick={pick} />
 
@@ -228,7 +234,7 @@ export function Inference() {
         <div ref={threadEnd} />
       </section>
 
-      <div className="composer" role="group" aria-label="Ask the network">
+      <div className="composer" role="group" aria-label={PLAIN_COPY.home.composerLabel}>
         <div className="composer-box">
           {turns.length === 0 && (
             <div className="composer-suggest">
@@ -253,7 +259,7 @@ export function Inference() {
             ref={composer}
             className="composer-input"
             rows={1}
-            placeholder="Ask the network anything…"
+            placeholder={PLAIN_COPY.home.placeholder}
             aria-label="Prompt"
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
@@ -297,7 +303,7 @@ export function Inference() {
                 </>
               ) : (
                 <>
-                  <Send size={15} /> Run inference
+                  <Send size={15} /> {PLAIN_COPY.home.ask}
                 </>
               )}
             </button>
@@ -322,7 +328,7 @@ export function Inference() {
 function EmptyThread() {
   return (
     <div className="chat-empty">
-      <h2 className="chat-empty-title">Ask the network.</h2>
+      <h2 className="chat-empty-title">{PLAIN_COPY.home.emptyTitle}</h2>
       <ul className="chat-empty-points">
         <li>
           <strong>Who served it.</strong> Your own node first; a named coordinator or community worker when yours can&rsquo;t.

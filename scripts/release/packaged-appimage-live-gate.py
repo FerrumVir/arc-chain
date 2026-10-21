@@ -1845,14 +1845,16 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901
         screenshots.append(client.screenshot(evidence / "03-observer-launch.png"))
         client.click(client.element(testid("btn-launch")))
 
-        def dashboard_or_error() -> str | None:
+        def home_or_error() -> str | None:
             errors = client.elements(testid("launch-error"))
             if errors:
                 raise GateError(f"native onboarding launch failed: {client.text(errors[0])[:500]}")
-            dashboards = client.elements(testid("dashboard"))
-            return dashboards[0] if dashboards else None
+            # Setup lands on Home ("Ask ARC") from v0.8.14; the dashboard
+            # tiles are read after navigating there below.
+            homes = client.elements(testid("inference-screen"))
+            return homes[0] if homes else None
 
-        client.wait(dashboard_or_error, "native dashboard after onboarding", 120)
+        client.wait(home_or_error, "native Home after onboarding", 120)
         node_process = wait_exact_process("arc-node", assets[NODE_NAME]["sha256"], timeout=45)[0]
         store_path = profile / "data" / "network.arc.desktop" / "store.json"
         store_info = regular_file(store_path, "native identity store", max_bytes=1024 * 1024)
@@ -1874,6 +1876,8 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901
             }
         )
 
+        client.click(client.element(testid("nav-dashboard")))
+        client.wait_element(testid("dashboard"), 15)
         dashboard_height_text = element_text(client, "node-block-height", 30)
         peers_tile = client.wait_element(f'{testid("stat-peers")} .stat-value', 30)
         peers = numeric_text(client.text(peers_tile), "local node peer count", minimum=0)

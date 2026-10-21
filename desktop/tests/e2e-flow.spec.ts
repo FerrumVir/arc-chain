@@ -42,13 +42,13 @@ test.describe("Onboarding → launch end-to-end", () => {
     await page.getByTestId("tier-skip").click();
     await page.getByTestId("btn-continue-model").click();
     await expect(page.getByTestId("step-launch")).toBeVisible();
-    await expect(page.getByText(/ready to set up/i)).toBeVisible();
+    await expect(page.getByText(/ready to start/i)).toBeVisible();
 
     await page.getByTestId("btn-launch").click();
 
-    // Mock flow: ensureBinary + startNode + waitForPeer resolve, then the
-    // dashboard renders without submitting any balance-changing request.
-    await expect(page.getByTestId("dashboard")).toBeVisible({ timeout: 15_000 });
+    // Mock flow: ensureBinary + startNode + waitForPeer resolve, then Home
+    // (Ask ARC) renders without submitting any balance-changing request.
+    await expect(page.getByTestId("inference-screen")).toBeVisible({ timeout: 15_000 });
   });
 
   test("launch button promises setup, not a successful network join", async ({
@@ -58,7 +58,7 @@ test.describe("Onboarding → launch end-to-end", () => {
     await walkToLaunch(page);
     await expect(page.getByTestId("btn-launch")).toBeVisible();
     await expect(page.getByTestId("btn-launch")).toContainText(
-      /set up this node/i,
+      /start my node/i,
     );
   });
 
@@ -93,7 +93,8 @@ test.describe("Onboarding → launch end-to-end", () => {
     // write. The explicit Wallet button remains the only faucet trigger.
     expect(src).toMatch(/waitForPeer/);
     expect(src).not.toMatch(/faucetClaim/);
-    expect(src).toMatch(/request testnet credit explicitly from Wallet/);
+    // The launch step carries the testnet line instead of a credit promise.
+    expect(src).toMatch(/PLAIN_COPY\.setup\.testnet/);
   });
 });
 

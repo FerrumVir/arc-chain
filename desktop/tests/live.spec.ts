@@ -71,9 +71,12 @@ test.describe("Authenticated production validator forward - real data", () => {
     await page.screenshot({ path: testInfo.outputPath("live-03-launch.png") });
     await page.getByTestId("btn-launch").click();
 
-    // Landing alone is not evidence that the real node answered. Require
-    // non-zero committed chain progress and at least one live peer before a
-    // screenshot or receipt can represent this first-launch path as healthy.
+    // Setup lands on Home (Ask ARC). Landing alone is not evidence that the
+    // real node answered. Require non-zero committed chain progress and at
+    // least one live peer before a screenshot or receipt can represent this
+    // first-launch path as healthy.
+    await expect(page.getByTestId("inference-screen")).toBeVisible({ timeout: 10_000 });
+    await page.getByTestId("nav-dashboard").click();
     await expect(page.getByTestId("dashboard")).toBeVisible({ timeout: 10_000 });
     await expect.poll(async () => {
       const value = await page.getByTestId("node-block-height").textContent();

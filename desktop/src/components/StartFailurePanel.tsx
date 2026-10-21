@@ -16,16 +16,19 @@ const COPIED_RESET_MS = 2_500;
  * chain was the message, and a stuck desktop showed a paragraph that repeated
  * itself.
  *
- * `onTryAgain` is for screens without their own retry button.
+ * `onTryAgain` is for screens without their own retry button. Setup passes
+ * `showAction={false}`: its own buttons lead with "Continue to ARC".
  */
 export function StartFailurePanel({
   error,
   onTryAgain,
   testId,
+  showAction = true,
 }: {
   error: string;
   onTryAgain?: () => void;
   testId?: string;
+  showAction?: boolean;
 }) {
   const update = useUpdaterSnapshot();
   const updateAvailable = update.phase === "available" && update.canInstall;
@@ -96,7 +99,8 @@ export function StartFailurePanel({
             </div>
             <div style={{ color: "var(--text-muted)" }}>
               {view.body}
-              {view.action === "install-update" &&
+              {showAction &&
+                view.action === "install-update" &&
                 ` ${PLAIN_COPY.startFailure.updateReady}`}
             </div>
           </div>
@@ -109,7 +113,7 @@ export function StartFailurePanel({
               marginTop: "var(--space-3)",
             }}
           >
-            {view.action === "install-update" ? (
+            {!showAction ? null : view.action === "install-update" ? (
               <button
                 type="button"
                 className="btn btn-primary btn-sm"

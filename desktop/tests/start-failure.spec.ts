@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PLAIN_COPY } from "../src/lib/plain-copy";
+import { describeNodeStrip, type NodeStripInput } from "../src/lib/node-strip";
 import {
   classifyStartFailure,
   cleanFailureDetails,
@@ -167,5 +168,87 @@ test.describe("start failure wording", () => {
     expect(startFence).toContain(
       `"managed-node ${NATIVE_RECONCILING}: ARC is checking how the previous node session ended`,
     );
+  });
+});
+
+test.describe("node strip on Home", () => {
+  const idle = { phase: "idle", canInstall: false } as const;
+  const ready = { phase: "available", canInstall: true } as const;
+  const off = { running: false, pid: null, lastError: null };
+  const running = { running: true, pid: 4242, lastError: null };
+  const strip = (input: Partial<NodeStripInput>) =>
+    describeNodeStrip({
+      status: off,
+      startBlock: null,
+      startError: null,
+      update: idle,
+      modelProgress: null,
+      ...input,
+    });
+
+  test("each node state is one sentence with at most one button", () => {
+    expect(strip({ status: undefined })).toMatchObject({
+      sentence: PLAIN_COPY.nodeStrip.checking,
+      action: null,
+    });
+    expect(strip({})).toMatchObject({ sentence: PLAIN_COPY.nodeStrip.off, action: "start-node" });
+    expect(strip({ status: running })).toMatchObject({
+      sentence: PLAIN_COPY.nodeStrip.running,
+      action: null,
+      tone: "ok",
+    });
+    expect(strip({ status: { running: false, pid: 4242, lastError: null } })).toMatchObject({
+      sentence: PLAIN_COPY.nodeStrip.starting,
+      action: null,
+    });
+    expect(
+      strip({
+        status: { running: false, pid: null, lastError: "arc-node exited unexpectedly (code 1)" },
+      }),
+    ).toMatchObject({ sentence: PLAIN_COPY.nodeStrip.crashed, action: "start-again" });
+    expect(
+      strip({
+        modelProgress: {
+          tier: "standard",
+          downloadedBytes: 1_200_000_000,
+          totalBytes: 3_800_000_000,
+          done: false,
+        },
+      }).sentence,
+    ).toMatch(/^Your node is getting ready: downloading the AI model \(.+ of .+\)\.$/);
+  });
+
+  test("a ready update shows on Home, and installing it says so", () => {
+    expect(strip({ status: running, update: ready })).toMatchObject({
+      sentence: PLAIN_COPY.nodeStrip.updateAvailable,
+      action: "update-arc",
+    });
+    expect(strip({ update: ready })).toMatchObject({ action: "update-arc" });
+    expect(strip({ update: { phase: "downloading", canInstall: false } })).toMatchObject({
+      sentence: PLAIN_COPY.nodeStrip.updating,
+      action: null,
+    });
+  });
+
+  test("a blocked node takes the start-failure sentence and its fix", () => {
+    const blocked = strip({ startBlock: V0812_FIELD_ERROR });
+    expect(blocked).toMatchObject({
+      sentence: PLAIN_COPY.startFailure.blocked.title,
+      action: "restart-arc",
+      tone: "attention",
+    });
+    expect(blocked.details?.split(NATIVE_REFUSAL_PREFIX)).toHaveLength(2);
+    // The update installs while the node is blocked, so it is the fix.
+    expect(strip({ startBlock: V0812_FIELD_ERROR, update: ready }).action).toBe("update-arc");
+    // Launch reconciliation clears by itself; the strip polls.
+    expect(strip({ startBlock: RECONCILING })).toMatchObject({
+      sentence: PLAIN_COPY.startFailure.reconciling.title,
+      action: null,
+      tone: "busy",
+    });
+    // A Start pressed on the strip that fails reads the same way.
+    expect(
+      strip({ startError: "another ARC desktop currently owns the managed node lifecycle for /x" }),
+    ).toMatchObject({ sentence: PLAIN_COPY.startFailure.needsRepair.title, action: "try-again" });
   });
 });
