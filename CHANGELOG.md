@@ -47,7 +47,8 @@ All notable changes to ARC Chain are tracked here. This project follows
   computer's node is running: a question goes to the ARC network when the
   local node can't take it. One line above it says what the node is doing
   (starting, downloading the AI model, off, stopped unexpectedly, blocked,
-  needing a repair, updating, or a new version ready) with the one button
+  needing a repair, updating, an update that needs ARC reopened, or a new
+  version ready) with the one button
   that fixes it, so an available update now shows on the home screen, not
   only in Settings. If the node can't start during setup, Continue to ARC
   finishes setup and opens Ask ARC, with Try again beside it. The recovery

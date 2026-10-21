@@ -84,6 +84,8 @@ export function Onboarding() {
   const [pendingConfig, setPendingConfig] = useState<NodeConfig | null>(null);
   const [setupSaved, setSetupSaved] = useState(false);
   const [continuing, setContinuing] = useState(false);
+  // Linux .deb and .rpm installs can't install their own updates.
+  const [packageManaged, setPackageManaged] = useState(false);
 
   // Connecting stage: elapsed time + which seed was reached
   const [connectElapsed, setConnectElapsed] = useState(0);
@@ -98,6 +100,19 @@ export function Onboarding() {
   const stepIndex = STEPS.indexOf(step);
   const next = () => setStep(STEPS[Math.min(stepIndex + 1, STEPS.length - 1)]);
   const back = () => setStep(STEPS[Math.max(stepIndex - 1, 0)]);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .updateInstallPolicy()
+      .then((policy) => {
+        if (!cancelled) setPackageManaged(!policy.canInstall);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (step === "identity" && !identity) {
@@ -336,7 +351,9 @@ export function Onboarding() {
                     {
                       icon: Network,
                       title: "Ready when you are",
-                      desc: PLAIN_COPY.setup.alwaysReady,
+                      desc: packageManaged
+                        ? PLAIN_COPY.setup.alwaysReadyPackageManaged
+                        : PLAIN_COPY.setup.alwaysReady,
                     },
                   ].map(({ icon: Icon, title, desc }) => (
                     <div

@@ -172,8 +172,9 @@ test.describe("start failure wording", () => {
 });
 
 test.describe("node strip on Home", () => {
-  const idle = { phase: "idle", canInstall: false } as const;
-  const ready = { phase: "available", canInstall: true } as const;
+  const settled = { canInstall: false, message: "", error: null, restartRequired: false };
+  const idle = { ...settled, phase: "idle" } as const;
+  const ready = { ...settled, phase: "available", canInstall: true } as const;
   const off = { running: false, pid: null, lastError: null };
   const running = { running: true, pid: 4242, lastError: null };
   const strip = (input: Partial<NodeStripInput>) =>
@@ -224,10 +225,70 @@ test.describe("node strip on Home", () => {
       action: "update-arc",
     });
     expect(strip({ update: ready })).toMatchObject({ action: "update-arc" });
-    expect(strip({ update: { phase: "downloading", canInstall: false } })).toMatchObject({
+    expect(strip({ update: { ...settled, phase: "downloading" } })).toMatchObject({
       sentence: PLAIN_COPY.nodeStrip.updating,
       action: null,
     });
+    const relaunching = {
+      ...settled,
+      phase: "ready",
+      message: "Version 0.8.14 installed. Restarting ARC now…",
+      restartRequired: true,
+    } as const;
+    expect(strip({ status: running, update: relaunching })).toMatchObject({
+      sentence: PLAIN_COPY.nodeStrip.updating,
+      action: null,
+      tone: "busy",
+    });
+  });
+
+  test("an update that couldn't finish says to quit ARC, not that it restarts by itself", () => {
+    const failures = [
+      {
+        phase: "ready",
+        message:
+          "Version 0.8.14 is installed, but ARC could not safely stop the old node and relaunch. Quit ARC from the tray, then reopen it to finish updating.",
+        error: "relaunch failed",
+      },
+      {
+        phase: "ready",
+        message:
+          "ARC could not verify that update 0.8.14 finished installing. The node remains safely stopped. Quit ARC from the tray, then reopen it; reinstall from the verified release if ARC does not reopen.",
+        error: "installer IPC disconnected",
+      },
+      {
+        phase: "error",
+        message:
+          "Automatic installation did not begin, but ARC could not confirm that its node resumed. Quit and reopen ARC before continuing.",
+        error: "prepare failed; resume failed: abort IPC disconnected",
+      },
+    ] as const;
+    for (const failure of failures) {
+      const update = { ...settled, ...failure, restartRequired: true };
+      // It outranks the node's own state and a refused Start: only a reopen clears it.
+      for (const input of [{ status: running }, {}, { startBlock: V0812_FIELD_ERROR }]) {
+        const view = strip({ ...input, update });
+        expect(view).toMatchObject({
+          sentence: PLAIN_COPY.nodeStrip.updateFailed,
+          action: "quit-arc",
+          tone: "attention",
+        });
+        expect(view.details).toBe(`${failure.message}\n${failure.error}`);
+      }
+    }
+    // An update that failed without needing a reopen leaves the node's state.
+    const retryable = {
+      ...settled,
+      phase: "error",
+      message: "Update was not installed: network down",
+      error: "network down",
+    } as const;
+    expect(strip({ status: running, update: retryable })).toMatchObject({
+      sentence: PLAIN_COPY.nodeStrip.running,
+      action: null,
+    });
+    expect(PLAIN_COPY.nodeStrip.updateFailed).toMatch(/Quit ARC and open it again\.$/);
+    expect(PLAIN_COPY.nodeStrip.updateFailed).not.toMatch(/by itself/);
   });
 
   test("a blocked node takes the start-failure sentence and its fix", () => {

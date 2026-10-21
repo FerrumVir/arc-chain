@@ -7,6 +7,7 @@ import type { UpdateSnapshot } from "./update-controller";
 export type NodeStripAction =
   | "update-arc"
   | "restart-arc"
+  | "quit-arc"
   | "start-node"
   | "start-again"
   | "try-again";
@@ -27,7 +28,7 @@ export interface NodeStripInput {
   startBlock: string | null;
   /** The error from the last Start pressed on the strip. */
   startError: string | null;
-  update: Pick<UpdateSnapshot, "phase" | "canInstall">;
+  update: Pick<UpdateSnapshot, "phase" | "canInstall" | "message" | "error" | "restartRequired">;
   modelProgress: ModelDownloadProgress | null;
 }
 
@@ -45,8 +46,23 @@ const FAILURE_ACTION: Record<StartFailureAction, NodeStripAction> = {
  */
 export function describeNodeStrip(input: NodeStripInput): NodeStripView {
   const copy = PLAIN_COPY.nodeStrip;
-  const updateReady = input.update.phase === "available" && input.update.canInstall;
-  if (input.update.phase === "downloading" || input.update.phase === "ready") {
+  const { update } = input;
+  const updateReady = update.phase === "available" && update.canInstall;
+  // "ready" with an error is a relaunch that failed or an install ARC could
+  // not confirm, and "error" with restartRequired an abort that could not
+  // confirm the node resumed. Starts are refused until ARC is reopened.
+  if (
+    (update.phase === "ready" && update.error !== null) ||
+    (update.phase === "error" && update.restartRequired)
+  ) {
+    return {
+      sentence: copy.updateFailed,
+      action: "quit-arc",
+      tone: "attention",
+      details: [update.message, update.error].filter(Boolean).join("\n"),
+    };
+  }
+  if (update.phase === "downloading" || update.phase === "ready") {
     return { sentence: copy.updating, action: null, tone: "busy", details: null };
   }
 

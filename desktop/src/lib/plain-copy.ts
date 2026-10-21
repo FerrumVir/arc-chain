@@ -39,6 +39,7 @@ export const PLAIN_COPY = {
     installUpdate: "Install update",
     installing: "Installing…",
     restartArc: "Restart ARC",
+    quitArc: "Quit ARC",
     tryAgain: "Try again",
     showDetails: "Show details",
     hideDetails: "Hide details",
@@ -72,16 +73,21 @@ export const PLAIN_COPY = {
     crashed: "Your node stopped unexpectedly.",
     updateAvailable: "A new version of ARC is ready.",
     updating: "Updating ARC. It will restart by itself in a moment.",
+    /** A relaunch or install the updater couldn't finish; only a reopen clears it. */
+    updateFailed: "ARC couldn't finish an update. Quit ARC and open it again.",
   },
   setup: {
     welcomeTitle: "Welcome to ARC",
     alwaysReady:
-      "It can start when ARC opens, and ARC keeps itself up to date. Work arrives only when assigned.",
+      "It can start when ARC opens, and ARC installs updates automatically unless you turn that off in Settings. Work arrives only when assigned.",
+    /** Linux .deb and .rpm installs, which ARC can't update itself. */
+    alwaysReadyPackageManaged:
+      "It can start when ARC opens. Update ARC with the package manager you installed it with. Work arrives only when assigned.",
     readyTitle: "Ready to start",
     readyWithModel: (size: string | null) =>
       `ARC downloads its AI model${size ? ` (${size})` : ""} and starts your node. This takes a few minutes.`,
     readyWithoutModel:
-      "ARC starts your node. It helps run the network but doesn't run AI jobs.",
+      "ARC starts your node. It joins the ARC network but doesn't run AI jobs.",
     testnet:
       "Testnet: jobs and rewards aren't guaranteed, and testnet ARC has no monetary value.",
     startButton: "Start my node",

@@ -195,7 +195,7 @@ test.describe("Onboarding wizard", () => {
     page,
   }) => {
     await page.goto("/");
-    await expect(page.getByText(/keeps itself up to date/i)).toBeVisible();
+    await expect(page.getByText(PLAIN_COPY.setup.alwaysReady)).toBeVisible();
     await expect(page.getByText(/you start earning/i)).toHaveCount(0);
     await page.getByTestId("btn-continue-welcome").click();
     await page.getByTestId("btn-reveal-seed").click();
@@ -206,6 +206,22 @@ test.describe("Onboarding wizard", () => {
     await expect(page.getByTestId("step-model")).toContainText(
       /do not multiply rewards or guarantee demand/i,
     );
+  });
+
+  test("a .deb or .rpm install isn't promised automatic updates", async ({ page }) => {
+    await page.addInitScript(() => {
+      (window as unknown as { __ARC_MOCK__: Record<string, unknown> }).__ARC_MOCK__ = {
+        update_install_policy: {
+          canInstall: false,
+          channel: "package-manager",
+          instructions:
+            "A signed update is available. Install the new .deb or .rpm with the same package manager used for this ARC installation.",
+        },
+      };
+    });
+    await page.goto("/");
+    await expect(page.getByText(PLAIN_COPY.setup.alwaysReadyPackageManaged)).toBeVisible();
+    await expect(page.getByText(/updates automatically/i)).toHaveCount(0);
   });
 
   test("observer setup never claims that a model will be downloaded", async ({

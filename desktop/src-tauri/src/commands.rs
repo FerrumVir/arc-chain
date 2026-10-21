@@ -1860,13 +1860,20 @@ fn inference_pre_dispatch_unavailable(detail: impl std::fmt::Display) -> String 
     format!("{INFERENCE_PRE_DISPATCH_UNAVAILABLE}: {detail}")
 }
 
-/// The local node's RPC port, without waiting on the node mutex. A launch
-/// recovery or a stop holds that mutex for minutes, and the chat and its
-/// network fallback must not wait behind it. While it is held the configured
-/// port stands in: the local node is not serving then anyway.
+/// The local node's RPC port, or `None` while the node mutex is held. A
+/// launch recovery, a Stop or Restart, or an update drain holds that mutex for
+/// minutes, and the chat must neither wait behind it nor send work to a node
+/// that may be stopping: it can still answer `/health` and then exit.
+fn try_local_rpc_port(state: &AppState) -> Option<u16> {
+    state.node.try_lock().ok().map(|node| node.rpc_port)
+}
+
+/// The local node's RPC port, without waiting on the node mutex. While it is
+/// held the configured port stands in, which is enough to recognise the local
+/// node's address.
 async fn local_rpc_port(state: &AppState) -> u16 {
-    if let Ok(node) = state.node.try_lock() {
-        return node.rpc_port;
+    if let Some(port) = try_local_rpc_port(state) {
+        return port;
     }
     state
         .store
@@ -1900,7 +1907,8 @@ async fn inference_readiness_ok(http: &reqwest::Client, host: &str) -> Result<bo
 ///    running the current build — the public seeds are still on v0.7.9,
 ///    whose coordinator is markedly slower — and routing through a
 ///    datacenter to compute something the user's own machine can compute is
-///    both slower and a worse story to tell.
+///    both slower and a worse story to tell. It is skipped while a Stop,
+///    Restart or update holds the node.
 /// 2. **Remotes are probed concurrently**, and only reachable ones are
 ///    returned, ordered by how fast they answered. The previous code walked
 ///    a fixed list sequentially with a per-host inference timeout, so an
@@ -1915,10 +1923,11 @@ async fn coordinator_candidates(state: &AppState) -> Vec<String> {
         return ordered;
     }
 
-    let port = local_rpc_port(state).await;
-    let local = paths::local_host(port);
-    if health_ok(&state.http, &local, COORDINATOR_HEALTH_TIMEOUT).await {
-        ordered.push(local);
+    if let Some(port) = try_local_rpc_port(state) {
+        let local = paths::local_host(port);
+        if health_ok(&state.http, &local, COORDINATOR_HEALTH_TIMEOUT).await {
+            ordered.push(local);
+        }
     }
 
     let mut set = tokio::task::JoinSet::new();
@@ -6826,7 +6835,7 @@ mod start_fence_tests {
     //! that replace it.
     use super::{
         app_update_boundary, local_rpc_port, require_data_migration_ready, require_start_fence,
-        run_inference_local_inner, start_block, StartTransaction,
+        run_inference_local_inner, start_block, try_local_rpc_port, StartTransaction,
         INFERENCE_PRE_DISPATCH_UNAVAILABLE,
     };
     use crate::start_fence::{
@@ -6993,7 +7002,7 @@ mod start_fence_tests {
     #[tokio::test]
     async fn home_never_waits_on_the_node_mutex() {
         let state = state_with(Some(at_launch(None)));
-        let _lifecycle_step = state.node.lock().await;
+        let lifecycle_step = state.node.lock().await;
 
         let waiting = start_block(&state).await.expect("reconciliation is a wait");
         assert!(waiting.contains("startup reconciliation is still in progress"));
@@ -7009,7 +7018,21 @@ mod start_fence_tests {
             .err()
             .expect("a busy node mutex skips the local node");
         assert!(skipped.starts_with(INFERENCE_PRE_DISPATCH_UNAVAILABLE));
+        // The network fallback skips it too: a node being stopped can still
+        // answer /health and then exit under the one POST.
+        assert_eq!(try_local_rpc_port(&state), None);
+        let candidates = body_between(
+            include_str!("commands.rs"),
+            "async fn coordinator_candidates(",
+            "/// Once the session has either displayed",
+        );
+        assert!(candidates.contains("if let Some(port) = try_local_rpc_port(state) {"));
+        assert!(!candidates.contains("local_rpc_port(state).await"));
+        // Recognising the local node's address still works.
         assert_eq!(local_rpc_port(&state).await, NodeConfig::default().rpc_port);
+        let rpc_port = lifecycle_step.rpc_port;
+        drop(lifecycle_step);
+        assert_eq!(try_local_rpc_port(&state), Some(rpc_port));
 
         *state.data_migration_error.lock().await = None;
         assert_eq!(start_block(&state).await, None);

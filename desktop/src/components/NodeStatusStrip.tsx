@@ -1,7 +1,7 @@
 import { useEffect, useId, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle2, CircleAlert, Loader2 } from "lucide-react";
-import { relaunch } from "@tauri-apps/plugin-process";
+import { exit, relaunch } from "@tauri-apps/plugin-process";
 import { api, isTauri } from "../lib/tauri";
 import { useAppStore } from "../lib/store";
 import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
@@ -12,6 +12,7 @@ import { DEFAULT_NODE_CONFIG, type ModelDownloadProgress } from "../lib/types";
 const ACTION_LABEL: Record<NodeStripAction, string> = {
   "update-arc": PLAIN_COPY.actions.updateArc,
   "restart-arc": PLAIN_COPY.actions.restartArc,
+  "quit-arc": PLAIN_COPY.actions.quitArc,
   "start-node": PLAIN_COPY.actions.startNode,
   "start-again": PLAIN_COPY.actions.startAgain,
   "try-again": PLAIN_COPY.actions.tryAgain,
@@ -81,6 +82,19 @@ export function NodeStatusStrip() {
       // Relaunching runs launch reconciliation again, which a refusal needs.
       if (isTauri) void relaunch();
       else window.location.reload();
+      return;
+    }
+    if (action === "quit-arc") {
+      if (!isTauri) {
+        window.location.reload();
+        return;
+      }
+      // The tray's Quit: stop the node, then exit. While an update holds the
+      // node, the stop is refused at once and ARC still exits.
+      setBusy(true);
+      await api.stopNode().catch(() => {});
+      await exit(0).catch(() => {});
+      setBusy(false);
       return;
     }
     setBusy(true);
