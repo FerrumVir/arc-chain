@@ -136,7 +136,7 @@ test.describe("UpdateController", () => {
         check: async () => {
           checks += 1;
           return {
-            version: "0.8.13",
+            version: "0.8.14",
             download: async () => {
               downloads += 1;
             },
@@ -162,7 +162,7 @@ test.describe("UpdateController", () => {
     expect(installs).toBe(0);
     expect(controller.getSnapshot()).toMatchObject({
       phase: "available",
-      version: "0.8.13",
+      version: "0.8.14",
       canInstall: true,
     });
     controller.dispose();
@@ -176,7 +176,7 @@ test.describe("UpdateController", () => {
       {
         supported: true,
         check: async () => ({
-          version: "0.8.13",
+          version: "0.8.14",
           download: async () => {
             order.push("download");
           },
@@ -248,7 +248,7 @@ test.describe("UpdateController", () => {
       {
         supported: true,
         check: async () => ({
-          version: "0.8.13",
+          version: "0.8.14",
           download: () => download.promise,
           install: async () => {
             installCalls += 1;
@@ -293,7 +293,7 @@ test.describe("UpdateController", () => {
       {
         supported: true,
         check: async () => ({
-          version: "0.8.13",
+          version: "0.8.14",
           download: async () => {
             order.push("download");
           },
@@ -343,7 +343,7 @@ test.describe("UpdateController", () => {
       {
         supported: true,
         check: async () => ({
-          version: "0.8.13",
+          version: "0.8.14",
           download: async () => {
             order.push("download");
           },
@@ -385,7 +385,7 @@ test.describe("UpdateController", () => {
       {
         supported: true,
         check: async () => ({
-          version: "0.8.13",
+          version: "0.8.14",
           download: async () => {
             order.push("download");
           },
@@ -890,7 +890,7 @@ test.describe("UpdateController", () => {
     const controller = createUpdateController({
       supported: true,
       check: async () => ({
-        version: "0.8.13",
+        version: "0.8.14",
         canInstall: false,
         installInstructions: instructions,
         download: async () => {
@@ -909,7 +909,7 @@ test.describe("UpdateController", () => {
     await controller.checkForUpdates("manual");
     expect(controller.getSnapshot()).toMatchObject({
       phase: "available",
-      version: "0.8.13",
+      version: "0.8.14",
       canInstall: false,
       message: instructions,
     });
