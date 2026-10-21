@@ -2041,6 +2041,9 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return undefined as T;
     case "clear_crash":
       return undefined as T;
+    // The start fence is native; a browser has nothing that can refuse.
+    case "node_start_block":
+      return null as T;
     case "ensure_binary":
       // Browser (live mode) can't install a native binary - pretend it's
       // already installed so the UI doesn't block onboarding.
@@ -2543,7 +2546,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         running,
         pid: running && !external ? 42_731 : null,
         health: running ? (uptime < 8 ? "syncing" : "live") : "offline",
-        version: "0.8.13",
+        version: "0.8.14",
         peers: running ? 8 : 0,
         round: running ? 43_821 + Math.floor(uptime / 4) : 0,
         committed: running ? 43_820 + Math.floor(uptime / 4) : 0,
@@ -2952,6 +2955,8 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     }
     case "clear_crash":
       return undefined as T;
+    case "node_start_block":
+      return null as T;
     case "save_logs":
       return {
         path: "/mock/Downloads/arc-node-20260817-120000.log",
@@ -3159,6 +3164,8 @@ export const api = {
   restartNode: () => invoke<void>("restart_node"),
   resetPeerState: () => invoke<ResetPeerStateResult>("reset_peer_state"),
   nodeStatus: () => invoke<NodeStatus>("node_status"),
+  /** What a Start would be told by the start fence now; null when starts are open. */
+  nodeStartBlock: () => invoke<string | null>("node_start_block"),
   fetchEarnings: () => invoke<Earnings>("fetch_earnings"),
   fetchAttestations: (limit = 20) =>
     invoke<Attestation[]>("fetch_attestations", { limit }),

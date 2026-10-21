@@ -18,6 +18,14 @@
 //! failed: ARC refused to start the node because chain-data migration is not
 //! safely resolved: managed-node startup reconciliation is still in progress".
 //!
+//! Through v0.8.13 a refusal also closed the desktop's own signed app update,
+//! so a desktop stuck behind one could be fixed only by a manual install. The
+//! app update now passes a refusal (`app_update_boundary`): it replaces only
+//! the desktop bundle, and the new version runs its own launch-time
+//! reconciliation before it starts arc-node or replaces its binary. A legacy
+//! v0.7 refusal, or a lifecycle lease that can't be taken, still leaves the
+//! manual install.
+//!
 //! This module depends on `std` only, so its tests also run standalone with
 //! `rustc --edition 2021 --test src/start_fence.rs`.
 
@@ -36,8 +44,9 @@ pub enum StartFence {
 /// Who is asking to pass the fence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartAccess {
-    /// WebView Start, Retry, Restart, Ensure binary, peer reset and update
-    /// preparation, and auto-start after reconciliation.
+    /// WebView Start, Retry, Restart, Ensure binary, peer reset, and
+    /// auto-start after reconciliation. The app update has its own rule,
+    /// `app_update_boundary`.
     Ordinary,
     /// The launch-time reconciliation's own quarantined recovery launch
     /// (`commands::recover_managed_shutdown_inner`). Nothing else uses it.
@@ -48,6 +57,24 @@ pub enum StartAccess {
 /// transient, so it does not tell the user to repair anything.
 pub const STARTUP_RECONCILIATION_IN_PROGRESS: &str =
     "managed-node startup reconciliation is still in progress: ARC is checking how the previous node session ended before it starts or updates arc-node. Try again in a few seconds";
+
+/// The framing of every refusal. A reason that already carries it, such as a
+/// refusal recorded as the reason of another, is reported once.
+const REFUSAL_PREFIX: &str =
+    "ARC refused to start the node because chain-data migration is not safely resolved: ";
+const REFUSAL_ADVICE: &str = "Restart ARC after repairing the reported path or permissions; do not point v0.8 at the preserved legacy directory.";
+
+/// Which boundary the desktop's own signed app update takes past the fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppUpdateBoundary {
+    /// The fence is open: stop the node and keep its exact launch so a
+    /// rejected install can resume it.
+    Ordinary,
+    /// A refusal holds, so no node runs or may start. Nothing is stopped or
+    /// resumed; the update only takes the lifecycle owner lease for its
+    /// install.
+    Fenced,
+}
 
 /// The fence before launch-time reconciliation begins. A migration failure
 /// found during setup is already a refusal; otherwise reconciliation holds
@@ -77,9 +104,37 @@ pub fn check(fence: Option<&StartFence>, access: StartAccess) -> Result<(), Stri
         (Some(StartFence::StartupReconciliation), StartAccess::Ordinary) => {
             Err(format!("{STARTUP_RECONCILIATION_IN_PROGRESS}."))
         }
-        (Some(StartFence::Refused(reason)), _) => Err(format!(
-            "ARC refused to start the node because chain-data migration is not safely resolved: {reason}. Restart ARC after repairing the reported path or permissions; do not point v0.8 at the preserved legacy directory."
-        )),
+        (Some(StartFence::Refused(reason)), _) => Err(refusal_message(reason)),
+    }
+}
+
+fn refusal_message(reason: &str) -> String {
+    if reason.contains(REFUSAL_PREFIX) {
+        reason.to_owned()
+    } else {
+        format!("{REFUSAL_PREFIX}{reason}. {REFUSAL_ADVICE}")
+    }
+}
+
+/// Which boundary the signed app update takes now.
+///
+/// The fence keeps arc-node from starting, and its binary from being
+/// replaced, until the previous session's data is safe. The app update does
+/// neither: it replaces only the desktop bundle. The receipt binds the exact
+/// node executable and genesis bytes, and the new version recovers with
+/// exactly those before it starts or replaces anything. So the refusal
+/// itself does not block the update that may carry its fix; the fenced
+/// boundary can still fail closed on its own lease (see
+/// `NodeManager::prepare_fenced_update_relaunch`). While launch-time
+/// reconciliation still owns the node the update waits like every caller;
+/// the node's own stop limits bound that wait.
+pub fn app_update_boundary(fence: Option<&StartFence>) -> Result<AppUpdateBoundary, String> {
+    match fence {
+        None => Ok(AppUpdateBoundary::Ordinary),
+        Some(StartFence::StartupReconciliation) => {
+            Err(format!("{STARTUP_RECONCILIATION_IN_PROGRESS}."))
+        }
+        Some(StartFence::Refused(_)) => Ok(AppUpdateBoundary::Fenced),
     }
 }
 
@@ -169,5 +224,67 @@ mod tests {
         assert!(error.contains("recovery node exited before its WAL barrier"));
         assert!(!error.contains(STARTUP_RECONCILIATION_IN_PROGRESS));
         assert_eq!(error.matches("ARC refused to start the node").count(), 1);
+    }
+
+    /// The trap behind every stuck report: a refusal used to close the app
+    /// update too, so the release with the fix could not reach the desktop.
+    /// The update now passes every refusal, while node starts, the recovery
+    /// launch and binary replacement stay closed.
+    #[test]
+    fn a_refusal_lets_the_app_update_through_and_nothing_else() {
+        for reason in [
+            "managed-node durability recovery failed: recovery node exited before its WAL barrier",
+            "legacy-data migration preflight failed: legacy data directory is a symbolic link",
+            "managed-node startup reconciliation failed: the private managed-node shutdown receipt cannot be validated",
+        ] {
+            let fence = StartFence::Refused(reason.into());
+            assert_eq!(
+                app_update_boundary(Some(&fence)),
+                Ok(AppUpdateBoundary::Fenced)
+            );
+            for access in [StartAccess::Ordinary, StartAccess::StartupRecovery] {
+                assert!(check(Some(&fence), access).is_err(), "{reason}");
+            }
+        }
+        let fence = at_launch(Some("disk full".into()));
+        assert_eq!(
+            app_update_boundary(Some(&fence)),
+            Ok(AppUpdateBoundary::Fenced)
+        );
+    }
+
+    #[test]
+    fn the_app_update_takes_the_ordinary_boundary_when_the_fence_is_open() {
+        assert_eq!(app_update_boundary(None), Ok(AppUpdateBoundary::Ordinary));
+        assert_eq!(
+            app_update_boundary(after_startup_reconciliation(Ok(())).as_ref()),
+            Ok(AppUpdateBoundary::Ordinary)
+        );
+    }
+
+    /// Launch-time reconciliation owns the node, possibly mid-way through a
+    /// WAL replay. The update waits for it rather than interrupt it, and
+    /// says so with the transient text, not a repair instruction.
+    #[test]
+    fn the_app_update_waits_for_startup_reconciliation() {
+        let error = app_update_boundary(Some(&at_launch(None)))
+            .expect_err("the update must not interrupt the recovery launch");
+        assert!(error.contains("startup reconciliation is still in progress"));
+        assert!(!error.contains(REFUSAL_PREFIX));
+    }
+
+    /// v0.8.12 recorded a refusal as the reason of another and showed the
+    /// framing and its advice twice. A reason that already carries the
+    /// framing is now reported as it is.
+    #[test]
+    fn a_refusal_inside_a_refusal_is_framed_once() {
+        let inner = refusal_message("managed-node startup reconciliation is still in progress");
+        let fence =
+            StartFence::Refused(format!("managed-node durability recovery failed: {inner}"));
+        let error = check(Some(&fence), StartAccess::Ordinary).unwrap_err();
+        assert_eq!(error.matches(REFUSAL_PREFIX).count(), 1);
+        assert_eq!(error.matches(REFUSAL_ADVICE).count(), 1);
+        assert!(error.contains("managed-node durability recovery failed"));
+        assert!(!error.contains(".."));
     }
 }

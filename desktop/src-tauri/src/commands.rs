@@ -1,5 +1,5 @@
 use crate::node_manager::{managed_binary_path, TestnetResources};
-use crate::start_fence::StartAccess;
+use crate::start_fence::{AppUpdateBoundary, StartAccess};
 use crate::types::*;
 use crate::{hardware, identity, paths, rpc_client, store::Store, AppState, CommunityReceiptRoute};
 use fs2::FileExt as _;
@@ -268,7 +268,12 @@ fn apply_webview_config_save(store: &mut Store, mut config: NodeConfig, save: Co
     preserve_authoritative_data_dir(&mut config, store.config.as_ref());
     match save {
         ConfigSave::Onboarding => {
-            preserve_unsent_contribution_choices(&mut config, store.config.as_ref())
+            preserve_unsent_contribution_choices(&mut config, store.config.as_ref());
+            // The wizard never asks about unattended installs, so a re-run
+            // ("Reset onboarding") keeps the stored answer, like keep-awake.
+            if let Some(persisted) = store.config.as_ref() {
+                config.auto_install_updates = persisted.auto_install_updates;
+            }
         }
         ConfigSave::Preferences => {
             preserve_native_contribution_state(&mut config, store.config.as_ref())
@@ -292,7 +297,7 @@ async fn save_webview_config(
             .as_ref()
             .is_some_and(|config| config.auto_start);
         let dir = state.data_dir.lock().await.clone();
-        store.save_to(&dir).map_err(map_err)?;
+        persist_webview_config(&store, &dir).map_err(map_err)?;
     }
     if !auto_start {
         state.cancel_startup_retry();
@@ -309,6 +314,18 @@ async fn save_webview_config(
             let _ = autostart.disable();
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Save a WebView-submitted config. A saved config is the user's answer, so
+/// the one-time unattended-install default is then recorded as applied too:
+/// if the launch failed to record it, a Settings "off" made since must not be
+/// turned back on at the next launch. That step is best-effort.
+fn persist_webview_config(store: &Store, dir: &Path) -> anyhow::Result<()> {
+    store.save_to(dir)?;
+    if let Err(error) = crate::auto_update::record_unattended_install_default(dir) {
+        tracing::warn!(%error, "could not record the unattended-update default after a config save");
     }
     Ok(())
 }
@@ -600,6 +617,16 @@ async fn require_start_fence(state: &AppState, access: StartAccess) -> Result<()
     crate::start_fence::check(fence.as_ref(), access)
 }
 
+/// Which boundary the desktop's own signed app update takes. A start refusal
+/// closes node starts and binary replacement, never the update that may carry
+/// its fix (`start_fence::app_update_boundary`). The fence leaves the
+/// in-progress state at most once, and a refusal holds until ARC restarts,
+/// so the boundary read here cannot go stale before the node lock is taken.
+async fn app_update_boundary(state: &AppState) -> Result<AppUpdateBoundary, String> {
+    let fence = state.data_migration_error.lock().await.clone();
+    crate::start_fence::app_update_boundary(fence.as_ref())
+}
+
 /// The fence check for every WebView entrypoint and auto-start.
 async fn require_data_migration_ready(state: &AppState) -> Result<(), String> {
     require_start_fence(state, StartAccess::Ordinary).await
@@ -633,24 +660,46 @@ pub async fn stop_node(state: State<'_, AppState>) -> CmdResult<()> {
 /// desktop can see a healthy old node and silently keep using an incompatible
 /// protocol. A failed stop blocks download/install instead of pretending the
 /// boundary is safe.
+///
+/// When no node runs and none may start (a start refusal, or a receipt whose
+/// recovery could not finish), there is nothing to stop. The update then takes
+/// the fenced boundary, so the release that fixes the refusal can install. A
+/// legacy v0.7 refusal, or a lease that can't be taken, still fails closed.
 #[tauri::command]
 pub async fn prepare_update_relaunch(state: State<'_, AppState>) -> CmdResult<()> {
-    state.cancel_startup_retry();
-    require_data_migration_ready(&state).await?;
+    // A wait for launch reconciliation returns here, before anything is
+    // cancelled, so pressing Install while ARC recovers keeps auto-start.
+    let boundary = app_update_boundary(&state).await?;
+    if boundary == AppUpdateBoundary::Ordinary {
+        state.cancel_startup_retry();
+    }
     let mut node = state.node.lock().await;
-    node.prepare_update_relaunch()
-        .await
+    let fenced = boundary == AppUpdateBoundary::Fenced || node.ordinary_update_boundary_is_fenced();
+    let result = if fenced {
+        // Nothing runs to stop, so only a lease actually taken cancels
+        // auto-start.
+        let prepared = node.prepare_fenced_update_relaunch();
+        if prepared.is_ok() {
+            state.cancel_startup_retry();
+        }
+        prepared
+    } else {
+        node.prepare_update_relaunch().await
+    };
+    result
         .map_err(|error| format!("could not establish the native update lifecycle fence: {error}"))
 }
 
 /// Unattended updates require separate saved consent, idle app-side writes,
-/// and an authenticated compute drain from the exact managed child.
+/// and an authenticated compute drain from the exact managed child. When no
+/// node runs and none may start, there is no child to drain, and the update
+/// takes the fenced boundary.
 #[tauri::command]
 pub async fn try_prepare_auto_update_relaunch(
     state: State<'_, AppState>,
 ) -> CmdResult<crate::auto_update::PrepareResult> {
     use crate::auto_update::{PrepareResult, RequestFence};
-    require_data_migration_ready(&state).await?;
+    let boundary = app_update_boundary(&state).await?;
     if !update_install_policy().await?.can_install {
         return Ok(PrepareResult::busy(
             "This installation is updated by its package manager",
@@ -692,6 +741,19 @@ pub async fn try_prepare_auto_update_relaunch(
             0,
         ));
     };
+    if boundary == AppUpdateBoundary::Fenced || node.ordinary_update_boundary_is_fenced() {
+        // No node runs or may start, so there is no worker to drain and
+        // nothing to resume. Without this the unattended update waited for a
+        // running node that the refusal it could fix never lets start. Only a
+        // lease actually taken cancels auto-start.
+        let prepared = node.prepare_fenced_update_relaunch();
+        if prepared.is_ok() {
+            state.cancel_startup_retry();
+        }
+        return prepared.map(|()| PrepareResult::Prepared).map_err(|error| {
+            format!("automatic update preparation requires a safe abort: {error}")
+        });
+    }
     if node.pid().is_some() {
         state.cancel_startup_retry();
     }
@@ -1194,6 +1256,19 @@ pub async fn node_status(state: State<'_, AppState>) -> CmdResult<NodeStatus> {
     status.cpu_cores = Some(cached_hardware().cpu_cores);
     status.model_unavailable = model_unavailable;
     Ok(status)
+}
+
+/// What a Start would be told by the start fence right now, or None when node
+/// starts are open. Home shows a blocked or recovering node from this before
+/// anyone presses Start. It reads only the fence, never the node mutex, so it
+/// answers during a long launch-time recovery too.
+#[tauri::command]
+pub async fn node_start_block(state: State<'_, AppState>) -> CmdResult<Option<String>> {
+    Ok(start_block(&state).await)
+}
+
+async fn start_block(state: &AppState) -> Option<String> {
+    require_data_migration_ready(state).await.err()
 }
 
 #[tauri::command]
@@ -1785,6 +1860,30 @@ fn inference_pre_dispatch_unavailable(detail: impl std::fmt::Display) -> String 
     format!("{INFERENCE_PRE_DISPATCH_UNAVAILABLE}: {detail}")
 }
 
+/// The local node's RPC port, or `None` while the node mutex is held. A
+/// launch recovery, a Stop or Restart, or an update drain holds that mutex for
+/// minutes, and the chat must neither wait behind it nor send work to a node
+/// that may be stopping: it can still answer `/health` and then exit.
+fn try_local_rpc_port(state: &AppState) -> Option<u16> {
+    state.node.try_lock().ok().map(|node| node.rpc_port)
+}
+
+/// The local node's RPC port, without waiting on the node mutex. While it is
+/// held the configured port stands in, which is enough to recognise the local
+/// node's address.
+async fn local_rpc_port(state: &AppState) -> u16 {
+    if let Some(port) = try_local_rpc_port(state) {
+        return port;
+    }
+    state
+        .store
+        .lock()
+        .await
+        .config
+        .as_ref()
+        .map_or(NodeConfig::default().rpc_port, |config| config.rpc_port)
+}
+
 fn inference_post_outcome_ambiguous(detail: impl std::fmt::Display) -> String {
     format!(
         "{INFERENCE_POST_OUTCOME_AMBIGUOUS}: an inference POST was attempted and may have created an assignment or reward; do not retry another route ({detail})"
@@ -1808,7 +1907,8 @@ async fn inference_readiness_ok(http: &reqwest::Client, host: &str) -> Result<bo
 ///    running the current build — the public seeds are still on v0.7.9,
 ///    whose coordinator is markedly slower — and routing through a
 ///    datacenter to compute something the user's own machine can compute is
-///    both slower and a worse story to tell.
+///    both slower and a worse story to tell. It is skipped while a Stop,
+///    Restart or update holds the node.
 /// 2. **Remotes are probed concurrently**, and only reachable ones are
 ///    returned, ordered by how fast they answered. The previous code walked
 ///    a fixed list sequentially with a per-host inference timeout, so an
@@ -1823,10 +1923,11 @@ async fn coordinator_candidates(state: &AppState) -> Vec<String> {
         return ordered;
     }
 
-    let port = state.node.lock().await.rpc_port;
-    let local = paths::local_host(port);
-    if health_ok(&state.http, &local, COORDINATOR_HEALTH_TIMEOUT).await {
-        ordered.push(local);
+    if let Some(port) = try_local_rpc_port(state) {
+        let local = paths::local_host(port);
+        if health_ok(&state.http, &local, COORDINATOR_HEALTH_TIMEOUT).await {
+            ordered.push(local);
+        }
     }
 
     let mut set = tokio::task::JoinSet::new();
@@ -1887,7 +1988,7 @@ async fn pin_community_receipt_route(
     let Some(settlement) = result.settlement.as_ref() else {
         return;
     };
-    let local_host = paths::local_host(state.node.lock().await.rpc_port);
+    let local_host = paths::local_host(local_rpc_port(state).await);
     if !settlement.submitted
         || settlement.tx_type != "0x25"
         || !matches!(
@@ -1993,7 +2094,7 @@ pub(crate) async fn fetch_community_reward_receipt_inner(
     worker: &str,
     receipt_url: &str,
 ) -> CmdResult<InferenceSettlement> {
-    let local_host = paths::local_host(state.node.lock().await.rpc_port);
+    let local_host = paths::local_host(local_rpc_port(state).await);
     if !community_receipt_source_is_pinned(source_host, &local_host) {
         return Err(RECEIPT_SOURCE_REJECTED.to_string());
     }
@@ -2051,7 +2152,14 @@ async fn run_inference_local_inner(
     chat_template: bool,
 ) -> CmdResult<InferenceResult> {
     let _write_guard = state.community_inference_write.lock().await;
-    let port = state.node.lock().await.rpc_port;
+    // A launch recovery or a stop holds the node mutex for minutes. Nothing
+    // has been sent yet, so skip the local node and let the network answer.
+    let port = match state.node.try_lock() {
+        Ok(node) => node.rpc_port,
+        Err(_) => return Err(inference_pre_dispatch_unavailable(
+            "the local node is busy starting, stopping or recovering; local inference was skipped",
+        )),
+    };
     let host = paths::local_host(port);
     if let Some(origin) = established_chain_origin(state).await {
         if origin != host {
@@ -2139,7 +2247,7 @@ async fn run_inference_via_coordinator_inner(
     }
     let client = inference_client(prompt, max_tokens, proxy_policy)
         .map_err(inference_pre_dispatch_unavailable)?;
-    let local_prefix = paths::local_host(state.node.lock().await.rpc_port);
+    let local_prefix = paths::local_host(local_rpc_port(state).await);
     // `/run_consensus` is itself a write/compute operation.  Health probes
     // may inspect as many candidates as needed, but after choosing the first
     // reachable origin the app sends exactly one POST and never migrates the
@@ -2779,7 +2887,7 @@ async fn run_inference_via_coordinator_direct_inner(
     })?;
     let client = inference_client(prompt, max_tokens, proxy_policy)
         .map_err(inference_pre_dispatch_unavailable)?;
-    let local_prefix = paths::local_host(state.node.lock().await.rpc_port);
+    let local_prefix = paths::local_host(local_rpc_port(state).await);
     let mut result = rpc_client::run_inference_remote(
         &client,
         &host,
@@ -2824,7 +2932,7 @@ pub(crate) async fn run_inference_via_exact_production_coordinator_inner(
     .await
 }
 
-const SETTLEMENT_WRITE_UNAVAILABLE: &str = "is unavailable in the v0.8.13 recovery candidate before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not production-ready. VRF selection and server-derived replica labels are not validator approval. Free/community inference remains available.";
+const SETTLEMENT_WRITE_UNAVAILABLE: &str = "is unavailable in the v0.8.14 recovery candidate before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not production-ready. VRF selection and server-derived replica labels are not validator approval. Free/community inference remains available.";
 
 fn settlement_write_unavailable<T>(flow: &str) -> CmdResult<T> {
     Err(format!("{} {}", flow, SETTLEMENT_WRITE_UNAVAILABLE))
@@ -6660,6 +6768,64 @@ mod compute_contribution_tests {
         assert_eq!(persisted.prevent_sleep_during_jobs, Some(true));
         assert!(!launches_as_worker(&persisted));
     }
+
+    /// The wizard never asks about unattended installs. A first run takes
+    /// the default; "Reset onboarding" keeps the stored answer, so it can't
+    /// turn an "off" back on. Only Settings changes it.
+    #[test]
+    fn a_rerun_wizard_keeps_the_unattended_install_answer() {
+        let mut store = Store::default();
+        apply_webview_config_save(
+            &mut store,
+            config("observer", None, Some(false)),
+            ConfigSave::Onboarding,
+        );
+        assert!(store.config.as_ref().unwrap().auto_install_updates);
+
+        let off = NodeConfig {
+            auto_install_updates: false,
+            ..config("observer", None, Some(false))
+        };
+        apply_webview_config_save(&mut store, off, ConfigSave::Preferences);
+        assert!(!store.config.as_ref().unwrap().auto_install_updates);
+
+        // The re-run wizard submits the WebView default, which is on.
+        apply_webview_config_save(
+            &mut store,
+            config("worker", Some("/m.gguf"), Some(true)),
+            ConfigSave::Onboarding,
+        );
+        assert!(!store.config.as_ref().unwrap().auto_install_updates);
+
+        apply_webview_config_save(
+            &mut store,
+            config("worker", Some("/m.gguf"), Some(true)),
+            ConfigSave::Preferences,
+        );
+        assert!(store.config.as_ref().unwrap().auto_install_updates);
+    }
+
+    /// The launch could not save the one-time default, so it recorded no
+    /// marker. A Settings "off" saved afterwards is the user's answer and must
+    /// survive the next launch.
+    #[test]
+    fn a_saved_settings_answer_is_never_overridden_by_the_one_time_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::default();
+        let off = NodeConfig {
+            auto_install_updates: false,
+            ..config("observer", None, Some(false))
+        };
+        apply_webview_config_save(&mut store, off, ConfigSave::Preferences);
+        persist_webview_config(&store, dir.path()).unwrap();
+
+        let mut relaunched = Store::load_from(dir.path());
+        assert!(
+            !crate::auto_update::apply_unattended_install_default(&mut relaunched, dir.path())
+                .unwrap()
+        );
+        assert!(!relaunched.config.unwrap().auto_install_updates);
+    }
 }
 
 #[cfg(test)]
@@ -6667,8 +6833,15 @@ mod start_fence_tests {
     //! The launch-time start fence through `AppState`: the v0.8.12 deadlock,
     //! where startup's recovery launch refused itself, and the transitions
     //! that replace it.
-    use super::{require_data_migration_ready, require_start_fence, StartTransaction};
-    use crate::start_fence::{after_startup_reconciliation, at_launch, StartAccess, StartFence};
+    use super::{
+        app_update_boundary, local_rpc_port, require_data_migration_ready, require_start_fence,
+        run_inference_local_inner, start_block, try_local_rpc_port, StartTransaction,
+        INFERENCE_PRE_DISPATCH_UNAVAILABLE,
+    };
+    use crate::start_fence::{
+        after_startup_reconciliation, at_launch, AppUpdateBoundary, StartAccess, StartFence,
+    };
+    use crate::types::NodeConfig;
     use crate::AppState;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -6798,5 +6971,130 @@ mod start_fence_tests {
         );
         assert!(gate.contains("StartAccess::Ordinary"));
         assert!(!gate.contains("StartupRecovery"));
+    }
+
+    /// The trap behind the stuck reports: a refusal closed the app update
+    /// too, so the release with the fix could not install. The update now
+    /// takes the fenced boundary while Start, auto-start, Restart and Ensure
+    /// binary keep refusing.
+    #[tokio::test]
+    async fn a_refusal_lets_the_app_update_through_and_keeps_node_starts_closed() {
+        let state = state_with(Some(at_launch(None)));
+        *state.data_migration_error.lock().await = after_startup_reconciliation(Err(
+            "managed-node durability recovery failed: recovery node exited before its WAL barrier"
+                .into(),
+        ));
+        assert_eq!(
+            app_update_boundary(&state).await,
+            Ok(AppUpdateBoundary::Fenced)
+        );
+        assert!(require_data_migration_ready(&state).await.is_err());
+        assert!(
+            require_start_fence(&state, StartTransaction::Start.fence_access())
+                .await
+                .is_err()
+        );
+    }
+
+    /// Home reads what a Start would be told, and its chat skips the local
+    /// node, without waiting on the node mutex that a launch recovery or a
+    /// stop holds for minutes.
+    #[tokio::test]
+    async fn home_never_waits_on_the_node_mutex() {
+        let state = state_with(Some(at_launch(None)));
+        let lifecycle_step = state.node.lock().await;
+
+        let waiting = start_block(&state).await.expect("reconciliation is a wait");
+        assert!(waiting.contains("startup reconciliation is still in progress"));
+        *state.data_migration_error.lock().await = after_startup_reconciliation(Err(
+            "managed-node durability recovery failed: recovery node exited before its WAL barrier"
+                .into(),
+        ));
+        let refused = start_block(&state).await.expect("a refusal blocks starts");
+        assert!(refused.contains("ARC refused to start the node"));
+
+        let skipped = run_inference_local_inner(&state, "The largest planet is", 1, true)
+            .await
+            .err()
+            .expect("a busy node mutex skips the local node");
+        assert!(skipped.starts_with(INFERENCE_PRE_DISPATCH_UNAVAILABLE));
+        // The network fallback skips it too: a node being stopped can still
+        // answer /health and then exit under the one POST.
+        assert_eq!(try_local_rpc_port(&state), None);
+        let candidates = body_between(
+            include_str!("commands.rs"),
+            "async fn coordinator_candidates(",
+            "/// Once the session has either displayed",
+        );
+        assert!(candidates.contains("if let Some(port) = try_local_rpc_port(state) {"));
+        assert!(!candidates.contains("local_rpc_port(state).await"));
+        // Recognising the local node's address still works.
+        assert_eq!(local_rpc_port(&state).await, NodeConfig::default().rpc_port);
+        let rpc_port = lifecycle_step.rpc_port;
+        drop(lifecycle_step);
+        assert_eq!(try_local_rpc_port(&state), Some(rpc_port));
+
+        *state.data_migration_error.lock().await = None;
+        assert_eq!(start_block(&state).await, None);
+    }
+
+    #[tokio::test]
+    async fn the_app_update_waits_for_startup_reconciliation_then_opens() {
+        let state = state_with(Some(at_launch(None)));
+        let error = app_update_boundary(&state).await.unwrap_err();
+        assert!(error.contains("startup reconciliation is still in progress"));
+
+        *state.data_migration_error.lock().await = after_startup_reconciliation(Ok(()));
+        assert_eq!(
+            app_update_boundary(&state).await,
+            Ok(AppUpdateBoundary::Ordinary)
+        );
+    }
+
+    /// Pin which rule each entrypoint uses: the two app-update entrypoints
+    /// pass a refusal, and nothing that starts arc-node or replaces its
+    /// binary does.
+    #[test]
+    fn only_the_app_update_entrypoints_pass_a_refusal() {
+        let source = include_str!("commands.rs");
+        for (name, start, end) in [
+            (
+                "prepare_update_relaunch",
+                "pub async fn prepare_update_relaunch(",
+                "/// Unattended updates require",
+            ),
+            (
+                "try_prepare_auto_update_relaunch",
+                "pub async fn try_prepare_auto_update_relaunch(",
+                "/// Seal the one-way native updater boundary",
+            ),
+        ] {
+            let body = body_between(source, start, end);
+            assert!(body.contains("app_update_boundary(&state)"), "{name}");
+            assert!(body.contains("prepare_fenced_update_relaunch()"), "{name}");
+            assert!(!body.contains("require_data_migration_ready"), "{name}");
+            // A wait for launch reconciliation cancels nothing, and the fenced
+            // path cancels auto-start only once its lease is taken.
+            let boundary_at = body.find("app_update_boundary(&state)").unwrap();
+            let first_cancel = body.find("state.cancel_startup_retry()").unwrap();
+            assert!(boundary_at < first_cancel, "{name}");
+            assert!(body.contains("if prepared.is_ok() {"), "{name}");
+        }
+        for (name, start, end) in [
+            (
+                "ensure_binary",
+                "pub async fn ensure_binary(",
+                "fn installed(",
+            ),
+            (
+                "restart_node",
+                "pub async fn restart_node(",
+                "pub(crate) async fn restart_node_inner(",
+            ),
+        ] {
+            let body = body_between(source, start, end);
+            assert!(body.contains("require_data_migration_ready"), "{name}");
+            assert!(!body.contains("app_update_boundary"), "{name}");
+        }
     }
 }

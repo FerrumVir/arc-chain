@@ -1,8 +1,21 @@
 import type { Page } from "@playwright/test";
 
+/**
+ * Open the app on a given screen. ARC opens on Home ("Ask ARC"); the seeded
+ * suites below test the other screens from the dashboard, as they always
+ * have, so the seed helpers open there. A Home test calls this with
+ * "inference" after seeding. Read once by store.ts at startup.
+ */
+export async function openOn(page: Page, route: string) {
+  await page.addInitScript((startRoute) => {
+    (window as unknown as { __ARC_START_ROUTE__?: string }).__ARC_START_ROUTE__ = startRoute;
+  }, route);
+}
+
 // Seed the app into a "post-onboarding" state so dashboard tests don't need to
 // walk the wizard. Writes the same shape the zustand store persists.
 export async function seedOnboarded(page: Page, address = "99".repeat(32)) {
+  await openOn(page, "dashboard");
   await page.addInitScript((workerAddress) => {
     localStorage.setItem(
       "arc-desktop-state-v1",
@@ -40,6 +53,7 @@ export async function seedOnboarded(page: Page, address = "99".repeat(32)) {
  * testing that the scrub-on-load path actually evicts it.
  */
 export async function seedOnboardedLegacy(page: Page) {
+  await openOn(page, "dashboard");
   await page.addInitScript(() => {
     localStorage.setItem(
       "arc-desktop-state-v1",
@@ -206,6 +220,7 @@ export async function clearState(page: Page) {
  * `return` early and silently do nothing.
  */
 export async function seedOnboardedWithoutConfig(page: Page) {
+  await openOn(page, "dashboard");
   await page.addInitScript(() => {
     localStorage.setItem(
       "arc-desktop-state-v1",

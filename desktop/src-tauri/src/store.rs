@@ -310,7 +310,7 @@ impl Store {
     }
 }
 
-fn secure_store_directory(dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn secure_store_directory(dir: &Path) -> anyhow::Result<()> {
     match arc_crypto::secret_file::secure_private_directory(dir) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

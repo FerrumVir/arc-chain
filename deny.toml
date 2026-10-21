@@ -114,6 +114,17 @@ ignore = [
     "RUSTSEC-2026-0370", # zvariant; remove with tauri-plugin-opener zbus 6
     "RUSTSEC-2026-0371", # zbus_names; remove with tauri-plugin-opener zbus 6
     "RUSTSEC-2026-0372", # zvariant_derive; remove with tauri-plugin-opener zbus 6
+    # 2026-10-21 ARC release engineering: the lockfiles move webpki-roots and
+    # webpki-root-certs to the patched 1.0.10 and rustls-webpki to 0.103.16
+    # (RUSTSEC-2026-0381, -0382, -0383). webpki-roots 0.26.11 has no patched
+    # 0.26 release, but it ships no roots of its own: its whole library is
+    # `pub use parent::TLS_SERVER_ROOTS;` with `parent` = webpki-roots "1",
+    # locked at 1.0.10, so it serves the patched roots. cargo-deny matches it
+    # by version only. It is reached through ureq 2.12.1, from
+    # arc-legacy-bridge and arc-olm only, never arc-node or the desktop.
+    # Remove when both move to ureq 3 (webpki-roots 1.x directly), no later
+    # than the v0.9.0 dependency review.
+    "RUSTSEC-2026-0381",
 ]
 
 # ------------------------------------------------------------- licenses ----

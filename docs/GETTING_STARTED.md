@@ -64,7 +64,7 @@ Windows version only after a release-blocking runtime test covers it.
 
 ### Linux (Ubuntu / Debian)
 
-After the complete v0.8.13 release is published, use its normalized desktop
+After the complete v0.8.14 release is published, use its normalized desktop
 asset name:
 
 ```bash
@@ -112,7 +112,7 @@ environment, or logs. The phrase is excluded from frontend `localStorage` and
 is never sent to a server by the identity flow. The app-data directory and
 store are owner-validated through open handles (`0700`/`0600` on Unix; a
 protected current-user/SYSTEM/Administrators DACL on Windows), and writes are
-atomic/no-follow. v0.8.13 does not yet use an OS keychain. Save a separate
+atomic/no-follow. v0.8.14 does not yet use an OS keychain. Save a separate
 offline backup: ARC Node has no “forgot password” recovery.
 
 Click **Continue**.
@@ -132,11 +132,15 @@ mode.
 
 ### Screen 4: Launch
 
-Review the role and ports, then click **Set up this node**. The app downloads
+Review the role and ports, then click **Start my node**. The app downloads
 the chosen model and node build, starts the process, and attempts a configured
 coordinator connection. It does **not** silently request faucet credit; use the
 Wallet screen's explicit **Claim from faucet** action after onboarding if you
 want testnet ARC. Startup and connectivity are reported separately.
+
+If the node can't start, setup doesn't stop there: click **Continue to ARC**
+(or **Try again**). ARC opens on Home, and the one-line node strip at the top
+says what the node needs and offers its one fix.
 
 ---
 
@@ -144,6 +148,10 @@ want testnet ARC. Startup and connectivity are reported separately.
 
 After setup:
 
+- ARC opens on Home, **Ask ARC**: the chat, which answers from the network
+  even while your node is off, blocked, starting or updating. The strip above
+  it says what your node is doing in one sentence, with one button when there
+  is something to do (Start node, Restart ARC, Update ARC).
 - The Dashboard distinguishes a running process from peer connectivity and
   selected-host chain health. Do not treat a `live` health string or advancing
   DAG round as proof of block production or cross-seed agreement.
@@ -164,9 +172,9 @@ After setup:
 
 ### Run an AI inference
 
-1. Click the **Inference** tab in the sidebar.
+1. Open **Ask ARC**, the first item in the sidebar (ARC opens there).
 2. Type a prompt. Example: `What is the capital of France?`
-3. Click **Run inference**.
+3. Click **Ask**.
 
 The result states which host says it served the request and exactly what
 agreement evidence came back. A raw `InferenceAttestation` (`0x16`) is only a
@@ -234,7 +242,7 @@ This is testnet ARC — no real-world value.
 2. Treat only a successful mined `CommunityInferenceReward` (`0x25`) receipt as
    payment. Raw `0x16` rows are shown separately as unpaid inference claims.
 
-The unreleased v0.8.13 candidate configures 2.5 testnet ARC per successful
+The unreleased v0.8.14 candidate configures 2.5 testnet ARC per successful
 `0x25` receipt, but issuance also requires exact-artifact work assignment,
 authenticated recomputation, a signed worker certificate, active genesis
 protocol activation, validator approval collection, strict

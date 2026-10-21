@@ -15,6 +15,7 @@ import {
   type NodeConfig,
 } from "../lib/types";
 import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
+import { PLAIN_COPY } from "../lib/plain-copy";
 import { setTheme, useTheme, type Theme } from "../lib/theme";
 
 /** The compute-contribution switch's mutation, so Save can wait for it. */
@@ -42,7 +43,7 @@ export function Settings() {
   );
   const [autoUpdate, setAutoUpdate] = useState(config?.autoUpdate ?? true);
   const [autoInstallUpdates, setAutoInstallUpdates] = useState(
-    config?.autoInstallUpdates ?? false,
+    config?.autoInstallUpdates ?? DEFAULT_NODE_CONFIG.autoInstallUpdates,
   );
   const [autoStart, setAutoStart] = useState(config?.autoStart ?? true);
   const [saved, setSaved] = useState(false);
@@ -232,9 +233,7 @@ export function Settings() {
                 Install signed app updates automatically when idle
               </div>
               <div style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>
-                Off by default. ARC downloads while the node runs, then asks
-                its native worker safety check to confirm inference has drained
-                before stopping the node and restarting ARC.
+                {PLAIN_COPY.updates.autoInstallDescription}
               </div>
             </div>
           </label>

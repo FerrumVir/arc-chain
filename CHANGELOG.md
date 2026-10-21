@@ -18,6 +18,48 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.14 - Release-preparation snapshot (2026-10-20)
+
+> **Candidate note:** This entry records the v0.8.14 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.14.
+
+- A refusal to start the node no longer blocks the desktop's own signed
+  app update. A desktop stuck behind one, such as v0.8.12's start deadlock
+  after an unclean node exit, can now install the release that fixes it
+  from inside the app. The update replaces only the app: it never starts,
+  stops or replaces arc-node, never touches the node's shutdown receipt,
+  and waits while the launch-time check is still running. Node starts,
+  the recovery start and node-binary replacement stay refused. A refused
+  v0.7 data migration still needs a manual install (#205).
+- Signed app updates install automatically by default. Desktops from
+  v0.8.13 and earlier are switched on once, including where it had been
+  turned off; Settings can turn it off again, and that choice is kept. Linux
+  .deb and .rpm installs still update through their package manager. This
+  takes effect from v0.8.14 on: v0.8.12 and
+  v0.8.13 desktops still need one click (Settings → Install) or a manual
+  install to reach it (#205).
+- A node that can't start is reported as one plain sentence with one
+  action (Install update, Restart ARC or Try again), with the full message
+  under Show details and Copy details. Problems the user has to repair, such
+  as a path, a permission, a migration or another ARC desktop holding the
+  node, keep their details open (#205).
+- ARC opens on Ask ARC, the AI chat, which works whether or not this
+  computer's node is running: a question goes to the ARC network when the
+  local node can't take it. One line above it says what the node is doing
+  (starting, downloading the AI model, off, stopped unexpectedly, blocked,
+  needing a repair, updating, an update that needs ARC reopened, or a new
+  version ready) with the one button
+  that fixes it, so an available update now shows on the home screen, not
+  only in Settings. If the node can't start during setup, Continue to ARC
+  finishes setup and opens Ask ARC, with Try again beside it. The recovery
+  phrase step and the choice to run AI jobs are unchanged (#205).
+- The legacy bridge pins arc-node v0.8.13 (bridge release v0.7.14), so v0.7
+  installs that update move to v0.8.13 instead of v0.8.12 (#204).
+- Security: rustls-webpki 0.103.16 (RUSTSEC-2026-0382, certificate
+  verification could accept distrusted intermediates), and webpki-roots and
+  webpki-root-certs 1.0.10 (RUSTSEC-2026-0381, -0383, bundled roots that
+  trusted distrusted emSign intermediates), in the node, CLI and desktop.
+
 ## v0.8.13 - Release-preparation snapshot (2026-10-18)
 
 > **Candidate note:** This entry records the v0.8.13 release-preparation
@@ -61,6 +103,19 @@ All notable changes to ARC Chain are tracked here. This project follows
   Linux and the BSDs, and no tauri-plugin-opener release accepts zbus 6
   yet. For every exception the file gives the reasons and the removal
   conditions, no later than the v0.9.0 dependency review (#202).
+- *Backfilled 2026-10-20:* these changes shipped in v0.8.13 but were
+  missing from this entry.
+  - The legacy bridge pinned arc-node v0.8.12 and moved to bridge release
+    v0.7.13, so v0.7 desktops could reach the v0.8 app through
+    `latest.json` (#199).
+  - A missing or unreadable model file no longer leaves the desktop's node
+    unable to start. The node starts as an observer with local compute
+    off, the dashboard says why, and Settings offers **Re-download model**.
+    Recovery starts take the same check, and a recorded node that has
+    provably exited no longer blocks startup (#200).
+  - quinn-proto is 0.11.18 in the node and desktop lockfiles, for
+    RUSTSEC-2026-0338, -0340 and -0343. The desktop's previous 0.11.16 was
+    also inside -0339, -0341 and -0342 (#201).
 
 ## v0.8.12 - Release-preparation snapshot (2026-10-11)
 

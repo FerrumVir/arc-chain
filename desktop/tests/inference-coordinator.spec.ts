@@ -360,9 +360,7 @@ test.describe("Inference - community-first coordinator routing", () => {
     );
     await expect(page.getByTestId("paid-mode-toggle")).toHaveCount(0);
     await expect(page.getByTestId("inference-max-fee")).toHaveCount(0);
-    await expect(page.getByTestId("btn-run-inference")).toContainText(
-      "Run inference",
-    );
+    await expect(page.getByTestId("btn-run-inference")).toHaveText("Ask");
     await expect(page.getByTestId("inference-model-policy")).toHaveText(
       "model identity: reported with response",
     );

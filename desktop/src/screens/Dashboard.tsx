@@ -23,6 +23,7 @@ import { EASE_OUT } from "../lib/motion";
 import { prefersReducedMotion } from "../components/Engraving";
 import type { ArchChainPhase } from "../lib/aqueduct/archchain";
 import { CrashBanner } from "../components/CrashBanner";
+import { StartFailurePanel } from "../components/StartFailurePanel";
 import { EmptyState } from "../components/EmptyState";
 import { InfoPopover } from "../components/InfoPopover";
 import { ModelUnavailableBanner } from "../components/ModelUnavailableBanner";
@@ -420,7 +421,17 @@ export function Dashboard() {
         <ModelUnavailableBanner reason={status.modelUnavailable} />
       )}
 
-      {(startMutation.error || stopMutation.error || restartMutation.error) && (
+      {(startMutation.error || restartMutation.error) && (
+        <StartFailurePanel
+          error={String(startMutation.error ?? restartMutation.error)}
+          onTryAgain={() =>
+            startMutation.error ? startMutation.mutate() : restartMutation.mutate()
+          }
+          testId="mutation-error"
+        />
+      )}
+
+      {stopMutation.error && !startMutation.error && !restartMutation.error && (
         <div
           role="alert"
           data-testid="mutation-error"
@@ -436,11 +447,7 @@ export function Dashboard() {
             whiteSpace: "pre-wrap",
           }}
         >
-          {String(
-            startMutation.error ??
-              stopMutation.error ??
-              restartMutation.error,
-          )}
+          {String(stopMutation.error)}
         </div>
       )}
 

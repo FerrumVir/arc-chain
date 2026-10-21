@@ -62,8 +62,10 @@ pub struct NodeConfig {
     pub p2p_port: u16,
     pub auto_start: bool,
     pub auto_update: bool,
-    /// Separate consent for unattended installation. Older stores opted in
-    /// only to checking for updates, so migration must leave this disabled.
+    /// Unattended installation of signed app updates, separate from checking
+    /// for them. On by default from v0.8.14, so a fix reaches a desktop
+    /// without a click; `auto_update::apply_unattended_install_default`
+    /// turns it on once for stores written before then.
     #[serde(default)]
     pub auto_install_updates: bool,
     pub data_dir: String,
@@ -100,7 +102,7 @@ impl Default for NodeConfig {
             p2p_port: 9091,
             auto_start: true,
             auto_update: true,
-            auto_install_updates: false,
+            auto_install_updates: true,
             // Keep protocol-v3 state separate from the managed binary, models,
             // and any v0.7 WAL that older desktop builds wrote in ~/.arc.
             data_dir: "~/.arc/data-v3".into(),
