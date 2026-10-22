@@ -4,6 +4,7 @@ import { AlertTriangle, Check, RefreshCw, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { NotAvailable } from "../components/NotAvailable";
+import { NodeCareSettings } from "../components/NodeCare";
 import { StatusPill } from "../components/StatusPill";
 import { api, isTauri } from "../lib/tauri";
 import { formatInt, modelDownloadStatus } from "../lib/format";
@@ -404,6 +405,11 @@ export function Settings() {
             </button>
           )}
         </div>
+      </Card>
+
+      <Card style={{ marginBottom: "var(--space-6)" }} data-testid="node-care-card">
+        <CardHeader title="Error reports" />
+        <NodeCareSettings />
       </Card>
 
       <Card>

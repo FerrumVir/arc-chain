@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./App";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { api } from "./lib/tauri";
+import { startNodeCare } from "./lib/node-care-runtime";
 import { initTheme } from "./lib/theme";
 import "./styles/fonts.css";
 import "./styles/tokens.css";
@@ -53,6 +54,9 @@ const queryClient = new QueryClient({
     },
   },
 });
+
+// Node Care: anonymous error reports, off in Settings (lib/node-care.ts).
+startNodeCare(queryClient);
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
