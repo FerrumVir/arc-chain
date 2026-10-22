@@ -3109,6 +3109,36 @@ async function realInvoke<T>(cmd: string, args?: unknown): Promise<T> {
   return invoke<T>(cmd, args as Record<string, unknown>);
 }
 
+// Node Care outside the native host: a browser preview has no report
+// endpoint and never sends. The notice counts as seen so previews and their
+// screenshots keep their layout; the switch still works in memory.
+let browserNodeCareState: string | null = JSON.stringify({
+  v: 1,
+  installId: "00000000000000000000000000000000",
+  enabled: true,
+  noticeShownAt: 0,
+});
+
+function browserNodeCare<T>(cmd: string, args?: unknown): T {
+  switch (cmd) {
+    case "node_care_info":
+      return {
+        endpointConfigured: false,
+        appVersion: "0.0.0-preview",
+        os: "preview",
+        arch: "preview",
+        homeDir: "",
+      } as T;
+    case "node_care_load_state":
+      return browserNodeCareState as T;
+    case "node_care_save_state":
+      browserNodeCareState = String((args as { json?: unknown } | undefined)?.json ?? "");
+      return undefined as T;
+    default:
+      return false as T;
+  }
+}
+
 export async function invoke<T>(cmd: string, args?: unknown): Promise<T> {
   if (IS_TAURI) return realInvoke<T>(cmd, args);
   if (IS_PROD_TAURI_BUNDLE) {
@@ -3116,8 +3146,30 @@ export async function invoke<T>(cmd: string, args?: unknown): Promise<T> {
       "ARC desktop is running outside its native host. Open the arc app, not the HTML bundle.",
     );
   }
+  if (cmd.startsWith("node_care_")) return browserNodeCare<T>(cmd, args);
   if (liveBase()) return liveInvoke<T>(cmd, args);
   return mockInvoke<T>(cmd, args);
+}
+
+/**
+ * Told about every refused Start or Restart, so Node Care can report it
+ * without each screen knowing about reporting. One listener; it must not throw.
+ */
+let startFailureListener: ((error: unknown, stage: string) => void) | null = null;
+
+export function onStartNodeFailure(listener: ((error: unknown, stage: string) => void) | null) {
+  startFailureListener = listener;
+}
+
+function noticeStartFailure<T>(promise: Promise<T>, stage: string): Promise<T> {
+  return promise.catch((error: unknown) => {
+    try {
+      startFailureListener?.(error, stage);
+    } catch {
+      /* reporting never changes what the caller sees */
+    }
+    throw error;
+  });
 }
 
 // Typed wrappers - call these, not invoke() directly.
@@ -3154,14 +3206,15 @@ export const api = {
   /** Answer it; recorded exactly like the Settings compute switch. */
   answerLegacyComputeQuestion: (contribute: boolean) =>
     invoke<NodeConfig>("answer_legacy_compute_question", { contribute }),
-  startNode: (config: NodeConfig) => invoke<void>("start_node", { config }),
+  startNode: (config: NodeConfig) =>
+    noticeStartFailure(invoke<void>("start_node", { config }), "start"),
   stopNode: () => invoke<void>("stop_node"),
   prepareUpdateRelaunch: () => invoke<void>("prepare_update_relaunch"),
   tryPrepareAutoUpdateRelaunch: () =>
     invoke<AutoUpdatePrepareResult>("try_prepare_auto_update_relaunch"),
   beginUpdateHandoff: () => invoke<void>("begin_update_handoff"),
   abortUpdateRelaunch: () => invoke<void>("abort_update_relaunch"),
-  restartNode: () => invoke<void>("restart_node"),
+  restartNode: () => noticeStartFailure(invoke<void>("restart_node"), "restart"),
   resetPeerState: () => invoke<ResetPeerStateResult>("reset_peer_state"),
   nodeStatus: () => invoke<NodeStatus>("node_status"),
   /** What a Start would be told by the start fence now; null when starts are open. */

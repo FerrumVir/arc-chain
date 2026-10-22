@@ -3,6 +3,7 @@ import { AnimatePresence, MotionConfig, motion } from "framer-motion";
 import { Sidebar } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
 import { DataMigrationBanner } from "./components/DataMigrationBanner";
+import { NodeCareNotice } from "./components/NodeCare";
 import { LegacyUpgradeDialog } from "./components/LegacyUpgradeDialog";
 import { Onboarding } from "./screens/Onboarding";
 import { Dashboard } from "./screens/Dashboard";
@@ -191,6 +192,7 @@ export function App() {
                 />
               )}
               <main className="main" data-testid="main" ref={mainRef}>
+                <NodeCareNotice />
                 {dataMigration && (
                   <DataMigrationBanner
                     notice={dataMigration}
