@@ -4,6 +4,7 @@ mod hardware;
 mod identity;
 mod legacy_upgrade;
 mod native_paid;
+mod node_care;
 mod node_manager;
 mod paths;
 mod production_acceptance;
@@ -817,6 +818,10 @@ pub fn run() {
             commands::existing_model_for_tier,
             commands::download_model,
             commands::remove_model,
+            node_care::node_care_info,
+            node_care::node_care_load_state,
+            node_care::node_care_save_state,
+            node_care::node_care_send,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ARC desktop");
