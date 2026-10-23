@@ -1073,6 +1073,8 @@ jobs:
         shell: bash
         env:
           ARC_BUILD_SOURCE_COMMIT: ${{ needs.validate.outputs.sha }}
+          # Node Care reports go here (desktop/PRIVACY.md); users can turn them off.
+          ARC_NODE_CARE_ENDPOINT: https://arc-node-care-intake.onrender.com
         run: |
           set -Eeuo pipefail
           npm exec --offline -- tauri build --ci --no-bundle \
