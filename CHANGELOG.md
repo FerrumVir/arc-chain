@@ -18,6 +18,27 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.15 - Release-preparation snapshot (2026-10-23)
+
+> **Candidate note:** This entry records the v0.8.15 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.15.
+
+- The desktop can send a short anonymous report when the node won't
+  start, crashes, gets stuck for 10 minutes or an update fails, and one
+  when it recovers, so problems get fixed without screenshots. A running
+  app also sends one small heartbeat a day. Reports carry a random install
+  ID, the app and node versions, the platform, the failing step, a short
+  error code and the error text with home folders, emails, IP addresses,
+  wallet addresses and keys removed. Nothing else is sent: no wallet
+  addresses, keys, recovery phrase, peers, logs or prompts. It is on by
+  default, shows a one-time notice before anything is sent, and can be
+  turned off in Settings → Error reports, which deletes anything still
+  waiting; See what's sent shows the last five payloads exactly.
+  `desktop/PRIVACY.md` lists every field (#209).
+- Release builds send those reports to
+  `https://arc-node-care-intake.onrender.com`; a build without a report
+  address sends nothing (#210).
+
 ## v0.8.14 - Release-preparation snapshot (2026-10-20)
 
 > **Candidate note:** This entry records the v0.8.14 release-preparation

@@ -1399,6 +1399,7 @@ release_secret_jobs_require_the_owner_environment() {
     for required in \
         'npm exec --offline -- tauri build --ci --no-bundle' \
         'ARC_BUILD_SOURCE_COMMIT: ${{ needs.validate.outputs.sha }}' \
+        'ARC_NODE_CARE_ENDPOINT: https://arc-node-care-intake.onrender.com' \
         'npm exec --offline -- tauri bundle --ci --no-sign' \
         'python3 scripts/release/seal_macos_app_bundle.py' \
         'unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD' \
