@@ -1246,7 +1246,7 @@ test.describe("UpdateController", () => {
     controller.setAutoInstallEnabled(false);
     expect(controller.getSnapshot()).toMatchObject({
       phase: "available",
-      message: "Version 0.8.14 is available.",
+      message: "Version 0.8.15 is available.",
       canInstall: true,
     });
     await timers.advanceBy(UPDATE_RECONCILIATION_RETRY_MS * 2);
@@ -1397,7 +1397,7 @@ test.describe("UpdateController", () => {
     await timers.advanceBy(0);
     expect(controller.getSnapshot()).toMatchObject({
       phase: "available",
-      message: PLAIN_COPY.updates.manualInstallOnly("0.8.14"),
+      message: PLAIN_COPY.updates.manualInstallOnly("0.8.15"),
     });
     controller.dispose();
   });
