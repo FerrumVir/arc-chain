@@ -2685,6 +2685,20 @@ fn open_and_try_lock_node_data_file(path: &Path, locked_data_dir: &Path) -> Resu
             locked_data_dir.display()
         )
     })?;
+    // A plain Windows create inherits the private data directory's ACEs
+    // rather than carrying its own protected DACL, and the desktop's private
+    // file checks refuse an inherited DACL. Give the lock ARC's protected
+    // private DACL through a second handle on the same file. This is best
+    // effort: the desktop repairs the lock itself as well, and a standalone
+    // node must not stop over the permissions of a pid marker.
+    #[cfg(windows)]
+    if let Err(error) = arc_crypto::secret_file::open_owned_private_read_write_repairing(path) {
+        tracing::warn!(
+            path = %path.display(),
+            %error,
+            "could not apply the private Windows DACL to the node data lock"
+        );
+    }
     Ok(file)
 }
 
@@ -12157,6 +12171,43 @@ mod tests {
             b"legacy-history",
             "create-only archival must not replace the first preserved history"
         );
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// The desktop opens `.arc-node.lock` through ARC's private-file checks.
+    /// A plain Windows create inherited the data directory's ACEs, and the
+    /// desktop refused that lock ("Windows DACL inherits from its parent") on
+    /// every later launch. The node now leaves a lock that passes the strict
+    /// private contract on Windows, while still holding it, and an inherited
+    /// lock left by an older node is repaired too.
+    #[test]
+    fn node_data_lock_satisfies_the_private_file_contract_while_held() {
+        let data_dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "arc-node-lock-private-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        arc_crypto::secret_file::create_private_directory_tree(&data_dir).unwrap();
+        let path = data_dir.join(".arc-node.lock");
+        // An older node's lock, created exactly as released binaries did.
+        drop(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .unwrap(),
+        );
+
+        let held = open_and_try_lock_node_data_file(&path, &data_dir).unwrap();
+        // On Unix an older lock keeps its mode here; the desktop repairs it.
+        #[cfg(windows)]
+        drop(arc_crypto::secret_file::open_private_read_write(&path).unwrap());
+        assert!(
+            open_and_try_lock_node_data_file(&path, &data_dir).is_err(),
+            "the lock still excludes a second node"
+        );
+        drop(held);
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 

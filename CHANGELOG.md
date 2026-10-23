@@ -38,6 +38,14 @@ All notable changes to ARC Chain are tracked here. This project follows
 - Release builds send those reports to
   `https://arc-node-care-intake.onrender.com`; a build without a report
   address sends nothing (#210).
+- Windows: the desktop no longer refuses to start the node with "DACL
+  inherits from its parent" on `.arc-node.lock`. On launch it repairs that
+  one file's permissions (you, SYSTEM and Administrators only) and still
+  refuses files owned by anyone else and links; `arc-node` now creates the
+  lock with private permissions in the first place (#211).
+- Dashboard text, error banners, logs and dialogs can be selected and
+  copied again, and the node status on Home has a Copy details button
+  (#211).
 
 ## v0.8.14 - Release-preparation snapshot (2026-10-20)
 

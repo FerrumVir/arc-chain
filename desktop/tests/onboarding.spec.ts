@@ -151,6 +151,17 @@ test.describe("Onboarding wizard", () => {
     expect(text.split("ARC refused to start the node")).toHaveLength(2);
     expect(text.split("Restart ARC after repairing")).toHaveLength(2);
     await expect(failure.getByTestId("btn-start-failure-copy")).toBeVisible();
+    // The error can be selected and copied by hand too; the buttons cannot.
+    for (const [testId, expected] of [
+      ["start-failure-title", "text"],
+      ["start-failure-details", "text"],
+      ["btn-start-failure-copy", "none"],
+    ] as const) {
+      const value = await failure
+        .getByTestId(testId)
+        .evaluate((element) => getComputedStyle(element).userSelect);
+      expect(value, testId).toBe(expected);
+    }
     await expect(page.getByTestId("dashboard")).toHaveCount(0);
 
     // Continue to ARC: Home opens without a running node, and the strip

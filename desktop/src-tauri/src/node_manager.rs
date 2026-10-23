@@ -592,7 +592,10 @@ fn refresh_managed_lifecycle_namespace(
     let _ = has_exact_lifecycle_namespace_proof(&data_dir, &[0u8; 32])?;
 
     let node_lock_path = data_dir.join(".arc-node.lock");
-    match arc_crypto::secret_file::open_private_read_write(&node_lock_path) {
+    // arc-node creates this lock with a plain open, so an existing one may
+    // carry an inherited Windows DACL (or a wider Unix mode). Repair only that
+    // boundary on ARC's own file; links and foreign owners are still refused.
+    match arc_crypto::secret_file::open_owned_private_read_write_repairing(&node_lock_path) {
         Ok(node_lock) => {
             node_lock.try_lock_exclusive().map_err(|error| {
                 anyhow::anyhow!(
@@ -4809,13 +4812,21 @@ fn recorded_process_state(target: &ManagedDetachedProcess) -> RecordedNodeState 
 /// process-table lookup says. Like the check after detached-process
 /// reconciliation, this opens only an existing lock file (a missing one
 /// means no node has run there) and releases the lock at once.
+///
+/// arc-node creates the lock with a plain open, so on Windows an existing
+/// lock inherits the data directory's ACEs rather than carrying a protected
+/// DACL. Through v0.8.14 the strict private opener refused it, and startup
+/// reconciliation failed on every launch with "private file Windows DACL
+/// inherits from its parent". The probe now repairs that boundary on ARC's
+/// own, owner-verified, non-link lock file before it looks at the lock.
 fn node_data_directory_held(data_dir: &Path) -> std::io::Result<bool> {
     let node_lock_path = data_dir.join(".arc-node.lock");
-    let node_lock = match arc_crypto::secret_file::open_private_read_write(&node_lock_path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
+    let node_lock =
+        match arc_crypto::secret_file::open_owned_private_read_write_repairing(&node_lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
     match node_lock.try_lock_exclusive() {
         Ok(()) => {
             fs2::FileExt::unlock(&node_lock)?;
@@ -7667,6 +7678,39 @@ mod tests {
         fs2::FileExt::unlock(&node_lock).unwrap();
         drop(node_lock);
         assert!(!node_data_directory_held(&dir).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Field failure on Windows: arc-node creates `.arc-node.lock` with a
+    /// plain open, so it inherits the data directory's ACEs (on Unix it can
+    /// carry a wider umask mode). The probe refused it on every launch and
+    /// startup reconciliation never finished. It now repairs the lock's
+    /// boundary and still reports only whether a node holds it.
+    #[test]
+    fn the_data_directory_lock_probe_repairs_a_lock_created_the_way_arc_node_creates_it() {
+        let dir = resource_test_dir("node-lock-probe-plain");
+        arc_crypto::secret_file::secure_private_directory_tree(&dir).unwrap();
+        let node_lock_path = dir.join(".arc-node.lock");
+        // arc-node's `open_and_try_lock_node_data_file` open (it never truncates).
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        let node_lock = options.open(&node_lock_path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            node_lock
+                .set_permissions(std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+        assert!(arc_crypto::secret_file::open_private_read_write(&node_lock_path).is_err());
+
+        node_lock.try_lock_exclusive().unwrap();
+        assert!(node_data_directory_held(&dir).unwrap());
+        fs2::FileExt::unlock(&node_lock).unwrap();
+        drop(node_lock);
+        assert!(!node_data_directory_held(&dir).unwrap());
+        // Repaired for good: the strict private contract holds now.
+        drop(arc_crypto::secret_file::open_private_read_write(&node_lock_path).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
