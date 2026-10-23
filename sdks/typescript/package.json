@@ -16,7 +16,7 @@
   "devDependencies": {
     "@types/jest": "^30.0",
     "jest": "^30.5",
-    "ts-jest": "^29.1",
+    "ts-jest": "^29.4",
     "typescript": "^5.4"
   },
   "overrides": {
