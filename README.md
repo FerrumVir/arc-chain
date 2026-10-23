@@ -857,6 +857,8 @@ Public GET paths carried verbatim in the sealed rollout manifest:
 `/economics/rewards`
 `/faucet/status`
 `/community/reward_policy`
+`/community/twin_stats`
+`/community/twin_receipts`
 `/workers/scoreboard`
 `/shards`
 `/models`
@@ -881,6 +883,7 @@ The gateway also admits these strictly shaped public GET routes:
 `/worker/earnings/{address}`
 `/community/reward_receipt/{tx_hash}`
 `/community/reward_job/{job_id}`
+`/community/twin/{job_id}`
 <!-- ARC_PUBLIC_PARAMETERIZED_GET_END -->
 
 Public POST paths carried verbatim in the sealed rollout manifest:
@@ -892,11 +895,21 @@ Public POST paths carried verbatim in the sealed rollout manifest:
 `/community/heartbeat`
 `/community/claim_work`
 `/community/submit_work`
+`/community/region`
 `/tx/submit`
 `/tx/submit_signed`
 `/tx/submit_batch`
 `/faucet/claim`
 <!-- ARC_PUBLIC_POST_END -->
+
+The twin-execution routes (`/community/twin_stats`, `/community/twin_receipts`,
+`/community/twin/{job_id}` and the signed worker report `POST /community/region`,
+see `docs/twin-execution.md`) are allowlisted so that the coordinator switches
+can be observed once an operator turns them on. With every switch at its
+default (off) the stats and receipt reads return empty bounded views, a receipt
+lookup returns 404, and `/community/region` accepts only a signed report from a
+registered worker. Allowlisting them changes nothing about twin dispatch, which
+stays off until a coordinator is started with `--community-twin-execution`.
 
 Clients may probe the mutation-free `/inference/readiness` contract at multiple
 origins, but one inference click selects one origin and sends at most one POST.
