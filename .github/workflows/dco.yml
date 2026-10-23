@@ -1,0 +1,119 @@
+name: DCO
+
+# Every commit in a pull request needs a Developer Certificate of Origin
+# sign-off (`Signed-off-by: Name <email>`) that matches its author. See
+# CONTRIBUTING.md. Merge commits and Dependabot pull requests are skipped.
+#
+# This check is advisory. It is not one of the `main` ruleset's required
+# status checks; making it required is a separate ruleset change.
+#
+# Fork safety: the `pull_request` trigger (never `pull_request_target`) gives
+# fork pull requests a read-only token and no secrets. The job reads commit
+# metadata with git and never builds or runs code from the pull request.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dco:
+    name: DCO sign-off
+    # Dependabot cannot sign off. A maintainer reviews its pull requests.
+    if: github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          # The check reads commit metadata only: full history, no file blobs.
+          fetch-depth: 0
+          filter: blob:none
+      - name: Check every commit for a matching Signed-off-by line
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 -I - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+
+          FULL_SHA = re.compile(r"[0-9a-f]{40}")
+          SIGNOFF = re.compile(
+              r"^Signed-off-by:[ \t]*(.*?)[ \t]*<([^<>]*)>[ \t]*$", re.MULTILINE
+          )
+
+
+          def git(*args):
+              return subprocess.run(
+                  ["git", *args],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+                  encoding="utf-8",
+                  errors="replace",
+              ).stdout
+
+
+          def same_name(left, right):
+              return " ".join(left.split()).casefold() == " ".join(right.split()).casefold()
+
+
+          def same_email(left, right):
+              return left.strip().casefold() == right.strip().casefold()
+
+
+          def log_safe(value):
+              # Commit metadata is untrusted input. Escape it so it can never
+              # start, end or extend a workflow command on its own line.
+              return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+          base = os.environ["BASE_SHA"]
+          head = os.environ["HEAD_SHA"]
+          if not (FULL_SHA.fullmatch(base) and FULL_SHA.fullmatch(head)):
+              print("::error::The pull request base or head is not a full commit SHA.")
+              sys.exit(1)
+
+          missing = []
+          checked = 0
+          merges = 0
+          for sha in git("rev-list", "--reverse", f"{base}..{head}").split():
+              parents, name, email, message = git(
+                  "show", "-s", "--format=%P%x00%an%x00%ae%x00%B", sha
+              ).split("\x00", 3)
+              if len(parents.split()) > 1:
+                  merges += 1
+                  continue
+              checked += 1
+              signed = any(
+                  same_name(signer, name) and same_email(signer_email, email)
+                  for signer, signer_email in SIGNOFF.findall(message)
+              )
+              if not signed:
+                  missing.append((sha, name))
+
+          print(f"Checked {checked} commit(s); skipped {merges} merge commit(s).")
+          if not missing:
+              print("Every commit has a Signed-off-by line that matches its author.")
+              sys.exit(0)
+          # Name the commit and its author, but keep author emails out of the log.
+          for sha, name in missing:
+              print(f"Missing sign-off: {sha} (author: {log_safe(name)})")
+          print(
+              f"::error::{len(missing)} commit(s) lack a Signed-off-by line that matches "
+              "the commit author. Sign off with `git commit -s` (or "
+              "`git rebase --signoff origin/main`) and force-push. See CONTRIBUTING.md."
+          )
+          sys.exit(1)
+          PY
