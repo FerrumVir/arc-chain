@@ -1,6 +1,6 @@
 import { useEffect, useId, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { CheckCircle2, CircleAlert, Loader2 } from "lucide-react";
+import { Check, CheckCircle2, CircleAlert, Copy, Loader2 } from "lucide-react";
 import { exit, relaunch } from "@tauri-apps/plugin-process";
 import { api, isTauri } from "../lib/tauri";
 import { useAppStore } from "../lib/store";
@@ -8,6 +8,8 @@ import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
 import { describeNodeStrip, type NodeStripAction } from "../lib/node-strip";
 import { PLAIN_COPY } from "../lib/plain-copy";
 import { DEFAULT_NODE_CONFIG, type ModelDownloadProgress } from "../lib/types";
+
+const COPIED_RESET_MS = 2_500;
 
 const ACTION_LABEL: Record<NodeStripAction, string> = {
   "update-arc": PLAIN_COPY.actions.updateArc,
@@ -32,7 +34,14 @@ export function NodeStatusStrip() {
   const [busy, setBusy] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [modelProgress, setModelProgress] = useState<ModelDownloadProgress | null>(null);
+  const [copied, setCopied] = useState<"idle" | "copied" | "failed">("idle");
   const detailsId = useId();
+
+  useEffect(() => {
+    if (copied === "idle") return;
+    const timer = window.setTimeout(() => setCopied("idle"), COPIED_RESET_MS);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
 
   const { data: status } = useQuery({
     queryKey: ["status"],
@@ -72,6 +81,17 @@ export function NodeStatusStrip() {
     update,
     modelProgress,
   });
+
+  // The native text, so a person can paste it into a report as it is.
+  const copyDetails = (details: string) => {
+    // Without a clipboard API the call throws before returning a promise.
+    void Promise.resolve()
+      .then(() => navigator.clipboard.writeText(details))
+      .then(
+        () => setCopied("copied"),
+        () => setCopied("failed"),
+      );
+  };
 
   const act = async (action: NodeStripAction) => {
     if (action === "update-arc") {
@@ -167,6 +187,29 @@ export function NodeStatusStrip() {
           {detailsOpen ? PLAIN_COPY.actions.hideDetails : PLAIN_COPY.actions.showDetails}
         </button>
       )}
+      {view.details && (
+        <button
+          type="button"
+          className="btn btn-ghost btn-sm"
+          onClick={() => copyDetails(view.details!)}
+          data-testid="node-strip-copy"
+        >
+          {copied === "copied" ? <Check size={12} /> : <Copy size={12} />}{" "}
+          {copied === "copied"
+            ? PLAIN_COPY.actions.copied
+            : copied === "failed"
+              ? PLAIN_COPY.actions.copyFailed
+              : PLAIN_COPY.actions.copyDetails}
+        </button>
+      )}
+      {/* The copy result, announced on its own. */}
+      <span className="sr-only" aria-live="polite">
+        {copied === "copied"
+          ? PLAIN_COPY.actions.copied
+          : copied === "failed"
+            ? PLAIN_COPY.actions.copyFailed
+            : ""}
+      </span>
       {view.details && (
         <pre
           id={detailsId}

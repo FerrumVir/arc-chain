@@ -63,6 +63,22 @@ test.describe("Home: Ask ARC", () => {
       "recovery node exited before its WAL barrier",
     );
 
+    // People share these errors: the sentence and the native text can be
+    // selected, the buttons cannot, and "Copy details" copies the text as is.
+    const userSelect = (testId: string) =>
+      strip
+        .getByTestId(testId)
+        .evaluate((element) => getComputedStyle(element).userSelect);
+    expect(await userSelect("node-strip-sentence")).toBe("text");
+    expect(await userSelect("node-strip-details")).toBe("text");
+    expect(await userSelect("node-strip-action")).toBe("none");
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+    await strip.getByTestId("node-strip-copy").click();
+    await expect(strip.getByTestId("node-strip-copy")).toHaveText(PLAIN_COPY.actions.copied);
+    const copied = await page.evaluate(() => navigator.clipboard.readText());
+    expect(copied).toContain("recovery node exited before its WAL barrier");
+    expect(copied.split("ARC refused to start the node")).toHaveLength(2);
+
     await page.getByTestId("inference-prompt").fill("Water boils at");
     await page.getByTestId("btn-run-inference").click();
     await expect(page.getByTestId("inference-output")).toContainText("mock response");

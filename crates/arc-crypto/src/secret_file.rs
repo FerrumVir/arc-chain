@@ -327,6 +327,26 @@ pub fn tighten_open_owned_private(file: &File, path: &Path) -> io::Result<()> {
     platform::tighten_open_owned_private(file, path)
 }
 
+/// Open an existing private file that ARC itself wrote for reading and
+/// writing, repairing only its permission boundary.
+///
+/// Released arc-node binaries create `.arc-node.lock` with a plain open. On
+/// Windows that file inherits the private data directory's ACEs instead of
+/// carrying its own protected DACL, so the strict `open_private_read_write`
+/// rejected it ("Windows DACL inherits from its parent") on every later
+/// launch, and nothing repaired it. This opener keeps every refusal that
+/// matters (a link or reparse point, a non-regular file, a file owned by
+/// anyone other than the current user or, on Windows, the Administrators
+/// group) and, when the only fault is an inherited or over-broad boundary,
+/// tightens that exact open handle to ARC's private policy (Unix: mode 0600
+/// with no extended ACL; Windows: a protected DACL granting full control to
+/// the current user, LocalSystem and Administrators only) before
+/// revalidating it. A file that already passes is not touched, so this only
+/// ever narrows access.
+pub fn open_owned_private_read_write_repairing(path: &Path) -> io::Result<File> {
+    platform::open_owned_private_read_write_repairing(path)
+}
+
 /// Revalidate the private-file contract through an already-open handle.
 pub fn validate_private(file: &File, path: &Path) -> io::Result<()> {
     platform::validate_private(file, path)
@@ -2723,6 +2743,21 @@ mod platform {
         Ok(file)
     }
 
+    pub(super) fn open_owned_private_read_write_repairing(path: &Path) -> io::Result<File> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        // O_NOFOLLOW refuses a final symlink; tightening re-checks the
+        // regular-file type and the effective-uid owner on this exact handle.
+        let file = options.open(path)?;
+        if validate_private(&file, path).is_err() {
+            tighten_open_owned_private(&file, path)?;
+        }
+        Ok(file)
+    }
+
     pub(super) fn open_private_append_owned_migration(path: &Path) -> io::Result<File> {
         let mut options = OpenOptions::new();
         options
@@ -3718,6 +3753,85 @@ mod tests {
         assert_eq!(std::fs::read(outside).unwrap(), b"must remain untouched");
     }
 
+    /// Field failure: released arc-node binaries create `.arc-node.lock` with
+    /// a plain open. On Windows it inherits the private data directory's ACEs
+    /// instead of carrying a protected DACL; on Unix it can carry a wider
+    /// umask mode. The strict opener refused it on every launch ("private
+    /// file Windows DACL inherits from its parent") and nothing repaired it.
+    /// The repairing opener tightens that exact file once, keeps its bytes,
+    /// and leaves an already-private file untouched.
+    #[test]
+    fn owned_private_read_write_repairing_tightens_a_plainly_created_node_lock() {
+        let dir = TestDir::new("repair-plain-node-lock");
+        let data_dir = dir.0.join("data");
+        secure_private_directory_tree(&data_dir).unwrap();
+        let path = data_dir.join(".arc-node.lock");
+        let contents = b"schema=arc.node.data-lock.v1\npid=1\n";
+        std::fs::write(&path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let error = open_private_read_write(&path)
+            .expect_err("the strict opener refuses the inherited boundary");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        #[cfg(windows)]
+        assert!(
+            error.to_string().contains("DACL inherits from its parent"),
+            "{error}"
+        );
+
+        let repaired = open_owned_private_read_write_repairing(&path).unwrap();
+        validate_private(&repaired, &path).unwrap();
+        drop(repaired);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // Repaired for good: the strict opener accepts it now, a second
+        // repair is a no-op, and the lock's bytes are unchanged.
+        drop(open_private_read_write(&path).unwrap());
+        drop(open_owned_private_read_write_repairing(&path).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
+    }
+
+    /// The repair never creates a file: a missing lock still reports
+    /// NotFound, which callers read as "no node has run here".
+    #[test]
+    fn owned_private_read_write_repairing_reports_a_missing_file_as_not_found() {
+        let dir = TestDir::new("repair-missing");
+        let error = open_owned_private_read_write_repairing(&dir.0.join(".arc-node.lock"))
+            .expect_err("a missing file is not created");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+        assert!(!dir.0.join(".arc-node.lock").exists());
+    }
+
+    /// Repair never follows a link and never touches the link's target.
+    #[cfg(unix)]
+    #[test]
+    fn owned_private_read_write_repairing_refuses_a_symlink_without_touching_its_target() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let dir = TestDir::new("repair-symlink");
+        let target = dir.0.join("operator-owned-target");
+        std::fs::write(&target, b"must remain untouched").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.0.join(".arc-node.lock");
+        symlink(&target, &link).unwrap();
+
+        assert!(open_owned_private_read_write_repairing(&link).is_err());
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"must remain untouched");
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_private_file_rejects_permissive_mode_and_symlink() {
@@ -4405,6 +4519,28 @@ mod platform {
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         )?;
         validate_private(&file, path)?;
+        Ok(file)
+    }
+
+    pub(super) fn open_owned_private_read_write_repairing(path: &Path) -> io::Result<File> {
+        // FILE_FLAG_OPEN_REPARSE_POINT opens a link itself, and
+        // `tighten_open_owned_private` refuses it, refuses a non-regular file,
+        // and refuses an owner other than the current user or Administrators
+        // before it changes anything.
+        let file = match open_private_raw_with_access_and_share(
+            path,
+            GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        ) {
+            Ok(file) => file,
+            // No right to change this DACL: it cannot be repaired here, so
+            // keep the strict contract and its precise refusal.
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                return open_private_read_write(path);
+            }
+            Err(error) => return Err(error),
+        };
+        tighten_open_owned_private(&file, path)?;
         Ok(file)
     }
 
