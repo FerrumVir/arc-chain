@@ -7691,9 +7691,9 @@ mod tests {
         let dir = resource_test_dir("node-lock-probe-plain");
         arc_crypto::secret_file::secure_private_directory_tree(&dir).unwrap();
         let node_lock_path = dir.join(".arc-node.lock");
-        // Exactly arc-node's `open_and_try_lock_node_data_file` open.
+        // arc-node's `open_and_try_lock_node_data_file` open (it never truncates).
         let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true);
+        options.read(true).write(true).create(true).truncate(false);
         let node_lock = options.open(&node_lock_path).unwrap();
         #[cfg(unix)]
         {
