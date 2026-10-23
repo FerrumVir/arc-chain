@@ -5738,6 +5738,62 @@ mod tests {
     }
 
     #[test]
+    fn recovery_snapshot_is_not_a_base_for_state_wal_truncation() {
+        // ARC-79 characterization, not an endorsed operation: unlike normal
+        // startup, ARCCHKPT startup accepts an empty WAL and reinstalls its
+        // original transition. An ordinary tip snapshot does not prevent a
+        // rollback. A compactor therefore needs an explicit mandatory base.
+        let (state, checkpoint, keys, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("compaction-precondition");
+        let block = commit_empty_recovery_block(
+            &state,
+            keys[0].address(),
+            1_787_777_001_000,
+            b"compaction-precondition",
+        );
+        state.publish_durable_snapshot().unwrap();
+        drop(state);
+
+        let intact =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy.clone(), None)
+                .unwrap();
+        assert_eq!(intact.height(), block.header.height);
+        assert_eq!(
+            intact.get_block(block.header.height).unwrap().hash,
+            block.hash
+        );
+        assert_eq!(intact.get_state_root(), block.header.state_root);
+        drop(intact);
+
+        let wal_path = active_dir.join("state.wal");
+        let original = fs::read(&wal_path).unwrap();
+        assert!(!original.is_empty());
+        fs::write(&wal_path, []).unwrap();
+        let reopened =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy.clone(), None)
+                .unwrap();
+        assert_eq!(reopened.height(), checkpoint.manifest.source_height + 1);
+        assert!(reopened.height() < block.header.height);
+        assert!(reopened.get_block(block.header.height).is_none());
+        drop(reopened);
+
+        // Restoring the actual WAL, without changing the snapshot or signed
+        // package, restores the committed tip. The fixture is otherwise valid.
+        fs::write(&wal_path, original).unwrap();
+        let restored =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restored.height(), block.header.height);
+        assert_eq!(
+            restored.get_block(block.header.height).unwrap().hash,
+            block.hash
+        );
+        assert_eq!(restored.get_state_root(), block.header.state_root);
+        drop(restored);
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
     fn recovery_replay_reuses_roots_but_checks_every_checkpoint() {
         let (state, checkpoint, keys, _, source_dir, active_dir) =
             persistent_recovery_fixture("cached-replay-checkpoints");
