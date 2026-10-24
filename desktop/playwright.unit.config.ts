@@ -10,6 +10,7 @@ export default defineConfig({
     "native-request.spec.ts",
     "model-download-progress.spec.ts",
     "start-failure.spec.ts",
+    "connection.spec.ts",
     "node-care.spec.ts",
   ],
   workers: 1,

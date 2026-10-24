@@ -11,6 +11,7 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import { useAppStore } from "../lib/store";
 import { api } from "../lib/tauri";
+import { describeConnection } from "../lib/connection";
 import { PulseDot } from "./PulseDot";
 import { Tagline, Wordmark } from "./Logo";
 import { formatUptime } from "../lib/format";
@@ -38,7 +39,9 @@ export function Sidebar() {
     refetchInterval: 2000,
   });
 
-  const level = status?.health ?? "offline";
+  // The connection in plain words (lib/connection.ts). Through v0.8.14 a
+  // connected community node read "Running · 0 peers" here, which looked broken.
+  const connection = describeConnection(status);
   const checking = status === undefined;   // no status yet: the node may well be running or starting
 
   return (
@@ -65,17 +68,7 @@ export function Sidebar() {
 
       <div className="sidebar-footer">
         <div className="node-status-chip" data-testid="sidebar-status">
-          <PulseDot
-            level={
-              checking
-                ? "checking"
-                : status?.running
-                  ? level
-                  : status?.pid != null
-                    ? "syncing"
-                    : level
-            }
-          />
+          <PulseDot level={connection.level} ariaLabel={connection.label} />
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontSize: 13, fontWeight: 500, color: "var(--text)" }}>
               {checking
@@ -84,16 +77,17 @@ export function Sidebar() {
                   ? "Running"
                   : status?.pid != null
                     ? "Starting"
-                    : "Stopped"}
+                    : "Off"}
             </div>
             {status?.running && (
-              <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                {formatUptime(status.uptimeSeconds)} · {status.peers} peers
+              <div style={{ fontSize: 11, color: "var(--text-muted)" }} data-testid="sidebar-connection">
+                {formatUptime(status.uptimeSeconds)}
+                {connection.via ? ` · ${connection.via}` : ""}
               </div>
             )}
             {!status?.running && status?.pid != null && (
               <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                loading model…
+                loading the AI model…
               </div>
             )}
           </div>

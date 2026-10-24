@@ -1,11 +1,14 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, RotateCw, X } from "lucide-react";
+import { RotateCw } from "lucide-react";
 import { api } from "../lib/tauri";
 import { useAppStore } from "../lib/store";
+import { PLAIN_COPY } from "../lib/plain-copy";
+import { ProblemNotice } from "./ProblemNotice";
 
-// Surfaces an inline banner whenever the Rust side reports that our child
-// arc-node process died on its own. One-click relaunch; dismiss clears the
-// crash state without restarting.
+// Shown when the Rust side reports that our child arc-node process died on
+// its own: one plain sentence, one button to start it again, and the node's
+// exit text behind "Show details". Dismiss clears the crash state without
+// restarting. Through v0.8.14 the exit text was the body of the banner.
 export function CrashBanner({ message }: { message: string }) {
   const queryClient = useQueryClient();
   const config = useAppStore((s) => s.config);
@@ -24,64 +27,27 @@ export function CrashBanner({ message }: { message: string }) {
   });
 
   return (
-    <div
-      role="alert"
-      data-testid="crash-banner"
-      style={{
-        display: "flex",
-        gap: "var(--space-3)",
-        alignItems: "flex-start",
-        padding: "var(--space-4) var(--space-5)",
-        background: "var(--danger-bg)",
-        border: "1px solid rgba(240, 115, 115, 0.3)",
-        borderRadius: "var(--radius-md)",
-        marginBottom: "var(--space-5)",
-      }}
-    >
-      <AlertTriangle
-        size={18}
-        style={{ color: "var(--danger)", flexShrink: 0, marginTop: 1 }}
-      />
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div
-          style={{
-            fontWeight: 500,
-            color: "var(--text)",
-            marginBottom: 2,
-          }}
-        >
-          Your node crashed
-        </div>
-        <div
-          style={{
-            fontSize: "var(--text-sm)",
-            color: "var(--text-muted)",
-            fontFamily: "var(--font-mono)",
-            lineHeight: 1.5,
-          }}
-        >
-          {message}
-        </div>
-      </div>
-      <div style={{ display: "flex", gap: "var(--space-2)" }}>
+    <ProblemNotice
+      testId="crash-banner"
+      title={PLAIN_COPY.nodeStrip.crashed}
+      body={PLAIN_COPY.dashboard.crashedBody}
+      details={message}
+      actions={
         <button
-          className="btn btn-secondary btn-sm"
+          type="button"
+          className="btn btn-primary btn-sm"
           onClick={() => relaunch.mutate()}
           disabled={relaunch.isPending}
+          aria-busy={relaunch.isPending || undefined}
           data-testid="btn-crash-relaunch"
         >
-          <RotateCw size={12} /> Relaunch
+          <RotateCw size={12} className={relaunch.isPending ? "spin" : undefined} />{" "}
+          {PLAIN_COPY.actions.startAgain}
         </button>
-        <button
-          className="btn btn-ghost btn-sm"
-          onClick={() => dismiss.mutate()}
-          aria-label="Dismiss crash"
-          data-testid="btn-crash-dismiss"
-          style={{ padding: 6 }}
-        >
-          <X size={12} />
-        </button>
-      </div>
-    </div>
+      }
+      onDismiss={() => dismiss.mutate()}
+      dismissLabel="Dismiss crash"
+      dismissTestId="btn-crash-dismiss"
+    />
   );
 }

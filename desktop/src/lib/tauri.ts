@@ -2542,10 +2542,14 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       // Restart must be refused.
       const external =
         (globalThis as { __ARC_MOCK_EXTERNAL_NODE__?: boolean }).__ARC_MOCK_EXTERNAL_NODE__ === true;
+      // Mirrors rpc_client.rs: a stopped node still probes the public seeds, and
+      // one answering makes the health "lite" with that coordinator's origin,
+      // so the preview reads "Node off", not "No connection", like the real app.
+      const previewCoordinator = "https://140.82.16.112";
       return {
         running,
         pid: running && !external ? 42_731 : null,
-        health: running ? (uptime < 8 ? "syncing" : "live") : "offline",
+        health: running ? (uptime < 8 ? "syncing" : "live") : "lite",
         version: "0.8.15",
         peers: running ? 8 : 0,
         round: running ? 43_821 + Math.floor(uptime / 4) : 0,
@@ -2555,7 +2559,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         address: MOCK_ADDRESS,
         rpcPort: 9090,
         lastError: null,
-        coordinatorUrl: null,
+        coordinatorUrl: running ? null : previewCoordinator,
         // Chain numbers are the network's, not this node's - and the mock
         // reflects the real testnet's stalled block production.
         chainHost: "http://140.82.16.112:9090",

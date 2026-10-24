@@ -312,4 +312,47 @@ test.describe("node strip on Home", () => {
       strip({ startError: "another ARC desktop currently owns the managed node lifecycle for /x" }),
     ).toMatchObject({ sentence: PLAIN_COPY.startFailure.needsRepair.title, action: "try-again" });
   });
+
+  test("a running node reads as connected once a peer or a coordinator answered, and ordinary states are never red", () => {
+    // A community node: no peers by design, a coordinator answering.
+    const connected = strip({
+      status: { ...running, health: "lite", coordinatorUrl: "https://140.82.16.112" },
+    });
+    expect(connected).toMatchObject({
+      sentence: PLAIN_COPY.nodeStrip.runningConnected,
+      action: null,
+      tone: "ok",
+    });
+    expect(strip({ status: { ...running, health: "live" } })).toMatchObject({
+      sentence: PLAIN_COPY.nodeStrip.runningConnected,
+      tone: "ok",
+    });
+    // Nothing has answered yet: a wait, not a warning.
+    expect(strip({ status: { ...running, health: "syncing" } })).toMatchObject({
+      sentence: PLAIN_COPY.nodeStrip.runningConnecting,
+      action: null,
+      tone: "busy",
+    });
+    // Off by choice is idle, and an update on offer is information.
+    expect(strip({})).toMatchObject({ tone: "idle" });
+    expect(strip({ update: ready }).tone).toBe("info");
+    // The status's "nothing answered" text is this computer's connection, not a failed start.
+    const offline = strip({
+      status: {
+        running: false,
+        pid: null,
+        lastError:
+          "No node is answering on http://127.0.0.1:9090 and every public seed is unreachable. Start your node, or check your internet connection and firewall.",
+      },
+    });
+    expect(offline).toMatchObject({
+      sentence: PLAIN_COPY.nodeStrip.offUnreachable,
+      action: "start-node",
+      tone: "idle",
+      details: null,
+    });
+    for (const view of [connected, offline]) {
+      expect(view.sentence).not.toMatch(/lite|syncing|degraded|0 peers|client mode/i);
+    }
+  });
 });

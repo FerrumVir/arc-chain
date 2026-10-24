@@ -851,7 +851,7 @@ export function Onboarding() {
                         : launchStage === "starting"
                           ? "Starting your node"
                           : launchStage === "connecting"
-                            ? "Connecting to a coordinator"
+                            ? PLAIN_COPY.setup.connectingTitle
                             : "Finishing up"}
                 </h1>
                 <p className="onboarding-subtitle" data-testid="launch-summary">
@@ -985,11 +985,13 @@ const SEEDS = [
   { label: "SGP", ip: "149.28.153.31" },
 ];
 
+// Plain words for the wait. A community node joins through a coordinator, so
+// there is no handshake or peer step to narrate; the seed chips below show
+// the coordinators being tried.
 function connectingPhaseMessage(elapsed: number): string {
-  if (elapsed < 10) return "Handshaking with seed nodes…";
-  if (elapsed < 25) return "Waiting for QUIC peers to respond…";
-  if (elapsed < 45) return "Still connecting — trying all 6 data centers…";
-  return "Taking longer than usual. Falling back to coordinator mode…";
+  if (elapsed < 25) return PLAIN_COPY.setup.connecting;
+  if (elapsed < 45) return PLAIN_COPY.setup.connectingStill;
+  return PLAIN_COPY.setup.connectingLong;
 }
 
 function ConnectingStatus({
@@ -1002,11 +1004,14 @@ function ConnectingStatus({
   const activeSeedIdx = Math.floor(elapsed / 3) % SEEDS.length;
 
   if (connectedVia) {
+    // "p2p" is the join through a peer; a coordinator is named by its city.
     const label =
-      SEEDS.find((s) => connectedVia.includes(s.ip))?.label ?? connectedVia;
+      connectedVia === "p2p"
+        ? null
+        : (SEEDS.find((s) => connectedVia.includes(s.ip))?.label ?? connectedVia);
     return (
-      <span style={{ color: "var(--success)" }}>
-        Connected via {label} coordinator ✓
+      <span style={{ color: "var(--success)" }} data-testid="launch-connected">
+        {PLAIN_COPY.setup.connected(label)}
       </span>
     );
   }

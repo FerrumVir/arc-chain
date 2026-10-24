@@ -65,16 +65,101 @@ export const PLAIN_COPY = {
   /** The one-line node strip on Home: one sentence, at most one button. */
   nodeStrip: {
     checking: "Checking your node…",
+    /** Running, and the connection is not known yet (older status shapes). */
     running: "Your node is running.",
+    /** Running, and a peer or a coordinator answered. */
+    runningConnected: "Your node is running and connected to the ARC network.",
+    /** Running, and nothing on the network has answered yet. */
+    runningConnecting: "Your node is running and connecting to the ARC network…",
     starting: "Your node is starting. Loading the AI model can take a few minutes.",
     downloadingModel: (amount: string) =>
       `Your node is getting ready: downloading the AI model (${amount}).`,
     off: "Your node is off.",
+    /** Off, and no coordinator answered either: the computer is offline, not the node broken. */
+    offUnreachable:
+      "Your node is off, and ARC can't reach the network. Check your internet connection.",
     crashed: "Your node stopped unexpectedly.",
     updateAvailable: "A new version of ARC is ready.",
     updating: "Updating ARC. It will restart by itself in a moment.",
     /** A relaunch or install the updater couldn't finish; only a reopen clears it. */
     updateFailed: "ARC couldn't finish an update. Quit ARC and open it again.",
+  },
+  /**
+   * How the node reaches the network, in plain words. A community node has no
+   * peers by design (arc-net admits only the validators), so it is connected
+   * when a coordinator answers, and "0 peers" is normal, not a fault.
+   */
+  connection: {
+    labels: {
+      checking: "Checking",
+      starting: "Starting",
+      off: "Node off",
+      unreachable: "No connection",
+      connecting: "Connecting",
+      connected: "Connected",
+    },
+    checking: "Reading your node's status…",
+    starting: "Your node is starting.",
+    off: "Your node is off.",
+    unreachable:
+      "Your node is off, and ARC can't reach the network. Check your internet connection.",
+    connecting: "Your node is running and connecting to the ARC network…",
+    /** Too long without an answer from any coordinator. */
+    connectingLong:
+      "ARC can't reach the network yet. Check your internet connection; your node keeps trying.",
+    connected: "Your node is connected to the ARC network.",
+    connectedPeers: (peers: string) =>
+      `Your node is connected to the ARC network with ${peers}.`,
+    connectedCoordinator: (host: string) =>
+      `Your node is connected to the ARC network through ${host}. Community nodes connect through coordinators rather than directly to other nodes, so 0 peers is normal.`,
+    /** The sidebar's second line while running. */
+    viaPeers: (peers: string) => peers,
+    viaCoordinator: (host: string) => `via ${host}`,
+    viaConnecting: "connecting…",
+    /** The Peers tile's explanation. */
+    peersInfo:
+      "Other nodes your node has a direct connection to. Community nodes connect through coordinators and normally show 0 peers; the number says nothing about work or rewards.",
+  },
+  /** Ask ARC: what the thread says while a question is out and when it isn't answered. */
+  ask: {
+    sending: "Sending…",
+    askingNode: "Asking your node…",
+    askingNetwork: "Asking the ARC network…",
+    stoppedWaiting: "You stopped waiting",
+    /** Added to the waiting note after a minute. */
+    slow: "The network is taking longer than usual.",
+    waitNote: "You can keep using ARC while you wait, or stop waiting below. A late answer still appears here.",
+    stoppedNote: "A late answer still appears here.",
+    /** No answer came back, and nothing says the request is still running. */
+    noAnswer: "The network didn't answer this time.",
+    noAnswerNote: "Try again in a moment.",
+    /** The request was sent and may still be running somewhere. */
+    unknownOutcome: "The network didn't answer, and the request may still be running.",
+    unknownOutcomeNote: "Sending it again starts a second job. Waiting a minute first is safer.",
+    /** No request was sent at all. */
+    notSent: "Nothing could take this question right now.",
+    notSentNote: "Nothing was sent, so trying again is safe.",
+    sendAgainAnyway: "Send again anyway",
+    /** The composer's button while a question is out. */
+    asking: "Asking…",
+  },
+  dashboard: {
+    subtitleChecking: "Reading your node's status…",
+    subtitleExternal: "Your node is running under launchd or systemd.",
+    subtitleStarting: "Your node is starting. Loading the AI model can take a few minutes.",
+    subtitleOff: "Your node is off. Start it to join the ARC network.",
+    startingBanner: (elapsed: string) =>
+      `Your node is starting${elapsed}. Loading the AI model can take a few minutes; Logs shows its progress.`,
+    stopFailed: "ARC couldn't stop your node.",
+    stopFailedBody: "It is still running. The details below say what went wrong.",
+    crashedBody: "Start it again when you're ready. The details below say what the node reported.",
+    /** The node reported a problem that is not a crash: the start it made by itself failed. */
+    reportedBody: "The details below say what the node reported.",
+  },
+  wallet: {
+    balanceUnavailable: "Balance unavailable right now. ARC keeps trying.",
+    faucetFailed: "The faucet claim didn't go through.",
+    sendFailed: "The transfer didn't go through.",
   },
   setup: {
     welcomeTitle: "Welcome to ARC",
@@ -92,6 +177,12 @@ export const PLAIN_COPY = {
       "Testnet: jobs and rewards aren't guaranteed, and testnet ARC has no monetary value.",
     startButton: "Start my node",
     failedHint: "Your node didn't start, but you can still use ARC. Home shows how to fix it.",
+    connectingTitle: "Connecting to the ARC network",
+    connecting: "Connecting to the ARC network…",
+    connectingStill: "Still connecting…",
+    connectingLong: "Taking longer than usual. ARC keeps trying for a little longer.",
+    connected: (via: string | null) =>
+      `Connected to the ARC network${via ? ` via ${via}` : ""} ✓`,
   },
   updates: {
     waitingForLastSession: (version: string) =>
@@ -100,5 +191,10 @@ export const PLAIN_COPY = {
       `Version ${version} can't install from inside ARC on this computer. Download it from the release page and install it by hand.`,
     autoInstallDescription:
       "On by default. ARC downloads updates in the background and installs them when no jobs are running, then restarts. Updates can install even when your node can't start.",
+    /** The check itself failed, usually a connection. ARC retries on its own. */
+    checkFailed:
+      "ARC couldn't check for updates right now. It tries again later, and you can check again here.",
+    /** An install that failed before it changed anything. */
+    installFailed: "The update didn't install. Nothing changed; you can try again here.",
   },
 } as const;

@@ -1,5 +1,6 @@
 import { PLAIN_COPY } from "./plain-copy";
 import { describeStartFailure, type StartFailureAction } from "./start-failure";
+import { isUnreachableMessage } from "./connection";
 import { formatBytes } from "./format";
 import type { ModelDownloadProgress, NodeStatus } from "./types";
 import type { UpdateSnapshot } from "./update-controller";
@@ -12,18 +13,28 @@ export type NodeStripAction =
   | "start-again"
   | "try-again";
 
+/**
+ * ok: running and connected. busy: something is happening by itself.
+ * attention: a problem with a fix. info: nothing wrong, something on offer
+ * (an update). idle: the node is off by choice, nothing is wrong.
+ */
+export type NodeStripTone = "ok" | "busy" | "attention" | "info" | "idle";
+
 export interface NodeStripView {
   sentence: string;
   /** At most one button. Null while something is already happening. */
   action: NodeStripAction | null;
-  tone: "ok" | "busy" | "attention";
+  tone: NodeStripTone;
   /** The native text behind "Show details", when there is one. */
   details: string | null;
 }
 
 export interface NodeStripInput {
   /** `node_status`; undefined until its first answer. */
-  status: Pick<NodeStatus, "running" | "pid" | "lastError"> | undefined;
+  status:
+    | (Pick<NodeStatus, "running" | "pid" | "lastError"> &
+        Partial<Pick<NodeStatus, "health" | "coordinatorUrl">>)
+    | undefined;
   /** What a Start would be told by the start fence now; null when starts are open. */
   startBlock: string | null;
   /** The error from the last Start pressed on the strip. */
@@ -43,6 +54,9 @@ const FAILURE_ACTION: Record<StartFailureAction, NodeStripAction> = {
  * start-failure rules, so a blocked node offers the update when one is ready
  * (it installs while the node is blocked) and a restart otherwise. With the
  * node healthy or off, a ready update is the one thing to show.
+ *
+ * Only a real problem gets the attention tone. A node that is off, an update
+ * on offer and a node still connecting are ordinary states, and read as such.
  */
 export function describeNodeStrip(input: NodeStripInput): NodeStripView {
   const copy = PLAIN_COPY.nodeStrip;
@@ -67,10 +81,13 @@ export function describeNodeStrip(input: NodeStripInput): NodeStripView {
   }
 
   const crashed = input.status?.lastError?.includes("exited unexpectedly") === true;
+  // The status's "nothing answered" text describes this computer's connection,
+  // not a start that failed; it is read below with the node's off state.
+  const unreachable = isUnreachableMessage(input.status?.lastError);
   const failure =
     input.startBlock ??
     input.startError ??
-    (input.status?.lastError && !crashed && !input.status.running
+    (input.status?.lastError && !crashed && !unreachable && !input.status.running
       ? input.status.lastError
       : null);
   if (failure) {
@@ -88,9 +105,16 @@ export function describeNodeStrip(input: NodeStripInput): NodeStripView {
   }
 
   if (updateReady) {
-    return { sentence: copy.updateAvailable, action: "update-arc", tone: "attention", details: null };
+    return { sentence: copy.updateAvailable, action: "update-arc", tone: "info", details: null };
   }
   if (input.status?.running) {
+    const { health, coordinatorUrl } = input.status;
+    if (health === "live" || health === "lite" || coordinatorUrl) {
+      return { sentence: copy.runningConnected, action: null, tone: "ok", details: null };
+    }
+    if (health === "syncing" || health === "offline") {
+      return { sentence: copy.runningConnecting, action: null, tone: "busy", details: null };
+    }
     return { sentence: copy.running, action: null, tone: "ok", details: null };
   }
   if (input.modelProgress && !input.modelProgress.done) {
@@ -112,5 +136,8 @@ export function describeNodeStrip(input: NodeStripInput): NodeStripView {
       details: input.status.lastError,
     };
   }
-  return { sentence: copy.off, action: "start-node", tone: "attention", details: null };
+  if (unreachable) {
+    return { sentence: copy.offUnreachable, action: "start-node", tone: "idle", details: null };
+  }
+  return { sentence: copy.off, action: "start-node", tone: "idle", details: null };
 }

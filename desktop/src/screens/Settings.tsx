@@ -7,6 +7,7 @@ import { NotAvailable } from "../components/NotAvailable";
 import { NodeCareSettings } from "../components/NodeCare";
 import { StatusPill } from "../components/StatusPill";
 import { api, isTauri } from "../lib/tauri";
+import { describeConnection } from "../lib/connection";
 import { formatInt, modelDownloadStatus } from "../lib/format";
 import { useAppStore } from "../lib/store";
 import {
@@ -325,19 +326,27 @@ export function Settings() {
                 ? "Automatic checks run after startup and every 24 hours. Signed app updates may install and restart ARC automatically only after native worker safety confirms inference has drained."
                 : "Automatic checks run after startup and every 24 hours. Background checks never install an update."}
         </p>
+        {/* A failed check is usually a connection, and ARC retries by itself: one plain sentence, with the
+            controller's text behind Show details. An install the updater could not finish is the one case that
+            needs the person (quit and reopen), and reads like the strip on Home. */}
         <p
           style={{
             fontSize: "var(--text-sm)",
-            color:
-              update.phase === "error"
-                ? "var(--danger)"
-                : "var(--text-secondary)",
+            color: "var(--text-secondary)",
             marginBottom: "var(--space-3)",
           }}
           data-testid="update-status"
           data-update-phase={update.phase}
         >
-          {update.message}
+          {update.phase === "error"
+            ? update.restartRequired
+              ? PLAIN_COPY.nodeStrip.updateFailed
+              : update.message.startsWith("Update check failed")
+                ? PLAIN_COPY.updates.checkFailed
+                : PLAIN_COPY.updates.installFailed
+            : update.phase === "ready" && update.error
+              ? PLAIN_COPY.nodeStrip.updateFailed
+              : update.message}
           {update.phase === "downloading" &&
           update.contentLength !== null &&
           update.contentLength > 0
@@ -345,21 +354,14 @@ export function Settings() {
             : ""}
         </p>
         {update.error && (
-          <p
-            style={{
-              fontSize: "var(--text-sm)",
-              color:
-                update.phase === "ready"
-                  ? "var(--warning)"
-                  : "var(--danger)",
-              marginBottom: "var(--space-3)",
-            }}
+          <details
+            className="plain-details"
+            style={{ marginTop: 0, marginBottom: "var(--space-3)" }}
             data-testid="update-error"
           >
-            {update.phase === "ready"
-              ? `Safe restart blocked: ${update.error}`
-              : `Update error: ${update.error}`}
-          </p>
+            <summary>{PLAIN_COPY.actions.showDetails}</summary>
+            <pre>{[update.message, update.error].filter(Boolean).join("\n")}</pre>
+          </details>
         )}
         <p
           style={{
@@ -976,20 +978,18 @@ function PersistenceCard() {
   const autoStart = config?.autoStart ?? DEFAULT_NODE_CONFIG.autoStart;
   const hasModel = !!config?.modelPath;
   const running = !!status?.running;
+  // A node that is off by choice is not red (lib/connection.ts).
+  const connection = describeConnection(status);
 
   return (
     <Card style={{ marginBottom: "var(--space-6)" }} data-testid="persistence-card">
       <CardHeader
         title="Startup readiness"
         action={
-          status === undefined ? (
-            <StatusPill level="checking" label="Checking" />
-          ) : (
-            <StatusPill
-              level={running ? "live" : "offline"}
-              label={running ? "Node running" : "Node stopped"}
-            />
-          )
+          <StatusPill
+            level={running ? "live" : connection.level}
+            label={running ? "Node running" : connection.label}
+          />
         }
       />
       <div

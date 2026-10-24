@@ -95,10 +95,12 @@ test.describe("Crash banner", () => {
       const match = html.match(/src="(\/assets\/index-[^"]+\.js)"/);
       if (!match) return false;
       const js = await (await fetch(match[1])).text();
+      // One plain sentence, one button; the exit text waits behind Show details.
       return (
-        js.includes("Your node crashed") &&
+        js.includes("Your node stopped unexpectedly.") &&
         js.includes("btn-crash-relaunch") &&
-        js.includes("btn-crash-dismiss")
+        js.includes("btn-crash-dismiss") &&
+        !js.includes("Your node crashed")
       );
     });
     expect(shipped).toBe(true);
