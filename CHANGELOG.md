@@ -54,7 +54,7 @@ All notable changes to ARC Chain are tracked here. This project follows
   holding the caller for up to 65 minutes and then returning 504. A
   withdrawn job can no longer be submitted, so no late worker result can
   race the fallback. Workers that are merely slow, submits already under
-  verification and recovery probes are unaffected.
+  verification and recovery probes are unaffected (#214).
 
 ## v0.8.14 - Release-preparation snapshot (2026-10-20)
 
