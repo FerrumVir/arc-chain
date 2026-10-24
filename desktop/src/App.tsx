@@ -3,6 +3,7 @@ import { AnimatePresence, MotionConfig, motion } from "framer-motion";
 import { Sidebar } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
 import { DataMigrationBanner } from "./components/DataMigrationBanner";
+import { PreviousInstallNotice } from "./components/PreviousInstallNotice";
 import { NodeCareNotice } from "./components/NodeCare";
 import { LegacyUpgradeDialog } from "./components/LegacyUpgradeDialog";
 import { Onboarding } from "./screens/Onboarding";
@@ -22,7 +23,11 @@ import {
 import { appUpdater } from "./lib/updater";
 import { dismissBootSplash } from "./lib/boot";
 import { EASE_OUT } from "./lib/motion";
-import type { DataMigrationNotice, LegacyComputeQuestion } from "./lib/types";
+import type {
+  DataMigrationNotice,
+  LegacyComputeQuestion,
+  PreviousInstallNotice as PreviousInstallNoticeData,
+} from "./lib/types";
 
 // If the native store never answers, stop waiting and show what the local state says.
 const BOOT_TIMEOUT_MS = 4_000;
@@ -85,6 +90,8 @@ export function App() {
   const [bootTimedOut, setBootTimedOut] = useState(false);
   const [dataMigration, setDataMigration] =
     useState<DataMigrationNotice | null>(null);
+  const [previousInstall, setPreviousInstall] =
+    useState<PreviousInstallNoticeData | null>(null);
   const [legacyQuestion, setLegacyQuestion] =
     useState<LegacyComputeQuestion | null>(null);
   const mainRef = useRef<HTMLElement>(null);
@@ -108,17 +115,24 @@ export function App() {
   useEffect(() => {
     let active = true;
     (async () => {
-      const [loadedIdentity, loadedConfig, loadedMigration, loadedQuestion] =
-        await Promise.all([
-          api.loadIdentity().catch(() => null),
-          api.loadConfig().catch(() => null),
-          api.loadDataMigrationNotice().catch(() => null),
-          api.loadLegacyComputeQuestion().catch(() => null),
-        ]);
+      const [
+        loadedIdentity,
+        loadedConfig,
+        loadedMigration,
+        loadedPreviousInstall,
+        loadedQuestion,
+      ] = await Promise.all([
+        api.loadIdentity().catch(() => null),
+        api.loadConfig().catch(() => null),
+        api.loadDataMigrationNotice().catch(() => null),
+        api.loadPreviousInstallNotice().catch(() => null),
+        api.loadLegacyComputeQuestion().catch(() => null),
+      ]);
       if (loadedIdentity) setIdentity(loadedIdentity);
       if (loadedConfig) setConfig(loadedConfig);
       if (loadedIdentity && loadedConfig) setOnboarded(true);
       if (active) setDataMigration(loadedMigration);
+      if (active) setPreviousInstall(loadedPreviousInstall);
       if (active) setLegacyQuestion(loadedQuestion);
       if (active) setConfigHydrated(true);
     })();
@@ -165,11 +179,17 @@ export function App() {
           >
             {isSyntheticPreview ? (
               <div className="synthetic-preview-page">
-                <Onboarding />
+                <Onboarding
+                  previousInstall={previousInstall}
+                  onPreviousInstallDismissed={() => setPreviousInstall(null)}
+                />
                 <SyntheticPreviewBanner />
               </div>
             ) : (
-              <Onboarding />
+              <Onboarding
+                previousInstall={previousInstall}
+                onPreviousInstallDismissed={() => setPreviousInstall(null)}
+              />
             )}
           </motion.div>
         ) : (
@@ -197,6 +217,12 @@ export function App() {
                   <DataMigrationBanner
                     notice={dataMigration}
                     onDismissed={() => setDataMigration(null)}
+                  />
+                )}
+                {previousInstall && (
+                  <PreviousInstallNotice
+                    notice={previousInstall}
+                    onDismissed={() => setPreviousInstall(null)}
                   />
                 )}
                 {/* Screen changes: a short exit, then the new screen from the top. The main area scrolls, so without

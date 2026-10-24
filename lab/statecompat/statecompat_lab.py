@@ -60,8 +60,8 @@ SCHEMA_SUMMARY = "arc.statecompat-lab.summary.v1"
 SCHEMA_MANIFEST = "arc.statecompat-lab.manifest.v1"
 
 REPOSITORY = "FerrumVir/arc-chain"
-SOURCE_SHA = "8a5fb4124e4eb8b612dec86c70fc56fd23e8b523"
-SOURCE_TREE = "8f9d2b2bdcb39a79d029c45177ea6d4bb5ccdbef"
+SOURCE_SHA = "f9d8868fe0b1fc1d9cf289f91343d580a32c9e16"
+SOURCE_TREE = "b16d8ef5c9db1abd8f93ac907001f899c0119e3e"
 BASELINE_SHA = "a38da3a37b0eedaefff1046534957e797eaa51c4"
 OLD_VERSION = "0.8.14"
 NEW_VERSION = "0.8.15"
@@ -1386,14 +1386,14 @@ def cmd_run_tier(args):
 # ------------------------------------------------------ production binaries ----
 
 PROD_OLD_SHA256 = "a0be31f95859f2576f4674732d04407d5c2c4e6532c67dfbed06ad41e754b38c"
-# The v0.8.15 candidate, from release-binding-v0815.json (B1, sha256 c342f8395d3e0203b9fb5fa505cd5f4eda711e1afe17aa712ced1b6baa3f2778):
+# The v0.8.15 candidate, from release-binding-v0815.json (B1, sha256 eb44308a23187b13e7381fef9cde988cb0f2b73653cc0151e0028e54e193c260):
 # candidate_artifact.binary_sha256, .zip_digest (hex part), .archive_sha256, .id, .job_id, and preflight.run_id.
 PROD_NEW_SHA256 = "ba116541d3691607b526d18a17525f04ee9ec12fbd69c8de444945172217a5f1"
-PROD_ZIP_SHA256 = "16ae8d4b76ee2630e5fb9a2bf3854ed0a41de8bef47d1db21a5511a301b131c6"
-PROD_ARCHIVE_SHA256 = "97eac5d9a2462f908961fcde858826524c2cc535c005cd8bf3035e7e94915cee"
-PROD_ARTIFACT_ID = "12566362826"
-PROD_BUILD_JOB_ID = "120919203141"
-PROD_PREFLIGHT_RUN = "40109877970"
+PROD_ZIP_SHA256 = "2bb133dbc1615aa9dd86e89fb036705bb2b8c1cf0f92f5bdac38fb62bf6ff8d9"
+PROD_ARCHIVE_SHA256 = "7992e418506ee261a9fc0c2ebb05c48041272c022fd21494c7ddacf8c06879cc"
+PROD_ARTIFACT_ID = "12575098347"
+PROD_BUILD_JOB_ID = "120984664004"
+PROD_PREFLIGHT_RUN = "40131713450"
 
 
 def gh(*argv, capture=True, stdout=None):

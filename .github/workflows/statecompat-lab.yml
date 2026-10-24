@@ -25,8 +25,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTUP_TOOLCHAIN: nightly-2026-03-16
-  SOURCE_SHA: 8a5fb4124e4eb8b612dec86c70fc56fd23e8b523
-  SOURCE_TREE: 8f9d2b2bdcb39a79d029c45177ea6d4bb5ccdbef
+  SOURCE_SHA: f9d8868fe0b1fc1d9cf289f91343d580a32c9e16
+  SOURCE_TREE: b16d8ef5c9db1abd8f93ac907001f899c0119e3e
   BASELINE_SHA: a38da3a37b0eedaefff1046534957e797eaa51c4
   OLD_PROD_SHA256: a0be31f95859f2576f4674732d04407d5c2c4e6532c67dfbed06ad41e754b38c
   NEW_PROD_SHA256: ba116541d3691607b526d18a17525f04ee9ec12fbd69c8de444945172217a5f1
@@ -187,7 +187,7 @@ jobs:
           retention-days: 30
 
   build-candidate:
-    name: build v0.8.15 SOURCE (8a5fb412) twice - release flags and native-test-executor
+    name: build v0.8.15 SOURCE (f9d8868f) twice - release flags and native-test-executor
     needs: guard
     runs-on: ubuntu-22.04
     timeout-minutes: 120

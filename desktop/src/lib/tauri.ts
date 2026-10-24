@@ -25,6 +25,7 @@ import type {
   NodeContribution,
   NodeStatus,
   PaidInferenceResult,
+  PreviousInstallNotice,
   RecentBlocks,
   ResetPeerStateResult,
   RewardEconomics,
@@ -933,6 +934,10 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "load_data_migration_notice":
       return null as T;
     case "dismiss_data_migration_notice":
+      return undefined as T;
+    case "load_previous_install_notice":
+      return null as T;
+    case "dismiss_previous_install_notice":
       return undefined as T;
     case "node_status": {
       // Mirror desktop/src-tauri/src/rpc_client.rs::fetch_status:
@@ -2548,6 +2553,10 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return null as T;
     case "dismiss_data_migration_notice":
       return undefined as T;
+    case "load_previous_install_notice":
+      return null as T;
+    case "dismiss_previous_install_notice":
+      return undefined as T;
     case "node_status": {
       const running = mockStartedAt !== null;
       const uptime = running
@@ -3221,6 +3230,11 @@ export const api = {
     invoke<DataMigrationNotice | null>("load_data_migration_notice"),
   dismissDataMigrationNotice: () =>
     invoke<void>("dismiss_data_migration_notice"),
+  /** Launch set node data from an earlier install aside, if it did. */
+  loadPreviousInstallNotice: () =>
+    invoke<PreviousInstallNotice | null>("load_previous_install_notice"),
+  dismissPreviousInstallNotice: () =>
+    invoke<void>("dismiss_previous_install_notice"),
   /** The first-launch question for an install upgraded from v0.7, if pending. */
   loadLegacyComputeQuestion: () =>
     invoke<LegacyComputeQuestion | null>("load_legacy_compute_question"),

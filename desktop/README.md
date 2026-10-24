@@ -30,6 +30,7 @@ desktop/
 │   │   ├── identity.rs      Generates an on-chain address + recovery phrase
 │   │   └── store.rs         Persists identity & config to the OS app-data dir
 │   ├── capabilities/    Tauri 2 permission manifest
+│   ├── windows/         NSIS installer hooks: the uninstaller asks before deleting wallet data
 │   └── tauri.conf.json  Bundle identifier, window, CSP
 └── tests/               Playwright browser/evidence/resilience suites
 ```
@@ -119,8 +120,8 @@ npm test                # all suites, headless
 npm run test:ui         # Playwright UI mode (time-travel debugger)
 ```
 
-At this audited tree state, `npx playwright test --list` enumerates 351 tests in
-29 files. That inventory includes `live.spec.ts`; its tests skip without
+At this audited tree state, `npx playwright test --list` enumerates 354 tests in
+30 files. That inventory includes `live.spec.ts`; its tests skip without
 `ARC_LIVE_PORT`, and the required real-node run uses `npm run test:live`.
 Native test inventory is intentionally not hard-coded: run
 `cargo test --manifest-path src-tauri/Cargo.toml -- --list`, and treat only a

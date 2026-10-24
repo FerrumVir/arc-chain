@@ -127,6 +127,18 @@ pub struct DataMigrationNotice {
     pub reason: String,
 }
 
+/// Persistent, dismissible notice that launch found node data from an earlier
+/// ARC install whose app data was gone and set it aside: renamed beside
+/// itself, never deleted (`previous_install`). The install starts fresh; a
+/// wallet comes back from its 12 words.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviousInstallNotice {
+    pub set_aside_data_dir: String,
+    pub active_data_dir: String,
+    pub set_aside_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeStatus {

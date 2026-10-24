@@ -58,6 +58,9 @@ MACOS_PACKAGE_PROVENANCE="$REPO_ROOT/scripts/recovery/build-macos-package-proven
 MACOS_PACKAGE_PROVENANCE_TEST="$REPO_ROOT/scripts/recovery/test_build_macos_package_provenance.py"
 DESKTOP_TAURI_LIB="$REPO_ROOT/desktop/src-tauri/src/lib.rs"
 DESKTOP_PRODUCTION_ACCEPTANCE="$REPO_ROOT/desktop/src-tauri/src/production_acceptance.rs"
+DESKTOP_TAURI_CONF_JSON="$REPO_ROOT/desktop/src-tauri/tauri.conf.json"
+DESKTOP_NSIS_INSTALLER_HOOKS="$REPO_ROOT/desktop/src-tauri/windows/installer-hooks.nsh"
+DESKTOP_PACKAGE_LOCK="$REPO_ROOT/desktop/package-lock.json"
 PUBLIC_PRODUCTION_STATUS="$REPO_ROOT/shared/frontend/production-status.json"
 ROOT_README="$REPO_ROOT/README.md"
 RECOVERY_RUNBOOK="$REPO_ROOT/scripts/recovery/README.md"
@@ -3296,6 +3299,68 @@ run_test 'archive transport credentials and temp roots are invocation-scoped' ar
 run_test 'macOS pre-tag community canary is exact, private, SIGTERM-only, and preservation-safe' macos_pretag_community_canary_is_exact_private_and_fail_closed
 run_test 'owner emergency recovery is canonical, create-only, fresh, and exact-input bound' owner_emergency_recovery_authorization_is_durable_and_exact
 run_test 'packaged AppImage and pre-Tauri native acceptance are mandatory and fail closed' packaged_appimage_and_native_acceptance_are_mandatory_and_fail_closed
+windows_uninstaller_asks_before_deleting_wallet_data() {
+    local hooks_path macro opens closes required
+    hooks_path="$(python3 - "$DESKTOP_TAURI_CONF_JSON" <<'PY'
+import json
+import sys
+
+config = json.load(open(sys.argv[1]))
+print(config.get("bundle", {}).get("windows", {}).get("nsis", {}).get("installerHooks", ""))
+PY
+)" || return 1
+    assert_equals 'windows/installer-hooks.nsh' "$hooks_path" \
+        'tauri.conf.json does not wire bundle.windows.nsis.installerHooks to the checked-in hooks file' \
+        || return 1
+    [ -f "$DESKTOP_NSIS_INSTALLER_HOOKS" ] || {
+        printf 'desktop/src-tauri/windows/installer-hooks.nsh is missing\n'
+        return 1
+    }
+    # The Tauri 2.11 installer.nsi template inserts exactly these four macros,
+    # each behind an `!ifmacrodef`, so a misspelt name is silently never run.
+    while read -r macro; do
+        case "$macro" in
+            NSIS_HOOK_PREINSTALL|NSIS_HOOK_POSTINSTALL|NSIS_HOOK_PREUNINSTALL|NSIS_HOOK_POSTUNINSTALL) ;;
+            *)
+                printf 'installer hook macro is not one the Tauri template inserts: %s\n' "$macro"
+                return 1
+                ;;
+        esac
+    done < <(sed -nE 's/^!macro[[:space:]]+([A-Za-z0-9_]+).*/\1/p' "$DESKTOP_NSIS_INSTALLER_HOOKS")
+    opens="$(grep -Ec '^!macro[[:space:]]' "$DESKTOP_NSIS_INSTALLER_HOOKS")"
+    closes="$(grep -Ec '^!macroend' "$DESKTOP_NSIS_INSTALLER_HOOKS")"
+    assert_equals "$opens" "$closes" \
+        'installer hooks file has unbalanced macro definitions' || return 1
+    assert_file_contains "$DESKTOP_NSIS_INSTALLER_HOOKS" '^!macro NSIS_HOOK_PREUNINSTALL$' \
+        'the uninstaller hook that guards app-data deletion is not defined' || return 1
+    # The hook reads the template's own checkbox and update-mode variables,
+    # asks once, names what is lost, keeps the data on No and in silent runs,
+    # and deletes nothing itself.
+    for required in \
+        '\$DeleteAppDataCheckboxState = 1' \
+        '\$UpdateMode <> 1' \
+        'MessageBox MB_YESNO[|]MB_ICONEXCLAMATION' \
+        '/SD IDNO' \
+        'ARC wallet keys' \
+        '12-word recovery phrase' \
+        'Delete anyway\?' \
+        'StrCpy \$DeleteAppDataCheckboxState 0'
+    do
+        assert_file_contains "$DESKTOP_NSIS_INSTALLER_HOOKS" "$required" \
+            "uninstaller hook lost its guard: $required" || return 1
+    done
+    assert_file_not_contains "$DESKTOP_NSIS_INSTALLER_HOOKS" 'RmDir|RMDir|^[[:space:]]*Delete ' \
+        'installer hooks must not delete anything themselves' || return 1
+    # The variable names and insertion points were verified against the
+    # Tauri 2.11 template; a CLI major or minor bump re-opens that check.
+    grep -A1 -F '"node_modules/@tauri-apps/cli": {' "$DESKTOP_PACKAGE_LOCK" \
+        | grep -Eq '"version": "2\.11\.[0-9]+"' || {
+        printf 'installer hooks were verified against the Tauri 2.11 NSIS template; re-check NSIS_HOOK_* names and $DeleteAppDataCheckboxState/$UpdateMode for the locked CLI\n'
+        return 1
+    }
+}
+
 run_test 'release-related shell scripts pass bash syntax validation' relevant_shell_is_syntax_valid
+run_test 'Windows uninstaller asks before deleting ARC wallet data and keeps it by default' windows_uninstaller_asks_before_deleting_wallet_data
 
 finish_tests
