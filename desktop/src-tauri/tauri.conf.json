@@ -52,7 +52,10 @@
       "signingIdentity": "-"
     },
     "windows": {
-      "certificateThumbprint": null
+      "certificateThumbprint": null,
+      "nsis": {
+        "installerHooks": "windows/installer-hooks.nsh"
+      }
     }
   },
   "plugins": {

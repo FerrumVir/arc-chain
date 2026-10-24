@@ -97,6 +97,7 @@ mod identity_generation_tests {
             identity: Some(identity),
             config: None,
             data_migration_notice: None,
+            previous_install_notice: None,
         };
         store.save_to(dir.path()).unwrap();
         let original_bytes = std::fs::read(dir.path().join("store.json")).unwrap();
@@ -397,6 +398,23 @@ pub async fn load_data_migration_notice(
 pub async fn dismiss_data_migration_notice(state: State<'_, AppState>) -> CmdResult<()> {
     let mut store = state.store.lock().await;
     store.data_migration_notice = None;
+    let dir = state.data_dir.lock().await.clone();
+    store.save_to(&dir).map_err(map_err)
+}
+
+/// Launch set node data from an earlier install aside (`previous_install`).
+#[tauri::command]
+pub async fn load_previous_install_notice(
+    state: State<'_, AppState>,
+) -> CmdResult<Option<PreviousInstallNotice>> {
+    let store = state.store.lock().await;
+    Ok(store.previous_install_notice.clone())
+}
+
+#[tauri::command]
+pub async fn dismiss_previous_install_notice(state: State<'_, AppState>) -> CmdResult<()> {
+    let mut store = state.store.lock().await;
+    store.previous_install_notice = None;
     let dir = state.data_dir.lock().await.clone();
     store.save_to(&dir).map_err(map_err)
 }

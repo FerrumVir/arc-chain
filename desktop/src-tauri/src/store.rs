@@ -1,4 +1,4 @@
-use crate::types::{DataMigrationNotice, Identity, NodeConfig};
+use crate::types::{DataMigrationNotice, Identity, NodeConfig, PreviousInstallNotice};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -30,6 +30,10 @@ pub struct Store {
     pub config: Option<NodeConfig>,
     #[serde(default)]
     pub data_migration_notice: Option<DataMigrationNotice>,
+    /// Launch set node data from an earlier install aside (`previous_install`).
+    /// Shown until dismissed; written to a store that may hold nothing else.
+    #[serde(default)]
+    pub previous_install_notice: Option<PreviousInstallNotice>,
 }
 
 impl Store {
@@ -437,6 +441,7 @@ mod tests {
             }),
             config: Some(NodeConfig::default()),
             data_migration_notice: None,
+            previous_install_notice: None,
         };
         store.save_to(&dir).expect("save private store");
         let loaded = Store::load_from(&dir);
@@ -483,6 +488,7 @@ mod tests {
             }),
             config: Some(NodeConfig::default()),
             data_migration_notice: None,
+            previous_install_notice: None,
         };
         let path = Store::file(&dir);
         fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
@@ -524,6 +530,7 @@ mod tests {
             }),
             config: Some(NodeConfig::default()),
             data_migration_notice: None,
+            previous_install_notice: None,
         };
         let new_config = NodeConfig {
             data_dir: dir.join("data-v3").to_string_lossy().into_owned(),
@@ -538,6 +545,7 @@ mod tests {
             }),
             config: Some(new_config),
             data_migration_notice: None,
+            previous_install_notice: None,
         };
 
         write_private_fixture(
@@ -575,6 +583,7 @@ mod tests {
             }),
             config: Some(NodeConfig::default()),
             data_migration_notice: None,
+            previous_install_notice: None,
         };
         write_private_fixture(
             &dir.join("store.json.previous"),
@@ -621,6 +630,7 @@ mod tests {
             identity: Some(identity),
             config: Some(config),
             data_migration_notice: None,
+            previous_install_notice: None,
         };
         store.save_to(&app_dir).unwrap();
 
@@ -678,6 +688,7 @@ mod tests {
                 ..NodeConfig::default()
             }),
             data_migration_notice: None,
+            previous_install_notice: None,
         };
 
         assert!(
@@ -719,6 +730,7 @@ mod tests {
                 ..NodeConfig::default()
             }),
             data_migration_notice: None,
+            previous_install_notice: None,
         };
         let notice = store
             .protect_legacy_v07_data()
@@ -762,6 +774,7 @@ mod tests {
             identity: None,
             config: Some(config),
             data_migration_notice: None,
+            previous_install_notice: None,
         };
         assert!(store.protect_legacy_v07_data().unwrap().is_none());
         assert_eq!(
@@ -790,6 +803,7 @@ mod tests {
                 ..NodeConfig::default()
             }),
             data_migration_notice: None,
+            previous_install_notice: None,
         };
 
         let error = store

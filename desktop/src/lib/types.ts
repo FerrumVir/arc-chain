@@ -227,6 +227,18 @@ export interface DataMigrationNotice {
 }
 
 /**
+ * Launch found node data from an earlier ARC install whose app data was gone
+ * (a Windows uninstall with "Delete the application data" ticked) and set it
+ * aside: renamed beside itself, never deleted. Mirrors
+ * `types::PreviousInstallNotice`. Shown until dismissed.
+ */
+export interface PreviousInstallNotice {
+  setAsideDataDir: string;
+  activeDataDir: string;
+  setAsideAt: number;
+}
+
+/**
  * Asked once, on the first launch after a v0.7 install reached this app
  * (normally through the v0.7 legacy bridge release). Until it is answered the
  * node runs as an observer without a model. Mirrors

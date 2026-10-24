@@ -207,6 +207,17 @@ export const PLAIN_COPY = {
     connected: (via: string | null) =>
       via ? `ARC is connected to the network via ${via} ✓` : "Your node is connected to the ARC network ✓",
   },
+  /**
+   * Launch found node data from an earlier install whose app data was gone
+   * and set it aside (renamed, never deleted). One sentence, during setup and
+   * on every screen after it, until dismissed.
+   */
+  previousInstall: {
+    sentence:
+      "ARC found node data from an earlier install and set it aside. If you had a wallet, restore it with your 12 words.",
+    dismiss: "Dismiss this notice",
+    dismissFailed: "Could not dismiss this notice:",
+  },
   updates: {
     waitingForLastSession: (version: string) =>
       `Version ${version} installs as soon as ARC finishes closing your node's last session.`,

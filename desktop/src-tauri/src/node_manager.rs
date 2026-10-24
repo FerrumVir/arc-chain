@@ -30,14 +30,14 @@ const CRASH_RESTART_MAX_DELAY: Duration = Duration::from_secs(16);
 const CRASH_RESTART_STABLE_RUNTIME: Duration = Duration::from_secs(10 * 60);
 const DESKTOP_SHUTDOWN_CONTROL_DIR_NAME: &str =
     arc_crypto::secret_file::DESKTOP_SHUTDOWN_CONTROL_DIR_NAME;
-const DESKTOP_SHUTDOWN_TOKEN_FILE_NAME: &str = "token";
+pub(crate) const DESKTOP_SHUTDOWN_TOKEN_FILE_NAME: &str = "token";
 const DESKTOP_SHUTDOWN_REQUEST_FILE_NAME: &str = "request";
 const DESKTOP_SHUTDOWN_REQUEST_SCHEMA: &str = "arc.desktop.shutdown.v1";
 const DESKTOP_LIFECYCLE_LOCK_FILE_NAME: &str =
     arc_crypto::secret_file::DESKTOP_LIFECYCLE_LOCK_FILE_NAME;
 const DESKTOP_LIFECYCLE_OWNER_LOCK_FILE_NAME: &str =
     arc_crypto::secret_file::DESKTOP_LIFECYCLE_OWNER_LOCK_FILE_NAME;
-const DESKTOP_EXECUTABLE_IDENTITY_FILE_NAME: &str = "managed-executable.path";
+pub(crate) const DESKTOP_EXECUTABLE_IDENTITY_FILE_NAME: &str = "managed-executable.path";
 const DESKTOP_EXECUTABLE_IDENTITY_SCHEMA: &str = "arc.desktop.executable-path.v1";
 const DESKTOP_EXECUTABLE_IDENTITY_MAX_BYTES: u64 = 32 * 1024;
 const DESKTOP_SHUTDOWN_FILE_MAX_BYTES: u64 = 256;
@@ -49,7 +49,7 @@ const DESKTOP_SHUTDOWN_PUBLICATION_RETRIES: usize = 250;
 const DESKTOP_SHUTDOWN_PUBLICATION_RETRY_DELAY: Duration = Duration::from_millis(20);
 const LEGACY_VALIDATOR_SEED_MAX_BYTES: usize = 1_024;
 
-fn refresh_process_command_metadata(system: &mut sysinfo::System) {
+pub(crate) fn refresh_process_command_metadata(system: &mut sysinfo::System) {
     system.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::All,
         true,
@@ -245,7 +245,7 @@ fn has_exact_lifecycle_namespace_proof(
         })
 }
 
-fn validate_configured_directory_ancestry_no_link(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn validate_configured_directory_ancestry_no_link(path: &Path) -> anyhow::Result<()> {
     let mut ancestors = path.ancestors().collect::<Vec<_>>();
     ancestors.reverse();
     for ancestor in ancestors {
@@ -1784,6 +1784,9 @@ impl NodeManager {
     pub fn configure_managed_data_dir(&mut self, configured: &str) -> anyhow::Result<()> {
         let data_dir = resolve_data_dir(configured);
         if !data_dir.exists() {
+            // Nothing has run there, so no receipt is armed. Launch re-points
+            // here after setting an earlier install's directory aside.
+            self.durability_failure = None;
             self.managed_data_dir = Some(data_dir);
             return Ok(());
         }
@@ -3458,7 +3461,7 @@ pub(crate) fn configured_model_unavailable(config: &NodeConfig) -> Option<ModelU
     ModelPreflight::check(Path::new(path)).map(|preflight| preflight.reason)
 }
 
-async fn push_log(logs: &Arc<Mutex<VecDeque<LogEntry>>>, level: &str, message: String) {
+pub(crate) async fn push_log(logs: &Arc<Mutex<VecDeque<LogEntry>>>, level: &str, message: String) {
     let entry = LogEntry {
         id: format!("log-{}", uuid_like()),
         timestamp: chrono::Utc::now().timestamp_millis(),
@@ -3834,7 +3837,10 @@ fn constant_time_legacy_seed_eq(candidate: &std::ffi::OsStr, expected: &Zeroizin
     difference == 0
 }
 
-fn canonical_process_path(value: &std::ffi::OsStr, process_cwd: Option<&Path>) -> Option<PathBuf> {
+pub(crate) fn canonical_process_path(
+    value: &std::ffi::OsStr,
+    process_cwd: Option<&Path>,
+) -> Option<PathBuf> {
     let path = Path::new(value);
     let resolved = if path.is_absolute() {
         path.to_path_buf()
@@ -4819,7 +4825,7 @@ fn recorded_process_state(target: &ManagedDetachedProcess) -> RecordedNodeState 
 /// reconciliation failed on every launch with "private file Windows DACL
 /// inherits from its parent". The probe now repairs that boundary on ARC's
 /// own, owner-verified, non-link lock file before it looks at the lock.
-fn node_data_directory_held(data_dir: &Path) -> std::io::Result<bool> {
+pub(crate) fn node_data_directory_held(data_dir: &Path) -> std::io::Result<bool> {
     let node_lock_path = data_dir.join(".arc-node.lock");
     let node_lock =
         match arc_crypto::secret_file::open_owned_private_read_write_repairing(&node_lock_path) {
@@ -7102,6 +7108,7 @@ mod tests {
             }),
             config: Some(old_config),
             data_migration_notice: None,
+            previous_install_notice: None,
         };
         let notice = store
             .protect_legacy_v07_data()
@@ -7327,6 +7334,7 @@ mod tests {
             }),
             config: Some(relative_config),
             data_migration_notice: None,
+            previous_install_notice: None,
         };
         let relative_notice = relative_store
             .protect_legacy_v07_data_at(&relative_data)
