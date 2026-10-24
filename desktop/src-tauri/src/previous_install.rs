@@ -579,7 +579,7 @@ mod tests {
                 "bom",
                 [
                     b"\xEF\xBB\xBF".as_slice(),
-                    br#"{"identity":null,"config":null}"#,
+                    br#"{"identity":null,"config":null}"#.as_slice(),
                 ]
                 .concat(),
             ),
