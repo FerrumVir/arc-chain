@@ -53,8 +53,13 @@ All notable changes to ARC Chain are tracked here. This project follows
   registry TTL, and answers from its own sharded pipeline instead of
   holding the caller for up to 65 minutes and then returning 504. A
   withdrawn job can no longer be submitted, so no late worker result can
-  race the fallback. Workers that are merely slow, submits already under
-  verification and recovery probes are unaffected (#214).
+  race the fallback. Two trade-offs: a worker whose heartbeats to a
+  coordinator fail for 90 s while it is computing loses that job and its
+  reward, where v0.8.14 still paid it if the result arrived in time; and
+  under a burst, questions queued behind one busy worker fall back after
+  30 s instead of being served in sequence. Workers that keep
+  heartbeating, submits already under verification, twin execution and
+  recovery probes are unaffected (#214).
 
 ## v0.8.14 - Release-preparation snapshot (2026-10-20)
 

@@ -7290,12 +7290,18 @@ impl std::fmt::Display for CommunityDispatchError {
 /// coordinator and re-polls 500 ms after each empty window, so an idle worker
 /// dequeues new work within about a second. An assignment still unclaimed
 /// after one full claim window has no idle worker on this coordinator: every
-/// registered worker is computing or settling for another coordinator, or has
-/// gone away without expiring from the registry yet. Nothing can claim it
-/// later that could not claim it now. Before this bound the dispatcher waited
-/// its whole compute budget (45 s to 65 min, `community_dispatch_timeout_secs`)
-/// for a claim that could not come, then answered 504 without using the
-/// sharded pipeline that was ready the whole time.
+/// registered worker is computing or settling a job, for this coordinator or
+/// another one, or has gone away without expiring from the registry yet. Such
+/// a request used to stay queued until a worker freed up, for as long as the
+/// whole compute budget (45 s to 65 min, `community_dispatch_timeout_secs`),
+/// and answered 504 if none did, without using the sharded pipeline that was
+/// ready the whole time. It is now withdrawn after one window and answered by
+/// this seed's own pipeline.
+///
+/// The trade-off: under a burst, requests queued behind one busy worker are no
+/// longer served in sequence by that worker as it frees up; they fall back
+/// after 30 s instead. The item each leaves in the queue is discarded as
+/// `job_expired` by the next worker that dequeues it.
 const COMMUNITY_UNCLAIMED_WITHDRAW_SECS: u64 = COMMUNITY_CLAIM_TIMEOUT_SECS;
 
 /// How often a waiting dispatcher re-reads its pending assignment and the
@@ -7309,10 +7315,16 @@ struct CommunityDispatchWindows {
     /// Withdraw an assignment nobody has claimed after this long. `None`
     /// waits for the whole compute budget.
     unclaimed_withdraw: Option<std::time::Duration>,
-    /// Withdraw a claimed assignment once its worker has been gone from the
-    /// registry for longer than `COMMUNITY_WORKER_TTL_SECS`, that is, once
-    /// its own submit would already be rejected as coming from an
-    /// unregistered worker.
+    /// Withdraw a claimed assignment once its worker has been absent from the
+    /// registry, or unheard from, for longer than `COMMUNITY_WORKER_TTL_SECS`.
+    /// Safety comes from removing the pending record, not from the registry:
+    /// `community_submit_work` checks only that the worker is registered,
+    /// never its TTL, and stale registrations are pruned lazily, so the
+    /// worker's late submit is rejected only because its job has no pending
+    /// record any more. The trade-off is that a worker whose heartbeats to
+    /// this coordinator fail for 90 s while it is computing loses that job and
+    /// its reward, where before its result was still paid if it arrived inside
+    /// the budget; workers do not retry the resulting 404.
     withdraw_unregistered_worker: bool,
     /// How often the pending assignment is re-read while waiting.
     watch_interval: std::time::Duration,
@@ -7343,8 +7355,8 @@ enum AbandonedAssignment {
     WorkerUnregistered(String),
 }
 
-/// Withdraw an assignment that can no longer be served, so its caller can
-/// fall back safely. The pending record is removed first: a later
+/// Withdraw an assignment this coordinator will no longer wait for, so its
+/// caller can fall back safely. The pending record is removed first: a later
 /// `/community/submit_work` for the job then fails as unknown work, exactly as
 /// after a dispatcher timeout, and the queued item is discarded as expired by
 /// the next worker that dequeues it. Returns `None` while the assignment can
@@ -7631,6 +7643,9 @@ async fn dispatch_to_community_worker_with_windows(
     let received = loop {
         let next_watch = tokio::time::Instant::now() + windows.watch_interval;
         tokio::select! {
+            // A result that is already there must never lose to the watch
+            // tick or the deadline.
+            biased;
             received = &mut osh_rx => break Some(received),
             _ = tokio::time::sleep_until(next_watch.min(deadline)) => {}
         }
@@ -8345,9 +8360,12 @@ async fn inference_run(
                         ),
                     ));
                 }
+                // Every fallback-safe outcome lands here: a refusal before
+                // enqueue, an authenticated decline, or a withdrawal (which
+                // is logged with its job where it happens).
                 tracing::warn!(
                     workers = live_workers,
-                    "community dispatch cannot complete and no worker can still submit it; falling back to this seed's own inference: {}",
+                    "community dispatch did not serve this request; falling back to this seed's own inference: {}",
                     e.message
                 );
             }
@@ -16998,8 +17016,16 @@ pub async fn community_claim_work(
                 })));
             }
             pending.assigned_worker = Some(req.worker_id.clone());
-            drop(pending);
+            // Commit the worker's slot while the pending entry is still
+            // locked, so the assignment and the slot change together. A
+            // withdrawal that removes this record under the same lock then
+            // always finds the slot it has to release; one that ran before the
+            // lock was taken left no record, and the uncommitted reservation
+            // above is released instead. Committing after the unlock left a
+            // gap in which the slot could be set with no record behind it,
+            // keeping the worker busy on this coordinator until restart.
             claim_reservation.commit(&item.job_id);
+            drop(pending);
 
             // Flat response shape — the worker (arc-node main.rs) reads
             // `job_id`, `input`, `max_tokens` directly off the top-level
@@ -26823,6 +26849,77 @@ mod tests {
         assert_eq!(response["routed_via"], "local");
         assert!(node.community_work_results.as_ref().unwrap().is_empty());
         assert!(!node.community_active_jobs.contains_key(worker_id));
+    }
+
+    #[tokio::test]
+    async fn job_claimed_through_claim_work_is_withdrawn_with_its_slot_and_its_late_submit_rejected()
+     {
+        // Through the real handlers: the worker claims, its heartbeats to this
+        // coordinator stop for longer than the TTL, the dispatcher withdraws
+        // the job and releases the worker's slot, and the worker's late
+        // submit is rejected as unknown work, so it can neither race the
+        // caller's fallback nor be paid.
+        let worker_id = "claims-then-goes-quiet";
+        let node =
+            fake_node_with_workers(vec![(worker(worker_id, &["inference"]), Instant::now())]);
+
+        let dispatch = dispatch_to_community_worker_with_windows(
+            &node,
+            "What is 2+2?".into(),
+            4,
+            Some(test_model_id()),
+            None,
+            None,
+            fast_dispatch_windows(Some(Duration::from_secs(30))),
+        );
+        let claim_then_go_quiet = async {
+            let Json(claim) = community_claim_work(
+                AxumState(node.clone()),
+                Json(ClaimWorkRequest {
+                    worker_id: worker_id.to_string(),
+                    capabilities: vec!["inference".to_string()],
+                    model_id: test_model_id(),
+                    execution_profile: canonical_profile(),
+                }),
+            )
+            .await
+            .expect("the long-poll hands out the queued job");
+            assert_eq!(claim["status"], "work");
+            let job_id = claim["job_id"].as_str().expect("job id").to_string();
+            assert_eq!(
+                node.community_active_jobs
+                    .get(worker_id)
+                    .map(|slot| slot.value().clone()),
+                Some(job_id.clone()),
+                "the claim commits the worker's slot together with the assignment"
+            );
+            node.community_workers
+                .get_mut(worker_id)
+                .expect("registered worker")
+                .value_mut()
+                .1 = Instant::now() - Duration::from_secs(COMMUNITY_WORKER_TTL_SECS + 30);
+            job_id
+        };
+        let (dispatched, job_id) = tokio::join!(dispatch, claim_then_go_quiet);
+
+        let error = dispatched.expect_err("a quiet worker's assignment is withdrawn");
+        assert!(error.local_fallback_safe);
+        assert!(error.contains("stopped heartbeating"));
+        assert!(node.community_work_results.as_ref().unwrap().is_empty());
+        assert!(!node.community_active_jobs.contains_key(worker_id));
+
+        // The worker is still registered (stale entries are pruned lazily), so
+        // only the missing pending record stands between its late result and
+        // a second answer or a reward.
+        assert!(node.community_workers.contains_key(worker_id));
+        let (status, message) = community_submit_work(
+            AxumState(node.clone()),
+            Json(successful_test_result(job_id, worker_id)),
+        )
+        .await
+        .expect_err("a late submit for a withdrawn job is rejected");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(message.contains("no pending work"));
     }
 
     #[tokio::test]
