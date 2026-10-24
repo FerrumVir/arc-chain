@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { PLAIN_COPY } from "../src/lib/plain-copy";
 import { seedMockOverrides, seedOnboarded } from "./helpers";
 
 const TEST_WORKER = "99".repeat(32);
@@ -600,8 +601,14 @@ test.describe("Dashboard", () => {
     await expect(connecting).toBeVisible({ timeout: 4000 });
     await expect(connecting).toHaveAttribute("role", "status");
     await expect(connecting).toContainText("Connecting to the ARC network");
+    await expect(page.getByTestId("dashboard-subtitle")).toHaveText(
+      PLAIN_COPY.nodeStrip.runningConnecting,
+    );
     // The mock reports "live" once the node has been up for 8 s.
     await expect(connecting).toBeHidden({ timeout: 20_000 });
+    await expect(page.getByTestId("dashboard-subtitle")).toHaveText(
+      PLAIN_COPY.nodeStrip.runningConnected,
+    );
     const restart = page.getByTestId("btn-restart");
     await expect(restart).toBeEnabled();
     await restart.click();

@@ -77,9 +77,9 @@ test.describe("Dashboard: a community node's connection", () => {
     await expect(notice).toContainText("connected to the ARC network through NYC");
     await expect(notice).toContainText("0 peers is normal");
     await expect(notice).not.toHaveText(JARGON);
-    await expect(page.getByTestId("dashboard-subtitle")).toHaveText(
-      PLAIN_COPY.nodeStrip.runningConnected,
-    );
+    // Browser live mode reports no pid, so the Dashboard reads this node as managed outside the app and its
+    // subtitle says so; dashboard.spec.ts pins the connected / connecting subtitles for a node the app spawned.
+    await expect(page.getByTestId("dashboard-subtitle")).not.toHaveText(JARGON);
 
     // The pill, the sidebar and the node card agree, in the same plain word.
     await expect(page.getByTestId("titlebar").getByTestId("status-pill-live")).toHaveText(
@@ -122,9 +122,7 @@ test.describe("Dashboard: a community node's connection", () => {
     await expect(notice).toContainText("Connecting to the ARC network");
     await expect(notice).toContainText(PLAIN_COPY.connection.connecting);
     await expect(notice).not.toHaveText(JARGON);
-    await expect(page.getByTestId("dashboard-subtitle")).toHaveText(
-      PLAIN_COPY.nodeStrip.runningConnecting,
-    );
+    await expect(page.getByTestId("dashboard-subtitle")).not.toHaveText(JARGON);
     await expect(page.getByTestId("titlebar").getByTestId("status-pill-syncing")).toHaveText(
       PLAIN_COPY.connection.labels.connecting,
     );
