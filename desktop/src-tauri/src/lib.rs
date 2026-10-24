@@ -137,19 +137,24 @@ pub struct CommunityReceiptRoute {
 /// (`previous_install`) while the launch-time fence is held: before
 /// reconciliation, when nothing holds the directory any more, and again after
 /// reconciliation has drained a node that was still running there. Returns
-/// the notice to record when the directory moved. With a stored identity this
-/// install may own the directory, and nothing moves.
+/// the notice to record when the directory moved. `app_data_absent` is
+/// whether no identity store existed when this launch began; a store that
+/// exists, readable or not, means this install may own the directory, and
+/// nothing moves.
 async fn set_aside_previous_install_data(
     node: &mut node_manager::NodeManager,
     configured_data_dir: &str,
-    has_identity: bool,
+    app_data_absent: bool,
 ) -> Option<types::PreviousInstallNotice> {
+    if !app_data_absent {
+        return None;
+    }
     let data_dir = node_manager::resolve_data_dir(configured_data_dir);
     let probe_dir = data_dir.clone();
     let decision = tokio::task::spawn_blocking(move || {
         previous_install::set_aside_if_previous_install(
             &probe_dir,
-            has_identity,
+            app_data_absent,
             std::time::SystemTime::now(),
         )
     })
@@ -196,7 +201,9 @@ async fn set_aside_previous_install_data(
 }
 
 /// Persist the set-aside notice so it shows until dismissed, also across a
-/// restart. The store may hold nothing else yet.
+/// restart. Called only after a move, which requires that no store existed
+/// at launch, so this never writes over a store that did not load; the
+/// shared store may by now hold the identity onboarding created meanwhile.
 async fn record_previous_install_notice(state: &AppState, notice: types::PreviousInstallNotice) {
     let mut store = state.store.lock().await;
     store.previous_install_notice = Some(notice);
@@ -218,7 +225,8 @@ async fn record_previous_install_notice(state: &AppState, notice: types::Previou
 /// armed receipt goes with it: the recovery launch that receipt would need
 /// requires an identity this install does not have, which through v0.8.14
 /// refused every Start with "managed-node durability recovery failed: no
-/// identity" until ARC restarted.
+/// identity" until ARC restarted. Each move is recorded the moment it
+/// happens, so a stop failure further down cannot hide it from the user.
 ///
 /// It drains any desktop-managed child left by an older app process,
 /// including one listening on a fallback port. It runs even when auto-start
@@ -238,18 +246,31 @@ async fn reconcile_previous_managed_node(
     handle: &tauri::AppHandle,
     state: &AppState,
     start_config: &types::NodeConfig,
-    has_identity: bool,
+    app_data_absent_at_launch: bool,
     legacy_migration_block: Option<String>,
     legacy_windows_stop: Option<(types::DataMigrationNotice, Zeroizing<String>)>,
 ) -> Result<(), String> {
+    // A directory nothing holds any more moves before anything reads it, and
+    // the move is recorded at once, in its own lock scope.
+    let set_aside_before_reconciliation = {
+        let mut node = state.node.lock().await;
+        set_aside_previous_install_data(
+            &mut node,
+            &start_config.data_dir,
+            app_data_absent_at_launch,
+        )
+        .await
+    };
+    if let Some(notice) = set_aside_before_reconciliation.as_ref() {
+        record_previous_install_notice(state, notice.clone()).await;
+    }
+
     let mut managed_recovery_required = false;
-    let mut previous_install_notice;
+    let mut set_aside_after_drain = None;
+    let mut repoint = Ok(());
     {
         let legacy_resources = commands::resolve_testnet_resources(handle);
         let mut node = state.node.lock().await;
-        previous_install_notice =
-            set_aside_previous_install_data(&mut node, &start_config.data_dir, has_identity)
-                .await;
         if let Err(error) = node.configure_managed_data_dir(&start_config.data_dir) {
             tracing::error!(
                 %error,
@@ -304,23 +325,26 @@ async fn reconcile_previous_managed_node(
         // earlier install's directory is set aside now, and a receipt it
         // left armed needs no recovery launch: nothing of this install ever
         // ran there, and the directory keeps every byte.
-        if previous_install_notice.is_none() {
-            if let Some(notice) =
-                set_aside_previous_install_data(&mut node, &start_config.data_dir, has_identity)
-                    .await
-            {
+        if set_aside_before_reconciliation.is_none() {
+            set_aside_after_drain = set_aside_previous_install_data(
+                &mut node,
+                &start_config.data_dir,
+                app_data_absent_at_launch,
+            )
+            .await;
+            if set_aside_after_drain.is_some() {
                 managed_recovery_required = false;
-                if let Err(error) = node.configure_managed_data_dir(&start_config.data_dir) {
-                    return Err(format!(
-                        "managed-node startup reconciliation failed: {error}"
-                    ));
-                }
-                previous_install_notice = Some(notice);
+                repoint = node.configure_managed_data_dir(&start_config.data_dir);
             }
         }
     }
-    if let Some(notice) = previous_install_notice {
+    if let Some(notice) = set_aside_after_drain {
         record_previous_install_notice(state, notice).await;
+    }
+    if let Err(error) = repoint {
+        return Err(format!(
+            "managed-node startup reconciliation failed: {error}"
+        ));
     }
 
     if managed_recovery_required {
@@ -482,7 +506,18 @@ pub fn run() {
             }
 
             // Load existing store from the resolved dir, if any.
-            let mut loaded_store = store::Store::load_from(&resolved);
+            let (mut loaded_store, store_load) =
+                store::Store::load_from_with_outcome(&resolved);
+            // Only an absent store lets launch set an earlier install's node
+            // data aside. A store that is present but unreadable loads empty
+            // too; that install owns its directory, and nothing is written
+            // over the store it could not read.
+            let app_data_absent_at_launch = previous_install::app_data_was_absent(store_load);
+            if store_load == store::StoreLoadOutcome::Failed {
+                tracing::error!(
+                    "the identity store is present but could not be read; node data stays in place and the store is not rewritten by launch"
+                );
+            }
             let had_durable_migration_notice = loaded_store.data_migration_notice.is_some();
             let legacy_identity_seed = loaded_store
                 .identity
@@ -758,7 +793,7 @@ pub fn run() {
                     &handle,
                     &state,
                     &start_config,
-                    has_identity,
+                    app_data_absent_at_launch,
                     legacy_migration_block,
                     legacy_windows_stop,
                 )

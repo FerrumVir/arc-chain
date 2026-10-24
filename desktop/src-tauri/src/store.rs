@@ -36,24 +36,52 @@ pub struct Store {
     pub previous_install_notice: Option<PreviousInstallNotice>,
 }
 
+/// How [`Store::load_from_with_outcome`] found the store on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreLoadOutcome {
+    /// Nothing was there when the load began: no app-data directory, or one
+    /// with no `store.json`, no rollback copy and no synced sidecar. A first
+    /// launch, or app data that was deleted.
+    Absent,
+    /// A store was read and validated, from `store.json` or a recovered
+    /// candidate.
+    Loaded,
+    /// Something was there but could not be read or validated: an insecure
+    /// directory, a refused or contended open, an oversize file, invalid
+    /// JSON. The returned store is empty and must never be written back over
+    /// the file it stands in for.
+    Failed,
+}
+
 impl Store {
     fn file(dir: &Path) -> PathBuf {
         dir.join("store.json")
     }
 
     pub fn load_from(dir: &Path) -> Self {
+        Self::load_from_with_outcome(dir).0
+    }
+
+    /// Load the store and say how it was found. A caller that acts on "no
+    /// store" (launch setting an earlier install's node data aside) must
+    /// require [`StoreLoadOutcome::Absent`]: a store that is present but
+    /// cannot be read also loads empty, and writing that emptiness back
+    /// would erase the identity it could not read.
+    pub fn load_from_with_outcome(dir: &Path) -> (Self, StoreLoadOutcome) {
+        // Decided before anything below can create the directory.
+        let absent = store_files_absent(dir);
         if let Err(error) = secure_store_directory(dir) {
             tracing::error!(
                 path = %dir.display(),
                 %error,
                 "refusing to load identity store from an insecure app-data directory"
             );
-            return Self::default();
+            return (Self::default(), StoreLoadOutcome::Failed);
         }
         let path = Self::file(dir);
 
         if let Some(store) = read_valid_store(&path) {
-            return store;
+            return (store, StoreLoadOutcome::Loaded);
         }
 
         // Windows replacement uses a complete `.previous` rollback file, and
@@ -111,10 +139,17 @@ impl Store {
                     );
                 }
             }
-            return store;
+            return (store, StoreLoadOutcome::Loaded);
         }
 
-        Self::default()
+        if absent {
+            return (Self::default(), StoreLoadOutcome::Absent);
+        }
+        tracing::error!(
+            path = %path.display(),
+            "an identity store is present but could not be read; starting with an empty store that launch does not write back"
+        );
+        (Self::default(), StoreLoadOutcome::Failed)
     }
 
     pub fn save_to(&self, dir: &Path) -> anyhow::Result<()> {
@@ -314,6 +349,32 @@ impl Store {
     }
 }
 
+/// Whether nothing of a store exists at `dir`: no directory, or a directory
+/// without `store.json`, its rollback copy or a synced sidecar. Inspected
+/// without following links, and before the directory is created.
+fn store_files_absent(dir: &Path) -> bool {
+    match fs::symlink_metadata(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+        Ok(_) => {}
+    }
+    let path = Store::file(dir);
+    for candidate in [path.clone(), path.with_extension("json.previous")] {
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return false,
+        }
+    }
+    match fs::read_dir(dir) {
+        Ok(entries) => !entries.flatten().any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".store.json.") && name.ends_with(".tmp")
+        }),
+        Err(_) => false,
+    }
+}
+
 pub(crate) fn secure_store_directory(dir: &Path) -> anyhow::Result<()> {
     match arc_crypto::secret_file::secure_private_directory(dir) {
         Ok(()) => Ok(()),
@@ -421,6 +482,63 @@ mod tests {
             std::process::id(),
             rand::random::<u64>()
         ))
+    }
+
+    /// Launch tells an absent store from one it could not read: only the
+    /// first may be acted on as "no store", and neither is written back.
+    #[test]
+    fn load_outcome_tells_absent_from_loaded_from_failed() {
+        let dir = test_dir();
+        // No directory, then a private directory with nothing in it.
+        let (store, outcome) = Store::load_from_with_outcome(&dir);
+        assert_eq!(outcome, StoreLoadOutcome::Absent);
+        assert!(store.identity.is_none());
+        assert!(dir.is_dir(), "the load creates the private directory");
+        assert_eq!(Store::load_from_with_outcome(&dir).1, StoreLoadOutcome::Absent);
+
+        let saved = Store {
+            identity: Some(Identity {
+                address: "11".repeat(32),
+                public_key: format!("0x{}", "22".repeat(32)),
+                seed_phrase: "an identity an unreadable load must not erase".to_string(),
+                created_at: 1,
+            }),
+            config: Some(NodeConfig::default()),
+            data_migration_notice: None,
+            previous_install_notice: None,
+        };
+        saved.save_to(&dir).unwrap();
+        let (store, outcome) = Store::load_from_with_outcome(&dir);
+        assert_eq!(outcome, StoreLoadOutcome::Loaded);
+        assert_eq!(
+            store.identity.as_ref().map(|identity| identity.address.clone()),
+            Some("11".repeat(32))
+        );
+
+        // The same file, made unreadable three ways, each left exactly as it
+        // was by the load that failed on it.
+        let path = dir.join("store.json");
+        let valid = std::fs::read(&path).unwrap();
+        let mut bom = b"\xEF\xBB\xBF".to_vec();
+        bom.extend_from_slice(&valid);
+        for (label, bytes) in [
+            ("bom", bom),
+            ("oversize", vec![b' '; MAX_STORE_BYTES as usize + 1]),
+            ("truncated", valid[..valid.len() / 2].to_vec()),
+        ] {
+            arc_crypto::secret_file::durably_replace_private(&path, &bytes).unwrap();
+            let (store, outcome) = Store::load_from_with_outcome(&dir);
+            assert_eq!(outcome, StoreLoadOutcome::Failed, "{label}");
+            assert!(store.identity.is_none(), "{label}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{label}");
+            assert!(!dir.join("store.json.previous").exists(), "{label}");
+        }
+        // A sidecar alone is a store that is present: a recovery candidate,
+        // never "absent".
+        std::fs::remove_file(&path).unwrap();
+        write_private_fixture(&dir.join(".store.json.4242.tmp"), b"{partial");
+        assert_eq!(Store::load_from_with_outcome(&dir).1, StoreLoadOutcome::Failed);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn write_private_fixture(path: &Path, bytes: &[u8]) {

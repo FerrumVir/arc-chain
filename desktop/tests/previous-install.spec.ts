@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { PLAIN_COPY } from "../src/lib/plain-copy";
-import { clearState, seedMockOverrides, seedOnboarded } from "./helpers";
+import { clearState, openOn, seedMockOverrides, seedOnboarded } from "./helpers";
 
 // A Windows reinstall whose uninstaller deleted the app data leaves the
 // node's data directory behind. Launch sets that directory aside (renamed,
@@ -13,9 +13,10 @@ const NOTICE = {
   activeDataDir: "C:\\Users\\community\\.arc\\data-v3",
   setAsideAt: 1_792_851_300_000,
 };
+const SENTENCE = PLAIN_COPY.previousInstall.sentence(NOTICE.setAsideDataDir);
 
 test.describe("node data from an earlier install", () => {
-  test("setup says the data was set aside and how a wallet comes back", async ({
+  test("setup says the data was set aside, where, and how a wallet comes back", async ({
     page,
   }) => {
     await clearState(page);
@@ -25,12 +26,13 @@ test.describe("node data from an earlier install", () => {
     await expect(page.getByTestId("step-welcome")).toBeVisible();
     const notice = page.getByTestId("previous-install-notice");
     await expect(notice).toBeVisible();
-    await expect(notice.getByTestId("previous-install-sentence")).toHaveText(
-      PLAIN_COPY.previousInstall.sentence,
-    );
-    await expect(notice.getByTestId("previous-install-path")).toHaveText(
+    await expect(notice.getByTestId("previous-install-sentence")).toHaveText(SENTENCE);
+    // The path stays visible, and the sentence says the node syncs again.
+    await expect(notice.getByTestId("previous-install-sentence")).toContainText(
       NOTICE.setAsideDataDir,
     );
+    expect(SENTENCE).toContain("12 words");
+    expect(SENTENCE).toContain("sync again from the start");
     // Calm: a status, not an alert, in plain words.
     await expect(notice).toHaveAttribute("role", "status");
     for (const jargon of [
@@ -42,9 +44,8 @@ test.describe("node data from an earlier install", () => {
       "refused",
       "lifecycle",
     ]) {
-      expect(PLAIN_COPY.previousInstall.sentence).not.toContain(jargon);
+      expect(SENTENCE).not.toContain(jargon);
     }
-    expect(PLAIN_COPY.previousInstall.sentence).toContain("12 words");
 
     // Setup goes on underneath it.
     await expect(page.getByTestId("btn-continue-welcome")).toBeEnabled();
@@ -57,14 +58,15 @@ test.describe("node data from an earlier install", () => {
     page,
   }) => {
     await seedOnboarded(page);
+    // The seed opens on the dashboard; the node strip lives on Home.
+    await openOn(page, "default");
     await seedMockOverrides(page, { load_previous_install_notice: NOTICE });
     await page.goto("/");
 
+    await expect(page.getByTestId("inference-screen")).toBeVisible();
     const notice = page.getByTestId("previous-install-notice");
     await expect(notice).toBeVisible();
-    await expect(notice.getByTestId("previous-install-sentence")).toHaveText(
-      PLAIN_COPY.previousInstall.sentence,
-    );
+    await expect(notice.getByTestId("previous-install-sentence")).toHaveText(SENTENCE);
     // The node is simply off: nothing red, and Start is still the one action.
     const strip = page.getByTestId("node-strip");
     await expect(strip.getByTestId("node-strip-sentence")).toHaveText(
@@ -80,6 +82,7 @@ test.describe("node data from an earlier install", () => {
     page,
   }) => {
     await seedOnboarded(page);
+    await openOn(page, "default");
     await seedMockOverrides(page, {
       load_previous_install_notice: NOTICE,
       dismiss_previous_install_notice: {
@@ -94,9 +97,7 @@ test.describe("node data from an earlier install", () => {
     await expect(notice.getByRole("alert")).toContainText(
       "existing identity store failed private owner/permission validation",
     );
-    await expect(notice.getByTestId("previous-install-sentence")).toHaveText(
-      PLAIN_COPY.previousInstall.sentence,
-    );
+    await expect(notice.getByTestId("previous-install-sentence")).toHaveText(SENTENCE);
     await expect(notice.getByTestId("dismiss-previous-install")).toBeEnabled();
   });
 });

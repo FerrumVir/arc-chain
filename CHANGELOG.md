@@ -89,13 +89,15 @@ All notable changes to ARC Chain are tracked here. This project follows
   running, it was drained and a fresh identity then ran on the old data.
   Launch now recognises node data left by an earlier install whose app data
   is gone (the desktop's own shutdown token or executable record is there,
-  and this install has no identity), renames it beside itself
-  (`data-v3.previous-install-<UTC>`, nothing deleted) once nothing live
-  holds it, starts fresh, and says so in one sentence during setup and on
-  Home: "ARC found node data from an earlier install and set it aside. If
-  you had a wallet, restore it with your 12 words." A directory a running
-  node or another ARC desktop still holds, a linked path, or any doubt
-  leaves it in place and runs the previous launch checks unchanged. The
+  and no identity store existed when ARC started; a store that is present
+  but cannot be read is left alone, and never written over), renames it
+  beside itself (`data-v3.previous-install-<UTC>`, nothing deleted) once
+  nothing live holds it, starts fresh, and says so in one sentence during
+  setup and on Home: "ARC found node data from an earlier install and set
+  it aside (<path>). If you had a wallet, restore it with your 12 words;
+  your node will sync again from the start." A directory a running node or
+  another ARC desktop still holds, a linked path, or any doubt leaves it in
+  place and runs the previous launch checks unchanged. The
   v0.8.15 Windows uninstaller asks "Delete anyway?" before deleting app
   data, says that the ARC wallet keys go with it and that the 12-word
   recovery phrase brings the wallet back, and keeps the data by default in

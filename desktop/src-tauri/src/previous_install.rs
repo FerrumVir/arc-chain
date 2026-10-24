@@ -13,12 +13,16 @@
 //! was refused until ARC restarted.
 //!
 //! When the directory provably came from a desktop that managed a node there
-//! and this install has no identity yet, nothing of this install can own it:
-//! a node needs the identity to start. It is set aside by renaming it beside
-//! itself (`data-v3.previous-install-<UTC>`), never deleted, and the install
-//! starts fresh. Every guard stays: a directory a live node or another ARC
-//! desktop holds, a linked path, a doubt of any kind leaves it in place and
-//! today's reconciliation runs as before.
+//! and this install's app data did not exist at launch, nothing of this
+//! install can own it: a node needs the stored identity to start. It is set
+//! aside by renaming it beside itself (`data-v3.previous-install-<UTC>`),
+//! never deleted, and the install starts fresh. The gate is the store's
+//! absence, not an empty identity: a store that is present but could not be
+//! read also loads empty (`store::StoreLoadOutcome::Failed`), and that
+//! install owns its directory and must never have its store written over.
+//! Every other guard stays: a directory a live node or another ARC desktop
+//! holds, a linked path, a doubt of any kind leaves it in place and today's
+//! reconciliation runs as before.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -27,6 +31,7 @@ use fs2::FileExt as _;
 
 use crate::node_manager;
 use crate::paths;
+use crate::store::StoreLoadOutcome;
 
 /// Inserted between the directory's name and the UTC stamp of the set-aside:
 /// `data-v3.previous-install-20261024T141500Z`.
@@ -36,8 +41,9 @@ const SET_ASIDE_MAX_ATTEMPTS: u32 = 1_000;
 /// What launch decided about the configured node data directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
-    /// Leave it: it is absent, no desktop ever managed a node there, or this
-    /// install has an identity and may own it.
+    /// Leave it: this install's app data existed at launch (readable or
+    /// not), the directory is absent, or no desktop ever managed a node
+    /// there.
     Keep,
     /// Evidence of a previous install, but a live holder or a doubt. Today's
     /// reconciliation runs unchanged; the reason is for the log.
@@ -46,16 +52,25 @@ pub enum Decision {
     SetAside { from: PathBuf, to: PathBuf },
 }
 
+/// Whether launch may set a previous install's directory aside, from how the
+/// identity store loaded. Only a store that was absent qualifies: an empty
+/// store that stands in for one that could not be read belongs to a live
+/// install, and the notice such a move records would be written over the
+/// unread identity.
+pub fn app_data_was_absent(outcome: StoreLoadOutcome) -> bool {
+    outcome == StoreLoadOutcome::Absent
+}
+
 /// Set the configured data directory aside when it provably belongs to a
 /// previous install that no longer exists on this computer and nothing live
-/// holds it. `has_identity` is this install's stored identity at launch; with
-/// one, this install may own the directory and it is kept.
+/// holds it. `app_data_absent` is [`app_data_was_absent`] for this launch's
+/// store load; when it is false the directory is kept, whatever is in it.
 pub fn set_aside_if_previous_install(
     data_dir: &Path,
-    has_identity: bool,
+    app_data_absent: bool,
     now: SystemTime,
 ) -> Decision {
-    if has_identity {
+    if !app_data_absent {
         return Decision::Keep;
     }
     match try_set_aside(data_dir, now) {
@@ -96,10 +111,14 @@ fn try_set_aside(data_dir: &Path, now: SystemTime) -> Result<Decision, String> {
     // that is working on the directory right now is a live holder.
     let namespace = arc_crypto::secret_file::try_acquire_private_directory_namespace_lock(data_dir)
         .map_err(|error| {
-            format!(
-                "another ARC desktop is working on the node data directory {}: {error}",
-                paths::display_with_home_redacted(data_dir)
-            )
+            let shown = paths::display_with_home_redacted(data_dir);
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                format!(
+                    "another ARC desktop is working on the node data directory {shown} right now"
+                )
+            } else {
+                format!("cannot lock the node data directory namespace {shown}: {error}")
+            }
         })?;
     namespace.restore_interrupted().map_err(|error| {
         format!(
@@ -304,6 +323,8 @@ pub fn utc_stamp(now: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Store;
+    use crate::types::{Identity, NodeConfig};
     use fs2::FileExt as _;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -311,6 +332,10 @@ mod tests {
     /// 2026-10-24T14:15:00Z.
     const NOW_SECS: u64 = 1_792_851_300;
     const STAMP: &str = "20261024T141500Z";
+    /// The launch of an install whose app data was deleted.
+    const APP_DATA_ABSENT: bool = true;
+    /// The launch of an install whose app data exists, readable or not.
+    const APP_DATA_PRESENT: bool = false;
 
     fn now() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(NOW_SECS)
@@ -374,6 +399,20 @@ mod tests {
         );
     }
 
+    fn identity_store() -> Store {
+        Store {
+            identity: Some(Identity {
+                address: "11".repeat(32),
+                public_key: format!("0x{}", "22".repeat(32)),
+                seed_phrase: "a recovery phrase the launch must never erase".to_string(),
+                created_at: 1,
+            }),
+            config: Some(NodeConfig::default()),
+            data_migration_notice: None,
+            previous_install_notice: None,
+        }
+    }
+
     #[test]
     fn the_utc_stamp_is_sortable_and_file_system_safe() {
         assert_eq!(utc_stamp(UNIX_EPOCH), "19700101T000000Z");
@@ -381,11 +420,20 @@ mod tests {
         assert!(STAMP.chars().all(|c| c.is_ascii_alphanumeric()));
     }
 
+    /// Only an absent store opens the gate. An empty store that stands in
+    /// for one that could not be read is a live install's.
+    #[test]
+    fn only_an_absent_store_opens_the_gate() {
+        assert!(app_data_was_absent(StoreLoadOutcome::Absent));
+        assert!(!app_data_was_absent(StoreLoadOutcome::Loaded));
+        assert!(!app_data_was_absent(StoreLoadOutcome::Failed));
+    }
+
     #[test]
     fn an_absent_directory_is_kept() {
         let root = test_root("absent");
         assert_eq!(
-            set_aside_if_previous_install(&root.join("data-v3"), false, now()),
+            set_aside_if_previous_install(&root.join("data-v3"), APP_DATA_ABSENT, now()),
             Decision::Keep
         );
         std::fs::remove_dir_all(root).unwrap();
@@ -412,7 +460,7 @@ mod tests {
             b"arc.desktop.lifecycle-namespace-proof.v3\n",
         );
         assert_eq!(
-            set_aside_if_previous_install(&data, false, now()),
+            set_aside_if_previous_install(&data, APP_DATA_ABSENT, now()),
             Decision::Keep
         );
         assert!(data.is_dir());
@@ -422,7 +470,7 @@ mod tests {
         std::fs::create_dir_all(manual.join("dag-wal")).unwrap();
         std::fs::write(manual.join(".arc-node.lock"), b"").unwrap();
         assert_eq!(
-            set_aside_if_previous_install(&manual, false, now()),
+            set_aside_if_previous_install(&manual, APP_DATA_ABSENT, now()),
             Decision::Keep
         );
         std::fs::remove_dir_all(root).unwrap();
@@ -433,7 +481,7 @@ mod tests {
         let root = test_root("set-aside");
         let data = previous_install_data(&root);
 
-        let decision = set_aside_if_previous_install(&data, false, now());
+        let decision = set_aside_if_previous_install(&data, APP_DATA_ABSENT, now());
         let expected = root.join(format!("data-v3{SET_ASIDE_INFIX}{STAMP}"));
         assert_eq!(
             decision,
@@ -455,10 +503,145 @@ mod tests {
         // A second launch finds nothing at the configured path and keeps
         // the set-aside directory as it is.
         assert_eq!(
-            set_aside_if_previous_install(&data, false, now()),
+            set_aside_if_previous_install(&data, APP_DATA_ABSENT, now()),
             Decision::Keep
         );
         assert_untouched(&expected);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The field case end to end: the app-data directory is gone, the node
+    /// data is not. The store loads as absent, and only then does the
+    /// directory move.
+    #[test]
+    fn an_absent_store_beside_previous_install_data_sets_it_aside() {
+        let root = test_root("store-absent");
+        let app_data = root.join("app-data");
+        let data = previous_install_data(&root);
+
+        let (store, outcome) = Store::load_from_with_outcome(&app_data);
+        assert_eq!(outcome, StoreLoadOutcome::Absent);
+        assert!(store.identity.is_none());
+        let decision = set_aside_if_previous_install(&data, app_data_was_absent(outcome), now());
+        let expected = root.join(format!("data-v3{SET_ASIDE_INFIX}{STAMP}"));
+        assert_eq!(
+            decision,
+            Decision::SetAside {
+                from: data,
+                to: expected.clone()
+            }
+        );
+        assert_untouched(&expected);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The same-install case: a store with an identity loads, so this
+    /// install may own the directory, whatever the control directory holds.
+    #[test]
+    fn a_store_with_an_identity_keeps_the_directory_and_the_store() {
+        let root = test_root("store-identity");
+        let app_data = root.join("app-data");
+        identity_store().save_to(&app_data).unwrap();
+        let store_bytes = std::fs::read(app_data.join("store.json")).unwrap();
+        let data = previous_install_data(&root);
+
+        let (store, outcome) = Store::load_from_with_outcome(&app_data);
+        assert_eq!(outcome, StoreLoadOutcome::Loaded);
+        assert_eq!(
+            store
+                .identity
+                .as_ref()
+                .map(|identity| identity.address.as_str()),
+            Some("11".repeat(32).as_str())
+        );
+        assert_eq!(
+            set_aside_if_previous_install(&data, app_data_was_absent(outcome), now()),
+            Decision::Keep
+        );
+        assert_untouched(&data);
+        assert_eq!(
+            std::fs::read(app_data.join("store.json")).unwrap(),
+            store_bytes
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A store that is present but cannot be read loads empty exactly like
+    /// an absent one. It is a live install's wallet: the node data stays, and
+    /// the store is not written.
+    #[test]
+    fn an_unreadable_store_keeps_the_directory_and_the_store() {
+        let root = test_root("store-unreadable");
+        let data = previous_install_data(&root);
+        let fixtures: Vec<(&str, Vec<u8>)> = vec![
+            // A UTF-8 byte-order mark in front of otherwise valid JSON.
+            (
+                "bom",
+                [
+                    b"\xEF\xBB\xBF".as_slice(),
+                    br#"{"identity":null,"config":null}"#,
+                ]
+                .concat(),
+            ),
+            // Over the 1 MiB bound the reader enforces.
+            ("oversize", vec![b' '; 1024 * 1024 + 1]),
+            ("truncated", br#"{"identity":{"address":"11"#.to_vec()),
+        ];
+        for (label, bytes) in fixtures {
+            let app_data = root.join(format!("app-data-{label}"));
+            // The directory exists and is private; only the store is wrong.
+            assert_eq!(
+                Store::load_from_with_outcome(&app_data).1,
+                StoreLoadOutcome::Absent
+            );
+            publish(&app_data.join("store.json"), &bytes);
+
+            let (store, outcome) = Store::load_from_with_outcome(&app_data);
+            assert_eq!(outcome, StoreLoadOutcome::Failed, "{label}");
+            assert!(store.identity.is_none(), "{label}");
+            assert!(!app_data_was_absent(outcome), "{label}");
+            assert_eq!(
+                set_aside_if_previous_install(&data, app_data_was_absent(outcome), now()),
+                Decision::Keep,
+                "{label}"
+            );
+            assert_untouched(&data);
+            assert_eq!(
+                std::fs::read(app_data.join("store.json")).unwrap(),
+                bytes,
+                "{label}: the store that could not be read is left exactly as it was"
+            );
+        }
+
+        // A store the private opener refuses: a link in place of the file.
+        #[cfg(unix)]
+        {
+            let app_data = root.join("app-data-linked");
+            assert_eq!(
+                Store::load_from_with_outcome(&app_data).1,
+                StoreLoadOutcome::Absent
+            );
+            let real = root.join("real-store.json");
+            identity_store().save_to(&root).unwrap();
+            std::fs::rename(root.join("store.json"), &real).unwrap();
+            std::os::unix::fs::symlink(&real, app_data.join("store.json")).unwrap();
+
+            let (store, outcome) = Store::load_from_with_outcome(&app_data);
+            assert_eq!(outcome, StoreLoadOutcome::Failed);
+            assert!(store.identity.is_none());
+            assert_eq!(
+                set_aside_if_previous_install(&data, app_data_was_absent(outcome), now()),
+                Decision::Keep
+            );
+            assert_untouched(&data);
+            assert!(std::fs::symlink_metadata(app_data.join("store.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(std::fs::read_to_string(&real)
+                .unwrap()
+                .contains("a recovery phrase the launch must never erase"));
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -470,7 +653,7 @@ mod tests {
         std::fs::write(taken.join("earlier"), b"an earlier set-aside").unwrap();
         let data = previous_install_data(&root);
 
-        let decision = set_aside_if_previous_install(&data, false, now());
+        let decision = set_aside_if_previous_install(&data, APP_DATA_ABSENT, now());
         let expected = root.join(format!("data-v3{SET_ASIDE_INFIX}{STAMP}-2"));
         assert_eq!(
             decision,
@@ -487,14 +670,14 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// The same-install case: with an identity this install may own the
-    /// directory, whatever the control directory holds.
+    /// Present app data, readable or not, keeps the directory whatever the
+    /// control directory holds.
     #[test]
-    fn an_install_with_an_identity_keeps_its_directory() {
+    fn present_app_data_keeps_the_directory() {
         let root = test_root("same-install");
         let data = previous_install_data(&root);
         assert_eq!(
-            set_aside_if_previous_install(&data, true, now()),
+            set_aside_if_previous_install(&data, APP_DATA_PRESENT, now()),
             Decision::Keep
         );
         assert_untouched(&data);
@@ -510,7 +693,7 @@ mod tests {
         let held = arc_crypto::secret_file::open_private_read_write(&node_lock).unwrap();
         held.try_lock_exclusive().unwrap();
 
-        match set_aside_if_previous_install(&data, false, now()) {
+        match set_aside_if_previous_install(&data, APP_DATA_ABSENT, now()) {
             Decision::Held(reason) => assert!(
                 reason.contains("a node still holds the data directory"),
                 "{reason}"
@@ -533,7 +716,7 @@ mod tests {
         let held = arc_crypto::secret_file::open_private_read_write(&owner_lock).unwrap();
         held.try_lock_exclusive().unwrap();
 
-        match set_aside_if_previous_install(&data, false, now()) {
+        match set_aside_if_previous_install(&data, APP_DATA_ABSENT, now()) {
             Decision::Held(reason) => assert!(
                 reason.contains("another ARC desktop currently owns"),
                 "{reason}"
@@ -555,7 +738,7 @@ mod tests {
         let namespace =
             arc_crypto::secret_file::acquire_private_directory_namespace_lock(&data).unwrap();
 
-        match set_aside_if_previous_install(&data, false, now()) {
+        match set_aside_if_previous_install(&data, APP_DATA_ABSENT, now()) {
             Decision::Held(reason) => assert!(
                 reason.contains("another ARC desktop is working on"),
                 "{reason}"
@@ -575,7 +758,7 @@ mod tests {
         let linked = root.join("linked-data-v3");
         std::os::unix::fs::symlink(&real, &linked).unwrap();
 
-        match set_aside_if_previous_install(&linked, false, now()) {
+        match set_aside_if_previous_install(&linked, APP_DATA_ABSENT, now()) {
             Decision::Held(reason) => assert!(reason.contains("link"), "{reason}"),
             other => panic!("a linked data path must not move: {other:?}"),
         }
@@ -589,7 +772,7 @@ mod tests {
         let other = root.join("other-data-v3");
         std::fs::create_dir_all(&other).unwrap();
         std::os::unix::fs::symlink(real.join(CONTROL), other.join(CONTROL)).unwrap();
-        match set_aside_if_previous_install(&other, false, now()) {
+        match set_aside_if_previous_install(&other, APP_DATA_ABSENT, now()) {
             Decision::Held(reason) => assert!(reason.contains("link"), "{reason}"),
             other => panic!("a linked control path must not move: {other:?}"),
         }
@@ -607,7 +790,7 @@ mod tests {
                 .join(node_manager::DESKTOP_SHUTDOWN_TOKEN_FILE_NAME),
         )
         .unwrap();
-        match set_aside_if_previous_install(&third, false, now()) {
+        match set_aside_if_previous_install(&third, APP_DATA_ABSENT, now()) {
             Decision::Held(reason) => assert!(reason.contains("link"), "{reason}"),
             other => panic!("a linked control file must not move: {other:?}"),
         }
@@ -620,7 +803,7 @@ mod tests {
         let root = test_root("file");
         let data = root.join("data-v3");
         std::fs::write(&data, b"not a directory").unwrap();
-        match set_aside_if_previous_install(&data, false, now()) {
+        match set_aside_if_previous_install(&data, APP_DATA_ABSENT, now()) {
             Decision::Held(reason) => assert!(reason.contains("not a directory"), "{reason}"),
             other => panic!("a file at the data path must not move: {other:?}"),
         }

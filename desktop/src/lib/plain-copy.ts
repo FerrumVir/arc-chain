@@ -213,8 +213,9 @@ export const PLAIN_COPY = {
    * on every screen after it, until dismissed.
    */
   previousInstall: {
-    sentence:
-      "ARC found node data from an earlier install and set it aside. If you had a wallet, restore it with your 12 words.",
+    /** `path` is where the data was moved to; it stays visible in the sentence. */
+    sentence: (path: string) =>
+      `ARC found node data from an earlier install and set it aside (${path}). If you had a wallet, restore it with your 12 words; your node will sync again from the start.`,
     dismiss: "Dismiss this notice",
     dismissFailed: "Could not dismiss this notice:",
   },

@@ -57,20 +57,11 @@ export function PreviousInstallNotice({
         style={{ color: "var(--text-muted)", flexShrink: 0, marginTop: 2 }}
       />
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div data-testid="previous-install-sentence" style={{ lineHeight: 1.5 }}>
-          {PLAIN_COPY.previousInstall.sentence}
-        </div>
         <div
-          data-testid="previous-install-path"
-          style={{
-            color: "var(--text-muted)",
-            fontSize: "var(--text-xs)",
-            fontFamily: "var(--font-mono)",
-            overflowWrap: "anywhere",
-            marginTop: 6,
-          }}
+          data-testid="previous-install-sentence"
+          style={{ lineHeight: 1.5, overflowWrap: "anywhere" }}
         >
-          {notice.setAsideDataDir}
+          {PLAIN_COPY.previousInstall.sentence(notice.setAsideDataDir)}
         </div>
         {error && (
           <div role="alert" style={{ color: "var(--danger)", marginTop: 6 }}>
