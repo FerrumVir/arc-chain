@@ -1,4 +1,4 @@
-import { Loader2, SquarePen, Send, CircleStop } from "lucide-react";
+import { Check, CircleStop, Copy, Loader2, Send, SquarePen } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { InfoPopover } from "../components/InfoPopover";
 import { NativePaidRequests } from "../components/NativePaidRequests";
@@ -63,19 +63,45 @@ async function runInferenceSmart(prompt: string, maxTokens: number, onRoute: (ro
   }
 }
 
+// What the thread says while a question is out. A community node cannot
+// take questions itself (it has no peers and usually no model loaded), so
+// going to the network is the normal path, not a shortfall of "your node".
 const ROUTE_WAITING: Record<DispatchRoute, string> = {
-  local: "Waiting for your node",
-  direct: "Your node can't take it; waiting for a coordinator",
-  consensus: "Waiting for a network consensus run",
+  local: PLAIN_COPY.ask.askingNode,
+  direct: PLAIN_COPY.ask.askingNetwork,
+  consensus: PLAIN_COPY.ask.askingNetwork,
 };
-const ROUTE_SHORT: Record<DispatchRoute, string> = { local: "your node", direct: "a coordinator", consensus: "network consensus" };
+const ROUTE_SHORT: Record<DispatchRoute, string> = { local: "your node", direct: "the ARC network", consensus: "a network consensus run" };
+
+// After this long the waiting note says the network is slow today.
+const SLOW_AFTER_SECS = 60;
+
+function formatElapsed(seconds: number): string {
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes} min ${seconds % 60} s`;
+}
+
+/** Why a question got no answer, from the error the dispatch returned. The text itself stays behind Show details. */
+function describeFailure(error: string | undefined) {
+  const raw = error ?? "";
+  const copy = PLAIN_COPY.ask;
+  // This exact sentinel is the only proof that no inference POST was sent.
+  if (raw.startsWith(INFERENCE_PRE_DISPATCH_UNAVAILABLE)) {
+    return { kind: "not-sent" as const, title: copy.notSent, note: copy.notSentNote, retry: PLAIN_COPY.actions.tryAgain, raw };
+  }
+  if (/OUTCOME_AMBIGUOUS|may still settle/i.test(raw)) {
+    return { kind: "unknown-outcome" as const, title: copy.unknownOutcome, note: copy.unknownOutcomeNote, retry: copy.sendAgainAnyway, raw };
+  }
+  return { kind: "no-answer" as const, title: copy.noAnswer, note: copy.noAnswerNote, retry: PLAIN_COPY.actions.tryAgain, raw };
+}
 
 /** One short line for screen readers about the newest turn, instead of reading whole answers aloud. */
 function announce(turns: ChatTurn[]): string {
   const t = turns[turns.length - 1];
   if (!t) return "";
-  if (t.status === "pending") return t.detached ? "Stopped waiting. A late answer will still appear." : t.route ? `${ROUTE_WAITING[t.route]}.` : "Sending.";
-  if (t.status === "failed") return "The request did not complete.";
+  if (t.status === "pending") return t.detached ? "Stopped waiting. A late answer will still appear." : t.route ? ROUTE_WAITING[t.route] : PLAIN_COPY.ask.sending;
+  if (t.status === "failed") return describeFailure(t.error).title;
   const r = t.result;
   if (!r) return "";
   const by = r.servedLocally ? "your node" : r.coordinator ? hostLabel(r.coordinator) : "the network";
@@ -299,7 +325,7 @@ export function Inference() {
             <button className="btn btn-primary composer-send" onClick={submit} disabled={waiting || !draft.trim()} data-testid="btn-run-inference">
               {waiting ? (
                 <>
-                  <Loader2 size={15} className="spin" /> Computing…
+                  <Loader2 size={15} className="spin" /> {PLAIN_COPY.ask.asking}
                 </>
               ) : (
                 <>
@@ -357,13 +383,14 @@ function useSeconds(since: number, running: boolean) {
 
 function Pending({ turn }: { turn: ChatTurn }) {
   const seconds = useSeconds(turn.sentAt, true);
-  const where = turn.route ? ROUTE_WAITING[turn.route] : "Sending";
+  const where = turn.route ? ROUTE_WAITING[turn.route] : PLAIN_COPY.ask.sending;
+  const slow = !turn.detached && seconds >= SLOW_AFTER_SECS;
   return (
-    <div className="answer answer-pending" aria-busy="true">
+    <div className="answer answer-pending" aria-busy="true" data-testid="inference-pending">
       <header className="answer-head">
         <span className="answer-mark" aria-hidden="true" />
-        <span className="answer-by">{turn.detached ? "You stopped waiting" : where}</span>
-        <span className="answer-stats">{seconds} s</span>
+        <span className="answer-by" data-testid="inference-pending-title">{turn.detached ? PLAIN_COPY.ask.stoppedWaiting : where}</span>
+        <span className="answer-stats" data-testid="inference-pending-elapsed">{formatElapsed(seconds)}</span>
       </header>
       <StageTrack
         label="What has happened to this prompt so far"
@@ -379,39 +406,78 @@ function Pending({ turn }: { turn: ChatTurn }) {
         ]}
       />
       <p className="pending-note">
-        {turn.detached
-          ? "The request was already sent and can't be recalled. If the node still answers, the answer will appear here."
-          : "A sent request can't be recalled. You can stop waiting (below); if the node still answers, the answer will appear here."}
+        {slow && <>{PLAIN_COPY.ask.slow} </>}
+        {turn.detached ? PLAIN_COPY.ask.stoppedNote : PLAIN_COPY.ask.waitNote}
       </p>
     </div>
   );
 }
 
+const COPIED_RESET_MS = 2_500;
+
+/**
+ * A question that got no answer: one plain sentence, what to do, and the text
+ * that came back behind Show details, selectable and copyable for a report.
+ * Through v0.8.14 the raw error was the body of this card, in red.
+ */
 function Failed({ turn, latest, onRetry, disabled }: { turn: ChatTurn; latest: boolean; onRetry: () => void; disabled: boolean }) {
-  const message = turn.error ?? "The request failed.";
-  const nothingSent = message.startsWith(INFERENCE_PRE_DISPATCH_UNAVAILABLE);
-  const mayStillRun = /OUTCOME_AMBIGUOUS|may still settle/i.test(message);
+  const failure = describeFailure(turn.error);
+  const tid = (name: string) => (latest ? name : `${name}-earlier`);
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState<"idle" | "copied" | "failed">("idle");
+  const detailsId = `${turn.id}-details`;
+  useEffect(() => {
+    if (copied === "idle") return;
+    const timer = window.setTimeout(() => setCopied("idle"), COPIED_RESET_MS);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+  const copyDetails = () => {
+    // Without a clipboard API the call throws before returning a promise.
+    void Promise.resolve()
+      .then(() => navigator.clipboard.writeText(failure.raw))
+      .then(
+        () => setCopied("copied"),
+        () => setCopied("failed"),
+      );
+  };
+  const waited = turn.settledAt ? formatElapsed(Math.max(0, Math.floor((turn.settledAt - turn.sentAt) / 1000))) : null;
   return (
-    <div className="answer answer-failed">
+    <div className="answer answer-failed" data-testid={tid("inference-error")} data-failure-kind={failure.kind}>
       <header className="answer-head">
         <span className="answer-mark" aria-hidden="true" />
-        <span className="answer-by">{nothingSent ? "Not sent: no route could take it" : mayStillRun ? "No answer, and the outcome is unknown" : "Did not complete"}</span>
+        <span className="answer-by" data-testid={tid("inference-error-title")}>{failure.title}</span>
+        {waited && <span className="answer-stats">{waited}</span>}
       </header>
-      <div className="answer-error" data-testid={latest ? "inference-error" : "inference-error-earlier"}>
-        {message}
-      </div>
-      <p className="pending-note">
-        {nothingSent
-          ? "Nothing was sent, so trying again is safe."
-          : mayStillRun
-            ? "The request may still be processed. Sending it again starts a second job."
-            : "Check your node and the network status, then try again."}
-      </p>
+      <p className="pending-note">{failure.note}</p>
       <div className="answer-tools">
-        <button type="button" className="chip-btn" onClick={onRetry} disabled={disabled}>
-          {mayStillRun ? "Send again anyway" : "Try again"}
+        <button type="button" className="chip-btn" onClick={onRetry} disabled={disabled} data-testid={tid("inference-error-retry")}>
+          {failure.retry}
         </button>
+        {failure.raw && (
+          <button
+            type="button"
+            className="chip-btn"
+            onClick={() => setOpen((o) => !o)}
+            aria-expanded={open}
+            aria-controls={detailsId}
+            data-testid={tid("inference-error-details-toggle")}
+          >
+            {open ? PLAIN_COPY.actions.hideDetails : PLAIN_COPY.actions.showDetails}
+          </button>
+        )}
+        {failure.raw && (
+          <button type="button" className="chip-btn" onClick={copyDetails} data-testid={tid("inference-error-copy")}>
+            {copied === "copied" ? <Check size={13} /> : <Copy size={13} />}{" "}
+            {copied === "copied" ? PLAIN_COPY.actions.copied : copied === "failed" ? PLAIN_COPY.actions.copyFailed : PLAIN_COPY.actions.copyDetails}
+          </button>
+        )}
       </div>
+      {/* Rendered while hidden so aria-controls always names a real element. */}
+      {failure.raw && (
+        <pre id={detailsId} className="answer-details" hidden={!open} data-testid={tid("inference-error-details")}>
+          {failure.raw}
+        </pre>
+      )}
     </div>
   );
 }

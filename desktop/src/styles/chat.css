@@ -100,7 +100,7 @@
 
 .answer-text,
 .ask-bubble,
-.answer-error,
+.answer-details,
 .evidence code,
 .answer-fingerprint code {
   -webkit-user-select: text;
@@ -493,13 +493,21 @@
   color: var(--text-muted);
   line-height: 1.5;
 }
-.answer-error {
-  padding: var(--space-3) var(--space-4);
-  border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
-  border-radius: var(--radius-md);
-  background: var(--danger-bg);
-  color: var(--danger);
-  font-size: 13px;
+/* A question that got no answer: the sentence is the message, in the thread's own voice. The text that came
+   back sits behind "Show details", monospace and copyable, never as the headline (through v0.8.14 it was a
+   red box holding the raw error). */
+.answer-failed .answer-by {
+  color: var(--text);
+}
+.answer-details {
+  margin: var(--space-2) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;

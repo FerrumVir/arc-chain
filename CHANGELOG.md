@@ -60,6 +60,29 @@ All notable changes to ARC Chain are tracked here. This project follows
   30 s instead of being served in sequence. Workers that keep
   heartbeating, submits already under verification, twin execution and
   recovery probes are unaffected (#214).
+- A healthy community node reads as calm status instead of errors. Such a
+  node never has peers (the network admits only validators as peers) and
+  reaches the chain through a coordinator, so its normal state showed as
+  "Lite", "Syncing", "Running · 0 peers", three Dashboard banners ("HTTP
+  client mode", "Client mode" with a Reset peer state button that could
+  not help, "Connecting to peers") and a red node strip for a node that
+  is off or an update that is ready. Every screen now says Connected,
+  Connecting, Node off or No connection in the same words, with one plain
+  line on the Dashboard; a node that is off is not red. Ask ARC says
+  "Asking the ARC network…" with the time elapsed and, when no answer
+  comes, one sentence ("The network didn't answer this time.") with the
+  returned text behind Show details and Copy details. The crash banner,
+  wallet errors and update errors take the same shape; a transfer or
+  faucet claim whose answer was lost after it was sent says to check the
+  balance before sending again, since the host may have included it. The
+  tray no longer says "syncing · 0 peers" (#215).
+- Security: tokio 1.53.3 in the node, CLI and desktop (RUSTSEC-2026-0386,
+  `AsyncFd` constructors that violate I/O safety). RUSTSEC-2026-0387
+  (crypto-bigint 0.5.5, timing variability) is recorded as a reviewed
+  exception in `deny.toml` until the k256 0.14 migration, no later than
+  v0.9.0: validators, the desktop and every node-side signer use Ed25519,
+  and secp256k1 signing is reached only by user-held keys in `arc-cli`
+  (#216).
 
 ## v0.8.14 - Release-preparation snapshot (2026-10-20)
 

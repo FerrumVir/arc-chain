@@ -29,17 +29,28 @@ test.describe("Home: Ask ARC", () => {
     await expect(strip.getByTestId("node-strip-action")).toHaveText(
       PLAIN_COPY.actions.startNode,
     );
+    // A node that is off by choice is not a problem, so the strip is not red.
+    await expect(strip).toHaveAttribute("data-tone", "idle");
 
     await page.getByTestId("inference-prompt").fill("The largest planet is");
     await page.getByTestId("btn-run-inference").click();
+    // While the question is out the thread says so, with the time elapsed.
     await expect(page.getByTestId("inference-output")).toContainText("mock response");
 
-    // The strip's one button starts the node, and the sentence follows.
+    // The strip's one button starts the node, and the sentence follows:
+    // connecting first, then connected once the network answers (the mock
+    // reports that after 8 s). Neither is red.
     await strip.getByTestId("node-strip-action").click();
     await expect(strip.getByTestId("node-strip-sentence")).toHaveText(
-      PLAIN_COPY.nodeStrip.running,
+      PLAIN_COPY.nodeStrip.runningConnecting,
     );
+    await expect(strip).toHaveAttribute("data-tone", "busy");
     await expect(strip.getByTestId("node-strip-action")).toHaveCount(0);
+    await expect(strip.getByTestId("node-strip-sentence")).toHaveText(
+      PLAIN_COPY.nodeStrip.runningConnected,
+      { timeout: 15_000 },
+    );
+    await expect(strip).toHaveAttribute("data-tone", "ok");
   });
 
   test("a blocked node shows its one fix on Home, and the chat still answers", async ({

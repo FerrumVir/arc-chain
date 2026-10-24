@@ -743,10 +743,19 @@
 .pulse-dot.syncing {
   background: var(--warning);
 }
+/* Nothing reachable at all: this computer's connection, not a fault in ARC. Amber, not red. */
 .pulse-dot.offline {
-  background: var(--danger);
+  background: var(--warning);
 }
 .pulse-dot.offline::after {
+  animation: none;
+  opacity: 0;
+}
+/* A node that is off by choice: no colour and no pulse. */
+.pulse-dot.off {
+  background: var(--text-muted);
+}
+.pulse-dot.off::after {
   animation: none;
   opacity: 0;
 }
@@ -788,12 +797,73 @@
   color: var(--warning);
 }
 .status-pill.offline {
-  background: var(--danger-bg);
-  color: var(--danger);
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+.status-pill.off {
+  background: var(--surface-elevated);
+  color: var(--text-muted);
 }
 .status-pill.info {
   background: var(--info-bg);
   color: var(--info);
+}
+
+/* - Connection notice: how the node reaches the network, as calm status (screens/Dashboard.tsx) - */
+.connection-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-6);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+.connection-notice > svg {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+.connection-notice strong {
+  color: var(--text);
+}
+.connection-notice .connection-elapsed {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.connection-notice .connection-body {
+  flex-basis: 100%;
+}
+
+/* - Plain details: the native text behind a one-sentence notice (Wallet, Settings) - */
+.plain-details {
+  margin-top: var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+.plain-details summary {
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.plain-details pre {
+  margin: var(--space-2) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: pre-wrap;
+  word-break: break-word;
+  text-align: left;
 }
 
 .lite-banner {
@@ -810,20 +880,6 @@
   color: var(--info);
   margin-right: var(--space-2);
 }
-.syncing-banner {
-  background: var(--warning-bg);
-  color: var(--warning);
-  border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent);
-  border-radius: var(--radius-lg);
-  padding: var(--space-3) var(--space-4);
-  margin-bottom: var(--space-6);
-  font-size: var(--text-sm);
-  line-height: 1.5;
-}
-.syncing-banner strong {
-  color: var(--warning);
-}
-
 /* - Big number - */
 .big-number {
   font-size: var(--text-4xl);

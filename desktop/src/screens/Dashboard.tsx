@@ -11,7 +11,6 @@ import {
   Users,
   Waypoints,
   Wifi,
-  WifiOff,
   Zap,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -23,6 +22,7 @@ import { EASE_OUT } from "../lib/motion";
 import { prefersReducedMotion } from "../components/Engraving";
 import type { ArchChainPhase } from "../lib/aqueduct/archchain";
 import { CrashBanner } from "../components/CrashBanner";
+import { ProblemNotice } from "../components/ProblemNotice";
 import { StartFailurePanel } from "../components/StartFailurePanel";
 import { EmptyState } from "../components/EmptyState";
 import { InfoPopover } from "../components/InfoPopover";
@@ -33,6 +33,7 @@ import { WorkerJobsCard } from "../components/WorkerJobs";
 import { ProjectedEarnings } from "../components/ProjectedEarnings";
 import { StatusPill } from "../components/StatusPill";
 import { api } from "../lib/tauri";
+import { CONNECTING_LONG_SECS, describeConnection, isUnreachableMessage } from "../lib/connection";
 import {
   formatAddress,
   formatHash,
@@ -41,6 +42,7 @@ import {
   formatUptime,
 } from "../lib/format";
 import { hostLabel } from "../lib/hosts";
+import { PLAIN_COPY } from "../lib/plain-copy";
 import { useAppStore } from "../lib/store";
 import { DEFAULT_NODE_CONFIG } from "../lib/types";
 
@@ -48,8 +50,8 @@ import { DEFAULT_NODE_CONFIG } from "../lib/types";
 // "Which host" is load-bearing context for any chain number here, because the
 // seeds are independent chains (CLAUDE.md rule 4).
 
-// A running node that finds no peers for this long is in client mode, a normal way to run: the start-up stage then
-// steps aside for the dashboard and its peer banners instead of holding the whole screen.
+// A running node that reaches nothing for this long steps out of the start-up stage, so the dashboard and its
+// connection line take over instead of the stage holding the whole screen.
 const PEER_WAIT_MS = 45_000;
 // How long the stage shows "Your node is live" when start-up finishes, before it steps aside.
 const LIVE_MOMENT_MS = 2_600;
@@ -152,38 +154,60 @@ export function Dashboard() {
     },
   });
 
-  // Wipes <data_dir>/known_peers.json and restarts the node. Most common
-  // cause of "I had peers, then I restarted, now I'm stuck" is a stale
-  // peer cache pinning to dead seeds. After wiping, the node falls back
-  // to the bundled testnet seeds and re-bootstraps cleanly.
-  const resetPeersMutation = useMutation({
-    mutationFn: () => api.resetPeerState(),
-    onSuccess: () => {
+  // The crash banner's "Start again": clear the crash, then start. The error
+  // lives here, not in the banner, because clearing the crash unmounts the
+  // banner; a refused start is shown below as the start-failure panel, the
+  // way Home's strip keeps its Start errors.
+  const startAgainMutation = useMutation({
+    mutationFn: async () => {
+      await api.clearCrash();
+      await api.startNode(config ?? DEFAULT_NODE_CONFIG);
+    },
+    onSettled: () => {
       queryClient.invalidateQueries({ queryKey: ["status"] });
     },
   });
 
   const running = !!status?.running;
+  // A start error is moot once the node runs, and a stop error once it has exited.
+  useEffect(() => {
+    if (running) {
+      startMutation.reset();
+      restartMutation.reset();
+      startAgainMutation.reset();
+    } else {
+      stopMutation.reset();
+    }
+    // The reset functions are stable; only the node's state decides.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running]);
+  // The one start or restart that failed, if any, in the order the buttons sit on this screen.
+  const startFailure = startMutation.error ?? restartMutation.error ?? startAgainMutation.error ?? null;
   const isExternal = running && status?.pid == null;
   // Nothing is known until the first status arrives: the node may be running, or auto-starting in the background, so
   // the screen says "Checking" rather than "stopped" and offers no Start button yet.
   const statusKnown = status !== undefined;
-  // The node is up but not peered — the state "Reset peer state" exists to
-  // fix. Covers both "lite" (a seed is reachable over HTTP) and "syncing"
-  // (nothing is).
-  const chainParticipationDisabled =
-    running && status?.chainParticipationEnabled === false;
-  const stuckWithoutPeers =
-    running && !chainParticipationDisabled && (status?.peers ?? 0) === 0;
+  // How the node reaches the network, in plain words (lib/connection.ts). A community node has no peers by
+  // design (arc-net admits only the validators), so zero peers with a coordinator answering is connected, not
+  // stuck. Through v0.8.14 that state carried three banners: "HTTP client mode", "Client mode" with a
+  // "Reset peer state" button, and "Connecting to peers" counting up.
+  const connection = describeConnection(status);
+  const connecting = running && connection.state === "connecting";
+  const connectedViaCoordinator =
+    running && connection.state === "connected" && (status?.peers ?? 0) === 0;
   const isCrashed =
     !!status?.lastError && status.lastError.includes("exited unexpectedly");
+  // The status's own "nothing answered" text is this computer's connection, told by the subtitle; any other
+  // lastError that is not a crash is a start the app made by itself that failed, told like a refused Start.
+  const reportedStartFailure =
+    !running && !isCrashed && !isUnreachableMessage(status?.lastError) ? status?.lastError ?? null : null;
   // Spawned but RPC not yet bound. arc-node spends most of its startup time
   // loading the GGUF model into memory (especially in debug builds), during
   // which /health doesn't respond, so status.running stays false even though
   // the child process is alive and working. Without surfacing this, the
   // Start button appears unresponsive for minutes.
   const isStarting =
-    (!running && status?.pid != null) || startMutation.isPending;
+    (!running && status?.pid != null) || startMutation.isPending || startAgainMutation.isPending;
 
   // The node's start, drawn as the first arch of an aqueduct: every step is one the node actually reports. No model-load
   // percentage exists, so that step shows work under way without claiming progress; catching up is drawn from the real
@@ -193,8 +217,9 @@ export function Dashboard() {
   const tipHeight = status?.chainHeight ?? null;
   const catchingUp =
     running && localHeight != null && tipHeight != null && tipHeight - localHeight > 50;
-  // "running" means the node's RPC already answers, so a running node without peers is finding peers, not opening
-  // its port. With no model configured (an observer) there is no model to load: that process is opening its port.
+  // "running" means the node's RPC already answers, so a running node that has reached nothing yet is connecting,
+  // not opening its port. With no model configured (an observer) there is no model to load: that process is
+  // opening its port.
   const findingPeers = running && (status?.peers ?? 0) === 0 && !catchingUp;
   const [peerWaitOver, setPeerWaitOver] = useState(false);
   useEffect(() => {
@@ -217,16 +242,18 @@ export function Dashboard() {
           : catchingUp
             ? "sync"
             : null;
-  // When start-up finishes with peers, the stage says so for a moment ("Your node is live"), then steps aside.
+  // When start-up finishes connected (a peer, or a coordinator for a community node), the stage says so for a
+  // moment ("Your node is live"), then steps aside.
   const [liveUntil, setLiveUntil] = useState<number | null>(null);
   const prevStartupPhase = useRef<ArchChainPhase | null>(null);
+  const connected = running && connection.state === "connected";
   useEffect(() => {
     const was = prevStartupPhase.current;
     prevStartupPhase.current = startupPhase;
-    if (was && !startupPhase && running && (status?.peers ?? 0) > 0) {
+    if (was && !startupPhase && connected) {
       setLiveUntil(Date.now() + LIVE_MOMENT_MS);
     }
-  }, [startupPhase, running, status?.peers]);
+  }, [startupPhase, connected]);
   useEffect(() => {
     if (liveUntil == null) return;
     const timer = setTimeout(() => setLiveUntil(null), Math.max(0, liveUntil - Date.now()));
@@ -254,20 +281,20 @@ export function Dashboard() {
 
   const [addressCopied, setAddressCopied] = useState(false);
 
+  // How long the running node has been reaching for the network without an answer.
   const [syncElapsed, setSyncElapsed] = useState(0);
   const syncTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
-    const isSyncing = !!(status?.running && status?.health === "syncing");
-    if (isSyncing && !syncTimerRef.current) {
+    if (connecting && !syncTimerRef.current) {
       setSyncElapsed(0);
       syncTimerRef.current = setInterval(() => setSyncElapsed((s) => s + 1), 1000);
-    } else if (!isSyncing && syncTimerRef.current) {
+    } else if (!connecting && syncTimerRef.current) {
       clearInterval(syncTimerRef.current);
       syncTimerRef.current = null;
       setSyncElapsed(0);
     }
-  }, [status?.running, status?.health]);
+  }, [connecting]);
 
   useEffect(
     () => () => {
@@ -370,210 +397,122 @@ export function Dashboard() {
       <div className="page-header" ref={detailsRef}>
         <div>
           <h1 className="page-title">Dashboard</h1>
-          <p className="page-subtitle">
+          <p className="page-subtitle" data-testid="dashboard-subtitle">
             {!statusKnown
-              ? "Reading your node's status…"
+              ? PLAIN_COPY.dashboard.subtitleChecking
               : running
-              ? isExternal
-                ? "The node process is running under launchd or systemd. Peering, compatible work, and reward settlement are separate checks."
-                : "The node process is running. Peering, compatible work, and reward settlement are separate checks."
-              : isStarting
-                ? "Starting node — loading model and binding RPC. This can take a few minutes on first run."
-                : "Your node is stopped. Start it to sync and make configured compute available."}
+                ? isExternal
+                  ? PLAIN_COPY.dashboard.subtitleExternal
+                  : connection.state === "connected"
+                    ? PLAIN_COPY.nodeStrip.runningConnected
+                    : PLAIN_COPY.nodeStrip.runningConnecting
+                : isStarting
+                  ? PLAIN_COPY.dashboard.subtitleStarting
+                  : connection.state === "unreachable"
+                    ? PLAIN_COPY.connection.unreachable
+                    : PLAIN_COPY.dashboard.subtitleOff}
           </p>
         </div>
         {!startPhase && controls}
       </div>
 
       {isStarting && (
-        <div
-          role="status"
-          data-testid="starting-banner"
-          style={{
-            margin: "var(--space-3) 0",
-            padding: "12px 16px",
-            border: "1px solid rgba(99, 102, 241, 0.4)",
-            background: "rgba(99, 102, 241, 0.08)",
-            color: "#c7d2fe",
-            borderRadius: 8,
-            fontSize: 13,
-            display: "flex",
-            alignItems: "center",
-            gap: 12,
-          }}
-        >
-          <RotateCw size={16} className="spin" />
-          <div>
-            <strong>Node is starting</strong>
-            {startedAt ? ` (${startingElapsedSec}s elapsed)` : ""} — arc-node is
-            loading its configured model before binding RPC. Startup time
-            depends on the artifact, storage, memory, and CPU. Switch to Logs
-            for measured progress from this process.
-          </div>
+        <div className="connection-notice" role="status" data-testid="starting-banner">
+          <RotateCw size={16} className="spin" aria-hidden="true" />
+          <span>
+            {PLAIN_COPY.dashboard.startingBanner(startedAt ? ` (${startingElapsedSec}s)` : "")}
+          </span>
         </div>
       )}
 
       {isCrashed && status?.lastError && (
-        <CrashBanner message={status.lastError} />
+        <CrashBanner
+          message={status.lastError}
+          onStartAgain={() => startAgainMutation.mutate()}
+          starting={startAgainMutation.isPending}
+        />
       )}
 
       {status?.modelUnavailable && (
         <ModelUnavailableBanner reason={status.modelUnavailable} />
       )}
 
-      {(startMutation.error || restartMutation.error) && (
+      {startFailure && (
         <StartFailurePanel
-          error={String(startMutation.error ?? restartMutation.error)}
+          error={String(startFailure)}
           onTryAgain={() =>
-            startMutation.error ? startMutation.mutate() : restartMutation.mutate()
+            startMutation.error
+              ? startMutation.mutate()
+              : restartMutation.error
+                ? restartMutation.mutate()
+                : startAgainMutation.mutate()
           }
           testId="mutation-error"
         />
       )}
 
-      {stopMutation.error && !startMutation.error && !restartMutation.error && (
-        <div
-          role="alert"
-          data-testid="mutation-error"
-          style={{
-            margin: "var(--space-3) 0",
-            padding: "12px 16px",
-            border: "1px solid #ef4444",
-            background: "rgba(239, 68, 68, 0.08)",
-            color: "#fca5a5",
-            borderRadius: 8,
-            fontFamily: "ui-monospace, monospace",
-            fontSize: 13,
-            whiteSpace: "pre-wrap",
-          }}
-        >
-          {String(stopMutation.error)}
-        </div>
+      {/* A start the app made by itself (at launch, after a crash) that failed reads like a refused Start: one
+          sentence, one action, the native text behind Show details. Not shown twice when a pressed Start failed
+          the same way. */}
+      {reportedStartFailure && !startFailure && (
+        <StartFailurePanel
+          error={reportedStartFailure}
+          onTryAgain={() => startMutation.mutate()}
+          testId="last-error"
+        />
       )}
 
-      {status?.running && !chainParticipationDisabled && status?.health === "syncing" && (
-        <div
-          className="syncing-banner"
-          role="status"
-          data-testid="syncing-banner"
-        >
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "var(--space-2)",
-              marginBottom: "var(--space-1)",
-            }}
-          >
-            <Loader2 size={13} className="spin" />
-            <strong>Connecting to peers</strong>
-            <span
-              style={{
-                fontFamily: "var(--font-mono)",
-                fontSize: "var(--text-xs)",
-                opacity: 0.7,
-              }}
-            >
-              {syncElapsed}s
-            </span>
-          </div>
-          {syncElapsed < 10
-            ? "Handshaking with seed nodes…"
-            : syncElapsed < 25
-              ? "Waiting for QUIC peers to respond…"
-              : syncElapsed < 45
-                ? "Still connecting — trying all 6 data centers…"
-                : "Taking longer than usual. If this persists, try resetting peer state below."}
-        </div>
-      )}
-
-      {chainParticipationDisabled && (
-        <div className="lite-banner" role="status" data-testid="chain-participation-disabled">
-          <strong>HTTP client mode</strong> — this process has chain participation disabled.
-          Zero peers are expected; resetting peer state will not enable chain transport.
-          {status?.coordinatorUrl
-            ? ` Chain reads use ${hostLabel(status.coordinatorUrl)}.`
-            : " No public coordinator is currently reachable."}
-          {" "}Compatible model execution and confirmed rewards are separate checks.
-        </div>
-      )}
-
-      {/* Recovery is gated on the actual problem — the node is up but has
-          no peers — rather than on the "lite" health level specifically.
-          "Reset peer state" is the documented fix for "stuck at 0 peers",
-          but it lived inside the lite-mode banner, which was unreachable in
-          the shipped app, so the one recovery action the docs point at could
-          never be clicked. It now also covers "syncing", which is the state
-          a genuinely stuck node sits in. */}
-      {stuckWithoutPeers && (
-        <div
-          className="lite-banner"
-          data-testid={
-            status?.health === "lite" ? "lite-mode-banner" : "no-peers-banner"
-          }
-          role="status"
-        >
-          {status?.coordinatorUrl ? (
-            <>
-              <strong>Client mode</strong> — your node has 0 peers, so reads and
-              inference requests are using {hostLabel(status.coordinatorUrl)}.
-              Any balance, faucet response, or transaction is scoped to that
-              host. Use the composite explorer to audit canonical agreement and
-              preserved forks. This process cannot receive peer-routed community
-              work in its current state.
-            </>
-          ) : (
-            <>
-              <strong>No peers yet</strong> — your node is running but has not
-              completed a handshake with a configured seed. It cannot receive
-              peer-routed community work in this state. A peer connection alone
-              still does not guarantee assignment or payment.
-            </>
-          )}{" "}
-          The most common cause is a stale peer cache from a prior session
-          pinning to seeds that have rotated.
-          <div
-            style={{
-              marginTop: "var(--space-3)",
-              display: "flex",
-              gap: "var(--space-3)",
-              alignItems: "center",
-              flexWrap: "wrap",
-            }}
-          >
+      {/* Only while the node is still running: once it has exited, a failed Stop is moot (and reset above). */}
+      {stopMutation.error && running && !startFailure && (
+        <ProblemNotice
+          testId="mutation-error"
+          title={PLAIN_COPY.dashboard.stopFailed}
+          body={PLAIN_COPY.dashboard.stopFailedBody}
+          details={String(stopMutation.error)}
+          actions={
             <button
               type="button"
-              className="btn btn-secondary"
-              data-testid="reset-peer-state-btn"
-              onClick={() => resetPeersMutation.mutate()}
-              disabled={resetPeersMutation.isPending}
+              className="btn btn-primary btn-sm"
+              onClick={() => stopMutation.mutate()}
+              disabled={stopMutation.isPending}
+              data-testid="btn-stop-again"
             >
-              {resetPeersMutation.isPending
-                ? "Resetting…"
-                : "Reset peer state & rebootstrap"}
+              {PLAIN_COPY.actions.tryAgain}
             </button>
-            {resetPeersMutation.data && (
-              <span
-                style={{
-                  color: "var(--text-muted)",
-                  fontSize: "var(--text-sm)",
-                }}
-                data-testid="reset-peer-state-result"
-              >
-                {resetPeersMutation.data.message}
-              </span>
-            )}
-            {resetPeersMutation.error && (
-              <span
-                style={{
-                  color: "var(--danger)",
-                  fontSize: "var(--text-sm)",
-                }}
-              >
-                {String(resetPeersMutation.error)}
-              </span>
-            )}
-          </div>
+          }
+        />
+      )}
+
+      {/* The connection, as status. A community node connects through a coordinator and has no peers, which is
+          its normal state; while nothing has answered yet the line counts the wait, and after a while it says to
+          check the internet connection. Nothing here is a fault, so nothing here is red. */}
+      {connectedViaCoordinator && (
+        <div
+          className="connection-notice"
+          role="status"
+          data-testid="connection-notice"
+          data-state="connected"
+        >
+          <Wifi size={15} aria-hidden="true" />
+          <span>{connection.sentence}</span>
+        </div>
+      )}
+
+      {connecting && (
+        <div
+          className="connection-notice"
+          role="status"
+          data-testid="connection-notice"
+          data-state="connecting"
+        >
+          <Loader2 size={15} className="spin" aria-hidden="true" />
+          <strong>{PLAIN_COPY.connection.labels.connecting} to the ARC network</strong>
+          <span className="connection-elapsed">{syncElapsed}s</span>
+          <span className="connection-body">
+            {syncElapsed < CONNECTING_LONG_SECS
+              ? PLAIN_COPY.connection.connecting
+              : PLAIN_COPY.connection.connectingLong}
+          </span>
         </div>
       )}
 
@@ -734,19 +673,12 @@ export function Dashboard() {
         data-testid="stat-grid"
       >
         <StatTile
-          icon={running ? Wifi : WifiOff}
+          icon={Wifi}
           label="Peers"
           value={status ? formatInt(status.peers) : <Skeleton width="2.5ch" height="0.8em" />}
           info={{
             title: "Peers",
-            children: (
-              <p>
-                Other nodes your node has an active QUIC connection to.
-                Peers can improve reachability and fault tolerance, but a peer
-                count is not proof of sync, assignment, verification, or
-                reward eligibility.
-              </p>
-            ),
+            children: <p>{PLAIN_COPY.connection.peersInfo}</p>,
           }}
         />
         <StatTile
@@ -940,9 +872,9 @@ export function Dashboard() {
               127.0.0.1:<rpcPort>. It used to be a remote seed's numbers. */}
           <CardHeader title="Your node" />
           <div className="kv">
-            <dt>Health</dt>
+            <dt>Connection</dt>
             <dd>
-              <StatusPill level={status ? status.health : "checking"} />
+              <StatusPill level={connection.level} label={connection.label} />
             </dd>
             <dt>Version</dt>
             <dd>{status?.running ? `v${status.version}` : "-"}</dd>
@@ -1021,22 +953,6 @@ export function Dashboard() {
               </>
             )}
           </p>
-          {status?.lastError && (
-            <div
-              style={{
-                marginTop: "var(--space-4)",
-                padding: "var(--space-3) var(--space-4)",
-                background: "var(--danger-bg)",
-                color: "var(--danger)",
-                borderRadius: "var(--radius-sm)",
-                fontSize: "var(--text-sm)",
-                border: "1px solid rgba(248, 113, 113, 0.2)",
-              }}
-              data-testid="last-error"
-            >
-              {status.lastError}
-            </div>
-          )}
 
           <div className="divider" />
 

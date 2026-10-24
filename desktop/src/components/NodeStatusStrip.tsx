@@ -1,11 +1,11 @@
 import { useEffect, useId, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, CheckCircle2, CircleAlert, Copy, Loader2 } from "lucide-react";
+import { Check, CheckCircle2, CircleAlert, Copy, Download, Loader2, Power } from "lucide-react";
 import { exit, relaunch } from "@tauri-apps/plugin-process";
 import { api, isTauri } from "../lib/tauri";
 import { useAppStore } from "../lib/store";
 import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
-import { describeNodeStrip, type NodeStripAction } from "../lib/node-strip";
+import { describeNodeStrip, type NodeStripAction, type NodeStripTone } from "../lib/node-strip";
 import { PLAIN_COPY } from "../lib/plain-copy";
 import { DEFAULT_NODE_CONFIG, type ModelDownloadProgress } from "../lib/types";
 
@@ -18,6 +18,23 @@ const ACTION_LABEL: Record<NodeStripAction, string> = {
   "start-node": PLAIN_COPY.actions.startNode,
   "start-again": PLAIN_COPY.actions.startAgain,
   "try-again": PLAIN_COPY.actions.tryAgain,
+};
+
+// Only the attention tone is red. Off and an update on offer are ordinary
+// states and take the muted and info colours; connected is green.
+const TONE_ICON: Record<NodeStripTone, typeof CheckCircle2> = {
+  ok: CheckCircle2,
+  busy: Loader2,
+  attention: CircleAlert,
+  info: Download,
+  idle: Power,
+};
+const TONE_COLOR: Record<NodeStripTone, string> = {
+  ok: "var(--success)",
+  busy: "var(--text-muted)",
+  attention: "var(--danger)",
+  info: "var(--info)",
+  idle: "var(--text-muted)",
 };
 
 /**
@@ -74,12 +91,33 @@ export function NodeStatusStrip() {
     };
   }, []);
 
+  // How long the running node has had nothing answering. The strip re-renders
+  // once a second while that lasts, so the sentence can change at the mark.
+  const connecting =
+    status?.running === true &&
+    (status.health === "syncing" || status.health === "offline") &&
+    !status.coordinatorUrl;
+  const [connectingSince, setConnectingSince] = useState<number | null>(null);
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!connecting) {
+      setConnectingSince(null);
+      return;
+    }
+    setConnectingSince((since) => since ?? Date.now());
+    const timer = window.setInterval(() => setTick((n) => n + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, [connecting]);
+  const connectingSeconds =
+    connecting && connectingSince !== null ? Math.floor((Date.now() - connectingSince) / 1000) : null;
+
   const view = describeNodeStrip({
     status,
     startBlock: startBlock ?? null,
     startError,
     update,
     modelProgress,
+    connectingSeconds,
   });
 
   // The native text, so a person can paste it into a report as it is.
@@ -131,8 +169,7 @@ export function NodeStatusStrip() {
     }
   };
 
-  const Icon =
-    view.tone === "ok" ? CheckCircle2 : view.tone === "busy" ? Loader2 : CircleAlert;
+  const Icon = TONE_ICON[view.tone];
   return (
     <div
       className="node-strip"
@@ -155,10 +192,7 @@ export function NodeStatusStrip() {
         size={15}
         aria-hidden="true"
         className={view.tone === "busy" ? "spin" : undefined}
-        style={{
-          flexShrink: 0,
-          color: view.tone === "attention" ? "var(--danger)" : "var(--text-muted)",
-        }}
+        style={{ flexShrink: 0, color: TONE_COLOR[view.tone] }}
       />
       <span role="status" style={{ flex: 1, minWidth: 0 }} data-testid="node-strip-sentence">
         {view.sentence}
@@ -166,7 +200,7 @@ export function NodeStatusStrip() {
       {view.action && (
         <button
           type="button"
-          className="btn btn-primary btn-sm"
+          className={view.tone === "attention" || view.tone === "info" ? "btn btn-primary btn-sm" : "btn btn-secondary btn-sm"}
           onClick={() => void act(view.action!)}
           disabled={busy}
           aria-busy={busy || undefined}

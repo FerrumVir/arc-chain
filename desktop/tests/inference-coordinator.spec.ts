@@ -10,6 +10,7 @@
 //      sharded-consensus fallback.
 
 import { expect, test, type Page } from "@playwright/test";
+import { PLAIN_COPY } from "../src/lib/plain-copy";
 import { seedOnboarded } from "./helpers";
 
 const COMMUNITY_WORKER = `0x${"11".repeat(32)}`;
@@ -827,7 +828,14 @@ test.describe("Inference - community-first coordinator routing", () => {
     await page.getByTestId("inference-prompt").fill("Do this once");
     await page.getByTestId("btn-run-inference").click();
 
-    await expect(page.getByTestId("inference-error")).toContainText(
+    // The sentence says what happened; the coordinator's text waits behind Show details.
+    const failed = page.getByTestId("inference-error");
+    await expect(failed.getByTestId("inference-error-title")).toHaveText(
+      PLAIN_COPY.ask.unknownOutcome,
+    );
+    await expect(failed.getByTestId("inference-error-details")).toBeHidden();
+    await failed.getByTestId("inference-error-details-toggle").click();
+    await expect(failed.getByTestId("inference-error-details")).toContainText(
       "may still settle",
     );
     expect(remoteDirectHits).toBe(1);
@@ -864,7 +872,12 @@ test.describe("Inference - community-first coordinator routing", () => {
     await page.getByTestId("inference-prompt").fill("exactly one local post");
     await page.getByTestId("btn-run-inference").click();
 
-    await expect(page.getByTestId("inference-error")).toContainText(
+    const failed = page.getByTestId("inference-error");
+    await expect(failed.getByTestId("inference-error-title")).toHaveText(
+      PLAIN_COPY.ask.unknownOutcome,
+    );
+    await failed.getByTestId("inference-error-details-toggle").click();
+    await expect(failed.getByTestId("inference-error-details")).toContainText(
       "ARC_INFERENCE_POST_OUTCOME_AMBIGUOUS",
     );
     expect(localPosts).toBe(1);
@@ -905,7 +918,12 @@ test.describe("Inference - community-first coordinator routing", () => {
     await page.getByTestId("inference-prompt").fill("exactly one direct post");
     await page.getByTestId("btn-run-inference").click();
 
-    await expect(page.getByTestId("inference-error")).toContainText(
+    const failed = page.getByTestId("inference-error");
+    await expect(failed.getByTestId("inference-error-title")).toHaveText(
+      PLAIN_COPY.ask.unknownOutcome,
+    );
+    await failed.getByTestId("inference-error-details-toggle").click();
+    await expect(failed.getByTestId("inference-error-details")).toContainText(
       "ARC_INFERENCE_POST_OUTCOME_AMBIGUOUS",
     );
     expect(localPosts).toBe(0);
