@@ -46,6 +46,15 @@ All notable changes to ARC Chain are tracked here. This project follows
 - Dashboard text, error banners, logs and dialogs can be selected and
   copied again, and the node status on Home has a Copy details button
   (#211).
+- Ask ARC no longer waits out the whole compute budget when the network
+  cannot serve a question. A coordinator now withdraws a community
+  assignment that no worker has claimed within one 30 s claim window, and
+  one whose worker has stopped heartbeating for longer than the 90 s
+  registry TTL, and answers from its own sharded pipeline instead of
+  holding the caller for up to 65 minutes and then returning 504. A
+  withdrawn job can no longer be submitted, so no late worker result can
+  race the fallback. Workers that are merely slow, submits already under
+  verification and recovery probes are unaffected.
 
 ## v0.8.14 - Release-preparation snapshot (2026-10-20)
 
