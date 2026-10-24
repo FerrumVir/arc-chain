@@ -76,6 +76,13 @@ All notable changes to ARC Chain are tracked here. This project follows
   faucet claim whose answer was lost after it was sent says to check the
   balance before sending again, since the host may have included it. The
   tray no longer says "syncing · 0 peers" (#215).
+- Security: tokio 1.53.3 in the node, CLI and desktop (RUSTSEC-2026-0386,
+  `AsyncFd` constructors that violate I/O safety). RUSTSEC-2026-0387
+  (crypto-bigint 0.5.5, timing variability) is recorded as a reviewed
+  exception in `deny.toml` until the k256 0.14 migration, no later than
+  v0.9.0: validators, the desktop and every node-side signer use Ed25519,
+  and secp256k1 signing is reached only by user-held keys in `arc-cli`
+  (#216).
 
 ## v0.8.14 - Release-preparation snapshot (2026-10-20)
 
