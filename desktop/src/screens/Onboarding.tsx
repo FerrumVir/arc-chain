@@ -17,6 +17,7 @@ import { api, isTauri } from "../lib/tauri";
 import { modelDownloadStatus } from "../lib/format";
 import { LogoMark, Tagline } from "../components/Logo";
 import { StartFailurePanel } from "../components/StartFailurePanel";
+import { PreviousInstallNotice } from "../components/PreviousInstallNotice";
 import { PLAIN_COPY } from "../lib/plain-copy";
 import {
   DEFAULT_NODE_CONFIG,
@@ -24,6 +25,7 @@ import {
   type ModelDownloadProgress,
   type ModelTierInfo,
   type NodeConfig,
+  type PreviousInstallNotice as PreviousInstallNoticeData,
 } from "../lib/types";
 
 const STEPS = ["welcome", "identity", "model", "launch"] as const;
@@ -50,7 +52,14 @@ function formatBytes(bytes: number): string {
 // How long "Connected via … ✓" stays up before the app takes over.
 const CONNECTED_PAUSE_MS = 1_400;
 
-export function Onboarding() {
+export function Onboarding({
+  previousInstall = null,
+  onPreviousInstallDismissed,
+}: {
+  /** Launch set node data from an earlier install aside; say so during setup. */
+  previousInstall?: PreviousInstallNoticeData | null;
+  onPreviousInstallDismissed?: () => void;
+} = {}) {
   const [step, setStep] = useState<Step>("welcome");
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [identityError, setIdentityError] = useState<string | null>(null);
@@ -297,6 +306,12 @@ export function Onboarding() {
   return (
     <div className="onboarding" data-testid="onboarding">
       <div className="onboarding-inner">
+        {previousInstall && (
+          <PreviousInstallNotice
+            notice={previousInstall}
+            onDismissed={() => onPreviousInstallDismissed?.()}
+          />
+        )}
         <div className="onboarding-steps" aria-label="Progress">
           {STEPS.map((_, i) => (
             <span
