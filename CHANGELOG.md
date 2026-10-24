@@ -46,6 +46,20 @@ All notable changes to ARC Chain are tracked here. This project follows
 - Dashboard text, error banners, logs and dialogs can be selected and
   copied again, and the node status on Home has a Copy details button
   (#211).
+- Ask ARC no longer waits out the whole compute budget when the network
+  cannot serve a question. A coordinator now withdraws a community
+  assignment that no worker has claimed within one 30 s claim window, and
+  one whose worker has stopped heartbeating for longer than the 90 s
+  registry TTL, and answers from its own sharded pipeline instead of
+  holding the caller for up to 65 minutes and then returning 504. A
+  withdrawn job can no longer be submitted, so no late worker result can
+  race the fallback. Two trade-offs: a worker whose heartbeats to a
+  coordinator fail for 90 s while it is computing loses that job and its
+  reward, where v0.8.14 still paid it if the result arrived in time; and
+  under a burst, questions queued behind one busy worker fall back after
+  30 s instead of being served in sequence. Workers that keep
+  heartbeating, submits already under verification, twin execution and
+  recovery probes are unaffected (#214).
 - A healthy community node reads as calm status instead of errors. Such a
   node never has peers (the network admits only validators as peers) and
   reaches the chain through a coordinator, so its normal state showed as

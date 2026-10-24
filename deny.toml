@@ -125,6 +125,44 @@ ignore = [
     # Remove when both move to ureq 3 (webpki-roots 1.x directly), no later
     # than the v0.9.0 dependency review.
     "RUSTSEC-2026-0381",
+    # 2026-10-24 ARC release engineering, risk accepted by ARC's CEO on
+    # 2026-10-24: crypto-bigint 0.5.5 timing variability (subtraction, zero
+    # counting, division, Montgomery multiplication, `UintRef` equality,
+    # `BoxedMontyForm::invert`). The only secret-operand use in these graphs
+    # is secp256k1 ECDSA through k256 0.13.4: its scalar add/negate/is_high/
+    # from_repr and the final reduction of every scalar multiply call
+    # `Uint::add_mod`/`neg_mod`/`ct_gt`/`ct_lt`/`sbb`, which bottom out in
+    # 0.5.5's wide-word `Limb::sbb`. That path is reached only by user-held
+    # keys handled explicitly in arc-cli: `arc keygen --scheme secp256k1`
+    # generates one, and `load_keyfile` (behind `arc transfer` and `arc
+    # keygen --verify`) parses it and signs one fixed validation challenge
+    # per invocation; no shipped code signs a transaction with a secp256k1
+    # key (`arc transfer` submits unsigned to /tx/submit) and the node only
+    # recovers public keys from externally signed secp256k1 transactions.
+    # No long-lived service key is secp256k1: validator identities are
+    # Ed25519 only (arc-node validator_identity.rs rejects any other scheme),
+    # every node-side signer uses that key, the RPC has no sign-on-request
+    # method (`eth_accounts` is empty), and the desktop, relayer and
+    # arc-channel sign with Ed25519. Every other 0.5.5 copy is verify-only or
+    # unreached: revm-precompile and alloy-primitives recover public keys;
+    # alloy-eip7702 signs only under cfg(test/arbitrary); starknet-crypto and
+    # starknet-ff serve stwo's Poseidon252 channel, which ARC never
+    # instantiates (Blake2s only); the desktop's p256/p384/p521 come from
+    # ssh-key 0.6.7 (verify-only, `ssh-ed25519` keys only) and sit in that
+    # lockfile only through weak features (rust-lang/cargo#10801). k256 never
+    # calls 0.5.5's Montgomery, division or zero-counting code, and
+    # `UintRef`/`BoxedMontyForm` do not exist in 0.5.5. Upstream's
+    # subtraction fix (crypto-bigint#1358) repairs a `borrowing_sub`
+    # formulation that #1029 added on 2025-12-10, two years after 0.5.5
+    # (2023-11-18); 0.5.5's `sbb` has not been shown to branch, nor verified
+    # not to. Remove when k256/ecdsa/elliptic-curve move to 0.14/0.17/0.14
+    # (crypto-bigint >= 0.7.6) and the remaining 0.5.5 copies are gone or
+    # re-scoped: no alloy-primitives (<= 1.7.3), alloy-eip7702 (<= 0.6.3) or
+    # revm-precompile (<= 43.0.3) release accepts k256 0.14 yet, and every
+    # starknet-crypto/starknet-ff release pins crypto-bigint ^0.5, so the
+    # vendored stwo must drop or feature-gate Poseidon252. No later than
+    # v0.9.0.
+    "RUSTSEC-2026-0387",
 ]
 
 # ------------------------------------------------------------- licenses ----
