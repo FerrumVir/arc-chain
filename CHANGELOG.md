@@ -58,8 +58,10 @@ All notable changes to ARC Chain are tracked here. This project follows
   "Asking the ARC network…" with the time elapsed and, when no answer
   comes, one sentence ("The network didn't answer this time.") with the
   returned text behind Show details and Copy details. The crash banner,
-  wallet errors and update errors take the same shape. The tray no longer
-  says "syncing · 0 peers" (#215).
+  wallet errors and update errors take the same shape; a transfer or
+  faucet claim whose answer was lost after it was sent says to check the
+  balance before sending again, since the host may have included it. The
+  tray no longer says "syncing · 0 peers" (#215).
 
 ## v0.8.14 - Release-preparation snapshot (2026-10-20)
 

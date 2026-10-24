@@ -17,6 +17,7 @@ import { isNativeOnlyChain } from "../lib/native-request";
 import { PLAIN_COPY } from "../lib/plain-copy";
 import { useAppStore } from "../lib/store";
 import { formatArcExact, formatInt } from "../lib/format";
+import { classifyWalletFailure } from "../lib/wallet-outcome";
 import type { TxLookup, WalletTxResult } from "../lib/types";
 
 /** The text a failed call returned, one click away from the sentence that says what happened. */
@@ -27,6 +28,50 @@ function FailureDetails({ error, testId }: { error: unknown; testId: string }) {
       <summary>{PLAIN_COPY.actions.showDetails}</summary>
       <pre>{message}</pre>
     </details>
+  );
+}
+
+/**
+ * One sentence for a failed claim or transfer. "Didn't go through" only when
+ * the request was refused before or by the host; when the answer was lost
+ * after the POST, the host may have accepted it, so the sentence asks the
+ * person to check their balance before sending again (lib/wallet-outcome.ts).
+ */
+function WalletFailure({
+  error,
+  flow,
+  testId,
+}: {
+  error: unknown;
+  flow: "faucet" | "send";
+  testId: string;
+}) {
+  const kind = classifyWalletFailure(error);
+  const copy = PLAIN_COPY.wallet;
+  const sentence =
+    flow === "faucet"
+      ? kind === "refused"
+        ? copy.faucetFailed
+        : copy.faucetUnconfirmed
+      : kind === "refused"
+        ? copy.sendFailed
+        : copy.sendUnconfirmed;
+  return (
+    <div
+      role="alert"
+      data-testid={testId}
+      data-failure-kind={kind}
+      style={{
+        marginTop: flow === "faucet" ? "var(--space-2)" : "var(--space-3)",
+        fontSize: "var(--text-xs)",
+        color: "var(--text)",
+        lineHeight: 1.5,
+        textAlign: flow === "faucet" ? "right" : undefined,
+      }}
+    >
+      <span data-testid={`${testId}-sentence`}>{sentence}</span>
+      <FailureDetails error={error} testId={`${testId}-details`} />
+    </div>
   );
 }
 
@@ -302,21 +347,7 @@ export function Wallet() {
                 <br />tx {faucet.data.txHash.slice(0, 10)}…
               </div>
             )}
-            {faucet.isError && (
-              <div
-                role="alert"
-                style={{
-                  marginTop: "var(--space-2)",
-                  fontSize: "var(--text-xs)",
-                  color: "var(--text)",
-                  textAlign: "right",
-                }}
-                data-testid="faucet-error"
-              >
-                {PLAIN_COPY.wallet.faucetFailed}
-                <FailureDetails error={faucet.error} testId="faucet-error-details" />
-              </div>
-            )}
+            {faucet.isError && <WalletFailure error={faucet.error} flow="faucet" testId="faucet-error" />}
           </div>
         </div>
       </Card>
@@ -478,21 +509,7 @@ export function Wallet() {
               <br />tx {send.data.txHash.slice(0, 12)}…
             </div>
           )}
-          {send.isError && (
-            <div
-              data-testid="send-error"
-              role="alert"
-              style={{
-                marginTop: "var(--space-3)",
-                color: "var(--text)",
-                fontSize: "var(--text-xs)",
-                lineHeight: 1.5,
-              }}
-            >
-              {PLAIN_COPY.wallet.sendFailed}
-              <FailureDetails error={send.error} testId="send-error-details" />
-            </div>
-          )}
+          {send.isError && <WalletFailure error={send.error} flow="send" testId="send-error" />}
         </Card>
       </div>
 

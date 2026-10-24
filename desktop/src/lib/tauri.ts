@@ -2212,6 +2212,16 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
 
 // Mock state - only used in browser preview. Tauri env always hits the real backend.
 let mockStartedAt: number | null = null;
+// Browser-preview only: `window.__ARC_MOCK_CRASH__ = true` makes the stopped
+// node report an unexpected exit until `clear_crash` runs, so the crash
+// banner and the start after it can be exercised without a native host.
+let mockCrashCleared = false;
+function mockCrashed(): boolean {
+  return (
+    !mockCrashCleared &&
+    (globalThis as { __ARC_MOCK_CRASH__?: boolean }).__ARC_MOCK_CRASH__ === true
+  );
+}
 let mockWorkerThreads: number | null = null;
 let mockConfig: NodeConfig | null = null;
 const mockLogs: LogEntry[] = [];
@@ -2486,6 +2496,12 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
   const override = mockOverride<T>(cmd);
   if (override !== undefined) {
     await new Promise((r) => setTimeout(r, 20));
+    // `{ __reject: "text" }` makes the command fail with that text, the way a
+    // native CmdResult error reaches the UI, so the degraded wording can be
+    // exercised without a native host.
+    if (override !== null && typeof override === "object" && "__reject" in override) {
+      throw new Error(String((override as unknown as { __reject: unknown }).__reject));
+    }
     return override;
   }
   await new Promise((r) => setTimeout(r, 120));
@@ -2558,7 +2574,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         uptimeSeconds: uptime,
         address: MOCK_ADDRESS,
         rpcPort: 9090,
-        lastError: null,
+        lastError: !running && mockCrashed() ? "arc-node exited unexpectedly (code 101)" : null,
         coordinatorUrl: running ? null : previewCoordinator,
         // Chain numbers are the network's, not this node's - and the mock
         // reflects the real testnet's stalled block production.
@@ -2958,6 +2974,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       throw settlementWriteUnavailable("Paid inference escrow");
     }
     case "clear_crash":
+      mockCrashCleared = true;
       return undefined as T;
     case "node_start_block":
       return null as T;

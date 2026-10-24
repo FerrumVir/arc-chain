@@ -91,12 +91,33 @@ export function NodeStatusStrip() {
     };
   }, []);
 
+  // How long the running node has had nothing answering. The strip re-renders
+  // once a second while that lasts, so the sentence can change at the mark.
+  const connecting =
+    status?.running === true &&
+    (status.health === "syncing" || status.health === "offline") &&
+    !status.coordinatorUrl;
+  const [connectingSince, setConnectingSince] = useState<number | null>(null);
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!connecting) {
+      setConnectingSince(null);
+      return;
+    }
+    setConnectingSince((since) => since ?? Date.now());
+    const timer = window.setInterval(() => setTick((n) => n + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, [connecting]);
+  const connectingSeconds =
+    connecting && connectingSince !== null ? Math.floor((Date.now() - connectingSince) / 1000) : null;
+
   const view = describeNodeStrip({
     status,
     startBlock: startBlock ?? null,
     startError,
     update,
     modelProgress,
+    connectingSeconds,
   });
 
   // The native text, so a person can paste it into a report as it is.

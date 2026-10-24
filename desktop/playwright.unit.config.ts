@@ -11,6 +11,7 @@ export default defineConfig({
     "model-download-progress.spec.ts",
     "start-failure.spec.ts",
     "connection.spec.ts",
+    "wallet-outcome.spec.ts",
     "node-care.spec.ts",
   ],
   workers: 1,

@@ -1,25 +1,30 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { RotateCw } from "lucide-react";
 import { api } from "../lib/tauri";
-import { useAppStore } from "../lib/store";
 import { PLAIN_COPY } from "../lib/plain-copy";
 import { ProblemNotice } from "./ProblemNotice";
 
-// Shown when the Rust side reports that our child arc-node process died on
-// its own: one plain sentence, one button to start it again, and the node's
-// exit text behind "Show details". Dismiss clears the crash state without
-// restarting. Through v0.8.14 the exit text was the body of the banner.
-export function CrashBanner({ message }: { message: string }) {
+/**
+ * Shown when the Rust side reports that our child arc-node process died on
+ * its own: one plain sentence, one button to start it again, and the node's
+ * exit text behind "Show details". Dismiss clears the crash state without
+ * restarting. Through v0.8.14 the exit text was the body of the banner.
+ *
+ * The start itself belongs to the Dashboard (`onStartAgain`): clearing the
+ * crash unmounts this banner, so an error kept here would vanish with it.
+ * The Dashboard keeps that error the way Home does and shows it as the
+ * start-failure panel.
+ */
+export function CrashBanner({
+  message,
+  onStartAgain,
+  starting,
+}: {
+  message: string;
+  onStartAgain: () => void;
+  starting: boolean;
+}) {
   const queryClient = useQueryClient();
-  const config = useAppStore((s) => s.config);
-
-  const relaunch = useMutation({
-    mutationFn: async () => {
-      await api.clearCrash();
-      if (config) await api.startNode(config);
-    },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["status"] }),
-  });
 
   const dismiss = useMutation({
     mutationFn: () => api.clearCrash(),
@@ -36,12 +41,12 @@ export function CrashBanner({ message }: { message: string }) {
         <button
           type="button"
           className="btn btn-primary btn-sm"
-          onClick={() => relaunch.mutate()}
-          disabled={relaunch.isPending}
-          aria-busy={relaunch.isPending || undefined}
+          onClick={onStartAgain}
+          disabled={starting}
+          aria-busy={starting || undefined}
           data-testid="btn-crash-relaunch"
         >
-          <RotateCw size={12} className={relaunch.isPending ? "spin" : undefined} />{" "}
+          <RotateCw size={12} className={starting ? "spin" : undefined} />{" "}
           {PLAIN_COPY.actions.startAgain}
         </button>
       }

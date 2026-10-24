@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PLAIN_COPY } from "../src/lib/plain-copy";
+import { CONNECTING_LONG_SECS } from "../src/lib/connection";
 import { describeNodeStrip, type NodeStripInput } from "../src/lib/node-strip";
 import {
   classifyStartFailure,
@@ -333,6 +334,23 @@ test.describe("node strip on Home", () => {
       action: null,
       tone: "busy",
     });
+    // After the same wait the Dashboard uses, Home says to check the connection: calm, nothing to press.
+    expect(
+      strip({ status: { ...running, health: "syncing" }, connectingSeconds: CONNECTING_LONG_SECS - 1 }),
+    ).toMatchObject({ sentence: PLAIN_COPY.nodeStrip.runningConnecting, tone: "busy" });
+    expect(
+      strip({ status: { ...running, health: "syncing" }, connectingSeconds: CONNECTING_LONG_SECS }),
+    ).toMatchObject({
+      sentence: PLAIN_COPY.nodeStrip.runningUnreachable,
+      action: null,
+      tone: "idle",
+      details: null,
+    });
+    // The sentences never claim the node itself reached the network through a coordinator.
+    for (const sentence of [PLAIN_COPY.nodeStrip.runningConnected, PLAIN_COPY.connection.connectedCoordinator("LAX")]) {
+      expect(sentence).toMatch(/ARC is connected/);
+      expect(sentence).not.toMatch(/node is (?:running and )?connected/);
+    }
     // Off by choice is idle, and an update on offer is information.
     expect(strip({})).toMatchObject({ tone: "idle" });
     expect(strip({ update: ready }).tone).toBe("info");

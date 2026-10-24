@@ -30,7 +30,10 @@ test.describe("connection in plain words", () => {
     expect(view.label).toBe(PLAIN_COPY.connection.labels.connected);
     expect(view.level).toBe("live");
     expect(view.via).toBe("via LAX");
-    expect(view.sentence).toContain("connected to the ARC network through LAX");
+    // The desktop's own probe reached the coordinator: ARC is connected. An observer node never talks to a
+    // coordinator, so the sentence does not say the node is.
+    expect(view.sentence).toContain("ARC is connected to the network through LAX");
+    expect(view.sentence).not.toContain("node is connected");
     expect(view.sentence).toContain("0 peers is normal");
     // The native side names the origin whenever it reports "lite"; without one, say what is known.
     expect(describeConnection({ ...community, coordinatorUrl: null }).via).toBe("via a coordinator");

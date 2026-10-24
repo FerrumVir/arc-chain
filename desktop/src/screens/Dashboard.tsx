@@ -33,7 +33,7 @@ import { WorkerJobsCard } from "../components/WorkerJobs";
 import { ProjectedEarnings } from "../components/ProjectedEarnings";
 import { StatusPill } from "../components/StatusPill";
 import { api } from "../lib/tauri";
-import { describeConnection, isUnreachableMessage } from "../lib/connection";
+import { CONNECTING_LONG_SECS, describeConnection, isUnreachableMessage } from "../lib/connection";
 import {
   formatAddress,
   formatHash,
@@ -53,8 +53,6 @@ import { DEFAULT_NODE_CONFIG } from "../lib/types";
 // A running node that reaches nothing for this long steps out of the start-up stage, so the dashboard and its
 // connection line take over instead of the stage holding the whole screen.
 const PEER_WAIT_MS = 45_000;
-// After this long without any coordinator answering, the connection line says to check the internet connection.
-const CONNECTING_LONG_SECS = 45;
 // How long the stage shows "Your node is live" when start-up finishes, before it steps aside.
 const LIVE_MOMENT_MS = 2_600;
 
@@ -156,7 +154,35 @@ export function Dashboard() {
     },
   });
 
+  // The crash banner's "Start again": clear the crash, then start. The error
+  // lives here, not in the banner, because clearing the crash unmounts the
+  // banner; a refused start is shown below as the start-failure panel, the
+  // way Home's strip keeps its Start errors.
+  const startAgainMutation = useMutation({
+    mutationFn: async () => {
+      await api.clearCrash();
+      await api.startNode(config ?? DEFAULT_NODE_CONFIG);
+    },
+    onSettled: () => {
+      queryClient.invalidateQueries({ queryKey: ["status"] });
+    },
+  });
+
   const running = !!status?.running;
+  // A start error is moot once the node runs, and a stop error once it has exited.
+  useEffect(() => {
+    if (running) {
+      startMutation.reset();
+      restartMutation.reset();
+      startAgainMutation.reset();
+    } else {
+      stopMutation.reset();
+    }
+    // The reset functions are stable; only the node's state decides.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running]);
+  // The one start or restart that failed, if any, in the order the buttons sit on this screen.
+  const startFailure = startMutation.error ?? restartMutation.error ?? startAgainMutation.error ?? null;
   const isExternal = running && status?.pid == null;
   // Nothing is known until the first status arrives: the node may be running, or auto-starting in the background, so
   // the screen says "Checking" rather than "stopped" and offers no Start button yet.
@@ -181,7 +207,7 @@ export function Dashboard() {
   // the child process is alive and working. Without surfacing this, the
   // Start button appears unresponsive for minutes.
   const isStarting =
-    (!running && status?.pid != null) || startMutation.isPending;
+    (!running && status?.pid != null) || startMutation.isPending || startAgainMutation.isPending;
 
   // The node's start, drawn as the first arch of an aqueduct: every step is one the node actually reports. No model-load
   // percentage exists, so that step shows work under way without claiming progress; catching up is drawn from the real
@@ -400,18 +426,26 @@ export function Dashboard() {
       )}
 
       {isCrashed && status?.lastError && (
-        <CrashBanner message={status.lastError} />
+        <CrashBanner
+          message={status.lastError}
+          onStartAgain={() => startAgainMutation.mutate()}
+          starting={startAgainMutation.isPending}
+        />
       )}
 
       {status?.modelUnavailable && (
         <ModelUnavailableBanner reason={status.modelUnavailable} />
       )}
 
-      {(startMutation.error || restartMutation.error) && (
+      {startFailure && (
         <StartFailurePanel
-          error={String(startMutation.error ?? restartMutation.error)}
+          error={String(startFailure)}
           onTryAgain={() =>
-            startMutation.error ? startMutation.mutate() : restartMutation.mutate()
+            startMutation.error
+              ? startMutation.mutate()
+              : restartMutation.error
+                ? restartMutation.mutate()
+                : startAgainMutation.mutate()
           }
           testId="mutation-error"
         />
@@ -420,7 +454,7 @@ export function Dashboard() {
       {/* A start the app made by itself (at launch, after a crash) that failed reads like a refused Start: one
           sentence, one action, the native text behind Show details. Not shown twice when a pressed Start failed
           the same way. */}
-      {reportedStartFailure && !startMutation.error && !restartMutation.error && (
+      {reportedStartFailure && !startFailure && (
         <StartFailurePanel
           error={reportedStartFailure}
           onTryAgain={() => startMutation.mutate()}
@@ -428,7 +462,8 @@ export function Dashboard() {
         />
       )}
 
-      {stopMutation.error && !startMutation.error && !restartMutation.error && (
+      {/* Only while the node is still running: once it has exited, a failed Stop is moot (and reset above). */}
+      {stopMutation.error && running && !startFailure && (
         <ProblemNotice
           testId="mutation-error"
           title={PLAIN_COPY.dashboard.stopFailed}

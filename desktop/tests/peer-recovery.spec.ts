@@ -74,7 +74,9 @@ test.describe("Dashboard: a community node's connection", () => {
     await expect(notice).toBeVisible({ timeout: 15_000 });
     await expect(notice).toHaveAttribute("data-state", "connected");
     await expect(notice).toHaveAttribute("role", "status");
-    await expect(notice).toContainText("connected to the ARC network through NYC");
+    // ARC's own probe reached the coordinator; the sentence does not claim the node did.
+    await expect(notice).toContainText("ARC is connected to the network through NYC");
+    await expect(notice).not.toContainText("node is connected");
     await expect(notice).toContainText("0 peers is normal");
     await expect(notice).not.toHaveText(JARGON);
     // Browser live mode reports no pid, so the Dashboard reads this node as managed outside the app and its

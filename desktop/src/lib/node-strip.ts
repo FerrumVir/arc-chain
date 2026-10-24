@@ -1,6 +1,6 @@
 import { PLAIN_COPY } from "./plain-copy";
 import { describeStartFailure, type StartFailureAction } from "./start-failure";
-import { isUnreachableMessage } from "./connection";
+import { CONNECTING_LONG_SECS, isUnreachableMessage } from "./connection";
 import { formatBytes } from "./format";
 import type { ModelDownloadProgress, NodeStatus } from "./types";
 import type { UpdateSnapshot } from "./update-controller";
@@ -41,6 +41,8 @@ export interface NodeStripInput {
   startError: string | null;
   update: Pick<UpdateSnapshot, "phase" | "canInstall" | "message" | "error" | "restartRequired">;
   modelProgress: ModelDownloadProgress | null;
+  /** How long the running node has had nothing answering, in seconds; null or absent when not connecting. */
+  connectingSeconds?: number | null;
 }
 
 const FAILURE_ACTION: Record<StartFailureAction, NodeStripAction> = {
@@ -113,6 +115,10 @@ export function describeNodeStrip(input: NodeStripInput): NodeStripView {
       return { sentence: copy.runningConnected, action: null, tone: "ok", details: null };
     }
     if (health === "syncing" || health === "offline") {
+      // After the same wait the Dashboard uses, say so plainly; still no red and nothing to press.
+      if ((input.connectingSeconds ?? 0) >= CONNECTING_LONG_SECS) {
+        return { sentence: copy.runningUnreachable, action: null, tone: "idle", details: null };
+      }
       return { sentence: copy.runningConnecting, action: null, tone: "busy", details: null };
     }
     return { sentence: copy.running, action: null, tone: "ok", details: null };

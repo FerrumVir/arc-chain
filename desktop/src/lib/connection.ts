@@ -30,6 +30,13 @@ export type ConnectionState =
 /** The dot and pill colour classes (styles/app.css). */
 export type ConnectionLevel = "checking" | "off" | "offline" | "syncing" | "live";
 
+/**
+ * A running node that nothing has answered for this long is told, on the
+ * Dashboard and on Home alike, to check the internet connection. Calm, no
+ * red: ARC keeps trying by itself.
+ */
+export const CONNECTING_LONG_SECS = 45;
+
 export interface ConnectionView {
   state: ConnectionState;
   /** One or two words, for the pill and the sidebar chip. */

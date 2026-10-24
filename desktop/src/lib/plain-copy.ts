@@ -67,10 +67,17 @@ export const PLAIN_COPY = {
     checking: "Checking your node…",
     /** Running, and the connection is not known yet (older status shapes). */
     running: "Your node is running.",
-    /** Running, and a peer or a coordinator answered. */
-    runningConnected: "Your node is running and connected to the ARC network.",
+    /**
+     * Running, and a peer or a coordinator answered. The desktop's own probe
+     * is what reached the coordinator, so the connection is ARC's, not a
+     * claim about the node's P2P (an observer never talks to coordinators).
+     */
+    runningConnected: "Your node is running, and ARC is connected to the network.",
     /** Running, and nothing on the network has answered yet. */
-    runningConnecting: "Your node is running and connecting to the ARC network…",
+    runningConnecting: "Your node is running, and ARC is connecting to the network…",
+    /** Running, and nothing has answered for a while: calm, no red, nothing to press. */
+    runningUnreachable:
+      "Your node is running, but ARC can't reach the network yet. Check your internet connection.",
     starting: "Your node is starting. Loading the AI model can take a few minutes.",
     downloadingModel: (amount: string) =>
       `Your node is getting ready: downloading the AI model (${amount}).`,
@@ -103,15 +110,21 @@ export const PLAIN_COPY = {
     off: "Your node is off.",
     unreachable:
       "Your node is off, and ARC can't reach the network. Check your internet connection.",
-    connecting: "Your node is running and connecting to the ARC network…",
+    connecting: "Your node is running, and ARC is connecting to the network…",
     /** Too long without an answer from any coordinator. */
     connectingLong:
-      "ARC can't reach the network yet. Check your internet connection; your node keeps trying.",
+      "ARC can't reach the network yet. Check your internet connection; it keeps trying.",
+    /** The node itself has a peer (health "live"), so the node is connected. */
     connected: "Your node is connected to the ARC network.",
     connectedPeers: (peers: string) =>
       `Your node is connected to the ARC network with ${peers}.`,
+    /**
+     * A coordinator answered the desktop's own probe. That is ARC's
+     * connection; the node has no peers, and an observer never talks to a
+     * coordinator, so the sentence does not say the node is connected.
+     */
     connectedCoordinator: (host: string) =>
-      `Your node is connected to the ARC network through ${host}. Community nodes connect through coordinators rather than directly to other nodes, so 0 peers is normal.`,
+      `Your node is running, and ARC is connected to the network through ${host}. ARC reaches the network through coordinators rather than node to node, so 0 peers is normal.`,
     /** The sidebar's second line while running. */
     viaPeers: (peers: string) => peers,
     viaCoordinator: (host: string) => `via ${host}`,
@@ -158,8 +171,17 @@ export const PLAIN_COPY = {
   },
   wallet: {
     balanceUnavailable: "Balance unavailable right now. ARC keeps trying.",
+    /** Refused before or by the host: nothing can have been included. */
     faucetFailed: "The faucet claim didn't go through.",
     sendFailed: "The transfer didn't go through.",
+    /**
+     * The request went out and no usable answer came back. The host may have
+     * accepted it, so the next step is to look before sending again.
+     */
+    faucetUnconfirmed:
+      "ARC didn't get a confirmation for this faucet claim. Check your balance before claiming again.",
+    sendUnconfirmed:
+      "ARC didn't get a confirmation for this transfer. Check your balance before sending again.",
   },
   setup: {
     welcomeTitle: "Welcome to ARC",
@@ -181,8 +203,9 @@ export const PLAIN_COPY = {
     connecting: "Connecting to the ARC network…",
     connectingStill: "Still connecting…",
     connectingLong: "Taking longer than usual. ARC keeps trying for a little longer.",
+    /** A coordinator answered ARC (named), or the node itself found a peer (null). */
     connected: (via: string | null) =>
-      `Connected to the ARC network${via ? ` via ${via}` : ""} ✓`,
+      via ? `ARC is connected to the network via ${via} ✓` : "Your node is connected to the ARC network ✓",
   },
   updates: {
     waitingForLastSession: (version: string) =>
@@ -194,7 +217,7 @@ export const PLAIN_COPY = {
     /** The check itself failed, usually a connection. ARC retries on its own. */
     checkFailed:
       "ARC couldn't check for updates right now. It tries again later, and you can check again here.",
-    /** An install that failed before it changed anything. */
-    installFailed: "The update didn't install. Nothing changed; you can try again here.",
+    /** An install that did not complete; the node may have been stopped for it. */
+    installFailed: "The update didn't install. You can try again here.",
   },
 } as const;
