@@ -18,10 +18,10 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
-## v0.8.16 - Unreleased
+## v0.8.16 - Release-preparation snapshot (2026-10-26)
 
-> **Candidate note:** This entry collects changes for the next release
-> candidate. It does not claim publication or deployment of v0.8.16.
+> **Candidate note:** This entry records the v0.8.16 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.16.
 
 - macOS: Install update no longer leaves ARC on its old version with the
   node stopped when ARC runs from somewhere its updater can't replace it:
