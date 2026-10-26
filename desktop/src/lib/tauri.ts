@@ -2049,6 +2049,9 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     // The start fence is native; a browser has nothing that can refuse.
     case "node_start_block":
       return null as T;
+    // So is the app bundle the updater would replace.
+    case "update_location_block":
+      return null as T;
     case "ensure_binary":
       // Browser (live mode) can't install a native binary - pretend it's
       // already installed so the UI doesn't block onboarding.
@@ -2986,6 +2989,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       mockCrashCleared = true;
       return undefined as T;
     case "node_start_block":
+    case "update_location_block":
       return null as T;
     case "save_logs":
       return {
@@ -3254,6 +3258,8 @@ export const api = {
   nodeStatus: () => invoke<NodeStatus>("node_status"),
   /** What a Start would be told by the start fence now; null when starts are open. */
   nodeStartBlock: () => invoke<string | null>("node_start_block"),
+  /** macOS: what an app update would be told about where ARC runs; null when it can update in place. */
+  updateLocationBlock: () => invoke<string | null>("update_location_block"),
   fetchEarnings: () => invoke<Earnings>("fetch_earnings"),
   fetchAttestations: (limit = 20) =>
     invoke<Attestation[]>("fetch_attestations", { limit }),

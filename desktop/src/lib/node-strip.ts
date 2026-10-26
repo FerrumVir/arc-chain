@@ -48,8 +48,26 @@ export interface NodeStripInput {
 const FAILURE_ACTION: Record<StartFailureAction, NodeStripAction> = {
   "install-update": "update-arc",
   "restart-arc": "restart-arc",
+  "quit-arc": "quit-arc",
   "try-again": "try-again",
 };
+
+/**
+ * An update ARC couldn't finish. "ready" with an error is a relaunch that
+ * failed or an install ARC could not confirm, and "error" with
+ * restartRequired an abort that could not confirm the node resumed. The
+ * update keeps the node until ARC exits, so Start and Restart are refused and
+ * only quitting and reopening ARC clears it. Home's strip and the Dashboard
+ * both offer that one step.
+ */
+export function isUnfinishedUpdate(
+  update: Pick<UpdateSnapshot, "phase" | "error" | "restartRequired">,
+): boolean {
+  return (
+    (update.phase === "ready" && update.error !== null) ||
+    (update.phase === "error" && update.restartRequired)
+  );
+}
 
 /**
  * The node's state in one sentence and at most one button. Failures use the
@@ -64,13 +82,8 @@ export function describeNodeStrip(input: NodeStripInput): NodeStripView {
   const copy = PLAIN_COPY.nodeStrip;
   const { update } = input;
   const updateReady = update.phase === "available" && update.canInstall;
-  // "ready" with an error is a relaunch that failed or an install ARC could
-  // not confirm, and "error" with restartRequired an abort that could not
-  // confirm the node resumed. Starts are refused until ARC is reopened.
-  if (
-    (update.phase === "ready" && update.error !== null) ||
-    (update.phase === "error" && update.restartRequired)
-  ) {
+  // Starts are refused until ARC is reopened.
+  if (isUnfinishedUpdate(update)) {
     return {
       sentence: copy.updateFailed,
       action: "quit-arc",

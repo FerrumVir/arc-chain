@@ -31,6 +31,8 @@ test.describe("Home: Ask ARC", () => {
     );
     // A node that is off by choice is not a problem, so the strip is not red.
     await expect(strip).toHaveAttribute("data-tone", "idle");
+    // ARC can update itself from where it runs, so there is nothing to say about that.
+    await expect(page.getByTestId("update-location-notice")).toHaveCount(0);
 
     await page.getByTestId("inference-prompt").fill("The largest planet is");
     await page.getByTestId("btn-run-inference").click();
@@ -91,6 +93,54 @@ test.describe("Home: Ask ARC", () => {
     expect(copied.split("ARC refused to start the node")).toHaveLength(2);
 
     await page.getByTestId("inference-prompt").fill("Water boils at");
+    await page.getByTestId("btn-run-inference").click();
+    await expect(page.getByTestId("inference-output")).toContainText("mock response");
+  });
+
+  // macOS: run from the mounted .dmg, a translocated download or another
+  // volume, the updater can't replace ARC. Launch says so once, calmly; the
+  // node, the strip and the chat work as they always do.
+  test("a copy ARC can't update in place says so in one calm line, and ARC stays usable", async ({
+    page,
+  }) => {
+    await seedOnboarded(page);
+    await openOn(page, "inference");
+    await seedMockOverrides(page, {
+      update_location_block:
+        "ARC can't update itself from where it's running. Quit ARC, drag ARC Node into your Applications folder, then open it from there.",
+    });
+    await page.goto("/");
+
+    const notice = page.getByTestId("update-location-notice");
+    await expect(notice).toHaveText(PLAIN_COPY.updates.wrongLocation);
+    // A status, not an alert.
+    await expect(notice).toHaveAttribute("role", "status");
+    // Not red: neither its text, its icon nor its border takes the danger colour.
+    const colours = await notice.evaluate((element) => {
+      const probe = document.createElement("span");
+      probe.style.color = "var(--danger)";
+      element.parentElement!.append(probe);
+      const danger = getComputedStyle(probe).color;
+      probe.remove();
+      const icon = element.querySelector("svg");
+      return {
+        danger,
+        used: [
+          getComputedStyle(element).color,
+          getComputedStyle(element).borderTopColor,
+          icon ? getComputedStyle(icon).color : "",
+        ],
+      };
+    });
+    for (const colour of colours.used) expect(colour).not.toBe(colours.danger);
+
+    const strip = page.getByTestId("node-strip");
+    await expect(strip.getByTestId("node-strip-sentence")).toHaveText(PLAIN_COPY.nodeStrip.off);
+    await strip.getByTestId("node-strip-action").click();
+    await expect(strip.getByTestId("node-strip-sentence")).toHaveText(
+      PLAIN_COPY.nodeStrip.runningConnecting,
+    );
+    await page.getByTestId("inference-prompt").fill("The sun is a");
     await page.getByTestId("btn-run-inference").click();
     await expect(page.getByTestId("inference-output")).toContainText("mock response");
   });

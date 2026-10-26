@@ -8,6 +8,15 @@ export const UPDATE_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 15 * 60_000] as const
 /** How often a verified update retries while launch reconciliation runs. */
 export const UPDATE_RECONCILIATION_RETRY_MS = 60_000;
 
+/**
+ * What both native update preparations refuse with on macOS when the updater
+ * can't replace ARC where it runs (`update_location.rs`). They refuse before
+ * anything stops or is fenced. update-controller.spec.ts pins it against the
+ * Rust source.
+ */
+export const NATIVE_WRONG_LOCATION =
+  "ARC can't update itself from where it's running. Quit ARC, drag ARC Node into your Applications folder, then open it from there.";
+
 export type UpdatePhase =
   | "idle"
   | "checking"
@@ -559,14 +568,20 @@ export class UpdateController {
               }
               return this.waitForLastSession(candidate, version, true);
             }
+            // The location refusal is the whole story, and the Settings
+            // install is refused the same way; moving ARC takes a quit, so
+            // nothing retries it. A legacy v0.7 refusal also refuses the
+            // Settings install.
+            const wrongLocation = detail.includes(NATIVE_WRONG_LOCATION);
             this.setSnapshot({
               ...this.snapshot,
               phase: "available",
-              // A legacy v0.7 refusal also refuses the Settings install.
-              message: /legacy desktop node reconciliation is unresolved/.test(detail)
-                ? PLAIN_COPY.updates.manualInstallOnly(version)
-                : `Automatic installation of ${version} was deferred because native worker safety could not be confirmed. Install it manually from Settings if you choose.`,
-              error: detail,
+              message: wrongLocation
+                ? PLAIN_COPY.updates.wrongLocation
+                : /legacy desktop node reconciliation is unresolved/.test(detail)
+                  ? PLAIN_COPY.updates.manualInstallOnly(version)
+                  : `Automatic installation of ${version} was deferred because native worker safety could not be confirmed. Install it manually from Settings if you choose.`,
+              error: wrongLocation ? null : detail,
               canInstall: true,
               restartRequired: false,
             });
@@ -713,6 +728,21 @@ export class UpdateController {
         }
         if (isStartupReconciliationInProgress(detail)) {
           return this.waitForLastSession(candidate, version, false);
+        }
+        if (detail.includes(NATIVE_WRONG_LOCATION)) {
+          // Refused before anything stopped: the node runs on, and the
+          // verified update stays offered with the one step that lets it
+          // install.
+          this.setSnapshot({
+            ...this.snapshot,
+            phase: "available",
+            version,
+            message: PLAIN_COPY.updates.wrongLocation,
+            error: null,
+            canInstall: true,
+            restartRequired: false,
+          });
+          return this.snapshot;
         }
         this.setSnapshot({
           ...this.snapshot,

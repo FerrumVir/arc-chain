@@ -380,6 +380,15 @@ pub async fn update_install_policy() -> CmdResult<UpdateInstallPolicy> {
     ))
 }
 
+/// What an app update would be told about where ARC runs, or None when the
+/// updater can replace it there (`update_location`, macOS only). Home reads
+/// it at launch and shows it as one calm line, so a copy opened from its
+/// disk image learns to move before an update needs it.
+#[tauri::command]
+pub async fn update_location_block() -> CmdResult<Option<String>> {
+    Ok(crate::update_location::refusal().map(str::to_owned))
+}
+
 #[tauri::command]
 pub async fn load_config(state: State<'_, AppState>) -> CmdResult<Option<NodeConfig>> {
     let store = state.store.lock().await;
@@ -518,6 +527,9 @@ async fn start_node_transaction(
     let resources = resolve_testnet_resources(app);
     {
         let mut node = state.node.lock().await;
+        // Before the owner lock below, which an app update in this process
+        // may hold as its fence.
+        node.refuse_start_during_update()?;
         if node.is_running() {
             return Ok(());
         }
@@ -645,6 +657,18 @@ async fn app_update_boundary(state: &AppState) -> Result<AppUpdateBoundary, Stri
     crate::start_fence::app_update_boundary(fence.as_ref())
 }
 
+/// The macOS location check (`update_location`), first in both app-update
+/// entrypoints: before anything is cancelled, drained, stopped or fenced.
+/// The updater can't replace ARC from the mounted .dmg, a translocated copy
+/// or another volume, and its install would fail only after the one-way
+/// handoff. Refused here, the update stays available and the node runs on.
+fn refuse_update_from_wrong_location() -> CmdResult<()> {
+    match crate::update_location::refusal() {
+        Some(refusal) => Err(refusal.to_owned()),
+        None => Ok(()),
+    }
+}
+
 /// The fence check for every WebView entrypoint and auto-start.
 async fn require_data_migration_ready(state: &AppState) -> Result<(), String> {
     require_start_fence(state, StartAccess::Ordinary).await
@@ -685,6 +709,7 @@ pub async fn stop_node(state: State<'_, AppState>) -> CmdResult<()> {
 /// legacy v0.7 refusal, or a lease that can't be taken, still fails closed.
 #[tauri::command]
 pub async fn prepare_update_relaunch(state: State<'_, AppState>) -> CmdResult<()> {
+    refuse_update_from_wrong_location()?;
     // A wait for launch reconciliation returns here, before anything is
     // cancelled, so pressing Install while ARC recovers keeps auto-start.
     let boundary = app_update_boundary(&state).await?;
@@ -717,6 +742,7 @@ pub async fn try_prepare_auto_update_relaunch(
     state: State<'_, AppState>,
 ) -> CmdResult<crate::auto_update::PrepareResult> {
     use crate::auto_update::{PrepareResult, RequestFence};
+    refuse_update_from_wrong_location()?;
     let boundary = app_update_boundary(&state).await?;
     if !update_install_policy().await?.can_install {
         return Ok(PrepareResult::busy(
@@ -825,6 +851,9 @@ pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResu
 pub(crate) async fn restart_node_inner(app: &AppHandle, state: &AppState) -> Result<(), String> {
     state.cancel_startup_retry();
     require_data_migration_ready(state).await?;
+    // Before the stop and the owner lock below: an app update in this
+    // process may hold the node, and only quitting ARC releases it.
+    state.node.lock().await.refuse_start_during_update()?;
     let (cfg, mut recovery_phrase, persisted_address) = {
         let store = state.store.lock().await;
         let cfg = store.config.clone().unwrap_or_default();
@@ -7114,5 +7143,86 @@ mod start_fence_tests {
             assert!(body.contains("require_data_migration_ready"), "{name}");
             assert!(!body.contains("app_update_boundary"), "{name}");
         }
+    }
+
+    /// A copy the updater can't replace (the mounted .dmg, a translocated
+    /// download, another volume) failed its install only after the node had
+    /// stopped and the handoff had begun. Both app-update entrypoints check
+    /// where ARC runs first, so a refusal leaves the node and the update as
+    /// they were.
+    #[test]
+    fn both_app_update_entrypoints_check_where_arc_runs_before_anything_else() {
+        let source = include_str!("commands.rs");
+        for (name, start, end) in [
+            (
+                "prepare_update_relaunch",
+                "pub async fn prepare_update_relaunch(",
+                "/// Unattended updates require",
+            ),
+            (
+                "try_prepare_auto_update_relaunch",
+                "pub async fn try_prepare_auto_update_relaunch(",
+                "/// Seal the one-way native updater boundary",
+            ),
+        ] {
+            let body = body_between(source, start, end);
+            let check = body
+                .find("refuse_update_from_wrong_location()?;")
+                .unwrap_or_else(|| panic!("{name} does not check where ARC runs"));
+            for later in [
+                "app_update_boundary(&state)",
+                "state.cancel_startup_retry()",
+                "state.node.",
+                "state.auto_update_requests",
+                "update_install_policy()",
+            ] {
+                if let Some(at) = body.find(later) {
+                    assert!(check < at, "{name} reaches {later} first");
+                }
+            }
+        }
+        let check = body_between(
+            source,
+            "fn refuse_update_from_wrong_location(",
+            "/// The fence check for every WebView entrypoint",
+        );
+        assert!(check.contains("crate::update_location::refusal()"));
+    }
+
+    /// Start and Restart refuse while an app update holds the node before
+    /// they reach the lifecycle owner lock, or Restart's stop. That lock is
+    /// the update's own fence, and failing against it was reported as
+    /// "another ARC desktop currently owns the managed node lifecycle".
+    #[test]
+    fn start_and_restart_refuse_an_update_held_node_before_the_owner_lock() {
+        let source = include_str!("commands.rs");
+        for (name, start, end, first_reach) in [
+            (
+                "start_node_transaction",
+                "async fn start_node_transaction(",
+                "pub async fn start_node_inner(",
+                "acquire_managed_lifecycle_lock(&lock_data_dir)",
+            ),
+            (
+                "restart_node_inner",
+                "pub(crate) async fn restart_node_inner(",
+                "// ── Compute contribution",
+                "node.stop().await",
+            ),
+        ] {
+            let body = body_between(source, start, end);
+            let refusal = body
+                .find(".refuse_start_during_update()?;")
+                .unwrap_or_else(|| panic!("{name} does not refuse during an update"));
+            assert!(refusal < body.find(first_reach).unwrap(), "{name}");
+            assert!(
+                refusal < body.find("acquire_managed_lifecycle_lock(").unwrap(),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            crate::node_manager::UPDATE_HOLDS_NODE,
+            "ARC couldn't finish an update. Quit ARC and open it again."
+        );
     }
 }

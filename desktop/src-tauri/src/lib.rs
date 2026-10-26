@@ -14,6 +14,7 @@ mod start_fence;
 mod store;
 mod tray;
 mod types;
+mod update_location;
 mod updater_channel;
 mod wallet;
 
@@ -961,6 +962,7 @@ pub fn run() {
             commands::ensure_binary,
             commands::get_autostart,
             commands::update_install_policy,
+            commands::update_location_block,
             updater_channel::check_arc_update,
             commands::list_model_tiers,
             commands::recommended_tier,

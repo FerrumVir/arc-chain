@@ -3,6 +3,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { InfoPopover } from "../components/InfoPopover";
 import { NativePaidRequests } from "../components/NativePaidRequests";
 import { NodeStatusStrip } from "../components/NodeStatusStrip";
+import { UpdateLocationNotice } from "../components/UpdateLocationNotice";
 import { PLAIN_COPY } from "../lib/plain-copy";
 import { Answer } from "../components/chat/Answer";
 import { StageTrack, timeOf } from "../components/chat/Stages";
@@ -217,6 +218,7 @@ export function Inference() {
       {/* Home: the node's state and its one fix. The chat below answers from
           the network whatever this says. */}
       <NodeStatusStrip />
+      <UpdateLocationNotice />
 
       <ChatAqueduct turns={turns} facts={facts} onPick={pick} />
 

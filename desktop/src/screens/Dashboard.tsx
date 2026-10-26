@@ -6,6 +6,7 @@ import {
   FileSignature,
   Loader2,
   Play,
+  Power,
   RotateCw,
   Sparkles,
   Users,
@@ -42,9 +43,13 @@ import {
   formatUptime,
 } from "../lib/format";
 import { hostLabel } from "../lib/hosts";
+import { isUnfinishedUpdate } from "../lib/node-strip";
 import { PLAIN_COPY } from "../lib/plain-copy";
+import { quitArc } from "../lib/quit";
+import { classifyStartFailure } from "../lib/start-failure";
 import { useAppStore } from "../lib/store";
 import { DEFAULT_NODE_CONFIG } from "../lib/types";
+import { useUpdaterSnapshot } from "../lib/updater";
 
 // Host labels live in lib/hosts.ts so every screen names a seed identically.
 // "Which host" is load-bearing context for any chain number here, because the
@@ -183,6 +188,14 @@ export function Dashboard() {
   }, [running]);
   // The one start or restart that failed, if any, in the order the buttons sit on this screen.
   const startFailure = startMutation.error ?? restartMutation.error ?? startAgainMutation.error ?? null;
+  // An update ARC couldn't finish keeps the node until ARC exits, and Start and Restart are refused, so this screen
+  // offers what Home's node strip does: Quit ARC. The updater's own state says so, or a refused Start does when this
+  // window no longer has that state (after a reload).
+  const update = useUpdaterSnapshot();
+  const updateUnfinished =
+    isUnfinishedUpdate(update) ||
+    (startFailure !== null && classifyStartFailure(String(startFailure)) === "update-unfinished");
+  const [quitting, setQuitting] = useState(false);
   const isExternal = running && status?.pid == null;
   // Nothing is known until the first status arrives: the node may be running, or auto-starting in the background, so
   // the screen says "Checking" rather than "stopped" and offers no Start button yet.
@@ -305,7 +318,20 @@ export function Dashboard() {
 
   const controls = (
         <div style={{ display: "flex", gap: "var(--space-2)" }}>
-          {!statusKnown ? (
+          {updateUnfinished ? (
+            <button
+              className="btn btn-primary"
+              onClick={() => {
+                setQuitting(true);
+                void quitArc().finally(() => setQuitting(false));
+              }}
+              disabled={quitting}
+              aria-busy={quitting || undefined}
+              data-testid="btn-quit-arc"
+            >
+              <Power size={14} /> {PLAIN_COPY.actions.quitArc}
+            </button>
+          ) : !statusKnown ? (
             <button className="btn btn-secondary" disabled aria-busy="true" data-testid="btn-checking">
               <RotateCw size={14} className="spin" /> Checking…
             </button>
@@ -398,19 +424,21 @@ export function Dashboard() {
         <div>
           <h1 className="page-title">Dashboard</h1>
           <p className="page-subtitle" data-testid="dashboard-subtitle">
-            {!statusKnown
-              ? PLAIN_COPY.dashboard.subtitleChecking
-              : running
-                ? isExternal
-                  ? PLAIN_COPY.dashboard.subtitleExternal
-                  : connection.state === "connected"
-                    ? PLAIN_COPY.nodeStrip.runningConnected
-                    : PLAIN_COPY.nodeStrip.runningConnecting
-                : isStarting
-                  ? PLAIN_COPY.dashboard.subtitleStarting
-                  : connection.state === "unreachable"
-                    ? PLAIN_COPY.connection.unreachable
-                    : PLAIN_COPY.dashboard.subtitleOff}
+            {updateUnfinished
+              ? PLAIN_COPY.nodeStrip.updateFailed
+              : !statusKnown
+                ? PLAIN_COPY.dashboard.subtitleChecking
+                : running
+                  ? isExternal
+                    ? PLAIN_COPY.dashboard.subtitleExternal
+                    : connection.state === "connected"
+                      ? PLAIN_COPY.nodeStrip.runningConnected
+                      : PLAIN_COPY.nodeStrip.runningConnecting
+                  : isStarting
+                    ? PLAIN_COPY.dashboard.subtitleStarting
+                    : connection.state === "unreachable"
+                      ? PLAIN_COPY.connection.unreachable
+                      : PLAIN_COPY.dashboard.subtitleOff}
           </p>
         </div>
         {!startPhase && controls}
@@ -437,7 +465,8 @@ export function Dashboard() {
         <ModelUnavailableBanner reason={status.modelUnavailable} />
       )}
 
-      {startFailure && (
+      {/* The header carries an update ARC couldn't finish, as one sentence and Quit ARC. */}
+      {startFailure && !updateUnfinished && (
         <StartFailurePanel
           error={String(startFailure)}
           onTryAgain={() =>
@@ -454,7 +483,7 @@ export function Dashboard() {
       {/* A start the app made by itself (at launch, after a crash) that failed reads like a refused Start: one
           sentence, one action, the native text behind Show details. Not shown twice when a pressed Start failed
           the same way. */}
-      {reportedStartFailure && !startFailure && (
+      {reportedStartFailure && !startFailure && !updateUnfinished && (
         <StartFailurePanel
           error={reportedStartFailure}
           onTryAgain={() => startMutation.mutate()}
