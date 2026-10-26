@@ -124,7 +124,7 @@ test.describe("Model file unavailable", () => {
     running: true,
     pid: 42_731,
     health: "live",
-    version: "0.8.15",
+    version: "0.8.16",
     peers: 8,
     round: 43_821,
     committed: 43_820,

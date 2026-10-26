@@ -25,7 +25,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.15"
+version = "0.8.16"
 edition = "2024"
 license = "BUSL-1.1"
 authors = ["FerrumVir"]
