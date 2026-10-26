@@ -32,6 +32,11 @@ export const PLAIN_COPY = {
       title: "ARC couldn't start your node",
       body: "Nothing was deleted. The details below say what went wrong.",
     },
+    /** An update ARC couldn't finish holds the node; only quitting ARC releases it. */
+    updateUnfinished: {
+      title: "ARC couldn't finish an update. Quit ARC and open it again.",
+      body: "Your node stays stopped until then. Nothing was deleted.",
+    },
     /** Added under the sentence when a newer version is ready. */
     updateReady: "A newer version is ready, and it may fix this.",
   },
@@ -224,6 +229,13 @@ export const PLAIN_COPY = {
       `Version ${version} installs as soon as ARC finishes closing your node's last session.`,
     manualInstallOnly: (version: string) =>
       `Version ${version} can't install from inside ARC on this computer. Download it from the release page and install it by hand.`,
+    /**
+     * macOS: ARC runs from somewhere its updater can't replace it (the
+     * mounted disk image, a copy macOS runs from a temporary read-only place,
+     * another drive). Shown on Home from launch and when an update is refused.
+     */
+    wrongLocation:
+      "ARC can't update itself from where it's running. Quit ARC, drag ARC Node into your Applications folder, then open it from there.",
     autoInstallDescription:
       "On by default. ARC downloads updates in the background and installs them when no jobs are running, then restarts. Updates can install even when your node can't start.",
     /** The check itself failed, usually a connection. ARC retries on its own. */

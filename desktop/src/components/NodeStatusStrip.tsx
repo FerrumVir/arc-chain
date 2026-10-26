@@ -1,8 +1,9 @@
 import { useEffect, useId, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, CheckCircle2, CircleAlert, Copy, Download, Loader2, Power } from "lucide-react";
-import { exit, relaunch } from "@tauri-apps/plugin-process";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { api, isTauri } from "../lib/tauri";
+import { quitArc } from "../lib/quit";
 import { useAppStore } from "../lib/store";
 import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
 import { describeNodeStrip, type NodeStripAction, type NodeStripTone } from "../lib/node-strip";
@@ -143,15 +144,8 @@ export function NodeStatusStrip() {
       return;
     }
     if (action === "quit-arc") {
-      if (!isTauri) {
-        window.location.reload();
-        return;
-      }
-      // The tray's Quit: stop the node, then exit. While an update holds the
-      // node, the stop is refused at once and ARC still exits.
       setBusy(true);
-      await api.stopNode().catch(() => {});
-      await exit(0).catch(() => {});
+      await quitArc();
       setBusy(false);
       return;
     }

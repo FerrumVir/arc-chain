@@ -18,6 +18,36 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.16 - Unreleased
+
+> **Candidate note:** This entry collects changes for the next release
+> candidate. It does not claim publication or deployment of v0.8.16.
+
+- macOS: Install update no longer leaves ARC on its old version with the
+  node stopped when ARC runs from somewhere its updater can't replace it:
+  the mounted .dmg, a copy macOS runs from a temporary read-only location
+  (App Translocation, for an app opened where it was downloaded), or a
+  different drive from the temporary folder. Tauri's updater moves the
+  running app aside before it puts the new one in place, and only a
+  "permission denied" refusal makes it ask for an administrator; any other
+  refusal failed the install after ARC had stopped the node, and every
+  reopen of the same copy offered the same update again. ARC now checks
+  where it runs before either update path stops the node or takes its
+  update lock: Install update keeps the update available, and an
+  unattended install is deferred, both with "ARC can't update itself from
+  where it's running. Quit ARC, drag ARC Node into your Applications folder,
+  then open it from there." The node keeps running. Home shows the same
+  sentence as one calm line from launch. An Applications folder you can't
+  write to is not refused: the updater asks for an administrator there, as
+  before (#218).
+- While an update ARC couldn't finish holds the node, which lasts until ARC
+  quits, Start said "another ARC desktop currently owns the managed node
+  lifecycle … Resource temporarily unavailable (os error 35)": it tried to
+  take the lock ARC's own update was holding. Restart was refused with
+  internal wording. Both now refuse with "ARC couldn't finish an update.
+  Quit ARC and open it again.", and the Dashboard offers Quit ARC in place
+  of Start and Restart, as Home's node strip already did (#218).
+
 ## v0.8.15 - Release-preparation snapshot (2026-10-23)
 
 > **Candidate note:** This entry records the v0.8.15 release-preparation

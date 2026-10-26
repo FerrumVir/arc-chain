@@ -11,6 +11,12 @@ export const NATIVE_REFUSAL_PREFIX =
 export const NATIVE_REFUSAL_ADVICE =
   "Restart ARC after repairing the reported path or permissions; do not point v0.8 at the preserved legacy directory.";
 export const NATIVE_RECONCILING = "startup reconciliation is still in progress";
+/**
+ * Start and Restart while an app update ARC couldn't finish holds the node
+ * (`UPDATE_HOLDS_NODE` in node_manager.rs). Only quitting ARC releases it.
+ */
+export const NATIVE_UPDATE_UNFINISHED =
+  "ARC couldn't finish an update. Quit ARC and open it again.";
 
 // Something on this computer needs fixing, and the native text says what: a
 // path, a permission, a migration preflight, another desktop holding the
@@ -30,11 +36,12 @@ const NETWORK_PATTERN =
 
 export type StartFailureKind =
   | "reconciling"
+  | "update-unfinished"
   | "blocked"
   | "needs-repair"
   | "network"
   | "unknown";
-export type StartFailureAction = "install-update" | "restart-arc" | "try-again";
+export type StartFailureAction = "install-update" | "restart-arc" | "quit-arc" | "try-again";
 
 export interface StartFailureView {
   kind: StartFailureKind;
@@ -58,6 +65,7 @@ export function isStartupReconciliationInProgress(raw: string): boolean {
 
 export function classifyStartFailure(raw: string): StartFailureKind {
   if (isStartupReconciliationInProgress(raw)) return "reconciling";
+  if (raw.includes(NATIVE_UPDATE_UNFINISHED)) return "update-unfinished";
   // Every refusal carries the same advice, which names paths and
   // permissions. Only the reason decides the kind.
   const reason = raw.split(NATIVE_REFUSAL_ADVICE).join(" ");
@@ -97,6 +105,8 @@ export function cleanFailureDetails(raw: string): string {
 /**
  * One plain sentence and one action for a node that would not start.
  * - A wait or a download failure asks for another try.
+ * - An update ARC couldn't finish holds the node: quit ARC, the one step
+ *   that releases it, as Home's strip says for the same state.
  * - An unclean last session offers the update when one is ready (it installs
  *   even while the node is blocked), otherwise a restart, which runs launch
  *   reconciliation again.
@@ -116,6 +126,8 @@ export function describeStartFailure(
   switch (kind) {
     case "reconciling":
       return { kind, ...copy.reconciling, action: "try-again", details, detailsOpen: false };
+    case "update-unfinished":
+      return { kind, ...copy.updateUnfinished, action: "quit-arc", details, detailsOpen: false };
     case "network":
       return { kind, ...copy.network, action: "try-again", details, detailsOpen: false };
     case "blocked":

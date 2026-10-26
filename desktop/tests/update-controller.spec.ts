@@ -1,12 +1,18 @@
 import { expect, test } from "@playwright/test";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { PLAIN_COPY } from "../src/lib/plain-copy";
 import {
   createUpdateController,
+  NATIVE_WRONG_LOCATION,
   UPDATE_RECONCILIATION_RETRY_MS,
   type UpdateCandidate,
   type UpdateDownloadEvent,
   type UpdateTimers,
 } from "../src/lib/update-controller";
+
+const __dirnameHere = path.dirname(fileURLToPath(import.meta.url));
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -1428,5 +1434,124 @@ test.describe("UpdateController", () => {
     });
     expect(controller.getSnapshot().message).toContain("Update was not installed");
     controller.dispose();
+  });
+
+  // macOS: run from the mounted .dmg, a translocated download or another
+  // volume, the updater's install failed only after the node had stopped and
+  // the one-way handoff had begun. Native preparation now refuses first.
+  test("a manual install from where ARC can't update itself stays available and stops nothing", async () => {
+    const order: string[] = [];
+    const controller = createUpdateController({
+      supported: true,
+      check: async () => ({
+        version: "0.8.16",
+        download: async () => {
+          order.push("download");
+        },
+        install: async () => {
+          order.push("install");
+        },
+      }),
+      prepareRelaunch: async () => {
+        order.push("prepare");
+        throw new Error(NATIVE_WRONG_LOCATION);
+      },
+      beginHandoff: async () => {
+        order.push("handoff");
+      },
+      abortRelaunch: async () => {
+        order.push("abort");
+      },
+      relaunch: async () => {
+        order.push("relaunch");
+      },
+    });
+
+    await controller.checkForUpdates("manual");
+    await controller.installAvailableUpdate();
+    // No handoff, so nothing holds the node: Start and Restart stay open.
+    expect(order).toEqual(["download", "prepare"]);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      version: "0.8.16",
+      message: PLAIN_COPY.updates.wrongLocation,
+      error: null,
+      canInstall: true,
+      restartRequired: false,
+    });
+
+    // Pressing Install again asks native preparation again; the verified
+    // payload is not downloaded twice.
+    await controller.installAvailableUpdate();
+    expect(order).toEqual(["download", "prepare", "prepare"]);
+    expect(controller.getSnapshot().message).toBe(PLAIN_COPY.updates.wrongLocation);
+    controller.dispose();
+  });
+
+  test("an automatic install from where ARC can't update itself is deferred with the same sentence", async () => {
+    const timers = new FakeTimers();
+    const order: string[] = [];
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => ({
+          version: "0.8.16",
+          download: async () => {
+            order.push("download");
+          },
+          install: async () => {
+            order.push("install");
+          },
+        }),
+        tryPrepareAutoUpdateRelaunch: async () => {
+          order.push("try-prepare");
+          throw new Error(NATIVE_WRONG_LOCATION);
+        },
+        prepareRelaunch: async () => {
+          order.push("manual-prepare");
+        },
+        beginHandoff: async () => {
+          order.push("handoff");
+        },
+        abortRelaunch: async () => {
+          order.push("abort");
+        },
+        relaunch: async () => {},
+      },
+      { startupDelayMs: 10, intervalMs: 24 * 60 * 60 * 1_000, retryDelaysMs: [60_000] },
+      timers,
+    );
+
+    controller.setAutoChecksEnabled(true);
+    controller.setAutoInstallEnabled(true);
+    await timers.advanceBy(10);
+    await timers.advanceBy(0);
+    // The pre-handoff abort finds nothing prepared to release.
+    expect(order).toEqual(["download", "try-prepare", "abort"]);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      version: "0.8.16",
+      message: PLAIN_COPY.updates.wrongLocation,
+      error: null,
+      canInstall: true,
+      restartRequired: false,
+    });
+
+    // Moving ARC takes a quit, so nothing retries from this process.
+    await timers.advanceBy(60_000 * 2);
+    expect(order).toEqual(["download", "try-prepare", "abort"]);
+    controller.dispose();
+  });
+
+  test("the location refusal it recognises is the sentence update_location.rs writes", () => {
+    const source = fs.readFileSync(
+      path.resolve(__dirnameHere, "..", "src-tauri", "src", "update_location.rs"),
+      "utf8",
+    );
+    expect(source).toContain(`"${NATIVE_WRONG_LOCATION}"`);
+    // One sentence to act on: where to put ARC, and that it takes a quit.
+    expect(PLAIN_COPY.updates.wrongLocation).toMatch(/^ARC can't update itself/);
+    expect(PLAIN_COPY.updates.wrongLocation).toContain("Quit ARC");
+    expect(PLAIN_COPY.updates.wrongLocation).toContain("Applications folder");
   });
 });

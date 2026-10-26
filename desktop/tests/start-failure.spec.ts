@@ -4,7 +4,11 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PLAIN_COPY } from "../src/lib/plain-copy";
 import { CONNECTING_LONG_SECS } from "../src/lib/connection";
-import { describeNodeStrip, type NodeStripInput } from "../src/lib/node-strip";
+import {
+  describeNodeStrip,
+  isUnfinishedUpdate,
+  type NodeStripInput,
+} from "../src/lib/node-strip";
 import {
   classifyStartFailure,
   cleanFailureDetails,
@@ -13,6 +17,7 @@ import {
   NATIVE_RECONCILING,
   NATIVE_REFUSAL_ADVICE,
   NATIVE_REFUSAL_PREFIX,
+  NATIVE_UPDATE_UNFINISHED,
 } from "../src/lib/start-failure";
 
 // Pure logic: no page. What a desktop that would not start says, and what it
@@ -169,6 +174,36 @@ test.describe("start failure wording", () => {
     expect(startFence).toContain(
       `"managed-node ${NATIVE_RECONCILING}: ARC is checking how the previous node session ended`,
     );
+    const nodeManager = fs.readFileSync(
+      path.resolve(__dirnameHere, "..", "src-tauri", "src", "node_manager.rs"),
+      "utf8",
+    );
+    expect(nodeManager).toContain(`"${NATIVE_UPDATE_UNFINISHED}"`);
+  });
+
+  // An install that failed after its handoff keeps the update's fence until
+  // ARC exits. Start used to fail against that fence as "another ARC
+  // desktop currently owns the managed node lifecycle" and offered another
+  // try; Start and Restart are refused before it now.
+  test("a Start refused while an unfinished update holds the node says to quit ARC", () => {
+    for (const updateAvailable of [false, true]) {
+      const view = describeStartFailure(NATIVE_UPDATE_UNFINISHED, { updateAvailable });
+      expect(view).toMatchObject({
+        kind: "update-unfinished",
+        title: PLAIN_COPY.startFailure.updateUnfinished.title,
+        body: PLAIN_COPY.startFailure.updateUnfinished.body,
+        action: "quit-arc",
+        detailsOpen: false,
+      });
+    }
+    // The same sentence Home shows from the updater's own state.
+    expect(PLAIN_COPY.startFailure.updateUnfinished.title).toBe(PLAIN_COPY.nodeStrip.updateFailed);
+    // The text a Start got before, from the update's own lock, still reads as a repair.
+    expect(
+      classifyStartFailure(
+        "another ARC desktop currently owns the managed node lifecycle for /Users/me/.arc/data-v3: Resource temporarily unavailable (os error 35)",
+      ),
+    ).toBe("needs-repair");
   });
 });
 
@@ -290,6 +325,23 @@ test.describe("node strip on Home", () => {
     });
     expect(PLAIN_COPY.nodeStrip.updateFailed).toMatch(/Quit ARC and open it again\.$/);
     expect(PLAIN_COPY.nodeStrip.updateFailed).not.toMatch(/by itself/);
+  });
+
+  test("a Start refused for an unfinished update offers Quit ARC, as the update's own state does", () => {
+    const refused = strip({ startError: NATIVE_UPDATE_UNFINISHED });
+    expect(refused).toMatchObject({
+      sentence: PLAIN_COPY.nodeStrip.updateFailed,
+      action: "quit-arc",
+      tone: "attention",
+    });
+    // An update on offer does not outrank it: nothing installs until ARC reopens.
+    expect(strip({ startError: NATIVE_UPDATE_UNFINISHED, update: ready }).action).toBe("quit-arc");
+    // The Dashboard reads the updater's state through the same rule.
+    expect(isUnfinishedUpdate({ phase: "ready", error: "installer IPC disconnected", restartRequired: true })).toBe(true);
+    expect(isUnfinishedUpdate({ phase: "error", error: "resume failed", restartRequired: true })).toBe(true);
+    expect(isUnfinishedUpdate({ phase: "ready", error: null, restartRequired: true })).toBe(false);
+    expect(isUnfinishedUpdate({ phase: "error", error: "network down", restartRequired: false })).toBe(false);
+    expect(isUnfinishedUpdate({ phase: "available", error: null, restartRequired: false })).toBe(false);
   });
 
   test("a blocked node takes the start-failure sentence and its fix", () => {

@@ -1,9 +1,10 @@
 import { useEffect, useId, useState } from "react";
-import { AlertTriangle, Check, Copy, Download, RotateCw } from "lucide-react";
+import { AlertTriangle, Check, Copy, Download, Power, RotateCw } from "lucide-react";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { isTauri } from "../lib/tauri";
 import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
 import { PLAIN_COPY } from "../lib/plain-copy";
+import { quitArc } from "../lib/quit";
 import { describeStartFailure } from "../lib/start-failure";
 
 const COPIED_RESET_MS = 2_500;
@@ -135,6 +136,15 @@ export function StartFailurePanel({
                 data-testid="btn-start-failure-restart"
               >
                 <RotateCw size={12} /> {PLAIN_COPY.actions.restartArc}
+              </button>
+            ) : view.action === "quit-arc" ? (
+              <button
+                type="button"
+                className="btn btn-primary btn-sm"
+                onClick={() => void quitArc()}
+                data-testid="btn-start-failure-quit"
+              >
+                <Power size={12} /> {PLAIN_COPY.actions.quitArc}
               </button>
             ) : (
               onTryAgain && (

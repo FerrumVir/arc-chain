@@ -1197,6 +1197,11 @@ pub fn is_managed_durability_recovery_required(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<ManagedDurabilityRecoveryRequired>())
 }
 
+/// What Start and Restart are told while a signed app update holds the node
+/// (`NodeManager::refuse_start_during_update`). Home's node strip says the
+/// same for that state, and `start-failure.ts` recognises it.
+pub const UPDATE_HOLDS_NODE: &str = "ARC couldn't finish an update. Quit ARC and open it again.";
+
 pub struct NodeManager {
     child: Option<Child>,
     started_at: Option<Instant>,
@@ -3035,6 +3040,21 @@ impl NodeManager {
             "updater handoff has already begun"
         );
         self.update_handoff_started = true;
+        Ok(())
+    }
+
+    /// Refuse a Start or Restart while a signed app update holds the node:
+    /// its lifecycle fence is held, or its one-way handoff has begun. After
+    /// an install that failed past the handoff, only exiting ARC releases
+    /// either. Start takes the lifecycle owner lock next, which this process
+    /// already holds as that fence. Locking a second open of the same file
+    /// fails against it (EWOULDBLOCK, os error 35 on macOS), and that used to
+    /// reach the user as "another ARC desktop currently owns the managed node
+    /// lifecycle". Restart's stop refused the fence in internal wording.
+    pub fn refuse_start_during_update(&self) -> Result<(), String> {
+        if self.update_lifecycle_lock.is_some() || self.update_handoff_started {
+            return Err(UPDATE_HOLDS_NODE.to_owned());
+        }
         Ok(())
     }
 
@@ -5903,6 +5923,55 @@ mod tests {
         assert!(manager.child.is_none());
 
         // Process exit is the only release after handoff.
+        drop(manager);
+        drop(acquire_managed_lifecycle_lock(&configured).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The trap behind "another ARC desktop currently owns the managed node
+    /// lifecycle": an install that failed after the handoff keeps the update
+    /// fence until ARC exits, and a Start in the same desktop took the owner
+    /// lock again and failed against it. Start and Restart refuse first now,
+    /// in the sentence Home shows for that state.
+    #[tokio::test]
+    async fn start_and_restart_refuse_plainly_while_an_update_holds_the_node() {
+        let root = resource_test_dir("update-holds-node");
+        arc_crypto::secret_file::secure_private_directory_tree(&root).unwrap();
+        let configured = root.join("data-v3").to_string_lossy().into_owned();
+        let mut manager = NodeManager::new();
+        manager.configure_managed_data_dir(&configured).unwrap();
+        assert_eq!(manager.refuse_start_during_update(), Ok(()));
+
+        manager.prepare_update_relaunch().await.unwrap();
+        assert_eq!(
+            manager.refuse_start_during_update(),
+            Err(UPDATE_HOLDS_NODE.to_owned())
+        );
+        // What the owner lock told such a Start before the refusal existed.
+        let contender = contend_for_lifecycle_lock(&configured);
+        assert!(
+            contender.contains("another ARC desktop currently owns the managed node lifecycle"),
+            "{contender}"
+        );
+
+        // A rejected install before the handoff releases the fence.
+        manager.abort_update_relaunch().await.unwrap();
+        assert_eq!(manager.refuse_start_during_update(), Ok(()));
+
+        // After the handoff nothing in this process releases it.
+        manager.prepare_update_relaunch().await.unwrap();
+        manager.begin_update_handoff().unwrap();
+        assert!(manager.abort_update_relaunch().await.is_err());
+        assert_eq!(
+            manager.refuse_start_during_update(),
+            Err(UPDATE_HOLDS_NODE.to_owned())
+        );
+        assert!(manager.stop().await.is_err());
+        assert_eq!(
+            manager.refuse_start_during_update(),
+            Err(UPDATE_HOLDS_NODE.to_owned())
+        );
+
         drop(manager);
         drop(acquire_managed_lifecycle_lock(&configured).unwrap());
         std::fs::remove_dir_all(root).unwrap();

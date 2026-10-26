@@ -629,6 +629,32 @@ test.describe("Dashboard", () => {
     await expect(restart).toHaveAttribute("title", /managed externally/);
   });
 
+  // An install that failed after its handoff keeps the update's fence until
+  // ARC exits. Start used to fail against it as "another ARC desktop
+  // currently owns the managed node lifecycle"; it is refused plainly now,
+  // and the Dashboard offers Home's one step instead of Start or Restart.
+  test("while an update ARC couldn't finish holds the node, the Dashboard offers Quit ARC instead of Start", async ({
+    page,
+  }) => {
+    await seedMockOverrides(page, {
+      start_node: { __reject: "ARC couldn't finish an update. Quit ARC and open it again." },
+    });
+    await page.goto("/");
+    await page.getByTestId("btn-start").click();
+
+    await expect(page.getByTestId("dashboard-subtitle")).toHaveText(
+      PLAIN_COPY.nodeStrip.updateFailed,
+    );
+    const quit = page.getByTestId("btn-quit-arc");
+    await expect(quit).toBeEnabled();
+    await expect(quit).toContainText(PLAIN_COPY.actions.quitArc);
+    await expect(page.getByTestId("btn-start")).toHaveCount(0);
+    await expect(page.getByTestId("btn-restart")).toHaveCount(0);
+    // The header carries the one sentence and the one step; no panel offers another try.
+    await expect(page.getByTestId("mutation-error")).toHaveCount(0);
+    await expect(page.getByTestId("btn-start-failure-retry")).toHaveCount(0);
+  });
+
   test("stats grid has four cards", async ({ page }) => {
     await page.goto("/");
     const grid = page.getByTestId("stat-grid");
