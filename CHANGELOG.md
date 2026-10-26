@@ -47,6 +47,17 @@ All notable changes to ARC Chain are tracked here. This project follows
   internal wording. Both now refuse with "ARC couldn't finish an update.
   Quit ARC and open it again.", and the Dashboard offers Quit ARC in place
   of Start and Restart, as Home's node strip already did (#218).
+- Node memory: the in-memory block table now stores each block behind a
+  pointer, so a bucket costs 17 bytes (a height, a pointer and a control
+  byte) instead of 313. The table keeps every block the node holds. It is
+  split into shards, and each shard's bucket array doubles when 7/8 full,
+  with every bucket sized for an entry whether filled or not: at 2^24
+  buckets in all (up to 14,680,064 blocks) the arrays took about 5,008 MiB,
+  and the next round of doublings, one per shard and all near the same
+  height, would have added another 5,008 MiB. That round now adds about
+  272 MiB. Each block is a separate allocation of its own size, so memory
+  still grows with the blocks held. Reads return the same blocks as
+  before, and nothing on disk or on the wire changes (#220).
 
 ## v0.8.15 - Release-preparation snapshot (2026-10-23)
 
