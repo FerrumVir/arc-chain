@@ -182,9 +182,9 @@ test.describe("start failure wording", () => {
   });
 
   // An install that failed after its handoff keeps the update's fence until
-  // ARC exits. Start and Restart used to fail against that fence as
-  // "another ARC desktop currently owns the managed node lifecycle" and
-  // offered another try; they are refused before it now.
+  // ARC exits. Start used to fail against that fence as "another ARC
+  // desktop currently owns the managed node lifecycle" and offered another
+  // try; Start and Restart are refused before it now.
   test("a Start refused while an unfinished update holds the node says to quit ARC", () => {
     for (const updateAvailable of [false, true]) {
       const view = describeStartFailure(NATIVE_UPDATE_UNFINISHED, { updateAvailable });

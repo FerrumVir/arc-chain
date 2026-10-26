@@ -41,12 +41,12 @@ All notable changes to ARC Chain are tracked here. This project follows
   write to is not refused: the updater asks for an administrator there, as
   before (#218).
 - While an update ARC couldn't finish holds the node, which lasts until ARC
-  quits, Start and Restart said "another ARC desktop currently owns the
-  managed node lifecycle … Resource temporarily unavailable (os error 35)":
-  they tried to take the lock ARC's own update was holding. They now refuse
-  with "ARC couldn't finish an update. Quit ARC and open it again.", and
-  the Dashboard offers Quit ARC in place of Start and Restart, as Home's
-  node strip already did (#218).
+  quits, Start said "another ARC desktop currently owns the managed node
+  lifecycle … Resource temporarily unavailable (os error 35)": it tried to
+  take the lock ARC's own update was holding. Restart was refused with
+  internal wording. Both now refuse with "ARC couldn't finish an update.
+  Quit ARC and open it again.", and the Dashboard offers Quit ARC in place
+  of Start and Restart, as Home's node strip already did (#218).
 
 ## v0.8.15 - Release-preparation snapshot (2026-10-23)
 

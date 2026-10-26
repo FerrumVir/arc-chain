@@ -3046,11 +3046,11 @@ impl NodeManager {
     /// Refuse a Start or Restart while a signed app update holds the node:
     /// its lifecycle fence is held, or its one-way handoff has begun. After
     /// an install that failed past the handoff, only exiting ARC releases
-    /// either. Their callers take the lifecycle owner lock next, which this
-    /// process already holds as that fence. Locking a second open of the
-    /// same file fails against it (EWOULDBLOCK, os error 35 on macOS), and
-    /// that used to reach the user as "another ARC desktop currently owns the
-    /// managed node lifecycle".
+    /// either. Start takes the lifecycle owner lock next, which this process
+    /// already holds as that fence. Locking a second open of the same file
+    /// fails against it (EWOULDBLOCK, os error 35 on macOS), and that used to
+    /// reach the user as "another ARC desktop currently owns the managed node
+    /// lifecycle". Restart's stop refused the fence in internal wording.
     pub fn refuse_start_during_update(&self) -> Result<(), String> {
         if self.update_lifecycle_lock.is_some() || self.update_handoff_started {
             return Err(UPDATE_HOLDS_NODE.to_owned());
@@ -5930,9 +5930,9 @@ mod tests {
 
     /// The trap behind "another ARC desktop currently owns the managed node
     /// lifecycle": an install that failed after the handoff keeps the update
-    /// fence until ARC exits, and a Start or Restart in the same desktop took
-    /// the owner lock again and failed against it. They refuse first now, in
-    /// the sentence Home shows for that state.
+    /// fence until ARC exits, and a Start in the same desktop took the owner
+    /// lock again and failed against it. Start and Restart refuse first now,
+    /// in the sentence Home shows for that state.
     #[tokio::test]
     async fn start_and_restart_refuse_plainly_while_an_update_holds_the_node() {
         let root = resource_test_dir("update-holds-node");
