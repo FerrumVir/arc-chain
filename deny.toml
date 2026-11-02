@@ -84,13 +84,34 @@ ignore = [
     # update, and only after `download()` has verified the update's minisign
     # signature. ARC publishes signed `-setup.exe` updater artifacts
     # (`createUpdaterArtifacts = true`), never zips, so an exploit needs the
-    # release signing key. No release accepts the patched zip >= 9.0.0:
-    # candle-core 0.11.0 requires zip ^8.6 and tauri-plugin-updater 2.14.0
-    # requires zip ^4. Remove all three once both crates accept zip >= 9 and
-    # the lockfiles move to it, no later than the v0.9.0 dependency review.
+    # release signing key. Corrected 2026-11-02: the patched zip >= 9.0.0
+    # now has released paths. candle-core 0.11.1 (2026-10-31) requires zip
+    # ^9.1.3, and tauri-plugin-updater 2.14.1 (2026-10-28) requires zip ^9 on
+    # Windows. The lockfiles still hold candle-core 0.8.4 and
+    # tauri-plugin-updater 2.10.1. The candle move needs the cross-arch
+    # golden vectors re-run and the updater move needs an update-path test,
+    # so both belong to the v0.9.0 dependency review. Remove all three once
+    # the lockfiles move to zip >= 9, no later than that review.
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    # 2026-11-02 ARC release engineering, risk accepted by ARC's CEO (TJ) on
+    # 2026-11-02: RUSTSEC-2026-0429 (GHSA-q7v9-x93c-xqv3) is a denial of
+    # service in `ZipArchive::extract`: a symlink entry with a huge declared
+    # size makes `Vec::with_capacity` abort the process (no memory
+    # unsafety, disclosure or corruption). The node graph's zip 1.1.4 (from
+    # candle-core 0.8.4) has no symlink branch in `extract`, so the
+    # vulnerable allocation does not exist in it (GitHub's advisory range
+    # starts at 1.3.0), and candle-core never calls `extract`. The desktop
+    # graph's zip 4.6.1 (from tauri-plugin-updater 2.10.1) compiles only on
+    # Windows and is reached only for a zip-format update payload after
+    # `download()` has verified its minisign signature. The updater channel
+    # (desktop/src-tauri/src/updater_channel.rs) binds Windows to the
+    # exact-tag `arc-desktop-windows-x86_64-setup.exe` asset, so an exploit
+    # needs the release signing key. Remove when the lockfiles move to
+    # candle-core >= 0.11.1 and tauri-plugin-updater >= 2.14.1 (both on
+    # zip >= 9), no later than the v0.9.0 dependency review.
+    "RUSTSEC-2026-0429",
     # 2026-10-18 ARC release engineering, risk accepted by the repository
     # owner (FerrumVir) on 2026-10-18: ruzstd 0.5.0 can be driven out of memory by a crafted zstd
     # input. It is reached only through object 0.32's default `compression`

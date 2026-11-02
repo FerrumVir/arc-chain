@@ -367,7 +367,15 @@ jobs:
         run: |
           set -Eeuo pipefail
           for package in dashboard desktop sdk sdk/typescript sdks/typescript; do
-            npm --prefix "$package" audit --package-lock-only --audit-level=low
+            if [ "$package" = sdks/typescript ]; then
+              # The published compatibility SDK ships only its runtime
+              # dependencies, which block at any severity; its dev-only test
+              # tooling blocks at high. Same policy as ci.yml.
+              npm --prefix "$package" audit --package-lock-only --omit=dev --audit-level=low
+              npm --prefix "$package" audit --package-lock-only --audit-level=high
+            else
+              npm --prefix "$package" audit --package-lock-only --audit-level=low
+            fi
           done
 
       - name: Install pinned Actionlint
