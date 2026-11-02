@@ -905,9 +905,9 @@ reason unless policy, confirmed history, treasury, and remaining consensus
 budget all permit one. These durability claims are still candidate behavior
 until the protected production cutover completes.
 
-The public v2 seeds still exhibit two known API bugs: `/models` double-counts
+The public v2 seeds had two known API bugs: `/models` double-counts
 replicated layer coverage, and `/worker/earnings/{addr}` reports display
-arithmetic rather than mined income. The v3 candidate fixes both: coverage is a
+arithmetic rather than mined income. v0.8.16 (protocol v3) fixes both: coverage is a
 range union, while earnings count only successful retained
 `CommunityInferenceReward` receipts. A submitted reward, raw `0x16`
 attestation, failed receipt, or faucet POST never increments confirmed ARC.
@@ -916,7 +916,7 @@ confirmed receipt history, a treasury that can fund another full reward, and
 remaining consensus block/epoch/worker/coordinator budget; otherwise the value is null and the API returns the reason. The v0.8 reward is a protocol-capped
 testnet promotional compute subsidy, not customer demand or revenue. Five-of-six
 recomputation proves output agreement, not that a customer paid for the job.
-Those fixes are not live until the fleet cutover completes.
+All six validators reported v0.8.16 on 2026-10-31.
 
 See `docs/HOW-SHARDING-WORKS.md` for the wire protocol.
 
