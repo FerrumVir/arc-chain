@@ -18,7 +18,7 @@ produces an identical transcript.
 | Prompts | 16 fixed, harmless prompts in [`scripts/determinism-proof/prompts.json`](../scripts/determinism-proof/prompts.json), tokenized by the GGUF SentencePiece tokenizer (`arc.gguf-llama.spm-score-merge.v1`) |
 | Budget | 32 new tokens per prompt |
 | Platforms | GitHub-hosted runners `macos-15` (Apple Silicon), `macos-15-intel` (Intel x86_64), `ubuntu-24.04` (x86_64) and `windows-latest` (x86_64) |
-| Kernels | The default scalar per-row INT8 projection kernel, and the opt-in SIMD "limb" kernel (`ARC_FAST_CANONICAL_KERNEL`): NEON dotprod on arm64, AVX2 on x86_64. Each runs in its own job. |
+| Kernels | The scalar per-row INT8 projection kernel, and the SIMD "limb" kernel: NEON dotprod on arm64, AVX2 on x86_64. Each runs in its own job, and the driver sets the kernel explicitly. When these results were measured the SIMD kernel was opt-in (`ARC_FAST_CANONICAL_KERNEL`). Since v0.8.12 it is on by default, and the engine can also pick a wider exact kernel (SMMLA on arm64, VNNI on x86_64), so the driver pins the SIMD job to the base kernel listed here. |
 
 The driver is
 [`crates/arc-inference/examples/determinism_proof.rs`](../crates/arc-inference/examples/determinism_proof.rs).
@@ -175,8 +175,10 @@ Rust toolchain manager `rustup`. The repository pins its toolchain, so the
 first build installs it. Run times on the CI runners are listed under Results;
 a personal computer will differ.
 
-Fetch one exact commit: the measured commit listed under Results, or any
-later commit that contains this page. Then run the script for your platform.
+Fetch one exact commit by its full 40-character ID (`git fetch` does not
+accept a shortened one): the measured commit,
+`be37100b2686eb6e8a1db0ea42b425a2ff7f6cde`, or any later commit that contains
+this page. Then run the script for your platform.
 
 macOS or Linux:
 
@@ -186,7 +188,7 @@ git init arc-chain && cd arc-chain
 git remote add origin https://github.com/FerrumVir/arc-chain.git
 git fetch --depth 1 origin "$ARC_SOURCE_REV"
 git checkout --detach FETCH_HEAD
-scripts/determinism-proof/run-proof.sh            # default scalar kernel
+scripts/determinism-proof/run-proof.sh            # scalar kernel (the script's default)
 scripts/determinism-proof/run-proof.sh --kernel simd
 ```
 
@@ -224,6 +226,9 @@ computer.
 - **Four runner types.** Other CPUs (for example RISC-V or 32-bit targets) are
   untested. The SIMD kernel is NEON dotprod on arm64 and AVX2 on x86_64; on
   arm64 the attention dot product also uses an exact NEON path in both jobs.
+  The wider exact kernels added in v0.8.12 (SMMLA on arm64, AVX-VNNI and
+  AVX-512 VNNI on x86_64) are not covered: the driver pins the SIMD job to the
+  base kernel.
   "Apple Silicon" is one GitHub-hosted virtual Apple M1 runner with 7 GB of
   memory; other Apple chips are untested.
 - **Two execution profiles.** This workflow runs `arc.gguf-llama.i8-per-row.rope-interleaved.v1`

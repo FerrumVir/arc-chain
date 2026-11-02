@@ -10,7 +10,13 @@
 //!
 //! Nothing machine-specific (OS, CPU, kernel choice, timing) is written to the
 //! transcript. That goes to the separate run JSON, so the scalar kernel and the
-//! opt-in SIMD kernel must also produce the identical transcript.
+//! SIMD kernel must also produce the identical transcript.
+//!
+//! `--kernel simd` pins the architecture's base limb kernel: NEON dotprod on
+//! arm64, AVX2 on x86_64. Since v0.8.12 the engine otherwise runs one-token
+//! projections on the widest exact kernel the CPU has (SMMLA on arm64, VNNI on
+//! x86_64), so the pin keeps `simd` meaning the kernel the published results
+//! measured.
 //!
 //! The generation loop is the engine's own greedy v2 loop
 //! (`try_generate_v2_greedy`): one internal BOS forward, token-at-a-time
@@ -37,7 +43,7 @@ use arc_inference::cached_integer_model::{
     load_cached_model_canonical_i8_interleaved_rope,
 };
 use arc_inference::canonical_prefill;
-use arc_inference::canonical_simd;
+use arc_inference::canonical_simd::{self, BatchedKernel};
 use arc_inference::integer_lut::argmax_i64;
 use arc_inference::llama_spm_tokenizer::LlamaGgufSpmTokenizer;
 use arc_inference::tensor_parallel::hash_i64;
@@ -66,13 +72,23 @@ impl Kernel {
         }
     }
 
+    /// The kernel this request pins for the engine's vector projections: none
+    /// for `scalar`, and the architecture's base limb kernel for `simd`, so a
+    /// CPU with SMMLA or VNNI still runs NEON dotprod or AVX2.
+    fn pinned(self) -> Option<BatchedKernel> {
+        match self {
+            Kernel::Scalar => None,
+            Kernel::Simd => [BatchedKernel::NeonSdot, BatchedKernel::Avx2]
+                .into_iter()
+                .find(|kernel| kernel.available()),
+        }
+    }
+
     /// The projection kernel this build actually dispatches for the request.
     fn effective_label(self) -> &'static str {
         match self {
             Kernel::Scalar => "scalar-i8xi64",
-            Kernel::Simd if cfg!(target_arch = "aarch64") => "neon-sdot-limb",
-            Kernel::Simd if cfg!(target_arch = "x86_64") => "avx2-limb",
-            Kernel::Simd => "unavailable",
+            Kernel::Simd => self.pinned().map_or("unavailable", BatchedKernel::label),
         }
     }
 }
@@ -572,11 +588,14 @@ fn main() -> Result<(), String> {
     }
 
     // Force each switch's one-time environment initialisation before setting
-    // it, so an inherited ARC_FAST_CANONICAL_KERNEL or ARC_BATCHED_PREFILL
-    // cannot change the path after this point.
+    // it, so an inherited ARC_CANONICAL_KERNEL, ARC_FAST_CANONICAL_KERNEL,
+    // ARC_CANONICAL_BATCHED_KERNEL or ARC_BATCHED_PREFILL cannot change the
+    // path after this point.
     let want_simd = args.kernel == Kernel::Simd;
     let _ = canonical_simd::fast_canonical_kernel_enabled();
+    let _ = canonical_simd::batched_kernel_preference();
     canonical_simd::set_fast_canonical_kernel(want_simd);
+    canonical_simd::set_batched_kernel_preference(args.kernel.pinned());
     if want_simd && !canonical_simd::dotprod_available() {
         return Err(format!(
             "--kernel simd requested, but this {} CPU/build has no exact SIMD backend \
@@ -586,6 +605,9 @@ fn main() -> Result<(), String> {
     }
     if canonical_simd::fast_canonical_kernel_enabled() != want_simd {
         return Err("the canonical kernel switch did not take effect".into());
+    }
+    if want_simd && canonical_simd::selected_batched_kernel() != args.kernel.pinned() {
+        return Err("the base kernel pin did not take effect".into());
     }
     let _ = canonical_prefill::batched_prefill_enabled();
     canonical_prefill::set_batched_prefill_enabled(false);
@@ -818,6 +840,7 @@ fn main() -> Result<(), String> {
             "effective": args.kernel.effective_label(),
             "simd_available": canonical_simd::dotprod_available(),
             "fast_kernel_enabled": canonical_simd::fast_canonical_kernel_enabled(),
+            "kernel_pinned": canonical_simd::batched_kernel_preference().map(BatchedKernel::label),
             "batched_prefill_enabled": canonical_prefill::batched_prefill_enabled(),
             "projection_census": serde_json::to_value(census).unwrap_or(Value::Null),
             "attention_dot": if cfg!(target_arch = "aarch64") {
@@ -834,7 +857,9 @@ fn main() -> Result<(), String> {
             "rayon_threads": rayon::current_num_threads(),
         },
         "environment": {
+            "ARC_CANONICAL_KERNEL": env("ARC_CANONICAL_KERNEL"),
             "ARC_FAST_CANONICAL_KERNEL": env("ARC_FAST_CANONICAL_KERNEL"),
+            "ARC_CANONICAL_BATCHED_KERNEL": env("ARC_CANONICAL_BATCHED_KERNEL"),
             "ARC_BATCHED_PREFILL": env("ARC_BATCHED_PREFILL"),
             "RAYON_NUM_THREADS": env("RAYON_NUM_THREADS"),
         },

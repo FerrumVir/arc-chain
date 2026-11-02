@@ -3,9 +3,10 @@ name: Determinism proof
 # Public, reproducible evidence that ARC's canonical per-row INT8 engine gives
 # byte-identical output for a real 7B model (Llama-2-7B-Chat Q4_K_M, pinned by
 # SHA-256) on four CPU platforms: Apple Silicon macOS, Intel macOS, Linux
-# x86_64 and Windows x86_64. Each platform runs the default scalar projection
-# kernel and the opt-in SIMD limb kernel (NEON dotprod on arm64, AVX2 on
-# x86_64) in separate jobs.
+# x86_64 and Windows x86_64. Each platform runs the scalar projection kernel
+# and the SIMD limb kernel (NEON dotprod on arm64, AVX2 on x86_64) in separate
+# jobs. The driver pins the SIMD jobs to that base kernel, so the wider SMMLA
+# and VNNI kernels that v0.8.12 can select do not replace it.
 #
 # Every leg writes a platform-independent transcript: the BLAKE3 of the exact
 # logits and K/V rows at every forward position plus every generated token ID.
