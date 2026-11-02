@@ -1,5 +1,14 @@
 # Getting Started with ARC Node
 
+> **Status (2026-11-02):** v0.8.16 was released on 2026-10-27. On 2026-10-31
+> at 03:23 UTC, all six validators reported v0.8.16 and returned the same
+> block hash and state root at height 14,743,000, so the public seeds are no
+> longer split. Rewards are paid in testnet ARC, which has no monetary value.
+> The 2026-08-31 notice below is kept as a dated record and is superseded by
+> this status.
+
+> **Superseded by the status above.**
+>
 > **Source-freeze recovery notice (2026-08-31; tag-stable):** At this review
 > cutoff, v0.8.0 was an unreleased recovery candidate, public v0.7.11 was
 > desktop-only, and the public seeds still ran older split/stalled chain state.
@@ -64,8 +73,8 @@ Windows version only after a release-blocking runtime test covers it.
 
 ### Linux (Ubuntu / Debian)
 
-After the complete v0.8.16 release is published, use its normalized desktop
-asset name:
+Use the normalized desktop asset name from the
+[v0.8.16 release](https://github.com/FerrumVir/arc-chain/releases/tag/v0.8.16):
 
 ```bash
 sudo apt install ./arc-desktop-linux-x86_64.deb
@@ -155,8 +164,10 @@ After setup:
 - The Dashboard distinguishes a running process from peer connectivity and
   selected-host chain health. Do not treat a `live` health string or advancing
   DAG round as proof of block production or cross-seed agreement.
-- The **Network** tab attributes every chain number to one pinned host. The
-  public seeds are divergent, so it intentionally does not blend them.
+- The **Network** tab attributes every chain number to one selected host and
+  intentionally does not blend hosts into one number. The public seeds were
+  divergent at the 2026-08-31 source freeze; on 2026-10-31 all six validators
+  returned the same block hash and state root at height 14,743,000.
 - The tray icon (🟣 dot, top-right of your menu bar / system tray) tells you
   the desktop process is present when the window is closed. Use Dashboard health
   and peer fields to check the node process and network state separately.
@@ -242,17 +253,15 @@ This is testnet ARC — no real-world value.
 2. Treat only a successful mined `CommunityInferenceReward` (`0x25`) receipt as
    payment. Raw `0x16` rows are shown separately as unpaid inference claims.
 
-The unreleased v0.8.16 candidate configures 2.5 testnet ARC per successful
-`0x25` receipt, but issuance also requires exact-artifact work assignment,
+v0.8.16 configures 2.5 testnet ARC per successful `0x25` receipt, but
+issuance also requires exact-artifact work assignment,
 authenticated recomputation, a signed worker certificate, active genesis
 protocol activation, validator approval collection, strict
 greater-than-two-thirds identity and active-stake approval, a funded treasury,
 and successful block inclusion. With six equally staked validators, five must
-approve. The source candidate implements approval collection, and the
-checkpoint-bound recovered genesis schedules activation at block 137146, but
-neither is available on the current v2 public fleet. Until the coordinated
-cutover proves that path and enables the independent runtime switch, the
-candidate fails closed and shows no forward reward projection.
+approve. Approval collection is implemented, and the checkpoint-bound
+recovered genesis schedules activation at block 137146. If any requirement is
+missing, issuance fails closed and the app shows no forward reward projection.
 
 The deployed v2 seeds expose legacy count × constant display arithmetic. That
 does not reconcile to payment and must not be described as earnings. The Aug 26
@@ -270,10 +279,9 @@ warning appears.
 
 ### Verify a block, transaction, or reward in the explorer
 
-The corrected static explorer is built but is not a supported public service
-until the coordinated v3 cutover passes its live gates. It will remain in
-maintenance mode rather than inventing a canonical chain from the current six
-forks.
+The corrected static explorer is built but is not yet a supported public
+service. It stays in maintenance mode until its live gates pass, rather than
+inventing a canonical chain.
 
 After a proven cutover, **Canonical timeline** retains blocks `0..H` from the
 signed checkpoint and continues with the exact parent-linked v3 block at
@@ -312,9 +320,16 @@ ceiling, not a reward multiplier.
 
 **How do I update?**
 
-When **Check for app updates automatically** is enabled, the candidate checks
-shortly after startup and every 24 hours. Background checks do not download or
-install anything; the user must confirm installation. The macOS, Windows NSIS,
+When **Check for app updates automatically** is on, ARC checks shortly after
+startup and every 24 hours. Since v0.8.14, **Install signed app updates
+automatically when idle** is also on by default: ARC downloads a signed update
+in the background, installs it when no jobs are running, and restarts. v0.8.14
+turned it on once for desktops that had it off; turn it off in Settings to
+confirm each install yourself, and that choice is kept. On macOS, keep ARC
+Node in your Applications folder and open it from there: since v0.8.16, ARC
+defers an update it can't apply where it runs (the mounted `.dmg`, the folder
+it was downloaded to, or another drive) and asks you to drag ARC Node into
+Applications. The macOS, Windows NSIS,
 and Linux AppImage builds consume the signed Tauri
 `latest.json` manifest. The updater refuses an artifact whose signature does
 not match the public key pinned in `desktop/src-tauri/tauri.conf.json`. Linux
@@ -336,9 +351,12 @@ the phrase. The local phrase copy is not a substitute for an offline backup
 and is removed if you delete the app-data directory. Do not reset or uninstall
 until you have verified your backup.
 
-**Where do I report bugs?**
+**Where do I get help or report bugs?**
 
-GitHub Issues: <https://github.com/FerrumVir/arc-chain/issues>
+Ask in the ARC community on [Discord](https://discord.com/invite/arcreactorai)
+or [Telegram](https://t.me/JoinTheARC). To report a reproducible bug, open a
+GitHub issue: <https://github.com/FerrumVir/arc-chain/issues>. Never post your
+12-word recovery phrase or a private key in a chat or an issue.
 
 ---
 

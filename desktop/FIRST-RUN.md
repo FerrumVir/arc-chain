@@ -86,8 +86,10 @@ chmod +x arc-desktop-linux-x86_64.AppImage
    off idle sleep only while a job is computing.
 5. **Submits** a testnet faucet request when onboarding reaches that step. A
    submission is not a balance credit; only a successful mined receipt on the
-   selected chain confirms it. The current public fleet is divergent, and the
-   checked-in observer genesis does not produce blocks.
+   selected chain confirms it. The public fleet was divergent at the
+   2026-08-31 source freeze; on 2026-10-31 all six validators returned the
+   same block hash and state root at height 14,743,000. The checked-in
+   observer genesis does not produce blocks.
 
 ## What to do if onboarding fails
 

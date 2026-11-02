@@ -2,6 +2,13 @@
 // On the Foundations of Trustworthy Artificial Intelligence
 // TJ Dunham — ARC — March 2026
 // ============================================================================
+// Scope note (2 November 2026): This paper is dated March 2026. Its GPU
+// bit-identity, speed, throughput and node-count figures are historical lab
+// and testnet results, not current claims. The current proven scope is in
+// INFERENCE_DETERMINISM.md in the ARC Chain repository
+// (github.com/FerrumVir/arc-chain): CPU known-answer tests on ARM and x86.
+// The same note is printed above the abstract.
+// ============================================================================
 
 #set document(
   title: "On the Foundations of Trustworthy Artificial Intelligence",
@@ -67,6 +74,16 @@
   #text(size: 9pt, fill: rgb("#777"))[March 2026]
   #v(1.4em)
 ]
+
+// ---------- Scope note ----------
+#block(
+  width: 100%,
+  inset: (x: 1em, y: 0.6em),
+  stroke: 0.5pt + rgb("#888"),
+)[
+  #text(size: 9pt)[*Scope note (2 November 2026).* This paper is dated March 2026. Its GPU bit-identity, speed, throughput and node-count figures are historical lab and testnet results, not current claims. The current proven scope is in `INFERENCE_DETERMINISM.md` in the ARC Chain repository (`github.com/FerrumVir/arc-chain`): CPU known-answer tests on ARM and x86.]
+]
+#v(0.6em)
 
 // ---------- Abstract ----------
 #block(

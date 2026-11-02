@@ -2,11 +2,10 @@
 ![Tests](https://img.shields.io/badge/Rust_tests-2%2C100%2B_defined-brightgreen)
 ![License](https://img.shields.io/badge/license-BUSL--1.1-blue)
 ![Inference](https://img.shields.io/badge/inference-CPU_KAT--verified-purple)
-![Testnet](https://img.shields.io/badge/public_fleet-forked-red)
 
 # ARC Chain - Trustworthy AI
 
-**A Rust Layer 1 recovery candidate designed to make AI inference
+**A Rust Layer 1 testnet designed to make AI inference
 reproducible, independently recomputed, and explicitly authorized before a
 community reward can settle.**
 
@@ -17,13 +16,19 @@ upstream components vendored for reproducibility are identified under
 ## v0.8.16 release status and quickstart
 
 <!-- ARC_PUBLIC_TRUTH_BEGIN -->
-> **Source-freeze snapshot (2026-08-31; tag-stable):** At this commit's review
-> cutoff, v0.8.0 / protocol v3 was not published or deployed, and GitHub
-> `latest` was still the desktop-only v0.7.11 bundle. This is a historical
-> pre-tag statement, not a live status probe. An immutable v0.8.0 tag keeps
-> this source-freeze record; determine current release and fleet status only
-> from the exact release evidence and signed rollout receipts described below.
-> The default branch may receive a reviewed post-rollout status update.
+> **Status (2026-11-02):** v0.8.16 was released on 2026-10-27. On 2026-10-31
+> at 03:23 UTC, all six validators reported v0.8.16 and returned the same
+> block hash and state root at height 14,743,000:
+>
+> - block hash `01b9bdd1218e88f814ec2a686114c5b589a62f99d0712265e868c7b9b7714f60`
+> - state root `b4f83133e1f61fbfda06b943df33113942bf7c376c21bdfd2f6a644bd9ecc333`
+>
+> Community rewards are paid in testnet ARC, which has no monetary value. This
+> is a dated record, not a live status probe. The
+> [2026-08-31 source-freeze snapshot](#history-2026-08-31-source-freeze-snapshot)
+> is superseded and kept under History. Older sections that describe the
+> 2026-08-31 source freeze or a release candidate are historical where they
+> differ from this status.
 
 This README does not use the moving `latest` release as an install source. The
 immutable v0.8.x release is intentionally not promoted to GitHub's global
@@ -31,10 +36,10 @@ immutable v0.8.x release is intentionally not promoted to GitHub's global
 v0.7-to-v0.8 migration is therefore manual and pinned to the exact tag; the
 legacy updater is not a supported migration mechanism.
 
-The protected v0.8.0 tag has no published assets. The current release target is
-v0.8.16. If the complete
+The protected v0.8.0 tag has no published assets. The current release is
+v0.8.16. The
 [exact v0.8.16 release](https://github.com/FerrumVir/arc-chain/releases/tag/v0.8.16)
-shows every required asset, `SHA256SUMS`, and `SHA256SUMS.sig`, an
+carries the signed release assets, `SHA256SUMS`, and `SHA256SUMS.sig`, so an
 SSH/EC2/VPS operator can run:
 
 ```bash
@@ -49,32 +54,18 @@ fi
 bash install.sh --version 0.8.16
 ```
 
-Expected `install.sh` SHA-256 for this candidate:
+Expected `install.sh` SHA-256 for v0.8.16:
 `893e930610f6380fe6b75cca64ca84ff84f9e711a3da09345abe86b4a66f1e8e`.
 
 The unified release contract restores headless Linux amd64 and arm64, Intel
 and Apple Silicon macOS, Windows CLI binaries, signed desktop-updater payloads,
-normalized desktop installers, and one checksummed installer. Until the exact
-release evidence exists, build and test only from a reviewed checkout; do not
-treat the commands above as a production download. Publication alone never
-proves fleet deployment: the public fleet also requires the
+normalized desktop installers, and one checksummed installer. Publication alone
+never proves fleet deployment: the public fleet also requires the
 [coordinated recovery/cutover gate](docs/VALIDATOR-FLEET-ROLLOUT.md).
 Unsigned artifacts, updater signatures, the owner-signed checksum manifest,
 draft publication, and read-only release verification cross separate
 exact-ID/digest-bound jobs; protected key windows execute only reviewed direct
 signing tools and never repository programs.
-
-### Community support answer sheet
-
-| Community question | Evidence-backed answer at the 2026-08-31 source freeze |
-|---|---|
-| Can an SSH-only EC2/VPS install ARC? | Not from public v0.7.11. The complete v0.8.0 release restores real headless `arc-node` assets for Linux amd64 and arm64; the GUI packages are not server binaries. |
-| Are Intel and Apple Silicon Macs supported? | The v0.8.0 contract builds separate Intel and Apple Silicon CLI and desktop assets. Treat those links as installable only when the exact immutable release exposes the complete signed asset set. |
-| Does automatic update work? | The first v0.7-to-v0.8 transition is manual and exact-tag pinned; the unsigned legacy updater is not allowed to perform that migration. Public v0.7.11 saved the desktop preference but never scheduled checks. The v0.8.0 source-freeze candidate adds signed desktop checks after startup and every 24 hours, plus a transactional daily headless updater. Desktop updates still require confirmation; `.deb` and `.rpm` remain package-manager owned. |
-| When are the seeds upgraded? | At the source freeze they had not been upgraded, and there is no honest calendar promise in this repository. Publishing v0.8.0 alone does not update them. Current deployment requires signed rollout receipts proving one coordinated, archive-bound checkpoint cutover and agreement by all six above the greatest block height users saw before maintenance. |
-| Can a stake-zero worker earn the configured 2.5 testnet ARC? | Stake zero is eligible, but registration and raw inference tx `0x16` pay nothing. Exact-model assignment, independent verification, five-of-six reward authorization, activation, treasury limits, and a successful mined `0x25` receipt are all required. At the source freeze, that payment path was not live on the public v2 fleet. |
-| What should a worker run? | A router needs no model or GPU. The current full-worker target is Llama-2-7B Q4_K_M (about 4 GB on disk). The release has no validated minimum-RAM claim yet: prove a complete model load and inference with OS/chain headroom on the target host. GPU is optional and hardware never guarantees work. |
-| Where are earnings and the block explorer? | At the source freeze, the corrected dashboard and source-pinned explorer were candidates rather than supported public services. They fail closed to maintenance mode unless live checkpoint, replica, inference, and receipt gates pass; projections fail closed to null when evidence is insufficient. |
 
 Use the [headless/server guide](docs/HEADLESS_INSTALL.md) for the complete
 platform, update, permissions, and troubleshooting contract. After the seed
@@ -86,6 +77,16 @@ missing evidence.
 <!-- ARC_PUBLIC_TRUTH_END -->
 
 📄 Paper: *On the Foundations of Trustworthy Artificial Intelligence*
+
+## Community and help
+
+- Discord: <https://discord.com/invite/arcreactorai>
+- Telegram: <https://t.me/JoinTheARC>
+
+**Get help:** ask in Discord or Telegram. To report a reproducible bug, open a
+[GitHub issue](https://github.com/FerrumVir/arc-chain/issues) with your
+operating system, your ARC version, and what you saw. Never post your 12-word
+recovery phrase or a private key in a chat or an issue.
 
 ---
 
@@ -161,65 +162,19 @@ trade, not a better prover.
 
 ---
 
-## Public fleet snapshot
-
-**Read-only public-fleet snapshot, 2026-08-31 around 13:19 CDT.** These are
-observations, not a standing uptime promise:
-
-| Seed | Version | State height | Peers | DAG round |
-|---|---:|---:|---:|---:|
-| NYC | 0.7.2 | 138,244 | 8 | 9,841,293 |
-| LAX | 0.7.9 | 129,637 | 8 | 9,841,293 |
-| AMS | 0.7.9 | 89,633 | 8 | 9,841,293 |
-| LHR | 0.7.9 | 51,422 | 8 | 9,841,292 |
-| NRT | 0.7.9 | 96,770 | 8 | 9,841,292 |
-| SGP | 0.7.9 | 97,591 | 8 | 9,841,292 |
-
-At common height 50,000, all six reachable seeds returned **six different
-block hashes and six different state roots**. The dashboard independently
-repeated the comparison at the highest common height, 51,422, with the same
-6/6 divergence. Nearly matching DAG rounds in the newer snapshot do not repair
-that block/state disagreement. Therefore the public fleet is not one replicated chain.
-Stop reward issuance, pin one source for diagnosis, and choose an approved
-canonical recovery state before any rollout. An advancing DAG round or
-`status: ok` does not override this result.
-
-The same snapshot found community `total_work_completed: 0` across the worker
-list. No public inference job, validator-authorized `0x25` reward, or mined
-community payment was demonstrated. A raw `InferenceAttestation` (`0x16`) is a
-computation claim and pays nothing.
-
-Version skew is real too: NYC runs v0.7.2, the other five run v0.7.9, and
-**nothing on the network runs v0.7.11** — that version exists only as a desktop
-bundle. See [`ALERTS.md`](ALERTS.md) for the dated 2026-08-17 alert record;
-re-probe the fleet rather than treating it as current status.
-
-The concise evidence record is
-[`docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md).
-
-There is also a trust-root incident: legacy production validator seed material
-was published in repository history. Those six identities must be replaced;
-deleting the strings from the current tree does not make them safe. The v3
-candidate requires mode-`0600` Ed25519 keyfiles and a complete public-address
-genesis, and intentionally refuses staked production startup until operators
-approve a new genesis/checkpoint and coordinated quorum cutover. Rewards remain
-off during that migration.
-
----
-
 ## Test it yourself
 
 ### Desktop GUI (requires a screen)
 
-| Candidate desktop build target | Normalized v0.8.16 asset (valid after publication) |
+| Desktop build target | Normalized v0.8.16 asset |
 |---|---|
 | **macOS — Apple Silicon** (built/packaged on macOS 15) | [DMG](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.16/arc-desktop-macos-arm64.dmg) |
 | **macOS — Intel** (built/packaged on macOS 15 Intel) | [DMG](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.16/arc-desktop-macos-x86_64.dmg) |
 | **Windows — x86_64** (built/packaged on GitHub `windows-latest`) | [NSIS installer](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.16/arc-desktop-windows-x86_64-setup.exe) · [MSI](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.16/arc-desktop-windows-x86_64.msi) |
 | **Linux desktop — x86_64** (built/packaged on Ubuntu 24.04) | [AppImage](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.16/arc-desktop-linux-x86_64.AppImage) · [.deb](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.16/arc-desktop-linux-x86_64.deb) · [.rpm](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.16/arc-desktop-linux-x86_64.rpm) |
 
-These stable names are generated by the unified v0.8.16 release pipeline;
-until that exact release is published, the links intentionally do not resolve.
+These stable names are generated by the unified v0.8.16 release pipeline, and
+the links point at the published v0.8.16 release.
 The macOS package metadata declares 11.0 as its minimum, but CI currently runs
 the package only on macOS 15; no older-macOS or Windows-version runtime floor is
 claimed until those exact versions receive a release-blocking test.
@@ -229,12 +184,18 @@ below. Linux ARM64 is also headless-only.
 
 The public v0.7.11 desktop could manually check, verify, and install a signed
 update from Settings, but its saved automatic-update preference never started
-a scheduler. The v0.8.16 candidate now checks the signed manifest shortly after
-startup and every 24 hours when that setting is enabled. Background checks do
-not download or install anything; the user confirms installation. macOS,
-Windows, and Linux AppImage can then update in place. `.deb` and `.rpm` remain
-owned by their package managers; the app reports the available version but
-cannot invoke in-app replacement for those channels.
+a scheduler. v0.8 desktops check the signed manifest shortly after startup and
+every 24 hours when **Check for app updates automatically** is on. Since
+v0.8.14, **Install signed app updates automatically when idle** is also on by
+default: ARC downloads a signed update in the background, installs it when no
+jobs are running, and restarts. v0.8.14 turned it on once for desktops that
+had it off; turn it off in Settings to confirm each install yourself, and that
+choice is kept. On macOS, run ARC from the Applications folder: since v0.8.16,
+ARC defers an update it can't apply where it runs (the mounted `.dmg`, the
+folder it was downloaded to, or another drive) and asks you to drag ARC Node
+into Applications. macOS, Windows, and Linux AppImage update in place. `.deb`
+and `.rpm` remain owned by their package managers; the app reports the
+available version but cannot invoke in-app replacement for those channels.
 
 **📖 Desktop controls:** [Getting Started with ARC Node](docs/GETTING_STARTED.md)
 — release gates, identity, inference evidence, faucet, mined reward receipts,
@@ -244,7 +205,7 @@ and FAQ.
 
 ### Headless / server node (no GUI or display required)
 
-The candidate headless assets target Linux x86_64/amd64 and ARM64, macOS Apple
+The v0.8.16 headless assets target Linux x86_64/amd64 and ARM64, macOS Apple
 Silicon and Intel, and Windows x86_64. The installer supports Linux and macOS;
 Windows Server operators download the two `.exe` assets and `SHA256SUMS`
 manually from the exact v0.8.16 release. The Linux x86_64/amd64 artifact is
@@ -254,9 +215,9 @@ runtime gate on Ubuntu 24.04 and 26.04. The macOS binaries boot on macOS 15
 Apple-Silicon and Intel runners, and the Windows x86_64 binary boots on GitHub's
 `windows-latest` runner; those gates do not establish older OS-version floors.
 
-The following recovery command is intentionally pinned and becomes valid only
-after GitHub shows the complete `v0.8.16` release. The moving `latest` alias is
-never used by the initial install command.
+The following recovery command is intentionally pinned to the complete
+`v0.8.16` release. The moving `latest` alias is never used by the initial
+install command.
 
 ```bash
 curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.16/install.sh
@@ -434,8 +395,9 @@ ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-demo.sh
 ```
 
 Run this only against a controlled local or reviewed recovery-candidate
-coordinator. Automatic public-fleet discovery is disabled because the public v2
-seeds have mixed versions and divergent state. The script inspects the selected
+coordinator. Automatic public-fleet discovery is disabled in this script; it
+was turned off during production recovery, when the public v2 seeds had mixed
+versions and divergent state. The script inspects the selected
 pipeline, dispatches a prompt, prints its trace, and asks for recomputation.
 
 A word on that re-run, because it is the point of the demo. The coordinator
@@ -458,11 +420,10 @@ proof.
 
 In the read-only 2026-08-28 public-v2 snapshot, `model_hash` was still a BLAKE3 of the model's
 shape label (`arc-32L-4096d-32h-32000v`), not of the weight bytes. It proves
-the same declared shape, not the same tensors. The unpublished v0.8.16/v3
-candidate instead streams the complete `--model` artifact through BLAKE3 and
-uses that exact byte commitment for shard routing, worker eligibility, caches,
-attestations, and verification. Do not read that candidate behavior as already
-deployed on the public fleet.
+the same declared shape, not the same tensors. v0.8.16 (protocol v3), which
+all six validators reported running on 2026-10-31, instead streams the
+complete `--model` artifact through BLAKE3 and uses that exact byte commitment
+for shard routing, worker eligibility, caches, attestations, and verification.
 
 ---
 
@@ -524,6 +485,12 @@ version-skewed public fleet observed at the 2026-08-31 source freeze:
 ---
 
 ## Measured performance
+
+> **Scope note (2026-11-02):** The GPU bit-identity, speed, throughput and
+> node-count figures in this section and in the papers under `papers/` are
+> historical lab and testnet results, not current claims. The current proven
+> scope is in [`INFERENCE_DETERMINISM.md`](INFERENCE_DETERMINISM.md): CPU
+> known-answer tests on ARM and x86.
 
 The values below are historical lab or public-path observations, not the
 v0.8.16 release gate and not an earnings promise. Re-run the linked harness on
@@ -735,7 +702,7 @@ thing you would assume from the name was not happening at the review cutoff:
 | Validator slashing (equivocation, liveness) | implemented in `arc-consensus`; no slash has been triggered on the live net |
 | VRF committee re-execution | committee is selected and recorded; votes are never collected |
 | Legacy inference claims in historical blocks | host-dependent on the forked fleet; v3 rejects new standalone `0x16`, and a historical mined `0x16` pays nothing |
-| Exact model identity | public v2 `model_hash` is shape-derived; the unpublished v0.8.16/v3 candidate commits to every byte of the source model artifact |
+| Exact model identity | public v2 `model_hash` is shape-derived; v0.8.16 (protocol v3) commits to every byte of the source model artifact |
 
 ### Roadmap — designed, not shipped
 
@@ -952,6 +919,79 @@ recomputation proves output agreement, not that a customer paid for the job.
 Those fixes are not live until the fleet cutover completes.
 
 See `docs/HOW-SHARDING-WORKS.md` for the wire protocol.
+
+---
+
+## History: 2026-08-31 source-freeze snapshot
+
+**Superseded.** This section is the dated record from the 2026-08-31 source
+freeze, kept for history. It was written before v0.8.16 was released on
+2026-10-27 and no longer describes the network. For the current status, see
+[v0.8.16 release status and quickstart](#v0816-release-status-and-quickstart).
+
+> **Source-freeze snapshot (2026-08-31; tag-stable):** At this commit's review
+> cutoff, v0.8.0 / protocol v3 was not published or deployed, and GitHub
+> `latest` was still the desktop-only v0.7.11 bundle. This is a historical
+> pre-tag statement, not a live status probe. An immutable v0.8.0 tag keeps
+> this source-freeze record; determine current release and fleet status only
+> from the exact release evidence and signed rollout receipts described below.
+> The default branch may receive a reviewed post-rollout status update.
+
+### Community support answer sheet
+
+| Community question | Evidence-backed answer at the 2026-08-31 source freeze |
+|---|---|
+| Can an SSH-only EC2/VPS install ARC? | Not from public v0.7.11. The complete v0.8.0 release restores real headless `arc-node` assets for Linux amd64 and arm64; the GUI packages are not server binaries. |
+| Are Intel and Apple Silicon Macs supported? | The v0.8.0 contract builds separate Intel and Apple Silicon CLI and desktop assets. Treat those links as installable only when the exact immutable release exposes the complete signed asset set. |
+| Does automatic update work? | The first v0.7-to-v0.8 transition is manual and exact-tag pinned; the unsigned legacy updater is not allowed to perform that migration. Public v0.7.11 saved the desktop preference but never scheduled checks. The v0.8.0 source-freeze candidate adds signed desktop checks after startup and every 24 hours, plus a transactional daily headless updater. Desktop updates still require confirmation; `.deb` and `.rpm` remain package-manager owned. |
+| When are the seeds upgraded? | At the source freeze they had not been upgraded, and there is no honest calendar promise in this repository. Publishing v0.8.0 alone does not update them. Current deployment requires signed rollout receipts proving one coordinated, archive-bound checkpoint cutover and agreement by all six above the greatest block height users saw before maintenance. |
+| Can a stake-zero worker earn the configured 2.5 testnet ARC? | Stake zero is eligible, but registration and raw inference tx `0x16` pay nothing. Exact-model assignment, independent verification, five-of-six reward authorization, activation, treasury limits, and a successful mined `0x25` receipt are all required. At the source freeze, that payment path was not live on the public v2 fleet. |
+| What should a worker run? | A router needs no model or GPU. The current full-worker target is Llama-2-7B Q4_K_M (about 4 GB on disk). The release has no validated minimum-RAM claim yet: prove a complete model load and inference with OS/chain headroom on the target host. GPU is optional and hardware never guarantees work. |
+| Where are earnings and the block explorer? | At the source freeze, the corrected dashboard and source-pinned explorer were candidates rather than supported public services. They fail closed to maintenance mode unless live checkpoint, replica, inference, and receipt gates pass; projections fail closed to null when evidence is insufficient. |
+
+### Public fleet snapshot
+
+**Read-only public-fleet snapshot, 2026-08-31 around 13:19 CDT.** These are
+observations, not a standing uptime promise:
+
+| Seed | Version | State height | Peers | DAG round |
+|---|---:|---:|---:|---:|
+| NYC | 0.7.2 | 138,244 | 8 | 9,841,293 |
+| LAX | 0.7.9 | 129,637 | 8 | 9,841,293 |
+| AMS | 0.7.9 | 89,633 | 8 | 9,841,293 |
+| LHR | 0.7.9 | 51,422 | 8 | 9,841,292 |
+| NRT | 0.7.9 | 96,770 | 8 | 9,841,292 |
+| SGP | 0.7.9 | 97,591 | 8 | 9,841,292 |
+
+At common height 50,000, all six reachable seeds returned **six different
+block hashes and six different state roots**. The dashboard independently
+repeated the comparison at the highest common height, 51,422, with the same
+6/6 divergence. Nearly matching DAG rounds in the newer snapshot do not repair
+that block/state disagreement. Therefore the public fleet is not one replicated chain.
+Stop reward issuance, pin one source for diagnosis, and choose an approved
+canonical recovery state before any rollout. An advancing DAG round or
+`status: ok` does not override this result.
+
+The same snapshot found community `total_work_completed: 0` across the worker
+list. No public inference job, validator-authorized `0x25` reward, or mined
+community payment was demonstrated. A raw `InferenceAttestation` (`0x16`) is a
+computation claim and pays nothing.
+
+Version skew is real too: NYC runs v0.7.2, the other five run v0.7.9, and
+**nothing on the network runs v0.7.11** — that version exists only as a desktop
+bundle. See [`ALERTS.md`](ALERTS.md) for the dated 2026-08-17 alert record;
+re-probe the fleet rather than treating it as current status.
+
+The concise evidence record is
+[`docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md).
+
+There is also a trust-root incident: legacy production validator seed material
+was published in repository history. Those six identities must be replaced;
+deleting the strings from the current tree does not make them safe. The v3
+candidate requires mode-`0600` Ed25519 keyfiles and a complete public-address
+genesis, and intentionally refuses staked production startup until operators
+approve a new genesis/checkpoint and coordinated quorum cutover. Rewards remain
+off during that migration.
 
 ---
 
