@@ -1,0 +1,124 @@
+name: Stage 0 arc-vrf
+
+# Path-scoped gate for the dormant Stage 0 crypto crate (RFC 9381 ECVRF and
+# BLS proof of possession). It runs on pushes to the crate's branch and on pull
+# requests that touch the crate, and only on Linux and Windows: the crate has no
+# platform-specific code, and macOS runner minutes stay reserved for the release
+# matrix in ci.yml. `cargo test -p arc-vrf` builds only the crate and its three
+# cryptographic dependencies, so the whole workflow is a few minutes.
+on:
+  push:
+    branches: [stage0-ecvrf-bls-pop]
+    paths:
+      - 'crates/arc-vrf/**'
+      - '.github/workflows/stage0-arc-vrf.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/arc-vrf/**'
+      - '.github/workflows/stage0-arc-vrf.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stage0-arc-vrf-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: arc-vrf rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Keep this dated toolchain aligned with rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: rustfmt
+      - run: cargo fmt --package arc-vrf -- --check
+
+  dormant:
+    name: arc-vrf stays dormant
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: No other crate depends on or imports arc-vrf
+        run: |
+          set -Eeuo pipefail
+          manifest_hits="$(grep -rl --include=Cargo.toml 'arc-vrf' . | grep -v '^\./crates/arc-vrf/' | grep -v '^\./Cargo.toml$' || true)"
+          source_hits="$(grep -rl --include='*.rs' 'arc_vrf' . | grep -v '^\./crates/arc-vrf/' || true)"
+          if [[ -n "$manifest_hits" || -n "$source_hits" ]]; then
+            echo "arc-vrf must stay a dormant library in this PR; found references:" >&2
+            printf '%s\n' "$manifest_hits" "$source_hits" >&2
+            exit 1
+          fi
+          echo "arc-vrf has no reverse dependencies and no importers outside crates/arc-vrf"
+
+  clippy:
+    name: arc-vrf clippy + rustdoc
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: stage0-arc-vrf-linux
+      - run: cargo clippy -p arc-vrf --all-targets --locked -- -D warnings
+      - name: rustdoc (deny warnings)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p arc-vrf --no-deps --locked
+
+  test:
+    name: arc-vrf test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: stage0-arc-vrf-${{ matrix.os }}
+      - name: Unit, integration and doc tests
+        run: cargo test -p arc-vrf --locked
+      - name: Print the ARC regression vectors (review aid)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p arc-vrf --locked --test regression_vectors -- --ignored --nocapture print_vectors
+
+  deny:
+    name: arc-vrf supply chain (cargo-deny, workspace lockfile)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Advisory, licence, source and dependency policy for the workspace graph
+        run: bash scripts/ci/run-cargo-deny.sh Cargo.toml
