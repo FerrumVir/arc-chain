@@ -254,16 +254,16 @@ This is testnet ARC — no real-world value.
    payment. Raw `0x16` rows are shown separately as unpaid inference claims.
 
 v0.8.16 configures 2.5 testnet ARC per successful `0x25` receipt, but
-issuance also requires exact-artifact work assignment,
-authenticated recomputation, a signed worker certificate, active genesis
-protocol activation, validator approval collection, strict
-greater-than-two-thirds identity and active-stake approval, a funded treasury,
-and successful block inclusion. With six equally staked validators, five must
+issuance also requires exact-artifact work assignment, authenticated
+recomputation, a signed worker certificate, active genesis protocol
+activation, validator approval collection, strict greater-than-two-thirds
+identity and active-stake approval, a funded treasury, and successful block
+inclusion. With six equally staked validators, five must
 approve. Approval collection is implemented, and the checkpoint-bound
 recovered genesis schedules activation at block 137146. If any requirement is
 missing, issuance fails closed and the app shows no forward reward projection.
 
-The deployed v2 seeds expose legacy count × constant display arithmetic. That
+The v2 seeds that ran before v0.8.16 exposed legacy count × constant display arithmetic. That
 does not reconcile to payment and must not be described as earnings. The Aug 26
 read-only snapshot showed community `total_work_completed: 0` across all
 workers and no successful community reward receipt.
