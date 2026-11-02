@@ -1,4 +1,4 @@
-import type { Page } from "@playwright/test";
+import { expect, type Locator, type Page } from "@playwright/test";
 
 /**
  * Open the app on a given screen. ARC opens on Home ("Ask ARC"); the seeded
@@ -257,4 +257,19 @@ export async function walkToLaunch(page: Page) {
   await page.getByTestId("btn-continue-identity").click();
   await page.getByTestId("tier-skip").click();
   await page.getByTestId("btn-continue-model").click();
+}
+
+/**
+ * Bring an onboarding step's action on screen the way a person does, with the
+ * mouse wheel, and assert all of it is visible. Playwright's own click scrolls
+ * even a container that a person cannot scroll (`overflow: hidden`), so a
+ * passing click alone does not prove the action can be reached.
+ */
+export async function wheelIntoView(page: Page, target: Locator) {
+  const viewport = page.viewportSize();
+  if (viewport) await page.mouse.move(viewport.width / 2, viewport.height / 2);
+  for (let i = 0; i < 8; i++) {
+    await page.mouse.wheel(0, 400);
+  }
+  await expect(target).toBeInViewport({ ratio: 1 });
 }

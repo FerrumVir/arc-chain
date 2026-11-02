@@ -449,9 +449,23 @@ export function Settings() {
                 <div style={{ color: "var(--warning)", fontWeight: 500, marginBottom: 2 }}>
                   Keep your recovery phrase safe
                 </div>
-                <div style={{ fontSize: "var(--text-sm)", color: "var(--text-secondary)" }}>
-                  The phrase you saw during setup is the only way to restore this identity.
-                  We don't store it.
+                {/* store.rs writes the identity, phrase included, to
+                    store.json in the app data folder as plain JSON. Nothing
+                    in the app sends the phrase over the network. */}
+                <div
+                  style={{ fontSize: "var(--text-sm)", color: "var(--text-secondary)" }}
+                  data-testid="recovery-phrase-storage"
+                >
+                  The phrase you saw during setup is the only way to restore this
+                  identity on another computer, or here if this app's data is
+                  deleted. This app keeps a plain-text copy on this computer only,
+                  in <code>store.json</code> in its <code>network.arc.desktop</code> data
+                  folder, and never sends it over the network. Outside the app, your
+                  system can still copy it: backups can include that folder, a Windows
+                  roaming profile can sync it to a server, and if you used Copy during
+                  setup, your clipboard may have kept it or synced it to your other
+                  devices. Write the phrase down, keep it offline, and keep this
+                  computer secure.
                 </div>
               </div>
             </div>

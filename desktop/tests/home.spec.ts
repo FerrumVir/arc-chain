@@ -34,6 +34,19 @@ test.describe("Home: Ask ARC", () => {
     // ARC can update itself from where it runs, so there is nothing to say about that.
     await expect(page.getByTestId("update-location-notice")).toHaveCount(0);
 
+    // Where a prompt goes, as the native route does it: to the coordinator
+    // this session reads the chain from, not to this computer's node first.
+    const home = page.getByTestId("inference-screen");
+    await expect(home).toContainText("A named community worker or coordinator on the ARC network");
+    await expect(home).not.toContainText("Your own node first");
+    await page.getByRole("button", { name: "What is how this works?" }).click();
+    const routeHelp = page.getByTestId("inference-route-help");
+    await expect(routeHelp).toContainText("Your prompt goes to the ARC coordinator this app reads the chain from");
+    await expect(routeHelp).toContainText("takes the prompt only if no coordinator has answered the app yet this session");
+    await expect(routeHelp).not.toContainText("your own node first");
+    await page.keyboard.press("Escape");
+    await expect(routeHelp).toHaveCount(0);
+
     await page.getByTestId("inference-prompt").fill("The largest planet is");
     await page.getByTestId("btn-run-inference").click();
     // While the question is out the thread says so, with the time elapsed.

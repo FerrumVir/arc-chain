@@ -23,6 +23,15 @@ test.describe("Settings", () => {
     await page.goto("/");
     page.once("dialog", (d) => d.accept());
     await page.getByTestId("nav-settings").click();
+    // The identity card says where this computer keeps the recovery phrase,
+    // instead of claiming it is not stored (store.rs writes it to store.json).
+    const storage = page.getByTestId("recovery-phrase-storage");
+    await expect(storage).toContainText("This app keeps a plain-text copy on this computer only");
+    await expect(storage).toContainText("store.json");
+    await expect(storage).toContainText("network.arc.desktop");
+    await expect(storage).toContainText("never sends it over the network");
+    await expect(storage).toContainText("Write the phrase down, keep it offline, and keep this computer secure.");
+    await expect(page.getByText("We don't store it")).toHaveCount(0);
     await page.getByTestId("btn-reset").click();
     await expect(page.getByTestId("onboarding")).toBeVisible();
     await expect(page.getByTestId("step-welcome")).toBeVisible();

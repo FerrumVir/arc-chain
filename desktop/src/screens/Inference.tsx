@@ -190,10 +190,15 @@ export function Inference() {
         </div>
         <div className="chat-header-actions">
           <InfoPopover title="How this works">
-            <p>
-              Your prompt goes to your own node first, at <code>POST /inference/run</code> on <code>127.0.0.1</code>. If your node isn&rsquo;t running or
-              has no compatible model loaded, it falls back to a reachable coordinator&rsquo;s community-first <code>/inference/run</code> route. Either
-              way the answer says where the compute ran and what the coordinator actually verified.
+            {/* commands.rs: the first status poll pins the session's chain
+                host to one of the production coordinators, and the local
+                route then refuses before sending (run_inference_local_inner).
+                The direct route posts only to that pinned origin. */}
+            <p data-testid="inference-route-help">
+              Your prompt goes to the ARC coordinator this app reads the chain from (the same one for the whole session), at its{" "}
+              <code>/inference/run</code> route. That coordinator offers it to a community worker first; if none takes it, ARC&rsquo;s own nodes can
+              compute it. Your own node, at <code>127.0.0.1</code>, takes the prompt only if no coordinator has answered the app yet this session, or
+              if the app reads the chain from your node. Either way the answer says where the compute ran and what the coordinator actually verified.
             </p>
             <p>1. Attempts the prompt on the selected execution path. A trace shows shard hops only when the coordinator reports one.</p>
             <p>
@@ -359,7 +364,7 @@ function EmptyThread() {
       <h2 className="chat-empty-title">{PLAIN_COPY.home.emptyTitle}</h2>
       <ul className="chat-empty-points">
         <li>
-          <strong>Who served it.</strong> Your own node first; a named coordinator or community worker when yours can&rsquo;t.
+          <strong>Who served it.</strong> A named community worker or coordinator on the ARC network, or your own node when it answered.
         </li>
         <li>
           <strong>Whether it was checked.</strong> Marked checked only when another computer re-ran it and the agreement is authenticated.
