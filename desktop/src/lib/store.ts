@@ -141,9 +141,34 @@ function persist(state: AppState) {
   writeStorage(state);
 }
 
+const ROUTES: readonly Route[] = [
+  "dashboard",
+  "wallet",
+  "inference",
+  "earnings",
+  "network",
+  "logs",
+  "settings",
+];
+
+/**
+ * ARC opens on Home, the "Ask ARC" chat: it works whatever state the node is
+ * in, and its strip says what to do about the node. Browser previews and the
+ * Playwright suites can open on another screen through `__ARC_START_ROUTE__`
+ * (set by the test helpers), the same kind of seam as `__ARC_MOCK__`; the
+ * native app never sets it.
+ */
+function startRoute(): Route {
+  const requested =
+    typeof window === "undefined"
+      ? undefined
+      : (window as Window & { __ARC_START_ROUTE__?: unknown }).__ARC_START_ROUTE__;
+  return ROUTES.find((route) => route === requested) ?? "inference";
+}
+
 export const useAppStore = create<AppState>((set, get) => ({
   ...loadInitial(),
-  route: "dashboard" as Route,
+  route: startRoute(),
   // Deliberately NOT persisted: a hash the user clicked three days ago is not
   // something to restore into a search box on next launch.
   pendingLookup: null,

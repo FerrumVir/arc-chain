@@ -4,7 +4,8 @@
 // users when something goes wrong.
 
 import { expect, test } from "@playwright/test";
-import { seedOnboarded } from "./helpers";
+import { PLAIN_COPY } from "../src/lib/plain-copy";
+import { seedMockOverrides, seedOnboarded } from "./helpers";
 
 test.describe("Error boundary", () => {
   test("catches render error + shows recovery UI with relaunch button", async ({
@@ -61,22 +62,47 @@ test.describe("Error boundary", () => {
 });
 
 test.describe("Crash banner", () => {
-  test("shows when node status.lastError indicates crash", async ({
+  test("a crash is one sentence with Start again; a refused start after it stays on screen", async ({
     page,
   }) => {
     await seedOnboarded(page);
-    // Override the mock to return a crashed status.
+    // The mock reports an unexpected exit until clear_crash runs, and the
+    // start that follows is refused the way a second desktop holding the
+    // node refuses it.
     await page.addInitScript(() => {
-      (window as unknown as { __ARC_MOCK_CRASH__: boolean }).__ARC_MOCK_CRASH__ =
-        true;
+      (window as unknown as { __ARC_MOCK_CRASH__: boolean }).__ARC_MOCK_CRASH__ = true;
     });
-    // Inject status fake before the app boots - we patch fetch for
-    // `/` not available, so instead we wait for dashboard then check the
-    // banner is absent (no crash in normal mock mode).
+    await seedMockOverrides(page, {
+      start_node: {
+        __reject:
+          "another ARC desktop currently owns the managed node lifecycle for /Users/me/.arc/data-v3: Resource temporarily unavailable (os error 35)",
+      },
+    });
     await page.goto("/");
     await expect(page.getByTestId("dashboard")).toBeVisible();
-    // In a normal (non-crashed) state, the banner is not visible.
+
+    const banner = page.getByTestId("crash-banner");
+    await expect(banner).toBeVisible();
+    await expect(banner.getByTestId("crash-banner-title")).toHaveText(PLAIN_COPY.nodeStrip.crashed);
+    // The exit text is behind Show details, not the body.
+    await expect(banner.getByTestId("crash-banner-details")).toBeHidden();
+    await banner.getByTestId("crash-banner-details-toggle").click();
+    await expect(banner.getByTestId("crash-banner-details")).toContainText("exited unexpectedly");
+
+    // Start again clears the crash (the banner goes) and the refused start is
+    // kept as the start-failure panel, not lost with the banner.
+    await page.getByTestId("btn-crash-relaunch").click();
     await expect(page.getByTestId("crash-banner")).toHaveCount(0);
+    const failure = page.getByTestId("mutation-error");
+    await expect(failure).toBeVisible();
+    await expect(failure).toHaveAttribute("data-failure-kind", "needs-repair");
+    await expect(failure.getByTestId("start-failure-title")).toHaveText(
+      PLAIN_COPY.startFailure.needsRepair.title,
+    );
+    await expect(failure.getByTestId("start-failure-details")).toContainText(
+      "another ARC desktop currently owns",
+    );
+    await expect(failure.getByTestId("btn-start-failure-retry")).toBeVisible();
   });
 
   test("relaunch + dismiss buttons render when banner is forced", async ({
@@ -95,10 +121,12 @@ test.describe("Crash banner", () => {
       const match = html.match(/src="(\/assets\/index-[^"]+\.js)"/);
       if (!match) return false;
       const js = await (await fetch(match[1])).text();
+      // One plain sentence, one button; the exit text waits behind Show details.
       return (
-        js.includes("Your node crashed") &&
+        js.includes("Your node stopped unexpectedly.") &&
         js.includes("btn-crash-relaunch") &&
-        js.includes("btn-crash-dismiss")
+        js.includes("btn-crash-dismiss") &&
+        !js.includes("Your node crashed")
       );
     });
     expect(shipped).toBe(true);

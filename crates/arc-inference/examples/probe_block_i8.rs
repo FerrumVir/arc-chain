@@ -6,11 +6,15 @@ use arc_inference::cached_integer_model::I8Weights;
 use candle_core::{Device, quantized::gguf_file};
 
 const ONE: i64 = 1 << 16;
-const MODEL_PATH: &str = "/Users/tjdunham/.arc-models/llama-2-7b.gguf";
+/// `$HOME/.arc-models/llama-2-7b.gguf`, resolved at run time.
+fn model_path() -> String {
+    let home = std::env::var("HOME").expect("HOME is set");
+    format!("{home}/.arc-models/llama-2-7b.gguf")
+}
 
 fn extract_f32(name: &str) -> Vec<f32> {
     let device = Device::Cpu;
-    let mut r = std::fs::File::open(MODEL_PATH).expect("open");
+    let mut r = std::fs::File::open(model_path()).expect("open");
     let content = gguf_file::Content::read(&mut r).expect("gguf");
     let qt = content.tensor(&mut r, name, &device).expect(name);
     qt.dequantize(&device)

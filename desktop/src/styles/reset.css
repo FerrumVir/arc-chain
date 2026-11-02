@@ -38,6 +38,32 @@ textarea,
   cursor: text;
 }
 
+/* The window chrome (titlebar, sidebar, buttons) stays unselectable like a
+   native app, but anything a person may need to quote or report can be
+   selected and copied: the page itself, error banners, status lines,
+   dialogs, logs and code. Through v0.8.14 the body rule above made every
+   error message impossible to copy. */
+main,
+[role="alert"],
+[role="alertdialog"],
+[role="dialog"],
+[role="log"],
+[role="status"],
+pre,
+code,
+.selectable {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* A click on a control never starts a text selection. */
+button,
+[role="button"],
+.btn {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
 button {
   font: inherit;
   color: inherit;

@@ -275,7 +275,7 @@ P4–P7 - blocked on P3. Not run.
 
 The B-open "regression" was not a tx-type bug - NYC's RPC port 9090
 was open to the internet and being hammered by ≥3 external IPs
-(`78.137.223.145`, `66.153.236.155`, `86.246.153.11`) that were
+(addresses redacted) that were
 spamming `Transfer`s from address `2d3adedff11b...`. The mempool
 and block-packer were saturating on those, and the legitimate
 `InferenceEscrowOpen` submissions were being drained but losing

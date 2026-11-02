@@ -1,6 +1,7 @@
 import { ExternalLink, Moon } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { api, isSyntheticPreview } from "../lib/tauri";
+import { describeConnection } from "../lib/connection";
 import { StatusPill } from "./StatusPill";
 import { Wordmark } from "./Logo";
 
@@ -11,8 +12,9 @@ export function Titlebar() {
     refetchInterval: 2000,
   });
 
-  // Until the first status arrives nothing is known: say "Checking", not "Offline".
-  const level = status ? status.health : "checking";
+  // Until the first status arrives nothing is known: "Checking", not "Offline".
+  // After that, the connection in plain words (lib/connection.ts).
+  const connection = describeConnection(status);
 
   return (
     <div className="titlebar" data-testid="titlebar" data-tauri-drag-region>
@@ -25,7 +27,7 @@ export function Titlebar() {
       </div>
 
       <div className="titlebar-right">
-        <StatusPill level={level} />
+        <StatusPill level={connection.level} label={connection.label} />
         {isSyntheticPreview && (
           <span className="titlebar-preview" data-testid="preview-mode">
             <Moon size={10} /> Synthetic preview · not live

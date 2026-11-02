@@ -5,18 +5,26 @@
 use candle_core::{Device, Tensor};
 use candle_transformers::models::quantized_llama::ModelWeights;
 
-const MODEL_PATH: &str = "/Users/tjdunham/.arc-models/llama-2-7b.gguf";
-const TOKENS_PATH: &str = "/Users/tjdunham/.arc-models/wiki.test.llama_bpe.json";
+/// `$HOME/.arc-models/llama-2-7b.gguf`, resolved at run time.
+fn model_path() -> String {
+    let home = std::env::var("HOME").expect("HOME is set");
+    format!("{home}/.arc-models/llama-2-7b.gguf")
+}
+/// `$HOME/.arc-models/wiki.test.llama_bpe.json`, resolved at run time.
+fn tokens_path() -> String {
+    let home = std::env::var("HOME").expect("HOME is set");
+    format!("{home}/.arc-models/wiki.test.llama_bpe.json")
+}
 
 fn main() {
     let device = Device::Cpu;
 
     eprintln!("Loading candle...");
-    let mut file = std::fs::File::open(MODEL_PATH).unwrap();
+    let mut file = std::fs::File::open(model_path()).unwrap();
     let content = candle_core::quantized::gguf_file::Content::read(&mut file).unwrap();
     let mut model = ModelWeights::from_gguf(content, &mut file, &device).unwrap();
 
-    let tokens_raw = std::fs::read_to_string(TOKENS_PATH).unwrap();
+    let tokens_raw = std::fs::read_to_string(tokens_path()).unwrap();
     let tokens: Vec<u32> = serde_json::from_str::<Vec<u64>>(&tokens_raw)
         .unwrap()
         .into_iter()

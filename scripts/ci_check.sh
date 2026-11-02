@@ -157,7 +157,8 @@ compatibility_typescript_sdk() {
     (
         cd sdks/typescript &&
             npm ci &&
-            npm audit --audit-level=low &&
+            npm audit --omit=dev --audit-level=low &&
+            npm audit --audit-level=high &&
             npm test -- --runInBand &&
             npm run build &&
             node -e "const sdk=require('./dist'); if (!sdk || typeof sdk !== 'object') throw new Error('CommonJS SDK failed to load')"

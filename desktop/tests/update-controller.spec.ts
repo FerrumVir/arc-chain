@@ -1,10 +1,18 @@
 import { expect, test } from "@playwright/test";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { PLAIN_COPY } from "../src/lib/plain-copy";
 import {
   createUpdateController,
+  NATIVE_WRONG_LOCATION,
+  UPDATE_RECONCILIATION_RETRY_MS,
   type UpdateCandidate,
   type UpdateDownloadEvent,
   type UpdateTimers,
 } from "../src/lib/update-controller";
+
+const __dirnameHere = path.dirname(fileURLToPath(import.meta.url));
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -134,7 +142,7 @@ test.describe("UpdateController", () => {
         check: async () => {
           checks += 1;
           return {
-            version: "0.8.10",
+            version: "0.8.16",
             download: async () => {
               downloads += 1;
             },
@@ -160,7 +168,7 @@ test.describe("UpdateController", () => {
     expect(installs).toBe(0);
     expect(controller.getSnapshot()).toMatchObject({
       phase: "available",
-      version: "0.8.10",
+      version: "0.8.16",
       canInstall: true,
     });
     controller.dispose();
@@ -174,7 +182,7 @@ test.describe("UpdateController", () => {
       {
         supported: true,
         check: async () => ({
-          version: "0.8.10",
+          version: "0.8.16",
           download: async () => {
             order.push("download");
           },
@@ -246,7 +254,7 @@ test.describe("UpdateController", () => {
       {
         supported: true,
         check: async () => ({
-          version: "0.8.10",
+          version: "0.8.16",
           download: () => download.promise,
           install: async () => {
             installCalls += 1;
@@ -291,7 +299,7 @@ test.describe("UpdateController", () => {
       {
         supported: true,
         check: async () => ({
-          version: "0.8.10",
+          version: "0.8.16",
           download: async () => {
             order.push("download");
           },
@@ -341,7 +349,7 @@ test.describe("UpdateController", () => {
       {
         supported: true,
         check: async () => ({
-          version: "0.8.10",
+          version: "0.8.16",
           download: async () => {
             order.push("download");
           },
@@ -383,7 +391,7 @@ test.describe("UpdateController", () => {
       {
         supported: true,
         check: async () => ({
-          version: "0.8.10",
+          version: "0.8.16",
           download: async () => {
             order.push("download");
           },
@@ -888,7 +896,7 @@ test.describe("UpdateController", () => {
     const controller = createUpdateController({
       supported: true,
       check: async () => ({
-        version: "0.8.10",
+        version: "0.8.16",
         canInstall: false,
         installInstructions: instructions,
         download: async () => {
@@ -907,7 +915,7 @@ test.describe("UpdateController", () => {
     await controller.checkForUpdates("manual");
     expect(controller.getSnapshot()).toMatchObject({
       phase: "available",
-      version: "0.8.10",
+      version: "0.8.16",
       canInstall: false,
       message: instructions,
     });
@@ -1050,5 +1058,500 @@ test.describe("UpdateController", () => {
     expect(checkCalls).toBe(0);
     expect(controller.getSnapshot().phase).toBe("unsupported");
     controller.dispose();
+  });
+
+  // The native refusal while launch-time reconciliation still owns the node
+  // (start_fence.rs STARTUP_RECONCILIATION_IN_PROGRESS).
+  const RECONCILING =
+    "managed-node startup reconciliation is still in progress: ARC is checking how the previous node session ended before it starts or updates arc-node. Try again in a few seconds.";
+
+  test("a manual install waits for the last session to close, then installs", async () => {
+    const timers = new FakeTimers();
+    const order: string[] = [];
+    let prepareAttempts = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => ({
+          version: "0.8.16",
+          download: async () => {
+            order.push("download");
+          },
+          install: async () => {
+            order.push("install");
+          },
+        }),
+        prepareRelaunch: async () => {
+          order.push("prepare");
+          prepareAttempts += 1;
+          if (prepareAttempts === 1) throw new Error(RECONCILING);
+        },
+        beginHandoff: async () => {
+          order.push("handoff");
+        },
+        abortRelaunch: async () => {
+          order.push("abort");
+        },
+        relaunch: async () => {
+          order.push("relaunch");
+        },
+      },
+      { startupDelayMs: 10, intervalMs: 1_000 },
+      timers,
+    );
+
+    await controller.checkForUpdates("manual");
+    await controller.installAvailableUpdate();
+    // Not an error: the verified download is kept and the install waits.
+    expect(order).toEqual(["download", "prepare"]);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      version: "0.8.16",
+      error: null,
+      canInstall: true,
+      restartRequired: false,
+    });
+    expect(controller.getSnapshot().message).toContain("last session");
+
+    await timers.advanceBy(UPDATE_RECONCILIATION_RETRY_MS - 1);
+    expect(order).toEqual(["download", "prepare"]);
+    await timers.advanceBy(1);
+    await timers.advanceBy(0);
+    expect(order).toEqual([
+      "download",
+      "prepare",
+      "prepare",
+      "handoff",
+      "install",
+      "relaunch",
+    ]);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "ready",
+      restartRequired: true,
+    });
+    controller.dispose();
+  });
+
+  test("an automatic install waits for the last session instead of giving up", async () => {
+    const timers = new FakeTimers();
+    const order: string[] = [];
+    let prepareAttempts = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => ({
+          version: "0.8.16",
+          download: async () => {
+            order.push("download");
+          },
+          install: async () => {
+            order.push("install");
+          },
+        }),
+        tryPrepareAutoUpdateRelaunch: async () => {
+          order.push("try-prepare");
+          prepareAttempts += 1;
+          if (prepareAttempts === 1) throw new Error(RECONCILING);
+          return { status: "prepared" };
+        },
+        prepareRelaunch: async () => {
+          order.push("manual-prepare");
+        },
+        beginHandoff: async () => {
+          order.push("handoff");
+        },
+        abortRelaunch: async () => {
+          order.push("abort");
+        },
+        relaunch: async () => {
+          order.push("relaunch");
+        },
+      },
+      // A daily interval: only the reconciliation retry can run in this window.
+      { startupDelayMs: 10, intervalMs: 24 * 60 * 60 * 1_000, retryDelaysMs: [] },
+      timers,
+    );
+
+    controller.setAutoChecksEnabled(true);
+    controller.setAutoInstallEnabled(true);
+    await timers.advanceBy(10);
+    expect(order).toEqual(["download", "try-prepare", "abort"]);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      error: null,
+      canInstall: true,
+      restartRequired: false,
+    });
+    expect(controller.getSnapshot().message).toContain("last session");
+
+    await timers.advanceBy(UPDATE_RECONCILIATION_RETRY_MS);
+    await timers.advanceBy(0);
+    expect(order).toEqual([
+      "download",
+      "try-prepare",
+      "abort",
+      "try-prepare",
+      "handoff",
+      "install",
+      "relaunch",
+    ]);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "ready",
+      restartRequired: true,
+    });
+    controller.dispose();
+  });
+
+  test("turning unattended installs off ends an automatic wait for the last session", async () => {
+    const timers = new FakeTimers();
+    const order: string[] = [];
+    const abort = deferred<void>();
+    let prepareAttempts = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => ({
+          version: "0.8.16",
+          download: async () => {
+            order.push("download");
+          },
+          install: async () => {
+            order.push("install");
+          },
+        }),
+        tryPrepareAutoUpdateRelaunch: async () => {
+          order.push("try-prepare");
+          prepareAttempts += 1;
+          throw new Error(RECONCILING);
+        },
+        prepareRelaunch: async () => {
+          order.push("manual-prepare");
+        },
+        beginHandoff: async () => {},
+        // The native abort waits for the recovery launch to release the node.
+        abortRelaunch: () => {
+          order.push("abort");
+          return abort.promise;
+        },
+        relaunch: async () => {},
+      },
+      { startupDelayMs: 10, intervalMs: 24 * 60 * 60 * 1_000, retryDelaysMs: [] },
+      timers,
+    );
+
+    controller.setAutoChecksEnabled(true);
+    controller.setAutoInstallEnabled(true);
+    await timers.advanceBy(10);
+    expect(order).toEqual(["download", "try-prepare", "abort"]);
+    // Already says why while the abort waits.
+    expect(controller.getSnapshot().message).toContain("last session");
+    abort.resolve();
+    await timers.advanceBy(0);
+    expect(controller.getSnapshot().message).toContain("last session");
+
+    controller.setAutoInstallEnabled(false);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      message: "Version 0.8.16 is available.",
+      canInstall: true,
+    });
+    await timers.advanceBy(UPDATE_RECONCILIATION_RETRY_MS * 2);
+    expect(prepareAttempts).toBe(1);
+    controller.dispose();
+  });
+
+  test("an Install press during an automatic wait survives unattended installs turning off", async () => {
+    const timers = new FakeTimers();
+    const order: string[] = [];
+    let manualAttempts = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => ({
+          version: "0.8.16",
+          download: async () => {
+            order.push("download");
+          },
+          install: async () => {
+            order.push("install");
+          },
+        }),
+        tryPrepareAutoUpdateRelaunch: async () => {
+          order.push("try-prepare");
+          throw new Error(RECONCILING);
+        },
+        prepareRelaunch: async () => {
+          order.push("prepare");
+          manualAttempts += 1;
+          if (manualAttempts === 1) throw new Error(RECONCILING);
+        },
+        beginHandoff: async () => {
+          order.push("handoff");
+        },
+        abortRelaunch: async () => {
+          order.push("abort");
+        },
+        relaunch: async () => {
+          order.push("relaunch");
+        },
+      },
+      { startupDelayMs: 10, intervalMs: 24 * 60 * 60 * 1_000, retryDelaysMs: [] },
+      timers,
+    );
+
+    controller.setAutoChecksEnabled(true);
+    controller.setAutoInstallEnabled(true);
+    await timers.advanceBy(10);
+    await timers.advanceBy(0);
+    expect(order).toEqual(["download", "try-prepare", "abort"]);
+
+    await controller.installAvailableUpdate();
+    expect(order).toEqual(["download", "try-prepare", "abort", "prepare"]);
+    controller.setAutoInstallEnabled(false);
+    expect(controller.getSnapshot().message).toContain("last session");
+
+    await timers.advanceBy(UPDATE_RECONCILIATION_RETRY_MS);
+    await timers.advanceBy(0);
+    expect(order).toEqual([
+      "download",
+      "try-prepare",
+      "abort",
+      "prepare",
+      "prepare",
+      "handoff",
+      "install",
+      "relaunch",
+    ]);
+    controller.dispose();
+  });
+
+  test("a newer release or dispose ends a wait for the last session", async () => {
+    const timers = new FakeTimers();
+    let checks = 0;
+    let prepareAttempts = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => {
+          checks += 1;
+          return {
+            version: checks === 1 ? "0.8.14" : "0.8.15",
+            download: async () => {},
+            install: async () => {},
+          };
+        },
+        prepareRelaunch: async () => {
+          prepareAttempts += 1;
+          throw new Error(RECONCILING);
+        },
+        beginHandoff: async () => {},
+        abortRelaunch: async () => {},
+        relaunch: async () => {},
+      },
+      { startupDelayMs: 10, intervalMs: 24 * 60 * 60 * 1_000 },
+      timers,
+    );
+
+    await controller.checkForUpdates("manual");
+    await controller.installAvailableUpdate();
+    expect(prepareAttempts).toBe(1);
+
+    // The waiting 0.8.14 install never runs once 0.8.15 replaces it.
+    await controller.checkForUpdates("manual");
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      version: "0.8.15",
+    });
+    await timers.advanceBy(UPDATE_RECONCILIATION_RETRY_MS * 2);
+    expect(prepareAttempts).toBe(1);
+
+    await controller.installAvailableUpdate();
+    expect(prepareAttempts).toBe(2);
+    controller.dispose();
+    await timers.advanceBy(UPDATE_RECONCILIATION_RETRY_MS * 2);
+    expect(prepareAttempts).toBe(2);
+  });
+
+  test("a legacy refusal points at the manual install, not at Settings", async () => {
+    const timers = new FakeTimers();
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => ({
+          version: "0.8.16",
+          download: async () => {},
+          install: async () => {},
+        }),
+        // The Settings install is refused the same way, so it can't be the advice.
+        tryPrepareAutoUpdateRelaunch: async () => {
+          throw new Error(
+            "automatic update preparation requires a safe abort: legacy desktop node reconciliation is unresolved; refusing the update boundary: legacy-data migration preflight failed",
+          );
+        },
+        prepareRelaunch: async () => {},
+        beginHandoff: async () => {},
+        abortRelaunch: async () => {},
+        relaunch: async () => {},
+      },
+      { startupDelayMs: 10, intervalMs: 24 * 60 * 60 * 1_000, retryDelaysMs: [] },
+      timers,
+    );
+
+    controller.setAutoChecksEnabled(true);
+    controller.setAutoInstallEnabled(true);
+    await timers.advanceBy(10);
+    await timers.advanceBy(0);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      message: PLAIN_COPY.updates.manualInstallOnly("0.8.16"),
+    });
+    controller.dispose();
+  });
+
+  test("a refusal from native preparation is still reported as an error", async () => {
+    const controller = createUpdateController({
+      supported: true,
+      check: async () => ({
+        version: "0.8.16",
+        download: async () => {},
+        install: async () => {},
+      }),
+      prepareRelaunch: async () => {
+        throw new Error(
+          "could not establish the native update lifecycle fence: a prior desktop update lifecycle transaction is unresolved",
+        );
+      },
+      beginHandoff: async () => {},
+      abortRelaunch: async () => {},
+      relaunch: async () => {},
+    });
+
+    await controller.checkForUpdates("manual");
+    await controller.installAvailableUpdate();
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "error",
+      canInstall: true,
+    });
+    expect(controller.getSnapshot().message).toContain("Update was not installed");
+    controller.dispose();
+  });
+
+  // macOS: run from the mounted .dmg, a translocated download or another
+  // volume, the updater's install failed only after the node had stopped and
+  // the one-way handoff had begun. Native preparation now refuses first.
+  test("a manual install from where ARC can't update itself stays available and stops nothing", async () => {
+    const order: string[] = [];
+    const controller = createUpdateController({
+      supported: true,
+      check: async () => ({
+        version: "0.8.16",
+        download: async () => {
+          order.push("download");
+        },
+        install: async () => {
+          order.push("install");
+        },
+      }),
+      prepareRelaunch: async () => {
+        order.push("prepare");
+        throw new Error(NATIVE_WRONG_LOCATION);
+      },
+      beginHandoff: async () => {
+        order.push("handoff");
+      },
+      abortRelaunch: async () => {
+        order.push("abort");
+      },
+      relaunch: async () => {
+        order.push("relaunch");
+      },
+    });
+
+    await controller.checkForUpdates("manual");
+    await controller.installAvailableUpdate();
+    // No handoff, so nothing holds the node: Start and Restart stay open.
+    expect(order).toEqual(["download", "prepare"]);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      version: "0.8.16",
+      message: PLAIN_COPY.updates.wrongLocation,
+      error: null,
+      canInstall: true,
+      restartRequired: false,
+    });
+
+    // Pressing Install again asks native preparation again; the verified
+    // payload is not downloaded twice.
+    await controller.installAvailableUpdate();
+    expect(order).toEqual(["download", "prepare", "prepare"]);
+    expect(controller.getSnapshot().message).toBe(PLAIN_COPY.updates.wrongLocation);
+    controller.dispose();
+  });
+
+  test("an automatic install from where ARC can't update itself is deferred with the same sentence", async () => {
+    const timers = new FakeTimers();
+    const order: string[] = [];
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => ({
+          version: "0.8.16",
+          download: async () => {
+            order.push("download");
+          },
+          install: async () => {
+            order.push("install");
+          },
+        }),
+        tryPrepareAutoUpdateRelaunch: async () => {
+          order.push("try-prepare");
+          throw new Error(NATIVE_WRONG_LOCATION);
+        },
+        prepareRelaunch: async () => {
+          order.push("manual-prepare");
+        },
+        beginHandoff: async () => {
+          order.push("handoff");
+        },
+        abortRelaunch: async () => {
+          order.push("abort");
+        },
+        relaunch: async () => {},
+      },
+      { startupDelayMs: 10, intervalMs: 24 * 60 * 60 * 1_000, retryDelaysMs: [60_000] },
+      timers,
+    );
+
+    controller.setAutoChecksEnabled(true);
+    controller.setAutoInstallEnabled(true);
+    await timers.advanceBy(10);
+    await timers.advanceBy(0);
+    // The pre-handoff abort finds nothing prepared to release.
+    expect(order).toEqual(["download", "try-prepare", "abort"]);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      version: "0.8.16",
+      message: PLAIN_COPY.updates.wrongLocation,
+      error: null,
+      canInstall: true,
+      restartRequired: false,
+    });
+
+    // Moving ARC takes a quit, so nothing retries from this process.
+    await timers.advanceBy(60_000 * 2);
+    expect(order).toEqual(["download", "try-prepare", "abort"]);
+    controller.dispose();
+  });
+
+  test("the location refusal it recognises is the sentence update_location.rs writes", () => {
+    const source = fs.readFileSync(
+      path.resolve(__dirnameHere, "..", "src-tauri", "src", "update_location.rs"),
+      "utf8",
+    );
+    expect(source).toContain(`"${NATIVE_WRONG_LOCATION}"`);
+    // One sentence to act on: where to put ARC, and that it takes a quit.
+    expect(PLAIN_COPY.updates.wrongLocation).toMatch(/^ARC can't update itself/);
+    expect(PLAIN_COPY.updates.wrongLocation).toContain("Quit ARC");
+    expect(PLAIN_COPY.updates.wrongLocation).toContain("Applications folder");
   });
 });

@@ -1,9 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  AlertTriangle,
   ClipboardCheck,
   Copy,
   Droplet,
+  Info,
   QrCode,
   Send,
   Wallet as WalletIcon,
@@ -14,9 +14,66 @@ import { InfoPopover } from "../components/InfoPopover";
 import { Skeleton } from "../components/Skeleton";
 import { api } from "../lib/tauri";
 import { isNativeOnlyChain } from "../lib/native-request";
+import { PLAIN_COPY } from "../lib/plain-copy";
 import { useAppStore } from "../lib/store";
 import { formatArcExact, formatInt } from "../lib/format";
+import { classifyWalletFailure } from "../lib/wallet-outcome";
 import type { TxLookup, WalletTxResult } from "../lib/types";
+
+/** The text a failed call returned, one click away from the sentence that says what happened. */
+function FailureDetails({ error, testId }: { error: unknown; testId: string }) {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    <details className="plain-details" data-testid={testId}>
+      <summary>{PLAIN_COPY.actions.showDetails}</summary>
+      <pre>{message}</pre>
+    </details>
+  );
+}
+
+/**
+ * One sentence for a failed claim or transfer. "Didn't go through" only when
+ * the request was refused before or by the host; when the answer was lost
+ * after the POST, the host may have accepted it, so the sentence asks the
+ * person to check their balance before sending again (lib/wallet-outcome.ts).
+ */
+function WalletFailure({
+  error,
+  flow,
+  testId,
+}: {
+  error: unknown;
+  flow: "faucet" | "send";
+  testId: string;
+}) {
+  const kind = classifyWalletFailure(error);
+  const copy = PLAIN_COPY.wallet;
+  const sentence =
+    flow === "faucet"
+      ? kind === "refused"
+        ? copy.faucetFailed
+        : copy.faucetUnconfirmed
+      : kind === "refused"
+        ? copy.sendFailed
+        : copy.sendUnconfirmed;
+  return (
+    <div
+      role="alert"
+      data-testid={testId}
+      data-failure-kind={kind}
+      style={{
+        marginTop: flow === "faucet" ? "var(--space-2)" : "var(--space-3)",
+        fontSize: "var(--text-xs)",
+        color: "var(--text)",
+        lineHeight: 1.5,
+        textAlign: flow === "faucet" ? "right" : undefined,
+      }}
+    >
+      <span data-testid={`${testId}-sentence`}>{sentence}</span>
+      <FailureDetails error={error} testId={`${testId}-details`} />
+    </div>
+  );
+}
 
 // How long the wallet keeps checking a submitted transaction for its mined receipt before it says so and stops.
 // It used to poll every 2 s for as long as the screen stayed open.
@@ -66,8 +123,9 @@ function receiptView(result: WalletTxResult, lookup?: TxLookup, timedOut = false
       text: `Submitted ${formatArcExact(result.amountArc)} ARC · no mined receipt after 3 minutes. The wallet stopped checking; look the hash up on the Network screen.`,
     };
   }
+  // Waiting for a block is the ordinary path after a submit, not a warning.
   return {
-    tone: "var(--warning)",
+    tone: "var(--text-muted)",
     text: `Submitted ${formatArcExact(result.amountArc)} ARC · waiting for a mined receipt`,
   };
 }
@@ -226,13 +284,15 @@ export function Wallet() {
             {balanceIsError && (
               <div
                 data-testid="wallet-balance-error"
+                role="status"
                 style={{
                   marginTop: "var(--space-2)",
-                  color: "var(--warning)",
+                  color: "var(--text-muted)",
                   fontSize: "var(--text-xs)",
                 }}
               >
-                Balance unavailable: {(balanceError as Error).message}
+                {PLAIN_COPY.wallet.balanceUnavailable}
+                <FailureDetails error={balanceError} testId="wallet-balance-error-details" />
               </div>
             )}
             {balance && balance.stakedBalanceBase !== "0" && (
@@ -287,19 +347,7 @@ export function Wallet() {
                 <br />tx {faucet.data.txHash.slice(0, 10)}…
               </div>
             )}
-            {faucet.isError && (
-              <div
-                style={{
-                  marginTop: "var(--space-2)",
-                  fontSize: "var(--text-xs)",
-                  color: "var(--danger)",
-                  textAlign: "right",
-                }}
-                data-testid="faucet-error"
-              >
-                {(faucet.error as Error).message}
-              </div>
-            )}
+            {faucet.isError && <WalletFailure error={faucet.error} flow="faucet" testId="faucet-error" />}
           </div>
         </div>
       </Card>
@@ -461,19 +509,7 @@ export function Wallet() {
               <br />tx {send.data.txHash.slice(0, 12)}…
             </div>
           )}
-          {send.isError && (
-            <div
-              data-testid="send-error"
-              style={{
-                marginTop: "var(--space-3)",
-                color: "var(--danger)",
-                fontSize: "var(--text-xs)",
-                lineHeight: 1.5,
-              }}
-            >
-              {(send.error as Error).message}
-            </div>
-          )}
+          {send.isError && <WalletFailure error={send.error} flow="send" testId="send-error" />}
         </Card>
       </div>
 
@@ -489,9 +525,11 @@ export function Wallet() {
             lineHeight: 1.55,
           }}
         >
-          <AlertTriangle
+          {/* A standing fact about testnet, not a warning: an info mark, not a triangle. */}
+          <Info
             size={16}
-            style={{ color: "var(--warning)", flexShrink: 0, marginTop: 2 }}
+            aria-hidden="true"
+            style={{ color: "var(--text-muted)", flexShrink: 0, marginTop: 2 }}
           />
           <div>
             These tokens are testnet ARC - no monetary value. Mainnet uses a

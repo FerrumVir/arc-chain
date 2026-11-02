@@ -6,7 +6,7 @@ Scope: inactive state adapter only; no TxBody, RPC, live model route, or deploym
 
 ## Implemented
 
-- Added [inference_contract_state.rs](/Users/excaulibur/work/arc-chain-readiness-20260919/crates/arc-state/src/inference_contract_state.rs:1), an owned `IsolatedInferenceLedger` over persistent `StateDB`. It exposes account/root reads and `admit(request, input_blob, now)`, `finalize`, and `refund`; it does not expose the underlying state handle.
+- Added [inference_contract_state.rs](../../crates/arc-state/src/inference_contract_state.rs#L1), an owned `IsolatedInferenceLedger` over persistent `StateDB`. It exposes account/root reads and `admit(request, input_blob, now)`, `finalize`, and `refund`; it does not expose the underlying state handle.
 - Constructor requires a persistent WAL, rejects recovery-bound state, verifies authenticated `genesis.network-hash` against the inference domain, and requires frozen members to equal `StateDB::active_validators()`.
 - Replaced independent model/profile/generation/assignment allowlists with bounded canonical `AllowedExecution` tuples. Commitment sorts/deduplicates complete tuples and admission requires exact tuple membership, avoiding unintended Cartesian combinations.
 - Admission checks `input_blob` against `TIER1_INPUT_BLOB_MAX` and the signed `InferenceJob.input_hash` before account mutation; the blob is persisted in signed metadata and rechecked on load/replay.

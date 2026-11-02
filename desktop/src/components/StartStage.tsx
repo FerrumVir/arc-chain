@@ -15,11 +15,13 @@ import { Aqueduct } from "./Aqueduct";
 import type { ArchChainPhase } from "../lib/aqueduct/archchain";
 import { formatInt } from "../lib/format";
 
+// A community node has no peers by design, so the step after the RPC port
+// opens is reaching the network's coordinators, not "finding peers".
 const STEP: Record<"survey" | "model" | "rpc" | "peers", string> = {
   survey: "Checking files",
   model: "Loading the model",
   rpc: "Opening the RPC port",
-  peers: "Finding peers",
+  peers: "Connecting to the ARC network",
 };
 
 export function StartStage({
@@ -62,7 +64,8 @@ export function StartStage({
         ? `${formatInt(toGo)} ${toGo === 1 ? "block" : "blocks"} to go`
         : "Catching up with the chain"
       : phase === "live"
-        ? localHeight != null
+        // A community node holds no blocks of its own (height 0): it is connected, not at "Block 0".
+        ? localHeight != null && localHeight > 0
           ? `Block ${formatInt(localHeight)}`
           : "Connected"
         : STEP[phase];

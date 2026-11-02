@@ -118,23 +118,28 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                 .timeout(std::time::Duration::from_secs(3))
                 .send()
                 .await;
+            // Plain words only. This loop sees the local /health alone, so it
+            // can say the node is running and how many peers it has, but not
+            // whether a coordinator answered; a community node has no peers
+            // by design, so "0 peers" and "syncing" are left out rather than
+            // shown as a fault. A missing /health is a node that is off or
+            // still loading its model.
             let (status_text, round_text) = match resp {
                 Ok(r) if r.status().is_success() => {
                     let v: serde_json::Value = r.json().await.unwrap_or(serde_json::Value::Null);
                     let peers = v.get("peers").and_then(|x| x.as_u64()).unwrap_or(0);
-                    let uptime = v.get("uptime_secs").and_then(|x| x.as_u64()).unwrap_or(0);
                     let round = v.get("dag_round").and_then(|x| x.as_u64()).unwrap_or(0);
-                    let health = if peers == 0 || uptime < 8 {
-                        "syncing"
+                    let status = if peers >= 1 {
+                        format!("Status: running · {} peers", peers)
                     } else {
-                        "live"
+                        "Status: running".to_string()
                     };
-                    (
-                        format!("Status: {} · {} peers", health, peers),
-                        format!("Round: {}", round),
-                    )
+                    (status, format!("Round: {}", round))
                 }
-                _ => ("Status: offline".to_string(), "Round: -".to_string()),
+                _ => (
+                    "Status: node off or starting".to_string(),
+                    "Round: -".to_string(),
+                ),
             };
             let _ = status_item.set_text(status_text);
             let _ = round_item.set_text(round_text);

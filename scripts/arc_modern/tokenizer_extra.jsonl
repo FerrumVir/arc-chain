@@ -1,0 +1,20 @@
+{"id": "special-1", "text": "<|im_start|>user\nHi<|im_end|>\n"}
+{"id": "special-2", "text": "<think>\n\n</think>\nAnswer"}
+{"id": "special-3", "text": "a<|im_end|>b<|im_end|><|im_start|>"}
+{"id": "special-4", "text": "<|begin_of_text|>text<|end_of_text|>"}
+{"id": "special-partial", "text": "<|im_sta and <think and </think"}
+{"id": "contractions", "text": "I'm sure you're right, they'll see we've done it; HE'S and SHE'D and it's"}
+{"id": "long-whitespace", "text": "a                                        b\n\n\n\n\t\t c   \n  "}
+{"id": "digits", "text": "1234567890123 007 3.14 1,000,000 x2y3z45"}
+{"id": "code", "text": "fn main() {\n    println!(\"hi {}\", 1 + 2);\n}\n"}
+{"id": "url", "text": "https://huggingface.co/HuggingFaceTB/SmolLM3-3B?x=1&y=2#z"}
+{"id": "unicode-spaces", "text": "non breaking thin　ideographic line"}
+{"id": "crlf", "text": "line1\r\nline2\rline3\n"}
+{"id": "mixed-script", "text": "naïve 中文 русский 🙂 العربية नमस्ते"}
+{"id": "case-contractions", "text": "'S 'T 'RE 'Ll 'Ve 'M 'D"}
+{"id": "only-newlines", "text": "\n\n\n"}
+{"id": "chat-default", "chat": {"user": "What is the capital of France? Answer in one sentence."}}
+{"id": "chat-golden-haiku", "chat": {"user": "Write a haiku about computers that always agree."}}
+{"id": "chat-think", "chat": {"user": "Is 91 prime?", "thinking": true}}
+{"id": "chat-system", "chat": {"system": "You answer like a pirate.", "user": "Hello there"}}
+{"id": "chat-system-think", "chat": {"system": "Be brief. /think", "user": "2+2?"}}

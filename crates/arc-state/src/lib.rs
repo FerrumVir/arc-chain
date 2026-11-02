@@ -575,7 +575,14 @@ pub struct StateDB {
     /// Contract storage (address → key → value).
     storage: DashMap<[u8; 32], DashMap<Hash256, Vec<u8>>>,
     /// Block chain (height → Block).
-    blocks: DashMap<u64, Block>,
+    ///
+    /// Boxed, so a bucket of this table is a height and a pointer. The table
+    /// keeps every committed block, and its hashbrown shards size an empty
+    /// bucket like a full one and double their bucket arrays when 7/8 full.
+    /// With `Block` (about 300 bytes) inline, each doubling allocated about
+    /// 300 bytes per new bucket at once; boxed, it allocates 16, and each
+    /// block is a separate allocation of its own size.
+    blocks: DashMap<u64, Box<Block>>,
     /// Current block height.
     height: RwLock<u64>,
     /// Transaction receipts indexed by tx hash.
@@ -861,7 +868,7 @@ impl StateDB {
             state.dirty_accounts.insert(addr.0);
         }
         let genesis = Block::genesis();
-        state.blocks.insert(0, genesis);
+        state.blocks.insert(0, Box::new(genesis));
         state
     }
 
@@ -982,7 +989,7 @@ impl StateDB {
 
             // Insert genesis block if not already present from WAL replay
             if state.blocks.get(&0).is_none() {
-                state.blocks.insert(0, Block::genesis());
+                state.blocks.insert(0, Box::new(Block::genesis()));
             }
 
             tracing::info!(
@@ -1014,7 +1021,7 @@ impl StateDB {
             }
 
             let genesis = Block::genesis();
-            state.blocks.insert(0, genesis.clone());
+            state.blocks.insert(0, Box::new(genesis.clone()));
             state.wal.append(WalOp::SetBlock(0, genesis), 0);
             state
                 .wal
@@ -1466,7 +1473,7 @@ impl StateDB {
                 // independent WAL record. Rebuild it while replaying each
                 // durable block so archive completeness can be recomputed
                 // after restart rather than depending on pre-crash memory.
-                if let Some(replaced) = self.blocks.insert(*height, block.clone()) {
+                if let Some(replaced) = self.blocks.insert(*height, Box::new(block.clone())) {
                     for old_hash in replaced.tx_hashes {
                         let points_to_replaced_height = self
                             .tx_index
@@ -3108,7 +3115,7 @@ impl StateDB {
     /// Get a block by height.
     pub fn get_block(&self, height: u64) -> Option<Block> {
         let _publication = self.native_inference_publication.read();
-        self.blocks.get(&height).map(|b| b.clone())
+        self.blocks.get(&height).map(|b| Block::clone(&b))
     }
 
     /// Look up a block by its hash. Scans from latest to earliest.
@@ -3118,7 +3125,7 @@ impl StateDB {
             if let Some(block) = self.blocks.get(&height)
                 && block.hash.0 == *hash
             {
-                return Some(block.clone());
+                return Some(Block::clone(&block));
             }
         }
         None
@@ -3311,7 +3318,7 @@ impl StateDB {
         }
 
         // Store block + WAL
-        self.blocks.insert(height, block.clone());
+        self.blocks.insert(height, Box::new(block.clone()));
         self.wal
             .append(WalOp::SetBlock(height, block.clone()), height);
         self.persist_restart_artifacts(transactions, &receipts, height);
@@ -3573,7 +3580,7 @@ impl StateDB {
             self.full_transactions.insert(tx.hash.0, tx.clone());
         }
 
-        self.blocks.insert(height, block.clone());
+        self.blocks.insert(height, Box::new(block.clone()));
         self.wal
             .append(WalOp::SetBlock(height, block.clone()), height);
         self.persist_restart_artifacts(transactions, &final_receipts, height);
@@ -3824,7 +3831,7 @@ impl StateDB {
         }
 
         // Store block + WAL
-        self.blocks.insert(height, block.clone());
+        self.blocks.insert(height, Box::new(block.clone()));
         self.wal
             .append(WalOp::SetBlock(height, block.clone()), height);
         self.persist_restart_artifacts(transactions, &receipts, height);
@@ -4088,7 +4095,7 @@ impl StateDB {
             self.full_transactions.insert(tx.hash.0, tx.clone());
         }
 
-        self.blocks.insert(height, block.clone());
+        self.blocks.insert(height, Box::new(block.clone()));
         self.wal
             .append(WalOp::SetBlock(height, block.clone()), height);
         self.persist_restart_artifacts(transactions, &receipts, height);
@@ -4225,7 +4232,7 @@ impl StateDB {
             self.full_transactions.insert(tx.hash.0, tx.clone());
         }
 
-        self.blocks.insert(height, block.clone());
+        self.blocks.insert(height, Box::new(block.clone()));
         self.wal
             .append(WalOp::SetBlock(height, block.clone()), height);
         self.persist_restart_artifacts(transactions, &receipts, height);
@@ -4376,7 +4383,7 @@ impl StateDB {
             self.full_transactions.insert(tx.hash.0, tx.clone());
         }
 
-        self.blocks.insert(height, block.clone());
+        self.blocks.insert(height, Box::new(block.clone()));
         self.wal
             .append(WalOp::SetBlock(height, block.clone()), height);
         self.persist_restart_artifacts(transactions, &receipts, height);
@@ -4598,7 +4605,7 @@ impl StateDB {
         // Empty tx_hashes vec - 10M hashes would be 320MB per block.
         // txs are reconstructable on-demand from nonce_base + deterministic params.
         let block = Block::new(header, vec![]);
-        self.blocks.insert(height, block.clone());
+        self.blocks.insert(height, Box::new(block.clone()));
 
         // ── Store nonce_base for on-demand reconstruction ───────────────
         self.benchmark_nonces.insert(height, current_nonce_base);
@@ -4816,7 +4823,7 @@ impl StateDB {
         // Store tx hashes in the Block for /block/{height}/txs listing
         let block_tx_hashes: Vec<Hash256> = transactions.iter().map(|tx| tx.hash).collect();
         let block = Block::new(header, block_tx_hashes);
-        self.blocks.insert(height, block.clone());
+        self.blocks.insert(height, Box::new(block.clone()));
 
         // ── 7. Store success flags for receipt reconstruction ────────────
         self.signed_block_data
@@ -5018,7 +5025,7 @@ impl StateDB {
         limit: u32,
     ) -> Vec<Transaction> {
         let block = match self.blocks.get(&height) {
-            Some(b) => b.clone(),
+            Some(b) => Block::clone(&b),
             None => return vec![],
         };
         let tx_count = block.header.tx_count;
@@ -8711,7 +8718,7 @@ impl StateDB {
             self.full_transactions.insert(tx.hash.0, tx.clone());
         }
 
-        self.blocks.insert(height, block.clone());
+        self.blocks.insert(height, Box::new(block.clone()));
         self.wal
             .append(WalOp::SetBlock(height, block.clone()), height);
         self.persist_restart_artifacts(transactions, &receipts, height);
@@ -9147,7 +9154,7 @@ impl StateDB {
         let end = to.min(from.saturating_add(limit as u64).saturating_sub(1));
         for h in from..=end {
             if let Some(block) = self.blocks.get(&h) {
-                blocks.push(block.clone());
+                blocks.push(Block::clone(&block));
             }
         }
         blocks
@@ -9978,7 +9985,7 @@ impl StateDB {
         let window = self.snapshot_history_window.load(Ordering::Acquire).max(1);
         let first = height.saturating_sub(window - 1);
         let blocks: Vec<(u64, Block)> = (first..=height)
-            .filter_map(|h| self.blocks.get(&h).map(|b| (h, b.value().clone())))
+            .filter_map(|h| self.blocks.get(&h).map(|b| (h, Block::clone(&b))))
             .collect();
         let in_window: Vec<[u8; 32]> = blocks
             .iter()
@@ -11379,6 +11386,108 @@ mod tests {
         assert_eq!(restarted.height(), 1);
         assert_eq!(restarted.get_block(1).unwrap().hash, block.hash);
         assert_eq!(restarted.get_state_root(), root);
+        drop(restarted);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Each block as its serialized bytes: `Block` has no `PartialEq`, and
+    /// equal bytes mean equal fields.
+    fn block_bytes(blocks: &[Block]) -> Vec<Vec<u8>> {
+        blocks
+            .iter()
+            .map(|block| bincode::serialize(block).expect("block serializes"))
+            .collect()
+    }
+
+    /// The block table keeps every committed block. Its hashbrown shards size
+    /// an empty bucket like a full one and double their bucket arrays when
+    /// 7/8 full, so with `Block` (about 300 bytes) inline each doubling
+    /// allocated about 300 bytes per new bucket at once. A boxed entry is a
+    /// height and a pointer. Storing `Block` inline again fails this test.
+    #[test]
+    fn block_table_entry_is_a_height_and_a_pointer() {
+        // dashmap stores `(K, SharedValue<V>)`, which is the size of `(K, V)`.
+        fn entry_size<K, V, S>(_: &dashmap::DashMap<K, V, S>) -> usize {
+            std::mem::size_of::<(K, V)>()
+        }
+        let state = StateDB::new();
+        assert!(entry_size(&state.blocks) <= 16);
+    }
+
+    /// Every reader of the block table returns the whole block that was
+    /// stored. A replayed block at a stored height replaces it, and the
+    /// replaced block's transactions leave `tx_index`. A clear empties the
+    /// table, and a snapshot's history window writes the blocks back.
+    #[test]
+    fn block_table_returns_stored_blocks_after_insert_overwrite_and_clear() {
+        let state = StateDB::with_genesis(&[(addr(1), 1_000)]);
+        let mut stored = vec![Block::genesis()];
+        for _ in 0..3 {
+            stored.push(state.execute_block(&[], addr(99)).unwrap().0);
+        }
+        let expected = block_bytes(&stored);
+        let by_height: Vec<Block> = (0..=3).map(|h| state.get_block(h).unwrap()).collect();
+        assert_eq!(block_bytes(&by_height), expected);
+        let by_hash: Vec<Block> = stored
+            .iter()
+            .map(|block| state.get_block_by_hash(&block.hash.0).unwrap())
+            .collect();
+        assert_eq!(block_bytes(&by_hash), expected);
+        assert_eq!(block_bytes(&state.get_block_range(0, 3, 10)), expected);
+        let window: Vec<Block> = state
+            .export_durable_snapshot()
+            .blocks
+            .into_iter()
+            .map(|(_, block)| block)
+            .collect();
+        assert_eq!(block_bytes(&window), expected);
+
+        let old_tx = hash_bytes(b"block-table-old-tx");
+        let new_tx = hash_bytes(b"block-table-new-tx");
+        let mut header = stored[3].header.clone();
+        header.tx_count = 1;
+        let older = Block::new(header.clone(), vec![old_tx]);
+        header.timestamp += 1;
+        let newer = Block::new(header, vec![new_tx]);
+        state.apply_wal_op(&WalOp::SetBlock(3, older));
+        assert_eq!(state.get_tx_location(&old_tx.0), Some((3, 0)));
+        state.apply_wal_op(&WalOp::SetBlock(3, newer.clone()));
+        stored[3] = newer;
+        let expected = block_bytes(&stored);
+        assert_eq!(block_bytes(&state.get_block_range(0, 3, 10)), expected);
+        assert_eq!(state.get_tx_location(&old_tx.0), None);
+        assert_eq!(state.get_tx_location(&new_tx.0), Some((3, 0)));
+        assert_eq!(state.blocks.len(), 4);
+
+        let payload = state.export_durable_snapshot();
+        state.clear_replayable_state();
+        assert!(state.blocks.is_empty());
+        assert!(state.get_block(0).is_none());
+        assert!(state.get_block_range(0, 3, 10).is_empty());
+        state.install_history_window(&payload);
+        assert_eq!(block_bytes(&state.get_block_range(0, 3, 10)), expected);
+        assert_eq!(state.get_tx_location(&new_tx.0), Some((3, 0)));
+    }
+
+    /// A restart rebuilds the block table from the WAL, and every block reads
+    /// back exactly as it was stored before the restart.
+    #[test]
+    fn block_table_after_restart_holds_the_same_blocks() {
+        let dir = persistent_test_dir("block-table-restart");
+        let genesis_hash = hash_bytes(b"block-table-restart");
+        let prefunded = [(addr(1), 123)];
+        let state = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap();
+        for _ in 0..3 {
+            state.execute_block(&[], addr(99)).unwrap();
+        }
+        let before = block_bytes(&state.get_block_range(0, 3, 10));
+        assert_eq!(before.len(), 4);
+        drop(state);
+
+        let restarted = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_hash).unwrap();
+        assert_eq!(restarted.height(), 3);
+        assert_eq!(restarted.blocks.len(), 4);
+        assert_eq!(block_bytes(&restarted.get_block_range(0, 3, 10)), before);
         drop(restarted);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -12793,7 +12902,7 @@ mod tests {
             state_diff: None,
         };
         let block = Block::new(header, tx_hashes);
-        state.blocks.insert(0, block.clone());
+        state.blocks.insert(0, Box::new(block.clone()));
         state.tx_index.insert(transaction_hash.0, (0, 0));
         state
             .full_transactions
@@ -12880,7 +12989,7 @@ mod tests {
             inclusion_proof: None,
             logs: Vec::new(),
         };
-        state.blocks.insert(height, block.clone());
+        state.blocks.insert(height, Box::new(block.clone()));
         state.tx_index.insert(transaction_hash.0, (height, 0));
         state
             .full_transactions

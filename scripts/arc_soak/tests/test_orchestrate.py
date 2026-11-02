@@ -15,7 +15,7 @@ from arc_soak import orchestrate  # noqa: E402
 REAL_RECORD = """=== ARC build provenance ===
 recorded_utc:     20260921T145417Z
 command:          cargo build -p arc-node --locked
-workdir:          /Users/excaulibur/work/arc-chain-readiness-20260919
+workdir:          ~/work/arc-chain-readiness-20260919
 source_revision:  a283e9dfa7c2c1257886eb406165c305c9a15eda
 dirty_files:      0
 input_digest:     745a7111d2b94ee3891c75f4a8a343e03230606bd3cece800b473ce522078d10   (content of crates/**, scripts/**, Cargo.toml, Cargo.lock)

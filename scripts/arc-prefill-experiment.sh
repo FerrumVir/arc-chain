@@ -14,9 +14,9 @@
 set -u
 
 TAG="${1:?tag}"; LEN="${2:?prompt_len}"; CHUNK="${3:-64}"; REPS="${4:-2}"; MAXWALL="${5:-1800}"
-OUT=/Users/excaulibur/work/outputs/arc-chain-readiness-20260919
-BIN=/Users/excaulibur/work/arc-chain-readiness-20260919/target/release/examples/batched_prefill_experiment
-GGUF=/Users/excaulibur/.arc/models/standard.gguf
+OUT="${HOME}/work/outputs/arc-chain-readiness-20260919"
+BIN="${HOME}/work/arc-chain-readiness-20260919/target/release/examples/batched_prefill_experiment"
+GGUF="${HOME}/.arc/models/standard.gguf"
 LOCK=/tmp/arc-model-experiment.lock
 
 # Bounds. Baseline swap is captured at launch; the run is killed if swap grows

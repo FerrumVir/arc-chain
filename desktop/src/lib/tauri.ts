@@ -9,6 +9,7 @@ import type {
   BinaryStatus,
   BlockTxs,
   DataMigrationNotice,
+  LegacyComputeQuestion,
   Earnings,
   EarningsProjection,
   FaucetResult,
@@ -24,6 +25,7 @@ import type {
   NodeContribution,
   NodeStatus,
   PaidInferenceResult,
+  PreviousInstallNotice,
   RecentBlocks,
   ResetPeerStateResult,
   RewardEconomics,
@@ -35,6 +37,7 @@ import type {
   TxLookup,
   UpdateInstallPolicy,
   WalletTxResult,
+  WorkerStatus,
 } from "./types";
 import type {
   NativeContextView,
@@ -49,6 +52,7 @@ import {
   nativeMockBalance,
   nativeMockEnabled,
 } from "./native-mock";
+import { DEFAULT_NODE_CONFIG } from "./types";
 
 const IS_TAURI =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -922,6 +926,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment" as T;
     case "load_identity":
       return null as T;
+    case "complete_onboarding":
     case "save_config":
       return undefined as T;
     case "load_config":
@@ -929,6 +934,10 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "load_data_migration_notice":
       return null as T;
     case "dismiss_data_migration_notice":
+      return undefined as T;
+    case "load_previous_install_notice":
+      return null as T;
+    case "dismiss_previous_install_notice":
       return undefined as T;
     case "node_status": {
       // Mirror desktop/src-tauri/src/rpc_client.rs::fetch_status:
@@ -2037,6 +2046,12 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return undefined as T;
     case "clear_crash":
       return undefined as T;
+    // The start fence is native; a browser has nothing that can refuse.
+    case "node_start_block":
+      return null as T;
+    // So is the app bundle the updater would replace.
+    case "update_location_block":
+      return null as T;
     case "ensure_binary":
       // Browser (live mode) can't install a native binary - pretend it's
       // already installed so the UI doesn't block onboarding.
@@ -2131,6 +2146,64 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       if (detailed.kind !== "ok") throw new Error("the receipt is unavailable");
       return { found: true, height: Number(health.height), receipt: detailed.body } as T;
     }
+    case "fetch_worker_status": {
+      const path = "/community/worker/status";
+      const detailed = await getDetailed(path);
+      const none: WorkerStatus = {
+        running: false,
+        unavailable: null,
+        state: null,
+        publicName: null,
+        coordinatorsRegistered: null,
+        coordinatorsTotal: null,
+        jobsClaimed: null,
+        jobsCompleted: null,
+        jobsVerified: null,
+        jobsFailed: null,
+        jobsDeclined: null,
+        lastJobCompletedUnixMs: null,
+        startedUnixMs: null,
+        preventSleepDuringJobs: null,
+      };
+      if (detailed.kind === "notFound") {
+        return {
+          ...none,
+          unavailable:
+            "This node is not running a community worker (observer mode, or no model loaded yet).",
+        } as T;
+      }
+      if (detailed.kind !== "ok") return { ...none, unavailable: reason(path, detailed) } as T;
+      const body = detailed.body;
+      const count = (key: string) => numOf(body, [key]);
+      return {
+        ...none,
+        running: true,
+        state: typeof body.state === "string" ? body.state : null,
+        publicName: typeof body.public_name === "string" ? body.public_name : null,
+        coordinatorsRegistered: count("coordinators_registered"),
+        coordinatorsTotal: count("coordinators_total"),
+        jobsClaimed: count("jobs_claimed"),
+        jobsCompleted: count("jobs_completed"),
+        jobsVerified: count("jobs_verified"),
+        jobsFailed: count("jobs_failed"),
+        jobsDeclined: count("jobs_declined"),
+        lastJobCompletedUnixMs: count("last_job_completed_unix_ms"),
+        startedUnixMs: count("started_unix_ms"),
+        preventSleepDuringJobs:
+          typeof body.prevent_sleep_during_jobs === "boolean"
+            ? body.prevent_sleep_during_jobs
+            : null,
+      } as T;
+    }
+    case "load_legacy_compute_question":
+      return null as T;
+    case "set_compute_contribution":
+    case "promote_consented_install":
+    case "set_prevent_sleep_during_jobs":
+    case "answer_legacy_compute_question":
+      throw new Error(
+        "Compute contribution can only be changed in the ARC desktop app, which owns the node.",
+      );
     case "native_journal":
       return [] as T;
     case "native_prepare":
@@ -2147,7 +2220,18 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
 
 // Mock state - only used in browser preview. Tauri env always hits the real backend.
 let mockStartedAt: number | null = null;
+// Browser-preview only: `window.__ARC_MOCK_CRASH__ = true` makes the stopped
+// node report an unexpected exit until `clear_crash` runs, so the crash
+// banner and the start after it can be exercised without a native host.
+let mockCrashCleared = false;
+function mockCrashed(): boolean {
+  return (
+    !mockCrashCleared &&
+    (globalThis as { __ARC_MOCK_CRASH__?: boolean }).__ARC_MOCK_CRASH__ === true
+  );
+}
 let mockWorkerThreads: number | null = null;
+let mockConfig: NodeConfig | null = null;
 const mockLogs: LogEntry[] = [];
 // Explicit browser-preview fixture for a hypothetical host whose candidate
 // receipt contract is ready. These are static layout values, never a claim
@@ -2420,6 +2504,12 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
   const override = mockOverride<T>(cmd);
   if (override !== undefined) {
     await new Promise((r) => setTimeout(r, 20));
+    // `{ __reject: "text" }` makes the command fail with that text, the way a
+    // native CmdResult error reaches the UI, so the degraded wording can be
+    // exercised without a native host.
+    if (override !== null && typeof override === "object" && "__reject" in override) {
+      throw new Error(String((override as unknown as { __reject: unknown }).__reject));
+    }
     return override;
   }
   await new Promise((r) => setTimeout(r, 120));
@@ -2440,13 +2530,35 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment" as T;
     case "load_identity":
       return null as T;
-    case "save_config":
+    case "complete_onboarding":
+      mockConfig = (args as { config?: NodeConfig } | undefined)?.config ?? mockConfig;
       return undefined as T;
+    case "save_config": {
+      // Mirrors commands.rs::preserve_native_contribution_state: once a
+      // config is stored, a preference save keeps its contribution state.
+      const submitted = (args as { config?: NodeConfig } | undefined)?.config;
+      if (submitted) {
+        mockConfig = mockConfig
+          ? {
+              ...submitted,
+              computeConsent: mockConfig.computeConsent,
+              preventSleepDuringJobs: mockConfig.preventSleepDuringJobs,
+              role: mockConfig.role,
+              modelPath: mockConfig.modelPath,
+            }
+          : submitted;
+      }
+      return undefined as T;
+    }
     case "load_config":
       return null as T;
     case "load_data_migration_notice":
       return null as T;
     case "dismiss_data_migration_notice":
+      return undefined as T;
+    case "load_previous_install_notice":
+      return null as T;
+    case "dismiss_previous_install_notice":
       return undefined as T;
     case "node_status": {
       const running = mockStartedAt !== null;
@@ -2458,11 +2570,15 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       // Restart must be refused.
       const external =
         (globalThis as { __ARC_MOCK_EXTERNAL_NODE__?: boolean }).__ARC_MOCK_EXTERNAL_NODE__ === true;
+      // Mirrors rpc_client.rs: a stopped node still probes the public seeds, and
+      // one answering makes the health "lite" with that coordinator's origin,
+      // so the preview reads "Node off", not "No connection", like the real app.
+      const previewCoordinator = "https://140.82.16.112";
       return {
         running,
         pid: running && !external ? 42_731 : null,
-        health: running ? (uptime < 8 ? "syncing" : "live") : "offline",
-        version: "0.8.10",
+        health: running ? (uptime < 8 ? "syncing" : "live") : "lite",
+        version: "0.8.16",
         peers: running ? 8 : 0,
         round: running ? 43_821 + Math.floor(uptime / 4) : 0,
         committed: running ? 43_820 + Math.floor(uptime / 4) : 0,
@@ -2470,8 +2586,8 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         uptimeSeconds: uptime,
         address: MOCK_ADDRESS,
         rpcPort: 9090,
-        lastError: null,
-        coordinatorUrl: null,
+        lastError: !running && mockCrashed() ? "arc-node exited unexpectedly (code 101)" : null,
+        coordinatorUrl: running ? null : previewCoordinator,
         // Chain numbers are the network's, not this node's - and the mock
         // reflects the real testnet's stalled block production.
         chainHost: "http://140.82.16.112:9090",
@@ -2870,12 +2986,103 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       throw settlementWriteUnavailable("Paid inference escrow");
     }
     case "clear_crash":
+      mockCrashCleared = true;
       return undefined as T;
+    case "node_start_block":
+    case "update_location_block":
+      return null as T;
     case "save_logs":
       return {
         path: "/mock/Downloads/arc-node-20260817-120000.log",
         lines: mockLogs.length,
       } as T;
+    case "fetch_worker_status": {
+      const config = mockConfig ?? DEFAULT_NODE_CONFIG;
+      const working =
+        mockStartedAt !== null && config.role === "worker" && !!config.modelPath;
+      if (!working) {
+        return {
+          running: false,
+          unavailable:
+            "This node is not running a community worker (observer mode, or no model loaded yet).",
+          state: null,
+          publicName: null,
+          coordinatorsRegistered: null,
+          coordinatorsTotal: null,
+          jobsClaimed: null,
+          jobsCompleted: null,
+          jobsVerified: null,
+          jobsFailed: null,
+          jobsDeclined: null,
+          lastJobCompletedUnixMs: null,
+          startedUnixMs: null,
+          preventSleepDuringJobs: null,
+        } as T;
+      }
+      return {
+        running: true,
+        unavailable: null,
+        state: "polling",
+        publicName: "node-99999999",
+        coordinatorsRegistered: 6,
+        coordinatorsTotal: 6,
+        jobsClaimed: 12,
+        jobsCompleted: 11,
+        jobsVerified: 10,
+        jobsFailed: 1,
+        jobsDeclined: 0,
+        lastJobCompletedUnixMs: Date.now() - 95_000,
+        startedUnixMs: mockStartedAt,
+        preventSleepDuringJobs: config.preventSleepDuringJobs === true,
+      } as T;
+    }
+    case "load_legacy_compute_question":
+      return null as T;
+    case "answer_legacy_compute_question": {
+      const { contribute } = args as { contribute: boolean };
+      const config = mockConfig ?? DEFAULT_NODE_CONFIG;
+      mockConfig = contribute
+        ? {
+            ...config,
+            computeConsent: true,
+            role: "worker",
+            modelPath: config.modelPath ?? "/mock/.arc/models/standard.gguf",
+          }
+        : { ...config, computeConsent: false, role: "observer" };
+      return mockConfig as T;
+    }
+    case "set_compute_contribution": {
+      const { enabled } = args as { enabled: boolean };
+      const config = mockConfig ?? DEFAULT_NODE_CONFIG;
+      mockConfig = enabled
+        ? {
+            ...config,
+            computeConsent: true,
+            role: "worker",
+            modelPath: config.modelPath ?? "/mock/.arc/models/standard.gguf",
+          }
+        : { ...config, computeConsent: false, role: "observer", modelPath: null };
+      return mockConfig as T;
+    }
+    case "promote_consented_install": {
+      const config = mockConfig ?? DEFAULT_NODE_CONFIG;
+      if (config.computeConsent !== true) {
+        throw new Error(
+          "Compute contribution is off. Turn it on in Settings to download the model and take ARC jobs on this computer.",
+        );
+      }
+      mockConfig = {
+        ...config,
+        role: "worker",
+        modelPath: config.modelPath ?? "/mock/.arc/models/standard.gguf",
+      };
+      return mockConfig as T;
+    }
+    case "set_prevent_sleep_during_jobs": {
+      const { enabled } = args as { enabled: boolean };
+      mockConfig = { ...(mockConfig ?? DEFAULT_NODE_CONFIG), preventSleepDuringJobs: enabled };
+      return mockConfig as T;
+    }
     case "set_worker_threads": {
       const { threads } = args as { threads: number };
       mockWorkerThreads = threads;
@@ -2936,6 +3143,36 @@ async function realInvoke<T>(cmd: string, args?: unknown): Promise<T> {
   return invoke<T>(cmd, args as Record<string, unknown>);
 }
 
+// Node Care outside the native host: a browser preview has no report
+// endpoint and never sends. The notice counts as seen so previews and their
+// screenshots keep their layout; the switch still works in memory.
+let browserNodeCareState: string | null = JSON.stringify({
+  v: 1,
+  installId: "00000000000000000000000000000000",
+  enabled: true,
+  noticeShownAt: 0,
+});
+
+function browserNodeCare<T>(cmd: string, args?: unknown): T {
+  switch (cmd) {
+    case "node_care_info":
+      return {
+        endpointConfigured: false,
+        appVersion: "0.0.0-preview",
+        os: "preview",
+        arch: "preview",
+        homeDir: "",
+      } as T;
+    case "node_care_load_state":
+      return browserNodeCareState as T;
+    case "node_care_save_state":
+      browserNodeCareState = String((args as { json?: unknown } | undefined)?.json ?? "");
+      return undefined as T;
+    default:
+      return false as T;
+  }
+}
+
 export async function invoke<T>(cmd: string, args?: unknown): Promise<T> {
   if (IS_TAURI) return realInvoke<T>(cmd, args);
   if (IS_PROD_TAURI_BUNDLE) {
@@ -2943,8 +3180,30 @@ export async function invoke<T>(cmd: string, args?: unknown): Promise<T> {
       "ARC desktop is running outside its native host. Open the arc app, not the HTML bundle.",
     );
   }
+  if (cmd.startsWith("node_care_")) return browserNodeCare<T>(cmd, args);
   if (liveBase()) return liveInvoke<T>(cmd, args);
   return mockInvoke<T>(cmd, args);
+}
+
+/**
+ * Told about every refused Start or Restart, so Node Care can report it
+ * without each screen knowing about reporting. One listener; it must not throw.
+ */
+let startFailureListener: ((error: unknown, stage: string) => void) | null = null;
+
+export function onStartNodeFailure(listener: ((error: unknown, stage: string) => void) | null) {
+  startFailureListener = listener;
+}
+
+function noticeStartFailure<T>(promise: Promise<T>, stage: string): Promise<T> {
+  return promise.catch((error: unknown) => {
+    try {
+      startFailureListener?.(error, stage);
+    } catch {
+      /* reporting never changes what the caller sees */
+    }
+    throw error;
+  });
 }
 
 // Typed wrappers - call these, not invoke() directly.
@@ -2962,21 +3221,45 @@ export const api = {
    */
   revealSeedPhrase: () => invoke<string>("reveal_seed_phrase"),
   saveConfig: (config: NodeConfig) => invoke<void>("save_config", { config }),
+  /**
+   * Onboarding's one save: records the wizard's compute choice (consent,
+   * role, model) with the defaults. `saveConfig` never changes those fields
+   * once a config is stored; the Settings switch and the observer banner
+   * use `setComputeContribution` instead.
+   */
+  completeOnboarding: (config: NodeConfig) =>
+    invoke<void>("complete_onboarding", { config }),
   loadConfig: () => invoke<NodeConfig | null>("load_config"),
   loadDataMigrationNotice: () =>
     invoke<DataMigrationNotice | null>("load_data_migration_notice"),
   dismissDataMigrationNotice: () =>
     invoke<void>("dismiss_data_migration_notice"),
-  startNode: (config: NodeConfig) => invoke<void>("start_node", { config }),
+  /** Launch set node data from an earlier install aside, if it did. */
+  loadPreviousInstallNotice: () =>
+    invoke<PreviousInstallNotice | null>("load_previous_install_notice"),
+  dismissPreviousInstallNotice: () =>
+    invoke<void>("dismiss_previous_install_notice"),
+  /** The first-launch question for an install upgraded from v0.7, if pending. */
+  loadLegacyComputeQuestion: () =>
+    invoke<LegacyComputeQuestion | null>("load_legacy_compute_question"),
+  /** Answer it; recorded exactly like the Settings compute switch. */
+  answerLegacyComputeQuestion: (contribute: boolean) =>
+    invoke<NodeConfig>("answer_legacy_compute_question", { contribute }),
+  startNode: (config: NodeConfig) =>
+    noticeStartFailure(invoke<void>("start_node", { config }), "start"),
   stopNode: () => invoke<void>("stop_node"),
   prepareUpdateRelaunch: () => invoke<void>("prepare_update_relaunch"),
   tryPrepareAutoUpdateRelaunch: () =>
     invoke<AutoUpdatePrepareResult>("try_prepare_auto_update_relaunch"),
   beginUpdateHandoff: () => invoke<void>("begin_update_handoff"),
   abortUpdateRelaunch: () => invoke<void>("abort_update_relaunch"),
-  restartNode: () => invoke<void>("restart_node"),
+  restartNode: () => noticeStartFailure(invoke<void>("restart_node"), "restart"),
   resetPeerState: () => invoke<ResetPeerStateResult>("reset_peer_state"),
   nodeStatus: () => invoke<NodeStatus>("node_status"),
+  /** What a Start would be told by the start fence now; null when starts are open. */
+  nodeStartBlock: () => invoke<string | null>("node_start_block"),
+  /** macOS: what an app update would be told about where ARC runs; null when it can update in place. */
+  updateLocationBlock: () => invoke<string | null>("update_location_block"),
   fetchEarnings: () => invoke<Earnings>("fetch_earnings"),
   fetchAttestations: (limit = 20) =>
     invoke<Attestation[]>("fetch_attestations", { limit }),
@@ -3119,6 +3402,20 @@ export const api = {
   /** Change how many cores the node contributes. */
   setWorkerThreads: (threads: number) =>
     invoke<ThreadsApplied>("set_worker_threads", { threads }),
+  /** This machine's community worker: state and job counters (local node only). */
+  fetchWorkerStatus: () => invoke<WorkerStatus>("fetch_worker_status"),
+  /**
+   * Turn compute contribution on (download the model if needed, worker mode,
+   * restart) or off (observer mode). Returns the saved config.
+   */
+  setComputeContribution: (enabled: boolean) =>
+    invoke<NodeConfig>("set_compute_contribution", { enabled }),
+  /** Finish enabling contribution for a user who already opted in. */
+  promoteConsentedInstall: () =>
+    invoke<NodeConfig>("promote_consented_install"),
+  /** Keep the computer awake while a job runs (applies at the next node start). */
+  setPreventSleepDuringJobs: (enabled: boolean) =>
+    invoke<NodeConfig>("set_prevent_sleep_during_jobs", { enabled }),
   ensureBinary: () => invoke<BinaryStatus>("ensure_binary"),
   getAutostart: () => invoke<boolean>("get_autostart"),
   updateInstallPolicy: () =>

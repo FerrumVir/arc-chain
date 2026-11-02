@@ -1,5 +1,8 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=ARC_BUILD_SOURCE_COMMIT");
+    // Node Care report endpoint, read by `option_env!` in node_care.rs.
+    // Unset or empty builds never send a report.
+    println!("cargo:rerun-if-env-changed=ARC_NODE_CARE_ENDPOINT");
     emit_git_rerun_path("HEAD");
     let sealed_commit = match std::env::var("ARC_BUILD_SOURCE_COMMIT") {
         Ok(value) if is_commit(&value) => Some(value),

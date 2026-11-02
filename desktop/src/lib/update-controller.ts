@@ -1,8 +1,21 @@
 import type { AutoUpdatePrepareResult } from "./types";
+import { PLAIN_COPY } from "./plain-copy";
+import { isStartupReconciliationInProgress } from "./start-failure";
 
 export const UPDATE_STARTUP_DELAY_MS = 5_000;
 export const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1_000;
 export const UPDATE_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 15 * 60_000] as const;
+/** How often a verified update retries while launch reconciliation runs. */
+export const UPDATE_RECONCILIATION_RETRY_MS = 60_000;
+
+/**
+ * What both native update preparations refuse with on macOS when the updater
+ * can't replace ARC where it runs (`update_location.rs`). They refuse before
+ * anything stops or is fenced. update-controller.spec.ts pins it against the
+ * Rust source.
+ */
+export const NATIVE_WRONG_LOCATION =
+  "ARC can't update itself from where it's running. Quit ARC, drag ARC Node into your Applications folder, then open it from there.";
 
 export type UpdatePhase =
   | "idle"
@@ -136,6 +149,8 @@ export class UpdateController {
   private intervalTimer: unknown | null = null;
   private retryTimer: unknown | null = null;
   private autoInstallRetryTimer: unknown | null = null;
+  private reconciliationRetryTimer: unknown | null = null;
+  private reconciliationWaitManual = false;
   private automaticFailureCount = 0;
   private autoInstallDeferralCount = 0;
   private autoChecksEnabled = false;
@@ -201,6 +216,22 @@ export class UpdateController {
     this.clearAutoInstallRetryTimer();
     this.autoInstallDeferralCount = 0;
 
+    // An automatic wait for the last session ends with unattended installs;
+    // a wait that an Install press started keeps going.
+    if (
+      !next &&
+      this.reconciliationRetryTimer !== null &&
+      !this.reconciliationWaitManual
+    ) {
+      this.clearReconciliationRetryTimer();
+      if (this.candidate && this.snapshot.phase === "available") {
+        this.setSnapshot({
+          ...this.snapshot,
+          message: `Version ${this.candidate.version} is available.`,
+        });
+      }
+    }
+
     // Saving explicit opt-in can apply to a signed candidate already found by
     // an earlier check. The currently installed bundle never changes here.
     if (
@@ -265,6 +296,7 @@ export class UpdateController {
         this.candidate = next;
         if (previous && previous !== next) {
           this.clearAutoInstallRetryTimer();
+          this.clearReconciliationRetryTimer();
           this.autoInstallDeferralCount = 0;
           if (this.downloadedCandidate === previous) {
             this.downloadedCandidate = null;
@@ -501,6 +533,10 @@ export class UpdateController {
             outcome = await this.runtime.tryPrepareAutoUpdateRelaunch!();
           } catch (error) {
             const detail = errorMessage(error);
+            const lastSession = isStartupReconciliationInProgress(detail);
+            // The native abort waits for the recovery launch to release the
+            // node, which can take a while; say why the install is waiting.
+            if (lastSession) this.showWaitingForLastSession(version);
             try {
               // The IPC may fail after native quiescence was established.
               // Abort is safe before beginUpdateHandoff and avoids leaving the
@@ -517,11 +553,35 @@ export class UpdateController {
               });
               return this.snapshot;
             }
+            if (lastSession) {
+              if (!this.isAutoInstallCurrent(autoInstallGeneration)) {
+                // Unattended installs were turned off during the abort.
+                this.setSnapshot({
+                  ...this.snapshot,
+                  phase: "available",
+                  message: `Version ${version} is available.`,
+                  error: null,
+                  canInstall: true,
+                  restartRequired: false,
+                });
+                return this.snapshot;
+              }
+              return this.waitForLastSession(candidate, version, true);
+            }
+            // The location refusal is the whole story, and the Settings
+            // install is refused the same way; moving ARC takes a quit, so
+            // nothing retries it. A legacy v0.7 refusal also refuses the
+            // Settings install.
+            const wrongLocation = detail.includes(NATIVE_WRONG_LOCATION);
             this.setSnapshot({
               ...this.snapshot,
               phase: "available",
-              message: `Automatic installation of ${version} was deferred because native worker safety could not be confirmed. Install it manually from Settings if you choose.`,
-              error: detail,
+              message: wrongLocation
+                ? PLAIN_COPY.updates.wrongLocation
+                : /legacy desktop node reconciliation is unresolved/.test(detail)
+                  ? PLAIN_COPY.updates.manualInstallOnly(version)
+                  : `Automatic installation of ${version} was deferred because native worker safety could not be confirmed. Install it manually from Settings if you choose.`,
+              error: wrongLocation ? null : detail,
               canInstall: true,
               restartRequired: false,
             });
@@ -666,6 +726,24 @@ export class UpdateController {
           });
           return this.snapshot;
         }
+        if (isStartupReconciliationInProgress(detail)) {
+          return this.waitForLastSession(candidate, version, false);
+        }
+        if (detail.includes(NATIVE_WRONG_LOCATION)) {
+          // Refused before anything stopped: the node runs on, and the
+          // verified update stays offered with the one step that lets it
+          // install.
+          this.setSnapshot({
+            ...this.snapshot,
+            phase: "available",
+            version,
+            message: PLAIN_COPY.updates.wrongLocation,
+            error: null,
+            canInstall: true,
+            restartRequired: false,
+          });
+          return this.snapshot;
+        }
         this.setSnapshot({
           ...this.snapshot,
           phase: "error",
@@ -689,6 +767,7 @@ export class UpdateController {
   dispose(): void {
     this.setAutoInstallEnabled(false);
     this.clearTimers();
+    this.clearReconciliationRetryTimer();
     this.autoChecksEnabled = false;
     const candidate = this.candidate;
     this.candidate = null;
@@ -722,6 +801,60 @@ export class UpdateController {
       this.timers.clearTimeout(this.autoInstallRetryTimer);
       this.autoInstallRetryTimer = null;
     }
+  }
+
+  // Not part of clearTimers: a settings save re-enables background checks,
+  // and must not drop an install the user already asked for.
+  private clearReconciliationRetryTimer(): void {
+    if (this.reconciliationRetryTimer !== null) {
+      this.timers.clearTimeout(this.reconciliationRetryTimer);
+      this.reconciliationRetryTimer = null;
+    }
+    this.reconciliationWaitManual = false;
+  }
+
+  private showWaitingForLastSession(version: string): void {
+    this.setSnapshot({
+      ...this.snapshot,
+      phase: "available",
+      version,
+      message: PLAIN_COPY.updates.waitingForLastSession(version),
+      error: null,
+      canInstall: true,
+      restartRequired: false,
+    });
+  }
+
+  /**
+   * Launch-time reconciliation still owns the node, possibly mid-way through
+   * a WAL replay. Never interrupt it: keep the verified candidate and try the
+   * same install again on a fixed cadence. Once reconciliation ends, native
+   * preparation either stops the node as usual or, behind a start refusal,
+   * takes the fenced boundary, so the wait ends in the install.
+   *
+   * One timer serves both paths. An Install press upgrades a pending
+   * automatic wait, so turning unattended installs off cannot drop it.
+   */
+  private waitForLastSession(
+    candidate: UpdateCandidate,
+    version: string,
+    automatic: boolean,
+  ): UpdateSnapshot {
+    this.showWaitingForLastSession(version);
+    if (this.reconciliationRetryTimer === null) {
+      this.reconciliationWaitManual = !automatic;
+      this.reconciliationRetryTimer = this.timers.setTimeout(() => {
+        const manual = this.reconciliationWaitManual;
+        this.reconciliationRetryTimer = null;
+        this.reconciliationWaitManual = false;
+        if (this.candidate !== candidate) return;
+        if (manual) void this.startInstall(null);
+        else void this.installAutomatically(candidate);
+      }, UPDATE_RECONCILIATION_RETRY_MS);
+    } else if (!automatic) {
+      this.reconciliationWaitManual = true;
+    }
+    return this.snapshot;
   }
 
   private isAutoInstallCurrent(generation: number | null): boolean {

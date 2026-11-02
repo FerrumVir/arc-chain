@@ -30,6 +30,7 @@ desktop/
 │   │   ├── identity.rs      Generates an on-chain address + recovery phrase
 │   │   └── store.rs         Persists identity & config to the OS app-data dir
 │   ├── capabilities/    Tauri 2 permission manifest
+│   ├── windows/         NSIS installer hooks: the uninstaller asks before deleting wallet data
 │   └── tauri.conf.json  Bundle identifier, window, CSP
 └── tests/               Playwright browser/evidence/resilience suites
 ```
@@ -97,6 +98,21 @@ the protected release environment, then verify the produced signatures before
 changing user-facing copy. Do not paste signing secrets into this file or the
 repository. Linux packages do not use either OS trust system.
 
+## Anonymous error reports (Node Care)
+
+When the node won't start, crashes, gets stuck or an update fails, the app
+sends one small scrubbed report, and once a day a heartbeat, so problems can
+be fixed without screenshots. It is on by default, shown once in a first-run
+notice, and turned off in Settings → Error reports, which also shows the exact
+last payloads. [`PRIVACY.md`](PRIVACY.md) lists every field.
+
+- Logic, scrubbing, queue and limits: `src/lib/node-care.ts`
+  (`tests/node-care.spec.ts`, in `npm run test:unit`).
+- Native side: `src-tauri/src/node_care.rs` keeps `node-care.json` in the
+  app-data folder and POSTs to `{ARC_NODE_CARE_ENDPOINT}/v1/report` and
+  `/v1/heartbeat`. Set `ARC_NODE_CARE_ENDPOINT` (HTTPS) in the build
+  environment to enable sending; unset or empty, the build never sends.
+
 ## Testing
 
 ```bash
@@ -104,8 +120,8 @@ npm test                # all suites, headless
 npm run test:ui         # Playwright UI mode (time-travel debugger)
 ```
 
-At this audited tree state, `npx playwright test --list` enumerates 281 tests in
-22 files. That inventory includes `live.spec.ts`; its tests skip without
+At this audited tree state, `npx playwright test --list` enumerates 361 tests in
+30 files. That inventory includes `live.spec.ts`; its tests skip without
 `ARC_LIVE_PORT`, and the required real-node run uses `npm run test:live`.
 Native test inventory is intentionally not hard-coded: run
 `cargo test --manifest-path src-tauri/Cargo.toml -- --list`, and treat only a

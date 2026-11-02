@@ -2,14 +2,19 @@ mod auto_update;
 mod commands;
 mod hardware;
 mod identity;
+mod legacy_upgrade;
 mod native_paid;
+mod node_care;
 mod node_manager;
 mod paths;
+mod previous_install;
 mod production_acceptance;
 mod rpc_client;
+mod start_fence;
 mod store;
 mod tray;
 mod types;
+mod update_location;
 mod updater_channel;
 mod wallet;
 
@@ -104,10 +109,12 @@ pub struct AppState {
     /// unreachable.
     pub has_tray: Arc<std::sync::atomic::AtomicBool>,
     /// Authoritative native fail-closed fence for an unresolved data
-    /// migration preflight. Every command that can start arc-node consults
-    /// this state; a WebView Start/Restart click cannot bypass a startup
-    /// failure and replay an ambiguous legacy WAL.
-    pub data_migration_error: Arc<Mutex<Option<String>>>,
+    /// migration preflight and for launch-time reconciliation. Every command
+    /// that can start arc-node consults this state; a WebView Start/Restart
+    /// click cannot bypass a startup failure and replay an ambiguous legacy
+    /// WAL. While reconciliation runs, only its own recovery launch may pass
+    /// (`start_fence::StartAccess::StartupRecovery`).
+    pub data_migration_error: Arc<Mutex<Option<start_fence::StartFence>>>,
     /// Cancels the single per-launch auto-start transaction and its bounded-
     /// rate network retry loop when Stop, Quit, update, or settings disable it.
     pub startup_retry_cancel: tokio::sync::watch::Sender<()>,
@@ -125,6 +132,238 @@ pub struct CommunityReceiptRoute {
     pub job_id: String,
     pub worker: String,
     pub receipt_url: String,
+}
+
+/// Node data from an earlier install whose app data is gone is set aside
+/// (`previous_install`) while the launch-time fence is held: before
+/// reconciliation, when nothing holds the directory any more, and again after
+/// reconciliation has drained a node that was still running there. Returns
+/// the notice to record when the directory moved. `app_data_absent` is
+/// whether no identity store existed when this launch began; a store that
+/// exists, readable or not, means this install may own the directory, and
+/// nothing moves.
+async fn set_aside_previous_install_data(
+    node: &mut node_manager::NodeManager,
+    configured_data_dir: &str,
+    app_data_absent: bool,
+) -> Option<types::PreviousInstallNotice> {
+    if !app_data_absent {
+        return None;
+    }
+    let data_dir = node_manager::resolve_data_dir(configured_data_dir);
+    let probe_dir = data_dir.clone();
+    let decision = tokio::task::spawn_blocking(move || {
+        previous_install::set_aside_if_previous_install(
+            &probe_dir,
+            app_data_absent,
+            std::time::SystemTime::now(),
+        )
+    })
+    .await;
+    match decision {
+        Ok(previous_install::Decision::Keep) => None,
+        Ok(previous_install::Decision::Held(reason)) => {
+            tracing::warn!(
+                %reason,
+                "node data from an earlier install stays in place; launch reconciliation runs as before"
+            );
+            None
+        }
+        Ok(previous_install::Decision::SetAside { from, to }) => {
+            let shown_from = paths::display_with_home_redacted(&from);
+            let shown_to = paths::display_with_home_redacted(&to);
+            tracing::warn!(
+                from = %shown_from,
+                to = %shown_to,
+                "set aside node data left by an earlier ARC install whose app data is gone"
+            );
+            node_manager::push_log(
+                &node.logs,
+                "warn",
+                format!(
+                    "ARC found node data from an earlier install at {shown_from} and set it aside at {shown_to}; nothing was deleted, and this install starts with a fresh data directory"
+                ),
+            )
+            .await;
+            Some(types::PreviousInstallNotice {
+                set_aside_data_dir: to.display().to_string(),
+                active_data_dir: data_dir.display().to_string(),
+                set_aside_at: chrono::Utc::now().timestamp_millis(),
+            })
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "the previous-install check did not complete; node data stays in place"
+            );
+            None
+        }
+    }
+}
+
+/// Persist the set-aside notice so it shows until dismissed, also across a
+/// restart. Called only after a move, which requires that no store existed
+/// at launch, so this never writes over a store that did not load; the
+/// shared store may by now hold the identity onboarding created meanwhile.
+async fn record_previous_install_notice(state: &AppState, notice: types::PreviousInstallNotice) {
+    let mut store = state.store.lock().await;
+    store.previous_install_notice = Some(notice);
+    let dir = state.data_dir.lock().await.clone();
+    if let Err(error) = store.save_to(&dir) {
+        tracing::error!(
+            %error,
+            "could not persist the previous-install notice; it shows for this session only"
+        );
+    }
+}
+
+/// Launch-time reconciliation of the managed node an earlier desktop process
+/// left behind, run while the launch-time start fence is held.
+///
+/// Before anything reads the configured data directory, and again after the
+/// node that may have held it is drained, a directory left by an earlier
+/// install whose app data is gone is set aside (`previous_install`). Its
+/// armed receipt goes with it: the recovery launch that receipt would need
+/// requires an identity this install does not have, which through v0.8.14
+/// refused every Start with "managed-node durability recovery failed: no
+/// identity" until ARC restarted. Each move is recorded the moment it
+/// happens, so a stop failure further down cannot hide it from the user.
+///
+/// It drains any desktop-managed child left by an older app process,
+/// including one listening on a fallback port. It runs even when auto-start
+/// is off or migration persistence failed: those states forbid starting a
+/// node but must not leave the pre-update child alive. A stop failure is a
+/// hard startup boundary; do not race two versions against one data
+/// directory. When the previous node exited without acknowledging its final
+/// WAL barrier, it then runs the one quarantined recovery launch that clears
+/// that receipt.
+///
+/// Every `Err` is the reason the caller keeps node start and binary
+/// replacement refused until ARC restarts. The signed app update still takes
+/// the fenced boundary past it (`start_fence::app_update_boundary`), except
+/// behind a legacy v0.7 refusal. No path leaves the fence to the caller's
+/// guesswork: the caller resolves it from this result alone.
+async fn reconcile_previous_managed_node(
+    handle: &tauri::AppHandle,
+    state: &AppState,
+    start_config: &types::NodeConfig,
+    app_data_absent_at_launch: bool,
+    legacy_migration_block: Option<String>,
+    legacy_windows_stop: Option<(types::DataMigrationNotice, Zeroizing<String>)>,
+) -> Result<(), String> {
+    // A directory nothing holds any more moves before anything reads it, and
+    // the move is recorded at once, in its own lock scope.
+    let set_aside_before_reconciliation = {
+        let mut node = state.node.lock().await;
+        set_aside_previous_install_data(
+            &mut node,
+            &start_config.data_dir,
+            app_data_absent_at_launch,
+        )
+        .await
+    };
+    if let Some(notice) = set_aside_before_reconciliation.as_ref() {
+        record_previous_install_notice(state, notice.clone()).await;
+    }
+
+    let mut managed_recovery_required = false;
+    let mut set_aside_after_drain = None;
+    let mut repoint = Ok(());
+    {
+        let legacy_resources = commands::resolve_testnet_resources(handle);
+        let mut node = state.node.lock().await;
+        if let Err(error) = node.configure_managed_data_dir(&start_config.data_dir) {
+            tracing::error!(
+                %error,
+                "managed-node durability receipt is invalid; blocking node start"
+            );
+            return Err(format!(
+                "managed-node startup reconciliation failed: {error}"
+            ));
+        }
+        if let Some(reason) = legacy_migration_block {
+            node.block_legacy_windows_reconciliation(reason.clone());
+            tracing::error!(
+                %reason,
+                "legacy desktop migration is not durable; leaving the old node running and blocking startup/update"
+            );
+            return Err(reason);
+        }
+        if let Some((notice, validator_seed)) = legacy_windows_stop {
+            if let Err(error) = node.configure_legacy_windows_stop_context(
+                start_config,
+                &notice,
+                validator_seed,
+                &legacy_resources,
+            ) {
+                tracing::error!(
+                    %error,
+                    "one-time tokenless legacy node context is invalid; blocking startup/update"
+                );
+                return Err(format!(
+                    "one-time legacy node reconciliation context is invalid: {error}"
+                ));
+            }
+        }
+        if let Err(error) = node.stop().await {
+            if node_manager::is_managed_durability_recovery_required(&error) {
+                managed_recovery_required = true;
+                tracing::warn!(
+                    %error,
+                    "an inherited managed-node durability fence requires a quarantined recovery cycle"
+                );
+            } else {
+                tracing::error!(
+                    %error,
+                    "could not stop stale managed arc-node; suppressing auto-start"
+                );
+                return Err(format!(
+                    "managed-node startup reconciliation failed: {error}"
+                ));
+            }
+        }
+        // The node just drained may have been the holder. With it gone, an
+        // earlier install's directory is set aside now, and a receipt it
+        // left armed needs no recovery launch: nothing of this install ever
+        // ran there, and the directory keeps every byte.
+        if set_aside_before_reconciliation.is_none() {
+            set_aside_after_drain = set_aside_previous_install_data(
+                &mut node,
+                &start_config.data_dir,
+                app_data_absent_at_launch,
+            )
+            .await;
+            if set_aside_after_drain.is_some() {
+                managed_recovery_required = false;
+                repoint = node.configure_managed_data_dir(&start_config.data_dir);
+            }
+        }
+    }
+    if let Some(notice) = set_aside_after_drain {
+        record_previous_install_notice(state, notice).await;
+    }
+    if let Err(error) = repoint {
+        return Err(format!(
+            "managed-node startup reconciliation failed: {error}"
+        ));
+    }
+
+    if managed_recovery_required {
+        // This is the step the launch-time fence waits for, so it uses the
+        // one transaction allowed through it. Through v0.8.12 it checked the
+        // fence like a WebView click and refused itself on every launch.
+        if let Err(error) = commands::recover_managed_shutdown_inner(handle, state).await {
+            tracing::error!(
+                %error,
+                "quarantined managed-node replay/WAL recovery failed; blocking node start"
+            );
+            return Err(format!("managed-node durability recovery failed: {error}"));
+        }
+        tracing::info!(
+            "recovered the previous managed node's unacknowledged shutdown; its durability receipt is clear"
+        );
+    }
+    Ok(())
 }
 
 fn configured_http_client() -> Result<reqwest::Client, String> {
@@ -268,7 +507,18 @@ pub fn run() {
             }
 
             // Load existing store from the resolved dir, if any.
-            let mut loaded_store = store::Store::load_from(&resolved);
+            let (mut loaded_store, store_load) =
+                store::Store::load_from_with_outcome(&resolved);
+            // Only an absent store lets launch set an earlier install's node
+            // data aside. A store that is present but unreadable loads empty
+            // too; that install owns its directory, and nothing is written
+            // over the store it could not read.
+            let app_data_absent_at_launch = previous_install::app_data_was_absent(store_load);
+            if store_load == store::StoreLoadOutcome::Failed {
+                tracing::error!(
+                    "the identity store is present but could not be read; node data stays in place and the store is not rewritten by launch"
+                );
+            }
             let had_durable_migration_notice = loaded_store.data_migration_notice.is_some();
             let legacy_identity_seed = loaded_store
                 .identity
@@ -284,6 +534,15 @@ pub fn run() {
                 }
                 _ => Ok(None),
             };
+            // A v0.7 desktop kept `dataDir` at the ~/.arc root itself (v0.7.11
+            // `types.rs` default "~/.arc"); every v0.8 build defaults to a
+            // `data-v3*` child. Read this before the fence below rewrites the
+            // pointer: a v0.7 install whose node never ran has no WAL to fence
+            // and no bridge record, yet must still be asked before it
+            // contributes compute.
+            let config_uses_v07_layout = loaded_store.config.as_ref().is_some_and(|config| {
+                legacy_upgrade::config_uses_v07_layout(config, &paths::home_dir())
+            });
             // A v0.7 desktop stored unbound chain state in the same ~/.arc
             // root as binaries and models. Fence that WAL before deriving the
             // auto-start config: old bytes stay untouched while only the
@@ -293,6 +552,7 @@ pub fn run() {
                 Ok(None) => loaded_store.protect_legacy_v07_data(),
                 Err(error) => Err(error),
             };
+            let migration_created_notice = matches!(migration_result, Ok(Some(_)));
             let (
                 migration_allows_autostart,
                 migration_failure_reason,
@@ -335,6 +595,36 @@ pub fn run() {
                     )
                 }
             };
+            // A v0.7 install that reached this build (normally through the
+            // v0.7 legacy bridge release) is asked once whether to keep
+            // contributing compute. Until it answers, it auto-starts as an
+            // observer without a model: no compute without consent.
+            let startup_hold = legacy_upgrade::hold_at_startup(
+                &mut loaded_store,
+                &resolved,
+                &paths::home_dir(),
+                migration_created_notice,
+                config_uses_v07_layout,
+                legacy_upgrade::now_unix_ms(),
+            );
+            if startup_hold.hold.held {
+                tracing::warn!(
+                    "upgraded from v0.7: compute contribution is held until the user answers the first-launch question"
+                );
+            }
+            if let Some(error) = startup_hold.hold.record_error {
+                tracing::error!(%error, "could not record the v0.7 upgrade compute question; the node is held as an observer anyway");
+            }
+            if let Some(error) = startup_hold.persist_error {
+                tracing::error!(%error, "could not persist the held observer config");
+            }
+            // This launch keeps the default in memory even if persisting it
+            // fails; the next launch applies it again.
+            if let Err(error) =
+                auto_update::apply_unattended_install_default(&mut loaded_store, &resolved)
+            {
+                tracing::error!(%error, "could not persist the unattended-update default");
+            }
             let autostart_desired = loaded_store
                 .config
                 .as_ref()
@@ -356,16 +646,13 @@ pub fn run() {
             let migration_error_shared = data_migration_error.clone();
             let node_shared = app.state::<AppState>().node.clone();
             let configured_rpc_port = start_config.rpc_port;
-            let startup_boundary_reason = migration_failure_reason.clone().or_else(|| {
-                Some(
-                    "managed-node startup reconciliation is still in progress; binary replacement and node start are temporarily blocked"
-                        .to_string(),
-                )
-            });
+            // Binary replacement and node start wait for launch-time
+            // reconciliation below; only its own recovery launch may pass.
+            let startup_fence = start_fence::at_launch(migration_failure_reason.clone());
             tauri::async_runtime::block_on(async move {
                 *store_shared.lock().await = loaded_store;
                 *data_dir_shared.lock().await = resolved;
-                *migration_error_shared.lock().await = startup_boundary_reason;
+                *migration_error_shared.lock().await = Some(startup_fence);
                 node_shared
                     .lock()
                     .await
@@ -466,7 +753,6 @@ pub fn run() {
                 // the old GUI's Tauri relaunch on some platforms; treating
                 // any HTTP 200 as compatible left the v0.8 desktop driving
                 // that stale process and its unbound WAL indefinitely.
-                let mut managed_recovery_required = false;
                 match commands::probe_local_node_compatibility(
                     &state.http,
                     start_config.rpc_port,
@@ -502,88 +788,27 @@ pub fn run() {
                 }
 
                 // Drain any desktop-managed child left by an older app
-                // process, including one listening on a fallback port. This
-                // reconciliation runs even when auto-start is off or migration
-                // persistence failed: those states forbid starting a node but
-                // must not leave the pre-update child alive. A stop failure is
-                // a hard updater/startup boundary; do not race two versions
-                // against one data directory.
-                {
-                    let legacy_resources = commands::resolve_testnet_resources(&handle);
-                    let mut node = state.node.lock().await;
-                    if let Err(error) =
-                        node.configure_managed_data_dir(&start_config.data_dir)
-                    {
-                        tracing::error!(
-                            %error,
-                            "managed-node durability receipt is invalid; blocking startup/update"
-                        );
-                        return;
-                    }
-                    if let Some(reason) = legacy_migration_block {
-                        node.block_legacy_windows_reconciliation(reason.clone());
-                        *state.data_migration_error.lock().await = Some(reason.clone());
-                        tracing::error!(
-                            %reason,
-                            "legacy desktop migration is not durable; leaving the old node running and blocking startup/update"
-                        );
-                        return;
-                    }
-                    if let Some((notice, validator_seed)) = legacy_windows_stop {
-                        if let Err(error) = node.configure_legacy_windows_stop_context(
-                            &start_config,
-                            &notice,
-                            validator_seed,
-                            &legacy_resources,
-                        ) {
-                            *state.data_migration_error.lock().await = Some(format!(
-                                "one-time legacy node reconciliation context is invalid: {error}"
-                            ));
-                            tracing::error!(
-                                %error,
-                                "one-time tokenless legacy node context is invalid; blocking startup/update"
-                            );
-                            return;
-                        }
-                    }
-                    if let Err(error) = node.stop().await {
-                        if node_manager::is_managed_durability_recovery_required(&error) {
-                            managed_recovery_required = true;
-                            tracing::warn!(
-                                %error,
-                                "an inherited managed-node durability fence requires a quarantined recovery cycle"
-                            );
-                        } else {
-                            *state.data_migration_error.lock().await = Some(format!(
-                                "managed-node startup reconciliation failed: {error}"
-                            ));
-                            tracing::error!(
-                                %error,
-                                "could not stop stale managed arc-node; suppressing auto-start"
-                            );
-                            return;
-                        }
-                    }
+                // process and recover an unacknowledged shutdown (see
+                // `reconcile_previous_managed_node`).
+                let reconciliation = reconcile_previous_managed_node(
+                    &handle,
+                    &state,
+                    &start_config,
+                    app_data_absent_at_launch,
+                    legacy_migration_block,
+                    legacy_windows_stop,
+                )
+                .await;
+                let reconciled = reconciliation.is_ok();
+                // Every outcome replaces the launch-time fence. Only after the
+                // exact old/detached process boundary is clear may WebView
+                // Start/Ensure/Update entrypoints mutate or spawn; a failure
+                // becomes an explicit refusal, never a stale "in progress".
+                *state.data_migration_error.lock().await =
+                    start_fence::after_startup_reconciliation(reconciliation);
+                if !reconciled {
+                    return;
                 }
-
-                if managed_recovery_required {
-                    if let Err(error) =
-                        commands::recover_managed_shutdown_inner(&handle, &state).await
-                    {
-                        *state.data_migration_error.lock().await = Some(format!(
-                            "managed-node durability recovery failed: {error}"
-                        ));
-                        tracing::error!(
-                            %error,
-                            "quarantined managed-node replay/WAL recovery failed; blocking startup/update"
-                        );
-                        return;
-                    }
-                }
-
-                // Only after the exact old/detached process boundary is clear
-                // may WebView Start/Ensure/Update entrypoints mutate or spawn.
-                *state.data_migration_error.lock().await = None;
 
                 if !should_start {
                     if start_config.auto_start && !migration_allows_autostart {
@@ -611,6 +836,12 @@ pub fn run() {
                     match outcome {
                         Ok(()) => {
                             tracing::info!("auto-started arc-node on launch");
+                            // A user who opted in to contributing compute but
+                            // is not a worker yet (an interrupted model
+                            // download, or consent given while offline) is
+                            // finished here, so the install takes jobs without
+                            // another click. No-op without consent.
+                            commands::promote_consented_install_on_startup(&handle, &state).await;
                             break;
                         }
                         Err(error) if error.is_transient() => {
@@ -673,9 +904,14 @@ pub fn run() {
             commands::import_identity,
             commands::load_identity,
             commands::save_config,
+            commands::complete_onboarding,
             commands::load_config,
             commands::load_data_migration_notice,
             commands::dismiss_data_migration_notice,
+            commands::load_previous_install_notice,
+            commands::dismiss_previous_install_notice,
+            legacy_upgrade::load_legacy_compute_question,
+            legacy_upgrade::answer_legacy_compute_question,
             commands::start_node,
             commands::stop_node,
             commands::prepare_update_relaunch,
@@ -685,6 +921,7 @@ pub fn run() {
             commands::restart_node,
             commands::reset_peer_state,
             commands::node_status,
+            commands::node_start_block,
             commands::fetch_earnings,
             commands::fetch_attestations,
             commands::fetch_logs,
@@ -692,6 +929,10 @@ pub fn run() {
             commands::fetch_reward_economics,
             commands::fetch_earnings_projection,
             commands::fetch_node_contribution,
+            commands::fetch_worker_status,
+            commands::set_compute_contribution,
+            commands::promote_consented_install,
+            commands::set_prevent_sleep_during_jobs,
             commands::fetch_network_overview,
             commands::fetch_recent_blocks,
             commands::fetch_block_txs,
@@ -721,12 +962,17 @@ pub fn run() {
             commands::ensure_binary,
             commands::get_autostart,
             commands::update_install_policy,
+            commands::update_location_block,
             updater_channel::check_arc_update,
             commands::list_model_tiers,
             commands::recommended_tier,
             commands::existing_model_for_tier,
             commands::download_model,
             commands::remove_model,
+            node_care::node_care_info,
+            node_care::node_care_load_state,
+            node_care::node_care_save_state,
+            node_care::node_care_send,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ARC desktop");
@@ -799,5 +1045,43 @@ mod startup_retry_tests {
         tokio::task::yield_now().await;
         cancel.send_replace(());
         assert!(!task.await.unwrap());
+    }
+}
+
+#[cfg(test)]
+mod startup_reconciliation_tests {
+    /// Launch-time reconciliation reports every outcome through its `Result`
+    /// and the startup task resolves the fence from it in exactly one place,
+    /// so no early return can leave the launch-time "in progress" fence
+    /// behind. (Through v0.8.12 an invalid receipt returned early and left it
+    /// up for the whole session.) The recovery launch, the one transaction
+    /// that may pass that fence, is started from reconciliation only.
+    #[test]
+    fn every_reconciliation_exit_resolves_the_launch_fence() {
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("async fn reconcile_previous_managed_node(")
+            .expect("reconciliation function");
+        let body = &source[start..];
+        let body = &body[..body
+            .find("fn configured_http_client()")
+            .expect("end of reconciliation function")];
+
+        // Needles are assembled at run time so this test's own text never
+        // matches them.
+        let fence_write = ["data_migration_error", ".lock().await ="].concat();
+        let resolve = ["start_fence::", "after_startup_reconciliation("].concat();
+        let recover = ["commands::", "recover_managed_shutdown_inner("].concat();
+
+        assert!(!body.contains("data_migration_error"));
+        assert!(body.contains(&recover));
+        assert_eq!(source.matches(&recover).count(), 1);
+        assert_eq!(source.matches(&fence_write).count(), 1);
+        assert_eq!(source.matches(&resolve).count(), 1);
+        let task_write: String = source[source.find(&fence_write).unwrap()..]
+            .chars()
+            .take(200)
+            .collect();
+        assert!(task_write.contains(&resolve));
     }
 }

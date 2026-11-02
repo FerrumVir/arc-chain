@@ -16,7 +16,8 @@
 //!    address of the arc-node child this app spawned; chain reads go
 //!    somewhere else entirely (see `commands::chain_host`).
 
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::OnceLock;
 
 /// Home directory resolved by Tauri's `PathResolver` during `setup()`. Used
@@ -62,6 +63,73 @@ pub fn expand_tilde(s: &str) -> PathBuf {
         return home_dir();
     }
     PathBuf::from(s)
+}
+
+/// Show `path` with a leading home directory shortened to `~`, the inverse
+/// of [`expand_tilde`]. Use it for any path written to the Logs screen:
+/// people paste that screen into public bug reports, and a full home path
+/// usually carries their account name.
+pub fn display_with_home_redacted(path: &Path) -> String {
+    redact_home_in(path, &home_dir(), HOME_PATHS_IGNORE_CASE)
+}
+
+/// macOS and Windows file systems ignore case by default, so a path can
+/// reach the home directory with different capitals than `home_dir()` has.
+const HOME_PATHS_IGNORE_CASE: bool = cfg!(any(target_os = "macos", target_os = "ios", windows));
+
+fn redact_home_in(path: &Path, home: &Path, ignore_case: bool) -> String {
+    // A relative fallback home (".") must never match, or every relative
+    // path would be shown as if it were under the home directory.
+    if home.is_absolute() {
+        // Whole components are compared, so a sibling such as `/home/alice2`
+        // is not shortened against a home of `/home/alice`.
+        let mut rest = path.components();
+        let under_home = home.components().all(|home_part| {
+            rest.next().is_some_and(|part| {
+                comparable(part, ignore_case) == comparable(home_part, ignore_case)
+            })
+        });
+        if under_home {
+            let rest = rest.as_path();
+            return if rest.as_os_str().is_empty() {
+                "~".to_owned()
+            } else {
+                format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display())
+            };
+        }
+    }
+    path.display().to_string()
+}
+
+/// One path component in a form that compares the way the file system does.
+/// A Windows verbatim prefix (`\\?\C:`, `\\?\UNC\server\share`) equals its
+/// ordinary form (`C:`, `\\server\share`), drive letters never differ by
+/// case, and names ignore case where the file system does.
+fn comparable(component: Component<'_>, ignore_case: bool) -> String {
+    let name = |value: &OsStr| {
+        let value = value.to_string_lossy();
+        if ignore_case {
+            value.to_lowercase()
+        } else {
+            value.into_owned()
+        }
+    };
+    match component {
+        Component::Prefix(prefix) => match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+                format!("disk:{}", char::from(drive).to_ascii_lowercase())
+            }
+            Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                format!("unc:{}\\{}", name(server), name(share))
+            }
+            Prefix::Verbatim(value) => format!("verbatim:{}", name(value)),
+            Prefix::DeviceNS(value) => format!("device:{}", name(value)),
+        },
+        Component::RootDir => "root".to_owned(),
+        Component::CurDir => ".".to_owned(),
+        Component::ParentDir => "..".to_owned(),
+        Component::Normal(value) => format!("name:{}", name(value)),
+    }
 }
 
 /// `~/.arc` — the root the node's data dir, managed binary and models all
@@ -114,5 +182,144 @@ mod tests {
     #[test]
     fn local_host_is_loopback() {
         assert_eq!(local_host(9090), "http://127.0.0.1:9090");
+    }
+
+    #[test]
+    fn redaction_shortens_the_home_directory_to_a_tilde() {
+        // An absolute fixture home on every platform, with no real account.
+        let home = std::env::temp_dir()
+            .join("arc-home-fixture")
+            .join("operator");
+        let model = home.join(".arc").join("models").join("standard.gguf");
+        let sep = std::path::MAIN_SEPARATOR;
+        for ignore_case in [false, true] {
+            let shown = redact_home_in(&model, &home, ignore_case);
+            assert_eq!(shown, format!("~{sep}.arc{sep}models{sep}standard.gguf"));
+            assert!(!shown.contains("operator"), "{shown}");
+            assert_eq!(redact_home_in(&home, &home, ignore_case), "~");
+        }
+    }
+
+    #[test]
+    fn redaction_leaves_paths_outside_the_home_directory_alone() {
+        let root = std::env::temp_dir().join("arc-home-fixture");
+        let home = root.join("operator");
+        for ignore_case in [false, true] {
+            // A sibling whose name merely starts with the home directory's name.
+            let sibling = root.join("operator2").join("model.gguf");
+            assert_eq!(
+                redact_home_in(&sibling, &home, ignore_case),
+                sibling.display().to_string()
+            );
+            let elsewhere = root.join("shared-models").join("model.gguf");
+            assert_eq!(
+                redact_home_in(&elsewhere, &home, ignore_case),
+                elsewhere.display().to_string()
+            );
+            // A relative fallback home never matches a relative path.
+            let relative = PathBuf::from("models").join("model.gguf");
+            assert_eq!(
+                redact_home_in(&relative, Path::new("."), ignore_case),
+                relative.display().to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn redaction_ignores_case_only_where_the_file_system_does() {
+        let root = std::env::temp_dir().join("arc-home-fixture");
+        let home = root.join("Operator");
+        let model = root.join("OPERATOR").join(".arc").join("standard.gguf");
+        let sep = std::path::MAIN_SEPARATOR;
+        // macOS and Windows: the same directory, so it is shortened.
+        assert_eq!(
+            redact_home_in(&model, &home, true),
+            format!("~{sep}.arc{sep}standard.gguf")
+        );
+        // A case-sensitive file system: a different directory.
+        assert_eq!(
+            redact_home_in(&model, &home, false),
+            model.display().to_string()
+        );
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn redaction_matches_the_home_directory_in_any_case() {
+        let home = home_dir();
+        // Meaningful only for a real home below the filesystem root.
+        if !home.is_absolute() || home.parent().is_none() {
+            return;
+        }
+        for variant in [
+            home.to_string_lossy().to_uppercase(),
+            home.to_string_lossy().to_lowercase(),
+        ] {
+            let model = PathBuf::from(variant).join(".arc").join("standard.gguf");
+            let shown = display_with_home_redacted(&model);
+            let sep = std::path::MAIN_SEPARATOR;
+            assert_eq!(shown, format!("~{sep}.arc{sep}standard.gguf"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn redaction_treats_windows_verbatim_paths_as_their_ordinary_form() {
+        let home = PathBuf::from(r"C:\Users\Operator");
+        assert_eq!(
+            redact_home_in(
+                Path::new(r"\\?\C:\Users\operator\.arc\models\standard.gguf"),
+                &home,
+                true
+            ),
+            r"~\.arc\models\standard.gguf"
+        );
+        assert_eq!(
+            redact_home_in(
+                Path::new(r"c:\users\operator\standard.gguf"),
+                Path::new(r"\\?\C:\Users\Operator"),
+                true
+            ),
+            r"~\standard.gguf"
+        );
+        assert_eq!(
+            redact_home_in(
+                Path::new(r"\\?\UNC\fileserver\homes\operator\standard.gguf"),
+                Path::new(r"\\fileserver\homes\operator"),
+                true
+            ),
+            r"~\standard.gguf"
+        );
+        // Another drive is another place.
+        let other_drive = Path::new(r"D:\Users\Operator\standard.gguf");
+        assert_eq!(
+            redact_home_in(other_drive, &home, true),
+            other_drive.display().to_string()
+        );
+        // And through the real home directory, when it is on a drive. A
+        // verbatim path takes `/` literally, so only a backslash form is used.
+        let real_home = home_dir();
+        if matches!(real_home.components().next(), Some(Component::Prefix(_)))
+            && real_home.parent().is_some()
+            && !real_home.to_string_lossy().contains('/')
+        {
+            let verbatim =
+                PathBuf::from(format!(r"\\?\{}", real_home.display())).join("standard.gguf");
+            assert_eq!(display_with_home_redacted(&verbatim), r"~\standard.gguf");
+        }
+    }
+
+    #[test]
+    fn redaction_uses_the_resolved_home_directory() {
+        let model = home_dir().join(".arc").join("models").join("standard.gguf");
+        let shown = display_with_home_redacted(&model);
+        // Meaningful only for a real home below the filesystem root.
+        if home_dir().is_absolute() && home_dir().parent().is_some() {
+            assert!(shown.starts_with('~'), "{shown}");
+            assert!(
+                !shown.contains(&home_dir().display().to_string()),
+                "the home directory must not appear: {shown}"
+            );
+        }
     }
 }

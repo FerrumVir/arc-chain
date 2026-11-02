@@ -1,7 +1,7 @@
 {
   "name": "arc-desktop",
   "private": true,
-  "version": "0.8.10",
+  "version": "0.8.16",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -37,6 +37,6 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^6.1.0",
     "typescript": "^5.6.3",
-    "vite": "^8.2.2"
+    "vite": "^8.2.4"
   }
 }

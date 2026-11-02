@@ -1,16 +1,27 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useIsMutating, useMutation, useQuery } from "@tanstack/react-query";
 import { Skeleton, SkeletonLines } from "../components/Skeleton";
 import { AlertTriangle, Check, RefreshCw, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { NotAvailable } from "../components/NotAvailable";
+import { NodeCareSettings } from "../components/NodeCare";
 import { StatusPill } from "../components/StatusPill";
-import { api } from "../lib/tauri";
-import { formatInt } from "../lib/format";
+import { api, isTauri } from "../lib/tauri";
+import { describeConnection } from "../lib/connection";
+import { formatInt, modelDownloadStatus } from "../lib/format";
 import { useAppStore } from "../lib/store";
-import { DEFAULT_NODE_CONFIG, type NodeConfig } from "../lib/types";
+import {
+  computeContributionEnabled,
+  DEFAULT_NODE_CONFIG,
+  type ModelDownloadProgress,
+  type NodeConfig,
+} from "../lib/types";
 import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
+import { PLAIN_COPY } from "../lib/plain-copy";
 import { setTheme, useTheme, type Theme } from "../lib/theme";
+
+/** The compute-contribution switch's mutation, so Save can wait for it. */
+const COMPUTE_CONTRIBUTION_MUTATION_KEY = ["compute-contribution"];
 
 export function Settings() {
   const config = useAppStore((s) => s.config);
@@ -18,6 +29,11 @@ export function Settings() {
   const setOnboarded = useAppStore((s) => s.setOnboarded);
   const setConfig = useAppStore((s) => s.setConfig);
   const setIdentity = useAppStore((s) => s.setIdentity);
+  // No Save while compute contribution is switching. The native side keeps
+  // the stored contribution state on a Settings save anyway; this also keeps
+  // a snapshot taken before the switch out of the UI store.
+  const contributionPending =
+    useIsMutating({ mutationKey: COMPUTE_CONTRIBUTION_MUTATION_KEY }) > 0;
   // Defaults now match the real ones (types.ts DEFAULT_NODE_CONFIG and the
   // Rust NodeConfig::default). The RPC field used to default to 9944 while
   // onboarding wrote 9090 and the node bound 9090.
@@ -29,7 +45,7 @@ export function Settings() {
   );
   const [autoUpdate, setAutoUpdate] = useState(config?.autoUpdate ?? true);
   const [autoInstallUpdates, setAutoInstallUpdates] = useState(
-    config?.autoInstallUpdates ?? false,
+    config?.autoInstallUpdates ?? DEFAULT_NODE_CONFIG.autoInstallUpdates,
   );
   const [autoStart, setAutoStart] = useState(config?.autoStart ?? true);
   const [saved, setSaved] = useState(false);
@@ -149,6 +165,8 @@ export function Settings() {
             </span>
           </div>
 
+          <ComputeConsent />
+
           <ComputeContribution />
 
           <label
@@ -217,9 +235,7 @@ export function Settings() {
                 Install signed app updates automatically when idle
               </div>
               <div style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>
-                Off by default. ARC downloads while the node runs, then asks
-                its native worker safety check to confirm inference has drained
-                before stopping the node and restarting ARC.
+                {PLAIN_COPY.updates.autoInstallDescription}
               </div>
             </div>
           </label>
@@ -228,7 +244,7 @@ export function Settings() {
             <button
               className="btn btn-primary"
               onClick={save}
-              disabled={saving}
+              disabled={saving || contributionPending}
               aria-busy={saving || undefined}
               data-testid="btn-save-settings"
             >
@@ -310,19 +326,27 @@ export function Settings() {
                 ? "Automatic checks run after startup and every 24 hours. Signed app updates may install and restart ARC automatically only after native worker safety confirms inference has drained."
                 : "Automatic checks run after startup and every 24 hours. Background checks never install an update."}
         </p>
+        {/* A failed check is usually a connection, and ARC retries by itself: one plain sentence, with the
+            controller's text behind Show details. An install the updater could not finish is the one case that
+            needs the person (quit and reopen), and reads like the strip on Home. */}
         <p
           style={{
             fontSize: "var(--text-sm)",
-            color:
-              update.phase === "error"
-                ? "var(--danger)"
-                : "var(--text-secondary)",
+            color: "var(--text-secondary)",
             marginBottom: "var(--space-3)",
           }}
           data-testid="update-status"
           data-update-phase={update.phase}
         >
-          {update.message}
+          {update.phase === "error"
+            ? update.restartRequired
+              ? PLAIN_COPY.nodeStrip.updateFailed
+              : update.message.startsWith("Update check failed")
+                ? PLAIN_COPY.updates.checkFailed
+                : PLAIN_COPY.updates.installFailed
+            : update.phase === "ready" && update.error
+              ? PLAIN_COPY.nodeStrip.updateFailed
+              : update.message}
           {update.phase === "downloading" &&
           update.contentLength !== null &&
           update.contentLength > 0
@@ -330,21 +354,14 @@ export function Settings() {
             : ""}
         </p>
         {update.error && (
-          <p
-            style={{
-              fontSize: "var(--text-sm)",
-              color:
-                update.phase === "ready"
-                  ? "var(--warning)"
-                  : "var(--danger)",
-              marginBottom: "var(--space-3)",
-            }}
+          <details
+            className="plain-details"
+            style={{ marginTop: 0, marginBottom: "var(--space-3)" }}
             data-testid="update-error"
           >
-            {update.phase === "ready"
-              ? `Safe restart blocked: ${update.error}`
-              : `Update error: ${update.error}`}
-          </p>
+            <summary>{PLAIN_COPY.actions.showDetails}</summary>
+            <pre>{[update.message, update.error].filter(Boolean).join("\n")}</pre>
+          </details>
         )}
         <p
           style={{
@@ -390,6 +407,11 @@ export function Settings() {
             </button>
           )}
         </div>
+      </Card>
+
+      <Card style={{ marginBottom: "var(--space-6)" }} data-testid="node-care-card">
+        <CardHeader title="Error reports" />
+        <NodeCareSettings />
       </Card>
 
       <Card>
@@ -466,6 +488,193 @@ export function Settings() {
       </Card>
 
       <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+    </div>
+  );
+}
+
+/**
+ * The explicit opt-in for running ARC jobs on this computer.
+ *
+ * Nothing downloads a model or switches the node to worker mode without this
+ * switch (or the equivalent choice in onboarding or the observer banner).
+ * Turning it on downloads the model if needed (resumable, verified), switches
+ * to worker mode and restarts the node; turning it off returns to observer
+ * mode at once.
+ */
+function ComputeConsent() {
+  const config = useAppStore((s) => s.config);
+  const setConfig = useAppStore((s) => s.setConfig);
+  const enabled = computeContributionEnabled(config);
+  const keepAwake = config?.preventSleepDuringJobs === true;
+  const { data: tier } = useQuery({
+    queryKey: ["recommended-tier"],
+    queryFn: api.recommendedTier,
+  });
+  const ineligible = tier === "none";
+  const [progress, setProgress] = useState<ModelDownloadProgress | null>(null);
+  // The running node reports when it had to start without its model (the
+  // file is missing or unreadable). Same query as the core slider below.
+  const { data: status } = useQuery({
+    queryKey: ["status"],
+    queryFn: api.nodeStatus,
+    refetchInterval: 3000,
+  });
+  const modelUnavailable = status?.modelUnavailable ?? null;
+
+  const toggle = useMutation({
+    mutationKey: COMPUTE_CONTRIBUTION_MUTATION_KEY,
+    mutationFn: (next: boolean) => api.setComputeContribution(next),
+    onMutate: () => setProgress(null),
+    onSuccess: (saved) => setConfig(saved),
+  });
+  // Re-run the existing download flow for a model file that has gone
+  // missing: it reuses a verified copy if one is on disk, otherwise
+  // downloads it, then restarts a running node with it.
+  const redownload = useMutation({
+    mutationKey: COMPUTE_CONTRIBUTION_MUTATION_KEY,
+    mutationFn: () => api.promoteConsentedInstall(),
+    onMutate: () => setProgress(null),
+    onSuccess: (saved) => setConfig(saved),
+  });
+  const awake = useMutation({
+    mutationFn: (next: boolean) => api.setPreventSleepDuringJobs(next),
+    onSuccess: (saved) => setConfig(saved),
+  });
+  const downloading = toggle.isPending || redownload.isPending;
+
+  useEffect(() => {
+    if (!isTauri || !downloading) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      const handle = await listen<ModelDownloadProgress>(
+        "model-download-progress",
+        (event) => setProgress(event.payload),
+      );
+      if (cancelled) handle();
+      else unlisten = handle;
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [downloading]);
+
+  return (
+    <div className="field" data-testid="compute-consent">
+      <span className="field-label">Contribute compute</span>
+      <label
+        htmlFor="compute-consent-toggle"
+        style={{ display: "flex", alignItems: "center", gap: "var(--space-3)", cursor: "pointer" }}
+      >
+        <input
+          id="compute-consent-toggle"
+          type="checkbox"
+          checked={enabled}
+          disabled={downloading || (!enabled && ineligible)}
+          onChange={(e) => toggle.mutate(e.target.checked)}
+          data-testid="compute-consent-toggle"
+        />
+        <span>Let ARC run inference jobs on this computer</span>
+      </label>
+      <span className="field-hint">
+        Off unless you turn it on here or chose the ARC model during setup.
+        When on, the app downloads the ARC model once
+        (3.80 GB, checked against its pinned SHA-256), switches your node to
+        worker mode, and takes jobs from the network while the app is open.
+        Turning it off returns the node to observer mode right away.
+      </span>
+      {ineligible && !enabled && (
+        <span className="field-hint" data-testid="compute-consent-ineligible">
+          This computer has less than 16 GB of memory, so it cannot run the ARC
+          model. It stays an observer, which still relays and verifies.
+        </span>
+      )}
+      {enabled && modelUnavailable && !downloading && (
+        <div
+          role="status"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "flex-start",
+            gap: "var(--space-2)",
+          }}
+          data-testid="compute-consent-model-unavailable"
+        >
+          <span className="field-hint">
+            {modelUnavailable === "notFound"
+              ? "The model file was not found, so local compute is off and your node is running as an observer. Restore the file, or re-download the model."
+              : "The model file can't be read, so local compute is off and your node is running as an observer. Check the file's permissions, or re-download the model."}
+          </span>
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => redownload.mutate()}
+            data-testid="btn-redownload-model"
+          >
+            Re-download model
+          </button>
+        </div>
+      )}
+      {downloading && (
+        <p
+          style={{ marginTop: "var(--space-2)", fontSize: "var(--text-sm)", color: "var(--text-muted)" }}
+          data-testid="compute-consent-progress"
+        >
+          {progress
+            ? modelDownloadStatus(progress)
+            : redownload.isPending
+              ? "Checking for the model…"
+              : enabled
+                ? "Switching to observer mode…"
+                : "Preparing worker mode…"}
+        </p>
+      )}
+      {(toggle.error || redownload.error) && (
+        <p
+          role="alert"
+          style={{ marginTop: "var(--space-2)", fontSize: "var(--text-sm)", color: "var(--danger)" }}
+          data-testid="compute-consent-error"
+        >
+          {String(toggle.error ?? redownload.error)}
+        </p>
+      )}
+
+      <label
+        htmlFor="prevent-sleep-toggle"
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: "var(--space-3)",
+          cursor: enabled ? "pointer" : "default",
+          marginTop: "var(--space-3)",
+        }}
+      >
+        <input
+          id="prevent-sleep-toggle"
+          type="checkbox"
+          checked={keepAwake}
+          disabled={!enabled || awake.isPending}
+          onChange={(e) => awake.mutate(e.target.checked)}
+          data-testid="prevent-sleep-toggle"
+        />
+        <span>Keep this computer awake while a job runs</span>
+      </label>
+      <span className="field-hint">
+        Holds off idle sleep only while a job is computing, so it is not lost
+        halfway. The computer still sleeps between jobs and when the lid
+        closes. Takes effect the next time the node starts.
+      </span>
+      {awake.error && (
+        <p
+          role="alert"
+          style={{ marginTop: "var(--space-2)", fontSize: "var(--text-sm)", color: "var(--danger)" }}
+          data-testid="prevent-sleep-error"
+        >
+          {String(awake.error)}
+        </p>
+      )}
     </div>
   );
 }
@@ -769,20 +978,18 @@ function PersistenceCard() {
   const autoStart = config?.autoStart ?? DEFAULT_NODE_CONFIG.autoStart;
   const hasModel = !!config?.modelPath;
   const running = !!status?.running;
+  // A node that is off by choice is not red (lib/connection.ts).
+  const connection = describeConnection(status);
 
   return (
     <Card style={{ marginBottom: "var(--space-6)" }} data-testid="persistence-card">
       <CardHeader
         title="Startup readiness"
         action={
-          status === undefined ? (
-            <StatusPill level="checking" label="Checking" />
-          ) : (
-            <StatusPill
-              level={running ? "live" : "offline"}
-              label={running ? "Node running" : "Node stopped"}
-            />
-          )
+          <StatusPill
+            level={running ? "live" : connection.level}
+            label={running ? "Node running" : connection.label}
+          />
         }
       />
       <div

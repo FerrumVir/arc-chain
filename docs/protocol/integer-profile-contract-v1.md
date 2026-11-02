@@ -256,7 +256,8 @@ These strategies are permitted only because each has bit-identity evidence.
 None of them is a profile:
 
 * batched multi-token prefill (`b489c80`/`92b9103`, 16,000,000 logits by digest);
-* the opt-in NEON limb kernel (`ARC_FAST_CANONICAL_KERNEL`, default off; it
+* the limb kernel (on by default where the CPU has it: AVX2 on x86-64, NEON
+  dotprod on arm64; `ARC_CANONICAL_KERNEL=scalar` forces the scalar kernel; it
   refuses inputs it cannot prove exact);
 * thread count (the KAT runs at 1, 2 and 4 threads);
 * layer-range sharding (the KAT's three-way split matches the whole model);

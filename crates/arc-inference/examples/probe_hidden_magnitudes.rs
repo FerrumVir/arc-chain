@@ -13,7 +13,11 @@ use arc_inference::cached_integer_model::{
 };
 use arc_inference::integer_lut::{FRAC_BITS, ONE, integer_exp};
 
-const MODEL_PATH: &str = "/Users/tjdunham/.arc-models/llama-2-7b.gguf";
+/// `$HOME/.arc-models/llama-2-7b.gguf`, resolved at run time.
+fn model_path() -> String {
+    let home = std::env::var("HOME").expect("HOME is set");
+    format!("{home}/.arc-models/llama-2-7b.gguf")
+}
 
 fn stats(label: &str, v: &[i64]) {
     let abs: Vec<i64> = v.iter().map(|x| x.abs()).collect();
@@ -49,7 +53,7 @@ fn stats(label: &str, v: &[i64]) {
 
 fn main() {
     println!("Loading...");
-    let model = load_cached_model(MODEL_PATH).expect("load");
+    let model = load_cached_model(&model_path()).expect("load");
     let cfg = &model.config;
     let d = cfg.d_model;
     println!(

@@ -18,6 +18,348 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.16 - Release-preparation snapshot (2026-10-26)
+
+> **Candidate note:** This entry records the v0.8.16 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.16.
+
+- macOS: Install update no longer leaves ARC on its old version with the
+  node stopped when ARC runs from somewhere its updater can't replace it:
+  the mounted .dmg, a copy macOS runs from a temporary read-only location
+  (App Translocation, for an app opened where it was downloaded), or a
+  different drive from the temporary folder. Tauri's updater moves the
+  running app aside before it puts the new one in place, and only a
+  "permission denied" refusal makes it ask for an administrator; any other
+  refusal failed the install after ARC had stopped the node, and every
+  reopen of the same copy offered the same update again. ARC now checks
+  where it runs before either update path stops the node or takes its
+  update lock: Install update keeps the update available, and an
+  unattended install is deferred, both with "ARC can't update itself from
+  where it's running. Quit ARC, drag ARC Node into your Applications folder,
+  then open it from there." The node keeps running. Home shows the same
+  sentence as one calm line from launch. An Applications folder you can't
+  write to is not refused: the updater asks for an administrator there, as
+  before (#218).
+- While an update ARC couldn't finish holds the node, which lasts until ARC
+  quits, Start said "another ARC desktop currently owns the managed node
+  lifecycle … Resource temporarily unavailable (os error 35)": it tried to
+  take the lock ARC's own update was holding. Restart was refused with
+  internal wording. Both now refuse with "ARC couldn't finish an update.
+  Quit ARC and open it again.", and the Dashboard offers Quit ARC in place
+  of Start and Restart, as Home's node strip already did (#218).
+- Node memory: the in-memory block table now stores each block behind a
+  pointer, so a bucket costs 17 bytes (a height, a pointer and a control
+  byte) instead of 313. The table keeps every block the node holds. It is
+  split into shards, and each shard's bucket array doubles when 7/8 full,
+  with every bucket sized for an entry whether filled or not: at 2^24
+  buckets in all (up to 14,680,064 blocks) the arrays took about 5,008 MiB,
+  and the next round of doublings, one per shard and all near the same
+  height, would have added another 5,008 MiB. That round now adds about
+  272 MiB. Each block is a separate allocation of its own size, so memory
+  still grows with the blocks held. Reads return the same blocks as
+  before, and nothing on disk or on the wire changes (#220).
+
+## v0.8.15 - Release-preparation snapshot (2026-10-23)
+
+> **Candidate note:** This entry records the v0.8.15 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.15.
+
+- The desktop can send a short anonymous report when the node won't
+  start, crashes, gets stuck for 10 minutes or an update fails, and one
+  when it recovers, so problems get fixed without screenshots. A running
+  app also sends one small heartbeat a day. Reports carry a random install
+  ID, the app and node versions, the platform, the failing step, a short
+  error code and the error text with home folders, emails, IP addresses,
+  wallet addresses and keys removed. Nothing else is sent: no wallet
+  addresses, keys, recovery phrase, peers, logs or prompts. It is on by
+  default, shows a one-time notice before anything is sent, and can be
+  turned off in Settings → Error reports, which deletes anything still
+  waiting; See what's sent shows the last five payloads exactly.
+  `desktop/PRIVACY.md` lists every field (#209).
+- Release builds send those reports to
+  `https://arc-node-care-intake.onrender.com`; a build without a report
+  address sends nothing (#210).
+- Windows: the desktop no longer refuses to start the node with "DACL
+  inherits from its parent" on `.arc-node.lock`. On launch it repairs that
+  one file's permissions (you, SYSTEM and Administrators only) and still
+  refuses files owned by anyone else and links; `arc-node` now creates the
+  lock with private permissions in the first place (#211).
+- Dashboard text, error banners, logs and dialogs can be selected and
+  copied again, and the node status on Home has a Copy details button
+  (#211).
+- Ask ARC no longer waits out the whole compute budget when the network
+  cannot serve a question. A coordinator now withdraws a community
+  assignment that no worker has claimed within one 30 s claim window, and
+  one whose worker has stopped heartbeating for longer than the 90 s
+  registry TTL, and answers from its own sharded pipeline instead of
+  holding the caller for up to 65 minutes and then returning 504. A
+  withdrawn job can no longer be submitted, so no late worker result can
+  race the fallback. Two trade-offs: a worker whose heartbeats to a
+  coordinator fail for 90 s while it is computing loses that job and its
+  reward, where v0.8.14 still paid it if the result arrived in time; and
+  under a burst, questions queued behind one busy worker fall back after
+  30 s instead of being served in sequence. Workers that keep
+  heartbeating, submits already under verification, twin execution and
+  recovery probes are unaffected (#214).
+- A healthy community node reads as calm status instead of errors. Such a
+  node never has peers (the network admits only validators as peers) and
+  reaches the chain through a coordinator, so its normal state showed as
+  "Lite", "Syncing", "Running · 0 peers", three Dashboard banners ("HTTP
+  client mode", "Client mode" with a Reset peer state button that could
+  not help, "Connecting to peers") and a red node strip for a node that
+  is off or an update that is ready. Every screen now says Connected,
+  Connecting, Node off or No connection in the same words, with one plain
+  line on the Dashboard; a node that is off is not red. Ask ARC says
+  "Asking the ARC network…" with the time elapsed and, when no answer
+  comes, one sentence ("The network didn't answer this time.") with the
+  returned text behind Show details and Copy details. The crash banner,
+  wallet errors and update errors take the same shape; a transfer or
+  faucet claim whose answer was lost after it was sent says to check the
+  balance before sending again, since the host may have included it. The
+  tray no longer says "syncing · 0 peers" (#215).
+- Windows: a manual upgrade through the installer's "Uninstall before
+  installing" choice runs the old version's uninstaller, whose "Delete the
+  application data" checkbox deleted `%APPDATA%\network.arc.desktop`: the
+  wallet key, the recovery phrase and the node identity. The node's data in
+  `%USERPROFILE%\.arc\data-v3` stayed behind, so the new install came up with
+  no identity next to an earlier install's node data. When that node had
+  already stopped without a clean shutdown, launch could not run the one
+  recovery launch that clears its receipt (it needs an identity), and every
+  Start was refused with "managed-node durability recovery failed: no
+  identity - run onboarding" until ARC restarted; with the node still
+  running, it was drained and a fresh identity then ran on the old data.
+  Launch now recognises node data left by an earlier install whose app data
+  is gone (the desktop's own shutdown token or executable record is there,
+  and no identity store existed when ARC started; a store that is present
+  but cannot be read is left alone, and never written over), renames it
+  beside itself (`data-v3.previous-install-<UTC>`, nothing deleted) once
+  nothing live holds it, starts fresh, and says so in one sentence during
+  setup and on Home: "ARC found node data from an earlier install and set
+  it aside (<path>). If you had a wallet, restore it with your 12 words;
+  your node will sync again from the start." A directory a running node or
+  another ARC desktop still holds, a linked path, or any doubt leaves it in
+  place and runs the previous launch checks unchanged. The
+  v0.8.15 Windows uninstaller asks "Delete anyway?" before deleting app
+  data, says that the ARC wallet keys go with it and that the 12-word
+  recovery phrase brings the wallet back, and keeps the data by default in
+  silent and passive runs. A v0.8.14 → v0.8.15 manual upgrade still runs
+  v0.8.14's uninstaller, so leave its "Delete the application data" box
+  clear; the launch fix above covers an install where it was ticked (#217).
+- Security: tokio 1.53.3 in the node, CLI and desktop (RUSTSEC-2026-0386,
+  `AsyncFd` constructors that violate I/O safety). RUSTSEC-2026-0387
+  (crypto-bigint 0.5.5, timing variability) is recorded as a reviewed
+  exception in `deny.toml` until the k256 0.14 migration, no later than
+  v0.9.0: validators, the desktop and every node-side signer use Ed25519,
+  and secp256k1 signing is reached only by user-held keys in `arc-cli`
+  (#216).
+
+## v0.8.14 - Release-preparation snapshot (2026-10-20)
+
+> **Candidate note:** This entry records the v0.8.14 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.14.
+
+- A refusal to start the node no longer blocks the desktop's own signed
+  app update. A desktop stuck behind one, such as v0.8.12's start deadlock
+  after an unclean node exit, can now install the release that fixes it
+  from inside the app. The update replaces only the app: it never starts,
+  stops or replaces arc-node, never touches the node's shutdown receipt,
+  and waits while the launch-time check is still running. Node starts,
+  the recovery start and node-binary replacement stay refused. A refused
+  v0.7 data migration still needs a manual install (#205).
+- Signed app updates install automatically by default. Desktops from
+  v0.8.13 and earlier are switched on once, including where it had been
+  turned off; Settings can turn it off again, and that choice is kept. Linux
+  .deb and .rpm installs still update through their package manager. This
+  takes effect from v0.8.14 on: v0.8.12 and
+  v0.8.13 desktops still need one click (Settings → Install) or a manual
+  install to reach it (#205).
+- A node that can't start is reported as one plain sentence with one
+  action (Install update, Restart ARC or Try again), with the full message
+  under Show details and Copy details. Problems the user has to repair, such
+  as a path, a permission, a migration or another ARC desktop holding the
+  node, keep their details open (#205).
+- ARC opens on Ask ARC, the AI chat, which works whether or not this
+  computer's node is running: a question goes to the ARC network when the
+  local node can't take it. One line above it says what the node is doing
+  (starting, downloading the AI model, off, stopped unexpectedly, blocked,
+  needing a repair, updating, an update that needs ARC reopened, or a new
+  version ready) with the one button
+  that fixes it, so an available update now shows on the home screen, not
+  only in Settings. If the node can't start during setup, Continue to ARC
+  finishes setup and opens Ask ARC, with Try again beside it. The recovery
+  phrase step and the choice to run AI jobs are unchanged (#205).
+- The legacy bridge pins arc-node v0.8.13 (bridge release v0.7.14), so v0.7
+  installs that update move to v0.8.13 instead of v0.8.12 (#204).
+- Security: rustls-webpki 0.103.16 (RUSTSEC-2026-0382, certificate
+  verification could accept distrusted intermediates), and webpki-roots and
+  webpki-root-certs 1.0.10 (RUSTSEC-2026-0381, -0383, bundled roots that
+  trusted distrusted emSign intermediates), in the node, CLI and desktop.
+- Security: the desktop's build tool vite moves to 8.2.4
+  (GHSA-698v-4r3x-3vcv, GHSA-r825-w8mm-5pxw, GHSA-587h-7wmj-h5pm, in the
+  editor launcher of vite's development server, which is not part of the
+  shipped app) (#207).
+
+## v0.8.13 - Release-preparation snapshot (2026-10-18)
+
+> **Candidate note:** This entry records the v0.8.13 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.13.
+
+> **If your desktop is stuck at "Couldn't start arc-node":** an install
+> that shows "managed-node durability recovery failed … startup
+> reconciliation is still in progress" cannot reach this release through
+> the in-app updater, because update preparation waits behind the same
+> check. Quit ARC from its menu-bar or tray icon (**Quit ARC Node**),
+> download v0.8.13 from its GitHub release page, and install it over the
+> current app (on Windows, run the installer; on Linux, replace the
+> AppImage). Its first launch finishes the interrupted shutdown, and the
+> node then starts as usual. Nothing needs to be deleted: the wallet and
+> the node's data stay where they are.
+
+- The desktop starts its node again after the previous node stopped
+  without ARC stopping it: a crash, a forced quit, or the computer
+  restarting, logging out or losing power while the node ran. On the next
+  launch ARC runs one recovery start of that exact node, so the node can
+  replay its data and acknowledge a clean shutdown. From v0.8.0 to v0.8.12,
+  ARC's own launch-time check refused that recovery start. Start, Retry,
+  setup and in-app updates then failed on every launch (#202).
+- Real refusals still block every start, the recovery start included: a
+  legacy-data migration that is not durable, an invalid shutdown receipt,
+  or a recovery that fails. ARC never moves the node's data directory and
+  never points v0.8 at preserved v0.7 data (#202).
+- While the launch-time check runs, Start and Retry say to try again in a
+  few seconds instead of giving repair instructions. An invalid shutdown
+  receipt is reported as itself, instead of leaving "still in progress" on
+  screen for the rest of the session (#202).
+- rustls is 0.23.46 in the node and desktop lockfiles, for
+  RUSTSEC-2026-0346, -0347, -0348 and -0349 (#202).
+- `deny.toml` records owner-accepted exceptions for RUSTSEC-2026-0367,
+  -0368 and -0369 (zip) and RUSTSEC-2026-0344 (ruzstd). No release of the
+  crates that pull them in accepts the patched versions yet (#202).
+- `deny.toml` also records owner-accepted exceptions for the
+  RUSTSEC-2026-0370, -0371 and -0372 maintenance notices (zvariant,
+  zbus_names and zvariant_derive). Upstream merged those crates into
+  zbus 6. The desktop reaches them only through tauri-plugin-opener on
+  Linux and the BSDs, and no tauri-plugin-opener release accepts zbus 6
+  yet. For every exception the file gives the reasons and the removal
+  conditions, no later than the v0.9.0 dependency review (#202).
+- *Backfilled 2026-10-20:* these changes shipped in v0.8.13 but were
+  missing from this entry.
+  - The legacy bridge pinned arc-node v0.8.12 and moved to bridge release
+    v0.7.13, so v0.7 desktops could reach the v0.8 app through
+    `latest.json` (#199).
+  - A missing or unreadable model file no longer leaves the desktop's node
+    unable to start. The node starts as an observer with local compute
+    off, the dashboard says why, and Settings offers **Re-download model**.
+    Recovery starts take the same check, and a recorded node that has
+    provably exited no longer blocks startup (#200).
+  - quinn-proto is 0.11.18 in the node and desktop lockfiles, for
+    RUSTSEC-2026-0338, -0340 and -0343. The desktop's previous 0.11.16 was
+    also inside -0339, -0341 and -0342 (#201).
+
+## v0.8.12 - Release-preparation snapshot (2026-10-11)
+
+> **Candidate note:** This entry records the v0.8.12 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.12.
+
+- Workers and validators now run the exact fast INT8 kernel by default:
+  AVX2 on x86-64 and NEON dot-product on arm64 (an x86-64 process that
+  Rosetta 2 translates on Apple Silicon stays on the scalar kernel). The
+  switch is process-wide, so community-worker generation, shard holders and
+  validator recomputes all use it. It computes exactly the values of the
+  scalar kernel and refuses any input it cannot compute exactly to the
+  scalar kernel before writing a byte (#173). To go back to the scalar
+  kernel set `ARC_CANONICAL_KERNEL=scalar` (or `ARC_FAST_CANONICAL_KERNEL=0`,
+  the older name, which is still honoured); `simd` and `auto` are also
+  accepted, and an unrecognised value selects scalar and logs a warning.
+- Behind the fast kernel a node uses the widest exact kernel its CPU has:
+  AVX-512 VNNI, then AVX-VNNI, then AVX2 on x86-64, and SMMLA (i8mm), then
+  SDOT on arm64. They serve one-token decode and multi-row projections with
+  the same checks and the same results (#190). Set
+  `ARC_CANONICAL_BATCHED_KERNEL` to `neon-sdot-limb`, `neon-i8mm-limb`,
+  `avx2-limb`, `avx-vnni-limb` or `avx512-vnni-limb` to pin one kernel; a
+  pinned kernel the CPU lacks falls back to the best one it has. The node
+  logs its kernels when it loads a model and reports them, with the pin
+  status and each kernel's projection count, under `kernels` in
+  `GET /node/threads` and `GET /node/info`.
+- Community jobs run on the node's configured inference thread pool, so
+  `--threads`, `[inference] threads` and `POST /node/threads` apply to them.
+  With no setting nothing changes (#173).
+- Public error responses carry generic reasons for journal and
+  shard-pipeline failures: no server paths, shard holder names, socket
+  addresses or request URLs. The detail goes to the node's own log with the
+  job or request it belongs to (#189).
+- Personal data is removed from the repository's tree: a retired
+  volatile-state capture, local account names in documentation paths,
+  scripts and probe examples, and third-party addresses in an archived note
+  (#187). Nothing changes at run time.
+- A stage holder can verify several rows in one pass (#185), and several
+  sequences can be batched exactly (#193). Neither is used by the node yet.
+  An execution-mode equivalence suite checks one-pass, chunked,
+  restored-prefix and speculative runs against pinned references (#179).
+- Off by default: `--community-release-on-verification` lets a coordinator
+  answer a verified community prompt before the reward approvals are
+  collected (#180), and `--community-verify-profiles` lets a validator also
+  verify the interleaved-RoPE profile, defaulting to `legacy-split-half` as
+  today (#194). With both off, dispatch, verification and rewards behave as
+  in v0.8.11.
+- The TypeScript SDK `npm audit` failure in CI is fixed (#172) and a SIGPIPE
+  flake in the release contract test is fixed (#184). New CI-only workflows
+  run the CPU kernel tests and benchmarks (`kernel-bench`,
+  `cpu-matrix-kernels`, and the label-gated `cpu-matrix-bench` and
+  `multi-seq-bench`).
+
+## v0.8.11 - Release-preparation snapshot (2026-10-06)
+
+> **Candidate note:** This entry records the v0.8.11 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.11.
+
+- Community workers no longer publish their computer's hostname. A worker
+  registers as `node-` plus the first eight hex characters of its address,
+  or under a validated `--node-name` nickname that cannot look like an
+  operating system's default computer name or another worker's label.
+  Validators redact names when a worker registers and again whenever
+  `/workers/scoreboard` or `/community/list` is served, so names stored by
+  older workers stop being published once validators run this release.
+- Windows and Linux machines that report slightly under 16 GB (within 15%,
+  or at least 1 GiB, of the marketed size) count as 16 GB for worker
+  eligibility.
+- Model downloads resume after an interruption, show progress, and are
+  checked against the pinned size and SHA-256 before the file is used.
+  A mirror that keeps restarting from byte 0 stops the download after a
+  bounded number of restarts instead of re-fetching the file indefinitely.
+- The macOS install steps follow macOS 15's Open Anyway flow.
+- Contributing compute is an explicit choice: a Settings switch, or choosing
+  the model during setup, which now says that it means running ARC jobs.
+  Once on, the app downloads the model if needed, switches to worker mode
+  and restarts the node. Turning it off returns the node to observer mode
+  without loading the model, and a refusal saved during a download is
+  never overwritten. Ordinary Settings saves never change this choice,
+  the role or the model path. Keeping the computer awake during a job is
+  a separate opt-in.
+- Community workers re-register with a coordinator that forgets them (at
+  most once per 15 seconds per coordinator), back off between failed claim
+  rounds, and report their job counters to the desktop
+  app over loopback (`/community/worker/status`), which shows them on a
+  Jobs card.
+- Coordinators can dispatch community jobs to two independent workers and
+  compare their outputs (twin execution), keep coarse region tags from
+  opt-in worker latency reports, and generate demo demand. Every switch is
+  off by default. With them off, dispatch, claims, submissions, rewards and
+  `/workers/scoreboard` behave as in v0.8.10, and no consensus or on-chain
+  rule changes.
+- SmolLM3-3B is available as an additional deterministic integer model
+  package with its own converter and `arc-modern` tool. The network's model
+  and every validator and worker inference path are unchanged.
+- The TypeScript SDK tests move to jest 30, and the lockfiles audited for
+  release builds no longer contain packages with published advisories:
+  braces and sprintf-js leave the TypeScript SDK test tree, desktop moves to
+  source-map-js 1.2.2, and the dashboard serves its compiled CSS as a
+  reviewed static file with no npm dependencies.
+- The Apple Silicon jobs of the required CI checks can run on a self-hosted
+  Mac Studio runner once a repository variable is set. Until then, and
+  always for fork and Dependabot pull requests and for the release
+  workflows, they run on GitHub-hosted runners.
+
 ## v0.8.10 - Release-preparation snapshot (2026-09-30)
 
 > **Candidate note:** This entry records the v0.8.10 release-preparation

@@ -42,13 +42,13 @@ test.describe("Onboarding → launch end-to-end", () => {
     await page.getByTestId("tier-skip").click();
     await page.getByTestId("btn-continue-model").click();
     await expect(page.getByTestId("step-launch")).toBeVisible();
-    await expect(page.getByText(/ready to set up/i)).toBeVisible();
+    await expect(page.getByText(/ready to start/i)).toBeVisible();
 
     await page.getByTestId("btn-launch").click();
 
-    // Mock flow: ensureBinary + startNode + waitForPeer resolve, then the
-    // dashboard renders without submitting any balance-changing request.
-    await expect(page.getByTestId("dashboard")).toBeVisible({ timeout: 15_000 });
+    // Mock flow: ensureBinary + startNode + waitForPeer resolve, then Home
+    // (Ask ARC) renders without submitting any balance-changing request.
+    await expect(page.getByTestId("inference-screen")).toBeVisible({ timeout: 15_000 });
   });
 
   test("launch button promises setup, not a successful network join", async ({
@@ -58,7 +58,7 @@ test.describe("Onboarding → launch end-to-end", () => {
     await walkToLaunch(page);
     await expect(page.getByTestId("btn-launch")).toBeVisible();
     await expect(page.getByTestId("btn-launch")).toContainText(
-      /set up this node/i,
+      /start my node/i,
     );
   });
 
@@ -93,7 +93,8 @@ test.describe("Onboarding → launch end-to-end", () => {
     // write. The explicit Wallet button remains the only faucet trigger.
     expect(src).toMatch(/waitForPeer/);
     expect(src).not.toMatch(/faucetClaim/);
-    expect(src).toMatch(/request testnet credit explicitly from Wallet/);
+    // The launch step carries the testnet line instead of a credit promise.
+    expect(src).toMatch(/PLAIN_COPY\.setup\.testnet/);
   });
 });
 
@@ -252,6 +253,21 @@ test.describe("Gatekeeper + first-run docs are shipped", () => {
     expect(text).toMatch(/xattr/i);
     expect(text).toMatch(/smartscreen/i);
     expect(text).toMatch(/linux/i);
+  });
+
+  test("both macOS guides use Open Anyway for macOS 15, where right-click → Open is gone", () => {
+    const guides = [
+      path.resolve(REPO_DESKTOP, "FIRST-RUN.md"),
+      path.resolve(REPO_DESKTOP, "..", "docs", "GETTING_STARTED.md"),
+    ];
+    for (const guide of guides) {
+      const text = fs.readFileSync(guide, "utf8");
+      expect(text, guide).toMatch(/macOS 15 Sequoia/);
+      expect(text, guide).toMatch(/System Settings\*\* → \*\*Privacy &\s+Security/);
+      expect(text, guide).toMatch(/\*\*Open Anyway\*\*/);
+      // Right-click → Open is described only as the macOS 14-and-earlier path.
+      expect(text, guide).toMatch(/macOS 14 Sonoma and earlier/);
+    }
   });
 });
 
@@ -484,6 +500,10 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     path.resolve(REPO_DESKTOP, "src-tauri", "src", "commands.rs"),
     "utf8",
   );
+  const startFence = fs.readFileSync(
+    path.resolve(REPO_DESKTOP, "src-tauri", "src", "start_fence.rs"),
+    "utf8",
+  );
   const updater = fs.readFileSync(
     path.resolve(REPO_DESKTOP, "src", "lib", "updater.ts"),
     "utf8",
@@ -589,7 +609,7 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     expect(transactionBegin).toBeGreaterThanOrEqual(0);
     expect(transactionEnd).toBeGreaterThan(transactionBegin);
     const migrationGate = startTransaction.indexOf(
-      "require_data_migration_ready(state).await?",
+      "require_start_fence(state, transaction.fence_access()).await?",
     );
     const lockAcquire = startTransaction.indexOf(
       "acquire_managed_lifecycle_lock(&lock_data_dir)",
@@ -599,7 +619,9 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     );
     expect(migrationGate).toBeGreaterThanOrEqual(0);
     expect(
-      startTransaction.match(/require_data_migration_ready\(state\)\.await\?/g),
+      startTransaction.match(
+        /require_start_fence\(state, transaction\.fence_access\(\)\)\.await\?/g,
+      ),
     ).toHaveLength(1);
     expect(lockAcquire).toBeGreaterThan(migrationGate);
     expect(writerSpawns.length).toBeGreaterThan(0);
@@ -610,8 +632,21 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     expect(startTransaction).toContain(
       "store.config.clone().unwrap_or_default()",
     );
-    expect(startWrapper).toContain(
-      "start_node_transaction(app, state, true).await",
+    // WebView Start/Retry and auto-start run the ordinary transaction, which
+    // waits behind the launch-time fence. Only launch reconciliation's own
+    // recovery launch may pass that fence (StartupRecoveryOnly).
+    expect(
+      startWrapper.match(
+        /start_node_transaction\(app, state, StartTransaction::Start\)/g,
+      ),
+    ).toHaveLength(2);
+    expect(startWrapper).not.toContain("StartupRecoveryOnly");
+    expect(commands).toContain("Self::Start => StartAccess::Ordinary");
+    expect(commands).toContain(
+      "require_start_fence(state, StartAccess::Ordinary).await",
+    );
+    expect(commands).toContain(
+      "start_node_transaction(app, state, StartTransaction::StartupRecoveryOnly)",
     );
     expect(startWrapper).not.toContain("node.start(");
     expect(restart).toContain("require_data_migration_ready(&state).await?");
@@ -631,7 +666,9 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     expect(commands).toContain("preserve_authoritative_data_dir(&mut config");
     expect(commands).toContain("start_node_inner(&app, &state).await");
     expect(commands).not.toContain("start_node_inner(&app, &state, &config)");
-    expect(commands).toContain("ARC refused to start the node");
+    expect(startFence).toContain("ARC refused to start the node");
+    // A real refusal blocks every caller, startup's recovery launch included.
+    expect(startFence).toContain("(Some(StartFence::Refused(reason)), _) => Err(");
   });
 
   test("auto-start: autostart plugin registered with --minimized arg", () => {

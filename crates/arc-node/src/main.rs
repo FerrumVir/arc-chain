@@ -494,6 +494,66 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     enable_community_rewards_v1: bool,
 
+    /// Coordinator: answer the waiting `/inference/run` caller as soon as the
+    /// validators' 2-of-3 recomputation verifies a single-worker community
+    /// result and its settlement is journaled, then collect the five-of-six
+    /// reward approvals on the existing settlement retry path. Approvals,
+    /// retries and the 0x25 reward are unchanged. At the journal's high-water
+    /// mark, beyond the epoch budgets once unpaid journaled rewards count, or
+    /// when the journal write fails, a job settles exactly as with the switch
+    /// off. Off by default; see docs/twin-execution.md, section 13.
+    #[arg(long, default_value_t = false)]
+    community_release_on_verification: bool,
+
+    /// Validator: the community reward profiles this validator verifies, as a
+    /// comma-separated list. `legacy-split-half` is today's live profile and
+    /// must stay listed. Adding `rope-interleaved-v1` (the GGUF
+    /// interleaved-RoPE profile) makes a shard holder keep a second copy of
+    /// the Q and K rows of its layers (about 0.5 GB for 15-17 Llama-2-7B
+    /// layers) and serve and announce its ranges under that profile too, and
+    /// makes this validator verify and approve jobs of that profile. Nothing
+    /// issues such jobs yet. Removing it again is the rollback; no binary
+    /// change is needed.
+    #[arg(
+        long,
+        env = "COMMUNITY_VERIFY_PROFILES",
+        default_value = "legacy-split-half"
+    )]
+    community_verify_profiles: String,
+
+    /// Coordinator: dispatch each community inference job to two community
+    /// workers with distinct node keys and compare their outputs (twin
+    /// execution v0). Validators recompute only on a mismatch, a spot check,
+    /// a reward or a missing twin. Off by default; see docs/twin-execution.md.
+    #[arg(long, default_value_t = false)]
+    community_twin_execution: bool,
+
+    /// Share of twin-matched jobs without a reward that validators still
+    /// recompute, in parts per thousand (at most six an hour).
+    #[arg(long, default_value_t = arc_node::twin::DEFAULT_SPOT_CHECK_PER_MILLE)]
+    community_twin_spot_check_per_mille: u16,
+
+    /// Coordinator: generate rate-limited public demo and replay jobs for
+    /// idle community workers. Off by default; see docs/twin-execution.md.
+    #[arg(long, default_value_t = false)]
+    community_demand_pump: bool,
+
+    /// Run the demand pump in dry-run mode: plan and log every tick without
+    /// dispatching a job. Use this before enabling the pump for real.
+    #[arg(long, default_value_t = false)]
+    community_demand_dry_run: bool,
+
+    /// Seconds between demand-pump ticks on this coordinator (minimum 30).
+    #[arg(long, default_value_t = arc_node::twin::DEFAULT_DEMAND_INTERVAL_SECS)]
+    community_demand_interval_secs: u64,
+
+    /// Worker: every ten minutes, time the configured community RPC origins
+    /// and send the round trips, signed, so coordinators can pair twins in
+    /// different regions. Only a coarse region label is ever published.
+    /// Off by default.
+    #[arg(long, default_value_t = false)]
+    community_region_probe: bool,
+
     /// One-flag community-node setup. Equivalent to `--stake 0
     /// --community-mode` PLUS auto-discovery of a Llama-2-7B GGUF from
     /// standard paths (./llama2-7b.gguf, $HOME/.arc-models/, /opt/arc/).
@@ -518,6 +578,15 @@ struct Cli {
     /// you are only allowed to read.
     #[arg(long, default_value_t = false)]
     no_community: bool,
+
+    /// Keep this computer from idle-sleeping while the community worker
+    /// computes a job, so an assignment is not lost halfway (macOS
+    /// `caffeinate`, Linux `systemd-inhibit`, Windows
+    /// `SetThreadExecutionState`). The computer can still sleep between jobs
+    /// and when its lid closes. Off by default; the desktop app passes it
+    /// only when the user turns on "Keep awake while a job runs".
+    #[arg(long, default_value_t = false)]
+    prevent_sleep_during_jobs: bool,
 
     /// Ask a seed to assign this node a layer range at boot (POST /shards/join).
     ///
@@ -2616,6 +2685,20 @@ fn open_and_try_lock_node_data_file(path: &Path, locked_data_dir: &Path) -> Resu
             locked_data_dir.display()
         )
     })?;
+    // A plain Windows create inherits the private data directory's ACEs
+    // rather than carrying its own protected DACL, and the desktop's private
+    // file checks refuse an inherited DACL. Give the lock ARC's protected
+    // private DACL through a second handle on the same file. This is best
+    // effort: the desktop repairs the lock itself as well, and a standalone
+    // node must not stop over the permissions of a pid marker.
+    #[cfg(windows)]
+    if let Err(error) = arc_crypto::secret_file::open_owned_private_read_write_repairing(path) {
+        tracing::warn!(
+            path = %path.display(),
+            %error,
+            "could not apply the private Windows DACL to the node data lock"
+        );
+    }
     Ok(file)
 }
 
@@ -5031,6 +5114,28 @@ fn public_node_name(cli: &Cli) -> String {
     format!("arc-{}", &hex::encode(digest.0)[..8])
 }
 
+/// The label this community worker registers under on every coordinator's
+/// public scoreboard, plus why a `--node-name` nickname was not used.
+///
+/// Never derived from the hostname, user name, data directory, or any other
+/// machine metadata: see [`rpc::community_public_name`].
+fn community_registration_name(
+    worker_id: &str,
+    requested: Option<&str>,
+) -> (String, Option<&'static str>) {
+    let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+        return (rpc::community_default_public_name(worker_id), None);
+    };
+    let public_name = rpc::community_public_name(worker_id, requested);
+    if public_name == requested {
+        return (public_name, None);
+    }
+    let reason = rpc::validate_community_nickname(requested)
+        .err()
+        .unwrap_or("nickname has the shape of another worker's default label");
+    (public_name, Some(reason))
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ValidatorHttpAudience {
     target_validator: Hash256,
@@ -5309,6 +5414,108 @@ fn community_audience_from_network_info(
     Ok((target_coordinator, transaction_domain))
 }
 
+/// Worker side of region tags v0. Every ten minutes, time `GET /health` on
+/// each configured community RPC origin (best of three, after a
+/// `/network/info` request has opened the connection) and send the round
+/// trips, signed, to every origin. Coordinators keep only the nearest
+/// validator's coarse region label; no IP or raw round trip is published.
+/// Coordinators without the endpoint answer 404, which is ignored.
+async fn run_community_region_probe_loop(
+    targets: Vec<String>,
+    keypair: arc_crypto::KeyPair,
+    worker_id: String,
+    mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) {
+    const FIRST_PROBE_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+    const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    else {
+        return;
+    };
+    let mut delay = FIRST_PROBE_DELAY;
+    loop {
+        if sleep_or_runtime_shutdown(&mut shutdown, delay).await {
+            return;
+        }
+        delay = PROBE_INTERVAL;
+        let mut samples = Vec::new();
+        for origin in &targets {
+            if let Some(sample) = measure_community_origin_rtt(&client, origin).await {
+                samples.push(sample);
+            }
+        }
+        if samples.is_empty() {
+            continue;
+        }
+        let report = arc_node::twin::CommunityRegionReport {
+            worker_id: worker_id.clone(),
+            samples,
+        };
+        for origin in &targets {
+            match post_signed_community(
+                &client,
+                origin,
+                arc_node::twin::COMMUNITY_REGION_PATH,
+                report.clone(),
+                &keypair,
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => tracing::debug!(
+                    seed = %origin,
+                    status = %response.status(),
+                    "coordinator did not accept the region report"
+                ),
+                Err(error) => tracing::debug!(seed = %origin, %error, "region report POST failed"),
+            }
+        }
+    }
+}
+
+/// Best of three `GET /health` round trips to one community RPC origin,
+/// labelled with the validator address that origin reports.
+async fn measure_community_origin_rtt(
+    client: &reqwest::Client,
+    origin: &str,
+) -> Option<arc_node::twin::CommunityRttSample> {
+    let info = client
+        .get(format!("{origin}/network/info"))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    let (validator, _) = community_audience_from_network_info(&info).ok()?;
+    let mut best: Option<u128> = None;
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let healthy = client
+            .get(format!("{origin}/health"))
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success());
+        if healthy {
+            let elapsed = started.elapsed().as_millis();
+            best = Some(best.map_or(elapsed, |current| current.min(elapsed)));
+        }
+    }
+    let rtt_ms = u32::try_from(best?)
+        .unwrap_or(u32::MAX)
+        .min(arc_node::twin::MAX_REPORTED_RTT_MS);
+    Some(arc_node::twin::CommunityRttSample {
+        validator: format!("0x{}", validator.to_hex()),
+        rtt_ms,
+    })
+}
+
 async fn post_signed_community<T: serde::Serialize>(
     client: &reqwest::Client,
     rpc_base: &str,
@@ -5345,6 +5552,19 @@ async fn post_signed_community<T: serde::Serialize>(
         .send()
         .await
         .with_context(|| format!("POST authenticated community mutation to {rpc_base}{path}"))
+}
+
+/// What one coordinator answered to a community claim long-poll.
+enum ClaimPoll {
+    /// An assignment for this worker.
+    Work(String, serde_json::Value),
+    /// The long-poll ended normally without work (`no_work`).
+    Idle,
+    /// The coordinator (by RPC base) does not know this worker: it
+    /// restarted, or pruned the registration while this machine slept.
+    NotRegistered(String),
+    /// No usable answer: network error, timeout, or an unexpected status.
+    Unreachable,
 }
 
 async fn decline_community_assignment(
@@ -5412,6 +5632,8 @@ async fn decline_community_assignment(
     }
 }
 
+/// Heartbeat interval for community presence; every fourth round registers.
+const COMMUNITY_PRESENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 const COMMUNITY_SUBMIT_LATE_GRACE_SECS: u64 = 5 * 60;
 const COMMUNITY_ASSIGNMENT_CLOCK_SKEW_SECS: u64 = 60;
 const COMMUNITY_SUBMIT_BACKOFF_BASE_MS: u64 = 250;
@@ -7888,6 +8110,9 @@ async fn run_arc_node() -> Result<()> {
     }
 
     let is_shard_holder = !held_ranges.is_empty();
+    let community_verify_profiles =
+        rpc::CommunityVerifyProfiles::parse(&cli.community_verify_profiles)
+            .map_err(|error| anyhow::anyhow!("--community-verify-profiles: {error}"))?;
     ensure!(
         !(is_shard_holder && cli.enable_i16),
         "--enable-i16 is local/nonreward-only and cannot be combined with validator shard ranges; protocol-v3 shard execution is pinned to canonical per-row INT8"
@@ -8017,6 +8242,24 @@ async fn run_arc_node() -> Result<()> {
                             std::env::consts::ARCH
                         );
                     }
+                    // The CPU kernel each kind of canonical INT8 projection
+                    // runs, and what became of an ARC_CANONICAL_BATCHED_KERNEL
+                    // pin. GET /node/threads reports the same, with each
+                    // kernel's projection count since start.
+                    let kernels = arc_inference::canonical_simd::kernel_report();
+                    if model.has_canonical_i8_profile() {
+                        tracing::info!(
+                            one_token = kernels.one_token_label(),
+                            batched = kernels.batched_label(),
+                            pin_status = kernels.pin_status.label(),
+                            "Canonical INT8 projection kernels: {kernels}"
+                        );
+                    } else {
+                        tracing::info!(
+                            "Canonical INT8 projection kernels: {kernels}. This model is not on \
+                             the canonical per-row INT8 profile, so none of its projections run them"
+                        );
+                    }
                     tracing::info!(
                         "Model loaded in {:.1}s - {} layers held / {} total, {} MB shard weights, vocab {}",
                         elapsed.as_secs_f64(),
@@ -8024,6 +8267,14 @@ async fn run_arc_node() -> Result<()> {
                         model.config.n_layers,
                         mb_held,
                         model.config.vocab_size
+                    );
+                    // Both kernels compute identical values; this records
+                    // which one runs, for operators comparing job times.
+                    tracing::info!(
+                        kernel = arc_inference::canonical_simd::effective_kernel_name(),
+                        source = arc_inference::canonical_simd::kernel_choice_source(),
+                        "Canonical INT8 projection kernel selected \
+                         (ARC_CANONICAL_KERNEL=scalar forces the scalar reference)"
                     );
                     Some(Arc::new(model))
                 }
@@ -8620,60 +8871,55 @@ async fn run_arc_node() -> Result<()> {
             "Configured shard ranges are not fully loaded; this node will not announce or serve them"
         );
     }
-    let shard_infos_for_broadcast: Vec<rpc::ShardInfo> =
-        match (&held_ranges, &inference_model, model_artifact_id) {
-            (ranges, Some(model), Some(artifact_id))
-                if !ranges.is_empty() && shard_ranges_are_loaded =>
-            {
-                let total_layers = model.config.n_layers;
-                let layers_held_total: usize =
-                    ranges.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
-                let memory_mb_total: usize = model
-                    .layers
-                    .iter()
-                    .filter(|l| l.is_loaded())
-                    .map(|l| {
-                        l.wq.memory_bytes()
-                            + l.wk.memory_bytes()
-                            + l.wv.memory_bytes()
-                            + l.wo.memory_bytes()
-                            + l.w_gate.memory_bytes()
-                            + l.w_up.memory_bytes()
-                            + l.w_down.memory_bytes()
-                    })
-                    .sum::<usize>()
-                    / (1024 * 1024);
-                let per_layer_mb = memory_mb_total / layers_held_total.max(1);
-                let full_model_mb = per_layer_mb * total_layers;
-                let model_display_name = format!(
-                    "arc-{}L-{}d-{}h-{}v",
-                    model.config.n_layers,
-                    model.config.d_model,
-                    model.config.n_heads,
-                    model.config.vocab_size
+    // --community-verify-profiles rope-interleaved-v1: a shard holder keeps
+    // the interleaved-RoPE Q/K rows of its resident layers beside its legacy
+    // model, so it can serve both profiles. Fail closed if the operator asked
+    // for it and it cannot be built.
+    let interleaved_rope_qk: Option<Arc<arc_inference::cached_integer_model::InterleavedRopeQk>> =
+        match (
+            &inference_model,
+            community_verify_profiles.interleaved_rope(),
+        ) {
+            (Some(model), true) if is_shard_holder && shard_ranges_are_loaded => {
+                let copy = arc_inference::cached_integer_model::InterleavedRopeQk::from_resident_layers(
+                model,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "--community-verify-profiles rope-interleaved-v1: cannot build the interleaved-RoPE Q/K copy: {error}"
+                )
+            })?;
+                tracing::info!(
+                    layers = copy.layer_count(),
+                    weight_mb = copy.weight_bytes() / (1024 * 1024),
+                    accounted_mb = copy.memory_bytes() / (1024 * 1024),
+                    "Loaded the interleaved-RoPE Q/K copy of this node's shard layers (--community-verify-profiles)"
                 );
-                let socket_addr = advertised_shard_rpc_origin(&cli, &rpc_addr)?;
-                ranges
-                    .iter()
-                    .map(|&(start, end)| rpc::ShardInfo {
-                        start_layer: start,
-                        end_layer: end,
-                        total_layers,
-                        model_id: format!("0x{}", hex::encode(artifact_id.0)),
-                        model_name: model_display_name.clone(),
-                        execution_profile: model.effective_precision_label().to_string(),
-                        memory_mb: per_layer_mb * (end - start),
-                        full_model_mb,
-                        socket_addr: socket_addr.clone(),
-                        // NOT validator_seed: this ShardInfo is POSTed to every seed
-                        // every 15s and served publicly by GET /shards, and the
-                        // desktop's seed is the wallet's BIP-39 phrase.
-                        node_name: public_node_name(&cli),
-                    })
-                    .collect()
+                Some(Arc::new(copy))
             }
-            _ => Vec::new(),
+            _ => None,
         };
+    let (shard_infos_for_broadcast, interleaved_rope_shard_infos): (
+        Vec<rpc::ShardInfo>,
+        Vec<rpc::ShardInfo>,
+    ) = match (&held_ranges, &inference_model, model_artifact_id) {
+        (ranges, Some(model), Some(artifact_id))
+            if !ranges.is_empty() && shard_ranges_are_loaded =>
+        {
+            // NOT validator_seed for the node name: these announcements are
+            // POSTed to every seed every 15s and served publicly by GET
+            // /shards, and the desktop's seed is the wallet's BIP-39 phrase.
+            rpc::shard_announcements(
+                model,
+                ranges,
+                artifact_id,
+                &advertised_shard_rpc_origin(&cli, &rpc_addr)?,
+                &public_node_name(&cli),
+                interleaved_rope_qk.as_deref(),
+            )
+        }
+        _ => (Vec::new(), Vec::new()),
+    };
     let shard_infos = shard_infos_for_broadcast.clone();
 
     // Announce each held range directly to every explicit validator HTTP
@@ -8681,7 +8927,11 @@ async fn run_arc_node() -> Result<()> {
     // and recovery domain; no raw or re-signed third-party announcement is
     // emitted. Direct holder announcements are the only topology authority.
     if !shard_infos_for_broadcast.is_empty() {
-        let sis = shard_infos_for_broadcast.clone();
+        let sis: Vec<rpc::ShardInfo> = shard_infos_for_broadcast
+            .iter()
+            .chain(&interleaved_rope_shard_infos)
+            .cloned()
+            .collect();
         // RPC origins are explicit TLS/gateway configuration. Never infer an
         // HTTP port from a P2P bootstrap address.
         let announcement_targets = coordinator_rpc_bases.clone();
@@ -8743,15 +8993,32 @@ async fn run_arc_node() -> Result<()> {
         tracing::info!("╚═══════════════════════════════════════╝");
     }
 
+    // The node's dedicated inference pool. The community worker loop below
+    // starts before the RPC server, so it holds this handle and `rpc::serve`
+    // attaches the same one: --threads, [inference] threads and the desktop's
+    // live POST /node/threads then size community jobs too. Unset, jobs run
+    // on rayon's global pool as before.
+    let compute_pool = rpc::ComputePool::default();
+
     if community_networking {
-        let public_node_name_c = public_node_name(&cli);
         let worker_id = format!("0x{}", hex::encode(validator_address.0));
-        let hostname = std::process::Command::new("hostname")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+        // Every validator serves this label on its public scoreboard. It is a
+        // validated `--node-name` nickname or `node-<short public-key hash>`,
+        // never the hostname: default computer names usually carry the
+        // owner's first name.
+        let (public_worker_name, rejected_nickname) =
+            community_registration_name(&worker_id, cli.node_name.as_deref());
+        if let Some(reason) = rejected_nickname {
+            tracing::warn!(
+                public_name = %public_worker_name,
+                reason,
+                "--node-name is not used on public community scoreboards"
+            );
+        }
+        tracing::info!(
+            public_name = %public_worker_name,
+            "community worker public name (choose a nickname with --node-name)"
+        );
         let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
         let worker_model = inference_model.as_ref().and_then(|m| {
             if !m.has_all_transformer_layers() || !m.has_canonical_i8_profile() {
@@ -8775,7 +9042,6 @@ async fn run_arc_node() -> Result<()> {
         let community_rpc_targets = community_rpc_bases.clone();
 
         let worker_id_c = worker_id.clone();
-        let hostname_c = hostname.clone();
         let platform_c = platform.clone();
         let model_name_c = worker_model.as_ref().map(|(name, _, _)| name.clone());
         let model_id_c = worker_model
@@ -8787,6 +9053,21 @@ async fn run_arc_node() -> Result<()> {
         let community_rpc_targets_c = community_rpc_targets.clone();
         let registration_keypair = validator_keypair.clone();
         let mut registration_shutdown = Some(background_admission_shutdown_rx.clone());
+        // Local status for the desktop app (GET /community/worker/status),
+        // and the queue of coordinators the claim loop reports as no longer
+        // knowing this worker (registered with again, each at most once per
+        // cooldown).
+        let worker_status = arc_node::community_worker::install(Arc::new(
+            arc_node::community_worker::CommunityWorkerStatus::new(
+                worker_id.clone(),
+                public_worker_name.clone(),
+                community_rpc_targets.len(),
+                cli.prevent_sleep_during_jobs,
+            ),
+        ));
+        let reregister = Arc::new(arc_node::community_worker::ReregistrationQueue::new());
+        let registration_status = worker_status.clone();
+        let registration_wakeup = reregister.clone();
 
         runtime_tasks.push(tokio::spawn(async move {
             // Settle before first POST
@@ -8823,7 +9104,7 @@ async fn run_arc_node() -> Result<()> {
             };
             let register_payload = rpc::CommunityRegisterRequest {
                 worker_id: worker_id_c.clone(),
-                name: format!("{} ({})", public_node_name_c, hostname_c),
+                name: public_worker_name,
                 capabilities,
                 model: model_name_c,
                 model_id: model_id_c,
@@ -8844,23 +9125,75 @@ async fn run_arc_node() -> Result<()> {
             // Seeds are contacted CONCURRENTLY. Serially, one unreachable
             // seed's 5 s timeout delayed every seed after it, and with six
             // seeds a full round could exceed the 15 s tick.
+            //
+            // Coordinators keep the registry in memory and prune a worker
+            // after 90 s without a heartbeat, so a coordinator restart or a
+            // sleeping laptop used to leave this worker unknown (every claim
+            // answered 404) until the next registration tick, up to a minute
+            // later. Register again immediately when a heartbeat gets 404,
+            // when the claim loop reports a 404, or when the wall clock shows
+            // the machine slept. A claim 404 names its coordinator, and that
+            // coordinator alone is registered with again, outside the 15 s
+            // schedule: at once the first time, then at most once per
+            // `REREGISTER_COOLDOWN` (the queue coalesces the rest).
+            enum Round {
+                // The schedule: heartbeat everyone, register every fourth
+                // round.
+                Scheduled,
+                // The claim loop reported these coordinators as not knowing
+                // this worker: register with them alone.
+                Requested(Vec<String>),
+            }
             let mut ticks: u64 = 0;
+            let mut round = Round::Scheduled;
+            let mut next_scheduled = tokio::time::Instant::now();
+            let mut previous_round = std::time::SystemTime::now();
             loop {
-                let register_tick = ticks.is_multiple_of(4);
+                let now = std::time::SystemTime::now();
+                let woke_from_sleep = arc_node::community_worker::wall_clock_gap_suggests_sleep(
+                    previous_round,
+                    now,
+                    COMMUNITY_PRESENCE_INTERVAL,
+                );
+                previous_round = now;
+                if woke_from_sleep {
+                    tracing::info!(
+                        "wall clock jumped (sleep or suspend); registering again with every coordinator"
+                    );
+                }
+                // A requested round leaves the schedule alone; after a sleep
+                // every coordinator has to be registered with anyway.
+                let (targets, register_tick, scheduled) =
+                    match std::mem::replace(&mut round, Round::Scheduled) {
+                        Round::Requested(requested)
+                            if !requested.is_empty() && !woke_from_sleep =>
+                        {
+                            tracing::info!(
+                                coordinators = ?requested,
+                                "registering again with coordinators that no longer know this worker"
+                            );
+                            (requested, true, false)
+                        }
+                        _ => (
+                            community_rpc_targets_c.clone(),
+                            ticks.is_multiple_of(4) || woke_from_sleep,
+                            true,
+                        ),
+                    };
                 let mut set = tokio::task::JoinSet::new();
-                for addr in &community_rpc_targets_c {
+                for addr in &targets {
                     let client = client.clone();
                     let addr = addr.clone();
                     let register_payload = register_payload.clone();
                     let heartbeat_payload = heartbeat_payload.clone();
                     let keypair = registration_keypair.clone();
                     set.spawn(async move {
-                        let response = if register_tick {
+                        let mut response = if register_tick {
                             post_signed_community(
                                 &client,
                                 &addr,
                                 rpc::COMMUNITY_REGISTER_PATH,
-                                register_payload,
+                                register_payload.clone(),
                                 &keypair,
                                 std::time::Duration::from_secs(5),
                             )
@@ -8876,30 +9209,62 @@ async fn run_arc_node() -> Result<()> {
                             )
                             .await
                         };
+                        if !register_tick
+                            && response.as_ref().is_ok_and(|response| {
+                                response.status() == reqwest::StatusCode::NOT_FOUND
+                            })
+                        {
+                            tracing::info!(
+                                seed = %addr,
+                                "coordinator no longer knows this worker; registering again"
+                            );
+                            response = post_signed_community(
+                                &client,
+                                &addr,
+                                rpc::COMMUNITY_REGISTER_PATH,
+                                register_payload,
+                                &keypair,
+                                std::time::Duration::from_secs(5),
+                            )
+                            .await;
+                        }
                         match response {
-                            Ok(response) if response.status().is_success() => {}
+                            Ok(response) if response.status().is_success() => true,
                             Ok(response) => {
                                 tracing::warn!(
                                     seed = %addr,
                                     status = %response.status(),
                                     "coordinator rejected authenticated community presence"
                                 );
+                                false
                             }
                             Err(error) => {
                                 tracing::debug!(seed = %addr, %error, "community presence POST failed");
+                                false
                             }
                         }
                     });
                 }
-                while set.join_next().await.is_some() {}
-                ticks += 1;
-                if sleep_or_runtime_shutdown(
-                    &mut registration_shutdown,
-                    std::time::Duration::from_secs(15),
-                )
-                .await
-                {
-                    return;
+                let mut accepted = 0usize;
+                while let Some(result) = set.join_next().await {
+                    if matches!(result, Ok(true)) {
+                        accepted += 1;
+                    }
+                }
+                if scheduled {
+                    // A requested round covers a subset; only a full round
+                    // says how many coordinators know this worker.
+                    registration_status.record_registration_round(accepted);
+                    ticks += 1;
+                    next_scheduled = tokio::time::Instant::now() + COMMUNITY_PRESENCE_INTERVAL;
+                }
+                tokio::select! {
+                    biased;
+                    () = wait_for_optional_runtime_shutdown(&mut registration_shutdown) => return,
+                    () = registration_wakeup.notified() => {
+                        round = Round::Requested(registration_wakeup.take_pending());
+                    }
+                    () = tokio::time::sleep_until(next_scheduled) => round = Round::Scheduled,
                 }
             }
         }));
@@ -8907,6 +9272,16 @@ async fn run_arc_node() -> Result<()> {
             "Community-mode HTTP registration started (worker_id={})",
             worker_id
         );
+
+        // Region tags v0 (opt-in): coarse, measured-latency pairing labels.
+        if cli.community_region_probe && worker_model.is_some() {
+            runtime_tasks.push(tokio::spawn(run_community_region_probe_loop(
+                community_rpc_targets.clone(),
+                validator_keypair.clone(),
+                worker_id.clone(),
+                Some(background_admission_shutdown_rx.clone()),
+            )));
+        }
 
         // ── Community inference worker loop ──────────────────────────────
         // Continuously long-poll /community/claim_work on all seeds. When
@@ -8934,8 +9309,14 @@ async fn run_arc_node() -> Result<()> {
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let worker_execution_gate = native_request_admission.worker_execution_gate();
             let mut worker_shutdown = Some(background_admission_shutdown_rx.clone());
+            let status_w = worker_status.clone();
+            let reregister_w = reregister.clone();
+            let prevent_sleep_during_jobs = cli.prevent_sleep_during_jobs;
+            let compute_pool_w = compute_pool.clone();
 
             runtime_tasks.push(tokio::spawn(async move {
+                use arc_node::community_worker::{JobOutcome, KeepAwake, WorkerState};
+
                 if sleep_or_runtime_shutdown(
                     &mut worker_shutdown,
                     std::time::Duration::from_secs(10),
@@ -8957,6 +9338,7 @@ async fn run_arc_node() -> Result<()> {
                     "Community inference worker started - polling for jobs"
                 );
                 let mut decline_tasks = tokio::task::JoinSet::new();
+                let mut failed_claim_rounds: u32 = 0;
                 loop {
                     while let Some(result) = decline_tasks.try_join_next() {
                         if let Err(error) = result {
@@ -9004,7 +9386,7 @@ async fn run_arc_node() -> Result<()> {
                         let target = addr.clone();
                         let keypair = worker_keypair.clone();
                         claims.spawn(async move {
-                            let response = post_signed_community(
+                            let Ok(response) = post_signed_community(
                                 &client,
                                 &target,
                                 rpc::COMMUNITY_CLAIM_WORK_PATH,
@@ -9013,25 +9395,50 @@ async fn run_arc_node() -> Result<()> {
                                 std::time::Duration::from_secs(35),
                             )
                             .await
-                            .ok()?;
-                            if !response.status().is_success() {
-                                return None;
+                            else {
+                                return ClaimPoll::Unreachable;
+                            };
+                            let status = response.status();
+                            if status == reqwest::StatusCode::NOT_FOUND {
+                                return ClaimPoll::NotRegistered(target);
                             }
-                            let job: serde_json::Value = response.json().await.ok()?;
+                            if !status.is_success() {
+                                return ClaimPoll::Unreachable;
+                            }
+                            let Ok(job) = response.json::<serde_json::Value>().await else {
+                                return ClaimPoll::Unreachable;
+                            };
                             if job.get("status").and_then(|s| s.as_str()) == Some("work") {
-                                Some((target, job))
+                                ClaimPoll::Work(target, job)
                             } else {
-                                None
+                                ClaimPoll::Idle
                             }
                         });
                     }
 
                     let mut claimed: Option<(String, serde_json::Value)> = None;
+                    let mut answered = false;
+                    let mut unregistered: Vec<String> = Vec::new();
                     while let Some(res) = claims.join_next().await {
-                        if let Ok(Some(hit)) = res {
-                            claimed = Some(hit);
-                            break;
+                        match res {
+                            Ok(ClaimPoll::Work(target, job)) => {
+                                claimed = Some((target, job));
+                                break;
+                            }
+                            Ok(ClaimPoll::Idle) => answered = true,
+                            Ok(ClaimPoll::NotRegistered(coordinator)) => {
+                                unregistered.push(coordinator)
+                            }
+                            Ok(ClaimPoll::Unreachable) | Err(_) => {}
                         }
+                    }
+                    for coordinator in unregistered {
+                        // The registration task registers with this
+                        // coordinator now instead of at its next one-minute
+                        // registration tick. Repeats within the cooldown are
+                        // coalesced, and the other coordinators are left
+                        // alone.
+                        reregister_w.request(&coordinator);
                     }
                     // A request can already have consumed a remote queue item
                     // by the time its future is canceled. Keep the remaining
@@ -9044,7 +9451,7 @@ async fn run_arc_node() -> Result<()> {
                         let decline_keypair = worker_keypair.clone();
                         decline_tasks.spawn(async move {
                             while let Some(result) = claims.join_next().await {
-                                let Ok(Some((coordinator, job))) = result else {
+                                let Ok(ClaimPoll::Work(coordinator, job)) = result else {
                                     continue;
                                 };
                                 decline_community_assignment(
@@ -9083,9 +9490,34 @@ async fn run_arc_node() -> Result<()> {
 
                     {
                         let Some((winner, job)) = claimed else {
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            // Long-polls that ended normally re-poll at once;
+                            // a round in which no coordinator answered backs
+                            // off instead of re-sending signed claims every
+                            // 500 ms to coordinators that are down or
+                            // unreachable (offline laptop, captive portal).
+                            failed_claim_rounds = if answered {
+                                0
+                            } else {
+                                failed_claim_rounds.saturating_add(1)
+                            };
+                            status_w.set_state(if answered {
+                                WorkerState::Polling
+                            } else {
+                                WorkerState::Reconnecting
+                            });
+                            if sleep_or_runtime_shutdown(
+                                &mut worker_shutdown,
+                                arc_node::community_worker::claim_retry_delay(failed_claim_rounds),
+                            )
+                            .await
+                            {
+                                break;
+                            }
                             continue;
                         };
+                        failed_claim_rounds = 0;
+                        status_w.set_state(WorkerState::Polling);
+                        status_w.record_claim();
                         let Some(worker_execution_permit) = worker_execution_gate.try_enter() else {
                             decline_community_assignment(
                                 client.clone(),
@@ -9096,6 +9528,7 @@ async fn run_arc_node() -> Result<()> {
                                 "worker is quiescing for desktop update",
                             )
                             .await;
+                            status_w.record_outcome(JobOutcome::Declined);
                             continue;
                         };
 
@@ -9119,6 +9552,7 @@ async fn run_arc_node() -> Result<()> {
                                 seed = %winner,
                                 "coordinator returned a community assignment without a job_id"
                             );
+                            status_w.record_outcome(JobOutcome::Declined);
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             continue;
                         }
@@ -9247,6 +9681,7 @@ async fn run_arc_node() -> Result<()> {
                                 std::time::Duration::from_secs(10),
                             )
                             .await;
+                            status_w.record_outcome(JobOutcome::Declined);
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             continue;
                         }
@@ -9323,36 +9758,52 @@ async fn run_arc_node() -> Result<()> {
                                 submission_deadline,
                             )
                             .await;
+                            status_w.record_outcome(JobOutcome::Declined);
                             continue;
                         }
                         let worker_execution_for_compute = worker_execution_permit.clone();
+                        let compute_pool_for_job = compute_pool_w.clone();
+                        status_w.set_state(WorkerState::Computing);
                         let inference = tokio::task::spawn_blocking(move || {
                             let _worker_execution_permit = worker_execution_for_compute;
-                            // The fallible model API is authoritative at this
-                            // untrusted boundary. It performs checked context
-                            // admission immediately before allocating KV state;
-                            // even a tokenizer-expanded prompt can only become
-                            // a typed worker failure, never an indexing panic.
-                            let (generated, hash) = inference_model
-                                .try_generate(
-                                    &inference_tokens,
-                                    max_tokens,
-                                    &inference_model.config.eos_tokens,
-                                )
-                                .map_err(|error| {
-                                    let helper_admitted = community_generation_fits_context(
-                                        inference_tokens.len(),
+                            // Created and dropped on this compute thread (the
+                            // Windows request is per thread). Inert unless
+                            // --prevent-sleep-during-jobs was given.
+                            let _keep_awake = KeepAwake::begin(prevent_sleep_during_jobs);
+                            // Compute on the node's configured inference pool
+                            // (--threads, [inference] threads or POST
+                            // /node/threads); with none set, on rayon's global
+                            // pool as before. This thread waits for the job,
+                            // so the keep-awake request above stays in force.
+                            compute_pool_for_job.install(|| {
+                                // The fallible model API is authoritative at
+                                // this untrusted boundary. It performs checked
+                                // context admission immediately before
+                                // allocating KV state; even a tokenizer-expanded
+                                // prompt can only become a typed worker failure,
+                                // never an indexing panic.
+                                let (generated, hash) = inference_model
+                                    .try_generate(
+                                        &inference_tokens,
                                         max_tokens,
-                                        inference_model.config.max_seq,
-                                    );
-                                    format!(
-                                        "{error}; worker_context_helper_admitted={helper_admitted}"
+                                        &inference_model.config.eos_tokens,
                                     )
-                                })?;
-                            let output_text = inference_model.decode(&generated);
-                            Ok::<_, String>((generated, hash, output_text))
+                                    .map_err(|error| {
+                                        let helper_admitted = community_generation_fits_context(
+                                            inference_tokens.len(),
+                                            max_tokens,
+                                            inference_model.config.max_seq,
+                                        );
+                                        format!(
+                                            "{error}; worker_context_helper_admitted={helper_admitted}"
+                                        )
+                                    })?;
+                                let output_text = inference_model.decode(&generated);
+                                Ok::<_, String>((generated, hash, output_text))
+                            })
                         })
                         .await;
+                        status_w.set_state(WorkerState::Polling);
                         let (generated, hash, output_text) = match inference {
                             Ok(Ok(result)) => result,
                             Ok(Err(error)) => {
@@ -9384,6 +9835,7 @@ async fn run_arc_node() -> Result<()> {
                                     submission_deadline,
                                 )
                                 .await;
+                                status_w.record_outcome(JobOutcome::Failed);
                                 continue;
                             }
                             Err(error) => {
@@ -9415,6 +9867,7 @@ async fn run_arc_node() -> Result<()> {
                                     submission_deadline,
                                 )
                                 .await;
+                                status_w.record_outcome(JobOutcome::Failed);
                                 continue;
                             }
                         };
@@ -9521,6 +9974,17 @@ async fn run_arc_node() -> Result<()> {
                             submission_deadline,
                         )
                         .await;
+                        status_w.record_outcome(match &submit_outcome {
+                            CommunitySubmitOutcome::Accepted { body } => JobOutcome::Completed {
+                                verified:
+                                    arc_node::community_worker::submit_response_is_quorum_verified(
+                                        body,
+                                    ),
+                            },
+                            CommunitySubmitOutcome::Rejected { .. }
+                            | CommunitySubmitOutcome::DeadlineExceeded
+                            | CommunitySubmitOutcome::LocalError => JobOutcome::Failed,
+                        });
 
                         // If a terminal response reports invalid_nonce, force
                         // a chain re-query before building the next immutable
@@ -9603,12 +10067,26 @@ async fn run_arc_node() -> Result<()> {
         coordinator_seed_rpcs,
         community_rpc_bases,
         compute_threads,
+        compute_pool,
         genesis_chain_identity,
         cli.enable_community_rewards_v1,
         native_serving,
         native_request_admission,
         Some(shutdown_rx),
         transport_wire_policy,
+        arc_node::twin::TwinConfig {
+            twin_execution: cli.community_twin_execution,
+            demand_pump: cli.community_demand_pump,
+            demand_dry_run: cli.community_demand_dry_run,
+            spot_check_per_mille: cli.community_twin_spot_check_per_mille,
+            demand_interval_secs: cli.community_demand_interval_secs,
+        },
+        cli.community_release_on_verification,
+        rpc::CommunityProfileServing {
+            verify: community_verify_profiles,
+            interleaved_rope_qk,
+            interleaved_rope_shard_infos,
+        },
     )
     .await;
 
@@ -9709,6 +10187,61 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn community_registration_name_is_a_nickname_or_public_key_hash_never_a_hostname() {
+        let keypair = arc_crypto::KeyPair::generate_ed25519();
+        let worker_id = format!("0x{}", keypair.address().to_hex());
+        let default_name = format!("node-{}", &keypair.address().to_hex()[..8]);
+
+        // No --node-name: the default is `node-` plus a short hash of the
+        // worker public key (its address), with no machine metadata at all.
+        assert_eq!(
+            community_registration_name(&worker_id, None),
+            (default_name.clone(), None)
+        );
+        assert_eq!(
+            community_registration_name(&worker_id, Some("   ")),
+            (default_name.clone(), None)
+        );
+
+        // A valid nickname is used verbatim (trimmed).
+        assert_eq!(
+            community_registration_name(&worker_id, Some(" basement rig 2 ")),
+            ("basement rig 2".to_string(), None)
+        );
+        assert_eq!(
+            community_registration_name(
+                &worker_id,
+                Some("github-linux-x86_64-community-verification")
+            ),
+            (
+                "github-linux-x86_64-community-verification".to_string(),
+                None
+            )
+        );
+
+        // Hostname-shaped or unsafe nicknames fall back with a stated reason.
+        for rejected in [
+            "Adas-MacBook-Pro.local",
+            "Adas-MacBook-Pro",
+            "DESKTOP-1A2B3C4",
+            "ada (Adas-MacBook-Pro.local)",
+            "<b>ada</b>",
+            "node-00000000",
+        ] {
+            let (name, reason) = community_registration_name(&worker_id, Some(rejected));
+            assert_eq!(name, default_name, "{rejected} must not be published");
+            assert!(
+                reason.is_some(),
+                "{rejected} must explain why it was refused"
+            );
+        }
+
+        // The worker's own default label is accepted as an explicit nickname.
+        let explicit_default = community_registration_name(&worker_id, Some(&*default_name));
+        assert_eq!(explicit_default, (default_name, None));
+    }
+
+    #[test]
     fn community_audience_accepts_live_0x_prefixed_network_info() {
         // Live v0.8.x coordinators publish 0x-prefixed hashes; before this
         // parser existed every community registration failed before POSTing.
@@ -9758,6 +10291,27 @@ mod tests {
         assert_eq!(
             from_genesis.certificate_domain(),
             Some(arc_consensus::ConsensusDomain::new(genesis, 0, 7))
+        );
+    }
+
+    #[test]
+    fn community_verify_profiles_are_legacy_only_unless_requested() {
+        let default = Cli::try_parse_from(["arc-node"]).unwrap();
+        assert_eq!(default.community_verify_profiles, "legacy-split-half");
+        assert_eq!(
+            rpc::CommunityVerifyProfiles::parse(&default.community_verify_profiles).unwrap(),
+            rpc::CommunityVerifyProfiles::default()
+        );
+        let both = Cli::try_parse_from([
+            "arc-node",
+            "--community-verify-profiles",
+            "legacy-split-half,rope-interleaved-v1",
+        ])
+        .unwrap();
+        assert!(
+            rpc::CommunityVerifyProfiles::parse(&both.community_verify_profiles)
+                .unwrap()
+                .interleaved_rope()
         );
     }
 
@@ -9836,6 +10390,20 @@ mod tests {
         ])
         .unwrap();
         assert!(configured.enable_native_inference_requests);
+    }
+
+    #[test]
+    fn community_release_on_verification_is_off_unless_requested() {
+        assert!(
+            !Cli::try_parse_from(["arc-node"])
+                .unwrap()
+                .community_release_on_verification
+        );
+        assert!(
+            Cli::try_parse_from(["arc-node", "--community-release-on-verification"])
+                .unwrap()
+                .community_release_on_verification
+        );
     }
 
     #[test]
@@ -10703,12 +11271,16 @@ mod tests {
                     Vec::new(),
                     vec![holder_origin],
                     0,
+                    rpc::ComputePool::default(),
                     None,
                     false,
                     None,
                     Arc::new(arc_node::native_inference::NativeRequestAdmission::default()),
                     Some(coordinator_shutdown_rx),
                     Arc::new(arc_net::transport::TransportWirePolicy::default()),
+                    arc_node::twin::TwinConfig::default(),
+                    false,
+                    rpc::CommunityProfileServing::default(),
                 )
                 .await
                 .unwrap();
@@ -11599,6 +12171,43 @@ mod tests {
             b"legacy-history",
             "create-only archival must not replace the first preserved history"
         );
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    /// The desktop opens `.arc-node.lock` through ARC's private-file checks.
+    /// A plain Windows create inherited the data directory's ACEs, and the
+    /// desktop refused that lock ("Windows DACL inherits from its parent") on
+    /// every later launch. The node now leaves a lock that passes the strict
+    /// private contract on Windows, while still holding it, and an inherited
+    /// lock left by an older node is repaired too.
+    #[test]
+    fn node_data_lock_satisfies_the_private_file_contract_while_held() {
+        let data_dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "arc-node-lock-private-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        arc_crypto::secret_file::create_private_directory_tree(&data_dir).unwrap();
+        let path = data_dir.join(".arc-node.lock");
+        // An older node's lock, created exactly as released binaries did.
+        drop(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .unwrap(),
+        );
+
+        let held = open_and_try_lock_node_data_file(&path, &data_dir).unwrap();
+        // On Unix an older lock keeps its mode here; the desktop repairs it.
+        #[cfg(windows)]
+        drop(arc_crypto::secret_file::open_private_read_write(&path).unwrap());
+        assert!(
+            open_and_try_lock_node_data_file(&path, &data_dir).is_err(),
+            "the lock still excludes a second node"
+        );
+        drop(held);
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 

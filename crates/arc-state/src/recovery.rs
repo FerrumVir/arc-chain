@@ -2494,7 +2494,7 @@ impl StateDB {
         let mut blocks: Vec<_> = self
             .blocks
             .iter()
-            .map(|entry| (*entry.key(), entry.value().clone()))
+            .map(|entry| (*entry.key(), Block::clone(entry.value())))
             .collect();
         blocks.sort_by_key(|entry| entry.0);
         let mut accounts: Vec<_> = self
@@ -3233,11 +3233,11 @@ impl StateDB {
         *self.recovery_manifest_hash.write() = Some(checkpoint.manifest_hash());
 
         for (height, block) in &payload.blocks {
-            self.blocks.insert(*height, block.clone());
+            self.blocks.insert(*height, Box::new(block.clone()));
         }
         let transition = checkpoint.manifest.transition_block()?;
         self.blocks
-            .insert(transition.header.height, transition.clone());
+            .insert(transition.header.height, Box::new(transition.clone()));
         *self.height.write() = transition.header.height;
 
         let computed = self.compute_recovery_state_root(&checkpoint.manifest.recovery_context());
@@ -5037,7 +5037,7 @@ mod tests {
         let mut anchor = state.get_block(0).unwrap();
         anchor.header.state_root = hash_bytes(b"forged-source-root");
         anchor.hash = Block::compute_hash(&anchor.header);
-        state.blocks.insert(0, anchor);
+        state.blocks.insert(0, Box::new(anchor));
         let (_, validators) = validators();
         seed_source_validator_metadata(&state, &validators);
         let error = ArcCheckpoint::export_unsigned(
@@ -5376,6 +5376,54 @@ mod tests {
             checkpoint.manifest.source_block_hash
         );
 
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    /// A checkpoint import puts its history window and transition block in
+    /// the block table, and committed blocks follow. Each reads back byte for
+    /// byte, by height and through the recovery export in height order, both
+    /// before and after a restart replays them.
+    #[test]
+    fn block_table_returns_the_same_blocks_after_import_commit_and_restart() {
+        fn encoded(blocks: &[(u64, Block)]) -> Vec<Vec<u8>> {
+            blocks
+                .iter()
+                .map(|entry| bincode::serialize(entry).unwrap())
+                .collect()
+        }
+        fn read_back(state: &StateDB, heights: &[u64]) -> Vec<(u64, Block)> {
+            heights
+                .iter()
+                .map(|height| (*height, state.get_block(*height).unwrap()))
+                .collect()
+        }
+        let (state, checkpoint, keys, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("block-table-identity");
+        let transition = checkpoint.manifest.transition_block().unwrap();
+        let mut written = checkpoint.payload.blocks.clone();
+        written.push((transition.header.height, transition));
+        for step in 1..=2u64 {
+            let block = commit_empty_recovery_block(
+                &state,
+                keys[0].address(),
+                1_787_777_000_000 + step,
+                &step.to_le_bytes(),
+            );
+            written.push((block.header.height, block));
+        }
+        let heights: Vec<u64> = written.iter().map(|(height, _)| *height).collect();
+        let expected = encoded(&written);
+        assert_eq!(encoded(&read_back(&state, &heights)), expected);
+        assert_eq!(encoded(&state.export_recovery_payload().blocks), expected);
+        drop(state);
+
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(encoded(&read_back(&restarted, &heights)), expected);
+        let exported = encoded(&restarted.export_recovery_payload().blocks);
+        assert_eq!(exported, expected);
+        drop(restarted);
         fs::remove_dir_all(source_dir).unwrap();
         fs::remove_dir_all(active_dir).unwrap();
     }

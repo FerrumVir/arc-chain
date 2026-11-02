@@ -56,7 +56,17 @@ export interface NodeStatus {
   workerThreads?: number | null;
   /** Logical cores on this machine (upper bound for the slider). */
   cpuCores?: number | null;
+  /**
+   * Set when the running node was started without its configured model
+   * because the file is missing (`notFound`) or cannot be read
+   * (`unreadable`). The node runs as an observer, so local compute is off
+   * until the file is back. Absent on older desktop builds.
+   */
+  modelUnavailable?: ModelUnavailableReason | null;
 }
+
+/** Why the configured model file could not be used for this launch. */
+export type ModelUnavailableReason = "notFound" | "unreadable";
 
 export interface ConfirmedRewardReceipt {
   txHash: string;
@@ -153,11 +163,36 @@ export interface NodeConfig {
   autoStart: boolean;
   /** Automatically check signed app releases. */
   autoUpdate: boolean;
-  /** Install signed app releases unattended, after native worker quiescence. */
+  /**
+   * Install signed app releases unattended, after native worker quiescence.
+   * On by default from v0.8.14; native code turns it on once for older stores.
+   */
   autoInstallUpdates: boolean;
   dataDir: string;
   /** Cores the node may use. null = every logical core. */
   workerThreads: number | null;
+  /**
+   * Answer to "contribute compute": true lets the app download the model and
+   * run as a worker, false keeps it an observer, null/absent = never asked.
+   */
+  computeConsent?: boolean | null;
+  /** Keep the computer awake while a job runs. Only true turns it on. */
+  preventSleepDuringJobs?: boolean | null;
+}
+
+/**
+ * Whether the user agreed to contribute compute. Mirrors
+ * `commands::compute_contribution_enabled`: an explicit answer wins, and
+ * configs from before the question count only if they already ran a worker
+ * with a model.
+ */
+export function computeContributionEnabled(
+  config: NodeConfig | null | undefined,
+): boolean {
+  if (!config) return false;
+  if (config.computeConsent === true) return true;
+  if (config.computeConsent === false) return false;
+  return config.role === "worker" && !!config.modelPath;
 }
 
 /**
@@ -173,7 +208,7 @@ export const DEFAULT_NODE_CONFIG: NodeConfig = {
   p2pPort: 9091,
   autoStart: true,
   autoUpdate: true,
-  autoInstallUpdates: false,
+  autoInstallUpdates: true,
   dataDir: "~/.arc/data-v3",
   workerThreads: null,
 };
@@ -189,6 +224,31 @@ export interface DataMigrationNotice {
   activeDataDir: string;
   migratedAt: number;
   reason: string;
+}
+
+/**
+ * Launch found node data from an earlier ARC install whose app data was gone
+ * (a Windows uninstall with "Delete the application data" ticked) and set it
+ * aside: renamed beside itself, never deleted. Mirrors
+ * `types::PreviousInstallNotice`. Shown until dismissed.
+ */
+export interface PreviousInstallNotice {
+  setAsideDataDir: string;
+  activeDataDir: string;
+  setAsideAt: number;
+}
+
+/**
+ * Asked once, on the first launch after a v0.7 install reached this app
+ * (normally through the v0.7 legacy bridge release). Until it is answered the
+ * node runs as an observer without a model. Mirrors
+ * `legacy_upgrade::LegacyComputeQuestion`.
+ */
+export interface LegacyComputeQuestion {
+  previousRole: string;
+  previousModelPath: string | null;
+  detectedBy: string;
+  recordedUnixMs: number;
 }
 
 /**
@@ -745,4 +805,42 @@ export interface ModelDownloadProgress {
   downloadedBytes: number;
   totalBytes: number;
   done: boolean;
+  /** `connecting`, `downloading`, `retrying`, `verifying`, or `done`. Absent from older backends. */
+  stage?: string;
+  /** Bytes saved by an earlier attempt or app run when this attempt started. */
+  resumedFromBytes?: number;
+  /** 1-based attempt number within this download. */
+  attempt?: number;
+  /** Seconds until the next attempt while retrying. */
+  retryInSecs?: number | null;
+  /** Why the previous attempt stopped, while retrying. */
+  message?: string | null;
+}
+
+/**
+ * This machine's community worker, read from its own node
+ * (`GET /community/worker/status`). Counters cover the node process's
+ * lifetime: local observations, not reward evidence.
+ */
+export interface WorkerStatus {
+  /** The local node runs a community worker and answered. */
+  running: boolean;
+  /** Why there is no reading, when `running` is false. */
+  unavailable: string | null;
+  /** `polling`, `computing`, or `reconnecting`. */
+  state: string | null;
+  /** The label validators show for this worker. */
+  publicName: string | null;
+  coordinatorsRegistered: number | null;
+  coordinatorsTotal: number | null;
+  jobsClaimed: number | null;
+  /** Results a coordinator accepted. */
+  jobsCompleted: number | null;
+  /** Accepted results the coordinator reported as quorum-verified. */
+  jobsVerified: number | null;
+  jobsFailed: number | null;
+  jobsDeclined: number | null;
+  lastJobCompletedUnixMs: number | null;
+  startedUnixMs: number | null;
+  preventSleepDuringJobs: boolean | null;
 }

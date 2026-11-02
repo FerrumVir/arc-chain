@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "arc-agents"
-version = "0.8.10"
+version = "0.8.16"
 dependencies = [
  "arc-crypto",
  "arc-types",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "arc-assign"
-version = "0.8.10"
+version = "0.8.16"
 dependencies = [
  "arc-bincode",
  "arc-crypto",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "arc-bench"
-version = "0.8.10"
+version = "0.8.16"
 dependencies = [
  "arc-bincode",
  "arc-consensus",
@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "arc-bincode"
-version = "0.8.10"
+version = "0.8.16"
 dependencies = [
  "cu-bincode",
  "hex",
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "arc-channel"
-version = "0.8.10"
+version = "0.8.16"
 dependencies = [
  "arc-crypto",
  "arc-types",
@@ -282,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "arc-cli"
-version = "0.8.10"
+version = "0.8.16"
 dependencies = [
  "anyhow",
  "arc-crypto",
@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "arc-consensus"
-version = "0.8.10"
+version = "0.8.16"
 dependencies = [
  "arc-bincode",
  "arc-crypto",
@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "arc-crypto"
-version = "0.8.10"
+version = "0.8.16"
 dependencies = [
  "blake3",
  "blst",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "arc-gpu"
-version = "0.8.10"
+version = "0.8.16"
 dependencies = [
  "arc-crypto",
  "arc-types",
@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "arc-inference"
-version = "0.8.10"
+version = "0.8.16"
 dependencies = [
  "arc-crypto",
  "arc-gpu",
@@ -388,19 +388,37 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "dashmap",
+ "fancy-regex",
  "hex",
  "libc",
  "rand 0.8.8",
  "rayon",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.20",
  "tracing",
 ]
 
 [[package]]
+name = "arc-legacy-bridge"
+version = "0.7.14"
+dependencies = [
+ "anyhow",
+ "base64",
+ "ed25519-dalek",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "ureq",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "arc-mempool"
-version = "0.8.10"
+version = "0.8.16"
 dependencies = [
  "arc-bincode",
  "arc-crypto",
@@ -417,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "arc-net"
-version = "0.8.10"
+version = "0.8.16"
 dependencies = [
  "anyhow",
  "arc-bincode",
@@ -443,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "arc-node"
-version = "0.8.10"
+version = "0.8.16"
 dependencies = [
  "anyhow",
  "arc-assign",
@@ -502,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "arc-relayer"
-version = "0.8.10"
+version = "0.8.16"
 dependencies = [
  "anyhow",
  "arc-types",
@@ -523,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "arc-state"
-version = "0.8.10"
+version = "0.8.16"
 dependencies = [
  "arc-bincode",
  "arc-crypto",
@@ -549,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "arc-types"
-version = "0.8.10"
+version = "0.8.16"
 dependencies = [
  "arc-bincode",
  "arc-crypto",
@@ -564,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "arc-vm"
-version = "0.8.10"
+version = "0.8.16"
 dependencies = [
  "arc-crypto",
  "arc-state",
@@ -3167,7 +3185,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.9",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
@@ -4608,9 +4626,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.17"
+version = "0.11.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04759210543be93709136e28212294a659ef5001836ff4eab4d663e4529bba83"
+checksum = "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc"
 dependencies = [
  "bytes",
  "fastbloom",
@@ -4992,7 +5010,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots 1.0.9",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
@@ -5222,9 +5240,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -5287,9 +5305,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -6069,7 +6087,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -6218,9 +6236,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
@@ -6982,9 +7000,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -6995,14 +7013,14 @@ version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
 dependencies = [
- "webpki-roots 1.0.9",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]

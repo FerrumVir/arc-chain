@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { PLAIN_COPY } from "../src/lib/plain-copy";
 import { seedMockOverrides, seedOnboarded } from "./helpers";
 
 const TEST_WORKER = "99".repeat(32);
@@ -592,17 +593,27 @@ test.describe("Dashboard", () => {
     await expect(page.getByTestId("btn-start")).toBeVisible({ timeout: 4000 });
   });
 
-  test("restart really restarts: the node goes back through syncing", async ({ page }) => {
+  test("restart really restarts: the node goes back through connecting", async ({ page }) => {
     await page.goto("/");
     await page.getByTestId("btn-start").click();
-    await expect(page.getByTestId("syncing-banner")).toBeVisible({ timeout: 4000 });
+    // While nothing on the network has answered, the connection line says so as status, not as a warning.
+    const connecting = page.locator('[data-testid="connection-notice"][data-state="connecting"]');
+    await expect(connecting).toBeVisible({ timeout: 4000 });
+    await expect(connecting).toHaveAttribute("role", "status");
+    await expect(connecting).toContainText("Connecting to the ARC network");
+    await expect(page.getByTestId("dashboard-subtitle")).toHaveText(
+      PLAIN_COPY.nodeStrip.runningConnecting,
+    );
     // The mock reports "live" once the node has been up for 8 s.
-    await expect(page.getByTestId("syncing-banner")).toBeHidden({ timeout: 20_000 });
+    await expect(connecting).toBeHidden({ timeout: 20_000 });
+    await expect(page.getByTestId("dashboard-subtitle")).toHaveText(
+      PLAIN_COPY.nodeStrip.runningConnected,
+    );
     const restart = page.getByTestId("btn-restart");
     await expect(restart).toBeEnabled();
     await restart.click();
-    // Uptime was reset by restart_node, so health is "syncing" again.
-    await expect(page.getByTestId("syncing-banner")).toBeVisible({ timeout: 8000 });
+    // Uptime was reset by restart_node, so the node is connecting again.
+    await expect(connecting).toBeVisible({ timeout: 8000 });
     await expect(page.getByTestId("btn-stop")).toBeVisible();
   });
 
@@ -616,6 +627,32 @@ test.describe("Dashboard", () => {
     await expect(restart).toBeVisible({ timeout: 4000 });
     await expect(restart).toBeDisabled();
     await expect(restart).toHaveAttribute("title", /managed externally/);
+  });
+
+  // An install that failed after its handoff keeps the update's fence until
+  // ARC exits. Start used to fail against it as "another ARC desktop
+  // currently owns the managed node lifecycle"; it is refused plainly now,
+  // and the Dashboard offers Home's one step instead of Start or Restart.
+  test("while an update ARC couldn't finish holds the node, the Dashboard offers Quit ARC instead of Start", async ({
+    page,
+  }) => {
+    await seedMockOverrides(page, {
+      start_node: { __reject: "ARC couldn't finish an update. Quit ARC and open it again." },
+    });
+    await page.goto("/");
+    await page.getByTestId("btn-start").click();
+
+    await expect(page.getByTestId("dashboard-subtitle")).toHaveText(
+      PLAIN_COPY.nodeStrip.updateFailed,
+    );
+    const quit = page.getByTestId("btn-quit-arc");
+    await expect(quit).toBeEnabled();
+    await expect(quit).toContainText(PLAIN_COPY.actions.quitArc);
+    await expect(page.getByTestId("btn-start")).toHaveCount(0);
+    await expect(page.getByTestId("btn-restart")).toHaveCount(0);
+    // The header carries the one sentence and the one step; no panel offers another try.
+    await expect(page.getByTestId("mutation-error")).toHaveCount(0);
+    await expect(page.getByTestId("btn-start-failure-retry")).toHaveCount(0);
   });
 
   test("stats grid has four cards", async ({ page }) => {

@@ -24,17 +24,24 @@ earned token. Reading time: ~5 minutes. Hands-on time: ~3 minutes.
 2. Drag **ARC Node** into your Applications folder.
 3. Eject the `.dmg`.
 4. Open **Applications → ARC Node** for the first time.
-5. macOS will say *"ARC Node can't be opened because it is from an unidentified developer."* That's normal for early releases.
-   - **Right-click** ARC Node in Applications.
-   - Choose **Open** from the context menu.
-   - Click **Open** in the dialog that appears.
-   - You only do this once. After the first launch, double-clicking works normally.
+5. macOS blocks the first launch because early releases are not notarized by
+   Apple. Approve it once; after that, double-clicking works normally.
+   - **macOS 15 Sequoia and later:** macOS says *"ARC Node" Not Opened*. Click
+     **Done**, then open Apple menu → **System Settings** → **Privacy &
+     Security**, scroll to **Security**, and click **Open Anyway** next to
+     *"ARC Node" was blocked to protect your Mac*. Enter your login password,
+     then click **Open Anyway** in the dialog that follows. The button appears
+     for about an hour after the blocked launch; if it is missing, double-click
+     ARC Node again first. The right-click → **Open** shortcut no longer works
+     on macOS 15.
+   - **macOS 14 Sonoma and earlier:** right-click (or Control-click) ARC Node in
+     Applications, choose **Open**, then click **Open** in the dialog.
 
 > **Got *"ARC Node is damaged and can't be opened. You should move it to the Trash"* instead?**
-> That's the same Gatekeeper rejection in disguise — it isn't actually damaged. macOS just refuses to verify a signature that doesn't exist on early builds. Two fixes:
+> That's the same Gatekeeper rejection in disguise — it isn't actually damaged, provided the `.dmg` matched the release's `SHA256SUMS`. macOS just refuses to verify a signature that doesn't exist on early builds, and usually offers no **Open Anyway** button for this message. Two fixes:
 >
 > - **Easy:** open Terminal and run `xattr -cr "/Applications/ARC Node.app"`, then double-click ARC Node again. The command strips the quarantine flag macOS adds to anything downloaded from a browser.
-> - **Or:** delete the .app, re-download the .dmg, and use the right-click → Open flow above *before* double-clicking.
+> - **Or:** delete the .app, re-download the .dmg, check it against `SHA256SUMS`, and repeat steps 1–5 for your macOS version.
 >
 > Permanent fix is on the roadmap — once the project is signed + notarized with an Apple Developer ID, this dialog goes away for everyone.
 
@@ -57,7 +64,7 @@ Windows version only after a release-blocking runtime test covers it.
 
 ### Linux (Ubuntu / Debian)
 
-After the complete v0.8.10 release is published, use its normalized desktop
+After the complete v0.8.16 release is published, use its normalized desktop
 asset name:
 
 ```bash
@@ -105,7 +112,7 @@ environment, or logs. The phrase is excluded from frontend `localStorage` and
 is never sent to a server by the identity flow. The app-data directory and
 store are owner-validated through open handles (`0700`/`0600` on Unix; a
 protected current-user/SYSTEM/Administrators DACL on Windows), and writes are
-atomic/no-follow. v0.8.10 does not yet use an OS keychain. Save a separate
+atomic/no-follow. v0.8.16 does not yet use an OS keychain. Save a separate
 offline backup: ARC Node has no “forgot password” recovery.
 
 Click **Continue**.
@@ -125,11 +132,15 @@ mode.
 
 ### Screen 4: Launch
 
-Review the role and ports, then click **Set up this node**. The app downloads
+Review the role and ports, then click **Start my node**. The app downloads
 the chosen model and node build, starts the process, and attempts a configured
 coordinator connection. It does **not** silently request faucet credit; use the
 Wallet screen's explicit **Claim from faucet** action after onboarding if you
 want testnet ARC. Startup and connectivity are reported separately.
+
+If the node can't start, setup doesn't stop there: click **Continue to ARC**
+(or **Try again**). ARC opens on Home, and the one-line node strip at the top
+says what the node needs and offers its one fix.
 
 ---
 
@@ -137,6 +148,10 @@ want testnet ARC. Startup and connectivity are reported separately.
 
 After setup:
 
+- ARC opens on Home, **Ask ARC**: the chat, which answers from the network
+  even while your node is off, blocked, starting or updating. The strip above
+  it says what your node is doing in one sentence, with one button when there
+  is something to do (Start node, Restart ARC, Update ARC).
 - The Dashboard distinguishes a running process from peer connectivity and
   selected-host chain health. Do not treat a `live` health string or advancing
   DAG round as proof of block production or cross-seed agreement.
@@ -157,9 +172,9 @@ After setup:
 
 ### Run an AI inference
 
-1. Click the **Inference** tab in the sidebar.
+1. Open **Ask ARC**, the first item in the sidebar (ARC opens there).
 2. Type a prompt. Example: `What is the capital of France?`
-3. Click **Run inference**.
+3. Click **Ask**.
 
 The result states which host says it served the request and exactly what
 agreement evidence came back. A raw `InferenceAttestation` (`0x16`) is only a
@@ -227,7 +242,7 @@ This is testnet ARC — no real-world value.
 2. Treat only a successful mined `CommunityInferenceReward` (`0x25`) receipt as
    payment. Raw `0x16` rows are shown separately as unpaid inference claims.
 
-The unreleased v0.8.10 candidate configures 2.5 testnet ARC per successful
+The unreleased v0.8.16 candidate configures 2.5 testnet ARC per successful
 `0x25` receipt, but issuance also requires exact-artifact work assignment,
 authenticated recomputation, a signed worker certificate, active genesis
 protocol activation, validator approval collection, strict
