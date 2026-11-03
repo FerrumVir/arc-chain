@@ -1029,12 +1029,37 @@ release_supply_chain_and_npm_audits_are_blocking() {
         }
     done
 
-    grep -Fq 'npm --prefix "$package" audit --package-lock-only --audit-level=low' \
-        <<<"$quality_block" \
-        || {
-            printf 'release-quality does not run the shared blocking npm audit loop\n'
+    # Every lockfile blocks at low, except that the compatibility SDK
+    # (sdks/typescript) blocks at low on its shipped runtime dependencies and
+    # at high on its dev-only test tooling. CI and the quality harness apply
+    # the same split.
+    for required in \
+        'npm --prefix "$package" audit --package-lock-only --audit-level=low' \
+        'if [ "$package" = sdks/typescript ]; then' \
+        'npm --prefix "$package" audit --package-lock-only --omit=dev --audit-level=low' \
+        'npm --prefix "$package" audit --package-lock-only --audit-level=high'
+    do
+        grep -Fq -- "$required" <<<"$quality_block" || {
+            printf 'release-quality does not run the shared blocking npm audit loop: %s\n' \
+                "$required"
             return 1
         }
+    done
+    grep -Fq -- 'npm audit --omit=dev --audit-level=low && npm audit --audit-level=high' \
+        "$CI_WORKFLOW" || {
+            printf 'CI compatibility TypeScript SDK audit drifted from the release policy\n'
+            return 1
+        }
+    for required in \
+        'npm audit --omit=dev --audit-level=low &&' \
+        'npm audit --audit-level=high &&'
+    do
+        grep -Fq -- "$required" "$QUALITY_HARNESS" || {
+            printf 'quality harness TypeScript SDK audit drifted from the release policy: %s\n' \
+                "$required"
+            return 1
+        }
+    done
     grep -Fq 'for package in dashboard desktop sdk sdk/typescript sdks/typescript; do' \
         <<<"$quality_block" || {
             printf 'release-quality npm audit loop does not enumerate all five lockfiles\n'

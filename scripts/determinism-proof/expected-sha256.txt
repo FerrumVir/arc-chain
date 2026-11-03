@@ -1,0 +1,7 @@
+# Combined SHA-256 of the determinism-proof transcript for the default
+# workload: every prompt in prompts.json, 32 new tokens, either kernel.
+# First measured identical on ubuntu-24.04 and windows-latest, with both the
+# scalar and AVX2 kernels, in workflow run 37461068933 (commit f20dcc617):
+# https://github.com/FerrumVir/arc-chain/actions/runs/37461068933
+# docs/determinism-proof.md lists every platform that has matched it since.
+d2c8c82b3a82beb166559b78ad26a748cbd6395c2cf13e8f012b03f90fa92872

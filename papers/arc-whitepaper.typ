@@ -1,6 +1,16 @@
 // ARC: A Deterministic Blockchain for Verifiable AI Inference
 // TJ Dunham
 // March 2026
+//
+// Scope note (2 November 2026): This paper is dated March 2026. Its GPU
+// bit-identity, speed, throughput and node-count figures are historical lab
+// and testnet results, not current claims. The current proven scope covers
+// CPUs only. It is set out in INFERENCE_DETERMINISM.md and
+// docs/determinism-proof.md in the ARC Chain repository
+// (github.com/FerrumVir/arc-chain): known-answer tests on ARM and x86, and
+// one 7-billion-parameter model that gave the same answer, bit for bit, on
+// the Linux, Windows, Intel Mac and Apple Silicon CPUs tested.
+// The same note is printed above the abstract.
 
 #set document(
   title: "ARC: A Deterministic Blockchain for Verifiable AI Inference",
@@ -27,6 +37,16 @@
 
   #v(1em)
 ]
+
+#block(
+  width: 100%,
+  inset: (x: 1em, y: 0.8em),
+  stroke: 0.5pt,
+)[
+  #text(size: 9.5pt)[*Scope note (2 November 2026).* This paper is dated March 2026. Its GPU bit-identity, speed, throughput and node-count figures are historical lab and testnet results, not current claims. The current proven scope covers CPUs only. It is set out in `INFERENCE_DETERMINISM.md` and `docs/determinism-proof.md` in the ARC Chain repository (`github.com/FerrumVir/arc-chain`): known-answer tests on ARM and x86, and one 7-billion-parameter model that gave the same answer, bit for bit, on the Linux, Windows, Intel Mac and Apple Silicon CPUs tested.]
+]
+
+#v(0.6em)
 
 #text(weight: "bold")[Abstract.]
 We present ARC, a Layer 1 blockchain for verifiable AI inference. ARC constructs a pure integer inference engine that eliminates all floating-point operations from the neural network forward pass, achieving bitwise identical output across ARM, x86, and GPU architectures. This engineering enables: (1) cryptographic verification of inference via hash comparison at O(1) cost, (2) distributed inference across untrusted heterogeneous devices without inter-node validation, (3) a roadmap for expert-parallel sharding of Mixture-of-Experts models across community GPU nodes, and (4) STARK proofs of neural network layers with a path to full-inference proofs. The system processes 33,230 transactions per second on a two-node network with DAG consensus, runs 7-billion parameter models at 76ms per token, and operates across 8 nodes on 6 continents producing identical output hashes. ARC introduces three inference verification tiers (all-execute, optimistic with fraud proofs, and STARK-proven), a VRF-based committee selection mechanism for large model verification, zero-fee AI agent settlements as first-class transaction types, and an EIP-1559-style inference gas lane. The system is implemented in 99,000 lines of Rust across 14 crates with 1,209 tests. A formal treatment of the underlying determinism requirement is given in our companion paper _On the Foundations of Trustworthy Artificial Intelligence_ (arXiv:2603.24904).

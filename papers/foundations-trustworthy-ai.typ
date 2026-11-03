@@ -2,6 +2,16 @@
 // On the Foundations of Trustworthy Artificial Intelligence
 // TJ Dunham — ARC — March 2026
 // ============================================================================
+// Scope note (2 November 2026): This paper is dated March 2026. Its GPU
+// bit-identity, speed, throughput and node-count figures are historical lab
+// and testnet results, not current claims. The current proven scope covers
+// CPUs only. It is set out in INFERENCE_DETERMINISM.md and
+// docs/determinism-proof.md in the ARC Chain repository
+// (github.com/FerrumVir/arc-chain): known-answer tests on ARM and x86, and
+// one 7-billion-parameter model that gave the same answer, bit for bit, on
+// the Linux, Windows, Intel Mac and Apple Silicon CPUs tested.
+// The same note is printed above the abstract.
+// ============================================================================
 
 #set document(
   title: "On the Foundations of Trustworthy Artificial Intelligence",
@@ -67,6 +77,16 @@
   #text(size: 9pt, fill: rgb("#777"))[March 2026]
   #v(1.4em)
 ]
+
+// ---------- Scope note ----------
+#block(
+  width: 100%,
+  inset: (x: 1em, y: 0.6em),
+  stroke: 0.5pt + rgb("#888"),
+)[
+  #text(size: 9pt)[*Scope note (2 November 2026).* This paper is dated March 2026. Its GPU bit-identity, speed, throughput and node-count figures are historical lab and testnet results, not current claims. The current proven scope covers CPUs only. It is set out in `INFERENCE_DETERMINISM.md` and `docs/determinism-proof.md` in the ARC Chain repository (`github.com/FerrumVir/arc-chain`): known-answer tests on ARM and x86, and one 7-billion-parameter model that gave the same answer, bit for bit, on the Linux, Windows, Intel Mac and Apple Silicon CPUs tested.]
+]
+#v(0.6em)
 
 // ---------- Abstract ----------
 #block(

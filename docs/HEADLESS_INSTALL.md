@@ -36,9 +36,9 @@ macOS or Windows-version floor.
 
 ## Linux and macOS
 
-After the complete v0.8.16 release is published, download the installer from
-the owner-created protected source tag and pin the same version when running
-it. Keeping download and execution separate makes network errors visible and
+For the published v0.8.16 release, download the installer from the
+owner-created protected source tag and pin the same version when running it.
+Keeping download and execution separate makes network errors visible and
 lets you inspect the script first.
 
 The v0.8.x release is intentionally not GitHub's global `latest` while legacy
