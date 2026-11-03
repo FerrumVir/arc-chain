@@ -865,7 +865,9 @@ impl PeerRateLimiter {
 /// entry makes replacement/removal atomic for a validator address.
 struct PeerConnection<S> {
     connection_id: u64,
-    send: S,
+    /// Shared so a writer can clone the handle out of the map and release the
+    /// shard guard before it awaits the network. See `write_to_peer`.
+    send: SharedPeerStream<S>,
     /// The address to dial this peer at (IP from connection + listen_port from handshake).
     dial_addr: SocketAddr,
     /// The peer's self-reported stake.
@@ -879,6 +881,81 @@ struct PeerConnection<S> {
 /// simultaneous dial, and resolved by the tie-break in `install_directed`.
 const SIMULTANEOUS_DIAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Every framed write to a peer gets this long plus `PEER_WRITE_MIN_BYTES_PER_SEC`
+/// worth of time for its payload. A peer that cannot take one frame in that
+/// time is treated as a dead connection. The wait for the stream's writer lock
+/// has its own budget of the same length; running out of it is not a failure.
+const PEER_WRITE_BASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Slowest sustained rate a live peer is assumed to accept. A 16 MiB frame
+/// therefore gets 5 s + 16 s instead of being cut off at a flat 5 s.
+const PEER_WRITE_MIN_BYTES_PER_SEC: u64 = 1024 * 1024;
+
+fn peer_write_timeout(base: std::time::Duration, payload_len: usize) -> std::time::Duration {
+    let allowance_ms = (payload_len as u64).saturating_mul(1000) / PEER_WRITE_MIN_BYTES_PER_SEC;
+    base.saturating_add(std::time::Duration::from_millis(allowance_ms))
+}
+
+/// One peer's send stream behind an async mutex. The mutex keeps exactly one
+/// framed write in flight per stream, so frames from different tasks never
+/// interleave and each task's frames keep their order.
+struct PeerStream<S> {
+    stream: S,
+    /// Set while a frame is being written and cleared once it is flushed. A
+    /// write that is cancelled by its timeout, or that fails, leaves it set:
+    /// the stream may then hold a partial frame, so no later frame may follow
+    /// it and the connection must be dropped.
+    torn: bool,
+}
+
+type SharedPeerStream<S> = Arc<tokio::sync::Mutex<PeerStream<S>>>;
+
+fn shared_peer_stream<S>(stream: S) -> SharedPeerStream<S> {
+    Arc::new(tokio::sync::Mutex::new(PeerStream {
+        stream,
+        torn: false,
+    }))
+}
+
+/// Why a write to a peer did not complete.
+#[derive(Debug)]
+enum PeerWriteFailure {
+    Io(std::io::Error),
+    TimedOut,
+    /// An earlier write on this stream was cut off mid-frame.
+    Torn,
+}
+
+impl std::fmt::Display for PeerWriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "{error}"),
+            Self::TimedOut => f.write_str("write timed out"),
+            Self::Torn => f.write_str("stream holds a partial frame from an earlier write"),
+        }
+    }
+}
+
+/// Outcome of one framed write to one peer.
+#[derive(Debug)]
+enum PeerWrite {
+    Sent,
+    /// The peer is not connected, or a different generation than the caller
+    /// expected now holds its slot. Nothing was written.
+    NotConnected,
+    /// Another task's write to this stream held its writer lock for the whole
+    /// wait budget. Nothing was written and the connection is left alone: the
+    /// holder is bounded by its own write timeout and removes the connection
+    /// itself if that write fails, so a frame queued behind a long but healthy
+    /// write never disconnects a live peer.
+    Busy,
+    /// The write failed; `connection_id` is the generation it was written to,
+    /// which the caller removes.
+    Failed {
+        connection_id: u64,
+        failure: PeerWriteFailure,
+    },
+}
+
 /// Tracks active peer send streams and metadata for outbound broadcast.
 struct PeerConnections<S = quinn::SendStream> {
     peers: DashMap<[u8; 32], PeerConnection<S>>,
@@ -886,6 +963,8 @@ struct PeerConnections<S = quinn::SendStream> {
     inbound_tx: mpsc::Sender<InboundMessage>,
     peer_count: Arc<AtomicU32>,
     wire_policy: Arc<TransportWirePolicy>,
+    /// `PEER_WRITE_BASE_TIMEOUT` in production; tests shorten it.
+    write_base_timeout: std::time::Duration,
 }
 
 impl<S> PeerConnections<S> {
@@ -901,6 +980,7 @@ impl<S> PeerConnections<S> {
             inbound_tx,
             peer_count,
             wire_policy,
+            write_base_timeout: PEER_WRITE_BASE_TIMEOUT,
         }
     }
 
@@ -954,7 +1034,7 @@ impl<S> PeerConnections<S> {
                 let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
                 entry.insert(PeerConnection {
                     connection_id,
-                    send,
+                    send: shared_peer_stream(send),
                     dial_addr,
                     stake,
                     initiated_locally,
@@ -966,7 +1046,7 @@ impl<S> PeerConnections<S> {
                 let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
                 entry.insert(PeerConnection {
                     connection_id,
-                    send,
+                    send: shared_peer_stream(send),
                     dial_addr,
                     stake,
                     initiated_locally,
@@ -1038,30 +1118,26 @@ impl<S: tokio::io::AsyncWrite + Unpin> PeerConnections<S> {
         let mut sent = 0usize;
         let mut dead_peers = Vec::new();
         for (key, connection_id) in &peer_keys {
-            if let Some(mut entry) = self.peers.get_mut(key) {
-                if entry.connection_id != *connection_id {
-                    continue;
-                }
-                // 5-second timeout per peer prevents one slow/dead peer from
-                // blocking the entire outbound fanout task, which was the
-                // secondary cause of the P2P channel filling up.
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    write_message(&mut entry.send, msg_type, payload),
-                )
+            // One slow or dead peer costs at most one write timeout before it
+            // is removed; it can never hold a peer-map guard while it waits.
+            match self
+                .write_to_peer(key, Some(*connection_id), msg_type, payload)
                 .await
-                {
-                    Ok(Ok(())) => {
-                        sent += 1;
-                    }
-                    Ok(Err(e)) => {
-                        warn!("Failed to send to peer: {}", e);
-                        dead_peers.push((*key, *connection_id));
-                    }
-                    Err(_) => {
-                        warn!("Timeout writing to peer, removing dead connection");
-                        dead_peers.push((*key, *connection_id));
-                    }
+            {
+                PeerWrite::Sent => sent += 1,
+                PeerWrite::NotConnected => {}
+                PeerWrite::Busy => {
+                    warn!(
+                        ?msg_type,
+                        "Peer stream busy with an earlier write; skipped this frame for it"
+                    );
+                }
+                PeerWrite::Failed {
+                    connection_id,
+                    failure,
+                } => {
+                    warn!(?msg_type, %failure, "Failed to send to peer, removing connection");
+                    dead_peers.push((*key, connection_id));
                 }
             }
         }
@@ -1093,26 +1169,119 @@ impl<S: tokio::io::AsyncWrite + Unpin> PeerConnections<S> {
             );
             return;
         }
-        let failed_generation = if let Some(mut entry) = self.peers.get_mut(&target.0) {
-            let connection_id = entry.connection_id;
-            if let Err(e) = write_message(&mut entry.send, msg_type, payload).await {
-                warn!("Failed to send {:?} to {}: {}", msg_type, target, e);
-                Some(connection_id)
-            } else {
-                None
+        match self.write_to_peer(&target.0, None, msg_type, payload).await {
+            PeerWrite::Sent => {}
+            PeerWrite::NotConnected => {
+                debug!(
+                    "send_to: peer {} not connected, cannot send {:?}",
+                    target, msg_type
+                );
             }
-        } else {
-            debug!(
-                "send_to: peer {} not connected, cannot send {:?}",
-                target, msg_type
-            );
-            None
-        };
-        // The DashMap guard above must be dropped before removal. The old code
-        // attempted `remove` while holding `get_mut`, which can deadlock.
-        if let Some(connection_id) = failed_generation {
-            self.remove_and_notify(*target, connection_id).await;
+            PeerWrite::Busy => {
+                warn!(
+                    "send_to: peer {} stream busy with an earlier write, skipped {:?}",
+                    target, msg_type
+                );
+            }
+            PeerWrite::Failed {
+                connection_id,
+                failure,
+            } => {
+                warn!("Failed to send {:?} to {}: {}", msg_type, target, failure);
+                self.remove_and_notify(*target, connection_id).await;
+            }
         }
+    }
+
+    /// Write one frame to one peer without holding any peer-map guard across
+    /// the network write.
+    ///
+    /// The stream handle and generation are cloned out under a short shard
+    /// read guard that is released before the first await. The wait for the
+    /// stream's own writer lock and the write itself then each run under the
+    /// write timeout, so one call takes at most twice that. Holding
+    /// a DashMap guard across the write let a stalled peer park every other
+    /// task that touched the same shard (`is_connected`, `len`, `iter`,
+    /// `install_directed`) on a synchronous lock, which on a small runtime
+    /// leaves no worker to finish the write and release the guard.
+    ///
+    /// With `expected_generation`, a slot now held by a different generation
+    /// is reported as `NotConnected` and left alone.
+    async fn write_to_peer(
+        &self,
+        key: &[u8; 32],
+        expected_generation: Option<u64>,
+        msg_type: MessageType,
+        payload: &[u8],
+    ) -> PeerWrite {
+        let handle = self
+            .peers
+            .get(key)
+            .map(|entry| (entry.connection_id, entry.send.clone()));
+        let Some((connection_id, stream)) = handle else {
+            return PeerWrite::NotConnected;
+        };
+        if expected_generation.is_some_and(|expected| expected != connection_id) {
+            return PeerWrite::NotConnected;
+        }
+        let limit = peer_write_timeout(self.write_base_timeout, payload.len());
+        let Ok(mut guard) = tokio::time::timeout(limit, stream.lock()).await else {
+            return PeerWrite::Busy;
+        };
+        if guard.torn {
+            return PeerWrite::Failed {
+                connection_id,
+                failure: PeerWriteFailure::Torn,
+            };
+        }
+        guard.torn = true;
+        let written =
+            tokio::time::timeout(limit, write_message(&mut guard.stream, msg_type, payload)).await;
+        let failure = match written {
+            Ok(Ok(())) => {
+                guard.torn = false;
+                return PeerWrite::Sent;
+            }
+            Ok(Err(error)) => PeerWriteFailure::Io(error),
+            Err(_) => PeerWriteFailure::TimedOut,
+        };
+        PeerWrite::Failed {
+            connection_id,
+            failure,
+        }
+    }
+
+    /// Write an empty heartbeat to every connected peer, one at a time, and
+    /// remove each generation whose write fails or times out. Dead QUIC
+    /// streams fail at once; a stalled one is cut off by the write timeout
+    /// rather than holding the peer map. Returns how many were removed.
+    async fn probe_peers(&self) -> usize {
+        let peer_keys: Vec<([u8; 32], u64)> = self
+            .peers
+            .iter()
+            .map(|e| (*e.key(), e.connection_id))
+            .collect();
+        let mut dead = Vec::new();
+        for (key, connection_id) in &peer_keys {
+            if let PeerWrite::Failed {
+                connection_id,
+                failure,
+            } = self
+                .write_to_peer(key, Some(*connection_id), MessageType::Heartbeat, &[])
+                .await
+            {
+                debug!(connection_id, %failure, "Heartbeat probe failed");
+                dead.push((*key, connection_id));
+            }
+        }
+        let mut removed = 0;
+        for (key, connection_id) in dead {
+            if self.remove_and_notify(Hash256(key), connection_id).await {
+                debug!(connection_id, "Pruned dead peer connection");
+                removed += 1;
+            }
+        }
+        removed
     }
 }
 
@@ -1955,36 +2124,11 @@ async fn run_transport_inner(
                         candidates.sort();
                         candidates.dedup();
 
-                        // Probe live connections: try writing a tiny heartbeat to each
-                        // peer stream. Dead QUIC streams fail immediately, letting us
-                        // prune stale entries that would otherwise block reconnect.
-                        {
-                            let peer_keys: Vec<([u8; 32], u64)> = conn_bg
-                                .peers
-                                .iter()
-                                .map(|e| (*e.key(), e.connection_id))
-                                .collect();
-                            let mut dead = Vec::new();
-                            for (key, connection_id) in &peer_keys {
-                                if let Some(mut entry) = conn_bg.peers.get_mut(key) {
-                                    if entry.connection_id != *connection_id {
-                                        continue;
-                                    }
-                                    // Write a Heartbeat message (type 0, empty payload)
-                                    if write_message(&mut entry.send, MessageType::Heartbeat, &[]).await.is_err() {
-                                        dead.push((*key, *connection_id));
-                                    }
-                                }
-                            }
-                            for (key, connection_id) in dead {
-                                if conn_bg
-                                    .remove_and_notify(Hash256(key), connection_id)
-                                    .await
-                                {
-                                    debug!(connection_id, "Pruned dead peer connection");
-                                }
-                            }
-                        }
+                        // Probe live connections with a tiny heartbeat to each peer
+                        // stream, pruning stale entries that would otherwise block
+                        // reconnect. Every probe write is bounded by the write
+                        // timeout and holds no peer-map guard while it waits.
+                        conn_bg.probe_peers().await;
 
                         let connected_addrs: std::collections::HashSet<SocketAddr> = conn_bg.peers.iter()
                             .map(|e| e.value().dial_addr)
@@ -3636,6 +3780,13 @@ mod tests {
         assert_eq!(peer_count.load(Ordering::Relaxed), 0);
     }
 
+    /// The stream currently installed for `key`, for tests whose streams are
+    /// plain labels.
+    fn installed_stream<S: Copy>(connections: &PeerConnections<S>, key: &[u8; 32]) -> S {
+        let stream = connections.peers.get(key).unwrap().send.clone();
+        stream.try_lock().expect("no write in flight").stream
+    }
+
     /// A local identity for the single-map tests (the lower of the pair).
     const LOCAL: [u8; 32] = [1_u8; 32];
 
@@ -3669,7 +3820,7 @@ mod tests {
         }
         let kept = |view: &PeerConnections<&'static str>, remote: [u8; 32]| {
             assert_eq!(view.peers.len(), 1, "exactly one connection per peer");
-            view.peers.get(&remote).unwrap().send
+            installed_stream(view, &remote)
         };
         (kept(&a_view, b), kept(&b_view, a))
     }
@@ -3710,7 +3861,7 @@ mod tests {
             connections.peers.get(&remote).unwrap().connection_id,
             kept_id
         );
-        assert_eq!(connections.peers.get(&remote).unwrap().send, "A->B");
+        assert_eq!(installed_stream(&connections, &remote), "A->B");
     }
 
     #[test]
@@ -3741,5 +3892,351 @@ mod tests {
             new_id
         );
         assert_eq!(peer_count.load(Ordering::Relaxed), 1);
+    }
+
+    /// A test send stream: either one that never accepts a byte, like a peer
+    /// whose flow-control window never reopens, or an in-memory pipe.
+    enum TestStream {
+        /// Notified on every write attempt, so a test knows a write is stuck.
+        Stalled(Arc<tokio::sync::Notify>),
+        Open(tokio::io::DuplexStream),
+    }
+
+    impl tokio::io::AsyncWrite for TestStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            match self.get_mut() {
+                Self::Stalled(attempted) => {
+                    attempted.notify_one();
+                    std::task::Poll::Pending
+                }
+                Self::Open(stream) => {
+                    tokio::io::AsyncWrite::poll_write(std::pin::Pin::new(stream), cx, buf)
+                }
+            }
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            match self.get_mut() {
+                Self::Stalled(_) => std::task::Poll::Pending,
+                Self::Open(stream) => {
+                    tokio::io::AsyncWrite::poll_flush(std::pin::Pin::new(stream), cx)
+                }
+            }
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            match self.get_mut() {
+                Self::Stalled(_) => std::task::Poll::Pending,
+                Self::Open(stream) => {
+                    tokio::io::AsyncWrite::poll_shutdown(std::pin::Pin::new(stream), cx)
+                }
+            }
+        }
+    }
+
+    const SHORT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
+    fn stalled_stream() -> (TestStream, Arc<tokio::sync::Notify>) {
+        let attempted = Arc::new(tokio::sync::Notify::new());
+        (TestStream::Stalled(attempted.clone()), attempted)
+    }
+
+    fn fast_timeout_connections(
+        write_base_timeout: std::time::Duration,
+    ) -> (
+        PeerConnections<TestStream>,
+        Arc<AtomicU32>,
+        mpsc::Receiver<InboundMessage>,
+    ) {
+        let (inbound_tx, inbound_rx) = mpsc::channel(8);
+        let peer_count = Arc::new(AtomicU32::new(0));
+        let mut connections = PeerConnections::new(
+            inbound_tx,
+            peer_count.clone(),
+            Arc::new(TransportWirePolicy::default()),
+        );
+        connections.write_base_timeout = write_base_timeout;
+        (connections, peer_count, inbound_rx)
+    }
+
+    #[test]
+    fn the_write_timeout_grows_with_the_payload() {
+        let base = PEER_WRITE_BASE_TIMEOUT;
+        assert_eq!(peer_write_timeout(base, 0), base);
+        assert_eq!(
+            peer_write_timeout(base, MAX_PAYLOAD_SIZE as usize),
+            base + std::time::Duration::from_secs(16)
+        );
+    }
+
+    /// Two workers, as on a validator's main runtime. A task stuck writing to
+    /// one peer must leave that peer's own shard free for every other task:
+    /// before, the writer held the shard's write guard across the network
+    /// write, and two more accesses parked both workers for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_peer_write_never_blocks_the_peer_map() {
+        // Long enough that the probes below run while the write is stuck.
+        let (connections, peer_count, mut inbound_rx) =
+            fast_timeout_connections(std::time::Duration::from_secs(2));
+        let connections = Arc::new(connections);
+        let stalled = [5_u8; 32];
+        let other = [6_u8; 32];
+        let addr: SocketAddr = "127.0.0.1:7336".parse().unwrap();
+        let (stream, attempted) = stalled_stream();
+        let (stalled_generation, _) = connections
+            .install_directed(stalled, LOCAL, stream, addr, 1, true)
+            .unwrap();
+
+        let writer = {
+            let connections = connections.clone();
+            tokio::spawn(async move {
+                connections
+                    .send_to(&Hash256(stalled), MessageType::DagHistoryResponse, &[7; 64])
+                    .await;
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), attempted.notified())
+            .await
+            .expect("the write reached the stalled stream");
+
+        // One task per worker, each touching the stalled peer's own shard.
+        // The test thread waits on a std channel, so it never needs a worker.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<&'static str>();
+        let (replacement_send, mut replacement_receive) = tokio::io::duplex(4096);
+        {
+            let connections = connections.clone();
+            let done = done_tx.clone();
+            tokio::spawn(async move {
+                // Either the stalled stream or its replacement holds the slot.
+                assert!(connections.is_connected(&stalled));
+                assert!(matches!(connections.peers.len(), 1 | 2));
+                done.send("is_connected and len").unwrap();
+            });
+        }
+        {
+            let connections = connections.clone();
+            let done = done_tx;
+            tokio::spawn(async move {
+                let (_, replaced) = connections
+                    .install_directed(
+                        stalled,
+                        LOCAL,
+                        TestStream::Open(replacement_send),
+                        addr,
+                        1,
+                        true,
+                    )
+                    .expect("a same-direction reconnect replaces the stalled stream");
+                assert_eq!(replaced, Some(stalled_generation));
+                let (stream, _) = stalled_stream();
+                connections
+                    .install_directed(other, LOCAL, stream, addr, 1, true)
+                    .unwrap();
+                done.send("install_directed").unwrap();
+            });
+        }
+        for _ in 0..2 {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("peer-map access completed while a peer write was stuck");
+        }
+
+        // The stuck write gives up on its own timeout. Its generation was
+        // already replaced, so its cleanup must leave the replacement alone.
+        tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+            .await
+            .expect("the stuck write gave up")
+            .unwrap();
+        assert!(connections.is_connected(&stalled));
+        assert_eq!(connections.peers.len(), 2);
+        assert_eq!(peer_count.load(Ordering::Relaxed), 2);
+        assert!(
+            inbound_rx.try_recv().is_err(),
+            "no disconnect for a replaced generation"
+        );
+
+        connections
+            .send_to(&Hash256(stalled), MessageType::Heartbeat, b"replacement")
+            .await;
+        let (kind, payload) = read_message(&mut replacement_receive).await.unwrap();
+        assert_eq!(kind, MessageType::Heartbeat);
+        assert_eq!(payload, b"replacement");
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_write_removes_and_reports_only_its_own_generation() {
+        let (connections, peer_count, mut inbound_rx) =
+            fast_timeout_connections(SHORT_WRITE_TIMEOUT);
+        let peer = [5_u8; 32];
+        let addr: SocketAddr = "127.0.0.1:7337".parse().unwrap();
+        let (stream, _) = stalled_stream();
+        let (generation, _) = connections
+            .install_directed(peer, LOCAL, stream, addr, 1, true)
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        connections
+            .send_to(&Hash256(peer), MessageType::DagHistoryResponse, &[1; 32])
+            .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(!connections.is_connected(&peer));
+        assert_eq!(peer_count.load(Ordering::Relaxed), 0);
+        match inbound_rx.try_recv() {
+            Ok(InboundMessage::PeerDisconnected {
+                address,
+                connection_id,
+            }) => {
+                assert_eq!(address, Hash256(peer));
+                assert_eq!(connection_id, generation);
+            }
+            _ => panic!("expected one disconnect for the timed-out generation"),
+        }
+        assert!(inbound_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn no_frame_follows_a_write_cut_off_mid_frame() {
+        let (connections, _, _inbound_rx) = fast_timeout_connections(SHORT_WRITE_TIMEOUT);
+        let peer = [5_u8; 32];
+        let addr: SocketAddr = "127.0.0.1:7338".parse().unwrap();
+        let (stream, _) = stalled_stream();
+        let (generation, _) = connections
+            .install_directed(peer, LOCAL, stream, addr, 1, true)
+            .unwrap();
+
+        match connections
+            .write_to_peer(&peer, None, MessageType::Heartbeat, &[])
+            .await
+        {
+            PeerWrite::Failed {
+                connection_id,
+                failure: PeerWriteFailure::TimedOut,
+            } => assert_eq!(connection_id, generation),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        // A writer that cloned the stream before the connection was removed
+        // must refuse it at once rather than write after a partial frame.
+        let started = std::time::Instant::now();
+        match connections
+            .write_to_peer(&peer, Some(generation), MessageType::Heartbeat, &[])
+            .await
+        {
+            PeerWrite::Failed {
+                failure: PeerWriteFailure::Torn,
+                ..
+            } => {}
+            other => panic!("expected a torn stream, got {other:?}"),
+        }
+        assert!(started.elapsed() < connections.write_base_timeout);
+        // A generation the caller did not expect is left alone.
+        assert!(matches!(
+            connections
+                .write_to_peer(&peer, Some(generation + 1), MessageType::Heartbeat, &[])
+                .await,
+            PeerWrite::NotConnected
+        ));
+    }
+
+    /// A short frame queued behind a longer write to the same peer must not
+    /// count the wait against itself and drop a peer that is still taking
+    /// that longer write. Only the write that holds the stream is judged.
+    #[tokio::test]
+    async fn a_write_queued_behind_a_longer_one_skips_the_peer_without_removing_it() {
+        let (connections, peer_count, mut inbound_rx) =
+            fast_timeout_connections(SHORT_WRITE_TIMEOUT);
+        let connections = Arc::new(connections);
+        let peer = [5_u8; 32];
+        let addr: SocketAddr = "127.0.0.1:7340".parse().unwrap();
+        let (stream, attempted) = stalled_stream();
+        let (generation, _) = connections
+            .install_directed(peer, LOCAL, stream, addr, 1, true)
+            .unwrap();
+
+        // A 2 MiB frame is allowed 2 s more than an empty heartbeat.
+        let large = vec![0_u8; 2 * 1024 * 1024];
+        let holder_limit = peer_write_timeout(SHORT_WRITE_TIMEOUT, large.len());
+        let holder = {
+            let connections = connections.clone();
+            tokio::spawn(async move {
+                connections
+                    .write_to_peer(
+                        &peer,
+                        Some(generation),
+                        MessageType::DagHistoryResponse,
+                        &large,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), attempted.notified())
+            .await
+            .expect("the long write reached the stream");
+
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            connections
+                .write_to_peer(&peer, Some(generation), MessageType::Heartbeat, &[])
+                .await,
+            PeerWrite::Busy
+        ));
+        assert_eq!(
+            connections.probe_peers().await,
+            0,
+            "a busy peer is not pruned"
+        );
+        assert!(started.elapsed() < holder_limit);
+        assert!(connections.is_connected(&peer));
+        assert_eq!(peer_count.load(Ordering::Relaxed), 1);
+        assert!(
+            inbound_rx.try_recv().is_err(),
+            "no disconnect for a busy peer"
+        );
+
+        // The write that held the stream is still bounded by its own timeout.
+        match holder.await.unwrap() {
+            PeerWrite::Failed {
+                connection_id,
+                failure: PeerWriteFailure::TimedOut,
+            } => assert_eq!(connection_id, generation),
+            other => panic!("expected the long write to time out, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_heartbeat_probe_prunes_a_stalled_peer_and_keeps_a_live_one() {
+        let (connections, peer_count, _inbound_rx) = fast_timeout_connections(SHORT_WRITE_TIMEOUT);
+        let stalled = [5_u8; 32];
+        let live = [6_u8; 32];
+        let addr: SocketAddr = "127.0.0.1:7339".parse().unwrap();
+        let (stream, _) = stalled_stream();
+        connections
+            .install_directed(stalled, LOCAL, stream, addr, 1, true)
+            .unwrap();
+        let (live_send, mut live_receive) = tokio::io::duplex(4096);
+        connections
+            .install_directed(live, LOCAL, TestStream::Open(live_send), addr, 1, true)
+            .unwrap();
+
+        let removed =
+            tokio::time::timeout(std::time::Duration::from_secs(5), connections.probe_peers())
+                .await
+                .expect("the probe is bounded by the write timeout");
+        assert_eq!(removed, 1);
+        assert!(!connections.is_connected(&stalled));
+        assert!(connections.is_connected(&live));
+        assert_eq!(peer_count.load(Ordering::Relaxed), 1);
+        let (kind, payload) = read_message(&mut live_receive).await.unwrap();
+        assert_eq!(kind, MessageType::Heartbeat);
+        assert!(payload.is_empty());
     }
 }

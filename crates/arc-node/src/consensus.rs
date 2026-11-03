@@ -411,6 +411,235 @@ fn try_drain_recovery_reconnect_replay(
     Ok(RecoveryReplayDrain::Complete)
 }
 
+/// The outbound transport queue may refuse every send for this long before
+/// the loop warns (and again every `OUTBOUND_BACKPRESSURE_WARN_EVERY`).
+const OUTBOUND_BACKPRESSURE_WARN_AFTER: Duration = Duration::from_secs(30);
+const OUTBOUND_BACKPRESSURE_WARN_EVERY: Duration = Duration::from_secs(60);
+/// After this long with the queue full and nothing taken from it, the
+/// transport is treated as wedged: the loop logs an error and returns, and the
+/// consensus thread then exits the process with a non-zero code so the
+/// service manager restarts it. Before, the loop retried the same send every
+/// tick, logging only at debug level, and the node hung without exiting.
+const OUTBOUND_BACKPRESSURE_EXIT_AFTER: Duration = Duration::from_secs(120);
+/// Inbound messages parked while the loop waits on outbound backpressure. One
+/// inbound channel's worth, so parking at most doubles what is already held.
+const MAX_PARKED_INBOUND: usize = 1_000;
+
+/// What the loop should do about the outbound queue this tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutboundBackpressureVerdict {
+    /// The queue had room, or has been full for less than the warning time.
+    Continue,
+    /// The queue has been full for `stalled`; log a warning.
+    Warn { stalled: Duration },
+    /// The queue has been full for `stalled`, past the exit bound.
+    GiveUp { stalled: Duration },
+}
+
+/// Tracks how long the outbound queue has stayed full.
+///
+/// It is sampled once per tick, before the loop enqueues anything, so a
+/// transport that takes even one message during the tick sleep shows spare
+/// capacity at the next sample and resets the clock. Only a queue that stays
+/// full at every sample, which is a transport that has stopped taking
+/// messages, reaches the exit bound.
+#[derive(Debug, Default)]
+struct OutboundBackpressure {
+    full_since: Option<Instant>,
+    last_warned: Option<Instant>,
+}
+
+impl OutboundBackpressure {
+    fn observe(&mut self, queue_full: bool, now: Instant) -> OutboundBackpressureVerdict {
+        if !queue_full {
+            self.full_since = None;
+            self.last_warned = None;
+            return OutboundBackpressureVerdict::Continue;
+        }
+        let since = *self.full_since.get_or_insert(now);
+        let stalled = now.saturating_duration_since(since);
+        if stalled >= OUTBOUND_BACKPRESSURE_EXIT_AFTER {
+            return OutboundBackpressureVerdict::GiveUp { stalled };
+        }
+        if stalled >= OUTBOUND_BACKPRESSURE_WARN_AFTER
+            && self.last_warned.is_none_or(|at| {
+                now.saturating_duration_since(at) >= OUTBOUND_BACKPRESSURE_WARN_EVERY
+            })
+        {
+            self.last_warned = Some(now);
+            return OutboundBackpressureVerdict::Warn { stalled };
+        }
+        OutboundBackpressureVerdict::Continue
+    }
+}
+
+/// Move inbound messages out of the transport channel into `parked`, in
+/// order, without handling any of them, until the channel is empty or
+/// `parked` holds `cap`. Returns how many were moved.
+///
+/// The loop calls this when it must not process input yet (an exact
+/// parent-first replay window is still waiting for outbound room). Leaving the
+/// messages in the channel would make the transport's peer readers wait on a
+/// full channel, stop reading their streams, and push the stall back onto the
+/// peers. Parked messages are handled first at the next drain, after any
+/// released blocks and before anything newer, which is the order they would
+/// have had in the channel.
+fn park_inbound<T>(
+    rx: Option<&mut mpsc::Receiver<T>>,
+    parked: &mut std::collections::VecDeque<T>,
+    cap: usize,
+) -> usize {
+    let Some(rx) = rx else {
+        return 0;
+    };
+    let mut moved = 0;
+    while parked.len() < cap {
+        match rx.try_recv() {
+            Ok(message) => {
+                parked.push_back(message);
+                moved += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    moved
+}
+
+/// The next inbound message to handle: blocks released this drain first, then
+/// messages parked during backpressure, then the transport channel.
+fn next_inbound<T>(
+    released: &mut std::collections::VecDeque<T>,
+    parked: &mut std::collections::VecDeque<T>,
+    rx: &mut mpsc::Receiver<T>,
+) -> Option<T> {
+    released
+        .pop_front()
+        .or_else(|| parked.pop_front())
+        .or_else(|| rx.try_recv().ok())
+}
+
+#[cfg(test)]
+mod outbound_backpressure_tests {
+    use super::*;
+
+    #[test]
+    fn a_queue_with_room_never_warns_or_exits() {
+        let mut pressure = OutboundBackpressure::default();
+        let start = Instant::now();
+        for second in 0..600 {
+            let now = start + Duration::from_secs(second);
+            // Full at every sample except one every 20 s.
+            let verdict = pressure.observe(second % 20 != 0, now);
+            assert_eq!(
+                verdict,
+                OutboundBackpressureVerdict::Continue,
+                "second {second}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_queue_that_stays_full_warns_then_gives_up() {
+        let mut pressure = OutboundBackpressure::default();
+        let start = Instant::now();
+        let mut warnings = Vec::new();
+        let mut gave_up = None;
+        // One sample per 50 ms tick.
+        for tick in 0..=(130 * 20) {
+            let now = start + Duration::from_millis(tick * 50);
+            match pressure.observe(true, now) {
+                OutboundBackpressureVerdict::Continue => {}
+                OutboundBackpressureVerdict::Warn { stalled } => warnings.push(stalled),
+                OutboundBackpressureVerdict::GiveUp { stalled } => {
+                    gave_up = Some(stalled);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            warnings,
+            vec![Duration::from_secs(30), Duration::from_secs(90)],
+            "first warning at 30 s, then once a minute"
+        );
+        assert_eq!(gave_up, Some(OUTBOUND_BACKPRESSURE_EXIT_AFTER));
+    }
+
+    #[test]
+    fn one_sample_with_room_restarts_the_clock() {
+        let mut pressure = OutboundBackpressure::default();
+        let start = Instant::now();
+        assert_eq!(
+            pressure.observe(true, start),
+            OutboundBackpressureVerdict::Continue
+        );
+        assert!(matches!(
+            pressure.observe(true, start + Duration::from_secs(119)),
+            OutboundBackpressureVerdict::Warn { .. }
+        ));
+        assert_eq!(
+            pressure.observe(false, start + Duration::from_secs(119)),
+            OutboundBackpressureVerdict::Continue
+        );
+        assert_eq!(
+            pressure.observe(true, start + Duration::from_secs(120)),
+            OutboundBackpressureVerdict::Continue
+        );
+        assert!(matches!(
+            pressure.observe(true, start + Duration::from_secs(240)),
+            OutboundBackpressureVerdict::GiveUp { .. }
+        ));
+    }
+
+    #[test]
+    fn a_real_full_channel_is_seen_as_full() {
+        let (tx, mut rx) = mpsc::channel::<u8>(2);
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+        assert_eq!(tx.capacity(), 0);
+        let mut pressure = OutboundBackpressure::default();
+        let start = Instant::now();
+        pressure.observe(tx.capacity() == 0, start);
+        assert!(matches!(
+            pressure.observe(tx.capacity() == 0, start + OUTBOUND_BACKPRESSURE_EXIT_AFTER),
+            OutboundBackpressureVerdict::GiveUp { .. }
+        ));
+        rx.try_recv().unwrap();
+        assert_eq!(
+            pressure.observe(tx.capacity() == 0, start + OUTBOUND_BACKPRESSURE_EXIT_AFTER),
+            OutboundBackpressureVerdict::Continue
+        );
+    }
+
+    #[test]
+    fn parked_inbound_keeps_channel_order_and_its_cap() {
+        let (tx, mut rx) = mpsc::channel::<u32>(16);
+        for message in 0..10 {
+            tx.try_send(message).unwrap();
+        }
+        let mut parked = std::collections::VecDeque::new();
+        assert_eq!(park_inbound(Some(&mut rx), &mut parked, 4), 4);
+        assert_eq!(park_inbound(Some(&mut rx), &mut parked, 4), 0, "cap holds");
+        assert_eq!(
+            park_inbound(None::<&mut mpsc::Receiver<u32>>, &mut parked, 99),
+            0
+        );
+        tx.try_send(10).unwrap();
+
+        // Released blocks first, then parked messages, then the channel.
+        let mut released = std::collections::VecDeque::from([100, 101]);
+        let mut order = Vec::new();
+        while let Some(message) = next_inbound(&mut released, &mut parked, &mut rx) {
+            order.push(message);
+            if message == 1 {
+                // A block released while handling a parked message is handled
+                // before the next parked one, as it would be for the channel.
+                released.push_back(102);
+            }
+        }
+        assert_eq!(order, vec![100, 101, 0, 1, 102, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+}
+
 /// Drop preimages no committed or retained DAG block can still need.
 ///
 /// A body whose transaction EXECUTED goes once every round naming it is behind
@@ -1826,6 +2055,11 @@ impl ConsensusManager {
         // what receiving a block means.
         let mut replay: std::collections::VecDeque<InboundMessage> =
             std::collections::VecDeque::new();
+        // Inbound messages taken off the transport channel, unhandled, while
+        // the loop waits on outbound backpressure. See `park_inbound`.
+        let mut parked_inbound: std::collections::VecDeque<InboundMessage> =
+            std::collections::VecDeque::new();
+        let mut outbound_backpressure = OutboundBackpressure::default();
         // When this node last asked each author for the history behind a held
         // block, so a burst of early blocks becomes one request per author.
         let mut targeted_fetch_at: std::collections::HashMap<Hash256, Instant> =
@@ -2055,6 +2289,33 @@ impl ConsensusManager {
                 break 'consensus_loop;
             }
 
+            // Bound how long the outbound queue may stay full. Every
+            // backpressure path below `continue`s and retries next tick, so
+            // without this a transport that stops taking messages would leave
+            // this loop spinning silently forever.
+            if let Some(tx) = outbound_tx.as_ref() {
+                match outbound_backpressure.observe(tx.capacity() == 0, Instant::now()) {
+                    OutboundBackpressureVerdict::Continue => {}
+                    OutboundBackpressureVerdict::Warn { stalled } => warn!(
+                        stalled_secs = stalled.as_secs(),
+                        queue = tx.max_capacity(),
+                        parked_inbound = parked_inbound.len(),
+                        round = self.engine.current_round(),
+                        "Outbound P2P queue has stayed full; the transport is not taking messages"
+                    ),
+                    OutboundBackpressureVerdict::GiveUp { stalled } => {
+                        error!(
+                            stalled_secs = stalled.as_secs(),
+                            queue = tx.max_capacity(),
+                            round = self.engine.current_round(),
+                            committed_round = self.engine.last_committed_round(),
+                            "Outbound P2P queue full for too long; stopping consensus so the node exits and restarts"
+                        );
+                        return;
+                    }
+                }
+            }
+
             // A previous reconnect attempt may have found the outbound queue
             // full. Retry its exact parent-first window before accepting a
             // dependent peer block or advancing local consensus state.
@@ -2076,7 +2337,17 @@ impl ConsensusManager {
                         );
                     }
                     Ok(RecoveryReplayDrain::Backpressured { round }) => {
-                        debug!(round, "Recovery DAG reconnect replay remains backpressured");
+                        // Handle nothing yet, but keep the transport's inbound
+                        // channel moving so peer readers do not stall on it.
+                        let parked = park_inbound(
+                            inbound_rx.as_mut(),
+                            &mut parked_inbound,
+                            MAX_PARKED_INBOUND,
+                        );
+                        debug!(
+                            round,
+                            parked, "Recovery DAG reconnect replay remains backpressured"
+                        );
                         continue;
                     }
                     Err(error) => {
@@ -2134,14 +2405,7 @@ impl ConsensusManager {
                 );
             }
             if let Some(ref mut rx) = inbound_rx {
-                loop {
-                    let msg = match replay.pop_front() {
-                        Some(released) => released,
-                        None => match rx.try_recv() {
-                            Ok(msg) => msg,
-                            Err(_) => break,
-                        },
-                    };
+                while let Some(msg) = next_inbound(&mut replay, &mut parked_inbound, rx) {
                     let _inbound_timer =
                         crate::consensus_diagnostics::InboundTimer::start(match &msg {
                             InboundMessage::DagBlockWithTxs { .. } => 0,
