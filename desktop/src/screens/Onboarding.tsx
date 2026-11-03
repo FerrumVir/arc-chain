@@ -110,6 +110,13 @@ export function Onboarding({
   const next = () => setStep(STEPS[Math.min(stepIndex + 1, STEPS.length - 1)]);
   const back = () => setStep(STEPS[Math.max(stepIndex - 1, 0)]);
 
+  // The steps scroll when the window is shorter than a step (the app allows
+  // 960x640), so a step's action is never cut off. Each step starts at its top.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: 0 });
+  }, [step]);
+
   useEffect(() => {
     let cancelled = false;
     api
@@ -133,9 +140,9 @@ export function Onboarding({
     }
   }, [step, identity, identityAttempt]);
 
-  // Load the network-compatible model and recommend it only when local RAM is
-  // sufficient. Lower-memory machines default to observer/router mode rather
-  // than downloading an artifact that cannot run safely.
+  // Load the network-compatible model and mark it recommended only when local
+  // RAM is sufficient. Every machine starts on observer/router mode:
+  // contributing compute is off until the user selects the model.
   useEffect(() => {
     if (step !== "model" || tiers.length > 0) return;
     let cancelled = false;
@@ -145,7 +152,7 @@ export function Onboarding({
         if (cancelled) return;
         setTiers(loadedTiers);
         setRecommendedTier(rec);
-        setSelectedTier(rec === "none" ? "skip" : rec);
+        setSelectedTier((current) => current ?? "skip");
         setTiersLoaded(true);
       },
       (err) => {
@@ -185,7 +192,9 @@ export function Onboarding({
     setLaunchError(null);
     setStoreIdentity(identity);
 
-    const tier = selectedTier ?? recommendedTier;
+    // Only an explicit selection of the model opts in. The recommended tier
+    // is a label, never a default answer.
+    const tier = selectedTier ?? "skip";
     const wantsModel = tier !== "skip";
     // Saved by "Continue to ARC" if the start fails before the native save.
     // A "yes" to running jobs is kept even without the model yet: native code
@@ -300,11 +309,12 @@ export function Onboarding({
     setOnboarded(true);
   };
 
-  const launchTier = tiers.find((tier) => tier.id === (selectedTier ?? recommendedTier));
+  const launchTier = tiers.find((tier) => tier.id === selectedTier);
   const launchModelSize = launchTier ? formatBytes(launchTier.sizeBytes) : null;
 
   return (
     <div className="onboarding" data-testid="onboarding">
+      <div className="onboarding-scroll" ref={scrollRef} data-testid="onboarding-scroll">
       <div className="onboarding-inner">
         {previousInstall && (
           <PreviousInstallNotice
@@ -644,14 +654,13 @@ export function Onboarding({
             {step === "model" && (
               <div data-testid="step-model">
                 <h1 className="onboarding-title">Choose your compute mode</h1>
-                <p className="onboarding-subtitle">
-                  ARC production work currently uses one exact 7B artifact.
-                  Machines with at least 16 GB RAM pre-select it; smaller
-                  machines stay useful as observer/routers. A model creates
-                  eligibility, not guaranteed assignments or rewards.
-                  Continuing with the model lets ARC run inference jobs on
-                  this computer while the app is open; choose Skip to keep it
-                  an observer. You can change this any time in Settings.
+                <p className="onboarding-subtitle" data-testid="compute-choice-default">
+                  Contributing compute is off until you select the ARC model.
+                  ARC production work currently uses one exact 7B artifact,
+                  marked Recommended on machines with at least 16 GB RAM;
+                  smaller machines stay useful as observer/routers. A model
+                  creates eligibility, not guaranteed assignments or rewards.
+                  You can change this any time in Settings.
                 </p>
                 <p
                   style={{
@@ -666,11 +675,13 @@ export function Onboarding({
                   demand.
                 </p>
 
+                <ContributionDisclosure />
+
                 <div
                   style={{
                     display: "grid",
                     gap: "var(--space-3)",
-                    margin: "var(--space-6) 0",
+                    margin: "var(--space-4) 0",
                   }}
                 >
                   {tiers.length === 0 &&
@@ -696,6 +707,7 @@ export function Onboarding({
                         key={tier.id}
                         type="button"
                         onClick={() => setSelectedTier(tier.id)}
+                        aria-pressed={isSelected}
                         data-testid={`tier-${tier.id}`}
                         style={{
                           textAlign: "left",
@@ -794,6 +806,7 @@ export function Onboarding({
                 <button
                   type="button"
                   onClick={() => setSelectedTier("skip")}
+                  aria-pressed={selectedTier === "skip"}
                   data-testid="tier-skip"
                   style={{
                     background: "none",
@@ -986,7 +999,73 @@ export function Onboarding({
           </motion.div>
         </AnimatePresence>
       </div>
+      </div>
+    </div>
+  );
+}
 
+/**
+ * What selecting the model means, shown on the compute step above the
+ * choices, so it is read before anything is chosen. Each sentence states only
+ * what the node and this app do: worker flags only for a chosen model, every
+ * core unless limited, and keep-awake only when switched on
+ * (node_manager.rs); jobs are a prompt in and generated text out
+ * (crates/arc-node/src/rpc.rs WorkItem and WorkResult); close-to-tray and the
+ * login item (lib.rs); the keep-awake guard is held per job
+ * (crates/arc-node/src/community_worker.rs).
+ */
+function ContributionDisclosure() {
+  return (
+    <div
+      data-testid="contribution-disclosure"
+      style={{
+        display: "grid",
+        gap: "var(--space-1)",
+        marginTop: "var(--space-4)",
+        padding: "var(--space-3) var(--space-4)",
+        background: "var(--surface)",
+        border: "1px solid var(--border)",
+        borderRadius: "var(--radius-md)",
+        fontSize: "var(--text-sm)",
+        color: "var(--text-secondary)",
+        lineHeight: 1.5,
+      }}
+    >
+      <div
+        style={{
+          fontSize: "var(--text-xs)",
+          color: "var(--text-muted)",
+          textTransform: "uppercase",
+          letterSpacing: "var(--tracking-wider)",
+          fontWeight: 600,
+        }}
+      >
+        If you select the model
+      </div>
+      <p style={{ margin: 0 }} data-testid="disclosure-runs">
+        <strong style={{ color: "var(--text)" }}>What runs.</strong> ARC
+        downloads the model, and your node runs AI jobs for the ARC network on
+        this computer. For each job it receives a prompt and sends back the
+        generated text.
+      </p>
+      <p style={{ margin: 0 }} data-testid="disclosure-when">
+        <strong style={{ color: "var(--text)" }}>When.</strong> Your node can
+        take jobs whenever it runs: from the menu bar or system tray after you
+        close the window, and after you log in while Start node on app launch
+        is on.
+      </p>
+      <p style={{ margin: 0 }} data-testid="disclosure-power">
+        <strong style={{ color: "var(--text)" }}>Power use.</strong> Jobs can
+        use every processor core (you can lower this in Settings), so expect
+        more power use, heat and battery drain while one runs.
+      </p>
+      <p style={{ margin: 0 }} data-testid="disclosure-keep-awake">
+        <strong style={{ color: "var(--text)" }}>Keep-awake.</strong> Off
+        unless you turn it on in Settings. When on, the computer does not sleep
+        on its own while a job is computing, and on Linux a sleep you request
+        is also blocked until the job ends. It can sleep between jobs, and
+        closing the lid can still put it to sleep.
+      </p>
     </div>
   );
 }

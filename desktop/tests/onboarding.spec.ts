@@ -1,6 +1,14 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { PLAIN_COPY } from "../src/lib/plain-copy";
-import { clearState, walkToLaunch } from "./helpers";
+import { clearState, walkToLaunch, wheelIntoView } from "./helpers";
+
+/** The node config the app saved, read from its persisted UI state. */
+async function savedConfig(page: Page) {
+  return page.evaluate(() => {
+    const raw = localStorage.getItem("arc-desktop-state-v1");
+    return raw ? JSON.parse(raw).config : null;
+  });
+}
 
 test.describe("Onboarding wizard", () => {
   test.beforeEach(async ({ page }) => {
@@ -10,6 +18,9 @@ test.describe("Onboarding wizard", () => {
   test("walks through all four steps and lands on Home", async ({
     page,
   }) => {
+    // The app opens at 1180x780 (tauri.conf.json). Each step's action must be
+    // reachable by scrolling there, not only by Playwright's own scrolling.
+    await page.setViewportSize({ width: 1180, height: 780 });
     await page.goto("/");
 
     // Welcome
@@ -18,6 +29,7 @@ test.describe("Onboarding wizard", () => {
     await expect(
       page.getByRole("heading", { name: /welcome to arc/i }),
     ).toBeVisible();
+    await wheelIntoView(page, page.getByTestId("btn-continue-welcome"));
     await page.getByTestId("btn-continue-welcome").click();
 
     // Identity (no role / hardware step - the role is derived later from
@@ -27,25 +39,62 @@ test.describe("Onboarding wizard", () => {
     await expect(page.getByTestId("btn-continue-identity")).toBeDisabled();
     await page.getByTestId("btn-reveal-seed").click();
     await expect(page.getByTestId("btn-continue-identity")).toBeEnabled();
+    await wheelIntoView(page, page.getByTestId("btn-continue-identity"));
     await page.getByTestId("btn-continue-identity").click();
 
     // Model picker. Added in v0.6.0 - this spec previously jumped straight
     // to launch and stalled here.
     await expect(page.getByTestId("step-model")).toBeVisible();
-    // The recommended tier is pre-selected, so the user can keep clicking
-    // through without choosing anything - Continue is enabled on arrival.
+    // Nothing opts in by default, even where the model is recommended.
+    // Observer mode is pre-selected (Continue is enabled on arrival), and
+    // what contributing runs, when, its power use and keep-awake are
+    // explained above the choices.
+    await expect(page.getByTestId("tier-skip")).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("tier-standard")).toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByTestId("tier-standard")).toContainText("Recommended");
+    await expect(page.getByTestId("compute-choice-default")).toContainText(
+      "Contributing compute is off until you select the ARC model.",
+    );
+    await expect(page.getByTestId("step-model")).not.toContainText("pre-select");
+    await expect(page.getByTestId("step-model")).not.toContainText("while the app is open");
+    const disclosure = page.getByTestId("contribution-disclosure");
+    await expect(disclosure).toBeVisible();
+    const runs = disclosure.getByTestId("disclosure-runs");
+    await expect(runs).toContainText("your node runs AI jobs for the ARC network on this computer");
+    await expect(runs).toContainText("it receives a prompt and sends back the generated text");
+    const when = disclosure.getByTestId("disclosure-when");
+    await expect(when).toContainText("from the menu bar or system tray after you close the window");
+    await expect(when).toContainText("after you log in while Start node on app launch is on");
+    const power = disclosure.getByTestId("disclosure-power");
+    await expect(power).toContainText("every processor core");
+    await expect(power).toContainText("battery drain");
+    const keepAwake = disclosure.getByTestId("disclosure-keep-awake");
+    await expect(keepAwake).toContainText("Off unless you turn it on in Settings.");
+    await expect(keepAwake).toContainText("does not sleep on its own while a job is computing");
+    await expect(keepAwake).toContainText("on Linux a sleep you request is also blocked until the job ends");
+    await expect(keepAwake).toContainText("closing the lid can still put it to sleep");
     await expect(page.getByTestId("btn-continue-model")).toBeEnabled();
-    // Opting out is still available and keeps Continue usable.
+    // Selecting the model is the explicit opt-in; Skip takes it back, and
+    // selecting it again opts in again.
+    await page.getByTestId("tier-standard").click();
+    await expect(page.getByTestId("tier-standard")).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("tier-skip")).toHaveAttribute("aria-pressed", "false");
     await page.getByTestId("tier-skip").click();
+    await expect(page.getByTestId("tier-skip")).toHaveAttribute("aria-pressed", "true");
     await expect(page.getByTestId("btn-continue-model")).toBeEnabled();
+    await page.getByTestId("tier-standard").click();
+    await expect(page.getByTestId("tier-standard")).toHaveAttribute("aria-pressed", "true");
+    await wheelIntoView(page, page.getByTestId("btn-continue-model"));
     await page.getByTestId("btn-continue-model").click();
 
     // Launch
     await expect(page.getByTestId("step-launch")).toBeVisible();
+    await expect(page.getByTestId("launch-summary")).toContainText("downloads its AI model");
     await expect(page.getByRole("button", { name: /start my node/i })).toBeVisible();
     await expect(page.getByTestId("launch-testnet-note")).toHaveText(
       PLAIN_COPY.setup.testnet,
     );
+    await wheelIntoView(page, page.getByTestId("btn-launch"));
     await page.getByTestId("btn-launch").click();
 
     // Lands on Home: Ask ARC, with the node's one-line strip.
@@ -54,6 +103,10 @@ test.describe("Onboarding wizard", () => {
       page.getByRole("heading", { name: PLAIN_COPY.home.title, level: 1 }),
     ).toBeVisible();
     await expect(page.getByTestId("node-strip")).toBeVisible();
+    // The explicit selection is what recorded consent.
+    const saved = await savedConfig(page);
+    expect(saved?.computeConsent).toBe(true);
+    expect(saved?.role).toBe("worker");
   });
 
   test("progress dots update per step (4 dots, one per wizard step)", async ({
@@ -238,16 +291,34 @@ test.describe("Onboarding wizard", () => {
   test("observer setup never claims that a model will be downloaded", async ({
     page,
   }) => {
+    // The smallest window the app allows (tauri.conf.json minWidth and
+    // minHeight). The compute step is taller than this, so it must scroll.
+    await page.setViewportSize({ width: 960, height: 640 });
     await page.goto("/");
+    await wheelIntoView(page, page.getByTestId("btn-continue-welcome"));
     await page.getByTestId("btn-continue-welcome").click();
     await page.getByTestId("btn-reveal-seed").click();
+    await wheelIntoView(page, page.getByTestId("btn-continue-identity"));
     await page.getByTestId("btn-continue-identity").click();
-    await page.getByTestId("tier-skip").click();
+    // No choice made, on a machine where the model is recommended:
+    // continuing keeps contribution off.
+    await expect(page.getByTestId("tier-standard")).toContainText("Recommended");
+    await expect(page.getByTestId("tier-standard")).toHaveAttribute("aria-pressed", "false");
+    await wheelIntoView(page, page.getByTestId("btn-continue-model"));
     await page.getByTestId("btn-continue-model").click();
 
     const summary = page.getByTestId("launch-summary");
     await expect(summary).toContainText(PLAIN_COPY.setup.readyWithoutModel);
     await expect(summary).toContainText("doesn't run AI jobs");
     await expect(summary).not.toContainText("downloads its AI model");
+
+    await wheelIntoView(page, page.getByTestId("btn-launch"));
+    await page.getByTestId("btn-launch").click();
+    await expect(page.getByTestId("inference-screen")).toBeVisible({ timeout: 15_000 });
+    // No consent was recorded from the recommendation.
+    const saved = await savedConfig(page);
+    expect(saved?.computeConsent).toBe(false);
+    expect(saved?.role).toBe("observer");
+    expect(saved?.modelPath).toBeNull();
   });
 });
