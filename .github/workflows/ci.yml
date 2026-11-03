@@ -727,12 +727,21 @@ jobs:
       - name: Enforce advisory, license, source, and dependency policy
         run: |
           set -euo pipefail
+          # Check every graph before failing, so a finding in one manifest
+          # cannot hide findings in the others.
+          failed=()
           for manifest in \
             Cargo.toml \
             desktop/src-tauri/Cargo.toml \
             tests/release/tauri-updater-verifier/Cargo.toml; do
-            bash scripts/ci/run-cargo-deny.sh "$manifest"
+            if ! bash scripts/ci/run-cargo-deny.sh "$manifest"; then
+              failed+=("$manifest")
+            fi
           done
+          if [ "${#failed[@]}" -ne 0 ]; then
+            printf '::error::cargo-deny failed for: %s\n' "${failed[*]}"
+            exit 1
+          fi
 
   # ------------------------------------------------------- shell syntax ----
   # Zero-debt gate, blocking from day one: `bash -n` parses without executing,
@@ -868,7 +877,10 @@ jobs:
           cache: npm
           cache-dependency-path: sdks/typescript/package-lock.json
       - run: npm ci
-      - run: npm audit --audit-level=low
+      # The published SDK ships only its runtime dependencies (files: dist),
+      # so those block at any severity; dev-only test tooling blocks at high.
+      # Keep in step with scripts/ci_check.sh and release.yml.
+      - run: npm audit --omit=dev --audit-level=low && npm audit --audit-level=high
       - run: npm test -- --runInBand
       - run: npm run build
       - name: Load the published CommonJS entrypoint
