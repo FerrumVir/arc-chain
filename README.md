@@ -489,14 +489,18 @@ version-skewed public fleet observed at the 2026-08-31 source freeze:
 > **Scope note (2026-11-02):** The GPU bit-identity, speed, throughput and
 > node-count figures in this section and in the papers under `papers/` are
 > historical lab and testnet results, not current claims. The current proven
-> scope is in [`INFERENCE_DETERMINISM.md`](INFERENCE_DETERMINISM.md): CPU
-> known-answer tests on ARM and x86.
+> scope covers CPUs only: the known-answer tests on ARM and x86 in
+> [`INFERENCE_DETERMINISM.md`](INFERENCE_DETERMINISM.md), and a run in which
+> one 7-billion-parameter model gave the same answer, bit for bit, on the
+> Linux, Windows, Intel Mac and Apple Silicon CPUs tested
+> ([`docs/determinism-proof.md`](docs/determinism-proof.md)).
 
 The values below are historical lab or public-path observations, not the
 v0.8.16 release gate and not an earnings promise. Re-run the linked harness on
 the exact commit, model artifact, backend, and hardware before quoting one.
 The blocking candidate evidence currently covers CPU ARM/x86 KATs; it does not
-validate GPU determinism or a production 7B GGUF.
+validate GPU determinism. The 7B model result above was measured in a separate
+workflow run and is not a blocking gate.
 
 **Read this row first, because it is the one people get wrong.** There are two
 very different latency stories here and the millisecond numbers below are the
