@@ -881,10 +881,10 @@ struct PeerConnection<S> {
 /// simultaneous dial, and resolved by the tie-break in `install_directed`.
 const SIMULTANEOUS_DIAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Every framed write to a peer, including the wait for that stream's writer
-/// lock, gets this long plus `PEER_WRITE_MIN_BYTES_PER_SEC` worth of time for
-/// its payload. A peer that cannot take one frame in that time is treated as a
-/// dead connection.
+/// Every framed write to a peer gets this long plus `PEER_WRITE_MIN_BYTES_PER_SEC`
+/// worth of time for its payload. A peer that cannot take one frame in that
+/// time is treated as a dead connection. The wait for the stream's writer lock
+/// has its own budget of the same length; running out of it is not a failure.
 const PEER_WRITE_BASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Slowest sustained rate a live peer is assumed to accept. A 16 MiB frame
 /// therefore gets 5 s + 16 s instead of being cut off at a flat 5 s.
@@ -942,6 +942,12 @@ enum PeerWrite {
     /// The peer is not connected, or a different generation than the caller
     /// expected now holds its slot. Nothing was written.
     NotConnected,
+    /// Another task's write to this stream held its writer lock for the whole
+    /// wait budget. Nothing was written and the connection is left alone: the
+    /// holder is bounded by its own write timeout and removes the connection
+    /// itself if that write fails, so a frame queued behind a long but healthy
+    /// write never disconnects a live peer.
+    Busy,
     /// The write failed; `connection_id` is the generation it was written to,
     /// which the caller removes.
     Failed {
@@ -1120,6 +1126,12 @@ impl<S: tokio::io::AsyncWrite + Unpin> PeerConnections<S> {
             {
                 PeerWrite::Sent => sent += 1,
                 PeerWrite::NotConnected => {}
+                PeerWrite::Busy => {
+                    warn!(
+                        ?msg_type,
+                        "Peer stream busy with an earlier write; skipped this frame for it"
+                    );
+                }
                 PeerWrite::Failed {
                     connection_id,
                     failure,
@@ -1165,6 +1177,12 @@ impl<S: tokio::io::AsyncWrite + Unpin> PeerConnections<S> {
                     target, msg_type
                 );
             }
+            PeerWrite::Busy => {
+                warn!(
+                    "send_to: peer {} stream busy with an earlier write, skipped {:?}",
+                    target, msg_type
+                );
+            }
             PeerWrite::Failed {
                 connection_id,
                 failure,
@@ -1179,8 +1197,9 @@ impl<S: tokio::io::AsyncWrite + Unpin> PeerConnections<S> {
     /// the network write.
     ///
     /// The stream handle and generation are cloned out under a short shard
-    /// read guard that is released before the first await. The write, and the
-    /// wait for the stream's own writer lock, then run under a timeout. Holding
+    /// read guard that is released before the first await. The wait for the
+    /// stream's own writer lock and the write itself then each run under the
+    /// write timeout, so one call takes at most twice that. Holding
     /// a DashMap guard across the write let a stalled peer park every other
     /// task that touched the same shard (`is_connected`, `len`, `iter`,
     /// `install_directed`) on a synchronous lock, which on a small runtime
@@ -1205,22 +1224,25 @@ impl<S: tokio::io::AsyncWrite + Unpin> PeerConnections<S> {
         if expected_generation.is_some_and(|expected| expected != connection_id) {
             return PeerWrite::NotConnected;
         }
-        let write = async {
-            let mut guard = stream.lock().await;
-            if guard.torn {
-                return Err(PeerWriteFailure::Torn);
-            }
-            guard.torn = true;
-            if let Err(error) = write_message(&mut guard.stream, msg_type, payload).await {
-                return Err(PeerWriteFailure::Io(error));
-            }
-            guard.torn = false;
-            Ok::<(), PeerWriteFailure>(())
-        };
         let limit = peer_write_timeout(self.write_base_timeout, payload.len());
-        let failure = match tokio::time::timeout(limit, write).await {
-            Ok(Ok(())) => return PeerWrite::Sent,
-            Ok(Err(failure)) => failure,
+        let Ok(mut guard) = tokio::time::timeout(limit, stream.lock()).await else {
+            return PeerWrite::Busy;
+        };
+        if guard.torn {
+            return PeerWrite::Failed {
+                connection_id,
+                failure: PeerWriteFailure::Torn,
+            };
+        }
+        guard.torn = true;
+        let written =
+            tokio::time::timeout(limit, write_message(&mut guard.stream, msg_type, payload)).await;
+        let failure = match written {
+            Ok(Ok(())) => {
+                guard.torn = false;
+                return PeerWrite::Sent;
+            }
+            Ok(Err(error)) => PeerWriteFailure::Io(error),
             Err(_) => PeerWriteFailure::TimedOut,
         };
         PeerWrite::Failed {
@@ -4123,6 +4145,71 @@ mod tests {
                 .await,
             PeerWrite::NotConnected
         ));
+    }
+
+    /// A short frame queued behind a longer write to the same peer must not
+    /// count the wait against itself and drop a peer that is still taking
+    /// that longer write. Only the write that holds the stream is judged.
+    #[tokio::test]
+    async fn a_write_queued_behind_a_longer_one_skips_the_peer_without_removing_it() {
+        let (connections, peer_count, mut inbound_rx) =
+            fast_timeout_connections(SHORT_WRITE_TIMEOUT);
+        let connections = Arc::new(connections);
+        let peer = [5_u8; 32];
+        let addr: SocketAddr = "127.0.0.1:7340".parse().unwrap();
+        let (stream, attempted) = stalled_stream();
+        let (generation, _) = connections
+            .install_directed(peer, LOCAL, stream, addr, 1, true)
+            .unwrap();
+
+        // A 2 MiB frame is allowed 2 s more than an empty heartbeat.
+        let large = vec![0_u8; 2 * 1024 * 1024];
+        let holder_limit = peer_write_timeout(SHORT_WRITE_TIMEOUT, large.len());
+        let holder = {
+            let connections = connections.clone();
+            tokio::spawn(async move {
+                connections
+                    .write_to_peer(
+                        &peer,
+                        Some(generation),
+                        MessageType::DagHistoryResponse,
+                        &large,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), attempted.notified())
+            .await
+            .expect("the long write reached the stream");
+
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            connections
+                .write_to_peer(&peer, Some(generation), MessageType::Heartbeat, &[])
+                .await,
+            PeerWrite::Busy
+        ));
+        assert_eq!(
+            connections.probe_peers().await,
+            0,
+            "a busy peer is not pruned"
+        );
+        assert!(started.elapsed() < holder_limit);
+        assert!(connections.is_connected(&peer));
+        assert_eq!(peer_count.load(Ordering::Relaxed), 1);
+        assert!(
+            inbound_rx.try_recv().is_err(),
+            "no disconnect for a busy peer"
+        );
+
+        // The write that held the stream is still bounded by its own timeout.
+        match holder.await.unwrap() {
+            PeerWrite::Failed {
+                connection_id,
+                failure: PeerWriteFailure::TimedOut,
+            } => assert_eq!(connection_id, generation),
+            other => panic!("expected the long write to time out, got {other:?}"),
+        }
     }
 
     #[tokio::test]
