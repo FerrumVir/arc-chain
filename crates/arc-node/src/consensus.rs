@@ -2405,10 +2405,7 @@ impl ConsensusManager {
                 );
             }
             if let Some(ref mut rx) = inbound_rx {
-                loop {
-                    let Some(msg) = next_inbound(&mut replay, &mut parked_inbound, rx) else {
-                        break;
-                    };
+                while let Some(msg) = next_inbound(&mut replay, &mut parked_inbound, rx) {
                     let _inbound_timer =
                         crate::consensus_diagnostics::InboundTimer::start(match &msg {
                             InboundMessage::DagBlockWithTxs { .. } => 0,
