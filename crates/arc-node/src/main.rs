@@ -6666,6 +6666,167 @@ fn broadcast_node_shutdown(
     let _ = http_shutdown.send(true);
 }
 
+/// How often the main runtime proves that it can still run a task.
+#[cfg(unix)]
+const RUNTIME_HEARTBEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+/// After SIGTERM, how long the main runtime may go without running a task
+/// before the process gives up on a graceful shutdown and exits.
+///
+/// This is a no-progress deadline, not a total one. A graceful stop may
+/// legitimately take much longer than this while it drains accepted work,
+/// joins writers and runs the WAL barrier, and the service unit's stop timeout
+/// already bounds that. A runtime that cannot run a one-second timer task for
+/// this long cannot finish any of it, so waiting longer only delays the
+/// service manager's kill.
+#[cfg(unix)]
+const SHUTDOWN_STALL_EXIT_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+/// Exit status when the deadline above fires. Non-zero, so the stop is never
+/// recorded as clean and any armed shutdown receipt stays armed.
+#[cfg(unix)]
+const SHUTDOWN_STALL_EXIT_CODE: i32 = 1;
+
+/// Decides when a shutdown has stopped making progress.
+#[cfg(any(unix, test))]
+struct ShutdownStallWatch {
+    last_beat: u64,
+    last_progress: Instant,
+    limit: std::time::Duration,
+}
+
+#[cfg(any(unix, test))]
+impl ShutdownStallWatch {
+    fn new(beat: u64, now: Instant, limit: std::time::Duration) -> Self {
+        Self {
+            last_beat: beat,
+            last_progress: now,
+            limit,
+        }
+    }
+
+    /// Returns how long the runtime has gone without a heartbeat, once that
+    /// reaches the limit. Any new heartbeat restarts the clock.
+    fn observe(&mut self, beat: u64, now: Instant) -> Option<std::time::Duration> {
+        if beat != self.last_beat {
+            self.last_beat = beat;
+            self.last_progress = now;
+            return None;
+        }
+        let stalled = now.saturating_duration_since(self.last_progress);
+        (stalled >= self.limit).then_some(stalled)
+    }
+}
+
+/// Count, on the current (main) runtime, one tick per `RUNTIME_HEARTBEAT_EVERY`.
+/// The counter stops when no worker is free to run the task.
+#[cfg(unix)]
+fn spawn_runtime_heartbeat() -> Arc<std::sync::atomic::AtomicU64> {
+    let beat = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = beat.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(RUNTIME_HEARTBEAT_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    beat
+}
+
+/// Receive SIGTERM on a dedicated OS thread with its own small runtime, then
+/// run `on_sigterm` there and start the no-progress deadline.
+///
+/// The handler was a task on the node's main runtime, so a node whose runtime
+/// workers were all blocked never saw SIGTERM and could only be SIGKILLed. A
+/// signal wakes every listening runtime, so this thread's runtime receives it
+/// whatever state the main runtime is in. Returns once the handler is armed.
+#[cfg(unix)]
+fn spawn_sigterm_thread(
+    runtime_heartbeat: Arc<std::sync::atomic::AtomicU64>,
+    on_sigterm: impl FnOnce() + Send + 'static,
+) -> Result<()> {
+    let (armed_tx, armed_rx) = std::sync::mpsc::sync_channel::<std::io::Result<()>>(1);
+    std::thread::Builder::new()
+        .name("arc-sigterm".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = armed_tx.send(Err(error));
+                    return;
+                }
+            };
+            let received = runtime.block_on(async move {
+                let mut sigterm =
+                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    {
+                        Ok(sigterm) => sigterm,
+                        Err(error) => {
+                            let _ = armed_tx.send(Err(error));
+                            return false;
+                        }
+                    };
+                let _ = armed_tx.send(Ok(()));
+                sigterm.recv().await.is_some()
+            });
+            if !received {
+                return;
+            }
+            // Start the deadline before the shutdown edge, which takes locks
+            // that a stuck task could hold.
+            let started = std::thread::Builder::new()
+                .name("arc-shutdown-deadline".to_string())
+                .spawn(move || exit_when_shutdown_stalls(&runtime_heartbeat));
+            if let Err(error) = started {
+                tracing::warn!(%error, "could not start the shutdown deadline thread");
+            }
+            on_sigterm();
+        })
+        .context("failed to start the SIGTERM thread")?;
+    armed_rx
+        .recv()
+        .context("the SIGTERM thread exited before arming")?
+        .context("failed to arm the SIGTERM handler")?;
+    Ok(())
+}
+
+/// Wait while the main runtime keeps running tasks; once it has gone
+/// `SHUTDOWN_STALL_EXIT_AFTER` without one, exit with a non-zero status.
+///
+/// Exiting here is no less safe for persistent state than the SIGKILL the
+/// service manager would otherwise send later: the consensus signing record
+/// is replaced only by a fsynced temporary file renamed over it, and a
+/// signature is released only after that returns, so an exit at any instant
+/// leaves either the old record or the new one and never an unrecorded
+/// signature. The state WAL is replayed on start as after any crash.
+#[cfg(unix)]
+fn exit_when_shutdown_stalls(runtime_heartbeat: &std::sync::atomic::AtomicU64) {
+    use std::sync::atomic::Ordering;
+    let mut watch = ShutdownStallWatch::new(
+        runtime_heartbeat.load(Ordering::Relaxed),
+        Instant::now(),
+        SHUTDOWN_STALL_EXIT_AFTER,
+    );
+    loop {
+        std::thread::sleep(RUNTIME_HEARTBEAT_EVERY);
+        if let Some(stalled) =
+            watch.observe(runtime_heartbeat.load(Ordering::Relaxed), Instant::now())
+        {
+            tracing::error!(
+                stalled_secs = stalled.as_secs(),
+                exit_code = SHUTDOWN_STALL_EXIT_CODE,
+                "Node runtime has run no task since SIGTERM; exiting without a clean shutdown"
+            );
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            std::process::exit(SHUTDOWN_STALL_EXIT_CODE);
+        }
+    }
+}
+
 fn complete_startup_shutdown_if_requested(
     shutdown_requested: &std::sync::atomic::AtomicBool,
     state: Option<&StateDB>,
@@ -6824,9 +6985,6 @@ async fn run_arc_node() -> Result<()> {
     let desktop_shutdown_receipt = Arc::new(std::sync::Mutex::new(
         None::<DesktopShutdownReceiptIdentity>,
     ));
-    #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("failed to install SIGTERM handler before node initialization")?;
     {
         let shutdown_requested = shutdown_requested.clone();
         let shutdown_tx = shutdown_tx.clone();
@@ -6849,14 +7007,15 @@ async fn run_arc_node() -> Result<()> {
             }
         });
     }
+    // SIGTERM is received on its own OS thread, not on this runtime, so a
+    // runtime whose workers are all blocked still sees `systemctl stop`.
     #[cfg(unix)]
     {
         let shutdown_requested = shutdown_requested.clone();
         let shutdown_tx = shutdown_tx.clone();
         let background_admission_shutdown_tx = background_admission_shutdown_tx.clone();
         let shutdown_worker_execution_gate = native_request_admission.worker_execution_gate();
-        tokio::spawn(async move {
-            sigterm.recv().await;
+        spawn_sigterm_thread(spawn_runtime_heartbeat(), move || {
             tracing::info!(
                 "SIGTERM received - stopping HTTP/background admission and draining active work"
             );
@@ -6866,11 +7025,12 @@ async fn run_arc_node() -> Result<()> {
                 &shutdown_tx,
                 &background_admission_shutdown_tx,
             );
-        });
+        })
+        .context("failed to install SIGTERM handler before node initialization")?;
     }
     // ctrl_c installs its platform handler on first poll. Yield before any
-    // synchronous startup phase so both signal listeners are polled and the
-    // Unix stream above is already registered on the calling thread.
+    // synchronous startup phase so that listener is polled. The SIGTERM
+    // thread above has already confirmed its handler is armed.
     tokio::task::yield_now().await;
     tracing::info!("lifecycle signal handlers armed before node initialization");
     let mut runtime_tasks = Vec::<tokio::task::JoinHandle<()>>::new();
@@ -10859,6 +11019,37 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_shutdown_deadline_fires_only_after_a_full_stall() {
+        let limit = std::time::Duration::from_secs(60);
+        let start = Instant::now();
+        let mut watch = ShutdownStallWatch::new(7, start, limit);
+        // A runtime that keeps beating is never cut off, however long the
+        // graceful shutdown takes.
+        for second in 1..=600_u64 {
+            let now = start + std::time::Duration::from_secs(second);
+            assert_eq!(watch.observe(7 + second, now), None, "second {second}");
+        }
+        // Once the beat stops, the deadline counts from the last beat.
+        let last_beat = start + std::time::Duration::from_secs(600);
+        assert_eq!(
+            watch.observe(607, last_beat + std::time::Duration::from_secs(59)),
+            None
+        );
+        assert_eq!(
+            watch.observe(607, last_beat + limit),
+            Some(limit),
+            "exits once the runtime has been silent for the whole limit"
+        );
+        // A beat resets it.
+        let resumed = last_beat + limit + std::time::Duration::from_secs(1);
+        assert_eq!(watch.observe(608, resumed), None);
+        assert_eq!(
+            watch.observe(608, resumed + std::time::Duration::from_secs(30)),
+            None
+        );
     }
 
     #[test]
