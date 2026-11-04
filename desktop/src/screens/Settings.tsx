@@ -1119,9 +1119,11 @@ function InferenceModeToggle() {
           <div style={{ fontWeight: 500 }}>Coordinator</div>
           <div style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>
             Tries your local node, then the selected coordinator path. The
-            protocol-v3 worker path accepts community work only after
-            authenticated 2-of-3 recomputation for every layer range and token.
-            Older nodes may return less evidence, which the result screen labels.
+            protocol-v3 worker path accepts community work only after two or
+            more validators recompute every layer range and token and return
+            the same authenticated result (2-of-3 when a range has three or
+            more live validators, 2-of-2 when it has two). Older nodes may
+            return less evidence, which the result screen labels.
           </div>
         </div>
       </label>

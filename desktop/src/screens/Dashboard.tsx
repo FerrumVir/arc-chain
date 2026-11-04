@@ -778,8 +778,10 @@ export function Dashboard() {
                   <p>
                     On the protocol-v3 path, a worker is eligible only after it
                     fully loads the exact model artifact requested. The
-                    coordinator independently recomputes every token through
-                    authenticated 2-of-3 agreement for each layer range.
+                    coordinator independently recomputes every token: two or
+                    more validators recompute each layer range and must return
+                    the same authenticated result (2-of-3 when the range has
+                    three or more live validators, 2-of-2 when it has two).
                   </p>
                   <p>
                     An <code>InferenceAttestation</code> (<code>0x16</code>)

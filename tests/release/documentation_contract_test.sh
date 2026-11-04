@@ -38,7 +38,12 @@ DESKTOP_DISTRIBUTION="$REPO_ROOT/desktop/DISTRIBUTION.md"
 DESKTOP_GAPS="$REPO_ROOT/desktop/PRODUCTION_GAPS.md"
 CLAUDE_GUIDE="$REPO_ROOT/CLAUDE.md"
 RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
-CANDIDATE_VERSION=0.8.16
+CANDIDATE_VERSION=0.8.17
+# README.md and the install guides name the latest PUBLISHED release: its exact
+# tag URL, pinned version and installer digest. They keep naming it until the
+# candidate is published, and move to the candidate in the documentation change
+# that follows publication, together with this value.
+PUBLISHED_VERSION=0.8.16
 
 require_literal() {
     local file="$1" literal="$2" message="$3"
@@ -103,14 +108,14 @@ candidate_version_is_consistent() {
         'desktop npm lock package root does not match the recovery candidate' || return 1
     require_literal "$RELEASE_WORKFLOW" '"desktop-npm-lock-root:$DESKTOP_NPM_LOCK_ROOT_VERSION"' \
         'release tag gate does not validate the npm lock package root' || return 1
-    require_literal "$CHANGELOG" "## v$CANDIDATE_VERSION - Release-preparation snapshot (2026-10-26)" \
+    require_literal "$CHANGELOG" "## v$CANDIDATE_VERSION - Release-preparation snapshot (2026-11-04)" \
         'changelog is missing the current release-preparation entry' || return 1
     require_literal "$CHANGELOG" '## v0.8.0 - Release-preparation snapshot (2026-08-31)' \
         'changelog no longer preserves the historical v0.8.0 source-freeze heading' || return 1
     require_literal "$CHANGELOG" 'Tag-stable lifecycle note' \
         'changelog lifecycle statement can become false after publication' || return 1
-    require_literal "$README" "## v$CANDIDATE_VERSION release status and quickstart" \
-        'README does not identify the current release target' || return 1
+    require_literal "$README" "## v$PUBLISHED_VERSION release status and quickstart" \
+        'README does not identify the current published release' || return 1
     require_literal "$README" 'Source-freeze snapshot (2026-08-31; tag-stable)' \
         'README release status is not preserved as a dated source-freeze fact' || return 1
     require_literal "$README" 'pre-tag statement, not a live status probe' \
@@ -118,7 +123,7 @@ candidate_version_is_consistent() {
 }
 
 candidate_install_commands_are_exact_and_honest() {
-    local exact_url="https://raw.githubusercontent.com/FerrumVir/arc-chain/v$CANDIDATE_VERSION/install.sh"
+    local exact_url="https://raw.githubusercontent.com/FerrumVir/arc-chain/v$PUBLISHED_VERSION/install.sh"
     local digest_line download_line execute_line file installer_sha
     if command -v sha256sum >/dev/null 2>&1; then
         installer_sha="$(sha256sum "$REPO_ROOT/install.sh" | awk '{print $1}')"
@@ -128,7 +133,7 @@ candidate_install_commands_are_exact_and_honest() {
     for file in "$README" "$HEADLESS" "$WALKTHROUGH" "$SCRIPTS_README"; do
         require_literal "$file" "$exact_url" \
             'candidate install guide does not download the exact installer tag' || return 1
-        require_literal "$file" "--version $CANDIDATE_VERSION" \
+        require_literal "$file" "--version $PUBLISHED_VERSION" \
             'candidate install guide does not pin the matching installer version' || return 1
         require_literal "$file" "$installer_sha" \
             'candidate install guide does not pin the exact installer SHA-256' || return 1
@@ -144,7 +149,7 @@ candidate_install_commands_are_exact_and_honest() {
             'candidate install guide could be mistaken for an already-published release' || return 1
         download_line="$(grep -nF -- "$exact_url" "$file" | head -n 1 | cut -d: -f1)"
         digest_line="$(grep -nF -- "ARC_INSTALL_SHA256=$installer_sha" "$file" | head -n 1 | cut -d: -f1)"
-        execute_line="$(grep -nF -- "bash install.sh --version $CANDIDATE_VERSION" "$file" | head -n 1 | cut -d: -f1)"
+        execute_line="$(grep -nF -- "bash install.sh --version $PUBLISHED_VERSION" "$file" | head -n 1 | cut -d: -f1)"
         if [ -z "$download_line" ] || [ -z "$digest_line" ] || [ -z "$execute_line" ] \
             || [ "$download_line" -ge "$digest_line" ] || [ "$digest_line" -ge "$execute_line" ]; then
             printf 'candidate guide executes install.sh before verifying the pinned digest: %s\n' "$file"
@@ -228,7 +233,7 @@ manual_updater_commands_are_identical() {
         require_literal "$file" "$system_command" \
             'system updater command drifted between operator docs' || return 1
     done
-    require_literal "$HEADLESS" "do not pin v$CANDIDATE_VERSION" \
+    require_literal "$HEADLESS" "do not pin v$PUBLISHED_VERSION" \
         'updater docs do not distinguish discovery from the pinned initial install' || return 1
 }
 
@@ -436,7 +441,7 @@ readme_counts_and_desktop_secret_copy_match_the_tree() {
     fi
     require_literal "$DESKTOP_README" 'recovery phrase is present' \
         'desktop README falsely implies the native store excludes its signing secret' || return 1
-    require_literal "$GETTING_STARTED" "v$CANDIDATE_VERSION does not yet use an OS keychain" \
+    require_literal "$GETTING_STARTED" "v$PUBLISHED_VERSION does not yet use an OS keychain" \
         'user guide omits the desktop recovery-secret storage boundary' || return 1
     require_literal "$DESKTOP_FIRST_RUN" 'only a successful mined receipt' \
         'first-run guide still upgrades faucet submission into confirmed credit' || return 1
@@ -450,7 +455,7 @@ persistence_rpc_and_transaction_copy_match_the_installer() {
     done
     require_literal "$README" 'Do not reuse a v0.7.11-or-earlier data directory.' \
         'README does not fail closed on v2 WAL reuse' || return 1
-    require_literal "$HEADLESS" "Do not point v$CANDIDATE_VERSION at a v0.7.11-or-earlier data directory." \
+    require_literal "$HEADLESS" "Do not point v$PUBLISHED_VERSION at a v0.7.11-or-earlier data directory." \
         'headless guide does not require a fresh observer data directory' || return 1
     require_literal "$WALKTHROUGH" 'Validators need the approved canonical checkpoint migration instead.' \
         'walkthrough omits the validator checkpoint-only migration rule' || return 1
@@ -1824,11 +1829,11 @@ PY
         'repos/FerrumVir/arc-chain/deployments' \
         './shared/frontend/arc-network.json' \
         'arc.post-release-installer-canary.v1' \
-        'Already up to date at v0.8.16' \
+        'Already up to date at v0.8.17' \
         'scripts/recovery/recovery_rollout.py verify' \
         'POST-RELEASE-ACCEPTANCE.json' \
         'scripts/release/build-postrelease-public-truth.py' \
-        "public_truth_branch='arc-recovery/public-truth-v0.8.16'" \
+        "public_truth_branch='arc-recovery/public-truth-v0.8.17'" \
         'repos/FerrumVir/arc-chain/git/matching-refs/heads/$public_truth_branch' \
         'PUBLIC-TRUTH-RULESETS-BASELINE.json' \
         'PUBLIC-TRUTH-REVIEW-AUTHORIZATION.json' \
@@ -2422,8 +2427,8 @@ PY
     }
 }
 
-run_test 'workspace, desktop, changelog, and README agree on unreleased v0.8.16' candidate_version_is_consistent
-run_test 'candidate install commands pin exact v0.8.16 without claiming publication' candidate_install_commands_are_exact_and_honest
+run_test 'workspace, desktop, and changelog agree on unreleased v0.8.17; README names published v0.8.16' candidate_version_is_consistent
+run_test 'install commands pin exact published v0.8.16 without claiming v0.8.17 is published' candidate_install_commands_are_exact_and_honest
 run_test 'README and headless guide share the same unpinned update-only commands' manual_updater_commands_are_identical
 run_test 'headless platform claims match the canonical release asset contract' headless_platform_claims_match_release_assets
 run_test 'desktop docs and generated release notes match artifacts, updater, and reward evidence' desktop_and_release_notes_match_the_artifact_and_reward_contract

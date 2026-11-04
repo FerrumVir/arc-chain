@@ -18,83 +18,33 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
-## v0.8.17 - Unreleased
+## v0.8.17 - Release-preparation snapshot (2026-11-04)
 
-> **Candidate note:** This entry collects changes for the next release
-> candidate. It does not claim publication or deployment of v0.8.17.
+> **Candidate note:** This entry records the v0.8.17 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.17.
 
-- The desktop setup step and the Settings note now say what the node does
-  while compute is on, and nothing more. The step reads "ARC Node can run AI
-  jobs for the ARC network on this computer. It uses up to a quarter of your
-  processor, at low priority so your own apps come first, and about 8 GB of
-  memory while it is ready for jobs. It keeps running on battery. First it
-  downloads the ARC model, about 4 GB, in the background. You can turn this
-  off here or at any time in Settings." The Settings note for a quarter of
-  the processor reads "Uses up to a quarter of your processor at low
-  priority, and about 8 GB of memory while ARC Node is running. It keeps
-  running on battery. Turn this off to stop ARC jobs and free that memory."
-  A note for another core count says the same about priority and memory. Both
-  replace the wording quoted in the next entry, which said "while the app is
-  open": closing the window hides ARC to the menu bar or system tray, and the
-  node keeps running there until ARC is quit. The step for a computer below
-  the memory requirement states the same facts. Nothing in this release
-  waits for idle time, heat or free memory, and none of that is promised
-  (#234).
-- The node the desktop starts now runs at low operating-system priority, so
-  the person's own apps get the processor first when it is busy:
-  BELOW_NORMAL_PRIORITY_CLASS on Windows, a nice value of 10 on macOS and
-  Linux, set before the node executes so every thread it creates inherits
-  it. This is scheduling only. The core cap still limits how much of the
-  processor the node may use, and nothing pauses it, on battery or
-  otherwise. If the system refuses the change the node still starts, and the
-  log says it did not get low priority (#234).
-- An install that finished setup before compute started on by default, has
-  compute off, and meets the memory requirement is asked once, the first
-  time ARC opens after the update: a dialog with the setup step's title and
-  body, and two buttons, Turn on and Not now. ARC records that it asked in a
-  marker file beside `store.json` before the dialog shows, so quitting with it
-  up never asks again, and a rollback that rewrites `store.json` does not
-  reset it. Turn on stores consent and, when no core count is stored, a
-  quarter of the logical cores, then downloads the model in the background as
-  setup does; Not now and Escape change nothing. It is not shown to an
-  install that has just finished setup, which asked the same question, to one
-  that already has compute on, to one that answered the v0.7 upgrade question
-  (which comes first), or to a computer below the memory requirement. A
-  launch where the question does not apply records the marker too, so
-  turning compute off later does not ask (#234).
-- Home's node strip says "Your node is getting ready: downloading the AI
-  model" with the amount downloaded while the model downloads in the
-  background with the node already running, as it does after setup and after
-  Turn on. It used to say so only while the node was off. A download that
-  reports nothing for 2.5 minutes without a final report, because it failed
-  or the computer slept, is no longer shown, and the next report brings the
-  line back (#234).
-- The generated release notes no longer say that updates never download or
-  install without confirmation, which stopped being true in v0.8.14. They say
-  that unattended installs have been on by default since v0.8.14 and that
-  turning off "Install signed app updates automatically when idle" in
-  Settings asks first. The release-contract check now fails if the notes
-  claim updates wait for confirmation, or name a Settings switch the app does
-  not show (#234).
-- Desktop setup starts with Contribute compute on when the computer meets the
-  memory requirement for the ARC model, the same check that marks the model
-  Recommended; below it the step starts off, as before. The step is titled
-  "Share your computer's spare power" and reads "ARC Node will use up to a
-  quarter of your processor to run AI jobs for the ARC network while the app
-  is open. It downloads the ARC model (about 4 GB) in the background first.
-  You can turn this off here or at any time in Settings." A Contribute
-  compute switch sits under it, and Skip still turns it off. With it on,
-  setup no longer waits for the 3.80 GB download: the node starts as an
-  observer, then the promotion path a consented install already takes at
-  launch reuses or downloads the model, checks its pinned SHA-256 and
-  restarts the node as a worker. A download that does not finish continues
-  the next time ARC starts the node at launch. A setup that turns compute on
-  stores a core cap of a quarter of the logical cores, rounded down and at
-  least one, which the node gets as `RAYON_NUM_THREADS` and `--threads`. A
-  core count already stored is kept, a re-run of setup keeps it, and a
-  Settings save no longer overwrites it. Existing installs keep their
-  settings and consent. Settings states the share that applies, for example
-  "Uses up to a quarter of your processor while ARC Node is open" (#231).
+- Transport writes are bounded and never hold the peer map across a write.
+  Broadcast, directed-send and heartbeat-probe writes take a handle to the
+  peer's send stream, release the peer map, then lock the stream and write
+  under a timeout of 5 s plus 1 s per MiB of payload. A write that times out
+  or fails removes that exact connection, and a write cut off mid-frame
+  marks the stream so no later frame follows it. A write that waits behind a
+  longer healthy one on the same stream, such as a large history or
+  checkpoint response, has its own wait budget; when that runs out it writes
+  nothing and leaves the connection alone (#224).
+- When the consensus outbound queue stays full, the node samples it once per
+  tick: it logs a warning after 30 s of continuous backpressure and once a
+  minute after that, and after 120 s it logs an error and the consensus
+  thread exits the process with status 1, so systemd restarts it (the units
+  `install.sh` writes restart a node that exits with an error). While a
+  parent-first replay window waits for room, inbound messages are moved,
+  unhandled and in order, into a bounded local queue, so the transport's
+  peer readers keep reading instead of waiting on a full channel (#224).
+- SIGTERM is handled on its own thread. The node receives it on a dedicated
+  operating-system thread with its own current-thread runtime, not as a task
+  on the main runtime. After SIGTERM, if the main runtime runs no task for
+  60 s, the process exits with status 1. A shutdown that keeps making
+  progress keeps the full service stop timeout (#224).
 - Community result verification now runs when a model layer range has
   exactly two live validator replicas. The coordinator recomputes such a
   range on both replicas, and both must return the same authenticated hash
@@ -140,6 +90,139 @@ All notable changes to ARC Chain are tracked here. This project follows
   verification on every range and position. A result verified with a
   two-replica quorum is now refused with that reason, instead of "omitted
   authenticated shard-quorum verification" (#232).
+- Desktop setup starts with Contribute compute on when the computer meets
+  the memory requirement for the ARC model, the same check that marks the
+  model Recommended; below it the step starts off, as before. The step is
+  titled "Share your computer's spare power", a Contribute compute switch
+  sits under its text, and Skip still turns it off. With it on, setup no
+  longer waits for the 3.80 GB download: the node starts as an observer,
+  then the promotion path a consented install already takes at launch reuses
+  or downloads the model, checks its pinned SHA-256 and restarts the node as
+  a worker. A download that does not finish continues the next time ARC
+  starts the node at launch. A setup that turns compute on stores a core cap
+  of a quarter of the logical cores, rounded down and at least one, which
+  the node gets as `RAYON_NUM_THREADS` and `--threads`. A core count already
+  stored is kept, a re-run of setup keeps it, and a Settings save no longer
+  overwrites it. Existing installs keep their settings and consent. Settings
+  states the share that applies. The wording of the step and of the Settings
+  note is in the next entry (#231).
+- The desktop setup step and the Settings note now say what the node does
+  while compute is on, and nothing more. The step reads "ARC Node can run AI
+  jobs for the ARC network on this computer. It uses up to a quarter of your
+  processor, at low priority so your own apps come first, and about 8 GB of
+  memory while it is ready for jobs. It keeps running on battery. First it
+  downloads the ARC model, about 4 GB, in the background. You can turn this
+  off here or at any time in Settings." The Settings note for a quarter of
+  the processor reads "Uses up to a quarter of your processor at low
+  priority, and about 8 GB of memory while ARC Node is running. It keeps
+  running on battery. Turn this off to stop ARC jobs and free that memory."
+  A note for another core count says the same about priority and memory. The
+  wording says the node runs while ARC Node is running: closing the window
+  hides ARC to the menu bar or system tray, and the node keeps running there
+  until ARC is quit. The step for a computer below the memory requirement
+  states the same facts. Nothing in this release waits for idle time, heat
+  or free memory, and none of that is promised (#234).
+- The node the desktop starts now runs at low operating-system priority, so
+  the person's own apps get the processor first when it is busy:
+  BELOW_NORMAL_PRIORITY_CLASS on Windows, a nice value of 10 on macOS and
+  Linux, set before the node executes so every thread it creates inherits
+  it. This is scheduling only. The core cap still limits how much of the
+  processor the node may use, and nothing pauses it, on battery or
+  otherwise. If the system refuses the change the node still starts, and the
+  log says it did not get low priority (#234).
+- An install that finished setup before compute started on by default, has
+  compute off, and meets the memory requirement is asked once, the first
+  time ARC opens after the update: a dialog with the setup step's title and
+  body, and two buttons, Turn on and Not now. ARC records that it asked in a
+  marker file beside `store.json` before the dialog shows, so quitting with it
+  up never asks again, and a rollback that rewrites `store.json` does not
+  reset it. Turn on stores consent and, when no core count is stored, a
+  quarter of the logical cores, then downloads the model in the background as
+  setup does; Not now and Escape change nothing. It is not shown to an
+  install that has just finished setup, which asked the same question, to one
+  that already has compute on, to one that answered the v0.7 upgrade question
+  (which comes first), or to a computer below the memory requirement. A
+  launch where the question does not apply records the marker too, so
+  turning compute off later does not ask (#234).
+- Home's node strip says "Your node is getting ready: downloading the AI
+  model" with the amount downloaded while the model downloads in the
+  background with the node already running, as it does after setup and after
+  Turn on. It used to say so only while the node was off. A download that
+  reports nothing for 2.5 minutes without a final report, because it failed
+  or the computer slept, is no longer shown, and the next report brings the
+  line back (#234).
+- The generated release notes no longer say that updates never download or
+  install without confirmation, which stopped being true in v0.8.14. They say
+  that unattended installs have been on by default since v0.8.14 and that
+  turning off "Install signed app updates automatically when idle" in
+  Settings asks first. The release-contract check now fails if the notes
+  claim updates wait for confirmation, or name a Settings switch the app does
+  not show (#234).
+- Settings → Identity no longer says the app doesn't store the recovery
+  phrase. The app keeps the identity, phrase included, as plain text in
+  `store.json` in its `network.arc.desktop` data folder on this computer,
+  and never sends it over the network. The card now says that, what the
+  system can still copy (backups that include the folder, a Windows roaming
+  profile, a clipboard that kept the phrase), and to write the phrase down,
+  keep it offline and keep the computer secure (#223).
+- The setup step for contributing compute shows what that means before setup
+  goes on: what runs, when jobs can run (whenever the node runs, including
+  from the menu bar or system tray after the window is closed, and after
+  login while Start node on app launch is on), power use, and that
+  keep-awake is off unless it is switched on in Settings. Every setup step
+  scrolls when the window is shorter than the step, so its action stays
+  reachable at the 960x640 minimum window (#223).
+- Ask ARC's help describes the path a prompt takes. It no longer says
+  prompts go to your own node first: the app reads the chain from one
+  coordinator for the whole session, and the prompt goes to that
+  coordinator's `/inference/run`, which offers it to a community worker
+  first and, if none takes it, to ARC's own nodes. Your own node takes the
+  prompt only if no coordinator has answered the app yet this session, or if
+  the app reads the chain from your node (#223).
+- Release tooling: an update of an existing chain can be attested with one
+  validator declared offline. By default all six validators must be live and
+  on the candidate, as before. In the exception, the owner's input names
+  exactly one validator (its site, IP address, validator identity and stake)
+  as declared offline and confirms it again when the attestation is
+  assembled and when the producer is dispatched. The five live validators
+  must hold at least the quorum stake and each run the selected binary in
+  both samples, and the declared validator's public health read must show no
+  answer. A configured validator that does not answer is never moved to the
+  offline set, and the claim authorizes no validator retirement (#233).
+- Security: `deny.toml` records RUSTSEC-2026-0429 (a denial of service in
+  the `zip` crate's `extract()`) as a reviewed exception. The node's zip
+  1.1.4 has no symlink branch in `extract()` and candle-core 0.8.4 never
+  calls it; the desktop's zip 4.6.1 compiles only on Windows and is reached
+  only for a signature-verified update zip, and the updater binds Windows to
+  the signed `setup.exe` asset. The exception is removed no later than the
+  v0.9.0 dependency review. The desktop lockfile moves async-executor to
+  1.14.1, because 1.14.0 was yanked for a use-after-free when a Waker fires
+  during `Executor::drop`. CI now runs cargo-deny on the workspace, the
+  desktop and the updater verifier and reports every failing graph, not just
+  the first, and audits the TypeScript SDK's shipped runtime dependencies at
+  low severity and its dev-only test tooling at high (#221).
+- Verification: a cross-platform determinism proof for the pinned
+  Llama-2-7B-Chat Q4_K_M model. A workflow runs 16 fixed prompts of 32 new
+  tokens each through the canonical INT8 profile on macOS (Apple Silicon and
+  Intel), Linux x86_64 and Windows x86_64, with the scalar kernel and the
+  SIMD kernel, and requires every run to produce a byte-identical
+  transcript. In the recorded run all 8 platform and kernel pairs matched.
+  The workflow runs only on a pull request that touches its files and
+  carries the `determinism-proof` label, or by dispatch from main, so normal
+  CI is unaffected. `docs/determinism-proof.md` has the measured results and
+  the steps to reproduce them (#136).
+- Documentation: the README, Getting Started and the headless guide state
+  that v0.8.16 is released, give a dated status (2026-11-02) and no longer
+  call it unpublished. The 2026-08-31 source-freeze snapshot, community
+  answer sheet and public fleet snapshot move, unchanged, under a dated
+  History heading that says they are superseded. The README and Getting
+  Started say that signed app updates have installed automatically by
+  default since v0.8.14, that Settings can turn that off, and that on macOS
+  v0.8.16 defers an update it can't apply where ARC runs; they also add the
+  Discord and Telegram links. The README performance section and both papers
+  carry a dated scope note: the GPU bit-identity, speed, throughput and
+  node-count figures are historical lab and testnet results, and the current
+  proven scope is `INFERENCE_DETERMINISM.md` (#222).
 
 ## v0.8.16 - Release-preparation snapshot (2026-10-26)
 
