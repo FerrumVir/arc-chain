@@ -108,6 +108,48 @@ class Fixtures(unittest.TestCase):
         self.assertEqual(run(str(FIXTURES / "does-not-exist")).returncode, 2)
 
 
+class MarkerlessWorkers(unittest.TestCase):
+    """workers[] supplies record context even without worker_id/address/etc."""
+
+    def test_default_device_name_fails_without_echoing_values_or_private_keys(self):
+        device = "SYNTHETIC-MacBook-Pro"
+        private_key = "synthetic-private-account-key"
+        record = {"name": device, "runs": 1}
+        self.assertFalse(ep.WORKER_MARKERS.intersection(record))
+        for wrapped in (False, True):
+            with self.subTest(wrapped=wrapped), tempfile.TemporaryDirectory() as tmp:
+                doc = {"workers": [record]}
+                if wrapped:
+                    doc = {private_key: doc}
+                path = Path(tmp, "scoreboard.json")
+                path.write_text(json.dumps(doc), encoding="utf-8")
+                result = run(str(path))  # the real CLI, not just the name heuristic
+                self.assertEqual(result.returncode, 1, result.stderr)
+                pointer = ("/<key 0>" if wrapped else "") + "/workers/0/name"
+                self.assertEqual(result.stderr,
+                    f"export-privacy: {path}: {pointer} (name): operating-system default computer name\n"
+                    "export-privacy: 1 finding(s). Do not commit exported node state; see scripts/ci/export_privacy.py.\n")
+                self.assertEqual(result.stdout, "")
+                for secret in (device, private_key):
+                    self.assertNotIn(secret, result.stdout + result.stderr)
+
+    def test_anonymized_name_passes_without_worker_markers(self):
+        for wrapped in (False, True):
+            with self.subTest(wrapped=wrapped), tempfile.TemporaryDirectory() as tmp:
+                record = {"name": "node-1a2b3c4d", "runs": 1}
+                self.assertFalse(ep.WORKER_MARKERS.intersection(record))
+                doc = {"workers": [record]}
+                if wrapped:
+                    doc = {"synthetic-private-account-key": doc}
+                path = Path(tmp, "scoreboard.json")
+                path.write_text(json.dumps(doc), encoding="utf-8")
+                result = run(str(path))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(result.stdout,
+                    "export-privacy: no exported node state or personal device names in the checked files.\n")
+
+
 class ReviewCorrections(unittest.TestCase):
     """Reviewer findings on eec3cccc: values printed through keys, unreadable JSON passing, and skip-list bypasses."""
 
