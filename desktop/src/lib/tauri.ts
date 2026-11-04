@@ -3163,7 +3163,8 @@ function browserNodeCare<T>(cmd: string, args?: unknown): T {
         appVersion: "0.0.0-preview",
         os: "preview",
         arch: "preview",
-        homeDir: "",
+        // A synthetic home folder, as the native side always reports one, so the preview shares scrubbed details.
+        homeDir: "/Users/preview",
       } as T);
     case "node_care_load_state":
       return browserNodeCareState as T;

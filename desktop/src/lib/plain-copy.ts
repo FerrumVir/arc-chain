@@ -249,6 +249,15 @@ export const PLAIN_COPY = {
    * README's "Community and help" links (lib/support.ts). No reply is promised:
    * these are community chats, and nobody is named as reading them yet.
    */
+  /** Copy details, everywhere it shares diagnostics (lib/support.ts sharePayload). */
+  share: {
+    /** In the shared text when ARC couldn't load what it needs to scrub the native text. */
+    omitted:
+      "Detailed diagnostics left out: ARC couldn't load what it needs to remove personal details from them. Try Copy details again in a moment.",
+    fallback: "Couldn't copy. Select the text below and copy it yourself.",
+    review: "Read it before you share it. ARC removes the personal details it recognises, but it can't promise to catch everything.",
+    localOnly: "Shown only on this computer, exactly as ARC recorded it. Copy details doesn't share this text as it is.",
+  },
   help: {
     button: "Get help",
     hide: "Hide help",

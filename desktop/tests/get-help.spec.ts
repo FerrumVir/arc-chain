@@ -59,16 +59,25 @@ test.describe("Get help: pure logic", () => {
       arch: "aarch64",
       title: PLAIN_COPY.startFailure.needsRepair.title,
       error: `${REFUSED} contact me at someone@example.com via https://10.0.0.7:9090`,
-      homeDir: "/Users/alice",
+      privacy: { state: "ready", homeDir: "/Users/alice" },
     });
     expect(text).toContain("App: 0.8.16 · Node: 0.8.16 · System: macos aarch64");
     expect(text).toContain("State: Couldn't start");
     expect(text).toContain(`ARC says: ${PLAIN_COPY.startFailure.needsRepair.title}`);
     expect(text).toContain("symbolic-link data directory ~/.arc");
     for (const leak of ["alice", "someone@example.com", "10.0.0.7"]) expect(text).not.toContain(leak);
-    expect(buildSupportDetails({ context: "off", appVersion: null, nodeVersion: "", os: null, arch: null })).toContain(
-      "App: unknown · Node: unknown · System: unknown unknown",
-    );
+    expect(
+      buildSupportDetails({ context: "off", appVersion: null, nodeVersion: "", os: null, arch: null, privacy: { state: "pending" } }),
+    ).toContain("App: unknown · Node: unknown · System: unknown unknown");
+    // Without privacy context the native text is left out, and versions that fail the shape check read unknown.
+    const withheld = buildSupportDetails({
+      context: "start-failure", appVersion: "0.8.16", nodeVersion: "0.8.16 /Users/alice", os: "macos", arch: "aarch64",
+      title: PLAIN_COPY.startFailure.needsRepair.title, error: REFUSED, privacy: { state: "unavailable" },
+    });
+    expect(withheld).toContain("App: 0.8.16 · Node: unknown · System: macos aarch64");
+    expect(withheld).toContain(PLAIN_COPY.share.omitted);
+    expect(withheld).not.toContain("symbolic-link");
+    expect(withheld).not.toContain("alice");
   });
 
   test("the report line says whether a report actually left this computer", () => {
@@ -160,7 +169,7 @@ test.describe("Get help: in the app", () => {
     await help.getByTestId("dashboard-help-toggle").click();
     await expect(help.getByTestId("dashboard-help-details")).toContainText("State: No connection");
     await help.getByTestId("dashboard-help-copy").click();
-    await expect(help.getByTestId("dashboard-help-copy-failed")).toHaveText(PLAIN_COPY.help.copyFailedFallback);
+    await expect(help.getByTestId("dashboard-help-copy-failed")).toHaveText(`${PLAIN_COPY.help.copyFailedFallback} ${PLAIN_COPY.share.review}`);
     await expect(help.getByTestId("dashboard-help-copy")).toHaveText(PLAIN_COPY.actions.copyDetails);
   });
 
@@ -287,7 +296,7 @@ test.describe("Start failure: both Copy details actions share scrubbed text", ()
     const help = failure.getByTestId("start-failure-help");
     await help.getByTestId("start-failure-help-toggle").click();
     await help.getByTestId("start-failure-help-copy").click();
-    await expect(help.getByTestId("start-failure-help-copy-failed")).toHaveText(PLAIN_COPY.help.copyFailedFallback);
+    await expect(help.getByTestId("start-failure-help-copy-failed")).toHaveText(`${PLAIN_COPY.help.copyFailedFallback} ${PLAIN_COPY.share.review}`);
     const helpManual = (await help.getByTestId("start-failure-help-details").textContent()) ?? "";
     for (const leak of LEAKS) expect(helpManual, leak).not.toContain(leak);
   });

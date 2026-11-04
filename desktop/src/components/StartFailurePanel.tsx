@@ -7,7 +7,7 @@ import { PLAIN_COPY } from "../lib/plain-copy";
 import { quitArc } from "../lib/quit";
 import { describeStartFailure } from "../lib/start-failure";
 import { GetHelp } from "./GetHelp";
-import { SHARE_COPY, ShareCopyFallback, useShareCopy } from "./ShareCopy";
+import { LocalOnlyNote, ShareCopyFallback, useShareCopy } from "./ShareCopy";
 
 
 /**
@@ -41,7 +41,7 @@ export function StartFailurePanel({
   const [toggled, setToggled] = useState<{ error: string; open: boolean } | null>(null);
   const open = toggled?.error === error ? toggled.open : view.detailsOpen;
   // What "Copy details" shares is scrubbed; the native text below stays exact for repair, on this computer only.
-  const { shareText, copied, copy: copyDetails } = useShareCopy(view.details);
+  const { shareText, copied, copy: copyDetails } = useShareCopy(view.details, view.title);
   const detailsId = useId();
 
   const restartArc = () => {
@@ -205,11 +205,7 @@ export function StartFailurePanel({
           >
             {view.details}
           </pre>
-          {open && (
-            <p data-testid="start-failure-details-note" style={{ margin: "var(--space-2) 0 0", color: "var(--text-muted)", fontSize: "var(--text-xs)" }}>
-              {SHARE_COPY.localOnly}
-            </p>
-          )}
+          {open && <LocalOnlyNote testId="start-failure-details-note" />}
           {copied === "failed" && <ShareCopyFallback text={shareText} testId="start-failure-copy-fallback" />}
 
           {/* A node waiting on its last session is not a problem yet; anything else gets the way to a person. */}

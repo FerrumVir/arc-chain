@@ -44,6 +44,42 @@ export function scrubForSharing(raw: string, homeDir?: string | null): string {
     });
 }
 
+/**
+ * Whether ARC has what it needs to scrub native text before it is shared:
+ * the home folder the native side reports. Anything else (still loading, the
+ * lookup failed, no home folder) is not ready, and native text is withheld.
+ */
+export type PrivacyContext = { state: "ready"; homeDir: string } | { state: "pending" | "unavailable" };
+
+export function privacyContextFrom(lookup: { status: "pending" | "error" | "success"; homeDir?: string | null }): PrivacyContext {
+  if (lookup.status === "pending") return { state: "pending" };
+  const home = String(lookup.homeDir ?? "").trim().replace(/[\\/]+$/, "");
+  if (lookup.status !== "success" || home.length < 2) return { state: "unavailable" };
+  return { state: "ready", homeDir: home };
+}
+
+/**
+ * The one policy for anything Copy details shares. With privacy context, the
+ * native text scrubbed by scrubForSharing. Without it, only app-authored
+ * context (the sentence ARC shows, which callers take from PLAIN_COPY) and a
+ * line saying the detailed diagnostics were left out: never the native text,
+ * however harmless it looks.
+ */
+export function sharePayload(input: { raw: string; title?: string | null; privacy: PrivacyContext }): { text: string; detailed: boolean } {
+  if (input.privacy.state === "ready") return { text: scrubForSharing(input.raw, input.privacy.homeDir), detailed: true };
+  const lines = input.title ? [`ARC says: ${input.title}`] : [];
+  lines.push(PLAIN_COPY.share.omitted);
+  return { text: lines.join("\n"), detailed: false };
+}
+
+// Version and system fields are app data, but they still pass a shape check before they are shared.
+const VERSION_SHAPE = /^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$/;
+const SYSTEM_SHAPE = /^[a-z0-9_]{1,16}$/;
+const shaped = (v: string | null | undefined, shape: RegExp) => {
+  const t = String(v ?? "").trim();
+  return shape.test(t) ? t : "unknown";
+};
+
 export interface SupportDetailsInput {
   context: HelpContext;
   appVersion: string | null;
@@ -52,9 +88,9 @@ export interface SupportDetailsInput {
   arch: string | null;
   /** The plain sentence the app shows, if any. */
   title?: string | null;
-  /** The native error text, if any. Scrubbed here before it is shown or copied. */
+  /** The native error text, if any. Shared only scrubbed, and only when `privacy` is ready. */
   error?: string | null;
-  homeDir?: string | null;
+  privacy: PrivacyContext;
 }
 
 /**
@@ -64,14 +100,16 @@ export interface SupportDetailsInput {
  */
 export function buildSupportDetails(input: SupportDetailsInput): string {
   const copy = PLAIN_COPY.help;
-  const value = (v: string | null | undefined) => (v && v.trim() ? v.trim() : "unknown");
   const lines = [
     copy.detailsHeader,
-    `App: ${value(input.appVersion)} · Node: ${value(input.nodeVersion)} · System: ${value(input.os)} ${value(input.arch)}`,
+    `App: ${shaped(input.appVersion, VERSION_SHAPE)} · Node: ${shaped(input.nodeVersion, VERSION_SHAPE)} · System: ${shaped(input.os, SYSTEM_SHAPE)} ${shaped(input.arch, SYSTEM_SHAPE)}`,
     `State: ${copy.state[input.context]}`,
   ];
   if (input.title) lines.push(`ARC says: ${input.title}`);
-  if (input.error) lines.push(`Details: ${scrubForSharing(input.error, input.homeDir)}`);
+  if (input.error) {
+    const shared = sharePayload({ raw: input.error, privacy: input.privacy });
+    lines.push(shared.detailed ? `Details: ${shared.text}` : shared.text);
+  }
   return lines.join("\n");
 }
 

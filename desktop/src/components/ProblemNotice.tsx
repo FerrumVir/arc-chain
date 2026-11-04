@@ -1,7 +1,7 @@
 import { useId, useState, type ReactNode } from "react";
 import { AlertTriangle, Check, Copy, Info } from "lucide-react";
 import { PLAIN_COPY } from "../lib/plain-copy";
-import { ShareCopyFallback, useShareCopy } from "./ShareCopy";
+import { LocalOnlyNote, ShareCopyFallback, useShareCopy } from "./ShareCopy";
 
 
 /**
@@ -42,7 +42,7 @@ export function ProblemNotice({
   const [toggled, setToggled] = useState<{ details: string; open: boolean } | null>(null);
   const open = toggled !== null && toggled.details === details ? toggled.open : detailsOpen;
   // Shared text is scrubbed; the native text under "Show details" stays exact, on this computer only.
-  const { shareText, copied, copy: copyDetails } = useShareCopy(details);
+  const { shareText, copied, copy: copyDetails } = useShareCopy(details, title);
   const detailsId = useId();
 
   const attention = tone === "attention";
@@ -137,6 +137,7 @@ export function ProblemNotice({
             {details}
           </pre>
         )}
+        {details && open && <LocalOnlyNote testId={testId ? `${testId}-details-note` : undefined} />}
         {details && copied === "failed" && <ShareCopyFallback text={shareText} testId={testId ? `${testId}-copy-fallback` : undefined} />}
       </div>
       {onDismiss && (

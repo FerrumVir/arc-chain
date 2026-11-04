@@ -1,5 +1,5 @@
 import { Check, CircleStop, Copy, Loader2, Send, SquarePen } from "lucide-react";
-import { ShareCopyFallback, useShareCopy } from "../components/ShareCopy";
+import { LocalOnlyNote, ShareCopyFallback, useShareCopy } from "../components/ShareCopy";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { InfoPopover } from "../components/InfoPopover";
 import { NativePaidRequests } from "../components/NativePaidRequests";
@@ -432,7 +432,7 @@ function Failed({ turn, latest, onRetry, disabled }: { turn: ChatTurn; latest: b
   const tid = (name: string) => (latest ? name : `${name}-earlier`);
   const [open, setOpen] = useState(false);
   // Shared text is scrubbed; the raw text under "Show details" stays on this computer.
-  const { shareText, copied, copy: copyDetails } = useShareCopy(failure.raw);
+  const { shareText, copied, copy: copyDetails } = useShareCopy(failure.raw, failure.title);
   const detailsId = `${turn.id}-details`;
   const waited = turn.settledAt ? formatElapsed(Math.max(0, Math.floor((turn.settledAt - turn.sentAt) / 1000))) : null;
   return (
@@ -472,6 +472,7 @@ function Failed({ turn, latest, onRetry, disabled }: { turn: ChatTurn; latest: b
           {failure.raw}
         </pre>
       )}
+      {failure.raw && open && <LocalOnlyNote testId={tid("inference-error-details-note")} />}
       {failure.raw && copied === "failed" && <ShareCopyFallback text={shareText} testId={tid("inference-error-copy-fallback")} />}
     </div>
   );

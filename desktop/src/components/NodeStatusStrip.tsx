@@ -1,5 +1,5 @@
 import { useEffect, useId, useState } from "react";
-import { ShareCopyFallback, useShareCopy } from "./ShareCopy";
+import { LocalOnlyNote, ShareCopyFallback, useShareCopy } from "./ShareCopy";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, CheckCircle2, CircleAlert, Copy, Download, Loader2, Power } from "lucide-react";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -115,7 +115,7 @@ export function NodeStatusStrip() {
   });
 
   // The native text for a report, scrubbed of personal details before it reaches the clipboard.
-  const { shareText, copied, copy: copyDetails } = useShareCopy(view.details);
+  const { shareText, copied, copy: copyDetails } = useShareCopy(view.details, view.sentence);
 
   const act = async (action: NodeStripAction) => {
     if (action === "update-arc") {
@@ -244,6 +244,7 @@ export function NodeStatusStrip() {
           {view.details}
         </pre>
       )}
+      {view.details && detailsOpen && <LocalOnlyNote testId="node-strip-details-note" />}
       {view.details && copied === "failed" && (
         <div style={{ flexBasis: "100%" }}>
           <ShareCopyFallback text={shareText} testId="node-strip-copy-fallback" />

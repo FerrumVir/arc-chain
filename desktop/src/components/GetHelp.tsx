@@ -1,12 +1,12 @@
 import { useEffect, useId, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import { Check, Copy, ExternalLink, LifeBuoy } from "lucide-react";
-import { api, invoke } from "../lib/tauri";
+import { api } from "../lib/tauri";
 import { useNodeCareSnapshot } from "../lib/node-care-runtime";
-import type { NodeCarePlatform } from "../lib/node-care";
 import type { NodeStatus } from "../lib/types";
 import { PLAIN_COPY } from "../lib/plain-copy";
 import { SUPPORT_LINKS, buildSupportDetails, describeReportState, type HelpContext } from "../lib/support";
+import { SHARE_COPY, usePrivacyContext } from "./ShareCopy";
 
 const COPIED_RESET_MS = 2_500;
 
@@ -38,12 +38,7 @@ export function GetHelp({
   const panelId = useId();
   const queryClient = useQueryClient();
   const snapshot = useNodeCareSnapshot();
-  const platform = useQuery({
-    queryKey: ["node-care-info"],
-    queryFn: () => invoke<NodeCarePlatform>("node_care_info"),
-    staleTime: Infinity,
-    enabled: open,
-  });
+  const { privacy, platform, retry } = usePrivacyContext();
   const status = queryClient.getQueryData<NodeStatus>(["status"]);
 
   useEffect(() => {
@@ -54,17 +49,19 @@ export function GetHelp({
 
   const details = buildSupportDetails({
     context,
-    appVersion: platform.data?.appVersion ?? null,
+    appVersion: platform?.appVersion ?? null,
     nodeVersion: status?.version ?? null,
-    os: platform.data?.os ?? null,
-    arch: platform.data?.arch ?? null,
+    os: platform?.os ?? null,
+    arch: platform?.arch ?? null,
     title,
     error,
-    homeDir: platform.data?.homeDir ?? null,
+    privacy,
   });
   const report = describeReportState(snapshot);
 
   const copyDetails = () => {
+    // Without the privacy context the native text is left out; ask again for a later copy.
+    if (error && privacy.state !== "ready") retry();
     // Without a clipboard API the call throws before returning a promise.
     void Promise.resolve()
       .then(() => navigator.clipboard.writeText(details))
@@ -134,7 +131,7 @@ export function GetHelp({
           </button>
           {copied === "failed" && (
             <p role="alert" data-testid={`${testId}-copy-failed`} style={{ margin: "var(--space-2) 0 0", color: "var(--danger)" }}>
-              {copy.copyFailedFallback}
+              {copy.copyFailedFallback} {SHARE_COPY.review}
             </p>
           )}
           <span className="sr-only" aria-live="polite">
