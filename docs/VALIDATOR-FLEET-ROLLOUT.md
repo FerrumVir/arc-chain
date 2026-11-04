@@ -500,10 +500,10 @@ cutover proves the sealed checkpoint and the six new validator keyfiles.
 ### User-facing explanation review — every tagged release
 
 The explanation-review step below applies to **every tagged release with
-user-facing explanations**, including desktop-only releases and releases using
+user-facing explanations**, including desktop-only and legacy-bridge releases, and releases using
 the `existing-recovered-chain-update-v1` profile. Its scope extends beyond this
 document's cutover procedure; it does not impose cutover-only operations on an
-update release. The release owner is the checklist owner for this step and
+update or legacy-bridge release. The release owner is the checklist owner for this step and
 must link and sign off the completed record for the exact candidate **before
 creating its release tag or dispatching `release.yml`**. Without that signed-off
 record, do not tag or dispatch. This is a human process requirement, not an
