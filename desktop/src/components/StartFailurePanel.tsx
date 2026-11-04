@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useId, useState } from "react";
 import { AlertTriangle, Check, Copy, Download, Power, RotateCw } from "lucide-react";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { isTauri } from "../lib/tauri";
@@ -6,8 +6,9 @@ import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
 import { PLAIN_COPY } from "../lib/plain-copy";
 import { quitArc } from "../lib/quit";
 import { describeStartFailure } from "../lib/start-failure";
+import { GetHelp } from "./GetHelp";
+import { LocalOnlyNote, ShareCopyFallback, useShareCopy } from "./ShareCopy";
 
-const COPIED_RESET_MS = 2_500;
 
 /**
  * A node that would not start, in one plain sentence with one action. The
@@ -39,30 +40,15 @@ export function StartFailurePanel({
   // its own default.
   const [toggled, setToggled] = useState<{ error: string; open: boolean } | null>(null);
   const open = toggled?.error === error ? toggled.open : view.detailsOpen;
-  const [copied, setCopied] = useState<"idle" | "copied" | "failed">("idle");
+  // What "Copy details" shares is scrubbed; the native text below stays exact for repair, on this computer only.
+  const { shareText, copied, copy: copyDetails } = useShareCopy(view.details, view.title);
   const detailsId = useId();
-
-  useEffect(() => {
-    if (copied === "idle") return;
-    const timer = window.setTimeout(() => setCopied("idle"), COPIED_RESET_MS);
-    return () => window.clearTimeout(timer);
-  }, [copied]);
 
   const restartArc = () => {
     // Relaunching runs launch-time reconciliation again. Outside the native
     // shell (browser previews) a reload is the closest equivalent.
     if (isTauri) void relaunch();
     else window.location.reload();
-  };
-
-  const copyDetails = () => {
-    // Without a clipboard API the call throws before returning a promise.
-    void Promise.resolve()
-      .then(() => navigator.clipboard.writeText(view.details))
-      .then(
-        () => setCopied("copied"),
-        () => setCopied("failed"),
-      );
   };
 
   const waiting = view.kind === "reconciling";
@@ -219,6 +205,11 @@ export function StartFailurePanel({
           >
             {view.details}
           </pre>
+          {open && <LocalOnlyNote testId="start-failure-details-note" />}
+          {copied === "failed" && <ShareCopyFallback text={shareText} testId="start-failure-copy-fallback" />}
+
+          {/* A node waiting on its last session is not a problem yet; anything else gets the way to a person. */}
+          {!waiting && <GetHelp context="start-failure" title={view.title} error={error} testId="start-failure-help" />}
         </div>
       </div>
     </div>

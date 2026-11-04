@@ -279,4 +279,49 @@ export const PLAIN_COPY = {
     /** An install that did not complete; the node may have been stopped for it. */
     installFailed: "The update didn't install. You can try again here.",
   },
+  /**
+   * Get help: the way from a problem to a person. The destinations are the
+   * README's "Community and help" links (lib/support.ts). No reply is promised:
+   * these are community chats, and nobody is named as reading them yet.
+   */
+  /** Copy details, everywhere it shares diagnostics (lib/support.ts sharePayload). */
+  share: {
+    /** In the shared text when ARC couldn't load what it needs to scrub the native text. */
+    omitted:
+      "Detailed diagnostics left out: ARC couldn't load what it needs to remove personal details from them. Try Copy details again in a moment.",
+    fallback: "Couldn't copy. Select the text below and copy it yourself.",
+    review: "Read it before you share it. ARC removes the personal details it recognises, but it can't promise to catch everything.",
+    localOnly: "Shown only on this computer, exactly as ARC recorded it. Copy details doesn't share this text as it is.",
+  },
+  help: {
+    button: "Get help",
+    hide: "Hide help",
+    title: "Get help",
+    stepCopy: "1. Copy the details below. Check them for anything personal before you share them.",
+    stepPost: "2. Post them in the ARC community and say what you were doing when this happened.",
+    copyFailedFallback: "Couldn't copy. Select the text above and copy it yourself.",
+    openDiscord: "Open Discord",
+    openTelegram: "Open Telegram",
+    openIssue: "Report a bug on GitHub",
+    openDocs: "Help in the ARC docs",
+    openFailed: (url: string) => `Couldn't open the link. Go to ${url}`,
+    safety: "These are community chats. Never post your 12-word recovery phrase or a private key.",
+    detailsHeader: "ARC support details",
+    state: {
+      "start-failure": "Couldn't start",
+      off: "Node off",
+      unreachable: "No connection",
+      settings: "Opened from Settings",
+    },
+    report: {
+      off: "Anonymous error reports are off, so ARC didn't send one. You can turn them on in Settings.",
+      notConfigured: "This build of ARC has no report address, so it didn't send an anonymous error report.",
+      none: "ARC hasn't sent an anonymous error report from this computer yet. Error reports are not help requests.",
+      sent: (when: string) =>
+        `ARC's error-report service accepted an anonymous error report from this computer at ${when}. That report is not a help request: it asks nobody to reply and doesn't mean a person has read it.`,
+      queued: (when: string) =>
+        `An anonymous error report from ${when} is waiting to send and retries on its own. It is not a help request and asks nobody to reply.`,
+      loading: "Checking anonymous error reports…",
+    },
+  },
 } as const;

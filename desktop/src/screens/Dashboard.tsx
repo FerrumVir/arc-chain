@@ -25,6 +25,7 @@ import type { ArchChainPhase } from "../lib/aqueduct/archchain";
 import { CrashBanner } from "../components/CrashBanner";
 import { ProblemNotice } from "../components/ProblemNotice";
 import { StartFailurePanel } from "../components/StartFailurePanel";
+import { GetHelp } from "../components/GetHelp";
 import { EmptyState } from "../components/EmptyState";
 import { InfoPopover } from "../components/InfoPopover";
 import { ModelUnavailableBanner } from "../components/ModelUnavailableBanner";
@@ -443,6 +444,17 @@ export function Dashboard() {
         </div>
         {!startPhase && controls}
       </div>
+
+      {/* Node off or no connection, with no failure panel of its own: the way to a person is one click away. */}
+      {statusKnown && !running && !isStarting && !startFailure && !reportedStartFailure && !updateUnfinished &&
+        (connection.state === "off" || connection.state === "unreachable") && (
+          <GetHelp
+            context={connection.state}
+            title={connection.state === "unreachable" ? PLAIN_COPY.connection.unreachable : null}
+            error={status?.lastError ?? null}
+            testId="dashboard-help"
+          />
+        )}
 
       {isStarting && (
         <div className="connection-notice" role="status" data-testid="starting-banner">
