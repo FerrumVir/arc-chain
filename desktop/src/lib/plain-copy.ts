@@ -280,10 +280,12 @@ export const PLAIN_COPY = {
     },
     report: {
       off: "Anonymous error reports are off, so ARC didn't send one. You can turn them on in Settings.",
-      notConfigured: "This build of ARC has no report address, so it didn't send an anonymous report.",
-      none: "ARC hasn't sent an anonymous problem report from this computer yet.",
-      sent: (when: string) => `ARC's latest anonymous problem report was sent at ${when}.`,
-      queued: (when: string) => `ARC's latest anonymous problem report (${when}) is waiting to send. It retries on its own.`,
+      notConfigured: "This build of ARC has no report address, so it didn't send an anonymous error report.",
+      none: "ARC hasn't sent an anonymous error report from this computer yet. Error reports are not help requests.",
+      sent: (when: string) =>
+        `ARC's error-report service accepted an anonymous error report from this computer at ${when}. That report is not a help request: it asks nobody to reply and doesn't mean a person has read it.`,
+      queued: (when: string) =>
+        `An anonymous error report from ${when} is waiting to send and retries on its own. It is not a help request and asks nobody to reply.`,
       loading: "Checking anonymous error reports…",
     },
   },

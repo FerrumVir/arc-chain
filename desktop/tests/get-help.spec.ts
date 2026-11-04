@@ -96,6 +96,14 @@ test.describe("Get help: pure logic", () => {
     );
   });
 
+  test("the report line never reads as a delivered help request", () => {
+    for (const line of [PLAIN_COPY.help.report.sent("2026-11-04 09:30 UTC"), PLAIN_COPY.help.report.queued("2026-11-04 09:30 UTC")]) {
+      expect(line).toContain("not a help request");
+      expect(line).toContain("asks nobody to reply");
+    }
+    expect(PLAIN_COPY.help.report.sent("x")).toContain("doesn't mean a person has read it");
+  });
+
   test("no help copy promises a reply or names a reader", () => {
     const all = JSON.stringify(PLAIN_COPY.help).toLowerCase();
     for (const promise of ["we'll reply", "we will reply", "someone will", "the team will", "within 24", "within 48", "guarantee", "reads every"]) {
