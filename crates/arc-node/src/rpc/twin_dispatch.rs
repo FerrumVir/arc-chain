@@ -37,7 +37,6 @@ const PUMP_GROUPS_PER_HOUR: u32 = 30;
 const PUMP_BURST: u32 = 2;
 const WORKER_STATE_CAP: usize = COMMUNITY_WORKER_REGISTRY_MAX;
 const RECENT_RECEIPTS_MAX: usize = 50;
-const VALIDATOR_RECOMPUTE_METHOD: &str = "authenticated_shard_quorum_2_of_3_per_range";
 
 /// Per-worker twin tallies since this coordinator started.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -1940,6 +1939,7 @@ async fn resolve_twin_group(node: &NodeState, group_id: &str) {
                 range_count: canonical.range_count,
                 range_position_quorum_count: canonical.range_position_quorum_count,
                 execution_profile: canonical.execution_profile,
+                range_replicas: canonical.range_replicas.clone(),
             },
         )),
         _ => None,
@@ -1993,7 +1993,9 @@ async fn resolve_twin_group(node: &NodeState, group_id: &str) {
         validator_recompute: twin::RecomputeReceipt {
             reason: recompute_reason,
             status: classification.recompute_status,
-            method: canonical.as_ref().map(|_| VALIDATOR_RECOMPUTE_METHOD),
+            method: canonical
+                .as_ref()
+                .map(|canonical| community_verification_method(&canonical.range_replicas)),
             output_hash: canonical
                 .as_ref()
                 .map(|canonical| format!("0x{}", canonical.output_hash.to_hex())),
