@@ -75,15 +75,20 @@ chmod +x arc-desktop-linux-x86_64.AppImage
    recovery phrase. The keyfile preserves the address you just saw; the app
    never places the phrase or secret key in node arguments, environment, or
    logs and reuses the same protected keyfile across restarts.
-4. **Attempts community-worker registration** (if you picked the Worker role,
-   or later turn on **Settings → Contribute compute**). ARC never runs jobs on
-   your computer unless you choose one of those, and the same switch turns it
-   off. Registration alone does not prove that the worker is eligible,
-   reachable, receiving jobs, or earning rewards; those states must be visible
-   in the app. The Dashboard's **Jobs on this computer** card shows the jobs
-   this computer completed and the ones the network verified since the node
-   last started. **Keep this computer awake while a job runs** (Settings) holds
-   off idle sleep only while a job is computing.
+4. **Contributes compute while Contribute compute is on.** Setup starts with
+   the switch on when the computer meets the memory requirement for the ARC
+   model (where the model is marked Recommended) and off otherwise; switch it
+   off there or at any time in **Settings → Contribute compute**. ARC never
+   runs jobs on your computer while it is off. When it is on, the node starts
+   first, ARC downloads the model (3.80 GB) in the background, then restarts
+   the node as a worker and attempts community-worker registration. Jobs use
+   up to a quarter of the processor cores unless you change **Settings →
+   Compute contribution**. Registration alone does not prove that the worker
+   is eligible, reachable, receiving jobs, or earning rewards; those states
+   must be visible in the app. The Dashboard's **Jobs on this computer** card
+   shows the jobs this computer completed and the ones the network verified
+   since the node last started. **Keep this computer awake while a job runs**
+   (Settings) holds off idle sleep only while a job is computing.
 5. **Submits** a testnet faucet request when onboarding reaches that step. A
    submission is not a balance credit; only a successful mined receipt on the
    selected chain confirms it. The public fleet was divergent at the
