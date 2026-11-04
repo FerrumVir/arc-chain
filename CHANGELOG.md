@@ -34,7 +34,7 @@ All notable changes to ARC Chain are tracked here. This project follows
   approval rule are unchanged, and nothing stored on chain or checked when
   blocks are applied changes. Each approving validator recomputes the job on
   its own node, so approvals for a job verified 2-of-2 need the approving
-  validators on this release.
+  validators on this release (#232).
 - The `verification` object in `/inference/run` and `/community/submit_work`
   responses says which quorum ran. `method` stays
   `authenticated_shard_quorum_2_of_3_per_range` when every range was verified
@@ -44,7 +44,7 @@ All notable changes to ARC Chain are tracked here. This project follows
   mix. `replicas_contacted_per_quorum` is the fewest replicas any range
   contacted, and a new `ranges_verified_2_of_2` field lists those ranges as
   `[start_layer, end_layer]` pairs; it is omitted when empty. Twin receipts
-  use the same labels in `validator_recompute.method`.
+  use the same labels in `validator_recompute.method` (#232).
 - `GET /inference/readiness` reports `community_dispatch_ready: true` only
   while a community result could be verified: every layer range of the
   validator shard pipeline needs at least two distinct live replicas, read
@@ -55,17 +55,18 @@ All notable changes to ARC Chain are tracked here. This project follows
   new `x-arc-community-dispatch` response header says `ready` or why
   community dispatch is not: `model_identity_unavailable`,
   `no_eligible_workers`, `work_queue_unavailable`,
-  `verification_pipeline_unavailable` or `verification_replicas_below_quorum`.
+  `verification_pipeline_unavailable` or `verification_replicas_below_quorum`
+  (#232).
 - `POST /inference/run` no longer sends a job to a community worker when its
   result could not be verified. It answers at once from this node's own model
   or the validators' sharded pipeline, as when no worker is eligible, instead
   of holding the request until the dispatch deadline. A sealed recovery probe
   in that state is refused at once with 503, and a public demo request gets a
-  503 that names verification as the reason.
+  503 that names verification as the reason (#232).
 - `scripts/recovery/community-reward-probe.py` still requires 2-of-3
   verification on every range and position. A result verified with a
   two-replica quorum is now refused with that reason, instead of "omitted
-  authenticated shard-quorum verification".
+  authenticated shard-quorum verification" (#232).
 
 ## v0.8.16 - Release-preparation snapshot (2026-10-26)
 
