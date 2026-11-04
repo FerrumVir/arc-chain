@@ -41,7 +41,7 @@ All notable changes to ARC Chain are tracked here. This project follows
   core count already stored is kept, a re-run of setup keeps it, and a
   Settings save no longer overwrites it. Existing installs keep their
   settings and consent. Settings states the share that applies, for example
-  "Uses up to a quarter of your processor while ARC Node is open."
+  "Uses up to a quarter of your processor while ARC Node is open" (#231).
 
 ## v0.8.16 - Release-preparation snapshot (2026-10-26)
 
