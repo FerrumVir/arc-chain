@@ -35,6 +35,42 @@ async function openWith(page: Page, workerStatus: unknown) {
 
 const NO_RESUME_PROMISE = /resum|automatic|back soon|protect|load/i;
 
+// Reasons that name inherited object properties must never reach the copy: before the
+// fix, "toString" blanked the label and "__proto__" crashed the dashboard (React #31).
+test.describe("Memory guard pause with a reason naming an inherited property", () => {
+  for (const reason of ["toString", "__proto__", "constructor", "hasOwnProperty", "valueOf"]) {
+    for (const [width, height] of [
+      [960, 640],
+      [1180, 780],
+    ] as const) {
+      test(`"${reason}" at ${width}x${height} shows the plain pause and the dashboard keeps working`, async ({ page }) => {
+        const errors: string[] = [];
+        page.on("pageerror", (error) => errors.push(error.message));
+        await page.setViewportSize({ width, height });
+        const card = await openWith(page, status("paused_memory_guard", { memoryGuardState: reason, memoryCheck: "ok" }));
+        const state = card.getByTestId("worker-jobs-state");
+        await expect(state).toHaveText("Paused: not taking new jobs");
+        await expect(card.getByTestId("worker-jobs-detail")).toContainText("While paused");
+        await expect(page.getByTestId("error-boundary")).toHaveCount(0);
+        // Still usable: the counters render and navigation works both ways.
+        await expect(card.getByTestId("worker-jobs-completed")).toHaveText("7");
+        await page.getByTestId("nav-settings").click();
+        await expect(page.getByTestId("compute-consent-toggle")).toBeVisible();
+        await page.getByTestId("nav-dashboard").click();
+        await expect(page.getByTestId("worker-jobs-state")).toHaveText("Paused: not taking new jobs");
+        expect(errors, errors.join("\n")).toEqual([]);
+        if (reason === "toString" || reason === "__proto__") {
+          await page.locator("#boot").waitFor({ state: "detached" });
+          await card.scrollIntoViewIfNeeded();
+          const name = reason === "__proto__" ? "proto" : reason;
+          await card.screenshot({ path: `test-results/worker-guard-preview/worker-guard-${name}-${width}x${height}.png` });
+          await page.screenshot({ path: `test-results/worker-guard-preview/worker-guard-${name}-${width}x${height}-page.png` });
+        }
+      });
+    }
+  }
+});
+
 test.describe("Memory guard pause on the dashboard", () => {
   for (const [guardState, check, copy] of [
     ["paused_low_memory", "ok", "Paused: not enough free memory for new jobs"],

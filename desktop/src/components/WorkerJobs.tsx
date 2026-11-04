@@ -14,12 +14,23 @@ const STATE_COPY: Record<string, string> = {
   reconnecting: "Reconnecting to coordinators",
 };
 
-/** Why the memory guard paused the worker, only as far as the node reported it. */
-const PAUSE_COPY: Record<string, string> = {
-  paused_low_memory: PLAIN_COPY.workerJobs.pausedLowMemory,
-  paused_memory_check_failed: PLAIN_COPY.workerJobs.pausedCheckFailed,
-  paused_decline_backoff: PLAIN_COPY.workerJobs.pausedAfterDeclines,
-};
+/**
+ * Why the memory guard paused the worker, only for a reason ARC recognizes. Matched
+ * explicitly, never by object-key lookup: any other value, including one that names an
+ * inherited property such as `toString` or `__proto__`, gets the plain pause.
+ */
+function pauseCopy(reason: string | null | undefined): string {
+  switch (reason) {
+    case "paused_low_memory":
+      return PLAIN_COPY.workerJobs.pausedLowMemory;
+    case "paused_memory_check_failed":
+      return PLAIN_COPY.workerJobs.pausedCheckFailed;
+    case "paused_decline_backoff":
+      return PLAIN_COPY.workerJobs.pausedAfterDeclines;
+    default:
+      return PLAIN_COPY.workerJobs.paused;
+  }
+}
 
 function isPausedByMemoryGuard(status: WorkerStatus): boolean {
   return status.running && status.state === "paused_memory_guard";
@@ -28,12 +39,7 @@ function isPausedByMemoryGuard(status: WorkerStatus): boolean {
 /** One sentence for the worker's current state, from its own node. */
 export function workerStateCopy(status: WorkerStatus): string {
   if (!status.running) return "Not taking jobs";
-  if (isPausedByMemoryGuard(status)) {
-    return (
-      (status.memoryGuardState && PAUSE_COPY[status.memoryGuardState]) ||
-      PLAIN_COPY.workerJobs.paused
-    );
-  }
+  if (isPausedByMemoryGuard(status)) return pauseCopy(status.memoryGuardState);
   return (status.state && STATE_COPY[status.state]) || "Running";
 }
 
