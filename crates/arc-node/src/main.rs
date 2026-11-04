@@ -11184,49 +11184,136 @@ mod tests {
         assert_eq!(guard.status().memory_check, "failed");
     }
 
-    #[test]
-    fn the_claim_loop_runs_inference_only_inside_the_guarded_compute_function() {
-        // Structural regression for the production loop: the community worker's only
-        // generation calls sit inside the compute closure passed to `memory_guarded_compute`,
-        // and the claim gate runs before every claim. Moving compute outside, or dropping either
-        // call, fails here; deleting a `let ... else` exit fails to compile.
-        let source = include_str!("main.rs");
+    /// The production claim loop's memory-guard wiring, read from `source` (this file). Line
+    /// endings are normalized first, so a CRLF checkout (Git on Windows) reads the same as LF.
+    /// Returns what is wrong, or `Ok` when the only generation calls sit inside the compute
+    /// closure passed to `memory_guarded_compute` and the claim gate runs before every claim.
+    fn claim_loop_guard_wiring(source: &str) -> Result<(), String> {
+        let source = source.replace("\r\n", "\n");
         let production = &source[..source
             .find("#[cfg(test)]\nmod tests {")
-            .expect("tests module")];
+            .ok_or("tests module not found")?];
         let start = production
             .find("Community inference worker started")
-            .expect("claim loop");
+            .ok_or("claim loop not found")?;
         let claim_loop = &production[start..];
         let call = claim_loop
             .find("let guarded = memory_guarded_compute(")
-            .expect("loop calls memory_guarded_compute");
+            .ok_or("loop does not call memory_guarded_compute")?;
         let exit = claim_loop
             .find("let Guarded::Computed(inference) = guarded else {")
-            .expect("let-else exit");
-        assert!(call < exit);
+            .ok_or("let-else exit after the guarded compute not found")?;
+        if call >= exit {
+            return Err("the let-else exit precedes the guarded compute".into());
+        }
         let generation_calls: Vec<usize> = claim_loop
             .match_indices("inference_model.try_generate")
             .map(|(at, _)| at)
             .collect();
-        assert_eq!(
-            generation_calls.len(),
-            2,
-            "try_generate and try_generate_with_reserved_kv, once each"
-        );
-        assert!(
-            generation_calls.iter().all(|&at| call < at && at < exit),
-            "generation outside the guarded compute"
-        );
+        if generation_calls.len() != 2 {
+            return Err(format!(
+                "expected try_generate and try_generate_with_reserved_kv once each, found {} generation calls",
+                generation_calls.len()
+            ));
+        }
+        if !generation_calls.iter().all(|&at| call < at && at < exit) {
+            return Err("generation outside the guarded compute".into());
+        }
         let gate = claim_loop
             .find("let gate = memory_guard_claim_gate(")
-            .expect("loop calls the claim gate");
+            .ok_or("loop does not call the claim gate")?;
         let claim = claim_loop
             .find("let claim_body = rpc::ClaimWorkRequest {")
-            .expect("claim");
-        assert!(
-            gate < claim && claim_loop[gate..claim].contains("let ClaimGate::Claim = gate else {")
-        );
+            .ok_or("claim not found")?;
+        if !(gate < claim && claim_loop[gate..claim].contains("let ClaimGate::Claim = gate else {"))
+        {
+            return Err("the claim gate does not run, and exit, before the claim".into());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_claim_loop_runs_inference_only_inside_the_guarded_compute_function() {
+        // Structural regression for the production loop: moving compute outside the guard, or
+        // dropping the guarded compute or the claim gate, fails here; deleting a `let ... else`
+        // exit fails to compile. It holds for this file with LF and with CRLF line endings.
+        let source = include_str!("main.rs");
+        let lf = source.replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        assert_eq!(claim_loop_guard_wiring(source), Ok(()));
+        assert_eq!(claim_loop_guard_wiring(&lf), Ok(()));
+        assert_eq!(claim_loop_guard_wiring(&crlf), Ok(()));
+    }
+
+    #[test]
+    fn the_claim_loop_wiring_check_rejects_real_violations_in_either_line_ending() {
+        let lf = include_str!("main.rs").replace("\r\n", "\n");
+        let tests_at = lf.find("#[cfg(test)]\nmod tests {").expect("tests module");
+        let (production, tests) = lf.split_at(tests_at);
+        let start = production
+            .find("Community inference worker started")
+            .expect("claim loop");
+        let exit_marker = "let Guarded::Computed(inference) = guarded else {";
+        let exit = start
+            + production[start..]
+                .find(exit_marker)
+                .expect("let-else exit");
+        let first_generation = start
+            + production[start..]
+                .find("inference_model.try_generate")
+                .expect("generation");
+        let mutants: Vec<(&str, String)> = vec![
+            (
+                "a generation call moved after the guarded compute",
+                format!(
+                    "{}inference_model.untouched{}{}inference_model.try_generate_moved(); {}",
+                    &production[..first_generation],
+                    &production[first_generation + "inference_model.try_generate".len()..exit],
+                    exit_marker,
+                    &production[exit + exit_marker.len()..]
+                ),
+            ),
+            (
+                "the guarded compute call removed",
+                production.replacen(
+                    "let guarded = memory_guarded_compute(",
+                    "let guarded = compute_directly(",
+                    1,
+                ),
+            ),
+            (
+                "the claim gate's let-else exit removed",
+                production.replacen(
+                    "let ClaimGate::Claim = gate else {",
+                    "if let ClaimGate::Claim = gate {",
+                    1,
+                ),
+            ),
+            (
+                "the claim gate dropped",
+                production.replacen(
+                    "let gate = memory_guard_claim_gate(",
+                    "let gate = always_claim(",
+                    1,
+                ),
+            ),
+        ];
+        for (what, mutant_production) in mutants {
+            assert_ne!(
+                mutant_production, production,
+                "{what}: mutation did not apply"
+            );
+            let mutant_lf = format!("{mutant_production}{tests}");
+            let mutant_crlf = mutant_lf.replace('\n', "\r\n");
+            assert!(
+                claim_loop_guard_wiring(&mutant_lf).is_err(),
+                "{what} (LF) was accepted"
+            );
+            assert!(
+                claim_loop_guard_wiring(&mutant_crlf).is_err(),
+                "{what} (CRLF) was accepted"
+            );
+        }
     }
 
     #[test]
