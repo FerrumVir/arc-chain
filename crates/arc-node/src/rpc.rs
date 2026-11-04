@@ -429,7 +429,7 @@ pub struct NodeState {
     pub community_rewards_v1_enabled: bool,
     /// Coordinator switch `--community-release-on-verification`, off by
     /// default. When set, a verified single-worker community job takes one of
-    /// two paths once its authenticated 2-of-3 recomputation passes:
+    /// two paths once its authenticated shard-quorum recomputation passes:
     /// - Its settlement is journaled and the answer goes to the waiting
     ///   `/inference/run` caller at once; the five-of-six reward approvals
     ///   then run on the existing settlement retry loop.
@@ -6828,7 +6828,7 @@ async fn channel_state(
 /// waited the full timeout before falling back to local. The math:
 /// 4 tokens × ~3.3 s/tok = ~13s real work, so the budget should be
 /// ~15s not 60s. A successful result is now independently recomputed by a
-/// 2-of-3 shard quorum before this timer completes, so the budget covers two
+/// shard quorum before this timer completes, so the budget covers two
 /// inference passes (worker + verifier), one claim-poll window, and network
 /// headroom. The cap prevents an abandoned request from living forever.
 const MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 45;
@@ -17046,7 +17046,7 @@ fn release_verified_community_reward(
 }
 
 /// Response marker for an answer released by `--community-release-on-verification`.
-/// The authenticated 2-of-3 recomputation has passed. The five-of-six reward
+/// The authenticated shard-quorum recomputation has passed. The five-of-six reward
 /// approvals and the 0x25 transaction are still outstanding. Only the
 /// journaling `coordinator` knows the job before it is mined, so the status
 /// URL is relative to the origin that answered `/inference/run`; it reports
@@ -17759,7 +17759,7 @@ pub async fn community_submit_work(
         } else {
             // Default: collect the five-of-six approvals here, before the
             // caller is answered. With the switch on, the result above has
-            // already passed its 2-of-3 recomputation, and
+            // already passed its shard-quorum recomputation, and
             // `release_verified_community_reward` decides: journal it and
             // answer now (the retry loop collects the approvals), or settle
             // inline exactly as by default.
@@ -26018,6 +26018,11 @@ mod tests {
             node_name: format!("0x{}", Hash256([index; 32]).to_hex()),
         };
 
+        // A third holder whose announcement lapsed is not a live replica, and
+        // a read-only GET must leave it in the registry.
+        let stale = now - std::time::Duration::from_secs(SHARD_REGISTRY_TTL_SECS + 5);
+        node.shard_registry.insert("h3".into(), (holder(3), stale));
+
         // One live replica: the validators' own sharded pipeline can still
         // answer, but no community result could carry two signatures.
         node.shard_registry.insert("h1".into(), (holder(1), now));
@@ -26040,7 +26045,8 @@ mod tests {
         assert_eq!(headers[COMMUNITY_DISPATCH_HEADER], "ready");
         let body = serde_json::to_value(&two).unwrap();
         assert_eq!(body.as_object().unwrap().len(), 9);
-        assert_eq!(node.shard_registry.len(), 2);
+        assert_eq!(node.shard_registry.len(), 3);
+        assert!(node.shard_registry.contains_key("h3"));
     }
 
     #[tokio::test]
@@ -26083,12 +26089,56 @@ mod tests {
             "recovery_probe_id": format!("0x{}", Hash256(probe_bytes).to_hex()),
             "expected_worker": worker_id,
         });
-        let error = inference_run(AxumState(node.clone()), Some(Json(probe)))
+        let error = inference_run(AxumState(node.clone()), Some(Json(probe.clone())))
             .await
             .expect_err("a recovery probe needs a verifiable community route");
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.1.error.contains("verification_replicas_below_quorum"));
         assert!(queue.lock().await.try_recv().is_err());
+
+        // With no verification pipeline to assemble at all, the probe is
+        // refused with that reason instead.
+        node.community_verification_pipeline_override = None;
+        let error = inference_run(AxumState(node.clone()), Some(Json(probe)))
+            .await
+            .expect_err("a recovery probe needs an assemblable pipeline");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.1.error.contains("verification_pipeline_unavailable"));
+        assert!(queue.lock().await.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn public_demo_names_verification_only_when_verification_is_the_reason() {
+        let worker_id = format!("0x{}", "1".repeat(64));
+        let mut node =
+            fake_node_with_workers(vec![(worker(&worker_id, &["inference"]), Instant::now())]);
+        node.inference_model = Some(context_test_inference_model(16));
+        node.community_twin = Arc::new(twin_dispatch::CommunityTwinState::new(
+            crate::twin::TwinConfig {
+                twin_execution: true,
+                ..crate::twin::TwinConfig::default()
+            },
+        ));
+        let demo = json!({"input": "ARC", "max_tokens": 1, "public_demo": true});
+
+        // The only layer range has one live replica: a worker could take the
+        // job, but nothing could verify its result, so the 503 says that.
+        let one_replica = vec![range_held_at(&["10.0.0.1:9090"])];
+        node.community_verification_pipeline_override = Some(one_replica);
+        let error = inference_run(AxumState(node.clone()), Some(Json(demo.clone())))
+            .await
+            .expect_err("a public demo needs a verifiable community route");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.1.error, COMMUNITY_RESULTS_UNVERIFIABLE);
+
+        // Verifiable now, but one worker cannot make a twin pair: the 503
+        // keeps its existing reason instead of blaming verification.
+        node.community_verification_pipeline_override = Some(verifiable_dispatch_pipeline());
+        let error = inference_run(AxumState(node.clone()), Some(Json(demo)))
+            .await
+            .expect_err("a public demo needs two workers");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.1.error.contains("fewer than two are available"));
     }
 
     #[test]

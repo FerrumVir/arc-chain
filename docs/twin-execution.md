@@ -30,7 +30,7 @@ This design adds three things:
 | Dispatch | A job id is derived from validator, boot epoch, nonce, model, input hash and max tokens. A pending record is inserted, the item is `try_send` onto a per-coordinator FIFO (capacity 256), and the dispatcher waits on a oneshot. The budget is 3 × 3.3 s per position × 1.5, plus a 30 s claim window. | `rpc.rs:6558`, `rpc.rs:6761`, `rpc.rs:6937`, `rpc.rs:6950`; `rpc.rs:1894`, `rpc.rs:1990`; `rpc.rs:6335` |
 | Claim (first come) | Each worker long-polls `/community/claim_work` on all six coordinators at once (30 s). The coordinator's poll loop `try_recv`s every 25 ms, so the first idle poller wins. The job is bound to that worker. A worker that wins two coordinators at once declines the extra job. | `main.rs:8912`, `main.rs:9001`, `main.rs:9050`; `rpc.rs:13321`, `rpc.rs:13327`, `rpc.rs:15553`, `rpc.rs:15730` |
 | Compute and submit | The worker runs the whole model (`try_generate`), signs an `InferenceAttestation` certificate over model, input and output hashes, and POSTs `/community/submit_work` with bounded retries. | `main.rs:9337`, `main.rs:9466`, `main.rs:9516`, `main.rs:5600` |
-| Coordinator verification | Every successful submit is recomputed through the validators' shard pipeline. There are 6 layer ranges, each replicated on 3 validators. Every position runs on all 3 replicas, with an authenticated 2-of-3 quorum per range and position. A range with only two live replicas runs on both, and both must agree (2-of-2); a range with fewer cannot be verified, and the coordinator then dispatches no community job. The output is compared on token hash, token count and text. | `rpc.rs:16068`, `rpc.rs:13929`, `rpc.rs:14041`, `rpc.rs:13808`, `rpc.rs:13756` |
+| Coordinator verification | Every successful submit is recomputed through the validators' shard pipeline. There are 6 layer ranges, each replicated on 3 validators. Every position runs on all 3 replicas, with an authenticated 2-of-3 quorum per range and position. A range with only two live replicas runs on both, and both must agree (2-of-2); a range with fewer cannot be verified, and `POST /inference/run` then dispatches no community job (the demand pump, section 6.1, is not gated by this check). The output is compared on token hash, token count and text. | `rpc.rs:16068`, `rpc.rs:13929`, `rpc.rs:14041`, `rpc.rs:13808`, `rpc.rs:13756` |
 | Reward | If issuance capacity remains (1 per block, 40 per epoch of 216,000 blocks, 16 per coordinator, 8 per worker), the coordinator signs its approval and asks all five other validators. Each of them recomputes the job before signing. 5 of 6 approvals make a 0x25 transaction of 2.5 testnet ARC, retried from a crash-durable journal. | `rpc.rs:15407`, `rpc.rs:15419`, `rpc.rs:14594`, `rpc.rs:14617`, `rpc.rs:14402`, `rpc.rs:14308`, `rpc.rs:14323`, `rpc.rs:15320`; `arc-state/src/lib.rs:58-62`; `arc-types/src/transaction.rs:889-891` |
 | Receipts and views | Reward receipt and job status, the activity feed, the in-memory scoreboard, and the explorer's receipt and activity panels. | `rpc.rs:16500`, `rpc.rs:16559`, `rpc.rs:16613`, `rpc.rs:8357`, `rpc.rs:1775`, `rpc.rs:8184`; `explorer/app.js:336`, `explorer/app.js:865` |
 | Validator limits | 2 concurrent public inferences per coordinator, 3 concurrent shard computations with a queue of 12 per validator, 1 approval recomputation with a queue of 6, and 32 shard KV caches. | `rpc.rs:173-188` |
@@ -226,6 +226,7 @@ The commitment binds who computed what, the comparison and the verdict. It does 
   - a twin demo job: one of 32 fixed, harmless public prompts, in rotation, through the model's chat template, with 32 output tokens; or
   - a replay (section 6.2): 25% of ticks, or whenever only one idle worker is available.
 - **It never competes with callers.** It starts only while every public inference slot is free and holds at most one of them.
+- **No replica-readiness check.** Unlike `POST /inference/run`, a tick does not check that every layer range has two live replicas (section 2, Coordinator verification). While a range has fewer, the pump can still hand idle workers demo and replay jobs.
 - **Hard limits.** At most one pump job in flight per coordinator and at most 30 groups per hour per coordinator. It never draws on the reward budget.
 - **Fairness.** The least-recently-served preference (section 3.2).
 - **`--community-demand-dry-run`.** Plans and logs every tick ("would dispatch …") and counts `demand_dry_run_ticks`, without dispatching. Run it before enabling the pump, per the automation dry-run rule.
@@ -384,7 +385,7 @@ Say this only after steps 1–2 above, with numbers read from `twin_stats` and r
 | `--community-demand-dry-run` | off | coordinator: plan and log only |
 | `--community-demand-interval-secs N` | 120 | coordinator: tick (minimum 30) |
 | `--community-region-probe` | off | worker: opt-in region report |
-| `--community-release-on-verification` | off | coordinator: answer the caller once 2-of-3 verification passes and the settlement is journaled, with reward approvals on the settlement retry path; below a journal high-water mark and within budget only, otherwise as with the switch off (section 13) |
+| `--community-release-on-verification` | off | coordinator: answer the caller once shard-quorum verification passes and the settlement is journaled, with reward approvals on the settlement retry path; below a journal high-water mark and within budget only, otherwise as with the switch off (section 13) |
 
 | Endpoint | Kind | Gateway |
 |---|---|---|
@@ -399,9 +400,9 @@ Say this only after steps 1–2 above, with numbers read from `twin_stats` and r
 
 A coordinator switch for single-worker community jobs. It changes no consensus, genesis or on-chain rule. With the switch on, a job is either answered early or settled on the switch-off path itself, so no job is handled worse than with the switch off. With the switch off, nothing changes.
 
-**Default ordering.** The waiting `/inference/run` caller is answered only after three steps: the worker's run, the validators' authenticated 2-of-3 recomputation, and the reward approvals (five of six validators, each recomputing the job, before the 0x25 transaction enters the mempool).
+**Default ordering.** The waiting `/inference/run` caller is answered only after three steps: the worker's run, the validators' authenticated shard-quorum recomputation (2-of-3, or 2-of-2 on a range with two live replicas), and the reward approvals (five of six validators, each recomputing the job, before the 0x25 transaction enters the mempool).
 
-**With the switch on.** Once the 2-of-3 recomputation has matched the worker's output, the coordinator checks, in this order:
+**With the switch on.** Once the shard-quorum recomputation has matched the worker's output, the coordinator checks, in this order:
 
 1. **Backpressure.** If 192 or more unpaid settlements are journaled, the job settles inline, exactly as with the switch off.
    - The caller waits for the approvals, holding one of the coordinator's two public permits, so intake slows to the approval rate.
@@ -427,7 +428,7 @@ A coordinator switch for single-worker community jobs. It changes no consensus, 
 - **The checks are not atomic across handlers.** The mark and the budget are read without a lock, so verifications that finish at the same moment can all pass before any of them journals. The overshoot is bounded by the coordinator's concurrent verifications: its two public permits plus late submits.
 
 **What does not change.**
-- No answer is released before its 2-of-3 recomputation has matched the worker's output.
+- No answer is released before its shard-quorum recomputation has matched the worker's output.
 - Settlement is the same code: the same five-of-six approvals, 0x25 transaction, backoff and expiry. The chain enforces the budgets as before.
 - A settlement that fails after the release is recorded in `last_error` and retried as before. It never changes or withdraws the answer already sent.
 - Each job has one journal entry and one retry task, and the chain's job marker still refuses a second payment.

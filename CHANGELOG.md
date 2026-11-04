@@ -24,17 +24,16 @@ All notable changes to ARC Chain are tracked here. This project follows
 > snapshot. It does not claim publication or deployment of v0.8.17.
 
 - Community result verification now runs when a model layer range has
-  exactly two live validator replicas, for example while a validator is
-  offline. The coordinator recomputes such a range on both replicas, and both
-  must return the same authenticated hash (and, on the last range, the same
-  token): a 2-of-2 quorum. A range with three or more live replicas is still
-  verified 2-of-3, exactly as before, and a range with one or none still
-  cannot be verified. Every quorum still needs two distinct, authenticated,
-  active-validator signatures. Rewards, issuance caps and the five-of-six
-  approval rule are unchanged, and nothing stored on chain or checked when
-  blocks are applied changes. Each approving validator recomputes the job on
-  its own node, so approvals for a job verified 2-of-2 need the approving
-  validators on this release (#232).
+  exactly two live validator replicas. The coordinator recomputes such a
+  range on both replicas, and both must return the same authenticated hash
+  (and, on the last range, the same token): a 2-of-2 quorum. A range with
+  three or more live replicas is still verified 2-of-3, exactly as before,
+  and a range with one or none still cannot be verified. Every quorum still
+  needs two distinct, authenticated, active-validator signatures. Rewards,
+  issuance caps and the five-of-six approval rule are unchanged, and nothing
+  stored on chain or checked when blocks are applied changes. Each approving
+  validator recomputes the job on its own node, so approvals for a job
+  verified 2-of-2 need the approving validators on this release (#232).
 - The `verification` object in `/inference/run` and `/community/submit_work`
   responses says which quorum ran. `method` stays
   `authenticated_shard_quorum_2_of_3_per_range` when every range was verified
@@ -62,7 +61,9 @@ All notable changes to ARC Chain are tracked here. This project follows
   or the validators' sharded pipeline, as when no worker is eligible, instead
   of holding the request until the dispatch deadline. A sealed recovery probe
   in that state is refused at once with 503, and a public demo request gets a
-  503 that names verification as the reason (#232).
+  503 that names verification as the reason. The optional community demand
+  pump (`--community-demand-pump`, off by default) is not gated by this check
+  (#232).
 - `scripts/recovery/community-reward-probe.py` still requires 2-of-3
   verification on every range and position. A result verified with a
   two-replica quorum is now refused with that reason, instead of "omitted

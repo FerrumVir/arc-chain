@@ -495,7 +495,7 @@ struct Cli {
     enable_community_rewards_v1: bool,
 
     /// Coordinator: answer the waiting `/inference/run` caller as soon as the
-    /// validators' 2-of-3 recomputation verifies a single-worker community
+    /// validators' shard-quorum recomputation verifies a single-worker community
     /// result and its settlement is journaled, then collect the five-of-six
     /// reward approvals on the existing settlement retry path. Approvals,
     /// retries and the 0x25 reward are unchanged. At the journal's high-water
