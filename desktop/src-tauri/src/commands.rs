@@ -2688,17 +2688,69 @@ mod inference_retry_tests {
         );
     }
 
+    /// After the answer, every stand-in stays up for this long before the tests check what
+    /// reached it, so dispatch started in the background (a spawned task, a timer) is still
+    /// seen. It is a bounded window, not proof that no later dispatch can ever happen.
+    const ROUTE_OBSERVATION_WINDOW: std::time::Duration = std::time::Duration::from_millis(1_000);
+
     /// A loopback stand-in for a node or coordinator, for the route-help contract below. It
-    /// answers `/inference/readiness` as safe and `/inference/run` with a synthetic flat answer,
-    /// and records each request as `METHOD path body`. No real node, model or coordinator.
-    async fn inference_host() -> (String, u16, Arc<std::sync::Mutex<Vec<String>>>) {
+    /// answers `/inference/readiness` as safe and `/inference/run` with a synthetic flat answer.
+    /// `accepted` counts every TCP connection at `accept()`, so a connection that never sends a
+    /// complete request is still seen; `log` records each complete request as
+    /// `METHOD path body`. No real node, model or coordinator.
+    struct InferenceHost {
+        origin: String,
+        port: u16,
+        accepted: Arc<AtomicUsize>,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl InferenceHost {
+        fn accepted(&self) -> usize {
+            self.accepted.load(Ordering::SeqCst)
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+
+        /// Exactly one readiness probe, then exactly one prompt POST carrying `prompt`, over
+        /// exactly two connections, and nothing else.
+        fn assert_served_exactly(&self, prompt: &str) {
+            let seen = self.requests();
+            assert_eq!(seen.len(), 2, "{}: {seen:?}", self.origin);
+            assert!(seen[0].starts_with("GET /inference/readiness "), "{seen:?}");
+            assert!(seen[1].starts_with("POST /inference/run "), "{seen:?}");
+            assert!(seen[1].contains(prompt), "{seen:?}");
+            assert_eq!(
+                self.accepted(),
+                2,
+                "{}: connections beyond the two requests",
+                self.origin
+            );
+        }
+
+        /// No connection at all, complete or not.
+        fn assert_untouched(&self, what: &str) {
+            assert_eq!(
+                (self.accepted(), self.requests()),
+                (0, Vec::<String>::new()),
+                "{what} ({}) was contacted",
+                self.origin
+            );
+        }
+    }
+
+    async fn inference_host() -> InferenceHost {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let origin = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let log = seen.clone();
+        let (count, log) = (accepted.clone(), seen.clone());
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
                 let log = log.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
@@ -2724,6 +2776,9 @@ mod inference_retry_tests {
                                 break;
                             }
                         }
+                    }
+                    if request.is_empty() {
+                        return; // counted at accept; no request to record or answer
                     }
                     let text = String::from_utf8_lossy(&request).to_string();
                     let mut words = text.split_whitespace();
@@ -2755,7 +2810,12 @@ mod inference_retry_tests {
                 });
             }
         });
-        (origin, port, seen)
+        InferenceHost {
+            origin,
+            port,
+            accepted,
+            log: seen,
+        }
     }
 
     async fn pin_displayed_chain(state: &AppState, host: &str) {
@@ -2769,25 +2829,22 @@ mod inference_retry_tests {
         ));
     }
 
-    fn requests(log: &Arc<std::sync::Mutex<Vec<String>>>) -> Vec<String> {
-        log.lock().unwrap().clone()
-    }
-
     // Route help (#223, `Inference.tsx`, "How this works"): the prompt goes to the coordinator
     // this session reads the chain from, at its `/inference/run`, and only there; the local
     // node at 127.0.0.1 takes it only before any coordinator is pinned, or when the chain is
     // read from the local node itself. These tests drive the native routes the UI calls
     // (`run_inference`, then `run_inference_via_coordinator_direct` on the pre-dispatch
-    // sentinel) against loopback stand-ins.
+    // sentinel) against loopback stand-ins, and check them only after
+    // `ROUTE_OBSERVATION_WINDOW` has passed.
 
     #[tokio::test]
     async fn route_help_remote_session_sends_the_prompt_only_to_the_pinned_coordinator() {
-        let (_, local_port, local_log) = inference_host().await;
-        let (pinned, _, pinned_log) = inference_host().await;
-        let (other, _, other_log) = inference_host().await;
+        let local = inference_host().await;
+        let pinned = inference_host().await;
+        let other = inference_host().await;
         let state = test_state();
-        state.node.lock().await.rpc_port = local_port;
-        pin_displayed_chain(&state, &pinned).await;
+        state.node.lock().await.rpc_port = local.port;
+        pin_displayed_chain(&state, &pinned.origin).await;
 
         let refused = run_inference_local_inner(&state, "route help prompt", 2, true)
             .await
@@ -2801,37 +2858,26 @@ mod inference_retry_tests {
             "route help prompt",
             2,
             true,
-            vec![other.clone(), pinned.clone()],
+            vec![other.origin.clone(), pinned.origin.clone()],
             InferenceProxyPolicy::Configured,
         )
         .await
         .expect("the pinned coordinator answers");
-
         assert_eq!(answer.output, "synthetic answer");
         assert!(!answer.served_locally);
-        assert_eq!(answer.coordinator.as_deref(), Some(pinned.as_str()));
-        let seen = requests(&pinned_log);
-        assert_eq!(seen.len(), 2, "{seen:?}");
-        assert!(seen[0].starts_with("GET /inference/readiness"));
-        assert!(seen[1].starts_with("POST /inference/run "));
-        assert!(seen[1].contains("route help prompt"));
-        assert!(
-            requests(&local_log).is_empty(),
-            "the local node was contacted: {:?}",
-            requests(&local_log)
-        );
-        assert!(
-            requests(&other_log).is_empty(),
-            "another coordinator was contacted: {:?}",
-            requests(&other_log)
-        );
+        assert_eq!(answer.coordinator.as_deref(), Some(pinned.origin.as_str()));
+
+        tokio::time::sleep(ROUTE_OBSERVATION_WINDOW).await;
+        pinned.assert_served_exactly("route help prompt");
+        local.assert_untouched("the local node");
+        other.assert_untouched("another coordinator");
     }
 
     #[tokio::test]
     async fn route_help_before_any_coordinator_is_pinned_the_local_node_takes_the_prompt() {
-        let (_, local_port, local_log) = inference_host().await;
+        let local = inference_host().await;
         let state = test_state();
-        state.node.lock().await.rpc_port = local_port;
+        state.node.lock().await.rpc_port = local.port;
         assert!(state.chain_host.lock().await.is_none());
         assert!(state.community_chain_host.lock().await.is_none());
 
@@ -2840,41 +2886,38 @@ mod inference_retry_tests {
             .expect("the local node answers");
         assert_eq!(answer.output, "synthetic answer");
         assert!(answer.served_locally);
-        let seen = requests(&local_log);
-        assert_eq!(seen.len(), 2, "{seen:?}");
-        assert!(seen[1].starts_with("POST /inference/run ") && seen[1].contains("first prompt"));
+
+        tokio::time::sleep(ROUTE_OBSERVATION_WINDOW).await;
+        local.assert_served_exactly("first prompt");
     }
 
     #[tokio::test]
     async fn route_help_a_session_reading_the_chain_from_the_local_node_keeps_local_inference() {
-        let (_, local_port, local_log) = inference_host().await;
+        let local = inference_host().await;
         let state = test_state();
-        state.node.lock().await.rpc_port = local_port;
-        pin_displayed_chain(&state, &crate::paths::local_host(local_port)).await;
+        state.node.lock().await.rpc_port = local.port;
+        pin_displayed_chain(&state, &crate::paths::local_host(local.port)).await;
 
         let answer = run_inference_local_inner(&state, "local chain prompt", 2, true)
             .await
             .expect("the local node answers when it is the chain host");
         assert!(answer.served_locally);
-        let seen = requests(&local_log);
-        assert!(
-            seen.iter()
-                .any(|r| r.starts_with("POST /inference/run ") && r.contains("local chain prompt")),
-            "{seen:?}"
-        );
+
+        tokio::time::sleep(ROUTE_OBSERVATION_WINDOW).await;
+        local.assert_served_exactly("local chain prompt");
     }
 
     #[tokio::test]
     async fn route_help_a_settlement_origin_overrides_the_displayed_chain_for_both_routes() {
-        let (_, local_port, local_log) = inference_host().await;
-        let (settled, _, settled_log) = inference_host().await;
-        let (displayed, _, displayed_log) = inference_host().await;
+        let local = inference_host().await;
+        let settled = inference_host().await;
+        let displayed = inference_host().await;
         let state = test_state();
-        state.node.lock().await.rpc_port = local_port;
+        state.node.lock().await.rpc_port = local.port;
         // The displayed chain is the local node, but a community settlement already pinned
         // this session's receipt origin to a coordinator: that origin wins for every route.
-        pin_displayed_chain(&state, &crate::paths::local_host(local_port)).await;
-        *state.community_chain_host.lock().await = Some(settled.clone());
+        pin_displayed_chain(&state, &crate::paths::local_host(local.port)).await;
+        *state.community_chain_host.lock().await = Some(settled.origin.clone());
 
         let refused = run_inference_local_inner(&state, "settled prompt", 2, true)
             .await
@@ -2888,25 +2931,17 @@ mod inference_retry_tests {
             "settled prompt",
             2,
             true,
-            vec![displayed.clone(), settled.clone()],
+            vec![displayed.origin.clone(), settled.origin.clone()],
             InferenceProxyPolicy::Configured,
         )
         .await
         .expect("the settlement origin answers");
-        assert_eq!(answer.coordinator.as_deref(), Some(settled.as_str()));
-        assert!(requests(&settled_log)
-            .iter()
-            .any(|r| r.starts_with("POST /inference/run ")));
-        assert!(
-            requests(&local_log).is_empty(),
-            "{:?}",
-            requests(&local_log)
-        );
-        assert!(
-            requests(&displayed_log).is_empty(),
-            "{:?}",
-            requests(&displayed_log)
-        );
+        assert_eq!(answer.coordinator.as_deref(), Some(settled.origin.as_str()));
+
+        tokio::time::sleep(ROUTE_OBSERVATION_WINDOW).await;
+        settled.assert_served_exactly("settled prompt");
+        local.assert_untouched("the local node");
+        displayed.assert_untouched("the displayed chain host");
     }
 
     #[tokio::test]

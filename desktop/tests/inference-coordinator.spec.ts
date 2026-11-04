@@ -385,6 +385,10 @@ test.describe("Inference - community-first coordinator routing", () => {
     );
   });
 
+  // How long interception stays active after an answer before the route-help test checks
+  // what was dispatched (see the test below).
+  const ROUTE_OBSERVATION_WINDOW_MS = 1_000;
+
   // Route help (#223): runInferenceSmart asks the local node first and moves the click to the
   // coordinator's /inference/run only on the pre-dispatch sentinel (no local POST was sent).
   // This drives that decision with held, intercepted transports: the waiting line follows the
@@ -463,10 +467,16 @@ test.describe("Inference - community-first coordinator routing", () => {
     expect(inferencePosts[0]).not.toBe("127.0.0.1");
     expect(readinessHosts[0]).toBe("127.0.0.1");
     expect(readinessHosts).toContain(inferencePosts[0]);
-    // 3. The coordinator answers; nothing else was posted and consensus never started.
+    // 3. The coordinator answers. Interception stays active through a bounded observation
+    //    window after the answer, so dispatch started later (a timer, a background promise)
+    //    is still seen. The window is a test limit, not proof that no later dispatch can
+    //    ever happen.
     releaseDirect();
     await expect(page.getByTestId("inference-output")).toHaveText("answer from the coordinator");
-    expect(inferencePosts).toEqual([inferencePosts[0]]);
+    const coordinator = inferencePosts[0];
+    await page.waitForTimeout(ROUTE_OBSERVATION_WINDOW_MS);
+    expect(inferencePosts).toEqual([coordinator]);
+    expect(readinessHosts).toEqual(["127.0.0.1", coordinator]);
     expect(consensusHits).toBe(0);
   });
 
