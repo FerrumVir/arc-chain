@@ -497,6 +497,18 @@ cutover proves the sealed checkpoint and the six new validator keyfiles.
 
 ## 4. Build and prove the release candidate
 
+### User-facing explanation review — every tagged release
+
+The explanation-review step below applies to **every tagged release with
+user-facing explanations**, including desktop-only releases and releases using
+the `existing-recovered-chain-update-v1` profile. Its scope extends beyond this
+document's cutover procedure; it does not impose cutover-only operations on an
+update release. The release owner is the checklist owner for this step and
+must link and sign off the completed record for the exact candidate **before
+creating its release tag or dispatching `release.yml`**. Without that signed-off
+record, do not tag or dispatch. This is a human process requirement, not an
+automated workflow guard.
+
 - [ ] **Review every applicable user-facing “how this works” explanation
   against the exact release-candidate code before release sign-off.** This
   includes unchanged explanations, not only strings changed in the release.
@@ -548,11 +560,13 @@ complete semantic audit. Link applicable behavioural tests such as
 with their actual scope and result; do not infer that they validate every
 explanation. These checks supplement the aggregate release gate below.
 
-The checklist owner must adopt this process and record its use for the
+The release owner must adopt this process and record its use for the
 candidate. Humans retain release execution and existing approval boundaries.
-This documentation PR neither releases [#223](https://github.com/FerrumVir/arc-chain/pull/223)
-nor approves held wording, tagging, publication or rollout; it does not mark
-any explanation reviewed merely by adding this step.
+Checklist completion does not itself publish a release or approve held wording,
+tagging, publication or rollout. Adding the step does not mark any explanation
+reviewed; separate release and operational approvals remain required.
+
+### Candidate build and cutover-specific proof
 
 From a clean checkout with Node.js 24 LTS and Actionlint installed, require the
 single aggregate gate to pass:
