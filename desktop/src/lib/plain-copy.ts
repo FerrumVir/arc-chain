@@ -195,9 +195,29 @@ export const PLAIN_COPY = {
     /** Linux .deb and .rpm installs, which ARC can't update itself. */
     alwaysReadyPackageManaged:
       "It can start when ARC opens. Update ARC with the package manager you installed it with. Work arrives only when assigned.",
+    /**
+     * The compute step. On a computer that can run the ARC model (the tier
+     * native code recommends), contributing starts on and the model downloads
+     * in the background after setup; the switch and Skip turn it off.
+     */
+    compute: {
+      title: "Share your computer's spare power",
+      body: "ARC Node will use up to a quarter of your processor to run AI jobs for the ARC network while the app is open. It downloads the ARC model (about 4 GB) in the background first. You can turn this off here or at any time in Settings.",
+      control: "Contribute compute",
+      /**
+       * In place of the body below the memory floor (`recommended_tier` is
+       * "none"): the step starts off there, and a model chosen anyway
+       * downloads during setup, before the node starts.
+       */
+      belowMemoryFloor:
+        "This computer has less than 16 GB of memory, which the ARC model needs, so this starts off. If you turn it on, setup downloads the model (about 4 GB) before your node starts, and ARC Node will use up to a quarter of your processor to run AI jobs for the ARC network while the app is open.",
+    },
     readyTitle: "Ready to start",
     readyWithModel: (size: string | null) =>
       `ARC downloads its AI model${size ? ` (${size})` : ""} and starts your node. This takes a few minutes.`,
+    /** Compute on, where the model downloads after setup. */
+    readyWithModelInBackground: (size: string | null) =>
+      `ARC starts your node, then downloads its AI model${size ? ` (${size})` : ""} in the background. Your node can run AI jobs once the model is ready.`,
     readyWithoutModel:
       "ARC starts your node. It joins the ARC network but doesn't run AI jobs.",
     testnet:
@@ -211,6 +231,21 @@ export const PLAIN_COPY = {
     /** A coordinator answered ARC (named), or the node itself found a peer (null). */
     connected: (via: string | null) =>
       via ? `ARC is connected to the network via ${via} ✓` : "Your node is connected to the ARC network ✓",
+  },
+  settings: {
+    /**
+     * Under Settings > Contribute compute while it is on: how much of the
+     * processor AI jobs may use. `threads` is the node's core cap (null: no
+     * cap, every core) and `cores` this computer's logical cores. A setup
+     * that turns compute on stores a quarter of them; a cap someone set, or
+     * none on an install from before that, is stated as it is.
+     */
+    computeShare: (threads: number | null, cores: number) =>
+      threads === null || threads >= cores
+        ? "Uses up to your whole processor while ARC Node is open."
+        : threads * 4 <= cores
+          ? "Uses up to a quarter of your processor while ARC Node is open."
+          : `Uses up to ${threads} of your ${cores} processor cores while ARC Node is open.`,
   },
   /**
    * Launch found node data from an earlier install whose app data was gone

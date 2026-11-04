@@ -42,21 +42,25 @@ test.describe("Onboarding wizard", () => {
     await wheelIntoView(page, page.getByTestId("btn-continue-identity"));
     await page.getByTestId("btn-continue-identity").click();
 
-    // Model picker. Added in v0.6.0 - this spec previously jumped straight
+    // Compute step. Added in v0.6.0 - this spec previously jumped straight
     // to launch and stalled here.
     await expect(page.getByTestId("step-model")).toBeVisible();
-    // Nothing opts in by default, even where the model is recommended.
-    // Observer mode is pre-selected (Continue is enabled on arrival), and
-    // what contributing runs, when, its power use and keep-awake are
-    // explained above the choices.
-    await expect(page.getByTestId("tier-skip")).toHaveAttribute("aria-pressed", "true");
-    await expect(page.getByTestId("tier-standard")).toHaveAttribute("aria-pressed", "false");
-    await expect(page.getByTestId("tier-standard")).toContainText("Recommended");
-    await expect(page.getByTestId("compute-choice-default")).toContainText(
-      "Contributing compute is off until you select the ARC model.",
+    // Where the model is recommended (the mock recommends it), contributing
+    // compute starts on, with the step saying plainly what that does.
+    // Continue is enabled on arrival; what contributing runs, when, its power
+    // use and keep-awake are explained above the choices.
+    await expect(
+      page.getByRole("heading", { name: PLAIN_COPY.setup.compute.title, level: 1 }),
+    ).toBeVisible();
+    await expect(page.getByTestId("compute-choice-default")).toHaveText(
+      PLAIN_COPY.setup.compute.body,
     );
-    await expect(page.getByTestId("step-model")).not.toContainText("pre-select");
-    await expect(page.getByTestId("step-model")).not.toContainText("while the app is open");
+    const computeSwitch = page.getByRole("switch", { name: PLAIN_COPY.setup.compute.control });
+    await expect(computeSwitch).toBeChecked();
+    await expect(page.getByTestId("tier-standard")).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("tier-standard")).toContainText("Recommended");
+    await expect(page.getByTestId("tier-skip")).toHaveAttribute("aria-pressed", "false");
+    await expect(page.getByTestId("step-model")).not.toContainText("off until you select");
     const disclosure = page.getByTestId("contribution-disclosure");
     await expect(disclosure).toBeVisible();
     const runs = disclosure.getByTestId("disclosure-runs");
@@ -66,7 +70,8 @@ test.describe("Onboarding wizard", () => {
     await expect(when).toContainText("from the menu bar or system tray after you close the window");
     await expect(when).toContainText("after you log in while Start node on app launch is on");
     const power = disclosure.getByTestId("disclosure-power");
-    await expect(power).toContainText("every processor core");
+    await expect(power).toContainText("up to a quarter of your processor");
+    await expect(power).not.toContainText("every processor core");
     await expect(power).toContainText("battery drain");
     const keepAwake = disclosure.getByTestId("disclosure-keep-awake");
     await expect(keepAwake).toContainText("Off unless you turn it on in Settings.");
@@ -74,21 +79,29 @@ test.describe("Onboarding wizard", () => {
     await expect(keepAwake).toContainText("on Linux a sleep you request is also blocked until the job ends");
     await expect(keepAwake).toContainText("closing the lid can still put it to sleep");
     await expect(page.getByTestId("btn-continue-model")).toBeEnabled();
-    // Selecting the model is the explicit opt-in; Skip takes it back, and
-    // selecting it again opts in again.
-    await page.getByTestId("tier-standard").click();
-    await expect(page.getByTestId("tier-standard")).toHaveAttribute("aria-pressed", "true");
-    await expect(page.getByTestId("tier-skip")).toHaveAttribute("aria-pressed", "false");
-    await page.getByTestId("tier-skip").click();
+    // The switch turns it off and on again on this screen, and Skip and the
+    // model follow it; Skip and the model turn the switch too.
+    await computeSwitch.click();
+    await expect(computeSwitch).not.toBeChecked();
     await expect(page.getByTestId("tier-skip")).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("tier-standard")).toHaveAttribute("aria-pressed", "false");
     await expect(page.getByTestId("btn-continue-model")).toBeEnabled();
-    await page.getByTestId("tier-standard").click();
+    await computeSwitch.click();
+    await expect(computeSwitch).toBeChecked();
     await expect(page.getByTestId("tier-standard")).toHaveAttribute("aria-pressed", "true");
+    await page.getByTestId("tier-skip").click();
+    await expect(computeSwitch).not.toBeChecked();
+    await page.getByTestId("tier-standard").click();
+    await expect(computeSwitch).toBeChecked();
+    await expect(page.getByTestId("tier-skip")).toHaveAttribute("aria-pressed", "false");
     await wheelIntoView(page, page.getByTestId("btn-continue-model"));
     await page.getByTestId("btn-continue-model").click();
 
-    // Launch
+    // Launch: the node starts first, and the model follows in the background.
     await expect(page.getByTestId("step-launch")).toBeVisible();
+    await expect(page.getByTestId("launch-summary")).toContainText(
+      PLAIN_COPY.setup.readyWithModelInBackground("3.80 GB"),
+    );
     await expect(page.getByTestId("launch-summary")).toContainText("downloads its AI model");
     await expect(page.getByRole("button", { name: /start my node/i })).toBeVisible();
     await expect(page.getByTestId("launch-testnet-note")).toHaveText(
@@ -97,16 +110,29 @@ test.describe("Onboarding wizard", () => {
     await wheelIntoView(page, page.getByTestId("btn-launch"));
     await page.getByTestId("btn-launch").click();
 
-    // Lands on Home: Ask ARC, with the node's one-line strip.
+    // Lands on Home: Ask ARC, with the node's one-line strip. Setup did not
+    // wait for the model download.
     await expect(page.getByTestId("inference-screen")).toBeVisible({ timeout: 15_000 });
     await expect(
       page.getByRole("heading", { name: PLAIN_COPY.home.title, level: 1 }),
     ).toBeVisible();
     await expect(page.getByTestId("node-strip")).toBeVisible();
-    // The explicit selection is what recorded consent.
+    // Continuing with the switch on recorded consent and a core cap of a
+    // quarter of the mock's 24 cores; the background download then made the
+    // node a worker with the model.
+    await expect.poll(async () => (await savedConfig(page))?.role).toBe("worker");
     const saved = await savedConfig(page);
     expect(saved?.computeConsent).toBe(true);
-    expect(saved?.role).toBe("worker");
+    expect(saved?.workerThreads).toBe(6);
+    expect(saved?.modelPath).toBe("/mock/.arc/models/standard.gguf");
+
+    // Settings says the same: on, and up to a quarter of the processor.
+    await page.getByTestId("nav-settings").click();
+    await expect(page.getByTestId("compute-consent-toggle")).toBeChecked();
+    await expect(page.getByTestId("compute-share-note")).toHaveText(
+      "Uses up to a quarter of your processor while ARC Node is open.",
+    );
+    await expect(page.getByTestId("worker-threads-value")).toHaveText("6 / 24");
   });
 
   test("progress dots update per step (4 dots, one per wizard step)", async ({
@@ -270,6 +296,19 @@ test.describe("Onboarding wizard", () => {
     await expect(page.getByTestId("step-model")).toContainText(
       /do not multiply rewards or guarantee demand/i,
     );
+    // The compute step's own words promise no earnings, $ARC or rewards.
+    const compute = PLAIN_COPY.setup.compute;
+    for (const copy of [
+      compute.title,
+      compute.body,
+      compute.control,
+      compute.belowMemoryFloor,
+      PLAIN_COPY.setup.readyWithModelInBackground("3.80 GB"),
+      PLAIN_COPY.settings.computeShare(6, 24),
+    ]) {
+      expect(copy).not.toMatch(/earn|\$ARC|reward|paid|payment/i);
+    }
+    await expect(page.getByTestId("compute-choice-default")).not.toContainText(/earn|reward/i);
   });
 
   test("a .deb or .rpm install isn't promised automatic updates", async ({ page }) => {
@@ -300,10 +339,16 @@ test.describe("Onboarding wizard", () => {
     await page.getByTestId("btn-reveal-seed").click();
     await wheelIntoView(page, page.getByTestId("btn-continue-identity"));
     await page.getByTestId("btn-continue-identity").click();
-    // No choice made, on a machine where the model is recommended:
-    // continuing keeps contribution off.
+    // Compute starts on where the model is recommended; Skip, on the same
+    // screen, turns it off.
     await expect(page.getByTestId("tier-standard")).toContainText("Recommended");
+    const computeSwitch = page.getByRole("switch", { name: PLAIN_COPY.setup.compute.control });
+    await expect(computeSwitch).toBeChecked();
+    await wheelIntoView(page, page.getByTestId("tier-skip"));
+    await page.getByTestId("tier-skip").click();
+    await expect(page.getByTestId("tier-skip")).toHaveAttribute("aria-pressed", "true");
     await expect(page.getByTestId("tier-standard")).toHaveAttribute("aria-pressed", "false");
+    await expect(computeSwitch).not.toBeChecked();
     await wheelIntoView(page, page.getByTestId("btn-continue-model"));
     await page.getByTestId("btn-continue-model").click();
 
@@ -315,10 +360,11 @@ test.describe("Onboarding wizard", () => {
     await wheelIntoView(page, page.getByTestId("btn-launch"));
     await page.getByTestId("btn-launch").click();
     await expect(page.getByTestId("inference-screen")).toBeVisible({ timeout: 15_000 });
-    // No consent was recorded from the recommendation.
+    // Skip recorded a no: an observer with no model and no core cap.
     const saved = await savedConfig(page);
     expect(saved?.computeConsent).toBe(false);
     expect(saved?.role).toBe("observer");
     expect(saved?.modelPath).toBeNull();
+    expect(saved?.workerThreads).toBeNull();
   });
 });

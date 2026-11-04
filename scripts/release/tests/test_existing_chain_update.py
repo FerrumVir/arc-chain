@@ -382,5 +382,409 @@ class ExistingChainUpdateTests(unittest.TestCase):
                     mod.verify_owner_verifier(args, {**owner, field: "0" * 64})
 
 
+OFFLINE_SITE = "ams"
+CANDIDATE = "c" * 64
+NETWORK_KEYS = ("genesis_file_sha256", "genesis_network_hash", "recovery_domain",
+                "checkpoint_manifest_hash", "validator_set_id")
+
+
+def offline_probe(pin, status=502, binary=None):
+    return {"site": pin["site"], "ip": pin["ip"], "validator": pin["validator"],
+            "health_url": "https://" + pin["ip"] + "/health", "http_status": status, "binary_sha256": binary}
+
+
+def five_live_inputs(candidate=CANDIDATE, status=502):
+    """The real six-host fixtures with ams declared offline and the other five live.
+
+    Returns the five-host config and proof, the declared row, and the two rows ams
+    reported in the original capture (on its own, non-candidate binary).
+    """
+    config = load("host-config-six-current-20260927.json")
+    proof = load("six-host-before-cfd-20260927.json")
+    offline = next(host for host in config["hosts"] if host["site"] == OFFLINE_SITE)
+    declared = {key: offline[key] for key in ("site", "ip", "validator", "stake")}
+    answering_rows = [node for sample in proof["samples"] for node in sample["nodes"]
+                      if node["site"] == OFFLINE_SITE]
+    config["hosts"] = [host for host in config["hosts"] if host["site"] != OFFLINE_SITE]
+    config["quorum_sites"] = [site for site in config["quorum_sites"] if site != OFFLINE_SITE]
+    config["unobserved_stake"] = offline["stake"]
+    config["declared_offline"] = [declared]
+    for sample in proof["samples"]:
+        sample["nodes"] = [node for node in sample["nodes"] if node["site"] != OFFLINE_SITE]
+        sample["declared_offline"] = [offline_probe(declared, status)]
+    proof["common_block"]["hosts"] = [row for row in proof["common_block"]["hosts"]
+                                      if row["site"] != OFFLINE_SITE]
+    if candidate is not None:
+        for host in config["hosts"]:
+            host["baseline_binary_sha256"] = candidate
+        for sample in proof["samples"]:
+            for node in sample["nodes"]:
+                node["binary_sha256"] = candidate
+    return config, proof, declared, answering_rows
+
+
+def check_quorum(config, proof, declared=None):
+    hosts, total, quorum = validator.validate_host_config(config)
+    declared = validator.declared_offline_hosts(config) if declared is None else declared
+    return validator.validate_quorum_proof(proof, hosts, total, quorum,
+        expected_network={key: config[key] for key in NETWORK_KEYS},
+        now=proof["captured_at_unix"] + 60, declared_offline=declared)
+
+
+def assembler_proof(config, proof, sites=(OFFLINE_SITE,), candidate=CANDIDATE):
+    """The assembler's own gate over files on disk, as the owner and the producer run it."""
+    with tempfile.TemporaryDirectory() as td:
+        config_path, proof_path = Path(td) / "host-config.json", Path(td) / "quorum-proof.json"
+        config_path.write_text(json.dumps(config))
+        proof_path.write_text(json.dumps(proof))
+        return mod.strict_proof(proof_path, config_path, validator_path, candidate,
+                                now=proof["captured_at_unix"] + 60, declared_offline_sites=sites)
+
+
+def verified_certificate():
+    verified = load("verified-checkpoint.json")
+    return {"recovery_domain": mod.norm_hash(verified["recovery_domain"], "recovery_domain"),
+            "protocol_version": verified["protocol_version"], "validator_set_id": verified["validator_set_id"],
+            "validators": verified["validators"],
+            "genesis_hash": mod.norm_hash(verified["genesis_hash"], "genesis_hash")}
+
+
+class DeclaredOfflineValidatorTests(unittest.TestCase):
+    def test_five_live_with_one_declared_offline_passes(self):
+        config, proof, declared, _ = five_live_inputs()
+        summary = check_quorum(config, proof)
+        self.assertEqual(summary["host_count"], 5)
+        self.assertEqual(summary["online_stake"], 33333333)
+        self.assertEqual(summary["declared_offline_sites"], [OFFLINE_SITE])
+        self.assertEqual(summary["declared_offline_stake"], declared["stake"])
+        self.assertEqual(summary["online_stake"] + summary["declared_offline_stake"], config["total_stake"])
+        for status in (None, 503, 504):
+            with self.subTest(status=status):
+                c, p, _, _ = five_live_inputs(status=status)
+                self.assertEqual(check_quorum(c, p)["host_count"], 5)
+        result, checked = assembler_proof(config, proof)
+        self.assertEqual(checked, config)
+        self.assertEqual((result["host_count"], result["declared_offline_sites"]), (5, [OFFLINE_SITE]))
+        hosts = {row["site"]: row for row in config["hosts"]}
+        approved = (FIXTURES / "approved-genesis.network-hash").read_text().strip()
+        mod.validate_crossbindings(verified_certificate(), hosts, config, config["genesis_file_sha256"],
+                                   CANDIDATE, proof, approved)
+
+    def test_five_live_with_none_declared_fails(self):
+        config, proof, _, _ = five_live_inputs()
+        anonymous = copy.deepcopy(config)
+        del anonymous["declared_offline"]
+        with self.assertRaisesRegex(validator.GateError, "unobserved stake must be exactly"):
+            validator.validate_host_config(anonymous)
+        undeclared = copy.deepcopy(anonymous)
+        undeclared["unobserved_stake"] = 0
+        with self.assertRaisesRegex(validator.GateError, "observed and explicitly unobserved stake"):
+            validator.validate_host_config(undeclared)
+        unprobed = copy.deepcopy(proof)
+        for sample in unprobed["samples"]:
+            del sample["declared_offline"]
+        for supplied in (anonymous, undeclared):
+            with self.subTest(unobserved_stake=supplied["unobserved_stake"]):
+                with self.assertRaisesRegex(RuntimeError, "unobserved stake"):
+                    assembler_proof(supplied, unprobed, sites=())
+        hosts = {row["site"]: row for row in anonymous["hosts"]}
+        with self.assertRaisesRegex(mod.ProfileError, "authority differs"):
+            mod.validate_certificate_authority(verified_certificate(), hosts, anonymous,
+                                               anonymous["genesis_file_sha256"])
+        # The declaration needs its explicit confirmation, and a confirmation needs the declaration.
+        for sites in ((), ("nrt",), (OFFLINE_SITE, OFFLINE_SITE)):
+            with self.subTest(confirmed=sites):
+                with self.assertRaisesRegex(mod.ProfileError, "explicit --declared-offline confirmation"):
+                    assembler_proof(config, proof, sites=sites)
+
+    def test_two_declared_offline_fails(self):
+        config, proof, _, _ = five_live_inputs()
+        second = next(host for host in config["hosts"] if host["site"] == "nrt")
+        config["hosts"].remove(second)
+        config["quorum_sites"].remove("nrt")
+        config["declared_offline"].append({key: second[key] for key in ("site", "ip", "validator", "stake")})
+        config["unobserved_stake"] += second["stake"]
+        for sample in proof["samples"]:
+            sample["nodes"] = [node for node in sample["nodes"] if node["site"] != "nrt"]
+            sample["declared_offline"].append(offline_probe(config["declared_offline"][1]))
+        proof["common_block"]["hosts"] = [row for row in proof["common_block"]["hosts"] if row["site"] != "nrt"]
+        # The four remaining hosts still hold exactly the quorum stake: only the one-validator limit refuses.
+        self.assertEqual(sum(host["stake"] for host in config["hosts"]), config["quorum_stake"])
+        with self.assertRaisesRegex(validator.GateError, "at most one validator may be declared offline"):
+            validator.validate_host_config(config)
+        hosts = {host["site"]: host for host in config["hosts"]}
+        with self.assertRaisesRegex(validator.GateError, "at most one validator may be declared offline"):
+            validator.validate_quorum_proof(proof, hosts, config["total_stake"], config["quorum_stake"],
+                now=proof["captured_at_unix"] + 60,
+                declared_offline={row["site"]: row for row in config["declared_offline"]})
+        with self.assertRaisesRegex(RuntimeError, "at most one validator may be declared offline"):
+            assembler_proof(config, proof, sites=(OFFLINE_SITE, "nrt"))
+        with self.assertRaisesRegex(mod.ProfileError, "more than one is declared"):
+            mod.validate_certificate_authority(verified_certificate(), hosts, config, config["genesis_file_sha256"])
+
+    def test_declared_offline_host_answering_on_a_different_binary_fails(self):
+        _, _, _, answering_rows = five_live_inputs()
+        old_binary = answering_rows[0]["binary_sha256"]
+        self.assertNotEqual(old_binary, CANDIDATE)
+
+        def health(**update):
+            return lambda p: p["samples"][1]["declared_offline"][0].update(update)
+
+        answers = {
+            "health answers on a different binary": health(http_status=200, binary_sha256=old_binary),
+            "health answers on the candidate binary": health(http_status=200, binary_sha256=CANDIDATE),
+            "health answers without a binary hash": health(http_status=200),
+            "health answers with another status": health(http_status=404),
+            "a binary behind a failing front": health(http_status=502, binary_sha256=old_binary),
+        }
+        for label, mutate in answers.items():
+            with self.subTest(label):
+                c, p, _, _ = five_live_inputs()
+                mutate(p)
+                with self.assertRaisesRegex(validator.GateError, "declared-offline validator ams"):
+                    check_quorum(c, p)
+                with self.assertRaisesRegex(RuntimeError, "declared-offline validator ams"):
+                    assembler_proof(c, p)
+        # The capturer reached ams and sampled it, still on its old binary.
+        c, p, _, rows = five_live_inputs()
+        for sample, row in zip(p["samples"], rows):
+            sample["nodes"].append(row)
+        with self.assertRaisesRegex(validator.GateError, "answered the capture as a live host in the samples"):
+            check_quorum(c, p)
+        with self.assertRaisesRegex(RuntimeError, "answered the capture as a live host"):
+            assembler_proof(c, p)
+        c, p, _, _ = five_live_inputs()
+        p["common_block"]["hosts"].append({**p["common_block"]["hosts"][0], "site": OFFLINE_SITE})
+        with self.assertRaisesRegex(validator.GateError, "answered the capture as a live host in the common block"):
+            check_quorum(c, p)
+
+    def test_live_stake_below_quorum_fails(self):
+        config, proof, _, _ = five_live_inputs()
+        # Same identities and total stake, but the declared validator holds enough that
+        # the five live hosts fall one short of the quorum.
+        moves = {"nyc": 5666667, "lhr": 1000000}
+        for host in config["hosts"]:
+            host["stake"] -= moves.get(host["site"], 0)
+        for sample in proof["samples"]:
+            for node in sample["nodes"]:
+                node["stake"] -= moves.get(node["site"], 0)
+        config["declared_offline"][0]["stake"] += sum(moves.values())
+        config["unobserved_stake"] = config["declared_offline"][0]["stake"]
+        live = sum(host["stake"] for host in config["hosts"])
+        self.assertEqual((live, live + config["unobserved_stake"]),
+                         (config["quorum_stake"] - 1, config["total_stake"]))
+        with self.assertRaisesRegex(validator.GateError, "cannot meet the stake quorum"):
+            validator.validate_host_config(config)
+        hosts = {host["site"]: host for host in config["hosts"]}
+        with self.assertRaisesRegex(validator.GateError, "below threshold"):
+            validator.validate_quorum_proof(proof, hosts, config["total_stake"], config["quorum_stake"],
+                expected_network={key: config[key] for key in NETWORK_KEYS},
+                now=proof["captured_at_unix"] + 60,
+                declared_offline={OFFLINE_SITE: config["declared_offline"][0]})
+        with self.assertRaisesRegex(RuntimeError, "cannot meet the stake quorum"):
+            assembler_proof(config, proof)
+
+    def test_offline_set_is_never_inferred_from_a_silent_host(self):
+        six = load("host-config-six-current-20260927.json")
+        _, silent, _, _ = five_live_inputs(candidate=None)
+        hosts, total, quorum = validator.validate_host_config(six)
+        self.assertEqual(validator.declared_offline_hosts(six), {})
+        expected = {key: six[key] for key in NETWORK_KEYS}
+        with self.assertRaisesRegex(validator.GateError, "must not carry offline probes"):
+            validator.validate_quorum_proof(silent, hosts, total, quorum, expected_network=expected,
+                                            now=silent["captured_at_unix"] + 60)
+        for sample in silent["samples"]:
+            del sample["declared_offline"]
+        with self.assertRaisesRegex(validator.GateError, "sample missing or duplicating a quorum host"):
+            validator.validate_quorum_proof(silent, hosts, total, quorum, expected_network=expected,
+                                            now=silent["captured_at_unix"] + 60)
+        # With ams declared, a second host that does not answer is a refusal, never a second offline validator.
+        config, proof, _, _ = five_live_inputs()
+        for sample in proof["samples"]:
+            sample["nodes"] = [node for node in sample["nodes"] if node["site"] != "nrt"]
+        with self.assertRaisesRegex(validator.GateError, "sample missing or duplicating a quorum host"):
+            check_quorum(config, proof)
+        with self.assertRaisesRegex(RuntimeError, "sample missing or duplicating a quorum host"):
+            assembler_proof(config, proof)
+
+    def test_declaration_binds_identity_certificate_and_probe(self):
+        config, _, declared, _ = five_live_inputs()
+        hosts = {row["site"]: row for row in config["hosts"]}
+        mod.validate_certificate_authority(verified_certificate(), hosts, config, config["genesis_file_sha256"])
+        for field, value in (("validator", "e" * 64), ("stake", declared["stake"] - 1)):
+            with self.subTest(certificate_field=field):
+                c = copy.deepcopy(config)
+                c["declared_offline"][0][field] = value
+                with self.assertRaisesRegex(mod.ProfileError, "authority differs"):
+                    mod.validate_certificate_authority(verified_certificate(), hosts, c, c["genesis_file_sha256"])
+        live = config["hosts"][0]
+        config_mutations = {
+            "declared site is live": lambda c: c["declared_offline"][0].update(site=live["site"]),
+            "declared identity is live": lambda c: c["declared_offline"][0].update(validator=live["validator"]),
+            "declared IP is live": lambda c: c["declared_offline"][0].update(ip=live["ip"]),
+            "extra declared field": lambda c: c["declared_offline"][0].update(reason="text"),
+            "declaration is not a list": lambda c: c.update(declared_offline=c["declared_offline"][0]),
+        }
+        for label, mutate in config_mutations.items():
+            with self.subTest(config=label):
+                c = copy.deepcopy(config)
+                mutate(c)
+                with self.assertRaises(validator.GateError):
+                    validator.validate_host_config(c)
+        probe_mutations = {
+            "missing in one sample": lambda p: p["samples"][0].pop("declared_offline"),
+            "empty in one sample": lambda p: p["samples"][1].update(declared_offline=[]),
+            "repeated": lambda p: p["samples"][0]["declared_offline"].append(
+                dict(p["samples"][0]["declared_offline"][0])),
+            "another IP": lambda p: p["samples"][0]["declared_offline"][0].update(ip="192.0.2.1"),
+            "plain HTTP": lambda p: p["samples"][0]["declared_offline"][0].update(
+                health_url="http://" + declared["ip"] + "/health"),
+            "another host's endpoint": lambda p: p["samples"][0]["declared_offline"][0].update(
+                health_url="https://" + live["ip"] + "/health"),
+            "extra probe field": lambda p: p["samples"][0]["declared_offline"][0].update(note="text"),
+            "status as text": lambda p: p["samples"][0]["declared_offline"][0].update(http_status="502"),
+        }
+        for label, mutate in probe_mutations.items():
+            with self.subTest(probe=label):
+                c, p, _, _ = five_live_inputs()
+                mutate(p)
+                with self.assertRaises(validator.GateError):
+                    check_quorum(c, p)
+
+    def test_six_host_update_keeps_its_strict_shape(self):
+        config = load("host-config-six-current-20260927.json")
+        proof = load("six-host-before-cfd-20260927.json")
+        for host in config["hosts"]:
+            host["baseline_binary_sha256"] = CANDIDATE
+        for sample in proof["samples"]:
+            for node in sample["nodes"]:
+                node["binary_sha256"] = CANDIDATE
+        summary, _ = assembler_proof(config, proof, sites=())
+        self.assertEqual(summary["host_count"], 6)
+        self.assertFalse({"declared_offline_sites", "declared_offline_stake"} & set(summary))
+        with self.assertRaisesRegex(mod.ProfileError, "explicit --declared-offline confirmation"):
+            assembler_proof(config, proof, sites=(OFFLINE_SITE,))
+        probed = copy.deepcopy(proof)
+        ams = next(host for host in config["hosts"] if host["site"] == OFFLINE_SITE)
+        probed["samples"][0]["declared_offline"] = [offline_probe(ams)]
+        with self.assertRaisesRegex(RuntimeError, "must not carry offline probes"):
+            assembler_proof(config, probed, sites=())
+
+    def run_assemble(self, config, proof, sites):
+        """assemble() with only artifact materialization and the checkpoint CLI stubbed."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config_path, proof_path = root / "host-config.json", root / "quorum-proof.json"
+            config_path.write_text(json.dumps(config))
+            proof_path.write_text(json.dumps(proof))
+            artifact = {"binary_path": root / "arc-node", "genesis_path": root / "genesis.toml",
+                        "binary_sha256": CANDIDATE, "genesis_sha256": config["genesis_file_sha256"],
+                        "artifact_id": 1, "artifact_digest": "sha256:" + "a" * 64, "archive_sha256": "b" * 64,
+                        "build_metadata_sha256": "d" * 64, "materialization_receipt_sha256": "e" * 64}
+            args = Namespace(repository="FerrumVir/arc-chain", tag="v0.8.17", commit="c" * 40, main_sha="c" * 40,
+                             run_id=1, run_attempt=1, recovery_epoch=1, repository_root=root,
+                             artifact_platform="linux-x86_64", verifier_platform="linux-x86_64",
+                             host_config=config_path, quorum_proof=proof_path, checkpoint=root / "recovery.arcchkpt",
+                             approved_genesis_network_hash=FIXTURES / "approved-genesis.network-hash",
+                             rollout_validator=validator_path, selection=FIXTURES / "selection-live-all-nine.json",
+                             api_artifacts=FIXTURES / "artifacts-live.json", selector=ROOT / "select-pretag-artifacts.py",
+                             declared_offline=list(sites) or None,
+                             proof_validation_time=proof["captured_at_unix"] + 60,
+                             attestation_generated_at=proof["captured_at_unix"] + 61)
+            with mock.patch.object(mod, "validate_main_pin"), \
+                 mock.patch.object(mod, "select_and_materialize",
+                                   return_value=(None, {"linux-x86_64": artifact}, {"sha256": "f" * 64})), \
+                 mock.patch.object(mod, "verify_checkpoint", return_value=verified_certificate()) as verify:
+                try:
+                    return mod.assemble(args), verify
+                except mod.ProfileError as error:
+                    return error, verify
+
+    def test_attestation_records_the_declared_offline_validator(self):
+        config, proof, declared, _ = five_live_inputs()
+        result, verify = self.run_assemble(config, proof, (OFFLINE_SITE,))
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["claim"], {"existing_recovered_chain_update": True,
+            "original_cutover_ceremony_verified": False, "original_cutover_archive_present": False,
+            "validator_retirement_authorized": False})
+        self.assertEqual(result["declared_offline_validators"], [declared])
+        self.assertNotIn(mod.SIX_HOST_PROOF_KEY, result)
+        live = result[mod.LIVE_HOST_PROOF_KEY]
+        self.assertEqual((live["host_count"], live["online_stake"], live["declared_offline_sites"],
+                          live["declared_offline_stake"]), (5, 33333333, [OFFLINE_SITE], declared["stake"]))
+        self.assertEqual(mod.attested_proof_key(result), mod.LIVE_HOST_PROOF_KEY)
+        # Without the explicit confirmation the declaration is refused before the slow checkpoint check.
+        refused, verify = self.run_assemble(config, proof, ())
+        self.assertIsInstance(refused, mod.ProfileError)
+        self.assertIn("explicit --declared-offline confirmation", str(refused))
+        verify.assert_not_called()
+        # A six-host update keeps exactly today's shape.
+        six = load("host-config-six-current-20260927.json")
+        six_proof = load("six-host-before-cfd-20260927.json")
+        for host in six["hosts"]:
+            host["baseline_binary_sha256"] = CANDIDATE
+        for sample in six_proof["samples"]:
+            for node in sample["nodes"]:
+                node["binary_sha256"] = CANDIDATE
+        strict, _ = self.run_assemble(six, six_proof, ())
+        self.assertIsInstance(strict, dict)
+        self.assertFalse({"declared_offline_validators", mod.LIVE_HOST_PROOF_KEY} & set(strict))
+        self.assertEqual(strict[mod.SIX_HOST_PROOF_KEY]["host_count"], 6)
+        self.assertFalse({"declared_offline_sites", "declared_offline_stake"} & set(strict[mod.SIX_HOST_PROOF_KEY]))
+        refused, verify = self.run_assemble(six, six_proof, (OFFLINE_SITE,))
+        self.assertIsInstance(refused, mod.ProfileError)
+        verify.assert_not_called()
+
+    def test_attestation_proof_key_follows_the_declaration(self):
+        six = {mod.SIX_HOST_PROOF_KEY: {"common_height": 1}}
+        live = {"declared_offline_validators": [{"site": OFFLINE_SITE}], mod.LIVE_HOST_PROOF_KEY: {"common_height": 1}}
+        self.assertEqual(mod.attested_proof_key(six), mod.SIX_HOST_PROOF_KEY)
+        self.assertEqual(mod.attested_proof_key(live), mod.LIVE_HOST_PROOF_KEY)
+        for bad in ({}, {**six, **live}, {mod.LIVE_HOST_PROOF_KEY: {}},
+                    {"declared_offline_validators": [{"site": OFFLINE_SITE}], **six}):
+            with self.subTest(keys=sorted(bad)), self.assertRaises(mod.ProfileError):
+                mod.attested_proof_key(bad)
+
+    def test_producer_reverification_marks_the_declared_offline_scope(self):
+        with tempfile.TemporaryDirectory() as td:
+            config, _, declared, _ = five_live_inputs()
+            path = Path(td) / "owner.json"
+            owner = {"schema": mod.SCHEMA, "generated_at_unix": 1000,
+                     "release": {"production_artifact": {"platform": "linux-x86_64", "binary_sha256": "a" * 64},
+                                 "checkpoint_verifier_artifact": {"platform": "macos-arm64", "binary_sha256": "b" * 64,
+                                     "artifact_id": 1, "artifact_digest": "sha256:" + "a" * 64},
+                                 "selection_sha256": "c" * 64, "api_artifact_response_sha256": "d" * 64},
+                     "checkpoint": {"checkpoint_sha256": "d" * 64},
+                     "network": {"host_config_sha256": "e" * 64},
+                     "declared_offline_validators": config["declared_offline"],
+                     mod.LIVE_HOST_PROOF_KEY: {"proof_sha256": "f" * 64, "captured_at_unix": 990}}
+            path.write_text(json.dumps(owner))
+            selection_path = Path(td) / "selection.json"
+            selection_path.write_text(json.dumps({"schema": "arc.pretag.selection.v1",
+                "repository": "FerrumVir/arc-chain", "commit": "c" * 40, "run_id": 123, "run_attempt": 1,
+                "artifacts": {"macos-arm64": {"headless": {"id": 1, "digest": "sha256:" + "a" * 64}}}}))
+            args = Namespace(rollout_validator=ROOT / "update-quorum-validator.py", commit="c" * 40,
+                             run_id=123, run_attempt=1, selection=selection_path)
+            producer = copy.deepcopy(owner)
+            producer["release"]["checkpoint_verifier_artifact"] = {
+                "platform": "linux-x86_64", "binary_sha256": "1" * 64}
+            producer["release"]["api_artifact_response_sha256"] = "2" * 64
+            with mock.patch.object(mod, "assemble", side_effect=lambda supplied: copy.deepcopy(producer)), \
+                 mock.patch.object(mod, "verify_owner_verifier"):
+                result = mod.validate_owner_attestation(args, path, now=1500)
+            reverification = result["producer_reverification"]
+            self.assertEqual(reverification["proof_scope"], mod.LIVE_HOST_PROOF_SCOPE)
+            self.assertIn("not a live publication-time assertion", reverification["proof_scope"])
+            self.assertEqual(reverification["freshness_at_capture_unix"], 990)
+            self.assertEqual(result["declared_offline_validators"], [declared])
+            # The producer derives the offline set from the host config itself; an owner
+            # declaration that the producer does not reproduce exactly is refused.
+            producer.pop("declared_offline_validators")
+            with mock.patch.object(mod, "assemble", side_effect=lambda supplied: copy.deepcopy(producer)), \
+                 mock.patch.object(mod, "verify_owner_verifier"):
+                with self.assertRaisesRegex(mod.ProfileError, "differs from independently reverified"):
+                    mod.validate_owner_attestation(args, path, now=1500)
+
+
 if __name__ == "__main__":
     unittest.main()

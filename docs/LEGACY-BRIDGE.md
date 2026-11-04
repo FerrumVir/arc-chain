@@ -221,7 +221,8 @@ reports `chain_participation_enabled: false` and `/node/info` reports
    observer config is persisted even when the question cannot be, so a
    failed write never lets an unasked install start as a worker. A v0.7
    install that never finished onboarding has no stored config; onboarding's
-   model step asks instead.
+   compute step asks instead, and from v0.8.17 that step starts with
+   Contribute compute on where the computer can run the model.
 
 ### Consent on every path
 

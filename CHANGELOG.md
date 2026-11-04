@@ -18,11 +18,30 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
-## v0.8.17 - Release-preparation snapshot (2026-11-04)
+## v0.8.17 - Unreleased
 
-> **Candidate note:** This entry records the v0.8.17 release-preparation
-> snapshot. It does not claim publication or deployment of v0.8.17.
+> **Candidate note:** This entry collects changes for the next release
+> candidate. It does not claim publication or deployment of v0.8.17.
 
+- Desktop setup starts with Contribute compute on when the computer meets the
+  memory requirement for the ARC model, the same check that marks the model
+  Recommended; below it the step starts off, as before. The step is titled
+  "Share your computer's spare power" and reads "ARC Node will use up to a
+  quarter of your processor to run AI jobs for the ARC network while the app
+  is open. It downloads the ARC model (about 4 GB) in the background first.
+  You can turn this off here or at any time in Settings." A Contribute
+  compute switch sits under it, and Skip still turns it off. With it on,
+  setup no longer waits for the 3.80 GB download: the node starts as an
+  observer, then the promotion path a consented install already takes at
+  launch reuses or downloads the model, checks its pinned SHA-256 and
+  restarts the node as a worker. A download that does not finish continues
+  the next time ARC starts the node at launch. A setup that turns compute on
+  stores a core cap of a quarter of the logical cores, rounded down and at
+  least one, which the node gets as `RAYON_NUM_THREADS` and `--threads`. A
+  core count already stored is kept, a re-run of setup keeps it, and a
+  Settings save no longer overwrites it. Existing installs keep their
+  settings and consent. Settings states the share that applies, for example
+  "Uses up to a quarter of your processor while ARC Node is open" (#231).
 - Community result verification now runs when a model layer range has
   exactly two live validator replicas. The coordinator recomputes such a
   range on both replicas, and both must return the same authenticated hash

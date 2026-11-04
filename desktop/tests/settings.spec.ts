@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { PLAIN_COPY } from "../src/lib/plain-copy";
 import {
   seedMockOverrides,
   seedOnboarded,
@@ -32,9 +33,31 @@ test.describe("Settings", () => {
     await expect(storage).toContainText("never sends it over the network");
     await expect(storage).toContainText("Write the phrase down, keep it offline, and keep this computer secure.");
     await expect(page.getByText("We don't store it")).toHaveCount(0);
+    // A core count set here before the reset.
+    await page.getByTestId("slider-worker-threads").fill("12");
+    await page.getByTestId("btn-apply-threads").click();
+    await expect(page.getByTestId("threads-result")).toContainText("12 cores");
     await page.getByTestId("btn-reset").click();
     await expect(page.getByTestId("onboarding")).toBeVisible();
     await expect(page.getByTestId("step-welcome")).toBeVisible();
+
+    // Setup again, leaving Contribute compute on: the count chosen before
+    // is kept instead of the quarter a new install gets.
+    await page.getByTestId("btn-continue-welcome").click();
+    await page.getByTestId("btn-reveal-seed").click();
+    await page.getByTestId("btn-continue-identity").click();
+    await expect(
+      page.getByRole("switch", { name: PLAIN_COPY.setup.compute.control }),
+    ).toBeChecked();
+    await page.getByTestId("btn-continue-model").click();
+    await page.getByTestId("btn-launch").click();
+    await expect(page.getByTestId("inference-screen")).toBeVisible({ timeout: 15_000 });
+    await page.getByTestId("nav-settings").click();
+    await expect(page.getByTestId("compute-consent-toggle")).toBeChecked();
+    await expect(page.getByTestId("worker-threads-value")).toHaveText("12 / 24");
+    await expect(page.getByTestId("compute-share-note")).toHaveText(
+      "Uses up to 12 of your 24 processor cores while ARC Node is open.",
+    );
   });
 
   test("check-for-updates reports a result", async ({ page }) => {

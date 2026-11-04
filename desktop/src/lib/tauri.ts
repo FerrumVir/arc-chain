@@ -52,7 +52,7 @@ import {
   nativeMockBalance,
   nativeMockEnabled,
 } from "./native-mock";
-import { DEFAULT_NODE_CONFIG } from "./types";
+import { DEFAULT_NODE_CONFIG, defaultWorkerThreads } from "./types";
 
 const IS_TAURI =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -2530,12 +2530,28 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment" as T;
     case "load_identity":
       return null as T;
-    case "complete_onboarding":
-      mockConfig = (args as { config?: NodeConfig } | undefined)?.config ?? mockConfig;
+    case "complete_onboarding": {
+      // Mirrors commands.rs::complete_onboarding: a setup that turns compute
+      // on and names no core count takes a quarter of the cores, and a count
+      // already stored (the Settings slider, an earlier setup) is kept.
+      const submitted = (args as { config?: NodeConfig } | undefined)?.config;
+      if (submitted) {
+        const setupDefault =
+          submitted.computeConsent === true
+            ? defaultWorkerThreads(DEFAULT_HARDWARE.cpuCores)
+            : null;
+        mockConfig = {
+          ...submitted,
+          workerThreads:
+            mockConfig?.workerThreads ?? submitted.workerThreads ?? setupDefault,
+        };
+      }
       return undefined as T;
+    }
     case "save_config": {
       // Mirrors commands.rs::preserve_native_contribution_state: once a
-      // config is stored, a preference save keeps its contribution state.
+      // config is stored, a preference save keeps its contribution state
+      // and core count.
       const submitted = (args as { config?: NodeConfig } | undefined)?.config;
       if (submitted) {
         mockConfig = mockConfig
@@ -2545,13 +2561,15 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
               preventSleepDuringJobs: mockConfig.preventSleepDuringJobs,
               role: mockConfig.role,
               modelPath: mockConfig.modelPath,
+              workerThreads: mockConfig.workerThreads,
             }
           : submitted;
       }
       return undefined as T;
     }
     case "load_config":
-      return null as T;
+      // What the native store holds: nothing until a save, as on a first launch.
+      return mockConfig as T;
     case "load_data_migration_notice":
       return null as T;
     case "dismiss_data_migration_notice":
@@ -3086,6 +3104,8 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "set_worker_threads": {
       const { threads } = args as { threads: number };
       mockWorkerThreads = threads;
+      // Persisted first, like commands.rs::set_worker_threads.
+      mockConfig = { ...(mockConfig ?? DEFAULT_NODE_CONFIG), workerThreads: threads };
       // Mirrors the real fallback: no /node/threads endpoint exists yet, so
       // applying a new width restarts the node.
       if (mockStartedAt !== null) mockStartedAt = Date.now();

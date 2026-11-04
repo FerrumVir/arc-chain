@@ -91,6 +91,8 @@ export function Onboarding({
   // to ARC" after a failed start saves them first if needed, so ARC opens on
   // Home next time too.
   const [pendingConfig, setPendingConfig] = useState<NodeConfig | null>(null);
+  // Whether those answers download the model in the background after setup.
+  const [pendingInBackground, setPendingInBackground] = useState(false);
   const [setupSaved, setSetupSaved] = useState(false);
   const [continuing, setContinuing] = useState(false);
   // Linux .deb and .rpm installs can't install their own updates.
@@ -141,8 +143,10 @@ export function Onboarding({
   }, [step, identity, identityAttempt]);
 
   // Load the network-compatible model and mark it recommended only when local
-  // RAM is sufficient. Every machine starts on observer/router mode:
-  // contributing compute is off until the user selects the model.
+  // RAM is sufficient. Where it is recommended, contributing compute starts
+  // on (the step says what that does, and the switch or Skip turns it off).
+  // Below the memory floor (`recommended_tier` is "none") the step starts on
+  // observer/router mode, as it always has there.
   useEffect(() => {
     if (step !== "model" || tiers.length > 0) return;
     let cancelled = false;
@@ -152,7 +156,8 @@ export function Onboarding({
         if (cancelled) return;
         setTiers(loadedTiers);
         setRecommendedTier(rec);
-        setSelectedTier((current) => current ?? "skip");
+        const recommendedOffered = loadedTiers.some((tier) => tier.id === rec);
+        setSelectedTier((current) => current ?? (recommendedOffered ? rec : "skip"));
         setTiersLoaded(true);
       },
       (err) => {
@@ -186,16 +191,35 @@ export function Onboarding({
     };
   }, []);
 
+  // The model download after setup, for a setup that contributes compute on
+  // a computer that can run the model. It is the same native path a
+  // consented install takes at launch (promote_consented_install): reuse or
+  // download the model, check its pinned SHA-256, record worker mode only if
+  // compute is still on, and restart a running node as a worker. It goes on
+  // after this screen is gone; a failure leaves compute on, and the next
+  // launch tries again.
+  const downloadModelInBackground = () => {
+    void api.promoteConsentedInstall().then(
+      (saved) => setStoreConfig(saved),
+      () => undefined,
+    );
+  };
+
   const finish = async () => {
     if (!identity) return;
     setLaunching(true);
     setLaunchError(null);
     setStoreIdentity(identity);
 
-    // Only an explicit selection of the model opts in. The recommended tier
-    // is a label, never a default answer.
+    // The switch's answer: the model tier (on) or "skip" (off). On a
+    // computer that can run the model the step starts on, and that model
+    // downloads in the background after setup. A model chosen below the
+    // memory floor downloads here first, as before: the native promotion
+    // refuses those computers.
     const tier = selectedTier ?? "skip";
     const wantsModel = tier !== "skip";
+    const inBackground = wantsModel && tier === recommendedTier;
+    setPendingInBackground(inBackground);
     // Saved by "Continue to ARC" if the start fails before the native save.
     // A "yes" to running jobs is kept even without the model yet: native code
     // finishes a consented install when the node next starts.
@@ -207,10 +231,12 @@ export function Onboarding({
     });
 
     try {
-      // 1. Download the exact production-compatible 7B artifact if selected;
-      //    progress is surfaced through the modelProgress event.
+      // 1. Download the exact production-compatible 7B artifact first only
+      //    when it was chosen below the memory floor; progress is surfaced
+      //    through the modelProgress event. With it on, the node starts as
+      //    an observer and the model follows in the background (step 5).
       let modelPath: string | null = null;
-      if (wantsModel) {
+      if (wantsModel && !inBackground) {
         setLaunchStage("model");
         // If the user previously downloaded this tier (re-running onboarding,
         // re-install on same disk), skip straight to the path.
@@ -226,13 +252,15 @@ export function Onboarding({
       //    role + modelPath set makes the node eligible to advertise an exact,
       //    fully loaded artifact. It does not promise assignment or payment.
       //    No model means observer/router mode with no local model execution.
-      //    Choosing the model here is the user's explicit consent to run ARC
-      //    jobs on this computer; choosing observer mode is an explicit no.
+      //    Continuing with the switch on is the user's consent to run ARC
+      //    jobs on this computer (the step says what that does); switching it
+      //    off or choosing Skip is an explicit no. A consenting setup also
+      //    gets the default core cap natively (complete_onboarding).
       const config: NodeConfig = {
         ...DEFAULT_NODE_CONFIG,
         role: modelPath ? "worker" : "observer",
         modelPath,
-        computeConsent: modelPath !== null,
+        computeConsent: wantsModel,
       };
       setStoreConfig(config);
       setPendingConfig(config);
@@ -272,6 +300,8 @@ export function Onboarding({
         // The finish line used to be skipped: onboarding ended in the same tick the confirmation would have shown.
         await new Promise((resolve) => setTimeout(resolve, CONNECTED_PAUSE_MS));
       }
+      // 5. With compute on, the model downloads now, in the background.
+      if (inBackground) downloadModelInBackground();
       setRoute("inference");
       setOnboarded(true);
     } catch (err) {
@@ -296,21 +326,33 @@ export function Onboarding({
   // failure came before the native save.
   const continueToArc = async () => {
     setContinuing(true);
+    let saved = setupSaved;
     if (!setupSaved && pendingConfig) {
       try {
         await api.completeOnboarding(pendingConfig);
+        saved = true;
         const stored = await api.loadConfig().catch(() => null);
         setStoreConfig(stored ?? pendingConfig);
       } catch {
         setStoreConfig(pendingConfig);
       }
     }
+    // Saved with compute on: the model download needs no running node, and
+    // once the model is ready the node's next start is as a worker.
+    if (saved && pendingInBackground) downloadModelInBackground();
     setRoute("inference");
     setOnboarded(true);
   };
 
   const launchTier = tiers.find((tier) => tier.id === selectedTier);
   const launchModelSize = launchTier ? formatBytes(launchTier.sizeBytes) : null;
+
+  // The Contribute compute switch selects the recommended tier, or below the
+  // memory floor the tier offered there, and "skip" when it is off.
+  const switchTier =
+    tiers.find((tier) => tier.id === recommendedTier)?.id ?? tiers[0]?.id ?? null;
+  const contributing = selectedTier !== null && selectedTier !== "skip";
+  const belowMemoryFloor = tiersLoaded && recommendedTier === "none";
 
   return (
     <div className="onboarding" data-testid="onboarding">
@@ -653,15 +695,46 @@ export function Onboarding({
 
             {step === "model" && (
               <div data-testid="step-model">
-                <h1 className="onboarding-title">Choose your compute mode</h1>
-                <p className="onboarding-subtitle" data-testid="compute-choice-default">
-                  Contributing compute is off until you select the ARC model.
-                  ARC production work currently uses one exact 7B artifact,
-                  marked Recommended on machines with at least 16 GB RAM;
-                  smaller machines stay useful as observer/routers. A model
-                  creates eligibility, not guaranteed assignments or rewards.
-                  You can change this any time in Settings.
+                <h1 className="onboarding-title">{PLAIN_COPY.setup.compute.title}</h1>
+                <p
+                  className="onboarding-subtitle"
+                  id="compute-choice-default"
+                  data-testid="compute-choice-default"
+                >
+                  {belowMemoryFloor
+                    ? PLAIN_COPY.setup.compute.belowMemoryFloor
+                    : PLAIN_COPY.setup.compute.body}
                 </p>
+                <label
+                  data-testid="compute-switch-row"
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "var(--space-3)",
+                    padding: "var(--space-3) var(--space-4)",
+                    background: contributing
+                      ? "rgba(99, 102, 241, 0.10)"
+                      : "var(--surface)",
+                    border: `1px solid ${contributing ? "var(--indigo-400)" : "var(--border)"}`,
+                    borderRadius: "var(--radius-md)",
+                    color: "var(--text)",
+                    fontWeight: 500,
+                    cursor: switchTier ? "pointer" : "default",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    role="switch"
+                    checked={contributing}
+                    disabled={!switchTier}
+                    onChange={(e) =>
+                      setSelectedTier(e.target.checked && switchTier ? switchTier : "skip")
+                    }
+                    aria-describedby="compute-choice-default"
+                    data-testid="compute-switch"
+                  />
+                  <span>{PLAIN_COPY.setup.compute.control}</span>
+                </label>
                 <p
                   style={{
                     color: "var(--text-muted)",
@@ -887,7 +960,9 @@ export function Onboarding({
                     <>
                       {selectedTier === "skip"
                         ? PLAIN_COPY.setup.readyWithoutModel
-                        : PLAIN_COPY.setup.readyWithModel(launchModelSize)}{" "}
+                        : selectedTier === recommendedTier
+                          ? PLAIN_COPY.setup.readyWithModelInBackground(launchModelSize)
+                          : PLAIN_COPY.setup.readyWithModel(launchModelSize)}{" "}
                       <em data-testid="launch-testnet-note">{PLAIN_COPY.setup.testnet}</em>
                     </>
                   )}
@@ -1005,10 +1080,12 @@ export function Onboarding({
 }
 
 /**
- * What selecting the model means, shown on the compute step above the
- * choices, so it is read before anything is chosen. Each sentence states only
- * what the node and this app do: worker flags only for a chosen model, every
- * core unless limited, and keep-awake only when switched on
+ * What contributing compute means, shown on the compute step above the
+ * choices, so it is read before setup goes on. Each sentence states only
+ * what the node and this app do: worker flags only with the model, a core
+ * cap of a quarter of the logical cores from setup unless one is stored
+ * (commands.rs default_worker_threads; node_manager.rs passes it as
+ * RAYON_NUM_THREADS and --threads), and keep-awake only when switched on
  * (node_manager.rs); jobs are a prompt in and generated text out
  * (crates/arc-node/src/rpc.rs WorkItem and WorkResult); close-to-tray and the
  * login item (lib.rs); the keep-awake guard is held per job
@@ -1040,7 +1117,7 @@ function ContributionDisclosure() {
           fontWeight: 600,
         }}
       >
-        If you select the model
+        While Contribute compute is on
       </div>
       <p style={{ margin: 0 }} data-testid="disclosure-runs">
         <strong style={{ color: "var(--text)" }}>What runs.</strong> ARC
@@ -1055,9 +1132,9 @@ function ContributionDisclosure() {
         is on.
       </p>
       <p style={{ margin: 0 }} data-testid="disclosure-power">
-        <strong style={{ color: "var(--text)" }}>Power use.</strong> Jobs can
-        use every processor core (you can lower this in Settings), so expect
-        more power use, heat and battery drain while one runs.
+        <strong style={{ color: "var(--text)" }}>Power use.</strong> Jobs use
+        up to a quarter of your processor unless you change that in Settings,
+        so expect more power use, heat and battery drain while one runs.
       </p>
       <p style={{ margin: 0 }} data-testid="disclosure-keep-awake">
         <strong style={{ color: "var(--text)" }}>Keep-awake.</strong> Off

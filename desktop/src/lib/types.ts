@@ -169,7 +169,11 @@ export interface NodeConfig {
    */
   autoInstallUpdates: boolean;
   dataDir: string;
-  /** Cores the node may use. null = every logical core. */
+  /**
+   * Cores the node may use. null = every logical core. Native code owns it
+   * once stored: the Settings slider sets it, and a setup that turns compute
+   * on without one stores `defaultWorkerThreads` of the logical cores.
+   */
   workerThreads: number | null;
   /**
    * Answer to "contribute compute": true lets the app download the model and
@@ -193,6 +197,16 @@ export function computeContributionEnabled(
   if (config.computeConsent === true) return true;
   if (config.computeConsent === false) return false;
   return config.role === "worker" && !!config.modelPath;
+}
+
+/**
+ * The core cap a setup that turns compute on stores when none is stored yet:
+ * a quarter of the logical cores, rounded down, and at least one. Mirrors
+ * `commands::default_worker_threads`, which applies it natively.
+ */
+export function defaultWorkerThreads(logicalCores: number): number {
+  const cores = Number.isFinite(logicalCores) ? logicalCores : 0;
+  return Math.max(1, Math.floor(cores / 4));
 }
 
 /**

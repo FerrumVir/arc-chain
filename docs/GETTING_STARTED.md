@@ -126,26 +126,37 @@ offline backup: ARC Node has no “forgot password” recovery.
 
 Click **Continue**.
 
-### Screen 3: Pick a model or observer mode
+### Screen 3: Share your computer's spare power
 
-Choose whether to download a model:
+This screen says what contributing compute does and has one switch,
+**Contribute compute**. It starts on when the computer meets the app's memory
+requirement for the exact network model (the model is marked **Recommended**)
+and off otherwise. Skip turns it off too.
 
-- **Worker candidate**: the node can advertise compute only after the complete
-  artifact loads. It is eligible only for requests carrying that exact artifact
-  ID. This does not guarantee peers, assignment, verification, or payment.
-- **Observer/router**: no local model execution. It can still query the selected
-  coordinator and follow whatever chain services the approved rollout enables.
+- **On (worker candidate)**: ARC Node uses up to a quarter of the processor
+  cores for AI jobs while the app is open. The node can advertise compute only
+  after the complete artifact loads. It is eligible only for requests carrying
+  that exact artifact ID. This does not guarantee peers, assignment,
+  verification, or payment.
+- **Off (observer/router)**: no local model execution. It can still query the
+  selected coordinator and follow whatever chain services the approved rollout
+  enables.
 
-Click **Continue** after choosing the exact network model or observer/router
-mode.
+You can change either answer later: **Settings → Contribute compute** turns it
+on or off, and **Settings → Compute contribution** sets how many cores jobs
+may use. Click **Continue**.
 
 ### Screen 4: Launch
 
-Review the role and ports, then click **Start my node**. The app downloads
-the chosen model and node build, starts the process, and attempts a configured
-coordinator connection. It does **not** silently request faucet credit; use the
-Wallet screen's explicit **Claim from faucet** action after onboarding if you
-want testnet ARC. Startup and connectivity are reported separately.
+Review the summary, then click **Start my node**. The app downloads the node
+build, starts the process, and attempts a configured coordinator connection.
+With Contribute compute on, it then downloads the model in the background and
+restarts the node as a worker once the model is verified; setup does not wait
+for that download. A model chosen on a computer below the memory requirement
+downloads before the node starts instead. It does **not** silently request
+faucet credit; use the Wallet screen's explicit **Claim from faucet** action
+after onboarding if you want testnet ARC. Startup and connectivity are reported
+separately.
 
 If the node can't start, setup doesn't stop there: click **Continue to ARC**
 (or **Try again**). ARC opens on Home, and the one-line node strip at the top
@@ -316,7 +327,9 @@ RAM figure. An observer needs no model. The current full-model worker target is
 about 4 GB on disk. The release has not established a minimum-RAM figure; prove
 a complete model load and inference on the target host while leaving OS and
 chain headroom. **Settings → Compute contribution** controls the worker thread
-ceiling, not a reward multiplier.
+ceiling, not a reward multiplier. A setup that turns compute on starts that
+ceiling at a quarter of the logical cores (at least one); an install that
+already has a ceiling keeps it.
 
 **How do I update?**
 

@@ -249,7 +249,8 @@ export async function seedOnboardedWithoutConfig(page: Page) {
  * they stalled on "Pick your model" and failed.
  *
  * Picks "skip" (verifier-only), which keeps the walk fast and implies no
- * GGUF download.
+ * GGUF download. The compute step starts on where the model is recommended,
+ * as in the mock, so Skip is what turns it off here.
  */
 export async function walkToLaunch(page: Page) {
   await page.getByTestId("btn-continue-welcome").click();
