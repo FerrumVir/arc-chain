@@ -71,6 +71,61 @@ test.describe("Memory guard pause with a reason naming an inherited property", (
   }
 });
 
+// The same hardening for the worker **state** field: an inherited property name falls back to
+// the existing "Running" (before, "__proto__" crashed the dashboard and "toString" blanked it).
+test.describe("Worker state naming an inherited property", () => {
+  for (const state of ["toString", "__proto__", "constructor", "hasOwnProperty", "valueOf"]) {
+    for (const [width, height] of [
+      [960, 640],
+      [1180, 780],
+    ] as const) {
+      test(`state "${state}" at ${width}x${height} shows "Running" and the dashboard keeps working`, async ({ page }) => {
+        const errors: string[] = [];
+        page.on("pageerror", (error) => errors.push(error.message));
+        await page.setViewportSize({ width, height });
+        const card = await openWith(page, status(state, { memoryGuardState: "paused_low_memory" }));
+        await expect(card.getByTestId("worker-jobs-state")).toHaveText("Running");
+        // Not paused: guard details are not shown for an unrecognized state.
+        await expect(card.getByTestId("worker-jobs-detail")).not.toContainText("While paused");
+        await expect(page.getByTestId("error-boundary")).toHaveCount(0);
+        await expect(card.getByTestId("worker-jobs-completed")).toHaveText("7");
+        await page.getByTestId("nav-settings").click();
+        await expect(page.getByTestId("compute-consent-toggle")).toBeVisible();
+        await page.getByTestId("nav-dashboard").click();
+        await expect(page.getByTestId("worker-jobs-state")).toHaveText("Running");
+        expect(errors, errors.join("\n")).toEqual([]);
+        if (state === "toString" || state === "__proto__") {
+          await page.locator("#boot").waitFor({ state: "detached" });
+          await card.scrollIntoViewIfNeeded();
+          const name = state === "__proto__" ? "proto" : state;
+          await card.screenshot({ path: `test-results/worker-guard-preview/worker-state-${name}-${width}x${height}.png` });
+          await page.screenshot({ path: `test-results/worker-guard-preview/worker-state-${name}-${width}x${height}-page.png` });
+        }
+      });
+    }
+  }
+
+  for (const [width, height] of [
+    [960, 640],
+    [1180, 780],
+  ] as const) {
+    test(`recognized states keep their labels at ${width}x${height}`, async ({ page }) => {
+      await page.setViewportSize({ width, height });
+      for (const [state, copy] of [
+        ["polling", "Ready: waiting for a job"],
+        ["computing", "Computing a job now"],
+        ["reconnecting", "Reconnecting to coordinators"],
+        ["paused_memory_guard", "Paused: not enough free memory for new jobs"],
+        ["some_future_state", "Running"],
+      ] as const) {
+        const card = await openWith(page, status(state, { memoryGuardState: "paused_low_memory" }));
+        await expect(card.getByTestId("worker-jobs-state")).toHaveText(copy);
+      }
+      await expect(page.getByTestId("error-boundary")).toHaveCount(0);
+    });
+  }
+});
+
 test.describe("Memory guard pause on the dashboard", () => {
   for (const [guardState, check, copy] of [
     ["paused_low_memory", "ok", "Paused: not enough free memory for new jobs"],
