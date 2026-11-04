@@ -35,6 +35,8 @@ pub enum WorkerState {
     Computing,
     /// No coordinator answered the last claim round; retrying with backoff.
     Reconnecting,
+    /// The memory guard (`--memory-guard`) paused claims; `memory_guard.state` says why.
+    PausedMemoryGuard,
 }
 
 impl WorkerState {
@@ -43,6 +45,7 @@ impl WorkerState {
             Self::Polling => 0,
             Self::Computing => 1,
             Self::Reconnecting => 2,
+            Self::PausedMemoryGuard => 3,
         }
     }
 
@@ -50,6 +53,7 @@ impl WorkerState {
         match value {
             1 => Self::Computing,
             2 => Self::Reconnecting,
+            3 => Self::PausedMemoryGuard,
             _ => Self::Polling,
         }
     }
@@ -85,6 +89,7 @@ pub struct CommunityWorkerStatus {
     jobs_declined: AtomicU64,
     last_job_completed_unix_ms: AtomicU64,
     last_registration_unix_ms: AtomicU64,
+    memory_guard: OnceLock<Arc<crate::memory_guard::MemoryGuard>>,
 }
 
 /// What `GET /community/worker/status` returns.
@@ -110,6 +115,9 @@ pub struct CommunityWorkerSnapshot {
     pub last_registration_unix_ms: Option<u64>,
     pub started_unix_ms: u64,
     pub prevent_sleep_during_jobs: bool,
+    /// Present only when `--memory-guard` is on. Absent means no memory protection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_guard: Option<crate::memory_guard::MemoryGuardStatus>,
 }
 
 fn unix_ms_now() -> u64 {
@@ -145,7 +153,13 @@ impl CommunityWorkerStatus {
             jobs_declined: AtomicU64::new(0),
             last_job_completed_unix_ms: AtomicU64::new(0),
             last_registration_unix_ms: AtomicU64::new(0),
+            memory_guard: OnceLock::new(),
         }
+    }
+
+    /// Report this memory guard's status in snapshots. The first guard attached wins.
+    pub fn attach_memory_guard(&self, guard: Arc<crate::memory_guard::MemoryGuard>) {
+        let _ = self.memory_guard.set(guard);
     }
 
     pub fn set_state(&self, state: WorkerState) {
@@ -207,6 +221,7 @@ impl CommunityWorkerStatus {
             ),
             started_unix_ms: self.started_unix_ms,
             prevent_sleep_during_jobs: self.prevent_sleep_during_jobs,
+            memory_guard: self.memory_guard.get().map(|guard| guard.status()),
         }
     }
 }
@@ -521,6 +536,59 @@ impl Drop for KeepAwake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_guard_state_and_status_appear_only_when_a_guard_is_attached() {
+        use crate::memory_guard::{
+            MemoryGuard, MemoryGuardPolicy, MemoryProbe, ProbeFailurePolicy, ProbeOutcome,
+        };
+        for state in [
+            WorkerState::Polling,
+            WorkerState::Computing,
+            WorkerState::Reconnecting,
+            WorkerState::PausedMemoryGuard,
+        ] {
+            assert_eq!(WorkerState::decode(state.encode()), state);
+        }
+        let status = CommunityWorkerStatus::new("0xabc", "node-abc", 1, false);
+        let json = serde_json::to_value(status.snapshot()).unwrap();
+        assert!(
+            json.get("memory_guard").is_none(),
+            "no guard attached: nothing claims memory protection"
+        );
+
+        status.set_state(WorkerState::PausedMemoryGuard);
+        assert_eq!(
+            serde_json::to_value(status.snapshot()).unwrap()["state"],
+            "paused_memory_guard"
+        );
+
+        struct Fails;
+        impl MemoryProbe for Fails {
+            fn read(&self) -> ProbeOutcome {
+                ProbeOutcome::Failed("synthetic".into())
+            }
+        }
+        let guard = Arc::new(MemoryGuard::new(
+            MemoryGuardPolicy {
+                headroom_bytes: 1,
+                resume_hysteresis_bytes: 0,
+                resume_consecutive_reads: 1,
+                recheck_interval: Duration::from_secs(1),
+                decline_backoff_after: None,
+                decline_backoff: Duration::ZERO,
+                on_probe_failure: ProbeFailurePolicy::Pause,
+            },
+            Box::new(Fails),
+        ));
+        guard.before_claim(Instant::now());
+        status.attach_memory_guard(guard);
+        let json = serde_json::to_value(status.snapshot()).unwrap();
+        assert_eq!(json["memory_guard"]["state"], "paused_memory_check_failed");
+        assert_eq!(json["memory_guard"]["memory_check"], "failed");
+        assert_eq!(json["memory_guard"]["probe_failures"], 1);
+        assert_eq!(json["memory_guard"]["headroom_bytes"], 1);
+    }
 
     #[test]
     fn snapshot_counts_claims_completions_verifications_and_failures() {
