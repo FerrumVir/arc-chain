@@ -587,61 +587,138 @@ pub fn linux_reading(read_file: &dyn Fn(&str) -> std::io::Result<Option<String>>
         Ok(None) => CgroupLocation::None,
         Err(error) => return ProbeOutcome::Failed(format!("/proc/self/cgroup: {error}")),
     };
-    let (limit_path, usage_path) = match &location {
-        CgroupLocation::V2(path) => {
-            let base = format!("/sys/fs/cgroup{}", path.trim_end_matches('/'));
-            (
-                format!("{base}/memory.max"),
-                format!("{base}/memory.current"),
-            )
-        }
-        CgroupLocation::V1(path) => {
-            let base = format!("/sys/fs/cgroup/memory{}", path.trim_end_matches('/'));
-            (
-                format!("{base}/memory.limit_in_bytes"),
-                format!("{base}/memory.usage_in_bytes"),
-            )
-        }
-        CgroupLocation::None => {
-            return ProbeOutcome::Reading(MemoryReading {
-                available,
-                total,
-                source,
-                cgroup_headroom: None,
+    let headroom = match &location {
+        CgroupLocation::None => Ok(None),
+        CgroupLocation::V2(path) => cgroup_v2_headroom(read_file, path),
+        CgroupLocation::V1(path) => cgroup_v1_headroom(read_file, path),
+    };
+    match headroom {
+        Ok(cgroup_headroom) => ProbeOutcome::Reading(MemoryReading {
+            available,
+            total,
+            source,
+            cgroup_headroom,
+        }),
+        Err(error) => ProbeOutcome::Failed(error),
+    }
+}
+
+/// The cgroup and each ancestor up to this cgroup namespace's root, leaf first:
+/// `/a/b` gives `["/a/b", "/a", "/"]`. A path with `..` lies outside this namespace (its
+/// limits are not visible here), and a relative path is not a cgroup path: both are errors,
+/// never guessed at.
+pub fn cgroup_levels(path: &str) -> Result<Vec<String>, String> {
+    if !path.starts_with('/') {
+        return Err(format!("cgroup path {path:?} is not absolute"));
+    }
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.iter().any(|part| *part == ".." || *part == ".") {
+        return Err(format!(
+            "cgroup path {path:?} lies outside this cgroup namespace; its limits are not visible"
+        ));
+    }
+    Ok((0..=parts.len())
+        .rev()
+        .map(|n| format!("/{}", parts[..n].join("/")))
+        .collect())
+}
+
+/// One cgroup level's headroom: `None` when it sets no limit (the limit file is absent, as
+/// where the memory controller is not enabled, or reads `max`), else limit − usage (0 when
+/// over). An unreadable or unparsable file, or a limit without its usage file, is an error.
+fn cgroup_level_headroom(
+    read_file: &dyn Fn(&str) -> std::io::Result<Option<String>>,
+    dir: &str,
+    limit_file: &str,
+    usage_file: &str,
+) -> Result<Option<u64>, String> {
+    let limit_path = format!("{dir}/{limit_file}");
+    let limit = match read_file(&limit_path) {
+        Ok(None) => None,
+        Ok(Some(text)) => parse_cgroup_limit(&text)?,
+        Err(error) => return Err(format!("{limit_path}: {error}")),
+    };
+    let Some(limit) = limit else { return Ok(None) };
+    let usage_path = format!("{dir}/{usage_file}");
+    match read_file(&usage_path) {
+        Ok(Some(text)) => Ok(cgroup_headroom(Some(limit), parse_cgroup_usage(&text)?)),
+        Ok(None) => Err(format!("{usage_path} is missing while a limit is set")),
+        Err(error) => Err(format!("{usage_path}: {error}")),
+    }
+}
+
+fn min_headroom(levels: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
+    levels.into_iter().flatten().min()
+}
+
+/// cgroup v2: the smallest headroom of the leaf and every ancestor up to the namespace root.
+/// An ancestor's `memory.current` counts all its descendants, so a parent near its limit
+/// bounds the leaf even when the leaf itself is unlimited.
+pub fn cgroup_v2_headroom(
+    read_file: &dyn Fn(&str) -> std::io::Result<Option<String>>,
+    path: &str,
+) -> Result<Option<u64>, String> {
+    let mut levels = Vec::new();
+    for level in cgroup_levels(path)? {
+        let dir = format!("/sys/fs/cgroup{}", level.trim_end_matches('/'));
+        levels.push(cgroup_level_headroom(
+            read_file,
+            &dir,
+            "memory.max",
+            "memory.current",
+        )?);
+    }
+    Ok(min_headroom(levels))
+}
+
+/// `hierarchical_memory_limit` from a v1 `memory.stat`: `None` when the key is absent.
+pub fn parse_memory_stat_hierarchical_limit(text: &str) -> Result<Option<u64>, String> {
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some("hierarchical_memory_limit") {
+            let value = parts.next().unwrap_or_default();
+            return value.parse::<u64>().map(Some).map_err(|_| {
+                format!("memory.stat: unparsable hierarchical_memory_limit {value:?}")
             });
         }
-    };
-    let limit = match read_file(&limit_path) {
-        // The controller is listed but its files are not visible here (for example a
-        // cgroup namespace without the memory controller mounted): no limit to apply.
+    }
+    Ok(None)
+}
+
+/// cgroup v1: the smallest headroom of the leaf and every ancestor up to the namespace root
+/// (`memory.limit_in_bytes` against `memory.usage_in_bytes`), and of the leaf's
+/// `hierarchical_memory_limit` (`memory.stat`) against the leaf's usage.
+pub fn cgroup_v1_headroom(
+    read_file: &dyn Fn(&str) -> std::io::Result<Option<String>>,
+    path: &str,
+) -> Result<Option<u64>, String> {
+    let mut levels = Vec::new();
+    let leaf_dir = format!("/sys/fs/cgroup/memory{}", path.trim_end_matches('/'));
+    for level in cgroup_levels(path)? {
+        let dir = format!("/sys/fs/cgroup/memory{}", level.trim_end_matches('/'));
+        levels.push(cgroup_level_headroom(
+            read_file,
+            &dir,
+            "memory.limit_in_bytes",
+            "memory.usage_in_bytes",
+        )?);
+    }
+    let stat_path = format!("{leaf_dir}/memory.stat");
+    let hierarchical = match read_file(&stat_path) {
         Ok(None) => None,
-        Ok(Some(text)) => match parse_cgroup_limit(&text) {
-            Ok(limit) => limit,
-            Err(error) => return ProbeOutcome::Failed(error),
-        },
-        Err(error) => return ProbeOutcome::Failed(format!("{limit_path}: {error}")),
+        Ok(Some(text)) => parse_memory_stat_hierarchical_limit(&text)?,
+        Err(error) => return Err(format!("{stat_path}: {error}")),
     };
-    let cgroup_headroom = match limit {
-        None => None,
-        Some(limit) => match read_file(&usage_path) {
-            Ok(Some(text)) => match parse_cgroup_usage(&text) {
-                Ok(usage) => cgroup_headroom(Some(limit), usage),
-                Err(error) => return ProbeOutcome::Failed(error),
-            },
-            Ok(None) => {
-                return ProbeOutcome::Failed(format!(
-                    "{usage_path} is missing while a limit is set"
-                ));
-            }
-            Err(error) => return ProbeOutcome::Failed(format!("{usage_path}: {error}")),
-        },
-    };
-    ProbeOutcome::Reading(MemoryReading {
-        available,
-        total,
-        source,
-        cgroup_headroom,
-    })
+    if let Some(limit) = hierarchical {
+        let usage_path = format!("{leaf_dir}/memory.usage_in_bytes");
+        let usage = match read_file(&usage_path) {
+            Ok(Some(text)) => parse_cgroup_usage(&text)?,
+            Ok(None) => return Err(format!("{usage_path} is missing while a limit is set")),
+            Err(error) => return Err(format!("{usage_path}: {error}")),
+        };
+        levels.push(cgroup_headroom(Some(limit), usage));
+    }
+    Ok(min_headroom(levels))
 }
 
 /// macOS available bytes from `host_statistics64` page counts, as sysinfo computes it:
@@ -1337,6 +1414,179 @@ mod tests {
             read(&[("/sys/fs/cgroup/worker.slice/memory.max", "1024")]),
             ProbeOutcome::Failed(_)
         ));
+    }
+
+    /// Reviewer's #228 reproductions plus ancestor usage, v1 hierarchy and namespace edges.
+    fn v2(path: &str, extra: &[(&str, &str)]) -> ProbeOutcome {
+        let cgroup = format!("0::{path}\n");
+        let mut all = vec![
+            ("/proc/meminfo", MEMINFO),
+            ("/proc/self/cgroup", cgroup.as_str()),
+        ];
+        all.extend_from_slice(extra);
+        linux_reading(&files(&all))
+    }
+
+    fn effective(outcome: ProbeOutcome) -> u64 {
+        match outcome {
+            ProbeOutcome::Reading(reading) => reading.effective_available(),
+            ProbeOutcome::Failed(error) => panic!("expected a reading, got {error}"),
+        }
+    }
+
+    #[test]
+    fn linux_v2_parent_limit_bounds_an_unlimited_leaf() {
+        // Parent 1 GiB with 256 MiB used, leaf unlimited: 768 MiB, not the host's 7.6 GiB.
+        let out = v2(
+            "/worker.slice/arc.service",
+            &[
+                ("/sys/fs/cgroup/worker.slice/memory.max", "1073741824\n"),
+                ("/sys/fs/cgroup/worker.slice/memory.current", "268435456\n"),
+                (
+                    "/sys/fs/cgroup/worker.slice/arc.service/memory.max",
+                    "max\n",
+                ),
+                (
+                    "/sys/fs/cgroup/worker.slice/arc.service/memory.current",
+                    "268435456\n",
+                ),
+            ],
+        );
+        assert_eq!(effective(out), 768 * MIB);
+    }
+
+    #[test]
+    fn linux_v2_parent_limit_below_a_larger_leaf_limit_wins() {
+        let out = v2(
+            "/worker.slice/arc.service",
+            &[
+                ("/sys/fs/cgroup/worker.slice/memory.max", "1073741824"),
+                ("/sys/fs/cgroup/worker.slice/memory.current", "0"),
+                (
+                    "/sys/fs/cgroup/worker.slice/arc.service/memory.max",
+                    "4294967296",
+                ),
+                (
+                    "/sys/fs/cgroup/worker.slice/arc.service/memory.current",
+                    "0",
+                ),
+            ],
+        );
+        assert_eq!(effective(out), GIB);
+    }
+
+    #[test]
+    fn linux_v2_ancestor_usage_counts_siblings_and_deeper_levels_and_the_tightest_wins() {
+        // The leaf has room, but the parent's usage (all its children) leaves 124 MiB; the
+        // grandparent, with a bigger limit, has more.
+        let out = v2(
+            "/a/b/c",
+            &[
+                ("/sys/fs/cgroup/a/memory.max", "8589934592"),
+                ("/sys/fs/cgroup/a/memory.current", "1073741824"),
+                ("/sys/fs/cgroup/a/b/memory.max", "1073741824"),
+                ("/sys/fs/cgroup/a/b/memory.current", "943718400"),
+                ("/sys/fs/cgroup/a/b/c/memory.max", "4294967296"),
+                ("/sys/fs/cgroup/a/b/c/memory.current", "104857600"),
+            ],
+        );
+        assert_eq!(effective(out), 124 * MIB);
+        // A level without memory.max (controller not enabled there) sets no limit.
+        let out = v2(
+            "/a/b",
+            &[
+                ("/sys/fs/cgroup/a/memory.max", "2147483648"),
+                ("/sys/fs/cgroup/a/memory.current", "0"),
+            ],
+        );
+        assert_eq!(effective(out), 2 * GIB);
+    }
+
+    #[test]
+    fn linux_namespace_root_and_inaccessible_ancestors_are_never_guessed() {
+        // At the namespace root: nothing visible to apply; the host figure is used.
+        let ProbeOutcome::Reading(r) = v2("/", &[]) else {
+            panic!("expected a reading")
+        };
+        assert_eq!(r.cgroup_headroom, None);
+        // A cgroup outside this namespace ("/.." in /proc/self/cgroup): Failed, not host memory.
+        assert!(
+            matches!(v2("/../../outside", &[]), ProbeOutcome::Failed(e) if e.contains("outside this cgroup namespace"))
+        );
+        assert!(matches!(v2("relative", &[]), ProbeOutcome::Failed(_)));
+        // An ancestor whose limit can't be read: Failed, never inferred.
+        let read = |path: &str| -> std::io::Result<Option<String>> {
+            match path {
+                "/proc/meminfo" => Ok(Some(MEMINFO.into())),
+                "/proc/self/cgroup" => Ok(Some("0::/slice/leaf\n".into())),
+                "/sys/fs/cgroup/slice/memory.max" => {
+                    Err(std::io::Error::other("permission denied"))
+                }
+                _ => Ok(None),
+            }
+        };
+        assert!(
+            matches!(linux_reading(&read), ProbeOutcome::Failed(e) if e.contains("permission denied"))
+        );
+        assert_eq!(cgroup_levels("/a/b").unwrap(), vec!["/a/b", "/a", "/"]);
+        assert_eq!(cgroup_levels("/").unwrap(), vec!["/"]);
+    }
+
+    #[test]
+    fn linux_v1_ancestors_and_hierarchical_limit() {
+        let cgroup = "9:memory:/docker/abc\n";
+        let base = [("/proc/meminfo", MEMINFO), ("/proc/self/cgroup", cgroup)];
+        let read = |extra: &[(&str, &str)]| {
+            let mut all = base.to_vec();
+            all.extend_from_slice(extra);
+            linux_reading(&files(&all))
+        };
+        const UNLIMITED: &str = "9223372036854771712";
+        // Parent limit 1 GiB with an unlimited leaf: the parent bounds it.
+        let out = read(&[
+            (
+                "/sys/fs/cgroup/memory/docker/memory.limit_in_bytes",
+                "1073741824",
+            ),
+            (
+                "/sys/fs/cgroup/memory/docker/memory.usage_in_bytes",
+                "536870912",
+            ),
+            (
+                "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+                UNLIMITED,
+            ),
+            (
+                "/sys/fs/cgroup/memory/docker/abc/memory.usage_in_bytes",
+                "268435456",
+            ),
+        ]);
+        assert_eq!(effective(out), 512 * MIB);
+        // hierarchical_memory_limit (use_hierarchy) below every visible level limit wins.
+        let out = read(&[
+            (
+                "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+                UNLIMITED,
+            ),
+            (
+                "/sys/fs/cgroup/memory/docker/abc/memory.usage_in_bytes",
+                "268435456",
+            ),
+            (
+                "/sys/fs/cgroup/memory/docker/abc/memory.stat",
+                "cache 0\nhierarchical_memory_limit 1073741824\nrss 1\n",
+            ),
+        ]);
+        assert_eq!(effective(out), 768 * MIB);
+        // An unparsable hierarchical limit is Failed.
+        assert!(matches!(
+            read(&[(
+                "/sys/fs/cgroup/memory/docker/abc/memory.stat",
+                "hierarchical_memory_limit lots"
+            )]),
+            ProbeOutcome::Failed(_)
+        ));
+        assert_eq!(parse_memory_stat_hierarchical_limit("cache 1\n"), Ok(None));
     }
 
     #[test]

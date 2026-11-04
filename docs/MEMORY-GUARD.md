@@ -21,7 +21,7 @@ Everything below happens after the model is loaded, inside `arc-node`. It applie
 |---|---|---|
 | macOS | `host_statistics64(HOST_VM_INFO64)` plus `sysctl hw.memsize`. Available is `free + inactive + purgeable − compressor` pages. Under heavy compression this saturates to 0, which is a real low reading. | not `KERN_SUCCESS`; sysctl failure |
 | Windows | `GlobalMemoryStatusEx` | `FALSE`; total of 0 |
-| Linux | `/proc/meminfo` `MemAvailable`, or the pre-3.14 estimate when it's absent; the source is recorded. With a memory cgroup (v2 or v1), the figure used is `min(host available, limit − usage)`. | unreadable or unparsable files. `"max"` means no limit, never `u64::MAX`. |
+| Linux | `/proc/meminfo` `MemAvailable`, or the pre-3.14 estimate when it's absent; the source is recorded. With a memory cgroup, the figure used is the minimum of host available memory and the headroom (`limit − usage`) of the process's cgroup **and every ancestor up to the cgroup namespace root**. An ancestor's usage counts all its descendants. For v1 the leaf's `hierarchical_memory_limit` also applies. A level without a limit file, or with `max`, sets no limit there. | unreadable or unparsable files, including an ancestor's: its limit is never inferred from host memory. A cgroup path outside this namespace (`/..`). `"max"` means no limit, never `u64::MAX`. |
 
 **What a job is charged.** All arithmetic is checked. A requirement that doesn't fit in a `u64` is declined as "job memory requirement not representable"; it never saturates.
 - **KV:** `required_positions × 2 × n_layers × d_kv × 8`, from the loaded model's config. For the Llama-2-7B shape that is 2 MiB per position.
@@ -59,6 +59,16 @@ The numbers above are **examples for testing the mechanism**. They are not recom
   "probe_failures": 0, "backoffs": 0
 }
 ```
+
+## Limitations (not resolved here)
+
+- **Model loading is not covered.** This needs the launch gate (G1).
+- **Allocation failure.** The KV reservation uses `Vec::with_capacity`. If memory runs out after admission (another program took it), the allocation failure aborts the process, as the existing growth path does. `try_reserve_exact` could turn this into a clean decline; that is not done here.
+- **Malformed cgroup membership.** An unparsable `/proc/self/cgroup` is read as "no cgroup", so host memory alone is used. It is not reported as `Failed`.
+- **Limits above the cgroup namespace root are not visible** from inside the namespace, and they are not guessed. Host available memory still bounds the figure.
+- **Conservative readings.** cgroup usage includes reclaimable page cache, so headroom reads low. The v1 "unlimited" sentinel reads as a very large limit, which is harmless.
+- **Memory taken between admission and compute, or during a job,** is not prevented; it is seen at the next decision.
+- **Desktop status.** The desktop shows unknown states as "Running", so `paused_memory_guard` would read as Running. A truthful status mapping is an **activation prerequisite**.
 
 ## Proposed policy for TJ (not decided; values unmeasured)
 

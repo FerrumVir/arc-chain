@@ -589,31 +589,36 @@ struct Cli {
     prevent_sleep_during_jobs: bool,
 
     /// Memory headroom guard for the community worker (ARC-410 L7). Off by default, and a
-    /// guard that is off protects nothing. When on, every value below must be given
-    /// explicitly: no production value has been decided or measured, so none is built in.
-    /// It pauses claims while available memory is below the headroom, and declines (without
-    /// computing or retrying) a job whose KV cache + working memory + headroom does not fit.
-    /// It does not cover loading the model.
+    /// guard that is off protects nothing. When on, five values are required, with no
+    /// defaults because none has been decided or measured: --memory-guard-headroom-bytes,
+    /// --memory-guard-resume-hysteresis-bytes, --memory-guard-resume-reads,
+    /// --memory-guard-recheck-secs and --memory-guard-on-probe-failure. The decline back-off
+    /// pair (--memory-guard-decline-backoff-after, --memory-guard-decline-backoff-secs) is
+    /// optional: give both or neither. It pauses claims while available memory is below the
+    /// headroom, and declines (without computing or retrying) a job whose KV cache + working
+    /// memory + headroom does not fit. It does not cover loading the model.
     #[arg(long, default_value_t = false)]
     memory_guard: bool,
 
-    /// Memory guard: bytes to leave free for the OS and other programs.
+    /// Memory guard (required with --memory-guard): bytes to leave free for the OS and other
+    /// programs.
     #[arg(long, value_name = "BYTES")]
     memory_guard_headroom_bytes: Option<u64>,
 
-    /// Memory guard: extra bytes above the headroom required before a low-memory pause ends.
+    /// Memory guard (required): extra bytes above the headroom before a low-memory pause ends.
     #[arg(long, value_name = "BYTES")]
     memory_guard_resume_hysteresis_bytes: Option<u64>,
 
-    /// Memory guard: consecutive reads above headroom + hysteresis before a pause ends (>= 1).
+    /// Memory guard (required): consecutive reads above headroom + hysteresis before a pause
+    /// ends (>= 1).
     #[arg(long, value_name = "N")]
     memory_guard_resume_reads: Option<u32>,
 
-    /// Memory guard: seconds between memory reads while claims are paused (>= 1).
+    /// Memory guard (required): seconds between memory reads while claims are paused (>= 1).
     #[arg(long, value_name = "SECS")]
     memory_guard_recheck_secs: Option<u64>,
 
-    /// Memory guard: what to do when the memory probe fails. `proceed` behaves as if the
+    /// Memory guard (required): what to do when the memory probe fails. `proceed` behaves as if the
     /// guard were off while the probe fails; `pause` stops claims and declines at admission.
     #[arg(long, value_name = "POLICY", value_parser = ["proceed", "pause"])]
     memory_guard_on_probe_failure: Option<String>,
@@ -6105,6 +6110,107 @@ fn memory_guard_policy_from_cli(
     }))
 }
 
+/// What the claim loop does after the memory guard's step before a claim round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClaimGate {
+    Claim,
+    /// Paused for this round (after sleeping); the loop starts the next round.
+    Paused,
+    /// The runtime is shutting down; the loop stops.
+    Shutdown,
+}
+
+/// The memory guard's step before each claim round, exactly as the claim loop runs it. No
+/// guard: claim. A pause: report `PausedMemoryGuard`, sleep (shutdown-aware) and return
+/// `Paused`. The first claim after a pause reports `Polling` again.
+async fn memory_guard_claim_gate<Sleep, SleepFuture>(
+    guard: Option<&arc_node::memory_guard::MemoryGuard>,
+    status: &arc_node::community_worker::CommunityWorkerStatus,
+    was_paused: &mut bool,
+    now: Instant,
+    sleep: Sleep,
+) -> ClaimGate
+where
+    Sleep: FnOnce(std::time::Duration) -> SleepFuture,
+    SleepFuture: std::future::Future<Output = bool>,
+{
+    use arc_node::community_worker::WorkerState;
+    use arc_node::memory_guard::ClaimDecision;
+    let Some(guard) = guard else {
+        return ClaimGate::Claim;
+    };
+    match guard.before_claim(now) {
+        ClaimDecision::Pause {
+            reason,
+            retry_after,
+        } => {
+            if !*was_paused {
+                tracing::warn!(?reason, "memory guard: claims paused");
+            }
+            *was_paused = true;
+            status.set_state(WorkerState::PausedMemoryGuard);
+            if sleep(retry_after).await {
+                ClaimGate::Shutdown
+            } else {
+                ClaimGate::Paused
+            }
+        }
+        ClaimDecision::Claim => {
+            if *was_paused {
+                tracing::info!("memory guard: claims resumed");
+                status.set_state(WorkerState::Polling);
+            }
+            *was_paused = false;
+            ClaimGate::Claim
+        }
+    }
+}
+
+/// The outcome of [`memory_guarded_compute`].
+enum Guarded<T> {
+    Computed(T),
+    Declined,
+}
+
+/// Memory-guard admission and then compute, exactly as the claim loop runs a preflighted
+/// job. A guard that declines: submit the declined result, return `Declined`, and never call
+/// `compute`. Otherwise call `compute` once, telling it to reserve the KV cache when a guard
+/// is on.
+#[allow(clippy::too_many_arguments)]
+async fn memory_guarded_compute<T, Submit, SubmitFuture, Compute, ComputeFuture>(
+    guard: Option<&arc_node::memory_guard::MemoryGuard>,
+    dims: &arc_node::memory_guard::ModelDims,
+    required_positions: Option<usize>,
+    max_tokens: u32,
+    job_id: &str,
+    worker_id: &str,
+    now: Instant,
+    submit_declined: Submit,
+    compute: Compute,
+) -> Guarded<T>
+where
+    Submit: FnOnce(rpc::WorkResult) -> SubmitFuture,
+    SubmitFuture: std::future::Future<Output = ()>,
+    Compute: FnOnce(bool) -> ComputeFuture,
+    ComputeFuture: std::future::Future<Output = T>,
+{
+    if let Some(guard) = guard
+        && let Some(declined) = memory_guard_decline(
+            guard,
+            dims,
+            required_positions,
+            max_tokens,
+            job_id,
+            worker_id,
+            now,
+        )
+    {
+        submit_declined(declined).await;
+        return Guarded::Declined;
+    }
+    Guarded::Computed(compute(guard.is_some()).await)
+}
+
 /// Memory-guard admission for one claimed, preflighted job: `Some(result)` to submit instead
 /// of computing (a declined result: no output, never retried by this worker), or `None` to
 /// compute. `required_positions` is the context preflight's count (`None` if it failed).
@@ -9714,28 +9820,21 @@ async fn run_arc_node() -> Result<()> {
                     // Memory guard (off unless configured): no claim while memory is below the
                     // headroom, or while a decline back-off or a failed probe (policy `pause`)
                     // holds claims.
-                    if let Some(guard) = memory_guard_w.as_ref() {
-                        match guard.before_claim(std::time::Instant::now()) {
-                            arc_node::memory_guard::ClaimDecision::Pause { reason, retry_after } => {
-                                if !memory_guard_paused {
-                                    tracing::warn!(?reason, "memory guard: claims paused");
-                                }
-                                memory_guard_paused = true;
-                                status_w.set_state(WorkerState::PausedMemoryGuard);
-                                if sleep_or_runtime_shutdown(&mut worker_shutdown, retry_after).await {
-                                    break;
-                                }
-                                continue;
-                            }
-                            arc_node::memory_guard::ClaimDecision::Claim => {
-                                if memory_guard_paused {
-                                    tracing::info!("memory guard: claims resumed");
-                                    status_w.set_state(WorkerState::Polling);
-                                }
-                                memory_guard_paused = false;
-                            }
+                    let shutdown = &mut worker_shutdown;
+                    let gate = memory_guard_claim_gate(
+                        memory_guard_w.as_deref(),
+                        &status_w,
+                        &mut memory_guard_paused,
+                        std::time::Instant::now(),
+                        move |pause| sleep_or_runtime_shutdown(shutdown, pause),
+                    )
+                    .await;
+                    let ClaimGate::Claim = gate else {
+                        if gate == ClaimGate::Shutdown {
+                            break;
                         }
-                    }
+                        continue;
+                    };
                     let claim_body = rpc::ClaimWorkRequest {
                         worker_id: worker_id_w.clone(),
                         capabilities: vec!["inference".to_string()],
@@ -10126,95 +10225,103 @@ async fn run_arc_node() -> Result<()> {
                             status_w.record_outcome(JobOutcome::Declined);
                             continue;
                         }
-                        // Memory guard admission (off unless configured): the job's exact KV
-                        // cache (reserved below) + working memory + headroom must fit in memory
-                        // read now. Otherwise decline before compute; the job is not retried.
-                        let use_reserved_kv = memory_guard_w.is_some();
-                        if let Some(guard) = memory_guard_w.as_ref() {
-                            let required_positions = inference_model
-                                .preflight_generation(inference_tokens.len(), max_tokens)
-                                .ok()
-                                .map(|admission| admission.required_positions);
-                            if let Some(failure) = memory_guard_decline(
-                                guard,
-                                &arc_node::memory_guard::ModelDims::from_config(&inference_model.config),
-                                required_positions,
-                                max_tokens,
-                                &job_id,
-                                &worker_id_w,
-                                std::time::Instant::now(),
-                            ) {
+                        // Memory guard admission, then compute (`memory_guarded_compute`): with
+                        // a guard that declines, the declined result is submitted and compute
+                        // is never called; the job is not retried. Off unless configured; with
+                        // the guard on, the KV cache is reserved for exactly what was charged.
+                        let required_positions = inference_model
+                            .preflight_generation(inference_tokens.len(), max_tokens)
+                            .ok()
+                            .map(|admission| admission.required_positions);
+                        let dims =
+                            arc_node::memory_guard::ModelDims::from_config(&inference_model.config);
+                        let worker_execution_for_compute = worker_execution_permit.clone();
+                        let compute_pool_for_job = compute_pool_w.clone();
+                        let compute_status = status_w.clone();
+                        let (submit_client, submit_winner, submit_keypair, submit_job) =
+                            (&client, &winner, &worker_keypair, job_id.as_str());
+                        let guarded = memory_guarded_compute(
+                            memory_guard_w.as_deref(),
+                            &dims,
+                            required_positions,
+                            max_tokens,
+                            &job_id,
+                            &worker_id_w,
+                            std::time::Instant::now(),
+                            move |failure| async move {
                                 tracing::warn!(
-                                    job_id,
-                                    seed = %winner,
+                                    job_id = submit_job,
+                                    seed = %submit_winner,
                                     reason = failure.error.as_deref().unwrap_or_default(),
                                     "declining community assignment before blocking compute"
                                 );
                                 let _ = submit_community_result_with_retry(
-                                    &client,
-                                    &winner,
+                                    submit_client,
+                                    submit_winner,
                                     &failure,
-                                    &worker_keypair,
+                                    submit_keypair,
                                     submission_deadline,
                                 )
                                 .await;
-                                status_w.record_outcome(JobOutcome::Declined);
-                                continue;
-                            }
-                        }
-                        let worker_execution_for_compute = worker_execution_permit.clone();
-                        let compute_pool_for_job = compute_pool_w.clone();
-                        status_w.set_state(WorkerState::Computing);
-                        let inference = tokio::task::spawn_blocking(move || {
-                            let _worker_execution_permit = worker_execution_for_compute;
-                            // Created and dropped on this compute thread (the
-                            // Windows request is per thread). Inert unless
-                            // --prevent-sleep-during-jobs was given.
-                            let _keep_awake = KeepAwake::begin(prevent_sleep_during_jobs);
-                            // Compute on the node's configured inference pool
-                            // (--threads, [inference] threads or POST
-                            // /node/threads); with none set, on rayon's global
-                            // pool as before. This thread waits for the job,
-                            // so the keep-awake request above stays in force.
-                            compute_pool_for_job.install(|| {
-                                // The fallible model API is authoritative at
-                                // this untrusted boundary. It performs checked
-                                // context admission immediately before
-                                // allocating KV state; even a tokenizer-expanded
-                                // prompt can only become a typed worker failure,
-                                // never an indexing panic.
-                                // With the memory guard on, the KV cache is reserved
-                                // for exactly the positions admission charged; same
-                                // tokens and hash either way.
-                                let generation = if use_reserved_kv {
-                                    inference_model.try_generate_with_reserved_kv(
-                                        &inference_tokens,
-                                        max_tokens,
-                                        &inference_model.config.eos_tokens,
-                                    )
-                                } else {
-                                    inference_model.try_generate(
-                                        &inference_tokens,
-                                        max_tokens,
-                                        &inference_model.config.eos_tokens,
-                                    )
-                                };
-                                let (generated, hash) = generation
-                                    .map_err(|error| {
-                                        let helper_admitted = community_generation_fits_context(
-                                            inference_tokens.len(),
-                                            max_tokens,
-                                            inference_model.config.max_seq,
-                                        );
-                                        format!(
-                                            "{error}; worker_context_helper_admitted={helper_admitted}"
-                                        )
-                                    })?;
-                                let output_text = inference_model.decode(&generated);
-                                Ok::<_, String>((generated, hash, output_text))
-                            })
-                        })
+                            },
+                            move |use_reserved_kv| {
+                                compute_status.set_state(WorkerState::Computing);
+                                tokio::task::spawn_blocking(move || {
+                                    let _worker_execution_permit = worker_execution_for_compute;
+                                    // Created and dropped on this compute thread (the
+                                    // Windows request is per thread). Inert unless
+                                    // --prevent-sleep-during-jobs was given.
+                                    let _keep_awake = KeepAwake::begin(prevent_sleep_during_jobs);
+                                    // Compute on the node's configured inference pool
+                                    // (--threads, [inference] threads or POST
+                                    // /node/threads); with none set, on rayon's global
+                                    // pool as before. This thread waits for the job,
+                                    // so the keep-awake request above stays in force.
+                                    compute_pool_for_job.install(|| {
+                                        // The fallible model API is authoritative at
+                                        // this untrusted boundary. It performs checked
+                                        // context admission immediately before
+                                        // allocating KV state; even a tokenizer-expanded
+                                        // prompt can only become a typed worker failure,
+                                        // never an indexing panic.
+                                        // With the memory guard on, the KV cache is reserved
+                                        // for exactly the positions admission charged; same
+                                        // tokens and hash either way.
+                                        let generation = if use_reserved_kv {
+                                            inference_model.try_generate_with_reserved_kv(
+                                                &inference_tokens,
+                                                max_tokens,
+                                                &inference_model.config.eos_tokens,
+                                            )
+                                        } else {
+                                            inference_model.try_generate(
+                                                &inference_tokens,
+                                                max_tokens,
+                                                &inference_model.config.eos_tokens,
+                                            )
+                                        };
+                                        let (generated, hash) = generation
+                                            .map_err(|error| {
+                                                let helper_admitted = community_generation_fits_context(
+                                                    inference_tokens.len(),
+                                                    max_tokens,
+                                                    inference_model.config.max_seq,
+                                                );
+                                                format!(
+                                                    "{error}; worker_context_helper_admitted={helper_admitted}"
+                                                )
+                                            })?;
+                                        let output_text = inference_model.decode(&generated);
+                                        Ok::<_, String>((generated, hash, output_text))
+                                    })
+                                })
+                            },
+                        )
                         .await;
+                        let Guarded::Computed(inference) = guarded else {
+                            status_w.record_outcome(JobOutcome::Declined);
+                            continue;
+                        };
                         status_w.set_state(WorkerState::Polling);
                         let (generated, hash, output_text) = match inference {
                             Ok(Ok(result)) => result,
@@ -10780,106 +10887,432 @@ mod tests {
         );
     }
 
-    /// A fake coordinator for the admission step: whatever the claim loop would submit
-    /// instead of computing, and how many computes ran.
-    #[derive(Default)]
-    struct FakeCoordinator {
-        submitted: Vec<rpc::WorkResult>,
-        computes: usize,
+    // ---- memory guard: the claim loop's own gate and admit-then-compute functions -----------
+    // Synthetic: a scripted probe, Instants as the clock, a fake coordinator (collects what
+    // would be submitted), fake compute (counts calls) and a fake sleep. No model, node,
+    // coordinator or memory reading of this machine.
+
+    use arc_node::community_worker::{CommunityWorkerStatus, WorkerState};
+    use arc_node::memory_guard::{
+        MemoryGuard, MemoryGuardPolicy, MemoryProbe, MemoryReading, ModelDims, ProbeFailurePolicy,
+        ProbeOutcome,
+    };
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::sync::Mutex as StdMutex;
+
+    const GIB: u64 = 1 << 30;
+    const DIMS: ModelDims = ModelDims {
+        n_layers: 32,
+        d_model: 4096,
+        d_kv: 4096,
+        d_ff: 11008,
+        vocab_size: 32000,
+    };
+
+    struct Scripted(StdMutex<(VecDeque<ProbeOutcome>, Option<ProbeOutcome>)>);
+    impl MemoryProbe for Scripted {
+        fn read(&self) -> ProbeOutcome {
+            let mut state = self.0.lock().unwrap();
+            if let Some(next) = state.0.pop_front() {
+                state.1 = Some(next);
+            }
+            state.1.clone().unwrap()
+        }
+    }
+    fn avail(bytes: u64) -> ProbeOutcome {
+        ProbeOutcome::Reading(MemoryReading {
+            available: bytes,
+            total: 16 * GIB,
+            source: "fake",
+            cgroup_headroom: None,
+        })
+    }
+    fn probe_failed() -> ProbeOutcome {
+        ProbeOutcome::Failed("synthetic".into())
+    }
+    fn test_guard(
+        script: Vec<ProbeOutcome>,
+        on_failure: ProbeFailurePolicy,
+        backoff: Option<(u32, u64)>,
+    ) -> MemoryGuard {
+        MemoryGuard::new(
+            MemoryGuardPolicy {
+                headroom_bytes: 2 * GIB,
+                resume_hysteresis_bytes: GIB / 2,
+                resume_consecutive_reads: 2,
+                recheck_interval: std::time::Duration::from_secs(30),
+                decline_backoff_after: backoff.map(|(after, _)| after),
+                decline_backoff: std::time::Duration::from_secs(
+                    backoff.map_or(0, |(_, secs)| secs),
+                ),
+                on_probe_failure: on_failure,
+            },
+            Box::new(Scripted(StdMutex::new((script.into(), None)))),
+        )
     }
 
-    impl FakeCoordinator {
-        /// The claim loop's admission step for one job: a decline is submitted and the
-        /// loop `continue`s before compute; otherwise the job computes once.
-        fn run_job(
-            &mut self,
-            guard: &arc_node::memory_guard::MemoryGuard,
-            required_positions: Option<usize>,
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    /// One claim round through the loop's own gate: (outcome, slept for, worker state).
+    fn gate_round(
+        guard: Option<&MemoryGuard>,
+        status: &CommunityWorkerStatus,
+        paused: &mut bool,
+        now: Instant,
+        shutdown: bool,
+    ) -> (ClaimGate, Option<std::time::Duration>, WorkerState) {
+        let slept = RefCell::new(None);
+        let outcome = block_on(memory_guard_claim_gate(
+            guard,
+            status,
+            paused,
+            now,
+            |pause| {
+                *slept.borrow_mut() = Some(pause);
+                std::future::ready(shutdown)
+            },
+        ));
+        (outcome, slept.into_inner(), status.snapshot().state)
+    }
+
+    /// The fake coordinator and compute around the loop's own admit-then-compute function.
+    #[derive(Default)]
+    struct FakeWorld {
+        submitted: RefCell<Vec<rpc::WorkResult>>,
+        computes: RefCell<Vec<bool>>,
+    }
+    impl FakeWorld {
+        /// Returns whether the job computed.
+        fn job(
+            &self,
+            guard: Option<&MemoryGuard>,
+            positions: Option<usize>,
             max_tokens: u32,
             now: Instant,
-        ) {
-            const DIMS: arc_node::memory_guard::ModelDims = arc_node::memory_guard::ModelDims {
-                n_layers: 32,
-                d_model: 4096,
-                d_kv: 4096,
-                d_ff: 11008,
-                vocab_size: 32000,
-            };
-            match memory_guard_decline(
+        ) -> bool {
+            let outcome = block_on(memory_guarded_compute(
                 guard,
                 &DIMS,
-                required_positions,
+                positions,
                 max_tokens,
                 "job-1",
                 "0xworker",
                 now,
-            ) {
-                Some(result) => self.submitted.push(result),
-                None => self.computes += 1,
-            }
+                |declined| {
+                    self.submitted.borrow_mut().push(declined);
+                    std::future::ready(())
+                },
+                |reserve| {
+                    self.computes.borrow_mut().push(reserve);
+                    std::future::ready("computed output")
+                },
+            ));
+            matches!(outcome, Guarded::Computed("computed output"))
         }
-    }
-
-    struct Fixed(u64);
-    impl arc_node::memory_guard::MemoryProbe for Fixed {
-        fn read(&self) -> arc_node::memory_guard::ProbeOutcome {
-            arc_node::memory_guard::ProbeOutcome::Reading(arc_node::memory_guard::MemoryReading {
-                available: self.0,
-                total: 16 << 30,
-                source: "fake",
-                cgroup_headroom: None,
-            })
-        }
-    }
-
-    fn fixed_guard(available: u64) -> arc_node::memory_guard::MemoryGuard {
-        arc_node::memory_guard::MemoryGuard::new(
-            arc_node::memory_guard::MemoryGuardPolicy {
-                headroom_bytes: 2 << 30,
-                resume_hysteresis_bytes: 0,
-                resume_consecutive_reads: 1,
-                recheck_interval: std::time::Duration::from_secs(30),
-                decline_backoff_after: None,
-                decline_backoff: std::time::Duration::ZERO,
-                on_probe_failure: arc_node::memory_guard::ProbeFailurePolicy::Pause,
-            },
-            Box::new(Fixed(available)),
-        )
     }
 
     #[test]
-    fn a_job_that_does_not_fit_is_declined_without_compute_and_not_retried() {
+    fn production_admission_declines_without_compute_output_or_attestation() {
         let now = Instant::now();
-        let mut coordinator = FakeCoordinator::default();
-        // 3 GiB free, 2 GiB headroom: a 1,000-position job needs ~2 GiB of KV alone.
-        let guard = fixed_guard(3 << 30);
-        coordinator.run_job(&guard, Some(1000), 256, now);
-        assert_eq!(coordinator.computes, 0);
-        assert_eq!(coordinator.submitted.len(), 1);
-        let declined = &coordinator.submitted[0];
+        let world = FakeWorld::default();
+        let guard = test_guard(vec![avail(3 * GIB)], ProbeFailurePolicy::Pause, None);
+        // ~2 GiB of KV for 1,000 positions + 2 GiB headroom > 3 GiB available.
+        assert!(!world.job(Some(&guard), Some(1000), 256, now));
+        assert!(
+            world.computes.borrow().is_empty(),
+            "compute must never run after a decline"
+        );
+        let submitted = world.submitted.borrow();
+        assert_eq!(submitted.len(), 1);
+        let declined = &submitted[0];
         assert!(declined.declined && !declined.success);
         assert!(declined.output.is_empty() && declined.output_hash.is_empty());
         assert_eq!(declined.tokens_generated, 0);
         assert!(declined.signed_attestation_hex.is_none());
-        assert!(declined.error.as_deref().unwrap().contains("memory guard"));
-        // The same job is never re-run by the worker: the next job is a new claim. A small one fits.
-        coordinator.run_job(&guard, Some(100), 32, now);
-        assert_eq!(coordinator.computes, 1);
-        assert_eq!(coordinator.submitted.len(), 1);
-        // A requirement that cannot be represented is declined, not computed.
-        coordinator.run_job(&guard, Some(usize::MAX), 32, now);
-        assert_eq!(coordinator.computes, 1);
         assert!(
-            coordinator.submitted[1]
+            declined
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("below headroom for this job")
+        );
+        drop(submitted);
+        // A job that fits computes once, with the KV cache reserved; nothing is submitted.
+        assert!(world.job(Some(&guard), Some(100), 32, now));
+        assert_eq!(*world.computes.borrow(), vec![true]);
+        assert_eq!(world.submitted.borrow().len(), 1);
+        // Unrepresentable and unknown requirements are declined, never computed.
+        assert!(!world.job(Some(&guard), Some(usize::MAX), 32, now));
+        assert!(!world.job(Some(&guard), None, 32, now));
+        assert_eq!(world.computes.borrow().len(), 1);
+        assert!(
+            world.submitted.borrow()[1]
                 .error
                 .as_deref()
                 .unwrap()
                 .contains("not representable")
         );
-        // A failed preflight count (None) is also never computed under the guard.
-        coordinator.run_job(&guard, None, 32, now);
-        assert_eq!(coordinator.computes, 1);
-        assert_eq!(coordinator.submitted.len(), 3);
+        // No guard: compute as before (no reservation), nothing submitted.
+        let off = FakeWorld::default();
+        assert!(off.job(None, Some(1000), 256, now));
+        assert_eq!(*off.computes.borrow(), vec![false]);
+        assert!(off.submitted.borrow().is_empty());
+    }
+
+    #[test]
+    fn production_gate_pauses_then_returns_to_polling() {
+        let t0 = Instant::now();
+        let status = CommunityWorkerStatus::new("0xw", "node-w", 1, false);
+        let mut paused = false;
+        // No guard: claim, never sleep, state untouched.
+        assert_eq!(
+            gate_round(None, &status, &mut paused, t0, false),
+            (ClaimGate::Claim, None, WorkerState::Polling)
+        );
+        let guard = test_guard(
+            vec![
+                avail(GIB),
+                avail(GIB),
+                avail(2 * GIB + GIB / 2),
+                avail(2 * GIB + GIB / 2),
+            ],
+            ProbeFailurePolicy::Pause,
+            None,
+        );
+        let thirty = Some(std::time::Duration::from_secs(30));
+        assert_eq!(
+            gate_round(Some(&guard), &status, &mut paused, t0, false),
+            (ClaimGate::Paused, thirty, WorkerState::PausedMemoryGuard)
+        );
+        assert_eq!(
+            gate_round(Some(&guard), &status, &mut paused, t0, false),
+            (ClaimGate::Paused, thirty, WorkerState::PausedMemoryGuard)
+        );
+        assert_eq!(
+            gate_round(Some(&guard), &status, &mut paused, t0, false).0,
+            ClaimGate::Paused,
+            "one good read is not enough"
+        );
+        assert_eq!(
+            gate_round(Some(&guard), &status, &mut paused, t0, false),
+            (ClaimGate::Claim, None, WorkerState::Polling)
+        );
+        assert!(!paused);
+        // A shutdown while paused stops the loop.
+        let low = test_guard(vec![avail(GIB)], ProbeFailurePolicy::Pause, None);
+        assert_eq!(
+            gate_round(Some(&low), &status, &mut paused, t0, true).0,
+            ClaimGate::Shutdown
+        );
+    }
+
+    #[test]
+    fn production_backoff_timing_after_repeated_memory_declines() {
+        let t0 = Instant::now();
+        let status = CommunityWorkerStatus::new("0xw", "node-w", 1, false);
+        let mut paused = false;
+        let world = FakeWorld::default();
+        let guard = test_guard(
+            vec![avail(3 * GIB)],
+            ProbeFailurePolicy::Pause,
+            Some((2, 120)),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                gate_round(Some(&guard), &status, &mut paused, t0, false).0,
+                ClaimGate::Claim
+            );
+            assert!(!world.job(Some(&guard), Some(1000), 256, t0));
+        }
+        let at = |secs| t0 + std::time::Duration::from_secs(secs);
+        assert_eq!(
+            gate_round(Some(&guard), &status, &mut paused, at(20), false),
+            (
+                ClaimGate::Paused,
+                Some(std::time::Duration::from_secs(100)),
+                WorkerState::PausedMemoryGuard
+            )
+        );
+        assert_eq!(
+            gate_round(Some(&guard), &status, &mut paused, at(119), false).1,
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            gate_round(Some(&guard), &status, &mut paused, at(120), false),
+            (ClaimGate::Claim, None, WorkerState::Polling)
+        );
+        assert!(world.computes.borrow().is_empty());
+    }
+
+    #[test]
+    fn production_probe_failure_policies() {
+        let now = Instant::now();
+        let status = CommunityWorkerStatus::new("0xw", "node-w", 1, false);
+        let mut paused = false;
+        // pause: no claim, and a claimed job is declined without compute.
+        let guard = test_guard(vec![probe_failed()], ProbeFailurePolicy::Pause, None);
+        assert_eq!(
+            gate_round(Some(&guard), &status, &mut paused, now, false).0,
+            ClaimGate::Paused
+        );
+        let world = FakeWorld::default();
+        assert!(!world.job(Some(&guard), Some(10), 8, now));
+        assert!(world.computes.borrow().is_empty());
+        assert!(
+            world.submitted.borrow()[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("memory check failed")
+        );
+        // proceed: claims and computes as if the guard were off (no protection), still visible.
+        let guard = test_guard(vec![probe_failed()], ProbeFailurePolicy::Proceed, None);
+        let mut paused = false;
+        assert_eq!(
+            gate_round(Some(&guard), &status, &mut paused, now, false).0,
+            ClaimGate::Claim
+        );
+        let world = FakeWorld::default();
+        assert!(world.job(Some(&guard), Some(10), 8, now));
+        assert_eq!(*world.computes.borrow(), vec![true]);
+        assert_eq!(guard.status().memory_check, "failed");
+    }
+
+    #[test]
+    fn the_claim_loop_runs_inference_only_inside_the_guarded_compute_function() {
+        // Structural regression for the production loop: the community worker's only
+        // generation calls sit inside the compute closure passed to `memory_guarded_compute`,
+        // and the claim gate runs before every claim. Moving compute outside, or dropping either
+        // call, fails here; deleting a `let ... else` exit fails to compile.
+        let source = include_str!("main.rs");
+        let production = &source[..source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("tests module")];
+        let start = production
+            .find("Community inference worker started")
+            .expect("claim loop");
+        let claim_loop = &production[start..];
+        let call = claim_loop
+            .find("let guarded = memory_guarded_compute(")
+            .expect("loop calls memory_guarded_compute");
+        let exit = claim_loop
+            .find("let Guarded::Computed(inference) = guarded else {")
+            .expect("let-else exit");
+        assert!(call < exit);
+        let generation_calls: Vec<usize> = claim_loop
+            .match_indices("inference_model.try_generate")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            generation_calls.len(),
+            2,
+            "try_generate and try_generate_with_reserved_kv, once each"
+        );
+        assert!(
+            generation_calls.iter().all(|&at| call < at && at < exit),
+            "generation outside the guarded compute"
+        );
+        let gate = claim_loop
+            .find("let gate = memory_guard_claim_gate(")
+            .expect("loop calls the claim gate");
+        let claim = claim_loop
+            .find("let claim_body = rpc::ClaimWorkRequest {")
+            .expect("claim");
+        assert!(
+            gate < claim && claim_loop[gate..claim].contains("let ClaimGate::Claim = gate else {")
+        );
+    }
+
+    #[test]
+    fn help_parser_and_docs_agree_on_five_required_values_and_an_optional_pair() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        let required = [
+            "--memory-guard-headroom-bytes",
+            "--memory-guard-resume-hysteresis-bytes",
+            "--memory-guard-resume-reads",
+            "--memory-guard-recheck-secs",
+            "--memory-guard-on-probe-failure",
+        ];
+        assert!(
+            help.contains("five values are required"),
+            "help must say five required values"
+        );
+        assert!(help.contains("optional: give both or neither"));
+        assert!(!help.contains("every value below must be given"));
+        // The parser requires exactly those five: dropping any one is refused, all five are enough.
+        let (_, base) = launcher_argvs().remove(0);
+        let values = ["2147483648", "536870912", "2", "30", "pause"];
+        for skip in 0..required.len() {
+            let mut argv = base.clone();
+            argv.push("--memory-guard");
+            for (i, (flag, value)) in required.iter().zip(values).enumerate() {
+                if i != skip {
+                    argv.extend([*flag, value]);
+                }
+            }
+            let error =
+                memory_guard_policy_from_cli(&Cli::try_parse_from(&argv).unwrap()).unwrap_err();
+            assert!(error.to_string().contains(&required[skip][2..]), "{error}");
+        }
+        // The documented configuration example parses, with and without its optional pair.
+        let doc = include_str!("../../../docs/MEMORY-GUARD.md");
+        let words: Vec<&str> = doc
+            .lines()
+            .skip_while(|line| !line.starts_with("```sh"))
+            .skip(1)
+            .take_while(|line| !line.starts_with("```"))
+            .flat_map(|line| line.trim_start_matches('#').split_whitespace())
+            .collect();
+        // Each documented flag, with its value when it takes one.
+        let mut example: Vec<&str> = Vec::new();
+        for (i, word) in words.iter().enumerate() {
+            if *word == "--memory-guard" {
+                example.push(word);
+            } else if word.starts_with("--memory-guard-") {
+                example.extend([*word, words[i + 1]]);
+            }
+        }
+        let flags: Vec<&str> = example
+            .iter()
+            .copied()
+            .filter(|w| w.starts_with("--memory-guard"))
+            .collect();
+        assert_eq!(
+            flags.len(),
+            8,
+            "the doc example shows --memory-guard, five required values and the optional pair: {example:?}"
+        );
+        for flag in required {
+            assert!(flags.contains(&flag), "{flag} missing from the doc example");
+        }
+        let mut with_pair = base.clone();
+        with_pair.extend(example.iter().copied());
+        let policy = memory_guard_policy_from_cli(&Cli::try_parse_from(&with_pair).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(policy.decline_backoff_after.is_some());
+        let backoff = with_pair
+            .iter()
+            .position(|w| *w == "--memory-guard-decline-backoff-after")
+            .unwrap();
+        let mut without_pair = with_pair.clone();
+        without_pair.drain(backoff..backoff + 2);
+        let secs = without_pair
+            .iter()
+            .position(|w| *w == "--memory-guard-decline-backoff-secs")
+            .unwrap();
+        without_pair.drain(secs..secs + 2);
+        let policy = memory_guard_policy_from_cli(&Cli::try_parse_from(&without_pair).unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(policy.decline_backoff_after.is_none());
     }
 
     #[test]
