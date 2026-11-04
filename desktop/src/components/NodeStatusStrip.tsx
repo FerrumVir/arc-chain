@@ -150,8 +150,11 @@ export function NodeStatusStrip() {
     }
   };
 
-  // The way to a person, wherever the strip shows a problem, an off node or no connection (not while busy or fine).
-  const helpContext: HelpContext | null = view.details
+  // The way to a person, wherever the strip shows a problem, an off node or no connection. Never while busy:
+  // a busy view can keep diagnostic details (startup reconciliation does) without being a problem.
+  const helpContext: HelpContext | null = view.tone === "busy" || view.tone === "ok"
+    ? null
+    : view.details
     ? "home-problem"
     : view.sentence === PLAIN_COPY.nodeStrip.offUnreachable || view.sentence === PLAIN_COPY.nodeStrip.runningUnreachable
       ? "unreachable"

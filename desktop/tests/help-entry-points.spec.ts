@@ -169,3 +169,27 @@ test.describe("Get help in first-run setup", () => {
     await expect(details).not.toContainText("entry-fixture-home");
   });
 });
+
+test.describe("No Get help while the strip is busy", () => {
+  // Browser's reproduction for #226: startup reconciliation keeps diagnostic details on a busy view, and that
+  // alone must not offer Get help. The busy sentence stays.
+  const RECONCILING =
+    "managed-node startup reconciliation is still in progress: ARC is checking how the previous node session ended before it starts or updates arc-node. Try again in a few seconds.";
+
+  test("startup reconciliation in progress: busy sentence shown, no Get help", async ({ page }) => {
+    await home(page, { node_start_block: RECONCILING });
+    const strip = page.getByTestId("node-strip");
+    await expect(strip.getByTestId("node-strip-sentence")).toHaveText(PLAIN_COPY.startFailure.reconciling.title);
+    await expect(strip).toHaveAttribute("data-tone", "busy");
+    // Held for a moment: the help must not appear late either.
+    await page.waitForTimeout(1_500);
+    await expect(strip.getByTestId("node-strip-sentence")).toHaveText(PLAIN_COPY.startFailure.reconciling.title);
+    await expect(page.getByTestId("node-strip-help")).toHaveCount(0);
+  });
+
+  test("a genuine refusal next to it still offers Get help", async ({ page }) => {
+    await home(page, { node_start_block: REFUSAL });
+    await expect(page.getByTestId("node-strip")).toHaveAttribute("data-tone", "attention");
+    await expect(page.getByTestId("node-strip-help")).toHaveAttribute("data-context", "home-problem");
+  });
+});
