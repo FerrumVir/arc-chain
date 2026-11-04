@@ -21,11 +21,16 @@ export function usePrivacyContext(): { privacy: PrivacyContext; platform: NodeCa
     queryKey: ["node-care-info"],
     queryFn: () => invoke<NodeCarePlatform>("node_care_info"),
     staleTime: Infinity,
+    // One lookup, then explicit Copy details retries. No background recovery loop.
+    retry: false,
+    retryOnMount: false,
+    refetchOnReconnect: false,
   });
   const platform = lookup.status === "success" ? lookup.data : null;
   const privacy = privacyContextFrom({ status: lookup.status, homeDir: platform?.homeDir });
   const retry = () => {
-    if (privacy.state !== "ready" && !lookup.isFetching) void lookup.refetch();
+    // Also deduplicate same-turn clicks/observers before isFetching has rerendered.
+    if (privacy.state !== "ready" && !lookup.isFetching) void lookup.refetch({ cancelRefetch: false });
   };
   return { privacy, platform, retry };
 }

@@ -60,8 +60,9 @@ export function GetHelp({
   const report = describeReportState(snapshot);
 
   const copyDetails = () => {
-    // Without the privacy context the native text is left out; ask again for a later copy.
-    if (error && privacy.state !== "ready") retry();
+    // Setup also needs versions/system metadata without an error. Retry for a later copy;
+    // this click still copies the current safe details, without waiting for the lookup.
+    if (privacy.state !== "ready") retry();
     // Without a clipboard API the call throws before returning a promise.
     void Promise.resolve()
       .then(() => navigator.clipboard.writeText(details))
