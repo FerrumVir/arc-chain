@@ -167,10 +167,57 @@ class ReviewCorrections(unittest.TestCase):
             self.assertEqual(flagged, set(files), "every planted file is found")
 
 
+class SecondReview(unittest.TestCase):
+    """Reviewer findings on 992e8a20: custom keys printed as schema, and exceptions trusted by path alone."""
+
+    def test_custom_machine_names_as_keys_are_never_printed(self):
+        for doc, custom in [
+            ({"workers": {"synthhomebox": {"hostname": "DESKTOP-AB12CD3"}}}, "synthhomebox"),
+            ({"data": {"synthalice": {"hostname": "Synth-MBP"}}}, "synthalice"),
+        ]:
+            with tempfile.TemporaryDirectory() as tmp:
+                Path(tmp, "export.json").write_text(json.dumps(doc), encoding="utf-8")
+                result = run(tmp)
+                self.assertEqual(result.returncode, 1, doc)
+                self.assertNotIn(custom, result.stdout + result.stderr, "an undetected custom name is not printed either")
+                self.assertIn("/<key 0>/hostname (hostname)" if "data" in doc else "/workers/<key 0>/hostname (hostname)", result.stderr)
+
+    def test_only_listed_keys_print(self):
+        self.assertEqual(ep._segment("hostname", 3, False), "hostname")
+        self.assertEqual(ep._segment("workers", 0, False), "workers")
+        self.assertEqual(ep._segment("synthalice", 2, False), "<key 2>")
+        self.assertEqual(ep._segment("hostname", 1, True), "<key 1>", "inside a host container every key is a machine name")
+
+    def test_pins_match_the_committed_files(self):
+        for rel, digest in {**ep.FIXTURE_FILES, **ep.UNPARSEABLE_ALLOWED}.items():
+            self.assertEqual(ep.sha256((REPO / rel).read_bytes()), digest, rel)
+
+    def test_changed_bytes_at_excepted_paths_are_scanned(self):
+        allowed = next(iter(ep.UNPARSEABLE_ALLOWED))
+        clean_fixture = "scripts/ci/tests/fixtures/export-privacy/clean/scoreboard.json"
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q", tmp], check=True)
+            planted = {
+                allowed: '{"workers":[{"worker_id":"w1","hostname":"DESKTOP-AB12CD3"}',
+                clean_fixture: json.dumps({"workers": [{"worker_id": "w", "name": "Synth-MacBook-Pro"}]}),
+            }
+            for rel, body in planted.items():
+                Path(tmp, rel).parent.mkdir(parents=True, exist_ok=True)
+                Path(tmp, rel).write_text(body, encoding="utf-8")
+            subprocess.run(["git", "-C", tmp, "add", "-f", "."], check=True)
+            found = ep.scan_tree(Path(tmp))
+            rules = {(f.path, f.rule) for f in found}
+            self.assertIn((allowed, "unreadable JSON: it does not parse, so this check cannot vouch for it"), rules)
+            self.assertIn((clean_fixture, "excepted fixture changed since review, so it is scanned like any other file"), rules)
+            self.assertIn((clean_fixture, "operating-system default computer name"), rules)
+        # The reviewed bytes themselves stay excepted.
+        self.assertEqual(ep.content_findings(allowed, b""), [])
+
+
 class Tree(unittest.TestCase):
     def test_tracked_tree_scan_skips_only_the_fixture_dir(self):
         listed = ep.tracked_files(REPO)
-        self.assertTrue(ep.FIXTURE_FILES <= set(listed), "the three fixtures are tracked")
+        self.assertTrue(set(ep.FIXTURE_FILES) <= set(listed), "the three fixtures are tracked")
         self.assertEqual(ep.scan_tree(REPO), [], "the committed tree is clean")
 
     def test_a_forced_add_of_an_export_would_fail(self):

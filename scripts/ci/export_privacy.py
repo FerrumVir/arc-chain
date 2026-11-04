@@ -22,10 +22,11 @@ fails CI on either of the two shapes that leak looked like:
 Limits, by design: a heuristic for operating-system default names, not a
 detector of every hostname. A custom name such as ``kitchen-server`` or a bare
 first name passes. Only JSON at the checked-out commit is read: git history and
-forks are out of scope, and so are files outside the repository. The three synthetic test fixtures under
-``scripts/ci/tests/fixtures/export-privacy/`` are excluded by exact path; nothing
-else is skipped. JSON that does not parse, or is over 8 MiB, is itself a finding
-(one existing file that does not parse is allowed by exact path).
+forks are out of scope, and so are files outside the repository. The three synthetic test fixtures are skipped only
+while their bytes match a pinned SHA-256; nothing else is skipped. JSON that does
+not parse, or is over 8 MiB, is itself a finding (one existing empty file is
+allowed, pinned the same way). Locations print only listed schema keys; any other
+key prints as ``<key N>``.
 
 This is not a complete personal-data scan. Custom names (``kitchen-server``,
 ``alice-laptop``) pass; only the keys listed below and host containers are
@@ -39,6 +40,7 @@ the JSON location and the rule; they never print the matched value.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -51,16 +53,23 @@ from typing import Iterable, Iterator
 EXPORT_ROOTS = ("arc-state-export",)
 SEED_LABELS = ("NYC", "LAX", "AMS", "LHR", "NRT", "SGP")
 EXPORTER_FILE = re.compile(r"^(?:%s)_[a-z0-9_]+\.json$" % "|".join(SEED_LABELS))
-# The three synthetic fixtures this check's own tests use, excluded from the tree scan by exact path only:
-# anything else placed beside them is scanned like any other file.
-FIXTURE_FILES = frozenset({
-    "scripts/ci/tests/fixtures/export-privacy/clean/scoreboard.json",
-    "scripts/ci/tests/fixtures/export-privacy/leaky-content/scoreboard.json",
-    "scripts/ci/tests/fixtures/export-privacy/leaky-export/arc-state-export/2026-01-01T00-00-00Z/NYC_workers_scoreboard.json",
-})
-# Tracked JSON that does not parse today, by exact path. Every other unreadable JSON is a finding: this check
-# cannot vouch for what it cannot read.
-UNPARSEABLE_ALLOWED = frozenset({"docs/arc-chain-v2/batch3-canonical-validation.json"})
+# Exceptions are pinned to the SHA-256 of their reviewed bytes, not just their path: if a file at an excepted path
+# changes, the exception no longer applies and the file is scanned (and reported) like any other.
+#
+# The three synthetic fixtures this check's own tests use, skipped by the tree scan while unchanged.
+FIXTURE_FILES = {
+    "scripts/ci/tests/fixtures/export-privacy/clean/scoreboard.json":
+        "04f21a43db64c5ef2bfaeaecefcc7736191c310947aa8081e554987b1f61cb1a",
+    "scripts/ci/tests/fixtures/export-privacy/leaky-content/scoreboard.json":
+        "4bb5b357a095299fe65e7a6ced2639b400acd61f64ce21f2909fb4cae58ff5a2",
+    "scripts/ci/tests/fixtures/export-privacy/leaky-export/arc-state-export/2026-01-01T00-00-00Z/NYC_workers_scoreboard.json":
+        "ec5adcca5abaefddf253468d696e51f45340b6ef3a9f3c772091f7b24275646b",
+}
+# Tracked JSON that does not parse today: one empty file. Any other unreadable JSON, or new bytes at this path, is a
+# finding: this check cannot vouch for what it cannot read.
+UNPARSEABLE_ALLOWED = {
+    "docs/arc-chain-v2/batch3-canonical-validation.json": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+}
 MAX_JSON_BYTES = 8 * 1024 * 1024
 
 # Keys that only ever hold a machine's name: checked wherever they appear.
@@ -72,9 +81,12 @@ WORKER_LIST_KEYS = {"workers", "community_workers", "scoreboard", "registrations
 # machine names ({"hostnames": ["...", ...]}).
 HOST_CONTAINER_KEYS = WORKER_LIST_KEYS | {"hosts", "hostnames", "devices", "machines", "computers"}
 WORKER_MARKERS = {"worker_id", "worker", "address", "pubkey", "public_key"}
-# Location segments printed as they are; any other object key is printed as <key N> so a finding never repeats
-# a key that might itself be a machine name.
-_SCHEMA_KEY = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
+# Object keys printed as they are in a finding's location: a fixed list of field names this check and the exporter
+# use. Any other key (and every key inside a host container, which is a machine name by definition) prints as
+# <key N>, so a finding never repeats a custom machine name it could not recognise.
+SCHEMA_KEYS = frozenset(HOSTNAME_KEYS | NAME_KEYS | HOST_CONTAINER_KEYS | WORKER_MARKERS | {
+    "schema", "host", "app_version", "node_version", "version", "runs", "status", "notes",
+})
 
 # Mirrors DEVICE_TOKENS in crates/arc-node/src/rpc.rs (looks_like_default_computer_name).
 DEVICE_TOKENS = {
@@ -140,48 +152,57 @@ def path_findings(rel: str) -> list[Finding]:
     return found
 
 
-def _segment(key: str, position: int) -> str:
-    """A location segment that is safe to print: known schema-style keys as they are, anything else by position."""
-    key = str(key)
-    if _SCHEMA_KEY.match(key) and personal_hostname_rule(key) is None:
-        return key
+def _segment(key: str, position: int, in_host_container: bool) -> str:
+    """A location segment that is safe to print: listed schema keys as they are, anything else by position."""
+    if not in_host_container and str(key) in SCHEMA_KEYS:
+        return str(key)
     return f"<key {position}>"
 
 
-def _walk(node, pointer: str, container: str | None) -> Iterator[tuple[str, str, str]]:
+def _walk(node, pointer: str, container: str | None, keys_are_hosts: bool) -> Iterator[tuple[str, str, str]]:
     """Yield (pointer, what, value) for every string that must not hold a device name.
 
-    `container` is the lower-cased key this node sits under (when that key is a worker or host container).
+    `container` is the lower-cased worker/host container key this node sits under, if any. `keys_are_hosts` is true
+    only for a mapping directly under such a container ({"workers": {"<machine name>": {...}}}): its keys are
+    machine names, checked and never printed. Records in a list under a container are worker records, not maps.
     """
     if isinstance(node, dict):
         workerish = container in WORKER_LIST_KEYS or bool(WORKER_MARKERS & {str(k).lower() for k in node})
         for position, (key, value) in enumerate(node.items()):
-            child = f"{pointer}/{_segment(key, position)}"
+            child = f"{pointer}/{_segment(key, position, keys_are_hosts)}"
             lowered = str(key).lower()
-            if container in HOST_CONTAINER_KEYS:
-                yield child, "key", str(key)  # {"workers": {"<machine name>": {...}}}
+            if keys_are_hosts:
+                yield child, "key", str(key)
             if isinstance(value, str):
                 if lowered in HOSTNAME_KEYS or (workerish and lowered in NAME_KEYS):
                     yield child, lowered, value
+            elif keys_are_hosts:
+                yield from _walk(value, child, container, False)  # the record under a machine-name key
+            elif lowered in HOST_CONTAINER_KEYS | HOSTNAME_KEYS:
+                yield from _walk(value, child, lowered, isinstance(value, dict) and lowered in HOST_CONTAINER_KEYS)
             else:
-                yield from _walk(value, child, lowered if lowered in HOST_CONTAINER_KEYS | HOSTNAME_KEYS else None)
+                yield from _walk(value, child, None, False)
     elif isinstance(node, list):
         for i, item in enumerate(node):
             if isinstance(item, str) and container in HOST_CONTAINER_KEYS | HOSTNAME_KEYS:
                 yield f"{pointer}/{i}", "item", item  # {"hostnames": ["<machine name>", ...]}
             else:
-                yield from _walk(item, f"{pointer}/{i}", container)
+                yield from _walk(item, f"{pointer}/{i}", container, False)
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def content_findings(rel: str, data: bytes) -> list[Finding]:
     try:
         doc = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        if rel in UNPARSEABLE_ALLOWED:
+        if UNPARSEABLE_ALLOWED.get(rel) == sha256(data):
             return []
         return [Finding(rel, "file", "unreadable JSON: it does not parse, so this check cannot vouch for it")]
     found = []
-    for pointer, what, value in _walk(doc, "", None):
+    for pointer, what, value in _walk(doc, "", None, False):
         rule = personal_hostname_rule(value)
         if rule:
             found.append(Finding(rel, f"{pointer or '/'} ({what})", rule))
@@ -210,8 +231,14 @@ def tracked_files(root: Path) -> list[str]:
 def scan_tree(root: Path) -> list[Finding]:
     found = []
     for rel in tracked_files(root):
-        if rel in FIXTURE_FILES:
-            continue
+        pinned = FIXTURE_FILES.get(rel)
+        if pinned is not None:
+            try:
+                if sha256((root / rel).read_bytes()) == pinned:
+                    continue
+            except OSError:
+                pass
+            found.append(Finding(rel, "file", "excepted fixture changed since review, so it is scanned like any other file"))
         found += scan_file(root / rel, rel)
     return found
 
