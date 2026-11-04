@@ -6,6 +6,7 @@ import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
 import { PLAIN_COPY } from "../lib/plain-copy";
 import { quitArc } from "../lib/quit";
 import { describeStartFailure } from "../lib/start-failure";
+import { GetHelp } from "./GetHelp";
 
 const COPIED_RESET_MS = 2_500;
 
@@ -219,6 +220,9 @@ export function StartFailurePanel({
           >
             {view.details}
           </pre>
+
+          {/* A node waiting on its last session is not a problem yet; anything else gets the way to a person. */}
+          {!waiting && <GetHelp context="start-failure" title={view.title} error={error} testId="start-failure-help" />}
         </div>
       </div>
     </div>

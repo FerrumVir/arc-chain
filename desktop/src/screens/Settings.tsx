@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { NotAvailable } from "../components/NotAvailable";
 import { NodeCareSettings } from "../components/NodeCare";
+import { GetHelp } from "../components/GetHelp";
 import { StatusPill } from "../components/StatusPill";
 import { api, isTauri } from "../lib/tauri";
 import { describeConnection } from "../lib/connection";
@@ -412,6 +413,11 @@ export function Settings() {
       <Card style={{ marginBottom: "var(--space-6)" }} data-testid="node-care-card">
         <CardHeader title="Error reports" />
         <NodeCareSettings />
+      </Card>
+
+      <Card style={{ marginBottom: "var(--space-6)" }} data-testid="help-card">
+        <CardHeader title="Get help" />
+        <GetHelp context="settings" testId="settings-help" />
       </Card>
 
       <Card>

@@ -244,4 +244,38 @@ export const PLAIN_COPY = {
     /** An install that did not complete; the node may have been stopped for it. */
     installFailed: "The update didn't install. You can try again here.",
   },
+  /**
+   * Get help: the way from a problem to a person. The destinations are the
+   * README's "Community and help" links (lib/support.ts). No reply is promised:
+   * these are community chats, and nobody is named as reading them yet.
+   */
+  help: {
+    button: "Get help",
+    hide: "Hide help",
+    title: "Get help",
+    stepCopy: "1. Copy the details below. Check them for anything personal before you share them.",
+    stepPost: "2. Post them in the ARC community and say what you were doing when this happened.",
+    copyFailedFallback: "Couldn't copy. Select the text above and copy it yourself.",
+    openDiscord: "Open Discord",
+    openTelegram: "Open Telegram",
+    openIssue: "Report a bug on GitHub",
+    openDocs: "Help in the ARC docs",
+    openFailed: (url: string) => `Couldn't open the link. Go to ${url}`,
+    safety: "These are community chats. Never post your 12-word recovery phrase or a private key.",
+    detailsHeader: "ARC support details",
+    state: {
+      "start-failure": "Couldn't start",
+      off: "Node off",
+      unreachable: "No connection",
+      settings: "Opened from Settings",
+    },
+    report: {
+      off: "Anonymous error reports are off, so ARC didn't send one. You can turn them on in Settings.",
+      notConfigured: "This build of ARC has no report address, so it didn't send an anonymous report.",
+      none: "ARC hasn't sent an anonymous problem report from this computer yet.",
+      sent: (when: string) => `ARC's latest anonymous problem report was sent at ${when}.`,
+      queued: (when: string) => `ARC's latest anonymous problem report (${when}) is waiting to send. It retries on its own.`,
+      loading: "Checking anonymous error reports…",
+    },
+  },
 } as const;

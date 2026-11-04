@@ -266,7 +266,7 @@ headless_platform_claims_match_release_assets() {
 }
 
 desktop_and_release_notes_match_the_artifact_and_reward_contract() {
-    local asset release_notes
+    local asset release_notes flat_notes
     release_notes="$(awk '
         /^[[:space:]]+RELEASE_NOTES:[[:space:]]+[|]$/ { capture=1; next }
         capture && /^[[:space:]]+run:[[:space:]]+[|]$/ { exit }
@@ -313,7 +313,9 @@ desktop_and_release_notes_match_the_artifact_and_reward_contract() {
 
     for literal in \
         'Linux ARM64 is headless-only' \
-        'download or install without confirmation' \
+        'unattended installs are on by default' \
+        'Install signed app updates' \
+        'Check for app' \
         'stake-zero' \
         'only a successful mined `0x25`' \
         'Projected earnings are' \
@@ -323,6 +325,30 @@ desktop_and_release_notes_match_the_artifact_and_reward_contract() {
             printf 'generated v0.8.0 release notes omit required support/evidence copy: %s\n' "$literal"
             return 1
         }
+    done
+
+    # The update sentence must match the shipped default (on since v0.8.14) and name
+    # the real Settings switches; "never download or install without confirmation"
+    # stayed in every release body after it stopped being true (ARC-410).
+    flat_notes="$(printf '%s\n' "$release_notes" | sed -E 's/^[[:space:]]+//' | tr '\n' ' ')"
+    if printf '%s\n' "$flat_notes" | grep -Fq -- 'without confirmation'; then
+        printf 'generated release notes still claim updates wait for confirmation\n'
+        return 1
+    fi
+    grep -Eq '^[[:space:]]+auto_install_updates: true,' "$REPO_ROOT/desktop/src-tauri/src/types.rs" || {
+        printf 'release notes say unattended installs are on by default, but NodeConfig::default disagrees\n'
+        return 1
+    }
+    for literal in \
+        'Install signed app updates automatically when idle' \
+        'Check for app updates automatically'
+    do
+        printf '%s\n' "$flat_notes" | grep -Fq -- "\"$literal\"" || {
+            printf 'release notes do not quote the Settings switch exactly: %s\n' "$literal"
+            return 1
+        }
+        require_literal "$REPO_ROOT/desktop/src/screens/Settings.tsx" "$literal" \
+            'release notes name a Settings switch the app does not show' || return 1
     done
 
     for literal in \
@@ -547,11 +573,11 @@ factual_candidate_copy_matches_source_and_release_gates() {
     local desktop_spec_files playwright_inventory
     desktop_spec_files="$(find "$REPO_ROOT/desktop/tests" -maxdepth 1 -type f \
         -name '*.spec.ts' | wc -l | tr -d ' ')"
-    assert_equals 30 "$desktop_spec_files" \
+    assert_equals 32 "$desktop_spec_files" \
         'documented Playwright file inventory drifted from the current tree' || return 1
-    require_literal "$DESKTOP_README" '361 tests in' \
+    require_literal "$DESKTOP_README" '373 tests in' \
         'desktop README does not carry the audited Playwright test inventory' || return 1
-    require_literal "$DESKTOP_README" '30 files.' \
+    require_literal "$DESKTOP_README" '32 files.' \
         'desktop README does not carry the audited Playwright file inventory' || return 1
     if grep -Eq '176 tests|68[[:space:]]+native tests' "$DESKTOP_README"; then
         printf 'desktop README retains a stale hard-coded test inventory\n'
@@ -566,7 +592,7 @@ factual_candidate_copy_matches_source_and_release_gates() {
             CI='' ./node_modules/.bin/playwright test --list 2>/dev/null \
                 | sed -n 's/^Total: //p' | tail -n 1
         )"
-        assert_equals '361 tests in 30 files' "$playwright_inventory" \
+        assert_equals '373 tests in 32 files' "$playwright_inventory" \
             'desktop README Playwright inventory differs from playwright --list' || return 1
     fi
 
