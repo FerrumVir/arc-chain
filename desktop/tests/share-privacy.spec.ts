@@ -19,10 +19,10 @@ const DELAY_MS = 5_000;
 
 type Info = "available" | "delayed" | "rejected" | "empty";
 type Clip = "ok" | "fail" | "absent";
-type Control = "start-panel" | "start-help" | "home" | "crash" | "stop" | "answer";
+type Control = "start-panel" | "start-help" | "home" | "home-help" | "crash" | "stop" | "answer";
 
 async function setup(page: Page, control: Control, info: Info, clip: Clip) {
-  await openOn(page, ["home", "answer"].includes(control) ? "inference" : "dashboard");
+  await openOn(page, ["home", "home-help", "answer"].includes(control) ? "inference" : "dashboard");
   await page.addInitScript(
     ({ control, info, clip, diag, home, delay }) => {
       localStorage.setItem(
@@ -51,7 +51,7 @@ async function setup(page: Page, control: Control, info: Info, clip: Clip) {
         run_inference_via_coordinator_direct: { __reject: diag },
         open_external: { __reject: "external destinations disabled in tests" },
       };
-      if (control === "home") mock.node_start_block = `ARC refused to start the node: ${diag}`;
+      if (control === "home" || control === "home-help") mock.node_start_block = `ARC refused to start the node: ${diag}`;
       const platform = { endpointConfigured: false, appVersion: "0.8.16", os: "macos", arch: "aarch64", homeDir: info === "empty" ? "" : home };
       if (info === "rejected") {
         Object.defineProperty(mock, "node_care_info", { enumerable: true, get: () => Promise.reject(new Error("synthetic: unavailable")) });
@@ -77,6 +77,8 @@ async function setup(page: Page, control: Control, info: Info, clip: Clip) {
     await page.getByTestId("btn-start").click();
     await expect(page.getByTestId("mutation-error")).toBeVisible();
     if (control === "start-help") await page.getByTestId("start-failure-help-toggle").click();
+  } else if (control === "home-help") {
+    await page.getByTestId("node-strip-help-toggle").click();
   } else if (control === "stop") {
     await page.getByTestId("btn-stop").click();
     await expect(page.getByTestId("mutation-error")).toBeVisible();
@@ -91,6 +93,7 @@ const IDS: Record<Control, { button: string; fallback: string; title: string }> 
   "start-panel": { button: "btn-start-failure-copy", fallback: "start-failure-copy-fallback-text", title: "ARC says:" },
   "start-help": { button: "start-failure-help-copy", fallback: "start-failure-help-details", title: "ARC says:" },
   home: { button: "node-strip-copy", fallback: "node-strip-copy-fallback-text", title: "ARC says:" },
+  "home-help": { button: "node-strip-help-copy", fallback: "node-strip-help-details", title: "ARC says:" },
   crash: { button: "crash-banner-copy", fallback: "crash-banner-copy-fallback-text", title: `ARC says: ${PLAIN_COPY.nodeStrip.crashed}` },
   stop: { button: "mutation-error-copy", fallback: "mutation-error-copy-fallback-text", title: `ARC says: ${PLAIN_COPY.dashboard.stopFailed}` },
   answer: { button: "inference-error-copy", fallback: "inference-error-copy-fallback-text", title: "ARC says:" },
@@ -105,8 +108,8 @@ async function share(page: Page, control: Control, clip: Clip): Promise<string> 
     await expect(page.getByTestId(ids.button)).toHaveText(PLAIN_COPY.actions.copied);
     return page.evaluate(() => navigator.clipboard.readText());
   }
-  if (control === "start-help") {
-    await expect(page.getByTestId("start-failure-help-copy-failed")).toContainText(PLAIN_COPY.share.review);
+  if (control === "start-help" || control === "home-help") {
+    await expect(page.getByTestId(`${ids.button}-failed`)).toContainText(PLAIN_COPY.share.review);
   } else {
     const alert = page.getByTestId(ids.fallback.replace(/-text$/, ""));
     await expect(alert).toContainText(PLAIN_COPY.share.fallback);
@@ -138,7 +141,7 @@ const CASES: [Info, Clip][] = [
   ["rejected", "ok"], ["rejected", "fail"],
   ["empty", "ok"], ["empty", "absent"],
 ];
-const CONTROLS: Control[] = ["start-panel", "start-help", "home", "crash", "stop", "answer"];
+const CONTROLS: Control[] = ["start-panel", "start-help", "home", "home-help", "crash", "stop", "answer"];
 
 test.describe.configure({ mode: "parallel" });
 
@@ -183,14 +186,14 @@ test.describe("raw local text is labelled on every surface", () => {
         crash: "crash-banner-details-toggle",
         stop: "mutation-error-details-toggle",
         answer: "inference-error-details-toggle",
-      }[control as Exclude<Control, "start-help">];
+      }[control as Exclude<Control, "start-help" | "home-help">];
       const note = {
         "start-panel": "start-failure-details-note",
         home: "node-strip-details-note",
         crash: "crash-banner-details-note",
         stop: "mutation-error-details-note",
         answer: "inference-error-details-note",
-      }[control as Exclude<Control, "start-help">];
+      }[control as Exclude<Control, "start-help" | "home-help">];
       const button = page.getByTestId(toggle);
       if ((await button.getAttribute("aria-expanded")) !== "true") await button.click();
       await expect(page.getByTestId(note)).toHaveText(PLAIN_COPY.share.localOnly);

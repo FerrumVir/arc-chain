@@ -266,10 +266,27 @@ export async function walkToLaunch(page: Page) {
  * passing click alone does not prove the action can be reached.
  */
 export async function wheelIntoView(page: Page, target: Locator) {
+  // Wait for the step to render first: wheeling an empty page and never again raced the first step (the
+  // onboarding flake: "viewport ratio 0" on btn-continue-welcome). Then wheel a step at a time, as a person
+  // does, until all of the target is on screen; never more than the 8 x 400 px the helper always allowed.
+  await target.waitFor({ state: "visible" });
   const viewport = page.viewportSize();
   if (viewport) await page.mouse.move(viewport.width / 2, viewport.height / 2);
-  for (let i = 0; i < 8; i++) {
+  // The same measure toBeInViewport uses: the visible share of the element, clipped by scroll containers.
+  const fullyInView = () =>
+    target.evaluate(
+      (el) =>
+        new Promise<boolean>((resolve) => {
+          const io = new IntersectionObserver(([entry]) => {
+            io.disconnect();
+            resolve((entry?.intersectionRatio ?? 0) >= 0.999);
+          });
+          io.observe(el);
+        }),
+    );
+  for (let i = 0; i < 8 && !(await fullyInView()); i++) {
     await page.mouse.wheel(0, 400);
+    await page.waitForTimeout(60);
   }
   await expect(target).toBeInViewport({ ratio: 1 });
 }

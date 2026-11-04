@@ -1,5 +1,7 @@
 import { useEffect, useId, useState } from "react";
 import { LocalOnlyNote, ShareCopyFallback, useShareCopy } from "./ShareCopy";
+import { GetHelp } from "./GetHelp";
+import type { HelpContext } from "../lib/support";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, CheckCircle2, CircleAlert, Copy, Download, Loader2, Power } from "lucide-react";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -148,6 +150,20 @@ export function NodeStatusStrip() {
     }
   };
 
+  // The way to a person, wherever the strip shows a problem, an off node or no connection. Never while busy:
+  // a busy view can keep diagnostic details (startup reconciliation does) without being a problem.
+  const helpContext: HelpContext | null = view.tone === "busy" || view.tone === "ok"
+    ? null
+    : view.details
+    ? "home-problem"
+    : view.sentence === PLAIN_COPY.nodeStrip.offUnreachable || view.sentence === PLAIN_COPY.nodeStrip.runningUnreachable
+      ? "unreachable"
+      : view.tone === "attention"
+        ? "home-problem"
+        : view.action === "start-node"
+          ? "off"
+          : null;
+
   const Icon = TONE_ICON[view.tone];
   return (
     <div
@@ -248,6 +264,11 @@ export function NodeStatusStrip() {
       {view.details && copied === "failed" && (
         <div style={{ flexBasis: "100%" }}>
           <ShareCopyFallback text={shareText} testId="node-strip-copy-fallback" />
+        </div>
+      )}
+      {helpContext && (
+        <div style={{ flexBasis: "100%" }}>
+          <GetHelp context={helpContext} title={view.sentence} error={view.details} testId="node-strip-help" />
         </div>
       )}
     </div>
