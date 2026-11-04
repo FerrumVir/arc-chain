@@ -912,6 +912,8 @@ pub fn run() {
             commands::dismiss_previous_install_notice,
             legacy_upgrade::load_legacy_compute_question,
             legacy_upgrade::answer_legacy_compute_question,
+            commands::claim_compute_prompt,
+            commands::accept_compute_prompt,
             commands::start_node,
             commands::stop_node,
             commands::prepare_update_relaunch,

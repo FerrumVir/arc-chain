@@ -1,6 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { PLAIN_COPY } from "../src/lib/plain-copy";
-import { clearState, walkToLaunch, wheelIntoView } from "./helpers";
+import { clearState, seedComputePrompt, walkToLaunch, wheelIntoView } from "./helpers";
 
 /** The node config the app saved, read from its persisted UI state. */
 async function savedConfig(page: Page) {
@@ -21,6 +21,9 @@ test.describe("Onboarding wizard", () => {
     // The app opens at 1180x780 (tauri.conf.json). Each step's action must be
     // reachable by scrolling there, not only by Playwright's own scrolling.
     await page.setViewportSize({ width: 1180, height: 780 });
+    // The preview would ask the one-time compute question of an install from
+    // before the default; this install is new, and must not be asked.
+    await seedComputePrompt(page);
     await page.goto("/");
 
     // Welcome
@@ -130,9 +133,13 @@ test.describe("Onboarding wizard", () => {
     await page.getByTestId("nav-settings").click();
     await expect(page.getByTestId("compute-consent-toggle")).toBeChecked();
     await expect(page.getByTestId("compute-share-note")).toHaveText(
-      "Uses up to a quarter of your processor while ARC Node is open.",
+      "Uses up to a quarter of your processor at low priority, and about 8 GB of memory while ARC Node is running. It keeps running on battery. Turn this off to stop ARC jobs and free that memory.",
     );
     await expect(page.getByTestId("worker-threads-value")).toHaveText("6 / 24");
+    // Setup asked the compute question itself, so the one-time question for
+    // installs from before it never shows to an install that just finished
+    // setup, even where the preview says that question is due.
+    await expect(page.getByTestId("compute-prompt-dialog")).toHaveCount(0);
   });
 
   test("progress dots update per step (4 dots, one per wizard step)", async ({

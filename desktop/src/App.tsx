@@ -6,6 +6,7 @@ import { DataMigrationBanner } from "./components/DataMigrationBanner";
 import { PreviousInstallNotice } from "./components/PreviousInstallNotice";
 import { NodeCareNotice } from "./components/NodeCare";
 import { LegacyUpgradeDialog } from "./components/LegacyUpgradeDialog";
+import { ComputePromptDialog } from "./components/ComputePromptDialog";
 import { Onboarding } from "./screens/Onboarding";
 import { Dashboard } from "./screens/Dashboard";
 import { Earnings } from "./screens/Earnings";
@@ -94,6 +95,8 @@ export function App() {
     useState<PreviousInstallNoticeData | null>(null);
   const [legacyQuestion, setLegacyQuestion] =
     useState<LegacyComputeQuestion | null>(null);
+  // The one-time compute question for an install from before the default.
+  const [computePrompt, setComputePrompt] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
 
   // The launch screen (index.html) stays up until the saved identity and config have loaded. Deciding between the
@@ -135,6 +138,19 @@ export function App() {
       if (active) setPreviousInstall(loadedPreviousInstall);
       if (active) setLegacyQuestion(loadedQuestion);
       if (active) setConfigHydrated(true);
+      // Once per launch, after the app is up, and only for an install whose
+      // setup was already complete when ARC opened: setup in this session
+      // asks the question itself. Native code decides whether to ask and has
+      // recorded that it did before it answers true, so a hardware read that
+      // takes seconds delays nothing here and the question never repeats.
+      if (active && (onboardedFlag || (loadedIdentity && loadedConfig))) {
+        void api.claimComputePrompt().then(
+          (due) => {
+            if (due) setComputePrompt(true);
+          },
+          () => undefined,
+        );
+      }
     })();
     return () => {
       active = false;
@@ -210,6 +226,9 @@ export function App() {
                   question={legacyQuestion}
                   onAnswered={() => setLegacyQuestion(null)}
                 />
+              )}
+              {computePrompt && !legacyQuestion && (
+                <ComputePromptDialog onClose={() => setComputePrompt(false)} />
               )}
               <main className="main" data-testid="main" ref={mainRef}>
                 <NodeCareNotice />

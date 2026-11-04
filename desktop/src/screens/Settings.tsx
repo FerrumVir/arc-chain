@@ -606,8 +606,8 @@ function ComputeConsent() {
         New installs start with this on when the computer can run the ARC
         model. When on, the app downloads the ARC model once
         (3.80 GB, checked against its pinned SHA-256), switches your node to
-        worker mode, and takes jobs from the network while the app is open.
-        Turning it off returns the node to observer mode right away.
+        worker mode, and takes jobs from the network while ARC Node is
+        running. Turning it off returns the node to observer mode right away.
       </span>
       {ineligible && !enabled && (
         <span className="field-hint" data-testid="compute-consent-ineligible">

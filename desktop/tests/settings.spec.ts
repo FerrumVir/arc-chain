@@ -56,7 +56,7 @@ test.describe("Settings", () => {
     await expect(page.getByTestId("compute-consent-toggle")).toBeChecked();
     await expect(page.getByTestId("worker-threads-value")).toHaveText("12 / 24");
     await expect(page.getByTestId("compute-share-note")).toHaveText(
-      "Uses up to 12 of your 24 processor cores while ARC Node is open.",
+      "Uses up to 12 of your 24 processor cores at low priority, and about 8 GB of memory while ARC Node is running. It keeps running on battery. Turn this off to stop ARC jobs and free that memory.",
     );
   });
 

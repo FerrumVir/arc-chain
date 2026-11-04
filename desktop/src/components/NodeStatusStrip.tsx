@@ -6,7 +6,12 @@ import { api, isTauri } from "../lib/tauri";
 import { quitArc } from "../lib/quit";
 import { useAppStore } from "../lib/store";
 import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
-import { describeNodeStrip, type NodeStripAction, type NodeStripTone } from "../lib/node-strip";
+import {
+  describeNodeStrip,
+  MODEL_PROGRESS_STALE_MS,
+  type NodeStripAction,
+  type NodeStripTone,
+} from "../lib/node-strip";
 import { PLAIN_COPY } from "../lib/plain-copy";
 import { DEFAULT_NODE_CONFIG, type ModelDownloadProgress } from "../lib/types";
 
@@ -72,7 +77,8 @@ export function NodeStatusStrip() {
     refetchInterval: 5000,
   });
 
-  // A consented install can still be downloading its model after setup.
+  // A consented install can still be downloading its model after setup, with
+  // the node already running.
   useEffect(() => {
     if (!isTauri) return;
     let unlisten: (() => void) | undefined;
@@ -91,6 +97,16 @@ export function NodeStatusStrip() {
       unlisten?.();
     };
   }, []);
+
+  // A download that stops reporting without a final event (it failed, or the
+  // computer slept through it) must not leave "downloading" on Home. The line
+  // goes when nothing has been reported for a while, and the next report
+  // brings it back.
+  useEffect(() => {
+    if (!modelProgress || modelProgress.done) return;
+    const timer = window.setTimeout(() => setModelProgress(null), MODEL_PROGRESS_STALE_MS);
+    return () => window.clearTimeout(timer);
+  }, [modelProgress]);
 
   // How long the running node has had nothing answering. The strip re-renders
   // once a second while that lasts, so the sentence can change at the mark.

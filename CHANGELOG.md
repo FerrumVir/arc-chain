@@ -23,6 +23,59 @@ All notable changes to ARC Chain are tracked here. This project follows
 > **Candidate note:** This entry collects changes for the next release
 > candidate. It does not claim publication or deployment of v0.8.17.
 
+- The desktop setup step and the Settings note now say what the node does
+  while compute is on, and nothing more. The step reads "ARC Node can run AI
+  jobs for the ARC network on this computer. It uses up to a quarter of your
+  processor, at low priority so your own apps come first, and about 8 GB of
+  memory while it is ready for jobs. It keeps running on battery. First it
+  downloads the ARC model, about 4 GB, in the background. You can turn this
+  off here or at any time in Settings." The Settings note for a quarter of
+  the processor reads "Uses up to a quarter of your processor at low
+  priority, and about 8 GB of memory while ARC Node is running. It keeps
+  running on battery. Turn this off to stop ARC jobs and free that memory."
+  A note for another core count says the same about priority and memory. Both
+  replace the wording quoted in the next entry, which said "while the app is
+  open": closing the window hides ARC to the menu bar or system tray, and the
+  node keeps running there until ARC is quit. The step for a computer below
+  the memory requirement states the same facts. Nothing in this release
+  waits for idle time, heat or free memory, and none of that is promised
+  (#234).
+- The node the desktop starts now runs at low operating-system priority, so
+  the person's own apps get the processor first when it is busy:
+  BELOW_NORMAL_PRIORITY_CLASS on Windows, a nice value of 10 on macOS and
+  Linux, set before the node executes so every thread it creates inherits
+  it. This is scheduling only. The core cap still limits how much of the
+  processor the node may use, and nothing pauses it, on battery or
+  otherwise. If the system refuses the change the node still starts, and the
+  log says it did not get low priority (#234).
+- An install that finished setup before compute started on by default, has
+  compute off, and meets the memory requirement is asked once, the first
+  time ARC opens after the update: a dialog with the setup step's title and
+  body, and two buttons, Turn on and Not now. ARC records that it asked in a
+  marker file beside `store.json` before the dialog shows, so quitting with it
+  up never asks again, and a rollback that rewrites `store.json` does not
+  reset it. Turn on stores consent and, when no core count is stored, a
+  quarter of the logical cores, then downloads the model in the background as
+  setup does; Not now and Escape change nothing. It is not shown to an
+  install that has just finished setup, which asked the same question, to one
+  that already has compute on, to one that answered the v0.7 upgrade question
+  (which comes first), or to a computer below the memory requirement. A
+  launch where the question does not apply records the marker too, so
+  turning compute off later does not ask (#234).
+- Home's node strip says "Your node is getting ready: downloading the AI
+  model" with the amount downloaded while the model downloads in the
+  background with the node already running, as it does after setup and after
+  Turn on. It used to say so only while the node was off. A download that
+  reports nothing for 2.5 minutes without a final report, because it failed
+  or the computer slept, is no longer shown, and the next report brings the
+  line back (#234).
+- The generated release notes no longer say that updates never download or
+  install without confirmation, which stopped being true in v0.8.14. They say
+  that unattended installs have been on by default since v0.8.14 and that
+  turning off "Install signed app updates automatically when idle" in
+  Settings asks first. The release-contract check now fails if the notes
+  claim updates wait for confirmation, or name a Settings switch the app does
+  not show (#234).
 - Desktop setup starts with Contribute compute on when the computer meets the
   memory requirement for the ARC model, the same check that marks the model
   Recommended; below it the step starts off, as before. The step is titled

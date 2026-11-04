@@ -2197,10 +2197,14 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     }
     case "load_legacy_compute_question":
       return null as T;
+    // A live gateway is not an install: there is no one-time question to ask.
+    case "claim_compute_prompt":
+      return false as T;
     case "set_compute_contribution":
     case "promote_consented_install":
     case "set_prevent_sleep_during_jobs":
     case "answer_legacy_compute_question":
+    case "accept_compute_prompt":
       throw new Error(
         "Compute contribution can only be changed in the ARC desktop app, which owns the node.",
       );
@@ -2232,6 +2236,9 @@ function mockCrashed(): boolean {
 }
 let mockWorkerThreads: number | null = null;
 let mockConfig: NodeConfig | null = null;
+// Where the browser preview keeps the one-time compute question's marker, so
+// that it survives a reload the way the native marker file survives a launch.
+const MOCK_COMPUTE_PROMPT_KEY = "arc-mock-compute-prompt-shown-at";
 const mockLogs: LogEntry[] = [];
 // Explicit browser-preview fixture for a hypothetical host whose candidate
 // receipt contract is ready. These are static layout values, never a claim
@@ -3069,6 +3076,37 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         : { ...config, computeConsent: false, role: "observer" };
       return mockConfig as T;
     }
+    case "claim_compute_prompt": {
+      // Mirrors commands.rs::claim_compute_prompt for the browser preview.
+      // `window.__ARC_MOCK_COMPUTE_PROMPT__ = true` stands for an install from
+      // before the default, with compute off, on a computer that can run the
+      // model; without it nothing is asked. As natively, the question is
+      // recorded before it is answered true and the record survives a reload,
+      // so it is asked once.
+      if ((globalThis as { __ARC_MOCK_COMPUTE_PROMPT__?: boolean }).__ARC_MOCK_COMPUTE_PROMPT__ !== true) {
+        return false as T;
+      }
+      try {
+        if (localStorage.getItem(MOCK_COMPUTE_PROMPT_KEY) !== null) return false as T;
+        localStorage.setItem(MOCK_COMPUTE_PROMPT_KEY, String(Date.now()));
+      } catch {
+        // Not recorded, so not asked: a question that could repeat is worse
+        // than one that is missed.
+        return false as T;
+      }
+      return true as T;
+    }
+    case "accept_compute_prompt": {
+      // Mirrors commands.rs::accept_compute_prompt: consent, and a quarter of
+      // the cores unless a count is stored, as a setup that leaves compute on.
+      const config = mockConfig ?? DEFAULT_NODE_CONFIG;
+      mockConfig = {
+        ...config,
+        computeConsent: true,
+        workerThreads: config.workerThreads ?? defaultWorkerThreads(DEFAULT_HARDWARE.cpuCores),
+      };
+      return mockConfig as T;
+    }
     case "set_compute_contribution": {
       const { enabled } = args as { enabled: boolean };
       const config = mockConfig ?? DEFAULT_NODE_CONFIG;
@@ -3265,6 +3303,19 @@ export const api = {
   /** Answer it; recorded exactly like the Settings compute switch. */
   answerLegacyComputeQuestion: (contribute: boolean) =>
     invoke<NodeConfig>("answer_legacy_compute_question", { contribute }),
+  /**
+   * Launch: whether to ask this install, once, to turn on compute. Only an
+   * install that finished setup before compute started on by default, has it
+   * off, and can run the model gets true; native code writes its record of
+   * having asked before it answers, so true comes at most once per install.
+   */
+  claimComputePrompt: () => invoke<boolean>("claim_compute_prompt"),
+  /**
+   * "Turn on" in that question: consent, and a quarter of the cores when no
+   * count is stored, as a setup that leaves compute on. The model download
+   * follows through `promoteConsentedInstall`.
+   */
+  acceptComputePrompt: () => invoke<NodeConfig>("accept_compute_prompt"),
   startNode: (config: NodeConfig) =>
     noticeStartFailure(invoke<void>("start_node", { config }), "start"),
   stopNode: () => invoke<void>("stop_node"),
