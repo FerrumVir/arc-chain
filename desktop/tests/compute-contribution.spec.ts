@@ -1,9 +1,13 @@
 import { expect, test } from "@playwright/test";
+import { PLAIN_COPY } from "../src/lib/plain-copy";
+import { defaultWorkerThreads } from "../src/lib/types";
 import { seedMockOverrides, seedOnboarded } from "./helpers";
 
-// Compute contribution is an explicit opt-in. The node only downloads the
-// model and takes jobs after the user turns it on, and the dashboard shows
-// what this computer actually did, read from its own node.
+// Compute contribution is the user's answer. New installs start with it on
+// at setup where the model can run (onboarding.spec.ts); an install from
+// before that keeps its answer, here off. The node only downloads the model
+// and takes jobs while it is on, and the dashboard shows what this computer
+// actually did, read from its own node.
 test.describe("Compute contribution opt-in", () => {
   test.beforeEach(async ({ page }) => {
     await seedOnboarded(page);
@@ -12,15 +16,48 @@ test.describe("Compute contribution opt-in", () => {
   test("is off until the user turns it on, and keep-awake waits for it", async ({
     page,
   }) => {
+    // The core cap setup stores for a compute-on install (mirrored from
+    // commands::default_worker_threads), and the share Settings states.
+    for (const [cores, cap] of [
+      [1, 1],
+      [2, 1],
+      [3, 1],
+      [4, 1],
+      [7, 1],
+      [8, 2],
+      [12, 3],
+      [16, 4],
+      [24, 6],
+      [64, 16],
+    ] as const) {
+      expect(defaultWorkerThreads(cores), `${cores} logical cores`).toBe(cap);
+    }
+    const share = PLAIN_COPY.settings.computeShare;
+    const quarter = "Uses up to a quarter of your processor while ARC Node is open.";
+    const whole = "Uses up to your whole processor while ARC Node is open.";
+    expect(share(6, 24)).toBe(quarter);
+    expect(share(3, 12)).toBe(quarter);
+    expect(share(1, 16)).toBe(quarter);
+    expect(share(7, 24)).toBe("Uses up to 7 of your 24 processor cores while ARC Node is open.");
+    // One core of two is more than a quarter, so it is not called one.
+    expect(share(1, 2)).toBe("Uses up to 1 of your 2 processor cores while ARC Node is open.");
+    expect(share(24, 24)).toBe(whole);
+    expect(share(null, 24)).toBe(whole);
+
     await page.goto("/");
     await page.getByTestId("nav-settings").click();
     const consent = page.getByTestId("compute-consent-toggle");
     const keepAwake = page.getByTestId("prevent-sleep-toggle");
     await expect(consent).not.toBeChecked();
     await expect(keepAwake).toBeDisabled();
+    // Off, so nothing is said about processor use.
+    await expect(page.getByTestId("compute-share-note")).toHaveCount(0);
 
     await consent.click();
     await expect(consent).toBeChecked();
+    // This install never had a core cap. Turning compute on here keeps that
+    // (only setup stores the quarter), and the note says what it means.
+    await expect(page.getByTestId("compute-share-note")).toHaveText(whole);
     await expect(keepAwake).toBeEnabled();
     await keepAwake.click();
     await expect(keepAwake).toBeChecked();
@@ -29,6 +66,7 @@ test.describe("Compute contribution opt-in", () => {
     await consent.click();
     await expect(consent).not.toBeChecked();
     await expect(keepAwake).toBeDisabled();
+    await expect(page.getByTestId("compute-share-note")).toHaveCount(0);
   });
 
   test("the dashboard shows jobs completed and verified from the local node", async ({

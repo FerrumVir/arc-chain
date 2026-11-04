@@ -7,8 +7,10 @@ import { expect, test } from "@playwright/test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { PLAIN_COPY } from "../src/lib/plain-copy";
 import {
   clearState,
+  seedMockOverrides,
   seedOnboarded,
   seedOnboardedLegacy,
   walkToLaunch,
@@ -25,6 +27,10 @@ test.describe("Onboarding → launch end-to-end", () => {
   test("four-step setup: welcome → identity → model → launch", async ({
     page,
   }) => {
+    // A computer below the memory floor for the ARC model: the native side
+    // recommends no tier, so the compute step starts off there, as it did
+    // before compute was on by default.
+    await seedMockOverrides(page, { recommended_tier: "none" });
     await page.goto("/");
 
     await page.getByTestId("btn-continue-welcome").click();
@@ -39,6 +45,14 @@ test.describe("Onboarding → launch end-to-end", () => {
     );
     await expect(page.getByTestId("tier-tiny")).toHaveCount(0);
     await expect(page.getByTestId("tier-big")).toHaveCount(0);
+    await expect(page.getByTestId("tier-standard")).not.toContainText("Recommended");
+    await expect(page.getByTestId("tier-skip")).toHaveAttribute("aria-pressed", "true");
+    await expect(
+      page.getByRole("switch", { name: PLAIN_COPY.setup.compute.control }),
+    ).not.toBeChecked();
+    await expect(page.getByTestId("compute-choice-default")).toHaveText(
+      PLAIN_COPY.setup.compute.belowMemoryFloor,
+    );
     await page.getByTestId("tier-skip").click();
     await page.getByTestId("btn-continue-model").click();
     await expect(page.getByTestId("step-launch")).toBeVisible();

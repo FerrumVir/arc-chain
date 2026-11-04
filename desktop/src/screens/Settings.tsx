@@ -507,13 +507,15 @@ export function Settings() {
 }
 
 /**
- * The explicit opt-in for running ARC jobs on this computer.
+ * The answer to running ARC jobs on this computer.
  *
  * Nothing downloads a model or switches the node to worker mode without this
- * switch (or the equivalent choice in onboarding or the observer banner).
+ * switch being on (here, on the onboarding step where it starts on for a
+ * computer that can run the model, or through the observer banner).
  * Turning it on downloads the model if needed (resumable, verified), switches
  * to worker mode and restarts the node; turning it off returns to observer
- * mode at once.
+ * mode at once. While it is on, a note states how much of the processor jobs
+ * may use: the core cap the node runs with, or the stored one.
  */
 function ComputeConsent() {
   const config = useAppStore((s) => s.config);
@@ -534,6 +536,9 @@ function ComputeConsent() {
     refetchInterval: 3000,
   });
   const modelUnavailable = status?.modelUnavailable ?? null;
+  // The same core count the Compute contribution slider shows.
+  const coreCap = status?.workerThreads ?? config?.workerThreads ?? null;
+  const logicalCores = status?.cpuCores ?? null;
 
   const toggle = useMutation({
     mutationKey: COMPUTE_CONTRIBUTION_MUTATION_KEY,
@@ -592,9 +597,14 @@ function ComputeConsent() {
         />
         <span>Let ARC run inference jobs on this computer</span>
       </label>
+      {enabled && logicalCores !== null && (
+        <span className="field-hint" data-testid="compute-share-note">
+          {PLAIN_COPY.settings.computeShare(coreCap, logicalCores)}
+        </span>
+      )}
       <span className="field-hint">
-        Off unless you turn it on here or chose the ARC model during setup.
-        When on, the app downloads the ARC model once
+        New installs start with this on when the computer can run the ARC
+        model. When on, the app downloads the ARC model once
         (3.80 GB, checked against its pinned SHA-256), switches your node to
         worker mode, and takes jobs from the network while the app is open.
         Turning it off returns the node to observer mode right away.

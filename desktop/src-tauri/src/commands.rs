@@ -240,12 +240,25 @@ pub async fn save_config(
 /// and `model_path`. It runs before the main screens exist, so no Settings
 /// save can race it, and "Reset onboarding" re-runs the wizard over the
 /// existing store with a fresh, explicit answer.
+///
+/// A setup that turns compute on and names no core count gets the default
+/// cap, a quarter of the logical cores (`default_worker_threads`). A count
+/// already stored is kept (`apply_webview_config_save`).
 #[tauri::command]
 pub async fn complete_onboarding(
     app: AppHandle,
     state: State<'_, AppState>,
     config: NodeConfig,
 ) -> CmdResult<()> {
+    let mut config = config;
+    if takes_setup_core_default(&config) {
+        // The first hardware read can block for seconds (system_profiler).
+        // A failed read gives the smallest cap, one core.
+        let logical_cores = tokio::task::spawn_blocking(|| cached_hardware().cpu_cores)
+            .await
+            .unwrap_or(0);
+        apply_setup_core_default(&mut config, logical_cores);
+    }
     save_webview_config(&app, &state, config, ConfigSave::Onboarding).await
 }
 
@@ -270,10 +283,15 @@ fn apply_webview_config_save(store: &mut Store, mut config: NodeConfig, save: Co
     match save {
         ConfigSave::Onboarding => {
             preserve_unsent_contribution_choices(&mut config, store.config.as_ref());
-            // The wizard never asks about unattended installs, so a re-run
-            // ("Reset onboarding") keeps the stored answer, like keep-awake.
             if let Some(persisted) = store.config.as_ref() {
+                // The wizard never asks about unattended installs, so a re-run
+                // ("Reset onboarding") keeps the stored answer, like keep-awake.
                 config.auto_install_updates = persisted.auto_install_updates;
+                // Nor about cores: a stored count (the Settings slider, or an
+                // earlier setup's default) wins over this setup's default.
+                if persisted.worker_threads.is_some() {
+                    config.worker_threads = persisted.worker_threads;
+                }
             }
         }
         ConfigSave::Preferences => {
@@ -909,10 +927,11 @@ pub(crate) async fn restart_node_inner(app: &AppHandle, state: &AppState) -> Res
         .map_err(map_err)
 }
 
-// ── Compute contribution (explicit opt-in) ─────────────────────────────────
+// ── Compute contribution (the user's answer) ──────────────────────────────
 //
 // An install contributes compute only after its user says yes: onboarding's
-// model choice, the observer banner, or the Settings switch. Nothing here
+// compute step (which starts on when the computer can run the model, and
+// says so), the observer banner, or the Settings switch. Nothing here
 // downloads a model or switches to worker mode without that answer, and
 // turning the switch off returns the node to observer mode at once.
 
@@ -931,6 +950,31 @@ pub(crate) fn compute_contribution_enabled(config: &NodeConfig) -> bool {
     config
         .compute_consent
         .unwrap_or(config.role == "worker" && config.model_path.is_some())
+}
+
+/// The core cap setup stores for an install that contributes compute when
+/// none is stored yet: a quarter of the logical cores, rounded down, and at
+/// least one. `NodeManager::start` passes `worker_threads` to the node as
+/// `RAYON_NUM_THREADS` and `--threads`, the width of the pool AI jobs run
+/// on. The Settings slider (`set_worker_threads`) changes it.
+pub(crate) fn default_worker_threads(logical_cores: u32) -> u32 {
+    (logical_cores / 4).max(1)
+}
+
+/// Whether `complete_onboarding` gives this config the default core cap: the
+/// setup turns compute on and names no core count. Only setup does this, so
+/// an existing install keeps whatever it has, every core included, until
+/// someone sets a count.
+fn takes_setup_core_default(config: &NodeConfig) -> bool {
+    config.compute_consent == Some(true) && config.worker_threads.is_none()
+}
+
+/// Give a setup's config the default core cap for `logical_cores` when it
+/// takes one (`takes_setup_core_default`).
+fn apply_setup_core_default(config: &mut NodeConfig, logical_cores: u32) {
+    if takes_setup_core_default(config) {
+        config.worker_threads = Some(default_worker_threads(logical_cores));
+    }
 }
 
 /// What a consented install still needs before it can take jobs.
@@ -973,13 +1017,17 @@ fn preserve_unsent_contribution_choices(config: &mut NodeConfig, persisted: Opti
 }
 
 /// Compute contribution is native-owned once a config is stored: a
-/// preference save keeps the stored consent, keep-awake answer, role and
-/// model path, whatever its snapshot says. Only `set_compute_contribution`,
-/// `set_prevent_sleep_during_jobs` and a completed promotion change them,
-/// and `complete_onboarding` records the wizard's choice. With nothing
-/// stored (a WebView from before `complete_onboarding` finishing its wizard
-/// through `save_config`) the submitted choice is the first answer, and is
-/// kept.
+/// preference save keeps the stored consent, keep-awake answer, role, model
+/// path and core count, whatever its snapshot says. Only
+/// `set_compute_contribution`, `set_prevent_sleep_during_jobs`,
+/// `set_worker_threads` and a completed promotion change them, and
+/// `complete_onboarding` records the wizard's choice. With nothing stored (a
+/// WebView from before `complete_onboarding` finishing its wizard through
+/// `save_config`) the submitted choice is the first answer, and is kept.
+///
+/// The core count matters because setup stores a default the WebView learns
+/// only by reading the config back: a Settings save from a snapshot taken
+/// before that read must not drop the cap to every core.
 fn preserve_native_contribution_state(config: &mut NodeConfig, persisted: Option<&NodeConfig>) {
     let Some(persisted) = persisted else {
         return;
@@ -988,6 +1036,7 @@ fn preserve_native_contribution_state(config: &mut NodeConfig, persisted: Option
     config.prevent_sleep_during_jobs = persisted.prevent_sleep_during_jobs;
     config.role.clone_from(&persisted.role);
     config.model_path.clone_from(&persisted.model_path);
+    config.worker_threads = persisted.worker_threads;
 }
 
 async fn current_config(state: &AppState) -> NodeConfig {
@@ -6872,6 +6921,146 @@ mod compute_contribution_tests {
                 .unwrap()
         );
         assert!(!relaunched.config.unwrap().auto_install_updates);
+    }
+
+    #[test]
+    fn the_setup_core_cap_is_a_quarter_of_the_logical_cores_and_at_least_one() {
+        for (logical_cores, cap) in [
+            (0, 1),
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 1),
+            (7, 1),
+            (8, 2),
+            (10, 2),
+            (12, 3),
+            (16, 4),
+            (24, 6),
+            (64, 16),
+            (u32::MAX, u32::MAX / 4),
+        ] {
+            assert_eq!(
+                default_worker_threads(logical_cores),
+                cap,
+                "{logical_cores} logical cores"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_setup_that_turns_compute_on_without_a_core_count_takes_the_cap() {
+        assert!(takes_setup_core_default(&config("observer", None, Some(true))));
+        // Compute off, or never asked: no cap is invented.
+        assert!(!takes_setup_core_default(&config("observer", None, Some(false))));
+        assert!(!takes_setup_core_default(&config("observer", None, None)));
+        // A count the save already carries stays.
+        let named = NodeConfig {
+            worker_threads: Some(10),
+            ..config("observer", None, Some(true))
+        };
+        assert!(!takes_setup_core_default(&named));
+    }
+
+    /// What `complete_onboarding` saves for `submitted` on a computer with
+    /// `logical_cores`.
+    fn complete_setup(store: &mut Store, submitted: NodeConfig, logical_cores: u32) {
+        let mut submitted = submitted;
+        apply_setup_core_default(&mut submitted, logical_cores);
+        apply_webview_config_save(store, submitted, ConfigSave::Onboarding);
+    }
+
+    #[test]
+    fn a_new_install_that_contributes_compute_starts_at_a_quarter_of_the_cores() {
+        // Setup with the switch left on: an observer until the background
+        // download makes it a worker, consenting, capped at 6 of 24 cores.
+        let mut store = Store::default();
+        complete_setup(&mut store, config("observer", None, Some(true)), 24);
+        let saved = store.config.clone().unwrap();
+        assert_eq!(saved.compute_consent, Some(true));
+        assert_eq!(saved.worker_threads, Some(6));
+        assert_eq!(promotion_need(&saved, 16), PromotionNeed::Promote);
+
+        // The promotion after the download keeps the cap the node runs with.
+        update_stored_config_in(&mut store, |config| {
+            config.role = "worker".into();
+            config.model_path = Some("/m.gguf".into());
+        });
+        assert_eq!(store.config.unwrap().worker_threads, Some(6));
+
+        // Setup with the switch off stores no cap.
+        let mut skipped = Store::default();
+        complete_setup(&mut skipped, config("observer", None, Some(false)), 24);
+        assert_eq!(skipped.config.unwrap().worker_threads, None);
+    }
+
+    #[test]
+    fn a_rerun_setup_keeps_the_core_count_already_stored() {
+        let mut store = Store::default();
+        complete_setup(&mut store, config("observer", None, Some(true)), 24);
+        // The person raises it with the slider (what `set_worker_threads`
+        // writes before it applies the count).
+        update_stored_config_in(&mut store, |config| config.worker_threads = Some(12));
+
+        // "Reset onboarding", switch left on: the default does not replace
+        // the chosen count ...
+        complete_setup(&mut store, config("observer", None, Some(true)), 24);
+        assert_eq!(store.config.as_ref().unwrap().worker_threads, Some(12));
+        // ... nor does a re-run that switches compute off.
+        complete_setup(&mut store, config("observer", None, Some(false)), 24);
+        assert_eq!(store.config.as_ref().unwrap().worker_threads, Some(12));
+    }
+
+    #[test]
+    fn existing_installs_keep_their_core_count_and_consent() {
+        // A store written before setup stored a cap: every core, compute off.
+        let existing: NodeConfig = serde_json::from_value(serde_json::json!({
+            "role": "observer",
+            "modelPath": null,
+            "rpcPort": 9090,
+            "p2pPort": 9091,
+            "autoStart": true,
+            "autoUpdate": true,
+            "dataDir": "~/.arc/data-v3",
+            "computeConsent": false
+        }))
+        .unwrap();
+        assert_eq!(existing.worker_threads, None);
+        let mut store = Store {
+            config: Some(existing),
+            ..Store::default()
+        };
+
+        // A Settings save, even from a snapshot with a count, changes neither.
+        let stale = NodeConfig {
+            rpc_port: 10_001,
+            worker_threads: Some(3),
+            ..config("observer", None, Some(true))
+        };
+        apply_webview_config_save(&mut store, stale, ConfigSave::Preferences);
+        let persisted = store.config.clone().unwrap();
+        assert_eq!(persisted.rpc_port, 10_001);
+        assert_eq!(persisted.compute_consent, Some(false));
+        assert_eq!(persisted.worker_threads, None);
+
+        // Turning compute on in Settings, and the promotion after it, keep
+        // every core: only setup stores the default.
+        update_stored_config_in(&mut store, |config| config.compute_consent = Some(true));
+        update_stored_config_in(&mut store, |config| {
+            config.role = "worker".into();
+            config.model_path = Some("/m.gguf".into());
+        });
+        assert_eq!(store.config.as_ref().unwrap().worker_threads, None);
+
+        // A count set with the slider survives a later Settings save that
+        // carries none.
+        update_stored_config_in(&mut store, |config| config.worker_threads = Some(8));
+        apply_webview_config_save(
+            &mut store,
+            config("worker", Some("/m.gguf"), Some(true)),
+            ConfigSave::Preferences,
+        );
+        assert_eq!(store.config.unwrap().worker_threads, Some(8));
     }
 }
 

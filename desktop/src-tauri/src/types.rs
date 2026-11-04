@@ -71,7 +71,10 @@ pub struct NodeConfig {
     pub data_dir: String,
     /// How many CPU cores the node may use for parallel work (rayon's global
     /// pool). `None` = let rayon size itself, which means every logical core.
-    /// Surfaced as the Settings "Compute contribution" slider.
+    /// Surfaced as the Settings "Compute contribution" slider. A setup that
+    /// turns compute on stores a quarter of the logical cores when no count
+    /// is stored (`commands::default_worker_threads`); nothing else sets a
+    /// default, so an existing install keeps its value.
     ///
     /// `#[serde(default)]` so a `store.json` written by an older build still
     /// deserializes instead of resetting the whole config to defaults.
