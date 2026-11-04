@@ -3,7 +3,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PLAIN_COPY } from "../src/lib/plain-copy";
-import { SUPPORT_LINKS, buildSupportDetails, describeReportState } from "../src/lib/support";
+import { SUPPORT_LINKS, buildSupportDetails, describeReportState, scrubForSharing } from "../src/lib/support";
+import { SHARE_COPY } from "../src/components/ShareCopy";
 import { seedMockOverrides, seedOnboarded } from "./helpers";
 
 // "Get help": a person who hits a problem can copy scrubbed details and is
@@ -190,5 +191,104 @@ test.describe("Get help: in the app", () => {
     // Turning anonymous reports off changes the line to say no report is sent.
     await page.getByTestId("toggle-node-care").uncheck();
     await expect(help.getByTestId("settings-help-report")).toHaveText(PLAIN_COPY.help.report.off);
+  });
+});
+
+// Synthetic sensitive diagnostics: every kind of personal detail the sharing scrubber must remove, next to the
+// parts that make an error useful (wording, codes, versions, paths under the home folder, times, heights).
+const SENSITIVE =
+  "ARC refused to start the node: cannot lock /Volumes/Data/synthetic-home/.arc/data-v3/.arc-node.lock (os error 35). " +
+  "Also seen in /Users/synthetic/.arc, /home/synthetic/.arc, C:\\Users\\Synthetic\\.arc and C:/Users/Synthetic/.arc and /root/.arc. " +
+  "Contact synthetic.person@example.com or @synthetic_handle on +1 (415) 555-0134 / +44 20 7946 0958. " +
+  "Coordinator https://user:pw@coordinator.example:9443/v1 via 203.0.113.7:9090 and [2001:db8::7]:9090 on Synthetic-MacBook-Pro.local. " +
+  "Error code NODE_LOCK_HELD at 12:30:45 on 2026-11-04, block 1234567890, app 0.8.16, npm @types/node.";
+const LEAKS = [
+  "synthetic-home", "/Users/synthetic", "/home/synthetic", "Synthetic\\.arc", "Users/Synthetic", "/root/",
+  "synthetic.person", "example.com", "synthetic_handle", "555-0134", "7946", "user:pw", "coordinator.example",
+  "203.0.113.7", "2001:db8", "Synthetic-MacBook-Pro",
+];
+const KEPT = [
+  "ARC refused to start the node", "~/.arc/data-v3/.arc-node.lock", "(os error 35)", "NODE_LOCK_HELD", "12:30:45",
+  "2026-11-04", "block 1234567890", "app 0.8.16", "@types/node", "https://[redacted]",
+];
+const PLATFORM = { endpointConfigured: false, appVersion: "0.8.16", os: "macos", arch: "aarch64", homeDir: "/Volumes/Data/synthetic-home" };
+
+test.describe("Sharing scrub", () => {
+  test("removes home folders on every platform, emails, hosts, handles and phones, and keeps what helps", () => {
+    const out = scrubForSharing(SENSITIVE, PLATFORM.homeDir);
+    for (const leak of LEAKS) expect(out, leak).not.toContain(leak);
+    for (const keep of KEPT) expect(out, keep).toContain(keep);
+    // Without the native home folder, the generic user-folder rules still apply.
+    const generic = scrubForSharing("open /Users/synthetic/.arc and /home/synthetic/x and C:\\Users\\Synthetic\\y");
+    expect(generic).toBe("open ~/.arc and ~/x and ~\\y");
+  });
+});
+
+test.describe("Start failure: both Copy details actions share scrubbed text", () => {
+  test("the panel's Copy details and Get help's Copy details both put scrubbed text on the clipboard", async ({ page }) => {
+    await seedNodeOff(page);
+    await seedMockOverrides(page, { start_node: { __reject: SENSITIVE }, node_care_info: PLATFORM });
+    await page.goto("/");
+    await page.getByTestId("btn-start").click();
+    const failure = page.getByTestId("mutation-error");
+    await expect(failure).toBeVisible();
+    await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+
+    // The exact native text stays on screen for repair, labelled as local-only.
+    const toggle = failure.getByTestId("btn-start-failure-details");
+    if ((await toggle.getAttribute("aria-expanded")) !== "true") await toggle.click();
+    await expect(failure.getByTestId("start-failure-details")).toContainText("/Users/synthetic/.arc");
+    await expect(failure.getByTestId("start-failure-details-note")).toHaveText(SHARE_COPY.localOnly);
+
+    // 1. The panel's own Copy details (the one that copied the raw text before).
+    await failure.getByTestId("btn-start-failure-copy").click();
+    await expect(failure.getByTestId("btn-start-failure-copy")).toHaveText(PLAIN_COPY.actions.copied);
+    const panelCopy = await page.evaluate(() => navigator.clipboard.readText());
+    for (const leak of LEAKS) expect(panelCopy, leak).not.toContain(leak);
+    for (const keep of KEPT) expect(panelCopy, keep).toContain(keep);
+
+    // 2. Get help's Copy details.
+    await page.evaluate(() => navigator.clipboard.writeText(""));
+    const help = failure.getByTestId("start-failure-help");
+    await help.getByTestId("start-failure-help-toggle").click();
+    await help.getByTestId("start-failure-help-copy").click();
+    await expect(help.getByTestId("start-failure-help-copy")).toHaveText(PLAIN_COPY.actions.copied);
+    const helpCopy = await page.evaluate(() => navigator.clipboard.readText());
+    for (const leak of LEAKS) expect(helpCopy, leak).not.toContain(leak);
+    expect(helpCopy).toContain("App: 0.8.16 · Node: 0.8.16 · System: macos aarch64");
+    expect(helpCopy).toContain("~/.arc/data-v3/.arc-node.lock");
+  });
+
+  test("when the clipboard fails, both actions point to scrubbed text to copy by hand", async ({ page }) => {
+    await seedNodeOff(page);
+    await seedMockOverrides(page, { start_node: { __reject: SENSITIVE }, node_care_info: PLATFORM });
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, "clipboard", {
+        configurable: true,
+        value: { writeText: () => Promise.reject(new Error("denied")), readText: () => Promise.resolve("") },
+      });
+    });
+    await page.goto("/");
+    await page.getByTestId("btn-start").click();
+    const failure = page.getByTestId("mutation-error");
+
+    await failure.getByTestId("btn-start-failure-copy").click();
+    await expect(failure.getByTestId("btn-start-failure-copy")).toHaveText(PLAIN_COPY.actions.copyFailed);
+    const fallback = failure.getByTestId("start-failure-copy-fallback");
+    await expect(fallback).toContainText(SHARE_COPY.fallback);
+    const manual = (await fallback.getByTestId("start-failure-copy-fallback-text").textContent()) ?? "";
+    for (const leak of LEAKS) expect(manual, leak).not.toContain(leak);
+    for (const keep of KEPT) expect(manual, keep).toContain(keep);
+    // It stays until the next attempt instead of vanishing while someone selects it.
+    await page.waitForTimeout(3_000);
+    await expect(fallback).toBeVisible();
+    expect(await fallback.evaluate((el) => getComputedStyle(el.querySelector("pre")!).userSelect)).toBe("text");
+
+    const help = failure.getByTestId("start-failure-help");
+    await help.getByTestId("start-failure-help-toggle").click();
+    await help.getByTestId("start-failure-help-copy").click();
+    await expect(help.getByTestId("start-failure-help-copy-failed")).toHaveText(PLAIN_COPY.help.copyFailedFallback);
+    const helpManual = (await help.getByTestId("start-failure-help-details").textContent()) ?? "";
+    for (const leak of LEAKS) expect(helpManual, leak).not.toContain(leak);
   });
 });

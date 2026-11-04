@@ -3156,13 +3156,15 @@ let browserNodeCareState: string | null = JSON.stringify({
 function browserNodeCare<T>(cmd: string, args?: unknown): T {
   switch (cmd) {
     case "node_care_info":
-      return {
+      // Test seam, browser preview only (invoke() reaches here only outside the native host and a
+      // production bundle): a spec can give a synthetic platform, e.g. a home folder to scrub.
+      return mockOverride<T>(cmd) ?? ({
         endpointConfigured: false,
         appVersion: "0.0.0-preview",
         os: "preview",
         arch: "preview",
         homeDir: "",
-      } as T;
+      } as T);
     case "node_care_load_state":
       return browserNodeCareState as T;
     case "node_care_save_state":

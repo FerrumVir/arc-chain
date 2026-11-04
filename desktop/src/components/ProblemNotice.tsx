@@ -1,8 +1,8 @@
-import { useEffect, useId, useState, type ReactNode } from "react";
+import { useId, useState, type ReactNode } from "react";
 import { AlertTriangle, Check, Copy, Info } from "lucide-react";
 import { PLAIN_COPY } from "../lib/plain-copy";
+import { ShareCopyFallback, useShareCopy } from "./ShareCopy";
 
-const COPIED_RESET_MS = 2_500;
 
 /**
  * One plain sentence about a problem, its one fix, and the native text one
@@ -41,25 +41,9 @@ export function ProblemNotice({
   // A toggle applies to the text it was made on; new text starts from the default.
   const [toggled, setToggled] = useState<{ details: string; open: boolean } | null>(null);
   const open = toggled !== null && toggled.details === details ? toggled.open : detailsOpen;
-  const [copied, setCopied] = useState<"idle" | "copied" | "failed">("idle");
+  // Shared text is scrubbed; the native text under "Show details" stays exact, on this computer only.
+  const { shareText, copied, copy: copyDetails } = useShareCopy(details);
   const detailsId = useId();
-
-  useEffect(() => {
-    if (copied === "idle") return;
-    const timer = window.setTimeout(() => setCopied("idle"), COPIED_RESET_MS);
-    return () => window.clearTimeout(timer);
-  }, [copied]);
-
-  const copyDetails = () => {
-    if (!details) return;
-    // Without a clipboard API the call throws before returning a promise.
-    void Promise.resolve()
-      .then(() => navigator.clipboard.writeText(details))
-      .then(
-        () => setCopied("copied"),
-        () => setCopied("failed"),
-      );
-  };
 
   const attention = tone === "attention";
   const Icon = attention ? AlertTriangle : Info;
@@ -153,6 +137,7 @@ export function ProblemNotice({
             {details}
           </pre>
         )}
+        {details && copied === "failed" && <ShareCopyFallback text={shareText} testId={testId ? `${testId}-copy-fallback` : undefined} />}
       </div>
       {onDismiss && (
         <button

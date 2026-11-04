@@ -17,6 +17,33 @@ export const SUPPORT_LINKS = {
 
 export type HelpContext = keyof typeof PLAIN_COPY.help.state;
 
+const REDACTED = "[redacted]";
+// Device names on a home or office network ("Toms-MacBook-Pro.local").
+const LOCAL_HOSTNAME = /\b[A-Za-z0-9][A-Za-z0-9-]{0,62}\.(?:local|lan|home|internal|localdomain)\b/gi;
+// @handles, not npm scopes ("@types/node") or emails (already removed). No lookbehind: older macOS WebViews can't parse it.
+const HANDLE = /(^|[^\w@./])@[A-Za-z0-9_]{3,32}(?![\w/])/g;
+// Phone numbers: 9+ digits written with a +, spaces, dashes or brackets. Dotted versions, clock
+// times ("12:30"), dates ("2026-11-04") and bare counts or heights never match.
+const PHONE = /(^|[^\w.+])(\+?\(?\d{1,4}\)?(?:[ -]?\(?\d{2,5}\)?){2,5})(?!\w|:|\.\d)/g;
+
+/**
+ * The one scrubber for anything a person copies to share: Node Care's report
+ * scrub (home folders on macOS, Linux and Windows, emails, URL hosts, IP
+ * addresses, keys, addresses and long hex), plus local device hostnames,
+ * @handles and phone numbers. Error wording, codes, versions and paths under
+ * the home folder stay, so the text is still useful to whoever answers.
+ */
+export function scrubForSharing(raw: string, homeDir?: string | null): string {
+  return scrubMessage(raw, homeDir)
+    .replace(LOCAL_HOSTNAME, REDACTED)
+    .replace(HANDLE, (_m, prefix: string) => `${prefix}@${REDACTED}`)
+    .replace(PHONE, (match, prefix: string, number: string) => {
+      const digits = number.replace(/\D/g, "").length;
+      const written = /[+()\s-]/.test(number.trim());
+      return digits >= 9 && written ? `${prefix}${REDACTED}` : match;
+    });
+}
+
 export interface SupportDetailsInput {
   context: HelpContext;
   appVersion: string | null;
@@ -44,7 +71,7 @@ export function buildSupportDetails(input: SupportDetailsInput): string {
     `State: ${copy.state[input.context]}`,
   ];
   if (input.title) lines.push(`ARC says: ${input.title}`);
-  if (input.error) lines.push(`Details: ${scrubMessage(input.error, input.homeDir)}`);
+  if (input.error) lines.push(`Details: ${scrubForSharing(input.error, input.homeDir)}`);
   return lines.join("\n");
 }
 

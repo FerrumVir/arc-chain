@@ -1,4 +1,5 @@
 import { useEffect, useId, useState } from "react";
+import { ShareCopyFallback, useShareCopy } from "./ShareCopy";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, CheckCircle2, CircleAlert, Copy, Download, Loader2, Power } from "lucide-react";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -10,7 +11,6 @@ import { describeNodeStrip, type NodeStripAction, type NodeStripTone } from "../
 import { PLAIN_COPY } from "../lib/plain-copy";
 import { DEFAULT_NODE_CONFIG, type ModelDownloadProgress } from "../lib/types";
 
-const COPIED_RESET_MS = 2_500;
 
 const ACTION_LABEL: Record<NodeStripAction, string> = {
   "update-arc": PLAIN_COPY.actions.updateArc,
@@ -52,14 +52,7 @@ export function NodeStatusStrip() {
   const [busy, setBusy] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [modelProgress, setModelProgress] = useState<ModelDownloadProgress | null>(null);
-  const [copied, setCopied] = useState<"idle" | "copied" | "failed">("idle");
   const detailsId = useId();
-
-  useEffect(() => {
-    if (copied === "idle") return;
-    const timer = window.setTimeout(() => setCopied("idle"), COPIED_RESET_MS);
-    return () => window.clearTimeout(timer);
-  }, [copied]);
 
   const { data: status } = useQuery({
     queryKey: ["status"],
@@ -121,16 +114,8 @@ export function NodeStatusStrip() {
     connectingSeconds,
   });
 
-  // The native text, so a person can paste it into a report as it is.
-  const copyDetails = (details: string) => {
-    // Without a clipboard API the call throws before returning a promise.
-    void Promise.resolve()
-      .then(() => navigator.clipboard.writeText(details))
-      .then(
-        () => setCopied("copied"),
-        () => setCopied("failed"),
-      );
-  };
+  // The native text for a report, scrubbed of personal details before it reaches the clipboard.
+  const { shareText, copied, copy: copyDetails } = useShareCopy(view.details);
 
   const act = async (action: NodeStripAction) => {
     if (action === "update-arc") {
@@ -219,7 +204,7 @@ export function NodeStatusStrip() {
         <button
           type="button"
           className="btn btn-ghost btn-sm"
-          onClick={() => copyDetails(view.details!)}
+          onClick={copyDetails}
           data-testid="node-strip-copy"
         >
           {copied === "copied" ? <Check size={12} /> : <Copy size={12} />}{" "}
@@ -258,6 +243,11 @@ export function NodeStatusStrip() {
         >
           {view.details}
         </pre>
+      )}
+      {view.details && copied === "failed" && (
+        <div style={{ flexBasis: "100%" }}>
+          <ShareCopyFallback text={shareText} testId="node-strip-copy-fallback" />
+        </div>
       )}
     </div>
   );

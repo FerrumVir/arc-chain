@@ -1,4 +1,5 @@
 import { Check, CircleStop, Copy, Loader2, Send, SquarePen } from "lucide-react";
+import { ShareCopyFallback, useShareCopy } from "../components/ShareCopy";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { InfoPopover } from "../components/InfoPopover";
 import { NativePaidRequests } from "../components/NativePaidRequests";
@@ -420,7 +421,6 @@ function Pending({ turn }: { turn: ChatTurn }) {
   );
 }
 
-const COPIED_RESET_MS = 2_500;
 
 /**
  * A question that got no answer: one plain sentence, what to do, and the text
@@ -431,22 +431,9 @@ function Failed({ turn, latest, onRetry, disabled }: { turn: ChatTurn; latest: b
   const failure = describeFailure(turn.error);
   const tid = (name: string) => (latest ? name : `${name}-earlier`);
   const [open, setOpen] = useState(false);
-  const [copied, setCopied] = useState<"idle" | "copied" | "failed">("idle");
+  // Shared text is scrubbed; the raw text under "Show details" stays on this computer.
+  const { shareText, copied, copy: copyDetails } = useShareCopy(failure.raw);
   const detailsId = `${turn.id}-details`;
-  useEffect(() => {
-    if (copied === "idle") return;
-    const timer = window.setTimeout(() => setCopied("idle"), COPIED_RESET_MS);
-    return () => window.clearTimeout(timer);
-  }, [copied]);
-  const copyDetails = () => {
-    // Without a clipboard API the call throws before returning a promise.
-    void Promise.resolve()
-      .then(() => navigator.clipboard.writeText(failure.raw))
-      .then(
-        () => setCopied("copied"),
-        () => setCopied("failed"),
-      );
-  };
   const waited = turn.settledAt ? formatElapsed(Math.max(0, Math.floor((turn.settledAt - turn.sentAt) / 1000))) : null;
   return (
     <div className="answer answer-failed" data-testid={tid("inference-error")} data-failure-kind={failure.kind}>
@@ -485,6 +472,7 @@ function Failed({ turn, latest, onRetry, disabled }: { turn: ChatTurn; latest: b
           {failure.raw}
         </pre>
       )}
+      {failure.raw && copied === "failed" && <ShareCopyFallback text={shareText} testId={tid("inference-error-copy-fallback")} />}
     </div>
   );
 }
