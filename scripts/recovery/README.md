@@ -7563,7 +7563,10 @@ exact eligible full-model worker, submits one real one-token `/inference/run`
 targeted to it, and refuses to
 emit evidence unless the response proves community routing, the canonical
 per-row INT8 execution profile, authenticated 2-of-3 verification for every
-range/position, five validator approvals, and a pending `0x25` transaction:
+range/position, five validator approvals, and a pending `0x25` transaction.
+A node verifies a layer range that has only two live holders 2-of-2 and labels
+the result with a `..._2_of_2_...` method; the probe refuses such a result and
+names the two-replica quorum as the reason:
 
 ```bash
 probe="$PWD/scripts/recovery/community-reward-probe.py"

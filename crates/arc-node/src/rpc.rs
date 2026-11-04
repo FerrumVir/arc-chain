@@ -6837,8 +6837,28 @@ const MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 45;
 // Keep the protocol budget below the reviewed 4,000s public/client ceiling
 // while never truncating a valid maximum-size job.
 const MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 3_900;
+/// Community verification contacts this many replicas of each layer range,
+/// or every replica of a range that has fewer live holders (never fewer
+/// than `COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED`).
 const COMMUNITY_VERIFICATION_REPLICAS: usize = 3;
+/// Distinct authenticated active-validator signatures that must agree on
+/// every range and position, whatever the number of replicas contacted.
 const COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED: usize = 2;
+/// Verification method labels: every range verified 2-of-3, every range
+/// verified 2-of-2 (two live replicas), or a mix of the two.
+const COMMUNITY_VERIFICATION_METHOD_2_OF_3: &str = "authenticated_shard_quorum_2_of_3_per_range";
+const COMMUNITY_VERIFICATION_METHOD_2_OF_2: &str = "authenticated_shard_quorum_2_of_2_per_range";
+const COMMUNITY_VERIFICATION_METHOD_MIXED: &str =
+    "authenticated_shard_quorum_2_of_3_or_2_of_2_per_range";
+/// Response header on `GET /inference/readiness`: `ready`, or the reason
+/// code for which `community_dispatch_ready` is false. It is a header rather
+/// than a body field because released clients accept only the nine-field
+/// `arc.inference.readiness.v1` body.
+const COMMUNITY_DISPATCH_HEADER: &str = "x-arc-community-dispatch";
+/// Public text for a community route withheld because its result could not
+/// be verified now; the reason code is in `COMMUNITY_DISPATCH_HEADER`.
+const COMMUNITY_RESULTS_UNVERIFIABLE: &str =
+    "community results cannot be independently verified on this coordinator right now";
 
 /// Compute the per-request community dispatch timeout from the complete
 /// generation context, not merely the requested output length. A long prompt
@@ -7894,6 +7914,55 @@ struct InferenceReadinessResponse {
     model_id: Option<String>,
     required_community_execution_profile: &'static str,
     mutation_free_observation: bool,
+    /// Why community dispatch is not ready, or `None` when it is. Served in
+    /// `COMMUNITY_DISPATCH_HEADER`, never in this body.
+    #[serde(skip)]
+    community_dispatch_blocked: Option<CommunityDispatchBlocked>,
+}
+
+impl InferenceReadinessResponse {
+    /// `ready`, or the machine-readable reason community dispatch is not.
+    fn community_dispatch_status(&self) -> &'static str {
+        self.community_dispatch_blocked
+            .map_or("ready", CommunityDispatchBlocked::code)
+    }
+}
+
+/// Why `/inference/readiness` reports `community_dispatch_ready: false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommunityDispatchBlocked {
+    /// This node has no exact model artifact identity or no tokenizer.
+    ModelIdentityUnavailable,
+    /// No idle community worker serves this model under the reward profile.
+    NoEligibleWorkers,
+    /// This node runs no community work queue.
+    WorkQueueUnavailable,
+    /// The validator shard pipeline that verifies community results cannot
+    /// be assembled for this model under the reward profile.
+    VerificationPipelineUnavailable,
+    /// A layer range has fewer distinct live validator replicas than the
+    /// signatures one verification quorum needs.
+    VerificationReplicasBelowQuorum,
+}
+
+impl CommunityDispatchBlocked {
+    fn code(self) -> &'static str {
+        match self {
+            Self::ModelIdentityUnavailable => "model_identity_unavailable",
+            Self::NoEligibleWorkers => "no_eligible_workers",
+            Self::WorkQueueUnavailable => "work_queue_unavailable",
+            Self::VerificationPipelineUnavailable => "verification_pipeline_unavailable",
+            Self::VerificationReplicasBelowQuorum => "verification_replicas_below_quorum",
+        }
+    }
+
+    /// Workers could take the job, but its result could not be verified.
+    fn is_verification(self) -> bool {
+        matches!(
+            self,
+            Self::VerificationPipelineUnavailable | Self::VerificationReplicasBelowQuorum
+        )
+    }
 }
 
 fn inference_readiness_snapshot(node: &NodeState) -> InferenceReadinessResponse {
@@ -7901,12 +7970,39 @@ fn inference_readiness_snapshot(node: &NodeState) -> InferenceReadinessResponse 
     // artifact identity plus the canonical reward execution profile, and
     // excludes expired/busy workers.  The sender handle is the other fact
     // required before `/inference/run` can enqueue a community assignment.
-    let live_community_workers = live_inference_worker_count(node);
+    let eligible_workers = live_inference_worker_count(node);
     let exact_model = exact_model_identity(node)
         .ok()
         .map(|(_, model_id)| model_id);
-    let community_dispatch_ready =
-        live_community_workers > 0 && node.community_work_tx.is_some() && exact_model.is_some();
+    // A community job is dispatched only when its result could be verified
+    // now: the verifier's own pipeline and replica plan, read here without
+    // pruning the shard registry, must give every layer range at least two
+    // distinct replicas.
+    let community_dispatch_blocked = if exact_model.is_none() {
+        Some(CommunityDispatchBlocked::ModelIdentityUnavailable)
+    } else if eligible_workers == 0 {
+        Some(CommunityDispatchBlocked::NoEligibleWorkers)
+    } else if node.community_work_tx.is_none() {
+        Some(CommunityDispatchBlocked::WorkQueueUnavailable)
+    } else {
+        plan_community_verification(
+            node,
+            arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
+            false,
+        )
+        .err()
+        .map(|(blocked, _)| blocked)
+    };
+    let community_dispatch_ready = community_dispatch_blocked.is_none();
+    // A worker counts only while a job could be dispatched to it, so this
+    // stays 0 whenever community dispatch is not ready. Released clients
+    // reject a body where `community_dispatch_ready` differs from
+    // `live_community_workers > 0`.
+    let live_community_workers = if community_dispatch_ready {
+        eligible_workers
+    } else {
+        0
+    };
 
     // These mirror the two non-community branches in `inference_run`: a
     // complete local model, or a partial local model backed by an actually
@@ -7943,6 +8039,7 @@ fn inference_readiness_snapshot(node: &NodeState) -> InferenceReadinessResponse 
         required_community_execution_profile:
             arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
         mutation_free_observation: true,
+        community_dispatch_blocked,
     }
 }
 
@@ -7952,11 +8049,18 @@ fn inference_readiness_snapshot(node: &NodeState) -> InferenceReadinessResponse 
 /// neither allocates a job ID nor touches the assignment registry, shard
 /// registry, mempool, or inference permit. Its only purpose is to let a client
 /// reject a known unavailable origin *before* spending its single inference
-/// POST.
+/// POST. The `x-arc-community-dispatch` header says `ready`, or why
+/// `community_dispatch_ready` is false.
 async fn inference_readiness(
     AxumState(node): AxumState<NodeState>,
-) -> Json<InferenceReadinessResponse> {
-    Json(inference_readiness_snapshot(&node))
+) -> (HeaderMap, Json<InferenceReadinessResponse>) {
+    let readiness = inference_readiness_snapshot(&node);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        COMMUNITY_DISPATCH_HEADER,
+        HeaderValue::from_static(readiness.community_dispatch_status()),
+    );
+    (headers, Json(readiness))
 }
 
 async fn inference_run(
@@ -8146,6 +8250,18 @@ async fn inference_run(
             "sealed recovery probe coordinator cannot dispatch to the exact accepted canary worker",
         ));
     }
+    // A recovery probe exists to prove the community path. It never falls
+    // through to this node's own inference, so refuse it outright while a
+    // community result could not be verified.
+    if recovery_probe_id.is_some() && !readiness.community_dispatch_ready {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "sealed recovery probe coordinator cannot dispatch a verifiable community job now ({})",
+                readiness.community_dispatch_status()
+            ),
+        ));
+    }
     // Public demo: a caller-labelled public, testnet-only prompt that is
     // always run by two independent community workers (twin execution).
     let public_demo = req
@@ -8166,10 +8282,15 @@ async fn inference_run(
             ));
         }
         if !twin_dispatch::twin_dispatch_ready(&node) || !readiness.community_dispatch_ready {
-            return Err(api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the public demo runs every prompt on two independent community workers, and fewer than two are available on this coordinator now",
-            ));
+            let message = if readiness
+                .community_dispatch_blocked
+                .is_some_and(CommunityDispatchBlocked::is_verification)
+            {
+                COMMUNITY_RESULTS_UNVERIFIABLE
+            } else {
+                "the public demo runs every prompt on two independent community workers, and fewer than two are available on this coordinator now"
+            };
+            return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, message));
         }
         twin_dispatch::admit_public_demo(&node, input_text)
             .map_err(|(status, message)| api_error(status, message))?;
@@ -8177,6 +8298,19 @@ async fn inference_run(
     } else {
         max_tokens
     };
+    // Community dispatch waits for a verified result. When none could be
+    // verified now, skip the community and serve this request below exactly
+    // as when no worker is eligible, instead of holding the caller until the
+    // dispatch deadline.
+    if !force_local
+        && let Some(blocked) = readiness.community_dispatch_blocked
+        && blocked.is_verification()
+    {
+        tracing::warn!(
+            reason = blocked.code(),
+            "community results cannot be verified now; serving this request without community dispatch"
+        );
+    }
     if !force_local && readiness.community_dispatch_ready {
         let dispatched_at = std::time::Instant::now();
         let assigned_model_id = node
@@ -11649,6 +11783,9 @@ fn pipeline_execution_profile(pipeline: &[PipelineHop]) -> Result<String, String
 ///
 /// DECODE stays sequential: each token depends on the previous token's logits,
 /// so there is nothing to overlap.
+///
+/// `strategies` holds one replica strategy per hop, in pipeline order, so a
+/// caller can size each range's quorum to that range's replicas.
 #[allow(clippy::too_many_arguments)]
 async fn run_pipeline(
     node: &NodeState,
@@ -11657,11 +11794,18 @@ async fn run_pipeline(
     request_id: &str,
     all_tokens: &[u32],
     max_tokens: u32,
-    strategy: HopStrategy,
+    strategies: &[HopStrategy],
     collect_votes: bool,
     include_eos: bool,
 ) -> Result<PipelineRun, String> {
     preflight_sharded_generation(model, all_tokens.len(), max_tokens)?;
+    if strategies.len() != pipeline.len() {
+        return Err(format!(
+            "sharded pipeline has {} ranges but {} hop strategies",
+            pipeline.len(),
+            strategies.len()
+        ));
+    }
     // Profile validation is a strict pre-work boundary. No feeder, worker, or
     // outbound shard request is launched until every replica is proven to be
     // in the same exact arithmetic group.
@@ -11703,6 +11847,7 @@ async fn run_pipeline(
 
         for i in 0..num_hops {
             let (start_layer, end_layer) = pipeline[i].0;
+            let strategy = strategies[i];
             let mut replicas = live_replicas[i].clone();
             let hop_node = node.clone();
             let req_id = request_id.to_string();
@@ -11864,6 +12009,7 @@ async fn run_pipeline(
             let mut next_tok: Option<u32> = None;
 
             for (i, ((s_layer, e_layer), _)) in pipeline.iter().enumerate() {
+                let strategy = strategies[i];
                 let req = ForwardShardRequest {
                     request_id: request_id.to_string(),
                     model_id: model_id_hex.clone(),
@@ -12663,7 +12809,7 @@ async fn inference_run_sharded(
         &request_id,
         &all_tokens,
         max_tokens,
-        strategy,
+        &vec![strategy; pipeline.len()],
         false,
         false,
     )
@@ -13109,7 +13255,7 @@ async fn inference_run_consensus(
         &request_id,
         &all_tokens,
         max_tokens,
-        strategy,
+        &vec![strategy; pipeline.len()],
         true,
         false,
     )
@@ -14354,22 +14500,32 @@ impl CommunityAuthenticatedPayload for CommunityRewardApprovalPayload {
 /// supplied or overridden by a worker.
 #[derive(Debug, Clone, Serialize)]
 struct CommunityVerificationSummary {
+    /// `COMMUNITY_VERIFICATION_METHOD_2_OF_3` when every range contacted
+    /// three replicas, `_2_OF_2` when every range contacted its two live
+    /// replicas, and `_MIXED` otherwise.
     method: &'static str,
     /// The verifier admitted the assignment and every replica under the one
     /// protocol-canonical reward profile; this is coordinator-created proof,
     /// not a worker assertion.
     profile_bound: bool,
-    /// Every generated position completed its authenticated 2-of-3 quorum.
+    /// Every generated position completed its authenticated quorum: 2-of-3,
+    /// or 2-of-2 on a range with two live replicas.
     quorum_verified: bool,
     execution_profile: &'static str,
     output_hash: String,
     tokens_generated: usize,
     ranges: usize,
-    /// One authenticated 2-of-3 quorum record for each verified model-range
-    /// and token-position pair. This is not a raw signature count.
+    /// One authenticated quorum record for each verified model-range and
+    /// token-position pair. This is not a raw signature count.
     range_position_quorums: usize,
     signatures_required_per_quorum: usize,
+    /// The fewest replicas any one quorum contacted: 3, or 2 when at least
+    /// one range was verified 2-of-2.
     replicas_contacted_per_quorum: usize,
+    /// The `[start_layer, end_layer)` ranges verified 2-of-2. Omitted when
+    /// every range was verified 2-of-3, so that response is unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ranges_verified_2_of_2: Vec<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -14575,6 +14731,8 @@ struct CommunityResultVerification {
     range_count: usize,
     range_position_quorum_count: usize,
     execution_profile: &'static str,
+    /// Each verified range with the number of replicas its quorums contacted.
+    range_replicas: Vec<((usize, usize), usize)>,
 }
 
 #[derive(Debug)]
@@ -14600,7 +14758,7 @@ impl std::fmt::Display for CommunityResultVerificationError {
 impl From<&CommunityResultVerification> for CommunityVerificationSummary {
     fn from(verified: &CommunityResultVerification) -> Self {
         Self {
-            method: "authenticated_shard_quorum_2_of_3_per_range",
+            method: community_verification_method(&verified.range_replicas),
             profile_bound: true,
             quorum_verified: true,
             execution_profile: verified.execution_profile,
@@ -14609,8 +14767,35 @@ impl From<&CommunityResultVerification> for CommunityVerificationSummary {
             ranges: verified.range_count,
             range_position_quorums: verified.range_position_quorum_count,
             signatures_required_per_quorum: COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED,
-            replicas_contacted_per_quorum: COMMUNITY_VERIFICATION_REPLICAS,
+            replicas_contacted_per_quorum: verified
+                .range_replicas
+                .iter()
+                .map(|(_, replicas)| *replicas)
+                .min()
+                .unwrap_or(COMMUNITY_VERIFICATION_REPLICAS),
+            ranges_verified_2_of_2: verified
+                .range_replicas
+                .iter()
+                .filter(|(_, replicas)| *replicas < COMMUNITY_VERIFICATION_REPLICAS)
+                .map(|(range, _)| *range)
+                .collect(),
         }
+    }
+}
+
+/// The method label for one verification, from the number of replicas each
+/// range's quorums contacted.
+fn community_verification_method(range_replicas: &[((usize, usize), usize)]) -> &'static str {
+    let two_of_two = range_replicas
+        .iter()
+        .filter(|(_, replicas)| *replicas < COMMUNITY_VERIFICATION_REPLICAS)
+        .count();
+    if two_of_two == 0 {
+        COMMUNITY_VERIFICATION_METHOD_2_OF_3
+    } else if two_of_two == range_replicas.len() {
+        COMMUNITY_VERIFICATION_METHOD_2_OF_2
+    } else {
+        COMMUNITY_VERIFICATION_METHOD_MIXED
     }
 }
 
@@ -14675,7 +14860,7 @@ fn compare_community_result_with_tokens(
     let claimed_hash = parse_hash256_hex(&result.output_hash, "output_hash")?;
     if actual_hash != claimed_hash {
         return Err(format!(
-            "worker output_hash {} does not match 2-of-3 recomputation {}",
+            "worker output_hash {} does not match the quorum recomputation {}",
             claimed_hash, actual_hash
         ));
     }
@@ -14735,21 +14920,37 @@ fn validate_community_reward_profile(result: &WorkResult) -> Result<(), String> 
 }
 
 /// Validate that a successful community recomputation contains one fixed,
-/// authenticated 2-of-3 record for every executed range and token position.
+/// authenticated quorum record for every executed range and token position.
 ///
 /// This deliberately does not equate `votes.len()` with quorum proof.  Each
 /// record must identify two distinct currently approved, positive-stake signer
-/// keys, and all three configured replica slots must have been contacted.  The
-/// complete range/position grid is checked so a missing hop cannot disappear
-/// behind an otherwise plausible aggregate count.
+/// keys, and every replica slot planned for its range must have been
+/// contacted: `replicas_per_range`, aligned with `pipeline`, is 3, or 2 for a
+/// range with exactly two live replicas.  The complete range/position grid is
+/// checked so a missing hop cannot disappear behind an otherwise plausible
+/// aggregate count.
 fn validate_community_range_position_quorums(
     pipeline: &[PipelineHop],
+    replicas_per_range: &[usize],
     hop_stats: &[HopStats],
     votes: &[RangeVote],
     active_validators: &[(Hash256, u64)],
 ) -> Result<usize, String> {
-    if pipeline.is_empty() || hop_stats.len() != pipeline.len() {
+    if pipeline.is_empty()
+        || hop_stats.len() != pipeline.len()
+        || replicas_per_range.len() != pipeline.len()
+    {
         return Err("community verification produced an invalid pipeline summary".to_string());
+    }
+    let planned = COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED..=COMMUNITY_VERIFICATION_REPLICAS;
+    if let Some(replicas) = replicas_per_range
+        .iter()
+        .find(|replicas| !planned.contains(*replicas))
+    {
+        return Err(format!(
+            "community verification planned {replicas} replica slot(s) for one range; each range needs {} to {}",
+            COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED, COMMUNITY_VERIFICATION_REPLICAS
+        ));
     }
     let positions = hop_stats[0].positions;
     if positions == 0 || hop_stats.iter().any(|stats| stats.positions != positions) {
@@ -14775,8 +14976,11 @@ fn validate_community_range_position_quorums(
         .iter()
         .filter_map(|(address, stake)| (*stake > 0).then_some(*address))
         .collect();
-    let expected_ranges: std::collections::HashSet<(usize, usize)> =
-        pipeline.iter().map(|(range, _)| *range).collect();
+    let expected_ranges: HashMap<(usize, usize), usize> = pipeline
+        .iter()
+        .map(|(range, _)| *range)
+        .zip(replicas_per_range.iter().copied())
+        .collect();
     let terminal_range = pipeline
         .last()
         .map(|(range, _)| *range)
@@ -14784,25 +14988,28 @@ fn validate_community_range_position_quorums(
     let mut observed = std::collections::HashSet::with_capacity(expected_count);
 
     for vote in votes {
-        if !expected_ranges.contains(&vote.range) || vote.position >= positions {
+        let Some(&expected_replicas) = expected_ranges
+            .get(&vote.range)
+            .filter(|_| vote.position < positions)
+        else {
             return Err(format!(
                 "community verification contains unexpected range {:?} position {}",
                 vote.range, vote.position
             ));
-        }
+        };
         if !observed.insert((vote.range, vote.position)) {
             return Err(format!(
                 "community verification duplicated range {:?} position {}",
                 vote.range, vote.position
             ));
         }
-        if vote.replicas_contacted.len() != COMMUNITY_VERIFICATION_REPLICAS {
+        if vote.replicas_contacted.len() != expected_replicas {
             return Err(format!(
                 "range {:?} position {} contacted {} replica slot(s), expected {}",
                 vote.range,
                 vote.position,
                 vote.replicas_contacted.len(),
-                COMMUNITY_VERIFICATION_REPLICAS
+                expected_replicas
             ));
         }
         if !vote.majority_hash.as_deref().is_some_and(is_hash256_hex) {
@@ -14845,9 +15052,9 @@ fn validate_community_range_position_quorums(
         }
     }
 
-    for range in expected_ranges {
+    for range in expected_ranges.keys() {
         for position in 0..positions {
-            if !observed.contains(&(range, position)) {
+            if !observed.contains(&(*range, position)) {
                 return Err(format!(
                     "community verification is missing range {:?} position {position}",
                     range
@@ -14859,7 +15066,9 @@ fn validate_community_range_position_quorums(
 }
 
 /// Independently recompute a community worker's claimed completion through
-/// three authenticated, distinct active-validator replicas per layer range.
+/// authenticated, distinct active-validator replicas of every layer range:
+/// three replicas, or both replicas of a range with exactly two live
+/// holders, and in either case two distinct signatures that agree.
 /// `pipeline_hop` only counts one vote per validator key, and every response
 /// is signed over the exact request and chain domain. No quorum means no
 /// accepted output and no reward.
@@ -14884,10 +15093,11 @@ async fn verify_community_result_with_quorum(
         range_count: recomputed.range_count,
         range_position_quorum_count: recomputed.range_position_quorum_count,
         execution_profile: recomputed.execution_profile,
+        range_replicas: recomputed.range_replicas,
     })
 }
 
-/// The validators' authenticated 2-of-3 recomputation of an assignment,
+/// The validators' authenticated quorum recomputation of an assignment,
 /// independent of any worker's claim. Twin execution recomputes once and
 /// classifies both legs against this output.
 struct CommunityCanonicalRecompute {
@@ -14898,11 +15108,121 @@ struct CommunityCanonicalRecompute {
     range_position_quorum_count: usize,
     /// The profile the validator shards executed: the assignment's own.
     execution_profile: &'static str,
+    /// Each verified range with the number of replicas its quorums contacted.
+    range_replicas: Vec<((usize, usize), usize)>,
 }
 
-/// Recompute an assignment through three authenticated, distinct
-/// active-validator replicas per layer range. Every failure is `Unavailable`:
-/// without a worker claim there is nothing for it to prove invalid.
+/// How many replicas community verification contacts for each range of
+/// `pipeline`, in pipeline order: every distinct replica, up to
+/// `COMMUNITY_VERIFICATION_REPLICAS`. A range with fewer distinct replicas
+/// than `COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED` fails the plan, because
+/// no quorum there could carry two independent signatures.
+fn community_verification_replica_plan(pipeline: &[PipelineHop]) -> Result<Vec<usize>, String> {
+    pipeline
+        .iter()
+        .map(|((start, end), replicas)| {
+            let distinct = replicas
+                .iter()
+                .map(|replica| replica.socket_addr.as_str())
+                .collect::<HashSet<_>>()
+                .len();
+            if distinct < COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED {
+                return Err(format!(
+                    "range [{start}, {end}) has {distinct} distinct replica(s); community verification requires at least {COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED}"
+                ));
+            }
+            Ok(distinct.min(COMMUNITY_VERIFICATION_REPLICAS))
+        })
+        .collect()
+}
+
+/// The pipeline one community verification runs on, with the number of
+/// replicas it contacts for each layer range, aligned with `pipeline`.
+struct CommunityVerificationPlan {
+    pipeline: Vec<PipelineHop>,
+    replicas_per_range: Vec<usize>,
+}
+
+/// The layer-range pipeline community verification runs on: this node's
+/// fresh shards for its exact model and `required_profile`, under the strict
+/// validator-identity policy. `prune_expired_shards` removes expired registry
+/// entries while reading; read-only callers pass false.
+fn community_verification_pipeline(
+    node: &NodeState,
+    required_profile: &str,
+    prune_expired_shards: bool,
+) -> Result<Vec<PipelineHop>, PipelineError> {
+    if let Some(pipeline) = community_verification_pipeline_override(node) {
+        return Ok(pipeline);
+    }
+    let model_id = node
+        .model_artifact_id
+        .ok_or(PipelineError::ModelIdentityUnavailable)?;
+    let shards = if prune_expired_shards {
+        fresh_shards(&node.shard_registry)
+    } else {
+        fresh_shards_snapshot(&node.shard_registry)
+    };
+    assemble_profile_bound_pipeline_for_model_with_identity_policy(
+        shards,
+        model_id,
+        Some(required_profile),
+        &node.latency_stats,
+        true,
+    )
+    .map(|selection| selection.hops)
+}
+
+/// Test-only explicit verification pipeline; see
+/// `NodeState::community_verification_pipeline_override`.
+#[cfg(test)]
+fn community_verification_pipeline_override(node: &NodeState) -> Option<Vec<PipelineHop>> {
+    node.community_verification_pipeline_override.clone()
+}
+
+#[cfg(not(test))]
+fn community_verification_pipeline_override(_node: &NodeState) -> Option<Vec<PipelineHop>> {
+    None
+}
+
+/// Plan a community verification of `required_profile` exactly as the
+/// verifier runs it: the pipeline, its execution profile, and the replica
+/// count of every range. `/inference/readiness` and `/inference/run` call it
+/// with `prune_expired_shards: false`, so a read never edits the registry.
+/// The error carries the readiness reason and the detail for this node's log.
+fn plan_community_verification(
+    node: &NodeState,
+    required_profile: &str,
+    prune_expired_shards: bool,
+) -> Result<CommunityVerificationPlan, (CommunityDispatchBlocked, String)> {
+    use CommunityDispatchBlocked as Blocked;
+
+    let pipeline = community_verification_pipeline(node, required_profile, prune_expired_shards)
+        .map_err(|error| {
+            let detail = format!("assemble verification pipeline: {error}");
+            (Blocked::VerificationPipelineUnavailable, detail)
+        })?;
+    let pipeline_profile = pipeline_execution_profile(&pipeline)
+        .map_err(|error| (Blocked::VerificationPipelineUnavailable, error))?;
+    if pipeline_profile != required_profile {
+        let detail = format!(
+            "reward verification pipeline uses {:?}, required {:?}",
+            pipeline_profile, required_profile
+        );
+        return Err((Blocked::VerificationPipelineUnavailable, detail));
+    }
+    let replicas_per_range = community_verification_replica_plan(&pipeline)
+        .map_err(|error| (Blocked::VerificationReplicasBelowQuorum, error))?;
+    Ok(CommunityVerificationPlan {
+        pipeline,
+        replicas_per_range,
+    })
+}
+
+/// Recompute an assignment through authenticated, distinct active-validator
+/// replicas of every layer range, as `verify_community_result_with_quorum`
+/// describes. Every failure is `Unavailable`: without a worker claim there is
+/// nothing for it to prove invalid.
 async fn recompute_community_output_with_quorum(
     node: &NodeState,
     work_item: &WorkItem,
@@ -14943,54 +15263,10 @@ async fn recompute_community_output_with_quorum(
         )));
     }
 
-    let pipeline = {
-        #[cfg(test)]
-        {
-            if let Some(pipeline) = node.community_verification_pipeline_override.clone() {
-                pipeline
-            } else {
-                assemble_profile_bound_pipeline_for(node, Some(required))
-                    .map(|selection| selection.hops)
-                    .map_err(|e| {
-                        CommunityResultVerificationError::Unavailable(format!(
-                            "assemble verification pipeline: {e}"
-                        ))
-                    })?
-            }
-        }
-        #[cfg(not(test))]
-        {
-            assemble_profile_bound_pipeline_for(node, Some(required))
-                .map(|selection| selection.hops)
-                .map_err(|e| {
-                    CommunityResultVerificationError::Unavailable(format!(
-                        "assemble verification pipeline: {e}"
-                    ))
-                })?
-        }
-    };
-    let pipeline_profile = pipeline_execution_profile(&pipeline)
-        .map_err(CommunityResultVerificationError::Unavailable)?;
-    if pipeline_profile != required {
-        return Err(CommunityResultVerificationError::Unavailable(format!(
-            "reward verification pipeline uses {:?}, required {:?}",
-            pipeline_profile, required
-        )));
-    }
-    for (range, replicas) in &pipeline {
-        let distinct_sockets: std::collections::HashSet<&str> = replicas
-            .iter()
-            .map(|replica| replica.socket_addr.as_str())
-            .collect();
-        if distinct_sockets.len() < COMMUNITY_VERIFICATION_REPLICAS {
-            return Err(CommunityResultVerificationError::Unavailable(format!(
-                "range [{}, {}) has {} distinct replicas; secure reward verification requires 3",
-                range.0,
-                range.1,
-                distinct_sockets.len()
-            )));
-        }
-    }
+    // Every range contacts all of its distinct replicas up to three, and one
+    // with fewer than two makes verification unavailable.
+    let plan = plan_community_verification(node, required, true)
+        .map_err(|(_, detail)| CommunityResultVerificationError::Unavailable(detail))?;
 
     let (all_tokens, _) =
         community_worker_generation_context(&model, &work_item.input, work_item.max_tokens)
@@ -15011,27 +15287,35 @@ async fn recompute_community_output_with_quorum(
         )
         .to_hex()
     );
+    // A fixed quorum per range, never degraded mid-run: 2-of-3 where three
+    // replicas are contacted, 2-of-2 where a range has exactly two.
+    let strategies: Vec<HopStrategy> = plan
+        .replicas_per_range
+        .iter()
+        .map(|&replicas| HopStrategy::Fanout {
+            fanout: replicas,
+            needed: COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED,
+            allow_degraded_quorum: false,
+        })
+        .collect();
     let run_result = run_pipeline(
         node,
         &model,
-        &pipeline,
+        &plan.pipeline,
         &request_id,
         &all_tokens,
         work_item.max_tokens,
-        HopStrategy::Fanout {
-            fanout: COMMUNITY_VERIFICATION_REPLICAS,
-            needed: COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED,
-            allow_degraded_quorum: false,
-        },
+        &strategies,
         true,
         true,
     )
     .await;
-    cleanup_shards(node, &pipeline, &request_id).await;
+    cleanup_shards(node, &plan.pipeline, &request_id).await;
     let run = run_result.map_err(CommunityResultVerificationError::Unavailable)?;
     let active_validators = node.dag_validators.read().clone();
     let range_position_quorum_count = validate_community_range_position_quorums(
-        &pipeline,
+        &plan.pipeline,
+        &plan.replicas_per_range,
         &run.hop_stats,
         &run.votes,
         &active_validators,
@@ -15047,9 +15331,15 @@ async fn recompute_community_output_with_quorum(
         output_hash: arc_crypto::hash_bytes(&output_bytes),
         generated: run.generated,
         output_text,
-        range_count: pipeline.len(),
+        range_count: plan.pipeline.len(),
         range_position_quorum_count,
         execution_profile: required,
+        range_replicas: plan
+            .pipeline
+            .iter()
+            .map(|(range, _)| *range)
+            .zip(plan.replicas_per_range.iter().copied())
+            .collect(),
     })
 }
 
@@ -21284,11 +21574,14 @@ mod tests {
             .iter()
             .map(|key| (key.address(), arc_state::StateDB::MIN_VALIDATOR_STAKE))
             .collect::<Vec<_>>();
-        assert_eq!(
-            validate_community_range_position_quorums(&pipeline, &hop_stats, &votes, &active,)
-                .unwrap(),
-            1
+        let quorums = validate_community_range_position_quorums(
+            &pipeline,
+            &[COMMUNITY_VERIFICATION_REPLICAS],
+            &hop_stats,
+            &votes,
+            &active,
         );
+        assert_eq!(quorums.unwrap(), 1);
         let mut worker_attestation = arc_types::Transaction {
             tx_type: arc_types::TxType::InferenceAttestation,
             from: worker.address(),
@@ -24062,6 +24355,199 @@ mod tests {
         let _ = std::fs::remove_dir_all(temporary);
     }
 
+    /// Verify `result` for `work_item` on a copy of `coordinator` whose
+    /// verification pipeline is the one range `[0, 1)` held by `replicas`.
+    async fn verify_through_replicas(
+        coordinator: &NodeState,
+        replicas: Vec<ShardInfo>,
+        work_item: &WorkItem,
+        result: &WorkResult,
+    ) -> Result<CommunityResultVerification, CommunityResultVerificationError> {
+        let mut coordinator = coordinator.clone();
+        coordinator.community_verification_pipeline_override = Some(vec![((0, 1), replicas)]);
+        verify_community_result_with_quorum(&coordinator, work_item, result).await
+    }
+
+    #[tokio::test]
+    async fn two_replica_ranges_verify_only_when_both_authenticated_replicas_agree() {
+        use arc_inference::cached_integer_model::{CANONICAL_REWARD_INFERENCE_PROFILE, I8Weights};
+
+        let (validator_keys, recovered, temporary) = recovered_six_validator_state();
+        let active = recovered.active_validators();
+        let model_id = arc_crypto::hash_bytes(b"two-replica-verification-model");
+        let other_id = arc_crypto::hash_bytes(b"another-model-artifact");
+        let model = Arc::new(test_reward_inference_model());
+        // Holder 3 signs with its own validator key but computes with other
+        // output weights, so its terminal logits disagree with the others.
+        // Holder 4 loaded another artifact and refuses every request.
+        let mut wrong_model = test_reward_inference_model();
+        let wrong_values: Vec<f32> = (0..32).map(|index| (index % 5) as f32 / 10.0).collect();
+        wrong_model.output_weight = I8Weights::quantize_f32(&wrong_values, 8, 4);
+        let wrong_model = Arc::new(wrong_model);
+
+        let mut shard_nodes = Vec::new();
+        let mut shard_handles = Vec::new();
+        let mut holders = Vec::new();
+        for (index, key) in validator_keys.iter().take(5).enumerate() {
+            let holder_model = if index == 3 { &wrong_model } else { &model };
+            let holder_model_id = if index == 4 { other_id } else { model_id };
+            let mut node = fake_node_with_workers(Vec::new());
+            node.state = recovered.clone();
+            node.validator_address = key.address();
+            node.validator_keypair = Some(Arc::new(key.clone()));
+            node.inference_model = Some(holder_model.clone());
+            node.model_artifact_id = Some(holder_model_id);
+            *node.dag_validators.write() = active.clone();
+            let info = ShardInfo {
+                start_layer: 0,
+                end_layer: 1,
+                total_layers: 1,
+                model_id: format!("0x{}", model_id.to_hex()),
+                model_name: model_display_name(&model),
+                execution_profile: canonical_profile(),
+                memory_mb: 1,
+                full_model_mb: 1,
+                socket_addr: String::new(),
+                node_name: format!("holder-{index}"),
+            };
+            node.shard_infos = vec![info.clone()];
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let app = Router::new()
+                .route("/network/info", get(network_info))
+                .route("/inference/forward_shard", post(inference_forward_shard))
+                .route("/inference/cleanup_shard", post(inference_cleanup_shard))
+                .with_state(node.clone());
+            shard_handles.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+            holders.push(ShardInfo {
+                socket_addr: origin,
+                ..info
+            });
+            shard_nodes.push(node);
+        }
+        let holder = |index: usize| holders[index].clone();
+
+        let mut coordinator = fake_node_with_workers(Vec::new());
+        coordinator.state = recovered.clone();
+        coordinator.validator_address = validator_keys[5].address();
+        coordinator.validator_keypair = Some(Arc::new(validator_keys[5].clone()));
+        coordinator.inference_model = Some(model.clone());
+        coordinator.model_artifact_id = Some(model_id);
+        *coordinator.dag_validators.write() = active;
+
+        let prompt = model.encode("ARC");
+        let (tokens, output_hash) = model.generate(&prompt, 1, &[]);
+        let job = |name: &str| WorkItem {
+            job_id: arc_crypto::hash_bytes(name.as_bytes()).to_hex(),
+            input: "ARC".to_string(),
+            max_tokens: 1,
+            model_id: Some(format!("0x{}", model_id.to_hex())),
+            execution_profile: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+            transaction_domain: None,
+            expected_worker_id: None,
+            submitted_at_unix_ms: 1,
+            expires_at_unix_ms: u64::MAX,
+        };
+        let result = |work_item: &WorkItem| WorkResult {
+            job_id: work_item.job_id.clone(),
+            worker_id: "two-replica-worker".to_string(),
+            success: true,
+            declined: false,
+            output: model.decode(&tokens),
+            output_hash: format!("0x{}", output_hash.to_hex()),
+            tokens_generated: tokens.len() as u64,
+            total_ms: 1,
+            ms_per_token: 1,
+            engine: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+            error: None,
+            signed_attestation_hex: None,
+        };
+
+        // Both replicas of a two-holder range agree: verified 2-of-2.
+        let work_item = job("both replicas agree");
+        let verified = verify_through_replicas(
+            &coordinator,
+            vec![holder(0), holder(1)],
+            &work_item,
+            &result(&work_item),
+        )
+        .await
+        .expect("two agreeing authenticated replicas verify a two-holder range");
+        assert_eq!(verified.range_replicas, vec![((0, 1), 2)]);
+        let summary = CommunityVerificationSummary::from(&verified);
+        assert_eq!(summary.method, COMMUNITY_VERIFICATION_METHOD_2_OF_2);
+        assert_eq!(summary.replicas_contacted_per_quorum, 2);
+        assert_eq!(summary.ranges_verified_2_of_2, vec![(0, 1)]);
+
+        // One of the two disagrees, or never answers: no quorum, so the
+        // result stays unverified and nothing is charged to the worker.
+        for (name, other) in [("one replica disagrees", 3), ("one replica refuses", 4)] {
+            let work_item = job(name);
+            let outcome = verify_through_replicas(
+                &coordinator,
+                vec![holder(0), holder(other)],
+                &work_item,
+                &result(&work_item),
+            )
+            .await;
+            let Err(CommunityResultVerificationError::Unavailable(reason)) = outcome else {
+                panic!("{name}: a two-holder range needs both replicas to agree");
+            };
+            assert!(reason.contains("No majority"), "{name}: {reason}");
+        }
+
+        // A range with one live replica cannot be verified at all.
+        let work_item = job("one live replica");
+        let outcome = verify_through_replicas(
+            &coordinator,
+            vec![holder(0)],
+            &work_item,
+            &result(&work_item),
+        )
+        .await;
+        let Err(CommunityResultVerificationError::Unavailable(reason)) = outcome else {
+            panic!("one live replica cannot verify a range");
+        };
+        assert!(reason.contains("requires at least 2"), "{reason}");
+
+        // Three replicas behave as before: two of three agreeing verify the
+        // range, and one of three does not.
+        let work_item = job("two of three agree");
+        let verified = verify_through_replicas(
+            &coordinator,
+            vec![holder(0), holder(3), holder(1)],
+            &work_item,
+            &result(&work_item),
+        )
+        .await
+        .expect("two agreeing replicas of three verify the range");
+        let summary = CommunityVerificationSummary::from(&verified);
+        assert_eq!(summary.method, COMMUNITY_VERIFICATION_METHOD_2_OF_3);
+        assert_eq!(summary.replicas_contacted_per_quorum, 3);
+        assert!(summary.ranges_verified_2_of_2.is_empty());
+
+        let work_item = job("one of three agrees");
+        let outcome = verify_through_replicas(
+            &coordinator,
+            vec![holder(0), holder(3), holder(4)],
+            &work_item,
+            &result(&work_item),
+        )
+        .await;
+        let Err(CommunityResultVerificationError::Unavailable(reason)) = outcome else {
+            panic!("one agreeing replica of three is not a quorum");
+        };
+        assert!(reason.contains("No majority"), "{reason}");
+
+        for handle in shard_handles {
+            handle.abort();
+        }
+        drop(shard_nodes);
+        let _ = std::fs::remove_dir_all(temporary);
+    }
+
     #[tokio::test]
     async fn work_queue_round_trip_after_serve_wiring() {
         // Smoke test: build_node_state alone leaves the queue None
@@ -24409,6 +24895,23 @@ mod tests {
             own_compute_ms: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
             community_verification_pipeline_override: None,
         }
+    }
+
+    /// The one layer range `[0, 1)`, held by one replica at each address.
+    fn range_held_at(addresses: &[&str]) -> PipelineHop {
+        let replicas = addresses
+            .iter()
+            .map(|address| shard(address, address, 0, 1))
+            .collect();
+        ((0, 1), replicas)
+    }
+
+    /// A verification pipeline that passes the community dispatch precheck:
+    /// one layer range held by two distinct validator replicas. A test that
+    /// dispatches through `/inference/run` needs it, because the coordinator
+    /// sends a job to a worker only while it could verify the result.
+    fn verifiable_dispatch_pipeline() -> Vec<PipelineHop> {
+        vec![range_held_at(&["10.0.0.1:9090", "10.0.0.2:9090"])]
     }
 
     pub(super) fn worker(id: &str, caps: &[&str]) -> CommunityWorker {
@@ -25461,8 +25964,16 @@ mod tests {
         );
         assert_eq!(value["schema"], "arc.inference.readiness.v1");
         assert_eq!(value["mutation_free_observation"], true);
-        assert_eq!(value["community_dispatch_ready"], true);
-        assert_eq!(value["safe_to_dispatch"], true);
+        // A live worker alone is not a community route: with no fresh shard
+        // nothing could verify its result, so neither the route nor its
+        // worker is offered, and nothing else can serve this request.
+        assert_eq!(value["community_dispatch_ready"], false);
+        assert_eq!(value["live_community_workers"], 0);
+        assert_eq!(value["safe_to_dispatch"], false);
+        assert_eq!(
+            response.community_dispatch_status(),
+            "verification_pipeline_unavailable"
+        );
         assert_eq!(
             value["required_community_execution_profile"],
             arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE
@@ -25481,6 +25992,103 @@ mod tests {
         assert!(!response.community_dispatch_ready);
         assert!(!response.local_model_ready);
         assert!(!response.sharded_pipeline_ready);
+        assert_eq!(
+            response.community_dispatch_status(),
+            "model_identity_unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_offers_community_dispatch_only_while_every_range_has_two_replicas() {
+        let now = std::time::Instant::now();
+        let mut node = fake_node_with_workers(vec![(worker("ready", &["inference"]), now)]);
+        let mut partial_model = test_reward_inference_model();
+        partial_model.layers.clear();
+        node.inference_model = Some(Arc::new(partial_model));
+        let holder = |index: u8| ShardInfo {
+            start_layer: 0,
+            end_layer: 1,
+            total_layers: 1,
+            model_id: test_model_id(),
+            model_name: "readiness-test-model".to_string(),
+            execution_profile: canonical_profile(),
+            memory_mb: 1,
+            full_model_mb: 1,
+            socket_addr: format!("198.51.100.{index}:9090"),
+            node_name: format!("0x{}", Hash256([index; 32]).to_hex()),
+        };
+
+        // One live replica: the validators' own sharded pipeline can still
+        // answer, but no community result could carry two signatures.
+        node.shard_registry.insert("h1".into(), (holder(1), now));
+        let (headers, Json(one)) = inference_readiness(AxumState(node.clone())).await;
+        assert!(!one.community_dispatch_ready);
+        assert_eq!(one.live_community_workers, 0);
+        assert!(one.sharded_pipeline_ready);
+        assert!(one.safe_to_dispatch);
+        assert_eq!(
+            headers[COMMUNITY_DISPATCH_HEADER],
+            "verification_replicas_below_quorum"
+        );
+
+        // A second distinct replica makes the range verifiable 2-of-2.
+        node.shard_registry.insert("h2".into(), (holder(2), now));
+        let (headers, Json(two)) = inference_readiness(AxumState(node.clone())).await;
+        assert!(two.community_dispatch_ready);
+        assert_eq!(two.live_community_workers, 1);
+        assert!(two.safe_to_dispatch);
+        assert_eq!(headers[COMMUNITY_DISPATCH_HEADER], "ready");
+        let body = serde_json::to_value(&two).unwrap();
+        assert_eq!(body.as_object().unwrap().len(), 9);
+        assert_eq!(node.shard_registry.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn inference_run_answers_without_community_dispatch_while_results_cannot_be_verified() {
+        let worker_id = format!("0x{}", "1".repeat(64));
+        let mut node =
+            fake_node_with_workers(vec![(worker(&worker_id, &["inference"]), Instant::now())]);
+        node.inference_model = Some(context_test_inference_model(16));
+        // The only layer range has one live replica, so no community result
+        // could be verified and the idle worker must not receive the job.
+        let one_replica = vec![range_held_at(&["10.0.0.1:9090"])];
+        node.community_verification_pipeline_override = Some(one_replica);
+        let readiness = inference_readiness_snapshot(&node);
+        assert!(!readiness.community_dispatch_ready);
+        assert!(readiness.local_model_ready);
+
+        let started = Instant::now();
+        let Json(response) = inference_run(
+            AxumState(node.clone()),
+            Some(Json(json!({"input": "ARC", "max_tokens": 1}))),
+        )
+        .await
+        .expect("the coordinator answers from its own model at once");
+        assert!(started.elapsed() < Duration::from_secs(MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS));
+        assert_eq!(response["success"], true);
+        assert_eq!(response["routed_via"], "local");
+        let queue = node.community_work_queue.as_ref().unwrap().clone();
+        assert!(queue.lock().await.try_recv().is_err());
+        assert!(node.community_work_results.as_ref().unwrap().is_empty());
+
+        // A sealed recovery probe proves the community path, so it is refused
+        // at once instead of falling through to this node's own model.
+        let mut probe_bytes = [0u8; 32];
+        probe_bytes[..arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX.len()]
+            .copy_from_slice(&arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX);
+        probe_bytes[arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX.len()..].fill(5);
+        let probe = json!({
+            "input": "ARC",
+            "max_tokens": 1,
+            "recovery_probe_id": format!("0x{}", Hash256(probe_bytes).to_hex()),
+            "expected_worker": worker_id,
+        });
+        let error = inference_run(AxumState(node.clone()), Some(Json(probe)))
+            .await
+            .expect_err("a recovery probe needs a verifiable community route");
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.1.error.contains("verification_replicas_below_quorum"));
+        assert!(queue.lock().await.try_recv().is_err());
     }
 
     #[test]
@@ -25912,6 +26520,7 @@ mod tests {
                         range_position_quorums: 6,
                         signatures_required_per_quorum: 2,
                         replicas_contacted_per_quorum: 3,
+                        ranges_verified_2_of_2: Vec::new(),
                     }),
                     settlement: Some(json!({"status": "test_settlement"})),
                     answer_release: None,
@@ -26116,10 +26725,11 @@ mod tests {
     #[tokio::test]
     async fn inference_run_recovery_retry_discovers_inflight_job_without_second_enqueue() {
         let expected_worker = format!("0x{}", "1".repeat(64));
-        let node = fake_node_with_workers(vec![(
+        let mut node = fake_node_with_workers(vec![(
             worker(&expected_worker, &["inference"]),
             std::time::Instant::now(),
         )]);
+        node.community_verification_pipeline_override = Some(verifiable_dispatch_pipeline());
         let mut probe_bytes = [0u8; 32];
         probe_bytes[..arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX.len()]
             .copy_from_slice(&arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX);
@@ -26171,10 +26781,11 @@ mod tests {
 
     #[tokio::test]
     async fn inference_run_surfaces_server_evidence_and_dispatches_at_shared_token_ceiling() {
-        let node = fake_node_with_workers(vec![(
+        let mut node = fake_node_with_workers(vec![(
             worker("w1", &["inference"]),
             std::time::Instant::now(),
         )]);
+        node.community_verification_pipeline_override = Some(verifiable_dispatch_pipeline());
         let queue = node.community_work_queue.as_ref().unwrap().clone();
         let results = node.community_work_results.as_ref().unwrap().clone();
         let observed_max = Arc::new(AtomicU32::new(0));
@@ -26212,6 +26823,7 @@ mod tests {
                         range_position_quorums: 6,
                         signatures_required_per_quorum: 2,
                         replicas_contacted_per_quorum: 3,
+                        ranges_verified_2_of_2: Vec::new(),
                     }),
                     settlement: Some(json!({
                         "status": "pending_mined_receipt",
@@ -26322,10 +26934,11 @@ mod tests {
 
     #[tokio::test]
     async fn inference_auto_dispatches_to_a_community_worker_without_a_local_model() {
-        let node = fake_node_with_workers(vec![(
+        let mut node = fake_node_with_workers(vec![(
             worker("w1", &["inference"]),
             std::time::Instant::now(),
         )]);
+        node.community_verification_pipeline_override = Some(verifiable_dispatch_pipeline());
         assert!(
             !node
                 .inference_model
@@ -26368,6 +26981,7 @@ mod tests {
                         range_position_quorums: 6,
                         signatures_required_per_quorum: 2,
                         replicas_contacted_per_quorum: 3,
+                        ranges_verified_2_of_2: Vec::new(),
                     }),
                     settlement: Some(unsubmitted_community_reward_settlement(
                         "reward_approval_quorum_unavailable",
@@ -26502,6 +27116,7 @@ mod tests {
         let mut node =
             fake_node_with_workers(vec![(worker(&worker_id, &["inference"]), Instant::now())]);
         node.inference_model = Some(context_test_inference_model(16));
+        node.community_verification_pipeline_override = Some(verifiable_dispatch_pipeline());
 
         let queue = node.community_work_queue.as_ref().unwrap().clone();
         let submit_node = node.clone();
@@ -26815,6 +27430,7 @@ mod tests {
         let mut node =
             fake_node_with_workers(vec![(worker(worker_id, &["inference"]), Instant::now())]);
         node.inference_model = Some(context_test_inference_model(16));
+        node.community_verification_pipeline_override = Some(verifiable_dispatch_pipeline());
         let queue = node.community_work_queue.as_ref().unwrap().clone();
         let results = node.community_work_results.as_ref().unwrap().clone();
         let active_jobs = node.community_active_jobs.clone();
@@ -31619,6 +32235,16 @@ mod tests {
                 .expect_err("mid-run replica eviction must fail the reward verifier closed");
             assert!(error.contains("fixed quorum unavailable"), "{error}");
         }
+        // A range planned with its two live replicas needs both of them, and
+        // losing one mid-run fails closed in the same way.
+        assert_eq!(
+            fanout_quorum_plan(2, 2, 2, false).unwrap(),
+            (2, 2),
+            "a two-replica range runs the exact 2-of-2 plan"
+        );
+        let error = fanout_quorum_plan(2, 2, 1, false)
+            .expect_err("a 2-of-2 range that loses a replica fails closed");
+        assert!(error.contains("fixed quorum unavailable"), "{error}");
         assert_eq!(
             fanout_quorum_plan(3, 2, 1, true).unwrap(),
             (1, 1),
@@ -31656,33 +32282,141 @@ mod tests {
         };
         let votes = vec![vote(0), vote(1)];
         let active = vec![(signer_a, 10), (signer_b, 10)];
-        assert_eq!(
-            validate_community_range_position_quorums(&pipeline, &hop_stats, &votes, &active,)
-                .unwrap(),
-            2
-        );
+        let validate = |grid: &[RangeVote]| {
+            validate_community_range_position_quorums(&pipeline, &[3], &hop_stats, grid, &active)
+        };
+        assert_eq!(validate(&votes).unwrap(), 2);
 
         let mut one_identity_twice = votes.clone();
         one_identity_twice[1].majority_signers = vec![signer_a, signer_a];
-        let error = validate_community_range_position_quorums(
-            &pipeline,
-            &hop_stats,
-            &one_identity_twice,
-            &active,
-        )
-        .expect_err("two aliases for one validator are not two approvals");
+        let error = validate(&one_identity_twice)
+            .expect_err("two aliases for one validator are not two approvals");
         assert!(error.contains("1 distinct authenticated signer"), "{error}");
 
         let mut includes_unapproved = votes;
         includes_unapproved[1].majority_signers = vec![signer_a, unapproved];
-        let error = validate_community_range_position_quorums(
-            &pipeline,
-            &hop_stats,
-            &includes_unapproved,
-            &active,
-        )
-        .expect_err("an unapproved signature cannot satisfy reward verification");
+        let error = validate(&includes_unapproved)
+            .expect_err("an unapproved signature cannot satisfy reward verification");
         assert!(error.contains("unapproved signer"), "{error}");
+    }
+
+    #[test]
+    fn two_replica_range_quorum_requires_both_replicas_to_agree() {
+        let signer_a = Hash256([0x11; 32]);
+        let signer_b = Hash256([0x22; 32]);
+        let pipeline = vec![range_held_at(&["10.0.0.1:9090", "10.0.0.2:9090"])];
+        let hop_stats = vec![HopStats {
+            positions: 1,
+            ..HopStats::default()
+        }];
+        let agreed = RangeVote {
+            position: 0,
+            range: (0, 1),
+            replicas_contacted: vec!["a".into(), "b".into()],
+            replicas_returned: vec!["a".into(), "b".into()],
+            majority_hash: Some(arc_crypto::hash_bytes(b"agreed").to_hex()),
+            majority_token_id: Some(3),
+            majority_signers: vec![signer_a, signer_b],
+            divergent: Vec::new(),
+            agreement: "unanimous".into(),
+        };
+        let active = vec![(signer_a, 10), (signer_b, 10)];
+        let validate = |replicas: &[usize], vote: &RangeVote| {
+            validate_community_range_position_quorums(
+                &pipeline,
+                replicas,
+                &hop_stats,
+                std::slice::from_ref(vote),
+                &active,
+            )
+        };
+        assert_eq!(validate(&[2], &agreed).unwrap(), 1);
+
+        // The other replica disagreed or never answered: one signature is
+        // not a quorum, whatever the number of replicas.
+        let mut one_signer = agreed.clone();
+        one_signer.majority_signers = vec![signer_a];
+        let error = validate(&[2], &one_signer).expect_err("2-of-2 needs both signatures");
+        assert!(error.contains("1 distinct authenticated signer"), "{error}");
+
+        // Each range's quorum contacts exactly the replicas planned for it.
+        let error = validate(&[3], &agreed).expect_err("a 2-of-3 range contacts three");
+        assert!(error.contains("slot(s), expected 3"), "{error}");
+        let mut three_contacted = agreed.clone();
+        three_contacted.replicas_contacted.push("c".into());
+        let error = validate(&[2], &three_contacted).expect_err("a 2-of-2 range contacts two");
+        assert!(error.contains("slot(s), expected 2"), "{error}");
+
+        // One replica is never a quorum, and the plan must cover every range.
+        let error = validate(&[1], &agreed).expect_err("one replica cannot verify a range");
+        assert!(error.contains("planned 1 replica slot(s)"), "{error}");
+        let error = validate(&[], &agreed).expect_err("every range needs a replica plan");
+        assert!(error.contains("invalid pipeline summary"), "{error}");
+    }
+
+    #[test]
+    fn community_verification_contacts_every_distinct_replica_up_to_three() {
+        let four = range_held_at(&["10.0.0.1:1", "10.0.0.2:1", "10.0.0.3:1", "10.0.0.4:1"]);
+        let three = range_held_at(&["10.0.0.1:1", "10.0.0.2:1", "10.0.0.3:1"]);
+        let two = range_held_at(&["10.0.0.1:1", "10.0.0.2:1"]);
+        assert_eq!(
+            community_verification_replica_plan(&[four, three.clone(), two]).unwrap(),
+            vec![3, 3, 2]
+        );
+
+        // One replica, two holders announcing one socket, or none at all:
+        // no quorum could carry two independent signatures.
+        let one = range_held_at(&["10.0.0.1:1"]);
+        let one_socket = range_held_at(&["10.0.0.1:1", "10.0.0.1:1"]);
+        let none = range_held_at(&[]);
+        for unverifiable in [one, one_socket, none] {
+            let error = community_verification_replica_plan(&[three.clone(), unverifiable])
+                .expect_err("a range below two distinct replicas cannot be verified");
+            assert!(error.contains("requires at least 2"), "{error}");
+        }
+    }
+
+    #[test]
+    fn verification_summary_reports_the_quorum_each_range_used() {
+        let summary = |range_replicas: Vec<((usize, usize), usize)>| {
+            CommunityVerificationSummary::from(&CommunityResultVerification {
+                output_hash: Hash256::ZERO,
+                tokens_generated: 1,
+                range_count: range_replicas.len(),
+                range_position_quorum_count: range_replicas.len(),
+                execution_profile:
+                    arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
+                range_replicas,
+            })
+        };
+
+        // Every range 2-of-3: exactly the summary and JSON shape main returns.
+        let all_three = summary(vec![((0, 6), 3), ((6, 12), 3)]);
+        assert_eq!(
+            all_three.method,
+            "authenticated_shard_quorum_2_of_3_per_range"
+        );
+        assert_eq!(all_three.replicas_contacted_per_quorum, 3);
+        let wire = serde_json::to_value(&all_three).unwrap();
+        assert!(wire.get("ranges_verified_2_of_2").is_none(), "{wire}");
+        assert_eq!(wire.as_object().unwrap().len(), 10);
+
+        let all_two = summary(vec![((0, 6), 2), ((6, 12), 2)]);
+        assert_eq!(
+            all_two.method,
+            "authenticated_shard_quorum_2_of_2_per_range"
+        );
+        assert_eq!(all_two.replicas_contacted_per_quorum, 2);
+        assert_eq!(all_two.signatures_required_per_quorum, 2);
+
+        let mixed = summary(vec![((0, 6), 2), ((6, 12), 3)]);
+        assert_eq!(
+            mixed.method,
+            "authenticated_shard_quorum_2_of_3_or_2_of_2_per_range"
+        );
+        assert_eq!(mixed.replicas_contacted_per_quorum, 2);
+        let wire = serde_json::to_value(&mixed).unwrap();
+        assert_eq!(wire["ranges_verified_2_of_2"], json!([[0, 6]]));
     }
 
     // ── canonical INT8 kernels ──────────────────────────────────────────

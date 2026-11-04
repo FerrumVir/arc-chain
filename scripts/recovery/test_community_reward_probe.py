@@ -29,6 +29,7 @@ class ProbeHandler(BaseHTTPRequestHandler):
     replay_mined = False
     settlement_patch: dict[str, Any] = {}
     settlement_drop: set[str] = set()
+    verification_patch: dict[str, Any] = {}
     scoreboard_worker = WORKER
     post_requests: list[dict[str, Any]] = []
 
@@ -122,6 +123,14 @@ class ProbeHandler(BaseHTTPRequestHandler):
         settlement.update(self.settlement_patch)
         for field in self.settlement_drop:
             settlement.pop(field, None)
+        verification = {
+            "method": "authenticated_shard_quorum_2_of_3_per_range",
+            "ranges": 6,
+            "range_position_quorums": 42,
+            "signatures_required_per_quorum": 2,
+            "replicas_contacted_per_quorum": 3,
+        }
+        verification.update(self.verification_patch)
         self.send_json(
             {
                 "success": True,
@@ -136,13 +145,7 @@ class ProbeHandler(BaseHTTPRequestHandler):
                     "tokens_generated": 1,
                     "output": "ok",
                 },
-                "verification": {
-                    "method": "authenticated_shard_quorum_2_of_3_per_range",
-                    "ranges": 6,
-                    "range_position_quorums": 42,
-                    "signatures_required_per_quorum": 2,
-                    "replicas_contacted_per_quorum": 3,
-                },
+                "verification": verification,
                 "settlement": settlement,
             }
         )
@@ -170,6 +173,7 @@ class CommunityRewardProbeTests(unittest.TestCase):
         ProbeHandler.replay_mined = False
         ProbeHandler.settlement_patch = {}
         ProbeHandler.settlement_drop = set()
+        ProbeHandler.verification_patch = {}
         ProbeHandler.scoreboard_worker = WORKER
         ProbeHandler.post_requests = []
 
@@ -282,6 +286,24 @@ class CommunityRewardProbeTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertIn("does not match", result.stderr)
         self.assertEqual(ProbeHandler.post_requests, [])
+
+    def test_two_replica_quorum_is_refused_with_its_own_reason(self) -> None:
+        for method in (
+            "authenticated_shard_quorum_2_of_2_per_range",
+            "authenticated_shard_quorum_2_of_3_or_2_of_2_per_range",
+        ):
+            with self.subTest(method=method):
+                ProbeHandler.verification_patch = {
+                    "method": method,
+                    "replicas_contacted_per_quorum": 2,
+                    "ranges_verified_2_of_2": [[0, 6]],
+                }
+                ProbeHandler.post_requests = []
+                result = self.run_probe()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("two-replica (2-of-2) quorum", result.stderr)
+                self.assertNotIn("omitted", result.stderr)
 
     def test_i16_worker_config_drift_fails_without_evidence(self) -> None:
         ProbeHandler.profile = "INT16 integer (per-row, cross-platform deterministic)"
