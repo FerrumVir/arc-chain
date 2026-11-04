@@ -385,6 +385,101 @@ test.describe("Inference - community-first coordinator routing", () => {
     );
   });
 
+  // How long interception stays active after an answer before the route-help test checks
+  // what was dispatched (see the test below).
+  const ROUTE_OBSERVATION_WINDOW_MS = 1_000;
+
+  // Route help (#223): runInferenceSmart asks the local node first and moves the click to the
+  // coordinator's /inference/run only on the pre-dispatch sentinel (no local POST was sent).
+  // This drives that decision with held, intercepted transports: the waiting line follows the
+  // route actually being dispatched, the local node never receives a POST, and consensus is
+  // never started. The native refusal and pinned-origin rules behind the same help text are
+  // exercised in `commands.rs` (`route_help_*`).
+  test("route help: the click moves from the local node to the coordinator only on the pre-dispatch sentinel, and the waiting line follows it", async ({
+    page,
+  }) => {
+    await seedOnboarded(page);
+    await page.addInitScript(() => {
+      (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
+    });
+    let releaseLocalReadiness!: () => void;
+    const localReadinessHeld = new Promise<void>((resolve) => (releaseLocalReadiness = resolve));
+    const readinessHosts: string[] = [];
+    await page.unroute("**/inference/readiness");
+    await page.route("**/inference/readiness", async (route) => {
+      const url = new URL(route.request().url());
+      readinessHosts.push(url.hostname);
+      const local = url.hostname === "127.0.0.1";
+      if (local) await localReadinessHeld;
+      // The local node reports no eligible route (as when the session's chain is remote or no
+      // model is loaded); the coordinators report a safe, mutation-free admission.
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(readinessPayload(!local)),
+      });
+    });
+    let releaseDirect!: () => void;
+    const directHeld = new Promise<void>((resolve) => (releaseDirect = resolve));
+    const inferencePosts: string[] = [];
+    await page.route("**/inference/run", async (route) => {
+      const url = new URL(route.request().url());
+      inferencePosts.push(url.hostname);
+      await directHeld;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          inference: {
+            input: "route help prompt",
+            output: "answer from the coordinator",
+            output_hash: `0x${"21".repeat(32)}`,
+            model_hash: `0x${"22".repeat(32)}`,
+            tokens_generated: 3,
+            inference_ms: 10,
+            deterministic: true,
+          },
+          attestation: { tx_hash: "" },
+        }),
+      });
+    });
+    let consensusHits = 0;
+    await page.route("**/inference/run_consensus", (route) => {
+      consensusHits += 1;
+      return route.fulfill({ status: 500, body: "must not be called" });
+    });
+
+    await page.goto("/");
+    await page.getByTestId("nav-inference").click();
+    await page.getByRole("button", { name: /how this works/i }).click();
+    await expect(page.getByTestId("inference-route-help")).toContainText("/inference/run");
+    await page.keyboard.press("Escape");
+
+    await page.getByTestId("inference-prompt").fill("route help prompt");
+    await page.getByTestId("btn-run-inference").click();
+    // 1. The local route is dispatched first.
+    await expect(page.getByTestId("inference-pending-title")).toHaveText(PLAIN_COPY.ask.askingNode);
+    expect(inferencePosts).toEqual([]);
+    // 2. Local readiness refuses before any POST: the click moves to the coordinator route.
+    releaseLocalReadiness();
+    await expect(page.getByTestId("inference-pending-title")).toHaveText(PLAIN_COPY.ask.askingNetwork);
+    await expect.poll(() => inferencePosts.length).toBe(1);
+    expect(inferencePosts[0]).not.toBe("127.0.0.1");
+    expect(readinessHosts[0]).toBe("127.0.0.1");
+    expect(readinessHosts).toContain(inferencePosts[0]);
+    // 3. The coordinator answers. Interception stays active through a bounded observation
+    //    window after the answer, so dispatch started later (a timer, a background promise)
+    //    is still seen. The window is a test limit, not proof that no later dispatch can
+    //    ever happen.
+    releaseDirect();
+    await expect(page.getByTestId("inference-output")).toHaveText("answer from the coordinator");
+    const coordinator = inferencePosts[0];
+    await page.waitForTimeout(ROUTE_OBSERVATION_WINDOW_MS);
+    expect(inferencePosts).toEqual([coordinator]);
+    expect(readinessHosts).toEqual(["127.0.0.1", coordinator]);
+    expect(consensusHits).toBe(0);
+  });
+
   test("observer routes to a community worker before standalone consensus and shows proof separately from payment", async ({
     page,
   }) => {
