@@ -22,8 +22,14 @@ fails CI on either of the two shapes that leak looked like:
 Limits, by design: a heuristic for operating-system default names, not a
 detector of every hostname. A custom name such as ``kitchen-server`` or a bare
 first name passes. Only JSON at the checked-out commit is read: git history and
-forks are out of scope, and so are files outside the repository. Synthetic test fixtures live under
-``scripts/ci/tests/fixtures/export-privacy/`` and are excluded from the tree scan.
+forks are out of scope, and so are files outside the repository. The three synthetic test fixtures under
+``scripts/ci/tests/fixtures/export-privacy/`` are excluded by exact path; nothing
+else is skipped. JSON that does not parse, or is over 8 MiB, is itself a finding
+(one existing file that does not parse is allowed by exact path).
+
+This is not a complete personal-data scan. Custom names (``kitchen-server``,
+``alice-laptop``) pass; only the keys listed below and host containers are
+checked; ``.jsonl``, ``.txt`` and ``.csv`` files are not read.
 
 Usage:
   python3 scripts/ci/export_privacy.py                 # scan the tracked tree (CI)
@@ -45,8 +51,16 @@ from typing import Iterable, Iterator
 EXPORT_ROOTS = ("arc-state-export",)
 SEED_LABELS = ("NYC", "LAX", "AMS", "LHR", "NRT", "SGP")
 EXPORTER_FILE = re.compile(r"^(?:%s)_[a-z0-9_]+\.json$" % "|".join(SEED_LABELS))
-FIXTURE_DIR = "scripts/ci/tests/fixtures/export-privacy/"
-SKIP_DIRS = ("node_modules/", "target/", "vendor/")
+# The three synthetic fixtures this check's own tests use, excluded from the tree scan by exact path only:
+# anything else placed beside them is scanned like any other file.
+FIXTURE_FILES = frozenset({
+    "scripts/ci/tests/fixtures/export-privacy/clean/scoreboard.json",
+    "scripts/ci/tests/fixtures/export-privacy/leaky-content/scoreboard.json",
+    "scripts/ci/tests/fixtures/export-privacy/leaky-export/arc-state-export/2026-01-01T00-00-00Z/NYC_workers_scoreboard.json",
+})
+# Tracked JSON that does not parse today, by exact path. Every other unreadable JSON is a finding: this check
+# cannot vouch for what it cannot read.
+UNPARSEABLE_ALLOWED = frozenset({"docs/arc-chain-v2/batch3-canonical-validation.json"})
 MAX_JSON_BYTES = 8 * 1024 * 1024
 
 # Keys that only ever hold a machine's name: checked wherever they appear.
@@ -54,7 +68,13 @@ HOSTNAME_KEYS = {"hostname", "host_name", "computer_name", "computername", "devi
 # Keys that hold a display name: checked inside worker-like records only.
 NAME_KEYS = {"name", "worker_name", "node_name", "public_name", "nickname", "label", "device"}
 WORKER_LIST_KEYS = {"workers", "community_workers", "scoreboard", "registrations", "registry"}
+# Containers whose object KEYS can be machine names ({"workers": {"<name>": {...}}}) and whose list items can be
+# machine names ({"hostnames": ["...", ...]}).
+HOST_CONTAINER_KEYS = WORKER_LIST_KEYS | {"hosts", "hostnames", "devices", "machines", "computers"}
 WORKER_MARKERS = {"worker_id", "worker", "address", "pubkey", "public_key"}
+# Location segments printed as they are; any other object key is printed as <key N> so a finding never repeats
+# a key that might itself be a machine name.
+_SCHEMA_KEY = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
 
 # Mirrors DEVICE_TOKENS in crates/arc-node/src/rpc.rs (looks_like_default_computer_name).
 DEVICE_TOKENS = {
@@ -120,44 +140,65 @@ def path_findings(rel: str) -> list[Finding]:
     return found
 
 
-def _walk(node, pointer: str, in_worker_list: bool) -> Iterator[tuple[str, str, str]]:
-    """Yield (pointer, key, value) for string fields that must not hold a device name."""
+def _segment(key: str, position: int) -> str:
+    """A location segment that is safe to print: known schema-style keys as they are, anything else by position."""
+    key = str(key)
+    if _SCHEMA_KEY.match(key) and personal_hostname_rule(key) is None:
+        return key
+    return f"<key {position}>"
+
+
+def _walk(node, pointer: str, container: str | None) -> Iterator[tuple[str, str, str]]:
+    """Yield (pointer, what, value) for every string that must not hold a device name.
+
+    `container` is the lower-cased key this node sits under (when that key is a worker or host container).
+    """
     if isinstance(node, dict):
-        workerish = in_worker_list or bool(WORKER_MARKERS & set(node))
-        for key, value in node.items():
-            child = f"{pointer}/{key}"
+        workerish = container in WORKER_LIST_KEYS or bool(WORKER_MARKERS & {str(k).lower() for k in node})
+        for position, (key, value) in enumerate(node.items()):
+            child = f"{pointer}/{_segment(key, position)}"
             lowered = str(key).lower()
+            if container in HOST_CONTAINER_KEYS:
+                yield child, "key", str(key)  # {"workers": {"<machine name>": {...}}}
             if isinstance(value, str):
                 if lowered in HOSTNAME_KEYS or (workerish and lowered in NAME_KEYS):
                     yield child, lowered, value
             else:
-                yield from _walk(value, child, lowered in WORKER_LIST_KEYS)
+                yield from _walk(value, child, lowered if lowered in HOST_CONTAINER_KEYS | HOSTNAME_KEYS else None)
     elif isinstance(node, list):
         for i, item in enumerate(node):
-            yield from _walk(item, f"{pointer}/{i}", in_worker_list)
+            if isinstance(item, str) and container in HOST_CONTAINER_KEYS | HOSTNAME_KEYS:
+                yield f"{pointer}/{i}", "item", item  # {"hostnames": ["<machine name>", ...]}
+            else:
+                yield from _walk(item, f"{pointer}/{i}", container)
 
 
 def content_findings(rel: str, data: bytes) -> list[Finding]:
     try:
         doc = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return []  # not JSON this check can read; other gates own syntax
+        if rel in UNPARSEABLE_ALLOWED:
+            return []
+        return [Finding(rel, "file", "unreadable JSON: it does not parse, so this check cannot vouch for it")]
     found = []
-    for pointer, key, value in _walk(doc, "", False):
+    for pointer, what, value in _walk(doc, "", None):
         rule = personal_hostname_rule(value)
         if rule:
-            found.append(Finding(rel, f"{pointer or '/'} ({key})", rule))
+            found.append(Finding(rel, f"{pointer or '/'} ({what})", rule))
     return found
 
 
 def scan_file(path: Path, rel: str) -> list[Finding]:
-    found = path_findings(rel)
+    found = path_findings(rel)  # always, wherever the file is
     if rel.endswith(".json"):
         try:
-            if path.stat().st_size <= MAX_JSON_BYTES:
+            size = path.stat().st_size
+            if size > MAX_JSON_BYTES:
+                found.append(Finding(rel, "file", f"JSON larger than {MAX_JSON_BYTES // (1024 * 1024)} MiB was not scanned"))
+            else:
                 found += content_findings(rel, path.read_bytes())
         except OSError:
-            pass
+            found.append(Finding(rel, "file", "could not be read, so this check cannot vouch for it"))
     return found
 
 
@@ -169,7 +210,7 @@ def tracked_files(root: Path) -> list[str]:
 def scan_tree(root: Path) -> list[Finding]:
     found = []
     for rel in tracked_files(root):
-        if rel.startswith(FIXTURE_DIR) or any(s in rel for s in SKIP_DIRS):
+        if rel in FIXTURE_FILES:
             continue
         found += scan_file(root / rel, rel)
     return found

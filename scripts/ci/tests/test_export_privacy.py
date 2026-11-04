@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import re
 import subprocess
 import sys
@@ -98,20 +99,78 @@ class Fixtures(unittest.TestCase):
         result = run(str(FIXTURES / "clean"))
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_unreadable_or_non_json_is_not_a_finding(self):
+    def test_non_json_files_are_not_read(self):
         with tempfile.TemporaryDirectory() as tmp:
-            Path(tmp, "broken.json").write_text("{not json", encoding="utf-8")
-            Path(tmp, "notes.txt").write_text("Adas-MacBook-Pro.local", encoding="utf-8")
+            Path(tmp, "notes.txt").write_text("Synth-MacBook-Pro.local", encoding="utf-8")
             self.assertEqual(run(tmp).returncode, 0)
 
     def test_missing_path_is_a_usage_error(self):
         self.assertEqual(run(str(FIXTURES / "does-not-exist")).returncode, 2)
 
 
+class ReviewCorrections(unittest.TestCase):
+    """Reviewer findings on eec3cccc: values printed through keys, unreadable JSON passing, and skip-list bypasses."""
+
+    def test_hostname_used_as_a_key_is_found_and_never_printed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "export.json").write_text(json.dumps(
+                {"workers": {"Synth-MacBook-Pro.local": {"hostname": "DESKTOP-AB12CD3"}, "node-1a2b3c4d": {"runs": 1}}}), encoding="utf-8")
+            result = run(tmp)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("/workers/<key 0> (key): mDNS/LAN host suffix", result.stderr)
+            self.assertIn("/workers/<key 0>/hostname (hostname): operating-system default computer name", result.stderr)
+            self.assertNotIn("/workers/<key 1>", result.stderr, "a hashed default key passes")
+            for value in ["Synth-MacBook-Pro", "DESKTOP-AB12CD3"]:
+                self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_lists_of_hostnames_are_checked(self):
+        found = ep.content_findings("x.json", json.dumps({"hostnames": ["validator-nyc-01", "Synth-iMac.lan"], "devices": ["SYNTH-PC"]}).encode())
+        self.assertEqual([f.where for f in found], ["/hostnames/1 (item)", "/devices/0 (item)"])
+
+    def test_truncated_json_is_a_finding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "cut.json").write_text('{"workers":[{"worker_id":"w1","name":"seed (Synth-MacBook-Pro.local)"}, {"hostname": "Synth', encoding="utf-8")
+            result = run(tmp)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("unreadable JSON", result.stderr)
+            self.assertNotIn("Synth", result.stderr)
+
+    def test_oversized_json_is_a_finding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            big = Path(tmp, "big.json")
+            big.write_text(json.dumps({"hostname": "DESKTOP-AB12CD3", "pad": "x" * (ep.MAX_JSON_BYTES + 1024)}), encoding="utf-8")
+            result = run(tmp)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("larger than 8 MiB was not scanned", result.stderr)
+
+    def test_only_the_one_known_unparseable_file_is_allowed(self):
+        allowed = next(iter(ep.UNPARSEABLE_ALLOWED))
+        self.assertEqual(ep.content_findings(allowed, b""), [])
+        self.assertTrue(ep.content_findings("docs/arc-chain-v2/another.json", b""))
+
+    def test_no_directory_is_a_bypass(self):
+        # The former substring skips (vendor/, target/, node_modules/) and the fixture-directory skip, in a throwaway repository.
+        leaky = json.dumps({"workers": [{"worker_id": "w", "name": "Synth-MacBook-Pro"}]})
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q", tmp], check=True)
+            files = {
+                "arc-state-export/vendor/NYC_workers_scoreboard.json": json.dumps({"workers": []}),
+                "docs/target/notes.json": leaky,
+                "node_modules/pkg/data.json": leaky,
+                "scripts/ci/tests/fixtures/export-privacy/extra/AMS_workers_scoreboard.json": json.dumps({"workers": []}),
+            }
+            for rel, body in files.items():
+                Path(tmp, rel).parent.mkdir(parents=True, exist_ok=True)
+                Path(tmp, rel).write_text(body, encoding="utf-8")
+            subprocess.run(["git", "-C", tmp, "add", "-f", "."], check=True)
+            flagged = {f.path for f in ep.scan_tree(Path(tmp))}
+            self.assertEqual(flagged, set(files), "every planted file is found")
+
+
 class Tree(unittest.TestCase):
     def test_tracked_tree_scan_skips_only_the_fixture_dir(self):
         listed = ep.tracked_files(REPO)
-        self.assertTrue(any(p.startswith(ep.FIXTURE_DIR) for p in listed), "fixtures are tracked")
+        self.assertTrue(ep.FIXTURE_FILES <= set(listed), "the three fixtures are tracked")
         self.assertEqual(ep.scan_tree(REPO), [], "the committed tree is clean")
 
     def test_a_forced_add_of_an_export_would_fail(self):
