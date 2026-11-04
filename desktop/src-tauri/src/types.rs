@@ -963,4 +963,11 @@ pub struct WorkerStatus {
     pub last_job_completed_unix_ms: Option<u64>,
     pub started_unix_ms: Option<u64>,
     pub prevent_sleep_during_jobs: Option<bool>,
+    /// Why a `paused_memory_guard` worker is paused, from the node's optional
+    /// `memory_guard` object: `ok`, `paused_low_memory`,
+    /// `paused_memory_check_failed` or `paused_decline_backoff`. Absent when the
+    /// node has no memory guard or it is off.
+    pub memory_guard_state: Option<String>,
+    /// `ok`, `failed` or `not_read_yet`, from the same object.
+    pub memory_check: Option<String>,
 }

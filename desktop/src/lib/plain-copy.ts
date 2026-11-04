@@ -174,6 +174,20 @@ export const PLAIN_COPY = {
     /** The node reported a problem that is not a crash: the start it made by itself failed. */
     reportedBody: "The details below say what the node reported.",
   },
+  workerJobs: {
+    /**
+     * The node's memory guard stopped taking new jobs (`paused_memory_guard`).
+     * Each line says only what the node reported: why it paused, when it said
+     * so, and nothing about when or whether it resumes.
+     */
+    pausedLowMemory: "Paused: not enough free memory for new jobs",
+    pausedCheckFailed: "Paused: ARC can't check free memory",
+    pausedAfterDeclines: "Paused: recent jobs needed more free memory",
+    /** The node said it is paused but gave no reason ARC recognizes. */
+    paused: "Paused: not taking new jobs",
+    /** Starts the detail line while paused. */
+    pausedDetail: "While paused, this computer doesn't take new jobs.",
+  },
   wallet: {
     balanceUnavailable: "Balance unavailable right now. ARC keeps trying.",
     /** Refused before or by the host: nothing can have been included. */

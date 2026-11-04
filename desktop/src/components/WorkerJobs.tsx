@@ -6,17 +6,53 @@ import { api } from "../lib/tauri";
 import { formatInt, formatRelativeTime } from "../lib/format";
 import { useAppStore } from "../lib/store";
 import { computeContributionEnabled, type WorkerStatus } from "../lib/types";
+import { PLAIN_COPY } from "../lib/plain-copy";
 
-const STATE_COPY: Record<string, string> = {
-  polling: "Ready: waiting for a job",
-  computing: "Computing a job now",
-  reconnecting: "Reconnecting to coordinators",
-};
+/**
+ * The worker's state in one sentence, only for a state ARC recognizes. Matched explicitly,
+ * never by object-key lookup: any other value, including one that names an inherited
+ * property such as `toString` or `__proto__`, gets the existing "Running".
+ */
+function stateCopy(state: string | null): string {
+  switch (state) {
+    case "polling":
+      return "Ready: waiting for a job";
+    case "computing":
+      return "Computing a job now";
+    case "reconnecting":
+      return "Reconnecting to coordinators";
+    default:
+      return "Running";
+  }
+}
+
+/**
+ * Why the memory guard paused the worker, only for a reason ARC recognizes. Matched
+ * explicitly, never by object-key lookup: any other value, including one that names an
+ * inherited property such as `toString` or `__proto__`, gets the plain pause.
+ */
+function pauseCopy(reason: string | null | undefined): string {
+  switch (reason) {
+    case "paused_low_memory":
+      return PLAIN_COPY.workerJobs.pausedLowMemory;
+    case "paused_memory_check_failed":
+      return PLAIN_COPY.workerJobs.pausedCheckFailed;
+    case "paused_decline_backoff":
+      return PLAIN_COPY.workerJobs.pausedAfterDeclines;
+    default:
+      return PLAIN_COPY.workerJobs.paused;
+  }
+}
+
+function isPausedByMemoryGuard(status: WorkerStatus): boolean {
+  return status.running && status.state === "paused_memory_guard";
+}
 
 /** One sentence for the worker's current state, from its own node. */
 export function workerStateCopy(status: WorkerStatus): string {
   if (!status.running) return "Not taking jobs";
-  return (status.state && STATE_COPY[status.state]) || "Running";
+  if (isPausedByMemoryGuard(status)) return pauseCopy(status.memoryGuardState);
+  return stateCopy(status.state);
 }
 
 function count(value: number | null): string {
@@ -117,6 +153,7 @@ export function WorkerJobsCard() {
             }}
             data-testid="worker-jobs-detail"
           >
+            {isPausedByMemoryGuard(status) ? `${PLAIN_COPY.workerJobs.pausedDetail} ` : ""}
             {status.lastJobCompletedUnixMs !== null
               ? `Last job ${formatRelativeTime(status.lastJobCompletedUnixMs)}. `
               : "No job completed since the node started. "}

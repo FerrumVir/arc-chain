@@ -2544,6 +2544,14 @@ pub(crate) fn worker_status_from_json(value: &Value) -> crate::types::WorkerStat
     let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
     let count = |key: &str| value.get(key).and_then(Value::as_u64);
     let small = |key: &str| count(key).and_then(|n| u32::try_from(n).ok());
+    // Present only when the node's memory guard is on (arc-chain #228).
+    let guard_text = |key: &str| {
+        value
+            .get("memory_guard")
+            .and_then(|guard| guard.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
     crate::types::WorkerStatus {
         running: true,
         unavailable: None,
@@ -2561,6 +2569,8 @@ pub(crate) fn worker_status_from_json(value: &Value) -> crate::types::WorkerStat
         prevent_sleep_during_jobs: value
             .get("prevent_sleep_during_jobs")
             .and_then(Value::as_bool),
+        memory_guard_state: guard_text("state"),
+        memory_check: guard_text("memory_check"),
     }
 }
 
@@ -4593,6 +4603,37 @@ mod worker_status_tests {
         );
         assert_eq!(status.last_job_completed_unix_ms, Some(1_760_000_000_000));
         assert_eq!(status.prevent_sleep_during_jobs, Some(true));
+        // A node without the memory guard (or with it off) reports no guard details.
+        assert_eq!(status.memory_guard_state, None);
+        assert_eq!(status.memory_check, None);
+    }
+
+    #[test]
+    fn worker_status_reads_the_memory_guard_details_when_present() {
+        let status = worker_status_from_json(&serde_json::json!({
+            "state": "paused_memory_guard",
+            "memory_guard": {
+                "state": "paused_memory_check_failed",
+                "memory_check": "failed",
+                "headroom_bytes": 2147483648u64,
+                "paused_rounds": 3
+            }
+        }));
+        assert_eq!(status.state.as_deref(), Some("paused_memory_guard"));
+        assert_eq!(
+            status.memory_guard_state.as_deref(),
+            Some("paused_memory_check_failed")
+        );
+        assert_eq!(status.memory_check.as_deref(), Some("failed"));
+        // Malformed details are dropped, not guessed.
+        let status = worker_status_from_json(&serde_json::json!({
+            "state": "paused_memory_guard",
+            "memory_guard": { "state": 3, "memory_check": null }
+        }));
+        assert_eq!(
+            (status.memory_guard_state, status.memory_check),
+            (None, None)
+        );
     }
 
     #[tokio::test]
