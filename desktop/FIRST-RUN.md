@@ -83,12 +83,17 @@ chmod +x arc-desktop-linux-x86_64.AppImage
    first, ARC downloads the model (3.80 GB) in the background, then restarts
    the node as a worker and attempts community-worker registration. Jobs use
    up to a quarter of the processor cores unless you change **Settings →
-   Compute contribution**. Registration alone does not prove that the worker
-   is eligible, reachable, receiving jobs, or earning rewards; those states
-   must be visible in the app. The Dashboard's **Jobs on this computer** card
-   shows the jobs this computer completed and the ones the network verified
-   since the node last started. **Keep this computer awake while a job runs**
-   (Settings) holds off idle sleep only while a job is computing.
+   Compute contribution**, at low operating-system priority so your own apps
+   come first; the node holds about 8 GB of memory while it is ready for jobs
+   and keeps running on battery. A computer that finished setup before this
+   default and has compute off is asked once, after the update, whether to
+   turn it on (**Turn on** or **Not now**) and is not asked again. Registration
+   alone does not prove that the worker is eligible, reachable, receiving
+   jobs, or earning rewards; those states must be visible in the app. The
+   Dashboard's **Jobs on this computer** card shows the jobs this computer
+   completed and the ones the network verified since the node last started.
+   **Keep this computer awake while a job runs** (Settings) holds off idle
+   sleep only while a job is computing.
 5. **Submits** a testnet faucet request when onboarding reaches that step. A
    submission is not a balance credit; only a successful mined receipt on the
    selected chain confirms it. The public fleet was divergent at the

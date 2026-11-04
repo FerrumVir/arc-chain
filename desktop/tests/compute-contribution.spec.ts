@@ -1,7 +1,15 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { PLAIN_COPY } from "../src/lib/plain-copy";
 import { defaultWorkerThreads } from "../src/lib/types";
-import { seedMockOverrides, seedOnboarded } from "./helpers";
+import { seedComputePrompt, seedMockOverrides, seedOnboarded } from "./helpers";
+
+/** The node config the app saved, read from its persisted UI state. */
+async function savedConfig(page: Page) {
+  return page.evaluate(() => {
+    const raw = localStorage.getItem("arc-desktop-state-v1");
+    return raw ? JSON.parse(raw).config : null;
+  });
+}
 
 // Compute contribution is the user's answer. New installs start with it on
 // at setup where the model can run (onboarding.spec.ts); an install from
@@ -33,14 +41,19 @@ test.describe("Compute contribution opt-in", () => {
       expect(defaultWorkerThreads(cores), `${cores} logical cores`).toBe(cap);
     }
     const share = PLAIN_COPY.settings.computeShare;
-    const quarter = "Uses up to a quarter of your processor while ARC Node is open.";
-    const whole = "Uses up to your whole processor while ARC Node is open.";
+    const quarter =
+      "Uses up to a quarter of your processor at low priority, and about 8 GB of memory while ARC Node is running. It keeps running on battery. Turn this off to stop ARC jobs and free that memory.";
+    // The other caps change the share and nothing else: the node starts at
+    // low priority and holds the model whatever its width.
+    const rest =
+      " at low priority, and about 8 GB of memory while ARC Node is running. It keeps running on battery. Turn this off to stop ARC jobs and free that memory.";
+    const whole = `Uses up to your whole processor${rest}`;
     expect(share(6, 24)).toBe(quarter);
     expect(share(3, 12)).toBe(quarter);
     expect(share(1, 16)).toBe(quarter);
-    expect(share(7, 24)).toBe("Uses up to 7 of your 24 processor cores while ARC Node is open.");
+    expect(share(7, 24)).toBe(`Uses up to 7 of your 24 processor cores${rest}`);
     // One core of two is more than a quarter, so it is not called one.
-    expect(share(1, 2)).toBe("Uses up to 1 of your 2 processor cores while ARC Node is open.");
+    expect(share(1, 2)).toBe(`Uses up to 1 of your 2 processor cores${rest}`);
     expect(share(24, 24)).toBe(whole);
     expect(share(null, 24)).toBe(whole);
 
@@ -148,6 +161,146 @@ test.describe("First launch after a v0.7 upgrade", () => {
     await page.goto("/");
     const dialog = page.getByTestId("legacy-upgrade-dialog");
     await dialog.getByTestId("legacy-upgrade-not-now").click();
+    await expect(dialog).toBeHidden();
+    await page.getByTestId("nav-settings").click();
+    await expect(page.getByTestId("compute-consent-toggle")).not.toBeChecked();
+  });
+});
+
+// What the setup step and the Settings note say is what this release does:
+// the node starts at low operating-system priority, jobs use at most a
+// quarter of the logical cores, the model holds about 8 GB, nothing pauses
+// the node on battery, and it runs on after the window closes (the tray keeps
+// ARC up). No rule for idle time, heat or free memory exists yet, so none is
+// promised. Pure logic: no page.
+test.describe("Compute copy states this release's facts", () => {
+  test("the setup step and every Settings note say priority, memory and battery", () => {
+    const { body, belowMemoryFloor } = PLAIN_COPY.setup.compute;
+    expect(body).toBe(
+      "ARC Node can run AI jobs for the ARC network on this computer. It uses up to a quarter of your processor, at low priority so your own apps come first, and about 8 GB of memory while it is ready for jobs. It keeps running on battery. First it downloads the ARC model, about 4 GB, in the background. You can turn this off here or at any time in Settings.",
+    );
+    // Below the memory requirement the step states the same facts.
+    for (const fact of [
+      "a quarter of your processor",
+      "at low priority so your own apps come first",
+      "about 8 GB of memory",
+      "It keeps running on battery.",
+    ]) {
+      expect(belowMemoryFloor).toContain(fact);
+    }
+    const share = PLAIN_COPY.settings.computeShare;
+    for (const note of [share(6, 24), share(7, 24), share(24, 24), share(null, 24)]) {
+      expect(note).toContain("at low priority");
+      expect(note).toContain("about 8 GB of memory while ARC Node is running");
+      expect(note).toContain("It keeps running on battery.");
+      expect(note).toContain("Turn this off to stop ARC jobs and free that memory.");
+      // The node runs on from the tray after the window closes.
+      expect(note).not.toContain("while the app is open");
+    }
+    expect(body).not.toContain("while the app is open");
+    expect(belowMemoryFloor).not.toContain("while the app is open");
+    for (const copy of [body, belowMemoryFloor, share(6, 24)]) {
+      expect(copy).not.toMatch(/\bidle\b|\bheat\b|\bthrottl|\bpause/i);
+    }
+  });
+});
+
+// An install that finished setup before compute started on by default is
+// asked once, on the first launch after the update, in the setup step's own
+// words. Native code decides and records that it asked before it answers; the
+// browser preview stands in for that with `seedComputePrompt`.
+test.describe("The one-time compute question", () => {
+  test.beforeEach(async ({ page }) => {
+    await seedOnboarded(page);
+    await seedComputePrompt(page);
+  });
+
+  test("asks once, in the setup step's words, and Not now leaves compute off", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    const dialog = page.getByTestId("compute-prompt-dialog");
+    await expect(dialog).toBeVisible();
+    await expect(
+      dialog.getByRole("heading", { name: PLAIN_COPY.setup.compute.title }),
+    ).toBeVisible();
+    await expect(dialog.getByTestId("compute-prompt-body")).toHaveText(
+      PLAIN_COPY.setup.compute.body,
+    );
+    await expect(dialog.getByTestId("compute-prompt-turn-on")).toHaveText("Turn on");
+    await expect(dialog.getByTestId("compute-prompt-not-now")).toHaveText("Not now");
+
+    await dialog.getByTestId("compute-prompt-not-now").click();
+    await expect(dialog).toBeHidden();
+    await page.getByTestId("nav-settings").click();
+    await expect(page.getByTestId("compute-consent-toggle")).not.toBeChecked();
+    // Not now changed nothing: no consent, no core count.
+    const saved = await savedConfig(page);
+    expect(saved?.computeConsent ?? null).toBeNull();
+    expect(saved?.workerThreads ?? null).toBeNull();
+
+    // Never again: the next launch does not ask. The preview answers after a
+    // short delay, so give a repeated question time to show before checking.
+    await page.reload();
+    await expect(page.getByTestId("app-shell")).toBeVisible();
+    await page.waitForTimeout(600);
+    await expect(page.getByTestId("compute-prompt-dialog")).toHaveCount(0);
+  });
+
+  test("Turn on stores consent and a quarter of the cores, and downloads in the background", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    const dialog = page.getByTestId("compute-prompt-dialog");
+    await dialog.getByTestId("compute-prompt-turn-on").click();
+    await expect(dialog).toBeHidden();
+
+    // The model follows in the background, the call setup makes with compute
+    // on: the node becomes a worker with the model. (This install is already
+    // "worker" with no model, so the model is what to wait for.)
+    await expect
+      .poll(async () => (await savedConfig(page))?.modelPath)
+      .toBe("/mock/.arc/models/standard.gguf");
+    const saved = await savedConfig(page);
+    expect(saved?.role).toBe("worker");
+    expect(saved?.computeConsent).toBe(true);
+    // A quarter of the preview's 24 logical cores.
+    expect(saved?.workerThreads).toBe(6);
+
+    await page.getByTestId("nav-settings").click();
+    await expect(page.getByTestId("compute-consent-toggle")).toBeChecked();
+    await expect(page.getByTestId("compute-share-note")).toHaveText(
+      "Uses up to a quarter of your processor at low priority, and about 8 GB of memory while ARC Node is running. It keeps running on battery. Turn this off to stop ARC jobs and free that memory.",
+    );
+  });
+
+  test("Escape closes it without changing anything", async ({ page }) => {
+    await page.goto("/");
+    const dialog = page.getByTestId("compute-prompt-dialog");
+    await expect(dialog).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+    await page.getByTestId("nav-settings").click();
+    await expect(page.getByTestId("compute-consent-toggle")).not.toBeChecked();
+    const saved = await savedConfig(page);
+    expect(saved?.computeConsent ?? null).toBeNull();
+  });
+
+  test("a Turn on that fails says why, stays open, and can still be dismissed", async ({
+    page,
+  }) => {
+    await seedMockOverrides(page, {
+      accept_compute_prompt: { __reject: "The settings could not be saved." },
+    });
+    await page.goto("/");
+    const dialog = page.getByTestId("compute-prompt-dialog");
+    await dialog.getByTestId("compute-prompt-turn-on").click();
+    await expect(dialog.getByTestId("compute-prompt-error")).toHaveText(
+      "The settings could not be saved.",
+    );
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByTestId("compute-prompt-turn-on")).toBeEnabled();
+    await dialog.getByTestId("compute-prompt-not-now").click();
     await expect(dialog).toBeHidden();
     await page.getByTestId("nav-settings").click();
     await expect(page.getByTestId("compute-consent-toggle")).not.toBeChecked();

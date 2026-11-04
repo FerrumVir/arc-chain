@@ -134,17 +134,28 @@ requirement for the exact network model (the model is marked **Recommended**)
 and off otherwise. Skip turns it off too.
 
 - **On (worker candidate)**: ARC Node uses up to a quarter of the processor
-  cores for AI jobs while the app is open. The node can advertise compute only
-  after the complete artifact loads. It is eligible only for requests carrying
-  that exact artifact ID. This does not guarantee peers, assignment,
-  verification, or payment.
+  cores for AI jobs, at low operating-system priority so your own apps come
+  first, and about 8 GB of memory while it is ready for jobs. It keeps running
+  on battery, and it keeps running after you close the window (ARC stays in the
+  menu bar or system tray) until you quit ARC from there. The node can
+  advertise compute only after the complete artifact loads. It is eligible only
+  for requests carrying that exact artifact ID. This does not guarantee peers,
+  assignment, verification, or payment.
 - **Off (observer/router)**: no local model execution. It can still query the
   selected coordinator and follow whatever chain services the approved rollout
   enables.
 
 You can change either answer later: **Settings → Contribute compute** turns it
-on or off, and **Settings → Compute contribution** sets how many cores jobs
-may use. Click **Continue**.
+on or off (off stops ARC jobs and frees that memory), and **Settings → Compute
+contribution** sets how many cores jobs may use. Click **Continue**.
+
+A computer that finished setup before this default, has compute off, and meets
+the same memory requirement is asked once, the first time ARC opens after the
+update, in these words with **Turn on** and **Not now**. **Turn on** does what
+leaving the switch on here does: it stores a quarter of the cores unless you
+already chose a count, then downloads the model in the background. **Not now**
+changes nothing. It is never asked again, and a new install is not asked after
+setup.
 
 ### Screen 4: Launch
 
@@ -322,14 +333,19 @@ to measure an address-specific rate. Hardware size is not a reward multiplier.
 
 **Will it slow down my computer?**
 
-Measure this on your own machine; the app does not promise a universal CPU or
-RAM figure. An observer needs no model. The current full-model worker target is
-about 4 GB on disk. The release has not established a minimum-RAM figure; prove
-a complete model load and inference on the target host while leaving OS and
-chain headroom. **Settings → Compute contribution** controls the worker thread
-ceiling, not a reward multiplier. A setup that turns compute on starts that
-ceiling at a quarter of the logical cores (at least one); an install that
-already has a ceiling keeps it.
+Measure this on your own machine; the app does not promise a universal CPU
+figure. An observer needs no model. The current full-model worker target is
+about 4 GB on disk, and a node with the model loaded holds about 8 GB of memory
+while it is ready for jobs.
+The release has not established a minimum-RAM figure; prove a complete model
+load and inference on the target host while leaving OS and chain headroom. The
+node starts at low operating-system priority, so your own apps get the
+processor first when it is busy, and it keeps running on battery; this release
+has no rule that pauses it for idle time, heat, or free memory. **Settings →
+Compute contribution** controls the worker thread ceiling, not a reward
+multiplier. A setup that turns compute on starts that ceiling at a quarter of
+the logical cores (at least one); an install that already has a ceiling keeps
+it.
 
 **How do I update?**
 

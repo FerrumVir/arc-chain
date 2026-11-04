@@ -45,6 +45,27 @@ export interface NodeStripInput {
   connectingSeconds?: number | null;
 }
 
+/**
+ * How long a model download may go without reporting before Home stops
+ * saying it is downloading. A download that fails ends without a final event,
+ * and a computer that slept through one resumes later, so the line must not
+ * outlive the reports. The quietest gaps inside a live download are an idle
+ * connection (60 s before it is dropped) and the wait before a retry (up to
+ * 60 s), so this is well past both; the next report brings the line back.
+ */
+export const MODEL_PROGRESS_STALE_MS = 150_000;
+
+/** The model is still on its way: the sentence for it, with no button. */
+function downloadingModelView(progress: ModelDownloadProgress): NodeStripView {
+  const amount = `${formatBytes(progress.downloadedBytes)} of ${formatBytes(progress.totalBytes)}`;
+  return {
+    sentence: PLAIN_COPY.nodeStrip.downloadingModel(amount),
+    action: null,
+    tone: "busy",
+    details: null,
+  };
+}
+
 const FAILURE_ACTION: Record<StartFailureAction, NodeStripAction> = {
   "install-update": "update-arc",
   "restart-arc": "restart-arc",
@@ -123,6 +144,12 @@ export function describeNodeStrip(input: NodeStripInput): NodeStripView {
     return { sentence: copy.updateAvailable, action: "update-arc", tone: "info", details: null };
   }
   if (input.status?.running) {
+    // A consented install downloads its model after the node has started
+    // (after setup, or after "Turn on"), so the node is running while it
+    // does. It is the one thing worth saying: jobs wait for the model.
+    if (input.modelProgress && !input.modelProgress.done) {
+      return downloadingModelView(input.modelProgress);
+    }
     const { health, coordinatorUrl } = input.status;
     if (health === "live" || health === "lite" || coordinatorUrl) {
       return { sentence: copy.runningConnected, action: null, tone: "ok", details: null };
@@ -137,9 +164,7 @@ export function describeNodeStrip(input: NodeStripInput): NodeStripView {
     return { sentence: copy.running, action: null, tone: "ok", details: null };
   }
   if (input.modelProgress && !input.modelProgress.done) {
-    const { downloadedBytes, totalBytes } = input.modelProgress;
-    const amount = `${formatBytes(downloadedBytes)} of ${formatBytes(totalBytes)}`;
-    return { sentence: copy.downloadingModel(amount), action: null, tone: "busy", details: null };
+    return downloadingModelView(input.modelProgress);
   }
   if (input.status === undefined) {
     return { sentence: copy.checking, action: null, tone: "busy", details: null };

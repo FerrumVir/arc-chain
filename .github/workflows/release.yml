@@ -1538,10 +1538,14 @@ jobs:
 
             Linux ARM64 is headless-only in this release. Tauri updater payloads
             carry application-update signatures. Enabled background checks read
-            the signed manifest after startup and every 24 hours, but never
-            download or install without confirmation. In-place updates cover
-            macOS, Windows NSIS, and AppImage. Windows MSI, `.deb`, and `.rpm`
-            remain manual package upgrades. The macOS and Windows installers
+            the signed manifest after startup and every 24 hours. Since v0.8.14,
+            unattended installs are on by default: the desktop downloads a signed
+            update in the background, installs it when no jobs are running, and
+            restarts. To be asked first, turn off "Install signed app updates
+            automatically when idle" in Settings; turning off "Check for app
+            updates automatically" stops both. In-place updates cover macOS,
+            Windows NSIS, and AppImage. Windows MSI, `.deb`, and `.rpm` remain
+            manual package upgrades. The macOS and Windows installers
             are not Apple Developer ID/notarized or Windows Authenticode signed,
             so operating-system trust approval may be required.
 

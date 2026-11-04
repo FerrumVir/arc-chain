@@ -1202,6 +1202,113 @@ pub fn is_managed_durability_recovery_required(error: &anyhow::Error) -> bool {
 /// same for that state, and `start-failure.ts` recognises it.
 pub const UPDATE_HOLDS_NODE: &str = "ARC couldn't finish an update. Quit ARC and open it again.";
 
+// ── Priority of the managed node ───────────────────────────────────────────
+//
+// The node runs on the person's own computer while they use it, so it starts
+// at low operating-system priority: their apps get the processor first when it
+// is busy, and the node takes what they leave. This changes scheduling only.
+// It does not limit how much of the processor the node may use (the core
+// count does that, `NodeConfig::worker_threads`), and it does not pause the
+// node for anything.
+
+/// The nice value the managed node starts with on macOS and Linux. 0 is
+/// normal and 19 is the lowest priority.
+#[cfg(unix)]
+const NODE_NICE: libc::c_int = 10;
+
+/// CreateProcess flags for the managed node on Windows. CREATE_NO_WINDOW and
+/// CREATE_NEW_PROCESS_GROUP detach it from the GUI's console (the note at the
+/// call in `start_while_lifecycle_locked` says why), and
+/// BELOW_NORMAL_PRIORITY_CLASS is the Windows counterpart of `NODE_NICE`.
+#[cfg(windows)]
+fn node_creation_flags() -> u32 {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+    CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | BELOW_NORMAL_PRIORITY_CLASS
+}
+
+/// Start `cmd`'s process with the nice value `nice`. A refused change is not
+/// an error: the process starts anyway, at the priority it inherited, and
+/// `unlowered_priority_warning` reports what it got.
+#[cfg(unix)]
+fn set_child_nice(cmd: &mut Command, nice: libc::c_int) {
+    // SAFETY: the closure runs in the forked child, between fork and exec,
+    // where only async-signal-safe calls are allowed. `setpriority` is a
+    // plain system call: it allocates nothing, takes no lock and logs
+    // nothing, and its result is ignored on purpose so that a node whose
+    // priority cannot be lowered still starts. The nice value is set before
+    // exec, so every thread the node creates later inherits it.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::setpriority(libc::PRIO_PROCESS as _, 0, nice);
+            Ok(())
+        });
+    }
+}
+
+/// The nice value of process `pid` as the system reports it. `getpriority`
+/// answers -1 both for a real value of -1 and for an error, so a caller that
+/// wants "at least this low" treats -1 as not lowered.
+#[cfg(unix)]
+fn process_nice(pid: u32) -> libc::c_int {
+    // SAFETY: getpriority only reads a scheduling field of the process.
+    unsafe { libc::getpriority(libc::PRIO_PROCESS as _, pid as libc::id_t) }
+}
+
+/// The log line for a node that did not get its low priority, or None when
+/// `nice` (read back from the running node) is `NODE_NICE` or lower priority.
+/// If ARC itself already runs at a higher nice value than `NODE_NICE`, the
+/// node inherits that: lower priority than asked for, and no failure.
+#[cfg(unix)]
+fn low_priority_warning(nice: libc::c_int) -> Option<String> {
+    (nice < NODE_NICE).then(|| {
+        format!(
+            "could not start arc-node at low priority (nice value {}, wanted {}); it runs at the priority ARC itself has, and jobs still run",
+            nice, NODE_NICE
+        )
+    })
+}
+
+#[cfg(unix)]
+fn unlowered_priority_warning(pid: u32) -> Option<String> {
+    low_priority_warning(process_nice(pid))
+}
+
+/// After a spawn: put a line in the logs if the node did not get low
+/// priority. The change itself runs in the forked child, where nothing can be
+/// logged, so it is read back here. The write goes through a spawned task
+/// because `start_while_lifecycle_locked` may not suspend between the spawn
+/// and installing the child.
+#[cfg(unix)]
+fn report_unlowered_priority(logs: &Arc<Mutex<VecDeque<LogEntry>>>, pid: Option<u32>) {
+    let Some(message) = pid.and_then(unlowered_priority_warning) else {
+        return;
+    };
+    let logs = logs.clone();
+    tokio::spawn(async move {
+        push_log(&logs, "warn", message).await;
+    });
+}
+
+/// The operating-system settings every managed node process starts with:
+/// detached from the GUI's console and below normal priority on Windows, a
+/// nice value of `NODE_NICE` on macOS and Linux. Called once, where the node
+/// is spawned.
+fn configure_node_process(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        // `tokio::process::Command::creation_flags` is a Windows-only
+        // inherent method (it forwards to CreateProcessW). No std trait
+        // import needed.
+        cmd.creation_flags(node_creation_flags());
+    }
+    #[cfg(unix)]
+    {
+        set_child_nice(cmd, NODE_NICE);
+    }
+}
+
 pub struct NodeManager {
     child: Option<Child>,
     started_at: Option<Instant>,
@@ -2208,15 +2315,15 @@ impl NodeManager {
         // console-event class of crashes. Stdio::piped() above still
         // gives us the child's stdout/stderr, so log capture is
         // unaffected.
-        #[cfg(windows)]
-        {
-            // `tokio::process::Command::creation_flags` is a Windows-only
-            // inherent method (it forwards to CreateProcessW). No std
-            // trait import needed.
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-        }
+        //
+        // Priority. The node shares this computer with the person using it,
+        // so it also starts below normal priority: BELOW_NORMAL_PRIORITY_CLASS
+        // on Windows, a nice value of 10 on macOS and Linux. Their own apps
+        // get the processor first when it is busy. This is scheduling only:
+        // `worker_threads` limits how much the node may use, and nothing
+        // pauses it. If the change is refused the node still starts, and
+        // the check after the spawn below logs it.
+        configure_node_process(&mut cmd);
 
         // Required signed-bundle network bootstrap files. Their selection is
         // deliberately absent from NodeConfig, so stale or malicious WebView
@@ -2361,6 +2468,14 @@ impl NodeManager {
                     push_log(&logs, level, line).await;
                 }
             });
+        }
+
+        // Read back whether the low priority took (see `configure_node_process`).
+        // A spawned task, not an await: nothing here may suspend before the
+        // child is installed.
+        #[cfg(unix)]
+        {
+            report_unlowered_priority(&self.logs, child.id());
         }
 
         self.child = Some(child);
@@ -6362,6 +6477,118 @@ mod tests {
         child.wait().await.unwrap();
         drop(manager);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The node shares the computer with the person using it, so it starts at
+    /// low priority. This starts a node through the real launch path and reads
+    /// back the nice value the system reports for it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_managed_node_starts_at_low_priority() {
+        let (root, _configured, mut manager, _plan) = updater_resume_fixture("low-priority-start");
+        manager.abort_update_relaunch().await.unwrap();
+        let pid = manager.pid().unwrap();
+        // The fixture execs `sleep`, which keeps the nice value set before exec.
+        let nice = process_nice(pid);
+        assert!(
+            nice >= NODE_NICE,
+            "the node must start at nice {NODE_NICE} or lower priority, not {nice}"
+        );
+        assert_eq!(unlowered_priority_warning(pid), None);
+
+        let mut child = manager.child.take().unwrap();
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A node whose priority could not be lowered still starts, and the log
+    /// says so. Asking an unprivileged process for a negative nice value is
+    /// refused (a privileged one is granted it): either way the child is
+    /// above low priority, which is the state this reports.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_node_that_could_not_be_lowered_still_starts_and_is_logged() {
+        if process_nice(std::process::id()) >= NODE_NICE {
+            // This test run is itself at low priority: nothing to refuse.
+            return;
+        }
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60");
+        set_child_nice(&mut cmd, -5);
+        let mut child = cmd
+            .spawn()
+            .expect("a refused priority change must not stop the spawn");
+        let pid = child.id().expect("the child is running");
+
+        let warning = unlowered_priority_warning(pid).expect("the unlowered node is reported");
+        assert!(warning.contains("low priority"), "{warning}");
+
+        let manager = NodeManager::new();
+        report_unlowered_priority(&manager.logs, Some(pid));
+        let logged = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let found = manager
+                    .logs
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|entry| entry.level == "warn" && entry.message.contains("low priority"));
+                if found {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        logged.expect("the unlowered node is logged as a warning");
+    }
+
+    /// A node at or below the priority it asked for is not reported.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_node_above_low_priority_is_reported() {
+        assert_eq!(low_priority_warning(NODE_NICE), None);
+        assert_eq!(low_priority_warning(NODE_NICE + 5), None);
+        for nice in [0, -1, -5] {
+            let warning = low_priority_warning(nice).expect("above low priority");
+            assert!(warning.contains(&format!("nice value {nice}")), "{warning}");
+            assert!(warning.contains("jobs still run"), "{warning}");
+        }
+    }
+
+    /// Windows: the node's process is created below normal priority, in
+    /// addition to the console detachment it always had.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_managed_node_starts_below_normal_priority() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetPriorityClass, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let mut cmd = Command::new("ping");
+        cmd.args(["-n", "60", "127.0.0.1"]).stdout(Stdio::null());
+        configure_node_process(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn a disposable Windows process");
+        let pid = child.id().expect("the child is running");
+        // SAFETY: OpenProcess takes a numeric PID of a process this test
+        // just spawned and returns an owned handle, closed below.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        assert!(!handle.is_null(), "{}", std::io::Error::last_os_error());
+        // SAFETY: the handle is valid and has query access.
+        let class = unsafe { GetPriorityClass(handle) };
+        // SAFETY: the handle was opened above and is closed once.
+        unsafe {
+            CloseHandle(handle);
+        }
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        // BELOW_NORMAL_PRIORITY_CLASS
+        assert_eq!(class, 0x0000_4000);
     }
 
     #[cfg(unix)]

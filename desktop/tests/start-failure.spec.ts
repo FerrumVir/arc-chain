@@ -7,6 +7,7 @@ import { CONNECTING_LONG_SECS } from "../src/lib/connection";
 import {
   describeNodeStrip,
   isUnfinishedUpdate,
+  MODEL_PROGRESS_STALE_MS,
   type NodeStripInput,
 } from "../src/lib/node-strip";
 import {
@@ -253,6 +254,37 @@ test.describe("node strip on Home", () => {
         },
       }).sentence,
     ).toMatch(/^Your node is getting ready: downloading the AI model \(.+ of .+\)\.$/);
+  });
+
+  test("a model download after setup shows on Home while the node runs", () => {
+    const downloading = {
+      tier: "standard",
+      downloadedBytes: 1_200_000_000,
+      totalBytes: 3_800_000_000,
+      done: false,
+    };
+    // Compute starts on at setup, so the node is up and the model follows.
+    const view = strip({ status: running, modelProgress: downloading });
+    expect(view.sentence).toMatch(
+      /^Your node is getting ready: downloading the AI model \(.+ of .+\)\.$/,
+    );
+    expect(view).toMatchObject({ action: null, tone: "busy" });
+    // The last report of a finished download is not "downloading".
+    expect(
+      strip({
+        status: running,
+        modelProgress: { ...downloading, downloadedBytes: 3_800_000_000, done: true },
+      }),
+    ).toMatchObject({ sentence: PLAIN_COPY.nodeStrip.running, tone: "ok" });
+    // An update on offer outranks it, as it does for a node that is off.
+    expect(strip({ status: running, modelProgress: downloading, update: ready })).toMatchObject({
+      sentence: PLAIN_COPY.nodeStrip.updateAvailable,
+      action: "update-arc",
+    });
+    // A download that goes quiet without a final report is forgotten, but
+    // only well after the longest quiet spell inside a live one (a dropped
+    // connection waits 60 s, then a retry up to 60 s).
+    expect(MODEL_PROGRESS_STALE_MS).toBeGreaterThanOrEqual(120_000);
   });
 
   test("a ready update shows on Home, and installing it says so", () => {

@@ -199,10 +199,25 @@ export const PLAIN_COPY = {
      * The compute step. On a computer that can run the ARC model (the tier
      * native code recommends), contributing starts on and the model downloads
      * in the background after setup; the switch and Skip turn it off.
+     *
+     * What the body states is what this release does, and nothing more: the
+     * node starts at low OS priority (node_manager.rs `configure_node_process`),
+     * jobs use at most a quarter of the logical cores (commands.rs
+     * `default_worker_threads`), a node with the model loaded holds about
+     * 8 GB, and nothing pauses it on battery. Closing the window hides ARC
+     * to the tray, where the node keeps running until ARC is quit (lib.rs
+     * `on_window_event`; with no tray, closing the window quits ARC and
+     * stops the node). That is why the Settings note says "while ARC Node
+     * is running", not "while the app is open". No rule that waits for idle
+     * time, battery, heat or free memory exists yet, so none is promised
+     * here or in `settings.computeShare`.
+     *
+     * The same title and body are the one-time question asked of an install
+     * from before this default (components/ComputePromptDialog.tsx).
      */
     compute: {
       title: "Share your computer's spare power",
-      body: "ARC Node will use up to a quarter of your processor to run AI jobs for the ARC network while the app is open. It downloads the ARC model (about 4 GB) in the background first. You can turn this off here or at any time in Settings.",
+      body: "ARC Node can run AI jobs for the ARC network on this computer. It uses up to a quarter of your processor, at low priority so your own apps come first, and about 8 GB of memory while it is ready for jobs. It keeps running on battery. First it downloads the ARC model, about 4 GB, in the background. You can turn this off here or at any time in Settings.",
       control: "Contribute compute",
       /**
        * In place of the body below the memory floor (`recommended_tier` is
@@ -210,7 +225,10 @@ export const PLAIN_COPY = {
        * downloads during setup, before the node starts.
        */
       belowMemoryFloor:
-        "This computer has less than 16 GB of memory, which the ARC model needs, so this starts off. If you turn it on, setup downloads the model (about 4 GB) before your node starts, and ARC Node will use up to a quarter of your processor to run AI jobs for the ARC network while the app is open.",
+        "This computer has less than 16 GB of memory, which the ARC model needs, so this starts off. If you turn it on, setup downloads the model (about 4 GB) before your node starts. ARC Node can then run AI jobs for the ARC network on this computer. It uses up to a quarter of your processor, at low priority so your own apps come first, and about 8 GB of memory while it is ready for jobs. It keeps running on battery.",
+      /** The two buttons of the one-time question for an existing install. */
+      turnOn: "Turn on",
+      notNow: "Not now",
     },
     readyTitle: "Ready to start",
     readyWithModel: (size: string | null) =>
@@ -235,17 +253,23 @@ export const PLAIN_COPY = {
   settings: {
     /**
      * Under Settings > Contribute compute while it is on: how much of the
-     * processor AI jobs may use. `threads` is the node's core cap (null: no
-     * cap, every core) and `cores` this computer's logical cores. A setup
-     * that turns compute on stores a quarter of them; a cap someone set, or
-     * none on an install from before that, is stated as it is.
+     * processor AI jobs may use, at what priority, and how much memory the
+     * node holds. `threads` is the node's core cap (null: no cap, every
+     * core) and `cores` this computer's logical cores. A setup that turns
+     * compute on stores a quarter of them; a cap someone set, or none on an
+     * install from before that, is stated as it is. The priority and the
+     * memory do not depend on the cap: the node starts at low priority
+     * whatever its width, and holds the model either way.
      */
-    computeShare: (threads: number | null, cores: number) =>
-      threads === null || threads >= cores
-        ? "Uses up to your whole processor while ARC Node is open."
-        : threads * 4 <= cores
-          ? "Uses up to a quarter of your processor while ARC Node is open."
-          : `Uses up to ${threads} of your ${cores} processor cores while ARC Node is open.`,
+    computeShare: (threads: number | null, cores: number) => {
+      const share =
+        threads === null || threads >= cores
+          ? "your whole processor"
+          : threads * 4 <= cores
+            ? "a quarter of your processor"
+            : `${threads} of your ${cores} processor cores`;
+      return `Uses up to ${share} at low priority, and about 8 GB of memory while ARC Node is running. It keeps running on battery. Turn this off to stop ARC jobs and free that memory.`;
+    },
   },
   /**
    * Launch found node data from an earlier install whose app data was gone

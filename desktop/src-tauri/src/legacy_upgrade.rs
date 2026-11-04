@@ -314,6 +314,11 @@ pub async fn answer_legacy_compute_question(
         .and_then(|config| config.compute_consent)
         == Some(contribute);
     if recorded {
+        // This was the compute question already, so the one-time question
+        // for installs from before the default is not asked after it. Recorded
+        // first: a failed `clear` leaves the answer standing, and the marker
+        // is what keeps a "Not now" from being asked again at the next launch.
+        crate::commands::note_compute_question_answered(&dir);
         clear(&dir).map_err(|error| error.to_string())?;
     }
     outcome

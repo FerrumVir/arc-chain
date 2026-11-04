@@ -205,6 +205,20 @@ export const ECONOMICS_NO_BALANCE = {
   bondRefundedAfterChallengePeriod: null,
 };
 
+/**
+ * Make the browser preview treat the app as an install from before compute
+ * started on by default, with compute off, on a computer that can run the
+ * model: the one-time question is due. The preview records it in localStorage
+ * before answering, as native code does with its marker file, so it is asked
+ * once and a reload does not ask again (see `claim_compute_prompt` in
+ * lib/tauri.ts). Without this nothing is asked.
+ */
+export async function seedComputePrompt(page: Page) {
+  await page.addInitScript(() => {
+    (window as unknown as { __ARC_MOCK_COMPUTE_PROMPT__?: boolean }).__ARC_MOCK_COMPUTE_PROMPT__ = true;
+  });
+}
+
 export async function clearState(page: Page) {
   await page.addInitScript(() => {
     localStorage.clear();
