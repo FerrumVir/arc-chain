@@ -6,6 +6,7 @@ import { api } from "../lib/tauri";
 import { formatInt, formatRelativeTime } from "../lib/format";
 import { useAppStore } from "../lib/store";
 import { computeContributionEnabled, type WorkerStatus } from "../lib/types";
+import { PLAIN_COPY } from "../lib/plain-copy";
 
 const STATE_COPY: Record<string, string> = {
   polling: "Ready: waiting for a job",
@@ -13,9 +14,26 @@ const STATE_COPY: Record<string, string> = {
   reconnecting: "Reconnecting to coordinators",
 };
 
+/** Why the memory guard paused the worker, only as far as the node reported it. */
+const PAUSE_COPY: Record<string, string> = {
+  paused_low_memory: PLAIN_COPY.workerJobs.pausedLowMemory,
+  paused_memory_check_failed: PLAIN_COPY.workerJobs.pausedCheckFailed,
+  paused_decline_backoff: PLAIN_COPY.workerJobs.pausedAfterDeclines,
+};
+
+function isPausedByMemoryGuard(status: WorkerStatus): boolean {
+  return status.running && status.state === "paused_memory_guard";
+}
+
 /** One sentence for the worker's current state, from its own node. */
 export function workerStateCopy(status: WorkerStatus): string {
   if (!status.running) return "Not taking jobs";
+  if (isPausedByMemoryGuard(status)) {
+    return (
+      (status.memoryGuardState && PAUSE_COPY[status.memoryGuardState]) ||
+      PLAIN_COPY.workerJobs.paused
+    );
+  }
   return (status.state && STATE_COPY[status.state]) || "Running";
 }
 
@@ -117,6 +135,7 @@ export function WorkerJobsCard() {
             }}
             data-testid="worker-jobs-detail"
           >
+            {isPausedByMemoryGuard(status) ? `${PLAIN_COPY.workerJobs.pausedDetail} ` : ""}
             {status.lastJobCompletedUnixMs !== null
               ? `Last job ${formatRelativeTime(status.lastJobCompletedUnixMs)}. `
               : "No job completed since the node started. "}

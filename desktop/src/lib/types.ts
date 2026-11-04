@@ -843,4 +843,13 @@ export interface WorkerStatus {
   lastJobCompletedUnixMs: number | null;
   startedUnixMs: number | null;
   preventSleepDuringJobs: boolean | null;
+  /**
+   * Why a `paused_memory_guard` worker is paused, from the node's optional
+   * `memory_guard` status: `paused_low_memory`, `paused_memory_check_failed`,
+   * `paused_decline_backoff` or `ok`. Absent when the node has no memory guard,
+   * or it is off.
+   */
+  memoryGuardState?: string | null;
+  /** `ok`, `failed` or `not_read_yet`, from the same status. */
+  memoryCheck?: string | null;
 }

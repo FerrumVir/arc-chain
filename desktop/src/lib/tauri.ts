@@ -602,6 +602,13 @@ function mockLatencyMs(): number {
   return Number.isFinite(value) && value > 0 ? Math.min(value, 10_000) : 0;
 }
 
+/** A string field of the worker status's optional `memory_guard` object, else null. */
+function guardText(guard: unknown, key: string): string | null {
+  if (typeof guard !== "object" || guard === null) return null;
+  const value = (guard as Record<string, unknown>)[key];
+  return typeof value === "string" ? value : null;
+}
+
 type MockOverrides = Record<string, unknown>;
 function mockOverride<T>(cmd: string): T | undefined {
   if (typeof window === "undefined") return undefined;
@@ -2193,6 +2200,9 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           typeof body.prevent_sleep_during_jobs === "boolean"
             ? body.prevent_sleep_during_jobs
             : null,
+        // Present only when the node's memory guard is on.
+        memoryGuardState: guardText(body.memory_guard, "state"),
+        memoryCheck: guardText(body.memory_guard, "memory_check"),
       } as T;
     }
     case "load_legacy_compute_question":
