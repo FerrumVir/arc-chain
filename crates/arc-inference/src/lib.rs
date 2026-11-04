@@ -521,3 +521,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/allocation_probe.rs"]
+mod allocation_probe;
