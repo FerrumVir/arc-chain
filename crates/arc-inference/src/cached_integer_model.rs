@@ -310,6 +310,27 @@ impl KVCache {
         }
     }
 
+    /// A cache with capacity for exactly `positions` positions of `d_kv` values in every
+    /// layer, so a job of at most that many positions never reallocates (and never holds a
+    /// grown, over-allocated buffer). `None` when the size does not fit in memory addressing.
+    pub fn with_reserved_positions(n_layers: usize, d_kv: usize, positions: usize) -> Option<Self> {
+        let per_layer = positions.checked_mul(d_kv)?;
+        // Vec::with_capacity panics past isize::MAX bytes; refuse instead.
+        let bytes = per_layer.checked_mul(std::mem::size_of::<i64>())?;
+        if bytes > isize::MAX as usize {
+            return None;
+        }
+        Some(Self {
+            k_data: (0..n_layers)
+                .map(|_| Vec::with_capacity(per_layer))
+                .collect(),
+            v_data: (0..n_layers)
+                .map(|_| Vec::with_capacity(per_layer))
+                .collect(),
+            seq_len: 0,
+        })
+    }
+
     pub fn clear(&mut self) {
         for l in 0..self.k_data.len() {
             self.k_data[l].clear();
@@ -4156,6 +4177,28 @@ impl CachedIntegerModel {
         Ok(self.generate_preflighted(prompt, max_tokens, eos_tokens))
     }
 
+    /// [`Self::try_generate`] with the KV cache reserved up front for exactly the preflighted
+    /// positions (1 BOS + prompt + `max_tokens`). Same tokens and hash; the cache never grows,
+    /// so its size is exactly what a memory admission check charged for it.
+    pub fn try_generate_with_reserved_kv(
+        &self,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos_tokens: &[u32],
+    ) -> Result<(Vec<u32>, Hash256), GenerationError> {
+        let admission = self.preflight_generation(prompt.len(), max_tokens)?;
+        let mut cache = KVCache::with_reserved_positions(
+            self.config.n_layers,
+            self.config.d_kv,
+            admission.required_positions,
+        )
+        .ok_or(GenerationError::PositionCountOverflow {
+            prompt_tokens: prompt.len(),
+            max_tokens,
+        })?;
+        Ok(self.generate_preflighted_in(&mut cache, prompt, max_tokens, eos_tokens))
+    }
+
     /// Trusted compatibility wrapper around [`Self::try_generate`].
     ///
     /// RPC, P2P, and other untrusted entry points must call `try_generate`
@@ -4284,15 +4327,26 @@ impl CachedIntegerModel {
         eos_tokens: &[u32],
     ) -> (Vec<u32>, Hash256) {
         let mut cache = KVCache::new(self.config.n_layers);
+        self.generate_preflighted_in(&mut cache, prompt, max_tokens, eos_tokens)
+    }
+
+    /// The legacy generation loop over a caller-provided, empty cache.
+    fn generate_preflighted_in(
+        &self,
+        cache: &mut KVCache,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos_tokens: &[u32],
+    ) -> (Vec<u32>, Hash256) {
         let mut generated = Vec::new();
 
         // The whole-model API owns the one required BOS forward. Callers pass
         // raw prompt tokens; using the artifact's configured token avoids both
         // a duplicate BOS and the hardcoded LLaMA-2 ID on other tokenizers.
-        let _ = self.forward_one_token(self.config.bos_token, &mut cache);
+        let _ = self.forward_one_token(self.config.bos_token, cache);
 
         for &tok in prompt {
-            let _logits = self.forward_one_token(tok, &mut cache);
+            let _logits = self.forward_one_token(tok, cache);
         }
 
         for _ in 0..max_tokens {
@@ -4300,7 +4354,7 @@ impl CachedIntegerModel {
                 .last()
                 .copied()
                 .unwrap_or(*prompt.last().unwrap_or(&0));
-            let mut logits = self.forward_one_token(last_token, &mut cache);
+            let mut logits = self.forward_one_token(last_token, cache);
             let next = select_next_token_with_repetition_penalty(&mut logits, &generated);
             generated.push(next);
             if eos_tokens.contains(&next) {
@@ -7690,6 +7744,64 @@ mod tests {
             .try_generate(&prompt, 3, &[])
             .expect("the exact context boundary must execute without indexing past RoPE");
         assert_eq!(generated.len(), 3);
+    }
+
+    #[test]
+    fn reserved_kv_generation_is_identical_and_never_reallocates() {
+        let model = build_test_model(32, 16, 2, 32, 2);
+        for (prompt, max_tokens, eos) in [
+            (vec![3u32, 4], 3u32, vec![]),
+            (vec![5, 6, 7, 8], 5, vec![]),
+            (
+                vec![1],
+                6,
+                vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            ),
+        ] {
+            let plain = model.try_generate(&prompt, max_tokens, &eos).unwrap();
+            let reserved = model
+                .try_generate_with_reserved_kv(&prompt, max_tokens, &eos)
+                .unwrap();
+            assert_eq!(
+                plain, reserved,
+                "reservation must not change tokens or hash"
+            );
+
+            let positions = model
+                .preflight_generation(prompt.len(), max_tokens)
+                .unwrap()
+                .required_positions;
+            let mut cache = KVCache::with_reserved_positions(
+                model.config.n_layers,
+                model.config.d_kv,
+                positions,
+            )
+            .unwrap();
+            let before: Vec<usize> = cache
+                .k_data
+                .iter()
+                .chain(&cache.v_data)
+                .map(Vec::capacity)
+                .collect();
+            assert!(before.iter().all(|&c| c == positions * model.config.d_kv));
+            let in_cache = model.generate_preflighted_in(&mut cache, &prompt, max_tokens, &eos);
+            assert_eq!(in_cache, plain);
+            let after: Vec<usize> = cache
+                .k_data
+                .iter()
+                .chain(&cache.v_data)
+                .map(Vec::capacity)
+                .collect();
+            assert_eq!(before, after, "a reserved cache never grows");
+            assert!(cache.seq_len <= positions);
+        }
+    }
+
+    #[test]
+    fn reserved_kv_refuses_unaddressable_sizes() {
+        assert!(KVCache::with_reserved_positions(2, usize::MAX, 2).is_none());
+        assert!(KVCache::with_reserved_positions(2, 1 << 40, 1 << 40).is_none());
+        assert!(KVCache::with_reserved_positions(2, 4, 0).is_some());
     }
 
     #[test]

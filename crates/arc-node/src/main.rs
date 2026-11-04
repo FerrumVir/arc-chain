@@ -588,6 +588,45 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     prevent_sleep_during_jobs: bool,
 
+    /// Memory headroom guard for the community worker (ARC-410 L7). Off by default, and a
+    /// guard that is off protects nothing. When on, every value below must be given
+    /// explicitly: no production value has been decided or measured, so none is built in.
+    /// It pauses claims while available memory is below the headroom, and declines (without
+    /// computing or retrying) a job whose KV cache + working memory + headroom does not fit.
+    /// It does not cover loading the model.
+    #[arg(long, default_value_t = false)]
+    memory_guard: bool,
+
+    /// Memory guard: bytes to leave free for the OS and other programs.
+    #[arg(long, value_name = "BYTES")]
+    memory_guard_headroom_bytes: Option<u64>,
+
+    /// Memory guard: extra bytes above the headroom required before a low-memory pause ends.
+    #[arg(long, value_name = "BYTES")]
+    memory_guard_resume_hysteresis_bytes: Option<u64>,
+
+    /// Memory guard: consecutive reads above headroom + hysteresis before a pause ends (>= 1).
+    #[arg(long, value_name = "N")]
+    memory_guard_resume_reads: Option<u32>,
+
+    /// Memory guard: seconds between memory reads while claims are paused (>= 1).
+    #[arg(long, value_name = "SECS")]
+    memory_guard_recheck_secs: Option<u64>,
+
+    /// Memory guard: what to do when the memory probe fails. `proceed` behaves as if the
+    /// guard were off while the probe fails; `pause` stops claims and declines at admission.
+    #[arg(long, value_name = "POLICY", value_parser = ["proceed", "pause"])]
+    memory_guard_on_probe_failure: Option<String>,
+
+    /// Memory guard (optional back-off): after this many consecutive memory declines, also
+    /// pause claims for `--memory-guard-decline-backoff-secs`. Give both or neither.
+    #[arg(long, value_name = "N")]
+    memory_guard_decline_backoff_after: Option<u32>,
+
+    /// Memory guard (optional back-off): seconds to pause claims after the declines above.
+    #[arg(long, value_name = "SECS")]
+    memory_guard_decline_backoff_secs: Option<u64>,
+
     /// Ask a seed to assign this node a layer range at boot (POST /shards/join).
     ///
     /// OFF by default, and it used to be implicit for any staked node with a
@@ -5980,6 +6019,128 @@ fn node_runtime_roles(chain_participation_enabled: bool, protocol_major: u16) ->
     }
 }
 
+/// The memory guard policy the operator configured, or `None` when `--memory-guard` is off.
+/// Every value is required once it is on; a `--memory-guard-*` value without `--memory-guard`
+/// is refused rather than silently ignored.
+fn memory_guard_policy_from_cli(
+    cli: &Cli,
+) -> Result<Option<arc_node::memory_guard::MemoryGuardPolicy>> {
+    use arc_node::memory_guard::{MemoryGuardPolicy, ProbeFailurePolicy};
+    let any_value = cli.memory_guard_headroom_bytes.is_some()
+        || cli.memory_guard_resume_hysteresis_bytes.is_some()
+        || cli.memory_guard_resume_reads.is_some()
+        || cli.memory_guard_recheck_secs.is_some()
+        || cli.memory_guard_on_probe_failure.is_some()
+        || cli.memory_guard_decline_backoff_after.is_some()
+        || cli.memory_guard_decline_backoff_secs.is_some();
+    if !cli.memory_guard {
+        ensure!(
+            !any_value,
+            "--memory-guard-* values were given without --memory-guard; the guard is off, so they would do nothing"
+        );
+        return Ok(None);
+    }
+    ensure!(
+        cli.model.is_some() && !cli.no_community,
+        "--memory-guard guards the community worker, which needs --model and community networking"
+    );
+    let required = |name: &str| {
+        anyhow::anyhow!(
+            "--memory-guard requires --memory-guard-{name} (no default has been decided)"
+        )
+    };
+    let headroom_bytes = cli
+        .memory_guard_headroom_bytes
+        .ok_or_else(|| required("headroom-bytes"))?;
+    let resume_hysteresis_bytes = cli
+        .memory_guard_resume_hysteresis_bytes
+        .ok_or_else(|| required("resume-hysteresis-bytes"))?;
+    let resume_consecutive_reads = cli
+        .memory_guard_resume_reads
+        .ok_or_else(|| required("resume-reads"))?;
+    ensure!(
+        resume_consecutive_reads >= 1,
+        "--memory-guard-resume-reads must be at least 1"
+    );
+    let recheck_secs = cli
+        .memory_guard_recheck_secs
+        .ok_or_else(|| required("recheck-secs"))?;
+    ensure!(
+        recheck_secs >= 1,
+        "--memory-guard-recheck-secs must be at least 1"
+    );
+    let on_probe_failure = match cli.memory_guard_on_probe_failure.as_deref() {
+        Some("proceed") => ProbeFailurePolicy::Proceed,
+        Some("pause") => ProbeFailurePolicy::Pause,
+        _ => return Err(required("on-probe-failure")),
+    };
+    let (decline_backoff_after, decline_backoff) = match (
+        cli.memory_guard_decline_backoff_after,
+        cli.memory_guard_decline_backoff_secs,
+    ) {
+        (None, None) => (None, std::time::Duration::ZERO),
+        (Some(after), Some(secs)) => {
+            ensure!(
+                after >= 1,
+                "--memory-guard-decline-backoff-after must be at least 1"
+            );
+            ensure!(
+                secs >= 1,
+                "--memory-guard-decline-backoff-secs must be at least 1"
+            );
+            (Some(after), std::time::Duration::from_secs(secs))
+        }
+        _ => bail!(
+            "give both --memory-guard-decline-backoff-after and --memory-guard-decline-backoff-secs, or neither"
+        ),
+    };
+    Ok(Some(MemoryGuardPolicy {
+        headroom_bytes,
+        resume_hysteresis_bytes,
+        resume_consecutive_reads,
+        recheck_interval: std::time::Duration::from_secs(recheck_secs),
+        decline_backoff_after,
+        decline_backoff,
+        on_probe_failure,
+    }))
+}
+
+/// Memory-guard admission for one claimed, preflighted job: `Some(result)` to submit instead
+/// of computing (a declined result: no output, never retried by this worker), or `None` to
+/// compute. `required_positions` is the context preflight's count (`None` if it failed).
+fn memory_guard_decline(
+    guard: &arc_node::memory_guard::MemoryGuard,
+    dims: &arc_node::memory_guard::ModelDims,
+    required_positions: Option<usize>,
+    max_tokens: u32,
+    job_id: &str,
+    worker_id: &str,
+    now: Instant,
+) -> Option<rpc::WorkResult> {
+    let requirement = required_positions.and_then(|positions| {
+        arc_node::memory_guard::job_requirement_bytes(dims, positions, max_tokens)
+    });
+    match guard.admit(requirement, now) {
+        arc_node::memory_guard::AdmissionDecision::Admit => None,
+        arc_node::memory_guard::AdmissionDecision::Decline { reason, .. } => {
+            Some(rpc::WorkResult {
+                job_id: job_id.to_owned(),
+                worker_id: worker_id.to_owned(),
+                success: false,
+                declined: true,
+                output: String::new(),
+                output_hash: String::new(),
+                tokens_generated: 0,
+                total_ms: 0,
+                ms_per_token: 0,
+                engine: String::new(),
+                error: Some(reason),
+                signed_attestation_hex: None,
+            })
+        }
+    }
+}
+
 fn validate_full_integer_worker_role(
     cli: &Cli,
     stake: u64,
@@ -7299,6 +7460,7 @@ async fn run_arc_node() -> Result<()> {
             .map_err(anyhow::Error::msg)
             .context("invalid community RPC configuration")?;
     validate_full_integer_worker_role(&cli, stake, &community_rpc_bases)?;
+    let memory_guard_policy = memory_guard_policy_from_cli(&cli)?;
     let mut raw_coordinator_rpc_bases = community_rpc_bases.clone();
     for shard_host in &cli.shard_hosts {
         let shard_host = shard_host.trim();
@@ -9225,6 +9387,22 @@ async fn run_arc_node() -> Result<()> {
                 cli.prevent_sleep_during_jobs,
             ),
         ));
+        // The memory guard is built only from an explicit operator configuration.
+        let memory_guard = memory_guard_policy.clone().map(|policy| {
+            Arc::new(arc_node::memory_guard::MemoryGuard::new(
+                policy,
+                Box::new(arc_node::memory_guard::OsMemoryProbe),
+            ))
+        });
+        match &memory_guard {
+            Some(guard) => {
+                worker_status.attach_memory_guard(guard.clone());
+                tracing::info!(policy = ?guard.policy(), "memory guard on: claims pause below the headroom and jobs that do not fit are declined (model loading is not covered)");
+            }
+            None => {
+                tracing::info!("memory guard off: the community worker has no memory protection")
+            }
+        }
         let reregister = Arc::new(arc_node::community_worker::ReregistrationQueue::new());
         let registration_status = worker_status.clone();
         let registration_wakeup = reregister.clone();
@@ -9470,6 +9648,7 @@ async fn run_arc_node() -> Result<()> {
             let worker_execution_gate = native_request_admission.worker_execution_gate();
             let mut worker_shutdown = Some(background_admission_shutdown_rx.clone());
             let status_w = worker_status.clone();
+            let memory_guard_w = memory_guard.clone();
             let reregister_w = reregister.clone();
             let prevent_sleep_during_jobs = cli.prevent_sleep_during_jobs;
             let compute_pool_w = compute_pool.clone();
@@ -9499,6 +9678,7 @@ async fn run_arc_node() -> Result<()> {
                 );
                 let mut decline_tasks = tokio::task::JoinSet::new();
                 let mut failed_claim_rounds: u32 = 0;
+                let mut memory_guard_paused = false;
                 loop {
                     while let Some(result) = decline_tasks.try_join_next() {
                         if let Err(error) = result {
@@ -9531,6 +9711,31 @@ async fn run_arc_node() -> Result<()> {
                     // so its dispatcher falls back immediately instead of
                     // silently losing the dequeued job when a request future
                     // is canceled.
+                    // Memory guard (off unless configured): no claim while memory is below the
+                    // headroom, or while a decline back-off or a failed probe (policy `pause`)
+                    // holds claims.
+                    if let Some(guard) = memory_guard_w.as_ref() {
+                        match guard.before_claim(std::time::Instant::now()) {
+                            arc_node::memory_guard::ClaimDecision::Pause { reason, retry_after } => {
+                                if !memory_guard_paused {
+                                    tracing::warn!(?reason, "memory guard: claims paused");
+                                }
+                                memory_guard_paused = true;
+                                status_w.set_state(WorkerState::PausedMemoryGuard);
+                                if sleep_or_runtime_shutdown(&mut worker_shutdown, retry_after).await {
+                                    break;
+                                }
+                                continue;
+                            }
+                            arc_node::memory_guard::ClaimDecision::Claim => {
+                                if memory_guard_paused {
+                                    tracing::info!("memory guard: claims resumed");
+                                    status_w.set_state(WorkerState::Polling);
+                                }
+                                memory_guard_paused = false;
+                            }
+                        }
+                    }
                     let claim_body = rpc::ClaimWorkRequest {
                         worker_id: worker_id_w.clone(),
                         capabilities: vec!["inference".to_string()],
@@ -9921,6 +10126,42 @@ async fn run_arc_node() -> Result<()> {
                             status_w.record_outcome(JobOutcome::Declined);
                             continue;
                         }
+                        // Memory guard admission (off unless configured): the job's exact KV
+                        // cache (reserved below) + working memory + headroom must fit in memory
+                        // read now. Otherwise decline before compute; the job is not retried.
+                        let use_reserved_kv = memory_guard_w.is_some();
+                        if let Some(guard) = memory_guard_w.as_ref() {
+                            let required_positions = inference_model
+                                .preflight_generation(inference_tokens.len(), max_tokens)
+                                .ok()
+                                .map(|admission| admission.required_positions);
+                            if let Some(failure) = memory_guard_decline(
+                                guard,
+                                &arc_node::memory_guard::ModelDims::from_config(&inference_model.config),
+                                required_positions,
+                                max_tokens,
+                                &job_id,
+                                &worker_id_w,
+                                std::time::Instant::now(),
+                            ) {
+                                tracing::warn!(
+                                    job_id,
+                                    seed = %winner,
+                                    reason = failure.error.as_deref().unwrap_or_default(),
+                                    "declining community assignment before blocking compute"
+                                );
+                                let _ = submit_community_result_with_retry(
+                                    &client,
+                                    &winner,
+                                    &failure,
+                                    &worker_keypair,
+                                    submission_deadline,
+                                )
+                                .await;
+                                status_w.record_outcome(JobOutcome::Declined);
+                                continue;
+                            }
+                        }
                         let worker_execution_for_compute = worker_execution_permit.clone();
                         let compute_pool_for_job = compute_pool_w.clone();
                         status_w.set_state(WorkerState::Computing);
@@ -9942,12 +10183,23 @@ async fn run_arc_node() -> Result<()> {
                                 // allocating KV state; even a tokenizer-expanded
                                 // prompt can only become a typed worker failure,
                                 // never an indexing panic.
-                                let (generated, hash) = inference_model
-                                    .try_generate(
+                                // With the memory guard on, the KV cache is reserved
+                                // for exactly the positions admission charged; same
+                                // tokens and hash either way.
+                                let generation = if use_reserved_kv {
+                                    inference_model.try_generate_with_reserved_kv(
                                         &inference_tokens,
                                         max_tokens,
                                         &inference_model.config.eos_tokens,
                                     )
+                                } else {
+                                    inference_model.try_generate(
+                                        &inference_tokens,
+                                        max_tokens,
+                                        &inference_model.config.eos_tokens,
+                                    )
+                                };
+                                let (generated, hash) = generation
                                     .map_err(|error| {
                                         let helper_admitted = community_generation_fits_context(
                                             inference_tokens.len(),
@@ -10345,6 +10597,290 @@ mod tests {
     use super::*;
     use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
     use serde_json::json;
+
+    // ---- memory guard (ARC-410 L7): configuration gate and admission decline ----------------
+
+    /// The argv each launcher builds today (desktop `node_manager.rs`, headless `install.sh`,
+    /// legacy bridge `launch.rs`), with synthetic paths. None passes a memory-guard flag.
+    fn launcher_argvs() -> Vec<(&'static str, Vec<&'static str>)> {
+        let common = [
+            "--rpc",
+            "127.0.0.1:9944",
+            "--p2p-port",
+            "9945",
+            "--seeds-file",
+            "/synthetic/seeds.txt",
+            "--genesis",
+            "/synthetic/genesis.toml",
+            "--stake",
+            "0",
+            "--data-dir",
+            "/synthetic/data",
+            "--validator-key-file",
+            "/synthetic/key",
+        ];
+        let worker = [
+            "--community-mode",
+            "--full-integer-worker",
+            "--community-rpc-url",
+            "https://coordinator.invalid",
+            "--model",
+            "/synthetic/model.gguf",
+        ];
+        let mut desktop = vec!["arc-node"];
+        desktop.extend(common);
+        desktop.extend(worker);
+        let mut headless = vec!["arc-node"];
+        headless.extend(common);
+        headless.extend(["--min-stake", "0", "--eth-rpc-port", "0"]);
+        headless.extend(worker);
+        let mut bridge = vec!["arc-node"];
+        bridge.extend(common);
+        bridge.extend(["--min-stake", "0", "--eth-rpc-port", "0"]);
+        bridge.extend(worker);
+        vec![
+            ("desktop", desktop),
+            ("headless", headless),
+            ("bridge", bridge),
+        ]
+    }
+
+    const GUARD_FLAGS: [&str; 11] = [
+        "--memory-guard",
+        "--memory-guard-headroom-bytes",
+        "2147483648",
+        "--memory-guard-resume-hysteresis-bytes",
+        "536870912",
+        "--memory-guard-resume-reads",
+        "2",
+        "--memory-guard-recheck-secs",
+        "30",
+        "--memory-guard-on-probe-failure",
+        "pause",
+    ];
+
+    #[test]
+    fn no_launcher_turns_the_memory_guard_on_and_off_means_no_guard() {
+        for (launcher, argv) in launcher_argvs() {
+            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{launcher}: {e}"));
+            assert!(!cli.memory_guard, "{launcher}");
+            assert_eq!(
+                memory_guard_policy_from_cli(&cli).unwrap(),
+                None,
+                "{launcher}: guard must stay off"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_configuration_turns_it_on_for_any_launcher_argv() {
+        for (launcher, mut argv) in launcher_argvs() {
+            argv.extend(GUARD_FLAGS);
+            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{launcher}: {e}"));
+            let policy = memory_guard_policy_from_cli(&cli)
+                .unwrap()
+                .expect("configured");
+            assert_eq!(policy.headroom_bytes, 2 << 30, "{launcher}");
+            assert_eq!(policy.resume_hysteresis_bytes, 512 << 20);
+            assert_eq!(policy.resume_consecutive_reads, 2);
+            assert_eq!(policy.recheck_interval, std::time::Duration::from_secs(30));
+            assert_eq!(
+                policy.on_probe_failure,
+                arc_node::memory_guard::ProbeFailurePolicy::Pause
+            );
+            assert_eq!(policy.decline_backoff_after, None);
+        }
+    }
+
+    #[test]
+    fn partial_or_orphaned_memory_guard_configuration_is_refused() {
+        let (_, base) = launcher_argvs().remove(0);
+        // Each required value missing in turn.
+        for skip in [1, 3, 5, 7, 9] {
+            let mut argv = base.clone();
+            for (i, flag) in GUARD_FLAGS.iter().enumerate() {
+                if i != skip && i != skip + 1 {
+                    argv.push(flag);
+                }
+            }
+            let cli = Cli::try_parse_from(&argv).unwrap();
+            let error = memory_guard_policy_from_cli(&cli).unwrap_err().to_string();
+            assert!(
+                error.contains("--memory-guard requires") || error.contains("must be"),
+                "{error}"
+            );
+        }
+        // A value without --memory-guard would silently do nothing: refused.
+        let mut argv = base.clone();
+        argv.extend(["--memory-guard-headroom-bytes", "1"]);
+        let cli = Cli::try_parse_from(&argv).unwrap();
+        assert!(
+            memory_guard_policy_from_cli(&cli)
+                .unwrap_err()
+                .to_string()
+                .contains("without --memory-guard")
+        );
+        // Back-off needs both values; zero values are refused.
+        for extra in [
+            vec!["--memory-guard-decline-backoff-after", "3"],
+            vec!["--memory-guard-decline-backoff-secs", "60"],
+        ] {
+            let mut argv = base.clone();
+            argv.extend(GUARD_FLAGS);
+            argv.extend(extra);
+            let cli = Cli::try_parse_from(&argv).unwrap();
+            assert!(
+                memory_guard_policy_from_cli(&cli)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("or neither")
+            );
+        }
+        let mut argv = base.clone();
+        argv.extend(GUARD_FLAGS);
+        argv.extend([
+            "--memory-guard-decline-backoff-after",
+            "3",
+            "--memory-guard-decline-backoff-secs",
+            "60",
+        ]);
+        let policy = memory_guard_policy_from_cli(&Cli::try_parse_from(&argv).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(policy.decline_backoff_after, Some(3));
+        assert_eq!(policy.decline_backoff, std::time::Duration::from_secs(60));
+        let mut argv = base.clone();
+        argv.extend(GUARD_FLAGS);
+        argv.extend(["--memory-guard-resume-reads", "0"]);
+        assert!(
+            Cli::try_parse_from(&argv).is_err()
+                || memory_guard_policy_from_cli(&Cli::try_parse_from(&argv).unwrap()).is_err()
+        );
+        // An unknown probe-failure policy is a parse error.
+        let mut argv = base.clone();
+        argv.extend([
+            "--memory-guard",
+            "--memory-guard-on-probe-failure",
+            "ignore",
+        ]);
+        assert!(Cli::try_parse_from(&argv).is_err());
+        // No community worker to guard.
+        let cli = Cli::try_parse_from([
+            "arc-node",
+            "--memory-guard",
+            "--memory-guard-headroom-bytes",
+            "1",
+        ])
+        .unwrap();
+        assert!(
+            memory_guard_policy_from_cli(&cli)
+                .unwrap_err()
+                .to_string()
+                .contains("guards the community worker")
+        );
+    }
+
+    /// A fake coordinator for the admission step: whatever the claim loop would submit
+    /// instead of computing, and how many computes ran.
+    #[derive(Default)]
+    struct FakeCoordinator {
+        submitted: Vec<rpc::WorkResult>,
+        computes: usize,
+    }
+
+    impl FakeCoordinator {
+        /// The claim loop's admission step for one job: a decline is submitted and the
+        /// loop `continue`s before compute; otherwise the job computes once.
+        fn run_job(
+            &mut self,
+            guard: &arc_node::memory_guard::MemoryGuard,
+            required_positions: Option<usize>,
+            max_tokens: u32,
+            now: Instant,
+        ) {
+            const DIMS: arc_node::memory_guard::ModelDims = arc_node::memory_guard::ModelDims {
+                n_layers: 32,
+                d_model: 4096,
+                d_kv: 4096,
+                d_ff: 11008,
+                vocab_size: 32000,
+            };
+            match memory_guard_decline(
+                guard,
+                &DIMS,
+                required_positions,
+                max_tokens,
+                "job-1",
+                "0xworker",
+                now,
+            ) {
+                Some(result) => self.submitted.push(result),
+                None => self.computes += 1,
+            }
+        }
+    }
+
+    struct Fixed(u64);
+    impl arc_node::memory_guard::MemoryProbe for Fixed {
+        fn read(&self) -> arc_node::memory_guard::ProbeOutcome {
+            arc_node::memory_guard::ProbeOutcome::Reading(arc_node::memory_guard::MemoryReading {
+                available: self.0,
+                total: 16 << 30,
+                source: "fake",
+                cgroup_headroom: None,
+            })
+        }
+    }
+
+    fn fixed_guard(available: u64) -> arc_node::memory_guard::MemoryGuard {
+        arc_node::memory_guard::MemoryGuard::new(
+            arc_node::memory_guard::MemoryGuardPolicy {
+                headroom_bytes: 2 << 30,
+                resume_hysteresis_bytes: 0,
+                resume_consecutive_reads: 1,
+                recheck_interval: std::time::Duration::from_secs(30),
+                decline_backoff_after: None,
+                decline_backoff: std::time::Duration::ZERO,
+                on_probe_failure: arc_node::memory_guard::ProbeFailurePolicy::Pause,
+            },
+            Box::new(Fixed(available)),
+        )
+    }
+
+    #[test]
+    fn a_job_that_does_not_fit_is_declined_without_compute_and_not_retried() {
+        let now = Instant::now();
+        let mut coordinator = FakeCoordinator::default();
+        // 3 GiB free, 2 GiB headroom: a 1,000-position job needs ~2 GiB of KV alone.
+        let guard = fixed_guard(3 << 30);
+        coordinator.run_job(&guard, Some(1000), 256, now);
+        assert_eq!(coordinator.computes, 0);
+        assert_eq!(coordinator.submitted.len(), 1);
+        let declined = &coordinator.submitted[0];
+        assert!(declined.declined && !declined.success);
+        assert!(declined.output.is_empty() && declined.output_hash.is_empty());
+        assert_eq!(declined.tokens_generated, 0);
+        assert!(declined.signed_attestation_hex.is_none());
+        assert!(declined.error.as_deref().unwrap().contains("memory guard"));
+        // The same job is never re-run by the worker: the next job is a new claim. A small one fits.
+        coordinator.run_job(&guard, Some(100), 32, now);
+        assert_eq!(coordinator.computes, 1);
+        assert_eq!(coordinator.submitted.len(), 1);
+        // A requirement that cannot be represented is declined, not computed.
+        coordinator.run_job(&guard, Some(usize::MAX), 32, now);
+        assert_eq!(coordinator.computes, 1);
+        assert!(
+            coordinator.submitted[1]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("not representable")
+        );
+        // A failed preflight count (None) is also never computed under the guard.
+        coordinator.run_job(&guard, None, 32, now);
+        assert_eq!(coordinator.computes, 1);
+        assert_eq!(coordinator.submitted.len(), 3);
+    }
 
     #[test]
     fn community_registration_name_is_a_nickname_or_public_key_hash_never_a_hostname() {
