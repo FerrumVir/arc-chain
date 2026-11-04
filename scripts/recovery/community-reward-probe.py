@@ -28,6 +28,15 @@ CANONICAL_PROFILE = "INT8 integer (per-row, cross-platform deterministic)"
 RECOVERY_PROBE_PREFIX = b"ARC-RCV-PROBE1\0\0"
 PROBE_ID_DOMAIN = b"ARC-recovery-reward-probe-id-v1\0"
 COORDINATOR_DOMAIN = b"ARC-recovery-reward-probe-coordinator-v1\0"
+# A node labels a verification with one of these methods when at least one
+# layer range had only two live replicas and was verified 2-of-2. This probe
+# still requires 2-of-3 on every range and position, and says why it refuses.
+TWO_REPLICA_VERIFICATION_METHODS = frozenset(
+    {
+        "authenticated_shard_quorum_2_of_2_per_range",
+        "authenticated_shard_quorum_2_of_3_or_2_of_2_per_range",
+    }
+)
 
 
 class ProbeError(RuntimeError):
@@ -276,7 +285,13 @@ def evidence_from_inference(
         fail("inference.output must be a string")
 
     verification = require_object(body.get("verification"), f"{origin} verification evidence")
-    if verification.get("method") != "authenticated_shard_quorum_2_of_3_per_range":
+    method = verification.get("method")
+    if isinstance(method, str) and method in TWO_REPLICA_VERIFICATION_METHODS:
+        fail(
+            f"{origin} verified at least one range with a two-replica (2-of-2) quorum; "
+            "this probe requires authenticated 2-of-3 verification for every range/position"
+        )
+    if method != "authenticated_shard_quorum_2_of_3_per_range":
         fail(f"{origin} omitted authenticated shard-quorum verification")
     require_int(verification.get("ranges"), "verification.ranges", 1)
     require_int(verification.get("range_position_quorums"), "verification.range_position_quorums", 1)

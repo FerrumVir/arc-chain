@@ -95,6 +95,51 @@ All notable changes to ARC Chain are tracked here. This project follows
   Settings save no longer overwrites it. Existing installs keep their
   settings and consent. Settings states the share that applies, for example
   "Uses up to a quarter of your processor while ARC Node is open" (#231).
+- Community result verification now runs when a model layer range has
+  exactly two live validator replicas. The coordinator recomputes such a
+  range on both replicas, and both must return the same authenticated hash
+  (and, on the last range, the same token): a 2-of-2 quorum. A range with
+  three or more live replicas is still verified 2-of-3, exactly as before,
+  and a range with one or none still cannot be verified. Every quorum still
+  needs two distinct, authenticated, active-validator signatures. Rewards,
+  issuance caps and the five-of-six approval rule are unchanged, and nothing
+  stored on chain or checked when blocks are applied changes. Each approving
+  validator recomputes the job on its own node, so approvals for a job
+  verified 2-of-2 need the approving validators on this release (#232).
+- The `verification` object in `/inference/run` and `/community/submit_work`
+  responses says which quorum ran. `method` stays
+  `authenticated_shard_quorum_2_of_3_per_range` when every range was verified
+  2-of-3, and the object is then the same as before. It is
+  `authenticated_shard_quorum_2_of_2_per_range` when every range was verified
+  2-of-2 and `authenticated_shard_quorum_2_of_3_or_2_of_2_per_range` for a
+  mix. `replicas_contacted_per_quorum` is the fewest replicas any range
+  contacted, and a new `ranges_verified_2_of_2` field lists those ranges as
+  `[start_layer, end_layer]` pairs; it is omitted when empty. Twin receipts
+  use the same labels in `validator_recompute.method` (#232).
+- `GET /inference/readiness` reports `community_dispatch_ready: true` only
+  while a community result could be verified: every layer range of the
+  validator shard pipeline needs at least two distinct live replicas, read
+  from the same shard view the verifier uses. While it is false,
+  `live_community_workers` is 0, and `safe_to_dispatch` is true only when this
+  node can still answer from its own model or the validators' sharded
+  pipeline. The body keeps its nine `arc.inference.readiness.v1` fields. A
+  new `x-arc-community-dispatch` response header says `ready` or why
+  community dispatch is not: `model_identity_unavailable`,
+  `no_eligible_workers`, `work_queue_unavailable`,
+  `verification_pipeline_unavailable` or `verification_replicas_below_quorum`
+  (#232).
+- `POST /inference/run` no longer sends a job to a community worker when its
+  result could not be verified. It answers at once from this node's own model
+  or the validators' sharded pipeline, as when no worker is eligible, instead
+  of holding the request until the dispatch deadline. A sealed recovery probe
+  in that state is refused at once with 503, and a public demo request gets a
+  503 that names verification as the reason. The optional community demand
+  pump (`--community-demand-pump`, off by default) is not gated by this check
+  (#232).
+- `scripts/recovery/community-reward-probe.py` still requires 2-of-3
+  verification on every range and position. A result verified with a
+  two-replica quorum is now refused with that reason, instead of "omitted
+  authenticated shard-quorum verification" (#232).
 
 ## v0.8.16 - Release-preparation snapshot (2026-10-26)
 

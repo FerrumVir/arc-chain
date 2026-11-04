@@ -94,9 +94,14 @@ def validate_public_fields(name, value):
         require(isinstance(row, dict) and set(row) <= set(allowed.split()),
                 "unexpected public operational field in " + name)
 
+    def rows(container, key):
+        items = container.get(key, [])
+        require(isinstance(items, list), "public operational list is malformed in " + name)
+        return items
+
     if name == "host-config.json":
         fields(value, "schema source_reference total_stake quorum_stake quorum_sites unobserved_stake "
-               "genesis_file_sha256 genesis_network_hash recovery_domain checkpoint_manifest_hash "
+               "declared_offline genesis_file_sha256 genesis_network_hash recovery_domain checkpoint_manifest_hash "
                "validator_set_id lax_access hosts")
         if "source_reference" in value:
             fields(value["source_reference"], "source_sha workflow_run_id recovery_proof recovery_proof_sha256 "
@@ -106,6 +111,8 @@ def validate_public_fields(name, value):
                    "baseline_binary_sha256 legacy_v3_wire native")
             if "native" in host:
                 fields(host["native"], "argv_tail files_sha256 context_commitment")
+        for offline in rows(value, "declared_offline"):
+            fields(offline, "site ip validator stake")
     elif name == "quorum-proof.json":
         fields(value, "schema scope transport captured_at_unix checkpoint_manifest_hash common_block "
                "genesis_file_sha256 genesis_network_hash quorum_stake recovery_domain samples total_stake validator_set_id")
@@ -114,7 +121,9 @@ def validate_public_fields(name, value):
         for host in block.get("hosts", []):
             fields(host, "hash height protocol_major site state_root")
         for sample in value.get("samples", []):
-            fields(sample, "captured_at_unix nodes")
+            fields(sample, "captured_at_unix nodes declared_offline")
+            for probe in rows(sample, "declared_offline"):
+                fields(probe, "site ip validator health_url http_status binary_sha256")
             for node in sample.get("nodes", []):
                 fields(node, "active active_stake argv_redacted binary_sha256 checkpoint_manifest_hash "
                        "genesis_sha256 health height hostname invocation_id ip last_block_height network_genesis_hash "
@@ -145,7 +154,13 @@ def validate_bindings(payloads: dict[str, bytes], main: str):
     require(checkpoint.get("checkpoint_sha256") == hashlib.sha256(payloads["recovery.arcchkpt"]).hexdigest()
             and checkpoint.get("checkpoint_size") == len(payloads["recovery.arcchkpt"]),
             "raw checkpoint differs from owner attestation")
-    require(attestation.get("fresh_six_host_proof", {}).get("proof_sha256") ==
+    # A six-host update keeps its original proof key. Only an attestation that names
+    # declared-offline validators records its proof as a live-host proof.
+    declared = attestation.get("declared_offline_validators")
+    proof_key, other_key = (("fresh_live_host_proof", "fresh_six_host_proof") if declared else
+                            ("fresh_six_host_proof", "fresh_live_host_proof"))
+    proof = attestation.get(proof_key)
+    require(other_key not in attestation and isinstance(proof, dict) and proof.get("proof_sha256") ==
             hashlib.sha256(payloads["quorum-proof.json"]).hexdigest(),
             "quorum proof differs from owner attestation")
     require(attestation.get("network", {}).get("host_config_sha256") == hashlib.sha256(payloads["host-config.json"]).hexdigest(),
@@ -153,6 +168,9 @@ def validate_bindings(payloads: dict[str, bytes], main: str):
     require(attestation.get("network", {}).get("approved_genesis_network_hash_file_sha256") ==
             hashlib.sha256(payloads["approved-genesis.network-hash"]).hexdigest(),
             "approved genesis hash file differs from owner attestation")
+    host_config = json.loads(payloads["host-config.json"])
+    require((declared or []) == host_config.get("declared_offline", []),
+            "declared-offline validators differ between the host configuration and the owner attestation")
 
 
 def create(root: Path, source: Path, main: str) -> str:

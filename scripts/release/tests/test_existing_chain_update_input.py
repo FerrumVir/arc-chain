@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import importlib.util
 import json
@@ -39,9 +40,44 @@ class UpdateInputTests(unittest.TestCase):
             "fresh_six_host_proof": {"proof_sha256": sha("quorum-proof.json")},
             "network": {"host_config_sha256": sha("host-config.json"),
                         "approved_genesis_network_hash_file_sha256": sha("approved-genesis.network-hash")}}
+        self.attestation = copy.deepcopy(attestation)
         values["update-attestation.json"] = json.dumps(attestation).encode()
         for name, value in values.items():
             (self.inputs / name).write_bytes(value)
+
+    def five_live_fixture(self):
+        """The real six-host fixtures with ams declared offline and the other five live."""
+        fixtures = SCRIPT.parent / "tests" / "fixtures"
+        config = json.loads((fixtures / "host-config-six-current-20260927.json").read_text())
+        proof = json.loads((fixtures / "six-host-before-cfd-20260927.json").read_text())
+        offline = next(host for host in config["hosts"] if host["site"] == "ams")
+        declared = {key: offline[key] for key in ("site", "ip", "validator", "stake")}
+        config["hosts"] = [host for host in config["hosts"] if host["site"] != "ams"]
+        config["quorum_sites"] = [site for site in config["quorum_sites"] if site != "ams"]
+        config["unobserved_stake"] = offline["stake"]
+        config["declared_offline"] = [declared]
+        for sample in proof["samples"]:
+            sample["nodes"] = [node for node in sample["nodes"] if node["site"] != "ams"]
+            sample["declared_offline"] = [{"site": "ams", "ip": offline["ip"], "validator": offline["validator"],
+                "health_url": "https://" + offline["ip"] + "/health", "http_status": 502, "binary_sha256": None}]
+        proof["common_block"]["hosts"] = [row for row in proof["common_block"]["hosts"] if row["site"] != "ams"]
+        return config, proof, declared
+
+    def write_declared_inputs(self, mutate=None):
+        """Owner inputs for a five-live update, bound the way the assembler binds them."""
+        config, proof, declared = self.five_live_fixture()
+        (self.inputs / "host-config.json").write_text(json.dumps(config))
+        (self.inputs / "quorum-proof.json").write_text(json.dumps(proof))
+        sha = lambda name: hashlib.sha256((self.inputs / name).read_bytes()).hexdigest()
+        attestation = copy.deepcopy(self.attestation)
+        summary = {"proof_sha256": sha("quorum-proof.json")}
+        del attestation["fresh_six_host_proof"]
+        attestation["fresh_live_host_proof"] = summary
+        attestation["declared_offline_validators"] = [declared]
+        attestation["network"]["host_config_sha256"] = sha("host-config.json")
+        if mutate is not None:
+            mutate(attestation, summary)
+        (self.inputs / "update-attestation.json").write_text(json.dumps(attestation))
 
     def test_roundtrip_preserves_exact_files_without_changing_checkout_or_refs(self):
         before = mod.git(self.repo, "show-ref")
@@ -115,6 +151,54 @@ class UpdateInputTests(unittest.TestCase):
         proof["samples"][0]["nodes"][0]["native"]["extra"] = 1
         with self.assertRaises(mod.InputError):
             mod.validate_bytes("quorum-proof.json", json.dumps(proof).encode())
+
+    def test_declared_offline_fields_have_closed_public_contracts(self):
+        config, proof, _ = self.five_live_fixture()
+        mod.validate_bytes("host-config.json", json.dumps(config).encode())
+        mod.validate_bytes("quorum-proof.json", json.dumps(proof).encode())
+        config_mutations = (
+            lambda c: c["declared_offline"][0].update(reason="text"),
+            lambda c: c.update(declared_offline=c["declared_offline"][0]),
+            lambda c: c.update(declared_offline=["ams"]),
+        )
+        for index, mutate in enumerate(config_mutations):
+            with self.subTest(config_mutation=index):
+                c = copy.deepcopy(config)
+                mutate(c)
+                with self.assertRaises(mod.InputError):
+                    mod.validate_bytes("host-config.json", json.dumps(c).encode())
+        proof_mutations = (
+            lambda p: p["samples"][0]["declared_offline"][0].update(note="text"),
+            lambda p: p["samples"][0].update(declared_offline=p["samples"][0]["declared_offline"][0]),
+        )
+        for index, mutate in enumerate(proof_mutations):
+            with self.subTest(proof_mutation=index):
+                p = copy.deepcopy(proof)
+                mutate(p)
+                with self.assertRaises(mod.InputError):
+                    mod.validate_bytes("quorum-proof.json", json.dumps(p).encode())
+
+    def test_declared_offline_attestation_binds_the_host_config_declaration(self):
+        self.write_declared_inputs()
+        commit = mod.create(self.repo, self.inputs, self.main)
+        payloads = mod.read_commit(self.repo, commit, self.main)
+        self.assertEqual(json.loads(payloads["host-config.json"])["declared_offline"][0]["site"], "ams")
+        cases = {
+            "six-host proof key on a declared update": (
+                lambda v, s: (v.pop("fresh_live_host_proof"), v.update(fresh_six_host_proof=s)), "proof differs"),
+            "both proof keys": (lambda v, s: v.update(fresh_six_host_proof=s), "proof differs"),
+            "attestation leaves the declaration out": (
+                lambda v, s: (v.pop("declared_offline_validators"), v.pop("fresh_live_host_proof"),
+                              v.update(fresh_six_host_proof=s)), "declared-offline validators differ"),
+            "attestation names another validator": (
+                lambda v, s: v["declared_offline_validators"][0].update(site="nrt"),
+                "declared-offline validators differ"),
+        }
+        for label, (mutate, message) in cases.items():
+            with self.subTest(label):
+                self.write_declared_inputs(mutate)
+                with self.assertRaisesRegex(mod.InputError, message):
+                    mod.create(self.repo, self.inputs, self.main)
 
     def test_symlink_and_wrong_parent_rejected(self):
         commit = mod.create(self.repo, self.inputs, self.main)
