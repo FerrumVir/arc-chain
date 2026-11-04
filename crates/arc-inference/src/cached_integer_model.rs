@@ -312,23 +312,33 @@ impl KVCache {
 
     /// A cache with capacity for exactly `positions` positions of `d_kv` values in every
     /// layer, so a job of at most that many positions never reallocates (and never holds a
-    /// grown, over-allocated buffer). `None` when the size does not fit in memory addressing.
+    /// grown, over-allocated buffer). `None` on capacity overflow or allocator refusal.
+    /// Both layer tables and all K/V buffers are fallibly reserved. Returning early drops
+    /// every buffer already reserved; no token generation has begun.
     pub fn with_reserved_positions(n_layers: usize, d_kv: usize, positions: usize) -> Option<Self> {
         let per_layer = positions.checked_mul(d_kv)?;
-        // Vec::with_capacity panics past isize::MAX bytes; refuse instead.
+        // Check addressing bounds before attempting any allocation, including the tables.
         let bytes = per_layer.checked_mul(std::mem::size_of::<i64>())?;
-        if bytes > isize::MAX as usize {
+        let table_bytes = n_layers.checked_mul(std::mem::size_of::<Vec<i64>>())?;
+        if bytes > isize::MAX as usize || table_bytes > isize::MAX as usize {
             return None;
         }
-        Some(Self {
-            k_data: (0..n_layers)
-                .map(|_| Vec::with_capacity(per_layer))
-                .collect(),
-            v_data: (0..n_layers)
-                .map(|_| Vec::with_capacity(per_layer))
-                .collect(),
+        let mut cache = Self {
+            k_data: Vec::new(),
+            v_data: Vec::new(),
             seq_len: 0,
-        })
+        };
+        cache.k_data.try_reserve_exact(n_layers).ok()?;
+        cache.v_data.try_reserve_exact(n_layers).ok()?;
+        for _ in 0..n_layers {
+            let mut k = Vec::new();
+            k.try_reserve_exact(per_layer).ok()?;
+            cache.k_data.push(k);
+            let mut v = Vec::new();
+            v.try_reserve_exact(per_layer).ok()?;
+            cache.v_data.push(v);
+        }
+        Some(cache)
     }
 
     pub fn clear(&mut self) {
@@ -569,6 +579,8 @@ pub struct GenerationPreflight {
 /// Why a whole-model generation request was rejected before compute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerationError {
+    /// Reserved KV capacity was unaddressable or the allocator refused it. No generation ran.
+    KvReservationFailed,
     /// The position-count formula overflowed the platform's `usize`.
     PositionCountOverflow {
         prompt_tokens: usize,
@@ -588,6 +600,7 @@ impl GenerationError {
     /// Stable machine-readable tag for RPC error mapping.
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::KvReservationFailed => "kv_reservation_failed",
             Self::PositionCountOverflow { .. } => "position_count_overflow",
             Self::ContextWindowExceeded { .. } => "context_window_exceeded",
         }
@@ -597,6 +610,10 @@ impl GenerationError {
 impl std::fmt::Display for GenerationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::KvReservationFailed => write!(
+                f,
+                "kv_reservation_failed: KV capacity could not be reserved"
+            ),
             Self::PositionCountOverflow {
                 prompt_tokens,
                 max_tokens,
@@ -4192,10 +4209,7 @@ impl CachedIntegerModel {
             self.config.d_kv,
             admission.required_positions,
         )
-        .ok_or(GenerationError::PositionCountOverflow {
-            prompt_tokens: prompt.len(),
-            max_tokens,
-        })?;
+        .ok_or(GenerationError::KvReservationFailed)?;
         Ok(self.generate_preflighted_in(&mut cache, prompt, max_tokens, eos_tokens))
     }
 
@@ -7606,103 +7620,7 @@ mod tests {
         crate::canonical_prefill::reset_prefill_census();
     }
 
-    fn build_test_model(
-        vs: usize,
-        d: usize,
-        nh: usize,
-        dff: usize,
-        nl: usize,
-    ) -> CachedIntegerModel {
-        let dh = d / nh;
-        let nkv = nh;
-        let dkv = dh * nkv;
-
-        let mut rng: u64 = 42;
-        let mut gen_f32 = |size: usize| -> Vec<f32> {
-            (0..size)
-                .map(|_| {
-                    rng = rng
-                        .wrapping_mul(6364136223846793005)
-                        .wrapping_add(1442695040888963407);
-                    ((rng >> 33) as f32 / u32::MAX as f32 - 0.5) * 0.2
-                })
-                .collect()
-        };
-        let mut gen_i8 = |rows: usize, cols: usize| -> I8Weights {
-            I8Weights::quantize_f32(&gen_f32(rows * cols), rows, cols)
-        };
-
-        let embedding_i8 = gen_i8(vs, d);
-        // For tests, Q16 embedding = i8 * scale (same as real loading)
-        let embedding_q16: Vec<i64> = {
-            let mut q16 = Vec::with_capacity(vs * d);
-            for i in 0..vs {
-                let scale = embedding_i8.scales[i];
-                for j in 0..d {
-                    q16.push((embedding_i8.data[i * d + j] as i64) * scale);
-                }
-            }
-            q16
-        };
-        let output_weight = gen_i8(vs, d);
-        let mut layers = Vec::new();
-        for _ in 0..nl {
-            layers.push(CachedLayer {
-                wq: gen_i8(d, d),
-                wk: gen_i8(dkv, d),
-                wv: gen_i8(dkv, d),
-                wo: gen_i8(d, d),
-                w_gate: gen_i8(dff, d),
-                w_up: gen_i8(dff, d),
-                w_down: gen_i8(d, dff),
-                attn_norm: vec![ONE; d],
-                ffn_norm: vec![ONE; d],
-            });
-        }
-
-        let (rope_cos, rope_sin) = compute_rope_tables(dh, 512, 10000.0);
-        let attn_scale = {
-            let s = integer_isqrt((dh as i64) * ONE);
-            (ONE * ONE) / s.max(1)
-        };
-
-        CachedIntegerModel {
-            config: ModelConfig {
-                n_layers: nl,
-                d_model: d,
-                n_heads: nh,
-                n_kv_heads: nkv,
-                d_ff: dff,
-                d_head: dh,
-                d_kv: dkv,
-                vocab_size: vs,
-                attn_scale,
-                rope_cos,
-                rope_sin,
-                max_seq: 512,
-                eos_tokens: vec![2, 128001, 128009],
-                bos_token: 1,
-                chat_template: String::new(),
-                arithmetic_profile: ArithmeticProfile::LegacySplitHalfV0,
-            },
-            embedding_q16,
-            embedding_i8,
-            layers,
-            final_norm: vec![ONE; d],
-            output_weight,
-            vocab: (0..vs).map(|i| format!("tok_{}", i)).collect(),
-            q4_layers: None,
-            q4_output: None,
-            i16_layers: None,
-            i16_output: None,
-            ternary_hybrid_layers: None,
-            ternary_hybrid_output: None,
-            block_i8_layers: None,
-            block_i8_output: None,
-            ternary_layers: None,
-            ternary_output: None,
-        }
-    }
+    include!("../tests/support/tiny_cached_model.rs");
 
     #[test]
     fn full_worker_requires_every_configured_transformer_layer() {
@@ -7744,6 +7662,73 @@ mod tests {
             .try_generate(&prompt, 3, &[])
             .expect("the exact context boundary must execute without indexing past RoPE");
         assert_eq!(generated.len(), 3);
+    }
+
+    #[test]
+    fn reserved_kv_allocator_refusal_cleans_every_partial_cache_and_stops_generation() {
+        let model = build_test_model(32, 16, 2, 32, 2);
+        let expected = model.try_generate(&[3, 4], 3, &[]).unwrap();
+        // Two layer tables, then K/V for both layers: fail each allocation in turn.
+        for fail_at in 0..6 {
+            let (result, observed) = crate::allocation_probe::refuse(fail_at, || {
+                model.try_generate_with_reserved_kv(&[3, 4], 3, &[])
+            });
+            assert_eq!(result, Err(GenerationError::KvReservationFailed));
+            assert_eq!(
+                observed.attempts,
+                fail_at + 1,
+                "no allocation/generation after refusal"
+            );
+            assert_eq!(
+                observed.live_allocations, 0,
+                "all partial KV allocations freed"
+            );
+            assert_eq!(
+                model
+                    .try_generate_with_reserved_kv(&[3, 4], 3, &[])
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_kv_capacity_boundaries_do_not_attempt_invalid_allocations() {
+        let element_limit = isize::MAX as usize / std::mem::size_of::<i64>();
+        let table_limit = isize::MAX as usize / std::mem::size_of::<Vec<i64>>();
+        for (layers, width, positions) in [
+            (2, usize::MAX, 2),
+            (2, element_limit + 1, 1),
+            (table_limit + 1, 1, 1),
+            (usize::MAX, 1, 1),
+        ] {
+            let (cache, observed) = crate::allocation_probe::refuse(0, || {
+                KVCache::with_reserved_positions(layers, width, positions)
+            });
+            assert!(cache.is_none());
+            assert_eq!(observed.attempts, 0);
+        }
+        // Exact byte-addressing limits pass arithmetic; refuse before a huge allocation.
+        for (layers, width, fail_at) in [(1, element_limit, 2), (table_limit, 0, 0)] {
+            let (cache, observed) = crate::allocation_probe::refuse(fail_at, || {
+                KVCache::with_reserved_positions(layers, width, 1)
+            });
+            assert!(cache.is_none());
+            assert_eq!(observed.attempts, fail_at + 1);
+            assert_eq!(observed.live_allocations, 0);
+        }
+        for (layers, width, positions) in [(0, 1, 1), (2, 0, 3), (2, 4, 0), (2, 4, 1)] {
+            let cache = KVCache::with_reserved_positions(layers, width, positions).unwrap();
+            assert_eq!(cache.k_data.len(), layers);
+            assert_eq!(cache.v_data.len(), layers);
+            assert!(
+                cache
+                    .k_data
+                    .iter()
+                    .chain(&cache.v_data)
+                    .all(|v| v.capacity() == width * positions)
+            );
+        }
     }
 
     #[test]

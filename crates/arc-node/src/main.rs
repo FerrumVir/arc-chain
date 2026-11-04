@@ -6211,6 +6211,52 @@ where
     Guarded::Computed(compute(guard.is_some()).await)
 }
 
+/// Map the model's typed result before any output/attestation work. Reservation refusal
+/// is a decline, not an inference failure; submission uses the existing transport retry
+/// policy but the claimed job is never generated again by this worker.
+async fn finish_community_generation<T, Submit, SubmitFuture>(
+    result: Result<T, arc_inference::cached_integer_model::GenerationError>,
+    job_id: &str,
+    worker_id: &str,
+    status: &arc_node::community_worker::CommunityWorkerStatus,
+    submit: Submit,
+) -> Option<T>
+where
+    Submit: FnOnce(rpc::WorkResult) -> SubmitFuture,
+    SubmitFuture: std::future::Future<Output = ()>,
+{
+    use arc_inference::cached_integer_model::GenerationError;
+    use arc_node::community_worker::JobOutcome;
+    match result {
+        Ok(output) => Some(output),
+        Err(error) => {
+            let declined = matches!(error, GenerationError::KvReservationFailed);
+            tracing::warn!(job_id, %error, declined, "community generation refused");
+            submit(rpc::WorkResult {
+                job_id: job_id.to_owned(),
+                worker_id: worker_id.to_owned(),
+                success: false,
+                declined,
+                output: String::new(),
+                output_hash: String::new(),
+                tokens_generated: 0,
+                total_ms: 0,
+                ms_per_token: 0,
+                engine: String::new(),
+                error: Some(format!("local inference task failed: {error}")),
+                signed_attestation_hex: None,
+            })
+            .await;
+            status.record_outcome(if declined {
+                JobOutcome::Declined
+            } else {
+                JobOutcome::Failed
+            });
+            None
+        }
+    }
+}
+
 /// Memory-guard admission for one claimed, preflighted job: `Some(result)` to submit instead
 /// of computing (a declined result: no output, never retried by this worker), or `None` to
 /// compute. `required_positions` is the context preflight's count (`None` if it failed).
@@ -10300,19 +10346,11 @@ async fn run_arc_node() -> Result<()> {
                                                 &inference_model.config.eos_tokens,
                                             )
                                         };
-                                        let (generated, hash) = generation
-                                            .map_err(|error| {
-                                                let helper_admitted = community_generation_fits_context(
-                                                    inference_tokens.len(),
-                                                    max_tokens,
-                                                    inference_model.config.max_seq,
-                                                );
-                                                format!(
-                                                    "{error}; worker_context_helper_admitted={helper_admitted}"
-                                                )
-                                            })?;
+                                        let (generated, hash) = generation?;
                                         let output_text = inference_model.decode(&generated);
-                                        Ok::<_, String>((generated, hash, output_text))
+                                        Ok::<_, arc_inference::cached_integer_model::GenerationError>(
+                                            (generated, hash, output_text),
+                                        )
                                     })
                                 })
                             },
@@ -10324,38 +10362,30 @@ async fn run_arc_node() -> Result<()> {
                         };
                         status_w.set_state(WorkerState::Polling);
                         let (generated, hash, output_text) = match inference {
-                            Ok(Ok(result)) => result,
-                            Ok(Err(error)) => {
-                                tracing::error!(
-                                    job_id,
-                                    seed = %winner,
-                                    %error,
-                                    "community inference worker task failed"
-                                );
-                                let failure = rpc::WorkResult {
-                                    job_id: job_id.clone(),
-                                    worker_id: worker_id_w.clone(),
-                                    success: false,
-                                    declined: false,
-                                    output: String::new(),
-                                    output_hash: String::new(),
-                                    tokens_generated: 0,
-                                    total_ms: 0,
-                                    ms_per_token: 0,
-                                    engine: String::new(),
-                                    error: Some(format!("local inference task failed: {error}")),
-                                    signed_attestation_hex: None,
-                                };
-                                let _ = submit_community_result_with_retry(
-                                    &client,
-                                    &winner,
-                                    &failure,
-                                    &worker_keypair,
-                                    submission_deadline,
+                            Ok(result) => {
+                                let Some(result) = finish_community_generation(
+                                    result,
+                                    &job_id,
+                                    &worker_id_w,
+                                    &status_w,
+                                    |failure| {
+                                        let (client, winner, keypair) = (&client, &winner, &worker_keypair);
+                                        async move {
+                                            let _ = submit_community_result_with_retry(
+                                                client,
+                                                winner,
+                                                &failure,
+                                                keypair,
+                                                submission_deadline,
+                                            )
+                                            .await;
+                                        }
+                                    },
                                 )
-                                .await;
-                                status_w.record_outcome(JobOutcome::Failed);
-                                continue;
+                                .await else {
+                                    continue;
+                                };
+                                result
                             }
                             Err(error) => {
                                 tracing::error!(
@@ -11017,6 +11047,173 @@ mod tests {
         }
     }
 
+    mod kv_fixture {
+        use arc_inference::cached_integer_model::*;
+        use arc_inference::integer_lut::*;
+        include!("../../arc-inference/tests/support/tiny_cached_model.rs");
+
+        pub fn model() -> CachedIntegerModel {
+            build_test_model(32, 16, 2, 32, 2)
+        }
+    }
+
+    #[test]
+    fn production_kv_refusal_submits_decline_then_accepts_a_fitting_job() {
+        use arc_inference::cached_integer_model::GenerationError;
+        let model = kv_fixture::model();
+        let expected = model.try_generate(&[3, 4], 3, &[]).unwrap();
+        let dims = ModelDims::from_config(&model.config);
+        let guard = test_guard(
+            vec![avail(16 * GIB)],
+            ProbeFailurePolicy::Pause,
+            Some((1, 120)),
+        );
+        let status = CommunityWorkerStatus::new("synthetic-worker", "synthetic", 1, false);
+        let submitted = RefCell::new(Vec::new());
+        let calls = std::cell::Cell::new(0);
+        for fail_at in 0..6 {
+            let job_id = format!("refused-{fail_at}");
+            let computed = block_on(memory_guarded_compute(
+                Some(&guard),
+                &dims,
+                Some(6),
+                3,
+                &job_id,
+                "synthetic-worker",
+                Instant::now(),
+                |_| async { panic!("fixture fits admission") },
+                |reserved| {
+                    assert!(reserved);
+                    calls.set(calls.get() + 1);
+                    let (result, observed) = crate::allocation_probe::refuse(fail_at, || {
+                        model.try_generate_with_reserved_kv(&[3, 4], 3, &[])
+                    });
+                    assert_eq!(result, Err(GenerationError::KvReservationFailed));
+                    assert_eq!(observed.attempts, fail_at + 1);
+                    assert_eq!(observed.live_allocations, 0);
+                    std::future::ready(result)
+                },
+            ));
+            let Guarded::Computed(result) = computed else {
+                panic!("admission passed");
+            };
+            let output = block_on(finish_community_generation(
+                result,
+                &job_id,
+                "synthetic-worker",
+                &status,
+                |failure| {
+                    submitted.borrow_mut().push(failure);
+                    std::future::ready(())
+                },
+            ));
+            assert!(
+                output.is_none(),
+                "no success/decode/attestation continuation"
+            );
+            assert_eq!(calls.get(), fail_at + 1, "no local generation retry");
+            let results = submitted.borrow();
+            assert_eq!(results.len(), fail_at + 1, "one declined result per job");
+            let failure = results.last().unwrap();
+            assert_eq!(failure.job_id, job_id);
+            assert_eq!(failure.worker_id, "synthetic-worker");
+            assert!(failure.declined && !failure.success);
+            assert!(failure.output.is_empty() && failure.output_hash.is_empty());
+            assert!(failure.engine.is_empty() && failure.signed_attestation_hex.is_none());
+            assert_eq!(
+                (
+                    failure.tokens_generated,
+                    failure.total_ms,
+                    failure.ms_per_token
+                ),
+                (0, 0, 0)
+            );
+            assert!(
+                failure
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("kv_reservation_failed")
+            );
+        }
+        assert_eq!(status.snapshot().jobs_declined, 6);
+        assert_eq!(status.snapshot().jobs_failed, 0);
+        let accounting = guard.status();
+        assert_eq!(
+            (
+                accounting.declined_low_memory,
+                accounting.declined_not_representable,
+                accounting.declined_probe_failed,
+                accounting.backoffs
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(
+            guard.before_claim(Instant::now()),
+            arc_node::memory_guard::ClaimDecision::Claim
+        );
+        // A later job is admitted by the same guard, and succeeds with the same tokens/hash.
+        // Also cover guard-off: the loop must still select the ordinary generation path.
+        for enabled in [true, false] {
+            let result = block_on(memory_guarded_compute(
+                enabled.then_some(&guard),
+                &dims,
+                Some(6),
+                3,
+                "next-job",
+                "synthetic-worker",
+                Instant::now(),
+                |_| async { panic!("next job must fit") },
+                |reserved| {
+                    std::future::ready(if reserved {
+                        model.try_generate_with_reserved_kv(&[3, 4], 3, &[])
+                    } else {
+                        model.try_generate(&[3, 4], 3, &[])
+                    })
+                },
+            ));
+            let Guarded::Computed(result) = result else {
+                panic!("next job declined");
+            };
+            assert_eq!(
+                block_on(finish_community_generation(
+                    result,
+                    "next-job",
+                    "synthetic-worker",
+                    &status,
+                    |_| async { panic!("successful result must reach output path") },
+                )),
+                Some(expected.clone())
+            );
+        }
+        assert_eq!(submitted.borrow().len(), 6);
+        assert_eq!(status.snapshot().jobs_declined, 6);
+    }
+
+    #[test]
+    fn production_non_allocation_error_remains_a_failure() {
+        use arc_inference::cached_integer_model::GenerationError;
+        let status = CommunityWorkerStatus::new("synthetic-worker", "synthetic", 1, false);
+        let submitted = RefCell::new(Vec::new());
+        let result = block_on(finish_community_generation::<(), _, _>(
+            Err(GenerationError::PositionCountOverflow {
+                prompt_tokens: usize::MAX,
+                max_tokens: 1,
+            }),
+            "invalid",
+            "synthetic-worker",
+            &status,
+            |failure| {
+                submitted.borrow_mut().push(failure);
+                std::future::ready(())
+            },
+        ));
+        assert!(result.is_none());
+        assert!(!submitted.borrow()[0].declined);
+        assert_eq!(status.snapshot().jobs_failed, 1);
+        assert_eq!(status.snapshot().jobs_declined, 0);
+    }
+
     #[test]
     fn production_admission_declines_without_compute_output_or_attestation() {
         let now = Instant::now();
@@ -11219,6 +11416,19 @@ mod tests {
         if !generation_calls.iter().all(|&at| call < at && at < exit) {
             return Err("generation outside the guarded compute".into());
         }
+        let finish = claim_loop
+            .find("let Some(result) = finish_community_generation(")
+            .ok_or("typed generation result handler missing")?;
+        let attestation = claim_loop
+            .find("let mut tx = arc_types::Transaction {")
+            .ok_or("attestation boundary missing")?;
+        if !(exit < finish
+            && finish < attestation
+            && claim_loop[finish..attestation]
+                .contains(".await else {\n                                    continue;"))
+        {
+            return Err("generation refusal must leave the job before attestation".into());
+        }
         let gate = claim_loop
             .find("let gate = memory_guard_claim_gate(")
             .ok_or("loop does not call the claim gate")?;
@@ -11263,6 +11473,22 @@ mod tests {
                 .find("inference_model.try_generate")
                 .expect("generation");
         let mutants: Vec<(&str, String)> = vec![
+            (
+                "typed generation result handler bypassed",
+                production.replacen(
+                    "let Some(result) = finish_community_generation(",
+                    "let Some(result) = ignored_generation_error(",
+                    1,
+                ),
+            ),
+            (
+                "generation failure exit bypassed",
+                production.replacen(
+                    ".await else {\n                                    continue;",
+                    ".await else {\n                                    successful_output();",
+                    1,
+                ),
+            ),
             (
                 "a generation call moved after the guarded compute",
                 format!(
@@ -15015,3 +15241,7 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "../../arc-inference/tests/support/allocation_probe.rs"]
+mod allocation_probe;
