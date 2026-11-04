@@ -30,7 +30,7 @@ Everything below happens after the model is loaded, inside `arc-node`. It applie
 
 ## Configuration
 
-Every value must be given explicitly once `--memory-guard` is on. **None has a default**, because no production value has been decided or measured. A `--memory-guard-*` value given without `--memory-guard` is refused rather than ignored, and so is a partial configuration.
+Five values are required when `--memory-guard` is enabled; the back-off pair is optional and must be supplied together or omitted together. **None has a default**, because no production value has been decided or measured. A `--memory-guard-*` value given without `--memory-guard` is refused rather than ignored, and so is a partial configuration.
 
 ```sh
 arc-node <the launcher's usual arguments> \
