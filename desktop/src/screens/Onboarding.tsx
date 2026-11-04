@@ -17,6 +17,7 @@ import { api, isTauri } from "../lib/tauri";
 import { modelDownloadStatus } from "../lib/format";
 import { LogoMark, Tagline } from "../components/Logo";
 import { StartFailurePanel } from "../components/StartFailurePanel";
+import { GetHelp } from "../components/GetHelp";
 import { PreviousInstallNotice } from "../components/PreviousInstallNotice";
 import { PLAIN_COPY } from "../lib/plain-copy";
 import {
@@ -998,6 +999,13 @@ export function Onboarding({
             )}
           </motion.div>
         </AnimatePresence>
+
+        {/* First run: the way to a person on every step. A failed launch carries its own Get help, with the error. */}
+        {!launchError && (
+          <div style={{ textAlign: "left", marginTop: "var(--space-6)" }}>
+            <GetHelp context="onboarding" testId="onboarding-help" />
+          </div>
+        )}
       </div>
       </div>
     </div>

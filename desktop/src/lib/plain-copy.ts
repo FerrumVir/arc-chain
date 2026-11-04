@@ -277,6 +277,8 @@ export const PLAIN_COPY = {
       off: "Node off",
       unreachable: "No connection",
       settings: "Opened from Settings",
+      "home-problem": "Problem shown on Home",
+      onboarding: "Setting up ARC",
     },
     report: {
       off: "Anonymous error reports are off, so ARC didn't send one. You can turn them on in Settings.",
