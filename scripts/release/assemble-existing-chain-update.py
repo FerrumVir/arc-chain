@@ -24,6 +24,17 @@ SHA = re.compile(r"[0-9a-f]{64}\Z")
 COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 TAG = re.compile(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
 PLATFORMS = ("linux-x86_64", "linux-arm64", "macos-arm64", "macos-x86_64", "windows-x86_64")
+# The recovered chain's signed validator set. Every one of them is either a live,
+# observed host or, for at most one, explicitly declared offline by the owner input.
+VALIDATOR_COUNT = 6
+MAX_DECLARED_OFFLINE = 1
+SIX_HOST_PROOF_KEY = "fresh_six_host_proof"
+LIVE_HOST_PROOF_KEY = "fresh_live_host_proof"
+SIX_HOST_PROOF_SCOPE = ("owner-attested six-host advancing proof at owner_observed_at_unix; independently "
+                        "reverified against pinned inputs, not a live publication-time assertion")
+LIVE_HOST_PROOF_SCOPE = ("owner-attested advancing proof of every live host at owner_observed_at_unix, with "
+                         "declared_offline_validators named offline by the owner input and not observed; "
+                         "independently reverified against pinned inputs, not a live publication-time assertion")
 
 
 class ProfileError(RuntimeError):
@@ -67,23 +78,68 @@ def load_module(path: Path, name: str):
     return module
 
 
+def confirm_declared_offline(declared_sites, confirmed_sites) -> None:
+    """The offline set is explicit twice: in the owner host config and on the command line."""
+    confirmed = list(confirmed_sites or ())
+    need(len(confirmed) == len(set(confirmed)) and set(confirmed) == set(declared_sites),
+         "declared-offline validators in the host config must equal the explicit --declared-offline confirmation")
+
+
+def declared_offline_rows(config: dict) -> list[dict]:
+    """The owner host config's declared-offline rows; the tracked validator checks the rest."""
+    rows = config.get("declared_offline", [])
+    need(isinstance(rows, list) and len(rows) <= MAX_DECLARED_OFFLINE and
+         all(isinstance(row, dict) and isinstance(row.get("site"), str) and
+             isinstance(row.get("validator"), str) and SHA.fullmatch(row["validator"]) is not None and
+             type(row.get("stake")) is int and row["stake"] > 0 for row in rows),
+         "declared-offline validators are malformed, or more than one is declared")
+    return rows
+
+
+def declared_offline_authority(config: dict) -> dict[str, int]:
+    """Identity and stake of each declared-offline validator."""
+    rows = declared_offline_rows(config)
+    authority = {row["validator"]: row["stake"] for row in rows}
+    need(len(authority) == len(rows), "a declared-offline validator identity is repeated")
+    return authority
+
+
 def strict_proof(proof_path: Path, config_path: Path, validator_path: Path,
-                 expected_binary_sha256: str, now: float | None = None) -> tuple[dict, dict]:
+                 expected_binary_sha256: str, now: float | None = None,
+                 declared_offline_sites=()) -> tuple[dict, dict]:
     """Delegate all quorum semantics to the deployed, tested rollout validator."""
     proof, config = read_json(proof_path), read_json(config_path)
     validator = load_module(validator_path, "arc_rollout_current_profile_validator")
+    need(callable(getattr(validator, "declared_offline_hosts", None)),
+         "rollout validator lacks the declared-offline validator contract")
     hosts, total, quorum = validator.validate_host_config(config)
+    declared = validator.declared_offline_hosts(config)
+    confirm_declared_offline(declared, declared_offline_sites)
     expected = {key: config[key] for key in ("genesis_file_sha256", "genesis_network_hash",
         "recovery_domain", "checkpoint_manifest_hash", "validator_set_id")}
     summary = validator.validate_quorum_proof(proof, hosts, total, quorum,
-        expected_network=expected, **({"now": now} if now is not None else {}))
-    need(len(hosts) == 6 and len(proof.get("common_block", {}).get("hosts", [])) == 6,
-         "update readiness requires the complete six-host quorum")
+        expected_network=expected, **({"now": now} if now is not None else {}),
+        **({"declared_offline": declared} if declared else {}))
+    need(len(declared) <= MAX_DECLARED_OFFLINE and len(hosts) + len(declared) == VALIDATOR_COUNT and
+         len(proof.get("common_block", {}).get("hosts", [])) == len(hosts),
+         "update readiness requires all six validators live, or five live and one declared offline")
+    need(total - sum(row["stake"] for row in declared.values()) >= quorum,
+         "live stake without the declared-offline validator is below the quorum")
     for sample in proof["samples"]:
         for row in sample["nodes"]:
             need(row["binary_sha256"] == expected_binary_sha256,
                  f"host {row['site']} is not running the selected candidate binary")
     return {"schema": proof["schema"], "proof_sha256": sha_file(proof_path), **summary}, config
+
+
+def attested_proof_key(attestation: dict) -> str:
+    """A six-host update keeps its original key; only a declared-offline update uses the live-host key."""
+    keys = [key for key in (SIX_HOST_PROOF_KEY, LIVE_HOST_PROOF_KEY) if key in attestation]
+    need(len(keys) == 1 and isinstance(attestation[keys[0]], dict),
+         "attestation must carry exactly one fresh proof summary")
+    need((keys[0] == LIVE_HOST_PROOF_KEY) == bool(attestation.get("declared_offline_validators")),
+         "only an attestation that names declared-offline validators may carry a live-host proof")
+    return keys[0]
 
 
 def validate_selection(selection: dict, commit: str, run_id: int, attempt: int) -> dict:
@@ -247,7 +303,7 @@ def validate_certificate_authority(checkpoint: dict, hosts: dict[str, dict], con
          checkpoint["protocol_version"] == "3.0.0" and checkpoint["validator_set_id"] == config["validator_set_id"],
          "checkpoint domain/protocol/set differs from live network profile")
     cert = checkpoint["validators"]
-    need(isinstance(cert, list) and len(cert) == 6, "verified certificate must describe six validators")
+    need(isinstance(cert, list) and len(cert) == VALIDATOR_COUNT, "verified certificate must describe six validators")
     certificate_authority = {}
     for row in cert:
         need(isinstance(row, dict), "malformed verifier validator row")
@@ -256,7 +312,13 @@ def validate_certificate_authority(checkpoint: dict, hosts: dict[str, dict], con
              "duplicate or invalid certificate authority")
         certificate_authority[address] = row["stake"]
     live_authority = {row["validator"]: row["stake"] for row in hosts.values()}
-    need(certificate_authority == live_authority, "verified checkpoint certificate authority differs from six live validator pins")
+    declared_authority = declared_offline_authority(config)
+    need(len(live_authority) == len(hosts) and not set(live_authority) & set(declared_authority),
+         "a validator identity is pinned twice, or both live and declared offline")
+    # Every signed validator is pinned exactly once: as a live host, or as the one
+    # validator the owner input declares offline. Nothing is dropped or added.
+    need(certificate_authority == {**live_authority, **declared_authority},
+         "verified checkpoint certificate authority differs from the live and declared-offline validator pins")
 
 
 def validate_crossbindings(checkpoint: dict, hosts: dict[str, dict], config: dict,
@@ -269,7 +331,7 @@ def validate_crossbindings(checkpoint: dict, hosts: dict[str, dict], config: dic
          "host config is not pinned to the selected production candidate binary")
     for sample in proof["samples"]:
         need(all(row["binary_sha256"] == artifact_binary_sha256 for row in sample["nodes"]),
-             "not all six hosts run the selected production candidate")
+             "not every live host runs the selected production candidate")
 
 
 def public_artifact(platform: str, value: dict) -> dict:
@@ -311,6 +373,9 @@ def assemble(args: argparse.Namespace) -> dict:
         need(selected["genesis_sha256"] == verifier["genesis_sha256"],
              "production and verifier platform artifacts carry different genesis bytes")
         config = read_json(args.host_config)
+        # Refuse an unconfirmed or unrequested offline declaration before the slow checkpoint check.
+        confirm_declared_offline([row["site"] for row in declared_offline_rows(config)],
+                                 getattr(args, "declared_offline", None))
         checkpoint = verify_checkpoint(verifier["binary_path"], args.checkpoint, verifier["genesis_path"],
             config["checkpoint_manifest_hash"], args.recovery_epoch, config["validator_set_id"], config["recovery_domain"])
         try:
@@ -329,9 +394,15 @@ def assemble(args: argparse.Namespace) -> dict:
         # verification is allowed to take several minutes.
         proof_now = getattr(args, "proof_validation_time", None)
         proof_summary, checked_config = strict_proof(args.quorum_proof, args.host_config,
-            args.rollout_validator, selected["binary_sha256"], now=proof_now)
+            args.rollout_validator, selected["binary_sha256"], now=proof_now,
+            declared_offline_sites=getattr(args, "declared_offline", None) or ())
         need(checked_config == config, "host config changed during qualification")
     proof_summary["rpc_genesis_network_hash"] = config["genesis_network_hash"]
+    # A six-host update keeps today's exact shape. Only an update that the owner input
+    # explicitly runs without one validator names it and labels its proof as live-host.
+    declared = config.get("declared_offline", [])
+    observation = ({"declared_offline_validators": declared, LIVE_HOST_PROOF_KEY: proof_summary}
+                   if declared else {SIX_HOST_PROOF_KEY: proof_summary})
     return {"schema": SCHEMA, "claim": {"existing_recovered_chain_update": True,
         "original_cutover_ceremony_verified": False, "original_cutover_archive_present": False,
         "validator_retirement_authorized": False},
@@ -349,7 +420,7 @@ def assemble(args: argparse.Namespace) -> dict:
             "recovery_domain": config["recovery_domain"], "checkpoint_manifest_hash": config["checkpoint_manifest_hash"],
             "validator_set_id": config["validator_set_id"], "total_stake": config["total_stake"],
             "quorum_stake": config["quorum_stake"]},
-        "checkpoint": checkpoint, "fresh_six_host_proof": proof_summary,
+        "checkpoint": checkpoint, **observation,
         "rollout_validator_sha256": sha_file(args.rollout_validator),
         "generated_at_unix": getattr(args, "attestation_generated_at", None) or time.time()}
 
@@ -394,9 +465,10 @@ def validate_owner_attestation(args: argparse.Namespace, owner_path: Path, now: 
          "owner and producer API response hashes are malformed")
     need(owner_projection == producer_projection,
          "owner attestation differs from independently reverified production artifact, checkpoint, network, or proof inputs")
+    proof_key = attested_proof_key(recomputed)
     result = dict(owner)
     result["producer_reverification"] = {
-        "freshness_at_capture_unix": owner.get("fresh_six_host_proof", {}).get("captured_at_unix"),
+        "freshness_at_capture_unix": owner.get(proof_key, {}).get("captured_at_unix"),
         "observed_at_unix": float(generated_at),
         "independently_reverified_at_unix": now,
         "owner_attestation_age_seconds": int(now - generated_at),
@@ -405,7 +477,7 @@ def validate_owner_attestation(args: argparse.Namespace, owner_path: Path, now: 
         "independently_reverified_api_artifact_response_sha256": producer_api_sha256,
         "owner_checkpoint_verifier_platform": owner_verifier["platform"],
         "producer_checkpoint_verifier_platform": producer_verifier["platform"],
-        "proof_scope": "owner-attested six-host advancing proof at owner_observed_at_unix; independently reverified against pinned inputs, not a live publication-time assertion",
+        "proof_scope": SIX_HOST_PROOF_SCOPE if proof_key == SIX_HOST_PROOF_KEY else LIVE_HOST_PROOF_SCOPE,
     }
     return result
 
@@ -422,7 +494,10 @@ def main() -> int:
     p.add_argument("--rollout-validator", type=Path,
                    default=Path(__file__).with_name("update-quorum-validator.py"))
     p.add_argument("--artifact-platform", choices=PLATFORMS, required=True,
-                   help="deployed candidate platform; all six hosts must currently run these exact bytes")
+                   help="deployed candidate platform; every live host must currently run these exact bytes")
+    p.add_argument("--declared-offline", action="append", metavar="SITE",
+                   help="confirm the one validator the host config declares offline (unobserved); required "
+                        "exactly when the host config declares one, and refused otherwise")
     p.add_argument("--verifier-platform", choices=PLATFORMS, required=True,
                    help="selected platform executable on this qualification host")
     p.add_argument("--checkpoint", type=Path, required=True); p.add_argument("--recovery-epoch", type=int, required=True)
@@ -436,6 +511,11 @@ def main() -> int:
         need(not args.output.exists() and not args.output.is_symlink(), "refusing to overwrite attestation")
         value = (validate_owner_attestation(args, args.owner_attestation)
                  if args.owner_attestation else assemble(args))
+        report = {"pass": True, "output": str(args.output), "schema": SCHEMA,
+            "checkpoint_sha256": value["checkpoint"]["checkpoint_sha256"],
+            "common_height": value[attested_proof_key(value)]["common_height"]}
+        if value.get("declared_offline_validators"):
+            report["declared_offline_sites"] = [row["site"] for row in value["declared_offline_validators"]]
         args.output.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -443,9 +523,7 @@ def main() -> int:
         dfd = os.open(args.output.parent, os.O_RDONLY | os.O_DIRECTORY)
         try: os.fsync(dfd)
         finally: os.close(dfd)
-        print(json.dumps({"pass": True, "output": str(args.output), "schema": SCHEMA,
-            "checkpoint_sha256": value["checkpoint"]["checkpoint_sha256"],
-            "common_height": value["fresh_six_host_proof"]["common_height"]}, sort_keys=True))
+        print(json.dumps(report, sort_keys=True))
         return 0
     except (ProfileError, OSError, ValueError, KeyError) as e:
         print(json.dumps({"pass": False, "halt": True, "error": f"{type(e).__name__}: {e}"}), file=sys.stderr)

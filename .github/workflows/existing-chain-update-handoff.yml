@@ -7,6 +7,11 @@ on:
         description: Exact public operational-input commit with current main as its sole parent
         required: true
         type: string
+      declared_offline_site:
+        description: Site of the one validator the input host config declares offline; leave empty when all six are live
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -34,10 +39,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_COMMIT: ${{ inputs.input_commit_sha }}
+          DECLARED_OFFLINE_SITE: ${{ inputs.declared_offline_site }}
         shell: bash
         run: |
           set -Eeuo pipefail
           [[ "$INPUT_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ -z "$DECLARED_OFFLINE_SITE" || "$DECLARED_OFFLINE_SITE" =~ ^[a-z]{3}$ ]] || {
+            echo '::error::declared_offline_site must be empty or one three-letter site name.'
+            exit 1
+          }
           [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]
           [ "$GITHUB_REF" = refs/heads/main ]
           [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ]
@@ -100,9 +110,17 @@ jobs:
           VERSION: ${{ steps.selection.outputs.version }}
           PREFLIGHT_RUN_ID: ${{ steps.selection.outputs.run_id }}
           PREFLIGHT_ATTEMPT: ${{ steps.selection.outputs.run_attempt }}
+          DECLARED_OFFLINE_SITE: ${{ inputs.declared_offline_site }}
         shell: bash
         run: |
           set -Eeuo pipefail
+          # The assembler refuses unless this explicit confirmation equals the
+          # declared-offline set in the owner host config (both empty for six live).
+          declared_offline=()
+          if [ -n "$DECLARED_OFFLINE_SITE" ]; then
+            [[ "$DECLARED_OFFLINE_SITE" =~ ^[a-z]{3}$ ]]
+            declared_offline=(--declared-offline "$DECLARED_OFFLINE_SITE")
+          fi
           mkdir update-handoff
           python3 scripts/release/assemble-existing-chain-update.py \
             --repository "$GITHUB_REPOSITORY" --repository-root . \
@@ -117,6 +135,7 @@ jobs:
             --checkpoint operational-input/recovery.arcchkpt --recovery-epoch 1 \
             --approved-genesis-network-hash operational-input/approved-genesis.network-hash \
             --owner-attestation operational-input/update-attestation.json \
+            "${declared_offline[@]}" \
             --output update-handoff/arc-existing-chain-update-attestation.json
 
       - name: Check source and current main before publishing the handoff
@@ -145,6 +164,7 @@ jobs:
         env:
           ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
           ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          DECLARED_OFFLINE_SITE: ${{ inputs.declared_offline_site }}
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -155,5 +175,6 @@ jobs:
             echo "Run/attempt: $GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
             echo "Artifact ID: $ARTIFACT_ID"
             echo "Artifact digest: sha256:$ARTIFACT_DIGEST"
+            echo "Declared offline (unobserved) validator: ${DECLARED_OFFLINE_SITE:-none; all six observed}"
             echo 'The observation time is recorded in the attestation. This handoff does not prove the original cutover ceremony or authorize retirement.'
           } >> "$GITHUB_STEP_SUMMARY"
