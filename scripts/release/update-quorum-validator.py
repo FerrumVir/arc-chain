@@ -11,6 +11,16 @@ QUORUM_SCHEMA = "arc.rollout.fresh-quorum.v1"
 MAX_PROOF_AGE = 120
 MIN_SAMPLE_INTERVAL = 10
 SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
+IP_RE = re.compile(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}\Z")
+SITE_RE = re.compile(r"[a-z]{3}\Z")
+# An update may leave at most one validator unobserved, and only when the owner
+# input names it. Nothing here ever derives that set from a host that fails to answer.
+MAX_DECLARED_OFFLINE = 1
+DECLARED_OFFLINE_FIELDS = frozenset({"site", "ip", "validator", "stake"})
+OFFLINE_PROBE_FIELDS = frozenset({"site", "ip", "validator", "health_url", "http_status", "binary_sha256"})
+# The public front answers 502, 503 or 504 when the node behind it does not
+# answer; no HTTP response at all is recorded as null. Every other result is an answer.
+NOT_ANSWERING_HTTP_STATUSES = frozenset({502, 503, 504})
 
 
 class GateError(RuntimeError):
@@ -47,6 +57,37 @@ def validate_native_pin(native: object, site: str) -> dict:
     require(re.fullmatch(r"(?:0x)?[0-9a-f]{64}", str(native["context_commitment"])) is not None,
             "native context commitment is malformed at " + site)
     return native
+
+
+def validate_declared_offline_rows(config: dict, live: dict[str, dict]) -> dict[str, dict]:
+    """The owner-named validators that this update deliberately does not observe.
+
+    Each row names one validator by site, IP, identity and stake. A declared row can
+    never also be a live host, and at most one validator may be declared.
+    """
+    rows = config.get("declared_offline", [])
+    require(isinstance(rows, list), "declared-offline validators must be a list")
+    require(len(rows) <= MAX_DECLARED_OFFLINE, "at most one validator may be declared offline")
+    live_ips = {host["ip"] for host in live.values()}
+    live_identities = {host["validator"] for host in live.values()}
+    declared: dict[str, dict] = {}
+    for row in rows:
+        require(isinstance(row, dict) and set(row) == DECLARED_OFFLINE_FIELDS,
+                "declared-offline row must hold exactly site, ip, validator and stake")
+        site = row["site"]
+        require(isinstance(site, str) and SITE_RE.fullmatch(site) is not None, "invalid declared-offline site name")
+        require(site not in live and site not in declared,
+                "declared-offline site is also a live host or is repeated: " + site)
+        require(isinstance(row["ip"], str) and IP_RE.fullmatch(row["ip"]) is not None and
+                row["ip"] not in live_ips and all(row["ip"] != other["ip"] for other in declared.values()),
+                "declared-offline IP is malformed, live or repeated at " + site)
+        require(isinstance(row["validator"], str) and SHA_RE.fullmatch(row["validator"]) is not None and
+                row["validator"] not in live_identities and
+                all(row["validator"] != other["validator"] for other in declared.values()),
+                "declared-offline validator identity is malformed, live or repeated at " + site)
+        require(type(row["stake"]) is int and row["stake"] > 0, "invalid declared-offline stake at " + site)
+        declared[site] = row
+    return declared
 
 
 def validate_host_config(config: dict) -> tuple[dict[str, dict], int, int]:
@@ -112,13 +153,75 @@ def validate_host_config(config: dict) -> tuple[dict[str, dict], int, int]:
             "configured host stakes exceed total validator stake")
     require(sum(h["stake"] for h in by_site.values()) + unobserved_stake == total_stake,
             "observed and explicitly unobserved stake must equal total validator stake")
+    declared = validate_declared_offline_rows(config, by_site)
+    require(sum(row["stake"] for row in declared.values()) == unobserved_stake,
+            "unobserved stake must be exactly the stake of the validators the owner declares offline")
     return {s: by_site[s] for s in quorum_sites}, total_stake, quorum_stake
+
+
+def declared_offline_hosts(config: dict) -> dict[str, dict]:
+    """Validate the whole host config and return its declared-offline validators by site."""
+    hosts, _, _ = validate_host_config(config)
+    return validate_declared_offline_rows(config, hosts)
+
+
+def validate_declared_offline_probes(sample: dict, declared: dict[str, dict]) -> None:
+    """Each sample must show every declared-offline validator not answering its public health read.
+
+    A declared validator that answers at all, on any binary, refutes the declaration: it
+    must be configured as a live host and run the candidate instead.
+    """
+    if not declared:
+        require("declared_offline" not in sample,
+                "a sample without declared-offline validators must not carry offline probes")
+        return
+    probes = sample.get("declared_offline")
+    require(isinstance(probes, list) and len(probes) == len(declared),
+            "every sample must probe each declared-offline validator exactly once")
+    seen: set[str] = set()
+    for probe in probes:
+        require(isinstance(probe, dict) and set(probe) == OFFLINE_PROBE_FIELDS,
+                "declared-offline probe row schema differs")
+        site = probe["site"]
+        require(isinstance(site, str) and site in declared and site not in seen,
+                "offline probe names an undeclared or repeated site")
+        seen.add(site)
+        pin = declared[site]
+        require(probe["ip"] == pin["ip"] and probe["validator"] == pin["validator"],
+                "offline probe identity differs from the declaration at " + site)
+        require(probe["health_url"] == "https://" + pin["ip"] + "/health",
+                "offline probe must read the declared host's public health endpoint at " + site)
+        status, binary = probe["http_status"], probe["binary_sha256"]
+        require(status is None or (type(status) is int and 100 <= status <= 599),
+                "offline probe HTTP status is malformed at " + site)
+        require(binary is None or (isinstance(binary, str) and SHA_RE.fullmatch(binary) is not None),
+                "offline probe binary hash is malformed at " + site)
+        require(binary is None, "declared-offline validator " + site + " is answering on binary " + str(binary) +
+                "; a validator that answers must be configured live and run the candidate")
+        require(status is None or status in NOT_ANSWERING_HTTP_STATUSES,
+                "declared-offline validator " + site + " answered its health read with HTTP " + str(status) +
+                "; a validator that answers must be configured live and run the candidate")
+
+
+def require_no_declared_rows(rows: object, declared: dict[str, dict], where: str) -> None:
+    """A declared-offline validator that shows up as a captured host refutes its declaration."""
+    for row in rows if isinstance(rows, list) else ():
+        if not isinstance(row, dict):
+            continue
+        for site, pin in declared.items():
+            require(row.get("site") != site and row.get("ip") != pin["ip"] and
+                    row.get("validator") != pin["validator"],
+                    "declared-offline validator " + site + " answered the capture as a live host in the " + where +
+                    "; a validator that answers must be configured live and run the candidate")
 
 
 def validate_quorum_proof(proof: dict, hosts: dict[str, dict], total_stake: int,
                           quorum_stake: int, *, expected_network: dict | None = None,
-                          now: float | None = None) -> dict:
+                          now: float | None = None, declared_offline: dict[str, dict] | None = None) -> dict:
     now = time.time() if now is None else now
+    declared = dict(declared_offline or {})
+    require(len(declared) <= MAX_DECLARED_OFFLINE, "at most one validator may be declared offline")
+    require(not set(declared) & set(hosts), "a declared-offline validator is also a live quorum host")
     require(proof.get("schema") == QUORUM_SCHEMA, "unsupported fresh quorum proof schema")
     require("StrictHostKeyChecking=yes" in proof.get("transport", "") and "IdentitiesOnly=yes" in proof.get("transport", ""),
             "quorum proof must use strict pinned SSH identities")
@@ -141,7 +244,9 @@ def validate_quorum_proof(proof: dict, hosts: dict[str, dict], total_stake: int,
     expected_sites = set(hosts)
     prior: dict[str, tuple] = {}
     for sample in samples:
+        validate_declared_offline_probes(sample, declared)
         rows = sample.get("nodes")
+        require_no_declared_rows(rows, declared, "samples")
         require(isinstance(rows, list) and len(rows) == len(expected_sites), "sample missing or duplicating a quorum host")
         current: dict[str, dict] = {}
         for row in rows:
@@ -213,6 +318,7 @@ def validate_quorum_proof(proof: dict, hosts: dict[str, dict], total_stake: int,
             "malformed common block evidence")
     require(common.get("protocol_major") == 3, "common block protocol major differs from the compatibility baseline")
     block_rows = common.get("hosts")
+    require_no_declared_rows(block_rows, declared, "common block")
     require(isinstance(block_rows, list) and len(block_rows) == len(expected_sites), "common block must cover every quorum host")
     hashes: set[tuple] = set()
     seen: set[str] = set()
@@ -230,8 +336,15 @@ def validate_quorum_proof(proof: dict, hosts: dict[str, dict], total_stake: int,
     require(online_stake >= quorum_stake, "authenticated quorum stake is below threshold")
     heights = [row["last_block_height"] for row in samples[1]["nodes"]]
     require(height <= min(heights), "common block is ahead of a sampled host")
-    return {"captured_at_unix": captured, "host_count": len(expected_sites), "online_stake": online_stake,
-            "total_stake": total_stake, "quorum_stake": quorum_stake, "common_height": height,
-            "common_hash": block_hash, "common_state_root": state_root}
+    summary = {"captured_at_unix": captured, "host_count": len(expected_sites), "online_stake": online_stake,
+               "total_stake": total_stake, "quorum_stake": quorum_stake, "common_height": height,
+               "common_hash": block_hash, "common_state_root": state_root}
+    if declared:
+        declared_stake = sum(pin["stake"] for pin in declared.values())
+        require(online_stake + declared_stake == total_stake,
+                "live and declared-offline stake must equal total validator stake")
+        summary["declared_offline_sites"] = sorted(declared)
+        summary["declared_offline_stake"] = declared_stake
+    return summary
 
 
