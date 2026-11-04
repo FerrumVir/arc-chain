@@ -213,16 +213,16 @@ All notable changes to ARC Chain are tracked here. This project follows
   the steps to reproduce them (#136).
 - Documentation: the README, Getting Started and the headless guide state
   that v0.8.16 is released, give a dated status (2026-11-02) and no longer
-  call it unpublished. The 2026-08-31 source-freeze snapshot, community
-  answer sheet and public fleet snapshot move, unchanged, under a dated
-  History heading that says they are superseded. The README and Getting
-  Started say that signed app updates have installed automatically by
-  default since v0.8.14, that Settings can turn that off, and that on macOS
-  v0.8.16 defers an update it can't apply where ARC runs; they also add the
-  Discord and Telegram links. The README performance section and both papers
-  carry a dated scope note: the GPU bit-identity, speed, throughput and
-  node-count figures are historical lab and testnet results, and the current
-  proven scope is `INFERENCE_DETERMINISM.md` (#222).
+  call it unpublished. The sections written for the 2026-08-31 snapshot
+  move, unchanged, under a dated History heading that says they are
+  superseded. The README and Getting Started say that signed app updates
+  have installed automatically by default since v0.8.14, that Settings can
+  turn that off, and that on macOS v0.8.16 defers an update it can't apply
+  where ARC runs; they also add the Discord and Telegram links. The README
+  performance section and both papers carry a dated scope note: the GPU
+  bit-identity, speed, throughput and node-count figures are historical lab
+  and testnet results, and the current proven scope is
+  `INFERENCE_DETERMINISM.md` (#222).
 
 ## v0.8.16 - Release-preparation snapshot (2026-10-26)
 
