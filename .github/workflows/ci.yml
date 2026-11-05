@@ -95,6 +95,10 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
       - run: bash tests/release/current_tree_secret_scan.sh
+      # ARC-410 L9: no exported node state, and no personal device names in tracked JSON.
+      # Heuristic and current-tree only; see the script.
+      - name: Exported-state privacy (current tree)
+        run: python3 scripts/ci/export_privacy.py
 
   # ------------------------------------------------ workflow syntax -------
   # Release and deployment behavior is encoded in Actions YAML, so malformed
@@ -742,6 +746,12 @@ jobs:
             printf '::error::cargo-deny failed for: %s\n' "${failed[*]}"
             exit 1
           fi
+      # ARC-410 L10: pin which shipped binary links QUIC, per release target. The Tauri app must not;
+      # the arc-node sidecar it runs does. Metadata only (cargo tree, --locked), so stable is enough.
+      - name: Desktop / sidecar dependency boundary (cargo tree)
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: python3 scripts/ci/desktop_dependency_boundary.py
 
   # ------------------------------------------------------- shell syntax ----
   # Zero-debt gate, blocking from day one: `bash -n` parses without executing,

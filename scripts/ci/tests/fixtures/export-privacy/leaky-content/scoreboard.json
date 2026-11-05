@@ -1,0 +1,11 @@
+{
+  "schema": "arc.workers.scoreboard.v1",
+  "app_version": "0.8.16",
+  "workers": [
+    {"worker_id": "0xaaaa", "name": "Adas-MacBook-Pro.local", "runs": 3},
+    {"worker_id": "0xbbbb", "name": "DESKTOP-1A2B3C4", "runs": 1},
+    {"worker_id": "0xcccc", "name": "arc-1a2b3c4d (Bens-Mac-mini.lan)", "runs": 0},
+    {"worker_id": "0xdddd", "name": "node-0f0f0f0f", "runs": 7}
+  ],
+  "host": {"hostname": "CAROL-PC"}
+}
