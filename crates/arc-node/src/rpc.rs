@@ -8063,6 +8063,25 @@ async fn inference_readiness(
     (headers, Json(readiness))
 }
 
+// Exact source-artifact BLAKE3 from docs/determinism-proof.md. The base
+// Llama-2 model shares general.name with Chat, so metadata is not an identity.
+const LLAMA2_CHAT_ARTIFACT_ID: Hash256 = Hash256([
+    0x93, 0x4e, 0xfc, 0x12, 0xa2, 0xed, 0x83, 0x72, 0xa9, 0x44, 0xe5, 0xaa, 0xed, 0xf0, 0x59, 0xa8,
+    0xa0, 0xf4, 0x2c, 0x09, 0x06, 0xf6, 0xb2, 0xf1, 0xfb, 0x36, 0x26, 0xbd, 0xeb, 0x1f, 0xfa, 0x67,
+]);
+
+/// Coordinator-only override for the pinned Chat GGUF, which has no template
+/// metadata. None retains each caller's existing behavior. Workers and
+/// verification tokenize the dispatched text directly; BOS stays a token.
+fn coordinator_chat_input(
+    text: &str,
+    chat_template_enabled: bool,
+    model_artifact_id: Option<Hash256>,
+) -> Option<String> {
+    (chat_template_enabled && model_artifact_id == Some(LLAMA2_CHAT_ARTIFACT_ID))
+        .then(|| format!("[INST] {text} [/INST]"))
+}
+
 async fn inference_run(
     AxumState(node): AxumState<NodeState>,
     body: Option<Json<Value>>,
@@ -8105,6 +8124,14 @@ async fn inference_run(
             "Input contains null bytes",
         ));
     }
+
+    let chat_template_enabled = req
+        .get("chat_template")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let chat_input =
+        coordinator_chat_input(input_text, chat_template_enabled, node.model_artifact_id);
+    let dispatched_input = chat_input.as_deref().unwrap_or(input_text);
 
     let requested_max_tokens = req.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(64);
     if requested_max_tokens == 0 {
@@ -8219,7 +8246,7 @@ async fn inference_run(
             &assignment_epoch,
             nonce,
             &model_id,
-            &arc_crypto::hash_bytes(input_text.as_bytes()),
+            &arc_crypto::hash_bytes(dispatched_input.as_bytes()),
             max_tokens,
         );
         let existing = {
@@ -8329,7 +8356,7 @@ async fn inference_run(
             } else {
                 (
                     crate::twin::DemandSource::PublicRequest,
-                    input_text.to_string(),
+                    dispatched_input.to_string(),
                 )
             };
             match twin_dispatch::dispatch_twin(
@@ -8382,7 +8409,7 @@ async fn inference_run(
         }
         match dispatch_to_community_worker_with_probe(
             &node,
-            input_text.to_string(),
+            dispatched_input.to_string(),
             max_tokens,
             assigned_model_id.clone(),
             recovery_probe_id,
@@ -8573,7 +8600,8 @@ async fn inference_run(
             model.layers.len()
         );
         let sharded_body = json!({
-            "input": input_text,
+            // Already wrapped at this coordinator; sharded defaults to no template.
+            "input": dispatched_input,
             "max_tokens": max_tokens,
         });
         // Reuse the live sharded handler instead of duplicating its
@@ -8601,8 +8629,8 @@ async fn inference_run(
 
     let start = std::time::Instant::now();
 
-    // Apply chat template from GGUF metadata (wraps input in model-specific format)
-    let templated_input = model.apply_chat_template(input_text);
+    // Preserve the legacy metadata template unless the pinned Chat override applies.
+    let templated_input = chat_input.unwrap_or_else(|| model.apply_chat_template(input_text));
 
     // Encode templated text to tokens using the tokenizer
     let prompt_tokens = model.encode(&templated_input);
@@ -12652,7 +12680,8 @@ async fn inference_run_sharded(
         .clone();
 
     let tokenized_text: String = if chat_template_enabled {
-        model.apply_chat_template(input_text)
+        coordinator_chat_input(input_text, chat_template_enabled, node.model_artifact_id)
+            .unwrap_or_else(|| model.apply_chat_template(input_text))
     } else {
         input_text.to_string()
     };
@@ -13203,7 +13232,8 @@ async fn inference_run_consensus(
 
     // Tokenize
     let tokenized_text = if chat_template_enabled {
-        model.apply_chat_template(input_text)
+        coordinator_chat_input(input_text, chat_template_enabled, node.model_artifact_id)
+            .unwrap_or_else(|| model.apply_chat_template(input_text))
     } else {
         input_text.to_string()
     };
@@ -24639,6 +24669,115 @@ mod tests {
             "0x{}",
             arc_crypto::hash_bytes(b"synthetic-model-artifact-exact-bytes").to_hex()
         )
+    }
+
+    #[test]
+    fn chat_format_pinned_artifact_wraps_once_without_bos_or_system_prompt() {
+        let manifest: Value = serde_json::from_str(include_str!(
+            "../../../docs/protocol/packages/llama-2-7b-q4km.manifest.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            LLAMA2_CHAT_ARTIFACT_ID.to_hex(),
+            manifest["artifact"]["blake3"]
+        );
+        assert_eq!(
+            coordinator_chat_input("What is 7 plus 5?", true, Some(LLAMA2_CHAT_ARTIFACT_ID)),
+            Some("[INST] What is 7 plus 5? [/INST]".to_string())
+        );
+    }
+
+    #[test]
+    fn chat_format_false_keeps_input_bytes() {
+        let input = "  x\n[INST] literal [/INST]  ";
+        assert_eq!(
+            coordinator_chat_input(input, false, Some(LLAMA2_CHAT_ARTIFACT_ID))
+                .as_deref()
+                .unwrap_or(input),
+            input
+        );
+    }
+
+    #[test]
+    fn chat_format_other_or_missing_artifact_keeps_input_bytes() {
+        let input = "  x\n";
+        let mut different_artifact = LLAMA2_CHAT_ARTIFACT_ID;
+        different_artifact.0[31] ^= 1;
+        for artifact in [None, Some(Hash256::ZERO), Some(different_artifact)] {
+            assert_eq!(coordinator_chat_input(input, true, artifact), None);
+        }
+    }
+
+    #[test]
+    fn chat_format_worker_tokenizes_assignment_directly() {
+        // The production worker loop lives in the binary, outside this lib
+        // test target. Guard its actual claim-to-generate code as well as the
+        // executable verifier-context check below, without changing workers.
+        let source = include_str!("main.rs");
+        let worker = source
+            .split_once("let input = job")
+            .expect("worker reads the assigned input")
+            .1
+            .split_once(".try_generate(")
+            .expect("worker generates from the assigned tokens")
+            .0;
+        assert!(worker.contains("let inference_tokens = inference_model.encode(&input);"));
+        assert!(!worker.contains("apply_chat_template"));
+        assert!(!worker.contains("coordinator_chat_input"));
+        assert!(!worker.contains("[INST]"));
+    }
+
+    #[tokio::test]
+    async fn chat_format_dispatched_input_and_verification_are_wrapped_once() {
+        // Drive the real handler and queue; no model download or validator I/O.
+        // Missing/false flags and other artifacts retain the exact input bytes.
+        for (flag, artifact, expected) in [
+            (Some(true), LLAMA2_CHAT_ARTIFACT_ID, "[INST]  x\n [/INST]"),
+            (Some(false), LLAMA2_CHAT_ARTIFACT_ID, " x\n"),
+            (None, LLAMA2_CHAT_ARTIFACT_ID, " x\n"),
+            (Some(true), Hash256::ZERO, " x\n"),
+        ] {
+            let mut assigned_worker = worker("w1", &["inference"]);
+            assigned_worker.model_id = Some(format!("0x{}", artifact.to_hex()));
+            let mut node = fake_node_with_workers(vec![(assigned_worker, Instant::now())]);
+            node.model_artifact_id = Some(artifact);
+            node.community_verification_pipeline_override = Some(verifiable_dispatch_pipeline());
+            let queue = node.community_work_queue.as_ref().unwrap().clone();
+            let model = node.inference_model.as_ref().unwrap().clone();
+            let mut request = json!({"input": " x\n", "max_tokens": 1});
+            if let Some(flag) = flag {
+                request["chat_template"] = json!(flag);
+            }
+            let inference = inference_run(AxumState(node), Some(Json(request)));
+            tokio::pin!(inference);
+            let item = tokio::select! {
+                result = &mut inference => {
+                    panic!("handler completed before dispatch: {}", match result {
+                        Ok(Json(value)) => value.to_string(),
+                        Err((status, Json(error))) => format!("{status}: {}", error.error),
+                    });
+                }
+                item = async { queue.lock().await.recv().await } => item.expect("dispatched job"),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                    panic!("handler did not dispatch");
+                }
+            };
+            assert_eq!(item.input, expected);
+            let worker_tokens = model.encode(&item.input);
+            let (verification_tokens, _) =
+                community_worker_generation_context(&model, &item.input, item.max_tokens).unwrap();
+            let mut expected_verification = vec![model.config.bos_token];
+            expected_verification.extend(&worker_tokens);
+            expected_verification.push(*worker_tokens.last().unwrap());
+            assert_eq!(verification_tokens, expected_verification);
+            if flag == Some(true) && artifact == LLAMA2_CHAT_ARTIFACT_ID {
+                assert_ne!(
+                    worker_tokens,
+                    model.encode(&format!("[INST] {expected} [/INST]"))
+                );
+                assert_eq!(item.input.matches("[INST]").count(), 1);
+            }
+        }
     }
 
     fn test_inference_model() -> Arc<arc_inference::cached_integer_model::CachedIntegerModel> {
