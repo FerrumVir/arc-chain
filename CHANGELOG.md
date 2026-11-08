@@ -18,7 +18,10 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
-## v0.8.18 - Chat question formatting (2026-11-08)
+## v0.8.18 - Release-preparation snapshot (2026-11-08)
+
+> **Candidate note:** This entry records the v0.8.18 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.18.
 
 - Network questions could be echoed or answered with an empty response because
   the pinned Llama-2-7B-Chat model received plain text instead of its chat format.
@@ -27,6 +30,10 @@ All notable changes to ARC Chain are tracked here. This project follows
   sharded inference and consensus inference. The public demo is unchanged.
 - Requests with `chat_template: false` (or no flag) are unchanged. Other model
   artifacts retain their existing behavior.
+
+- Very short chat questions may receive fewer output tokens to preserve older
+  desktops' timeout headroom; requests that cannot fit even one output token
+  ask the caller to request more tokens or add words.
 
 ## v0.8.17 - Release-preparation snapshot (2026-11-04)
 
