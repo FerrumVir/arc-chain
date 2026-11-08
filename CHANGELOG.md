@@ -27,13 +27,13 @@ All notable changes to ARC Chain are tracked here. This project follows
   the pinned Llama-2-7B-Chat model received plain text instead of its chat format.
   Requests with `chat_template: true` now use `[INST] ... [/INST]` once at the
   coordinator for that exact model, including community dispatch, local fallback,
-  sharded inference and consensus inference. The public demo is unchanged.
+  sharded inference and consensus inference. The public demo is unchanged (#240).
 - Requests with `chat_template: false` (or no flag) are unchanged. Other model
-  artifacts retain their existing behavior.
+  artifacts retain their existing behavior (#240).
 
 - Very short chat questions may receive fewer output tokens to preserve older
   desktops' timeout headroom; requests that cannot fit even one output token
-  ask the caller to request more tokens or add words.
+  ask the caller to request more tokens or add words (#240).
 
 ## v0.8.17 - Release-preparation snapshot (2026-11-04)
 

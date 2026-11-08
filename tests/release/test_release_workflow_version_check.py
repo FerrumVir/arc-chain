@@ -26,7 +26,7 @@ class ReleaseWorkflowVersionCheckTests(unittest.TestCase):
         return subprocess.run(
             ["bash", "-euo", "pipefail", "-c", version_check_shell()],
             cwd=root,
-            env={**os.environ, "VERSION": "0.8.17", "TAG": "v0.8.17"},
+            env={**os.environ, "VERSION": "0.8.18", "TAG": "v0.8.18"},
             text=True,
             capture_output=True,
             check=False,
@@ -37,9 +37,9 @@ class ReleaseWorkflowVersionCheckTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_current_release_fixture_matches_tag(self) -> None:
-        fixture = ROOT / "tests/release/fixtures/release-v0.8.17.json"
+        fixture = ROOT / "tests/release/fixtures/release-v0.8.18.json"
         release = json.loads(fixture.read_text())
-        self.assertEqual(release["tag_name"], "v0.8.17")
+        self.assertEqual(release["tag_name"], "v0.8.18")
 
     def test_actual_workflow_version_block_rejects_mismatch_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -56,7 +56,7 @@ class ReleaseWorkflowVersionCheckTests(unittest.TestCase):
                 shutil.copy2(ROOT / relative, destination)
             package_json = fixture / "desktop/package.json"
             package = json.loads(package_json.read_text())
-            # Previously published v0.8.0 bytes cannot satisfy the v0.8.17 tag.
+            # Previously published v0.8.0 bytes cannot satisfy the v0.8.18 tag.
             package["version"] = "0.8.0"
             package_json.write_text(json.dumps(package))
 
