@@ -8063,6 +8063,69 @@ async fn inference_readiness(
     (headers, Json(readiness))
 }
 
+// Exact source-artifact BLAKE3 from docs/determinism-proof.md. The base
+// Llama-2 model shares general.name with Chat, so metadata is not an identity.
+const LLAMA2_CHAT_ARTIFACT_ID: Hash256 = Hash256([
+    0x93, 0x4e, 0xfc, 0x12, 0xa2, 0xed, 0x83, 0x72, 0xa9, 0x44, 0xe5, 0xaa, 0xed, 0xf0, 0x59, 0xa8,
+    0xa0, 0xf4, 0x2c, 0x09, 0x06, 0xf6, 0xb2, 0xf1, 0xfb, 0x36, 0x26, 0xbd, 0xeb, 0x1f, 0xfa, 0x67,
+]);
+
+/// Coordinator-only override for the pinned Chat GGUF, which has no template
+/// metadata. None retains each caller's existing behavior. Workers and
+/// verification tokenize the dispatched text directly; BOS stays a token.
+fn coordinator_chat_input(
+    text: &str,
+    chat_template_enabled: bool,
+    model_artifact_id: Option<Hash256>,
+) -> Option<String> {
+    let text = text.trim();
+    (chat_template_enabled
+        && model_artifact_id == Some(LLAMA2_CHAT_ARTIFACT_ID)
+        && !text.is_empty())
+    .then(|| format!("[INST] {text} [/INST]"))
+}
+
+/// Frozen copy of desktop v0.8.14-v0.8.17's
+/// `inference_prompt_token_upper_bound` (desktop/src-tauri/src/commands.rs).
+/// Those clients budget the ORIGINAL input: SentencePiece's leading marker
+/// costs three UTF-8 bytes, and each ASCII space becomes another marker.
+/// Keep this bound even if a future desktop changes its timeout calculation.
+fn legacy_desktop_prompt_bound(prompt: &str) -> u64 {
+    const SENTENCEPIECE_MARKER_BYTES: u64 = 3;
+
+    prompt
+        .as_bytes()
+        .iter()
+        .fold(SENTENCEPIECE_MARKER_BYTES, |transformed_bytes, byte| {
+            transformed_bytes.saturating_add(if *byte == b' ' {
+                SENTENCEPIECE_MARKER_BYTES
+            } else {
+                1
+            })
+        })
+}
+
+fn chat_format_max_tokens(
+    model: &arc_inference::cached_integer_model::CachedIntegerModel,
+    original: &str,
+    wrapped: &str,
+    max_tokens: u32,
+) -> Result<u32, String> {
+    let legacy_positions = 1u64
+        .saturating_add(legacy_desktop_prompt_bound(original))
+        .saturating_add(u64::from(max_tokens));
+    let (_, preflight) = community_worker_generation_context(model, wrapped, max_tokens)?;
+    let excess = (preflight.required_positions as u64).saturating_sub(legacy_positions);
+    let effective = u64::from(max_tokens).saturating_sub(excess);
+    if effective == 0 {
+        return Err(
+            "Chat formatting cannot fit this request's token budget. Ask for more tokens or add words to your question."
+                .to_string(),
+        );
+    }
+    Ok(effective as u32)
+}
+
 async fn inference_run(
     AxumState(node): AxumState<NodeState>,
     body: Option<Json<Value>>,
@@ -8106,6 +8169,29 @@ async fn inference_run(
         ));
     }
 
+    let chat_template_enabled = req
+        .get("chat_template")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let public_demo = req
+        .get("public_demo")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // Without the tokenizer we cannot preserve older desktops' deadline.
+    // Public demo retains its existing, separate metadata-template path.
+    let chat_input = node
+        .inference_model
+        .as_ref()
+        .filter(|model| !model.vocab.is_empty())
+        .and_then(|_| {
+            coordinator_chat_input(
+                input_text,
+                chat_template_enabled && !public_demo,
+                node.model_artifact_id,
+            )
+        });
+    let dispatched_input = chat_input.as_deref().unwrap_or(input_text);
+
     let requested_max_tokens = req.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(64);
     if requested_max_tokens == 0 {
         return Err(api_error(
@@ -8114,6 +8200,30 @@ async fn inference_run(
         ));
     }
     let max_tokens = requested_max_tokens.min(u64::from(INFERENCE_RUN_MAX_TOKENS)) as u32;
+    // Apply once before job-ID derivation, dispatch, or any fallback. Exact
+    // wrapped positions must fit the original desktop budget, leaving its
+    // full 60-second response headroom. A rejected request cannot fall back.
+    let max_tokens = if let Some(wrapped) = chat_input.as_deref() {
+        chat_format_max_tokens(
+            node.inference_model
+                .as_ref()
+                .expect("wrapping requires a tokenizer"),
+            input_text,
+            wrapped,
+            max_tokens,
+        )
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?
+    } else {
+        max_tokens
+    };
+    let wrap_used = chat_input.is_some();
+    let report_token_budget = |mut response: Value| {
+        if wrap_used {
+            response["requested_max_tokens"] = json!(requested_max_tokens);
+            response["effective_max_tokens"] = json!(max_tokens);
+        }
+        response
+    };
     let bond = req
         .get("bond")
         .and_then(|v| v.as_u64())
@@ -8219,7 +8329,7 @@ async fn inference_run(
             &assignment_epoch,
             nonce,
             &model_id,
-            &arc_crypto::hash_bytes(input_text.as_bytes()),
+            &arc_crypto::hash_bytes(dispatched_input.as_bytes()),
             max_tokens,
         );
         let existing = {
@@ -8233,7 +8343,7 @@ async fn inference_run(
         }
         .map_err(|error| api_error(StatusCode::CONFLICT, error))?;
         if let Some(response) = existing {
-            return Ok(Json(response));
+            return Ok(Json(report_token_budget(response)));
         }
         Some(expected)
     } else {
@@ -8264,10 +8374,6 @@ async fn inference_run(
     }
     // Public demo: a caller-labelled public, testnet-only prompt that is
     // always run by two independent community workers (twin execution).
-    let public_demo = req
-        .get("public_demo")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let max_tokens = if public_demo {
         if force_local || recovery_probe_id.is_some() {
             return Err(api_error(
@@ -8329,7 +8435,7 @@ async fn inference_run(
             } else {
                 (
                     crate::twin::DemandSource::PublicRequest,
-                    input_text.to_string(),
+                    dispatched_input.to_string(),
                 )
             };
             match twin_dispatch::dispatch_twin(
@@ -8348,13 +8454,15 @@ async fn inference_run(
                 Ok(outcome) => {
                     let dispatch_ms =
                         u64::try_from(dispatched_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    return Ok(Json(twin_dispatch::twin_inference_response(
-                        &node,
-                        input_text,
-                        outcome,
-                        live_workers,
-                        dispatch_ms,
-                        public_demo,
+                    return Ok(Json(report_token_budget(
+                        twin_dispatch::twin_inference_response(
+                            &node,
+                            input_text,
+                            outcome,
+                            live_workers,
+                            dispatch_ms,
+                            public_demo,
+                        ),
                     )));
                 }
                 Err(error) if error.local_fallback_safe && !public_demo => {
@@ -8382,7 +8490,7 @@ async fn inference_run(
         }
         match dispatch_to_community_worker_with_probe(
             &node,
-            input_text.to_string(),
+            dispatched_input.to_string(),
             max_tokens,
             assigned_model_id.clone(),
             recovery_probe_id,
@@ -8453,7 +8561,7 @@ async fn inference_run(
                 if let Some(answer_release) = answer_release {
                     response["answer_release"] = answer_release;
                 }
-                return Ok(Json(response));
+                return Ok(Json(report_token_budget(response)));
             }
             Err(e) => {
                 if let (Some(probe_id), Some(expected_job)) =
@@ -8470,7 +8578,7 @@ async fn inference_run(
                     }
                     .map_err(|error| api_error(StatusCode::CONFLICT, error))?;
                     if let Some(response) = replay {
-                        return Ok(Json(response));
+                        return Ok(Json(report_token_budget(response)));
                     }
                     return Err(api_error(
                         StatusCode::GATEWAY_TIMEOUT,
@@ -8518,7 +8626,7 @@ async fn inference_run(
     let model = match &node.inference_model {
         Some(m) => m.clone(),
         None => {
-            return Ok(Json(json!({
+            return Ok(Json(report_token_budget(json!({
                 "success": false,
                 "routed_via": "none",
                 "error": format!(
@@ -8527,7 +8635,7 @@ async fn inference_run(
                      or wait for a worker to register.",
                     live_workers
                 ),
-            })));
+            }))));
         }
     };
     let (model_id_data, model_id_hash) =
@@ -8573,7 +8681,8 @@ async fn inference_run(
             model.layers.len()
         );
         let sharded_body = json!({
-            "input": input_text,
+            // Already wrapped at this coordinator; sharded defaults to no template.
+            "input": dispatched_input,
             "max_tokens": max_tokens,
         });
         // Reuse the live sharded handler instead of duplicating its
@@ -8585,7 +8694,7 @@ async fn inference_run(
         let Json(mut response) =
             inference_run_sharded(AxumState(node.clone()), Json(sharded_body)).await?;
         response["routed_via"] = json!("sharded_seed_pipeline");
-        return Ok(Json(response));
+        return Ok(Json(report_token_budget(response)));
     }
 
     let inference_permit = node
@@ -8601,18 +8710,18 @@ async fn inference_run(
 
     let start = std::time::Instant::now();
 
-    // Apply chat template from GGUF metadata (wraps input in model-specific format)
-    let templated_input = model.apply_chat_template(input_text);
+    // Preserve the legacy metadata template unless the pinned Chat override applies.
+    let templated_input = chat_input.unwrap_or_else(|| model.apply_chat_template(input_text));
 
     // Encode templated text to tokens using the tokenizer
     let prompt_tokens = model.encode(&templated_input);
     let encode_ms = start.elapsed().as_millis() as u64;
 
     if prompt_tokens.is_empty() {
-        return Ok(Json(json!({
+        return Ok(Json(report_token_budget(json!({
             "success": false,
             "error": "Failed to encode input text to tokens",
-        })));
+        }))));
     }
 
     // Candle consumes the complete prompt tensor and therefore needs the BOS
@@ -8781,7 +8890,7 @@ async fn inference_run(
         }),
     );
 
-    Ok(Json(json!({
+    Ok(Json(report_token_budget(json!({
         "success": true,
         "routed_via": "local",
         "inference": {
@@ -8808,7 +8917,7 @@ async fn inference_run(
         },
         "explorer_url": explorer_url,
         "explorer_url_unavailable_reason": explorer_url_unavailable_reason,
-    })))
+    }))))
 }
 
 /// Per-worker earnings, derived from successful on-chain
@@ -12652,7 +12761,8 @@ async fn inference_run_sharded(
         .clone();
 
     let tokenized_text: String = if chat_template_enabled {
-        model.apply_chat_template(input_text)
+        coordinator_chat_input(input_text, chat_template_enabled, node.model_artifact_id)
+            .unwrap_or_else(|| model.apply_chat_template(input_text))
     } else {
         input_text.to_string()
     };
@@ -13203,7 +13313,8 @@ async fn inference_run_consensus(
 
     // Tokenize
     let tokenized_text = if chat_template_enabled {
-        model.apply_chat_template(input_text)
+        coordinator_chat_input(input_text, chat_template_enabled, node.model_artifact_id)
+            .unwrap_or_else(|| model.apply_chat_template(input_text))
     } else {
         input_text.to_string()
     };
@@ -19154,6 +19265,7 @@ async fn inference_auto(
         let local_req = json!({
             "input": input,
             "max_tokens": max_tokens,
+            "chat_template": req.get("chat_template").and_then(|v| v.as_bool()).unwrap_or(false),
             // `/inference/run` normally prefers community workers. This
             // branch has already selected the documented local strategy, so
             // make that choice explicit instead of dispatching elsewhere and
@@ -19179,6 +19291,7 @@ async fn inference_auto(
         let community_req = json!({
             "input": input,
             "max_tokens": max_tokens,
+            "chat_template": req.get("chat_template").and_then(|v| v.as_bool()).unwrap_or(false),
         });
         let result = inference_run(AxumState(node.clone()), Some(Json(community_req))).await;
         match result {
@@ -24639,6 +24752,495 @@ mod tests {
             "0x{}",
             arc_crypto::hash_bytes(b"synthetic-model-artifact-exact-bytes").to_hex()
         )
+    }
+
+    #[test]
+    fn chat_format_pinned_artifact_wraps_once_without_bos_or_system_prompt() {
+        let manifest: Value = serde_json::from_str(include_str!(
+            "../../../docs/protocol/packages/llama-2-7b-q4km.manifest.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            LLAMA2_CHAT_ARTIFACT_ID.to_hex(),
+            manifest["artifact"]["blake3"]
+        );
+        assert_eq!(
+            coordinator_chat_input("What is 7 plus 5?", true, Some(LLAMA2_CHAT_ARTIFACT_ID)),
+            Some("[INST] What is 7 plus 5? [/INST]".to_string())
+        );
+    }
+
+    #[test]
+    fn chat_format_false_keeps_input_bytes() {
+        let input = "  x\n[INST] literal [/INST]  ";
+        assert_eq!(
+            coordinator_chat_input(input, false, Some(LLAMA2_CHAT_ARTIFACT_ID))
+                .as_deref()
+                .unwrap_or(input),
+            input
+        );
+    }
+
+    #[test]
+    fn chat_format_other_or_missing_artifact_keeps_input_bytes() {
+        let input = "  x\n";
+        let mut different_artifact = LLAMA2_CHAT_ARTIFACT_ID;
+        different_artifact.0[31] ^= 1;
+        for artifact in [None, Some(Hash256::ZERO), Some(different_artifact)] {
+            assert_eq!(coordinator_chat_input(input, true, artifact), None);
+        }
+    }
+
+    #[test]
+    fn chat_format_worker_tokenizes_assignment_directly() {
+        // The production worker loop lives in the binary, outside this lib
+        // test target. Guard its actual claim-to-generate code as well as the
+        // executable verifier-context check below, without changing workers.
+        let source = include_str!("main.rs");
+        let worker = source
+            .split_once("let input = job")
+            .expect("worker reads the assigned input")
+            .1
+            .split_once(".try_generate(")
+            .expect("worker generates from the assigned tokens")
+            .0;
+        assert!(worker.contains("let inference_tokens = inference_model.encode(&input);"));
+        assert!(!worker.contains("apply_chat_template"));
+        assert!(!worker.contains("coordinator_chat_input"));
+        assert!(!worker.contains("[INST]"));
+    }
+
+    #[tokio::test]
+    async fn chat_format_dispatched_input_and_verification_are_wrapped_once() {
+        // Drive the real handler and queue; no model download or validator I/O.
+        // Missing/false flags and other artifacts retain the exact input bytes.
+        for (flag, artifact, expected) in [
+            (Some(true), LLAMA2_CHAT_ARTIFACT_ID, "[INST] x [/INST]"),
+            (Some(false), LLAMA2_CHAT_ARTIFACT_ID, " x\n"),
+            (None, LLAMA2_CHAT_ARTIFACT_ID, " x\n"),
+            (Some(true), Hash256::ZERO, " x\n"),
+        ] {
+            let mut assigned_worker = worker("w1", &["inference"]);
+            assigned_worker.model_id = Some(format!("0x{}", artifact.to_hex()));
+            let mut node = fake_node_with_workers(vec![(assigned_worker, Instant::now())]);
+            node.model_artifact_id = Some(artifact);
+            node.community_verification_pipeline_override = Some(verifiable_dispatch_pipeline());
+            let queue = node.community_work_queue.as_ref().unwrap().clone();
+            let model = node.inference_model.as_ref().unwrap().clone();
+            let mut request = json!({"input": " x\n", "max_tokens": 16});
+            if let Some(flag) = flag {
+                request["chat_template"] = json!(flag);
+            }
+            let inference = inference_run(AxumState(node), Some(Json(request)));
+            tokio::pin!(inference);
+            let item = tokio::select! {
+                result = &mut inference => {
+                    panic!("handler completed before dispatch: {}", match result {
+                        Ok(Json(value)) => value.to_string(),
+                        Err((status, Json(error))) => format!("{status}: {}", error.error),
+                    });
+                }
+                item = async { queue.lock().await.recv().await } => item.expect("dispatched job"),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                    panic!("handler did not dispatch");
+                }
+            };
+            assert_eq!(item.input, expected);
+            let worker_tokens = model.encode(&item.input);
+            let (verification_tokens, _) =
+                community_worker_generation_context(&model, &item.input, item.max_tokens).unwrap();
+            let mut expected_verification = vec![model.config.bos_token];
+            expected_verification.extend(&worker_tokens);
+            expected_verification.push(*worker_tokens.last().unwrap());
+            assert_eq!(verification_tokens, expected_verification);
+            if flag == Some(true) && artifact == LLAMA2_CHAT_ARTIFACT_ID {
+                assert_ne!(
+                    worker_tokens,
+                    model.encode(&format!("[INST] {expected} [/INST]"))
+                );
+                assert_eq!(item.input.matches("[INST]").count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn chat_format_trims_only_the_opted_in_nonempty_text() {
+        for text in [" \t1\n", "\u{2003}1\r\n"] {
+            assert_eq!(
+                coordinator_chat_input(text, true, Some(LLAMA2_CHAT_ARTIFACT_ID)),
+                Some("[INST] 1 [/INST]".into())
+            );
+            assert_eq!(
+                coordinator_chat_input(text, false, Some(LLAMA2_CHAT_ARTIFACT_ID)),
+                None
+            );
+            assert_eq!(
+                coordinator_chat_input(text, true, Some(Hash256::ZERO)),
+                None
+            );
+        }
+        for text in ["", " \t\n", "\u{2003}"] {
+            assert_eq!(
+                coordinator_chat_input(text, true, Some(LLAMA2_CHAT_ARTIFACT_ID)),
+                None
+            );
+        }
+        assert_eq!(legacy_desktop_prompt_bound("1"), 4);
+        assert_eq!(legacy_desktop_prompt_bound(" 1 "), 10);
+        assert_eq!(legacy_desktop_prompt_bound("🙂"), 7);
+    }
+
+    fn chat_format_model(
+        complete: bool,
+    ) -> Arc<arc_inference::cached_integer_model::CachedIntegerModel> {
+        use arc_inference::cached_integer_model::{CachedLayer, I8Weights};
+        // Use the existing synthetic tokenizer and tiny integer model, with
+        // the production encode path. These pieces reproduce the reviewed
+        // nine-token short question without loading/downloading a GGUF.
+        let mut model = test_reward_inference_model();
+        model.vocab = test_inference_model().vocab.clone();
+        model
+            .vocab
+            .extend(["▁[", "INST", "]", "▁"].map(str::to_string));
+        model.config.vocab_size = model.vocab.len();
+        model.config.max_seq = 512;
+        model.config.rope_cos = vec![1 << 16; 1024];
+        model.config.rope_sin = vec![0; 1024];
+        let values = vec![0.03; model.config.vocab_size * model.config.d_model];
+        model.embedding_q16 = values
+            .iter()
+            .map(|value| (value * 65536.0) as i64)
+            .collect();
+        model.embedding_i8 =
+            I8Weights::quantize_f32(&values, model.config.vocab_size, model.config.d_model);
+        model.output_weight =
+            I8Weights::quantize_f32(&values, model.config.vocab_size, model.config.d_model);
+        if !complete {
+            model.layers[0] = CachedLayer::placeholder();
+        }
+        assert_eq!(model.encode("[INST] 1 [/INST]").len(), 9);
+        Arc::new(model)
+    }
+
+    fn chat_format_node(complete: bool, workers: usize, twin: bool) -> NodeState {
+        let mut node = fake_node_with_workers(
+            (0..workers)
+                .map(|i| {
+                    let mut w = worker(&format!("w{i}"), &["inference"]);
+                    w.model_id = Some(format!("0x{}", LLAMA2_CHAT_ARTIFACT_ID.to_hex()));
+                    (w, Instant::now())
+                })
+                .collect(),
+        );
+        node.model_artifact_id = Some(LLAMA2_CHAT_ARTIFACT_ID);
+        node.inference_model = Some(chat_format_model(complete));
+        node.community_verification_pipeline_override = Some(verifiable_dispatch_pipeline());
+        node.community_twin = Arc::new(twin_dispatch::CommunityTwinState::new(
+            crate::twin::TwinConfig {
+                twin_execution: twin,
+                spot_check_per_mille: 0,
+                ..Default::default()
+            },
+        ));
+        node
+    }
+
+    fn chat_format_request(input: &str, max_tokens: u32, flag: Option<bool>) -> Value {
+        let mut request = json!({"input": input, "max_tokens": max_tokens});
+        if let Some(flag) = flag {
+            request["chat_template"] = json!(flag);
+        }
+        request
+    }
+
+    fn chat_format_desktop_timeout(input: &str, max_tokens: u32) -> u64 {
+        // Frozen desktop timeout, independent of the server's timeout helper.
+        let positions = 1 + legacy_desktop_prompt_bound(input) + u64::from(max_tokens);
+        ((positions * 14_850).div_ceil(1000) + 30).clamp(45, 3900) + 60
+    }
+
+    #[tokio::test]
+    async fn chat_format_deadline_rejects_before_any_work_or_fallback() {
+        // Twin, single-worker, local, partial-model fallback, and recovery:
+        // none may enqueue, allocate an ID, or compute after this rejection.
+        for (complete, workers, twin, force_local, recovery) in [
+            (false, 2, true, false, false),
+            (false, 1, false, false, false),
+            (true, 0, false, false, false),
+            (false, 0, false, false, false),
+            (true, 1, false, true, false),
+            (false, 1, false, false, true),
+        ] {
+            let node = chat_format_node(complete, workers, twin);
+            let mut request = chat_format_request("1", 1, Some(true));
+            request["force_local"] = json!(force_local);
+            if recovery {
+                // Even recovery validation/ID lookup must follow the guard.
+                request["recovery_probe_id"] = json!("invalid");
+            }
+            let error = inference_run(AxumState(node.clone()), Some(Json(request)))
+                .await
+                .unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(
+                error.1.error.contains("Ask for more tokens or add words"),
+                "{}",
+                error.1.error
+            );
+            assert!(
+                node.community_work_queue
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .await
+                    .try_recv()
+                    .is_err()
+            );
+            assert!(node.community_work_results.as_ref().unwrap().is_empty());
+            assert!(node.community_active_jobs.is_empty());
+            assert!(node.inference_results.is_empty());
+            assert_eq!(node.attestation_nonce.load(Ordering::Relaxed), 0);
+            assert_eq!(node.inference_request_counter.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn chat_format_deadline_lowers_short_questions_and_keeps_normal_sentences() {
+        let model = chat_format_model(false);
+        for (input, expected) in [
+            ("1", 11),
+            ("What is the capital of France?", 16),
+            ("   1   ", 16),
+        ] {
+            let wrapped =
+                coordinator_chat_input(input, true, Some(LLAMA2_CHAT_ARTIFACT_ID)).unwrap();
+            let effective = chat_format_max_tokens(&model, input, &wrapped, 16).unwrap();
+            assert_eq!(effective, expected, "{input:?}");
+            let (_, context) =
+                community_worker_generation_context(&model, &wrapped, effective).unwrap();
+            assert!(
+                community_dispatch_timeout_secs(context.required_positions).unwrap() + 60
+                    <= chat_format_desktop_timeout(input, 16)
+            );
+        }
+        assert_eq!(chat_format_desktop_timeout("1", 1), 180);
+        assert_eq!(chat_format_desktop_timeout("1", 16), 402);
+        let (_, before) =
+            community_worker_generation_context(&model, "[INST] 1 [/INST]", 16).unwrap();
+        assert_eq!(
+            community_dispatch_timeout_secs(before.required_positions).unwrap(),
+            417
+        );
+        let (_, after) =
+            community_worker_generation_context(&model, "[INST] 1 [/INST]", 11).unwrap();
+        assert_eq!(
+            community_dispatch_timeout_secs(after.required_positions).unwrap() + 60,
+            402
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_format_single_twin_and_auto_community_dispatch_once_with_effective_budget() {
+        for (auto, twin) in [(false, false), (false, true), (true, false)] {
+            for flag in [Some(true), Some(false), None] {
+                let node = chat_format_node(false, if twin { 2 } else { 1 }, twin);
+                let queue = node.community_work_queue.as_ref().unwrap().clone();
+                let request = chat_format_request("1", 16, flag);
+                let inference = async {
+                    if auto {
+                        inference_auto(AxumState(node.clone()), Json(request)).await
+                    } else {
+                        inference_run(AxumState(node.clone()), Some(Json(request))).await
+                    }
+                };
+                tokio::pin!(inference);
+                let items = tokio::select! {
+                    response = &mut inference => panic!("completed before enqueue: {response:?}"),
+                    items = async {
+                        let mut queue = queue.lock().await;
+                        let mut items = vec![queue.recv().await.unwrap()];
+                        if twin { items.push(queue.recv().await.unwrap()); }
+                        items
+                    } => items,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => panic!("no dispatch"),
+                };
+                for item in items {
+                    let (expected, effective) = if flag == Some(true) {
+                        ("[INST] 1 [/INST]", 11)
+                    } else {
+                        ("1", 16)
+                    };
+                    assert_eq!(item.input, expected);
+                    assert_eq!(item.max_tokens, effective);
+                    let model = node.inference_model.as_ref().unwrap();
+                    let (_, context) =
+                        community_worker_generation_context(model, &item.input, item.max_tokens)
+                            .unwrap();
+                    assert!(
+                        community_dispatch_timeout_secs(context.required_positions).unwrap() + 60
+                            <= chat_format_desktop_timeout("1", 16)
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_format_local_fallback_and_auto_local_wrap_once_and_report_budget() {
+        for auto in [false, true] {
+            for flag in [Some(true), Some(false), None] {
+                let node = chat_format_node(true, 0, false);
+                let model = node.inference_model.as_ref().unwrap().clone();
+                let input = " 1\n";
+                let expected = if flag == Some(true) {
+                    "[INST] 1 [/INST]"
+                } else {
+                    input
+                };
+                let effective = if flag == Some(true) { 15 } else { 16 };
+                let request = chat_format_request(input, 16, flag);
+                let Json(response) = if auto {
+                    inference_auto(AxumState(node), Json(request)).await
+                } else {
+                    inference_run(AxumState(node), Some(Json(request))).await
+                }
+                .unwrap();
+                assert_eq!(response["routed_via"], "local");
+                if auto {
+                    assert_eq!(response["route"], "local_model");
+                }
+                assert_eq!(
+                    response["inference"]["input_tokens"],
+                    model.encode(expected).len()
+                );
+                assert_eq!(response["inference"]["tokens_generated"], effective);
+                assert_eq!(response["inference"]["input"], input);
+                if flag == Some(true) {
+                    assert_eq!(response["requested_max_tokens"], 16);
+                    assert_eq!(response["effective_max_tokens"], effective);
+                } else {
+                    assert!(response.get("requested_max_tokens").is_none());
+                    assert!(response.get("effective_max_tokens").is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_format_sharded_consensus_and_auto_sharded_tokenize_once() {
+        // An intentionally tiny context rejects at the exact token boundary,
+        // before pipeline I/O. Check the typed preflight error, not source text.
+        for route in ["sharded", "consensus", "auto"] {
+            for flag in [Some(true), Some(false), None] {
+                let mut node = chat_format_node(false, 0, false);
+                Arc::get_mut(node.inference_model.as_mut().unwrap())
+                    .unwrap()
+                    .config
+                    .max_seq = 1;
+                let mut holder = shard("fixture", "192.0.2.1:9090", 0, 1);
+                holder.total_layers = 1;
+                holder.node_name = format!("0x{}", Hash256([7; 32]).to_hex());
+                holder.model_id = format!("0x{}", LLAMA2_CHAT_ARTIFACT_ID.to_hex());
+                node.shard_registry
+                    .insert("fixture".into(), (holder, Instant::now()));
+                assert!(assemble_pipeline_for(&node).is_ok());
+                let input = " 1\n";
+                let expected = if flag == Some(true) {
+                    "[INST] 1 [/INST]"
+                } else {
+                    input
+                };
+                let model = node.inference_model.as_ref().unwrap();
+                let expected_error =
+                    preflight_sharded_generation(model, 1 + model.encode(expected).len(), 16)
+                        .unwrap_err();
+                let request = chat_format_request(input, 16, flag);
+                let error = match route {
+                    "sharded" => {
+                        inference_run_sharded(AxumState(node.clone()), Json(request)).await
+                    }
+                    "consensus" => {
+                        inference_run_consensus(AxumState(node.clone()), Json(request)).await
+                    }
+                    _ => inference_auto(AxumState(node.clone()), Json(request)).await,
+                }
+                .unwrap_err();
+                assert_eq!(error.0, StatusCode::BAD_REQUEST);
+                assert_eq!(
+                    error.1.error,
+                    format!("Invalid sharded generation context: {expected_error}")
+                );
+                assert_eq!(node.inference_request_counter.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_format_partial_model_fallback_uses_once_wrapped_cache_key_and_lowered_limit() {
+        use arc_inference::distributed::{CacheEntry, DistributedCache};
+        let node = chat_format_node(false, 0, false);
+        let mut holder = shard("fixture", "192.0.2.1:9090", 0, 1);
+        holder.total_layers = 1;
+        holder.node_name = format!("0x{}", Hash256([7; 32]).to_hex());
+        holder.model_id = format!("0x{}", LLAMA2_CHAT_ARTIFACT_ID.to_hex());
+        node.shard_registry
+            .insert("fixture".into(), (holder, Instant::now()));
+        let model = node.inference_model.as_ref().unwrap();
+        let mut tokens = vec![model.config.bos_token];
+        tokens.extend(model.encode("[INST] 1 [/INST]"));
+        tokens.push(11);
+        let cache_model =
+            profile_bound_cache_model_id(LLAMA2_CHAT_ARTIFACT_ID, &canonical_profile());
+        let key = DistributedCache::cache_key(&cache_model, &tokens);
+        node.inference_cache.insert(
+            key,
+            CacheEntry {
+                output_tokens: vec![1],
+                output_hash: Hash256::ZERO,
+                model_id: cache_model,
+                hit_count: 0,
+                created_at_secs: 0,
+            },
+        );
+        // A wrong wrap or token limit misses this exact key. No validator is
+        // involved: the handler must answer entirely from the seeded cache.
+        let Json(response) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            inference_run(
+                AxumState(node.clone()),
+                Some(Json(chat_format_request("1", 16, Some(true)))),
+            ),
+        )
+        .await
+        .expect("cached fallback must not perform network work")
+        .unwrap();
+        assert_eq!(response["routed_via"], "sharded_seed_pipeline");
+        assert_eq!(response["cache"]["hit"], true);
+        assert_eq!(response["cache"]["key"], format!("0x{}", key.to_hex()));
+        assert_eq!(response["requested_max_tokens"], 16);
+        assert_eq!(response["effective_max_tokens"], 11);
+    }
+
+    #[tokio::test]
+    async fn chat_format_no_tokenizer_and_public_demo_skip_the_deadline_override() {
+        let mut no_tokenizer = chat_format_node(false, 0, false);
+        no_tokenizer.inference_model = None;
+        let Json(response) = inference_run(
+            AxumState(no_tokenizer),
+            Some(Json(chat_format_request("1", 1, Some(true)))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["routed_via"], "none");
+        assert!(response.get("effective_max_tokens").is_none());
+        let node = chat_format_node(false, 0, false);
+        let mut demo = chat_format_request("1", 1, Some(true));
+        demo["public_demo"] = json!(true);
+        let error = inference_run(AxumState(node), Some(Json(demo)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.1.error.contains("public demo is not enabled"));
     }
 
     fn test_inference_model() -> Arc<arc_inference::cached_integer_model::CachedIntegerModel> {
