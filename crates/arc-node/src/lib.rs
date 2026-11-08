@@ -6,6 +6,7 @@ pub mod build_identity;
 pub mod chunk_cache;
 pub mod coalesce;
 pub mod community_worker;
+pub mod memory_guard;
 // Offline qualification tools reuse the node's validated genesis/identity
 // parsing instead of maintaining another interpretation of chain identity.
 pub mod config;
