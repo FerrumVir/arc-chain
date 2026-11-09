@@ -18,6 +18,20 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.19 - Unreleased
+
+- Validators can check committed output tokens in one pipelined pass, with the
+  same authenticated shard quorums and repetition penalty as sequential
+  generation. Unsuccessful checks fall back to sequential verification.
+- Workers send exact output tokens only when the coordinator advertises support.
+  Verified tokens can also accelerate capable reward approvers without changing
+  stored settlement journals or reward signatures.
+- Coordinators probe committee identities before starting ordinary reward
+  approval rounds and defer rounds that cannot reach five distinct validators.
+  Recovery probes retain their existing scheduling.
+- Increase shard queue headroom for overlapping verification passes while
+  keeping the compute concurrency limit unchanged.
+
 ## v0.8.18 - Release-preparation snapshot (2026-11-08)
 
 > **Candidate note:** This entry records the v0.8.18 release-preparation

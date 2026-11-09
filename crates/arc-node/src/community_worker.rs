@@ -710,3 +710,79 @@ mod tests {
         assert!(!guard.is_active());
     }
 }
+
+/// Build the immutable success claim from the exact generated tokens. Older
+/// coordinators reject unknown fields, so the claim response negotiates tokens.
+pub fn successful_work_result(
+    claim: &serde_json::Value,
+    job_id: String,
+    worker: arc_crypto::Hash256,
+    generated: Vec<u32>,
+    output: String,
+    total_ms: u64,
+    signed_attestation_hex: Option<String>,
+) -> crate::rpc::WorkResult {
+    let bytes: Vec<u8> = generated
+        .iter()
+        .flat_map(|token| token.to_le_bytes())
+        .collect();
+    let tokens_generated = generated.len() as u64;
+    crate::rpc::WorkResult {
+        job_id,
+        worker_id: format!("0x{}", worker.to_hex()),
+        success: true,
+        declined: false,
+        output,
+        output_hash: format!("0x{}", arc_crypto::hash_bytes(&bytes).to_hex()),
+        tokens_generated,
+        total_ms,
+        ms_per_token: total_ms.checked_div(tokens_generated).unwrap_or(0),
+        engine: arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+        error: None,
+        signed_attestation_hex,
+        output_tokens: (claim
+            .get("accepts_output_tokens")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true))
+        .then_some(generated),
+    }
+}
+
+#[cfg(test)]
+mod token_claim_tests {
+    use super::*;
+    #[test]
+    fn success_tokens_are_negotiated_and_hash_the_exact_list() {
+        for capable in [false, true] {
+            let claim = if capable {
+                serde_json::json!({"accepts_output_tokens": true})
+            } else {
+                serde_json::json!({"job_id": "old"})
+            };
+            let result = successful_work_result(
+                &claim,
+                "job".into(),
+                arc_crypto::Hash256::ZERO,
+                vec![1, 257, 2],
+                "text".into(),
+                12,
+                None,
+            );
+            assert_eq!(result.output_tokens, capable.then_some(vec![1, 257, 2]));
+            assert_eq!(
+                result.output_hash,
+                format!(
+                    "0x{}",
+                    arc_crypto::hash_bytes(&[1, 0, 0, 0, 1, 1, 0, 0, 2, 0, 0, 0]).to_hex()
+                )
+            );
+            assert_eq!(
+                serde_json::to_value(&result)
+                    .unwrap()
+                    .get("output_tokens")
+                    .is_some(),
+                capable
+            );
+        }
+    }
+}
