@@ -18,28 +18,31 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
-## v0.8.19 - Unreleased
+## v0.8.19 - Release-preparation snapshot (2026-11-10)
+
+> **Candidate note:** This entry records the v0.8.19 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.19.
 
 - Coordinators prefer the fastest waiting worker using their own accepted-result
   timing per model position. New workers get a bounded share of assignments;
-  a preferred worker can hold a queued job for at most 1.5 seconds.
+  a preferred worker can hold a queued job for at most 1.5 seconds (#243).
 - A quickly declined job can be retried once on another waiting worker when
-  the dispatch budget allows it. This needs no worker update.
+  the dispatch budget allows it. This needs no worker update (#243).
 - Validators can check committed output tokens in one pipelined pass, with the
   same authenticated shard quorums and repetition penalty as sequential
-  generation. Unsuccessful checks fall back to sequential verification.
+  generation. Unsuccessful checks fall back to sequential verification (#244).
 - Workers send exact output tokens only when the coordinator advertises support.
   Verified tokens can also accelerate capable reward approvers without changing
-  stored settlement journals or reward signatures.
+  stored settlement journals or reward signatures (#244).
 - Coordinators probe committee identities before starting ordinary reward
   approval rounds and defer rounds that cannot reach five distinct validators.
-  Recovery probes retain their existing scheduling.
+  Recovery probes retain their existing scheduling (#244).
 - Increase shard queue headroom for overlapping verification passes while
-  keeping the compute concurrency limit unchanged.
+  keeping the compute concurrency limit unchanged (#244).
 - The community worker processes the prompt in batches (same tokens and hash).
-  `POST /node/threads` now answers only direct calls from the same machine.
+  `POST /node/threads` now answers only direct calls from the same machine (#245).
 - RPC reward, attestation and receipt queries no longer hold a transaction-map
-  lock while reading published block state.
+  lock while reading published block state (#247).
 
 Desktop app:
 
@@ -49,28 +52,28 @@ Desktop app:
   for the next launch or a click. It resumes from the bytes already saved. It
   stops once the computer is contributing, compute is turned off, the
   computer has less than 16 GB of memory, or the disk lacks room for the rest
-  of the download.
+  of the download (#242).
 - These background retries download only on mains power, and not on a
   network the system reports as metered (read on Linux through
   NetworkManager; Windows and macOS are treated as unmetered for now). A
-  download you start yourself is never held back.
+  download you start yourself is never held back (#242).
 - A contributing computer whose model file went missing or became unreadable
-  now downloads it again by itself, at launch and in the background.
+  now downloads it again by itself, at launch and in the background (#242).
 - Only one setup attempt runs at a time. A click while a background attempt
-  is running waits for that attempt and shows its result.
+  is running waits for that attempt and shows its result (#242).
 - Updates arrive sooner: the app checks every 6 hours, when its window is
   shown or focused, and after the computer wakes, with at most one such
   check every 15 minutes. These checks are timed from the native app, so a
-  window hidden in the tray still runs them.
+  window hidden in the tray still runs them (#242).
 - An automatic update that is waiting for an AI job to finish now tries again
   every hour for as long as the job keeps it waiting, instead of giving up
-  after three tries.
+  after three tries (#242).
 - The one-time "Share your computer's spare power" question is now asked
   only once the window is visible. A launch that starts hidden in the tray
-  at login no longer uses it up without anyone seeing it.
+  at login no longer uses it up without anyone seeing it (#242).
 - Verified work whose reward is waiting for validator approval now reads
   "Verified. Reward pending validator approval." instead of saying no ARC
-  reward can be confirmed.
+  reward can be confirmed (#242).
 
 ## v0.8.18 - Release-preparation snapshot (2026-11-08)
 
