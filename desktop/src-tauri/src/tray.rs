@@ -52,6 +52,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                     let _ = win.show();
                     let _ = win.set_focus();
                     let _ = win.unminimize();
+                    crate::wake::emit_signal(app, crate::wake::SignalReason::Shown);
                 }
             }
             "quit" => {
@@ -85,6 +86,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                     let _ = win.show();
                     let _ = win.set_focus();
                     let _ = win.unminimize();
+                    crate::wake::emit_signal(app, crate::wake::SignalReason::Shown);
                 }
             }
         })
