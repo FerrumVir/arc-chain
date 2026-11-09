@@ -769,7 +769,7 @@ def synthetic_update_inputs(stakes=(11, 10, 10, 10, 10, 10), offline_count=2):
     sites = ("aaa", "bbb", "ccc", "ddd", "eee", "fff")
     total = sum(stakes)
     config = {"schema": validator.HOST_SCHEMA, "total_stake": total,
-              "quorum_stake": (2 * total + 2) // 3, "validator_set_id": 1,
+              "quorum_stake": 1 if total == 0 else total - (total - 1) // 3, "validator_set_id": 1,
               "genesis_file_sha256": "1" * 64, "genesis_network_hash": "2" * 64,
               "recovery_domain": "3" * 64, "checkpoint_manifest_hash": "4" * 64}
     all_hosts = []
@@ -1030,19 +1030,52 @@ class TwoDeclaredOfflineTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("two distinct three-letter sites", result.stdout)
 
-    def test_existing_ceiling_matches_node_rule_except_totals_divisible_by_three(self):
-        # arc-consensus uses arc_types::strict_supermajority_threshold: floor(2T/3)+1.
-        # The tooling's preserved ceil(2T/3) is one lower for totals divisible by 3.
-        for total in (*range(1, 1001), 2**64 - 2, 2**64 - 1):
+    def test_threshold_equals_node_rule_through_u64_max(self):
+        # Exact rule in crates/arc-types/src/lib.rs; cover every power-of-two
+        # boundary and its neighbours, including floating-point precision limits.
+        totals = set(range(10_001))
+        totals.update(2**bits + offset for bits in range(1, 65) for offset in (-1, 0, 1)
+                      if 0 <= 2**bits + offset <= 2**64 - 1)
+        totals.update((2**64 - 3, 2**64 - 2, 2**64 - 1))
+        for total in sorted(totals):
             with self.subTest(total=total):
-                tooling = (2 * total + 2) // 3
-                node = total - (total - 1) // 3
+                node = 1 if total == 0 else total - (total - 1) // 3
+                self.assertEqual(validator.strict_supermajority_threshold(total), node)
                 self.assertEqual(node, (2 * total) // 3 + 1)
-                self.assertEqual(node - tooling, int(total % 3 == 0))
                 if total >= 6:
                     config, _ = synthetic_update_inputs((total - 5, 1, 1, 1, 1, 1), offline_count=0)
                     _, checked_total, checked_quorum = validator.validate_host_config(config)
-                    self.assertEqual((checked_total, checked_quorum), (total, tooling))
+                    self.assertEqual((checked_total, checked_quorum), (total, node))
+        config, _ = synthetic_update_inputs((0, 0, 0, 0, 0, 0), offline_count=0)
+        with self.assertRaisesRegex(validator.GateError, "invalid total validator stake"):
+            validator.validate_host_config(config)
+
+    def test_exactly_two_thirds_live_stake_is_refused(self):
+        config, proof = synthetic_update_inputs((10, 10, 10, 10, 10, 10))
+        self.assertEqual(config["total_stake"], 60)
+        self.assertEqual(config["quorum_stake"], 41)
+        self.assertEqual(sum(host["stake"] for host in config["hosts"]), 40)
+        with self.assertRaisesRegex(validator.GateError, "cannot meet the stake quorum"):
+            check_quorum(config, proof)
+        with self.assertRaisesRegex(RuntimeError, "cannot meet the stake quorum"):
+            assembler_proof(config, proof, sites=("eee", "fff"))
+        # Supplying the old rounded-up threshold cannot authorize the update.
+        config["quorum_stake"] = proof["quorum_stake"] = 40
+        with self.assertRaisesRegex(validator.GateError, "strict supermajority threshold"):
+            check_quorum(config, proof)
+        with self.assertRaisesRegex(RuntimeError, "strict supermajority threshold"):
+            assembler_proof(config, proof, sites=("eee", "fff"))
+
+    def test_divisible_total_at_strict_threshold_passes(self):
+        config, proof = synthetic_update_inputs((11, 10, 10, 10, 10, 9))
+        self.assertEqual(config["total_stake"], 60)
+        summary = check_quorum(config, proof)
+        self.assertEqual(summary["online_stake"], 41)
+        self.assertEqual(summary["online_stake"], summary["quorum_stake"])
+        self.assertTrue(summary["zero_margin"])
+        assembled, _ = assembler_proof(config, proof, sites=("eee", "fff"))
+        self.assertEqual(assembled["online_stake"], assembled["quorum_stake"])
+
 
 
 if __name__ == "__main__":

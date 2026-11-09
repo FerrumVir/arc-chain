@@ -90,15 +90,18 @@ def validate_declared_offline_rows(config: dict, live: dict[str, dict]) -> dict[
     return declared
 
 
+def strict_supermajority_threshold(total_stake: int) -> int:
+    """Match arc_types::strict_supermajority_threshold, including zero power."""
+    return 1 if total_stake == 0 else total_stake - (total_stake - 1) // 3
+
+
 def validate_host_config(config: dict) -> tuple[dict[str, dict], int, int]:
     require(config.get("schema") == HOST_SCHEMA, "unsupported host config schema")
     total_stake = config.get("total_stake")
     quorum_stake = config.get("quorum_stake")
     require(type(total_stake) is int and total_stake > 0, "invalid total validator stake")
-    # This existing ceiling equals strict_supermajority_threshold only when the
-    # total is not divisible by three; see the threshold regression test.
-    require(type(quorum_stake) is int and quorum_stake == (2 * total_stake + 2) // 3,
-            "quorum stake must be the integer two-thirds threshold")
+    require(type(quorum_stake) is int and quorum_stake == strict_supermajority_threshold(total_stake),
+            "quorum stake must be the strict supermajority threshold")
     hosts = config.get("hosts")
     quorum_sites = config.get("quorum_sites")
     unobserved_stake = config.get("unobserved_stake", 0)
