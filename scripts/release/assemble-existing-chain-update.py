@@ -25,9 +25,10 @@ COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 TAG = re.compile(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
 PLATFORMS = ("linux-x86_64", "linux-arm64", "macos-arm64", "macos-x86_64", "windows-x86_64")
 # The recovered chain's signed validator set. Every one of them is either a live,
-# observed host or, for at most one, explicitly declared offline by the owner input.
+# observed host or, for at most two, explicitly declared offline by the owner input.
 VALIDATOR_COUNT = 6
-MAX_DECLARED_OFFLINE = 1
+MAX_DECLARED_OFFLINE = 2
+ZERO_MARGIN_WARNING = "Zero margin: if any one live validator fails to restart, blocks stop until it is fixed."
 SIX_HOST_PROOF_KEY = "fresh_six_host_proof"
 LIVE_HOST_PROOF_KEY = "fresh_live_host_proof"
 SIX_HOST_PROOF_SCOPE = ("owner-attested six-host advancing proof at owner_observed_at_unix; independently "
@@ -92,7 +93,9 @@ def declared_offline_rows(config: dict) -> list[dict]:
          all(isinstance(row, dict) and isinstance(row.get("site"), str) and
              isinstance(row.get("validator"), str) and SHA.fullmatch(row["validator"]) is not None and
              type(row.get("stake")) is int and row["stake"] > 0 for row in rows),
-         "declared-offline validators are malformed, or more than one is declared")
+         "declared-offline validators are malformed, or more than two are declared")
+    need(rows == sorted(rows, key=lambda row: row["site"]),
+         "declared-offline validators must be sorted by site")
     return rows
 
 
@@ -122,9 +125,9 @@ def strict_proof(proof_path: Path, config_path: Path, validator_path: Path,
         **({"declared_offline": declared} if declared else {}))
     need(len(declared) <= MAX_DECLARED_OFFLINE and len(hosts) + len(declared) == VALIDATOR_COUNT and
          len(proof.get("common_block", {}).get("hosts", [])) == len(hosts),
-         "update readiness requires all six validators live, or five live and one declared offline")
+         "update readiness requires all six validators live or explicitly declared offline, with at most two offline")
     need(total - sum(row["stake"] for row in declared.values()) >= quorum,
-         "live stake without the declared-offline validator is below the quorum")
+         "live stake without the declared-offline validators is below the quorum")
     for sample in proof["samples"]:
         for row in sample["nodes"]:
             need(row["binary_sha256"] == expected_binary_sha256,
@@ -315,7 +318,7 @@ def validate_certificate_authority(checkpoint: dict, hosts: dict[str, dict], con
     declared_authority = declared_offline_authority(config)
     need(len(live_authority) == len(hosts) and not set(live_authority) & set(declared_authority),
          "a validator identity is pinned twice, or both live and declared offline")
-    # Every signed validator is pinned exactly once: as a live host, or as the one
+    # Every signed validator is pinned exactly once: as a live host, or as a
     # validator the owner input declares offline. Nothing is dropped or added.
     need(certificate_authority == {**live_authority, **declared_authority},
          "verified checkpoint certificate authority differs from the live and declared-offline validator pins")
@@ -398,11 +401,13 @@ def assemble(args: argparse.Namespace) -> dict:
             declared_offline_sites=getattr(args, "declared_offline", None) or ())
         need(checked_config == config, "host config changed during qualification")
     proof_summary["rpc_genesis_network_hash"] = config["genesis_network_hash"]
-    # A six-host update keeps today's exact shape. Only an update that the owner input
-    # explicitly runs without one validator names it and labels its proof as live-host.
-    declared = config.get("declared_offline", [])
+    # Only an update with explicit declarations names the offline validators and
+    # labels its proof as live-host. Rows use the same site order as the host config.
+    declared = declared_offline_rows(config)
     observation = ({"declared_offline_validators": declared, LIVE_HOST_PROOF_KEY: proof_summary}
                    if declared else {SIX_HOST_PROOF_KEY: proof_summary})
+    if proof_summary["zero_margin"]:
+        observation["warnings"] = [ZERO_MARGIN_WARNING]
     return {"schema": SCHEMA, "claim": {"existing_recovered_chain_update": True,
         "original_cutover_ceremony_verified": False, "original_cutover_archive_present": False,
         "validator_retirement_authorized": False},
@@ -496,8 +501,8 @@ def main() -> int:
     p.add_argument("--artifact-platform", choices=PLATFORMS, required=True,
                    help="deployed candidate platform; every live host must currently run these exact bytes")
     p.add_argument("--declared-offline", action="append", metavar="SITE",
-                   help="confirm the one validator the host config declares offline (unobserved); required "
-                        "exactly when the host config declares one, and refused otherwise")
+                   help="confirm a validator the host config declares offline (unobserved); repeat for up to two; "
+                        "must exactly match the declared sites")
     p.add_argument("--verifier-platform", choices=PLATFORMS, required=True,
                    help="selected platform executable on this qualification host")
     p.add_argument("--checkpoint", type=Path, required=True); p.add_argument("--recovery-epoch", type=int, required=True)
@@ -523,6 +528,8 @@ def main() -> int:
         dfd = os.open(args.output.parent, os.O_RDONLY | os.O_DIRECTORY)
         try: os.fsync(dfd)
         finally: os.close(dfd)
+        for warning in value.get("warnings", []):
+            print(warning, file=sys.stderr)
         print(json.dumps(report, sort_keys=True))
         return 0
     except (ProfileError, OSError, ValueError, KeyError) as e:
