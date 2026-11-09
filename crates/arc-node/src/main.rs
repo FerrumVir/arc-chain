@@ -5585,6 +5585,7 @@ async fn decline_community_assignment(
         return;
     };
     let decline = rpc::WorkResult {
+        output_tokens: None,
         job_id: job_id.clone(),
         worker_id,
         success: false,
@@ -9816,6 +9817,7 @@ async fn run_arc_node() -> Result<()> {
                                 "declining malformed community assignment"
                             );
                             let failure = rpc::WorkResult {
+                                output_tokens: None,
                                 job_id: job_id.clone(),
                                 worker_id: worker_id_w.clone(),
                                 success: false,
@@ -9897,6 +9899,7 @@ async fn run_arc_node() -> Result<()> {
                                 "declining community assignment before blocking compute"
                             );
                             let failure = rpc::WorkResult {
+                                output_tokens: None,
                                 job_id: job_id.clone(),
                                 worker_id: worker_id_w.clone(),
                                 success: false,
@@ -9974,6 +9977,7 @@ async fn run_arc_node() -> Result<()> {
                                     "community inference worker task failed"
                                 );
                                 let failure = rpc::WorkResult {
+                                    output_tokens: None,
                                     job_id: job_id.clone(),
                                     worker_id: worker_id_w.clone(),
                                     success: false,
@@ -10006,6 +10010,7 @@ async fn run_arc_node() -> Result<()> {
                                     "community inference worker blocking task aborted"
                                 );
                                 let failure = rpc::WorkResult {
+                                    output_tokens: None,
                                     job_id: job_id.clone(),
                                     worker_id: worker_id_w.clone(),
                                     success: false,
@@ -10110,21 +10115,10 @@ async fn run_arc_node() -> Result<()> {
                             }
                         };
 
-                        let result_body = rpc::WorkResult {
-                            job_id: job_id.clone(),
-                            worker_id: format!("0x{}", hex::encode(worker_address.0)),
-                            success: true,
-                            declined: false,
-                            output: output_text,
-                            output_hash: format!("0x{}", hex::encode(hash.0)),
-                            tokens_generated: tokens_gen,
-                            total_ms: elapsed_ms,
-                            ms_per_token: ms_per_tok,
-                            engine: arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE
-                                .to_string(),
-                            error: None,
-                            signed_attestation_hex,
-                        };
+                        let result_body = arc_node::community_worker::successful_work_result(
+                            &job, job_id.clone(), worker_address, generated, output_text,
+                            elapsed_ms, signed_attestation_hex,
+                        );
 
                         let submit_outcome = submit_community_result_with_retry(
                             &client,

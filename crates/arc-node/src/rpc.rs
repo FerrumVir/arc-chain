@@ -23,8 +23,10 @@ use std::time::{Duration, Instant};
 use tower_http::cors::CorsLayer;
 
 mod community_routing;
+mod teacher_forced;
 /// Twin execution v0 orchestration (coordinator-side, off by default).
 mod twin_dispatch;
+use teacher_forced::try_teacher_forced_community_output;
 
 /// Exact transport for the primary ARC HTTP API. Production validators use a
 /// Unix socket so a crashed origin cannot be replaced by a local TCP binder.
@@ -181,7 +183,15 @@ const PUBLIC_INFERENCE_CONCURRENCY: usize = 2;
 // pool.  The separate approval semaphore below keeps whole recomputations
 // bounded; this reserve is the width of one production replica set.
 const VALIDATOR_SHARD_CONCURRENCY: usize = 3;
-const VALIDATOR_SHARD_QUEUE_CAP: usize = 12;
+// Six checks x three held ranges = 18 outstanding requests. Reserve another
+// 18 for public sharded/consensus work, two coordinator jobs, a twin check,
+// and background approval retries. Compute stays at three; sibling ranges
+// can occupy permits while waiting for the same request's KV mutex.
+// A check uses one KV cache per holder, not per range. Six checks plus two
+// public jobs, two coordinator jobs, a twin and a retry use 12 of 32 caches.
+// One signer with one approval plus those local sources uses seven of eight;
+// the fast namespace is cleaned before its sequential fallback starts.
+const VALIDATOR_SHARD_QUEUE_CAP: usize = 36;
 const VALIDATOR_SHARD_QUEUE_TIMEOUT_SECS: u64 = 120;
 const VALIDATOR_SHARD_REQUEST_ID_MAX_BYTES: usize = 128;
 const VALIDATOR_SHARD_KV_CACHE_CAP: usize = 32;
@@ -190,6 +200,8 @@ const VALIDATOR_SHARD_KV_CACHE_TTL_SECS: u64 = 10 * 60;
 const VALIDATOR_RPC_AUDIENCE_TTL_SECS: u64 = 60;
 const COMMUNITY_APPROVAL_RECOMPUTE_CONCURRENCY: usize = 1;
 const COMMUNITY_APPROVAL_QUEUE_CAP: usize = 6;
+// Includes the bounded cleanup barrier, leaving room for a full fallback.
+const COMMUNITY_FAST_VERIFY_TIMEOUT_SECS: u64 = 340;
 const COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS: u64 = 1_500;
 pub const COMMUNITY_SUBMIT_REQUEST_TIMEOUT_SECS: u64 = 2_700;
 pub const PUBLIC_INFERENCE_REQUEST_TIMEOUT_SECS: u64 = 4_000;
@@ -14646,6 +14658,8 @@ struct CommunityRewardSubmission {
 
 #[derive(Debug, Clone)]
 struct VerifiedCommunitySettlement {
+    // Never serialized: the retained payload and journal keep the old shape.
+    output_tokens: Option<Vec<u32>>,
     payload: CommunityRewardApprovalPayload,
     verified_at_unix_ms: u64,
     attempts: u32,
@@ -14659,6 +14673,8 @@ struct VerifiedCommunitySettlement {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommunityRewardApprovalPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_tokens: Option<Vec<u32>>,
     coordinator_id: String,
     reward: arc_types::transaction::CommunityInferenceRewardBody,
     input: String,
@@ -14851,6 +14867,9 @@ impl Drop for ActiveCommunityJobReservation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkResult {
+    /// Optional exact token claim, negotiated by the claim response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<Vec<u32>>,
     /// Must match the WorkItem.job_id.
     pub job_id: String,
     /// Worker's self-chosen identifier (hex of validator pubkey).
@@ -14904,6 +14923,7 @@ impl CommunityAuthenticatedPayload for WorkResult {
 
 #[derive(Debug, Clone)]
 struct CommunityResultVerification {
+    accepted_tokens: Vec<u32>,
     output_hash: Hash256,
     tokens_generated: usize,
     range_count: usize,
@@ -15257,7 +15277,10 @@ async fn verify_community_result_with_quorum(
 ) -> Result<CommunityResultVerification, CommunityResultVerificationError> {
     validate_community_reward_profile_for_job(node, work_item, result)
         .map_err(CommunityResultVerificationError::Invalid)?;
-    let recomputed = recompute_community_output_with_quorum(node, work_item).await?;
+    let recomputed = match try_teacher_forced_community_output(node, work_item, result).await {
+        Some(verified) => verified,
+        None => recompute_community_output_with_quorum(node, work_item).await?,
+    };
     let output_hash = compare_community_result_with_tokens(
         result,
         &recomputed.generated,
@@ -15266,6 +15289,7 @@ async fn verify_community_result_with_quorum(
     .map_err(CommunityResultVerificationError::Invalid)?;
 
     Ok(CommunityResultVerification {
+        accepted_tokens: recomputed.generated.clone(),
         output_hash,
         tokens_generated: recomputed.generated.len(),
         range_count: recomputed.range_count,
@@ -15731,6 +15755,7 @@ fn validate_reward_approval_payload(
         expires_at_unix_ms: u64::MAX,
     };
     let result = WorkResult {
+        output_tokens: payload.output_tokens.clone(),
         job_id: work_item.job_id.clone(),
         worker_id: format!("0x{}", payload.reward.worker.to_hex()),
         success: true,
@@ -15987,6 +16012,108 @@ fn validate_collected_reward_approvals(
     Ok(approvals)
 }
 
+#[derive(Clone)]
+struct RewardApprovalAudience {
+    seed: String,
+    target: Hash256,
+    transaction_domain: Option<Hash256>,
+    accepts_output_tokens: bool,
+}
+
+async fn probe_reward_approval_audience(
+    client: reqwest::Client,
+    seed: String,
+) -> Result<RewardApprovalAudience, String> {
+    let info = client
+        .get(format!("{seed}/network/info"))
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json::<Value>()
+        .await
+        .map_err(|e| e.to_string())?;
+    let target = info
+        .get("validator_address")
+        .and_then(Value::as_str)
+        .ok_or("validator approval audience omitted address")
+        .and_then(|value| {
+            parse_hash256_hex(value, "validator_address").map_err(|_| "malformed validator address")
+        })?;
+    let transaction_domain = match info.get("transaction_domain") {
+        Some(Value::String(value)) => Some(parse_hash256_hex(value, "transaction_domain")?),
+        Some(Value::Null) | None => None,
+        Some(_) => return Err("validator transaction_domain is malformed".into()),
+    };
+    Ok(RewardApprovalAudience {
+        seed,
+        target,
+        transaction_domain,
+        accepts_output_tokens: info
+            .get("community_approval_output_tokens")
+            .and_then(Value::as_bool)
+            == Some(true),
+    })
+}
+
+async fn post_remote_reward_approval(
+    client: reqwest::Client,
+    audience: RewardApprovalAudience,
+    mut payload: CommunityRewardApprovalPayload,
+    output_tokens: Option<Vec<u32>>,
+    coordinator_key: Arc<arc_crypto::KeyPair>,
+) -> Result<Option<arc_types::transaction::CommunityRewardValidatorApproval>, String> {
+    payload.output_tokens = if audience.accepts_output_tokens {
+        output_tokens
+    } else {
+        None
+    };
+    // Both attempts share one approval timeout. A compatibility retry signs
+    // the changed payload again, including a fresh authentication nonce.
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS);
+    for attempt in 0..2 {
+        let signed = sign_community_request(
+            COMMUNITY_REWARD_APPROVE_PATH,
+            payload.clone(),
+            &coordinator_key,
+            audience.target,
+            audience.transaction_domain,
+        )?;
+        let response = client
+            .post(format!(
+                "{}{}",
+                audience.seed, COMMUNITY_REWARD_APPROVE_PATH
+            ))
+            .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .json(&signed)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = response.status();
+        if status.is_success() {
+            return response.json().await.map(Some).map_err(|e| e.to_string());
+        }
+        if attempt == 0
+            && status == StatusCode::UNPROCESSABLE_ENTITY
+            && payload.output_tokens.is_some()
+        {
+            let body = response.text().await.map_err(|e| e.to_string())?;
+            if body.contains("unknown field `output_tokens`")
+                || body.contains("unknown field \"output_tokens\"")
+            {
+                payload.output_tokens = None;
+                continue;
+            }
+        }
+        return Err(format!("validator returned HTTP {status}"));
+    }
+    Err("approval compatibility retry exhausted".into())
+}
+
+// Kept for recovery probes, which retain their original probe/POST scheduling.
 async fn request_remote_reward_approval(
     client: reqwest::Client,
     seed: String,
@@ -15994,113 +16121,102 @@ async fn request_remote_reward_approval(
     coordinator_key: Arc<arc_crypto::KeyPair>,
     coordinator: Hash256,
 ) -> Result<Option<arc_types::transaction::CommunityRewardValidatorApproval>, String> {
-    let info = client
-        .get(format!("{seed}/network/info"))
-        .timeout(std::time::Duration::from_secs(8))
-        .send()
-        .await
-        .map_err(|error| format!("fetch validator approval audience: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("validator approval audience rejected: {error}"))?
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("decode validator approval audience: {error}"))?;
-    let target = info
-        .get("validator_address")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "validator approval audience omitted address".to_string())
-        .and_then(|value| parse_hash256_hex(value, "validator_address"))?;
-    // The configured production list contains all six origins, including the
-    // local coordinator.  Its vote was already produced from the coordinator's
-    // independent verification, so a second HTTP recomputation adds load but
-    // can never add a distinct approval identity.
-    if target == coordinator {
+    let audience = probe_reward_approval_audience(client.clone(), seed).await?;
+    if audience.target == coordinator {
         return Ok(None);
     }
-    let transaction_domain = match info.get("transaction_domain") {
-        Some(Value::String(value)) => Some(parse_hash256_hex(value, "transaction_domain")?),
-        Some(Value::Null) | None => None,
-        Some(_) => return Err("validator transaction_domain is malformed".to_string()),
-    };
-    let signed = sign_community_request(
-        COMMUNITY_REWARD_APPROVE_PATH,
-        payload,
-        &coordinator_key,
-        target,
-        transaction_domain,
-    )?;
-    let response = client
-        .post(format!("{seed}{COMMUNITY_REWARD_APPROVE_PATH}"))
-        .timeout(std::time::Duration::from_secs(
-            COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS,
-        ))
-        .json(&signed)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-    if !response.status().is_success() {
-        return Err(format!("validator returned HTTP {}", response.status()));
-    }
-    response
-        .json::<arc_types::transaction::CommunityRewardValidatorApproval>()
-        .await
-        .map(Some)
-        .map_err(|error| error.to_string())
+    post_remote_reward_approval(client, audience, payload, None, coordinator_key).await
 }
 
 async fn collect_community_reward_approvals(
     node: &NodeState,
     payload: CommunityRewardApprovalPayload,
+    output_tokens: Option<Vec<u32>>,
 ) -> Result<Vec<arc_types::transaction::CommunityRewardValidatorApproval>, String> {
+    use arc_types::transaction::{
+        COMMUNITY_REWARD_APPROVALS_REQUIRED, CommunityInferenceRewardBody,
+    };
     let coordinator_key = node
         .validator_keypair
         .as_ref()
-        .ok_or_else(|| "coordinator validator key is unavailable".to_string())?;
-    // The coordinator completed `verify_community_result_with_quorum`
-    // immediately before entering this private collector. Revalidate every
-    // signed semantic here, then reuse that independent computation for its
-    // one local vote. Remote validators still execute the full recomputation
-    // endpoint in parallel; rerunning the coordinator a second time would add
-    // latency without adding an independent identity.
+        .ok_or("coordinator validator key is unavailable")?;
     validate_reward_approval_payload(node, &payload)?;
-    let local = sign_validated_reward_approval(node, &payload.reward)?;
-    let mut approvals = vec![local];
+    let mut approvals = vec![sign_validated_reward_approval(node, &payload.reward)?];
     let mut requests = tokio::task::JoinSet::new();
-    // Start every configured committee origin immediately. Production has six
-    // origins (one resolves to the already-counted local identity, five are
-    // remote); staging may omit the local origin and provide exactly five.
-    // The previous width-two pump made the fourth remote recomputation wait
-    // for two complete model passes before it was even launched.
+    let mut probes = tokio::task::JoinSet::new();
+    let recovery = CommunityInferenceRewardBody::is_recovery_probe_assignment(
+        &payload.reward.assignment_epoch,
+    );
     for seed in node.community_rpc_bases.iter().cloned() {
         let client = node.inference_http.clone();
-        let request_payload = payload.clone();
-        let coordinator_key = coordinator_key.clone();
-        let coordinator = node.validator_address;
-        requests.spawn(async move {
-            request_remote_reward_approval(
+        if recovery {
+            requests.spawn(request_remote_reward_approval(
                 client,
                 seed,
-                request_payload,
-                coordinator_key,
-                coordinator,
-            )
-            .await
-        });
+                payload.clone(),
+                coordinator_key.clone(),
+                node.validator_address,
+            ));
+        } else {
+            probes.spawn(probe_reward_approval_audience(client, seed));
+        }
     }
-    while let Some(joined) = requests.join_next().await {
-        if let Ok(Ok(Some(approval))) = joined {
-            approvals.push(approval);
-            if let Ok(collected) =
-                validate_collected_reward_approvals(node, &payload.reward, approvals.clone())
-            {
-                // Ordinary work returns on any valid quorum. Recovery work
-                // returns only once its deterministic address-sorted quorum
-                // is present, so an excluded slow sixth validator cannot add
-                // latency or change the resulting transaction bytes.
-                cancel_and_drain_join_set(&mut requests).await;
-                return Ok(collected);
+    let active: HashSet<_> = node
+        .state
+        .active_validators()
+        .into_iter()
+        .map(|(address, _)| address)
+        .collect();
+    let mut reachable = HashSet::from([node.validator_address]);
+    let mut waiting = Vec::new();
+    let mut started = recovery;
+    while !probes.is_empty() || !requests.is_empty() {
+        tokio::select! {
+            joined = probes.join_next(), if !probes.is_empty() => {
+                match joined.unwrap() {
+                    Ok(Ok(audience)) => {
+                        if audience.target != node.validator_address {
+                            if active.contains(&audience.target) { reachable.insert(audience.target); }
+                            waiting.push(audience);
+                        }
+                    }
+                    Ok(Err(error)) => tracing::debug!(%error, "approval audience unavailable"),
+                    Err(error) => {
+                        // A local task failure is not proof that the remote is
+                        // unreachable. Preserve the old behavior on doubt.
+                        tracing::warn!(%error, "approval probe task failed; attempting approval round");
+                        started = true;
+                    }
+                }
+                started |= reachable.len() >= COMMUNITY_REWARD_APPROVALS_REQUIRED;
+                if started {
+                    for audience in waiting.drain(..) {
+                        requests.spawn(post_remote_reward_approval(node.inference_http.clone(), audience, payload.clone(), output_tokens.clone(), coordinator_key.clone()));
+                    }
+                }
+            }
+            joined = requests.join_next(), if !requests.is_empty() => {
+                if let Some(Ok(Ok(Some(approval)))) = joined {
+                    approvals.push(approval);
+                    if let Ok(collected) = validate_collected_reward_approvals(node, &payload.reward, approvals.clone()) {
+                        cancel_and_drain_join_set(&mut probes).await;
+                        cancel_and_drain_join_set(&mut requests).await;
+                        return Ok(collected);
+                    }
+                }
             }
         }
+    }
+    if !started {
+        let count = reachable.len();
+        tracing::info!(
+            reachable = count,
+            required = COMMUNITY_REWARD_APPROVALS_REQUIRED,
+            "skipping unreachable community approval quorum"
+        );
+        return Err(format!(
+            "approval quorum unreachable: {count} distinct active validators reachable, {COMMUNITY_REWARD_APPROVALS_REQUIRED} required"
+        ));
     }
     validate_collected_reward_approvals(node, &payload.reward, approvals)
 }
@@ -16519,6 +16635,7 @@ fn replay_verified_settlement_journal(node: &NodeState) -> Result<Vec<Hash256>, 
         node.community_verified_settlements.insert(
             expected_job,
             VerifiedCommunitySettlement {
+                output_tokens: None,
                 payload: record.payload,
                 verified_at_unix_ms: record.verified_at_unix_ms,
                 attempts: 0,
@@ -16547,8 +16664,9 @@ fn public_settlement_journal_error(job_id: Hash256, error: String) -> String {
 
 fn retain_verified_settlement(
     node: &NodeState,
-    payload: CommunityRewardApprovalPayload,
+    mut payload: CommunityRewardApprovalPayload,
 ) -> Result<(), String> {
+    payload.output_tokens = None;
     let _gate = node.community_verified_settlements_gate.lock();
     let now = now_unix_ms();
     prune_verified_settlements_locked(node)
@@ -16578,6 +16696,7 @@ fn retain_verified_settlement(
     node.community_verified_settlements.insert(
         payload.reward.job_id,
         VerifiedCommunitySettlement {
+            output_tokens: None,
             payload,
             verified_at_unix_ms: now,
             attempts: 0,
@@ -16716,16 +16835,17 @@ async fn attempt_verified_community_reward(
     if let Some(submission) = live_community_reward_submission(node, job_id) {
         return Ok(pending_mined_receipt_value(node, job_id, &submission));
     }
-    let payload = node
+    let (payload, output_tokens) = node
         .community_verified_settlements
         .get(&job_id)
-        .map(|record| record.payload.clone())
+        .map(|record| (record.payload.clone(), record.output_tokens.clone()))
         .ok_or_else(|| "verified settlement retry state is unavailable".to_string())?;
     if let Some(mut record) = node.community_verified_settlements.get_mut(&job_id) {
         record.attempts = record.attempts.saturating_add(1);
     }
 
-    let approvals = collect_community_reward_approvals(node, payload.clone()).await?;
+    let approvals =
+        collect_community_reward_approvals(node, payload.clone(), output_tokens).await?;
     let approval_count = approvals.len();
     let mut reward = payload.reward;
     reward.validator_approvals = approvals;
@@ -16957,6 +17077,7 @@ fn retain_verified_community_reward(
         );
     }
     let payload = CommunityRewardApprovalPayload {
+        output_tokens: None,
         coordinator_id: format!("0x{}", node.validator_address.to_hex()),
         reward,
         input: work_item.input.clone(),
@@ -16965,6 +17086,9 @@ fn retain_verified_community_reward(
         execution_profile: work_item.execution_profile.clone(),
     };
     retain_verified_settlement(node, payload)?;
+    if let Some(mut record) = node.community_verified_settlements.get_mut(&job_id) {
+        record.output_tokens = result.output_tokens.clone();
+    }
     Ok(job_id)
 }
 
@@ -17504,6 +17628,7 @@ pub async fn community_claim_work(
             // JSON. Don't nest under "work".
             let mut body = json!({
                 "status": "work",
+                "accepts_output_tokens": true,
                 "job_id": item.job_id,
                 "input": item.input,
                 "max_tokens": item.max_tokens,
@@ -17589,7 +17714,7 @@ fn unsubmitted_community_reward_settlement(
 
 pub async fn community_submit_work(
     AxumState(node): AxumState<NodeState>,
-    Json(result): Json<WorkResult>,
+    Json(mut result): Json<WorkResult>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // A worker may submit during the coordinator's late-result grace period,
     // after its `/inference/run` dispatch permit has been released. Verification
@@ -17625,6 +17750,7 @@ pub async fn community_submit_work(
     if result.declined
         && (!result.output.is_empty()
             || !result.output_hash.is_empty()
+            || result.output_tokens.is_some()
             || result.tokens_generated != 0
             || result.total_ms != 0
             || result.ms_per_token != 0
@@ -17908,6 +18034,10 @@ pub async fn community_submit_work(
     } else {
         None
     };
+
+    result.output_tokens = verification
+        .as_ref()
+        .map(|verified| verified.accepted_tokens.clone());
 
     // Verification succeeded (or this is an explicit worker failure). Only
     // now atomically consume the pending assignment. Until this point the drop
@@ -19656,6 +19786,7 @@ async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
 
     Json(json!({
         // ── Identity ──────────────────────────────────────────────────────
+        "community_approval_output_tokens": true,
         "network": network,
         "chain_id": chain_id,
         "network_source": if node.chain_identity.is_some() {
@@ -20100,6 +20231,7 @@ fn insert_kernel_report(body: &mut Value, node: &NodeState) {
 #[cfg(test)]
 mod tests {
     include!("rpc/community_routing_tests.rs");
+    include!("rpc/teacher_forced_tests.rs");
     use super::*;
 
     #[cfg(unix)]
@@ -20142,6 +20274,7 @@ mod tests {
     ) -> CommunityRewardApprovalPayload {
         use arc_types::transaction::{CommunityInferenceRewardBody, WorkerInferenceCertificate};
         CommunityRewardApprovalPayload {
+            output_tokens: None,
             coordinator_id: format!("0x{}", Hash256([8; 32]).to_hex()),
             reward: CommunityInferenceRewardBody {
                 chain_domain: CommunityInferenceRewardBody::expected_chain_domain(),
@@ -21056,11 +21189,15 @@ mod tests {
         ));
         assert!(
             COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS
-                >= one_pass + VALIDATOR_SHARD_QUEUE_TIMEOUT_SECS
+                >= COMMUNITY_FAST_VERIFY_TIMEOUT_SECS
+                    + one_pass
+                    + VALIDATOR_SHARD_QUEUE_TIMEOUT_SECS
         );
         assert!(
             COMMUNITY_SUBMIT_REQUEST_TIMEOUT_SECS
-                >= one_pass + COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS
+                >= COMMUNITY_FAST_VERIFY_TIMEOUT_SECS
+                    + one_pass
+                    + COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS
         );
         assert!(
             protocol
@@ -21120,6 +21257,7 @@ mod tests {
 
         let coordinator = arc_crypto::KeyPair::generate_ed25519();
         let payload = CommunityRewardApprovalPayload {
+            output_tokens: None,
             coordinator_id: format!("0x{}", coordinator.address().to_hex()),
             reward: CommunityInferenceRewardBody {
                 chain_domain: CommunityInferenceRewardBody::expected_chain_domain(),
@@ -21196,6 +21334,7 @@ mod tests {
     #[tokio::test]
     async fn community_submit_enforces_reviewed_sixteen_kib_output_cap() {
         let result_with = |output: String| WorkResult {
+            output_tokens: None,
             job_id: "job".to_string(),
             worker_id: format!("0x{}", Hash256([47; 32]).to_hex()),
             success: true,
@@ -21728,6 +21867,7 @@ mod tests {
         assert_eq!(worker_hash, validator_hash);
         let decoded = worker_model.decode(&worker_tokens);
         let mut result = WorkResult {
+            output_tokens: None,
             job_id: "profile-proof".to_string(),
             worker_id: format!("0x{}", worker.address().to_hex()),
             success: true,
@@ -22422,6 +22562,7 @@ mod tests {
             validator_approvals: Vec::new(),
         };
         let payload = CommunityRewardApprovalPayload {
+            output_tokens: None,
             coordinator_id: format!("0x{}", validator_keys[0].address().to_hex()),
             reward: reward.clone(),
             input: input.to_string(),
@@ -23040,6 +23181,7 @@ mod tests {
                 self.coordinator.community_verified_settlements.insert(
                     job_id,
                     VerifiedCommunitySettlement {
+                        output_tokens: None,
                         payload,
                         verified_at_unix_ms: 1,
                         attempts: 0,
@@ -23125,6 +23267,7 @@ mod tests {
                 .sign_in_domain(&self.worker, &self.transaction_domain)
                 .unwrap();
             let result = WorkResult {
+                output_tokens: None,
                 job_id: job_id.clone(),
                 worker_id: self.worker_id.clone(),
                 success: true,
@@ -24370,6 +24513,7 @@ mod tests {
              generator: &arc_inference::cached_integer_model::CachedIntegerModel| {
                 let (tokens, output_hash) = generator.generate(&prompt, max_tokens, &[]);
                 WorkResult {
+                    output_tokens: None,
                     job_id: work_item.job_id.clone(),
                     worker_id: "dual-profile-worker".to_string(),
                     success: true,
@@ -24658,6 +24802,7 @@ mod tests {
             expires_at_unix_ms: u64::MAX,
         };
         let result = |work_item: &WorkItem| WorkResult {
+            output_tokens: None,
             job_id: work_item.job_id.clone(),
             worker_id: "two-replica-worker".to_string(),
             success: true,
@@ -25649,6 +25794,7 @@ mod tests {
         let error = community_submit_work(
             AxumState(node),
             Json(WorkResult {
+                output_tokens: None,
                 job_id: String::new(),
                 worker_id: String::new(),
                 success: false,
@@ -25733,6 +25879,7 @@ mod tests {
         node.community_verified_settlements.insert(
             job_id,
             VerifiedCommunitySettlement {
+                output_tokens: None,
                 payload: payload.clone(),
                 verified_at_unix_ms: 1,
                 attempts: 1,
@@ -25794,6 +25941,7 @@ mod tests {
         }
 
         let pending_result = WorkResult {
+            output_tokens: None,
             job_id: format!("0x{}", job_id.to_hex()),
             worker_id: worker_id.clone(),
             success: true,
@@ -26022,6 +26170,7 @@ mod tests {
         race_node.community_verified_settlements.insert(
             race_job_id,
             VerifiedCommunitySettlement {
+                output_tokens: None,
                 payload: race_payload,
                 verified_at_unix_ms: 1,
                 attempts: 1,
@@ -26045,6 +26194,7 @@ mod tests {
         );
 
         let result = WorkResult {
+            output_tokens: None,
             job_id: format!("0x{}", race_job_id.to_hex()),
             worker_id: race_worker_id,
             success: true,
@@ -26350,6 +26500,7 @@ mod tests {
         let submit = sign_community_request(
             COMMUNITY_SUBMIT_WORK_PATH,
             WorkResult {
+                output_tokens: None,
                 job_id: "unknown-job".to_string(),
                 worker_id,
                 success: false,
@@ -27242,6 +27393,7 @@ mod tests {
             if let Some((_, pending)) = results.remove(&item.job_id) {
                 let _ = pending.sender.send(CommunityDispatchOutcome {
                     result: WorkResult {
+                        output_tokens: None,
                         job_id: item.job_id,
                         worker_id: "w1".into(),
                         success: true,
@@ -27545,6 +27697,7 @@ mod tests {
                 let settlement_job_id = item.job_id.clone();
                 let _ = pending.sender.send(CommunityDispatchOutcome {
                     result: WorkResult {
+                        output_tokens: None,
                         job_id: item.job_id,
                         worker_id: "w1".to_string(),
                         success: true,
@@ -27703,6 +27856,7 @@ mod tests {
                 let job_id = item.job_id.clone();
                 let _ = pending.sender.send(CommunityDispatchOutcome {
                     result: WorkResult {
+                        output_tokens: None,
                         job_id: job_id.clone(),
                         worker_id: "w1".to_string(),
                         success: true,
@@ -27793,6 +27947,7 @@ mod tests {
             if let Some((_, pending)) = results.remove(&item.job_id) {
                 let _ = pending.sender.send(CommunityDispatchOutcome {
                     result: WorkResult {
+                        output_tokens: None,
                         job_id: item.job_id,
                         worker_id: "w1".into(),
                         success: false,
@@ -27836,6 +27991,7 @@ mod tests {
         let error = community_submit_work(
             AxumState(node),
             Json(WorkResult {
+                output_tokens: None,
                 job_id: "claimed-job".to_string(),
                 worker_id: "worker".to_string(),
                 success: false,
@@ -27883,6 +28039,7 @@ mod tests {
             let signed = sign_community_request(
                 COMMUNITY_SUBMIT_WORK_PATH,
                 WorkResult {
+                    output_tokens: None,
                     job_id: item.job_id,
                     worker_id: submit_worker_id,
                     success: false,
@@ -27935,6 +28092,7 @@ mod tests {
 
     fn successful_test_result(job_id: String, worker_id: &str) -> WorkResult {
         WorkResult {
+            output_tokens: None,
             job_id,
             worker_id: worker_id.to_string(),
             success: true,
@@ -28608,6 +28766,7 @@ mod tests {
         }
         let signed_attestation_hex = format!("0x{}", hex::encode(bincode::serialize(&tx).unwrap()));
         WorkResult {
+            output_tokens: None,
             job_id: item.job_id.clone(),
             worker_id: keypair.address().to_hex(),
             success: true,
@@ -29189,6 +29348,7 @@ mod tests {
         let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
         let decoded = "verified output";
         let mut result = WorkResult {
+            output_tokens: None,
             job_id: "job".to_string(),
             worker_id: "worker".to_string(),
             success: true,
@@ -29216,6 +29376,7 @@ mod tests {
     #[test]
     fn community_reward_rejects_precision_profile_drift_before_quorum_work() {
         let mut result = WorkResult {
+            output_tokens: None,
             job_id: "job".to_string(),
             worker_id: "worker".to_string(),
             success: true,
@@ -29262,6 +29423,7 @@ mod tests {
         let Json(response) = community_submit_work(
             AxumState(node.clone()),
             Json(WorkResult {
+                output_tokens: None,
                 job_id: item.job_id.clone(),
                 worker_id: worker_id.clone(),
                 success: false,
@@ -33130,6 +33292,7 @@ mod tests {
     fn verification_summary_reports_the_quorum_each_range_used() {
         let summary = |range_replicas: Vec<((usize, usize), usize)>| {
             CommunityVerificationSummary::from(&CommunityResultVerification {
+                accepted_tokens: Vec::new(),
                 output_hash: Hash256::ZERO,
                 tokens_generated: 1,
                 range_count: range_replicas.len(),

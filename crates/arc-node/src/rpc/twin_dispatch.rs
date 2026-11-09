@@ -1631,9 +1631,11 @@ async fn run_twin_recompute(
 async fn twin_settlement(
     node: &NodeState,
     leg: &LegSnapshot,
-    validators_confirmed: bool,
+    canonical: Option<&CommunityCanonicalRecompute>,
 ) -> Option<Value> {
-    let result = leg.result.as_ref()?;
+    let mut verified_result = leg.result.as_ref()?.clone();
+    verified_result.output_tokens = canonical.map(|value| value.generated.clone());
+    let result = &verified_result;
     let Some(attestation) = leg.attestation.as_ref() else {
         return Some(unsubmitted_community_reward_settlement(
             "missing_worker_attestation",
@@ -1649,7 +1651,7 @@ async fn twin_settlement(
             &result.worker_id,
             "result verified, but reward issuance requires both the genesis-committed activation height and the local issuance switch",
         )
-    } else if !validators_confirmed {
+    } else if canonical.is_none() {
         unsubmitted_community_reward_settlement(
             "twin_verified_without_reward_recomputation",
             &result.job_id,
@@ -1777,7 +1779,7 @@ async fn resolve_twin_group(node: &NodeState, group_id: &str) {
 
     let settlement = match classification.chosen_leg {
         Some(index) if input.source.reward_eligible() => match input.legs.get(index) {
-            Some(leg) => twin_settlement(node, leg, canonical.is_some()).await,
+            Some(leg) => twin_settlement(node, leg, canonical.as_ref()).await,
             None => None,
         },
         _ => None,
@@ -1940,6 +1942,7 @@ async fn resolve_twin_group(node: &NodeState, group_id: &str) {
     let verification = match (&canonical, classification.chosen_leg) {
         (Some(canonical), Some(_)) => Some(CommunityVerificationSummary::from(
             &CommunityResultVerification {
+                accepted_tokens: Vec::new(),
                 output_hash: canonical.output_hash,
                 tokens_generated: canonical.generated.len(),
                 range_count: canonical.range_count,
@@ -2229,6 +2232,7 @@ mod tests {
 
     fn result(job_id: &str, worker_id: &str, output: &str) -> WorkResult {
         WorkResult {
+            output_tokens: None,
             job_id: job_id.to_string(),
             worker_id: worker_id.to_string(),
             success: true,
@@ -2247,6 +2251,7 @@ mod tests {
     /// A failed (`declined = false`) or declined (`declined = true`) result.
     fn failed(job_id: &str, worker_id: &str, declined: bool) -> WorkResult {
         WorkResult {
+            output_tokens: None,
             job_id: job_id.to_string(),
             worker_id: worker_id.to_string(),
             success: false,

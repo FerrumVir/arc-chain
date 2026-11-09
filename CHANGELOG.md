@@ -25,6 +25,17 @@ All notable changes to ARC Chain are tracked here. This project follows
   a preferred worker can hold a queued job for at most 1.5 seconds.
 - A quickly declined job can be retried once on another waiting worker when
   the dispatch budget allows it. This needs no worker update.
+- Validators can check committed output tokens in one pipelined pass, with the
+  same authenticated shard quorums and repetition penalty as sequential
+  generation. Unsuccessful checks fall back to sequential verification.
+- Workers send exact output tokens only when the coordinator advertises support.
+  Verified tokens can also accelerate capable reward approvers without changing
+  stored settlement journals or reward signatures.
+- Coordinators probe committee identities before starting ordinary reward
+  approval rounds and defer rounds that cannot reach five distinct validators.
+  Recovery probes retain their existing scheduling.
+- Increase shard queue headroom for overlapping verification passes while
+  keeping the compute concurrency limit unchanged.
 
 ## v0.8.18 - Release-preparation snapshot (2026-11-08)
 
