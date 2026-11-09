@@ -687,8 +687,12 @@ async fn teacher_forced_skip_counts_distinct_active_validators_and_pending_retri
 async fn teacher_forced_released_settlement_retains_tokens_and_bad_approval_hints_fall_back() {
     let fixture = ReleaseOnVerificationFixture::build(true).await;
     let job = fixture.start_job().await;
-    job.submit.await.unwrap().unwrap();
-    job.run.await.unwrap().unwrap();
+    let Json(submitted) = job.submit.await.unwrap().unwrap();
+    assert_eq!(submitted["ok"], true);
+    let Json(answer) = job.run.await.unwrap().unwrap();
+    assert_eq!(answer["success"], true);
+    assert_eq!(answer["answer_release"]["mode"], "on_verification");
+    assert_eq!(answer["settlement"]["status"], "verified_pending_approval");
     fixture.coordinator.runtime_tasks.lock().abort_all();
     let record = fixture
         .coordinator
