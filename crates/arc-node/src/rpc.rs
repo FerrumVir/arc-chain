@@ -3685,19 +3685,8 @@ fn is_native_inference_transaction(tx: &Transaction) -> bool {
     )
 }
 
-/// This node's row cohort (`crate::row_cohort`): its machines, the bounded
-/// books and the recent placement records, for the operator. Machine names,
-/// measured rates and request timing describe the operator's own
-/// infrastructure, so only a direct loopback caller is answered: 404
-/// otherwise, as when the node runs no cohort, including anything a proxy
-/// forwarded. On the sealed production origin every request arrives through
-/// the nginx filter as loopback; that filter's route allowlist, which ends in
-/// `return 404`, does not include `/assignment/`.
-async fn assignment_cohort(
-    AxumState(node): AxumState<NodeState>,
-    ConnectInfo(RpcPeerAddr(peer_addr)): ConnectInfo<RpcPeerAddr>,
-    headers: axum::http::HeaderMap,
-) -> Result<Json<crate::row_cohort::CohortView>, StatusCode> {
+/// Only direct local operator requests may use local control routes.
+fn is_direct_loopback_operator(peer_addr: SocketAddr, headers: &axum::http::HeaderMap) -> bool {
     // Not the operator's own when: a same-host reverse proxy forwarded it
     // (deploy/nginx.conf forwards /rpc/ from 127.0.0.1 and marks what it
     // forwards); a browser page sent it (browsers add Origin or Sec-Fetch-*);
@@ -3713,7 +3702,23 @@ async fn assignment_cohort(
         .get(axum::http::header::HOST)
         .and_then(|host| host.to_str().ok())
         .is_some_and(crate::row_cohort::host_header_is_loopback);
-    if !peer_addr.ip().is_loopback() || proxied || from_a_page || !named_here {
+    peer_addr.ip().is_loopback() && !proxied && !from_a_page && named_here
+}
+
+/// This node's row cohort (`crate::row_cohort`): its machines, the bounded
+/// books and the recent placement records, for the operator. Machine names,
+/// measured rates and request timing describe the operator's own
+/// infrastructure, so only a direct loopback caller is answered: 404
+/// otherwise, as when the node runs no cohort, including anything a proxy
+/// forwarded. On the sealed production origin every request arrives through
+/// the nginx filter as loopback; that filter's route allowlist, which ends in
+/// `return 404`, does not include `/assignment/`.
+async fn assignment_cohort(
+    AxumState(node): AxumState<NodeState>,
+    ConnectInfo(RpcPeerAddr(peer_addr)): ConnectInfo<RpcPeerAddr>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<crate::row_cohort::CohortView>, StatusCode> {
+    if !is_direct_loopback_operator(peer_addr, &headers) {
         return Err(StatusCode::NOT_FOUND);
     }
     let cohort = node
@@ -19939,8 +19944,13 @@ struct SetThreadsRequest {
 /// par_iter over attention heads and the par_chunks_mut inside every matmul.
 async fn set_node_threads(
     AxumState(node): AxumState<NodeState>,
+    ConnectInfo(RpcPeerAddr(peer_addr)): ConnectInfo<RpcPeerAddr>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<SetThreadsRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    if !is_direct_loopback_operator(peer_addr, &headers) {
+        return Err(api_error(StatusCode::NOT_FOUND, "not found"));
+    }
     let before = node.compute_threads.load(Ordering::Relaxed);
     let applied = set_compute_threads(&node, req.threads)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
@@ -20005,6 +20015,7 @@ fn kernel_report_json(node: &NodeState) -> Value {
         "available_kernels": available_kernels,
         "one_token_runs": one_token_runs,
         "batched_runs": batched_runs,
+        "batched_prefill_enabled": arc_inference::canonical_prefill::batched_prefill_enabled(),
         "serves_loaded_model": serves_loaded_model,
     })
 }
@@ -33090,6 +33101,139 @@ mod tests {
         let Json(info) = node_info(AxumState(node)).await;
         let info = serde_json::to_value(&info).expect("node info serialises");
         assert_eq!(&info["kernels"]["one_token"], &kernels["one_token"]);
+    }
+
+    #[tokio::test]
+    async fn node_threads_only_direct_loopback_operator_can_resize() {
+        use tower::ServiceExt;
+
+        let node = fake_node_with_workers(vec![]);
+        let app = Router::new()
+            .route(
+                "/node/threads",
+                get(get_node_threads).post(set_node_threads),
+            )
+            .with_state(node.clone());
+        // The desktop Rust client posts JSON to 127.0.0.1, without browser headers.
+        for host in ["127.0.0.1:4317", "localhost:4317", "[::1]:4317"] {
+            let peer = if host.starts_with('[') {
+                "[::1]:12345"
+            } else {
+                "127.0.0.1:12345"
+            };
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("http://127.0.0.1:4317/node/threads")
+                        .header("host", host)
+                        .header("content-type", "application/json")
+                        .extension(ConnectInfo(RpcPeerAddr(peer.parse().unwrap())))
+                        .body(axum::body::Body::from(r#"{"threads":2}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{host}");
+            assert_eq!(node.compute_threads.load(Ordering::Relaxed), 2);
+            assert_eq!(
+                install_on_compute_pool(&node, rayon::current_num_threads),
+                2
+            );
+        }
+
+        let refused = [
+            ("192.0.2.1:12345", Some("127.0.0.1:4317"), None),
+            ("127.0.0.1:12345", Some("example.com"), None),
+            ("127.0.0.1:12345", None, None),
+            (
+                "127.0.0.1:12345",
+                Some("127.0.0.1:4317"),
+                Some(("x-forwarded-for", "127.0.0.1")),
+            ),
+            (
+                "127.0.0.1:12345",
+                Some("127.0.0.1:4317"),
+                Some(("x-real-ip", "127.0.0.1")),
+            ),
+            (
+                "127.0.0.1:12345",
+                Some("127.0.0.1:4317"),
+                Some(("forwarded", "for=127.0.0.1")),
+            ),
+            (
+                "127.0.0.1:12345",
+                Some("127.0.0.1:4317"),
+                Some(("origin", "http://localhost")),
+            ),
+            (
+                "127.0.0.1:12345",
+                Some("127.0.0.1:4317"),
+                Some(("sec-fetch-site", "same-origin")),
+            ),
+            (
+                "127.0.0.1:12345",
+                Some("127.0.0.1:4317"),
+                Some(("sec-fetch-mode", "cors")),
+            ),
+        ];
+        let pool = node.compute_pool.read().clone().unwrap();
+        for (peer, host, extra) in refused {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/node/threads")
+                .header("content-type", "application/json")
+                .extension(ConnectInfo(RpcPeerAddr(peer.parse().unwrap())));
+            if let Some(host) = host {
+                request = request.header("host", host);
+            }
+            if let Some((name, value)) = extra {
+                request = request.header(name, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    request
+                        .body(axum::body::Body::from(r#"{"threads":3}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{peer} {host:?} {extra:?}"
+            );
+            assert_eq!(node.compute_threads.load(Ordering::Relaxed), 2);
+            assert_eq!(
+                install_on_compute_pool(&node, rayon::current_num_threads),
+                2
+            );
+            assert!(Arc::ptr_eq(
+                &pool,
+                node.compute_pool.read().as_ref().unwrap()
+            ));
+        }
+        // The read-only route remains available without operator headers.
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/node/threads")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["kernels"]["batched_prefill_enabled"],
+            arc_inference::canonical_prefill::batched_prefill_enabled()
+        );
     }
 
     // ── compute pool ────────────────────────────────────────────────────
