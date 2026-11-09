@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tower_http::cors::CorsLayer;
 
+mod community_routing;
 /// Twin execution v0 orchestration (coordinator-side, off by default).
 mod twin_dispatch;
 
@@ -642,6 +643,7 @@ pub struct NodeState {
     /// seed-poll requests. Value is the assigned job id; an empty value means
     /// a claim long-poll currently holds the worker's reservation.
     pub community_active_jobs: Arc<dashmap::DashMap<String, String>>,
+    community_routing: Arc<parking_lot::Mutex<community_routing::RoutingState>>,
     /// Twin execution, region tags and generated demand. Every switch in its
     /// configuration defaults to off; see `docs/twin-execution.md`.
     community_twin: Arc<twin_dispatch::CommunityTwinState>,
@@ -1953,6 +1955,7 @@ pub fn build_node_state(
         community_work_queue: None,
         community_work_results: None,
         community_active_jobs: Arc::new(dashmap::DashMap::new()),
+        community_routing: Arc::new(parking_lot::Mutex::new(Default::default())),
         community_twin: Arc::new(twin_dispatch::CommunityTwinState::new(
             crate::twin::TwinConfig::default(),
         )),
@@ -7472,6 +7475,8 @@ async fn dispatch_to_community_worker_with_windows(
     expected_worker_id: Option<String>,
     windows: CommunityDispatchWindows,
 ) -> Result<CommunityDispatchOutcome, CommunityDispatchError> {
+    let dispatch_started = tokio::time::Instant::now();
+    let mut excluded_worker: Option<String> = None;
     let _worker_execution_permit = node
         .native_request_admission
         .worker_execution_gate()
@@ -7545,199 +7550,250 @@ async fn dispatch_to_community_worker_with_windows(
         })?
         .clone();
 
-    // Normal public inference uses the boot epoch plus a monotonic nonce so
-    // concurrent identical prompts remain distinct. A sealed recovery probe
-    // instead uses its domain-separated rollout/ordinal identity so a retry
-    // after either process restarts reproduces the exact same job commitment.
-    let (assignment_epoch, nonce) = recovery_probe_id
-        .map(recovery_probe_assignment)
-        .unwrap_or_else(|| {
-            (
-                node.community_job_epoch,
-                node.attestation_nonce.fetch_add(1, Ordering::Relaxed),
-            )
-        });
-    let input_hash = arc_crypto::hash_bytes(input.as_bytes());
-    let job_id = community_job_id(
-        &node.validator_address,
-        &assignment_epoch,
-        &model_id_hash,
-        &input_hash,
-        max_tokens,
-        nonce,
-    );
-    let expected_job_hash = parse_hash256_hex(&job_id, "recovery job_id")
-        .map_err(CommunityDispatchError::before_enqueue)?;
+    loop {
+        // Normal public inference uses the boot epoch plus a monotonic nonce so
+        // concurrent identical prompts remain distinct. A sealed recovery probe
+        // instead uses its domain-separated rollout/ordinal identity so a retry
+        // after either process restarts reproduces the exact same job commitment.
+        let (assignment_epoch, nonce) = recovery_probe_id
+            .map(recovery_probe_assignment)
+            .unwrap_or_else(|| {
+                (
+                    node.community_job_epoch,
+                    node.attestation_nonce.fetch_add(1, Ordering::Relaxed),
+                )
+            });
+        let input_hash = arc_crypto::hash_bytes(input.as_bytes());
+        let job_id = community_job_id(
+            &node.validator_address,
+            &assignment_epoch,
+            &model_id_hash,
+            &input_hash,
+            max_tokens,
+            nonce,
+        );
+        let expected_job_hash = parse_hash256_hex(&job_id, "recovery job_id")
+            .map_err(CommunityDispatchError::before_enqueue)?;
 
-    let submitted_at_unix_ms = now_unix_ms();
-    let submitted_at = i64::try_from(submitted_at_unix_ms).map_err(|_| {
-        CommunityDispatchError::before_enqueue("community submission timestamp overflow")
-    })?;
-    let expires_at_unix_ms = timeout_secs
-        .checked_add(COMMUNITY_LATE_SUBMIT_GRACE_SECS)
-        .and_then(|seconds| seconds.checked_mul(1_000))
-        .and_then(|window_ms| submitted_at_unix_ms.checked_add(window_ms))
-        .ok_or_else(|| {
-            CommunityDispatchError::before_enqueue("community assignment expiry overflow")
+        let submitted_at_unix_ms = now_unix_ms();
+        let submitted_at = i64::try_from(submitted_at_unix_ms).map_err(|_| {
+            CommunityDispatchError::before_enqueue("community submission timestamp overflow")
         })?;
-    let item = WorkItem {
-        job_id: job_id.clone(),
-        input,
-        max_tokens,
-        model_id: Some(model_id),
-        execution_profile: arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE
-            .to_string(),
-        transaction_domain: node
-            .state
-            .transaction_domain_hash()
-            .map(|domain| format!("0x{}", domain.to_hex())),
-        expected_worker_id,
-        submitted_at_unix_ms: submitted_at,
-        expires_at_unix_ms,
-    };
+        let expires_at_unix_ms = timeout_secs
+            .checked_add(COMMUNITY_LATE_SUBMIT_GRACE_SECS)
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .and_then(|window_ms| submitted_at_unix_ms.checked_add(window_ms))
+            .ok_or_else(|| {
+                CommunityDispatchError::before_enqueue("community assignment expiry overflow")
+            })?;
+        let item = WorkItem {
+            job_id: job_id.clone(),
+            input: input.clone(),
+            max_tokens,
+            model_id: Some(model_id.clone()),
+            execution_profile:
+                arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+            transaction_domain: node
+                .state
+                .transaction_domain_hash()
+                .map(|domain| format!("0x{}", domain.to_hex())),
+            expected_worker_id: expected_worker_id.clone(),
+            submitted_at_unix_ms: submitted_at,
+            expires_at_unix_ms,
+        };
 
-    let (osh_tx, mut osh_rx) = tokio::sync::oneshot::channel::<CommunityDispatchOutcome>();
-    // Serialize the scan+insert only for deterministic recovery probes. This
-    // closes the concurrent same-ID and same-probe/different-semantics races
-    // without holding a synchronous guard across an await.
-    let probe_gate = recovery_probe_id.map(|_| node.community_verified_settlements_gate.lock());
-    if recovery_probe_id.is_some() {
-        match recovery_probe_existing_job(node, assignment_epoch) {
-            Ok(Some(existing)) if existing != expected_job_hash => {
+        let (osh_tx, mut osh_rx) = tokio::sync::oneshot::channel::<CommunityDispatchOutcome>();
+        // Serialize the scan+insert only for deterministic recovery probes. This
+        // closes the concurrent same-ID and same-probe/different-semantics races
+        // without holding a synchronous guard across an await.
+        let probe_gate = recovery_probe_id.map(|_| node.community_verified_settlements_gate.lock());
+        if recovery_probe_id.is_some() {
+            match recovery_probe_existing_job(node, assignment_epoch) {
+                Ok(Some(existing)) if existing != expected_job_hash => {
+                    return Err(CommunityDispatchError::after_enqueue(
+                        "recovery probe identity is already bound to different inference semantics",
+                    ));
+                }
+                Ok(Some(_)) => {
+                    return Err(CommunityDispatchError::after_enqueue(
+                        "recovery probe job already exists; retry its exact status",
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => return Err(CommunityDispatchError::after_enqueue(error)),
+            }
+        }
+        use dashmap::mapref::entry::Entry;
+        match results.entry(job_id.clone()) {
+            Entry::Occupied(_) => {
                 return Err(CommunityDispatchError::after_enqueue(
-                    "recovery probe identity is already bound to different inference semantics",
+                    "community job already exists; retry its exact status",
                 ));
             }
-            Ok(Some(_)) => {
-                return Err(CommunityDispatchError::after_enqueue(
-                    "recovery probe job already exists; retry its exact status",
-                ));
-            }
-            Ok(None) => {}
-            Err(error) => return Err(CommunityDispatchError::after_enqueue(error)),
-        }
-    }
-    use dashmap::mapref::entry::Entry;
-    match results.entry(job_id.clone()) {
-        Entry::Occupied(_) => {
-            return Err(CommunityDispatchError::after_enqueue(
-                "community job already exists; retry its exact status",
-            ));
-        }
-        Entry::Vacant(entry) => entry.insert(PendingCommunityWork {
-            item: item.clone(),
-            assignment_epoch,
-            job_nonce: nonce,
-            assigned_worker: None,
-            submitting: false,
-            sender: osh_tx,
-        }),
-    };
-    drop(probe_gate);
-    let _pending_reservation = PendingDispatchReservation {
-        results: results.clone(),
-        active_jobs: node.community_active_jobs.clone(),
-        job_id: job_id.clone(),
-    };
+            Entry::Vacant(entry) => entry.insert(PendingCommunityWork {
+                item: item.clone(),
+                assignment_epoch,
+                job_nonce: nonce,
+                assigned_worker: None,
+                assigned_at: None,
+                first_submit_at: None,
+                routing: community_routing::PendingRouting {
+                    prompt_len: generation_preflight.prompt_tokens,
+                    excluded_worker: excluded_worker.clone(),
+                    ..Default::default()
+                },
+                submitting: false,
+                sender: osh_tx,
+            }),
+        };
+        drop(probe_gate);
+        let _pending_reservation = PendingDispatchReservation {
+            results: results.clone(),
+            active_jobs: node.community_active_jobs.clone(),
+            job_id: job_id.clone(),
+        };
 
-    if let Err(e) = tx.try_send(item) {
-        // Enqueue is part of the bounded admission decision. Waiting for a
-        // queue slot here let 257+ concurrent public requests hang forever
-        // before their dispatch timeout even started. A saturated/closed
-        // queue now fails immediately and the smart router can use its local
-        // fallback without growing the pending map.
-        results.remove(&job_id);
-        return Err(CommunityDispatchError::before_enqueue(format!(
-            "community queue unavailable: {e}"
-        )));
-    }
+        if let Err(e) = tx.try_send(item) {
+            // Enqueue is part of the bounded admission decision. Waiting for a
+            // queue slot here let 257+ concurrent public requests hang forever
+            // before their dispatch timeout even started. A saturated/closed
+            // queue now fails immediately and the smart router can use its local
+            // fallback without growing the pending map.
+            results.remove(&job_id);
+            return Err(CommunityDispatchError::before_enqueue(format!(
+                "community queue unavailable: {e}"
+            )));
+        }
 
-    // Wait for the result inside the protocol compute budget, re-reading the
-    // assignment every `watch_interval` so an assignment that can no longer be
-    // served is withdrawn instead of holding the caller for the whole budget.
-    let timeout = tokio::time::Duration::from_secs(timeout_secs);
-    let deadline = tokio::time::Instant::now() + timeout;
-    let unclaimed_deadline = windows
-        .unclaimed_withdraw
-        .map(|window| tokio::time::Instant::now() + window);
-    let received = loop {
-        let next_watch = tokio::time::Instant::now() + windows.watch_interval;
-        tokio::select! {
-            // A result that is already there must never lose to the watch
-            // tick or the deadline.
-            biased;
-            received = &mut osh_rx => break Some(received),
-            _ = tokio::time::sleep_until(next_watch.min(deadline)) => {}
-        }
-        if tokio::time::Instant::now() >= deadline {
-            break None;
-        }
-        match withdraw_abandoned_assignment(node, &results, &job_id, windows, unclaimed_deadline) {
-            None => {}
-            Some(AbandonedAssignment::Unclaimed) => {
-                let waited_secs = windows.unclaimed_withdraw.unwrap_or_default().as_secs();
-                tracing::warn!(
-                    job_id = %job_id,
-                    waited_secs,
-                    "no community worker claimed the assignment within one claim window; withdrawn so the caller can fall back"
+        // Wait for the result inside the protocol compute budget, re-reading the
+        // assignment every `watch_interval` so an assignment that can no longer be
+        // served is withdrawn instead of holding the caller for the whole budget.
+        let timeout = tokio::time::Duration::from_secs(timeout_secs);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let unclaimed_deadline = windows
+            .unclaimed_withdraw
+            .map(|window| tokio::time::Instant::now() + window);
+        let received = loop {
+            let next_watch = tokio::time::Instant::now() + windows.watch_interval;
+            tokio::select! {
+                // A result that is already there must never lose to the watch
+                // tick or the deadline.
+                biased;
+                received = &mut osh_rx => break Some(received),
+                _ = tokio::time::sleep_until(next_watch.min(deadline)) => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break None;
+            }
+            match withdraw_abandoned_assignment(
+                node,
+                &results,
+                &job_id,
+                windows,
+                unclaimed_deadline,
+            ) {
+                None => {}
+                Some(AbandonedAssignment::Unclaimed) => {
+                    let waited_secs = windows.unclaimed_withdraw.unwrap_or_default().as_secs();
+                    tracing::warn!(
+                        job_id = %job_id,
+                        waited_secs,
+                        "no community worker claimed the assignment within one claim window; withdrawn so the caller can fall back"
+                    );
+                    return Err(CommunityDispatchError::withdrawn(format!(
+                        "no community worker claimed the job within {waited_secs}s; the assignment was withdrawn before any worker could start it"
+                    )));
+                }
+                Some(AbandonedAssignment::WorkerUnregistered(worker_id)) => {
+                    community_routing::record_slow(
+                        node,
+                        &worker_id,
+                        timeout_secs,
+                        generation_preflight.required_positions,
+                    );
+                    tracing::warn!(
+                        job_id = %job_id,
+                        worker = %worker_id,
+                        "assigned community worker stopped heartbeating; assignment withdrawn so the caller can fall back"
+                    );
+                    return Err(CommunityDispatchError::withdrawn(format!(
+                        "assigned community worker {worker_id} stopped heartbeating and the job was withdrawn from it; it can no longer submit a result"
+                    )));
+                }
+            }
+        };
+        return match received {
+            Some(Ok(outcome)) => {
+                if !outcome.result.success {
+                    let err = outcome
+                        .result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "worker reported failure".to_string());
+                    if outcome.result.declined
+                        && recovery_probe_id.is_none()
+                        && excluded_worker.is_none()
+                        && community_routing::retry_fits(dispatch_started.elapsed(), timeout_secs)
+                        && community_routing::has_other_waiter(
+                            node,
+                            &model_id,
+                            &outcome.result.worker_id,
+                        )
+                    {
+                        tracing::info!(job_id = %job_id, declined_worker = %outcome.result.worker_id,
+                        elapsed_ms = dispatch_started.elapsed().as_millis(), "retrying community job after quick decline");
+                        excluded_worker = Some(outcome.result.worker_id.clone());
+                        continue;
+                    }
+                    if !outcome.result.declined {
+                        community_routing::record_slow(
+                            node,
+                            &outcome.result.worker_id,
+                            timeout_secs,
+                            generation_preflight.required_positions,
+                        );
+                    }
+                    return Err(if outcome.result.declined {
+                        CommunityDispatchError::declined(err)
+                    } else {
+                        CommunityDispatchError::after_enqueue(err)
+                    });
+                }
+                // Keep the existing worker-reported display metric. Routing uses
+                // separate coordinator timing. Keyed by
+                // worker_id so it's distinguishable from the seed-to-seed
+                // forward_shard latency table.
+                record_latency(
+                    &node.latency_stats,
+                    &format!("worker:{}", outcome.result.worker_id),
+                    outcome.result.total_ms,
                 );
-                return Err(CommunityDispatchError::withdrawn(format!(
-                    "no community worker claimed the job within {waited_secs}s; the assignment was withdrawn before any worker could start it"
-                )));
+                Ok(outcome)
             }
-            Some(AbandonedAssignment::WorkerUnregistered(worker_id)) => {
-                tracing::warn!(
-                    job_id = %job_id,
-                    worker = %worker_id,
-                    "assigned community worker stopped heartbeating; assignment withdrawn so the caller can fall back"
+            Some(Err(_)) => {
+                // oneshot sender dropped without sending — the worker
+                // disconnected mid-job or the queue purged us.
+                Err(CommunityDispatchError::after_enqueue(
+                    "worker disconnected before completing job",
+                ))
+            }
+            None => {
+                community_routing::record_timeout(
+                    node,
+                    &results,
+                    &job_id,
+                    timeout_secs,
+                    generation_preflight.required_positions,
                 );
-                return Err(CommunityDispatchError::withdrawn(format!(
-                    "assigned community worker {worker_id} stopped heartbeating and the job was withdrawn from it; it can no longer submit a result"
-                )));
+                // The drop guard removes an unclaimed job immediately and gives an
+                // already-claimed worker a bounded grace window to submit and
+                // settle without its public caller remaining connected.
+                Err(CommunityDispatchError::timed_out(format!(
+                    "no worker completed within {}s",
+                    timeout_secs
+                )))
             }
-        }
-    };
-    match received {
-        Some(Ok(outcome)) => {
-            if !outcome.result.success {
-                let err = outcome
-                    .result
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "worker reported failure".to_string());
-                return Err(if outcome.result.declined {
-                    CommunityDispatchError::declined(err)
-                } else {
-                    CommunityDispatchError::after_enqueue(err)
-                });
-            }
-            // Record dispatch latency in EWMA so future routing favors
-            // workers that consistently beat the deadline. Keyed by
-            // worker_id so it's distinguishable from the seed-to-seed
-            // forward_shard latency table.
-            record_latency(
-                &node.latency_stats,
-                &format!("worker:{}", outcome.result.worker_id),
-                outcome.result.total_ms,
-            );
-            Ok(outcome)
-        }
-        Some(Err(_)) => {
-            // oneshot sender dropped without sending — the worker
-            // disconnected mid-job or the queue purged us.
-            Err(CommunityDispatchError::after_enqueue(
-                "worker disconnected before completing job",
-            ))
-        }
-        None => {
-            // The drop guard removes an unclaimed job immediately and gives an
-            // already-claimed worker a bounded grace window to submit and
-            // settle without its public caller remaining connected.
-            Err(CommunityDispatchError::timed_out(format!(
-                "no worker completed within {}s",
-                timeout_secs
-            )))
-        }
+        };
     }
 }
 
@@ -14489,12 +14545,20 @@ const COMMUNITY_CLAIM_TIMEOUT_SECS: u64 = 30;
 async fn poll_community_work_queue(
     queue: &Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<WorkItem>>>,
     timeout: tokio::time::Duration,
+    claimant: Option<(&NodeState, &str)>,
 ) -> Result<Option<WorkItem>, ()> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let attempt = queue.lock().await.try_recv();
+        let mut queue = queue.lock().await;
+        let attempt = if let Some((node, worker)) = claimant {
+            community_routing::poll(node, worker, &mut queue)
+        } else {
+            queue.try_recv().map(Some)
+        };
+        drop(queue);
         match attempt {
-            Ok(item) => return Ok(Some(item)),
+            Ok(Some(item)) => return Ok(Some(item)),
+            Ok(None) => {}
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return Err(()),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
         }
@@ -14562,6 +14626,9 @@ pub struct PendingCommunityWork {
     assignment_epoch: Hash256,
     job_nonce: u64,
     assigned_worker: Option<String>,
+    assigned_at: Option<tokio::time::Instant>,
+    first_submit_at: Option<tokio::time::Instant>,
+    routing: community_routing::PendingRouting,
     /// Set while one authenticated submit is independently recomputed.  The
     /// record stays in the map until verification succeeds, so cancellation or
     /// transient shard failure cannot irreversibly consume the assignment.
@@ -17305,6 +17372,8 @@ pub async fn community_claim_work(
         }
     };
 
+    community_routing::open_claim(&node, &req.worker_id, registered_model_id);
+
     // ── Long-poll: try to receive a WorkItem from the queue ─────────────
     let work_rx = node.community_work_queue.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -17312,7 +17381,7 @@ pub async fn community_claim_work(
     ))?;
 
     let timeout = tokio::time::Duration::from_secs(COMMUNITY_CLAIM_TIMEOUT_SECS);
-    match poll_community_work_queue(work_rx, timeout).await {
+    match poll_community_work_queue(work_rx, timeout, Some((&node, &req.worker_id))).await {
         Ok(Some(item)) => {
             if item.expires_at_unix_ms <= now_unix_ms() {
                 if let Some(results) = node.community_work_results.as_ref() {
@@ -17417,6 +17486,7 @@ pub async fn community_claim_work(
                 })));
             }
             pending.assigned_worker = Some(req.worker_id.clone());
+            pending.assigned_at = Some(tokio::time::Instant::now());
             // Commit the worker's slot while the pending entry is still
             // locked, so the assignment and the slot change together. A
             // withdrawal that removes this record under the same lock then
@@ -17427,6 +17497,7 @@ pub async fn community_claim_work(
             // keeping the worker busy on this coordinator until restart.
             claim_reservation.commit(&item.job_id);
             drop(pending);
+            community_routing::assigned(&node, &req.worker_id);
 
             // Flat response shape — the worker (arc-node main.rs) reads
             // `job_id`, `input`, `max_tokens` directly off the top-level
@@ -17711,6 +17782,9 @@ pub async fn community_submit_work(
                 }
             }
             pending.submitting = true;
+            pending
+                .first_submit_at
+                .get_or_insert_with(tokio::time::Instant::now);
             (pending.item.clone(), assigned_worker)
         }
         None => {
@@ -17772,6 +17846,7 @@ pub async fn community_submit_work(
             verified_attestation,
         );
     }
+    let submit_arrived = tokio::time::Instant::now();
     let verification = if result.success {
         match verify_community_result_with_quorum(&node, &work_item, &result).await {
             Ok(verification) => Some(verification),
@@ -17847,6 +17922,7 @@ pub async fn community_submit_work(
             ),
         ));
     };
+    community_routing::record_accepted(&node, &pending, &result, submit_arrived);
     let _active_job_reservation = ActiveCommunityJobReservation {
         active_jobs: node.community_active_jobs.clone(),
         worker_id: assigned_worker,
@@ -20023,6 +20099,7 @@ fn insert_kernel_report(body: &mut Value, node: &NodeState) {
 
 #[cfg(test)]
 mod tests {
+    include!("rpc/community_routing_tests.rs");
     use super::*;
 
     #[cfg(unix)]
@@ -20960,6 +21037,23 @@ mod tests {
         let protocol = community_dispatch_timeout_secs(required_positions).unwrap();
         let one_pass = (required_positions as u64 * 3_300).div_ceil(1_000);
         assert_eq!(protocol, 3_862);
+        assert!(community_routing::retry_fits(
+            Duration::from_secs(30),
+            protocol
+        ));
+        let largest = community_dispatch_timeout_secs(260).unwrap();
+        assert!(community_routing::retry_fits(
+            Duration::from_secs(9),
+            largest
+        ));
+        assert!(!community_routing::retry_fits(
+            Duration::from_millis(9_001),
+            largest
+        ));
+        assert!(!community_routing::retry_fits(
+            Duration::from_millis(30_001),
+            protocol
+        ));
         assert!(
             COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS
                 >= one_pass + VALIDATOR_SHARD_QUEUE_TIMEOUT_SECS
@@ -24699,7 +24793,7 @@ mod tests {
         for _ in 0..3 {
             let queue = queue.clone();
             waiters.spawn(async move {
-                poll_community_work_queue(&queue, std::time::Duration::from_secs(1))
+                poll_community_work_queue(&queue, std::time::Duration::from_secs(1), None)
                     .await
                     .unwrap()
                     .expect("one queued job")
@@ -25412,6 +25506,7 @@ mod tests {
             community_work_queue: Some(Arc::new(tokio::sync::Mutex::new(rx))),
             community_work_results: Some(Arc::new(dashmap::DashMap::new())),
             community_active_jobs: Arc::new(dashmap::DashMap::new()),
+            community_routing: Arc::new(parking_lot::Mutex::new(Default::default())),
             community_twin: Arc::new(twin_dispatch::CommunityTwinState::new(
                 crate::twin::TwinConfig::default(),
             )),
@@ -28541,6 +28636,9 @@ mod tests {
                 assignment_epoch: Hash256([7u8; 32]),
                 job_nonce: 1,
                 assigned_worker,
+                assigned_at: None,
+                first_submit_at: None,
+                routing: Default::default(),
                 submitting: false,
                 sender,
             },
