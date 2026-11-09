@@ -726,6 +726,9 @@ pub struct NodeState {
     /// rejection or depending on a CI host's routable interface address.
     #[cfg(test)]
     community_verification_pipeline_override: Option<Vec<PipelineHop>>,
+    /// Pauses a candidate query immediately before its first publication read.
+    #[cfg(test)]
+    state_lock_order_pause: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Rolling EWMA of forward_shard hop latency for a single replica socket.
@@ -2003,6 +2006,8 @@ pub fn build_node_state(
         )),
         #[cfg(test)]
         community_verification_pipeline_override: None,
+        #[cfg(test)]
+        state_lock_order_pause: None,
     }
 }
 
@@ -9045,6 +9050,8 @@ async fn worker_earnings(
         if body.worker != want {
             continue;
         }
+        #[cfg(test)]
+        pause_before_state_publication_read(&node);
         let evidence =
             canonical_transaction_evidence(&node, Hash256(index_hash)).map_err(|error| {
                 (
@@ -9560,6 +9567,8 @@ async fn inference_list_attestations(
         }
         match &tx.body {
             TxBody::InferenceAttestation(body) if tx.tx_type == TxType::InferenceAttestation => {
+                #[cfg(test)]
+                pause_before_state_publication_read(&node);
                 let Some(receipt) = node.state.get_receipt(hash) else {
                     continue;
                 };
@@ -9597,6 +9606,8 @@ async fn inference_list_attestations(
             TxBody::CommunityInferenceReward(body)
                 if tx.tx_type == TxType::CommunityInferenceReward =>
             {
+                #[cfg(test)]
+                pause_before_state_publication_read(&node);
                 let Some(receipt) = canonical_transaction_evidence(&node, Hash256(*hash))
                     .map_err(|error| {
                         tracing::error!(tx_hash = %hex::encode(hash), %error, "invalid community reward chain evidence");
@@ -15380,6 +15391,13 @@ fn community_verification_pipeline(
     .map(|selection| selection.hops)
 }
 
+#[cfg(test)]
+fn pause_before_state_publication_read(node: &NodeState) {
+    if let Some(pause) = &node.state_lock_order_pause {
+        pause();
+    }
+}
+
 /// Test-only explicit verification pipeline; see
 /// `NodeState::community_verification_pipeline_override`.
 #[cfg(test)]
@@ -18409,6 +18427,8 @@ fn indexed_reward_for_job(
                 job_id.to_hex()
             ));
         }
+        #[cfg(test)]
+        pause_before_state_publication_read(node);
         let evidence = canonical_transaction_evidence(node, index_hash).map_err(|error| {
             format!(
                 "reward job 0x{} has invalid chain evidence: {error}",
@@ -18513,6 +18533,8 @@ async fn community_reward_receipt(
                 "transaction is not type 0x25".to_string(),
             ));
         };
+        #[cfg(test)]
+        pause_before_state_publication_read(&node);
         let value = community_reward_receipt_value(&node, tx_hash)
             .map_err(|error| (StatusCode::CONFLICT, error))?;
         return Ok(Json(value));
@@ -25747,6 +25769,7 @@ mod tests {
             runtime_tasks: Arc::new(parking_lot::Mutex::new(tokio::task::JoinSet::new())),
             own_compute_ms: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
             community_verification_pipeline_override: None,
+            state_lock_order_pause: None,
         }
     }
 
@@ -29553,6 +29576,263 @@ mod tests {
             .await
             .expect("valid signed transaction");
         assert_eq!(node.mempool.len(), 1);
+    }
+
+    // The native RPC fixture's activation and signed next-block request.
+    fn state_lock_order_native_fixture() -> (tempfile::TempDir, NodeState, Transaction) {
+        let temporary = tempfile::tempdir().unwrap();
+        let state_dir = temporary.path().join("state");
+        let genesis = arc_crypto::hash_bytes(b"native-rpc-private-fixture");
+        let requester = KeyPair::generate_ed25519();
+        let mut validators: Vec<_> = (0..6).map(|_| KeyPair::generate_ed25519()).collect();
+        let mut members: Vec<_> = validators
+            .iter()
+            .map(|key| {
+                arc_types::inference_contract::ValidatorMember::new(
+                    key.address(),
+                    StateDB::MIN_VALIDATOR_STAKE,
+                )
+            })
+            .collect();
+        members.sort_by_key(|member| member.address.0);
+        let tuple = arc_crypto::hash_bytes(b"native-rpc-private-fixture-tuple");
+        let context = arc_state::InferenceAdmissionContext {
+            domain: arc_types::inference_contract::InferenceDomain {
+                chain_genesis: genesis,
+                recovery_epoch: 0,
+                validator_set_hash: arc_types::inference_contract::validator_set_commitment(
+                    &members,
+                )
+                .unwrap(),
+            },
+            members: members.clone(),
+            allowed_executions: vec![arc_state::AllowedExecution {
+                model_hash: tuple,
+                profile_hash: tuple,
+                generation_hash: tuple,
+                assignment_hash: tuple,
+            }],
+            selection_rule: arc_state::NativeSelectionRule::SkipUsedNoncesV2,
+        };
+        let mut prefunded = vec![(requester.address(), 1_000)];
+        prefunded.extend(members.iter().map(|member| (member.address, 0)));
+        let state =
+            Arc::new(StateDB::with_genesis_persistent(&prefunded, &state_dir, genesis).unwrap());
+        state.seed_genesis_validators(
+            &members
+                .iter()
+                .map(|member| (member.address, member.stake))
+                .collect::<Vec<_>>(),
+        );
+        state.activate_native_inference(context.clone()).unwrap();
+        let producer = validators.remove(0);
+        let mempool = Arc::new(Mempool::new(16));
+        let node = build_node_state(
+            state.clone(),
+            mempool.clone(),
+            producer.address(),
+            Some(Arc::new(producer)),
+            StateDB::MIN_VALIDATOR_STAKE,
+            Instant::now(),
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            None,
+            None,
+        );
+        let input = [11u32, 12]
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect::<Vec<_>>();
+        let request = arc_types::inference_contract::InferenceRequest::sign(
+            arc_types::inference_contract::InferenceJob {
+                version: arc_types::inference_contract::INFERENCE_CONTRACT_VERSION,
+                domain: context.domain,
+                requester: requester.address(),
+                nonce: 0,
+                model_hash: tuple,
+                profile_hash: tuple,
+                input_hash: arc_crypto::hash_bytes(&input),
+                generation_hash: tuple,
+                assignment_hash: tuple,
+                max_tokens: 8,
+                max_output_bytes: 128,
+                execution_price: 10,
+                reserved_max_payment: 100,
+                expires_at: 10,
+            },
+            &requester,
+        )
+        .unwrap();
+        let mut tx = Transaction {
+            tx_type: TxType::NativeInferenceRequest,
+            from: requester.address(),
+            nonce: 0,
+            body: TxBody::NativeInferenceRequest(NativeInferenceRequestBody {
+                request,
+                input_blob: input,
+            }),
+            fee: 0,
+            gas_limit: gas_costs::NATIVE_INFERENCE_REQUEST,
+            hash: Hash256::ZERO,
+            signature: arc_crypto::Signature::null(),
+            sig_verified: false,
+        };
+        state.sign_transaction(&mut tx, &requester).unwrap();
+        (temporary, node, tx)
+    }
+
+    #[test]
+    fn state_lock_order_reward_scans_release_map_guards_before_publication_reads() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Separate state and channels per case: no process-wide test lock.
+        // Both attestation variants must reach their earliest publication read.
+        for case in [
+            "earnings",
+            "attestation",
+            "attestation_reward",
+            "indexed",
+            "receipt",
+        ] {
+            let (temporary, mut node, native) = state_lock_order_native_fixture();
+            let state = node.state.clone();
+            let job_id = Hash256([21; 32]);
+            let reward = test_verified_settlement_payload(job_id, 100).reward;
+            let worker = reward.worker;
+            let signer = KeyPair::generate_ed25519();
+            let mut candidate = None;
+            for nonce in 0..10_000 {
+                let row = if case == "attestation" {
+                    sign_attestation_for(&signer, nonce, 0).0
+                } else {
+                    Transaction::new_community_inference_reward(
+                        reward.coordinator,
+                        nonce,
+                        reward.clone(),
+                    )
+                };
+                state.full_transactions.insert(row.hash.0, row.clone());
+                let guard = state.full_transactions.get(&row.hash.0).unwrap();
+                let same_shard = state
+                    .full_transactions
+                    .try_get_mut(&native.hash.0)
+                    .is_locked();
+                drop(guard);
+                if same_shard {
+                    candidate = Some(row);
+                    break;
+                }
+                state.full_transactions.remove(&row.hash.0);
+            }
+            let row = candidate.expect("same-shard probe exhausted 10,000 candidates");
+            let row_hash = row.hash;
+            // Build a structurally valid historical block/index, as in the reward
+            // endpoint fixtures; the successful receipt is seeded explicitly.
+            let history = StateDB::new();
+            let (block, mut receipts) = history
+                .execute_block(std::slice::from_ref(&row), Hash256::ZERO)
+                .unwrap();
+            receipts[0].success = true;
+            let mut snapshot = state.export_durable_snapshot();
+            snapshot.height = block.header.height;
+            snapshot.blocks.push((block.header.height, block.clone()));
+            snapshot.receipts.push((row_hash, receipts[0].clone()));
+            state.install_durable_snapshot(&snapshot);
+            assert_eq!(
+                state.get_tx_location(&row_hash.0),
+                Some((block.header.height, 0))
+            );
+            assert!(!state.receipts.contains_key(&native.hash.0));
+
+            let (reached_tx, reached_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let pause = parking_lot::Mutex::new(Some((reached_tx, resume_rx)));
+            node.state_lock_order_pause = Some(Arc::new(move || {
+                if let Some((reached, resume)) = pause.lock().take() {
+                    reached.send(()).unwrap();
+                    resume.recv_timeout(Duration::from_secs(30)).unwrap();
+                }
+            }));
+            let producer = node.validator_address;
+            let (reader_tx, reader_rx) = mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let result = runtime.block_on(async {
+                    match case {
+                        "earnings" => worker_earnings(
+                            AxumState(node), AxumPath(worker.to_hex()),
+                        ).await.map(|Json(value)| value).map_err(|error| error.1),
+                        "attestation" | "attestation_reward" => inference_list_attestations(
+                            AxumState(node), Query(HashMap::new()),
+                        ).await.map(|Json(value)| value).map_err(|error| error.to_string()),
+                        "indexed" => indexed_reward_for_job(&node, job_id)
+                            .map(|value| json!({"tx_hash": value.map(|(hash, _)| format!("0x{}", hash.to_hex()))})),
+                        "receipt" => community_reward_receipt(
+                            AxumState(node), AxumPath(row_hash.to_hex()),
+                        ).await.map(|Json(value)| value).map_err(|error| error.1),
+                        _ => unreachable!(),
+                    }
+                });
+                reader_tx.send(result).unwrap();
+            });
+            reached_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("query did not reach its publication-read hook");
+            let native_hash = native.hash;
+            let writer_state = state.clone();
+            let (writer_tx, writer_rx) = mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                // Keep the persistent fixture alive even on a timeout failure.
+                let _temporary = temporary;
+                let result = writer_state.execute_block_adaptive_at_with_proof(
+                    &[native],
+                    producer,
+                    block.header.timestamp + 1,
+                    Hash256([91; 32]),
+                );
+                writer_tx.send(result).unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(30);
+            // persist_restart_artifacts appends WAL entries only. This receipt
+            // becomes visible only inside the publication write scope.
+            while !state.receipts.contains_key(&native_hash.0) {
+                assert!(
+                    Instant::now() < deadline,
+                    "{case}: publisher did not insert receipt"
+                );
+                std::thread::yield_now();
+            }
+            resume_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let response =
+                reader_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+            let published =
+                writer_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+            let response = response
+                .unwrap_or_else(|error| panic!("{case}: reader timed out: {error}"))
+                .unwrap();
+            let (_, receipts) = published
+                .unwrap_or_else(|error| panic!("{case}: publisher timed out: {error}"))
+                .unwrap();
+            reader.join().unwrap();
+            writer.join().unwrap();
+            assert!(receipts[0].success, "{case}: native request must execute");
+            let hash = format!("0x{}", row_hash.to_hex());
+            match case {
+                "earnings" => assert_eq!(response["confirmed_receipts"][0]["tx_hash"], hash),
+                "attestation" | "attestation_reward" => {
+                    assert_eq!(response["activities"][0]["tx_hash"], hash);
+                    assert_eq!(response["activities"][0]["success"], true);
+                }
+                "indexed" | "receipt" => assert_eq!(response["tx_hash"], hash),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[tokio::test]
