@@ -36,6 +36,8 @@ All notable changes to ARC Chain are tracked here. This project follows
   Recovery probes retain their existing scheduling.
 - Increase shard queue headroom for overlapping verification passes while
   keeping the compute concurrency limit unchanged.
+- The community worker processes the prompt in batches (same tokens and hash).
+  `POST /node/threads` now answers only direct calls from the same machine.
 
 Desktop app:
 

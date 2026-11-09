@@ -5114,6 +5114,12 @@ fn public_node_name(cli: &Cli) -> String {
     format!("arc-{}", &hex::encode(digest.0)[..8])
 }
 
+// Called only when a community worker loop will start. Validators keep their
+// existing prefill setting, and an explicit zero preserves the support opt-out.
+fn community_worker_batched_prefill_default(stake: u64, setting: Option<&str>) -> bool {
+    stake == 0 && setting != Some("0")
+}
+
 /// The label this community worker registers under on every coordinator's
 /// public scoreboard, plus why a `--node-name` nickname was not used.
 ///
@@ -9452,6 +9458,12 @@ async fn run_arc_node() -> Result<()> {
         if let (Some(model), Some((_, worker_model_id, worker_model_id_hash))) =
             (inference_model.clone(), worker_model.clone())
         {
+            if community_worker_batched_prefill_default(
+                stake,
+                std::env::var("ARC_BATCHED_PREFILL").ok().as_deref(),
+            ) {
+                arc_inference::canonical_prefill::set_batched_prefill_enabled(true);
+            }
             let worker_id_w = worker_id.clone();
             let community_rpc_targets_w = community_rpc_targets.clone();
             // Worker keypair + address for signing InferenceAttestation txs
@@ -10339,6 +10351,16 @@ mod tests {
     use super::*;
     use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
     use serde_json::json;
+
+    #[test]
+    fn community_worker_batched_prefill_respects_opt_out_and_validator_role() {
+        for setting in [None, Some("1"), Some(""), Some("other")] {
+            assert!(community_worker_batched_prefill_default(0, setting));
+            assert!(!community_worker_batched_prefill_default(1, setting));
+        }
+        assert!(!community_worker_batched_prefill_default(0, Some("0")));
+        assert!(!community_worker_batched_prefill_default(1, Some("0")));
+    }
 
     #[test]
     fn community_registration_name_is_a_nickname_or_public_key_hash_never_a_hostname() {
