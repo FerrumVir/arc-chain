@@ -44,11 +44,14 @@ jobs:
         run: |
           set -Eeuo pipefail
           [[ "$INPUT_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-          [[ -z "$DECLARED_OFFLINE_SITE" || "$DECLARED_OFFLINE_SITE" =~ ^[a-z]{3}(,[a-z]{3})?$ ]] &&
-            [[ "$DECLARED_OFFLINE_SITE" != *,* || "${DECLARED_OFFLINE_SITE%%,*}" != "${DECLARED_OFFLINE_SITE##*,}" ]] || {
+          if [[ -n "$DECLARED_OFFLINE_SITE" && ! "$DECLARED_OFFLINE_SITE" =~ ^[a-z]{3}(,[a-z]{3})?$ ]]; then
             echo '::error::declared_offline_site must be empty, one three-letter site, or two distinct three-letter sites separated by a comma.'
             exit 1
-          }
+          fi
+          if [[ "$DECLARED_OFFLINE_SITE" == *,* && "${DECLARED_OFFLINE_SITE%%,*}" == "${DECLARED_OFFLINE_SITE##*,}" ]]; then
+            echo '::error::declared_offline_site must be empty, one three-letter site, or two distinct three-letter sites separated by a comma.'
+            exit 1
+          fi
           [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]
           [ "$GITHUB_REF" = refs/heads/main ]
           [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ]

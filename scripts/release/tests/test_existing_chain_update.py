@@ -1013,8 +1013,7 @@ class TwoDeclaredOfflineTests(unittest.TestCase):
 
     def test_workflow_accepts_only_empty_one_or_two_distinct_sites_and_forwards_each(self):
         workflow = (ROOT.parents[1] / ".github/workflows/existing-chain-update-handoff.yml").read_text()
-        validation = workflow.split('          [[ -z "$DECLARED_OFFLINE_SITE"', 1)[1].split('          [ "$GITHUB_EVENT_NAME"', 1)[0]
-        validation = '[[ -z "$DECLARED_OFFLINE_SITE"' + validation
+        validation = workflow.split('          [[ "$INPUT_COMMIT" =~ ^[0-9a-f]{40}$ ]]\n', 1)[1].split('          [ "$GITHUB_EVENT_NAME"', 1)[0]
         forwarding = workflow.split('          declared_offline=()\n', 1)[1].split('          mkdir update-handoff', 1)[0]
         script = 'set -Eeuo pipefail\n' + validation + '\ndeclared_offline=()\n' + forwarding
         script += '\nif ((${#declared_offline[@]})); then printf "%s\\n" "${declared_offline[@]}"; fi\n'
@@ -1027,8 +1026,9 @@ class TwoDeclaredOfflineTests(unittest.TestCase):
                     self.assertEqual(result.stdout.splitlines(),
                                      [arg for site in value.split(",") if site for arg in ("--declared-offline", site)])
                 else:
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("two distinct three-letter sites", result.stdout)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout, "::error::declared_offline_site must be empty, one three-letter site, "
+                                     "or two distinct three-letter sites separated by a comma.\n")
 
     def test_threshold_equals_node_rule_through_u64_max(self):
         # Exact rule in crates/arc-types/src/lib.rs; cover every power-of-two
