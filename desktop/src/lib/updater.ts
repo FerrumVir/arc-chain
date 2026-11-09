@@ -5,7 +5,7 @@ import {
   type DownloadEvent,
 } from "@tauri-apps/plugin-updater";
 import { relaunch as tauriRelaunch } from "@tauri-apps/plugin-process";
-import { api, isTauri } from "./tauri";
+import { api, isTauri, listenForAppSignals } from "./tauri";
 import {
   createUpdateController,
   type UpdateCandidate,
@@ -68,6 +68,13 @@ export const appUpdater = createUpdateController({
   abortRelaunch: api.abortUpdateRelaunch,
   relaunch: tauriRelaunch,
 });
+
+// The native shell drives the schedule (`wake.rs`): a hidden WebView's own
+// timers may be throttled on Windows and Linux, and only native code sees a
+// wake from sleep. `signal` ignores everything while automatic checks are off.
+if (isTauri) {
+  void listenForAppSignals((signal) => appUpdater.signal(signal));
+}
 
 export function useUpdaterSnapshot() {
   return useSyncExternalStore(
