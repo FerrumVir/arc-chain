@@ -236,7 +236,7 @@ pub(super) fn poll(
             let mut work = HeldWork {
                 item,
                 chosen: None,
-                explore: state.decisions % 4 == 0,
+                explore: state.decisions.is_multiple_of(4),
             };
             if may_take(&mut state, node, worker, &mut work) {
                 Ok(Some(work.item))

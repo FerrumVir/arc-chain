@@ -223,9 +223,11 @@ mod routing_tests {
         waiting(&n, "decliner");
         let job = item("decline-old");
         let rx = insert_pending_job(&n, job.clone(), Some("decliner".into()));
-        community_submit_work(AxumState(n.clone()), Json(decline(&job.job_id, "decliner")))
-            .await
-            .unwrap();
+        let Json(submitted) =
+            community_submit_work(AxumState(n.clone()), Json(decline(&job.job_id, "decliner")))
+                .await
+                .unwrap();
+        assert_eq!(submitted["ok"], true);
         assert!(rx.await.unwrap().result.declined);
         assert!(!routing::has_other_waiter(
             &n,
@@ -362,9 +364,11 @@ mod routing_tests {
             let first = claim(&n, "first").await;
             let first_job = first["job_id"].as_str().unwrap();
             waiting(&n, "second");
-            community_submit_work(AxumState(n.clone()), Json(decline(first_job, "first")))
-                .await
-                .unwrap();
+            let Json(submitted) =
+                community_submit_work(AxumState(n.clone()), Json(decline(first_job, "first")))
+                    .await
+                    .unwrap();
+            assert_eq!(submitted["ok"], true);
             while n
                 .community_work_queue
                 .as_ref()
@@ -395,9 +399,13 @@ mod routing_tests {
                     .unwrap_err();
             assert_eq!(late.0, StatusCode::NOT_FOUND);
             if second_decline {
-                community_submit_work(AxumState(n.clone()), Json(decline(second_job, "second")))
-                    .await
-                    .unwrap();
+                let Json(submitted) = community_submit_work(
+                    AxumState(n.clone()),
+                    Json(decline(second_job, "second")),
+                )
+                .await
+                .unwrap();
+                assert_eq!(submitted["ok"], true);
                 assert!(dispatch.await.unwrap().unwrap_err().local_fallback_safe);
             } else {
                 // Verification/settlement have their own tests. Send a fully
@@ -446,13 +454,34 @@ mod routing_tests {
             let first_id = format!("0x{}", "1".repeat(64));
             let mut n = node(&[&first_id, "other"]);
             n.inference_model = Some(context_test_inference_model(512));
-            let prompt_len = n.inference_model.as_ref().unwrap().encode("ARC").len();
+            // This tokenizer maps each "ARC" to one token. Three prompt
+            // tokens plus BOS and 256 output tokens reach the 260-position
+            // boundary without exceeding the public output-token limit.
+            let input = if case == "largest" {
+                "ARC ARC ARC"
+            } else {
+                "ARC"
+            };
             let max_tokens = if case == "largest" {
-                (259 - prompt_len) as u32
+                INFERENCE_RUN_MAX_TOKENS
             } else {
                 1
             };
             assert!(max_tokens <= INFERENCE_RUN_MAX_TOKENS);
+            if case == "largest" {
+                let (_, preflight) = community_worker_generation_context(
+                    n.inference_model.as_ref().unwrap(),
+                    input,
+                    max_tokens,
+                )
+                .unwrap();
+                assert_eq!(preflight.prompt_tokens, 3);
+                assert_eq!(preflight.required_positions, 260);
+                assert_eq!(
+                    community_dispatch_timeout_secs(preflight.required_positions).unwrap(),
+                    3_891
+                );
+            }
             let probe = if case == "probe" {
                 let mut bytes = [3; 32];
                 let prefix = arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX;
@@ -466,7 +495,7 @@ mod routing_tests {
             let dispatch = tokio::spawn(async move {
                 dispatch_to_community_worker_with_probe(
                     &cloned,
-                    "ARC".into(),
+                    input.into(),
                     max_tokens,
                     Some(test_model_id()),
                     probe,
@@ -476,6 +505,8 @@ mod routing_tests {
             });
             let first = claim(&n, &first_id).await;
             assert_eq!(first["status"], "work");
+            assert_eq!(first["input"], input);
+            assert_eq!(first["max_tokens"], max_tokens);
             if case != "no-waiter" {
                 waiting(&n, "other");
             }
@@ -485,12 +516,13 @@ mod routing_tests {
             if case == "largest" {
                 tokio::time::advance(Duration::from_millis(9_001)).await;
             }
-            community_submit_work(
+            let Json(submitted) = community_submit_work(
                 AxumState(n.clone()),
                 Json(decline(first["job_id"].as_str().unwrap(), &first_id)),
             )
             .await
             .unwrap();
+            assert_eq!(submitted["ok"], true);
             assert!(
                 dispatch.await.unwrap().unwrap_err().local_fallback_safe,
                 "{case}"
@@ -546,9 +578,10 @@ mod routing_tests {
         waiting(&n, "other");
         let mut result = decline(body["job_id"].as_str().unwrap(), "failed");
         result.declined = false;
-        community_submit_work(AxumState(n.clone()), Json(result))
+        let Json(submitted) = community_submit_work(AxumState(n.clone()), Json(result))
             .await
             .unwrap();
+        assert_eq!(submitted["ok"], true);
         assert!(!dispatch.await.unwrap().unwrap_err().local_fallback_safe);
         let positions =
             community_worker_generation_context(n.inference_model.as_ref().unwrap(), "ARC", 1)
