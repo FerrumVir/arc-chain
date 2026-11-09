@@ -478,7 +478,7 @@ fn teacher_forced_optional_fields_preserve_old_bytes_and_journal_hash() {
     let mut node = fake_node_with_workers(Vec::new());
     let directory = std::env::temp_dir().join(format!("tf-journal-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&directory).unwrap();
-    node.community_settlement_journal_dir = Some(directory);
+    node.community_settlement_journal_dir = Some(Arc::new(directory));
     let mut payload = test_verified_settlement_payload(Hash256([45; 32]), 500);
     let bytes = serde_json::to_vec(&payload).unwrap();
     let old: TfLegacyApprovalPayload = serde_json::from_slice(&bytes).unwrap();
@@ -726,15 +726,16 @@ async fn teacher_forced_released_settlement_retains_tokens_and_bad_approval_hint
     let mut coordinator = fixture.coordinator.clone();
     coordinator.community_rpc_bases = Arc::new(origins);
     let _ = attempt_verified_community_reward(&coordinator, job.job_hash).await;
-    let requests = received.lock().unwrap();
-    assert_eq!(requests.len(), 4);
-    for request in requests.iter() {
-        assert_eq!(
-            request["payload"]["output_tokens"],
-            serde_json::to_value(&record.output_tokens).unwrap()
-        );
+    {
+        let requests = received.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        for request in requests.iter() {
+            assert_eq!(
+                request["payload"]["output_tokens"],
+                serde_json::to_value(&record.output_tokens).unwrap()
+            );
+        }
     }
-    drop(requests);
     servers.shutdown().await;
 }
 
