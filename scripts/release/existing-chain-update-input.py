@@ -169,7 +169,13 @@ def validate_bindings(payloads: dict[str, bytes], main: str):
             hashlib.sha256(payloads["approved-genesis.network-hash"]).hexdigest(),
             "approved genesis hash file differs from owner attestation")
     host_config = json.loads(payloads["host-config.json"])
-    require((declared or []) == host_config.get("declared_offline", []),
+    offline_rows = host_config.get("declared_offline", [])
+    require(isinstance(offline_rows, list) and
+            all(isinstance(row, dict) and isinstance(row.get("site"), str) for row in offline_rows),
+            "declared-offline validators must be rows with site names")
+    require(offline_rows == sorted(offline_rows, key=lambda row: row["site"]),
+            "declared-offline validators must be sorted by site")
+    require((declared or []) == offline_rows,
             "declared-offline validators differ between the host configuration and the owner attestation")
 
 

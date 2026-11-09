@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       declared_offline_site:
-        description: Site of the one validator the input host config declares offline; leave empty when all six are live
+        description: Up to two distinct three-letter sites declared offline, separated by a comma; empty when all six are live
         required: false
         default: ''
         type: string
@@ -44,10 +44,14 @@ jobs:
         run: |
           set -Eeuo pipefail
           [[ "$INPUT_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-          [[ -z "$DECLARED_OFFLINE_SITE" || "$DECLARED_OFFLINE_SITE" =~ ^[a-z]{3}$ ]] || {
-            echo '::error::declared_offline_site must be empty or one three-letter site name.'
+          if [[ -n "$DECLARED_OFFLINE_SITE" && ! "$DECLARED_OFFLINE_SITE" =~ ^[a-z]{3}(,[a-z]{3})?$ ]]; then
+            echo '::error::declared_offline_site must be empty, one three-letter site, or two distinct three-letter sites separated by a comma.'
             exit 1
-          }
+          fi
+          if [[ "$DECLARED_OFFLINE_SITE" == *,* && "${DECLARED_OFFLINE_SITE%%,*}" == "${DECLARED_OFFLINE_SITE##*,}" ]]; then
+            echo '::error::declared_offline_site must be empty, one three-letter site, or two distinct three-letter sites separated by a comma.'
+            exit 1
+          fi
           [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]
           [ "$GITHUB_REF" = refs/heads/main ]
           [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ]
@@ -118,8 +122,10 @@ jobs:
           # declared-offline set in the owner host config (both empty for six live).
           declared_offline=()
           if [ -n "$DECLARED_OFFLINE_SITE" ]; then
-            [[ "$DECLARED_OFFLINE_SITE" =~ ^[a-z]{3}$ ]]
-            declared_offline=(--declared-offline "$DECLARED_OFFLINE_SITE")
+            IFS=, read -r -a offline_sites <<< "$DECLARED_OFFLINE_SITE"
+            for site in "${offline_sites[@]}"; do
+              declared_offline+=(--declared-offline "$site")
+            done
           fi
           mkdir update-handoff
           python3 scripts/release/assemble-existing-chain-update.py \
@@ -175,6 +181,7 @@ jobs:
             echo "Run/attempt: $GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
             echo "Artifact ID: $ARTIFACT_ID"
             echo "Artifact digest: sha256:$ARTIFACT_DIGEST"
-            echo "Declared offline (unobserved) validator: ${DECLARED_OFFLINE_SITE:-none; all six observed}"
+            echo "Declared offline (unobserved) validators: ${DECLARED_OFFLINE_SITE:-none; all six observed}"
+            jq -r '.warnings[]?' update-handoff/arc-existing-chain-update-attestation.json
             echo 'The observation time is recorded in the attestation. This handoff does not prove the original cutover ceremony or authorize retirement.'
           } >> "$GITHUB_STEP_SUMMARY"
