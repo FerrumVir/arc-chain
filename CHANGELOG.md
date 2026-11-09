@@ -37,6 +37,37 @@ All notable changes to ARC Chain are tracked here. This project follows
 - Increase shard queue headroom for overlapping verification passes while
   keeping the compute concurrency limit unchanged.
 
+Desktop app:
+
+- A computer that agreed to share compute now keeps trying to finish setting
+  up. If the 4 GB model download stalls or fails, the app tries again every
+  20 minutes and soon after the computer wakes from sleep, instead of waiting
+  for the next launch or a click. It resumes from the bytes already saved. It
+  stops once the computer is contributing, compute is turned off, the
+  computer has less than 16 GB of memory, or the disk lacks room for the rest
+  of the download.
+- These background retries download only on mains power, and not on a
+  network the system reports as metered (read on Linux through
+  NetworkManager; Windows and macOS are treated as unmetered for now). A
+  download you start yourself is never held back.
+- A contributing computer whose model file went missing or became unreadable
+  now downloads it again by itself, at launch and in the background.
+- Only one setup attempt runs at a time. A click while a background attempt
+  is running waits for that attempt and shows its result.
+- Updates arrive sooner: the app checks every 6 hours, when its window is
+  shown or focused, and after the computer wakes, with at most one such
+  check every 15 minutes. These checks are timed from the native app, so a
+  window hidden in the tray still runs them.
+- An automatic update that is waiting for an AI job to finish now tries again
+  every hour for as long as the job keeps it waiting, instead of giving up
+  after three tries.
+- The one-time "Share your computer's spare power" question is now asked
+  only once the window is visible. A launch that starts hidden in the tray
+  at login no longer uses it up without anyone seeing it.
+- Verified work whose reward is waiting for validator approval now reads
+  "Verified. Reward pending validator approval." instead of saying no ARC
+  reward can be confirmed.
+
 ## v0.8.18 - Release-preparation snapshot (2026-11-08)
 
 > **Candidate note:** This entry records the v0.8.18 release-preparation

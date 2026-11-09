@@ -53,6 +53,7 @@ import {
   nativeMockEnabled,
 } from "./native-mock";
 import { DEFAULT_NODE_CONFIG, defaultWorkerThreads } from "./types";
+import type { UpdateSignal } from "./update-controller";
 
 const IS_TAURI =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -3264,6 +3265,102 @@ function noticeStartFailure<T>(promise: Promise<T>, stage: string): Promise<T> {
   });
 }
 
+// ── The main window and native signals ─────────────────────────────────
+
+const APP_SIGNALS: readonly UpdateSignal[] = ["tick", "wake", "focus", "shown"];
+
+/**
+ * Listen to the native `app-signal` event (`wake.rs`). Outside the native
+ * shell there is none, and this never calls `handler`. Resolves to the
+ * function that stops listening.
+ */
+export async function listenForAppSignals(
+  handler: (signal: UpdateSignal) => void,
+): Promise<() => void> {
+  if (!IS_TAURI) return () => {};
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<{ reason?: unknown }>("app-signal", (event) => {
+    const reason = event.payload?.reason;
+    if (APP_SIGNALS.includes(reason as UpdateSignal)) {
+      handler(reason as UpdateSignal);
+    }
+  });
+}
+
+/**
+ * Whether someone can see the main window. A login launch starts it hidden
+ * in the tray (`--minimized`). In the browser preview,
+ * `window.__ARC_MOCK_WINDOW_HIDDEN__ = true` stands for that hidden window.
+ */
+async function isMainWindowVisible(): Promise<boolean> {
+  if (IS_TAURI) {
+    try {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      return await getCurrentWindow().isVisible();
+    } catch {
+      return document.visibilityState === "visible" && document.hasFocus();
+    }
+  }
+  if (
+    (globalThis as { __ARC_MOCK_WINDOW_HIDDEN__?: boolean })
+      .__ARC_MOCK_WINDOW_HIDDEN__ === true
+  ) {
+    return false;
+  }
+  return document.visibilityState !== "hidden";
+}
+
+/**
+ * Call `onSeen` once, as soon as the main window is visible: now if it
+ * already is, otherwise at the first focus, `visibilitychange` to visible,
+ * or native focus or show. Returns the function that stops waiting.
+ */
+function whenMainWindowSeen(onSeen: () => void): () => void {
+  let done = false;
+  let checking = false;
+  const cleanups: Array<() => void> = [];
+  const stop = () => {
+    done = true;
+    for (const cleanup of cleanups.splice(0)) cleanup();
+  };
+  const check = () => {
+    if (done || checking) return;
+    checking = true;
+    void isMainWindowVisible().then(
+      (visible) => {
+        checking = false;
+        if (visible && !done) {
+          stop();
+          onSeen();
+        }
+      },
+      () => {
+        checking = false;
+      },
+    );
+  };
+  const onVisibility = () => {
+    if (document.visibilityState === "visible") check();
+  };
+  window.addEventListener("focus", check);
+  document.addEventListener("visibilitychange", onVisibility);
+  cleanups.push(
+    () => window.removeEventListener("focus", check),
+    () => document.removeEventListener("visibilitychange", onVisibility),
+  );
+  void listenForAppSignals((signal) => {
+    if (signal === "focus" || signal === "shown") check();
+  }).then(
+    (unlisten) => {
+      if (done) unlisten();
+      else cleanups.push(unlisten);
+    },
+    () => undefined,
+  );
+  check();
+  return stop;
+}
+
 // Typed wrappers - call these, not invoke() directly.
 
 export const api = {
@@ -3310,6 +3407,13 @@ export const api = {
    * having asked before it answers, so true comes at most once per install.
    */
   claimComputePrompt: () => invoke<boolean>("claim_compute_prompt"),
+  /** Whether the main window is visible now (hidden in the tray at login). */
+  isMainWindowVisible,
+  /**
+   * Run `onSeen` once the main window is first visible. The one-time compute
+   * question is claimed only then, so a launch nobody sees never spends it.
+   */
+  whenMainWindowSeen,
   /**
    * "Turn on" in that question: consent, and a quarter of the cores when no
    * count is stored, as a setup that leaves compute on. The model download
