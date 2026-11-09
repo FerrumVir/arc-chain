@@ -707,6 +707,9 @@ pub struct StateDB {
     pub(crate) pending_binding_update: RwLock<Option<(u64, Hash256, InferenceAdmissionContext)>>,
     native_inference_pending: DashMap<[u8; 32], u64>,
     native_inference_execution: parking_lot::Mutex<()>,
+    /// Lock order: native_inference_execution, native_inference_publication,
+    /// then height and StateDB map shards. Never acquire publication while
+    /// holding a map iterator, Ref, RefMulti, or RefMut (including in helpers).
     native_inference_publication: RwLock<()>,
 }
 
@@ -1801,6 +1804,7 @@ impl StateDB {
     }
 
     /// Get a storage value for a contract.
+    /// Takes the publication read lock; callers must hold no StateDB map guard.
     pub fn get_storage(&self, contract: &Address, key: &Hash256) -> Option<Vec<u8>> {
         let _publication = self.native_inference_publication.read();
         self.storage
@@ -1829,6 +1833,7 @@ impl StateDB {
     ///
     /// When a GPU state cache is enabled, checks GPU memory first for ~40x
     /// bandwidth improvement on hot accounts.
+    /// Takes the publication read lock; callers must hold no StateDB map guard.
     pub fn get_account(&self, addr: &Address) -> Option<Account> {
         let _publication = self.native_inference_publication.read();
         // Fast path: check GPU cache first.
@@ -3063,6 +3068,7 @@ impl StateDB {
         .collect()
     }
 
+    /// Takes the publication read lock; callers must hold no StateDB map guard.
     pub fn height(&self) -> u64 {
         let _publication = self.native_inference_publication.read();
         *self.height.read()
@@ -3113,6 +3119,7 @@ impl StateDB {
     }
 
     /// Get a block by height.
+    /// Takes the publication read lock; callers must hold no StateDB map guard.
     pub fn get_block(&self, height: u64) -> Option<Block> {
         let _publication = self.native_inference_publication.read();
         self.blocks.get(&height).map(|b| Block::clone(&b))
@@ -9129,12 +9136,14 @@ impl StateDB {
     }
 
     /// Look up a transaction receipt by tx hash.
+    /// Takes the publication read lock; callers must hold no StateDB map guard.
     pub fn get_receipt(&self, tx_hash: &[u8; 32]) -> Option<TxReceipt> {
         let _publication = self.native_inference_publication.read();
         self.receipts.get(tx_hash).map(|r| r.clone())
     }
 
     /// Look up transaction location (block_height, tx_index) by tx hash.
+    /// Takes the publication read lock; callers must hold no StateDB map guard.
     pub fn get_tx_location(&self, tx_hash: &[u8; 32]) -> Option<(u64, u32)> {
         let _publication = self.native_inference_publication.read();
         self.tx_index.get(tx_hash).map(|r| *r)
@@ -10666,6 +10675,7 @@ impl StateDB {
     ///
     /// Accounts are serialised with bincode, hashed, then sorted to ensure a
     /// deterministic tree regardless of DashMap iteration order.
+    /// Takes the publication read lock; callers must hold no StateDB map guard.
     pub fn get_state_root(&self) -> Hash256 {
         let _publication = self.native_inference_publication.read();
         self.compute_state_root()

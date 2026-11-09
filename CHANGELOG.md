@@ -38,6 +38,8 @@ All notable changes to ARC Chain are tracked here. This project follows
   keeping the compute concurrency limit unchanged.
 - The community worker processes the prompt in batches (same tokens and hash).
   `POST /node/threads` now answers only direct calls from the same machine.
+- RPC reward, attestation and receipt queries no longer hold a transaction-map
+  lock while reading published block state.
 
 Desktop app:
 

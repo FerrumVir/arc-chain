@@ -1953,6 +1953,9 @@ impl StateDB {
         self.wal.append(WalOp::Checkpoint(state_root), height);
         self.durable_wal_barrier()?;
         {
+            // Writes accounts, dirty_accounts, storage, native_inference_pending,
+            // blocks, tx_index, receipts and full_transactions. Follow the lock
+            // order documented on StateDB::native_inference_publication.
             let _publication = self.native_inference_publication.write();
             if let Some(record) = record {
                 self.apply_wal_op(&WalOp::InferenceTransition(Box::new(record)));

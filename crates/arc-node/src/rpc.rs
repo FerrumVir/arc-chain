@@ -6155,7 +6155,12 @@ fn eth_get_logs(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
     let max_height = to_block.min(from_block + 10_000); // Cap range
 
     for height in from_block..=max_height {
-        if let Some(logs) = node.state.event_logs.get(&height) {
+        let logs = node
+            .state
+            .event_logs
+            .get(&height)
+            .map(|entry| entry.value().clone());
+        if let Some(logs) = logs {
             for log in logs.iter() {
                 // Address filter
                 if let Some(ref addrs) = address_filter
@@ -9040,20 +9045,19 @@ async fn worker_earnings(
     let mut confirmed_receipts: Vec<(u64, u32, [u8; 32], Value)> = Vec::new();
     let mut successful_job_ids = HashSet::new();
 
-    for entry in node.state.full_transactions.iter() {
-        let index_hash = *entry.key();
-        let tx = entry.value();
-        let body = match &tx.body {
-            TxBody::CommunityInferenceReward(b) => b,
-            _ => continue,
-        };
-        if body.worker != want {
-            continue;
-        }
+    // Release the iterator and every shard guard before reading published state.
+    let candidates: Vec<_> = node
+        .state
+        .full_transactions
+        .iter()
+        .filter(|entry| matches!(&entry.body, TxBody::CommunityInferenceReward(body) if body.worker == want))
+        .map(|entry| (*entry.key(), entry.value().clone()))
+        .collect();
+    for (index_hash, tx) in candidates {
         #[cfg(test)]
         pause_before_state_publication_read(&node);
-        let evidence =
-            canonical_transaction_evidence(&node, Hash256(index_hash)).map_err(|error| {
+        let evidence = canonical_transaction_evidence_for_body(&node, Hash256(index_hash), tx)
+            .map_err(|error| {
                 (
                     StatusCode::CONFLICT,
                     format!(
@@ -9062,6 +9066,9 @@ async fn worker_earnings(
                     ),
                 )
             })?;
+        let TxBody::CommunityInferenceReward(body) = &evidence.transaction.body else {
+            unreachable!("candidate filter selects only rewards");
+        };
         let Some(receipt) = evidence.receipt else {
             continue;
         };
@@ -9082,7 +9089,7 @@ async fn worker_earnings(
         let bh = receipt.block_height;
         if last_block.map(|cur| bh > cur).unwrap_or(true) {
             last_block = Some(bh);
-            last_tx_hash = Some(format!("0x{}", hex::encode(entry.key())));
+            last_tx_hash = Some(format!("0x{}", hex::encode(index_hash)));
         }
         if first_block.map(|cur| bh < cur).unwrap_or(true) {
             first_block = Some(bh);
@@ -9093,7 +9100,7 @@ async fn worker_earnings(
             index_hash,
             json!({
                 "tx_type": "0x25",
-                "tx_hash": format!("0x{}", hex::encode(entry.key())),
+                "tx_hash": format!("0x{}", hex::encode(index_hash)),
                 "job_id": format!("0x{}", body.job_id.to_hex()),
                 "worker": format!("0x{}", body.worker.to_hex()),
                 "model_id": format!("0x{}", body.model_id.to_hex()),
@@ -9114,7 +9121,7 @@ async fn worker_earnings(
                 "reward_arc": REWARD_PER_ATTESTATION_ARC,
                 "receipt_url": format!(
                     "/community/reward_receipt/0x{}",
-                    hex::encode(entry.key())
+                    hex::encode(index_hash)
                 ),
             }),
         ));
@@ -9555,6 +9562,7 @@ async fn inference_list_attestations(
     // inclusion: the map key, signed transaction hash/type, and receipt hash
     // must all agree before any row is called mined.
     let mut receipt_backed_local_ids = HashSet::<[u8; 32]>::new();
+    let mut candidates = Vec::new();
     for entry in node.state.full_transactions.iter() {
         let hash = entry.key();
         let tx = entry.value();
@@ -9565,6 +9573,16 @@ async fn inference_list_attestations(
             }
             continue;
         }
+        if matches!(
+            &tx.body,
+            TxBody::InferenceAttestation(_) | TxBody::CommunityInferenceReward(_)
+        ) {
+            candidates.push((*hash, tx.clone()));
+        }
+    }
+    // No StateDB map guard survives into receipt or canonical evidence reads.
+    for (hash, tx) in candidates {
+        let hash = &hash;
         match &tx.body {
             TxBody::InferenceAttestation(body) if tx.tx_type == TxType::InferenceAttestation => {
                 #[cfg(test)]
@@ -9603,18 +9621,20 @@ async fn inference_list_attestations(
                     }),
                 ));
             }
-            TxBody::CommunityInferenceReward(body)
+            TxBody::CommunityInferenceReward(_)
                 if tx.tx_type == TxType::CommunityInferenceReward =>
             {
                 #[cfg(test)]
                 pause_before_state_publication_read(&node);
-                let Some(receipt) = canonical_transaction_evidence(&node, Hash256(*hash))
+                let evidence = canonical_transaction_evidence_for_body(&node, Hash256(*hash), tx)
                     .map_err(|error| {
                         tracing::error!(tx_hash = %hex::encode(hash), %error, "invalid community reward chain evidence");
                         StatusCode::CONFLICT
-                    })?
-                    .receipt
-                else {
+                    })?;
+                let TxBody::CommunityInferenceReward(body) = &evidence.transaction.body else {
+                    unreachable!("candidate match selects only rewards");
+                };
+                let Some(receipt) = evidence.receipt else {
                     continue;
                 };
                 receipt_backed_local_ids.extend([
@@ -9663,7 +9683,7 @@ async fn inference_list_attestations(
                         "paid": receipt.success,
                         "earned": receipt.success,
                         "worker": format!("0x{}", body.worker.to_hex()),
-                        "submitted_by": format!("0x{}", tx.from.to_hex()),
+                        "submitted_by": format!("0x{}", evidence.transaction.from.to_hex()),
                         "job_id": format!("0x{}", body.job_id.to_hex()),
                         "block_height": receipt.block_height,
                         "block_hash": format!("0x{}", receipt.block_hash.to_hex()),
@@ -18335,6 +18355,8 @@ fn validate_canonical_transaction_inclusion(
 /// its height, block hash, and index must identify the exact transaction in a
 /// structurally valid block. Every public payment view uses this helper so a
 /// corrupted or partially recovered index cannot be reported as earned ARC.
+///
+/// Takes the publication read lock; callers must hold no StateDB map guard.
 fn canonical_transaction_evidence(
     node: &NodeState,
     tx_hash: Hash256,
@@ -18347,7 +18369,17 @@ fn canonical_transaction_evidence(
     validate_canonical_transaction_identity(&tx, tx_hash)?;
     let transaction = tx.clone();
     drop(tx);
+    canonical_transaction_evidence_for_body(node, tx_hash, transaction)
+}
 
+/// Bind an owned transaction body to the canonical block index and receipt.
+/// Takes the publication read lock; callers must hold no StateDB map guard.
+fn canonical_transaction_evidence_for_body(
+    node: &NodeState,
+    tx_hash: Hash256,
+    transaction: Transaction,
+) -> Result<CanonicalTransactionEvidence, String> {
+    validate_canonical_transaction_identity(&transaction, tx_hash)?;
     let indexed = node
         .state
         .tx_index
@@ -18406,6 +18438,7 @@ fn indexed_reward_for_job(
     let mut successful = Vec::new();
     let mut failed = Vec::new();
     let mut receipt_unavailable = Vec::new();
+    let mut candidates = Vec::new();
     for entry in node.state.full_transactions.iter() {
         let tx = entry.value();
         let arc_types::TxBody::CommunityInferenceReward(body) = &tx.body else {
@@ -18427,26 +18460,34 @@ fn indexed_reward_for_job(
                 job_id.to_hex()
             ));
         }
+        candidates.push((index_hash, tx.clone()));
+    }
+    // Evaluate the collected body even if its map entry has since been evicted.
+    for (index_hash, tx) in candidates {
         #[cfg(test)]
         pause_before_state_publication_read(node);
-        let evidence = canonical_transaction_evidence(node, index_hash).map_err(|error| {
-            format!(
-                "reward job 0x{} has invalid chain evidence: {error}",
-                job_id.to_hex()
-            )
-        })?;
+        let evidence =
+            canonical_transaction_evidence_for_body(node, index_hash, tx).map_err(|error| {
+                format!(
+                    "reward job 0x{} has invalid chain evidence: {error}",
+                    job_id.to_hex()
+                )
+            })?;
         if evidence.inclusion.is_none() {
             return Err(format!(
                 "reward job 0x{} transaction body has no canonical block index",
                 job_id.to_hex()
             ));
         }
+        let TxBody::CommunityInferenceReward(body) = evidence.transaction.body else {
+            unreachable!("candidate filter selects only rewards");
+        };
         match evidence.receipt {
             Some(receipt) if receipt.success => {
-                successful.push((index_hash, body.clone()));
+                successful.push((index_hash, body));
             }
-            Some(_) => failed.push((index_hash, body.clone())),
-            None => receipt_unavailable.push((index_hash, body.clone())),
+            Some(_) => failed.push((index_hash, body)),
+            None => receipt_unavailable.push((index_hash, body)),
         }
     }
     if successful.len() > 1 {
@@ -18469,6 +18510,14 @@ fn indexed_reward_for_job(
 fn community_reward_receipt_value(node: &NodeState, tx_hash: Hash256) -> Result<Value, String> {
     let evidence = canonical_transaction_evidence(node, tx_hash)
         .map_err(|error| format!("invalid reward chain evidence: {error}"))?;
+    community_reward_receipt_value_for_evidence(node, evidence)
+}
+
+fn community_reward_receipt_value_for_evidence(
+    node: &NodeState,
+    evidence: CanonicalTransactionEvidence,
+) -> Result<Value, String> {
+    let tx_hash = evidence.transaction.hash;
     let TxBody::CommunityInferenceReward(body) = &evidence.transaction.body else {
         return Err("canonical transaction is not type 0x25".to_string());
     };
@@ -18520,7 +18569,12 @@ async fn community_reward_receipt(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let tx_hash = parse_hash256_hex(&hash, "reward tx hash")
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    if let Some(tx) = node.state.full_transactions.get(&tx_hash.0) {
+    let transaction = node
+        .state
+        .full_transactions
+        .get(&tx_hash.0)
+        .map(|entry| entry.value().clone());
+    if let Some(tx) = transaction {
         if tx.tx_type != TxType::CommunityInferenceReward || tx.hash != tx_hash {
             return Err((
                 StatusCode::CONFLICT,
@@ -18535,7 +18589,14 @@ async fn community_reward_receipt(
         };
         #[cfg(test)]
         pause_before_state_publication_read(&node);
-        let value = community_reward_receipt_value(&node, tx_hash)
+        let evidence =
+            canonical_transaction_evidence_for_body(&node, tx_hash, tx).map_err(|error| {
+                (
+                    StatusCode::CONFLICT,
+                    format!("invalid reward chain evidence: {error}"),
+                )
+            })?;
+        let value = community_reward_receipt_value_for_evidence(&node, evidence)
             .map_err(|error| (StatusCode::CONFLICT, error))?;
         return Ok(Json(value));
     }
