@@ -871,6 +871,9 @@ fn requeue_twin_leg(
                 assignment_epoch,
                 job_nonce,
                 assigned_worker: None,
+                assigned_at: None,
+                first_submit_at: None,
+                routing: Default::default(),
                 submitting: false,
                 sender: leg_sender,
             });
@@ -1130,6 +1133,9 @@ pub(super) async fn dispatch_twin(
                     assignment_epoch: *assignment_epoch,
                     job_nonce: *job_nonce,
                     assigned_worker: None,
+                    assigned_at: None,
+                    first_submit_at: None,
+                    routing: Default::default(),
                     submitting: false,
                     sender: leg_sender,
                 });
