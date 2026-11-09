@@ -117,6 +117,7 @@ export function App() {
 
   useEffect(() => {
     let active = true;
+    let stopWaitingToBeSeen: (() => void) | null = null;
     (async () => {
       const [
         loadedIdentity,
@@ -143,17 +144,23 @@ export function App() {
       // asks the question itself. Native code decides whether to ask and has
       // recorded that it did before it answers true, so a hardware read that
       // takes seconds delays nothing here and the question never repeats.
+      // A login launch starts hidden in the tray, so the claim waits until
+      // the window is first visible: recorded but never seen, the question
+      // would be spent on nobody.
       if (active && (onboardedFlag || (loadedIdentity && loadedConfig))) {
-        void api.claimComputePrompt().then(
-          (due) => {
-            if (due) setComputePrompt(true);
-          },
-          () => undefined,
-        );
+        stopWaitingToBeSeen = api.whenMainWindowSeen(() => {
+          void api.claimComputePrompt().then(
+            (due) => {
+              if (due) setComputePrompt(true);
+            },
+            () => undefined,
+          );
+        });
       }
     })();
     return () => {
       active = false;
+      stopWaitingToBeSeen?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

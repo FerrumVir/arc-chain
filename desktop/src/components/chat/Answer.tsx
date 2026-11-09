@@ -169,6 +169,9 @@ export function Answer({
     communitySettlementMessage = `${confirmedCommunityRewardAmount} confirmed for the serving worker by an independently fetched successful mined 0x25 receipt`;
   } else if (settlement?.txType && settlement.txType !== "0x25") {
     communitySettlementMessage = `unrecognized settlement type ${settlement.txType}; no community reward credited`;
+  } else if (settlement && !settlement.submitted && settlement.status === "verified_pending_approval") {
+    // Verified work whose reward waits for validator approval is usually paid; it is pending, not lost.
+    communitySettlementMessage = "Verified. Reward pending validator approval.";
   } else if (settlement && !settlement.submitted) {
     communitySettlementMessage = `No 0x25 was submitted (${settlement.status.replaceAll("_", " ")}); no ARC reward can be confirmed`;
   } else if (minedFailedCommunityReward) {

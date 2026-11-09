@@ -3,8 +3,29 @@ import { PLAIN_COPY } from "./plain-copy";
 import { isStartupReconciliationInProgress } from "./start-failure";
 
 export const UPDATE_STARTUP_DELAY_MS = 5_000;
-export const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1_000;
+export const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1_000;
+/** Retries for a failed check or a failed update download. */
 export const UPDATE_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 15 * 60_000] as const;
+/**
+ * How often an automatic install waiting for inference to finish tries
+ * again. It keeps trying while the same update stays waiting.
+ */
+export const UPDATE_BUSY_RETRY_MS = 60 * 60 * 1_000;
+/**
+ * The least time between two checks started by a signal (the window shown
+ * or focused, a wake from sleep). Release discovery reads the GitHub API,
+ * which allows an address 60 unauthenticated requests an hour.
+ */
+export const UPDATE_SIGNAL_MIN_GAP_MS = 15 * 60_000;
+
+/**
+ * What the native shell tells the controller (`wake.rs`):
+ * - `tick`: sent every few minutes from Rust. Runs any check or retry whose
+ *   time has come, in case the hidden WebView's own timers were held back.
+ * - `wake`: the computer woke from sleep.
+ * - `focus`, `shown`: the main window gained focus or the tray showed it.
+ */
+export type UpdateSignal = "tick" | "wake" | "focus" | "shown";
 /** How often a verified update retries while launch reconciliation runs. */
 export const UPDATE_RECONCILIATION_RETRY_MS = 60_000;
 
@@ -83,6 +104,8 @@ export interface UpdateSchedule {
   startupDelayMs?: number;
   intervalMs?: number;
   retryDelaysMs?: readonly number[];
+  busyRetryMs?: number;
+  signalMinGapMs?: number;
 }
 
 type UpdateCheckSource = "automatic" | "manual" | "retry";
@@ -149,6 +172,12 @@ export class UpdateController {
   private intervalTimer: unknown | null = null;
   private retryTimer: unknown | null = null;
   private autoInstallRetryTimer: unknown | null = null;
+  // When each pending timer is due, on the wall clock. A `tick` signal runs
+  // an overdue one at once.
+  private intervalDueAt: number | null = null;
+  private retryDueAt: number | null = null;
+  private autoInstallRetryDueAt: number | null = null;
+  private lastCheckStartedAt: number | null = null;
   private reconciliationRetryTimer: unknown | null = null;
   private reconciliationWaitManual = false;
   private automaticFailureCount = 0;
@@ -159,6 +188,8 @@ export class UpdateController {
   private readonly startupDelayMs: number;
   private readonly intervalMs: number;
   private readonly retryDelaysMs: readonly number[];
+  private readonly busyRetryMs: number;
+  private readonly signalMinGapMs: number;
 
   constructor(
     private readonly runtime: UpdateRuntime,
@@ -169,6 +200,12 @@ export class UpdateController {
       schedule.startupDelayMs ?? UPDATE_STARTUP_DELAY_MS;
     this.intervalMs = schedule.intervalMs ?? UPDATE_CHECK_INTERVAL_MS;
     this.retryDelaysMs = schedule.retryDelaysMs ?? UPDATE_RETRY_DELAYS_MS;
+    this.busyRetryMs = schedule.busyRetryMs ?? UPDATE_BUSY_RETRY_MS;
+    this.signalMinGapMs = schedule.signalMinGapMs ?? UPDATE_SIGNAL_MIN_GAP_MS;
+  }
+
+  private now(): number {
+    return (this.runtime.now ?? Date.now)();
   }
 
   getSnapshot = (): UpdateSnapshot => this.snapshot;
@@ -196,14 +233,76 @@ export class UpdateController {
       void this.checkForUpdates("automatic");
     }, this.startupDelayMs);
 
-    this.intervalTimer = this.timers.setInterval(() => {
-      // A bounded retry sequence owns the cadence after a recent failure.
-      // When retries are exhausted, a new ordinary interval starts a fresh
-      // sequence in case connectivity has returned.
-      if (this.retryTimer !== null) return;
-      this.automaticFailureCount = 0;
-      void this.checkForUpdates("automatic");
+    this.scheduleIntervalCheck();
+  }
+
+  private scheduleIntervalCheck(): void {
+    this.intervalDueAt = this.now() + this.intervalMs;
+    this.intervalTimer = this.timers.setTimeout(() => {
+      this.intervalTimer = null;
+      this.runIntervalCheck();
     }, this.intervalMs);
+  }
+
+  private runIntervalCheck(): void {
+    this.scheduleIntervalCheck();
+    // A bounded retry sequence owns the cadence after a recent failure.
+    // When retries are exhausted, a new ordinary interval starts a fresh
+    // sequence in case connectivity has returned.
+    if (this.retryTimer !== null) return;
+    this.automaticFailureCount = 0;
+    void this.checkForUpdates("automatic");
+  }
+
+  /**
+   * A signal from the native shell. Every signal first runs whatever is
+   * overdue: the periodic check, a failed-check retry, a waiting install.
+   * A wake, a focus or a show also checks now, unless an update is already
+   * found (its own retries handle it) or a check started less than
+   * `signalMinGapMs` ago.
+   */
+  signal(signal: UpdateSignal): void {
+    if (!this.autoChecksEnabled || !this.runtime.supported) return;
+    if (this.snapshot.restartRequired) return;
+    const now = this.now();
+    this.runOverdue(now);
+    if (signal === "tick" || this.candidate !== null) return;
+    if (
+      this.lastCheckStartedAt !== null &&
+      now - this.lastCheckStartedAt < this.signalMinGapMs
+    ) {
+      return;
+    }
+    void this.checkForUpdates("automatic");
+  }
+
+  private runOverdue(now: number): void {
+    if (
+      this.autoInstallRetryTimer !== null &&
+      this.autoInstallRetryDueAt !== null &&
+      this.autoInstallRetryDueAt <= now
+    ) {
+      const fire = this.autoInstallRetryFire;
+      this.clearAutoInstallRetryTimer();
+      fire?.();
+    }
+    if (
+      this.retryTimer !== null &&
+      this.retryDueAt !== null &&
+      this.retryDueAt <= now
+    ) {
+      this.clearRetryTimer();
+      void this.checkForUpdates("retry");
+    }
+    if (
+      this.intervalTimer !== null &&
+      this.intervalDueAt !== null &&
+      this.intervalDueAt <= now
+    ) {
+      this.timers.clearTimeout(this.intervalTimer);
+      this.intervalTimer = null;
+      this.runIntervalCheck();
+    }
   }
 
   /** Enable unattended installs only when automatic discovery is also enabled. */
@@ -276,6 +375,7 @@ export class UpdateController {
     }
 
     this.automaticCheckRequestedInFlight = source !== "manual";
+    this.lastCheckStartedAt = this.now();
 
     this.setSnapshot({
       ...this.snapshot,
@@ -598,7 +698,7 @@ export class UpdateController {
               canInstall: true,
               restartRequired: false,
             });
-            this.scheduleAutoInstallRetry(candidate);
+            this.scheduleBusyInstallRetry(candidate);
             return this.snapshot;
           }
 
@@ -782,9 +882,10 @@ export class UpdateController {
       this.startupTimer = null;
     }
     if (this.intervalTimer !== null) {
-      this.timers.clearInterval(this.intervalTimer);
+      this.timers.clearTimeout(this.intervalTimer);
       this.intervalTimer = null;
     }
+    this.intervalDueAt = null;
     this.clearRetryTimer();
     this.clearAutoInstallRetryTimer();
   }
@@ -794,6 +895,7 @@ export class UpdateController {
       this.timers.clearTimeout(this.retryTimer);
       this.retryTimer = null;
     }
+    this.retryDueAt = null;
   }
 
   private clearAutoInstallRetryTimer(): void {
@@ -801,6 +903,21 @@ export class UpdateController {
       this.timers.clearTimeout(this.autoInstallRetryTimer);
       this.autoInstallRetryTimer = null;
     }
+    this.autoInstallRetryDueAt = null;
+    this.autoInstallRetryFire = null;
+  }
+
+  private autoInstallRetryFire: (() => void) | null = null;
+
+  private setAutoInstallRetry(fire: () => void, delayMs: number): void {
+    this.autoInstallRetryDueAt = this.now() + delayMs;
+    this.autoInstallRetryFire = fire;
+    this.autoInstallRetryTimer = this.timers.setTimeout(() => {
+      this.autoInstallRetryTimer = null;
+      this.autoInstallRetryDueAt = null;
+      this.autoInstallRetryFire = null;
+      fire();
+    }, delayMs);
   }
 
   // Not part of clearTimers: a settings save re-enables background checks,
@@ -877,10 +994,27 @@ export class UpdateController {
     const delayMs = this.retryDelaysMs[this.autoInstallDeferralCount];
     if (delayMs === undefined) return;
     this.autoInstallDeferralCount += 1;
-    this.autoInstallRetryTimer = this.timers.setTimeout(() => {
-      this.autoInstallRetryTimer = null;
+    this.setAutoInstallRetry(() => {
       void this.installAutomatically(candidate);
     }, delayMs);
+  }
+
+  /**
+   * Inference was still running. Try again every `busyRetryMs` for as long
+   * as the same update keeps waiting; this never uses up the failure
+   * retries.
+   */
+  private scheduleBusyInstallRetry(candidate: UpdateCandidate): void {
+    if (
+      !this.autoInstallEnabled ||
+      this.autoInstallRetryTimer !== null ||
+      this.candidate !== candidate
+    ) {
+      return;
+    }
+    this.setAutoInstallRetry(() => {
+      void this.installAutomatically(candidate);
+    }, this.busyRetryMs);
   }
 
   private scheduleAutomaticRetry(): void {
@@ -888,8 +1022,10 @@ export class UpdateController {
     const delayMs = this.retryDelaysMs[this.automaticFailureCount];
     if (delayMs === undefined) return;
     this.automaticFailureCount += 1;
+    this.retryDueAt = this.now() + delayMs;
     this.retryTimer = this.timers.setTimeout(() => {
       this.retryTimer = null;
+      this.retryDueAt = null;
       void this.checkForUpdates("retry");
     }, delayMs);
   }

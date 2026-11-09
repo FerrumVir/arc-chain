@@ -1,4 +1,5 @@
 mod auto_update;
+mod background_promotion;
 mod commands;
 mod hardware;
 mod identity;
@@ -16,6 +17,7 @@ mod tray;
 mod types;
 mod update_location;
 mod updater_channel;
+mod wake;
 mod wallet;
 
 use std::collections::HashMap;
@@ -719,6 +721,10 @@ pub fn run() {
                 }
             });
 
+            // Wake detection and the periodic `app-signal` tick, from Rust so
+            // a hidden, throttled WebView still runs its update checks.
+            wake::spawn(app.handle().clone());
+
             // If the app was launched with `--minimized` (set by the
             // autostart plugin on login), keep the window hidden and
             // let the tray be the only surface until the user clicks it.
@@ -810,6 +816,15 @@ pub fn run() {
                     return;
                 }
 
+                // Keep retrying a consented install's model download, or a
+                // worker's missing model, until it can take jobs. Started
+                // only now that reconciliation succeeded; it runs whether or
+                // not the node auto-starts (with auto-start off the model
+                // downloads and the node stays stopped). The launch's own
+                // attempt below comes first; the loop's first tick follows
+                // one interval later.
+                tauri::async_runtime::spawn(background_promotion::run_retry_loop(handle.clone()));
+
                 if !should_start {
                     if start_config.auto_start && !migration_allows_autostart {
                         tracing::error!(
@@ -871,6 +886,11 @@ pub fn run() {
         // tray → Quit menu item, which calls app.exit() after stopping
         // arc-node cleanly.
         .on_window_event(|window, event| {
+            if let WindowEvent::Focused(true) = event {
+                if window.label() == "main" {
+                    wake::emit_signal(window.app_handle(), wake::SignalReason::Focus);
+                }
+            }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
                     // Only hide-to-tray if there is a tray to hide to.

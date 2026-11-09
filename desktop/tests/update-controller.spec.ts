@@ -6,7 +6,11 @@ import { PLAIN_COPY } from "../src/lib/plain-copy";
 import {
   createUpdateController,
   NATIVE_WRONG_LOCATION,
+  UPDATE_BUSY_RETRY_MS,
+  UPDATE_CHECK_INTERVAL_MS,
   UPDATE_RECONCILIATION_RETRY_MS,
+  UPDATE_RETRY_DELAYS_MS,
+  UPDATE_SIGNAL_MIN_GAP_MS,
   type UpdateCandidate,
   type UpdateDownloadEvent,
   type UpdateTimers,
@@ -41,6 +45,19 @@ class FakeTimers implements UpdateTimers {
 
   setInterval = (callback: () => void, delayMs: number): number =>
     this.add(callback, delayMs, delayMs);
+
+  /** The fake wall clock, for `UpdateRuntime.now`. */
+  now = (): number => this.nowMs;
+
+  /**
+   * Move the clock without firing anything: a hidden WebView whose timers
+   * were throttled, or a computer that slept.
+   */
+  async skipWithoutFiring(ms: number): Promise<void> {
+    this.nowMs += ms;
+    for (const task of this.tasks.values()) task.at += ms;
+    await this.flushPromises();
+  }
 
   clearInterval = this.clearTimeout;
 
@@ -213,7 +230,8 @@ test.describe("UpdateController", () => {
       {
         startupDelayMs: 10,
         intervalMs: 1_000,
-        retryDelaysMs: [20],
+        retryDelaysMs: [500],
+        busyRetryMs: 20,
       },
       timers,
     );
@@ -242,6 +260,332 @@ test.describe("UpdateController", () => {
       phase: "ready",
       restartRequired: true,
     });
+    controller.dispose();
+  });
+
+  test("the default cadence is a check every 6 hours, with busy installs retried hourly", () => {
+    expect(UPDATE_CHECK_INTERVAL_MS).toBe(6 * 60 * 60 * 1_000);
+    expect(UPDATE_BUSY_RETRY_MS).toBe(60 * 60 * 1_000);
+    expect(UPDATE_RETRY_DELAYS_MS).toEqual([60_000, 5 * 60_000, 15 * 60_000]);
+    expect(UPDATE_SIGNAL_MIN_GAP_MS).toBe(15 * 60_000);
+  });
+
+  test("checks every 6 hours by default", async () => {
+    const timers = new FakeTimers();
+    let checkCalls = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => {
+          checkCalls += 1;
+          return null;
+        },
+        prepareRelaunch: async () => {},
+        beginHandoff: async () => {},
+        abortRelaunch: async () => {},
+        relaunch: async () => {},
+        now: timers.now,
+      },
+      {},
+      timers,
+    );
+    controller.setAutoChecksEnabled(true);
+    await timers.advanceBy(5_000);
+    expect(checkCalls).toBe(1);
+    await timers.advanceBy(6 * 60 * 60 * 1_000 - 5_000 - 1);
+    expect(checkCalls).toBe(1);
+    await timers.advanceBy(1);
+    expect(checkCalls).toBe(2);
+    await timers.advanceBy(6 * 60 * 60 * 1_000);
+    expect(checkCalls).toBe(3);
+    controller.dispose();
+  });
+
+  test("checks when the window is shown or focused and after a wake, at most once per gap", async () => {
+    const timers = new FakeTimers();
+    let checkCalls = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => {
+          checkCalls += 1;
+          return null;
+        },
+        prepareRelaunch: async () => {},
+        beginHandoff: async () => {},
+        abortRelaunch: async () => {},
+        relaunch: async () => {},
+        now: timers.now,
+      },
+      { startupDelayMs: 10, intervalMs: 100_000, signalMinGapMs: 1_000 },
+      timers,
+    );
+
+    // Nothing happens while automatic checks are off.
+    controller.signal("focus");
+    await timers.advanceBy(0);
+    expect(checkCalls).toBe(0);
+
+    controller.setAutoChecksEnabled(true);
+    await timers.advanceBy(10);
+    expect(checkCalls).toBe(1);
+
+    // Too soon after the startup check.
+    controller.signal("focus");
+    await timers.advanceBy(0);
+    expect(checkCalls).toBe(1);
+
+    await timers.advanceBy(1_000);
+    controller.signal("shown");
+    await timers.advanceBy(0);
+    expect(checkCalls).toBe(2);
+
+    await timers.advanceBy(1_000);
+    controller.signal("focus");
+    await timers.advanceBy(0);
+    expect(checkCalls).toBe(3);
+
+    // A tick alone never checks early.
+    await timers.advanceBy(1_000);
+    controller.signal("tick");
+    await timers.advanceBy(0);
+    expect(checkCalls).toBe(3);
+
+    // A wake after a long sleep checks at once, even though the WebView's
+    // timers did not run while the computer slept.
+    await timers.skipWithoutFiring(50_000);
+    controller.signal("wake");
+    await timers.advanceBy(0);
+    expect(checkCalls).toBe(4);
+
+    controller.setAutoChecksEnabled(false);
+    await timers.advanceBy(5_000);
+    controller.signal("wake");
+    await timers.advanceBy(0);
+    expect(checkCalls).toBe(4);
+    controller.dispose();
+  });
+
+  test("a native tick runs the 6-hour check that throttled WebView timers held back", async () => {
+    const timers = new FakeTimers();
+    let checkCalls = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => {
+          checkCalls += 1;
+          return null;
+        },
+        prepareRelaunch: async () => {},
+        beginHandoff: async () => {},
+        abortRelaunch: async () => {},
+        relaunch: async () => {},
+        now: timers.now,
+      },
+      { startupDelayMs: 10, intervalMs: 1_000 },
+      timers,
+    );
+    controller.setAutoChecksEnabled(true);
+    await timers.advanceBy(10);
+    expect(checkCalls).toBe(1);
+
+    // The WebView's timer never fires; the clock moves past its due time.
+    await timers.skipWithoutFiring(5_000);
+    expect(checkCalls).toBe(1);
+    controller.signal("tick");
+    await timers.advanceBy(0);
+    expect(checkCalls).toBe(2);
+
+    // The interval starts again from that check.
+    await timers.advanceBy(999);
+    expect(checkCalls).toBe(2);
+    await timers.advanceBy(1);
+    expect(checkCalls).toBe(3);
+    controller.dispose();
+  });
+
+  test("an install deferred by running inference retries every hour while it stays busy", async () => {
+    const timers = new FakeTimers();
+    const order: string[] = [];
+    let prepareAttempts = 0;
+    const hour = 60 * 60 * 1_000;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => ({
+          version: "0.8.19",
+          download: async () => {
+            order.push("download");
+          },
+          install: async () => {
+            order.push("install");
+          },
+        }),
+        tryPrepareAutoUpdateRelaunch: async () => {
+          prepareAttempts += 1;
+          order.push("try-prepare");
+          return prepareAttempts <= 5
+            ? { status: "busy", reason: "inference active", activeJobs: 1 }
+            : { status: "prepared" };
+        },
+        prepareRelaunch: async () => {},
+        beginHandoff: async () => {
+          order.push("handoff");
+        },
+        abortRelaunch: async () => {},
+        relaunch: async () => {
+          order.push("relaunch");
+        },
+        now: timers.now,
+      },
+      // A long interval, so only the busy retry runs here.
+      { startupDelayMs: 10, intervalMs: 100 * hour },
+      timers,
+    );
+    controller.setAutoChecksEnabled(true);
+    controller.setAutoInstallEnabled(true);
+    await timers.advanceBy(10);
+    expect(prepareAttempts).toBe(1);
+
+    // Not at the old 1, 5 and 15 minute marks...
+    await timers.advanceBy(15 * 60_000);
+    expect(prepareAttempts).toBe(1);
+    // ...but every hour, more than the three failure retries allow.
+    await timers.advanceBy(hour - 15 * 60_000 - 1);
+    expect(prepareAttempts).toBe(1);
+    await timers.advanceBy(1);
+    expect(prepareAttempts).toBe(2);
+    for (let attempt = 3; attempt <= 5; attempt += 1) {
+      await timers.advanceBy(hour);
+      expect(prepareAttempts).toBe(attempt);
+      expect(controller.getSnapshot().message).toContain("waiting for inference to finish");
+    }
+    expect(order.filter((step) => step === "download")).toEqual(["download"]);
+
+    // A throttled timer is caught up by a native tick.
+    await timers.skipWithoutFiring(hour);
+    controller.signal("tick");
+    await timers.advanceBy(0);
+    expect(prepareAttempts).toBe(6);
+    expect(order.slice(-3)).toEqual(["handoff", "install", "relaunch"]);
+    controller.dispose();
+  });
+
+  test("a signal does not re-check while a found update waits to install", async () => {
+    const timers = new FakeTimers();
+    let checkCalls = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => {
+          checkCalls += 1;
+          return {
+            version: "0.8.19",
+            download: async () => {},
+            install: async () => {},
+          };
+        },
+        tryPrepareAutoUpdateRelaunch: async () => ({
+          status: "busy",
+          reason: "inference active",
+          activeJobs: 1,
+        }),
+        prepareRelaunch: async () => {},
+        beginHandoff: async () => {},
+        abortRelaunch: async () => {},
+        relaunch: async () => {},
+        now: timers.now,
+      },
+      { startupDelayMs: 10, intervalMs: 100_000_000, signalMinGapMs: 1_000 },
+      timers,
+    );
+    controller.setAutoChecksEnabled(true);
+    controller.setAutoInstallEnabled(true);
+    await timers.advanceBy(10);
+    expect(checkCalls).toBe(1);
+    await timers.advanceBy(10_000);
+    controller.signal("focus");
+    controller.signal("wake");
+    await timers.advanceBy(0);
+    expect(checkCalls, "the update already found is not downloaded again").toBe(1);
+    controller.dispose();
+  });
+
+  test("failed checks still retry at 1, 5 and 15 minutes by default", async () => {
+    const timers = new FakeTimers();
+    let checkCalls = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => {
+          checkCalls += 1;
+          throw new Error("offline");
+        },
+        prepareRelaunch: async () => {},
+        beginHandoff: async () => {},
+        abortRelaunch: async () => {},
+        relaunch: async () => {},
+        now: timers.now,
+      },
+      { startupDelayMs: 10 },
+      timers,
+    );
+    controller.setAutoChecksEnabled(true);
+    await timers.advanceBy(10);
+    expect(checkCalls).toBe(1);
+    await timers.advanceBy(60_000);
+    expect(checkCalls).toBe(2);
+    await timers.advanceBy(5 * 60_000);
+    expect(checkCalls).toBe(3);
+    await timers.advanceBy(15 * 60_000);
+    expect(checkCalls).toBe(4);
+    // The retries are spent; the next try is the 6-hour check.
+    await timers.advanceBy(60 * 60_000);
+    expect(checkCalls).toBe(4);
+    controller.dispose();
+  });
+
+  test("a failed update download still retries at the failure delays", async () => {
+    const timers = new FakeTimers();
+    let downloads = 0;
+    const controller = createUpdateController(
+      {
+        supported: true,
+        check: async () => ({
+          version: "0.8.19",
+          download: async () => {
+            downloads += 1;
+            throw new Error("connection reset");
+          },
+          install: async () => {},
+        }),
+        tryPrepareAutoUpdateRelaunch: async () => ({ status: "prepared" }),
+        prepareRelaunch: async () => {},
+        beginHandoff: async () => {},
+        abortRelaunch: async () => {},
+        relaunch: async () => {},
+        now: timers.now,
+      },
+      {
+        startupDelayMs: 10,
+        intervalMs: 100_000_000,
+        retryDelaysMs: [20, 40],
+        busyRetryMs: 5,
+      },
+      timers,
+    );
+    controller.setAutoChecksEnabled(true);
+    controller.setAutoInstallEnabled(true);
+    await timers.advanceBy(10);
+    expect(downloads).toBe(1);
+    await timers.advanceBy(19);
+    expect(downloads).toBe(1);
+    await timers.advanceBy(1);
+    expect(downloads).toBe(2);
+    await timers.advanceBy(40);
+    expect(downloads).toBe(3);
+    await timers.advanceBy(1_000);
+    expect(downloads).toBe(3);
     controller.dispose();
   });
 

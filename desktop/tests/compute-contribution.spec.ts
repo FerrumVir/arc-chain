@@ -274,6 +274,63 @@ test.describe("The one-time compute question", () => {
     );
   });
 
+  test("a launch hidden in the tray does not spend it; the first show asks it once", async ({
+    page,
+  }) => {
+    const markerKey = "arc-mock-compute-prompt-shown-at";
+    const marker = () => page.evaluate((key) => localStorage.getItem(key), markerKey);
+    // A login launch: the window starts hidden in the tray.
+    await page.addInitScript(() => {
+      (window as unknown as { __ARC_MOCK_WINDOW_HIDDEN__: boolean }).__ARC_MOCK_WINDOW_HIDDEN__ = true;
+    });
+    await page.goto("/");
+    await expect(page.getByTestId("app-shell")).toBeAttached();
+    // Focus and visibility events while still hidden claim nothing.
+    await page.evaluate(() => {
+      window.dispatchEvent(new Event("focus"));
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await page.waitForTimeout(600);
+    await expect(page.getByTestId("compute-prompt-dialog")).toHaveCount(0);
+    expect(await marker(), "no marker while the window is hidden").toBeNull();
+
+    // The user opens it from the tray.
+    await page.evaluate(() => {
+      (window as unknown as { __ARC_MOCK_WINDOW_HIDDEN__: boolean }).__ARC_MOCK_WINDOW_HIDDEN__ = false;
+      window.dispatchEvent(new Event("focus"));
+    });
+    const dialog = page.getByTestId("compute-prompt-dialog");
+    await expect(dialog).toBeVisible();
+    const recorded = await marker();
+    expect(recorded, "one marker after the first show").not.toBeNull();
+
+    // Later focus changes neither the marker nor the dialog.
+    await page.evaluate(() => {
+      window.dispatchEvent(new Event("focus"));
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await page.waitForTimeout(600);
+    await expect(dialog).toHaveCount(1);
+    expect(await marker()).toBe(recorded);
+  });
+
+  test("a hidden launch that becomes visible asks it on visibilitychange", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      (window as unknown as { __ARC_MOCK_WINDOW_HIDDEN__: boolean }).__ARC_MOCK_WINDOW_HIDDEN__ = true;
+    });
+    await page.goto("/");
+    await expect(page.getByTestId("app-shell")).toBeAttached();
+    await page.waitForTimeout(600);
+    await expect(page.getByTestId("compute-prompt-dialog")).toHaveCount(0);
+    await page.evaluate(() => {
+      (window as unknown as { __ARC_MOCK_WINDOW_HIDDEN__: boolean }).__ARC_MOCK_WINDOW_HIDDEN__ = false;
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await expect(page.getByTestId("compute-prompt-dialog")).toBeVisible();
+  });
+
   test("Escape closes it without changing anything", async ({ page }) => {
     await page.goto("/");
     const dialog = page.getByTestId("compute-prompt-dialog");
