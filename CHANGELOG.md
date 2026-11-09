@@ -18,6 +18,10 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## Unreleased
+
+- The community worker processes the prompt in batches (same tokens and hash). `POST /node/threads` now answers only direct calls from the same machine.
+
 ## v0.8.18 - Release-preparation snapshot (2026-11-08)
 
 > **Candidate note:** This entry records the v0.8.18 release-preparation
