@@ -13,9 +13,9 @@ MIN_SAMPLE_INTERVAL = 10
 SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
 IP_RE = re.compile(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}\Z")
 SITE_RE = re.compile(r"[a-z]{3}\Z")
-# An update may leave at most one validator unobserved, and only when the owner
-# input names it. Nothing here ever derives that set from a host that fails to answer.
-MAX_DECLARED_OFFLINE = 1
+# An update may leave at most two validators unobserved, and only when the owner
+# input names them. Nothing here ever derives that set from a host that fails to answer.
+MAX_DECLARED_OFFLINE = 2
 DECLARED_OFFLINE_FIELDS = frozenset({"site", "ip", "validator", "stake"})
 OFFLINE_PROBE_FIELDS = frozenset({"site", "ip", "validator", "health_url", "http_status", "binary_sha256"})
 # The public front answers 502, 503 or 504 when the node behind it does not
@@ -63,11 +63,11 @@ def validate_declared_offline_rows(config: dict, live: dict[str, dict]) -> dict[
     """The owner-named validators that this update deliberately does not observe.
 
     Each row names one validator by site, IP, identity and stake. A declared row can
-    never also be a live host, and at most one validator may be declared.
+    never also be a live host, and at most two validators may be declared.
     """
     rows = config.get("declared_offline", [])
     require(isinstance(rows, list), "declared-offline validators must be a list")
-    require(len(rows) <= MAX_DECLARED_OFFLINE, "at most one validator may be declared offline")
+    require(len(rows) <= MAX_DECLARED_OFFLINE, "at most two validators may be declared offline")
     live_ips = {host["ip"] for host in live.values()}
     live_identities = {host["validator"] for host in live.values()}
     declared: dict[str, dict] = {}
@@ -95,6 +95,8 @@ def validate_host_config(config: dict) -> tuple[dict[str, dict], int, int]:
     total_stake = config.get("total_stake")
     quorum_stake = config.get("quorum_stake")
     require(type(total_stake) is int and total_stake > 0, "invalid total validator stake")
+    # This existing ceiling equals strict_supermajority_threshold only when the
+    # total is not divisible by three; see the threshold regression test.
     require(type(quorum_stake) is int and quorum_stake == (2 * total_stake + 2) // 3,
             "quorum stake must be the integer two-thirds threshold")
     hosts = config.get("hosts")
@@ -220,7 +222,7 @@ def validate_quorum_proof(proof: dict, hosts: dict[str, dict], total_stake: int,
                           now: float | None = None, declared_offline: dict[str, dict] | None = None) -> dict:
     now = time.time() if now is None else now
     declared = dict(declared_offline or {})
-    require(len(declared) <= MAX_DECLARED_OFFLINE, "at most one validator may be declared offline")
+    require(len(declared) <= MAX_DECLARED_OFFLINE, "at most two validators may be declared offline")
     require(not set(declared) & set(hosts), "a declared-offline validator is also a live quorum host")
     require(proof.get("schema") == QUORUM_SCHEMA, "unsupported fresh quorum proof schema")
     require("StrictHostKeyChecking=yes" in proof.get("transport", "") and "IdentitiesOnly=yes" in proof.get("transport", ""),
@@ -337,7 +339,9 @@ def validate_quorum_proof(proof: dict, hosts: dict[str, dict], total_stake: int,
     heights = [row["last_block_height"] for row in samples[1]["nodes"]]
     require(height <= min(heights), "common block is ahead of a sampled host")
     summary = {"captured_at_unix": captured, "host_count": len(expected_sites), "online_stake": online_stake,
-               "total_stake": total_stake, "quorum_stake": quorum_stake, "common_height": height,
+               "total_stake": total_stake, "quorum_stake": quorum_stake,
+               "zero_margin": all(online_stake - host["stake"] < quorum_stake for host in hosts.values()),
+               "common_height": height,
                "common_hash": block_hash, "common_state_root": state_root}
     if declared:
         declared_stake = sum(pin["stake"] for pin in declared.values())

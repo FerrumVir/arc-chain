@@ -219,5 +219,51 @@ class UpdateInputTests(unittest.TestCase):
             mod.create(self.repo, self.inputs, self.main)
 
 
+    def write_two_offline_inputs(self, *, reverse_config=False, mutate=None):
+        rows = [{"site": "eee", "ip": "192.0.2.5", "validator": "5" * 64, "stake": 10},
+                {"site": "fff", "ip": "192.0.2.6", "validator": "6" * 64, "stake": 10}]
+        config = {"declared_offline": list(reversed(rows)) if reverse_config else rows}
+        proof = {"samples": [{"declared_offline": [
+            {**{key: row[key] for key in ("site", "ip", "validator")},
+             "health_url": "https://" + row["ip"] + "/health", "http_status": 502, "binary_sha256": None}
+            for row in rows]} for _ in range(2)]}
+        (self.inputs / "host-config.json").write_text(json.dumps(config))
+        (self.inputs / "quorum-proof.json").write_text(json.dumps(proof))
+        attestation = copy.deepcopy(self.attestation)
+        attestation["fresh_live_host_proof"] = attestation.pop("fresh_six_host_proof")
+        attestation["fresh_live_host_proof"]["proof_sha256"] = hashlib.sha256((self.inputs / "quorum-proof.json").read_bytes()).hexdigest()
+        attestation["network"]["host_config_sha256"] = hashlib.sha256((self.inputs / "host-config.json").read_bytes()).hexdigest()
+        attestation["declared_offline_validators"] = copy.deepcopy(config["declared_offline"])
+        if mutate:
+            mutate(attestation["declared_offline_validators"])
+        (self.inputs / "update-attestation.json").write_text(json.dumps(attestation))
+        return config, proof
+
+    def test_two_offline_input_roundtrip_preserves_sorted_rows_and_both_probes(self):
+        config, proof = self.write_two_offline_inputs()
+        commit = mod.create(self.repo, self.inputs, self.main)
+        output = self.root / "two-offline-output"
+        mod.materialize(self.repo, commit, self.main, output)
+        self.assertEqual(json.loads((output / "host-config.json").read_text()), config)
+        self.assertEqual(json.loads((output / "quorum-proof.json").read_text()), proof)
+        attestation = json.loads((output / "update-attestation.json").read_text())
+        self.assertEqual(attestation["declared_offline_validators"], config["declared_offline"])
+        self.assertEqual([row["site"] for row in attestation["declared_offline_validators"]], ["eee", "fff"])
+
+    def test_two_offline_attestation_list_must_match_exactly_in_site_order(self):
+        mutations = {"reversed": lambda rows: rows.reverse(), "missing": lambda rows: rows.pop(),
+                     "duplicate": lambda rows: rows.append(copy.deepcopy(rows[0]))}
+        for field, value in (("site", "ggg"), ("ip", "192.0.2.7"), ("validator", "7" * 64), ("stake", 11)):
+            mutations[field] = lambda rows, key=field, val=value: rows[1].update({key: val})
+        for name, mutate in mutations.items():
+            with self.subTest(mutation=name):
+                self.write_two_offline_inputs(mutate=mutate)
+                with self.assertRaisesRegex(mod.InputError, "declared-offline validators differ"):
+                    mod.create(self.repo, self.inputs, self.main)
+        self.write_two_offline_inputs(reverse_config=True)
+        with self.assertRaisesRegex(mod.InputError, "sorted by site"):
+            mod.create(self.repo, self.inputs, self.main)
+
+
 if __name__ == "__main__":
     unittest.main()
