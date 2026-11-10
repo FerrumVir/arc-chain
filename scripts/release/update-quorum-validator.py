@@ -300,8 +300,11 @@ def validate_quorum_proof(proof: dict, hosts: dict[str, dict], total_stake: int,
             health = row.get("health") or {}
             require(type(row.get("height")) is int and type(row.get("last_block_height")) is int,
                     "host height fields are malformed at " + site)
+            # Each live host must see every other live host, up to the six-host floor of four:
+            # four live hosts (two declared offline) can only ever report three peers.
             require(health.get("status") == "ok" and health.get("chain_advancing") is True and
-                    health.get("peers", 0) >= 4 and health.get("validators") == 6 and
+                    type(health.get("peers")) is int and health["peers"] >= min(4, len(hosts) - 1) and
+                    health.get("validators") == 6 and
                     health.get("last_block_age_secs", 999999) <= 120,
                     "host health/peer/progress gate failed at " + site)
             current[site] = row

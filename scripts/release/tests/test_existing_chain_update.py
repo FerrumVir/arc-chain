@@ -472,6 +472,19 @@ class DeclaredOfflineValidatorTests(unittest.TestCase):
         mod.validate_crossbindings(verified_certificate(), hosts, config, config["genesis_file_sha256"],
                                    CANDIDATE, proof, approved)
 
+    def test_five_live_hosts_keep_the_four_peer_floor(self):
+        for peers, passes in ((4, True), (5, True), (3, False)):
+            with self.subTest(peers=peers):
+                config, proof, _, _ = five_live_inputs()
+                for sample in proof["samples"]:
+                    for node in sample["nodes"]:
+                        node["health"]["peers"] = peers
+                if passes:
+                    self.assertEqual(check_quorum(config, proof)["host_count"], 5)
+                else:
+                    with self.assertRaisesRegex(validator.GateError, "host health/peer/progress gate failed"):
+                        check_quorum(config, proof)
+
     def test_five_live_with_none_declared_fails(self):
         config, proof, _, _ = five_live_inputs()
         anonymous = copy.deepcopy(config)
@@ -802,7 +815,8 @@ def synthetic_update_inputs(stakes=(11, 10, 10, 10, 10, 10), offline_count=2):
                           **{key: config[key] for key in NETWORK_KEYS[2:]},
                           "pid": 100 + index, "restarts": 0, "invocation_id": f"{index:032x}",
                           "height": 100 + sample_index, "last_block_height": 100 + sample_index,
-                          "health": {"status": "ok", "chain_advancing": True, "peers": 4,
+                          "health": {"status": "ok", "chain_advancing": True,
+                                     "peers": len(config["hosts"]) - 1,
                                      "validators": 6, "last_block_age_secs": 1}})
         sample = {"captured_at_unix": timestamp, "nodes": nodes}
         if offline:
@@ -825,6 +839,21 @@ class TwoDeclaredOfflineTests(unittest.TestCase):
                 self.assertEqual(summary["online_stake"] + summary["declared_offline_stake"], sum(stakes))
                 result, _ = assembler_proof(config, proof, sites=("fff", "eee"))
                 self.assertEqual(result["online_stake"], sum(stakes[:4]))
+
+    def test_four_live_hosts_each_need_the_other_three_as_peers(self):
+        config, proof = synthetic_update_inputs()
+        self.assertEqual({node["health"]["peers"] for sample in proof["samples"] for node in sample["nodes"]}, {3})
+        self.assertEqual(check_quorum(config, proof)["host_count"], 4)
+        for peers in (2, 0, None, "3", 3.0, True):
+            with self.subTest(peers=peers):
+                c, p = synthetic_update_inputs()
+                p["samples"][1]["nodes"][2]["health"]["peers"] = peers
+                with self.assertRaisesRegex(validator.GateError, "host health/peer/progress gate failed"):
+                    check_quorum(c, p)
+        c, p = synthetic_update_inputs()
+        del p["samples"][0]["nodes"][0]["health"]["peers"]
+        with self.assertRaisesRegex(validator.GateError, "host health/peer/progress gate failed"):
+            check_quorum(c, p)
 
     def test_two_offline_one_below_threshold_fails(self):
         config, proof = synthetic_update_inputs((10, 10, 10, 10, 11, 10))
