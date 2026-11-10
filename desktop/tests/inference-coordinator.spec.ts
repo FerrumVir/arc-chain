@@ -590,6 +590,51 @@ test.describe("Inference - community-first coordinator routing", () => {
     expect(receiptFetches).toBe(0);
   });
 
+  test("verified work awaiting validator approval reads as pending, not lost", async ({
+    page,
+  }) => {
+    await seedOnboarded(page);
+    await page.addInitScript(() => {
+      (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
+    });
+    let receiptFetches = 0;
+    await page.route("**/inference/run", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ...COMMUNITY_PAYLOAD,
+          settlement: {
+            ...COMMUNITY_PAYLOAD.settlement,
+            status: "verified_pending_approval",
+            submitted: false,
+          },
+        }),
+      }),
+    );
+    await page.route("**/community/reward_receipt/**", (route) => {
+      receiptFetches += 1;
+      return route.fulfill({ status: 500, body: "must not poll" });
+    });
+
+    await page.goto("/");
+    await page.getByTestId("nav-inference").click();
+    await page.getByTestId("inference-prompt").fill("The largest planet is");
+    await page.getByTestId("btn-run-inference").click();
+
+    const settlement = page.getByTestId("community-settlement");
+    await expect(settlement).toContainText(
+      "Verified. Reward pending validator approval.",
+    );
+    await expect(settlement).not.toContainText("no ARC reward can be confirmed");
+    await expect(settlement).toHaveAttribute(
+      "data-receipt-status",
+      "verified_pending_approval",
+    );
+    await expect(page.getByTestId("btn-lookup-reward")).toHaveCount(0);
+    expect(receiptFetches).toBe(0);
+  });
+
   test("a submission claim remains provisional while the pinned receipt moves pending to success", async ({
     page,
   }) => {

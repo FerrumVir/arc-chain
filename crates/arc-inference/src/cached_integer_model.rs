@@ -4291,9 +4291,7 @@ impl CachedIntegerModel {
         // a duplicate BOS and the hardcoded LLaMA-2 ID on other tokenizers.
         let _ = self.forward_one_token(self.config.bos_token, &mut cache);
 
-        for &tok in prompt {
-            let _logits = self.forward_one_token(tok, &mut cache);
-        }
+        let _ = self.prefill_prompt_into_cache(prompt, &mut cache);
 
         for _ in 0..max_tokens {
             let last_token = generated
@@ -7550,6 +7548,177 @@ mod tests {
 
         crate::canonical_prefill::set_batched_prefill_enabled(prev);
         crate::canonical_prefill::reset_prefill_census();
+    }
+
+    // Keep the old v1 forward sequence as an independent oracle, including
+    // its repeated last prompt token. The optional helper exposes KV state
+    // for comparison without changing the production generation API.
+    fn legacy_prefill_trace(
+        model: &CachedIntegerModel,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos: &[u32],
+        use_helper: bool,
+    ) -> ((Vec<u32>, Hash256), KVCache) {
+        let mut cache = KVCache::new(model.config.n_layers);
+        model.forward_one_token(model.config.bos_token, &mut cache);
+        if use_helper {
+            model.prefill_prompt_into_cache(prompt, &mut cache);
+        } else {
+            for &token in prompt {
+                model.forward_one_token(token, &mut cache);
+            }
+        }
+        let mut tokens = Vec::new();
+        for _ in 0..max_tokens {
+            let last = tokens
+                .last()
+                .copied()
+                .unwrap_or(*prompt.last().unwrap_or(&0));
+            let mut logits = model.forward_one_token(last, &mut cache);
+            let next = select_next_token_with_repetition_penalty(&mut logits, &tokens);
+            tokens.push(next);
+            if eos.contains(&next) {
+                break;
+            }
+        }
+        let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        ((tokens, arc_crypto::hash_bytes(&bytes)), cache)
+    }
+
+    struct RestorePrefillSwitches(bool, bool);
+
+    impl RestorePrefillSwitches {
+        fn capture() -> Self {
+            Self(
+                crate::canonical_prefill::batched_prefill_enabled(),
+                crate::canonical_simd::fast_canonical_kernel_enabled(),
+            )
+        }
+    }
+
+    impl Drop for RestorePrefillSwitches {
+        fn drop(&mut self) {
+            crate::canonical_prefill::set_batched_prefill_enabled(self.0);
+            crate::canonical_simd::set_fast_canonical_kernel(self.1);
+            crate::canonical_prefill::reset_prefill_census();
+        }
+    }
+
+    fn check_legacy_prefill_case(
+        model: &CachedIntegerModel,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos: &[u32],
+    ) {
+        use crate::canonical_prefill as prefill;
+        let (reference, reference_cache) =
+            legacy_prefill_trace(model, prompt, max_tokens, eos, false);
+        for enabled in [false, true] {
+            prefill::set_batched_prefill_enabled(enabled);
+            prefill::reset_prefill_census();
+            let actual = model.try_generate(prompt, max_tokens, eos).unwrap();
+            assert_eq!(
+                actual,
+                reference,
+                "v1 tokens/hash: len={} max={max_tokens} eos={eos:?} enabled={enabled}",
+                prompt.len()
+            );
+            let census = prefill::prefill_census();
+            if enabled
+                && prompt.len() >= prefill::MIN_PROFITABLE_BATCH_TOKENS
+                && model.has_canonical_i8_profile()
+            {
+                let chunk =
+                    prefill::SERVING_PREFILL_CHUNK.min(prefill::max_chunk_within_scratch_budget(
+                        model.config.d_model,
+                        model.config.d_kv,
+                        model.config.d_ff,
+                    ));
+                assert_eq!(census.chunks as usize, prompt.len().div_ceil(chunk));
+                assert_eq!(census.tokens as usize, prompt.len());
+                assert_eq!(census.refused_total(), 0);
+            } else {
+                assert_eq!(census.chunks, 0);
+            }
+            let (traced, cache) = legacy_prefill_trace(model, prompt, max_tokens, eos, true);
+            assert_eq!(traced, actual);
+            assert_same_cache(
+                &reference_cache,
+                &cache,
+                "legacy generation, BOS + prompt + decode",
+            );
+            assert_eq!(cache.seq_len, 1 + prompt.len() + actual.0.len());
+        }
+    }
+
+    #[test]
+    fn legacy_batched_prefill_preserves_tokens_hash_and_kv() {
+        let _switch = crate::canonical_simd::kernel_switch_guard();
+        let _restore = RestorePrefillSwitches::capture();
+        let legacy = build_test_model(64, 32, 4, 64, 3);
+        let mut interleaved = build_test_model(32, 16, 2, 32, 2);
+        interleaved
+            .canonicalize_gguf_interleaved_rope_rows()
+            .unwrap();
+        let mut fallback = build_test_model(32, 16, 2, 32, 2);
+        fallback.enable_i16();
+        assert!(!fallback.has_canonical_i8_profile());
+        for simd in [false, true] {
+            crate::canonical_simd::set_fast_canonical_kernel(simd);
+            let mut checked_mid_generation_eos = false;
+            for model in [&legacy, &interleaved, &fallback] {
+                for len in [0, 1, 3, 4, 5, 63, 64, 65, 130] {
+                    let prompt: Vec<u32> = (0..len)
+                        .map(|i| (i * 7 + 3) as u32 % model.config.vocab_size as u32)
+                        .collect();
+                    for max_tokens in [1, 8] {
+                        check_legacy_prefill_case(model, &prompt, max_tokens, &[]);
+                    }
+                    // Pick a token whose first occurrence is strictly inside
+                    // generation, so EOS cannot accidentally test only step 1.
+                    let ((tokens, _), _) = legacy_prefill_trace(model, &prompt, 8, &[], false);
+                    if let Some((index, token)) = tokens
+                        .iter()
+                        .enumerate()
+                        .skip(1)
+                        .take(6)
+                        .find(|(index, token)| !tokens[..*index].contains(token))
+                    {
+                        check_legacy_prefill_case(model, &prompt, 8, &[*token]);
+                        assert_eq!(
+                            model.try_generate(&prompt, 8, &[*token]).unwrap().0.len(),
+                            index + 1
+                        );
+                        checked_mid_generation_eos = true;
+                    }
+                }
+            }
+            assert!(checked_mid_generation_eos);
+        }
+    }
+
+    #[test]
+    fn legacy_batched_prefill_clamps_scratch_and_preserves_kv() {
+        use crate::canonical_prefill as prefill;
+        let _switch = crate::canonical_simd::kernel_switch_guard();
+        let _restore = RestorePrefillSwitches::capture();
+        // A narrow attention width and wide FFN exercise the real scratch
+        // clamp with modest weights, rather than merely testing its formula.
+        let model = build_test_model(8, 4, 1, 180_000, 1);
+        let cfg = &model.config;
+        let chunk = prefill::max_chunk_within_scratch_budget(cfg.d_model, cfg.d_kv, cfg.d_ff);
+        assert!(chunk < prefill::SERVING_PREFILL_CHUNK);
+        assert!(
+            prefill::prefill_chunk_scratch_bytes(
+                prefill::SERVING_PREFILL_CHUNK,
+                cfg.d_model,
+                cfg.d_kv,
+                cfg.d_ff
+            ) > prefill::MAX_PREFILL_SCRATCH_BYTES
+        );
+        let prompt: Vec<u32> = (0..65).map(|i| (i % 8) as u32).collect();
+        check_legacy_prefill_case(&model, &prompt, 1, &[]);
     }
 
     fn build_test_model(

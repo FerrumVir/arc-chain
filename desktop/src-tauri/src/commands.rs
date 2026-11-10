@@ -990,7 +990,7 @@ fn apply_setup_core_default(config: &mut NodeConfig, logical_cores: u32) {
 }
 
 /// What a consented install still needs before it can take jobs.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PromotionNeed {
     /// The user has not opted in; never touch the machine.
     NoConsent,
@@ -1154,7 +1154,32 @@ pub async fn promote_consented_install(
     promote_consented_install_inner(&app, &state).await
 }
 
+/// One promotion at a time in this process, whoever asks: the startup hook,
+/// the background retry loop, `promote_consented_install`, and
+/// `set_compute_contribution(true)`. Model downloads are also serialized
+/// across processes by the per-target file lock in `download_model`; this
+/// keeps a background tick from queueing on that lock behind a user's
+/// download.
+static PROMOTION_FLIGHT: crate::background_promotion::SingleFlight<Result<NodeConfig, String>> =
+    crate::background_promotion::SingleFlight::new();
+
+const PROMOTION_INTERRUPTED: &str =
+    "Enabling compute contribution was interrupted. Try again; anything already downloaded is kept.";
+
+/// Promote, or wait for the promotion in flight and return its result.
 pub(crate) async fn promote_consented_install_inner(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<NodeConfig, String> {
+    PROMOTION_FLIGHT
+        .run_or_join(
+            || promote_consented_install_once(app, state),
+            || Err(PROMOTION_INTERRUPTED.to_string()),
+        )
+        .await
+}
+
+async fn promote_consented_install_once(
     app: &AppHandle,
     state: &AppState,
 ) -> Result<NodeConfig, String> {
@@ -1169,8 +1194,8 @@ pub(crate) async fn promote_consented_install_inner(
         PromotionNeed::Ineligible => return Err(COMPUTE_INELIGIBLE.to_string()),
         // A worker whose model file is missing or unreadable is not ready:
         // the node runs as an observer until the file is back (community PR
-        // #132). This explicit request re-downloads it. The startup hook acts
-        // only on `Promote`, so it never downloads on its own.
+        // #132). This request downloads it again, whether a user, the startup
+        // hook or the background retry loop made it.
         PromotionNeed::Ready
             if crate::node_manager::configured_model_unavailable(&config).is_none() =>
         {
@@ -1196,15 +1221,27 @@ pub(crate) async fn promote_consented_install_inner(
     Ok(promoted)
 }
 
+/// Whether a consented install still needs the promotion path: it is not a
+/// worker yet, or it is a worker whose model file is missing or unreadable.
+fn needs_promotion(config: &NodeConfig, ram_gb: u64) -> bool {
+    match promotion_need(config, ram_gb) {
+        PromotionNeed::Promote => true,
+        PromotionNeed::Ready => crate::node_manager::configured_model_unavailable(config).is_some(),
+        PromotionNeed::NoConsent | PromotionNeed::Ineligible => false,
+    }
+}
+
 /// Startup hook: once the node is up, finish enabling contribution for a
-/// consented install that is not a worker yet. Silent when there is nothing
-/// to do; a failure is logged and retried on the next launch or toggle.
+/// consented install that is not a worker yet, or download a worker's
+/// missing model again. Silent when there is nothing to do; a failure is
+/// logged and retried by the background loop (`background_promotion`), on
+/// the next launch, or on a toggle.
 pub(crate) async fn promote_consented_install_on_startup(app: &AppHandle, state: &AppState) {
     let config = current_config(state).await;
     let ram_gb = tokio::task::spawn_blocking(|| cached_hardware().ram_gb)
         .await
         .unwrap_or(0);
-    if promotion_need(&config, ram_gb) != PromotionNeed::Promote {
+    if !needs_promotion(&config, ram_gb) {
         return;
     }
     match promote_consented_install_inner(app, state).await {
@@ -5452,6 +5489,83 @@ where
     }
 }
 
+/// Free space a model download lacks: the bytes still to fetch beyond the
+/// saved partial, plus `MODEL_DOWNLOAD_DISK_MARGIN_BYTES`.
+#[derive(Debug, PartialEq, Eq)]
+struct DiskShortfall {
+    needed: u64,
+    available: u64,
+    dir: PathBuf,
+}
+
+/// The one free-space rule, used before a download starts and before each
+/// background retry. `None` when it fits, or when free space cannot be read.
+async fn model_disk_shortfall(target: &Path, spec: &ModelTierSpec) -> Option<DiskShortfall> {
+    let parent = target.parent()?;
+    let saved = model_partial_len(&model_partial_path(target, spec)).await;
+    let available = fs2::available_space(parent).ok()?;
+    disk_shortfall(spec.size_bytes, saved, available).map(|needed| DiskShortfall {
+        needed,
+        available,
+        dir: parent.to_path_buf(),
+    })
+}
+
+/// The bytes needed when `available` is too little, else `None`.
+fn disk_shortfall(size_bytes: u64, saved_bytes: u64, available: u64) -> Option<u64> {
+    let needed = size_bytes
+        .saturating_sub(saved_bytes)
+        .saturating_add(MODEL_DOWNLOAD_DISK_MARGIN_BYTES);
+    (available < needed).then_some(needed)
+}
+
+/// Whether a background retry should stop for lack of disk space. A model
+/// file already at its pinned size needs no download (promotion hashes and
+/// reuses it), so it is never short of space.
+async fn background_download_lacks_disk(tier: &str) -> bool {
+    let Some(spec) = tier_spec(tier) else {
+        return false;
+    };
+    let target = model_path_for(tier);
+    let complete = tokio::fs::metadata(&target)
+        .await
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() == spec.size_bytes);
+    !complete && model_disk_shortfall(&target, spec).await.is_some()
+}
+
+/// The production environment of a background promotion tick.
+pub(crate) struct BackgroundPromotionEnv<'a> {
+    pub app: &'a AppHandle,
+    pub state: &'a AppState,
+}
+
+impl crate::background_promotion::TickEnv for BackgroundPromotionEnv<'_> {
+    async fn facts(&self) -> crate::background_promotion::PromotionFacts {
+        let config = current_config(self.state).await;
+        let ram_gb = tokio::task::spawn_blocking(|| cached_hardware().ram_gb)
+            .await
+            .unwrap_or(0);
+        let need = promotion_need(&config, ram_gb);
+        let tier = tier_for_ram_gb(ram_gb);
+        let model_unavailable = need == PromotionNeed::Ready
+            && crate::node_manager::configured_model_unavailable(&config).is_some();
+        let wants_download = need == PromotionNeed::Promote || model_unavailable;
+        crate::background_promotion::PromotionFacts {
+            need,
+            model_unavailable,
+            model_fits: tier != "none",
+            disk_full: wants_download && background_download_lacks_disk(tier).await,
+        }
+    }
+
+    async fn promote_unless_busy(&self) -> Option<Result<(), String>> {
+        PROMOTION_FLIGHT
+            .run_unless_busy(|| promote_consented_install_once(self.app, self.state))
+            .await
+            .map(|result| result.map(|_| ()))
+    }
+}
+
 async fn verify_model_file_blocking(
     path: &Path,
     spec: &'static ModelTierSpec,
@@ -5489,21 +5603,13 @@ where
 
     let partial = model_partial_path(target, spec);
     cleanup_model_partials(target, Some(partial.as_path()))?;
-    if let Some(parent) = target.parent() {
-        let needed = spec
-            .size_bytes
-            .saturating_sub(model_partial_len(&partial).await)
-            .saturating_add(MODEL_DOWNLOAD_DISK_MARGIN_BYTES);
-        if let Ok(available) = fs2::available_space(parent) {
-            if available < needed {
-                return Err(format!(
-                    "Not enough free disk space for the model: {} is needed and {} is free in {}. Free some space and try again; anything already downloaded is kept.",
-                    format_gb(needed),
-                    format_gb(available),
-                    parent.display()
-                ));
-            }
-        }
+    if let Some(shortfall) = model_disk_shortfall(target, spec).await {
+        return Err(format!(
+            "Not enough free disk space for the model: {} is needed and {} is free in {}. Free some space and try again; anything already downloaded is kept.",
+            format_gb(shortfall.needed),
+            format_gb(shortfall.available),
+            shortfall.dir.display()
+        ));
     }
 
     download_model_resumable(
@@ -6864,6 +6970,47 @@ mod compute_contribution_tests {
             promotion_need(&config("worker", Some("/m.gguf"), Some(true)), 16),
             PromotionNeed::Ready
         );
+    }
+
+    #[test]
+    fn a_worker_whose_model_file_is_gone_needs_promotion_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("standard.gguf");
+        std::fs::write(&present, b"model").unwrap();
+        let present = present.to_string_lossy().into_owned();
+        let missing = dir.path().join("gone.gguf").to_string_lossy().into_owned();
+
+        let ready = config("worker", Some(&present), Some(true));
+        assert!(
+            !needs_promotion(&ready, 16),
+            "a readable model needs nothing"
+        );
+        let repair = config("worker", Some(&missing), Some(true));
+        assert_eq!(promotion_need(&repair, 16), PromotionNeed::Ready);
+        assert!(
+            needs_promotion(&repair, 16),
+            "a missing model is downloaded again"
+        );
+        assert!(needs_promotion(&config("observer", None, Some(true)), 16));
+        assert!(!needs_promotion(
+            &config("worker", Some(&missing), Some(false)),
+            16
+        ));
+        assert!(!needs_promotion(&config("observer", None, Some(true)), 12));
+    }
+
+    #[test]
+    fn the_disk_rule_counts_saved_bytes_and_the_margin() {
+        let size = 4_081_004_224;
+        let margin = MODEL_DOWNLOAD_DISK_MARGIN_BYTES;
+        assert_eq!(disk_shortfall(size, 0, size + margin), None);
+        assert_eq!(
+            disk_shortfall(size, 0, size + margin - 1),
+            Some(size + margin)
+        );
+        // Saved bytes are kept and need no new room.
+        assert_eq!(disk_shortfall(size, size - 1, margin + 1), None);
+        assert_eq!(disk_shortfall(size, size - 1, margin), Some(margin + 1));
     }
 
     #[test]

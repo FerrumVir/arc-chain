@@ -22,8 +22,11 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tower_http::cors::CorsLayer;
 
+mod community_routing;
+mod teacher_forced;
 /// Twin execution v0 orchestration (coordinator-side, off by default).
 mod twin_dispatch;
+use teacher_forced::try_teacher_forced_community_output;
 
 /// Exact transport for the primary ARC HTTP API. Production validators use a
 /// Unix socket so a crashed origin cannot be replaced by a local TCP binder.
@@ -180,7 +183,15 @@ const PUBLIC_INFERENCE_CONCURRENCY: usize = 2;
 // pool.  The separate approval semaphore below keeps whole recomputations
 // bounded; this reserve is the width of one production replica set.
 const VALIDATOR_SHARD_CONCURRENCY: usize = 3;
-const VALIDATOR_SHARD_QUEUE_CAP: usize = 12;
+// Six checks x three held ranges = 18 outstanding requests. Reserve another
+// 18 for public sharded/consensus work, two coordinator jobs, a twin check,
+// and background approval retries. Compute stays at three; sibling ranges
+// can occupy permits while waiting for the same request's KV mutex.
+// A check uses one KV cache per holder, not per range. Six checks plus two
+// public jobs, two coordinator jobs, a twin and a retry use 12 of 32 caches.
+// One signer with one approval plus those local sources uses seven of eight;
+// the fast namespace is cleaned before its sequential fallback starts.
+const VALIDATOR_SHARD_QUEUE_CAP: usize = 36;
 const VALIDATOR_SHARD_QUEUE_TIMEOUT_SECS: u64 = 120;
 const VALIDATOR_SHARD_REQUEST_ID_MAX_BYTES: usize = 128;
 const VALIDATOR_SHARD_KV_CACHE_CAP: usize = 32;
@@ -189,6 +200,8 @@ const VALIDATOR_SHARD_KV_CACHE_TTL_SECS: u64 = 10 * 60;
 const VALIDATOR_RPC_AUDIENCE_TTL_SECS: u64 = 60;
 const COMMUNITY_APPROVAL_RECOMPUTE_CONCURRENCY: usize = 1;
 const COMMUNITY_APPROVAL_QUEUE_CAP: usize = 6;
+// Includes the bounded cleanup barrier, leaving room for a full fallback.
+const COMMUNITY_FAST_VERIFY_TIMEOUT_SECS: u64 = 340;
 const COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS: u64 = 1_500;
 pub const COMMUNITY_SUBMIT_REQUEST_TIMEOUT_SECS: u64 = 2_700;
 pub const PUBLIC_INFERENCE_REQUEST_TIMEOUT_SECS: u64 = 4_000;
@@ -642,6 +655,7 @@ pub struct NodeState {
     /// seed-poll requests. Value is the assigned job id; an empty value means
     /// a claim long-poll currently holds the worker's reservation.
     pub community_active_jobs: Arc<dashmap::DashMap<String, String>>,
+    community_routing: Arc<parking_lot::Mutex<community_routing::RoutingState>>,
     /// Twin execution, region tags and generated demand. Every switch in its
     /// configuration defaults to off; see `docs/twin-execution.md`.
     community_twin: Arc<twin_dispatch::CommunityTwinState>,
@@ -712,6 +726,9 @@ pub struct NodeState {
     /// rejection or depending on a CI host's routable interface address.
     #[cfg(test)]
     community_verification_pipeline_override: Option<Vec<PipelineHop>>,
+    /// Pauses a candidate query immediately before its first publication read.
+    #[cfg(test)]
+    state_lock_order_pause: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Rolling EWMA of forward_shard hop latency for a single replica socket.
@@ -1953,6 +1970,7 @@ pub fn build_node_state(
         community_work_queue: None,
         community_work_results: None,
         community_active_jobs: Arc::new(dashmap::DashMap::new()),
+        community_routing: Arc::new(parking_lot::Mutex::new(Default::default())),
         community_twin: Arc::new(twin_dispatch::CommunityTwinState::new(
             crate::twin::TwinConfig::default(),
         )),
@@ -1988,6 +2006,8 @@ pub fn build_node_state(
         )),
         #[cfg(test)]
         community_verification_pipeline_override: None,
+        #[cfg(test)]
+        state_lock_order_pause: None,
     }
 }
 
@@ -3685,19 +3705,8 @@ fn is_native_inference_transaction(tx: &Transaction) -> bool {
     )
 }
 
-/// This node's row cohort (`crate::row_cohort`): its machines, the bounded
-/// books and the recent placement records, for the operator. Machine names,
-/// measured rates and request timing describe the operator's own
-/// infrastructure, so only a direct loopback caller is answered: 404
-/// otherwise, as when the node runs no cohort, including anything a proxy
-/// forwarded. On the sealed production origin every request arrives through
-/// the nginx filter as loopback; that filter's route allowlist, which ends in
-/// `return 404`, does not include `/assignment/`.
-async fn assignment_cohort(
-    AxumState(node): AxumState<NodeState>,
-    ConnectInfo(RpcPeerAddr(peer_addr)): ConnectInfo<RpcPeerAddr>,
-    headers: axum::http::HeaderMap,
-) -> Result<Json<crate::row_cohort::CohortView>, StatusCode> {
+/// Only direct local operator requests may use local control routes.
+fn is_direct_loopback_operator(peer_addr: SocketAddr, headers: &axum::http::HeaderMap) -> bool {
     // Not the operator's own when: a same-host reverse proxy forwarded it
     // (deploy/nginx.conf forwards /rpc/ from 127.0.0.1 and marks what it
     // forwards); a browser page sent it (browsers add Origin or Sec-Fetch-*);
@@ -3713,7 +3722,23 @@ async fn assignment_cohort(
         .get(axum::http::header::HOST)
         .and_then(|host| host.to_str().ok())
         .is_some_and(crate::row_cohort::host_header_is_loopback);
-    if !peer_addr.ip().is_loopback() || proxied || from_a_page || !named_here {
+    peer_addr.ip().is_loopback() && !proxied && !from_a_page && named_here
+}
+
+/// This node's row cohort (`crate::row_cohort`): its machines, the bounded
+/// books and the recent placement records, for the operator. Machine names,
+/// measured rates and request timing describe the operator's own
+/// infrastructure, so only a direct loopback caller is answered: 404
+/// otherwise, as when the node runs no cohort, including anything a proxy
+/// forwarded. On the sealed production origin every request arrives through
+/// the nginx filter as loopback; that filter's route allowlist, which ends in
+/// `return 404`, does not include `/assignment/`.
+async fn assignment_cohort(
+    AxumState(node): AxumState<NodeState>,
+    ConnectInfo(RpcPeerAddr(peer_addr)): ConnectInfo<RpcPeerAddr>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<crate::row_cohort::CohortView>, StatusCode> {
+    if !is_direct_loopback_operator(peer_addr, &headers) {
         return Err(StatusCode::NOT_FOUND);
     }
     let cohort = node
@@ -6130,7 +6155,12 @@ fn eth_get_logs(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
     let max_height = to_block.min(from_block + 10_000); // Cap range
 
     for height in from_block..=max_height {
-        if let Some(logs) = node.state.event_logs.get(&height) {
+        let logs = node
+            .state
+            .event_logs
+            .get(&height)
+            .map(|entry| entry.value().clone());
+        if let Some(logs) = logs {
             for log in logs.iter() {
                 // Address filter
                 if let Some(ref addrs) = address_filter
@@ -7472,6 +7502,8 @@ async fn dispatch_to_community_worker_with_windows(
     expected_worker_id: Option<String>,
     windows: CommunityDispatchWindows,
 ) -> Result<CommunityDispatchOutcome, CommunityDispatchError> {
+    let dispatch_started = tokio::time::Instant::now();
+    let mut excluded_worker: Option<String> = None;
     let _worker_execution_permit = node
         .native_request_admission
         .worker_execution_gate()
@@ -7545,199 +7577,250 @@ async fn dispatch_to_community_worker_with_windows(
         })?
         .clone();
 
-    // Normal public inference uses the boot epoch plus a monotonic nonce so
-    // concurrent identical prompts remain distinct. A sealed recovery probe
-    // instead uses its domain-separated rollout/ordinal identity so a retry
-    // after either process restarts reproduces the exact same job commitment.
-    let (assignment_epoch, nonce) = recovery_probe_id
-        .map(recovery_probe_assignment)
-        .unwrap_or_else(|| {
-            (
-                node.community_job_epoch,
-                node.attestation_nonce.fetch_add(1, Ordering::Relaxed),
-            )
-        });
-    let input_hash = arc_crypto::hash_bytes(input.as_bytes());
-    let job_id = community_job_id(
-        &node.validator_address,
-        &assignment_epoch,
-        &model_id_hash,
-        &input_hash,
-        max_tokens,
-        nonce,
-    );
-    let expected_job_hash = parse_hash256_hex(&job_id, "recovery job_id")
-        .map_err(CommunityDispatchError::before_enqueue)?;
+    loop {
+        // Normal public inference uses the boot epoch plus a monotonic nonce so
+        // concurrent identical prompts remain distinct. A sealed recovery probe
+        // instead uses its domain-separated rollout/ordinal identity so a retry
+        // after either process restarts reproduces the exact same job commitment.
+        let (assignment_epoch, nonce) = recovery_probe_id
+            .map(recovery_probe_assignment)
+            .unwrap_or_else(|| {
+                (
+                    node.community_job_epoch,
+                    node.attestation_nonce.fetch_add(1, Ordering::Relaxed),
+                )
+            });
+        let input_hash = arc_crypto::hash_bytes(input.as_bytes());
+        let job_id = community_job_id(
+            &node.validator_address,
+            &assignment_epoch,
+            &model_id_hash,
+            &input_hash,
+            max_tokens,
+            nonce,
+        );
+        let expected_job_hash = parse_hash256_hex(&job_id, "recovery job_id")
+            .map_err(CommunityDispatchError::before_enqueue)?;
 
-    let submitted_at_unix_ms = now_unix_ms();
-    let submitted_at = i64::try_from(submitted_at_unix_ms).map_err(|_| {
-        CommunityDispatchError::before_enqueue("community submission timestamp overflow")
-    })?;
-    let expires_at_unix_ms = timeout_secs
-        .checked_add(COMMUNITY_LATE_SUBMIT_GRACE_SECS)
-        .and_then(|seconds| seconds.checked_mul(1_000))
-        .and_then(|window_ms| submitted_at_unix_ms.checked_add(window_ms))
-        .ok_or_else(|| {
-            CommunityDispatchError::before_enqueue("community assignment expiry overflow")
+        let submitted_at_unix_ms = now_unix_ms();
+        let submitted_at = i64::try_from(submitted_at_unix_ms).map_err(|_| {
+            CommunityDispatchError::before_enqueue("community submission timestamp overflow")
         })?;
-    let item = WorkItem {
-        job_id: job_id.clone(),
-        input,
-        max_tokens,
-        model_id: Some(model_id),
-        execution_profile: arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE
-            .to_string(),
-        transaction_domain: node
-            .state
-            .transaction_domain_hash()
-            .map(|domain| format!("0x{}", domain.to_hex())),
-        expected_worker_id,
-        submitted_at_unix_ms: submitted_at,
-        expires_at_unix_ms,
-    };
+        let expires_at_unix_ms = timeout_secs
+            .checked_add(COMMUNITY_LATE_SUBMIT_GRACE_SECS)
+            .and_then(|seconds| seconds.checked_mul(1_000))
+            .and_then(|window_ms| submitted_at_unix_ms.checked_add(window_ms))
+            .ok_or_else(|| {
+                CommunityDispatchError::before_enqueue("community assignment expiry overflow")
+            })?;
+        let item = WorkItem {
+            job_id: job_id.clone(),
+            input: input.clone(),
+            max_tokens,
+            model_id: Some(model_id.clone()),
+            execution_profile:
+                arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+            transaction_domain: node
+                .state
+                .transaction_domain_hash()
+                .map(|domain| format!("0x{}", domain.to_hex())),
+            expected_worker_id: expected_worker_id.clone(),
+            submitted_at_unix_ms: submitted_at,
+            expires_at_unix_ms,
+        };
 
-    let (osh_tx, mut osh_rx) = tokio::sync::oneshot::channel::<CommunityDispatchOutcome>();
-    // Serialize the scan+insert only for deterministic recovery probes. This
-    // closes the concurrent same-ID and same-probe/different-semantics races
-    // without holding a synchronous guard across an await.
-    let probe_gate = recovery_probe_id.map(|_| node.community_verified_settlements_gate.lock());
-    if recovery_probe_id.is_some() {
-        match recovery_probe_existing_job(node, assignment_epoch) {
-            Ok(Some(existing)) if existing != expected_job_hash => {
+        let (osh_tx, mut osh_rx) = tokio::sync::oneshot::channel::<CommunityDispatchOutcome>();
+        // Serialize the scan+insert only for deterministic recovery probes. This
+        // closes the concurrent same-ID and same-probe/different-semantics races
+        // without holding a synchronous guard across an await.
+        let probe_gate = recovery_probe_id.map(|_| node.community_verified_settlements_gate.lock());
+        if recovery_probe_id.is_some() {
+            match recovery_probe_existing_job(node, assignment_epoch) {
+                Ok(Some(existing)) if existing != expected_job_hash => {
+                    return Err(CommunityDispatchError::after_enqueue(
+                        "recovery probe identity is already bound to different inference semantics",
+                    ));
+                }
+                Ok(Some(_)) => {
+                    return Err(CommunityDispatchError::after_enqueue(
+                        "recovery probe job already exists; retry its exact status",
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => return Err(CommunityDispatchError::after_enqueue(error)),
+            }
+        }
+        use dashmap::mapref::entry::Entry;
+        match results.entry(job_id.clone()) {
+            Entry::Occupied(_) => {
                 return Err(CommunityDispatchError::after_enqueue(
-                    "recovery probe identity is already bound to different inference semantics",
+                    "community job already exists; retry its exact status",
                 ));
             }
-            Ok(Some(_)) => {
-                return Err(CommunityDispatchError::after_enqueue(
-                    "recovery probe job already exists; retry its exact status",
-                ));
-            }
-            Ok(None) => {}
-            Err(error) => return Err(CommunityDispatchError::after_enqueue(error)),
-        }
-    }
-    use dashmap::mapref::entry::Entry;
-    match results.entry(job_id.clone()) {
-        Entry::Occupied(_) => {
-            return Err(CommunityDispatchError::after_enqueue(
-                "community job already exists; retry its exact status",
-            ));
-        }
-        Entry::Vacant(entry) => entry.insert(PendingCommunityWork {
-            item: item.clone(),
-            assignment_epoch,
-            job_nonce: nonce,
-            assigned_worker: None,
-            submitting: false,
-            sender: osh_tx,
-        }),
-    };
-    drop(probe_gate);
-    let _pending_reservation = PendingDispatchReservation {
-        results: results.clone(),
-        active_jobs: node.community_active_jobs.clone(),
-        job_id: job_id.clone(),
-    };
+            Entry::Vacant(entry) => entry.insert(PendingCommunityWork {
+                item: item.clone(),
+                assignment_epoch,
+                job_nonce: nonce,
+                assigned_worker: None,
+                assigned_at: None,
+                first_submit_at: None,
+                routing: community_routing::PendingRouting {
+                    prompt_len: generation_preflight.prompt_tokens,
+                    excluded_worker: excluded_worker.clone(),
+                    ..Default::default()
+                },
+                submitting: false,
+                sender: osh_tx,
+            }),
+        };
+        drop(probe_gate);
+        let _pending_reservation = PendingDispatchReservation {
+            results: results.clone(),
+            active_jobs: node.community_active_jobs.clone(),
+            job_id: job_id.clone(),
+        };
 
-    if let Err(e) = tx.try_send(item) {
-        // Enqueue is part of the bounded admission decision. Waiting for a
-        // queue slot here let 257+ concurrent public requests hang forever
-        // before their dispatch timeout even started. A saturated/closed
-        // queue now fails immediately and the smart router can use its local
-        // fallback without growing the pending map.
-        results.remove(&job_id);
-        return Err(CommunityDispatchError::before_enqueue(format!(
-            "community queue unavailable: {e}"
-        )));
-    }
+        if let Err(e) = tx.try_send(item) {
+            // Enqueue is part of the bounded admission decision. Waiting for a
+            // queue slot here let 257+ concurrent public requests hang forever
+            // before their dispatch timeout even started. A saturated/closed
+            // queue now fails immediately and the smart router can use its local
+            // fallback without growing the pending map.
+            results.remove(&job_id);
+            return Err(CommunityDispatchError::before_enqueue(format!(
+                "community queue unavailable: {e}"
+            )));
+        }
 
-    // Wait for the result inside the protocol compute budget, re-reading the
-    // assignment every `watch_interval` so an assignment that can no longer be
-    // served is withdrawn instead of holding the caller for the whole budget.
-    let timeout = tokio::time::Duration::from_secs(timeout_secs);
-    let deadline = tokio::time::Instant::now() + timeout;
-    let unclaimed_deadline = windows
-        .unclaimed_withdraw
-        .map(|window| tokio::time::Instant::now() + window);
-    let received = loop {
-        let next_watch = tokio::time::Instant::now() + windows.watch_interval;
-        tokio::select! {
-            // A result that is already there must never lose to the watch
-            // tick or the deadline.
-            biased;
-            received = &mut osh_rx => break Some(received),
-            _ = tokio::time::sleep_until(next_watch.min(deadline)) => {}
-        }
-        if tokio::time::Instant::now() >= deadline {
-            break None;
-        }
-        match withdraw_abandoned_assignment(node, &results, &job_id, windows, unclaimed_deadline) {
-            None => {}
-            Some(AbandonedAssignment::Unclaimed) => {
-                let waited_secs = windows.unclaimed_withdraw.unwrap_or_default().as_secs();
-                tracing::warn!(
-                    job_id = %job_id,
-                    waited_secs,
-                    "no community worker claimed the assignment within one claim window; withdrawn so the caller can fall back"
+        // Wait for the result inside the protocol compute budget, re-reading the
+        // assignment every `watch_interval` so an assignment that can no longer be
+        // served is withdrawn instead of holding the caller for the whole budget.
+        let timeout = tokio::time::Duration::from_secs(timeout_secs);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let unclaimed_deadline = windows
+            .unclaimed_withdraw
+            .map(|window| tokio::time::Instant::now() + window);
+        let received = loop {
+            let next_watch = tokio::time::Instant::now() + windows.watch_interval;
+            tokio::select! {
+                // A result that is already there must never lose to the watch
+                // tick or the deadline.
+                biased;
+                received = &mut osh_rx => break Some(received),
+                _ = tokio::time::sleep_until(next_watch.min(deadline)) => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break None;
+            }
+            match withdraw_abandoned_assignment(
+                node,
+                &results,
+                &job_id,
+                windows,
+                unclaimed_deadline,
+            ) {
+                None => {}
+                Some(AbandonedAssignment::Unclaimed) => {
+                    let waited_secs = windows.unclaimed_withdraw.unwrap_or_default().as_secs();
+                    tracing::warn!(
+                        job_id = %job_id,
+                        waited_secs,
+                        "no community worker claimed the assignment within one claim window; withdrawn so the caller can fall back"
+                    );
+                    return Err(CommunityDispatchError::withdrawn(format!(
+                        "no community worker claimed the job within {waited_secs}s; the assignment was withdrawn before any worker could start it"
+                    )));
+                }
+                Some(AbandonedAssignment::WorkerUnregistered(worker_id)) => {
+                    community_routing::record_slow(
+                        node,
+                        &worker_id,
+                        timeout_secs,
+                        generation_preflight.required_positions,
+                    );
+                    tracing::warn!(
+                        job_id = %job_id,
+                        worker = %worker_id,
+                        "assigned community worker stopped heartbeating; assignment withdrawn so the caller can fall back"
+                    );
+                    return Err(CommunityDispatchError::withdrawn(format!(
+                        "assigned community worker {worker_id} stopped heartbeating and the job was withdrawn from it; it can no longer submit a result"
+                    )));
+                }
+            }
+        };
+        return match received {
+            Some(Ok(outcome)) => {
+                if !outcome.result.success {
+                    let err = outcome
+                        .result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "worker reported failure".to_string());
+                    if outcome.result.declined
+                        && recovery_probe_id.is_none()
+                        && excluded_worker.is_none()
+                        && community_routing::retry_fits(dispatch_started.elapsed(), timeout_secs)
+                        && community_routing::has_other_waiter(
+                            node,
+                            &model_id,
+                            &outcome.result.worker_id,
+                        )
+                    {
+                        tracing::info!(job_id = %job_id, declined_worker = %outcome.result.worker_id,
+                        elapsed_ms = dispatch_started.elapsed().as_millis(), "retrying community job after quick decline");
+                        excluded_worker = Some(outcome.result.worker_id.clone());
+                        continue;
+                    }
+                    if !outcome.result.declined {
+                        community_routing::record_slow(
+                            node,
+                            &outcome.result.worker_id,
+                            timeout_secs,
+                            generation_preflight.required_positions,
+                        );
+                    }
+                    return Err(if outcome.result.declined {
+                        CommunityDispatchError::declined(err)
+                    } else {
+                        CommunityDispatchError::after_enqueue(err)
+                    });
+                }
+                // Keep the existing worker-reported display metric. Routing uses
+                // separate coordinator timing. Keyed by
+                // worker_id so it's distinguishable from the seed-to-seed
+                // forward_shard latency table.
+                record_latency(
+                    &node.latency_stats,
+                    &format!("worker:{}", outcome.result.worker_id),
+                    outcome.result.total_ms,
                 );
-                return Err(CommunityDispatchError::withdrawn(format!(
-                    "no community worker claimed the job within {waited_secs}s; the assignment was withdrawn before any worker could start it"
-                )));
+                Ok(outcome)
             }
-            Some(AbandonedAssignment::WorkerUnregistered(worker_id)) => {
-                tracing::warn!(
-                    job_id = %job_id,
-                    worker = %worker_id,
-                    "assigned community worker stopped heartbeating; assignment withdrawn so the caller can fall back"
+            Some(Err(_)) => {
+                // oneshot sender dropped without sending — the worker
+                // disconnected mid-job or the queue purged us.
+                Err(CommunityDispatchError::after_enqueue(
+                    "worker disconnected before completing job",
+                ))
+            }
+            None => {
+                community_routing::record_timeout(
+                    node,
+                    &results,
+                    &job_id,
+                    timeout_secs,
+                    generation_preflight.required_positions,
                 );
-                return Err(CommunityDispatchError::withdrawn(format!(
-                    "assigned community worker {worker_id} stopped heartbeating and the job was withdrawn from it; it can no longer submit a result"
-                )));
+                // The drop guard removes an unclaimed job immediately and gives an
+                // already-claimed worker a bounded grace window to submit and
+                // settle without its public caller remaining connected.
+                Err(CommunityDispatchError::timed_out(format!(
+                    "no worker completed within {}s",
+                    timeout_secs
+                )))
             }
-        }
-    };
-    match received {
-        Some(Ok(outcome)) => {
-            if !outcome.result.success {
-                let err = outcome
-                    .result
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "worker reported failure".to_string());
-                return Err(if outcome.result.declined {
-                    CommunityDispatchError::declined(err)
-                } else {
-                    CommunityDispatchError::after_enqueue(err)
-                });
-            }
-            // Record dispatch latency in EWMA so future routing favors
-            // workers that consistently beat the deadline. Keyed by
-            // worker_id so it's distinguishable from the seed-to-seed
-            // forward_shard latency table.
-            record_latency(
-                &node.latency_stats,
-                &format!("worker:{}", outcome.result.worker_id),
-                outcome.result.total_ms,
-            );
-            Ok(outcome)
-        }
-        Some(Err(_)) => {
-            // oneshot sender dropped without sending — the worker
-            // disconnected mid-job or the queue purged us.
-            Err(CommunityDispatchError::after_enqueue(
-                "worker disconnected before completing job",
-            ))
-        }
-        None => {
-            // The drop guard removes an unclaimed job immediately and gives an
-            // already-claimed worker a bounded grace window to submit and
-            // settle without its public caller remaining connected.
-            Err(CommunityDispatchError::timed_out(format!(
-                "no worker completed within {}s",
-                timeout_secs
-            )))
-        }
+        };
     }
 }
 
@@ -8962,18 +9045,19 @@ async fn worker_earnings(
     let mut confirmed_receipts: Vec<(u64, u32, [u8; 32], Value)> = Vec::new();
     let mut successful_job_ids = HashSet::new();
 
-    for entry in node.state.full_transactions.iter() {
-        let index_hash = *entry.key();
-        let tx = entry.value();
-        let body = match &tx.body {
-            TxBody::CommunityInferenceReward(b) => b,
-            _ => continue,
-        };
-        if body.worker != want {
-            continue;
-        }
-        let evidence =
-            canonical_transaction_evidence(&node, Hash256(index_hash)).map_err(|error| {
+    // Release the iterator and every shard guard before reading published state.
+    let candidates: Vec<_> = node
+        .state
+        .full_transactions
+        .iter()
+        .filter(|entry| matches!(&entry.body, TxBody::CommunityInferenceReward(body) if body.worker == want))
+        .map(|entry| (*entry.key(), entry.value().clone()))
+        .collect();
+    for (index_hash, tx) in candidates {
+        #[cfg(test)]
+        pause_before_state_publication_read(&node);
+        let evidence = canonical_transaction_evidence_for_body(&node, Hash256(index_hash), tx)
+            .map_err(|error| {
                 (
                     StatusCode::CONFLICT,
                     format!(
@@ -8982,6 +9066,9 @@ async fn worker_earnings(
                     ),
                 )
             })?;
+        let TxBody::CommunityInferenceReward(body) = &evidence.transaction.body else {
+            unreachable!("candidate filter selects only rewards");
+        };
         let Some(receipt) = evidence.receipt else {
             continue;
         };
@@ -9002,7 +9089,7 @@ async fn worker_earnings(
         let bh = receipt.block_height;
         if last_block.map(|cur| bh > cur).unwrap_or(true) {
             last_block = Some(bh);
-            last_tx_hash = Some(format!("0x{}", hex::encode(entry.key())));
+            last_tx_hash = Some(format!("0x{}", hex::encode(index_hash)));
         }
         if first_block.map(|cur| bh < cur).unwrap_or(true) {
             first_block = Some(bh);
@@ -9013,7 +9100,7 @@ async fn worker_earnings(
             index_hash,
             json!({
                 "tx_type": "0x25",
-                "tx_hash": format!("0x{}", hex::encode(entry.key())),
+                "tx_hash": format!("0x{}", hex::encode(index_hash)),
                 "job_id": format!("0x{}", body.job_id.to_hex()),
                 "worker": format!("0x{}", body.worker.to_hex()),
                 "model_id": format!("0x{}", body.model_id.to_hex()),
@@ -9034,7 +9121,7 @@ async fn worker_earnings(
                 "reward_arc": REWARD_PER_ATTESTATION_ARC,
                 "receipt_url": format!(
                     "/community/reward_receipt/0x{}",
-                    hex::encode(entry.key())
+                    hex::encode(index_hash)
                 ),
             }),
         ));
@@ -9475,6 +9562,7 @@ async fn inference_list_attestations(
     // inclusion: the map key, signed transaction hash/type, and receipt hash
     // must all agree before any row is called mined.
     let mut receipt_backed_local_ids = HashSet::<[u8; 32]>::new();
+    let mut candidates = Vec::new();
     for entry in node.state.full_transactions.iter() {
         let hash = entry.key();
         let tx = entry.value();
@@ -9485,8 +9573,20 @@ async fn inference_list_attestations(
             }
             continue;
         }
+        if matches!(
+            &tx.body,
+            TxBody::InferenceAttestation(_) | TxBody::CommunityInferenceReward(_)
+        ) {
+            candidates.push((*hash, tx.clone()));
+        }
+    }
+    // No StateDB map guard survives into receipt or canonical evidence reads.
+    for (hash, tx) in candidates {
+        let hash = &hash;
         match &tx.body {
             TxBody::InferenceAttestation(body) if tx.tx_type == TxType::InferenceAttestation => {
+                #[cfg(test)]
+                pause_before_state_publication_read(&node);
                 let Some(receipt) = node.state.get_receipt(hash) else {
                     continue;
                 };
@@ -9521,16 +9621,20 @@ async fn inference_list_attestations(
                     }),
                 ));
             }
-            TxBody::CommunityInferenceReward(body)
+            TxBody::CommunityInferenceReward(_)
                 if tx.tx_type == TxType::CommunityInferenceReward =>
             {
-                let Some(receipt) = canonical_transaction_evidence(&node, Hash256(*hash))
+                #[cfg(test)]
+                pause_before_state_publication_read(&node);
+                let evidence = canonical_transaction_evidence_for_body(&node, Hash256(*hash), tx)
                     .map_err(|error| {
                         tracing::error!(tx_hash = %hex::encode(hash), %error, "invalid community reward chain evidence");
                         StatusCode::CONFLICT
-                    })?
-                    .receipt
-                else {
+                    })?;
+                let TxBody::CommunityInferenceReward(body) = &evidence.transaction.body else {
+                    unreachable!("candidate match selects only rewards");
+                };
+                let Some(receipt) = evidence.receipt else {
                     continue;
                 };
                 receipt_backed_local_ids.extend([
@@ -9579,7 +9683,7 @@ async fn inference_list_attestations(
                         "paid": receipt.success,
                         "earned": receipt.success,
                         "worker": format!("0x{}", body.worker.to_hex()),
-                        "submitted_by": format!("0x{}", tx.from.to_hex()),
+                        "submitted_by": format!("0x{}", evidence.transaction.from.to_hex()),
                         "job_id": format!("0x{}", body.job_id.to_hex()),
                         "block_height": receipt.block_height,
                         "block_hash": format!("0x{}", receipt.block_hash.to_hex()),
@@ -14489,12 +14593,20 @@ const COMMUNITY_CLAIM_TIMEOUT_SECS: u64 = 30;
 async fn poll_community_work_queue(
     queue: &Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<WorkItem>>>,
     timeout: tokio::time::Duration,
+    claimant: Option<(&NodeState, &str)>,
 ) -> Result<Option<WorkItem>, ()> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let attempt = queue.lock().await.try_recv();
+        let mut queue = queue.lock().await;
+        let attempt = if let Some((node, worker)) = claimant {
+            community_routing::poll(node, worker, &mut queue)
+        } else {
+            queue.try_recv().map(Some)
+        };
+        drop(queue);
         match attempt {
-            Ok(item) => return Ok(Some(item)),
+            Ok(Some(item)) => return Ok(Some(item)),
+            Ok(None) => {}
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return Err(()),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
         }
@@ -14562,6 +14674,9 @@ pub struct PendingCommunityWork {
     assignment_epoch: Hash256,
     job_nonce: u64,
     assigned_worker: Option<String>,
+    assigned_at: Option<tokio::time::Instant>,
+    first_submit_at: Option<tokio::time::Instant>,
+    routing: community_routing::PendingRouting,
     /// Set while one authenticated submit is independently recomputed.  The
     /// record stays in the map until verification succeeds, so cancellation or
     /// transient shard failure cannot irreversibly consume the assignment.
@@ -14579,6 +14694,8 @@ struct CommunityRewardSubmission {
 
 #[derive(Debug, Clone)]
 struct VerifiedCommunitySettlement {
+    // Never serialized: the retained payload and journal keep the old shape.
+    output_tokens: Option<Vec<u32>>,
     payload: CommunityRewardApprovalPayload,
     verified_at_unix_ms: u64,
     attempts: u32,
@@ -14592,6 +14709,8 @@ struct VerifiedCommunitySettlement {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommunityRewardApprovalPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_tokens: Option<Vec<u32>>,
     coordinator_id: String,
     reward: arc_types::transaction::CommunityInferenceRewardBody,
     input: String,
@@ -14784,6 +14903,9 @@ impl Drop for ActiveCommunityJobReservation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkResult {
+    /// Optional exact token claim, negotiated by the claim response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<Vec<u32>>,
     /// Must match the WorkItem.job_id.
     pub job_id: String,
     /// Worker's self-chosen identifier (hex of validator pubkey).
@@ -14837,6 +14959,7 @@ impl CommunityAuthenticatedPayload for WorkResult {
 
 #[derive(Debug, Clone)]
 struct CommunityResultVerification {
+    accepted_tokens: Vec<u32>,
     output_hash: Hash256,
     tokens_generated: usize,
     range_count: usize,
@@ -15190,7 +15313,10 @@ async fn verify_community_result_with_quorum(
 ) -> Result<CommunityResultVerification, CommunityResultVerificationError> {
     validate_community_reward_profile_for_job(node, work_item, result)
         .map_err(CommunityResultVerificationError::Invalid)?;
-    let recomputed = recompute_community_output_with_quorum(node, work_item).await?;
+    let recomputed = match try_teacher_forced_community_output(node, work_item, result).await {
+        Some(verified) => verified,
+        None => recompute_community_output_with_quorum(node, work_item).await?,
+    };
     let output_hash = compare_community_result_with_tokens(
         result,
         &recomputed.generated,
@@ -15199,6 +15325,7 @@ async fn verify_community_result_with_quorum(
     .map_err(CommunityResultVerificationError::Invalid)?;
 
     Ok(CommunityResultVerification {
+        accepted_tokens: recomputed.generated.clone(),
         output_hash,
         tokens_generated: recomputed.generated.len(),
         range_count: recomputed.range_count,
@@ -15282,6 +15409,13 @@ fn community_verification_pipeline(
         true,
     )
     .map(|selection| selection.hops)
+}
+
+#[cfg(test)]
+fn pause_before_state_publication_read(node: &NodeState) {
+    if let Some(pause) = &node.state_lock_order_pause {
+        pause();
+    }
 }
 
 /// Test-only explicit verification pipeline; see
@@ -15664,6 +15798,7 @@ fn validate_reward_approval_payload(
         expires_at_unix_ms: u64::MAX,
     };
     let result = WorkResult {
+        output_tokens: payload.output_tokens.clone(),
         job_id: work_item.job_id.clone(),
         worker_id: format!("0x{}", payload.reward.worker.to_hex()),
         success: true,
@@ -15920,6 +16055,108 @@ fn validate_collected_reward_approvals(
     Ok(approvals)
 }
 
+#[derive(Clone)]
+struct RewardApprovalAudience {
+    seed: String,
+    target: Hash256,
+    transaction_domain: Option<Hash256>,
+    accepts_output_tokens: bool,
+}
+
+async fn probe_reward_approval_audience(
+    client: reqwest::Client,
+    seed: String,
+) -> Result<RewardApprovalAudience, String> {
+    let info = client
+        .get(format!("{seed}/network/info"))
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json::<Value>()
+        .await
+        .map_err(|e| e.to_string())?;
+    let target = info
+        .get("validator_address")
+        .and_then(Value::as_str)
+        .ok_or("validator approval audience omitted address")
+        .and_then(|value| {
+            parse_hash256_hex(value, "validator_address").map_err(|_| "malformed validator address")
+        })?;
+    let transaction_domain = match info.get("transaction_domain") {
+        Some(Value::String(value)) => Some(parse_hash256_hex(value, "transaction_domain")?),
+        Some(Value::Null) | None => None,
+        Some(_) => return Err("validator transaction_domain is malformed".into()),
+    };
+    Ok(RewardApprovalAudience {
+        seed,
+        target,
+        transaction_domain,
+        accepts_output_tokens: info
+            .get("community_approval_output_tokens")
+            .and_then(Value::as_bool)
+            == Some(true),
+    })
+}
+
+async fn post_remote_reward_approval(
+    client: reqwest::Client,
+    audience: RewardApprovalAudience,
+    mut payload: CommunityRewardApprovalPayload,
+    output_tokens: Option<Vec<u32>>,
+    coordinator_key: Arc<arc_crypto::KeyPair>,
+) -> Result<Option<arc_types::transaction::CommunityRewardValidatorApproval>, String> {
+    payload.output_tokens = if audience.accepts_output_tokens {
+        output_tokens
+    } else {
+        None
+    };
+    // Both attempts share one approval timeout. A compatibility retry signs
+    // the changed payload again, including a fresh authentication nonce.
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS);
+    for attempt in 0..2 {
+        let signed = sign_community_request(
+            COMMUNITY_REWARD_APPROVE_PATH,
+            payload.clone(),
+            &coordinator_key,
+            audience.target,
+            audience.transaction_domain,
+        )?;
+        let response = client
+            .post(format!(
+                "{}{}",
+                audience.seed, COMMUNITY_REWARD_APPROVE_PATH
+            ))
+            .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .json(&signed)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = response.status();
+        if status.is_success() {
+            return response.json().await.map(Some).map_err(|e| e.to_string());
+        }
+        if attempt == 0
+            && status == StatusCode::UNPROCESSABLE_ENTITY
+            && payload.output_tokens.is_some()
+        {
+            let body = response.text().await.map_err(|e| e.to_string())?;
+            if body.contains("unknown field `output_tokens`")
+                || body.contains("unknown field \"output_tokens\"")
+            {
+                payload.output_tokens = None;
+                continue;
+            }
+        }
+        return Err(format!("validator returned HTTP {status}"));
+    }
+    Err("approval compatibility retry exhausted".into())
+}
+
+// Kept for recovery probes, which retain their original probe/POST scheduling.
 async fn request_remote_reward_approval(
     client: reqwest::Client,
     seed: String,
@@ -15927,113 +16164,102 @@ async fn request_remote_reward_approval(
     coordinator_key: Arc<arc_crypto::KeyPair>,
     coordinator: Hash256,
 ) -> Result<Option<arc_types::transaction::CommunityRewardValidatorApproval>, String> {
-    let info = client
-        .get(format!("{seed}/network/info"))
-        .timeout(std::time::Duration::from_secs(8))
-        .send()
-        .await
-        .map_err(|error| format!("fetch validator approval audience: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("validator approval audience rejected: {error}"))?
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("decode validator approval audience: {error}"))?;
-    let target = info
-        .get("validator_address")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "validator approval audience omitted address".to_string())
-        .and_then(|value| parse_hash256_hex(value, "validator_address"))?;
-    // The configured production list contains all six origins, including the
-    // local coordinator.  Its vote was already produced from the coordinator's
-    // independent verification, so a second HTTP recomputation adds load but
-    // can never add a distinct approval identity.
-    if target == coordinator {
+    let audience = probe_reward_approval_audience(client.clone(), seed).await?;
+    if audience.target == coordinator {
         return Ok(None);
     }
-    let transaction_domain = match info.get("transaction_domain") {
-        Some(Value::String(value)) => Some(parse_hash256_hex(value, "transaction_domain")?),
-        Some(Value::Null) | None => None,
-        Some(_) => return Err("validator transaction_domain is malformed".to_string()),
-    };
-    let signed = sign_community_request(
-        COMMUNITY_REWARD_APPROVE_PATH,
-        payload,
-        &coordinator_key,
-        target,
-        transaction_domain,
-    )?;
-    let response = client
-        .post(format!("{seed}{COMMUNITY_REWARD_APPROVE_PATH}"))
-        .timeout(std::time::Duration::from_secs(
-            COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS,
-        ))
-        .json(&signed)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-    if !response.status().is_success() {
-        return Err(format!("validator returned HTTP {}", response.status()));
-    }
-    response
-        .json::<arc_types::transaction::CommunityRewardValidatorApproval>()
-        .await
-        .map(Some)
-        .map_err(|error| error.to_string())
+    post_remote_reward_approval(client, audience, payload, None, coordinator_key).await
 }
 
 async fn collect_community_reward_approvals(
     node: &NodeState,
     payload: CommunityRewardApprovalPayload,
+    output_tokens: Option<Vec<u32>>,
 ) -> Result<Vec<arc_types::transaction::CommunityRewardValidatorApproval>, String> {
+    use arc_types::transaction::{
+        COMMUNITY_REWARD_APPROVALS_REQUIRED, CommunityInferenceRewardBody,
+    };
     let coordinator_key = node
         .validator_keypair
         .as_ref()
-        .ok_or_else(|| "coordinator validator key is unavailable".to_string())?;
-    // The coordinator completed `verify_community_result_with_quorum`
-    // immediately before entering this private collector. Revalidate every
-    // signed semantic here, then reuse that independent computation for its
-    // one local vote. Remote validators still execute the full recomputation
-    // endpoint in parallel; rerunning the coordinator a second time would add
-    // latency without adding an independent identity.
+        .ok_or("coordinator validator key is unavailable")?;
     validate_reward_approval_payload(node, &payload)?;
-    let local = sign_validated_reward_approval(node, &payload.reward)?;
-    let mut approvals = vec![local];
+    let mut approvals = vec![sign_validated_reward_approval(node, &payload.reward)?];
     let mut requests = tokio::task::JoinSet::new();
-    // Start every configured committee origin immediately. Production has six
-    // origins (one resolves to the already-counted local identity, five are
-    // remote); staging may omit the local origin and provide exactly five.
-    // The previous width-two pump made the fourth remote recomputation wait
-    // for two complete model passes before it was even launched.
+    let mut probes = tokio::task::JoinSet::new();
+    let recovery = CommunityInferenceRewardBody::is_recovery_probe_assignment(
+        &payload.reward.assignment_epoch,
+    );
     for seed in node.community_rpc_bases.iter().cloned() {
         let client = node.inference_http.clone();
-        let request_payload = payload.clone();
-        let coordinator_key = coordinator_key.clone();
-        let coordinator = node.validator_address;
-        requests.spawn(async move {
-            request_remote_reward_approval(
+        if recovery {
+            requests.spawn(request_remote_reward_approval(
                 client,
                 seed,
-                request_payload,
-                coordinator_key,
-                coordinator,
-            )
-            .await
-        });
+                payload.clone(),
+                coordinator_key.clone(),
+                node.validator_address,
+            ));
+        } else {
+            probes.spawn(probe_reward_approval_audience(client, seed));
+        }
     }
-    while let Some(joined) = requests.join_next().await {
-        if let Ok(Ok(Some(approval))) = joined {
-            approvals.push(approval);
-            if let Ok(collected) =
-                validate_collected_reward_approvals(node, &payload.reward, approvals.clone())
-            {
-                // Ordinary work returns on any valid quorum. Recovery work
-                // returns only once its deterministic address-sorted quorum
-                // is present, so an excluded slow sixth validator cannot add
-                // latency or change the resulting transaction bytes.
-                cancel_and_drain_join_set(&mut requests).await;
-                return Ok(collected);
+    let active: HashSet<_> = node
+        .state
+        .active_validators()
+        .into_iter()
+        .map(|(address, _)| address)
+        .collect();
+    let mut reachable = HashSet::from([node.validator_address]);
+    let mut waiting = Vec::new();
+    let mut started = recovery;
+    while !probes.is_empty() || !requests.is_empty() {
+        tokio::select! {
+            joined = probes.join_next(), if !probes.is_empty() => {
+                match joined.unwrap() {
+                    Ok(Ok(audience)) => {
+                        if audience.target != node.validator_address {
+                            if active.contains(&audience.target) { reachable.insert(audience.target); }
+                            waiting.push(audience);
+                        }
+                    }
+                    Ok(Err(error)) => tracing::debug!(%error, "approval audience unavailable"),
+                    Err(error) => {
+                        // A local task failure is not proof that the remote is
+                        // unreachable. Preserve the old behavior on doubt.
+                        tracing::warn!(%error, "approval probe task failed; attempting approval round");
+                        started = true;
+                    }
+                }
+                started |= reachable.len() >= COMMUNITY_REWARD_APPROVALS_REQUIRED;
+                if started {
+                    for audience in waiting.drain(..) {
+                        requests.spawn(post_remote_reward_approval(node.inference_http.clone(), audience, payload.clone(), output_tokens.clone(), coordinator_key.clone()));
+                    }
+                }
+            }
+            joined = requests.join_next(), if !requests.is_empty() => {
+                if let Some(Ok(Ok(Some(approval)))) = joined {
+                    approvals.push(approval);
+                    if let Ok(collected) = validate_collected_reward_approvals(node, &payload.reward, approvals.clone()) {
+                        cancel_and_drain_join_set(&mut probes).await;
+                        cancel_and_drain_join_set(&mut requests).await;
+                        return Ok(collected);
+                    }
+                }
             }
         }
+    }
+    if !started {
+        let count = reachable.len();
+        tracing::info!(
+            reachable = count,
+            required = COMMUNITY_REWARD_APPROVALS_REQUIRED,
+            "skipping unreachable community approval quorum"
+        );
+        return Err(format!(
+            "approval quorum unreachable: {count} distinct active validators reachable, {COMMUNITY_REWARD_APPROVALS_REQUIRED} required"
+        ));
     }
     validate_collected_reward_approvals(node, &payload.reward, approvals)
 }
@@ -16452,6 +16678,7 @@ fn replay_verified_settlement_journal(node: &NodeState) -> Result<Vec<Hash256>, 
         node.community_verified_settlements.insert(
             expected_job,
             VerifiedCommunitySettlement {
+                output_tokens: None,
                 payload: record.payload,
                 verified_at_unix_ms: record.verified_at_unix_ms,
                 attempts: 0,
@@ -16480,8 +16707,9 @@ fn public_settlement_journal_error(job_id: Hash256, error: String) -> String {
 
 fn retain_verified_settlement(
     node: &NodeState,
-    payload: CommunityRewardApprovalPayload,
+    mut payload: CommunityRewardApprovalPayload,
 ) -> Result<(), String> {
+    payload.output_tokens = None;
     let _gate = node.community_verified_settlements_gate.lock();
     let now = now_unix_ms();
     prune_verified_settlements_locked(node)
@@ -16511,6 +16739,7 @@ fn retain_verified_settlement(
     node.community_verified_settlements.insert(
         payload.reward.job_id,
         VerifiedCommunitySettlement {
+            output_tokens: None,
             payload,
             verified_at_unix_ms: now,
             attempts: 0,
@@ -16649,16 +16878,17 @@ async fn attempt_verified_community_reward(
     if let Some(submission) = live_community_reward_submission(node, job_id) {
         return Ok(pending_mined_receipt_value(node, job_id, &submission));
     }
-    let payload = node
+    let (payload, output_tokens) = node
         .community_verified_settlements
         .get(&job_id)
-        .map(|record| record.payload.clone())
+        .map(|record| (record.payload.clone(), record.output_tokens.clone()))
         .ok_or_else(|| "verified settlement retry state is unavailable".to_string())?;
     if let Some(mut record) = node.community_verified_settlements.get_mut(&job_id) {
         record.attempts = record.attempts.saturating_add(1);
     }
 
-    let approvals = collect_community_reward_approvals(node, payload.clone()).await?;
+    let approvals =
+        collect_community_reward_approvals(node, payload.clone(), output_tokens).await?;
     let approval_count = approvals.len();
     let mut reward = payload.reward;
     reward.validator_approvals = approvals;
@@ -16890,6 +17120,7 @@ fn retain_verified_community_reward(
         );
     }
     let payload = CommunityRewardApprovalPayload {
+        output_tokens: None,
         coordinator_id: format!("0x{}", node.validator_address.to_hex()),
         reward,
         input: work_item.input.clone(),
@@ -16898,6 +17129,9 @@ fn retain_verified_community_reward(
         execution_profile: work_item.execution_profile.clone(),
     };
     retain_verified_settlement(node, payload)?;
+    if let Some(mut record) = node.community_verified_settlements.get_mut(&job_id) {
+        record.output_tokens = result.output_tokens.clone();
+    }
     Ok(job_id)
 }
 
@@ -17305,6 +17539,8 @@ pub async fn community_claim_work(
         }
     };
 
+    community_routing::open_claim(&node, &req.worker_id, registered_model_id);
+
     // ── Long-poll: try to receive a WorkItem from the queue ─────────────
     let work_rx = node.community_work_queue.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -17312,7 +17548,7 @@ pub async fn community_claim_work(
     ))?;
 
     let timeout = tokio::time::Duration::from_secs(COMMUNITY_CLAIM_TIMEOUT_SECS);
-    match poll_community_work_queue(work_rx, timeout).await {
+    match poll_community_work_queue(work_rx, timeout, Some((&node, &req.worker_id))).await {
         Ok(Some(item)) => {
             if item.expires_at_unix_ms <= now_unix_ms() {
                 if let Some(results) = node.community_work_results.as_ref() {
@@ -17417,6 +17653,7 @@ pub async fn community_claim_work(
                 })));
             }
             pending.assigned_worker = Some(req.worker_id.clone());
+            pending.assigned_at = Some(tokio::time::Instant::now());
             // Commit the worker's slot while the pending entry is still
             // locked, so the assignment and the slot change together. A
             // withdrawal that removes this record under the same lock then
@@ -17427,12 +17664,14 @@ pub async fn community_claim_work(
             // keeping the worker busy on this coordinator until restart.
             claim_reservation.commit(&item.job_id);
             drop(pending);
+            community_routing::assigned(&node, &req.worker_id);
 
             // Flat response shape — the worker (arc-node main.rs) reads
             // `job_id`, `input`, `max_tokens` directly off the top-level
             // JSON. Don't nest under "work".
             let mut body = json!({
                 "status": "work",
+                "accepts_output_tokens": true,
                 "job_id": item.job_id,
                 "input": item.input,
                 "max_tokens": item.max_tokens,
@@ -17518,7 +17757,7 @@ fn unsubmitted_community_reward_settlement(
 
 pub async fn community_submit_work(
     AxumState(node): AxumState<NodeState>,
-    Json(result): Json<WorkResult>,
+    Json(mut result): Json<WorkResult>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // A worker may submit during the coordinator's late-result grace period,
     // after its `/inference/run` dispatch permit has been released. Verification
@@ -17554,6 +17793,7 @@ pub async fn community_submit_work(
     if result.declined
         && (!result.output.is_empty()
             || !result.output_hash.is_empty()
+            || result.output_tokens.is_some()
             || result.tokens_generated != 0
             || result.total_ms != 0
             || result.ms_per_token != 0
@@ -17711,6 +17951,9 @@ pub async fn community_submit_work(
                 }
             }
             pending.submitting = true;
+            pending
+                .first_submit_at
+                .get_or_insert_with(tokio::time::Instant::now);
             (pending.item.clone(), assigned_worker)
         }
         None => {
@@ -17772,6 +18015,7 @@ pub async fn community_submit_work(
             verified_attestation,
         );
     }
+    let submit_arrived = tokio::time::Instant::now();
     let verification = if result.success {
         match verify_community_result_with_quorum(&node, &work_item, &result).await {
             Ok(verification) => Some(verification),
@@ -17834,6 +18078,10 @@ pub async fn community_submit_work(
         None
     };
 
+    result.output_tokens = verification
+        .as_ref()
+        .map(|verified| verified.accepted_tokens.clone());
+
     // Verification succeeded (or this is an explicit worker failure). Only
     // now atomically consume the pending assignment. Until this point the drop
     // guard resets `submitting`, preserving retryability on every error and
@@ -17847,6 +18095,7 @@ pub async fn community_submit_work(
             ),
         ));
     };
+    community_routing::record_accepted(&node, &pending, &result, submit_arrived);
     let _active_job_reservation = ActiveCommunityJobReservation {
         active_jobs: node.community_active_jobs.clone(),
         worker_id: assigned_worker,
@@ -18106,6 +18355,8 @@ fn validate_canonical_transaction_inclusion(
 /// its height, block hash, and index must identify the exact transaction in a
 /// structurally valid block. Every public payment view uses this helper so a
 /// corrupted or partially recovered index cannot be reported as earned ARC.
+///
+/// Takes the publication read lock; callers must hold no StateDB map guard.
 fn canonical_transaction_evidence(
     node: &NodeState,
     tx_hash: Hash256,
@@ -18118,7 +18369,17 @@ fn canonical_transaction_evidence(
     validate_canonical_transaction_identity(&tx, tx_hash)?;
     let transaction = tx.clone();
     drop(tx);
+    canonical_transaction_evidence_for_body(node, tx_hash, transaction)
+}
 
+/// Bind an owned transaction body to the canonical block index and receipt.
+/// Takes the publication read lock; callers must hold no StateDB map guard.
+fn canonical_transaction_evidence_for_body(
+    node: &NodeState,
+    tx_hash: Hash256,
+    transaction: Transaction,
+) -> Result<CanonicalTransactionEvidence, String> {
+    validate_canonical_transaction_identity(&transaction, tx_hash)?;
     let indexed = node
         .state
         .tx_index
@@ -18177,6 +18438,7 @@ fn indexed_reward_for_job(
     let mut successful = Vec::new();
     let mut failed = Vec::new();
     let mut receipt_unavailable = Vec::new();
+    let mut candidates = Vec::new();
     for entry in node.state.full_transactions.iter() {
         let tx = entry.value();
         let arc_types::TxBody::CommunityInferenceReward(body) = &tx.body else {
@@ -18198,24 +18460,34 @@ fn indexed_reward_for_job(
                 job_id.to_hex()
             ));
         }
-        let evidence = canonical_transaction_evidence(node, index_hash).map_err(|error| {
-            format!(
-                "reward job 0x{} has invalid chain evidence: {error}",
-                job_id.to_hex()
-            )
-        })?;
+        candidates.push((index_hash, tx.clone()));
+    }
+    // Evaluate the collected body even if its map entry has since been evicted.
+    for (index_hash, tx) in candidates {
+        #[cfg(test)]
+        pause_before_state_publication_read(node);
+        let evidence =
+            canonical_transaction_evidence_for_body(node, index_hash, tx).map_err(|error| {
+                format!(
+                    "reward job 0x{} has invalid chain evidence: {error}",
+                    job_id.to_hex()
+                )
+            })?;
         if evidence.inclusion.is_none() {
             return Err(format!(
                 "reward job 0x{} transaction body has no canonical block index",
                 job_id.to_hex()
             ));
         }
+        let TxBody::CommunityInferenceReward(body) = evidence.transaction.body else {
+            unreachable!("candidate filter selects only rewards");
+        };
         match evidence.receipt {
             Some(receipt) if receipt.success => {
-                successful.push((index_hash, body.clone()));
+                successful.push((index_hash, body));
             }
-            Some(_) => failed.push((index_hash, body.clone())),
-            None => receipt_unavailable.push((index_hash, body.clone())),
+            Some(_) => failed.push((index_hash, body)),
+            None => receipt_unavailable.push((index_hash, body)),
         }
     }
     if successful.len() > 1 {
@@ -18238,6 +18510,14 @@ fn indexed_reward_for_job(
 fn community_reward_receipt_value(node: &NodeState, tx_hash: Hash256) -> Result<Value, String> {
     let evidence = canonical_transaction_evidence(node, tx_hash)
         .map_err(|error| format!("invalid reward chain evidence: {error}"))?;
+    community_reward_receipt_value_for_evidence(node, evidence)
+}
+
+fn community_reward_receipt_value_for_evidence(
+    node: &NodeState,
+    evidence: CanonicalTransactionEvidence,
+) -> Result<Value, String> {
+    let tx_hash = evidence.transaction.hash;
     let TxBody::CommunityInferenceReward(body) = &evidence.transaction.body else {
         return Err("canonical transaction is not type 0x25".to_string());
     };
@@ -18289,7 +18569,12 @@ async fn community_reward_receipt(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let tx_hash = parse_hash256_hex(&hash, "reward tx hash")
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    if let Some(tx) = node.state.full_transactions.get(&tx_hash.0) {
+    let transaction = node
+        .state
+        .full_transactions
+        .get(&tx_hash.0)
+        .map(|entry| entry.value().clone());
+    if let Some(tx) = transaction {
         if tx.tx_type != TxType::CommunityInferenceReward || tx.hash != tx_hash {
             return Err((
                 StatusCode::CONFLICT,
@@ -18302,7 +18587,16 @@ async fn community_reward_receipt(
                 "transaction is not type 0x25".to_string(),
             ));
         };
-        let value = community_reward_receipt_value(&node, tx_hash)
+        #[cfg(test)]
+        pause_before_state_publication_read(&node);
+        let evidence =
+            canonical_transaction_evidence_for_body(&node, tx_hash, tx).map_err(|error| {
+                (
+                    StatusCode::CONFLICT,
+                    format!("invalid reward chain evidence: {error}"),
+                )
+            })?;
+        let value = community_reward_receipt_value_for_evidence(&node, evidence)
             .map_err(|error| (StatusCode::CONFLICT, error))?;
         return Ok(Json(value));
     }
@@ -19580,6 +19874,7 @@ async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
 
     Json(json!({
         // ── Identity ──────────────────────────────────────────────────────
+        "community_approval_output_tokens": true,
         "network": network,
         "chain_id": chain_id,
         "network_source": if node.chain_identity.is_some() {
@@ -19939,8 +20234,13 @@ struct SetThreadsRequest {
 /// par_iter over attention heads and the par_chunks_mut inside every matmul.
 async fn set_node_threads(
     AxumState(node): AxumState<NodeState>,
+    ConnectInfo(RpcPeerAddr(peer_addr)): ConnectInfo<RpcPeerAddr>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<SetThreadsRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    if !is_direct_loopback_operator(peer_addr, &headers) {
+        return Err(api_error(StatusCode::NOT_FOUND, "not found"));
+    }
     let before = node.compute_threads.load(Ordering::Relaxed);
     let applied = set_compute_threads(&node, req.threads)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
@@ -20005,6 +20305,7 @@ fn kernel_report_json(node: &NodeState) -> Value {
         "available_kernels": available_kernels,
         "one_token_runs": one_token_runs,
         "batched_runs": batched_runs,
+        "batched_prefill_enabled": arc_inference::canonical_prefill::batched_prefill_enabled(),
         "serves_loaded_model": serves_loaded_model,
     })
 }
@@ -20023,6 +20324,8 @@ fn insert_kernel_report(body: &mut Value, node: &NodeState) {
 
 #[cfg(test)]
 mod tests {
+    include!("rpc/community_routing_tests.rs");
+    include!("rpc/teacher_forced_tests.rs");
     use super::*;
 
     #[cfg(unix)]
@@ -20065,6 +20368,7 @@ mod tests {
     ) -> CommunityRewardApprovalPayload {
         use arc_types::transaction::{CommunityInferenceRewardBody, WorkerInferenceCertificate};
         CommunityRewardApprovalPayload {
+            output_tokens: None,
             coordinator_id: format!("0x{}", Hash256([8; 32]).to_hex()),
             reward: CommunityInferenceRewardBody {
                 chain_domain: CommunityInferenceRewardBody::expected_chain_domain(),
@@ -20960,13 +21264,34 @@ mod tests {
         let protocol = community_dispatch_timeout_secs(required_positions).unwrap();
         let one_pass = (required_positions as u64 * 3_300).div_ceil(1_000);
         assert_eq!(protocol, 3_862);
+        assert!(community_routing::retry_fits(
+            Duration::from_secs(30),
+            protocol
+        ));
+        let largest = community_dispatch_timeout_secs(260).unwrap();
+        assert!(community_routing::retry_fits(
+            Duration::from_secs(9),
+            largest
+        ));
+        assert!(!community_routing::retry_fits(
+            Duration::from_millis(9_001),
+            largest
+        ));
+        assert!(!community_routing::retry_fits(
+            Duration::from_millis(30_001),
+            protocol
+        ));
         assert!(
             COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS
-                >= one_pass + VALIDATOR_SHARD_QUEUE_TIMEOUT_SECS
+                >= COMMUNITY_FAST_VERIFY_TIMEOUT_SECS
+                    + one_pass
+                    + VALIDATOR_SHARD_QUEUE_TIMEOUT_SECS
         );
         assert!(
             COMMUNITY_SUBMIT_REQUEST_TIMEOUT_SECS
-                >= one_pass + COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS
+                >= COMMUNITY_FAST_VERIFY_TIMEOUT_SECS
+                    + one_pass
+                    + COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS
         );
         assert!(
             protocol
@@ -21026,6 +21351,7 @@ mod tests {
 
         let coordinator = arc_crypto::KeyPair::generate_ed25519();
         let payload = CommunityRewardApprovalPayload {
+            output_tokens: None,
             coordinator_id: format!("0x{}", coordinator.address().to_hex()),
             reward: CommunityInferenceRewardBody {
                 chain_domain: CommunityInferenceRewardBody::expected_chain_domain(),
@@ -21102,6 +21428,7 @@ mod tests {
     #[tokio::test]
     async fn community_submit_enforces_reviewed_sixteen_kib_output_cap() {
         let result_with = |output: String| WorkResult {
+            output_tokens: None,
             job_id: "job".to_string(),
             worker_id: format!("0x{}", Hash256([47; 32]).to_hex()),
             success: true,
@@ -21634,6 +21961,7 @@ mod tests {
         assert_eq!(worker_hash, validator_hash);
         let decoded = worker_model.decode(&worker_tokens);
         let mut result = WorkResult {
+            output_tokens: None,
             job_id: "profile-proof".to_string(),
             worker_id: format!("0x{}", worker.address().to_hex()),
             success: true,
@@ -22328,6 +22656,7 @@ mod tests {
             validator_approvals: Vec::new(),
         };
         let payload = CommunityRewardApprovalPayload {
+            output_tokens: None,
             coordinator_id: format!("0x{}", validator_keys[0].address().to_hex()),
             reward: reward.clone(),
             input: input.to_string(),
@@ -22946,6 +23275,7 @@ mod tests {
                 self.coordinator.community_verified_settlements.insert(
                     job_id,
                     VerifiedCommunitySettlement {
+                        output_tokens: None,
                         payload,
                         verified_at_unix_ms: 1,
                         attempts: 0,
@@ -23031,6 +23361,7 @@ mod tests {
                 .sign_in_domain(&self.worker, &self.transaction_domain)
                 .unwrap();
             let result = WorkResult {
+                output_tokens: None,
                 job_id: job_id.clone(),
                 worker_id: self.worker_id.clone(),
                 success: true,
@@ -24276,6 +24607,7 @@ mod tests {
              generator: &arc_inference::cached_integer_model::CachedIntegerModel| {
                 let (tokens, output_hash) = generator.generate(&prompt, max_tokens, &[]);
                 WorkResult {
+                    output_tokens: None,
                     job_id: work_item.job_id.clone(),
                     worker_id: "dual-profile-worker".to_string(),
                     success: true,
@@ -24564,6 +24896,7 @@ mod tests {
             expires_at_unix_ms: u64::MAX,
         };
         let result = |work_item: &WorkItem| WorkResult {
+            output_tokens: None,
             job_id: work_item.job_id.clone(),
             worker_id: "two-replica-worker".to_string(),
             success: true,
@@ -24699,7 +25032,7 @@ mod tests {
         for _ in 0..3 {
             let queue = queue.clone();
             waiters.spawn(async move {
-                poll_community_work_queue(&queue, std::time::Duration::from_secs(1))
+                poll_community_work_queue(&queue, std::time::Duration::from_secs(1), None)
                     .await
                     .unwrap()
                     .expect("one queued job")
@@ -25412,6 +25745,7 @@ mod tests {
             community_work_queue: Some(Arc::new(tokio::sync::Mutex::new(rx))),
             community_work_results: Some(Arc::new(dashmap::DashMap::new())),
             community_active_jobs: Arc::new(dashmap::DashMap::new()),
+            community_routing: Arc::new(parking_lot::Mutex::new(Default::default())),
             community_twin: Arc::new(twin_dispatch::CommunityTwinState::new(
                 crate::twin::TwinConfig::default(),
             )),
@@ -25496,6 +25830,7 @@ mod tests {
             runtime_tasks: Arc::new(parking_lot::Mutex::new(tokio::task::JoinSet::new())),
             own_compute_ms: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
             community_verification_pipeline_override: None,
+            state_lock_order_pause: None,
         }
     }
 
@@ -25554,6 +25889,7 @@ mod tests {
         let error = community_submit_work(
             AxumState(node),
             Json(WorkResult {
+                output_tokens: None,
                 job_id: String::new(),
                 worker_id: String::new(),
                 success: false,
@@ -25638,6 +25974,7 @@ mod tests {
         node.community_verified_settlements.insert(
             job_id,
             VerifiedCommunitySettlement {
+                output_tokens: None,
                 payload: payload.clone(),
                 verified_at_unix_ms: 1,
                 attempts: 1,
@@ -25699,6 +26036,7 @@ mod tests {
         }
 
         let pending_result = WorkResult {
+            output_tokens: None,
             job_id: format!("0x{}", job_id.to_hex()),
             worker_id: worker_id.clone(),
             success: true,
@@ -25927,6 +26265,7 @@ mod tests {
         race_node.community_verified_settlements.insert(
             race_job_id,
             VerifiedCommunitySettlement {
+                output_tokens: None,
                 payload: race_payload,
                 verified_at_unix_ms: 1,
                 attempts: 1,
@@ -25950,6 +26289,7 @@ mod tests {
         );
 
         let result = WorkResult {
+            output_tokens: None,
             job_id: format!("0x{}", race_job_id.to_hex()),
             worker_id: race_worker_id,
             success: true,
@@ -26255,6 +26595,7 @@ mod tests {
         let submit = sign_community_request(
             COMMUNITY_SUBMIT_WORK_PATH,
             WorkResult {
+                output_tokens: None,
                 job_id: "unknown-job".to_string(),
                 worker_id,
                 success: false,
@@ -27147,6 +27488,7 @@ mod tests {
             if let Some((_, pending)) = results.remove(&item.job_id) {
                 let _ = pending.sender.send(CommunityDispatchOutcome {
                     result: WorkResult {
+                        output_tokens: None,
                         job_id: item.job_id,
                         worker_id: "w1".into(),
                         success: true,
@@ -27450,6 +27792,7 @@ mod tests {
                 let settlement_job_id = item.job_id.clone();
                 let _ = pending.sender.send(CommunityDispatchOutcome {
                     result: WorkResult {
+                        output_tokens: None,
                         job_id: item.job_id,
                         worker_id: "w1".to_string(),
                         success: true,
@@ -27608,6 +27951,7 @@ mod tests {
                 let job_id = item.job_id.clone();
                 let _ = pending.sender.send(CommunityDispatchOutcome {
                     result: WorkResult {
+                        output_tokens: None,
                         job_id: job_id.clone(),
                         worker_id: "w1".to_string(),
                         success: true,
@@ -27698,6 +28042,7 @@ mod tests {
             if let Some((_, pending)) = results.remove(&item.job_id) {
                 let _ = pending.sender.send(CommunityDispatchOutcome {
                     result: WorkResult {
+                        output_tokens: None,
                         job_id: item.job_id,
                         worker_id: "w1".into(),
                         success: false,
@@ -27741,6 +28086,7 @@ mod tests {
         let error = community_submit_work(
             AxumState(node),
             Json(WorkResult {
+                output_tokens: None,
                 job_id: "claimed-job".to_string(),
                 worker_id: "worker".to_string(),
                 success: false,
@@ -27788,6 +28134,7 @@ mod tests {
             let signed = sign_community_request(
                 COMMUNITY_SUBMIT_WORK_PATH,
                 WorkResult {
+                    output_tokens: None,
                     job_id: item.job_id,
                     worker_id: submit_worker_id,
                     success: false,
@@ -27840,6 +28187,7 @@ mod tests {
 
     fn successful_test_result(job_id: String, worker_id: &str) -> WorkResult {
         WorkResult {
+            output_tokens: None,
             job_id,
             worker_id: worker_id.to_string(),
             success: true,
@@ -28513,6 +28861,7 @@ mod tests {
         }
         let signed_attestation_hex = format!("0x{}", hex::encode(bincode::serialize(&tx).unwrap()));
         WorkResult {
+            output_tokens: None,
             job_id: item.job_id.clone(),
             worker_id: keypair.address().to_hex(),
             success: true,
@@ -28541,6 +28890,9 @@ mod tests {
                 assignment_epoch: Hash256([7u8; 32]),
                 job_nonce: 1,
                 assigned_worker,
+                assigned_at: None,
+                first_submit_at: None,
+                routing: Default::default(),
                 submitting: false,
                 sender,
             },
@@ -29091,6 +29443,7 @@ mod tests {
         let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
         let decoded = "verified output";
         let mut result = WorkResult {
+            output_tokens: None,
             job_id: "job".to_string(),
             worker_id: "worker".to_string(),
             success: true,
@@ -29118,6 +29471,7 @@ mod tests {
     #[test]
     fn community_reward_rejects_precision_profile_drift_before_quorum_work() {
         let mut result = WorkResult {
+            output_tokens: None,
             job_id: "job".to_string(),
             worker_id: "worker".to_string(),
             success: true,
@@ -29164,6 +29518,7 @@ mod tests {
         let Json(response) = community_submit_work(
             AxumState(node.clone()),
             Json(WorkResult {
+                output_tokens: None,
                 job_id: item.job_id.clone(),
                 worker_id: worker_id.clone(),
                 success: false,
@@ -29282,6 +29637,263 @@ mod tests {
             .await
             .expect("valid signed transaction");
         assert_eq!(node.mempool.len(), 1);
+    }
+
+    // The native RPC fixture's activation and signed next-block request.
+    fn state_lock_order_native_fixture() -> (tempfile::TempDir, NodeState, Transaction) {
+        let temporary = tempfile::tempdir().unwrap();
+        let state_dir = temporary.path().join("state");
+        let genesis = arc_crypto::hash_bytes(b"native-rpc-private-fixture");
+        let requester = KeyPair::generate_ed25519();
+        let mut validators: Vec<_> = (0..6).map(|_| KeyPair::generate_ed25519()).collect();
+        let mut members: Vec<_> = validators
+            .iter()
+            .map(|key| {
+                arc_types::inference_contract::ValidatorMember::new(
+                    key.address(),
+                    StateDB::MIN_VALIDATOR_STAKE,
+                )
+            })
+            .collect();
+        members.sort_by_key(|member| member.address.0);
+        let tuple = arc_crypto::hash_bytes(b"native-rpc-private-fixture-tuple");
+        let context = arc_state::InferenceAdmissionContext {
+            domain: arc_types::inference_contract::InferenceDomain {
+                chain_genesis: genesis,
+                recovery_epoch: 0,
+                validator_set_hash: arc_types::inference_contract::validator_set_commitment(
+                    &members,
+                )
+                .unwrap(),
+            },
+            members: members.clone(),
+            allowed_executions: vec![arc_state::AllowedExecution {
+                model_hash: tuple,
+                profile_hash: tuple,
+                generation_hash: tuple,
+                assignment_hash: tuple,
+            }],
+            selection_rule: arc_state::NativeSelectionRule::SkipUsedNoncesV2,
+        };
+        let mut prefunded = vec![(requester.address(), 1_000)];
+        prefunded.extend(members.iter().map(|member| (member.address, 0)));
+        let state =
+            Arc::new(StateDB::with_genesis_persistent(&prefunded, &state_dir, genesis).unwrap());
+        state.seed_genesis_validators(
+            &members
+                .iter()
+                .map(|member| (member.address, member.stake))
+                .collect::<Vec<_>>(),
+        );
+        state.activate_native_inference(context.clone()).unwrap();
+        let producer = validators.remove(0);
+        let mempool = Arc::new(Mempool::new(16));
+        let node = build_node_state(
+            state.clone(),
+            mempool.clone(),
+            producer.address(),
+            Some(Arc::new(producer)),
+            StateDB::MIN_VALIDATOR_STAKE,
+            Instant::now(),
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            None,
+            None,
+        );
+        let input = [11u32, 12]
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect::<Vec<_>>();
+        let request = arc_types::inference_contract::InferenceRequest::sign(
+            arc_types::inference_contract::InferenceJob {
+                version: arc_types::inference_contract::INFERENCE_CONTRACT_VERSION,
+                domain: context.domain,
+                requester: requester.address(),
+                nonce: 0,
+                model_hash: tuple,
+                profile_hash: tuple,
+                input_hash: arc_crypto::hash_bytes(&input),
+                generation_hash: tuple,
+                assignment_hash: tuple,
+                max_tokens: 8,
+                max_output_bytes: 128,
+                execution_price: 10,
+                reserved_max_payment: 100,
+                expires_at: 10,
+            },
+            &requester,
+        )
+        .unwrap();
+        let mut tx = Transaction {
+            tx_type: TxType::NativeInferenceRequest,
+            from: requester.address(),
+            nonce: 0,
+            body: TxBody::NativeInferenceRequest(NativeInferenceRequestBody {
+                request,
+                input_blob: input,
+            }),
+            fee: 0,
+            gas_limit: gas_costs::NATIVE_INFERENCE_REQUEST,
+            hash: Hash256::ZERO,
+            signature: arc_crypto::Signature::null(),
+            sig_verified: false,
+        };
+        state.sign_transaction(&mut tx, &requester).unwrap();
+        (temporary, node, tx)
+    }
+
+    #[test]
+    fn state_lock_order_reward_scans_release_map_guards_before_publication_reads() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Separate state and channels per case: no process-wide test lock.
+        // Both attestation variants must reach their earliest publication read.
+        for case in [
+            "earnings",
+            "attestation",
+            "attestation_reward",
+            "indexed",
+            "receipt",
+        ] {
+            let (temporary, mut node, native) = state_lock_order_native_fixture();
+            let state = node.state.clone();
+            let job_id = Hash256([21; 32]);
+            let reward = test_verified_settlement_payload(job_id, 100).reward;
+            let worker = reward.worker;
+            let signer = KeyPair::generate_ed25519();
+            let mut candidate = None;
+            for nonce in 0..10_000 {
+                let row = if case == "attestation" {
+                    sign_attestation_for(&signer, nonce, 0).0
+                } else {
+                    Transaction::new_community_inference_reward(
+                        reward.coordinator,
+                        nonce,
+                        reward.clone(),
+                    )
+                };
+                state.full_transactions.insert(row.hash.0, row.clone());
+                let guard = state.full_transactions.get(&row.hash.0).unwrap();
+                let same_shard = state
+                    .full_transactions
+                    .try_get_mut(&native.hash.0)
+                    .is_locked();
+                drop(guard);
+                if same_shard {
+                    candidate = Some(row);
+                    break;
+                }
+                state.full_transactions.remove(&row.hash.0);
+            }
+            let row = candidate.expect("same-shard probe exhausted 10,000 candidates");
+            let row_hash = row.hash;
+            // Build a structurally valid historical block/index, as in the reward
+            // endpoint fixtures; the successful receipt is seeded explicitly.
+            let history = StateDB::new();
+            let (block, mut receipts) = history
+                .execute_block(std::slice::from_ref(&row), Hash256::ZERO)
+                .unwrap();
+            receipts[0].success = true;
+            let mut snapshot = state.export_durable_snapshot();
+            snapshot.height = block.header.height;
+            snapshot.blocks.push((block.header.height, block.clone()));
+            snapshot.receipts.push((row_hash, receipts[0].clone()));
+            state.install_durable_snapshot(&snapshot);
+            assert_eq!(
+                state.get_tx_location(&row_hash.0),
+                Some((block.header.height, 0))
+            );
+            assert!(!state.receipts.contains_key(&native.hash.0));
+
+            let (reached_tx, reached_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let pause = parking_lot::Mutex::new(Some((reached_tx, resume_rx)));
+            node.state_lock_order_pause = Some(Arc::new(move || {
+                if let Some((reached, resume)) = pause.lock().take() {
+                    reached.send(()).unwrap();
+                    resume.recv_timeout(Duration::from_secs(30)).unwrap();
+                }
+            }));
+            let producer = node.validator_address;
+            let (reader_tx, reader_rx) = mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let result = runtime.block_on(async {
+                    match case {
+                        "earnings" => worker_earnings(
+                            AxumState(node), AxumPath(worker.to_hex()),
+                        ).await.map(|Json(value)| value).map_err(|error| error.1),
+                        "attestation" | "attestation_reward" => inference_list_attestations(
+                            AxumState(node), Query(HashMap::new()),
+                        ).await.map(|Json(value)| value).map_err(|error| error.to_string()),
+                        "indexed" => indexed_reward_for_job(&node, job_id)
+                            .map(|value| json!({"tx_hash": value.map(|(hash, _)| format!("0x{}", hash.to_hex()))})),
+                        "receipt" => community_reward_receipt(
+                            AxumState(node), AxumPath(row_hash.to_hex()),
+                        ).await.map(|Json(value)| value).map_err(|error| error.1),
+                        _ => unreachable!(),
+                    }
+                });
+                reader_tx.send(result).unwrap();
+            });
+            reached_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("query did not reach its publication-read hook");
+            let native_hash = native.hash;
+            let writer_state = state.clone();
+            let (writer_tx, writer_rx) = mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                // Keep the persistent fixture alive even on a timeout failure.
+                let _temporary = temporary;
+                let result = writer_state.execute_block_adaptive_at_with_proof(
+                    &[native],
+                    producer,
+                    block.header.timestamp + 1,
+                    Hash256([91; 32]),
+                );
+                writer_tx.send(result).unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(30);
+            // persist_restart_artifacts appends WAL entries only. This receipt
+            // becomes visible only inside the publication write scope.
+            while !state.receipts.contains_key(&native_hash.0) {
+                assert!(
+                    Instant::now() < deadline,
+                    "{case}: publisher did not insert receipt"
+                );
+                std::thread::yield_now();
+            }
+            resume_tx.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let response =
+                reader_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+            let published =
+                writer_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+            let response = response
+                .unwrap_or_else(|error| panic!("{case}: reader timed out: {error}"))
+                .unwrap();
+            let (_, receipts) = published
+                .unwrap_or_else(|error| panic!("{case}: publisher timed out: {error}"))
+                .unwrap();
+            reader.join().unwrap();
+            writer.join().unwrap();
+            assert!(receipts[0].success, "{case}: native request must execute");
+            let hash = format!("0x{}", row_hash.to_hex());
+            match case {
+                "earnings" => assert_eq!(response["confirmed_receipts"][0]["tx_hash"], hash),
+                "attestation" | "attestation_reward" => {
+                    assert_eq!(response["activities"][0]["tx_hash"], hash);
+                    assert_eq!(response["activities"][0]["success"], true);
+                }
+                "indexed" | "receipt" => assert_eq!(response["tx_hash"], hash),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[tokio::test]
@@ -33032,6 +33644,7 @@ mod tests {
     fn verification_summary_reports_the_quorum_each_range_used() {
         let summary = |range_replicas: Vec<((usize, usize), usize)>| {
             CommunityVerificationSummary::from(&CommunityResultVerification {
+                accepted_tokens: Vec::new(),
                 output_hash: Hash256::ZERO,
                 tokens_generated: 1,
                 range_count: range_replicas.len(),
@@ -33090,6 +33703,139 @@ mod tests {
         let Json(info) = node_info(AxumState(node)).await;
         let info = serde_json::to_value(&info).expect("node info serialises");
         assert_eq!(&info["kernels"]["one_token"], &kernels["one_token"]);
+    }
+
+    #[tokio::test]
+    async fn node_threads_only_direct_loopback_operator_can_resize() {
+        use tower::ServiceExt;
+
+        let node = fake_node_with_workers(vec![]);
+        let app = Router::new()
+            .route(
+                "/node/threads",
+                get(get_node_threads).post(set_node_threads),
+            )
+            .with_state(node.clone());
+        // The desktop Rust client posts JSON to 127.0.0.1, without browser headers.
+        for host in ["127.0.0.1:4317", "localhost:4317", "[::1]:4317"] {
+            let peer = if host.starts_with('[') {
+                "[::1]:12345"
+            } else {
+                "127.0.0.1:12345"
+            };
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("http://127.0.0.1:4317/node/threads")
+                        .header("host", host)
+                        .header("content-type", "application/json")
+                        .extension(ConnectInfo(RpcPeerAddr(peer.parse().unwrap())))
+                        .body(axum::body::Body::from(r#"{"threads":2}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{host}");
+            assert_eq!(node.compute_threads.load(Ordering::Relaxed), 2);
+            assert_eq!(
+                install_on_compute_pool(&node, rayon::current_num_threads),
+                2
+            );
+        }
+
+        let refused = [
+            ("192.0.2.1:12345", Some("127.0.0.1:4317"), None),
+            ("127.0.0.1:12345", Some("example.com"), None),
+            ("127.0.0.1:12345", None, None),
+            (
+                "127.0.0.1:12345",
+                Some("127.0.0.1:4317"),
+                Some(("x-forwarded-for", "127.0.0.1")),
+            ),
+            (
+                "127.0.0.1:12345",
+                Some("127.0.0.1:4317"),
+                Some(("x-real-ip", "127.0.0.1")),
+            ),
+            (
+                "127.0.0.1:12345",
+                Some("127.0.0.1:4317"),
+                Some(("forwarded", "for=127.0.0.1")),
+            ),
+            (
+                "127.0.0.1:12345",
+                Some("127.0.0.1:4317"),
+                Some(("origin", "http://localhost")),
+            ),
+            (
+                "127.0.0.1:12345",
+                Some("127.0.0.1:4317"),
+                Some(("sec-fetch-site", "same-origin")),
+            ),
+            (
+                "127.0.0.1:12345",
+                Some("127.0.0.1:4317"),
+                Some(("sec-fetch-mode", "cors")),
+            ),
+        ];
+        let pool = node.compute_pool.read().clone().unwrap();
+        for (peer, host, extra) in refused {
+            let mut request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/node/threads")
+                .header("content-type", "application/json")
+                .extension(ConnectInfo(RpcPeerAddr(peer.parse().unwrap())));
+            if let Some(host) = host {
+                request = request.header("host", host);
+            }
+            if let Some((name, value)) = extra {
+                request = request.header(name, value);
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    request
+                        .body(axum::body::Body::from(r#"{"threads":3}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{peer} {host:?} {extra:?}"
+            );
+            assert_eq!(node.compute_threads.load(Ordering::Relaxed), 2);
+            assert_eq!(
+                install_on_compute_pool(&node, rayon::current_num_threads),
+                2
+            );
+            assert!(Arc::ptr_eq(
+                &pool,
+                node.compute_pool.read().as_ref().unwrap()
+            ));
+        }
+        // The read-only route remains available without operator headers.
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/node/threads")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["kernels"]["batched_prefill_enabled"],
+            arc_inference::canonical_prefill::batched_prefill_enabled()
+        );
     }
 
     // ── compute pool ────────────────────────────────────────────────────
