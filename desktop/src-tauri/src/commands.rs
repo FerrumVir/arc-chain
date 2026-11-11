@@ -4968,7 +4968,7 @@ pub async fn recommended_tier() -> CmdResult<String> {
 /// `ram_gb` is the marketed size from [`hardware::nominal_ram_gb`], not the
 /// OS-visible total floored to whole GiB: a 16 GB Windows or Linux machine
 /// reports 15.x GiB and must still be offered the model.
-fn tier_for_ram_gb(ram_gb: u64) -> &'static str {
+pub(crate) fn tier_for_ram_gb(ram_gb: u64) -> &'static str {
     if ram_gb >= hardware::WORKER_MIN_NOMINAL_RAM_GB { "standard" } else { "none" }
 }
 
@@ -7506,6 +7506,13 @@ mod compute_contribution_tests {
             );
             assert!(!launches_as_worker(&config));
             assert!(!needs_promotion(&config, 12));
+            let launched = crate::node_manager::effective_launch_config_for_ram(&config, 12);
+            assert_eq!(launched.role, "observer");
+            assert_eq!(launched.model_path, None);
+            assert_eq!(
+                Store::load_from(dir.path()).config.unwrap().model_path,
+                config.model_path
+            );
         }
     }
 
