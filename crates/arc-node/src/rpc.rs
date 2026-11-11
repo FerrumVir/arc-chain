@@ -32732,7 +32732,8 @@ mod tests {
 
     fn single_tiling() -> Vec<ShardInfo> {
         let mut seen = std::collections::BTreeSet::new();
-        live_topology().into_iter()
+        live_topology()
+            .into_iter()
             .filter(|s| seen.insert((s.start_layer, s.end_layer)))
             .collect()
     }
@@ -32812,10 +32813,11 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.0, StatusCode::CONFLICT);
         assert_eq!(node.shard_registry.len(), 4);
-        assert!(node
-            .shard_registry
-            .iter()
-            .all(|entry| entry.value().1 == seen));
+        assert!(
+            node.shard_registry
+                .iter()
+                .all(|entry| entry.value().1 == seen)
+        );
     }
 
     #[test]
@@ -32856,7 +32858,7 @@ mod tests {
                 .collect();
             let selected = assemble_pipeline(available, &no_stats()).unwrap();
             assert_eq!(selected[0].1[0].socket_addr, replica.socket_addr);
-            assert_eq!(selected.last().unwrap().0 .1, 32);
+            assert_eq!(selected.last().unwrap().0.1, 32);
         }
     }
 
