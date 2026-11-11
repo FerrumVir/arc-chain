@@ -24,7 +24,7 @@ fn map_err<E: std::fmt::Display>(e: E) -> String {
 /// being run twice per onboarding (once here, once inside `recommended_tier`)
 /// on a tokio worker with no `spawn_blocking`. The result never changes
 /// during a session, so detect once and hand out clones.
-fn cached_hardware() -> HardwareInfo {
+pub(crate) fn cached_hardware() -> HardwareInfo {
     use std::sync::OnceLock;
     static HW: OnceLock<HardwareInfo> = OnceLock::new();
     HW.get_or_init(hardware::detect).clone()
@@ -421,8 +421,19 @@ pub async fn update_location_block() -> CmdResult<Option<String>> {
 
 #[tauri::command]
 pub async fn load_config(state: State<'_, AppState>) -> CmdResult<Option<NodeConfig>> {
+    let ram_gb = tokio::task::spawn_blocking(|| cached_hardware().ram_gb)
+        .await
+        .map_err(map_err)?;
     let store = state.store.lock().await;
-    Ok(store.config.clone())
+    let mut config = store.config.clone();
+    if tier_for_ram_gb(ram_gb) == "none" {
+        if let Some(config) = &mut config {
+            config.compute_consent = Some(false);
+            config.role = "observer".into();
+            config.model_path = None;
+        }
+    }
+    Ok(config)
 }
 
 #[tauri::command]
@@ -941,11 +952,9 @@ pub(crate) async fn restart_node_inner(app: &AppHandle, state: &AppState) -> Res
 
 // ── Compute contribution (the user's answer) ──────────────────────────────
 //
-// An install contributes compute only after its user says yes: onboarding's
-// compute step (which starts on when the computer can run the model, and
-// says so), the observer banner, or the Settings switch. Nothing here
-// downloads a model or switches to worker mode without that answer, and
-// turning the switch off returns the node to observer mode at once.
+// Startup resolves an unanswered eligible install to the sharing default
+// before any node starts. Setup and the legacy v0.7 question keep their own
+// choices. A stored refusal always wins; switching off returns to observer.
 
 /// Shown when the app is asked to promote an install whose user never opted in.
 pub(crate) const COMPUTE_CONSENT_REQUIRED: &str =
@@ -955,13 +964,46 @@ pub(crate) const COMPUTE_CONSENT_REQUIRED: &str =
 pub(crate) const COMPUTE_INELIGIBLE: &str =
     "This computer has less than 16 GB of memory, so it cannot run the ARC model. It stays an observer, which still relays and verifies.";
 
-/// Whether the user agreed to contribute compute. An explicit answer is
-/// authoritative. Installs from before the question existed count as opted
-/// in only if their user had already chosen worker mode with a model.
+/// Read the resolved contribution choice. Startup applies the eligible
+/// default first; raw legacy worker configs remain compatible. Failed default
+/// persistence and pending v0.7 questions must never silently promote.
 pub(crate) fn compute_contribution_enabled(config: &NodeConfig) -> bool {
     config
         .compute_consent
         .unwrap_or(config.role == "worker" && config.model_path.is_some())
+}
+
+/// Resolve an unanswered install once, before any node starts or the UI reads
+/// it. The legacy v0.7 question retains precedence. A persisted refusal is
+/// never changed. Keep the notice pending across hidden launches and crashes.
+pub(crate) fn apply_compute_default(
+    store: &mut Store,
+    ram_gb: u64,
+    cores: u32,
+    legacy_pending: bool,
+) -> bool {
+    if store.identity.is_none() || legacy_pending {
+        return false;
+    }
+    let Some(config) = store.config.as_mut() else {
+        return false;
+    };
+    if tier_for_ram_gb(ram_gb) == "none" {
+        let changed = config.role != "observer"
+            || config.model_path.is_some()
+            || config.compute_default_notice_pending;
+        config.role = "observer".into();
+        config.model_path = None;
+        config.compute_default_notice_pending = false;
+        return changed;
+    }
+    if config.compute_consent.is_some() {
+        return false;
+    }
+    let already_sharing = config.role == "worker" && config.model_path.is_some();
+    turn_on_compute(config, cores);
+    config.compute_default_notice_pending = !already_sharing;
+    true
 }
 
 /// The core cap setup stores for an install that contributes compute when
@@ -973,10 +1015,8 @@ pub(crate) fn default_worker_threads(logical_cores: u32) -> u32 {
     (logical_cores / 4).max(1)
 }
 
-/// Whether `complete_onboarding` gives this config the default core cap: the
-/// setup turns compute on and names no core count. Only setup does this, so
-/// an existing install keeps whatever it has, every core included, until
-/// someone sets a count.
+/// Setup and the unanswered-install migration apply the default core cap
+/// after recording yes, unless a count is already stored.
 fn takes_setup_core_default(config: &NodeConfig) -> bool {
     config.compute_consent == Some(true) && config.worker_threads.is_none()
 }
@@ -1005,10 +1045,10 @@ pub(crate) enum PromotionNeed {
 pub(crate) fn promotion_need(config: &NodeConfig, ram_gb: u64) -> PromotionNeed {
     if !compute_contribution_enabled(config) {
         PromotionNeed::NoConsent
-    } else if config.role == "worker" && config.model_path.is_some() {
-        PromotionNeed::Ready
     } else if tier_for_ram_gb(ram_gb) == "none" {
         PromotionNeed::Ineligible
+    } else if config.role == "worker" && config.model_path.is_some() {
+        PromotionNeed::Ready
     } else {
         PromotionNeed::Promote
     }
@@ -1022,6 +1062,10 @@ fn preserve_unsent_contribution_choices(config: &mut NodeConfig, persisted: Opti
         if config.compute_consent.is_none() {
             config.compute_consent = persisted.compute_consent;
         }
+        if config.keep_awake_while_sharing.is_none() {
+            config.keep_awake_while_sharing = persisted.keep_awake_while_sharing;
+        }
+        config.compute_default_notice_pending = persisted.compute_default_notice_pending;
         if config.prevent_sleep_during_jobs.is_none() {
             config.prevent_sleep_during_jobs = persisted.prevent_sleep_during_jobs;
         }
@@ -1045,6 +1089,8 @@ fn preserve_native_contribution_state(config: &mut NodeConfig, persisted: Option
         return;
     };
     config.compute_consent = persisted.compute_consent;
+    config.keep_awake_while_sharing = persisted.keep_awake_while_sharing;
+    config.compute_default_notice_pending = persisted.compute_default_notice_pending;
     config.prevent_sleep_during_jobs = persisted.prevent_sleep_during_jobs;
     config.role.clone_from(&persisted.role);
     config.model_path.clone_from(&persisted.model_path);
@@ -1068,6 +1114,9 @@ async fn update_stored_config(
     let config = update_stored_config_in(&mut store, update);
     let dir = state.data_dir.lock().await.clone();
     store.save_to(&dir).map_err(map_err)?;
+    crate::sharing_awake::set_enabled(
+        config.keep_awake_while_sharing == Some(true) && compute_contribution_enabled(&config),
+    );
     Ok(config)
 }
 
@@ -1115,6 +1164,7 @@ async fn persist_promotion_if_still_consented(
 /// after re-checking its pinned SHA-256 (`existing_model_for_tier`).
 fn withdraw_compute_consent(config: &mut NodeConfig) {
     config.compute_consent = Some(false);
+    config.compute_default_notice_pending = false;
     config.role = "observer".into();
     config.model_path = None;
 }
@@ -1133,6 +1183,7 @@ pub async fn set_compute_contribution(
     enabled: bool,
 ) -> CmdResult<NodeConfig> {
     if !enabled {
+        crate::sharing_awake::set_enabled(false);
         let config = update_stored_config(&state, withdraw_compute_consent).await?;
         let running = state.node.lock().await.is_running();
         if running {
@@ -1223,6 +1274,7 @@ async fn promote_consented_install_once(
 
 /// Whether a consented install still needs the promotion path: it is not a
 /// worker yet, or it is a worker whose model file is missing or unreadable.
+#[cfg(test)]
 fn needs_promotion(config: &NodeConfig, ram_gb: u64) -> bool {
     match promotion_need(config, ram_gb) {
         PromotionNeed::Promote => true,
@@ -1237,50 +1289,24 @@ fn needs_promotion(config: &NodeConfig, ram_gb: u64) -> bool {
 /// logged and retried by the background loop (`background_promotion`), on
 /// the next launch, or on a toggle.
 pub(crate) async fn promote_consented_install_on_startup(app: &AppHandle, state: &AppState) {
-    let config = current_config(state).await;
-    let ram_gb = tokio::task::spawn_blocking(|| cached_hardware().ram_gb)
-        .await
-        .unwrap_or(0);
-    if !needs_promotion(&config, ram_gb) {
-        return;
-    }
-    match promote_consented_install_inner(app, state).await {
-        Ok(_) => tracing::info!("compute contribution enabled: worker mode with a verified model"),
-        Err(error) => {
-            tracing::warn!(%error, "could not finish enabling compute contribution; will retry")
-        }
-    }
+    let env = BackgroundPromotionEnv { app, state };
+    let outcome = crate::background_promotion::background_tick(
+        &env,
+        &crate::background_promotion::SystemConditions,
+    )
+    .await;
+    tracing::info!(?outcome, "startup background promotion");
 }
 
-// ── The one-time question for an existing install ─────────────────────────
-//
-// An install that finished setup before compute started on by default was
-// never shown "Share your computer's spare power". The first launch after the
-// update asks it once, in a dialog with two buttons ("Turn on", "Not now"),
-// and never again. The WebView calls `claim_compute_prompt` once per launch,
-// after the app has loaded.
-//
-// "Once" is a marker file beside store.json, written before the dialog is
-// shown, so quitting or crashing with the dialog up never asks twice. It is a
-// file and not a field in store.json for the reason the unattended-install
-// default is (auto_update.rs): a release that rewrites store.json without the
-// fields it does not know, such as a rollback, would reset a field and not a
-// file.
-//
-// The window is the first launch after setup is complete. Setup records it
-// when it asks the question itself (`persist_webview_save`), the v0.7 upgrade
-// question records it when it is answered (it is the same question), and a
-// launch where the question does not apply records it too: compute is already
-// on, or the computer cannot run the model. Turning compute off later, or
-// adding memory, then never asks out of the blue.
+// ── One-time sharing notice ──────────────────────────────────────────────
+// Keep the v1 question marker for setup and the untouched v0.7 upgrade flow.
+// The default's v2 notice has its own marker: an old claim may have been
+// consumed before anybody saw it. A native pending bit is saved atomically
+// with the new sharing default, and only a rendered notice records v2.
 
 /// The marker's name. Its content is the time of the launch that recorded it,
 /// in milliseconds since the Unix epoch.
 const COMPUTE_PROMPT_MARKER: &str = "compute-prompt-shown-at.v1";
-
-fn compute_prompt_recorded(dir: &Path) -> bool {
-    dir.join(COMPUTE_PROMPT_MARKER).exists()
-}
 
 /// Record the marker. `Ok(true)` means this call wrote it and `Ok(false)`
 /// that it was already there; the write is atomic and durable, so of two ARC
@@ -1302,99 +1328,52 @@ pub(crate) fn note_compute_question_answered(dir: &Path) {
     }
 }
 
-/// What a launch does about the one-time question.
-#[derive(Debug, PartialEq, Eq)]
-enum ComputePromptPlan {
-    /// Not yet, and nothing recorded: setup is not finished, or the v0.7
-    /// upgrade question is waiting for its answer, which settles this one.
-    Later,
-    /// Already recorded by an earlier launch, by setup, or by the v0.7
-    /// question.
-    Handled,
-    /// This is the one-time window, but the question does not apply. Record
-    /// it and ask nothing.
-    Skip,
-    /// Record it, then ask.
-    Ask,
+const COMPUTE_NOTICE_MARKER: &str = "compute-default-notice-shown-at.v2";
+
+fn compute_notice_due(store: &Store, dir: &Path) -> bool {
+    store.identity.is_some()
+        && store
+            .config
+            .as_ref()
+            .is_some_and(|c| c.compute_default_notice_pending && c.compute_consent == Some(true))
+        && !dir.join(COMPUTE_NOTICE_MARKER).exists()
 }
 
-/// Decide the launch's plan. `recorded` is whether the marker exists,
-/// `model_fits` whether this computer meets the memory requirement setup
-/// recommends the model at (`tier_for_ram_gb` is not "none"), and
-/// `legacy_question_pending` whether the v0.7 upgrade dialog will show.
-///
-/// Compute is off exactly when `compute_contribution_enabled` says so, which
-/// counts a worker with a model from before the question as on, even though
-/// its stored consent is still `None`. Setup is complete when the store holds
-/// an identity and a config, the same test the WebView applies at launch.
-fn plan_compute_prompt(
-    store: &Store,
-    recorded: bool,
-    model_fits: bool,
-    legacy_question_pending: bool,
-) -> ComputePromptPlan {
-    let (Some(_), Some(config)) = (store.identity.as_ref(), store.config.as_ref()) else {
-        return ComputePromptPlan::Later;
-    };
-    if legacy_question_pending {
-        ComputePromptPlan::Later
-    } else if recorded {
-        ComputePromptPlan::Handled
-    } else if compute_contribution_enabled(config) || !model_fits {
-        ComputePromptPlan::Skip
-    } else {
-        ComputePromptPlan::Ask
-    }
-}
-
-/// The store and disk side of `claim_compute_prompt`. `Ok(true)` means ask
-/// now, and the marker is already written. Only the call that wrote it asks:
-/// another ARC desktop that lost the race gets `false`.
-fn claim_compute_prompt_in(
-    dir: &Path,
-    store: &Store,
-    model_fits: bool,
-    legacy_question_pending: bool,
-) -> std::io::Result<bool> {
-    let recorded = compute_prompt_recorded(dir);
-    match plan_compute_prompt(store, recorded, model_fits, legacy_question_pending) {
-        ComputePromptPlan::Later | ComputePromptPlan::Handled => Ok(false),
-        ComputePromptPlan::Skip => record_compute_prompt(dir).map(|_| false),
-        ComputePromptPlan::Ask => record_compute_prompt(dir),
-    }
-}
-
-/// Launch: whether to ask this install, once, to turn on compute. The marker
-/// is written before this returns `true`, so the dialog can be quit or can
-/// crash without it ever showing again. A marker that cannot be written
-/// means no question: one that could repeat is worse than one that is missed.
+/// A read-only claim. The visible, mounted dialog acknowledges separately;
+/// a hidden window or an interrupted IPC call cannot consume the notice.
 #[tauri::command]
 pub async fn claim_compute_prompt(state: State<'_, AppState>) -> CmdResult<bool> {
-    let dir = state.data_dir.lock().await.clone();
-    // Every launch after the first costs one stat, not a hardware read.
-    if compute_prompt_recorded(&dir) {
-        return Ok(false);
-    }
-    // The first hardware read can block for seconds (system_profiler).
-    let ram_gb = tokio::task::spawn_blocking(|| cached_hardware().ram_gb)
-        .await
-        .map_err(map_err)?;
-    let model_fits = tier_for_ram_gb(ram_gb) != "none";
     let store = state.store.lock().await;
-    // The same test `load_legacy_compute_question` applies: asked of a launch
-    // that has no answer yet and has a recorded question.
-    let legacy_question_pending = store
-        .config
-        .as_ref()
-        .is_some_and(|config| config.compute_consent.is_none())
-        && crate::legacy_upgrade::load(&dir).is_some();
-    match claim_compute_prompt_in(&dir, &store, model_fits, legacy_question_pending) {
-        Ok(ask) => Ok(ask),
-        Err(error) => {
-            tracing::warn!(%error, "could not record the one-time compute question; not asking it");
-            Ok(false)
-        }
+    let dir = state.data_dir.lock().await;
+    Ok(compute_notice_due(&store, &dir))
+}
+
+#[tauri::command]
+pub async fn acknowledge_compute_notice(state: State<'_, AppState>) -> CmdResult<()> {
+    let store = state.store.lock().await;
+    let dir = state.data_dir.lock().await;
+    if compute_notice_due(&store, &dir) {
+        arc_crypto::secret_file::durably_publish_new_private(
+            &dir.join(COMPUTE_NOTICE_MARKER),
+            b"shown\n",
+        )
+        .map_err(map_err)?;
     }
+    Ok(())
+}
+
+/// Independent of the per-job setting; takes effect without a restart.
+#[tauri::command]
+pub async fn set_keep_awake_while_sharing(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> CmdResult<NodeConfig> {
+    if !enabled {
+        crate::sharing_awake::set_enabled(false);
+    }
+    let config =
+        update_stored_config(&state, |c| c.keep_awake_while_sharing = Some(enabled)).await?;
+    Ok(config)
 }
 
 /// What "Turn on" stores: consent, and the core cap setup stores when none is
@@ -7411,163 +7390,84 @@ mod compute_contribution_tests {
     }
 
     #[test]
-    fn the_question_is_for_an_install_with_compute_off_that_can_run_the_model() {
-        // Compute off: never asked (None) or an earlier no (Some(false)).
-        for consent in [None, Some(false)] {
+    fn sharing_default_respects_memory_refusal_and_legacy_question() {
+        for (ram, consent, legacy, expected) in [
+            (16, None, false, Some(true)),
+            (12, None, false, None),
+            (64, Some(false), false, Some(false)),
+            (64, None, true, None),
+        ] {
+            let mut store = existing_install("observer", None, consent);
+            apply_compute_default(&mut store, ram, 24, legacy);
+            let config = store.config.unwrap();
+            assert_eq!(config.compute_consent, expected);
             assert_eq!(
-                plan_compute_prompt(&existing_install("observer", None, consent), false, true, false),
-                ComputePromptPlan::Ask,
-                "consent {consent:?}"
+                config.compute_default_notice_pending,
+                expected == Some(true)
             );
+            if expected == Some(true) {
+                assert_eq!(config.worker_threads, Some(6));
+            } else {
+                assert_eq!(config.role, "observer");
+            }
         }
-        // Already on: it does not apply, and the window is spent.
+        let mut legacy = existing_install("worker", Some("model.gguf"), None);
+        legacy.config.as_mut().unwrap().worker_threads = Some(3);
+        assert!(apply_compute_default(&mut legacy, 64, 24, false));
+        assert!(
+            !legacy
+                .config
+                .as_ref()
+                .unwrap()
+                .compute_default_notice_pending
+        );
+        assert_eq!(legacy.config.unwrap().worker_threads, Some(3));
+    }
+
+    #[test]
+    fn sharing_notice_survives_claims_and_old_marker_until_rendered_once() {
+        let dir = tempfile::tempdir().unwrap();
+        record_compute_prompt(dir.path()).unwrap(); // Old unseen question must not suppress the notice.
+        let mut store = existing_install("observer", None, None);
+        apply_compute_default(&mut store, 16, 24, false);
+        store.save_to(dir.path()).unwrap();
+        let reopened = Store::load_from(dir.path());
+        assert!(compute_notice_due(&reopened, dir.path()));
+        assert!(
+            compute_notice_due(&reopened, dir.path()),
+            "claim does not consume"
+        );
+        arc_crypto::secret_file::durably_publish_new_private(
+            &dir.path().join(COMPUTE_NOTICE_MARKER),
+            b"shown\n",
+        )
+        .unwrap();
+        assert!(!compute_notice_due(&reopened, dir.path()));
+        assert!(!apply_compute_default(&mut store, 16, 24, false));
+        withdraw_compute_consent(store.config.as_mut().unwrap());
+        assert_eq!(store.config.as_ref().unwrap().compute_consent, Some(false));
+        assert_eq!(store.config.as_ref().unwrap().role, "observer");
+        assert!(!apply_compute_default(&mut store, 16, 24, false));
+    }
+
+    #[test]
+    fn sharing_awake_choice_defaults_off_and_survives_stale_saves() {
+        let mut store = existing_install("observer", None, None);
         assert_eq!(
-            plan_compute_prompt(&existing_install("observer", None, Some(true)), false, true, false),
-            ComputePromptPlan::Skip
+            store.config.as_ref().unwrap().keep_awake_while_sharing,
+            None
         );
-        // A worker with a model from before the question counts as on, even
-        // though its stored consent is still None.
+        update_stored_config_in(&mut store, |c| c.keep_awake_while_sharing = Some(true));
+        apply_webview_config_save(&mut store, NodeConfig::default(), ConfigSave::Preferences);
+        let dir = tempfile::tempdir().unwrap();
+        store.save_to(dir.path()).unwrap();
         assert_eq!(
-            plan_compute_prompt(
-                &existing_install("worker", Some("/m.gguf"), None),
-                false,
-                true,
-                false
-            ),
-            ComputePromptPlan::Skip
+            Store::load_from(dir.path())
+                .config
+                .unwrap()
+                .keep_awake_while_sharing,
+            Some(true)
         );
-        // Below the memory requirement there is nothing to turn on.
-        assert_eq!(
-            plan_compute_prompt(&existing_install("observer", None, Some(false)), false, false, false),
-            ComputePromptPlan::Skip
-        );
-    }
-
-    #[test]
-    fn nothing_is_asked_before_setup_ends_or_while_the_upgrade_question_waits() {
-        // Setup has not finished: no config, or no identity, or neither.
-        let no_config = Store {
-            identity: Some(test_identity()),
-            ..Store::default()
-        };
-        let no_identity = Store {
-            config: Some(config("observer", None, Some(false))),
-            ..Store::default()
-        };
-        let neither = Store::default();
-        for store in [&no_config, &no_identity, &neither] {
-            assert_eq!(
-                plan_compute_prompt(store, false, true, false),
-                ComputePromptPlan::Later
-            );
-        }
-        // The v0.7 upgrade question comes first; answering it settles this one.
-        assert_eq!(
-            plan_compute_prompt(&existing_install("observer", None, None), false, true, true),
-            ComputePromptPlan::Later
-        );
-    }
-
-    #[test]
-    fn a_recorded_question_is_never_asked_again() {
-        for consent in [None, Some(false), Some(true)] {
-            assert_eq!(
-                plan_compute_prompt(&existing_install("observer", None, consent), true, true, false),
-                ComputePromptPlan::Handled,
-                "consent {consent:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_question_is_recorded_before_it_is_asked_and_only_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = existing_install("observer", None, Some(false));
-        assert!(!compute_prompt_recorded(dir.path()));
-
-        // The launch that asks has already written the marker ...
-        assert!(claim_compute_prompt_in(dir.path(), &store, true, false).unwrap());
-        assert!(compute_prompt_recorded(dir.path()));
-        let content = std::fs::read_to_string(dir.path().join(COMPUTE_PROMPT_MARKER)).unwrap();
-        assert!(content.trim().parse::<u64>().unwrap() > 0, "{content:?}");
-
-        // ... so a quit with the dialog up, and every later launch, ask nothing.
-        assert!(!claim_compute_prompt_in(dir.path(), &store, true, false).unwrap());
-        assert!(!claim_compute_prompt_in(dir.path(), &store, true, false).unwrap());
-    }
-
-    #[test]
-    fn a_launch_where_the_question_does_not_apply_spends_it() {
-        // First launch after the update, with compute already on: nothing is
-        // asked, and it is recorded.
-        let dir = tempfile::tempdir().unwrap();
-        let on = existing_install("worker", Some("/m.gguf"), Some(true));
-        assert!(!claim_compute_prompt_in(dir.path(), &on, true, false).unwrap());
-        assert!(compute_prompt_recorded(dir.path()));
-        // The person turns compute off in Settings later: not asked.
-        let off = existing_install("observer", None, Some(false));
-        assert!(!claim_compute_prompt_in(dir.path(), &off, true, false).unwrap());
-
-        // The same for a computer that cannot run the model, whatever memory
-        // it gets later.
-        let small = tempfile::tempdir().unwrap();
-        assert!(!claim_compute_prompt_in(small.path(), &off, false, false).unwrap());
-        assert!(compute_prompt_recorded(small.path()));
-        assert!(!claim_compute_prompt_in(small.path(), &off, true, false).unwrap());
-    }
-
-    #[test]
-    fn nothing_is_recorded_while_the_question_is_not_yet_due() {
-        let dir = tempfile::tempdir().unwrap();
-        let unfinished = Store {
-            identity: Some(test_identity()),
-            ..Store::default()
-        };
-        assert!(!claim_compute_prompt_in(dir.path(), &unfinished, true, false).unwrap());
-        let waiting = existing_install("observer", None, None);
-        assert!(!claim_compute_prompt_in(dir.path(), &waiting, true, true).unwrap());
-        assert!(!compute_prompt_recorded(dir.path()));
-
-        // Answering the v0.7 question records it, so the "Not now" it may
-        // have stored is not asked again at the next launch.
-        note_compute_question_answered(dir.path());
-        assert!(compute_prompt_recorded(dir.path()));
-        let said_no = existing_install("observer", None, Some(false));
-        assert!(!claim_compute_prompt_in(dir.path(), &said_no, true, false).unwrap());
-    }
-
-    #[test]
-    fn a_question_that_cannot_be_recorded_is_not_asked() {
-        // The "directory" is a file, so the marker cannot be written.
-        let dir = tempfile::tempdir().unwrap();
-        let not_a_directory = dir.path().join("a-file");
-        std::fs::write(&not_a_directory, b"x").unwrap();
-        let store = existing_install("observer", None, Some(false));
-        assert!(claim_compute_prompt_in(&not_a_directory, &store, true, false).is_err());
-        assert!(!compute_prompt_recorded(&not_a_directory));
-    }
-
-    #[test]
-    fn setup_records_that_it_asked_so_a_new_install_is_never_asked_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::default();
-        apply_webview_config_save(
-            &mut store,
-            config("observer", None, Some(false)),
-            ConfigSave::Onboarding,
-        );
-        store.identity = Some(test_identity());
-
-        // A Settings save is not the question.
-        let settings = tempfile::tempdir().unwrap();
-        persist_webview_save(&store, settings.path(), ConfigSave::Preferences).unwrap();
-        assert!(!compute_prompt_recorded(settings.path()));
-
-        // Setup's save is. The install that just said no to it, or yes, is
-        // not asked once more at its next launch.
-        persist_webview_save(&store, dir.path(), ConfigSave::Onboarding).unwrap();
-        assert!(compute_prompt_recorded(dir.path()));
-        assert!(!claim_compute_prompt_in(dir.path(), &store, true, false).unwrap());
     }
 
     #[test]

@@ -2479,6 +2479,16 @@ impl NodeManager {
         }
 
         self.child = Some(child);
+        crate::sharing_awake::set_worker(
+            if config.role == "worker"
+                && config.model_path.is_some()
+                && self.active_model_unavailable.is_none()
+            {
+                self.pid()
+            } else {
+                None
+            },
+        );
         Ok(())
     }
 
@@ -2496,6 +2506,7 @@ impl NodeManager {
                 let was_stopping = self
                     .stopping
                     .swap(false, std::sync::atomic::Ordering::SeqCst);
+                crate::sharing_awake::set_worker(None);
                 self.child = None;
                 self.started_at = None;
                 self.shutdown_control = None;
@@ -2655,6 +2666,7 @@ impl NodeManager {
     }
 
     async fn stop_and_retain_lifecycle_lock(&mut self) -> anyhow::Result<StopLifecycleOutcome> {
+        crate::sharing_awake::set_worker(None);
         // Suppress crash restarts before any intentional process drain starts,
         // including Stop, Quit, local mutations, and updater preparation.
         self.clear_desired_running();

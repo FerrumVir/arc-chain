@@ -56,6 +56,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                 }
             }
             "quit" => {
+                crate::sharing_awake::set_enabled(false);
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     // Stop arc-node cleanly before exiting; the window-close
@@ -66,6 +67,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                         let mut node = state.node.lock().await;
                         let _ = node.stop().await;
                     }
+                    crate::sharing_awake::set_enabled(false);
                     handle.exit(0);
                 });
             }
