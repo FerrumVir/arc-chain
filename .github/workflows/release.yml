@@ -70,7 +70,7 @@ env:
 jobs:
   validate:
     name: Validate release tag and pin commit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       actions: read
@@ -327,7 +327,7 @@ jobs:
   release-quality:
     name: Full quality gate on validated release commit
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -479,7 +479,7 @@ jobs:
   release-supply-chain:
     name: Cargo dependency policy (${{ matrix.graph }})
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -869,7 +869,7 @@ jobs:
   assemble-release:
     name: Assemble the exact unsigned release manifest
     needs: [validate, release-quality, release-supply-chain, cross-arch-golden-vectors, headless, linux-server-compat, desktop]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       # The isolated updater verifier is a stable-toolchain release utility.
@@ -1067,7 +1067,7 @@ jobs:
   manifest-sign:
     name: Sign only the verified release manifest
     needs: [validate, assemble-release]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: release
     timeout-minutes: 15
     permissions:
