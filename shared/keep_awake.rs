@@ -19,18 +19,38 @@ pub struct KeepAwake {
 /// The helper command that keeps the machine awake while `pid` lives, on
 /// platforms that use one.
 pub fn keep_awake_helper_command(pid: u32) -> Option<(&'static str, Vec<String>)> {
-    if cfg!(target_os = "macos") {
+    helper_command(std::env::consts::OS, pid, Purpose::Job)
+}
+
+#[derive(Clone, Copy)]
+enum Purpose {
+    Job,
+    Sharing,
+}
+
+fn helper_command(os: &str, pid: u32, purpose: Purpose) -> Option<(&'static str, Vec<String>)> {
+    if os == "macos" {
         Some((
             "/usr/bin/caffeinate",
             vec!["-i".to_string(), "-w".to_string(), pid.to_string()],
         ))
-    } else if cfg!(target_os = "linux") {
+    } else if os == "linux" {
         Some((
             "systemd-inhibit",
             vec![
-                "--what=idle:sleep".to_string(),
+                // Sharing must allow explicit suspend. logind's idle lock only
+                // prevents IdleAction; it takes no sleep/key/display inhibitor.
+                match purpose {
+                    Purpose::Job => "--what=idle:sleep",
+                    Purpose::Sharing => "--what=idle",
+                }
+                .to_string(),
                 "--who=ARC Node".to_string(),
-                "--why=Running an ARC network job".to_string(),
+                match purpose {
+                    Purpose::Job => "--why=Running an ARC network job",
+                    Purpose::Sharing => "--why=Available for ARC network jobs",
+                }
+                .to_string(),
                 "--mode=block".to_string(),
                 "tail".to_string(),
                 format!("--pid={pid}"),
@@ -62,12 +82,23 @@ impl KeepAwake {
 
     /// Same OS hold, released by Unix helpers if the watched worker exits.
     pub fn begin_for_process(enabled: bool, pid: u32) -> Self {
+        Self::begin_with_purpose(enabled, pid, Purpose::Job)
+    }
+
+    /// Opt-in idle-system-sleep hold for an available worker. Unlike the legacy
+    /// Linux per-job hold, this never inhibits an explicit suspend request.
+    /// No platform requests a display/screen-saver hold.
+    pub fn begin_sharing_for_process(pid: u32) -> Self {
+        Self::begin_with_purpose(true, pid, Purpose::Sharing)
+    }
+
+    fn begin_with_purpose(enabled: bool, pid: u32, purpose: Purpose) -> Self {
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        let _ = pid;
+        let _ = (pid, purpose);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             let command = if enabled {
-                keep_awake_helper_command(pid)
+                helper_command(std::env::consts::OS, pid, purpose)
             } else {
                 None
             };
@@ -145,5 +176,62 @@ impl Drop for KeepAwake {
                 windows_power::SetThreadExecutionState(windows_power::ES_CONTINUOUS);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sharing_helper_allows_manual_suspend_and_display_sleep() {
+        // Check both Unix command contracts on every test host. This does not
+        // claim runtime verification of Linux logind or a desktop environment.
+        let (program, args) = helper_command("linux", 4242, Purpose::Sharing).unwrap();
+        assert_eq!(program, "systemd-inhibit");
+        assert_eq!(
+            args,
+            [
+                "--what=idle",
+                "--who=ARC Node",
+                "--why=Available for ARC network jobs",
+                "--mode=block",
+                "tail",
+                "--pid=4242",
+                "-f",
+                "/dev/null"
+            ]
+        );
+        let (program, args) = helper_command("macos", 4242, Purpose::Sharing).unwrap();
+        assert_eq!(program, "/usr/bin/caffeinate");
+        assert_eq!(args, ["-i", "-w", "4242"]); // no -d display or -s forced sleep hold
+    }
+
+    #[test]
+    fn per_job_helper_contract_is_unchanged() {
+        let (program, args) = helper_command("linux", 4242, Purpose::Job).unwrap();
+        assert_eq!(program, "systemd-inhibit");
+        assert_eq!(
+            args,
+            [
+                "--what=idle:sleep",
+                "--who=ARC Node",
+                "--why=Running an ARC network job",
+                "--mode=block",
+                "tail",
+                "--pid=4242",
+                "-f",
+                "/dev/null"
+            ]
+        );
+        assert_eq!(
+            helper_command("macos", 4242, Purpose::Job),
+            helper_command("macos", 4242, Purpose::Sharing)
+        );
+        assert_eq!(
+            keep_awake_helper_command(4242),
+            helper_command(std::env::consts::OS, 4242, Purpose::Job)
+        );
+        assert!(!KeepAwake::begin(false).is_active());
     }
 }
