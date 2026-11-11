@@ -94,7 +94,10 @@ pub struct NodeConfig {
     /// Opt-in idle-sleep hold while plugged in and running a sharing worker.
     #[serde(default)]
     pub keep_awake_while_sharing: Option<bool>,
-    /// Native-owned notice for an install enabled by the v0.8.20 default.
+    /// Native-owned provenance for an install enabled by the v0.8.20 default.
+    /// The separate v2 marker acknowledges its notice without clearing this
+    /// bit, so startup downloads stay gated on later launches. An explicit
+    /// contribution answer clears it.
     #[serde(default)]
     pub compute_default_notice_pending: bool,
 }

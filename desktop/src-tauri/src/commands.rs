@@ -282,7 +282,11 @@ fn apply_webview_config_save(store: &mut Store, mut config: NodeConfig, save: Co
     preserve_authoritative_data_dir(&mut config, store.config.as_ref());
     match save {
         ConfigSave::Onboarding => {
+            let explicitly_answered = config.compute_consent.is_some();
             preserve_unsent_contribution_choices(&mut config, store.config.as_ref());
+            if explicitly_answered {
+                config.compute_default_notice_pending = false;
+            }
             if let Some(persisted) = store.config.as_ref() {
                 // The wizard never asks about unattended installs, so a re-run
                 // ("Reset onboarding") keeps the stored answer, like keep-awake.
@@ -421,9 +425,7 @@ pub async fn update_location_block() -> CmdResult<Option<String>> {
 
 #[tauri::command]
 pub async fn load_config(state: State<'_, AppState>) -> CmdResult<Option<NodeConfig>> {
-    let ram_gb = tokio::task::spawn_blocking(|| cached_hardware().ram_gb)
-        .await
-        .map_err(map_err)?;
+    let (ram_gb, _) = crate::hardware::compute_capacity();
     let store = state.store.lock().await;
     let mut config = store.config.clone();
     if tier_for_ram_gb(ram_gb) == "none" {
@@ -989,19 +991,23 @@ pub(crate) fn apply_compute_default(
         return false;
     };
     if tier_for_ram_gb(ram_gb) == "none" {
-        let changed = config.role != "observer"
-            || config.model_path.is_some()
-            || config.compute_default_notice_pending;
+        let changed = config.role != "observer";
+        // Enforce the worker floor without erasing the user's stored choices
+        // or model path. Promotion independently checks the same floor.
         config.role = "observer".into();
-        config.model_path = None;
-        config.compute_default_notice_pending = false;
         return changed;
     }
     if config.compute_consent.is_some() {
         return false;
     }
     let already_sharing = config.role == "worker" && config.model_path.is_some();
-    turn_on_compute(config, cores);
+    if already_sharing {
+        // An unset count already means all cores. Do not apply setup's cap
+        // to a worker that was contributing before this migration.
+        config.compute_consent = Some(true);
+    } else {
+        turn_on_compute(config, cores);
+    }
     config.compute_default_notice_pending = !already_sharing;
     true
 }
@@ -1191,7 +1197,7 @@ pub async fn set_compute_contribution(
         }
         return Ok(config);
     }
-    update_stored_config(&state, |config| config.compute_consent = Some(true)).await?;
+    update_stored_config(&state, record_explicit_compute_consent).await?;
     promote_consented_install_inner(&app, &state).await
 }
 
@@ -1274,7 +1280,6 @@ async fn promote_consented_install_once(
 
 /// Whether a consented install still needs the promotion path: it is not a
 /// worker yet, or it is a worker whose model file is missing or unreadable.
-#[cfg(test)]
 fn needs_promotion(config: &NodeConfig, ram_gb: u64) -> bool {
     match promotion_need(config, ram_gb) {
         PromotionNeed::Promote => true,
@@ -1289,13 +1294,43 @@ fn needs_promotion(config: &NodeConfig, ram_gb: u64) -> bool {
 /// logged and retried by the background loop (`background_promotion`), on
 /// the next launch, or on a toggle.
 pub(crate) async fn promote_consented_install_on_startup(app: &AppHandle, state: &AppState) {
-    let env = BackgroundPromotionEnv { app, state };
-    let outcome = crate::background_promotion::background_tick(
-        &env,
-        &crate::background_promotion::SystemConditions,
-    )
-    .await;
-    tracing::info!(?outcome, "startup background promotion");
+    let config = current_config(state).await;
+    let ram_gb = tokio::task::spawn_blocking(|| cached_hardware().ram_gb)
+        .await
+        .unwrap_or(0);
+    if !needs_promotion(&config, ram_gb) {
+        return;
+    }
+    if let Err(reason) =
+        startup_download_gate(&config, &crate::background_promotion::SystemConditions)
+    {
+        tracing::info!(?reason, "default-enabled startup promotion deferred");
+        return;
+    }
+    // Preserve v0.8.19's startup recovery and shared single-flight path for
+    // users who already agreed, including workers with a missing model.
+    match promote_consented_install_inner(app, state).await {
+        Ok(_) => tracing::info!("compute contribution enabled: worker mode with a verified model"),
+        Err(error) => {
+            tracing::warn!(%error, "could not finish enabling compute contribution; will retry")
+        }
+    }
+}
+
+fn startup_download_gate(
+    config: &NodeConfig,
+    conditions: &impl crate::background_promotion::DownloadConditions,
+) -> Result<(), crate::background_promotion::SkipReason> {
+    use crate::background_promotion::{download_gate, Trigger};
+    // The native bit records default enablement even after the notice was
+    // acknowledged (the separate v2 marker records that). It survives relaunch
+    // and stale Settings saves, until an explicit contribution choice replaces it.
+    let trigger = if config.compute_default_notice_pending {
+        Trigger::Background
+    } else {
+        Trigger::User
+    };
+    download_gate(trigger, conditions)
 }
 
 // ── One-time sharing notice ──────────────────────────────────────────────
@@ -1330,8 +1365,9 @@ pub(crate) fn note_compute_question_answered(dir: &Path) {
 
 const COMPUTE_NOTICE_MARKER: &str = "compute-default-notice-shown-at.v2";
 
-fn compute_notice_due(store: &Store, dir: &Path) -> bool {
-    store.identity.is_some()
+fn compute_notice_due(store: &Store, dir: &Path, ram_gb: u64) -> bool {
+    tier_for_ram_gb(ram_gb) != "none"
+        && store.identity.is_some()
         && store
             .config
             .as_ref()
@@ -1345,14 +1381,18 @@ fn compute_notice_due(store: &Store, dir: &Path) -> bool {
 pub async fn claim_compute_prompt(state: State<'_, AppState>) -> CmdResult<bool> {
     let store = state.store.lock().await;
     let dir = state.data_dir.lock().await;
-    Ok(compute_notice_due(&store, &dir))
+    Ok(compute_notice_due(
+        &store,
+        &dir,
+        crate::hardware::compute_capacity().0,
+    ))
 }
 
 #[tauri::command]
 pub async fn acknowledge_compute_notice(state: State<'_, AppState>) -> CmdResult<()> {
     let store = state.store.lock().await;
     let dir = state.data_dir.lock().await;
-    if compute_notice_due(&store, &dir) {
+    if compute_notice_due(&store, &dir, crate::hardware::compute_capacity().0) {
         arc_crypto::secret_file::durably_publish_new_private(
             &dir.join(COMPUTE_NOTICE_MARKER),
             b"shown\n",
@@ -1376,10 +1416,16 @@ pub async fn set_keep_awake_while_sharing(
     Ok(config)
 }
 
+/// An explicit answer supersedes automatic enablement and its download gate.
+fn record_explicit_compute_consent(config: &mut NodeConfig) {
+    config.compute_consent = Some(true);
+    config.compute_default_notice_pending = false;
+}
+
 /// What "Turn on" stores: consent, and the core cap setup stores when none is
 /// stored yet (`apply_setup_core_default`). A count someone chose stays.
 fn turn_on_compute(config: &mut NodeConfig, logical_cores: u32) {
-    config.compute_consent = Some(true);
+    record_explicit_compute_consent(config);
     apply_setup_core_default(config, logical_cores);
 }
 
@@ -7425,6 +7471,108 @@ mod compute_contribution_tests {
     }
 
     #[test]
+    fn existing_workers_keep_their_effective_core_count() {
+        for threads in [None, Some(3)] {
+            let mut store = existing_install("worker", Some("model.gguf"), None);
+            store.config.as_mut().unwrap().worker_threads = threads;
+            assert!(apply_compute_default(&mut store, 64, 24, false));
+            let config = store.config.as_ref().unwrap();
+            assert_eq!(config.worker_threads, threads); // None still means all cores.
+            assert_eq!(config.compute_consent, Some(true));
+            assert!(!config.compute_default_notice_pending);
+            assert_eq!(promotion_need(config, 64), PromotionNeed::Ready);
+            let dir = tempfile::tempdir().unwrap();
+            store.save_to(dir.path()).unwrap();
+            let mut reopened = Store::load_from(dir.path());
+            assert!(!apply_compute_default(&mut reopened, 64, 24, false));
+            assert_eq!(reopened.config.unwrap().worker_threads, threads);
+        }
+    }
+
+    #[test]
+    fn below_floor_keeps_stored_model_and_choices_as_observer() {
+        for consent in [None, Some(false), Some(true)] {
+            let mut store = existing_install("worker", Some("model.gguf"), consent);
+            let mut expected = store.config.clone().unwrap();
+            expected.role = "observer".into();
+            assert!(apply_compute_default(&mut store, 12, 24, false));
+            let dir = tempfile::tempdir().unwrap();
+            store.save_to(dir.path()).unwrap();
+            let reopened = Store::load_from(dir.path());
+            let config = reopened.config.unwrap();
+            assert_eq!(
+                serde_json::to_value(&config).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            assert!(!launches_as_worker(&config));
+            assert!(!needs_promotion(&config, 12));
+        }
+    }
+
+    #[test]
+    fn explicit_yes_is_not_gated_but_default_enablement_survives_notice_and_relaunch() {
+        use crate::background_promotion::{DownloadConditions, PowerSource, SkipReason};
+        struct Conditions(PowerSource, Option<bool>);
+        impl DownloadConditions for Conditions {
+            fn power_source(&self) -> PowerSource {
+                self.0
+            }
+            fn network_metered(&self) -> Option<bool> {
+                self.1
+            }
+        }
+        struct NeverSample;
+        impl DownloadConditions for NeverSample {
+            fn power_source(&self) -> PowerSource {
+                panic!("explicit yes must not query power")
+            }
+            fn network_metered(&self) -> Option<bool> {
+                panic!("explicit yes must not query network")
+            }
+        }
+        for role in ["observer", "worker"] {
+            let model = (role == "worker").then_some("missing-model.gguf");
+            let mut store = existing_install(role, model, Some(true));
+            assert!(!apply_compute_default(&mut store, 64, 24, false));
+            let config = store.config.as_ref().unwrap();
+            assert!(needs_promotion(config, 64));
+            assert_eq!(startup_download_gate(config, &NeverSample), Ok(()));
+        }
+        let mut store = existing_install("observer", None, None);
+        apply_compute_default(&mut store, 64, 24, false);
+        apply_webview_config_save(&mut store, NodeConfig::default(), ConfigSave::Preferences);
+        let dir = tempfile::tempdir().unwrap();
+        arc_crypto::secret_file::durably_publish_new_private(
+            &dir.path().join(COMPUTE_NOTICE_MARKER),
+            b"shown\n",
+        )
+        .unwrap();
+        store.save_to(dir.path()).unwrap();
+        let reopened = Store::load_from(dir.path());
+        assert!(!compute_notice_due(&reopened, dir.path(), 16));
+        let mut config = reopened.config.unwrap();
+        assert_eq!(
+            startup_download_gate(&config, &Conditions(PowerSource::Battery, Some(false))),
+            Err(SkipReason::OnBattery)
+        );
+        assert_eq!(
+            startup_download_gate(&config, &Conditions(PowerSource::Mains, Some(true))),
+            Err(SkipReason::MeteredNetwork)
+        );
+        assert_eq!(
+            startup_download_gate(&config, &Conditions(PowerSource::Mains, Some(false))),
+            Ok(())
+        );
+        record_explicit_compute_consent(&mut config);
+        assert_eq!(startup_download_gate(&config, &NeverSample), Ok(()));
+        apply_webview_config_save(&mut store, config, ConfigSave::Onboarding);
+        assert_eq!(
+            startup_download_gate(store.config.as_ref().unwrap(), &NeverSample),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn sharing_notice_survives_claims_and_old_marker_until_rendered_once() {
         let dir = tempfile::tempdir().unwrap();
         record_compute_prompt(dir.path()).unwrap(); // Old unseen question must not suppress the notice.
@@ -7432,9 +7580,10 @@ mod compute_contribution_tests {
         apply_compute_default(&mut store, 16, 24, false);
         store.save_to(dir.path()).unwrap();
         let reopened = Store::load_from(dir.path());
-        assert!(compute_notice_due(&reopened, dir.path()));
+        assert!(compute_notice_due(&reopened, dir.path(), 16));
+        assert!(!compute_notice_due(&reopened, dir.path(), 12));
         assert!(
-            compute_notice_due(&reopened, dir.path()),
+            compute_notice_due(&reopened, dir.path(), 16),
             "claim does not consume"
         );
         arc_crypto::secret_file::durably_publish_new_private(
@@ -7442,7 +7591,7 @@ mod compute_contribution_tests {
             b"shown\n",
         )
         .unwrap();
-        assert!(!compute_notice_due(&reopened, dir.path()));
+        assert!(!compute_notice_due(&reopened, dir.path(), 16));
         assert!(!apply_compute_default(&mut store, 16, 24, false));
         withdraw_compute_consent(store.config.as_mut().unwrap());
         assert_eq!(store.config.as_ref().unwrap().compute_consent, Some(false));

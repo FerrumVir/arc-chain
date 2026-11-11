@@ -633,9 +633,9 @@ pub fn run() {
                 tracing::error!(%error, "could not persist the unattended-update default");
             }
             if !startup_hold.hold.held && loaded_store.identity.is_some() && loaded_store.config.is_some() {
-                let hardware = commands::cached_hardware();
+                let (ram_gb, cpu_cores) = hardware::compute_capacity();
                 let before = loaded_store.config.clone();
-                if commands::apply_compute_default(&mut loaded_store, hardware.ram_gb, hardware.cpu_cores, false) {
+                if commands::apply_compute_default(&mut loaded_store, ram_gb, cpu_cores, false) {
                     if let Err(error) = loaded_store.save_to(&resolved) {
                         loaded_store.config = before;
                         tracing::error!(%error, "could not persist sharing default; leaving the previous choice intact");
