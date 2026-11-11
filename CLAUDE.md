@@ -46,9 +46,11 @@ because the failure already happened once.
 3. **Keep auto-shard-join off on the public net without separate approval.**
    `--auto-shard-join` remains off by default; the opt-in trigger also needs
    stake > 0, a model, and no explicit range. The updated planner fills gaps
-   at occupied boundaries or replicates an exact fresh range with the fewest
-   holders (lowest start on ties). Local tests cover the 6-range tiling,
-   gaps, and a 7-entry pipeline with either duplicate available. Planning
+   at occupied boundaries or replicates an exact fresh production-tiling
+   range with the fewest holders (lowest start on ties). Off-grid strays are
+   excluded; full coverage without a fresh on-grid candidate returns 409.
+   Local tests cover the 6-range tiling, off-grid exclusion, gaps, and a
+   7-entry pipeline with either duplicate available. Planning
    does not register a node; signed `/shards/announce` is still required.
    These tests do not prove that deployed seeds have this planner. Older
    seeds can assign off-grid `[0, 8)` ranges. Keep using explicit on-grid

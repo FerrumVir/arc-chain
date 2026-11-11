@@ -321,8 +321,10 @@ registration is a separate worker path and cannot change voting membership.
 2. **Auto-shard-join on the public net still needs separate approval.**
    The flag remains off by default. The updated planner fills uncovered
    intervals at existing boundaries; with full coverage it selects an exact
-   fresh range with the fewest replicas, breaking ties by lowest start.
-   Local tests cover the 6-range grid, gaps, and seven announcements with
+   fresh production-tiling range with the fewest replicas, breaking ties by
+   lowest start. Off-grid strays are excluded; full coverage with no fresh
+   on-grid candidate returns 409 instead of an unsafe replica assignment.
+   Local tests cover the 6-range grid, off-grid exclusion, gaps, and seven announcements with
    either replica serving the duplicated hop. `/shards/join` only plans;
    registration still requires signed `/shards/announce`. This does not
    establish that deployed seeds are updated: older planners may return

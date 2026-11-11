@@ -591,8 +591,10 @@ struct Cli {
     /// Ask a seed to assign this node a layer range at boot (POST /shards/join).
     ///
     /// OFF by default. Updated coordinators fill the largest uncovered gap
-    /// at existing boundaries, or replicate the exact fresh range with the
-    /// fewest holders (lowest start breaks ties). Planning never registers
+    /// at existing boundaries, or replicate the exact fresh production-tiling
+    /// range with the fewest holders (lowest start breaks ties). Off-grid
+    /// ranges are excluded; no fresh on-grid candidate means no assignment.
+    /// Planning never registers
     /// this node: it must submit a separate signed /shards/announce.
     /// Older coordinators may still assign off-grid ranges. Public-network
     /// use requires separate operator approval; prefer an explicit range.
