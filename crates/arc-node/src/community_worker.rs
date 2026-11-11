@@ -378,7 +378,7 @@ impl ReregistrationQueue {
 // Shared OS implementation; per-job call sites and semantics are unchanged.
 #[path = "../../../shared/keep_awake.rs"]
 mod keep_awake;
-pub use keep_awake::{keep_awake_helper_command, KeepAwake};
+pub use keep_awake::{KeepAwake, keep_awake_helper_command};
 
 #[cfg(test)]
 mod tests {
