@@ -1371,6 +1371,9 @@ pub struct NodeManager {
     desired_running: bool,
     crash_restart_policy: CrashRestartPolicy,
     update_restart_was_desired: bool,
+    /// Instance-local fixture capacity; absent from production builds.
+    #[cfg(test)]
+    test_ram_gb: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1668,6 +1671,8 @@ impl NodeManager {
             desired_running: false,
             crash_restart_policy: CrashRestartPolicy::default(),
             update_restart_was_desired: false,
+            #[cfg(test)]
+            test_ram_gb: None,
         }
     }
 
@@ -2065,7 +2070,13 @@ impl NodeManager {
         // what `withdraw_compute_consent` persists. Consent `None` keeps the
         // existing rule (a worker with a model from before the question
         // counts as opted in), so v0.8.10 workers start unchanged.
+        #[cfg(not(test))]
         let mut effective = effective_launch_config(config);
+        #[cfg(test)]
+        let mut effective = match self.test_ram_gb {
+            Some(ram_gb) => effective_launch_config_for_ram(config, ram_gb),
+            None => effective_launch_config(config),
+        };
         if matches!(effective, std::borrow::Cow::Owned(_)) {
             push_log(
                 &self.logs,
@@ -8205,6 +8216,10 @@ mod tests {
         let receipt_binary = plan.binary.path.clone();
         let receipt_genesis = plan.genesis.path.clone();
         let mut manager = NodeManager::new();
+        // This fixture exercises model availability across real start/relaunch
+        // paths, so deliberately supply eligible RAM even on small CI hosts.
+        // Keep it on this manager: parallel tests retain their own capacity.
+        manager.test_ram_gb = Some(16);
         manager.configure_managed_data_dir(&configured).unwrap();
         manager.update_lifecycle_lock = Some(acquire_managed_lifecycle_lock(&configured).unwrap());
         manager.update_restart_plan = Some(plan);
