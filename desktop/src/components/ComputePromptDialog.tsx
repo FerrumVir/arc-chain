@@ -1,5 +1,5 @@
 import { Cpu } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../lib/tauri";
 import { useAppStore } from "../lib/store";
 
@@ -8,26 +8,53 @@ export function ComputePromptDialog({ onClose }: { onClose: () => void }) {
   const setConfig = useAppStore((s) => s.setConfig);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const lastControlRef = useRef<HTMLElement | null>(null);
   const notNowRef = useRef<HTMLButtonElement>(null);
   const savedKeepAwake = useAppStore((s) => s.config?.keepAwakeWhileSharing === true);
   const [keepAwake, setKeepAwake] = useState(savedKeepAwake);
 
+  // Existing dialogs have no shared focus scope. Keep this notice's focus
+  // boundary in its current markup, including on older supported WebViews.
+  useLayoutEffect(() => {
+    const dialog = dialogRef.current!;
+    const previousFocus = document.activeElement;
+    const containFocus = (event: FocusEvent) => {
+      if (event.target instanceof Node && !dialog.contains(event.target)) {
+        const target = lastControlRef.current;
+        if (target?.isConnected && !target.matches(":disabled")) target.focus();
+        else dialog.focus();
+      }
+    };
+    document.addEventListener("focusin", containFocus);
+    notNowRef.current?.focus();
+    return () => {
+      document.removeEventListener("focusin", containFocus);
+      if (previousFocus instanceof HTMLElement && previousFocus.isConnected
+          && previousFocus !== document.body) {
+        previousFocus.focus();
+      }
+      // A launch-time notice often has no invoking control. Return the user
+      // to the current page's navigation item instead of leaving focus on body.
+      if (document.activeElement === document.body || dialog.contains(document.activeElement)) {
+        document.querySelector<HTMLElement>('nav [aria-current="page"]')?.focus();
+      }
+    };
+  }, []);
+
+  // Saving disables every control. Park focus on the modal while pending,
+  // then return to the control that initiated the save (also after an error).
+  useLayoutEffect(() => {
+    if (busy) dialogRef.current?.focus();
+    else lastControlRef.current?.focus();
+  }, [busy]);
+
   // Dismissing the notice leaves sharing and the independent opt-in intact.
   useEffect(() => {
-    notNowRef.current?.focus();
     return api.whenMainWindowSeen(() => {
       void api.acknowledgeComputeNotice().catch(() => undefined);
     });
   }, []);
-
-  useEffect(() => {
-    if (busy) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [busy, onClose]);
 
   const turnOff = async () => {
     setBusy(true);
@@ -56,7 +83,32 @@ export function ComputePromptDialog({ onClose }: { onClose: () => void }) {
 
   return (
     <div
+      ref={dialogRef}
       role="dialog"
+      tabIndex={-1}
+      onFocusCapture={(event) => {
+        if (event.target !== event.currentTarget) lastControlRef.current = event.target;
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          event.stopPropagation();
+          if (!busy) onClose();
+          return;
+        }
+        if (event.key !== "Tab") return;
+        const controls = Array.from(event.currentTarget.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), input:not(:disabled)',
+        ));
+        const first = controls[0];
+        const last = controls[controls.length - 1];
+        const active = document.activeElement;
+        // Wrap both ends explicitly so Tab never leaves for browser chrome.
+        if (!first || active === event.currentTarget
+            || (event.shiftKey ? active === first : active === last)) {
+          event.preventDefault();
+          (event.shiftKey ? last : first)?.focus();
+        }
+      }}
       aria-modal="true"
       aria-labelledby="compute-prompt-title"
       aria-describedby="compute-prompt-body"
