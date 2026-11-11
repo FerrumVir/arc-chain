@@ -43,16 +43,16 @@ because the failure already happened once.
    `genesis.toml` declares 6 validators, LAX `/validators` reports 7 at full
    stake. Always pass `--stake 0` (or `--community`).
 
-3. **Never let a node auto-shard-join the public net.** The trigger is
-   `stake > 0 && --model is set && no explicit shard range`. It POSTs
-   `/shards/join` to the first seed in the seeds file (NYC), which inserts the
-   announcement verbatim with no stub-address check, and — because the live
-   pipeline is already fully covered — assigns `[0, 8)`, off the existing
-   6-range tiling. The v0.7.9 seeds lack the mitigation, so their pipeline
-   assembler then aborts with `503 Pipeline gap: expected layer 6 next, got
-   shard [0, 8)`. That takes out sharded inference on the healthiest seed.
-   Break the trigger with any one of: `--stake 0`, no `--model`, or an
-   explicit on-grid `--shard-range`.
+3. **Keep auto-shard-join off on the public net without separate approval.**
+   `--auto-shard-join` remains off by default; the opt-in trigger also needs
+   stake > 0, a model, and no explicit range. The updated planner fills gaps
+   at occupied boundaries or replicates an exact fresh range with the fewest
+   holders (lowest start on ties). Local tests cover the 6-range tiling,
+   gaps, and a 7-entry pipeline with either duplicate available. Planning
+   does not register a node; signed `/shards/announce` is still required.
+   These tests do not prove that deployed seeds have this planner. Older
+   seeds can assign off-grid `[0, 8)` ranges. Keep using explicit on-grid
+   ranges; no live-network rollout is authorized by this change.
 
 4. **The seeds are per-node chains. Pin one seed for any balance demo.** They
    share a DAG round but not state — `/block/43000` returns a different hash on

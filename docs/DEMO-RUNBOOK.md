@@ -318,15 +318,15 @@ registration is a separate worker path and cannot change voting membership.
    editing one node's genesis, validator list, or stake: unequal trust roots
    deliberately fail to reach quorum.
 
-2. **Auto-shard-join on the public net.** The trigger is
-   `stake > 0 && --model is set && no explicit shard range`. It POSTs
-   `/shards/join` to the first seed in the seeds file (NYC), which inserts the
-   announcement verbatim with **no stub-address check**. Because the live
-   pipeline is already fully covered, it assigns `[0, 8)` — off the existing
-   6-range tiling — and the v0.7.9 assembler then aborts with
-   `503 Pipeline gap: expected layer 6 next, got shard [0, 8)`. That kills
-   sharded inference on the seed you are demoing against, caused by the demo
-   itself. `--stake 0` breaks the trigger; so does omitting `--model`.
+2. **Auto-shard-join on the public net still needs separate approval.**
+   The flag remains off by default. The updated planner fills uncovered
+   intervals at existing boundaries; with full coverage it selects an exact
+   fresh range with the fewest replicas, breaking ties by lowest start.
+   Local tests cover the 6-range grid, gaps, and seven announcements with
+   either replica serving the duplicated hop. `/shards/join` only plans;
+   registration still requires signed `/shards/announce`. This does not
+   establish that deployed seeds are updated: older planners may return
+   off-grid `[0, 8)`. Use an explicit on-grid range until rollout is approved.
 
 3. **Restarting any seed.** See the failure playbook.
 

@@ -19325,11 +19325,42 @@ struct ShardJoinRequest {
     gpu_tier: u8,
 }
 
+/// Choose an uncovered interval, or an exact existing range to replicate.
+/// Input is already filtered to fresh announcements for one model/profile.
+/// A gap ends at the next occupied boundary, so it cannot partly overlap a
+/// holder. Full coverage replicates whole ranges, never arbitrary slices.
+fn plan_shard_join(total_layers: usize, existing: &[ShardInfo]) -> (usize, usize) {
+    let mut ranges = std::collections::BTreeMap::<(usize, usize), usize>::new();
+    for shard in existing {
+        if shard.start_layer < shard.end_layer && shard.end_layer <= total_layers {
+            *ranges.entry((shard.start_layer, shard.end_layer)).or_default() += 1;
+        }
+    }
+    let mut covered_to = 0;
+    let mut best = (0, 0);
+    for &(start, end) in ranges.keys() {
+        if start > covered_to && start - covered_to > best.1 - best.0 {
+            best = (covered_to, start);
+        }
+        covered_to = covered_to.max(end);
+    }
+    if total_layers > covered_to && total_layers - covered_to > best.1 - best.0 {
+        best = (covered_to, total_layers);
+    }
+    if best.0 < best.1 {
+        return best;
+    }
+    ranges.into_iter()
+        .min_by_key(|((start, end), replicas)| (*replicas, *start, *end))
+        .map(|(range, _)| range)
+        .unwrap_or((0, total_layers))
+}
+
 /// POST /shards/join
 /// A node with a model calls this to ask the coordinator: "what layers should I hold?"
 /// The coordinator looks at the existing shard registry, finds gaps in the pipeline,
-/// and assigns the new node a layer range that fills the biggest gap (or splits
-/// an overloaded range). Returns the assignment so the node can load it, then
+/// and assigns the new node the biggest uncovered interval, or an exact fresh
+/// range with the fewest replicas (lowest start breaks ties). Returns the assignment so the node can load it, then
 /// authenticate a separate signed announcement before serving.
 ///
 /// This is the KEY endpoint for automatic sharding - nodes don't need manual
@@ -19364,68 +19395,7 @@ async fn shard_join(
         .filter(|s| s.execution_profile == req.execution_profile)
         .collect();
 
-    // 2. Find the biggest uncovered gap in the pipeline
-    let mut covered: Vec<bool> = vec![false; req.total_layers as usize];
-    for s in &existing {
-        for c in covered
-            .iter_mut()
-            .take(s.end_layer.min(req.total_layers as usize))
-            .skip(s.start_layer)
-        {
-            *c = true;
-        }
-    }
-
-    // Find the longest contiguous uncovered range
-    let mut best_start = 0usize;
-    let mut best_len = 0usize;
-    let mut run_start = 0usize;
-    let mut in_run = false;
-
-    for (i, &is_covered) in covered.iter().enumerate() {
-        if !is_covered {
-            if !in_run {
-                run_start = i;
-                in_run = true;
-            }
-            let run_len = i - run_start + 1;
-            if run_len > best_len {
-                best_start = run_start;
-                best_len = run_len;
-            }
-        } else {
-            in_run = false;
-        }
-    }
-
-    // If no gap, this model is fully covered. Assign as a redundant shard
-    // covering the most thinly-covered range (for fault tolerance).
-    if best_len == 0 {
-        // Count how many shards cover each layer
-        let mut coverage_count: Vec<usize> = vec![0; req.total_layers as usize];
-        for s in &existing {
-            for c in coverage_count
-                .iter_mut()
-                .take(s.end_layer.min(req.total_layers as usize))
-                .skip(s.start_layer)
-            {
-                *c += 1;
-            }
-        }
-        // Find the layer with minimum coverage
-        let min_coverage = *coverage_count.iter().min().unwrap_or(&0);
-        let thin_start = coverage_count
-            .iter()
-            .position(|&c| c == min_coverage)
-            .unwrap_or(0);
-        // Assign a range around the thinnest spot
-        let range_size = (req.total_layers as usize / 4).max(1);
-        best_start = thin_start;
-        best_len = range_size.min(req.total_layers as usize - thin_start);
-    }
-
-    let assigned_start = best_start;
-    let assigned_end = best_start + best_len;
+    let (assigned_start, assigned_end) = plan_shard_join(req.total_layers as usize, &existing);
 
     // This route is an unauthenticated planner, never a topology mutation.
     // The joining process must load the assigned range and then prove its
@@ -32733,6 +32703,59 @@ mod tests {
         assert_eq!(identities.len(), 2);
         assert!(identities.contains(&format!("0x{}", first_key.address().to_hex())));
         assert!(identities.contains(&format!("0x{}", second_key.address().to_hex())));
+    }
+
+    fn single_tiling() -> Vec<ShardInfo> {
+        let mut seen = std::collections::BTreeSet::new();
+        live_topology().into_iter()
+            .filter(|s| seen.insert((s.start_layer, s.end_layer)))
+            .collect()
+    }
+
+    #[test]
+    fn shard_join_full_tiling_replicates_exact_least_held_range() {
+        let mut shards = single_tiling();
+        assert_eq!(plan_shard_join(32, &shards), (0, 6));
+        shards.push(shard("JOINER", "203.0.113.7:9090", 0, 6));
+        assert_eq!(plan_shard_join(32, &shards), (6, 12));
+        shards.reverse();
+        assert_eq!(plan_shard_join(32, &shards), (6, 12), "order does not break ties");
+    }
+
+    #[test]
+    fn shard_join_gaps_end_at_occupied_boundaries() {
+        assert_eq!(plan_shard_join(32, &[]), (0, 32));
+        for missing in [(0, 6), (6, 12), (12, 17), (17, 22), (22, 27), (27, 32)] {
+            let shards: Vec<_> = single_tiling().into_iter()
+                .filter(|s| (s.start_layer, s.end_layer) != missing).collect();
+            assert_eq!(plan_shard_join(32, &shards), missing);
+        }
+        let shards = vec![shard("A", "203.0.113.1:9090", 3, 9),
+                          shard("B", "203.0.113.2:9090", 7, 12),
+                          shard("C", "203.0.113.3:9090", 17, 32)];
+        assert_eq!(plan_shard_join(32, &shards), (12, 17));
+        let tied = vec![shard("A", "203.0.113.1:9090", 5, 10)];
+        assert_eq!(plan_shard_join(15, &tied), (0, 5));
+    }
+
+    #[test]
+    fn shard_join_replica_keeps_seven_entry_pipeline_contiguous() {
+        let mut shards = single_tiling();
+        let assigned = plan_shard_join(32, &shards);
+        shards.push(shard("JOINER", "203.0.113.7:9090", assigned.0, assigned.1));
+        assert_eq!(shards.len(), 7);
+        let hops = assemble_pipeline(shards.clone(), &no_stats()).unwrap();
+        assert_eq!(hops.len(), 6);
+        assert_eq!(hops[0].1.len(), 2);
+        // Either replica alone can serve the first hop, with the same grid.
+        for replica in &hops[0].1 {
+            let available = shards.iter().filter(|s|
+                s.start_layer != assigned.0 || s.socket_addr == replica.socket_addr
+            ).cloned().collect();
+            let selected = assemble_pipeline(available, &no_stats()).unwrap();
+            assert_eq!(selected[0].1[0].socket_addr, replica.socket_addr);
+            assert_eq!(selected.last().unwrap().0.1, 32);
+        }
     }
 
     #[test]
