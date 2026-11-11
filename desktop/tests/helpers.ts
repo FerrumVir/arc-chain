@@ -41,6 +41,7 @@ export async function seedOnboarded(page: Page, address = "99".repeat(32)) {
           autoInstallUpdates: false,
           dataDir: "~/.arc/data-v3",
           workerThreads: null,
+          computeConsent: false,
         },
         inferenceMode: "coordinator",
       }),
@@ -205,17 +206,15 @@ export const ECONOMICS_NO_BALANCE = {
   bondRefundedAfterChallengePeriod: null,
 };
 
-/**
- * Make the browser preview treat the app as an install from before compute
- * started on by default, with compute off, on a computer that can run the
- * model: the one-time question is due. The preview records it in localStorage
- * before answering, as native code does with its marker file, so it is asked
- * once and a reload does not ask again (see `claim_compute_prompt` in
- * lib/tauri.ts). Without this nothing is asked.
- */
+/** Model an eligible, unanswered install migrated to the sharing default. */
 export async function seedComputePrompt(page: Page) {
   await page.addInitScript(() => {
     (window as unknown as { __ARC_MOCK_COMPUTE_PROMPT__?: boolean }).__ARC_MOCK_COMPUTE_PROMPT__ = true;
+    const stored = JSON.parse(localStorage.getItem("arc-desktop-state-v1") ?? "{}");
+    if (stored.config) {
+      stored.config.computeConsent = null;
+      localStorage.setItem("arc-desktop-state-v1", JSON.stringify(stored));
+    }
   });
 }
 
@@ -283,8 +282,11 @@ export async function walkToLaunch(page: Page) {
 export async function wheelIntoView(page: Page, target: Locator) {
   const viewport = page.viewportSize();
   if (viewport) await page.mouse.move(viewport.width / 2, viewport.height / 2);
-  for (let i = 0; i < 8; i++) {
+  // Wait for the step to mount before dispatching wheel events. Sending all
+  // eight events during the startup transition can scroll the splash instead.
+  await expect(target).toBeVisible();
+  await expect(async () => {
     await page.mouse.wheel(0, 400);
-  }
-  await expect(target).toBeInViewport({ ratio: 1 });
+    await expect(target).toBeInViewport({ ratio: 1, timeout: 200 });
+  }).toPass({ intervals: [100], timeout: 6000 });
 }

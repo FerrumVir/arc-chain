@@ -89,6 +89,7 @@ export function App() {
   const setOnboarded = useAppStore((s) => s.setOnboarded);
   const [configHydrated, setConfigHydrated] = useState(false);
   const [bootTimedOut, setBootTimedOut] = useState(false);
+  const [bootDismissed, setBootDismissed] = useState(false);
   const [dataMigration, setDataMigration] =
     useState<DataMigrationNotice | null>(null);
   const [previousInstall, setPreviousInstall] =
@@ -107,7 +108,7 @@ export function App() {
     return () => window.clearTimeout(timer);
   }, []);
   useEffect(() => {
-    if (ready) dismissBootSplash();
+    if (ready) void dismissBootSplash().then(() => setBootDismissed(true));
   }, [ready]);
 
   // The wizard stages identity/config before downloading and starting the
@@ -139,19 +140,14 @@ export function App() {
       if (active) setPreviousInstall(loadedPreviousInstall);
       if (active) setLegacyQuestion(loadedQuestion);
       if (active) setConfigHydrated(true);
-      // Once per launch, after the app is up, and only for an install whose
-      // setup was already complete when ARC opened: setup in this session
-      // asks the question itself. Native code decides whether to ask and has
-      // recorded that it did before it answers true, so a hardware read that
-      // takes seconds delays nothing here and the question never repeats.
-      // A login launch starts hidden in the tray, so the claim waits until
-      // the window is first visible: recorded but never seen, the question
-      // would be spent on nobody.
+      // Claim only once the main window is visible. The dialog acknowledges
+      // after mounting, so a hidden launch or interrupted claim cannot spend
+      // an unseen notice. Native startup has already resolved the default.
       if (active && (onboardedFlag || (loadedIdentity && loadedConfig))) {
         stopWaitingToBeSeen = api.whenMainWindowSeen(() => {
           void api.claimComputePrompt().then(
             (due) => {
-              if (due) setComputePrompt(true);
+              if (active && due) setComputePrompt(true);
             },
             () => undefined,
           );
@@ -234,7 +230,7 @@ export function App() {
                   onAnswered={() => setLegacyQuestion(null)}
                 />
               )}
-              {computePrompt && !legacyQuestion && (
+              {computePrompt && bootDismissed && !legacyQuestion && (
                 <ComputePromptDialog onClose={() => setComputePrompt(false)} />
               )}
               <main className="main" data-testid="main" ref={mainRef}>

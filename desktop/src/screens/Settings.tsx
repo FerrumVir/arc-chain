@@ -520,13 +520,14 @@ export function Settings() {
 function ComputeConsent() {
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
-  const enabled = computeContributionEnabled(config);
+  const contributionChosen = computeContributionEnabled(config);
   const keepAwake = config?.preventSleepDuringJobs === true;
   const { data: tier } = useQuery({
     queryKey: ["recommended-tier"],
     queryFn: api.recommendedTier,
   });
   const ineligible = tier === "none";
+  const enabled = contributionChosen && !ineligible;
   const [progress, setProgress] = useState<ModelDownloadProgress | null>(null);
   // The running node reports when it had to start without its model (the
   // file is missing or unreadable). Same query as the core slider below.
@@ -557,6 +558,10 @@ function ComputeConsent() {
   });
   const awake = useMutation({
     mutationFn: (next: boolean) => api.setPreventSleepDuringJobs(next),
+    onSuccess: (saved) => setConfig(saved),
+  });
+  const sharingAwake = useMutation({
+    mutationFn: (next: boolean) => api.setKeepAwakeWhileSharing(next),
     onSuccess: (saved) => setConfig(saved),
   });
   const downloading = toggle.isPending || redownload.isPending;
@@ -603,7 +608,7 @@ function ComputeConsent() {
         </span>
       )}
       <span className="field-hint">
-        New installs start with this on when the computer can run the ARC
+        Sharing starts on unless you turned it off, when the computer can run the ARC
         model. When on, the app downloads the ARC model once
         (3.80 GB, checked against its pinned SHA-256), switches your node to
         worker mode, and takes jobs from the network while ARC Node is
@@ -664,6 +669,16 @@ function ComputeConsent() {
           {String(toggle.error ?? redownload.error)}
         </p>
       )}
+
+      <label style={{ display: "flex", gap: "var(--space-3)", marginTop: "var(--space-3)" }}>
+        <input type="checkbox" checked={config?.keepAwakeWhileSharing === true}
+          disabled={sharingAwake.isPending}
+          onChange={(event) => sharingAwake.mutate(event.target.checked)}
+          data-testid="sharing-keep-awake-toggle" />
+        <span>Keep this computer awake while plugged in so it can take jobs</span>
+      </label>
+      <span className="field-hint">Only while sharing is on and the node is running as a worker. The display can still sleep.</span>
+      {sharingAwake.error && <p role="alert">{String(sharingAwake.error)}</p>}
 
       <label
         htmlFor="prevent-sleep-toggle"

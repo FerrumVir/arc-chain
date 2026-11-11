@@ -2,33 +2,22 @@ import { Cpu } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/tauri";
 import { useAppStore } from "../lib/store";
-import { PLAIN_COPY } from "../lib/plain-copy";
 
-/**
- * Asked once, on the first launch after the update that made setup start with
- * Contribute compute on, of an install that finished setup before that and
- * has compute off on a computer that can run the ARC model. Native code
- * decides that and records that it asked before this shows
- * (`claim_compute_prompt`), so closing ARC with the dialog up never asks
- * again. It never shows to an install that has just finished setup, which
- * was asked the same question there.
- *
- * It says what the setup step says, word for word: the same title and body.
- * "Turn on" stores what a setup that leaves compute on stores and starts the
- * model download in the background, the same call setup makes. "Not now"
- * and Escape close it and change nothing; compute stays off, and Settings
- * turns it on at any time.
- */
+/** Visible acknowledgement is separate from claiming the pending notice. */
 export function ComputePromptDialog({ onClose }: { onClose: () => void }) {
   const setConfig = useAppStore((s) => s.setConfig);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const notNowRef = useRef<HTMLButtonElement>(null);
-  const copy = PLAIN_COPY.setup.compute;
+  const savedKeepAwake = useAppStore((s) => s.config?.keepAwakeWhileSharing === true);
+  const [keepAwake, setKeepAwake] = useState(savedKeepAwake);
 
-  // Not now is the answer that changes nothing, so it starts with the focus.
+  // Dismissing the notice leaves sharing and the independent opt-in intact.
   useEffect(() => {
     notNowRef.current?.focus();
+    return api.whenMainWindowSeen(() => {
+      void api.acknowledgeComputeNotice().catch(() => undefined);
+    });
   }, []);
 
   useEffect(() => {
@@ -40,24 +29,29 @@ export function ComputePromptDialog({ onClose }: { onClose: () => void }) {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [busy, onClose]);
 
-  const turnOn = async () => {
+  const turnOff = async () => {
     setBusy(true);
     setError(null);
     try {
-      const saved = await api.acceptComputePrompt();
+      const saved = await api.setComputeContribution(false);
       setConfig(saved);
       onClose();
-      // The model downloads in the background and the node becomes a worker
-      // when it is ready: the call setup makes with compute on. A failure
-      // leaves compute on, and the next launch tries again.
-      void api.promoteConsentedInstall().then(
-        (promoted) => setConfig(promoted),
-        () => undefined,
-      );
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
       setBusy(false);
     }
+  };
+
+  const toggleAwake = async (enabled: boolean) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const saved = await api.setKeepAwakeWhileSharing(enabled);
+      setConfig(saved);
+      setKeepAwake(saved.keepAwakeWhileSharing === true);
+    } catch (cause) {
+      setError(String(cause));
+    } finally { setBusy(false); }
   };
 
   return (
@@ -96,7 +90,7 @@ export function ComputePromptDialog({ onClose }: { onClose: () => void }) {
             marginBottom: "var(--space-2)",
           }}
         >
-          {copy.title}
+          ARC now shares this computer’s spare compute
         </h2>
         <p
           id="compute-prompt-body"
@@ -108,8 +102,14 @@ export function ComputePromptDialog({ onClose }: { onClose: () => void }) {
             marginBottom: "var(--space-5)",
           }}
         >
-          {copy.body}
+          Turn it off any time in Settings. The model downloads in the background when this computer is plugged in and the network allows it.
         </p>
+        <label style={{ display: "flex", gap: "var(--space-3)", marginBottom: "var(--space-4)" }}>
+          <input type="checkbox" checked={keepAwake} disabled={busy}
+            onChange={(event) => void toggleAwake(event.target.checked)}
+            data-testid="compute-notice-keep-awake" />
+          <span>Keep this computer awake while plugged in so it can take jobs.</span>
+        </label>
         {error && (
           <div
             role="alert"
@@ -128,17 +128,17 @@ export function ComputePromptDialog({ onClose }: { onClose: () => void }) {
             disabled={busy}
             data-testid="compute-prompt-not-now"
           >
-            {copy.notNow}
+            Got it
           </button>
           <button
             type="button"
             className="btn btn-primary"
-            onClick={() => void turnOn()}
+            onClick={() => void turnOff()}
             disabled={busy}
             aria-busy={busy || undefined}
-            data-testid="compute-prompt-turn-on"
+            data-testid="compute-prompt-turn-off"
           >
-            {copy.turnOn}
+            Turn off
           </button>
         </div>
       </div>
