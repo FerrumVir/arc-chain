@@ -55,6 +55,9 @@ def materialize(args):
          value.get("release", {}).get("repository") == "FerrumVir/arc-chain" and
          value.get("release", {}).get("commit") == args.commit,
          "attestation schema/repository/commit differs")
+    profile = getattr(args, "profile", "existing-recovered-chain-update-v1")
+    need(value.get("profile", "existing-recovered-chain-update-v1") == profile,
+         "attestation profile differs from explicit dispatch")
     need(not args.output_dir.exists() and not args.output_dir.is_symlink(), "output must be absent")
     args.output_dir.mkdir(mode=0o700)
     fd = os.open(args.output_dir / ASSET, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444)
@@ -71,6 +74,8 @@ def materialize(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile", choices=("existing-recovered-chain-update-v1",
+                        "desktop-update-existing-validators-v1"), default="existing-recovered-chain-update-v1")
     for name in ("downloads-root", "output-dir"):
         parser.add_argument("--" + name, type=Path, required=True)
     for name in ("artifact-id", "artifact-size"):

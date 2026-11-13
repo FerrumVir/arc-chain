@@ -71,6 +71,11 @@ EXISTING_UPDATE_RELEASE_ASSETS = frozenset(
         "arc-cutover-policy.json",
     }) | {"arc-existing-chain-update-attestation.json"}
 )
+DESKTOP_UPDATE_RELEASE_ASSETS = frozenset(
+    (EXISTING_UPDATE_RELEASE_ASSETS - {"arc-existing-chain-update-attestation.json"})
+    | {"arc-desktop-update-attestation.json"}
+)
+PROFILE_DESKTOP_UPDATE_V1 = "desktop-update-existing-validators-v1"
 PROFILE_CUTOVER_V1 = "cutover-v1"
 PROFILE_EXISTING_UPDATE_V1 = "existing-recovered-chain-update-v1"
 
@@ -81,6 +86,8 @@ def release_profile_for_assets(names: set[str] | frozenset[str]) -> str:
         return PROFILE_CUTOVER_V1
     if names == EXISTING_UPDATE_RELEASE_ASSETS:
         return PROFILE_EXISTING_UPDATE_V1
+    if names == DESKTOP_UPDATE_RELEASE_ASSETS:
+        return PROFILE_DESKTOP_UPDATE_V1
     missing_cutover = sorted(EXPECTED_RELEASE_ASSETS - names)
     extra_cutover = sorted(names - EXPECTED_RELEASE_ASSETS)
     raise AcceptanceError(
@@ -850,8 +857,8 @@ def command_bind(args: argparse.Namespace) -> None:
         ),
         "tag": args.tag,
     }
-    if profile == PROFILE_EXISTING_UPDATE_V1:
-        binding["profile"] = PROFILE_EXISTING_UPDATE_V1
+    if profile in (PROFILE_EXISTING_UPDATE_V1, PROFILE_DESKTOP_UPDATE_V1):
+        binding["profile"] = profile
     write_canonical(args.output, binding)
 
 
@@ -883,7 +890,9 @@ def validate_binding(binding: dict[str, Any]) -> None:
         raise AcceptanceError("binding commit is malformed")
     exact(binding.get("repository"), EXPECTED_REPOSITORY, "binding repository")
     if is_update:
-        exact(binding.get("profile"), PROFILE_EXISTING_UPDATE_V1, "binding profile")
+        if binding.get("profile") not in (PROFILE_EXISTING_UPDATE_V1, PROFILE_DESKTOP_UPDATE_V1):
+            raise AcceptanceError("unsupported binding profile")
+        exact(release_profile_for_assets(set(binding.get("assets", {}))), binding["profile"], "binding asset profile")
         exact(binding.get("tag"), "v0.8.19", "binding tag")
     else:
         exact(binding.get("tag"), "v0.8.19", "binding tag")
@@ -953,7 +962,8 @@ def validate_binding(binding: dict[str, Any]) -> None:
     )
     assets = binding.get("assets")
     expected_assets = (
-        EXISTING_UPDATE_RELEASE_ASSETS if is_update else EXPECTED_RELEASE_ASSETS
+        DESKTOP_UPDATE_RELEASE_ASSETS if binding.get("profile") == PROFILE_DESKTOP_UPDATE_V1
+        else EXISTING_UPDATE_RELEASE_ASSETS if is_update else EXPECTED_RELEASE_ASSETS
     )
     if not isinstance(assets, dict) or set(assets) != expected_assets:
         raise AcceptanceError("binding has an invalid release asset set")
@@ -1051,11 +1061,11 @@ def command_verify_legacy(args: argparse.Namespace) -> None:
 def validate_platform_checks(
     platform: str, checks: dict[str, Any], profile: str = PROFILE_CUTOVER_V1
 ) -> None:
-    if profile not in {PROFILE_CUTOVER_V1, PROFILE_EXISTING_UPDATE_V1}:
+    if profile not in {PROFILE_CUTOVER_V1, PROFILE_EXISTING_UPDATE_V1, PROFILE_DESKTOP_UPDATE_V1}:
         raise AcceptanceError(f"unsupported release profile: {profile!r}")
     required = dict(REQUIRED_CHECKS[platform])
     if platform == "linux-x86_64":
-        is_update = profile == PROFILE_EXISTING_UPDATE_V1
+        is_update = profile in (PROFILE_EXISTING_UPDATE_V1, PROFILE_DESKTOP_UPDATE_V1)
         exact(
             checks.get("legacy_migration_refused", False), is_update,
             "linux-x86_64 check legacy_migration_refused",

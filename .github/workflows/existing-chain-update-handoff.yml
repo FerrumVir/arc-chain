@@ -3,6 +3,19 @@ name: Existing recovered-chain update handoff
 on:
   workflow_dispatch:
     inputs:
+      release_profile:
+        description: Explicit update profile (desktop profile requires independent compatibility review)
+        required: true
+        default: existing-recovered-chain-update-v1
+        type: choice
+        options:
+          - existing-recovered-chain-update-v1
+          - desktop-update-existing-validators-v1
+      previous_release_tag:
+        description: Newest immutable bot-authored release whose node remains on validators (desktop profile only)
+        required: false
+        default: ''
+        type: string
       input_commit_sha:
         description: Exact public operational-input commit with current main as its sole parent
         required: true
@@ -110,6 +123,9 @@ jobs:
 
       - name: Independently verify the checkpoint and bounded owner observation
         env:
+          GH_TOKEN: ${{ github.token }}
+          UPDATE_PROFILE: ${{ inputs.release_profile }}
+          PREVIOUS_RELEASE_TAG: ${{ inputs.previous_release_tag }}
           PLANNED_TAG: ${{ steps.selection.outputs.tag }}
           VERSION: ${{ steps.selection.outputs.version }}
           PREFLIGHT_RUN_ID: ${{ steps.selection.outputs.run_id }}
@@ -120,6 +136,15 @@ jobs:
           set -Eeuo pipefail
           # The assembler refuses unless this explicit confirmation equals the
           # declared-offline set in the owner host config (both empty for six live).
+          profile_args=(--profile "$UPDATE_PROFILE")
+          case "$UPDATE_PROFILE" in
+            desktop-update-existing-validators-v1)
+              [[ "$PREVIOUS_RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+              profile_args+=(--previous-release-tag "$PREVIOUS_RELEASE_TAG" --confirm-node-compatible)
+              ;;
+            existing-recovered-chain-update-v1) [ -z "$PREVIOUS_RELEASE_TAG" ] ;;
+            *) exit 1 ;;
+          esac
           declared_offline=()
           if [ -n "$DECLARED_OFFLINE_SITE" ]; then
             IFS=, read -r -a offline_sites <<< "$DECLARED_OFFLINE_SITE"
@@ -129,6 +154,7 @@ jobs:
           fi
           mkdir update-handoff
           python3 scripts/release/assemble-existing-chain-update.py \
+            "${profile_args[@]}" \
             --repository "$GITHUB_REPOSITORY" --repository-root . \
             --tag "$PLANNED_TAG" --version "$VERSION" --commit "$GITHUB_SHA" --main-sha "$GITHUB_SHA" \
             --run-id "$PREFLIGHT_RUN_ID" --run-attempt "$PREFLIGHT_ATTEMPT" \

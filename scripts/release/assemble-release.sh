@@ -44,7 +44,7 @@ case "$RELEASE_PROFILE" in
         [ -f "$CUTOVER_ASSET_VALIDATOR" ] || die "cutover asset validator is missing: $CUTOVER_ASSET_VALIDATOR"
         [ "$RELEASE_TAG" = "v0.8.0" ] || die "cutover-v1 remains pinned to v0.8.0"
         ;;
-    existing-recovered-chain-update-v1)
+    existing-recovered-chain-update-v1|desktop-update-existing-validators-v1)
         [ -d "$EXISTING_UPDATE_HANDOFF_DIR" ] || die "protected existing-chain update handoff is missing"
         ;;
     *) die "unsupported RELEASE_PROFILE: $RELEASE_PROFILE" ;;
@@ -226,8 +226,9 @@ else
     [ -s "$UPDATE_ATTESTATION" ] && [ ! -L "$UPDATE_ATTESTATION" ] \
         || die "existing-chain update attestation is missing or unsafe"
     if ! python3 - "$UPDATE_ATTESTATION" "$REPOSITORY" "$RELEASE_TAG" "$RELEASE_COMMIT" \
-        "$OUTPUT_DIR/arc-node-linux-x86_64" <<'PY'
+        "$OUTPUT_DIR/arc-node-linux-x86_64" "$RELEASE_PROFILE" "$SCRIPT_DIR" <<'PY'
 import json, sys
+import importlib.util, time, os
 import hashlib
 from pathlib import Path
 p = Path(sys.argv[1])
@@ -236,6 +237,14 @@ assert isinstance(v, dict) and v.get("schema") == "arc.existing-recovered-chain-
 assert v.get("release", {}).get("repository") == sys.argv[2]
 assert v.get("release", {}).get("tag") == sys.argv[3]
 assert v.get("release", {}).get("commit") == sys.argv[4]
+assert v.get("profile", "existing-recovered-chain-update-v1") == sys.argv[6]
+if sys.argv[6] == "desktop-update-existing-validators-v1":
+    spec = importlib.util.spec_from_file_location("previous_release", Path(sys.argv[7]) / "previous-validator-release.py")
+    previous = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(previous)
+    previous.verify_attestation(v, sys.argv[3], time.time())
+    previous.verify_preflight_binding(v, int(os.environ["PRETAG_RUN_ID"]),
+        int(os.environ["PRETAG_RUN_ATTEMPT"]), json.loads(os.environ["PRETAG_SELECTION"]))
 artifact = v.get("release", {}).get("production_artifact", {})
 assert artifact.get("platform") == "linux-x86_64"
 assert artifact.get("binary_sha256") == hashlib.sha256(Path(sys.argv[5]).read_bytes()).hexdigest()
@@ -247,7 +256,11 @@ PY
     then
         die "existing-chain update attestation identity or production artifact is invalid"
     fi
-    copy_as "$UPDATE_ATTESTATION" arc-existing-chain-update-attestation.json
+    if [ "$RELEASE_PROFILE" = desktop-update-existing-validators-v1 ]; then
+        copy_as "$UPDATE_ATTESTATION" arc-desktop-update-attestation.json
+    else
+        copy_as "$UPDATE_ATTESTATION" arc-existing-chain-update-attestation.json
+    fi
 fi
 
 VERSION="${RELEASE_TAG#v}"

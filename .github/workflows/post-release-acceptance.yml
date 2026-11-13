@@ -514,7 +514,7 @@ jobs:
             --no-service --no-auto-update \
             > evidence-linux/legacy-migration.stdout \
             2> evidence-linux/legacy-migration.stderr || migration_status=$?
-          if [ "$profile" = existing-recovered-chain-update-v1 ]; then
+          if [ "$profile" = existing-recovered-chain-update-v1 ] || [ "$profile" = desktop-update-existing-validators-v1 ]; then
             [ "$migration_status" -ne 0 ]
             grep -Fq 'Legacy v0.7 migration is unsupported by existing-recovered-chain-update-v1 releases' \
               evidence-linux/legacy-migration.stderr
@@ -558,7 +558,7 @@ jobs:
             --install-dir "$legacy_root" --no-service --no-auto-update \
             > evidence-linux/legacy-update.stdout \
             2> evidence-linux/legacy-update.stderr || update_status=$?
-          if [ "$profile" = existing-recovered-chain-update-v1 ]; then
+          if [ "$profile" = existing-recovered-chain-update-v1 ] || [ "$profile" = desktop-update-existing-validators-v1 ]; then
             [ "$update_status" -ne 0 ]
             grep -Fq 'Legacy v0.7 migration is unsupported by existing-recovered-chain-update-v1 releases' \
               evidence-linux/legacy-update.stderr
@@ -644,7 +644,7 @@ jobs:
           def digest(path):
               return hashlib.sha256(Path(path).read_bytes()).hexdigest()
           binding = json.loads(Path("binding/release-binding.json").read_text())
-          migration_refused = binding.get("profile") == "existing-recovered-chain-update-v1"
+          migration_refused = binding.get("profile") in {"existing-recovered-chain-update-v1", "desktop-update-existing-validators-v1"}
           checks = {
               "appimage_process_stable": True,
               "appimage_updater_signature_valid": True,
