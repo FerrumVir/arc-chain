@@ -186,6 +186,37 @@ class DesktopAssemblyTests(unittest.TestCase):
 
 
 class ProfileBoundaryTests(unittest.TestCase):
+    def test_platform_provenance_helpers_accept_only_supported_update_profiles(self):
+        linux = load("appimage_fixtures", ROOT / "tests/release/test_packaged_appimage_live_gate.py").GATE
+        mac = load("macos_fixtures", ROOT / "scripts/recovery/test_build_macos_package_provenance.py").gate
+        for gate, names, validate, error in (
+                (linux, (linux.APPIMAGE_NAME, linux.APPIMAGE_SIGNATURE_NAME, linux.NODE_NAME),
+                 linux.validate_release_binding, linux.GateError),
+                (mac, (mac.APP_ARCHIVE_NAME, mac.APP_SIGNATURE_NAME, mac.DMG_NAME),
+                 mac.load_release_binding, mac.ProvenanceError)):
+            with self.subTest(platform=gate.__name__), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                root.chmod(0o700)
+                binding = dict(assets={name: dict(id=i, sha256=str(i) * 64, size=1)
+                                      for i, name in enumerate(names, 1)},
+                    commit="a" * 40, legacy_source={}, published_evidence={},
+                    release=dict(id=1, immutable=True),
+                    release_workflow=dict(event="workflow_dispatch", head_branch="main", head_sha="a" * 40,
+                        id=1, jobs_sha256="b" * 64, path=".github/workflows/release.yml", run_attempt=1, run_id=1),
+                    repository=gate.REPOSITORY, schema=gate.UPDATE_RELEASE_SCHEMA, tag=gate.TAG)
+                for i, profile in enumerate((previous.PROFILE, handoff.PROFILE_EXISTING_UPDATE_V1,
+                                             "cutover-v1", "unsupported")):
+                    binding["profile"] = profile
+                    path = root / f"binding-{i}.json"
+                    path.write_bytes(gate.canonical_json(binding))
+                    path.chmod(0o400)
+                    if i < 2:
+                        self.assertEqual(validate(path)[0]["profile"], profile)
+                    else:
+                        with self.assertRaises(error):
+                            validate(path)
+
+
     def test_preflight_run_attempt_and_artifact_swap_rejected(self):
         artifact = dict(platform="linux-x86_64", artifact_id=42, artifact_digest="sha256:" + "a" * 64)
         value = {"release": dict(preflight_run_id=10, preflight_run_attempt=2,

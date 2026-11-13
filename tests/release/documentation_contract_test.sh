@@ -42,8 +42,10 @@ CANDIDATE_VERSION=0.8.19
 # README.md and the install guides name the latest PUBLISHED release: its exact
 # tag URL, pinned version and installer digest. They keep naming it until the
 # candidate is published, and move to the candidate in the documentation change
-# that follows publication, together with this value.
+# that follows publication, together with these values. The installer digest
+# belongs to that published tag, not the unreleased installer in this tree.
 PUBLISHED_VERSION=0.8.16
+PUBLISHED_INSTALLER_SHA256=893e930610f6380fe6b75cca64ca84ff84f9e711a3da09345abe86b4a66f1e8e
 
 require_literal() {
     local file="$1" literal="$2" message="$3"
@@ -124,12 +126,8 @@ candidate_version_is_consistent() {
 
 candidate_install_commands_are_exact_and_honest() {
     local exact_url="https://raw.githubusercontent.com/FerrumVir/arc-chain/v$PUBLISHED_VERSION/install.sh"
-    local digest_line download_line execute_line file installer_sha
-    if command -v sha256sum >/dev/null 2>&1; then
-        installer_sha="$(sha256sum "$REPO_ROOT/install.sh" | awk '{print $1}')"
-    else
-        installer_sha="$(shasum -a 256 "$REPO_ROOT/install.sh" | awk '{print $1}')"
-    fi
+    local digest_line download_line execute_line file
+    local installer_sha="$PUBLISHED_INSTALLER_SHA256"
     for file in "$README" "$HEADLESS" "$WALKTHROUGH" "$SCRIPTS_README"; do
         require_literal "$file" "$exact_url" \
             'candidate install guide does not download the exact installer tag' || return 1

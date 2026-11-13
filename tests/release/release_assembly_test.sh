@@ -152,6 +152,13 @@ complete_fixture_produces_verifiable_contract() {
         return 1
     }
 
+    # Published install guides pin an older tag. The candidate release must
+    # still ship this tree's installer, covered by its own manifest below.
+    if ! cmp -s "$REPO_ROOT/install.sh" "$sandbox/output/install.sh"; then
+        printf 'assembled release does not ship the current tree installer\n'
+        return 1
+    fi
+
     expected_count="$(find "$sandbox/output" -maxdepth 1 -type f ! -name SHA256SUMS | wc -l | tr -d ' ')"
     actual_count="$(awk '$1 ~ /^[0-9a-f]{64}$/ && NF == 2 { count += 1 } END { print count + 0 }' "$sandbox/output/SHA256SUMS")"
     assert_equals "$expected_count" "$actual_count" 'SHA256SUMS must cover every other published file exactly once' || return 1

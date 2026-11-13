@@ -5854,8 +5854,11 @@ ARC_DESKTOP_RELEASE_BINDING="$ARC_DESKTOP_TRANSFER_ROOT/release-binding.json"
 case "$(/usr/bin/plutil -extract schema raw -o - "$ARC_DESKTOP_RELEASE_BINDING")" in
   arc.published-release-binding.v1) ;;
   arc.published-release-binding.v2)
-    test "$(/usr/bin/plutil -extract profile raw -o - \
-      "$ARC_DESKTOP_RELEASE_BINDING")" = existing-recovered-chain-update-v1 ;;
+    case "$(/usr/bin/plutil -extract profile raw -o - \
+      "$ARC_DESKTOP_RELEASE_BINDING")" in
+      existing-recovered-chain-update-v1|desktop-update-existing-validators-v1) ;;
+      *) false ;;
+    esac ;;
   *) false ;;
 esac
 test "$(/usr/bin/plutil -extract commit raw -o - \

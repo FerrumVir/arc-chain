@@ -50,6 +50,7 @@ RELEASE_SCHEMA = "arc.published-release-binding.v1"
 # identical binding produced by published-artifact-acceptance.py.
 UPDATE_RELEASE_SCHEMA = "arc.published-release-binding.v2"
 UPDATE_RELEASE_PROFILE = "existing-recovered-chain-update-v1"
+DESKTOP_RELEASE_PROFILE = "desktop-update-existing-validators-v1"
 REPOSITORY = "FerrumVir/arc-chain"
 TAG = "v0.8.19"
 LAX_HOST = "140.82.16.112"
@@ -515,7 +516,7 @@ def validate_release_binding(path: Path) -> tuple[dict[str, Any], bytes]:
     require_exact_keys(binding, expected_keys, "published release binding")
     if binding.get("schema") not in (RELEASE_SCHEMA, UPDATE_RELEASE_SCHEMA):
         raise GateError("published release binding schema mismatch")
-    if is_update and binding.get("profile") != UPDATE_RELEASE_PROFILE:
+    if is_update and binding.get("profile") not in (UPDATE_RELEASE_PROFILE, DESKTOP_RELEASE_PROFILE):
         raise GateError("published update release binding profile mismatch")
     if binding.get("repository") != REPOSITORY or binding.get("tag") != TAG:
         raise GateError("published release binding repository/tag mismatch")
