@@ -38,12 +38,14 @@ DESKTOP_DISTRIBUTION="$REPO_ROOT/desktop/DISTRIBUTION.md"
 DESKTOP_GAPS="$REPO_ROOT/desktop/PRODUCTION_GAPS.md"
 CLAUDE_GUIDE="$REPO_ROOT/CLAUDE.md"
 RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
-CANDIDATE_VERSION=0.8.19
+CANDIDATE_VERSION=0.8.20
 # README.md and the install guides name the latest PUBLISHED release: its exact
 # tag URL, pinned version and installer digest. They keep naming it until the
 # candidate is published, and move to the candidate in the documentation change
-# that follows publication, together with this value.
+# that follows publication, together with these values. The installer digest
+# belongs to that published tag, not the unreleased installer in this tree.
 PUBLISHED_VERSION=0.8.16
+PUBLISHED_INSTALLER_SHA256=893e930610f6380fe6b75cca64ca84ff84f9e711a3da09345abe86b4a66f1e8e
 
 require_literal() {
     local file="$1" literal="$2" message="$3"
@@ -108,7 +110,7 @@ candidate_version_is_consistent() {
         'desktop npm lock package root does not match the recovery candidate' || return 1
     require_literal "$RELEASE_WORKFLOW" '"desktop-npm-lock-root:$DESKTOP_NPM_LOCK_ROOT_VERSION"' \
         'release tag gate does not validate the npm lock package root' || return 1
-    require_literal "$CHANGELOG" "## v$CANDIDATE_VERSION - Release-preparation snapshot (2026-11-10)" \
+    require_literal "$CHANGELOG" "## v$CANDIDATE_VERSION - Release-preparation snapshot (2026-11-13)" \
         'changelog is missing the current release-preparation entry' || return 1
     require_literal "$CHANGELOG" '## v0.8.0 - Release-preparation snapshot (2026-08-31)' \
         'changelog no longer preserves the historical v0.8.0 source-freeze heading' || return 1
@@ -124,12 +126,8 @@ candidate_version_is_consistent() {
 
 candidate_install_commands_are_exact_and_honest() {
     local exact_url="https://raw.githubusercontent.com/FerrumVir/arc-chain/v$PUBLISHED_VERSION/install.sh"
-    local digest_line download_line execute_line file installer_sha
-    if command -v sha256sum >/dev/null 2>&1; then
-        installer_sha="$(sha256sum "$REPO_ROOT/install.sh" | awk '{print $1}')"
-    else
-        installer_sha="$(shasum -a 256 "$REPO_ROOT/install.sh" | awk '{print $1}')"
-    fi
+    local digest_line download_line execute_line file
+    local installer_sha="$PUBLISHED_INSTALLER_SHA256"
     for file in "$README" "$HEADLESS" "$WALKTHROUGH" "$SCRIPTS_README"; do
         require_literal "$file" "$exact_url" \
             'candidate install guide does not download the exact installer tag' || return 1
@@ -578,11 +576,11 @@ factual_candidate_copy_matches_source_and_release_gates() {
     local desktop_spec_files playwright_inventory
     desktop_spec_files="$(find "$REPO_ROOT/desktop/tests" -maxdepth 1 -type f \
         -name '*.spec.ts' | wc -l | tr -d ' ')"
-    assert_equals 30 "$desktop_spec_files" \
+    assert_equals 31 "$desktop_spec_files" \
         'documented Playwright file inventory drifted from the current tree' || return 1
-    require_literal "$DESKTOP_README" '378 tests in' \
+    require_literal "$DESKTOP_README" '390 tests in' \
         'desktop README does not carry the audited Playwright test inventory' || return 1
-    require_literal "$DESKTOP_README" '30 files.' \
+    require_literal "$DESKTOP_README" '31 files.' \
         'desktop README does not carry the audited Playwright file inventory' || return 1
     if grep -Eq '176 tests|68[[:space:]]+native tests' "$DESKTOP_README"; then
         printf 'desktop README retains a stale hard-coded test inventory\n'
@@ -597,7 +595,7 @@ factual_candidate_copy_matches_source_and_release_gates() {
             CI='' ./node_modules/.bin/playwright test --list 2>/dev/null \
                 | sed -n 's/^Total: //p' | tail -n 1
         )"
-        assert_equals '378 tests in 30 files' "$playwright_inventory" \
+        assert_equals '390 tests in 31 files' "$playwright_inventory" \
             'desktop README Playwright inventory differs from playwright --list' || return 1
     fi
 
@@ -1829,11 +1827,11 @@ PY
         'repos/FerrumVir/arc-chain/deployments' \
         './shared/frontend/arc-network.json' \
         'arc.post-release-installer-canary.v1' \
-        'Already up to date at v0.8.19' \
+        'Already up to date at v0.8.20' \
         'scripts/recovery/recovery_rollout.py verify' \
         'POST-RELEASE-ACCEPTANCE.json' \
         'scripts/release/build-postrelease-public-truth.py' \
-        "public_truth_branch='arc-recovery/public-truth-v0.8.19'" \
+        "public_truth_branch='arc-recovery/public-truth-v0.8.20'" \
         'repos/FerrumVir/arc-chain/git/matching-refs/heads/$public_truth_branch' \
         'PUBLIC-TRUTH-RULESETS-BASELINE.json' \
         'PUBLIC-TRUTH-REVIEW-AUTHORIZATION.json' \
@@ -2427,8 +2425,8 @@ PY
     }
 }
 
-run_test 'workspace, desktop, and changelog agree on unreleased v0.8.19; README names published v0.8.16' candidate_version_is_consistent
-run_test 'install commands pin exact published v0.8.16 without claiming v0.8.19 is published' candidate_install_commands_are_exact_and_honest
+run_test 'workspace, desktop, and changelog agree on unreleased v0.8.20; README names published v0.8.16' candidate_version_is_consistent
+run_test 'install commands pin exact published v0.8.16 without claiming v0.8.20 is published' candidate_install_commands_are_exact_and_honest
 run_test 'README and headless guide share the same unpinned update-only commands' manual_updater_commands_are_identical
 run_test 'headless platform claims match the canonical release asset contract' headless_platform_claims_match_release_assets
 run_test 'desktop docs and generated release notes match artifacts, updater, and reward evidence' desktop_and_release_notes_match_the_artifact_and_reward_contract

@@ -20,6 +20,8 @@ import tempfile
 import time
 
 SCHEMA = "arc.existing-recovered-chain-update/v1"
+DESKTOP_PROFILE = "desktop-update-existing-validators-v1"
+UPDATE_PROFILE = "existing-recovered-chain-update-v1"
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 TAG = re.compile(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
@@ -367,11 +369,25 @@ def assemble(args: argparse.Namespace) -> dict:
     need(args.run_id > 0 and args.run_attempt > 0 and args.recovery_epoch == 1,
          "invalid preflight run or recovery epoch")
     validate_main_pin(args.repository_root, args.commit, args.main_sha)
+    profile = getattr(args, "profile", UPDATE_PROFILE)
+    need(profile in (UPDATE_PROFILE, DESKTOP_PROFILE), "unknown update profile")
+    desktop = profile == DESKTOP_PROFILE
+    prior = None
+    if desktop:
+        need(args.artifact_platform == "linux-x86_64" and
+             getattr(args, "confirm_node_compatible", False),
+             "desktop profile requires Linux production artifact and independent compatibility review")
+        previous = load_module(Path(__file__).with_name("previous-validator-release.py"), "previous_validator_release")
+        prior = previous.authenticate(getattr(args, "previous_release_tag", None), args.tag)
+    else:
+        need(not getattr(args, "previous_release_tag", None) and
+             not getattr(args, "confirm_node_compatible", False), "previous-release inputs require desktop profile")
 
     with tempfile.TemporaryDirectory(prefix="arc-existing-chain-profile-") as td:
         materialized_root = Path(td) / "materialized"
         selection, artifacts, materializer = select_and_materialize(args, materialized_root)
         selected = artifacts[args.artifact_platform]
+        validator_binary_sha256 = prior["binary_sha256"] if prior else selected["binary_sha256"]
         verifier = artifacts[args.verifier_platform]
         need(selected["genesis_sha256"] == verifier["genesis_sha256"],
              "production and verifier platform artifacts carry different genesis bytes")
@@ -391,13 +407,13 @@ def assemble(args: argparse.Namespace) -> dict:
         # CLI genesis_hash is computed from the signed genesis; RPC's legacy
         # genesis_network_hash is a distinct pin and is retained separately.
         validate_crossbindings(checkpoint, {h["site"]: h for h in config["hosts"]}, config,
-                               selected["genesis_sha256"], selected["binary_sha256"], proof,
+                               selected["genesis_sha256"], validator_binary_sha256, proof,
                                approved_genesis_hash)
         # Run the strict freshness/liveness validator last: full checkpoint
         # verification is allowed to take several minutes.
         proof_now = getattr(args, "proof_validation_time", None)
         proof_summary, checked_config = strict_proof(args.quorum_proof, args.host_config,
-            args.rollout_validator, selected["binary_sha256"], now=proof_now,
+            args.rollout_validator, validator_binary_sha256, now=proof_now,
             declared_offline_sites=getattr(args, "declared_offline", None) or ())
         need(checked_config == config, "host config changed during qualification")
     proof_summary["rpc_genesis_network_hash"] = config["genesis_network_hash"]
@@ -408,6 +424,9 @@ def assemble(args: argparse.Namespace) -> dict:
                    if declared else {SIX_HOST_PROOF_KEY: proof_summary})
     if proof_summary["zero_margin"]:
         observation["warnings"] = [ZERO_MARGIN_WARNING]
+    if prior:
+        observation.update(profile=DESKTOP_PROFILE, validators_release=prior,
+                           node_compatible_with_validators=True)
     return {"schema": SCHEMA, "claim": {"existing_recovered_chain_update": True,
         "original_cutover_ceremony_verified": False, "original_cutover_archive_present": False,
         "validator_retirement_authorized": False},
@@ -489,6 +508,10 @@ def validate_owner_attestation(args: argparse.Namespace, owner_path: Path, now: 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--profile", choices=(UPDATE_PROFILE, DESKTOP_PROFILE), default=UPDATE_PROFILE)
+    p.add_argument("--previous-release-tag", help="newest immutable bot-authored release; desktop profile only")
+    p.add_argument("--confirm-node-compatible", action="store_true",
+                   help="confirm an independent review found candidate node compatible with validators")
     p.add_argument("--repository", required=True); p.add_argument("--repository-root", type=Path, required=True)
     p.add_argument("--tag", required=True); p.add_argument("--commit", required=True); p.add_argument("--main-sha", required=True)
     p.add_argument("--run-id", type=int, required=True); p.add_argument("--run-attempt", type=int, required=True)

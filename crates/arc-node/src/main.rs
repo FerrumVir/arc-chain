@@ -590,15 +590,14 @@ struct Cli {
 
     /// Ask a seed to assign this node a layer range at boot (POST /shards/join).
     ///
-    /// OFF by default, and it used to be implicit for any staked node with a
-    /// model and no explicit --shard-range. That implicit trigger is how a
-    /// joining node injected an off-grid `[0, 8)` shard into a pipeline
-    /// already fully covered by the 6-range tiling: the seed inserts the
-    /// announcement verbatim with no stub-address check, and v0.7.9 seeds'
-    /// pipeline assemblers then abort with
-    /// `503 Pipeline gap: expected layer 6 next, got shard [0, 8)` — taking
-    /// out sharded inference network-wide. Opt in only when you mean it, and
-    /// prefer an explicit on-grid `--shard-range`.
+    /// OFF by default. Updated coordinators fill the largest uncovered gap
+    /// at existing boundaries, or replicate the exact fresh production-tiling
+    /// range with the fewest holders (lowest start breaks ties). Off-grid
+    /// ranges are excluded; no fresh on-grid candidate means no assignment.
+    /// Planning never registers
+    /// this node: it must submit a separate signed /shards/announce.
+    /// Older coordinators may still assign off-grid ranges. Public-network
+    /// use requires separate operator approval; prefer an explicit range.
     #[arg(long, default_value_t = false)]
     auto_shard_join: bool,
 

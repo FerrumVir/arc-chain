@@ -25,7 +25,7 @@ concurrency:
 jobs:
   validate:
     name: bind the candidate to exact protected main
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       sha: ${{ steps.candidate.outputs.sha }}
@@ -387,7 +387,7 @@ jobs:
 
   manifest-key:
     name: protected manifest-key canary (ubuntu)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: release
     needs: validate
@@ -1222,7 +1222,7 @@ jobs:
 
   desktop-signer-handoff:
     name: seal verified desktop payloads for isolated signers
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs: [validate, desktop-unsigned]
     permissions:
@@ -1928,7 +1928,7 @@ jobs:
 
   seal:
     name: seal exact-main pre-tag evidence
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     needs:
       - validate

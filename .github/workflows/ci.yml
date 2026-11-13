@@ -47,7 +47,7 @@ jobs:
   # or accidental service start before a tag can be cut.
   release-contract:
     name: release + installer contract
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -87,7 +87,7 @@ jobs:
   # pinned Gitleaks binary; any secret present in the releasable tree blocks CI.
   secret-scan:
     name: secret scan (current tree)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -102,7 +102,7 @@ jobs:
   # time. The binary and checksum are pinned to the upstream release.
   workflow-syntax:
     name: workflow syntax (actionlint)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -134,7 +134,7 @@ jobs:
   # dependency-free static HTML.
   dashboard-contract:
     name: dashboard build + contract
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     defaults:
       run:
@@ -153,7 +153,7 @@ jobs:
 
   explorer-contract:
     name: explorer contract
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -169,7 +169,7 @@ jobs:
   # of waiting behind a multi-minute cargo build.
   fmt:
     name: rustfmt
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -186,7 +186,7 @@ jobs:
   # ------------------------------------------------------------- clippy ----
   clippy:
     name: clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -421,7 +421,7 @@ jobs:
   # blocks fast unit feedback.
   integration:
     name: integration tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     # The timing-sensitive three-node transition scenario remains explicitly
     # ignored; every integration test that actually runs is a required gate.
@@ -449,7 +449,7 @@ jobs:
   # release, across four parallel platform bundles.
   desktop-typecheck:
     name: desktop typecheck
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     defaults:
       run:
@@ -689,7 +689,7 @@ jobs:
   # required gate alongside the desktop typecheck.
   desktop-e2e:
     name: desktop e2e (playwright)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
       run:
@@ -718,7 +718,7 @@ jobs:
   # -------------------------------------------------------------- audit ----
   audit:
     name: supply chain (cargo-deny)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -748,7 +748,7 @@ jobs:
   # so it can only fail on a genuine syntax error.
   shell-syntax:
     name: shell syntax
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -773,7 +773,7 @@ jobs:
   # cannot merge.
   shellcheck:
     name: shellcheck
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -798,7 +798,7 @@ jobs:
   # resolved at an exact version.
   forge:
     name: contracts (forge)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -891,7 +891,7 @@ jobs:
 
   python-sdk:
     name: Python SDK (${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
       PYTHONPYCACHEPREFIX: /tmp/arc-python-sdk-pycache-${{ matrix.python-version }}
@@ -941,7 +941,7 @@ jobs:
   # preview server (see that config's own comment).
   script-suites:
     name: script suites (python + node contract + desktop unit)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

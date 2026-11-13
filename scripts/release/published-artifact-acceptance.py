@@ -71,6 +71,11 @@ EXISTING_UPDATE_RELEASE_ASSETS = frozenset(
         "arc-cutover-policy.json",
     }) | {"arc-existing-chain-update-attestation.json"}
 )
+DESKTOP_UPDATE_RELEASE_ASSETS = frozenset(
+    (EXISTING_UPDATE_RELEASE_ASSETS - {"arc-existing-chain-update-attestation.json"})
+    | {"arc-desktop-update-attestation.json"}
+)
+PROFILE_DESKTOP_UPDATE_V1 = "desktop-update-existing-validators-v1"
 PROFILE_CUTOVER_V1 = "cutover-v1"
 PROFILE_EXISTING_UPDATE_V1 = "existing-recovered-chain-update-v1"
 
@@ -81,6 +86,8 @@ def release_profile_for_assets(names: set[str] | frozenset[str]) -> str:
         return PROFILE_CUTOVER_V1
     if names == EXISTING_UPDATE_RELEASE_ASSETS:
         return PROFILE_EXISTING_UPDATE_V1
+    if names == DESKTOP_UPDATE_RELEASE_ASSETS:
+        return PROFILE_DESKTOP_UPDATE_V1
     missing_cutover = sorted(EXPECTED_RELEASE_ASSETS - names)
     extra_cutover = sorted(names - EXPECTED_RELEASE_ASSETS)
     raise AcceptanceError(
@@ -207,7 +214,7 @@ REQUIRED_CHECKS = {
         "bundle_architecture": "arm64",
         "bundle_codesign_valid": True,
         "bundle_identifier": "network.arc.desktop",
-        "bundle_version": "0.8.19",
+        "bundle_version": "0.8.20",
         "desktop_process_stable": True,
         "desktop_visible_window": True,
         "dmg_bundle_matches": True,
@@ -221,7 +228,7 @@ REQUIRED_CHECKS = {
         "bundle_architecture": "x86_64",
         "bundle_codesign_valid": True,
         "bundle_identifier": "network.arc.desktop",
-        "bundle_version": "0.8.19",
+        "bundle_version": "0.8.20",
         "desktop_process_stable": True,
         "desktop_visible_window": True,
         "dmg_bundle_matches": True,
@@ -236,7 +243,7 @@ REQUIRED_CHECKS = {
         "embedded_app_pe_machine": "AMD64",
         "isolated_profile": True,
         "msi_administrative_extract": True,
-        "msi_product_version": "0.8.19",
+        "msi_product_version": "0.8.20",
         "no_installed_service": True,
         "setup_pe_machine": "AMD64",
         "updater_signature_valid": True,
@@ -538,7 +545,7 @@ def command_select_published_evidence(args: argparse.Namespace) -> None:
     run_attempt = positive_int(args.release_run_attempt, "release run attempt")
     release = load_object(args.release_json, "release API document")
     release_id = positive_int(release.get("id"), "release id")
-    exact(release.get("tag_name"), "v0.8.19", "release tag")
+    exact(release.get("tag_name"), "v0.8.20", "release tag")
     exact(release.get("target_commitish"), args.commit, "release target")
     exact(release.get("draft"), False, "release draft state")
     exact(release.get("immutable"), True, "release immutable state")
@@ -712,8 +719,8 @@ def command_bind(args: argparse.Namespace) -> None:
     exact(repository, EXPECTED_REPOSITORY, "production repository")
     if not STRICT_TAG.fullmatch(args.tag):
         raise AcceptanceError("release tag must be strict vMAJOR.MINOR.PATCH")
-    if args.tag != "v0.8.19":
-        raise AcceptanceError("this production acceptance is pinned to v0.8.19")
+    if args.tag != "v0.8.20":
+        raise AcceptanceError("this production acceptance is pinned to v0.8.20")
     if not SHA40.fullmatch(args.commit):
         raise AcceptanceError("release commit must be 40 lowercase hex characters")
     run_id = positive_int(args.release_run_id, "release run id")
@@ -850,8 +857,8 @@ def command_bind(args: argparse.Namespace) -> None:
         ),
         "tag": args.tag,
     }
-    if profile == PROFILE_EXISTING_UPDATE_V1:
-        binding["profile"] = PROFILE_EXISTING_UPDATE_V1
+    if profile in (PROFILE_EXISTING_UPDATE_V1, PROFILE_DESKTOP_UPDATE_V1):
+        binding["profile"] = profile
     write_canonical(args.output, binding)
 
 
@@ -883,10 +890,12 @@ def validate_binding(binding: dict[str, Any]) -> None:
         raise AcceptanceError("binding commit is malformed")
     exact(binding.get("repository"), EXPECTED_REPOSITORY, "binding repository")
     if is_update:
-        exact(binding.get("profile"), PROFILE_EXISTING_UPDATE_V1, "binding profile")
-        exact(binding.get("tag"), "v0.8.19", "binding tag")
+        if binding.get("profile") not in (PROFILE_EXISTING_UPDATE_V1, PROFILE_DESKTOP_UPDATE_V1):
+            raise AcceptanceError("unsupported binding profile")
+        exact(release_profile_for_assets(set(binding.get("assets", {}))), binding["profile"], "binding asset profile")
+        exact(binding.get("tag"), "v0.8.20", "binding tag")
     else:
-        exact(binding.get("tag"), "v0.8.19", "binding tag")
+        exact(binding.get("tag"), "v0.8.20", "binding tag")
     exact(binding.get("legacy_source"), LEGACY_SOURCE, "binding v0.7.7 source")
     release = binding.get("release")
     if not isinstance(release, dict):
@@ -953,7 +962,8 @@ def validate_binding(binding: dict[str, Any]) -> None:
     )
     assets = binding.get("assets")
     expected_assets = (
-        EXISTING_UPDATE_RELEASE_ASSETS if is_update else EXPECTED_RELEASE_ASSETS
+        DESKTOP_UPDATE_RELEASE_ASSETS if binding.get("profile") == PROFILE_DESKTOP_UPDATE_V1
+        else EXISTING_UPDATE_RELEASE_ASSETS if is_update else EXPECTED_RELEASE_ASSETS
     )
     if not isinstance(assets, dict) or set(assets) != expected_assets:
         raise AcceptanceError("binding has an invalid release asset set")
@@ -1051,11 +1061,11 @@ def command_verify_legacy(args: argparse.Namespace) -> None:
 def validate_platform_checks(
     platform: str, checks: dict[str, Any], profile: str = PROFILE_CUTOVER_V1
 ) -> None:
-    if profile not in {PROFILE_CUTOVER_V1, PROFILE_EXISTING_UPDATE_V1}:
+    if profile not in {PROFILE_CUTOVER_V1, PROFILE_EXISTING_UPDATE_V1, PROFILE_DESKTOP_UPDATE_V1}:
         raise AcceptanceError(f"unsupported release profile: {profile!r}")
     required = dict(REQUIRED_CHECKS[platform])
     if platform == "linux-x86_64":
-        is_update = profile == PROFILE_EXISTING_UPDATE_V1
+        is_update = profile in (PROFILE_EXISTING_UPDATE_V1, PROFILE_DESKTOP_UPDATE_V1)
         exact(
             checks.get("legacy_migration_refused", False), is_update,
             "linux-x86_64 check legacy_migration_refused",

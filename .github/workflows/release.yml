@@ -23,6 +23,7 @@ on:
         options:
           - cutover-v1
           - existing-recovered-chain-update-v1
+          - desktop-update-existing-validators-v1
       update_handoff_artifact_id:
         description: Immutable existing-chain update handoff artifact ID (update profile only)
         required: false
@@ -70,7 +71,7 @@ env:
 jobs:
   validate:
     name: Validate release tag and pin commit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       actions: read
@@ -144,7 +145,7 @@ jobs:
               HANDOFF_PREFIX=arc-recovery-release-handoff
               HANDOFF_WORKFLOW=.github/workflows/recovery-release-handoff.yml
               ;;
-            existing-recovered-chain-update-v1)
+            existing-recovered-chain-update-v1|desktop-update-existing-validators-v1)
               [ -z "$REQUESTED_CUTOVER_ARTIFACT_ID$REQUESTED_CUTOVER_ARTIFACT_DIGEST$REQUESTED_CUTOVER_RUN_ATTEMPT" ]
               REQUESTED_CUTOVER_ARTIFACT_ID="$REQUESTED_UPDATE_ARTIFACT_ID"
               REQUESTED_CUTOVER_ARTIFACT_DIGEST="$REQUESTED_UPDATE_ARTIFACT_DIGEST"
@@ -327,7 +328,7 @@ jobs:
   release-quality:
     name: Full quality gate on validated release commit
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -479,7 +480,7 @@ jobs:
   release-supply-chain:
     name: Cargo dependency policy (${{ matrix.graph }})
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -869,7 +870,7 @@ jobs:
   assemble-release:
     name: Assemble the exact unsigned release manifest
     needs: [validate, release-quality, release-supply-chain, cross-arch-golden-vectors, headless, linux-server-compat, desktop]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       # The isolated updater verifier is a stable-toolchain release utility.
@@ -978,11 +979,12 @@ jobs:
             --commit "${{ needs.validate.outputs.sha }}"
 
       - name: Materialize the exact one-file existing-chain update handoff
-        if: env.RELEASE_PROFILE == 'existing-recovered-chain-update-v1'
+        if: env.RELEASE_PROFILE == 'existing-recovered-chain-update-v1' || env.RELEASE_PROFILE == 'desktop-update-existing-validators-v1'
         shell: bash
         run: |
           set -Eeuo pipefail
           python3 scripts/release/materialize-update-handoff.py \
+            --profile "$RELEASE_PROFILE" \
             --downloads-root cutover-handoff-download \
             --output-dir cutover-handoff \
             --artifact-id "${{ needs.validate.outputs.cutover_artifact_id }}" \
@@ -1000,7 +1002,11 @@ jobs:
           RELEASE_COMMIT: ${{ needs.validate.outputs.sha }}
           REPOSITORY: ${{ github.repository }}
           CUTOVER_HANDOFF_DIR: cutover-handoff
+          GH_TOKEN: ${{ github.token }}
           EXISTING_UPDATE_HANDOFF_DIR: cutover-handoff
+          PRETAG_RUN_ID: ${{ needs.validate.outputs.pretag_run_id }}
+          PRETAG_RUN_ATTEMPT: ${{ needs.validate.outputs.pretag_run_attempt }}
+          PRETAG_SELECTION: ${{ needs.validate.outputs.pretag_artifacts }}
         run: ./scripts/release/assemble-release.sh
 
       - name: Cryptographically verify every updater payload against the embedded key
@@ -1067,7 +1073,7 @@ jobs:
   manifest-sign:
     name: Sign only the verified release manifest
     needs: [validate, assemble-release]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: release
     timeout-minutes: 15
     permissions:
@@ -1112,6 +1118,7 @@ jobs:
           [[ "$EXPECTED_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           profile_marker=""
           if [ "$RELEASE_PROFILE" = existing-recovered-chain-update-v1 ]; then profile_marker="existing-update-"; fi
+          if [ "$RELEASE_PROFILE" = desktop-update-existing-validators-v1 ]; then profile_marker="desktop-update-"; fi
           expected_name="arc-release-${profile_marker}unsigned-handoff-$EXPECTED_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$EXPECTED_METADATA_SHA"
           [ "$EXPECTED_ARTIFACT_NAME" = "$expected_name" ]
           /usr/bin/python3 -I - "$GITHUB_REPOSITORY" "$EXPECTED_SHA" "$RELEASE_TAG" \
@@ -1139,9 +1146,9 @@ jobs:
           metadata = json.loads(raw)
           canonical = (json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n").encode()
           profile = os.environ["RELEASE_PROFILE"]
-          if profile not in {"cutover-v1", "existing-recovered-chain-update-v1"}:
+          if profile not in {"cutover-v1", "existing-recovered-chain-update-v1", "desktop-update-existing-validators-v1"}:
               raise SystemExit("unsupported release profile")
-          is_update = profile == "existing-recovered-chain-update-v1"
+          is_update = profile in {"existing-recovered-chain-update-v1", "desktop-update-existing-validators-v1"}
           expected_schema = "arc.release-manifest-handoff.v2" if is_update else "arc.release-manifest-handoff.v1"
           if metadata.get("profile") != (profile if is_update else None):
               raise SystemExit("handoff profile metadata differs")
@@ -1166,7 +1173,8 @@ jobs:
           }
           if is_update:
               expected -= {"arc-legacy-maintenance-boundary.json", "arc-recovery-checkpoint-descriptor.json", "arc-cutover-policy.json"}
-              expected.add("arc-existing-chain-update-attestation.json")
+              expected.add("arc-desktop-update-attestation.json" if profile == "desktop-update-existing-validators-v1"
+                           else "arc-existing-chain-update-attestation.json")
           files = metadata.get("files")
           if not isinstance(files, dict) or set(files) != expected or \
              {path.name for path in release.iterdir()} != expected:
@@ -1365,6 +1373,7 @@ jobs:
           [[ "$EXPECTED_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           profile_marker=""
           if [ "$RELEASE_PROFILE" = existing-recovered-chain-update-v1 ]; then profile_marker="existing-update-"; fi
+          if [ "$RELEASE_PROFILE" = desktop-update-existing-validators-v1 ]; then profile_marker="desktop-update-"; fi
           expected_name="arc-release-${profile_marker}sealed-handoff-$EXPECTED_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$EXPECTED_METADATA_SHA"
           [ "$EXPECTED_ARTIFACT_NAME" = "$expected_name" ]
           /usr/bin/python3 -I - "$GITHUB_REPOSITORY" "$EXPECTED_SHA" "$RELEASE_TAG" \
@@ -1392,9 +1401,9 @@ jobs:
           metadata = json.loads(raw)
           canonical = (json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n").encode()
           profile = os.environ["RELEASE_PROFILE"]
-          if profile not in {"cutover-v1", "existing-recovered-chain-update-v1"}:
+          if profile not in {"cutover-v1", "existing-recovered-chain-update-v1", "desktop-update-existing-validators-v1"}:
               raise SystemExit("unsupported release profile")
-          is_update = profile == "existing-recovered-chain-update-v1"
+          is_update = profile in {"existing-recovered-chain-update-v1", "desktop-update-existing-validators-v1"}
           expected_schema = "arc.release-manifest-handoff.v2" if is_update else "arc.release-manifest-handoff.v1"
           if metadata.get("profile") != (profile if is_update else None):
               raise SystemExit("handoff profile metadata differs")
@@ -1418,7 +1427,8 @@ jobs:
           }
           if is_update:
               expected -= {"arc-legacy-maintenance-boundary.json", "arc-recovery-checkpoint-descriptor.json", "arc-cutover-policy.json"}
-              expected.add("arc-existing-chain-update-attestation.json")
+              expected.add("arc-desktop-update-attestation.json" if profile == "desktop-update-existing-validators-v1"
+                           else "arc-existing-chain-update-attestation.json")
           files, modes = metadata.get("files"), metadata.get("modes")
           if not isinstance(files, dict) or set(files) != expected or \
              not isinstance(modes, dict) or set(modes) != expected or \
@@ -1586,6 +1596,16 @@ jobs:
             exit 1
           fi
 
+          if [ "$RELEASE_PROFILE" = desktop-update-existing-validators-v1 ]; then
+            prior_tag="$(/usr/bin/jq -er '.validators_release.tag' release-files/arc-desktop-update-attestation.json)"
+            prior_hash="$(/usr/bin/jq -er '.validators_release.binary_sha256' release-files/arc-desktop-update-attestation.json)"
+            [[ "$prior_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+            [[ "$prior_hash" =~ ^[0-9a-f]{64}$ ]]
+            RELEASE_NOTES="Desktop-only update: validators remain on $prior_tag (arc-node-linux-x86_64 SHA256: $prior_hash). Independent review confirmed this release's node is compatible with that validator version. The signed arc-desktop-update-attestation.json records the bounded observation.
+
+          $RELEASE_NOTES"
+          fi
+
           preflight_json="$RUNNER_TEMP/current-preflight-run.json"
           /usr/bin/gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SELECTED_PREFLIGHT_RUN_ID/attempts/$SELECTED_PREFLIGHT_RUN_ATTEMPT" \
             > "$preflight_json"
@@ -1657,7 +1677,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY"
           /usr/bin/gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > "$response"
           expected_asset_count=32
-          if [ "$RELEASE_PROFILE" = existing-recovered-chain-update-v1 ]; then expected_asset_count=30; fi
+          if [ "$RELEASE_PROFILE" = existing-recovered-chain-update-v1 ] || [ "$RELEASE_PROFILE" = desktop-update-existing-validators-v1 ]; then expected_asset_count=30; fi
           /usr/bin/jq -e --argjson id "$release_id" --arg tag "$RELEASE_TAG" \
             --arg sha "$EXPECTED_SHA" --argjson expected_asset_count "$expected_asset_count" \
             '.id == $id and .tag_name == $tag and .target_commitish == $sha
@@ -2040,7 +2060,7 @@ jobs:
             exit 1
           }
           expected_asset_count=32
-          if [ "$RELEASE_PROFILE" = existing-recovered-chain-update-v1 ]; then expected_asset_count=30; fi
+          if [ "$RELEASE_PROFILE" = existing-recovered-chain-update-v1 ] || [ "$RELEASE_PROFILE" = desktop-update-existing-validators-v1 ]; then expected_asset_count=30; fi
           /usr/bin/jq -e --argjson id "$RELEASE_ID" --arg tag "$RELEASE_TAG" \
             --arg sha "$EXPECTED_SHA" --argjson expected_asset_count "$expected_asset_count" \
             '.id == $id and .tag_name == $tag and .target_commitish == $sha

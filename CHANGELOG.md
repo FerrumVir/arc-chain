@@ -18,6 +18,25 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.20 - Release-preparation snapshot (2026-11-13)
+
+> **Candidate note:** This entry records the v0.8.20 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.20.
+
+- Auto-shard-join excludes off-grid replicas from the production six-range tiling;
+  full coverage with no fresh on-grid candidate returns a planning conflict (#249).
+- Preserve existing workers’ core counts and below-floor model settings during
+  default-sharing migration; retain explicit-consent startup downloads and avoid
+  full hardware probing before first paint (#250).
+- Desktop sharing defaults on for eligible installs without a stored answer, with
+  a one-time notice and immediate Turn off. Optional keep-awake while sharing on
+  mains power starts off and is separate from per-job keep-awake; automatic model
+  downloads use the background power/network gate (#250).
+- The sharing notice contains keyboard focus and restores it when dismissed (#250).
+- An explicitly selected desktop release profile can keep validators on the
+  previous immutable release after independent compatibility review, with signed
+  baseline hashes and the existing quorum, artifact and publication checks.
+
 ## v0.8.19 - Release-preparation snapshot (2026-11-10)
 
 > **Candidate note:** This entry records the v0.8.19 release-preparation

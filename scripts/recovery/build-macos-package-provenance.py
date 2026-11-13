@@ -45,13 +45,14 @@ from typing import Any, Iterable, Mapping, NoReturn, Sequence
 
 
 REPOSITORY = "FerrumVir/arc-chain"
-TAG = "v0.8.19"
-VERSION = "0.8.19"
+TAG = "v0.8.20"
+VERSION = "0.8.20"
 RELEASE_SCHEMA = "arc.published-release-binding.v1"
 # Existing-chain update releases are bound by the same acceptance tool with an
 # explicit profile; the asset/workflow contract is otherwise identical.
 UPDATE_RELEASE_SCHEMA = "arc.published-release-binding.v2"
 UPDATE_RELEASE_PROFILE = "existing-recovered-chain-update-v1"
+DESKTOP_RELEASE_PROFILE = "desktop-update-existing-validators-v1"
 SIGNATURE_SCHEMA = "arc.macos-updater-signature-verification.v1"
 GUEST_SIGNATURE_SCHEMA = "arc.macos-updater-signature-guest.v1"
 INSPECTION_SCHEMA = "arc.macos-package-inspection.v1"
@@ -446,7 +447,7 @@ def load_release_binding(path: Path) -> tuple[dict[str, Any], bytes]:
         or value["tag"] != TAG
     ):
         fail("published release binding repository/schema/tag differs")
-    if is_update and value["profile"] != UPDATE_RELEASE_PROFILE:
+    if is_update and value["profile"] not in (UPDATE_RELEASE_PROFILE, DESKTOP_RELEASE_PROFILE):
         fail("published update release binding profile differs")
     commit = require_commit(value["commit"], "published release binding commit")
     release = value["release"]

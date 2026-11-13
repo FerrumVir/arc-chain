@@ -1371,6 +1371,9 @@ pub struct NodeManager {
     desired_running: bool,
     crash_restart_policy: CrashRestartPolicy,
     update_restart_was_desired: bool,
+    /// Instance-local fixture capacity; absent from production builds.
+    #[cfg(test)]
+    test_ram_gb: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1668,6 +1671,8 @@ impl NodeManager {
             desired_running: false,
             crash_restart_policy: CrashRestartPolicy::default(),
             update_restart_was_desired: false,
+            #[cfg(test)]
+            test_ram_gb: None,
         }
     }
 
@@ -2065,12 +2070,18 @@ impl NodeManager {
         // what `withdraw_compute_consent` persists. Consent `None` keeps the
         // existing rule (a worker with a model from before the question
         // counts as opted in), so v0.8.10 workers start unchanged.
+        #[cfg(not(test))]
         let mut effective = effective_launch_config(config);
+        #[cfg(test)]
+        let mut effective = match self.test_ram_gb {
+            Some(ram_gb) => effective_launch_config_for_ram(config, ram_gb),
+            None => effective_launch_config(config),
+        };
         if matches!(effective, std::borrow::Cow::Owned(_)) {
             push_log(
                 &self.logs,
                 "warn",
-                "compute contribution is switched off; starting as an observer without the model or worker flags"
+                "compute contribution is off or this computer is below the model RAM minimum; starting as an observer without the model or worker flags. Saved settings are unchanged."
                     .to_string(),
             )
             .await;
@@ -2350,10 +2361,6 @@ impl NodeManager {
                     "this arc-node cannot run a deterministic community worker without announcing an overlapping shard; update arc-node before starting worker mode"
                 );
             }
-            cmd.arg("--community-mode").arg("--full-integer-worker");
-            for origin in crate::rpc_client::PRODUCTION_RPC_ORIGINS {
-                cmd.arg("--community-rpc-url").arg(origin);
-            }
         }
         if keep_awake_during_jobs_requested(config) {
             // Probed like --threads: an unknown flag is a hard clap failure,
@@ -2371,9 +2378,7 @@ impl NodeManager {
             }
         }
 
-        if let Some(model) = &config.model_path {
-            cmd.arg("--model").arg(model);
-        }
+        append_compute_launch_args(&mut cmd, config);
 
         // Capture every launch identity before arming the shutdown receipt or
         // spawning. Nothing after a successful spawn may fail before the
@@ -2479,6 +2484,16 @@ impl NodeManager {
         }
 
         self.child = Some(child);
+        crate::sharing_awake::set_worker(
+            if config.role == "worker"
+                && config.model_path.is_some()
+                && self.active_model_unavailable.is_none()
+            {
+                self.pid()
+            } else {
+                None
+            },
+        );
         Ok(())
     }
 
@@ -2496,6 +2511,7 @@ impl NodeManager {
                 let was_stopping = self
                     .stopping
                     .swap(false, std::sync::atomic::Ordering::SeqCst);
+                crate::sharing_awake::set_worker(None);
                 self.child = None;
                 self.started_at = None;
                 self.shutdown_control = None;
@@ -2655,6 +2671,7 @@ impl NodeManager {
     }
 
     async fn stop_and_retain_lifecycle_lock(&mut self) -> anyhow::Result<StopLifecycleOutcome> {
+        crate::sharing_awake::set_worker(None);
         // Suppress crash restarts before any intentional process drain starts,
         // including Stop, Quit, local mutations, and updater preparation.
         self.clear_desired_running();
@@ -3492,8 +3509,28 @@ fn request_graceful_stop(
 /// the model, exactly what `withdraw_compute_consent` persists, so the worker
 /// flags, `--model`, the keep-awake flag and the recorded launch plan agree
 /// with each other. Consent `None` keeps the existing rule: a worker with a
-/// model from before the question counts as opted in.
+/// model from before the question counts as opted in. Below the RAM floor,
+/// omit even an observer's saved model: arc-node loads `--model` without
+/// worker flags too. This projection must never be saved to the store.
 pub(crate) fn effective_launch_config(config: &NodeConfig) -> std::borrow::Cow<'_, NodeConfig> {
+    effective_launch_config_for_ram(config, crate::hardware::compute_capacity().0)
+}
+
+pub(crate) fn effective_launch_config_for_ram(
+    config: &NodeConfig,
+    ram_gb: u64,
+) -> std::borrow::Cow<'_, NodeConfig> {
+    if crate::commands::tier_for_ram_gb(ram_gb) == "none" && config.model_path.is_some() {
+        tracing::warn!(
+            ram_gb,
+            "below the model RAM minimum; launching as an observer without the model or worker flags; saved settings are unchanged"
+        );
+        return std::borrow::Cow::Owned(NodeConfig {
+            role: "observer".into(),
+            model_path: None,
+            ..config.clone()
+        });
+    }
     if config.role == "worker"
         && config.model_path.is_some()
         && !crate::commands::compute_contribution_enabled(config)
@@ -3505,6 +3542,20 @@ pub(crate) fn effective_launch_config(config: &NodeConfig) -> std::borrow::Cow<'
         })
     } else {
         std::borrow::Cow::Borrowed(config)
+    }
+}
+
+/// Append compute arguments after the caller checks binary compatibility.
+/// Kept separate so launch projections can be tested without spawning a node.
+fn append_compute_launch_args(cmd: &mut Command, config: &NodeConfig) {
+    if config.role == "worker" && config.model_path.is_some() {
+        cmd.arg("--community-mode").arg("--full-integer-worker");
+        for origin in crate::rpc_client::PRODUCTION_RPC_ORIGINS {
+            cmd.arg("--community-rpc-url").arg(origin);
+        }
+    }
+    if let Some(model) = &config.model_path {
+        cmd.arg("--model").arg(model);
     }
 }
 
@@ -8165,6 +8216,10 @@ mod tests {
         let receipt_binary = plan.binary.path.clone();
         let receipt_genesis = plan.genesis.path.clone();
         let mut manager = NodeManager::new();
+        // This fixture exercises model availability across real start/relaunch
+        // paths, so deliberately supply eligible RAM even on small CI hosts.
+        // Keep it on this manager: parallel tests retain their own capacity.
+        manager.test_ram_gb = Some(16);
         manager.configure_managed_data_dir(&configured).unwrap();
         manager.update_lifecycle_lock = Some(acquire_managed_lifecycle_lock(&configured).unwrap());
         manager.update_restart_plan = Some(plan);
@@ -8451,7 +8506,7 @@ mod effective_launch_config_tests {
     #[test]
     fn a_withdrawn_consent_launches_an_observer_without_the_model() {
         let stored = worker_with_model(Some(false));
-        let launched = effective_launch_config(&stored);
+        let launched = effective_launch_config_for_ram(&stored, 16);
         assert!(matches!(launched, std::borrow::Cow::Owned(_)));
         assert_eq!(launched.role, "observer");
         assert_eq!(launched.model_path, None);
@@ -8470,7 +8525,7 @@ mod effective_launch_config_tests {
     fn consent_given_or_never_asked_launches_the_stored_config_unchanged() {
         for consent in [Some(true), None] {
             let stored = worker_with_model(consent);
-            let launched = effective_launch_config(&stored);
+            let launched = effective_launch_config_for_ram(&stored, 16);
             assert!(
                 matches!(launched, std::borrow::Cow::Borrowed(_)),
                 "{consent:?}"
@@ -8478,6 +8533,84 @@ mod effective_launch_config_tests {
             assert_eq!(launched.role, "worker");
             assert_eq!(launched.model_path, stored.model_path);
             assert!(keep_awake_during_jobs_requested(&launched));
+        }
+    }
+
+    fn compute_args(config: &NodeConfig) -> Vec<String> {
+        // Build argv only. Never execute this command or contact a node.
+        let mut command = Command::new("arc-node-not-executed");
+        append_compute_launch_args(&mut command, config);
+        command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn below_floor_launch_omits_saved_model_and_worker_flags_after_disk_reload() {
+        use crate::store::Store;
+        for role in ["observer", "worker"] {
+            for consent in [None, Some(false), Some(true)] {
+                let dir = tempfile::tempdir().unwrap();
+                let model = dir.path().join("standard.gguf");
+                std::fs::write(&model, b"GGUF").unwrap();
+                let stored = NodeConfig {
+                    role: role.into(),
+                    model_path: Some(model.to_str().unwrap().into()),
+                    worker_threads: Some(3),
+                    ..worker_with_model(consent)
+                };
+                Store {
+                    config: Some(stored.clone()),
+                    ..Store::default()
+                }
+                .save_to(dir.path())
+                .unwrap();
+                let before = std::fs::read(dir.path().join("store.json")).unwrap();
+                let reopened = Store::load_from(dir.path()).config.unwrap();
+                for ram_gb in [0, 8, 12, 15] {
+                    let mut launched = effective_launch_config_for_ram(&reopened, ram_gb);
+                    assert_eq!(launched.role, "observer");
+                    assert_eq!(launched.model_path, None);
+                    assert!(compute_args(&launched).is_empty());
+                    assert!(!keep_awake_during_jobs_requested(&launched));
+                    assert!(drop_unavailable_model(&mut launched).is_none());
+                    let mut expected = stored.clone();
+                    expected.role = "observer".into();
+                    expected.model_path = None;
+                    assert_eq!(
+                        serde_json::to_value(&*launched).unwrap(),
+                        serde_json::to_value(expected).unwrap()
+                    );
+                }
+                assert_eq!(
+                    std::fs::read(dir.path().join("store.json")).unwrap(),
+                    before
+                );
+                assert_eq!(
+                    serde_json::to_value(Store::load_from(dir.path()).config.unwrap()).unwrap(),
+                    serde_json::to_value(stored).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eligible_worker_keeps_model_and_worker_arguments() {
+        for consent in [None, Some(true)] {
+            for ram_gb in [16, 32, 64] {
+                let stored = worker_with_model(consent);
+                let launched = effective_launch_config_for_ram(&stored, ram_gb);
+                assert!(matches!(launched, std::borrow::Cow::Borrowed(_)));
+                let args = compute_args(&launched);
+                assert!(args.iter().any(|arg| arg == "--community-mode"));
+                assert!(args.iter().any(|arg| arg == "--full-integer-worker"));
+                assert!(args.iter().any(|arg| arg == "--community-rpc-url"));
+                let model_index = args.iter().position(|arg| arg == "--model").unwrap();
+                assert_eq!(args[model_index + 1], stored.model_path.as_deref().unwrap());
+                assert!(keep_awake_during_jobs_requested(&launched));
+            }
         }
     }
 
@@ -8491,7 +8624,7 @@ mod effective_launch_config_tests {
                 ..NodeConfig::default()
             };
             assert!(matches!(
-                effective_launch_config(&observer),
+                effective_launch_config_for_ram(&observer, 16),
                 std::borrow::Cow::Borrowed(_)
             ));
         }
@@ -8528,7 +8661,7 @@ mod model_preflight_tests {
         let missing = dir.join("standard.gguf");
         let stored = consenting_worker(&missing);
 
-        let mut launched = effective_launch_config(&stored);
+        let mut launched = effective_launch_config_for_ram(&stored, 16);
         let preflight = drop_unavailable_model(&mut launched).expect("missing model is reported");
         assert_eq!(preflight.reason, ModelUnavailableReason::NotFound);
         // No `--model`, no `--community-mode --full-integer-worker`, no
@@ -8562,7 +8695,7 @@ mod model_preflight_tests {
         std::fs::create_dir(&not_a_file).unwrap();
         let stored = consenting_worker(&not_a_file);
 
-        let mut launched = effective_launch_config(&stored);
+        let mut launched = effective_launch_config_for_ram(&stored, 16);
         let preflight = drop_unavailable_model(&mut launched).expect("unusable model is reported");
         assert_eq!(preflight.reason, ModelUnavailableReason::Unreadable);
         assert_eq!(launched.model_path, None);
@@ -8608,7 +8741,7 @@ mod model_preflight_tests {
         std::fs::write(&model, b"GGUF").unwrap();
         let stored = consenting_worker(&model);
 
-        let mut launched = effective_launch_config(&stored);
+        let mut launched = effective_launch_config_for_ram(&stored, 16);
         assert!(drop_unavailable_model(&mut launched).is_none());
         assert!(matches!(launched, std::borrow::Cow::Borrowed(_)));
         assert_eq!(launched.model_path, stored.model_path);
@@ -8624,7 +8757,7 @@ mod model_preflight_tests {
             model_path: None,
             ..NodeConfig::default()
         };
-        let mut launched = effective_launch_config(&observer);
+        let mut launched = effective_launch_config_for_ram(&observer, 16);
         assert!(drop_unavailable_model(&mut launched).is_none());
         assert!(matches!(launched, std::borrow::Cow::Borrowed(_)));
 
@@ -8635,7 +8768,7 @@ mod model_preflight_tests {
             compute_consent: Some(false),
             ..consenting_worker(&dir.join("standard.gguf"))
         };
-        let mut launched = effective_launch_config(&withdrawn);
+        let mut launched = effective_launch_config_for_ram(&withdrawn, 16);
         assert!(drop_unavailable_model(&mut launched).is_none());
         assert_eq!(launched.model_path, None);
         std::fs::remove_dir_all(dir).unwrap();

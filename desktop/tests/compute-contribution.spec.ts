@@ -16,12 +16,12 @@ async function savedConfig(page: Page) {
 // before that keeps its answer, here off. The node only downloads the model
 // and takes jobs while it is on, and the dashboard shows what this computer
 // actually did, read from its own node.
-test.describe("Compute contribution opt-in", () => {
+test.describe("Explicit compute contribution choices", () => {
   test.beforeEach(async ({ page }) => {
     await seedOnboarded(page);
   });
 
-  test("is off until the user turns it on, and keep-awake waits for it", async ({
+  test("an explicit off stays off until changed, and per-job keep-awake waits for it", async ({
     page,
   }) => {
     // The core cap setup stores for a compute-on install (mirrored from
@@ -205,118 +205,72 @@ test.describe("Compute copy states this release's facts", () => {
   });
 });
 
-// An install that finished setup before compute started on by default is
-// asked once, on the first launch after the update, in the setup step's own
-// words. Native code decides and records that it asked before it answers; the
-// browser preview stands in for that with `seedComputePrompt`.
-test.describe("The one-time compute question", () => {
+test.describe("The one-time sharing notice", () => {
   test.beforeEach(async ({ page }) => {
     await seedOnboarded(page);
     await seedComputePrompt(page);
   });
 
-  test("asks once, in the setup step's words, and Not now leaves compute off", async ({
-    page,
-  }) => {
+  test("defaults sharing on with the core cap, but keep-awake off; shown once", async ({ page }) => {
     await page.goto("/");
     const dialog = page.getByTestId("compute-prompt-dialog");
     await expect(dialog).toBeVisible();
-    await expect(
-      dialog.getByRole("heading", { name: PLAIN_COPY.setup.compute.title }),
-    ).toBeVisible();
-    await expect(dialog.getByTestId("compute-prompt-body")).toHaveText(
-      PLAIN_COPY.setup.compute.body,
-    );
-    await expect(dialog.getByTestId("compute-prompt-turn-on")).toHaveText("Turn on");
-    await expect(dialog.getByTestId("compute-prompt-not-now")).toHaveText("Not now");
-
-    await dialog.getByTestId("compute-prompt-not-now").click();
-    await expect(dialog).toBeHidden();
-    await page.getByTestId("nav-settings").click();
-    await expect(page.getByTestId("compute-consent-toggle")).not.toBeChecked();
-    // Not now changed nothing: no consent, no core count.
+    await expect(page.locator("#boot")).toHaveCount(0);
+    await expect(dialog).toContainText("ARC now shares this computer’s spare compute");
+    await expect(dialog.getByTestId("compute-notice-keep-awake")).not.toBeChecked();
     const saved = await savedConfig(page);
-    expect(saved?.computeConsent ?? null).toBeNull();
-    expect(saved?.workerThreads ?? null).toBeNull();
-
-    // Never again: the next launch does not ask. The preview answers after a
-    // short delay, so give a repeated question time to show before checking.
+    expect(saved.computeConsent).toBe(true);
+    expect(saved.workerThreads).toBe(6);
+    expect(saved.keepAwakeWhileSharing ?? false).toBe(false);
+    await dialog.getByText("Got it", { exact: true }).click();
     await page.reload();
     await expect(page.getByTestId("app-shell")).toBeVisible();
     await page.waitForTimeout(600);
-    await expect(page.getByTestId("compute-prompt-dialog")).toHaveCount(0);
+    await expect(dialog).toHaveCount(0);
   });
 
-  test("Turn on stores consent and a quarter of the cores, and downloads in the background", async ({
-    page,
-  }) => {
+  test("Turn off stores a refusal and immediately returns to observer", async ({ page }) => {
     await page.goto("/");
-    const dialog = page.getByTestId("compute-prompt-dialog");
-    await dialog.getByTestId("compute-prompt-turn-on").click();
-    await expect(dialog).toBeHidden();
-
-    // The model follows in the background, the call setup makes with compute
-    // on: the node becomes a worker with the model. (This install is already
-    // "worker" with no model, so the model is what to wait for.)
-    await expect
-      .poll(async () => (await savedConfig(page))?.modelPath)
-      .toBe("/mock/.arc/models/standard.gguf");
+    await page.getByTestId("compute-prompt-turn-off").click();
+    await expect(page.getByTestId("compute-prompt-dialog")).toBeHidden();
     const saved = await savedConfig(page);
-    expect(saved?.role).toBe("worker");
-    expect(saved?.computeConsent).toBe(true);
-    // A quarter of the preview's 24 logical cores.
-    expect(saved?.workerThreads).toBe(6);
-
+    expect(saved.computeConsent).toBe(false);
+    expect(saved.role).toBe("observer");
+    expect(saved.modelPath).toBeNull();
     await page.getByTestId("nav-settings").click();
-    await expect(page.getByTestId("compute-consent-toggle")).toBeChecked();
-    await expect(page.getByTestId("compute-share-note")).toHaveText(
-      "Uses up to a quarter of your processor at low priority, and about 8 GB of memory while ARC Node is running. It keeps running on battery. Turn this off to stop ARC jobs and free that memory.",
-    );
+    await expect(page.getByTestId("compute-consent-toggle")).not.toBeChecked();
   });
 
-  test("a launch hidden in the tray does not spend it; the first show asks it once", async ({
-    page,
-  }) => {
-    const markerKey = "arc-mock-compute-prompt-shown-at";
-    const marker = () => page.evaluate((key) => localStorage.getItem(key), markerKey);
-    // A login launch: the window starts hidden in the tray.
-    await page.addInitScript(() => {
-      (window as unknown as { __ARC_MOCK_WINDOW_HIDDEN__: boolean }).__ARC_MOCK_WINDOW_HIDDEN__ = true;
-    });
+  test("the opt-in is stored and can be unticked in Settings with one click", async ({ page }) => {
     await page.goto("/");
-    await expect(page.getByTestId("app-shell")).toBeAttached();
-    // Focus and visibility events while still hidden claim nothing.
-    await page.evaluate(() => {
-      window.dispatchEvent(new Event("focus"));
-      document.dispatchEvent(new Event("visibilitychange"));
-    });
-    await page.waitForTimeout(600);
-    await expect(page.getByTestId("compute-prompt-dialog")).toHaveCount(0);
-    expect(await marker(), "no marker while the window is hidden").toBeNull();
-
-    // The user opens it from the tray.
-    await page.evaluate(() => {
-      (window as unknown as { __ARC_MOCK_WINDOW_HIDDEN__: boolean }).__ARC_MOCK_WINDOW_HIDDEN__ = false;
-      window.dispatchEvent(new Event("focus"));
-    });
     const dialog = page.getByTestId("compute-prompt-dialog");
-    await expect(dialog).toBeVisible();
-    const recorded = await marker();
-    expect(recorded, "one marker after the first show").not.toBeNull();
-
-    // Later focus changes neither the marker nor the dialog.
-    await page.evaluate(() => {
-      window.dispatchEvent(new Event("focus"));
-      document.dispatchEvent(new Event("visibilitychange"));
-    });
-    await page.waitForTimeout(600);
-    await expect(dialog).toHaveCount(1);
-    expect(await marker()).toBe(recorded);
+    await dialog.getByTestId("compute-notice-keep-awake").click();
+    await expect(dialog.getByTestId("compute-notice-keep-awake")).toBeChecked();
+    expect((await savedConfig(page)).keepAwakeWhileSharing).toBe(true);
+    expect((await savedConfig(page)).preventSleepDuringJobs ?? false).toBe(false);
+    await dialog.getByText("Got it", { exact: true }).click();
+    await page.getByTestId("nav-settings").click();
+    const toggle = page.getByTestId("sharing-keep-awake-toggle");
+    await expect(toggle).toBeChecked();
+    await toggle.click();
+    await expect(toggle).not.toBeChecked();
+    expect((await savedConfig(page)).keepAwakeWhileSharing).toBe(false);
   });
 
-  test("a hidden launch that becomes visible asks it on visibilitychange", async ({
-    page,
-  }) => {
+  test("explicit sharing off stays off and gets no notice", async ({ page }) => {
+    await page.addInitScript(() => {
+      const data = JSON.parse(localStorage.getItem("arc-desktop-state-v1")!);
+      data.config.computeConsent = false;
+      localStorage.setItem("arc-desktop-state-v1", JSON.stringify(data));
+    });
+    await page.goto("/");
+    await page.getByTestId("nav-settings").click();
+    await expect(page.getByTestId("compute-consent-toggle")).not.toBeChecked();
+    await expect(page.getByTestId("compute-prompt-dialog")).toHaveCount(0);
+  });
+
+  test("hidden launches do not consume the notice; showing acknowledges it", async ({ page }) => {
+    const key = "arc-mock-compute-prompt-shown-at";
     await page.addInitScript(() => {
       (window as unknown as { __ARC_MOCK_WINDOW_HIDDEN__: boolean }).__ARC_MOCK_WINDOW_HIDDEN__ = true;
     });
@@ -324,43 +278,21 @@ test.describe("The one-time compute question", () => {
     await expect(page.getByTestId("app-shell")).toBeAttached();
     await page.waitForTimeout(600);
     await expect(page.getByTestId("compute-prompt-dialog")).toHaveCount(0);
+    expect(await page.evaluate((key) => localStorage.getItem(key), key)).toBeNull();
     await page.evaluate(() => {
       (window as unknown as { __ARC_MOCK_WINDOW_HIDDEN__: boolean }).__ARC_MOCK_WINDOW_HIDDEN__ = false;
-      document.dispatchEvent(new Event("visibilitychange"));
+      window.dispatchEvent(new Event("focus"));
     });
     await expect(page.getByTestId("compute-prompt-dialog")).toBeVisible();
+    await expect.poll(() => page.evaluate((key) => localStorage.getItem(key), key)).not.toBeNull();
   });
 
-  test("Escape closes it without changing anything", async ({ page }) => {
+  test("a failed Turn off stays visible and reports the save error", async ({ page }) => {
+    await seedMockOverrides(page, { set_compute_contribution: { __reject: "The settings could not be saved." } });
     await page.goto("/");
-    const dialog = page.getByTestId("compute-prompt-dialog");
-    await expect(dialog).toBeVisible();
-    await page.keyboard.press("Escape");
-    await expect(dialog).toBeHidden();
-    await page.getByTestId("nav-settings").click();
-    await expect(page.getByTestId("compute-consent-toggle")).not.toBeChecked();
-    const saved = await savedConfig(page);
-    expect(saved?.computeConsent ?? null).toBeNull();
-  });
-
-  test("a Turn on that fails says why, stays open, and can still be dismissed", async ({
-    page,
-  }) => {
-    await seedMockOverrides(page, {
-      accept_compute_prompt: { __reject: "The settings could not be saved." },
-    });
-    await page.goto("/");
-    const dialog = page.getByTestId("compute-prompt-dialog");
-    await dialog.getByTestId("compute-prompt-turn-on").click();
-    await expect(dialog.getByTestId("compute-prompt-error")).toHaveText(
-      "The settings could not be saved.",
-    );
-    await expect(dialog).toBeVisible();
-    await expect(dialog.getByTestId("compute-prompt-turn-on")).toBeEnabled();
-    await dialog.getByTestId("compute-prompt-not-now").click();
-    await expect(dialog).toBeHidden();
-    await page.getByTestId("nav-settings").click();
-    await expect(page.getByTestId("compute-consent-toggle")).not.toBeChecked();
+    await page.getByTestId("compute-prompt-turn-off").click();
+    await expect(page.getByTestId("compute-prompt-error")).toHaveText("The settings could not be saved.");
+    await expect(page.getByTestId("compute-prompt-dialog")).toBeVisible();
   });
 });
 
@@ -372,7 +304,7 @@ test.describe("Model file unavailable", () => {
     running: true,
     pid: 42_731,
     health: "live",
-    version: "0.8.19",
+    version: "0.8.20",
     peers: 8,
     round: 43_821,
     committed: 43_820,

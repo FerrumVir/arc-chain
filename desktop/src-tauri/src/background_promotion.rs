@@ -177,9 +177,11 @@ impl<T: Clone + Send + Sync> SingleFlight<T> {
 /// Where the computer draws power from, as far as the OS reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PowerSource {
-    /// Mains, or a computer with no battery, or a state the OS cannot report.
+    /// Mains, or a computer with no battery.
     Mains,
     Battery,
+    /// The OS could not establish mains power. Downloads may proceed; idle holds may not.
+    Unknown,
 }
 
 /// What a background download checks before it pulls gigabytes. One trait,
@@ -276,8 +278,9 @@ mod platform {
     }
 
     /// `IOPSGetProvidingPowerSourceType` names the source: "AC Power",
-    /// "Battery Power" or "UPS Power". Only "Battery Power" counts as
-    /// battery; a Mac without a battery reports "AC Power".
+    /// "Battery Power" or "UPS Power". A Mac without a battery reports
+    /// "AC Power". Unknown/UPS retain the download gate's permissive policy
+    /// but cannot acquire an opt-in mains-only idle hold.
     pub(super) fn power_source() -> PowerSource {
         // SAFETY: the snapshot is a CF object we own and release once; the
         // providing type is borrowed from it (the "Get" rule) and read before
@@ -285,7 +288,7 @@ mod platform {
         unsafe {
             let snapshot = IOPSCopyPowerSourcesInfo();
             if snapshot.is_null() {
-                return PowerSource::Mains;
+                return PowerSource::Unknown;
             }
             let kind = IOPSGetProvidingPowerSourceType(snapshot);
             let mut buffer = [0 as c_char; 64];
@@ -296,13 +299,17 @@ mod platform {
                     buffer.len() as isize,
                     K_CF_STRING_ENCODING_UTF8,
                 ) != 0;
-            let on_battery = read && CStr::from_ptr(buffer.as_ptr()).to_bytes() == b"Battery Power";
-            CFRelease(snapshot);
-            if on_battery {
-                PowerSource::Battery
+            let source = if !read {
+                PowerSource::Unknown
             } else {
-                PowerSource::Mains
-            }
+                match CStr::from_ptr(buffer.as_ptr()).to_bytes() {
+                    b"AC Power" => PowerSource::Mains,
+                    b"Battery Power" => PowerSource::Battery,
+                    _ => PowerSource::Unknown,
+                }
+            };
+            CFRelease(snapshot);
+            source
         }
     }
 
@@ -323,7 +330,7 @@ mod platform {
         // else.
         let mut status: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
         if unsafe { GetSystemPowerStatus(&mut status) } == 0 {
-            return PowerSource::Mains;
+            return PowerSource::Unknown;
         }
         super::windows_power_source(status.ACLineStatus, status.BatteryFlag)
     }
@@ -346,7 +353,7 @@ mod platform {
 
     pub(super) fn power_source() -> PowerSource {
         let Ok(entries) = std::fs::read_dir("/sys/class/power_supply") else {
-            return PowerSource::Mains;
+            return PowerSource::Unknown;
         };
         let supplies: Vec<PowerSupply> = entries
             .flatten()
@@ -407,8 +414,10 @@ fn windows_power_source(ac_line_status: u8, battery_flag: u8) -> PowerSource {
     const NO_SYSTEM_BATTERY: u8 = 128;
     if ac_line_status == AC_OFFLINE && battery_flag & NO_SYSTEM_BATTERY == 0 {
         PowerSource::Battery
-    } else {
+    } else if ac_line_status == 1 || battery_flag == NO_SYSTEM_BATTERY {
         PowerSource::Mains
+    } else {
+        PowerSource::Unknown
     }
 }
 
@@ -446,7 +455,7 @@ fn linux_power_source(supplies: &[PowerSupply]) -> PowerSource {
     if discharging {
         PowerSource::Battery
     } else {
-        PowerSource::Mains
+        PowerSource::Unknown
     }
 }
 
@@ -865,8 +874,8 @@ mod tests {
         assert_eq!(windows_power_source(1, 8), PowerSource::Mains);
         assert_eq!(
             windows_power_source(255, 1),
-            PowerSource::Mains,
-            "unknown counts as mains"
+            PowerSource::Unknown,
+            "unknown must not acquire an idle hold"
         );
         assert_eq!(
             windows_power_source(0, 128),

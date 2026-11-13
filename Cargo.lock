@@ -199,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "arc-agents"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "arc-crypto",
  "arc-types",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "arc-assign"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "arc-bincode",
  "arc-crypto",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "arc-bench"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "arc-bincode",
  "arc-consensus",
@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "arc-bincode"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "cu-bincode",
  "hex",
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "arc-channel"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "arc-crypto",
  "arc-types",
@@ -282,7 +282,7 @@ dependencies = [
 
 [[package]]
 name = "arc-cli"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "anyhow",
  "arc-crypto",
@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "arc-consensus"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "arc-bincode",
  "arc-crypto",
@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "arc-crypto"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "blake3",
  "blst",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "arc-gpu"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "arc-crypto",
  "arc-types",
@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "arc-inference"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "arc-crypto",
  "arc-gpu",
@@ -418,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "arc-mempool"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "arc-bincode",
  "arc-crypto",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "arc-net"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "anyhow",
  "arc-bincode",
@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "arc-node"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "anyhow",
  "arc-assign",
@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "arc-relayer"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "anyhow",
  "arc-types",
@@ -541,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "arc-state"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "arc-bincode",
  "arc-crypto",
@@ -567,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "arc-types"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "arc-bincode",
  "arc-crypto",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "arc-vm"
-version = "0.8.19"
+version = "0.8.20"
 dependencies = [
  "arc-crypto",
  "arc-state",
@@ -4626,9 +4626,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.18"
+version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc"
+checksum = "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
 dependencies = [
  "bytes",
  "fastbloom",
@@ -4650,9 +4650,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-udp"
-version = "0.5.15"
+version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35a133f956daabe89a61a685c2649f13d82d5aa4bd5d12d1277e1072a21c0694"
+checksum = "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
 dependencies = [
  "cfg_aliases",
  "libc",
@@ -5227,9 +5227,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.1",
  "errno",

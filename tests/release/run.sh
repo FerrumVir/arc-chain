@@ -57,4 +57,7 @@ python3 "$TEST_DIR/test_ubuntu_server_smoke_script.py" || status=1
 printf '# %s\n' "test_build_macos_package_provenance.py"
 python3 "$TEST_DIR/../../scripts/recovery/test_build_macos_package_provenance.py" || status=1
 
+printf '# %s\n' "test_desktop_update_profile.py"
+python3 "$TEST_DIR/test_desktop_update_profile.py" || status=1
+
 exit "$status"

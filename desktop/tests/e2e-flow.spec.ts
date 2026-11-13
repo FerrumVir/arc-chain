@@ -332,7 +332,7 @@ test.describe("Spawn CLI contract (Rust source)", () => {
     activeStartBegin,
   );
   const activeStart = src.slice(activeStartBegin, activeStartEnd);
-  const productionEnd = src.indexOf("#[cfg(test)]");
+  const productionEnd = src.indexOf("\n#[cfg(test)]\nmod tests {");
   const production = src.slice(0, productionEnd);
   const legacyMatcherBegin = production.indexOf(
     "fn legacy_windows_command_matches(\n",
@@ -366,11 +366,18 @@ test.describe("Spawn CLI contract (Rust source)", () => {
       '"--seeds-file"',
       '"--genesis"',
       '"--eth-rpc-port"',
-      '"--community-mode"',
-      '"--full-integer-worker"',
     ]) {
       expect(activeStart).toContain(flag);
     }
+    // Compute flags are appended by the shared launch-projection helper.
+    // Require the live spawn path to call it, then inspect that helper's argv.
+    expect(activeStart).toContain("append_compute_launch_args(&mut cmd, config);");
+    const computeBegin = production.indexOf("fn append_compute_launch_args(");
+    expect(computeBegin).toBeGreaterThanOrEqual(0);
+    const computeEnd = production.indexOf("\n}\n", computeBegin);
+    expect(computeEnd).toBeGreaterThan(computeBegin);
+    const computeArgs = production.slice(computeBegin, computeEnd);
+    expect(computeArgs).toContain('cmd.arg("--community-mode").arg("--full-integer-worker")');
     expect(activeStart).not.toContain('"--validator-seed"');
     expect(activeStart).not.toContain("ARC_VALIDATOR_SEED");
     expect(activeStart).toContain("<app-owned-private-keyfile>");

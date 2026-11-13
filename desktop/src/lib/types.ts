@@ -182,6 +182,9 @@ export interface NodeConfig {
   computeConsent?: boolean | null;
   /** Keep the computer awake while a job runs. Only true turns it on. */
   preventSleepDuringJobs?: boolean | null;
+  /** Opt-in hold while sharing as a worker on mains power. */
+  keepAwakeWhileSharing?: boolean | null;
+  computeDefaultNoticePending?: boolean;
 }
 
 /**

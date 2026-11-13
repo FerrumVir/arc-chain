@@ -23,7 +23,7 @@ const JARGON =
 // The local /health of a healthy community node, as arc-node reports it today.
 const HEALTHY_COMMUNITY = {
   status: "degraded",
-  version: "0.8.19",
+  version: "0.8.20",
   height: 0,
   peers: 0,
   uptime_secs: 60,

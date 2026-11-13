@@ -18,6 +18,7 @@ SCHEMA_V1 = "arc.release-manifest-handoff.v1"
 SCHEMA_V2 = "arc.release-manifest-handoff.v2"
 PROFILE_CUTOVER_V1 = "cutover-v1"
 PROFILE_EXISTING_UPDATE_V1 = "existing-recovered-chain-update-v1"
+PROFILE_DESKTOP_UPDATE_V1 = "desktop-update-existing-validators-v1"
 HANDOFF_NAME = "ARC-RELEASE-HANDOFF.json"
 HEADLESS = (
     "arc-node-linux-x86_64",
@@ -121,6 +122,9 @@ def profile_files(profile: str) -> tuple[str, ...]:
         return BASE_FILES
     if profile == PROFILE_EXISTING_UPDATE_V1:
         return UPDATE_FILES
+    if profile == PROFILE_DESKTOP_UPDATE_V1:
+        return tuple("arc-desktop-update-attestation.json" if name ==
+                     "arc-existing-chain-update-attestation.json" else name for name in UPDATE_FILES)
     fail("unknown release profile")
 
 
@@ -213,7 +217,7 @@ def stage(args: argparse.Namespace) -> None:
     release_dir.mkdir(parents=True, mode=0o700)
     for name in sorted(expected_files(args.sealed, args.profile)):
         copy_exclusive(args.source_dir / name, release_dir / name, modes[name])
-    is_update = args.profile == PROFILE_EXISTING_UPDATE_V1
+    is_update = args.profile in (PROFILE_EXISTING_UPDATE_V1, PROFILE_DESKTOP_UPDATE_V1)
     metadata = {
         "schema": SCHEMA_V2 if is_update else SCHEMA_V1,
         "sealed": args.sealed,
@@ -227,7 +231,7 @@ def stage(args: argparse.Namespace) -> None:
         "manifest_sha256": hashes["SHA256SUMS"],
     }
     if is_update:
-        metadata["profile"] = PROFILE_EXISTING_UPDATE_V1
+        metadata["profile"] = args.profile
     metadata_bytes = canonical_json(metadata)
     metadata_sha = hashlib.sha256(metadata_bytes).hexdigest()
     copy_target = args.stage_dir / HANDOFF_NAME
@@ -244,7 +248,8 @@ def stage(args: argparse.Namespace) -> None:
     finally:
         os.close(descriptor)
     kind = "sealed" if args.sealed else "unsigned"
-    profile_name = "existing-update-" if is_update else ""
+    profile_name = ("desktop-update-" if args.profile == PROFILE_DESKTOP_UPDATE_V1
+                    else "existing-update-" if is_update else "")
     artifact_name = (
         f"arc-release-{profile_name}{kind}-handoff-{args.commit}-{args.run_id}-"
         f"{args.run_attempt}-{metadata_sha}"
@@ -275,7 +280,7 @@ def verify(args: argparse.Namespace) -> None:
         fail(f"handoff metadata is invalid JSON: {error}")
     if canonical_json(metadata) != metadata_bytes:
         fail("handoff metadata is not canonical")
-    is_update = args.profile == PROFILE_EXISTING_UPDATE_V1
+    is_update = args.profile in (PROFILE_EXISTING_UPDATE_V1, PROFILE_DESKTOP_UPDATE_V1)
     expected_identity = {
         "schema": SCHEMA_V2 if is_update else SCHEMA_V1,
         "sealed": args.sealed,
@@ -286,7 +291,7 @@ def verify(args: argparse.Namespace) -> None:
         "workflow_run_attempt": args.run_attempt,
     }
     if is_update:
-        expected_identity["profile"] = PROFILE_EXISTING_UPDATE_V1
+        expected_identity["profile"] = args.profile
     if set(metadata) != set(expected_identity) | {"files", "modes", "manifest_sha256"}:
         fail("handoff metadata fields differ from the selected profile schema")
     for field, expected in expected_identity.items():
@@ -310,7 +315,7 @@ def common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--run-id", required=True, type=int)
     parser.add_argument("--run-attempt", required=True, type=int)
     parser.add_argument("--sealed", action="store_true")
-    parser.add_argument("--profile", choices=(PROFILE_CUTOVER_V1, PROFILE_EXISTING_UPDATE_V1),
+    parser.add_argument("--profile", choices=(PROFILE_CUTOVER_V1, PROFILE_EXISTING_UPDATE_V1, PROFILE_DESKTOP_UPDATE_V1),
                         default=PROFILE_CUTOVER_V1)
 
 

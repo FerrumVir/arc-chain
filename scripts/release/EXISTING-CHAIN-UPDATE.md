@@ -40,3 +40,38 @@ An update may publish while up to two of the six validators are offline only whe
 - **Must not be answering.** Each proof sample carries one `declared_offline` row per declared validator (`site`, `ip`, `validator`, `health_url`, `http_status`, `binary_sha256`) recording an HTTPS GET of `https://<ip>/health`. Only no HTTP response (`http_status` null), or HTTP 502, 503 or 504 from the front, with `binary_sha256` null, counts as not answering. Any other result refuses the proof, on any binary: a validator that answers must be configured live and run the candidate. A declared validator that appears as a sampled host or common-block row also refuses the proof. A proof without a declaration may not carry these rows.
 
 The attestation then names the validators in `declared_offline_validators`, in ascending `site` order exactly matching the host config's `declared_offline` list (unsorted lists are refused), and records its proof under `fresh_live_host_proof`, with `host_count`, `online_stake`, `declared_offline_sites` and `declared_offline_stake`. A six-host update keeps `fresh_six_host_proof` and is otherwise unchanged. The claim is unchanged too: each declared validator stays in the validator set, and nothing here authorizes retirement. The health read shows only that the declared host's public RPC did not answer. It does not show that no process runs on that host, and it does not observe peer-to-peer traffic. The declaration is the owner's record of an offline validator, not a measurement.
+
+## Desktop updates with existing validators
+
+`desktop-update-existing-validators-v1` is an explicit opt-in profile. Use it only
+when an independent review finds the release's node changes compatible with the
+validators' current version. The compatibility review for v0.8.20 with v0.8.19
+validators is the initial use case; selecting the profile confirms that review.
+This is a release preparation path, not authorization to restart validators.
+
+Pass `--profile desktop-update-existing-validators-v1 --previous-release-tag
+vX.Y.Z --confirm-node-compatible` to the owner assembler, then use the same
+`release_profile` and `previous_release_tag` inputs on
+`existing-chain-update-handoff.yml`. The named baseline must be the newest
+qualifying strict semantic version in the complete GitHub release listing:
+immutable, published, not a prerelease, authored by github-actions[bot], and named
+`ARC Chain vX.Y.Z`. It must precede the candidate. Its published `SHA256SUMS` must
+verify with the installer's source-pinned release-manifest key and namespace
+`arc-release-manifest-v1`; its Linux node hash must match the published asset.
+
+Every live host must run exactly that previous Linux binary. All other quorum,
+checkpoint, network, artifact, and at-most-two-declared-offline rules above still
+apply. Capture retains the existing 120-second freshness check; the protected
+producer accepts owner evidence up to two hours old. Desktop release assembly
+also enforces that two-hour observation bound and re-authenticates the newest
+published baseline, so a newly published qualifying release invalidates an old
+handoff. The candidate production and checkpoint-verifier binaries remain bound
+to the selected signing-preflight artifacts, independently of the validator hash.
+
+Dispatch `release.yml` explicitly with this profile and the same immutable update
+handoff ID, digest and attempt tuple. Its signed, 30-asset package substitutes
+`arc-desktop-update-attestation.json` for the ordinary update attestation. That
+asset records the previous tag, node hash, signed manifest hashes and compatibility
+declaration; release notes repeat the tag and node hash. Post-release acceptance
+recognizes the distinct asset set and still refuses legacy migration. No default,
+cutover behavior, ordinary update rule, signing gate or updater limit changes.
