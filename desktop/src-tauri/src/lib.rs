@@ -3,6 +3,9 @@ mod background_promotion;
 mod commands;
 mod hardware;
 mod identity;
+#[allow(dead_code)]
+#[path = "../../../shared/keep_awake.rs"]
+mod keep_awake;
 mod legacy_upgrade;
 mod native_paid;
 mod node_care;
@@ -11,6 +14,8 @@ mod paths;
 mod previous_install;
 mod production_acceptance;
 mod rpc_client;
+#[cfg_attr(test, allow(dead_code))]
+mod sharing_awake;
 mod start_fence;
 mod store;
 mod tray;
@@ -627,6 +632,20 @@ pub fn run() {
             {
                 tracing::error!(%error, "could not persist the unattended-update default");
             }
+            if !startup_hold.hold.held && loaded_store.identity.is_some() && loaded_store.config.is_some() {
+                let (ram_gb, cpu_cores) = hardware::compute_capacity();
+                let before = loaded_store.config.clone();
+                if commands::apply_compute_default(&mut loaded_store, ram_gb, cpu_cores, false) {
+                    if let Err(error) = loaded_store.save_to(&resolved) {
+                        loaded_store.config = before;
+                        tracing::error!(%error, "could not persist sharing default; leaving the previous choice intact");
+                    }
+                }
+            }
+            if let Some(config) = &loaded_store.config {
+                sharing_awake::set_enabled(config.keep_awake_while_sharing == Some(true)
+                    && commands::compute_contribution_enabled(config));
+            }
             let autostart_desired = loaded_store
                 .config
                 .as_ref()
@@ -905,6 +924,7 @@ pub fn run() {
                         let _ = window.hide();
                         api.prevent_close();
                     } else {
+                        sharing_awake::set_enabled(false);
                         let handle = window.app_handle().clone();
                         tauri::async_runtime::spawn(async move {
                             if let Some(state) = handle.try_state::<AppState>() {
@@ -912,6 +932,7 @@ pub fn run() {
                                 let mut node = state.node.lock().await;
                                 let _ = node.stop().await;
                             }
+                            crate::sharing_awake::set_enabled(false);
                             handle.exit(0);
                         });
                     }
@@ -933,6 +954,8 @@ pub fn run() {
             legacy_upgrade::load_legacy_compute_question,
             legacy_upgrade::answer_legacy_compute_question,
             commands::claim_compute_prompt,
+            commands::acknowledge_compute_notice,
+            commands::set_keep_awake_while_sharing,
             commands::accept_compute_prompt,
             commands::start_node,
             commands::stop_node,
@@ -996,8 +1019,13 @@ pub fn run() {
             node_care::node_care_save_state,
             node_care::node_care_send,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running ARC desktop");
+        .build(tauri::generate_context!())
+        .expect("error while building ARC desktop")
+        .run(|_, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                sharing_awake::set_enabled(false);
+            }
+        });
 }
 
 #[cfg(test)]

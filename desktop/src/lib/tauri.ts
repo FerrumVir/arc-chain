@@ -2567,6 +2567,8 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
               ...submitted,
               computeConsent: mockConfig.computeConsent,
               preventSleepDuringJobs: mockConfig.preventSleepDuringJobs,
+              keepAwakeWhileSharing: mockConfig.keepAwakeWhileSharing,
+              computeDefaultNoticePending: mockConfig.computeDefaultNoticePending,
               role: mockConfig.role,
               modelPath: mockConfig.modelPath,
               workerThreads: mockConfig.workerThreads,
@@ -2575,9 +2577,18 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       }
       return undefined as T;
     }
-    case "load_config":
-      // What the native store holds: nothing until a save, as on a first launch.
+    case "load_config": {
+      if ((globalThis as { __ARC_MOCK_COMPUTE_PROMPT__?: boolean }).__ARC_MOCK_COMPUTE_PROMPT__ === true) {
+        const stored = JSON.parse(localStorage.getItem("arc-desktop-state-v1") ?? "{}").config;
+        const config = mockConfig ?? stored ?? DEFAULT_NODE_CONFIG;
+        mockConfig = config.computeConsent === false ? config : {
+          ...config, computeConsent: true,
+          workerThreads: config.workerThreads ?? defaultWorkerThreads(DEFAULT_HARDWARE.cpuCores),
+          computeDefaultNoticePending: true,
+        };
+      }
       return mockConfig as T;
+    }
     case "load_data_migration_notice":
       return null as T;
     case "dismiss_data_migration_notice":
@@ -3078,24 +3089,19 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return mockConfig as T;
     }
     case "claim_compute_prompt": {
-      // Mirrors commands.rs::claim_compute_prompt for the browser preview.
-      // `window.__ARC_MOCK_COMPUTE_PROMPT__ = true` stands for an install from
-      // before the default, with compute off, on a computer that can run the
-      // model; without it nothing is asked. As natively, the question is
-      // recorded before it is answered true and the record survives a reload,
-      // so it is asked once.
-      if ((globalThis as { __ARC_MOCK_COMPUTE_PROMPT__?: boolean }).__ARC_MOCK_COMPUTE_PROMPT__ !== true) {
-        return false as T;
-      }
-      try {
-        if (localStorage.getItem(MOCK_COMPUTE_PROMPT_KEY) !== null) return false as T;
+      return (mockConfig?.computeDefaultNoticePending === true
+        && mockConfig.computeConsent === true
+        && localStorage.getItem(MOCK_COMPUTE_PROMPT_KEY) === null) as T;
+    }
+    case "acknowledge_compute_notice": {
+      if (localStorage.getItem(MOCK_COMPUTE_PROMPT_KEY) === null)
         localStorage.setItem(MOCK_COMPUTE_PROMPT_KEY, String(Date.now()));
-      } catch {
-        // Not recorded, so not asked: a question that could repeat is worse
-        // than one that is missed.
-        return false as T;
-      }
-      return true as T;
+      return undefined as T;
+    }
+    case "set_keep_awake_while_sharing": {
+      const { enabled } = args as { enabled: boolean };
+      mockConfig = { ...(mockConfig ?? DEFAULT_NODE_CONFIG), keepAwakeWhileSharing: enabled };
+      return mockConfig as T;
     }
     case "accept_compute_prompt": {
       // Mirrors commands.rs::accept_compute_prompt: consent, and a quarter of
@@ -3407,6 +3413,8 @@ export const api = {
    * having asked before it answers, so true comes at most once per install.
    */
   claimComputePrompt: () => invoke<boolean>("claim_compute_prompt"),
+  acknowledgeComputeNotice: () => invoke<void>("acknowledge_compute_notice"),
+  setKeepAwakeWhileSharing: (enabled: boolean) => invoke<NodeConfig>("set_keep_awake_while_sharing", { enabled }),
   /** Whether the main window is visible now (hidden in the tray at login). */
   isMainWindowVisible,
   /**

@@ -46,6 +46,14 @@ pub fn nominal_ram_gb(visible_bytes: u64) -> u64 {
     visible_bytes / GIB
 }
 
+/// Minimal launch-time facts: no process scan, GPU probe or system_profiler.
+pub(crate) fn compute_capacity() -> (u64, u32) {
+    let mut sys = System::new();
+    sys.refresh_memory_specifics(sysinfo::MemoryRefreshKind::new().with_ram());
+    sys.refresh_cpu_list(sysinfo::CpuRefreshKind::new());
+    (nominal_ram_gb(sys.total_memory()), sys.cpus().len() as u32)
+}
+
 pub fn detect() -> HardwareInfo {
     let mut sys = System::new_all();
     sys.refresh_all();
