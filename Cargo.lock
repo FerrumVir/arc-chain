@@ -601,6 +601,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-vrf"
+version = "0.8.10"
+dependencies = [
+ "blst",
+ "curve25519-dalek",
+ "hex",
+ "rand 0.8.8",
+ "rand_core 0.6.4",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "zeroize",
+]
+
+[[package]]
 name = "ark-ff"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
