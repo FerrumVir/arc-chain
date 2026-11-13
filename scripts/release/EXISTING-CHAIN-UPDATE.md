@@ -6,7 +6,7 @@ The helper re-runs `select-pretag-artifacts.py` against the saved artifact API r
 
 The helper delegates quorum validation to tracked `scripts/release/update-quorum-validator.py` and records that script's hash. It requires a fresh advancing proof of every live host, pinned SSH identities, one common block, exact network pins, and every live host's process/hash to match the selected production artifact. By default all six validators must be live; the only exception is the declared-offline mode below, with up to two validators named offline by the owner input. The proof's RPC `genesis_network_hash` is recorded distinctly from the checkpoint verifier's signed-genesis hash; the latter must also equal the approved `genesis.network-hash` input file. Both values are retained without conflating the two fields. The verifier's certificate authority and stake set must equal the live validator pins plus the declared-offline pins, if any: each of the six signed validators is pinned exactly once.
 
-Native inference is irreversibly activated on the live chain. A host config row may therefore carry a `native` pin (`argv_tail`, `files_sha256`, `context_commitment`); pins must cover every host or none and share one context commitment. For a pinned host the running argv must end with exactly that tail, no native flag may appear anywhere else, and the proof row must repeat the pin and report identical native file hashes. An unpinned host must show no native flag and no native evidence.
+Native inference is irreversibly activated on the live chain. A host config row may therefore carry a `native` pin (`argv_tail`, `files_sha256`, `context_commitment`); pins must cover every host or none and share one context commitment. For a pinned host the running argv must end with exactly that tail followed by the optional desktop-only `argv_suffix` described below, no native flag may appear anywhere else, and the proof row must repeat the pin and report identical native file hashes. An unpinned host must show no native flag and no native evidence.
 
 The attestation is prepared against a planned `vX.Y.Z` and exact protected-main commit before that tag exists; it binds the tag version to pre-tag build metadata and the commit. The final release workflow remains responsible for requiring the real protected tag to resolve to that commit and current main. This avoids the release-cycle loop where a tag is needed to build the proof that must gate publishing the tag.
 
@@ -48,6 +48,9 @@ when an independent review finds the release's node changes compatible with the
 validators' current version. The compatibility review for v0.8.20 with v0.8.19
 validators is the initial use case; selecting the profile confirms that review.
 This is a release preparation path, not authorization to restart validators.
+
+Only this desktop profile permits an optional host `argv_suffix`, exactly `["--community-twin-execution", "--community-demand-pump", "--community-demand-dry-run"]` or `["--community-twin-execution", "--community-demand-pump"]`, immediately after the pinned native tail (or after the non-native prefix when there is no native pin).
+Every `--community-twin-*` and `--community-demand-*` argument must appear only in that exact pinned suffix; unpinned, missing, reordered or extended suffixes and suffix pins under the validator update profile are refused.
 
 Pass `--profile desktop-update-existing-validators-v1 --previous-release-tag
 vX.Y.Z --confirm-node-compatible` to the owner assembler, then use the same

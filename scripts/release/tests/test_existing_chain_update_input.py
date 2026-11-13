@@ -152,6 +152,16 @@ class UpdateInputTests(unittest.TestCase):
         with self.assertRaises(mod.InputError):
             mod.validate_bytes("quorum-proof.json", json.dumps(proof).encode())
 
+    def test_practice_suffix_is_a_public_host_field_only(self):
+        suffix = ["--community-twin-execution", "--community-demand-pump"]
+        mod.validate_bytes("host-config.json", json.dumps({
+            "hosts": [{"site": "lhr", "argv_suffix": suffix}]}).encode())
+        with self.assertRaises(mod.InputError):
+            mod.validate_bytes("host-config.json", json.dumps({"argv_suffix": suffix}).encode())
+        with self.assertRaises(mod.InputError):
+            mod.validate_bytes("quorum-proof.json", json.dumps({
+                "samples": [{"nodes": [{"argv_suffix": suffix}]}]}).encode())
+
     def test_declared_offline_fields_have_closed_public_contracts(self):
         config, proof, _ = self.five_live_fixture()
         mod.validate_bytes("host-config.json", json.dumps(config).encode())

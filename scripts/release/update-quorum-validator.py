@@ -6,6 +6,13 @@ import re
 import time
 from pathlib import Path
 
+DESKTOP_PROFILE = "desktop-update-existing-validators-v1"
+UPDATE_PROFILE = "existing-recovered-chain-update-v1"
+PRACTICE_SUFFIXES = (
+    ["--community-twin-execution", "--community-demand-pump", "--community-demand-dry-run"],
+    ["--community-twin-execution", "--community-demand-pump"],
+)
+
 HOST_SCHEMA = "arc.rollout.host-config.v1"
 QUORUM_SCHEMA = "arc.rollout.fresh-quorum.v1"
 MAX_PROOF_AGE = 120
@@ -34,6 +41,21 @@ def require(condition: bool, message: str) -> None:
 
 def is_native_arg(value: object) -> bool:
     return str(value).startswith("--native") or str(value).startswith("--enable-native")
+
+
+def is_practice_arg(value: object) -> bool:
+    return str(value).startswith(("--community-twin-", "--community-demand-"))
+
+
+def validate_argv_suffix(pin: dict, site: str, profile: str) -> list[str]:
+    if "argv_suffix" not in pin:
+        return []
+    require(profile == DESKTOP_PROFILE,
+            "argv_suffix requires the desktop update profile at " + site)
+    suffix = pin["argv_suffix"]
+    require(isinstance(suffix, list) and suffix in PRACTICE_SUFFIXES,
+            "argv_suffix must be an exact allowed practice-flag list at " + site)
+    return suffix
 
 
 def validate_native_pin(native: object, site: str) -> dict:
@@ -95,7 +117,7 @@ def strict_supermajority_threshold(total_stake: int) -> int:
     return 1 if total_stake == 0 else total_stake - (total_stake - 1) // 3
 
 
-def validate_host_config(config: dict) -> tuple[dict[str, dict], int, int]:
+def validate_host_config(config: dict, *, profile: str = UPDATE_PROFILE) -> tuple[dict[str, dict], int, int]:
     require(config.get("schema") == HOST_SCHEMA, "unsupported host config schema")
     total_stake = config.get("total_stake")
     quorum_stake = config.get("quorum_stake")
@@ -139,6 +161,7 @@ def validate_host_config(config: dict) -> tuple[dict[str, dict], int, int]:
             path = host[path_key]
             require(isinstance(path, str) and path.startswith("/") and ".." not in Path(path).parts,
                     "unsafe " + path_key + " for " + site)
+        validate_argv_suffix(host, site, profile)
         if "native" in host:
             validate_native_pin(host["native"], site)
         by_site[site] = host
@@ -164,9 +187,9 @@ def validate_host_config(config: dict) -> tuple[dict[str, dict], int, int]:
     return {s: by_site[s] for s in quorum_sites}, total_stake, quorum_stake
 
 
-def declared_offline_hosts(config: dict) -> dict[str, dict]:
+def declared_offline_hosts(config: dict, *, profile: str = UPDATE_PROFILE) -> dict[str, dict]:
     """Validate the whole host config and return its declared-offline validators by site."""
-    hosts, _, _ = validate_host_config(config)
+    hosts, _, _ = validate_host_config(config, profile=profile)
     return validate_declared_offline_rows(config, hosts)
 
 
@@ -221,7 +244,7 @@ def require_no_declared_rows(rows: object, declared: dict[str, dict], where: str
 
 
 def validate_quorum_proof(proof: dict, hosts: dict[str, dict], total_stake: int,
-                          quorum_stake: int, *, expected_network: dict | None = None,
+                          quorum_stake: int, *, profile: str = UPDATE_PROFILE, expected_network: dict | None = None,
                           now: float | None = None, declared_offline: dict[str, dict] | None = None) -> dict:
     now = time.time() if now is None else now
     declared = dict(declared_offline or {})
@@ -266,6 +289,13 @@ def validate_quorum_proof(proof: dict, hosts: dict[str, dict], total_stake: int,
             argv = row.get("argv_redacted")
             require(isinstance(argv, list) and argv and Path(argv[0]).name.startswith("arc-node."),
                     "running argv is absent or not an immutable versioned binary at " + site)
+            suffix = validate_argv_suffix(pin, site, profile)
+            if suffix:
+                require(len(argv) > len(suffix) and argv[-len(suffix):] == suffix,
+                        "running argv differs from the exact pinned argv_suffix at " + site)
+                argv = argv[:-len(suffix)]
+            require(not any(is_practice_arg(value) for value in argv),
+                    "practice arguments are forbidden outside the pinned argv_suffix at " + site)
             native = pin.get("native")
             if native is None:
                 require(not any(is_native_arg(value) for value in argv) and row.get("native") is None and
