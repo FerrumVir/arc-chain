@@ -497,6 +497,77 @@ cutover proves the sealed checkpoint and the six new validator keyfiles.
 
 ## 4. Build and prove the release candidate
 
+### User-facing explanation review — every tagged release
+
+The explanation-review step below applies to **every tagged release with
+user-facing explanations**, including desktop-only and legacy-bridge releases, and releases using
+the `existing-recovered-chain-update-v1` profile. Its scope extends beyond this
+document's cutover procedure; it does not impose cutover-only operations on an
+update or legacy-bridge release. The release owner is the checklist owner for this step and
+must link and sign off the completed record for the exact candidate **before
+creating its release tag or dispatching `release.yml`**. Without that signed-off
+record, do not tag or dispatch. This is a human process requirement, not an
+automated workflow guard.
+
+- [ ] **Review every applicable user-facing “how this works” explanation
+  against the exact release-candidate code before release sign-off.** This
+  includes unchanged explanations, not only strings changed in the release.
+  Account for desktop screens/help/errors, README and user/operator guides,
+  generated release notes, and any other explanation shipped or published with
+  the release. Inventory the surfaces searched, source revisions and exclusions
+  with reasons; a search for changed strings alone is not a complete inventory.
+
+Keep a traceable review record in the candidate's release PR or its linked
+internal release record, using the existing
+[PR template](../.github/PULL_REQUEST_TEMPLATE.md) Summary/Testing sections to
+link it. For each applicable explanation, record:
+
+| Required field | Review record |
+|---|---|
+| Wording and surface | Exact text (including applicable rendered substitutions), screen/state or document location, and source file/key or section. List each surface if wording is shared. |
+| Release and source | Candidate version and immutable commit SHA; separate wording and implementation revisions if they differ; exact code paths/functions supporting each claim. |
+| Conditions and defaults | Applicable platform, configuration/defaults, feature flags, prerequisites, routing/fallback and failure conditions. State what the explanation does and does not cover. |
+| Evidence | Links to source review and relevant test names/results at exact revisions, with fixtures and limits; separately record any authorized released-artifact/live observation, its version, environment and date, or explicitly “not verified”. |
+| Disposition | Reviewed now, carried forward with a validated basis, not reviewed, or not applicable with rationale. Record mismatches, resolution links and remaining unknowns. |
+| Accountability | Named reviewer, review date, and the checklist owner's sign-off linked to the record. An unassigned reviewer or owner is not completed review. |
+
+For unchanged wording, link its previous exact-text/source review and have the
+current reviewer check whether the relevant code, defaults, conditions and
+surfaces changed. Record that comparison and its evidence before carrying the
+review forward; unchanged text alone is not evidence of unchanged behaviour.
+If there is no traceable prior review, review it now or mark it **not reviewed**.
+Do not label an unexamined explanation checked. Account for every inventory
+entry; unexplained omissions, applicable entries not reviewed, and unresolved
+wording/code mismatches **block release sign-off**. Recheck affected entries if
+the candidate code, wording, defaults or conditions change after review.
+
+Keep evidence types separate: source review establishes what the inspected
+revision implements; synthetic tests establish only the exercised conditions;
+released-artifact and live observations establish only the identified build
+and environment at the recorded time. None automatically substitutes for the
+others. A wording-presence/source-drift assertion is not a behavioural test,
+and a source merge or synthetic PASS is not proof of release or deployment.
+If wording requires an unverified live/released fact, block that claim's
+sign-off until evidence or separately approved, accurate wording resolves it;
+this step does not authorize a live check or a public wording change.
+
+Use the existing [generated release-note template](../.github/workflows/release.yml)
+(`RELEASE_NOTES`) and
+[documentation contract checks](../tests/release/documentation_contract_test.sh),
+including their update-default/source checks, as supporting evidence, not a
+complete semantic audit. Link applicable behavioural tests such as
+[the inference coordinator tests](../desktop/tests/inference-coordinator.spec.ts)
+with their actual scope and result; do not infer that they validate every
+explanation. These checks supplement the aggregate release gate below.
+
+The release owner must adopt this process and record its use for the
+candidate. Humans retain release execution and existing approval boundaries.
+Checklist completion does not itself publish a release or approve held wording,
+tagging, publication or rollout. Adding the step does not mark any explanation
+reviewed; separate release and operational approvals remain required.
+
+### Candidate build and cutover-specific proof
+
 From a clean checkout with Node.js 24 LTS and Actionlint installed, require the
 single aggregate gate to pass:
 
