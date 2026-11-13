@@ -66,6 +66,8 @@ run_unittest "arc_ops: receipt reconciliation (P9)"     arc_ops.tests.test_recei
 # throwaway tree with stub cargo/npm/pgrep, so it builds nothing and never
 # looks at the processes actually running on the host.
 cd "$REPO_ROOT" || exit 1
+run_unittest "ci: exported-state privacy (ARC-410 L9)"        scripts/ci/tests/test_export_privacy.py
+run_unittest "ci: desktop dependency boundary (ARC-410 L10)" scripts/ci/tests/test_desktop_dependency_boundary.py
 run_unittest "release: SBOM builder (R2)"                    scripts/release/tests/test_sbom.py
 run_unittest "release: signing-path FIXTURE tests (R3/U7)"   scripts/release/tests/test_signing_fixtures.py
 run_unittest "release: local artifact verifier (R2)"         scripts/release/tests/test_verify_local_artifacts.py

@@ -1,0 +1,13 @@
+{
+  "schema": "arc.workers.scoreboard.v1",
+  "app_version": "0.8.16",
+  "node_version": "0.8.16+candle",
+  "workers": [
+    {"worker_id": "0xaaaa", "name": "node-1a2b3c4d", "runs": 3},
+    {"worker_id": "0xbbbb", "name": "harbor-relay", "runs": 1},
+    {"worker_id": "0xcccc", "name": "arc-1a2b3c4d", "runs": 0},
+    {"worker_id": "0xdddd", "name": "Macro economics desk", "runs": 0}
+  ],
+  "notes": "Exported from a synthetic fixture. Default Mac names such as <Name>s-MacBook-Pro are refused by the node; this sentence is prose, not a name.",
+  "host": {"hostname": "validator-nyc-01"}
+}
