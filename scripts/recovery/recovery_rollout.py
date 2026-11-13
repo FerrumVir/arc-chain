@@ -156,6 +156,8 @@ DEFAULT_PUBLIC_GET_PATHS = (
     "/economics/rewards",
     "/faucet/status",
     "/community/reward_policy",
+    "/community/twin_stats",
+    "/community/twin_receipts",
     "/workers/scoreboard",
     "/shards",
     "/models",
@@ -184,6 +186,7 @@ DEFAULT_PUBLIC_POST_PATHS = (
     "/community/heartbeat",
     "/community/claim_work",
     "/community/submit_work",
+    "/community/region",
     "/tx/submit",
     "/tx/submit_signed",
     "/tx/submit_batch",
@@ -199,6 +202,7 @@ PUBLIC_PARAMETERIZED_GET_PATHS = (
     "/worker/earnings/{address}",
     "/community/reward_receipt/{tx_hash}",
     "/community/reward_job/{job_id}",
+    "/community/twin/{job_id}",
 )
 INTERNAL_VALIDATOR_POST_PATHS = (
     "/internal/community/reward/approve",
@@ -10854,7 +10858,7 @@ WantedBy=multi-user.target
         method OPTIONS
         header Origin {PUBLIC_BROWSER_ORIGIN}
         header Access-Control-Request-Method GET
-        path {get_paths} /block/* /tx/* /account/* /account/*/txs /worker/earnings/* /community/reward_receipt/* /community/reward_job/*
+        path {get_paths} /block/* /tx/* /account/* /account/*/txs /worker/earnings/* /community/reward_receipt/* /community/reward_job/* /community/twin/*
     }}
     handle @readPreflight {{
         header Access-Control-Allow-Origin "{PUBLIC_BROWSER_ORIGIN}"
@@ -10883,7 +10887,7 @@ WantedBy=multi-user.target
     @corsRead {{
         method GET
         header Origin {PUBLIC_BROWSER_ORIGIN}
-        path {get_paths} /block/* /tx/* /account/* /account/*/txs /worker/earnings/* /community/reward_receipt/* /community/reward_job/*
+        path {get_paths} /block/* /tx/* /account/* /account/*/txs /worker/earnings/* /community/reward_receipt/* /community/reward_job/* /community/twin/*
     }}
     handle @corsRead {{
         header Access-Control-Allow-Origin "{PUBLIC_BROWSER_ORIGIN}"
@@ -10899,7 +10903,7 @@ WantedBy=multi-user.target
 
     @read {{
         method GET
-        path {get_paths} /block/* /tx/* /account/* /account/*/txs /worker/earnings/* /community/reward_receipt/* /community/reward_job/*
+        path {get_paths} /block/* /tx/* /account/* /account/*/txs /worker/earnings/* /community/reward_receipt/* /community/reward_job/* /community/twin/*
     }}
     handle @read {{
         request_body {{
@@ -11064,7 +11068,7 @@ http {{
             proxy_pass_request_body off;
             proxy_set_header Content-Length "";
         }}
-        location ~ ^/(?:health|info|network/info|stats|validators|block/latest|blocks|inference/readiness|inference/attestations|economics/rewards|faucet/status|community/reward_policy|workers/scoreboard|shards|models|models/shards)$ {{
+        location ~ ^/(?:health|info|network/info|stats|validators|block/latest|blocks|inference/readiness|inference/attestations|economics/rewards|faucet/status|community/reward_policy|community/twin_stats|community/twin_receipts|workers/scoreboard|shards|models|models/shards)$ {{
             auth_request /__arc_interlock_gate;
             limit_except GET OPTIONS {{ deny all; }}
             limit_req zone=arc_read_{zone} burst=60 nodelay;
@@ -11072,7 +11076,7 @@ http {{
             proxy_http_version 1.1;
             proxy_read_timeout 60s;
         }}
-        location ~ "^/(?:block/[0-9]+(?:/txs)?|tx/(?:0x)?[0-9a-fA-F]{{64}}(?:/full)?|account/(?:0x)?[0-9a-fA-F]{{64}}(?:/txs)?|worker/earnings/(?:0x)?[0-9a-fA-F]{{64}}|community/reward_(?:receipt|job)/(?:0x)?[0-9a-fA-F]{{64}})$" {{
+        location ~ "^/(?:block/[0-9]+(?:/txs)?|tx/(?:0x)?[0-9a-fA-F]{{64}}(?:/full)?|account/(?:0x)?[0-9a-fA-F]{{64}}(?:/txs)?|worker/earnings/(?:0x)?[0-9a-fA-F]{{64}}|community/reward_(?:receipt|job)/(?:0x)?[0-9a-fA-F]{{64}}|community/twin/(?:0x)?[0-9a-fA-F]{{64}})$" {{
             auth_request /__arc_interlock_gate;
             limit_except GET OPTIONS {{ deny all; }}
             limit_req zone=arc_read_{zone} burst=60 nodelay;
@@ -11100,7 +11104,7 @@ http {{
             proxy_read_timeout {WORKER_SUBMIT_TIMEOUT_SECONDS}s;
             proxy_send_timeout 60s;
         }}
-        location ~ ^/(?:community/(?:register|heartbeat|claim_work)|tx/submit(?:_signed|_batch)?)$ {{
+        location ~ ^/(?:community/(?:register|heartbeat|claim_work|region)|tx/submit(?:_signed|_batch)?)$ {{
             auth_request /__arc_interlock_gate;
             limit_except POST OPTIONS {{ deny all; }}
             limit_req zone=arc_write_{zone} burst=10 nodelay;
