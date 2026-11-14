@@ -185,6 +185,158 @@ class DesktopAssemblyTests(unittest.TestCase):
             acceptance.release_profile_for_assets(files | {"arc-existing-chain-update-attestation.json"})
 
 
+class PracticeSuffixTests(unittest.TestCase):
+    SUFFIXES = (
+        ["--community-twin-execution", "--community-demand-pump", "--community-demand-dry-run"],
+        ["--community-twin-execution", "--community-demand-pump"],
+    )
+
+    def fixture(self, suffix, native=True):
+        config, proof = existing.synthetic_update_inputs()
+        host = config["hosts"][0]
+        old_site = host["site"]
+        host.update(site="lhr", hostname="arc-node-lhr", unit="arc-node-v3-lhr.service")
+        config["quorum_sites"][0] = "lhr"
+        proof["common_block"]["hosts"][0]["site"] = "lhr"
+        pin = dict(argv_tail=list(existing.ExistingChainUpdateTests.NATIVE_TAIL),
+                   files_sha256=dict(existing.ExistingChainUpdateTests.NATIVE_FILES),
+                   context_commitment="d0" * 32)
+        if native:
+            for row in config["hosts"]:
+                row["native"] = copy.deepcopy(pin)
+        for sample in proof["samples"]:
+            for row in sample["nodes"]:
+                if row["site"] == old_site:
+                    row.update(site="lhr", hostname="arc-node-lhr")
+                if native:
+                    row["argv_redacted"].extend(pin["argv_tail"])
+                    row["native"] = copy.deepcopy(pin)
+                    row["native_files_sha256"] = dict(pin["files_sha256"])
+            sample["nodes"][0]["argv_redacted"].extend(suffix)
+        host["argv_suffix"] = list(suffix)
+        return config, proof
+
+    def check(self, config, proof, profile=previous.PROFILE, direct=False):
+        validator = existing.validator
+        hosts = {row["site"]: row for row in config["hosts"]}
+        total, quorum = config["total_stake"], config["quorum_stake"]
+        if not direct:
+            hosts, total, quorum = validator.validate_host_config(config, profile=profile)
+        return validator.validate_quorum_proof(proof, hosts, total, quorum,
+            profile=profile, expected_network=config, now=1080,
+            declared_offline={row["site"]: row for row in config["declared_offline"]})
+
+    def test_both_suffixes_with_and_without_native_pins_reach_assembler(self):
+        for suffix in self.SUFFIXES:
+            for native in (False, True):
+                with self.subTest(suffix=suffix, native=native):
+                    config, proof = self.fixture(suffix, native)
+                    self.assertTrue(all("argv_suffix" not in h for h in config["hosts"][1:]))
+                    self.assertEqual(self.check(config, proof)["host_count"], 4)
+                    result = DesktopAssemblyTests().assemble(config, proof)
+                    self.assertEqual(result["profile"], previous.PROFILE)
+                    self.assertEqual(result[assembler.LIVE_HOST_PROOF_KEY]["host_count"], 4)
+
+    def test_running_unpinned_practice_flags_fail_in_both_profiles(self):
+        for profile in (previous.PROFILE, assembler.UPDATE_PROFILE):
+            for native in (False, True):
+                for suffix in self.SUFFIXES:
+                    config, proof = self.fixture(suffix, native)
+                    del config["hosts"][0]["argv_suffix"]
+                    with self.subTest(profile=profile, native=native, suffix=suffix), \
+                         self.assertRaisesRegex(existing.validator.GateError, "lhr"):
+                        self.check(config, proof, profile)
+
+    def test_missing_reordered_extended_and_prefixed_runtime_suffixes_fail(self):
+        for native in (False, True):
+            for suffix in self.SUFFIXES:
+                for sample in (0, 1):
+                    mutations = {
+                        "absent": lambda argv: argv[:-len(suffix)],
+                        "wrong order": lambda argv: argv[:-len(suffix)] + list(reversed(suffix)),
+                        "extra": lambda argv: argv + ["--community-demand-pump"],
+                        "unknown": lambda argv: argv + ["--community-demand-unknown"],
+                        "unrelated": lambda argv: argv + ["--unexpected"],
+                        "value": lambda argv: argv + ["true"],
+                        "native in suffix": lambda argv: argv + ["--native-inference-runtime"],
+                        "practice prefix": lambda argv: argv[:1] + ["--community-twin-execution"] + argv[1:],
+                        "unknown practice prefix": lambda argv: argv[:1] + ["--community-demand-unknown=true"] + argv[1:],
+                        "native prefix": lambda argv: argv[:1] + ["--native-inference-runtime"] + argv[1:],
+                    }
+                    for name, mutate in mutations.items():
+                        config, proof = self.fixture(suffix, native)
+                        row = proof["samples"][sample]["nodes"][0]
+                        row["argv_redacted"] = mutate(row["argv_redacted"])
+                        with self.subTest(native=native, suffix=suffix, sample=sample, mutation=name), \
+                             self.assertRaisesRegex(existing.validator.GateError, "lhr"):
+                            self.check(config, proof)
+
+    def test_malformed_suffix_pins_fail_even_when_runtime_matches(self):
+        invalid = [None, [], "--community-twin-execution", {},
+                   list(reversed(self.SUFFIXES[1])), ["--community-demand-pump"],
+                   self.SUFFIXES[1] + ["--community-demand-unknown"],
+                   self.SUFFIXES[1] + ["--unexpected"],
+                   self.SUFFIXES[1] + ["true"],
+                   self.SUFFIXES[1] + ["--native-inference-runtime"],
+                   self.SUFFIXES[1] + ["--community-demand-pump"],
+                   ["--community-twin-execution=true", "--community-demand-pump"]]
+        for suffix in invalid:
+            for direct in (False, True):
+                config, proof = self.fixture([])
+                config["hosts"][0]["argv_suffix"] = suffix
+                for sample in proof["samples"]:
+                    sample["nodes"][0]["argv_redacted"].extend(suffix if isinstance(suffix, list) else [])
+                with self.subTest(suffix=suffix, direct=direct), \
+                     self.assertRaisesRegex(existing.validator.GateError, "lhr"):
+                    self.check(config, proof, direct=direct)
+
+    def test_suffix_pins_fail_under_validator_default_and_unknown_profiles(self):
+        for profile in (assembler.UPDATE_PROFILE, "unknown", None):
+            for direct in (False, True):
+                config, proof = self.fixture(self.SUFFIXES[1])
+                with self.subTest(profile=profile, direct=direct), \
+                     self.assertRaisesRegex(existing.validator.GateError, "desktop update profile at lhr"):
+                    self.check(config, proof, profile, direct=direct)
+        with self.assertRaisesRegex(existing.validator.GateError, "lhr"):
+            existing.validator.validate_host_config(config)
+        with self.assertRaisesRegex(existing.validator.GateError, "lhr"):
+            existing.validator.declared_offline_hosts(config)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config.json").write_text(json.dumps(config))
+            (root / "proof.json").write_text(json.dumps(proof))
+            with self.assertRaisesRegex(RuntimeError, "lhr"):
+                assembler.strict_proof(root / "proof.json", root / "config.json",
+                    existing.validator_path, existing.CANDIDATE, now=1080,
+                    declared_offline_sites=[row["site"] for row in config["declared_offline"]])
+
+    def test_suffix_cannot_mask_native_hash_context_or_other_host_checks(self):
+        mutations = {
+            "binary": lambda row: row.update(binary_sha256="0" * 64),
+            "identity": lambda row: row.update(validator="0" * 64),
+            "genesis": lambda row: row.update(genesis_sha256="0" * 64),
+            "data dir": lambda row: row["argv_redacted"].__setitem__(2, "/wrong"),
+            "wire": lambda row: row["argv_redacted"].insert(1, "--legacy-v3-wire"),
+            "native files": lambda row: row.update(native_files_sha256={}),
+            "context": lambda row: row["native"].update(context_commitment="0" * 64),
+            "stake": lambda row: row.update(active_stake=1),
+            "height": lambda row: row.update(height=100),
+        }
+        for name, mutate in mutations.items():
+            config, proof = self.fixture(self.SUFFIXES[1])
+            mutate(proof["samples"][1]["nodes"][0])
+            with self.subTest(mutation=name), self.assertRaisesRegex(existing.validator.GateError, "lhr"):
+                self.check(config, proof)
+
+    def test_unpinned_hosts_cannot_add_practice_flags(self):
+        for index in (1, 2, 3):
+            config, proof = self.fixture(self.SUFFIXES[1])
+            row = proof["samples"][1]["nodes"][index]
+            row["argv_redacted"].extend(self.SUFFIXES[1])
+            with self.subTest(site=row["site"]), self.assertRaisesRegex(existing.validator.GateError, row["site"]):
+                self.check(config, proof)
+
+
 class ProfileBoundaryTests(unittest.TestCase):
     def test_platform_provenance_helpers_accept_only_supported_update_profiles(self):
         linux = load("appimage_fixtures", ROOT / "tests/release/test_packaged_appimage_live_gate.py").GATE

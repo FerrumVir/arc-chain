@@ -108,7 +108,7 @@ def validate_public_fields(name, value):
                    "full_state_copy_qualification full_state_copy_qualification_sha256 scope")
         for host in value.get("hosts", []):
             fields(host, "site ip hostname validator stake unit data_dir genesis_path genesis_sha256 "
-                   "baseline_binary_sha256 legacy_v3_wire native")
+                   "baseline_binary_sha256 legacy_v3_wire native argv_suffix")
             if "native" in host:
                 fields(host["native"], "argv_tail files_sha256 context_commitment")
         for offline in rows(value, "declared_offline"):

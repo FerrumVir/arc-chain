@@ -111,19 +111,19 @@ def declared_offline_authority(config: dict) -> dict[str, int]:
 
 def strict_proof(proof_path: Path, config_path: Path, validator_path: Path,
                  expected_binary_sha256: str, now: float | None = None,
-                 declared_offline_sites=()) -> tuple[dict, dict]:
+                 declared_offline_sites=(), *, profile: str = UPDATE_PROFILE) -> tuple[dict, dict]:
     """Delegate all quorum semantics to the deployed, tested rollout validator."""
     proof, config = read_json(proof_path), read_json(config_path)
     validator = load_module(validator_path, "arc_rollout_current_profile_validator")
     need(callable(getattr(validator, "declared_offline_hosts", None)),
          "rollout validator lacks the declared-offline validator contract")
-    hosts, total, quorum = validator.validate_host_config(config)
-    declared = validator.declared_offline_hosts(config)
+    hosts, total, quorum = validator.validate_host_config(config, profile=profile)
+    declared = validator.declared_offline_hosts(config, profile=profile)
     confirm_declared_offline(declared, declared_offline_sites)
     expected = {key: config[key] for key in ("genesis_file_sha256", "genesis_network_hash",
         "recovery_domain", "checkpoint_manifest_hash", "validator_set_id")}
     summary = validator.validate_quorum_proof(proof, hosts, total, quorum,
-        expected_network=expected, **({"now": now} if now is not None else {}),
+        profile=profile, expected_network=expected, **({"now": now} if now is not None else {}),
         **({"declared_offline": declared} if declared else {}))
     need(len(declared) <= MAX_DECLARED_OFFLINE and len(hosts) + len(declared) == VALIDATOR_COUNT and
          len(proof.get("common_block", {}).get("hosts", [])) == len(hosts),
@@ -414,7 +414,7 @@ def assemble(args: argparse.Namespace) -> dict:
         proof_now = getattr(args, "proof_validation_time", None)
         proof_summary, checked_config = strict_proof(args.quorum_proof, args.host_config,
             args.rollout_validator, validator_binary_sha256, now=proof_now,
-            declared_offline_sites=getattr(args, "declared_offline", None) or ())
+            declared_offline_sites=getattr(args, "declared_offline", None) or (), profile=profile)
         need(checked_config == config, "host config changed during qualification")
     proof_summary["rpc_genesis_network_hash"] = config["genesis_network_hash"]
     # Only an update with explicit declarations names the offline validators and
