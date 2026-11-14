@@ -1119,6 +1119,11 @@ report from v0.6 users.
 
 ## Unreleased - 2026-04-22
 
+- Preserve existing workers’ core counts and below-floor model settings during default-sharing migration; retain explicit-consent startup downloads and avoid full hardware probing before first paint.
+
+- Desktop sharing defaults on for eligible installs without a stored answer, with a one-time notice and immediate Turn off. Optional keep-awake while sharing on mains power starts off and is separate from per-job keep-awake; automatic model downloads use the background power/network gate.
+
+
 **Cluster self-heal, latency-aware routing, slashing hook-in, retirement of dead seeds.**
 
 ### Self-heal daemon (GH #30)
