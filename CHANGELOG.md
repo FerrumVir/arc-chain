@@ -1119,6 +1119,8 @@ report from v0.6 users.
 
 ## Unreleased - 2026-04-22
 
+- Auto-shard-join excludes off-grid replicas from the production six-range tiling; full coverage with no fresh on-grid candidate returns a planning conflict.
+
 **Cluster self-heal, latency-aware routing, slashing hook-in, retirement of dead seeds.**
 
 ### Self-heal daemon (GH #30)
