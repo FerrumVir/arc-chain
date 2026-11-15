@@ -1982,6 +1982,7 @@ pub fn build_node_state(
         inference_http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::none())
+            .tcp_nodelay(true)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .pool_max_idle_per_host(8)
             .build()
@@ -10080,12 +10081,50 @@ fn verify_forward_shard_response_auth(
     verify_forward_shard_response_semantics(req, response)
 }
 
+#[inline]
+fn hash_i64_slice_le(values: &[i64]) -> Hash256 {
+    #[cfg(target_endian = "little")]
+    {
+        // Sound: i64 has no padding bytes, and on little-endian targets the
+        // memory layout of &[i64] matches sequential `.to_le_bytes()`.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
+        };
+        arc_crypto::hash_bytes(bytes)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut hasher = blake3::Hasher::new();
+        for v in values {
+            hasher.update(&v.to_le_bytes());
+        }
+        Hash256(*hasher.finalize().as_bytes())
+    }
+}
+
+#[inline]
+fn hash_tokens_le(tokens: &[u32]) -> Hash256 {
+    #[cfg(target_endian = "little")]
+    {
+        // Sound: u32 has no padding bytes, and on little-endian targets the
+        // memory layout of &[u32] matches sequential `.to_le_bytes()`.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(tokens.as_ptr() as *const u8, std::mem::size_of_val(tokens))
+        };
+        arc_crypto::hash_bytes(bytes)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut hasher = blake3::Hasher::new();
+        for t in tokens {
+            hasher.update(&t.to_le_bytes());
+        }
+        Hash256(*hasher.finalize().as_bytes())
+    }
+}
+
 fn hidden_state_hash_hex(hidden: &[i64]) -> String {
-    let bytes: Vec<u8> = hidden
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect();
-    format!("0x{}", arc_crypto::hash_bytes(&bytes).to_hex())
+    format!("0x{}", hash_i64_slice_le(hidden).to_hex())
 }
 
 fn is_hash256_hex(value: &str) -> bool {
@@ -12916,8 +12955,7 @@ async fn inference_run_sharded(
 
     if !force_recompute && let Some(cached_tokens) = node.inference_cache.get(&cache_key) {
         let output_text = model.decode(&cached_tokens);
-        let output_bytes: Vec<u8> = cached_tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
-        let output_hash = arc_crypto::hash_bytes(&output_bytes);
+        let output_hash = hash_tokens_le(&cached_tokens);
         let elapsed_us = overall_start.elapsed().as_micros() as u64;
 
         // A cache hit is NOT a sharded run: no pipeline was walked, no
@@ -13038,8 +13076,7 @@ async fn inference_run_sharded(
     let total_ms = overall_start.elapsed().as_millis() as u64;
     let generated = run.generated;
     let output_text = model.decode(&generated);
-    let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
-    let output_hash = arc_crypto::hash_bytes(&output_bytes);
+    let output_hash = hash_tokens_le(&generated);
     let shard_trace = render_shard_trace(&pipeline, &run.hop_stats);
 
     node.sharded_runs_total.fetch_add(1, Ordering::Relaxed);
@@ -13483,8 +13520,7 @@ async fn inference_run_consensus(
     let generated = run.generated;
     let votes = run.votes;
     let output_text = model.decode(&generated);
-    let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
-    let output_hash = arc_crypto::hash_bytes(&output_bytes);
+    let output_hash = hash_tokens_le(&generated);
     let shard_trace = render_shard_trace(&pipeline, &run.hop_stats);
     let quorum_verified = free_consensus_quorum_verified(&pipeline, &run.hop_stats, &votes);
     let assurance = free_inference_assurance(true, quorum_verified);
@@ -21082,6 +21118,96 @@ mod tests {
             verify_forward_shard_response_auth(None, &request, &wrong_shape, &active)
                 .unwrap_err()
                 .contains("terminal=true")
+        );
+    }
+
+    #[test]
+    fn zero_allocation_slice_hashing_matches_byte_collection_baseline() {
+        // 1. Boundary values
+        let i64_values: Vec<i64> = vec![
+            -9223372036854775808,
+            -1,
+            0,
+            1,
+            42,
+            1337,
+            9223372036854775807,
+        ];
+        let baseline_i64_bytes: Vec<u8> =
+            i64_values.iter().flat_map(|v| (*v).to_le_bytes()).collect();
+        let baseline_i64_hash = arc_crypto::hash_bytes(&baseline_i64_bytes);
+        assert_eq!(hash_i64_slice_le(&i64_values), baseline_i64_hash);
+        assert_eq!(
+            hidden_state_hash_hex(&i64_values),
+            format!("0x{}", baseline_i64_hash.to_hex())
+        );
+
+        let u32_values: Vec<u32> = vec![0u32, 1, 42, 1337, 65535, u32::MAX];
+        let baseline_u32_bytes: Vec<u8> =
+            u32_values.iter().flat_map(|t| (*t).to_le_bytes()).collect();
+        let baseline_u32_hash = arc_crypto::hash_bytes(&baseline_u32_bytes);
+        assert_eq!(hash_tokens_le(&u32_values), baseline_u32_hash);
+
+        // 2. Empty slice edge cases
+        let empty_i64: Vec<i64> = vec![];
+        let baseline_empty_i64_bytes: Vec<u8> =
+            empty_i64.iter().flat_map(|v| (*v).to_le_bytes()).collect();
+        assert_eq!(
+            hash_i64_slice_le(&empty_i64),
+            arc_crypto::hash_bytes(&baseline_empty_i64_bytes)
+        );
+        assert_eq!(
+            hidden_state_hash_hex(&empty_i64),
+            format!(
+                "0x{}",
+                arc_crypto::hash_bytes(&baseline_empty_i64_bytes).to_hex()
+            )
+        );
+
+        let empty_u32: Vec<u32> = vec![];
+        let baseline_empty_u32_bytes: Vec<u8> =
+            empty_u32.iter().flat_map(|t| (*t).to_le_bytes()).collect();
+        assert_eq!(
+            hash_tokens_le(&empty_u32),
+            arc_crypto::hash_bytes(&baseline_empty_u32_bytes)
+        );
+
+        // 3. Single-element slice
+        let single_i64: Vec<i64> = vec![42];
+        let baseline_single_i64: Vec<u8> =
+            single_i64.iter().flat_map(|v| (*v).to_le_bytes()).collect();
+        assert_eq!(
+            hash_i64_slice_le(&single_i64),
+            arc_crypto::hash_bytes(&baseline_single_i64)
+        );
+
+        // 4. Arbitrary odd length
+        let odd_len_i64: Vec<i64> = (0..17).map(|i| (i * 101 - 50) as i64).collect();
+        let baseline_odd_i64: Vec<u8> = odd_len_i64
+            .iter()
+            .flat_map(|v| (*v).to_le_bytes())
+            .collect();
+        assert_eq!(
+            hash_i64_slice_le(&odd_len_i64),
+            arc_crypto::hash_bytes(&baseline_odd_i64)
+        );
+
+        // 5. Realistic production hidden dimension tensor (4,096 elements)
+        let large_tensor: Vec<i64> = (0..4096).map(|i| (i as i64 * 31) ^ 0x5a5a).collect();
+        let baseline_large_bytes: Vec<u8> = large_tensor
+            .iter()
+            .flat_map(|v| (*v).to_le_bytes())
+            .collect();
+        assert_eq!(
+            hash_i64_slice_le(&large_tensor),
+            arc_crypto::hash_bytes(&baseline_large_bytes)
+        );
+        assert_eq!(
+            hidden_state_hash_hex(&large_tensor),
+            format!(
+                "0x{}",
+                arc_crypto::hash_bytes(&baseline_large_bytes).to_hex()
+            )
         );
     }
 
