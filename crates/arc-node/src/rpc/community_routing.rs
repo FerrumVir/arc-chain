@@ -27,6 +27,25 @@ struct HeldWork {
     explore: bool,
 }
 
+/// Owned by one admitted long poll. A selection can become ineligible before
+/// the claim/bind gate; do not select that leg again during this poll. Other
+/// workers (and the next poll from this worker) may still take it.
+#[derive(Default)]
+pub(super) struct ClaimPoll {
+    refused: HashSet<String>,
+}
+
+impl ClaimPoll {
+    pub(super) fn excludes(&self, job: &str) -> bool {
+        self.refused.contains(job)
+    }
+
+    pub(super) fn refuse(&mut self, node: &NodeState, item: WorkItem) {
+        self.refused.insert(item.job_id.clone());
+        twin_dispatch::requeue_item(node, item);
+    }
+}
+
 #[derive(Default)]
 pub(super) struct RoutingState {
     /// Seconds per position, using the same alpha as the displayed latency EWMA.
@@ -210,9 +229,10 @@ pub(super) fn poll(
     node: &NodeState,
     worker: &str,
     queue: &mut Receiver<WorkItem>,
+    claim: &ClaimPoll,
 ) -> Result<Option<WorkItem>, TryRecvError> {
-    if node.community_twin.config.fan_out() {
-        return poll_fanout(node, worker, queue);
+    if node.community_twin.config.effective_reserve() > 0 {
+        return poll_with_reserve(node, worker, queue, claim);
     }
     let mut state = node.community_routing.lock();
     // Temporarily take the list only inside this synchronous critical section.
@@ -253,12 +273,14 @@ pub(super) fn poll(
     }
 }
 
-/// Fan-out uses a separate bounded pump queue. Examine all available caller
-/// candidates before it, including items held for a different worker.
-fn poll_fanout(
+/// With an explicit reserve or fan-out, examine all shared candidates without
+/// dequeuing ineligible legs on every attempt. Fan-out then tries its separate
+/// pump queue. The no-flag path above retains the original refusal response.
+fn poll_with_reserve(
     node: &NodeState,
     worker: &str,
     queue: &mut Receiver<WorkItem>,
+    claim: &ClaimPoll,
 ) -> Result<Option<WorkItem>, TryRecvError> {
     let mut state = node.community_routing.lock();
     let mut work = std::mem::take(&mut state.held);
@@ -293,6 +315,7 @@ fn poll_fanout(
         let targeted = candidate.item.expected_worker_id.as_deref();
         let twin = twin_dispatch::is_twin_leg(node, &candidate.item.job_id);
         let eligible = selected.is_none()
+            && !claim.excludes(&candidate.item.job_id)
             && if targeted.is_some() || twin {
                 targeted.is_none_or(|id| id == worker)
                     && twin_dispatch::may_claim(node, &candidate.item.job_id, worker)
@@ -312,7 +335,7 @@ fn poll_fanout(
     if selected.is_some() {
         return Ok(selected);
     }
-    if !callers_waiting && let Some(item) = twin_dispatch::poll_pump(node, worker) {
+    if !callers_waiting && let Some(item) = twin_dispatch::poll_pump(node, worker, claim) {
         return Ok(Some(item));
     }
     if disconnected && !callers_waiting {

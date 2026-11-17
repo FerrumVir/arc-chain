@@ -249,8 +249,13 @@ starts replacement work. Dry runs log the number of groups and idle workers.
 
 Fan-out pump work uses its own queue (at most 64 legs), consumes no public
 inference permit, and yields to caller work at both planning and claim time.
-The original caller queue remains 256 items. Ineligible pump candidates are
-skipped within the same long poll. Independence and diversity preferences remain;
+The caller channel remains 256 items; opt-in routing also holds candidates outside
+that channel. Current public producers are bounded by two inference permits.
+With fan-out or an explicit reserve, routing checks eligibility without recording
+refusals. A leg refused or deferred after selection is requeued once and excluded
+for the rest of that worker's long poll; other eligible work can still be served.
+Idle polling retains its 25 ms cadence. With no new flags, a refusal still returns
+the original immediate `no_work` response. Independence and diversity preferences remain;
 the pump's least-recently-served deferral is disabled only in fan-out mode.
 
 **Capacity distinction:** fan-out permits up to 32 pump groups separately from

@@ -974,27 +974,53 @@ pub(super) fn may_claim(node: &NodeState, job_id: &str, worker: &str) -> bool {
 /// Separate queue keeps fan-out pump legs out of the caller's bounded channel.
 /// Called only after routing has examined caller work; refused legs stay here
 /// while the same claimer tries every other candidate.
-pub(super) fn poll_pump(node: &NodeState, worker: &str) -> Option<WorkItem> {
+pub(super) fn poll_pump(
+    node: &NodeState,
+    worker: &str,
+    claim: &community_routing::ClaimPoll,
+) -> Option<WorkItem> {
     if !node.community_twin.config.fan_out()
         || !exact_live_inference_worker(node, worker)
         || node.public_inference_permits.available_permits() < PUBLIC_INFERENCE_CONCURRENCY
     {
         return None;
     }
-    let count = node.community_twin.inner.lock().pump_queue.len();
-    for _ in 0..count {
-        let item = node.community_twin.inner.lock().pump_queue.pop_front()?;
+    // Inspect a bounded ID snapshot without rotating refused legs through the
+    // queue. Release the twin lock before the eligibility check takes it again.
+    let candidates: Vec<_> = node
+        .community_twin
+        .inner
+        .lock()
+        .pump_queue
+        .iter()
+        .map(|item| (item.job_id.clone(), item.expires_at_unix_ms))
+        .collect();
+    for (job_id, expires_at) in candidates {
         let live = node
             .community_work_results
             .as_ref()
-            .is_some_and(|results| results.contains_key(&item.job_id));
-        if !live || item.expires_at_unix_ms <= now_unix_ms() {
+            .is_some_and(|results| results.contains_key(&job_id));
+        if !live || expires_at <= now_unix_ms() {
+            node.community_twin
+                .inner
+                .lock()
+                .pump_queue
+                .retain(|item| item.job_id != job_id);
             continue;
         }
-        if claim_decision_inner(node, &item.job_id, worker, false) == Some(ClaimDecision::Accept) {
-            return Some(item);
+        if claim.excludes(&job_id)
+            || claim_decision_inner(node, &job_id, worker, false) != Some(ClaimDecision::Accept)
+        {
+            continue;
         }
-        requeue_item(node, item);
+        let mut inner = node.community_twin.inner.lock();
+        if let Some(index) = inner
+            .pump_queue
+            .iter()
+            .position(|item| item.job_id == job_id)
+        {
+            return inner.pump_queue.remove(index);
+        }
     }
     None
 }
@@ -3283,7 +3309,7 @@ mod tests {
         for id in ["worker-3", "worker-4", "worker-5"] {
             node.community_active_jobs.remove(id);
         }
-        assert!(poll_pump(&node, "worker-1").is_none());
+        assert!(poll_pump(&node, "worker-1", &community_routing::ClaimPoll::default()).is_none());
         assert_eq!(
             claim_decision(&node, &first, "worker-1"),
             Some(ClaimDecision::Defer("pump_worker_reserve"))
@@ -3494,6 +3520,271 @@ mod tests {
         tick.await.unwrap().unwrap();
         assert_eq!(node.community_twin.pump_groups.load(Ordering::Acquire), 0);
         assert_eq!(node.public_inference_permits.available_permits(), 2);
+    }
+
+    /// The reviewer regression now covers a complete long poll, including
+    /// serial-with-reserve and fan-out, with a strict once-per-leg bound.
+    #[tokio::test(start_paused = true)]
+    async fn review_refused_claim_retry_does_not_hot_loop() {
+        for (reserve, max_groups) in [(0, 1), (4, 1), (0, 8)] {
+            let node = fanout_node(3, reserve, max_groups);
+            let dispatcher = spawn_dispatch(&node, DemandSource::PublicRequest);
+            wait_for_pending(&node, 2).await;
+            node.community_active_jobs.remove("worker-0");
+            let first = job_of(&claim(&node, "worker-0").await);
+            node.community_active_jobs.remove("worker-0");
+            let before = node.community_twin.inner.lock().counters.pairing_refused;
+            let start = tokio::time::Instant::now();
+            let response = claim(&node, "worker-0").await;
+            let refusals = node.community_twin.inner.lock().counters.pairing_refused - before;
+            assert_eq!(response["status"], "no_work");
+            assert!(
+                refusals <= 1,
+                "recorded {refusals} refusals in one long poll"
+            );
+            if reserve == 0 && max_groups == 1 {
+                assert_eq!(refusals, 1);
+                assert_eq!(response["reason"], twin::REASON_SAME_WORKER);
+                assert!(start.elapsed() < Duration::from_secs(1));
+            } else {
+                assert_eq!(refusals, 0, "eligibility peeks must not record refusals");
+                assert!(start.elapsed() >= Duration::from_secs(COMMUNITY_CLAIM_TIMEOUT_SECS));
+            }
+            // The refused leg remains available to a different worker.
+            node.community_active_jobs.remove("worker-1");
+            assert_ne!(job_of(&claim(&node, "worker-1").await), first);
+            dispatcher.abort();
+            let _ = dispatcher.await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reserve_poll_serves_new_eligible_caller_behind_refused_sibling() {
+        for (reserve, max_groups) in [(4, 1), (0, 8)] {
+            let node = fanout_node(6, reserve, max_groups);
+            let first_dispatch = spawn_dispatch(&node, DemandSource::PublicRequest);
+            wait_for_pending(&node, 2).await;
+            node.community_active_jobs.remove("worker-0");
+            let first = job_of(&claim(&node, "worker-0").await);
+            node.community_active_jobs.remove("worker-0");
+            let poll_node = node.clone();
+            let waiting = tokio::spawn(async move { claim(&poll_node, "worker-0").await });
+            // Let the same poll encounter the refused sibling before new work.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!waiting.is_finished());
+            let second_dispatch = spawn_dispatch(&node, DemandSource::PublicRequest);
+            wait_for_pending(&node, 4).await;
+            let response = tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .expect("eligible work must be served by the waiting poll")
+                .unwrap();
+            let next = job_of(&response);
+            {
+                let inner = node.community_twin.inner.lock();
+                assert_ne!(inner.leg_to_group[&first].0, inner.leg_to_group[&next].0);
+                assert_eq!(inner.counters.pairing_refused, 0);
+            }
+            first_dispatch.abort();
+            second_dispatch.abort();
+            let _ = first_dispatch.await;
+            let _ = second_dispatch.await;
+        }
+    }
+
+    /// Deterministically interleave selection and claim, exactly where the
+    /// handler can race. A new sibling claim makes the selected leg ineligible.
+    #[tokio::test(start_paused = true)]
+    async fn fanout_selection_race_refuses_once_and_keeps_other_work_reachable() {
+        for (reason, new_work) in [
+            (twin::REASON_SAME_WORKER, false),
+            (twin::REASON_SAME_WORKER, true),
+            ("caller_inference_in_flight", false),
+            ("caller_inference_in_flight", true),
+            ("pump_worker_reserve", false),
+            ("pump_worker_reserve", true),
+        ] {
+            let node = fanout_node(6, 0, 8);
+            let dispatcher = spawn_dispatch(&node, DemandSource::PumpDemo);
+            wait_for_pending(&node, 2).await;
+            let mut poll = community_routing::ClaimPoll::default();
+            let queue = node.community_work_queue.as_ref().unwrap();
+            let selected =
+                poll_community_work_queue(queue, Duration::ZERO, Some((&node, "worker-0", &poll)))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let sibling = poll_pump(&node, "worker-0", &poll).unwrap();
+            let caller_permit = (reason == "caller_inference_in_flight").then(|| {
+                node.public_inference_permits
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap()
+            });
+            if reason == "pump_worker_reserve" {
+                for i in 1..6 {
+                    node.community_active_jobs
+                        .insert(format!("worker-{i}"), "busy".into());
+                }
+            } else if reason == twin::REASON_SAME_WORKER {
+                assert_eq!(
+                    claim_decision(&node, &sibling.job_id, "worker-0"),
+                    Some(ClaimDecision::Accept)
+                );
+            }
+            {
+                let _gate = node.community_routing.lock();
+                let decision = claim_decision(&node, &selected.job_id, "worker-0");
+                assert_eq!(decision.and_then(refusal_reason), Some(reason));
+                poll.refuse(&node, selected.clone());
+            }
+            // Even if the raced condition clears, this poll must not pick that
+            // leg again. A fresh poll or another worker may still take it.
+            drop(caller_permit);
+            for i in 1..6 {
+                node.community_active_jobs
+                    .insert(format!("worker-{i}"), String::new());
+            }
+            release_claim(&node, &sibling.job_id, "worker-0");
+            assert!(may_claim(&node, &selected.job_id, "worker-0"));
+            let other = new_work.then(|| spawn_dispatch(&node, DemandSource::PumpDemo));
+            if new_work {
+                wait_for_pending(&node, 4).await;
+            }
+            let response = poll_community_work_queue(
+                queue,
+                Duration::from_secs(COMMUNITY_CLAIM_TIMEOUT_SECS),
+                Some((&node, "worker-0", &poll)),
+            )
+            .await
+            .unwrap();
+            if new_work {
+                let job = response
+                    .expect("same poll must find another eligible group")
+                    .job_id;
+                let inner = node.community_twin.inner.lock();
+                assert_ne!(
+                    inner.leg_to_group[&job].0,
+                    inner.leg_to_group[&selected.job_id].0
+                );
+            } else {
+                assert!(response.is_none());
+                assert_eq!(node.community_twin.inner.lock().pump_queue.len(), 1);
+            }
+            assert_eq!(
+                node.community_twin.inner.lock().counters.pairing_refused,
+                u64::from(reason == twin::REASON_SAME_WORKER)
+            );
+            let fresh = community_routing::ClaimPoll::default();
+            assert_eq!(
+                poll_pump(&node, "worker-0", &fresh).unwrap().job_id,
+                selected.job_id
+            );
+            dispatcher.abort();
+            let _ = dispatcher.await;
+            if let Some(other) = other {
+                other.abort();
+                let _ = other.await;
+            }
+        }
+    }
+
+    /// Concurrent claimers must never leave fewer than the reserve idle.
+    #[tokio::test]
+    async fn review_concurrent_claims_keep_reserve() {
+        for round in 0..20 {
+            let node = fanout_node(8, 0, 8); // effective reserve 2
+            run_demand_tick(&node).await.unwrap();
+            assert_eq!(node.community_twin.pump_groups.load(Ordering::Acquire), 3);
+            for id in ["worker-5", "worker-6", "worker-7"] {
+                node.community_active_jobs
+                    .insert(id.to_string(), format!("busy-{id}"));
+            }
+            for i in 0..5 {
+                node.community_active_jobs.remove(&format!("worker-{i}"));
+            }
+            let mut handles = Vec::new();
+            for i in 0..5 {
+                let node = node.clone();
+                handles.push(tokio::spawn(async move {
+                    tokio::time::timeout(
+                        Duration::from_millis(400),
+                        claim(&node, &format!("worker-{i}")),
+                    )
+                    .await
+                    .ok()
+                    .filter(|v| v["status"] == "work")
+                    .is_some()
+                }));
+            }
+            let mut won = 0;
+            for handle in handles {
+                if handle.await.unwrap() {
+                    won += 1;
+                }
+            }
+            assert!(
+                won <= 3,
+                "round {round}: {won} pump legs left fewer than 2 idle"
+            );
+        }
+    }
+
+    /// A fan-out pump dispatch cancelled while collecting releases its slot,
+    /// leaves no queued legs, and a late result from its claimed leg stays a
+    /// non-reward late leg.
+    #[tokio::test]
+    async fn review_cancelled_fanout_group_late_leg_is_not_settled() {
+        let node = fanout_node(6, 0, 8);
+        let dispatcher = spawn_dispatch(&node, DemandSource::PumpDemo);
+        for _ in 0..200 {
+            if node.community_twin.inner.lock().pump_queue.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(node.community_twin.pump_groups.load(Ordering::Acquire), 1);
+        node.community_active_jobs.remove("worker-0");
+        let job = job_of(&claim(&node, "worker-0").await);
+        dispatcher.abort();
+        let _ = dispatcher.await;
+        {
+            let inner = node.community_twin.inner.lock();
+            assert!(inner.groups.is_empty());
+            assert!(inner.pump_queue.is_empty());
+            assert!(inner.pump_legs.contains_key(&job));
+        }
+        assert_eq!(node.community_twin.pump_groups.load(Ordering::Acquire), 0);
+        let late = submit(&node, result(&job, "worker-0", "late")).await;
+        assert_eq!(late["twin"]["status"], "late_after_resolution");
+        assert!(late.get("settlement").is_none());
+    }
+
+    /// No new flag: pump legs still use the shared caller channel and ring.
+    #[tokio::test]
+    async fn review_default_pump_uses_shared_channel_and_ring() {
+        let node = fanout_node(4, 0, 1);
+        let task_node = node.clone();
+        let tick = tokio::spawn(async move { run_demand_tick(&task_node).await });
+        wait_for_pending(&node, 2).await;
+        assert!(node.community_twin.inner.lock().pump_queue.is_empty());
+        assert_eq!(
+            node.community_work_tx.as_ref().unwrap().capacity(),
+            COMMUNITY_WORK_QUEUE_CAP - 2
+        );
+        let group = node
+            .community_twin
+            .inner
+            .lock()
+            .groups
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        resolve_twin_group(&node, &group).await;
+        tick.await.unwrap().unwrap();
+        let inner = node.community_twin.inner.lock();
+        assert!(inner.pump_legs.is_empty());
+        assert_eq!(inner.resolved_legs.len(), 2);
     }
 
     #[test]

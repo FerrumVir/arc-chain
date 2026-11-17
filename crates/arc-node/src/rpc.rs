@@ -14593,13 +14593,13 @@ const COMMUNITY_CLAIM_TIMEOUT_SECS: u64 = 30;
 async fn poll_community_work_queue(
     queue: &Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<WorkItem>>>,
     timeout: tokio::time::Duration,
-    claimant: Option<(&NodeState, &str)>,
+    claimant: Option<(&NodeState, &str, &community_routing::ClaimPoll)>,
 ) -> Result<Option<WorkItem>, ()> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let mut queue = queue.lock().await;
-        let attempt = if let Some((node, worker)) = claimant {
-            community_routing::poll(node, worker, &mut queue)
+        let attempt = if let Some((node, worker, claim)) = claimant {
+            community_routing::poll(node, worker, &mut queue, claim)
         } else {
             queue.try_recv().map(Some)
         };
@@ -17549,16 +17549,13 @@ pub async fn community_claim_work(
 
     let timeout = tokio::time::Duration::from_secs(COMMUNITY_CLAIM_TIMEOUT_SECS);
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut retry_claim = false;
+    let mut claim_poll = community_routing::ClaimPoll::default();
     loop {
-        if retry_claim {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let response = match poll_community_work_queue(
             work_rx,
             remaining,
-            Some((&node, &req.worker_id)),
+            Some((&node, &req.worker_id, &claim_poll)),
         )
         .await
         {
@@ -17620,17 +17617,19 @@ pub async fn community_claim_work(
                     .then(|| node.community_routing.lock());
                 let twin_claim = twin_dispatch::claim_decision(&node, &item.job_id, &req.worker_id);
                 if let Some(reason) = twin_claim.and_then(twin_dispatch::refusal_reason) {
-                    twin_dispatch::requeue_item(&node, item);
-                    drop(claim_gate);
-                    if node.community_twin.config.fan_out()
-                        || node.community_twin.config.effective_reserve() > 0
-                    {
+                    if node.community_twin.config.effective_reserve() > 0 {
+                        // Peek/claim races are possible. Requeue once, exclude
+                        // this leg for the rest of this poll, then examine other
+                        // work. Empty polls use the normal 25 ms cadence.
+                        claim_poll.refuse(&node, item);
+                        drop(claim_gate);
                         if tokio::time::Instant::now() >= deadline {
                             return Ok(Json(json!({ "status": "no_work" })));
                         }
-                        retry_claim = true;
                         continue;
                     }
+                    twin_dispatch::requeue_item(&node, item);
+                    drop(claim_gate);
                     return Ok(Json(json!({
                         "status": "no_work",
                         "reason": reason,
