@@ -1,3 +1,6 @@
+> **Last changed 2026-09-02. This document is historical, not current guidance.**
+> Check behaviour in the code, and start with [AGENTS.md](../AGENTS.md).
+
 # Inference Investigation — Tier-1 On-Chain Inference Does Not Finalize on the Live Seeds
 
 > **Dated incident record.** Statements below about worker count, working

@@ -1,3 +1,6 @@
+> **Last changed 2026-09-08. This is the one-time protocol-v3 recovery and cutover checklist, kept for history.**
+> Other docs still link to it, and the doc contract test still checks its bash blocks. For updating an existing recovered chain, see [scripts/release/EXISTING-CHAIN-UPDATE.md](../scripts/release/EXISTING-CHAIN-UPDATE.md). Check behaviour in the code, and start with [AGENTS.md](../AGENTS.md).
+
 # ARC validator fleet recovery and protocol-v3 cutover
 
 This is an incident-recovery checklist, not authorization to modify the

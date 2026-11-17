@@ -1,3 +1,6 @@
+> **Last changed 2026-09-02. This document is historical, not current guidance.**
+> Check behaviour in the code, and start with [AGENTS.md](../AGENTS.md).
+
 # ARC Chain Scale Architecture - True Spec
 
 > **Historical design record.** The session observations below are not current

@@ -1,3 +1,6 @@
+> **Last changed 2026-09-02. This document is historical, not current guidance.**
+> Check behaviour in the code, and start with [AGENTS.md](../AGENTS.md).
+
 # Session Handoff — Tier 1 On-Chain Inference (archived 2026-05-16)
 
 > **Historical implementation handoff, not current rollout state or operator

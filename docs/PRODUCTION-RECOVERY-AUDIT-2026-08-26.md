@@ -1,3 +1,6 @@
+> **Last changed 2026-09-08. This document is historical, not current guidance.**
+> Check behaviour in the code, and start with [AGENTS.md](../AGENTS.md).
+
 # ARC production-recovery audit — 2026-08-26
 
 This is a read-only evidence snapshot plus the contract of the unreleased
