@@ -17548,164 +17548,179 @@ pub async fn community_claim_work(
     ))?;
 
     let timeout = tokio::time::Duration::from_secs(COMMUNITY_CLAIM_TIMEOUT_SECS);
-    match poll_community_work_queue(work_rx, timeout, Some((&node, &req.worker_id))).await {
-        Ok(Some(item)) => {
-            if item.expires_at_unix_ms <= now_unix_ms() {
-                if let Some(results) = node.community_work_results.as_ref() {
-                    results.remove(&item.job_id);
-                }
-                return Ok(Json(json!({
-                    "status": "no_work",
-                    "reason": "job_expired",
-                })));
-            }
-            if item
-                .expected_worker_id
-                .as_deref()
-                .is_some_and(|expected| expected != req.worker_id)
-            {
-                if let Some(ref tx) = node.community_work_tx {
-                    let job_id = item.job_id.clone();
-                    if tx.try_send(item).is_err()
-                        && let Some(results) = node.community_work_results.as_ref()
-                    {
-                        results.remove(&job_id);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut retry_claim = false;
+    loop {
+        if retry_claim {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let response = match poll_community_work_queue(
+            work_rx,
+            remaining,
+            Some((&node, &req.worker_id)),
+        )
+        .await
+        {
+            Ok(Some(item)) => {
+                if item.expires_at_unix_ms <= now_unix_ms() {
+                    if let Some(results) = node.community_work_results.as_ref() {
+                        results.remove(&item.job_id);
                     }
+                    return Ok(Json(json!({
+                        "status": "no_work",
+                        "reason": "job_expired",
+                    })));
                 }
-                return Ok(Json(json!({
-                    "status": "no_work",
-                    "reason": "worker_mismatch",
-                })));
-            }
-            // Exact model commitments, not display names, decide whether this
-            // worker can execute the coordinator-issued job.
-            let item_model_id = item
-                .model_id
-                .as_deref()
-                .and_then(|value| parse_hash256_hex(value, "model_id").ok());
-            if item_model_id != Some(registered_model_id) {
-                // Model mismatch - put the item back on the queue so
-                // another worker can pick it up, then tell this worker
-                // there's no matching work.
-                if let Some(ref tx) = node.community_work_tx {
-                    let job_id = item.job_id.clone();
-                    if tx.try_send(item).is_err()
-                        && let Some(results) = node.community_work_results.as_ref()
-                    {
-                        // Never strand a dispatcher when a racing producer
-                        // consumed the slot we just freed. Dropping its
-                        // oneshot wakes it immediately for local fallback.
-                        results.remove(&job_id);
+                if item
+                    .expected_worker_id
+                    .as_deref()
+                    .is_some_and(|expected| expected != req.worker_id)
+                {
+                    twin_dispatch::requeue_item(&node, item);
+                    return Ok(Json(json!({
+                        "status": "no_work",
+                        "reason": "worker_mismatch",
+                    })));
+                }
+                // Exact model commitments, not display names, decide whether this
+                // worker can execute the coordinator-issued job.
+                let item_model_id = item
+                    .model_id
+                    .as_deref()
+                    .and_then(|value| parse_hash256_hex(value, "model_id").ok());
+                if item_model_id != Some(registered_model_id) {
+                    // Model mismatch - put the item back on the queue so
+                    // another worker can pick it up, then tell this worker
+                    // there's no matching work.
+                    twin_dispatch::requeue_item(&node, item);
+                    return Ok(Json(json!({
+                        "status": "no_work",
+                        "reason": "model_mismatch",
+                    })));
+                }
+                if item.execution_profile != canonical {
+                    if let Some(results) = node.community_work_results.as_ref() {
+                        results.remove(&item.job_id);
                     }
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "coordinator queued a non-canonical community execution profile"
+                            .to_string(),
+                    ));
                 }
-                return Ok(Json(json!({
-                    "status": "no_work",
-                    "reason": "model_mismatch",
-                })));
-            }
-            if item.execution_profile != canonical {
-                if let Some(results) = node.community_work_results.as_ref() {
-                    results.remove(&item.job_id);
-                }
-                return Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "coordinator queued a non-canonical community execution profile".to_string(),
-                ));
-            }
 
-            // A twin leg must go to a worker independent of its sibling
-            // (crate::twin::decide_claim); a refused or briefly deferred leg
-            // goes back on the queue for another worker.
-            let twin_claim = twin_dispatch::claim_decision(&node, &item.job_id, &req.worker_id);
-            if let Some(reason) = twin_claim.and_then(twin_dispatch::refusal_reason) {
-                twin_dispatch::requeue_item(&node, item);
-                return Ok(Json(json!({
-                    "status": "no_work",
-                    "reason": reason,
-                })));
-            }
-
-            // Bind this coordinator-issued job to the worker that actually
-            // claimed it before returning the prompt. The pending record can
-            // disappear here when the dispatcher timed out while the item was
-            // still queued; never hand an expired job to a worker.
-            let Some(mut pending) = node
-                .community_work_results
-                .as_ref()
-                .and_then(|pending| pending.get_mut(&item.job_id))
-            else {
-                if twin_claim.is_some() {
-                    twin_dispatch::release_claim(&node, &item.job_id, &req.worker_id);
+                // A twin leg must go to a worker independent of its sibling
+                // (crate::twin::decide_claim); a refused or briefly deferred leg
+                // goes back on the queue for another worker.
+                // Serialize fan-out reserve decisions through the actual bind.
+                // Caller bindings use the same gate, so an idle snapshot cannot
+                // spend a worker that a concurrent handler has just assigned.
+                let claim_gate = (node.community_twin.config.effective_reserve() > 0)
+                    .then(|| node.community_routing.lock());
+                let twin_claim = twin_dispatch::claim_decision(&node, &item.job_id, &req.worker_id);
+                if let Some(reason) = twin_claim.and_then(twin_dispatch::refusal_reason) {
+                    twin_dispatch::requeue_item(&node, item);
+                    drop(claim_gate);
+                    if node.community_twin.config.fan_out()
+                        || node.community_twin.config.effective_reserve() > 0
+                    {
+                        if tokio::time::Instant::now() >= deadline {
+                            return Ok(Json(json!({ "status": "no_work" })));
+                        }
+                        retry_claim = true;
+                        continue;
+                    }
+                    return Ok(Json(json!({
+                        "status": "no_work",
+                        "reason": reason,
+                    })));
                 }
-                return Ok(Json(json!({
-                    "status": "no_work",
-                    "reason": "job_expired",
-                })));
-            };
-            if pending.assigned_worker.is_some() {
+
+                // Bind this coordinator-issued job to the worker that actually
+                // claimed it before returning the prompt. The pending record can
+                // disappear here when the dispatcher timed out while the item was
+                // still queued; never hand an expired job to a worker.
+                let Some(mut pending) = node
+                    .community_work_results
+                    .as_ref()
+                    .and_then(|pending| pending.get_mut(&item.job_id))
+                else {
+                    if twin_claim.is_some() {
+                        twin_dispatch::release_claim(&node, &item.job_id, &req.worker_id);
+                    }
+                    return Ok(Json(json!({
+                        "status": "no_work",
+                        "reason": "job_expired",
+                    })));
+                };
+                if pending.assigned_worker.is_some() {
+                    drop(pending);
+                    if twin_claim.is_some() {
+                        twin_dispatch::release_claim(&node, &item.job_id, &req.worker_id);
+                    }
+                    return Ok(Json(json!({
+                        "status": "no_work",
+                        "reason": "job_already_claimed",
+                    })));
+                }
+                pending.assigned_worker = Some(req.worker_id.clone());
+                pending.assigned_at = Some(tokio::time::Instant::now());
+                // Commit the worker's slot while the pending entry is still
+                // locked, so the assignment and the slot change together. A
+                // withdrawal that removes this record under the same lock then
+                // always finds the slot it has to release; one that ran before the
+                // lock was taken left no record, and the uncommitted reservation
+                // above is released instead. Committing after the unlock left a
+                // gap in which the slot could be set with no record behind it,
+                // keeping the worker busy on this coordinator until restart.
+                claim_reservation.commit(&item.job_id);
                 drop(pending);
-                if twin_claim.is_some() {
-                    twin_dispatch::release_claim(&node, &item.job_id, &req.worker_id);
-                }
-                return Ok(Json(json!({
-                    "status": "no_work",
-                    "reason": "job_already_claimed",
-                })));
-            }
-            pending.assigned_worker = Some(req.worker_id.clone());
-            pending.assigned_at = Some(tokio::time::Instant::now());
-            // Commit the worker's slot while the pending entry is still
-            // locked, so the assignment and the slot change together. A
-            // withdrawal that removes this record under the same lock then
-            // always finds the slot it has to release; one that ran before the
-            // lock was taken left no record, and the uncommitted reservation
-            // above is released instead. Committing after the unlock left a
-            // gap in which the slot could be set with no record behind it,
-            // keeping the worker busy on this coordinator until restart.
-            claim_reservation.commit(&item.job_id);
-            drop(pending);
-            community_routing::assigned(&node, &req.worker_id);
+                drop(claim_gate);
+                community_routing::assigned(&node, &req.worker_id);
 
-            // Flat response shape — the worker (arc-node main.rs) reads
-            // `job_id`, `input`, `max_tokens` directly off the top-level
-            // JSON. Don't nest under "work".
-            let mut body = json!({
-                "status": "work",
-                "accepts_output_tokens": true,
-                "job_id": item.job_id,
-                "input": item.input,
-                "max_tokens": item.max_tokens,
-                "execution_profile": item.execution_profile,
-                "submitted_at_unix_ms": item.submitted_at_unix_ms,
-                "expires_at_unix_ms": item.expires_at_unix_ms,
-                // A recovery-v3 worker certificate is signed over this
-                // transaction domain and is embedded in the eventual 0x25
-                // reward.  Never make the worker infer the domain from a
-                // different endpoint (or silently fall back to legacy
-                // signing when the coordinator requires v3).
-                "transaction_domain_required": item.transaction_domain.is_some(),
-            });
-            if let Some(mid) = item.model_id {
-                body["model_id"] = Value::String(mid);
+                // Flat response shape — the worker (arc-node main.rs) reads
+                // `job_id`, `input`, `max_tokens` directly off the top-level
+                // JSON. Don't nest under "work".
+                let mut body = json!({
+                    "status": "work",
+                    "accepts_output_tokens": true,
+                    "job_id": item.job_id,
+                    "input": item.input,
+                    "max_tokens": item.max_tokens,
+                    "execution_profile": item.execution_profile,
+                    "submitted_at_unix_ms": item.submitted_at_unix_ms,
+                    "expires_at_unix_ms": item.expires_at_unix_ms,
+                    // A recovery-v3 worker certificate is signed over this
+                    // transaction domain and is embedded in the eventual 0x25
+                    // reward.  Never make the worker infer the domain from a
+                    // different endpoint (or silently fall back to legacy
+                    // signing when the coordinator requires v3).
+                    "transaction_domain_required": item.transaction_domain.is_some(),
+                });
+                if let Some(mid) = item.model_id {
+                    body["model_id"] = Value::String(mid);
+                }
+                if let Some(transaction_domain) = item.transaction_domain {
+                    body["transaction_domain"] = Value::String(transaction_domain);
+                }
+                Ok(Json(body))
             }
-            if let Some(transaction_domain) = item.transaction_domain {
-                body["transaction_domain"] = Value::String(transaction_domain);
+            Err(()) => {
+                // Channel closed - coordinator shut down
+                Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "work queue closed - coordinator shutting down".to_string(),
+                ))
             }
-            Ok(Json(body))
-        }
-        Err(()) => {
-            // Channel closed - coordinator shut down
-            Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "work queue closed - coordinator shutting down".to_string(),
-            ))
-        }
-        Ok(None) => {
-            // Timeout - no work within the window
-            Ok(Json(json!({
-                "status": "no_work",
-            })))
-        }
+            Ok(None) => {
+                // Timeout - no work within the window
+                Ok(Json(json!({
+                    "status": "no_work",
+                })))
+            }
+        };
+        return response;
     }
 }
 

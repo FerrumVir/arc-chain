@@ -52,6 +52,12 @@ pub const DEFAULT_DEMAND_INTERVAL_SECS: u64 = 120;
 pub const MIN_DEMAND_INTERVAL_SECS: u64 = 30;
 /// Default share of demand ticks spent on re-executing a verified prompt.
 pub const DEFAULT_REPLAY_SHARE_PER_MILLE: u16 = 250;
+/// Maximum fan-out and pump-only open groups.
+pub const MAX_DEMAND_GROUPS: usize = 32;
+/// Default pump refill, in groups per hour.
+pub const DEFAULT_DEMAND_GROUPS_PER_HOUR: u32 = 30;
+/// Bound memory and generated load to one group per second on average.
+pub const MAX_DEMAND_GROUPS_PER_HOUR: u32 = 3_600;
 /// Output budget of coordinator-generated demo and replay jobs.
 pub const PUMP_MAX_TOKENS: u32 = 32;
 /// Output budget of caller requests marked `public_demo`.
@@ -161,6 +167,12 @@ pub struct TwinConfig {
     pub spot_check_per_mille: u16,
     /// Seconds between demand ticks on this coordinator.
     pub demand_interval_secs: u64,
+    /// Open pump groups, including resolution. Default 1; clamped to 1..=32.
+    pub demand_max_groups: usize,
+    /// Idle workers reserved for callers; at least two during fan-out.
+    pub demand_reserve_workers: usize,
+    /// Pump token-bucket refill; clamped to 1..=3,600 groups/hour.
+    pub demand_groups_per_hour: u32,
 }
 
 impl Default for TwinConfig {
@@ -171,19 +183,74 @@ impl Default for TwinConfig {
             demand_dry_run: false,
             spot_check_per_mille: DEFAULT_SPOT_CHECK_PER_MILLE,
             demand_interval_secs: DEFAULT_DEMAND_INTERVAL_SECS,
+            demand_max_groups: 1,
+            demand_reserve_workers: 0,
+            demand_groups_per_hour: DEFAULT_DEMAND_GROUPS_PER_HOUR,
         }
     }
 }
 
 impl TwinConfig {
+    pub fn fan_out(self) -> bool {
+        self.demand_max_groups > 1
+    }
+
+    pub fn effective_reserve(self) -> usize {
+        self.demand_reserve_workers
+            .max(if self.fan_out() { 2 } else { 0 })
+    }
+
+    pub fn pump_burst(self) -> u32 {
+        self.demand_max_groups.max(2) as u32
+    }
+
+    /// Keep the default ring path unchanged; isolate IDs when throughput changes.
+    pub fn separate_pump_memory(self) -> bool {
+        self.fan_out() || self.demand_groups_per_hour != DEFAULT_DEMAND_GROUPS_PER_HOUR
+    }
+
+    /// Two legs per group, a full burst, plus every previously open group.
+    /// Live entries are never evicted to make room: admission backs off instead.
+    pub fn pump_leg_memory_cap(self, assignment_lifetime_secs: u64) -> usize {
+        2 * ((u64::from(self.demand_groups_per_hour) * assignment_lifetime_secs).div_ceil(3_600)
+            as usize
+            + self.pump_burst() as usize
+            + MAX_DEMAND_GROUPS)
+    }
+
     /// Clamp operator input to the reviewed bounds.
     pub fn normalized(self) -> Self {
         Self {
+            demand_max_groups: self.demand_max_groups.clamp(1, MAX_DEMAND_GROUPS),
+            demand_groups_per_hour: self
+                .demand_groups_per_hour
+                .clamp(1, MAX_DEMAND_GROUPS_PER_HOUR),
             spot_check_per_mille: self.spot_check_per_mille.min(1_000),
             demand_interval_secs: self.demand_interval_secs.max(MIN_DEMAND_INTERVAL_SECS),
             ..self
         }
     }
+}
+
+/// Idle capacity left for the next plan, including legs not yet claimed.
+pub fn pump_worker_budget(idle: usize, reserve: usize, unclaimed_legs: usize) -> usize {
+    idle.saturating_sub(reserve).saturating_sub(unclaimed_legs)
+}
+
+/// Number of same-size jobs that fit both the worker budget and open slots.
+pub fn pump_group_budget(
+    idle: usize,
+    reserve: usize,
+    unclaimed_legs: usize,
+    in_flight: usize,
+    max_groups: usize,
+    legs_per_group: usize,
+) -> usize {
+    if legs_per_group == 0 {
+        return 0;
+    }
+    (pump_worker_budget(idle, reserve, unclaimed_legs) / legs_per_group)
+        .min(max_groups.saturating_sub(in_flight))
 }
 
 /// How precisely a region tag places a worker.
@@ -1418,6 +1485,7 @@ mod tests {
             demand_dry_run: true,
             spot_check_per_mille: 5_000,
             demand_interval_secs: 1,
+            ..TwinConfig::default()
         }
         .normalized();
         assert_eq!(clamped.spot_check_per_mille, 1_000);

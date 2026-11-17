@@ -547,6 +547,18 @@ struct Cli {
     #[arg(long, default_value_t = arc_node::twin::DEFAULT_DEMAND_INTERVAL_SECS)]
     community_demand_interval_secs: u64,
 
+    /// Maximum open pump groups (1..=32). Default 1 preserves serial demand.
+    #[arg(long, default_value_t = 1)]
+    community_demand_max_groups: usize,
+
+    /// Idle eligible workers reserved for callers (at least 2 when max-groups > 1).
+    #[arg(long, default_value_t = 0)]
+    community_demand_reserve_workers: usize,
+
+    /// Pump refill in groups/hour (1..=3600); burst is max(2, max-groups).
+    #[arg(long, default_value_t = arc_node::twin::DEFAULT_DEMAND_GROUPS_PER_HOUR)]
+    community_demand_groups_per_hour: u32,
+
     /// Worker: every ten minutes, time the configured community RPC origins
     /// and send the round trips, signed, so coordinators can pair twins in
     /// different regions. Only a coarse region label is ever published.
@@ -10245,6 +10257,9 @@ async fn run_arc_node() -> Result<()> {
             demand_dry_run: cli.community_demand_dry_run,
             spot_check_per_mille: cli.community_twin_spot_check_per_mille,
             demand_interval_secs: cli.community_demand_interval_secs,
+            demand_max_groups: cli.community_demand_max_groups,
+            demand_reserve_workers: cli.community_demand_reserve_workers,
+            demand_groups_per_hour: cli.community_demand_groups_per_hour,
         },
         cli.community_release_on_verification,
         rpc::CommunityProfileServing {

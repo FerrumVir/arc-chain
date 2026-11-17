@@ -13,13 +13,13 @@ use crate::twin::{
     RecomputeStatus, TwinConfig, Verdict,
 };
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 /// How long a group waits for its sibling leg to be claimed after the first
 /// leg finished, before it resolves without it.
 const TWIN_SIBLING_CLAIM_WINDOW_MS: u64 = 30_000;
 const TWIN_WATCHDOG_TICK_MS: u64 = 2_000;
-/// Unresolved groups one coordinator tracks at once.
+/// Caller open-group cap; also the shared cap on the default serial path.
 const TWIN_OPEN_GROUP_CAP: usize = 64;
 /// Leg job ids remembered after resolution, so late legs are recognized
 /// instead of being verified and settled as ordinary jobs.
@@ -33,8 +33,6 @@ const TWIN_SPOT_CHECKS_PER_HOUR: u32 = 6;
 const TWIN_SPOT_CHECK_BURST: u32 = 2;
 const PUBLIC_DEMO_PER_HOUR: u32 = 60;
 const PUBLIC_DEMO_BURST: u32 = 6;
-const PUMP_GROUPS_PER_HOUR: u32 = 30;
-const PUMP_BURST: u32 = 2;
 const WORKER_STATE_CAP: usize = COMMUNITY_WORKER_REGISTRY_MAX;
 const RECENT_RECEIPTS_MAX: usize = 50;
 
@@ -87,12 +85,17 @@ struct TwinGroup {
     reference: Option<twin::ReplayReference>,
     outcome_tx: Option<tokio::sync::oneshot::Sender<TwinGroupOutcome>>,
     state: GroupState,
+    _pump_slot: Option<PumpGroupGuard>,
 }
 
 struct TwinInner {
     groups: HashMap<String, TwinGroup>,
     leg_to_group: HashMap<String, (String, usize)>,
     resolved_legs: VecDeque<String>,
+    // Pump-only tombstones survive caller churn. Issued IDs are retained until
+    // expiry AND removal of the pending record, including delayed cleanup.
+    pump_legs: HashMap<String, u64>,
+    pump_queue: VecDeque<WorkItem>,
     regions: HashMap<String, twin::RegionTag>,
     last_served: HashMap<String, u64>,
     worker_legs: HashMap<String, WorkerTwinTally>,
@@ -186,6 +189,7 @@ pub(super) struct CommunityTwinState {
     inner: parking_lot::Mutex<TwinInner>,
     recompute_permits: Arc<tokio::sync::Semaphore>,
     pump_running: AtomicBool,
+    pump_groups: Arc<AtomicUsize>,
 }
 
 struct PumpRunningGuard<'a>(&'a AtomicBool);
@@ -193,6 +197,40 @@ struct PumpRunningGuard<'a>(&'a AtomicBool);
 impl Drop for PumpRunningGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
+    }
+}
+
+struct PumpGroupGuard(Arc<AtomicUsize>);
+
+impl Drop for PumpGroupGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct FanoutGroupCleanup {
+    state: Arc<CommunityTwinState>,
+    group_id: String,
+    collecting_only: bool,
+}
+
+impl Drop for FanoutGroupCleanup {
+    fn drop(&mut self) {
+        let mut inner = self.state.inner.lock();
+        let remove = inner.groups.get(&self.group_id).is_some_and(|group| {
+            group.source.is_pump()
+                && self.state.config.fan_out()
+                && (!self.collecting_only || group.state == GroupState::Collecting)
+        });
+        if remove {
+            if let Some(group) = inner.groups.remove(&self.group_id) {
+                for leg in group.legs {
+                    inner.leg_to_group.remove(&leg.item.job_id);
+                }
+            }
+            let ids: HashSet<String> = inner.leg_to_group.keys().cloned().collect();
+            inner.pump_queue.retain(|item| ids.contains(&item.job_id));
+        }
     }
 }
 
@@ -241,14 +279,17 @@ fn pair_differences(
 impl CommunityTwinState {
     pub(super) fn new(config: TwinConfig) -> Self {
         let now = now_unix_ms();
+        let config = config.normalized();
         Self {
-            config: config.normalized(),
+            config,
             secret: random_secret(),
             started_at_unix_ms: now,
             inner: parking_lot::Mutex::new(TwinInner {
                 groups: HashMap::new(),
                 leg_to_group: HashMap::new(),
                 resolved_legs: VecDeque::new(),
+                pump_legs: HashMap::new(),
+                pump_queue: VecDeque::new(),
                 regions: HashMap::new(),
                 last_served: HashMap::new(),
                 worker_legs: HashMap::new(),
@@ -266,23 +307,58 @@ impl CommunityTwinState {
                     TWIN_SPOT_CHECKS_PER_HOUR,
                     now,
                 ),
-                pump_bucket: twin::TokenBucket::new(PUMP_BURST, PUMP_GROUPS_PER_HOUR, now),
+                pump_bucket: twin::TokenBucket::new(
+                    config.pump_burst(),
+                    config.demand_groups_per_hour,
+                    now,
+                ),
                 demand_counter: 0,
             }),
             recompute_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             pump_running: AtomicBool::new(false),
+            pump_groups: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     fn is_twin_leg(&self, job_id: &str) -> bool {
-        self.inner.lock().leg_to_group.contains_key(job_id)
+        let inner = self.inner.lock();
+        inner.leg_to_group.contains_key(job_id) || inner.pump_legs.contains_key(job_id)
     }
 
-    fn register_group(&self, group_id: String, group: TwinGroup) -> Result<(), &'static str> {
+    fn register_group(&self, group_id: String, mut group: TwinGroup) -> Result<(), &'static str> {
         let mut guard = self.inner.lock();
         let inner = &mut *guard;
-        if inner.groups.len() >= TWIN_OPEN_GROUP_CAP {
+        if self.config.fan_out() {
+            let pumps = self.pump_groups.load(Ordering::Acquire);
+            if group.source.is_pump() {
+                // Keep pump use within half the original group budget. Caller
+                // capacity stays 64: completed dispatchers can leave resolving
+                // caller groups behind, so reserving only 32 is not sufficient.
+                if pumps >= self.config.demand_max_groups.min(TWIN_OPEN_GROUP_CAP / 2) {
+                    return Err("the demand pump is at its open-group capacity");
+                }
+            } else if inner.groups.len().saturating_sub(pumps) >= TWIN_OPEN_GROUP_CAP {
+                return Err("twin execution is at its open-group capacity");
+            }
+        } else if inner.groups.len() >= TWIN_OPEN_GROUP_CAP {
             return Err("twin execution is at its open-group capacity");
+        }
+        if group.source.is_pump() && self.config.separate_pump_memory() {
+            let cap = self.config.pump_leg_memory_cap(
+                MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS + COMMUNITY_LATE_SUBMIT_GRACE_SECS,
+            );
+            if inner.pump_legs.len() + group.legs.len() > cap {
+                return Err("the demand pump's late-leg memory is full");
+            }
+            for leg in &group.legs {
+                inner
+                    .pump_legs
+                    .insert(leg.item.job_id.clone(), leg.item.expires_at_unix_ms);
+            }
+        }
+        if group.source.is_pump() {
+            self.pump_groups.fetch_add(1, Ordering::AcqRel);
+            group._pump_slot = Some(PumpGroupGuard(self.pump_groups.clone()));
         }
         for (index, leg) in group.legs.iter().enumerate() {
             inner
@@ -301,6 +377,9 @@ impl CommunityTwinState {
         if let Some(group) = inner.groups.remove(group_id) {
             for leg in &group.legs {
                 inner.leg_to_group.remove(&leg.item.job_id);
+                inner
+                    .pump_queue
+                    .retain(|item| item.job_id != leg.item.job_id);
             }
         }
     }
@@ -335,6 +414,7 @@ impl CommunityTwinState {
         idle_ids: &[String],
         platforms: &HashMap<String, String>,
         now: u64,
+        record: bool,
     ) -> ClaimDecision {
         let mut guard = self.inner.lock();
         let inner = &mut *guard;
@@ -353,6 +433,23 @@ impl CommunityTwinState {
         let Some(leg) = group.legs.get(leg_index) else {
             return ClaimDecision::Accept;
         };
+        if group.source.is_pump() && self.config.effective_reserve() > 0 {
+            let claimed: HashSet<&str> = inner
+                .groups
+                .values()
+                .filter(|g| g.source.is_pump())
+                .flat_map(|g| &g.legs)
+                .filter(|leg| leg.status == LegStatus::Claimed)
+                .filter_map(|leg| leg.worker.as_deref())
+                .collect();
+            let remaining = idle_ids
+                .iter()
+                .filter(|id| !claimed.contains(id.as_str()))
+                .count();
+            if remaining < self.config.effective_reserve() {
+                return ClaimDecision::Defer("pump_worker_reserve");
+            }
+        }
         let facts = |id: &str| worker_facts(&inner.regions, &inner.last_served, platforms, id);
         let mut related = Vec::new();
         for (index, other) in group.legs.iter().enumerate() {
@@ -376,8 +473,11 @@ impl CommunityTwinState {
             idle_alternatives: &alternatives,
             waited_ms: now.saturating_sub(leg.enqueued_at_unix_ms),
             preference_window_ms: twin::CLAIM_PREFERENCE_WINDOW_MS,
-            prefer_least_recently_served: group.source.is_pump(),
+            prefer_least_recently_served: group.source.is_pump() && !self.config.fan_out(),
         });
+        if !record {
+            return decision;
+        }
         let sibling_pair = if group.reference.is_none() && decision == ClaimDecision::Accept {
             related
                 .first()
@@ -469,7 +569,12 @@ impl CommunityTwinState {
     ) -> Option<(String, bool)> {
         let mut guard = self.inner.lock();
         let inner = &mut *guard;
-        let (group_id, leg_index) = inner.leg_to_group.get(job_id).cloned()?;
+        let Some((group_id, leg_index)) = inner.leg_to_group.get(job_id).cloned() else {
+            if inner.pump_legs.contains_key(job_id) {
+                inner.counters.late_legs += 1;
+            }
+            return None;
+        };
         let Some(group) = inner
             .groups
             .get_mut(&group_id)
@@ -646,7 +751,14 @@ impl CommunityTwinState {
         inner.receipts.insert(receipt);
         if let Some(group) = inner.groups.remove(group_id) {
             for leg in &group.legs {
-                inner.resolved_legs.push_back(leg.item.job_id.clone());
+                inner
+                    .pump_queue
+                    .retain(|item| item.job_id != leg.item.job_id);
+                if group.source.is_pump() && self.config.separate_pump_memory() {
+                    inner.leg_to_group.remove(&leg.item.job_id);
+                } else {
+                    inner.resolved_legs.push_back(leg.item.job_id.clone());
+                }
             }
         }
         while inner.resolved_legs.len() > TWIN_RESOLVED_LEG_CAP {
@@ -697,11 +809,21 @@ impl CommunityTwinState {
         model_id: &Hash256,
         now: u64,
     ) -> Result<PlannedDemand, &'static str> {
+        self.plan_tick_with_budget(idle_workers, idle_workers.len(), model_id, now)
+    }
+
+    fn plan_tick_with_budget(
+        &self,
+        idle_workers: &[String],
+        budget: usize,
+        model_id: &Hash256,
+        now: u64,
+    ) -> Result<PlannedDemand, &'static str> {
         let mut guard = self.inner.lock();
         let inner = &mut *guard;
         let roll = (random_u64() % 1_000) as u16;
         let kind = twin::plan_demand(
-            idle_workers.len(),
+            budget,
             self.config.twin_execution,
             inner.references.has_model(model_id),
             roll,
@@ -792,8 +914,22 @@ pub(super) fn claim_decision(
     job_id: &str,
     worker_id: &str,
 ) -> Option<ClaimDecision> {
+    claim_decision_inner(node, job_id, worker_id, true)
+}
+
+fn claim_decision_inner(
+    node: &NodeState,
+    job_id: &str,
+    worker_id: &str,
+    record: bool,
+) -> Option<ClaimDecision> {
     if !node.community_twin.is_twin_leg(job_id) {
         return None;
+    }
+    if is_fanout_pump_leg(node, job_id)
+        && node.public_inference_permits.available_permits() < PUBLIC_INFERENCE_CONCURRENCY
+    {
+        return Some(ClaimDecision::Defer("caller_inference_in_flight"));
     }
     let idle_ids: Vec<String> = node
         .community_active_jobs
@@ -801,6 +937,14 @@ pub(super) fn claim_decision(
         .filter(|entry| entry.value().is_empty() && entry.key().as_str() != worker_id)
         .map(|entry| entry.key().clone())
         .collect();
+    let idle_ids: Vec<String> = if node.community_twin.config.effective_reserve() > 0 {
+        idle_ids
+            .into_iter()
+            .filter(|id| exact_live_inference_worker(node, id))
+            .collect()
+    } else {
+        idle_ids
+    };
     let related = node.community_twin.related_workers(job_id);
     let mut platforms = HashMap::new();
     for id in idle_ids
@@ -819,7 +963,78 @@ pub(super) fn claim_decision(
         &idle_ids,
         &platforms,
         now_unix_ms(),
+        record,
     ))
+}
+
+pub(super) fn may_claim(node: &NodeState, job_id: &str, worker: &str) -> bool {
+    claim_decision_inner(node, job_id, worker, false).is_none_or(|d| d == ClaimDecision::Accept)
+}
+
+/// Separate queue keeps fan-out pump legs out of the caller's bounded channel.
+/// Called only after routing has examined caller work; refused legs stay here
+/// while the same claimer tries every other candidate.
+pub(super) fn poll_pump(node: &NodeState, worker: &str) -> Option<WorkItem> {
+    if !node.community_twin.config.fan_out()
+        || !exact_live_inference_worker(node, worker)
+        || node.public_inference_permits.available_permits() < PUBLIC_INFERENCE_CONCURRENCY
+    {
+        return None;
+    }
+    let count = node.community_twin.inner.lock().pump_queue.len();
+    for _ in 0..count {
+        let item = node.community_twin.inner.lock().pump_queue.pop_front()?;
+        let live = node
+            .community_work_results
+            .as_ref()
+            .is_some_and(|results| results.contains_key(&item.job_id));
+        if !live || item.expires_at_unix_ms <= now_unix_ms() {
+            continue;
+        }
+        if claim_decision_inner(node, &item.job_id, worker, false) == Some(ClaimDecision::Accept) {
+            return Some(item);
+        }
+        requeue_item(node, item);
+    }
+    None
+}
+
+fn is_fanout_pump_leg(node: &NodeState, job_id: &str) -> bool {
+    node.community_twin.config.fan_out()
+        && node
+            .community_twin
+            .inner
+            .lock()
+            .pump_legs
+            .contains_key(job_id)
+}
+
+fn prune_pump_memory(node: &NodeState) {
+    let now = now_unix_ms();
+    // Snapshot first: never hold the twin mutex while locking pending records.
+    let expired: Vec<String> = node
+        .community_twin
+        .inner
+        .lock()
+        .pump_legs
+        .iter()
+        .filter(|(_, expiry)| **expiry <= now)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let absent: Vec<String> = expired
+        .into_iter()
+        .filter(|id| {
+            node.community_work_results
+                .as_ref()
+                .is_none_or(|results| !results.contains_key(id))
+        })
+        .collect();
+    let mut inner = node.community_twin.inner.lock();
+    for id in absent {
+        if !inner.leg_to_group.contains_key(&id) {
+            inner.pump_legs.remove(&id);
+        }
+    }
 }
 
 /// The `no_work` reason for a refused or deferred claim.
@@ -835,9 +1050,37 @@ pub(super) fn release_claim(node: &NodeState, job_id: &str, worker_id: &str) {
     node.community_twin.release_claim(job_id, worker_id);
 }
 
+fn queue_live_pump_leg(node: &NodeState, item: WorkItem) -> bool {
+    let mut inner = node.community_twin.inner.lock();
+    let unclaimed = inner
+        .leg_to_group
+        .get(&item.job_id)
+        .and_then(|(id, index)| inner.groups.get(id).map(|group| (group, *index)))
+        .is_some_and(|(group, index)| {
+            group.state == GroupState::Collecting
+                && group
+                    .legs
+                    .get(index)
+                    .is_some_and(|leg| leg.status == LegStatus::Unclaimed)
+        });
+    if unclaimed
+        && !inner
+            .pump_queue
+            .iter()
+            .any(|queued| queued.job_id == item.job_id)
+    {
+        inner.pump_queue.push_back(item);
+    }
+    unclaimed
+}
+
 /// Put a dequeued item back for another worker. If the queue is full the
 /// pending record is dropped so no dispatcher waits on a lost item.
 pub(super) fn requeue_item(node: &NodeState, item: WorkItem) {
+    if is_fanout_pump_leg(node, &item.job_id) {
+        queue_live_pump_leg(node, item);
+        return;
+    }
     if let Some(tx) = node.community_work_tx.as_ref() {
         let job_id = item.job_id.clone();
         if tx.try_send(item).is_err()
@@ -878,6 +1121,14 @@ fn requeue_twin_leg(
                 sender: leg_sender,
             });
         }
+    }
+    if is_fanout_pump_leg(node, &item.job_id) {
+        let job_id = item.job_id.clone();
+        if !queue_live_pump_leg(node, item) {
+            results.remove(&job_id);
+            return false;
+        }
+        return true;
     }
     let job_id = item.job_id.clone();
     if tx.try_send(item).is_err() {
@@ -971,20 +1222,40 @@ pub(super) async fn dispatch_twin(
     node: &NodeState,
     request: TwinDispatchRequest,
 ) -> Result<TwinGroupOutcome, CommunityDispatchError> {
+    dispatch_twin_started(node, request, None).await
+}
+
+async fn dispatch_twin_started(
+    node: &NodeState,
+    request: TwinDispatchRequest,
+    started: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<TwinGroupOutcome, CommunityDispatchError> {
+    let fanout_pump = request.source.is_pump() && node.community_twin.config.fan_out();
+    prune_pump_memory(node);
     let _worker_execution_permit = node
         .native_request_admission
         .worker_execution_gate()
         .try_enter()
         .ok_or_else(|| CommunityDispatchError::before_enqueue("worker is quiescing for update"))?;
-    let _inference_permit = node
-        .public_inference_permits
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| {
-            CommunityDispatchError::before_enqueue(
-                "public inference capacity is saturated; retry after 2 seconds",
-            )
-        })?;
+    let _inference_permit = if fanout_pump {
+        if node.public_inference_permits.available_permits() < PUBLIC_INFERENCE_CONCURRENCY {
+            return Err(CommunityDispatchError::before_enqueue(
+                "caller inference is in flight",
+            ));
+        }
+        None
+    } else {
+        Some(
+            node.public_inference_permits
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| {
+                    CommunityDispatchError::before_enqueue(
+                        "public inference capacity is saturated; retry after 2 seconds",
+                    )
+                })?,
+        )
+    };
     let TwinDispatchRequest {
         input,
         max_tokens,
@@ -1108,9 +1379,16 @@ pub(super) async fn dispatch_twin(
                 reference,
                 outcome_tx: Some(outcome_tx),
                 state: GroupState::Collecting,
+                _pump_slot: None,
             },
         )
         .map_err(CommunityDispatchError::before_enqueue)?;
+
+    let _fanout_cleanup = fanout_pump.then(|| FanoutGroupCleanup {
+        state: node.community_twin.clone(),
+        group_id: group_id.clone(),
+        collecting_only: true,
+    });
 
     // Dropping a reservation removes an unclaimed leg immediately and keeps
     // a claimed leg for its bounded late-submit grace, as for single jobs.
@@ -1148,6 +1426,10 @@ pub(super) async fn dispatch_twin(
         });
     }
     for (index, (item, _, _)) in pending_specs.into_iter().enumerate() {
+        if fanout_pump {
+            node.community_twin.inner.lock().pump_queue.push_back(item);
+            continue;
+        }
         if let Err(error) = tx.try_send(item) {
             node.community_twin.unregister_group(&group_id);
             let message = format!("community queue unavailable: {error}");
@@ -1159,6 +1441,9 @@ pub(super) async fn dispatch_twin(
         }
     }
     spawn_twin_watchdog(node, group_id);
+    if let Some(started) = started {
+        let _ = started.send(());
+    }
 
     let wait = Duration::from_secs(timeout_secs.saturating_add(TWIN_RESOLUTION_GRACE_SECS));
     let outcome = match tokio::time::timeout(wait, outcome_rx).await {
@@ -1336,6 +1621,9 @@ pub(super) fn scoreboard_summary(node: &NodeState) -> Option<Value> {
     let inner = &mut *guard;
     let (jobs, tokens) = inner.throughput.summary(now);
     Some(json!({
+        "pump_groups_in_flight": node.community_twin.pump_groups.load(Ordering::Acquire),
+        "pump_max_groups": config.demand_max_groups,
+        "idle_eligible_workers": idle_eligible_workers(node).len(),
         "twin_execution": config.twin_execution,
         "demand_pump": config.demand_pump,
         "groups_matched": inner.counters.groups_matched,
@@ -1419,7 +1707,7 @@ pub(super) async fn community_twin_stats(AxumState(node): AxumState<NodeState>) 
             "spot_check_per_mille": config.spot_check_per_mille,
             "spot_checks_per_hour_max": TWIN_SPOT_CHECKS_PER_HOUR,
             "demand_interval_secs": config.demand_interval_secs,
-            "pump_groups_per_hour_max": PUMP_GROUPS_PER_HOUR,
+            "pump_groups_per_hour_max": config.demand_groups_per_hour,
             "replay_share_per_mille": twin::DEFAULT_REPLAY_SHARE_PER_MILLE,
             "pump_max_tokens": twin::PUMP_MAX_TOKENS,
             "public_demo_max_tokens": twin::PUBLIC_DEMO_MAX_TOKENS,
@@ -1588,6 +1876,7 @@ async fn run_twin_recompute(
     node: &NodeState,
     item: &WorkItem,
     reason: RecomputeReason,
+    source: DemandSource,
 ) -> Result<(CommunityCanonicalRecompute, u64), RecomputeStatus> {
     let Some(_worker_execution_permit) = node
         .native_request_admission
@@ -1596,8 +1885,16 @@ async fn run_twin_recompute(
     else {
         return Err(RecomputeStatus::Unavailable);
     };
+    if source.is_pump()
+        && node.community_twin.config.fan_out()
+        && node.public_inference_permits.available_permits() < PUBLIC_INFERENCE_CONCURRENCY
+    {
+        return Err(RecomputeStatus::SkippedBusy);
+    }
     let permits = node.community_twin.recompute_permits.clone();
-    let _permit = if reason == RecomputeReason::SpotCheck {
+    let _permit = if reason == RecomputeReason::SpotCheck
+        || (source.is_pump() && node.community_twin.config.fan_out())
+    {
         // A spot check never queues: it runs only while this validator is
         // not already recomputing for an approval or another twin group.
         if node.community_approval_permits.available_permits() == 0 {
@@ -1711,6 +2008,11 @@ async fn resolve_twin_group(node: &NodeState, group_id: &str) {
     let Some(mut input) = node.community_twin.begin_resolution(group_id) else {
         return;
     };
+    let _cleanup = FanoutGroupCleanup {
+        state: node.community_twin.clone(),
+        group_id: group_id.to_string(),
+        collecting_only: false,
+    };
     if let Some(results) = node.community_work_results.as_ref() {
         for job_id in &input.cancelled_jobs {
             results.remove(job_id);
@@ -1744,7 +2046,7 @@ async fn resolve_twin_group(node: &NodeState, group_id: &str) {
             .or_else(|| outputs.iter().position(Option::is_some))
             .unwrap_or(0);
         if let Some(leg) = input.legs.get(item_index) {
-            match run_twin_recompute(node, &leg.item, reason).await {
+            match run_twin_recompute(node, &leg.item, reason, input.source).await {
                 Ok((recomputed, elapsed_ms)) => {
                     recompute_ms = Some(elapsed_ms);
                     canonical = Some(recomputed);
@@ -2095,15 +2397,37 @@ fn idle_eligible_workers(node: &NodeState) -> Vec<String> {
 }
 
 async fn run_demand_tick(node: &NodeState) -> Result<(), &'static str> {
+    let dry_run = node.community_twin.config.demand_dry_run;
+    let before = node.community_twin.inner.lock().demand_counter;
+    let idle = if dry_run {
+        idle_eligible_workers(node).len()
+    } else {
+        0
+    };
+    let result = run_demand_tick_inner(node).await;
+    if dry_run {
+        let groups = node
+            .community_twin
+            .inner
+            .lock()
+            .demand_counter
+            .wrapping_sub(before);
+        tracing::info!(groups, idle_workers = idle, skipped = ?result.as_ref().err(),
+            "community demand pump dry run: groups this tick would start");
+    }
+    result
+}
+
+async fn run_demand_tick_inner(node: &NodeState) -> Result<(), &'static str> {
     let state = &node.community_twin;
     // Generated demand never competes with callers: it starts only while
     // every public inference slot is free and holds at most one of them.
     if node.public_inference_permits.available_permits() < PUBLIC_INFERENCE_CONCURRENCY {
         return Err("caller inference is in flight");
     }
-    let Some(model) = node.inference_model.as_ref() else {
+    if node.inference_model.is_none() {
         return Err("coordinator has no tokenizer");
-    };
+    }
     let Some(model_id) = node.model_artifact_id else {
         return Err("coordinator has no exact model artifact identity");
     };
@@ -2111,8 +2435,20 @@ async fn run_demand_tick(node: &NodeState) -> Result<(), &'static str> {
         return Err("the previous demand job is still running");
     }
     let _running = PumpRunningGuard(&state.pump_running);
+    if state.config.fan_out() {
+        return run_fanout_tick(node, model_id).await;
+    }
     let idle = idle_eligible_workers(node);
-    let planned = state.plan_tick(&idle, &model_id, now_unix_ms())?;
+    let planned = if state.config.effective_reserve() == 0 {
+        state.plan_tick(&idle, &model_id, now_unix_ms())?
+    } else {
+        state.plan_tick_with_budget(
+            &idle,
+            twin::pump_worker_budget(idle.len(), state.config.effective_reserve(), 0),
+            &model_id,
+            now_unix_ms(),
+        )?
+    };
     if state.config.demand_dry_run {
         let (kind, prompt_index) = match &planned {
             PlannedDemand::Twin { prompt_index, .. } => ("twin_demo", *prompt_index),
@@ -2123,12 +2459,29 @@ async fn run_demand_tick(node: &NodeState) -> Result<(), &'static str> {
             kind,
             prompt_index,
             idle_workers = idle.len(),
+            groups = 1,
             "community demand pump dry run: would dispatch this job"
         );
         return Ok(());
     }
+    let request = demand_request(node, planned, model_id);
+    dispatch_twin(node, request)
+        .await
+        .map(|_| ())
+        .map_err(|_| "the demand job did not complete")
+}
+
+fn demand_request(
+    node: &NodeState,
+    planned: PlannedDemand,
+    model_id: Hash256,
+) -> TwinDispatchRequest {
+    let model = node
+        .inference_model
+        .as_ref()
+        .expect("tick checked tokenizer");
     let model_id_hint = Some(format!("0x{}", model_id.to_hex()));
-    let request = match planned {
+    match planned {
         PlannedDemand::Twin {
             prompt_index,
             prompt,
@@ -2150,11 +2503,96 @@ async fn run_demand_tick(node: &NodeState) -> Result<(), &'static str> {
                 .map(|prompt| (reference.prompt_index, *prompt)),
             reference: Some(*reference),
         },
-    };
-    dispatch_twin(node, request)
-        .await
-        .map(|_| ())
-        .map_err(|_| "the demand job did not complete")
+    }
+}
+
+async fn run_fanout_tick(node: &NodeState, model_id: Hash256) -> Result<(), &'static str> {
+    let state = &node.community_twin;
+    prune_pump_memory(node);
+    let mut planned_groups = 0;
+    let mut simulated_legs = 0;
+    loop {
+        if node.public_inference_permits.available_permits() < PUBLIC_INFERENCE_CONCURRENCY {
+            break;
+        }
+        let idle = idle_eligible_workers(node);
+        let (in_flight, unclaimed) = {
+            let inner = state.inner.lock();
+            let unclaimed = inner
+                .groups
+                .values()
+                .filter(|g| g.source.is_pump())
+                .flat_map(|g| &g.legs)
+                .filter(|leg| {
+                    leg.status == LegStatus::Unclaimed
+                        || (leg.status == LegStatus::Claimed
+                            && leg.worker.as_ref().is_some_and(|id| idle.contains(id)))
+                })
+                .count();
+            (state.pump_groups.load(Ordering::Acquire), unclaimed)
+        };
+        let simulated_groups = if state.config.demand_dry_run {
+            planned_groups
+        } else {
+            0
+        };
+        let unclaimed = unclaimed + simulated_legs;
+        if twin::pump_group_budget(
+            idle.len(),
+            state.config.effective_reserve(),
+            unclaimed,
+            in_flight + simulated_groups,
+            state.config.demand_max_groups,
+            1,
+        ) == 0
+        {
+            break;
+        }
+        let budget =
+            twin::pump_worker_budget(idle.len(), state.config.effective_reserve(), unclaimed);
+        let planned = match state.plan_tick_with_budget(&idle, budget, &model_id, now_unix_ms()) {
+            Ok(planned) => planned,
+            Err(_) => break,
+        };
+        let legs = if matches!(planned, PlannedDemand::Twin { .. }) {
+            2
+        } else {
+            1
+        };
+        if state.config.demand_dry_run {
+            simulated_legs += legs;
+        } else {
+            let request = demand_request(node, planned, model_id);
+            let task_node = node.clone();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let mut shutdown = node.runtime_shutdown.clone();
+            spawn_node_runtime_task(node, async move {
+                tokio::select! {
+                    biased;
+                    _ = wait_for_optional_runtime_shutdown(&mut shutdown) => {}
+                    result = dispatch_twin_started(&task_node, request, Some(started_tx)) => {
+                        if let Err(error) = result {
+                            tracing::debug!(?error, "fan-out pump group did not complete");
+                        }
+                    }
+                }
+            });
+            // Registration is synchronous before this signal. The next plan
+            // therefore sees all open groups and their unclaimed legs.
+            if started_rx.await.is_err() {
+                break;
+            }
+        }
+        planned_groups += 1;
+        // Top up only at ticks, even if a very fast group completes mid-tick.
+        if planned_groups >= state.config.demand_max_groups {
+            break;
+        }
+    }
+    if state.config.demand_dry_run {
+        state.inner.lock().counters.demand_dry_run_ticks += 1;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2181,6 +2619,7 @@ mod tests {
             demand_dry_run: false,
             spot_check_per_mille: 0,
             demand_interval_secs: twin::DEFAULT_DEMAND_INTERVAL_SECS,
+            ..TwinConfig::default()
         }
     }
 
