@@ -3129,6 +3129,373 @@ mod tests {
         );
     }
 
+    fn fanout_node(idle: usize, reserve: usize, max_groups: usize) -> NodeState {
+        let ids: Vec<String> = (0..idle).map(|i| format!("worker-{i}")).collect();
+        let mut node = twin_node(
+            &ids.iter().map(String::as_str).collect::<Vec<_>>(),
+            TwinConfig {
+                demand_pump: true,
+                demand_max_groups: max_groups,
+                demand_reserve_workers: reserve,
+                ..enabled()
+            },
+        );
+        // Model the production caller channel, independently of the pump queue.
+        let (tx, rx) = tokio::sync::mpsc::channel(COMMUNITY_WORK_QUEUE_CAP);
+        node.community_work_tx = Some(Arc::new(tx));
+        node.community_work_queue = Some(Arc::new(tokio::sync::Mutex::new(rx)));
+        for id in ids {
+            node.community_active_jobs.insert(id, String::new());
+        }
+        node
+    }
+
+    fn synthetic_group(id: &str, source: DemandSource) -> TwinGroup {
+        let now = now_unix_ms();
+        TwinGroup {
+            source,
+            public_prompt: None,
+            model_id: parse_hash256_hex(&test_model_id(), "model").unwrap(),
+            input_hash: arc_crypto::hash_bytes(b"x x"),
+            max_tokens: 4,
+            created_at_unix_ms: now,
+            collect_deadline_unix_ms: now + 60_000,
+            legs: vec![TwinLeg {
+                item: WorkItem {
+                    job_id: id.into(),
+                    input: "x x".into(),
+                    max_tokens: 4,
+                    model_id: Some(test_model_id()),
+                    execution_profile: canonical_profile(),
+                    transaction_domain: None,
+                    expected_worker_id: None,
+                    submitted_at_unix_ms: now as i64,
+                    expires_at_unix_ms: now + 4_200_000,
+                },
+                assignment_epoch: Hash256::ZERO,
+                job_nonce: 0,
+                enqueued_at_unix_ms: now,
+                worker: None,
+                status: LegStatus::Unclaimed,
+                terminal_at_unix_ms: None,
+                result: None,
+                attestation: None,
+            }],
+            reference: None,
+            outcome_tx: None,
+            state: GroupState::Collecting,
+            _pump_slot: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_cold_start_counts_and_dry_run() {
+        for (reserve, expected) in [(0, [0, 2, 8, 8]), (4, [0, 1, 8, 8])] {
+            for (idle, expected) in [2, 6, 20, 100].into_iter().zip(expected) {
+                let node = fanout_node(idle, reserve, 8);
+                run_demand_tick(&node).await.unwrap();
+                assert_eq!(
+                    node.community_twin.pump_groups.load(Ordering::Acquire),
+                    expected
+                );
+                assert_eq!(
+                    node.community_twin.inner.lock().pump_queue.len(),
+                    expected * 2
+                );
+                assert_eq!(node.public_inference_permits.available_permits(), 2);
+                assert_eq!(
+                    node.community_work_tx.as_ref().unwrap().capacity(),
+                    COMMUNITY_WORK_QUEUE_CAP
+                );
+                let summary = scoreboard_summary(&node).unwrap();
+                assert_eq!(summary["pump_groups_in_flight"], expected);
+                assert_eq!(summary["pump_max_groups"], 8);
+                assert_eq!(summary["idle_eligible_workers"], idle);
+                // Repeating a tick cannot spend workers already promised to legs.
+                run_demand_tick(&node).await.unwrap();
+                assert_eq!(
+                    node.community_twin.pump_groups.load(Ordering::Acquire),
+                    expected
+                );
+            }
+        }
+        let mut node = fanout_node(20, 0, 8);
+        let config = TwinConfig {
+            demand_dry_run: true,
+            ..node.community_twin.config
+        };
+        node.community_twin = Arc::new(CommunityTwinState::new(config));
+        run_demand_tick(&node).await.unwrap();
+        let inner = node.community_twin.inner.lock();
+        assert_eq!(inner.demand_counter, 8);
+        assert_eq!(inner.counters.demand_dry_run_ticks, 1);
+        assert!(inner.groups.is_empty() && inner.pump_queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fanout_full_burst_admits_callers_and_yields_claims() {
+        let node = fanout_node(100, 0, 32);
+        run_demand_tick(&node).await.unwrap();
+        assert_eq!(node.community_twin.pump_groups.load(Ordering::Acquire), 32);
+        let first = spawn_dispatch(&node, DemandSource::PublicRequest);
+        let second = spawn_dispatch(&node, DemandSource::PublicRequest);
+        wait_for_pending(&node, 68).await;
+        assert_eq!(node.public_inference_permits.available_permits(), 0);
+        assert_eq!(
+            run_demand_tick(&node).await.unwrap_err(),
+            "caller inference is in flight"
+        );
+        node.community_active_jobs.remove("worker-0");
+        let claimed = claim(&node, "worker-0").await;
+        let job = job_of(&claimed);
+        let inner = node.community_twin.inner.lock();
+        let (group, _) = inner.leg_to_group.get(&job).unwrap();
+        assert_eq!(inner.groups[group].source, DemandSource::PublicRequest);
+        assert_eq!(inner.pump_queue.len(), 64);
+        drop(inner);
+        assert_eq!(
+            node.community_work_tx.as_ref().unwrap().capacity(),
+            COMMUNITY_WORK_QUEUE_CAP
+        );
+        first.abort();
+        second.abort();
+        let _ = first.await;
+        let _ = second.await;
+    }
+
+    #[tokio::test]
+    async fn fanout_claim_reserve_and_refused_sibling_do_not_park_claimer() {
+        let node = fanout_node(6, 0, 8);
+        run_demand_tick(&node).await.unwrap();
+        node.community_active_jobs.remove("worker-0");
+        let first = job_of(&claim(&node, "worker-0").await);
+        // Emulate another poll after this worker becomes idle. Its sibling
+        // refuses it; another independent group's leg is returned immediately.
+        node.community_active_jobs.remove("worker-0");
+        let other = tokio::time::timeout(Duration::from_millis(100), claim(&node, "worker-0"))
+            .await
+            .expect("refused sibling must not end the poll");
+        let other = job_of(&other);
+        let inner = node.community_twin.inner.lock();
+        assert_ne!(inner.leg_to_group[&first].0, inner.leg_to_group[&other].0);
+        drop(inner);
+        // Reduce the live idle pool to the reserve. No pump work may leave it.
+        for id in ["worker-3", "worker-4", "worker-5"] {
+            node.community_active_jobs.remove(id);
+        }
+        assert!(poll_pump(&node, "worker-1").is_none());
+        assert_eq!(
+            claim_decision(&node, &first, "worker-1"),
+            Some(ClaimDecision::Defer("pump_worker_reserve"))
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_open_slots_include_resolution_and_preserve_caller_capacity() {
+        let node = fanout_node(0, 0, 50); // normalized to 32, never 50 concurrent groups
+        let state = &node.community_twin;
+        for i in 0..32 {
+            let id = format!("pump-{i}");
+            state
+                .register_group(id.clone(), synthetic_group(&id, DemandSource::PumpDemo))
+                .unwrap();
+            assert!(state.begin_resolution(&id).is_some());
+        }
+        assert!(
+            state
+                .register_group(
+                    "overflow".into(),
+                    synthetic_group("overflow", DemandSource::PumpDemo)
+                )
+                .is_err()
+        );
+        for i in 0..TWIN_OPEN_GROUP_CAP {
+            let id = format!("caller-{i}");
+            state
+                .register_group(
+                    id.clone(),
+                    synthetic_group(&id, DemandSource::PublicRequest),
+                )
+                .unwrap();
+        }
+        assert_eq!(state.inner.lock().groups.len(), 96);
+        assert!(
+            state
+                .register_group(
+                    "caller-overflow".into(),
+                    synthetic_group("caller-overflow", DemandSource::PublicRequest)
+                )
+                .is_err()
+        );
+        state.unregister_group("pump-0");
+        assert_eq!(state.pump_groups.load(Ordering::Acquire), 31);
+        state
+            .register_group(
+                "replacement".into(),
+                synthetic_group("replacement", DemandSource::PumpDemo),
+            )
+            .unwrap();
+        assert_eq!(state.pump_groups.load(Ordering::Acquire), 32);
+    }
+
+    #[tokio::test]
+    async fn fanout_recompute_never_queues_but_default_and_callers_still_wait() {
+        for (max_groups, source, should_wait) in [
+            (8, DemandSource::PumpDemo, false),
+            (1, DemandSource::PumpDemo, true),
+            (8, DemandSource::PublicRequest, true),
+        ] {
+            let node = fanout_node(0, 0, max_groups);
+            let held = node
+                .community_twin
+                .recompute_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .unwrap();
+            let item = synthetic_group("recompute", source).legs.remove(0).item;
+            let attempt = tokio::time::timeout(
+                Duration::from_millis(20),
+                run_twin_recompute(&node, &item, RecomputeReason::Mismatch, source),
+            )
+            .await;
+            if should_wait {
+                assert!(attempt.is_err());
+            } else {
+                assert!(matches!(attempt, Ok(Err(RecomputeStatus::SkippedBusy))));
+            }
+            drop(held);
+            assert_eq!(node.community_twin.recompute_permits.available_permits(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn fanout_late_pump_leg_survives_caller_ring_churn_and_delayed_cleanup() {
+        let node = fanout_node(4, 0, 8);
+        run_demand_tick(&node).await.unwrap();
+        node.community_active_jobs.remove("worker-0");
+        let job = job_of(&claim(&node, "worker-0").await);
+        let group = node.community_twin.inner.lock().leg_to_group[&job]
+            .0
+            .clone();
+        resolve_twin_group(&node, &group).await;
+        for i in 0..=TWIN_RESOLVED_LEG_CAP {
+            let id = format!("churn-{i}");
+            node.community_twin
+                .register_group(
+                    id.clone(),
+                    synthetic_group(&id, DemandSource::PublicRequest),
+                )
+                .unwrap();
+            resolve_twin_group(&node, &id).await;
+        }
+        assert_eq!(
+            node.community_twin.inner.lock().resolved_legs.len(),
+            TWIN_RESOLVED_LEG_CAP
+        );
+        assert!(is_twin_leg(&node, &job));
+        // Even an expired tombstone stays while delayed cleanup leaves a
+        // pending record that could still accept a submit.
+        node.community_twin
+            .inner
+            .lock()
+            .pump_legs
+            .insert(job.clone(), 0);
+        prune_pump_memory(&node);
+        assert!(is_twin_leg(&node, &job));
+        let late = submit(&node, result(&job, "worker-0", "late")).await;
+        assert_eq!(late["twin"]["status"], "late_after_resolution");
+        assert!(late.get("settlement").is_none());
+        assert_eq!(node.community_twin.inner.lock().counters.late_legs, 1);
+        prune_pump_memory(&node);
+        assert!(!is_twin_leg(&node, &job));
+        assert!(!DemandSource::PumpDemo.reward_eligible());
+        assert!(!DemandSource::PumpReplay.reward_eligible());
+    }
+
+    #[tokio::test]
+    async fn fanout_reopened_leg_cannot_resurrect_a_resolved_group() {
+        let node = fanout_node(4, 0, 8);
+        run_demand_tick(&node).await.unwrap();
+        node.community_active_jobs.remove("worker-0");
+        let job = job_of(&claim(&node, "worker-0").await);
+        let group = node.community_twin.inner.lock().leg_to_group[&job]
+            .0
+            .clone();
+        // A decline consumes the old pending record, then reopens the leg.
+        node.community_work_results.as_ref().unwrap().remove(&job);
+        let (item, epoch, nonce) = node
+            .community_twin
+            .reopen_declined_leg(&job, now_unix_ms())
+            .unwrap();
+        // Force the watchdog to win the race before re-insertion.
+        resolve_twin_group(&node, &group).await;
+        assert!(!requeue_twin_leg(&node, item.clone(), epoch, nonce));
+        requeue_item(&node, item);
+        assert!(
+            !node
+                .community_work_results
+                .as_ref()
+                .unwrap()
+                .contains_key(&job)
+        );
+        assert!(node.community_twin.inner.lock().pump_queue.is_empty());
+        assert_eq!(node.community_twin.pump_groups.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn fanout_memory_pressure_skips_pump_instead_of_evicting_live_ids() {
+        let node = fanout_node(0, 0, 8);
+        let cap = node.community_twin.config.pump_leg_memory_cap(4200);
+        for i in 0..cap {
+            node.community_twin
+                .inner
+                .lock()
+                .pump_legs
+                .insert(format!("live-{i}"), u64::MAX);
+        }
+        assert!(
+            node.community_twin
+                .register_group(
+                    "pump".into(),
+                    synthetic_group("pump", DemandSource::PumpDemo)
+                )
+                .is_err()
+        );
+        node.community_twin
+            .register_group(
+                "caller".into(),
+                synthetic_group("caller", DemandSource::PublicRequest),
+            )
+            .unwrap();
+        assert_eq!(node.community_twin.inner.lock().pump_legs.len(), cap);
+        assert_eq!(node.community_twin.pump_groups.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn default_tick_still_awaits_one_group_and_holds_one_public_permit() {
+        let node = fanout_node(20, 0, 1);
+        let task_node = node.clone();
+        let tick = tokio::spawn(async move { run_demand_tick(&task_node).await });
+        wait_for_pending(&node, 2).await;
+        assert!(!tick.is_finished());
+        assert_eq!(node.community_twin.pump_groups.load(Ordering::Acquire), 1);
+        assert_eq!(node.public_inference_permits.available_permits(), 1);
+        let group = node
+            .community_twin
+            .inner
+            .lock()
+            .groups
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        resolve_twin_group(&node, &group).await;
+        tick.await.unwrap().unwrap();
+        assert_eq!(node.community_twin.pump_groups.load(Ordering::Acquire), 0);
+        assert_eq!(node.public_inference_permits.available_permits(), 2);
+    }
+
     #[test]
     fn jittered_intervals_stay_within_twenty_percent() {
         for _ in 0..64 {

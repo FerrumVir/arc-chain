@@ -1494,6 +1494,51 @@ mod tests {
     }
 
     #[test]
+    fn pump_capacity_table_and_flag_bounds() {
+        let defaults = TwinConfig::default().normalized();
+        assert_eq!(defaults.demand_max_groups, 1);
+        assert_eq!(defaults.effective_reserve(), 0);
+        assert_eq!(defaults.demand_groups_per_hour, 30);
+        assert_eq!(defaults.pump_burst(), 2);
+        assert!(!defaults.separate_pump_memory());
+        for (reserve, expected) in [(0, [0, 2, 8, 8]), (4, [0, 1, 8, 8])] {
+            let config = TwinConfig {
+                demand_max_groups: 8,
+                demand_reserve_workers: reserve,
+                ..defaults
+            }
+            .normalized();
+            for (idle, count) in [2, 6, 20, 100].into_iter().zip(expected) {
+                assert_eq!(
+                    pump_group_budget(idle, config.effective_reserve(), 0, 0, 8, 2),
+                    count
+                );
+            }
+        }
+        assert_eq!(pump_group_budget(10, 2, 4, 2, 8, 2), 2);
+        assert_eq!(pump_group_budget(10, 2, 4, 2, 8, 1), 4);
+        assert_eq!(pump_group_budget(1, 4, 10, 9, 8, 2), 0);
+        let high = TwinConfig {
+            demand_max_groups: usize::MAX,
+            demand_groups_per_hour: u32::MAX,
+            ..defaults
+        }
+        .normalized();
+        assert_eq!(high.demand_max_groups, 32);
+        assert_eq!(high.demand_groups_per_hour, 3600);
+        assert_eq!(high.pump_burst(), 32);
+        assert_eq!(high.pump_leg_memory_cap(4200), 8528);
+        let low = TwinConfig {
+            demand_max_groups: 0,
+            demand_groups_per_hour: 0,
+            ..defaults
+        }
+        .normalized();
+        assert_eq!(low.demand_max_groups, 1);
+        assert_eq!(low.demand_groups_per_hour, 1);
+    }
+
+    #[test]
     fn region_classification_uses_research_7_diameters() {
         let amsterdam = known_validator(2);
         let tokyo = known_validator(4);
