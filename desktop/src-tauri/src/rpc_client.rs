@@ -187,6 +187,8 @@ pub async fn fetch_status(
         cpu_cores: None,
         // Filled in by the command layer from the running launch.
         model_unavailable: None,
+        crash_retry_in_secs: None,
+        model_download_wait: None,
     }
 }
 

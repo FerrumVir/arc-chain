@@ -95,14 +95,14 @@ test.describe("Crash banner", () => {
     await expect(page.getByTestId("crash-banner")).toHaveCount(0);
     const failure = page.getByTestId("mutation-error");
     await expect(failure).toBeVisible();
-    await expect(failure).toHaveAttribute("data-failure-kind", "needs-repair");
+    await expect(failure).toHaveAttribute("data-failure-kind", "other-desktop");
     await expect(failure.getByTestId("start-failure-title")).toHaveText(
-      PLAIN_COPY.startFailure.needsRepair.title,
+      PLAIN_COPY.startFailure.otherDesktop.title,
     );
     await expect(failure.getByTestId("start-failure-details")).toContainText(
       "another ARC desktop currently owns",
     );
-    await expect(failure.getByTestId("btn-start-failure-retry")).toBeVisible();
+    await expect(failure.getByTestId("btn-start-failure-close-copy")).toBeVisible();
   });
 
   test("relaunch + dismiss buttons render when banner is forced", async ({
@@ -131,4 +131,20 @@ test.describe("Crash banner", () => {
     });
     expect(shipped).toBe(true);
   });
+});
+
+test("a contended copy cannot offer settings changes or claim its own running node", async ({ page }) => {
+  await seedOnboarded(page);
+  await seedMockOverrides(page, {
+    node_start_block: "ARC is already open on this computer.",
+    node_status: { running: false, pid: null, health: "offline", version: "0.8.21", round: 0, committed: 0, height: 0, peers: 0, uptimeSeconds: 0, address: null, rpcPort: 9090, lastError: "ARC is already open on this computer." },
+  });
+  await page.goto("/");
+  await expect(page.getByTestId("btn-start")).toHaveCount(0);
+  await page.getByTestId("nav-settings").click();
+  await expect(page.getByTestId("settings-screen")).toContainText("ARC is already open on this computer.");
+  await expect(page.getByTestId("settings-screen").locator("input")).toHaveCount(0);
+  await expect(page.getByTestId("btn-start-failure-close-copy")).toBeVisible();
+  await expect(page.locator("#boot")).toHaveCount(0);
+  await page.screenshot({ path: "../evidence/macos-browser-refused-settings.png", fullPage: true });
 });

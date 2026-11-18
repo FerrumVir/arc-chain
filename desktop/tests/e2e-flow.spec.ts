@@ -689,7 +689,8 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     expect(commands).not.toContain("start_node_inner(&app, &state, &config)");
     expect(startFence).toContain("ARC refused to start the node");
     // A real refusal blocks every caller, startup's recovery launch included.
-    expect(startFence).toContain("(Some(StartFence::Refused(reason)), _) => Err(");
+    expect(startFence).toContain("(Some(StartFence::MigrationRefused(reason)), _) => Err(refusal_message(reason))");
+    expect(startFence).toMatch(/\(Some\(StartFence::Refused\(reason\)\), _\) => \{\s*Err\(/);
   });
 
   test("auto-start: autostart plugin registered with --minimized arg", () => {

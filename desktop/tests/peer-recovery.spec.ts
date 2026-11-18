@@ -14,7 +14,7 @@
 
 import { expect, test, type Page } from "@playwright/test";
 import { PLAIN_COPY } from "../src/lib/plain-copy";
-import { seedOnboarded } from "./helpers";
+import { seedOnboarded, seedMockOverrides } from "./helpers";
 
 // Operator vocabulary that must not reach the screen in a normal state.
 const JARGON =
@@ -23,7 +23,7 @@ const JARGON =
 // The local /health of a healthy community node, as arc-node reports it today.
 const HEALTHY_COMMUNITY = {
   status: "degraded",
-  version: "0.8.20",
+  version: "0.8.21",
   height: 0,
   peers: 0,
   uptime_secs: 60,
@@ -131,4 +131,33 @@ test.describe("Dashboard: a community node's connection", () => {
     await expect(page.getByTestId("dashboard").getByRole("alert")).toHaveCount(0);
     await expect(page.getByTestId("reset-peer-state-btn")).toHaveCount(0);
   });
+});
+
+test("a healthy home node at height zero never catches up to the chain tip", async ({ page }) => {
+  await seedOnboarded(page);
+  await seedMockOverrides(page, {
+    node_status: {
+      running: true, pid: 4242, round: 0, committed: 0, address: null, rpcPort: 9090, workerThreads: null, cpuCores: 4, health: "lite", version: HEALTHY_COMMUNITY.version,
+      height: HEALTHY_COMMUNITY.height, peers: HEALTHY_COMMUNITY.peers,
+      uptimeSeconds: HEALTHY_COMMUNITY.uptime_secs,
+      chainParticipationEnabled: HEALTHY_COMMUNITY.chain_participation_enabled,
+      chainHeight: 2000000, lastError: null, coordinatorUrl: "https://149.28.32.76",
+    },
+  });
+  await page.goto("/");
+  await expect(page.getByTestId("connection-notice")).toHaveAttribute("data-state", "connected");
+  await expect(page.getByTestId("dashboard")).not.toContainText("Catching up");
+  await expect(page.getByTestId("dashboard")).not.toContainText("blocks to go");
+  await expect(page.locator("#boot")).toHaveCount(0);
+  await page.screenshot({ path: "../evidence/macos-browser-home-node.png", fullPage: true });
+});
+
+test("a chain participant behind the tip still catches up", async ({ page }) => {
+  await seedOnboarded(page);
+  await seedMockOverrides(page, { node_status: {
+    running: true, pid: 4242, health: "live", height: 10, peers: 2, round: 10, committed: 10, version: "0.8.21", uptimeSeconds: 60, address: null, rpcPort: 9090, workerThreads: null, cpuCores: 4,
+    chainParticipationEnabled: true, chainHeight: 2000000, lastError: null,
+  } });
+  await page.goto("/");
+  await expect(page.getByTestId("dashboard")).toContainText("Catching up");
 });

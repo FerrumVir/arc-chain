@@ -132,6 +132,80 @@ fn comparable(component: Component<'_>, ignore_case: bool) -> String {
     }
 }
 
+/// Redact the home prefix in diagnostic prose, including Windows verbatim
+/// prefixes. Only a complete directory prefix is replaced.
+pub fn redact_home_text(text: &str) -> String {
+    redact_home_text_at(text, &home_dir().to_string_lossy(), HOME_PATHS_IGNORE_CASE)
+}
+
+fn redact_home_text_at(text: &str, home: &str, ignore_case: bool) -> String {
+    if home.len() < 2 || home == "." {
+        return text.into();
+    }
+    let home = home.trim_end_matches(['/', '\\']);
+    let mut result = text.to_owned();
+    let slash_home = home.replace('\\', "/");
+    let backslash_home = home.replace('/', "\\");
+    let prefixes = if ignore_case {
+        vec![
+            format!(r"\\?\{backslash_home}"),
+            format!("//?/{slash_home}"),
+            backslash_home,
+            slash_home,
+            home.to_owned(),
+        ]
+    } else {
+        vec![home.to_owned()]
+    };
+    for prefix in prefixes {
+        let mut at = 0;
+        loop {
+            let haystack = if ignore_case {
+                result.to_ascii_lowercase()
+            } else {
+                result.clone()
+            };
+            let needle = if ignore_case {
+                prefix.to_ascii_lowercase()
+            } else {
+                prefix.clone()
+            };
+            let Some(found) = haystack[at..].find(&needle) else {
+                break;
+            };
+            let start = at + found;
+            let end = start + prefix.len();
+            if result.is_char_boundary(start)
+                && result.is_char_boundary(end)
+                && result[end..].chars().next().map_or(true, |c| {
+                    c.is_whitespace()
+                        || matches!(
+                            c,
+                            '/' | '\\'
+                                | ':'
+                                | '.'
+                                | ','
+                                | ')'
+                                | ']'
+                                | '}'
+                                | ';'
+                                | '!'
+                                | '?'
+                                | '\''
+                                | '"'
+                        )
+                })
+            {
+                result.replace_range(start..end, "~");
+                at = start + 1;
+            } else {
+                at = end;
+            }
+        }
+    }
+    result
+}
+
 /// `~/.arc` — the root the node's data dir, managed binary and models all
 /// live under by default.
 pub fn arc_home() -> PathBuf {
@@ -150,6 +224,45 @@ pub fn local_host(port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_text_hides_home_and_windows_verbatim_prefix() {
+        assert_eq!(
+            redact_home_text_at("failed /Users/person/.arc/data", "/Users/person", false),
+            "failed ~/.arc/data"
+        );
+        assert_eq!(
+            redact_home_text_at(r"failed \\?\C:\Users\Person\.arc", r"C:\Users\Person", true),
+            r"failed ~\.arc"
+        );
+        assert_eq!(
+            redact_home_text_at("/Users/person2/data", "/Users/person", false),
+            "/Users/person2/data"
+        );
+    }
+
+    #[test]
+    fn diagnostic_home_redaction_covers_punctuation_and_windows_separators() {
+        for suffix in [".", ",", ")", "]", "}", ";", "!", "?", "\t", "\r\n"] {
+            assert_eq!(
+                redact_home_text_at(
+                    &format!("failed /custom/person{suffix}"),
+                    "/custom/person",
+                    false
+                ),
+                format!("failed ~{suffix}")
+            );
+        }
+        for path in [
+            "C:/Users/Person/.arc",
+            r"C:\Users\Person\.arc",
+            "//?/C:/Users/Person/.arc",
+        ] {
+            let result = redact_home_text_at(path, r"C:\Users\Person", true);
+            assert!(result.starts_with('~'), "{result}");
+            assert!(!result.contains("Person"));
+        }
+    }
 
     #[test]
     fn home_dir_is_never_empty() {

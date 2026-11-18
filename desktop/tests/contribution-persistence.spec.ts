@@ -140,9 +140,7 @@ test.describe("Persistence - auto-start on", () => {
     await gotoSettings(page);
     const summary = page.getByTestId("persistence-summary");
     await expect(summary).toBeVisible();
-    await expect(summary).toContainText("when the app opens");
-    await expect(summary).toContainText("OS login item is registered");
-    await expect(summary).toContainText("does not prove peers, work, or payment");
+    await expect(summary).toHaveText("ARC opens when you log in and starts your node.");
   });
 
   test("reports the config flag and the OS login item separately", async ({
@@ -162,9 +160,7 @@ test.describe("Persistence - auto-start on", () => {
     // seedOnboarded writes modelPath: null.
     await gotoSettings(page);
     const role = page.getByTestId("persistence-role");
-    await expect(role).toContainText("observer");
-    await expect(role).toContainText("cannot execute local model inference");
-    await expect(role).toContainText("does not promise work or payment");
+    await expect(role).toHaveText("Your node needs a model before it can answer questions.");
   });
 
   test("says worker candidate without promising work or payment", async ({
@@ -179,10 +175,7 @@ test.describe("Persistence - auto-start on", () => {
     });
     await gotoSettings(page);
     const role = page.getByTestId("persistence-role");
-    await expect(role).toContainText("worker candidate");
-    await expect(role).toContainText("artifact must load completely");
-    await expect(role).toContainText("successful mined");
-    await expect(role).toContainText("0x25");
+    await expect(role).toHaveText("Your node can answer questions after its model is ready.");
   });
 
   test("the Dashboard also answers whether it starts with the OS", async ({
@@ -210,9 +203,7 @@ test.describe("Persistence - auto-start off", () => {
     });
     await gotoSettings(page);
     const summary = page.getByTestId("persistence-summary");
-    await expect(summary).toContainText("does not start on its own");
-    await expect(summary).toContainText("cannot serve local inference");
-    await expect(summary).toContainText("does not guarantee peers, assignment, or payment");
+    await expect(summary).toHaveText("ARC does not start your node by itself. You can turn that on below.");
     await expect(page.getByTestId("persistence-autostart")).toHaveText("off");
   });
 });

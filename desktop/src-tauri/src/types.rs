@@ -153,7 +153,7 @@ pub struct PreviousInstallNotice {
     pub set_aside_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeStatus {
     pub running: bool,
@@ -220,6 +220,25 @@ pub struct NodeStatus {
     /// is stopped.
     #[serde(default)]
     pub model_unavailable: Option<ModelUnavailableReason>,
+    /// A slow automatic crash retry is pending; absent after Stop or disabling auto-start.
+    #[serde(default)]
+    pub crash_retry_in_secs: Option<u64>,
+    #[serde(default)]
+    pub model_download_wait: Option<ModelDownloadWait>,
+}
+
+/// A native download wait survives WebView reloads and hidden windows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "reason",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ModelDownloadWait {
+    OnBattery,
+    MeteredNetwork,
+    DiskFull { needed_bytes: u64 },
+    Failed,
 }
 
 /// Why the configured model file could not be used for this launch.

@@ -1,0 +1,14 @@
+{
+  "_comment": "Same policy as the deny.toml ignore list: every exception records the date added, who accepted the risk, why it is not exploitable here, the removal condition, and a hard expiry. Re-review the whole list at every release. Remove on a patched release, at the latest the expiry date; never extend silently.",
+  "exceptions": [
+    {
+      "advisory": "GHSA-fc5q-39xc-vjpf",
+      "package": "picomatch",
+      "added": "2026-11-18",
+      "owner": "TJ Dunham",
+      "expires": "2026-12-17",
+      "reason": "Desktop pulls picomatch through the dev dependency vite, both directly and via tinyglobby (including fdir). The compatibility TypeScript SDK pulls it through dev dependencies @types/jest, jest and ts-jest: jest-message-util, jest-haste-map (also @parcel/watcher, anymatch and fdir), and jest-util. These are build and test tools only. After clean installs, npm ls picomatch --omit=dev is empty in both desktop and sdks/typescript; neither shipped runtime dependency tree includes picomatch, and the SDK publishes only dist. Neither runtime source tree imports these matchers. The glob patterns used by these tools come from checked-in build/test configuration and tooling defaults (desktop/vite.config.ts and the jest configuration in sdks/typescript/package.json), not application user input. The advisory requires attacker-controlled repeated extglob patterns, which are not exposed by these build/test invocations. No patched picomatch version is available as of 2026-11-18.",
+      "removal": "Remove when a patched picomatch release is available, no later than 2026-12-17. Do not extend silently."
+    }
+  ]
+}

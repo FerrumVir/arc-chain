@@ -292,7 +292,7 @@ test.describe("Onboarding wizard", () => {
     page,
   }) => {
     await page.goto("/");
-    await expect(page.getByText(PLAIN_COPY.setup.alwaysReady)).toBeVisible();
+    await expect(page.getByText(PLAIN_COPY.home.shareBody)).toBeVisible();
     await expect(page.getByText(/you start earning/i)).toHaveCount(0);
     await page.getByTestId("btn-continue-welcome").click();
     await page.getByTestId("btn-reveal-seed").click();
@@ -330,7 +330,7 @@ test.describe("Onboarding wizard", () => {
       };
     });
     await page.goto("/");
-    await expect(page.getByText(PLAIN_COPY.setup.alwaysReadyPackageManaged)).toBeVisible();
+    await expect(page.getByText(PLAIN_COPY.home.shareBody)).toBeVisible();
     await expect(page.getByText(/updates automatically/i)).toHaveCount(0);
   });
 

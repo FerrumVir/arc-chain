@@ -4,6 +4,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import re
 from argparse import Namespace
 from pathlib import Path
 import subprocess
@@ -106,6 +107,272 @@ class PreviousReleaseTests(unittest.TestCase):
                 previous.verify_attestation(value, "v1.0.1", 1010)
 
 
+class ConsecutiveDesktopUpdateTests(unittest.TestCase):
+    """All API reads are fixtures; manifests use real ephemeral SSH signatures."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.key = self.root / "test-key"
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(self.key)],
+                       check=True, capture_output=True)
+        patch = mock.patch.object(previous, "PUBLIC_KEY", self.key.with_suffix(".pub").read_text().strip())
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.rows = []
+        self.payloads = {}
+        self.reads = []
+        patch = mock.patch.object(previous, "gh", side_effect=self.api)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.baseline = self.add_release("v0.8.19")
+        self.desktop = self.add_release("v0.8.20", self.desktop_value())
+
+    def desktop_value(self):
+        return dict(profile=previous.PROFILE, node_compatible_with_validators=True,
+                    validators_release=dict(tag="v0.8.19", binary_sha256="b" * 64))
+
+    def api(self, *args):
+        self.reads.append(args[-1])
+        if args[-1].endswith("/releases?per_page=100"):
+            # API order and page boundaries must not determine version order.
+            return json.dumps([[r] for r in reversed(self.rows)]).encode()
+        return self.payloads[int(args[-1].rsplit("/", 1)[1])]
+
+    def add_release(self, tag, value=None, manifest_hash=None, omit_attestation=False,
+                    namespace=None, raw_attestation=None):
+        rid = len(self.rows) + 1
+        r = release(tag, id=rid, target_commitish=f"{rid:040x}")
+        body = raw_attestation if raw_attestation is not None else (
+            json.dumps(value).encode() if value is not None else None)
+        manifest = ("# ARC release manifest v1\n# repository=FerrumVir/arc-chain\n"
+                    f"# tag={tag}\n# commit={r['target_commitish']}\n"
+                    + "b" * 64 + "  arc-node-linux-x86_64\n").encode()
+        if body is not None and not omit_attestation:
+            digest = manifest_hash or hashlib.sha256(body).hexdigest()
+            manifest += f"{digest}  {previous.ASSET}\n".encode()
+        path = self.root / f"manifest-{rid}"
+        path.write_bytes(manifest)
+        subprocess.run(["ssh-keygen", "-Y", "sign", "-f", str(self.key),
+                        "-n", namespace or previous.NAMESPACE, str(path)],
+                       check=True, capture_output=True)
+        signature = path.with_suffix(".sig").read_bytes()
+        files = [("SHA256SUMS", manifest), ("SHA256SUMS.sig", signature),
+                 ("arc-node-linux-x86_64", b"binary")]
+        if body is not None:
+            files.append((previous.ASSET, body))
+        r["assets"] = []
+        for index, (name, payload) in enumerate(files):
+            aid = rid * 10 + index
+            digest = "b" * 64 if name == "arc-node-linux-x86_64" else hashlib.sha256(payload).hexdigest()
+            r["assets"].append(dict(name=name, id=aid, state="uploaded", size=len(payload),
+                digest="sha256:" + digest, uploader={"login": "github-actions[bot]"},
+                browser_download_url=f"https://github.com/FerrumVir/arc-chain/releases/download/{tag}/{name}"))
+            self.payloads[aid] = payload
+        self.rows.append(r)
+        return r
+
+    def asset(self, name=previous.ASSET, row=None):
+        return next(a for a in (row or self.desktop)["assets"] if a["name"] == name)
+
+    def select(self, candidate="v0.8.21", baseline="v0.8.19"):
+        return previous.authenticate(baseline, candidate)
+
+    def refused(self):
+        with self.assertRaisesRegex(ValueError, previous.NOT_NEWEST):
+            self.select()
+
+    def replace_desktop(self, value, **kwargs):
+        self.rows.pop()
+        # Fresh filenames avoid any interactive ssh-keygen overwrite prompt.
+        self.root = self.root / "replacement"
+        self.root.mkdir()
+        self.desktop = self.add_release("v0.8.20", value, **kwargs)
+
+    def test_one_skipped_desktop_update(self):
+        result = self.select()
+        self.assertEqual(result["tag"], "v0.8.19")
+        self.assertEqual(result["binary_sha256"], "b" * 64)
+        self.assertEqual(result[previous.SKIPPED], [dict(tag="v0.8.20", release_id=2,
+            commit=self.desktop["target_commitish"],
+            attestation_sha256=hashlib.sha256(self.payloads[self.asset()["id"]]).hexdigest())])
+
+    def test_two_skipped_updates_in_ascending_version_order(self):
+        self.add_release("v0.8.21", self.desktop_value())
+        result = self.select("v0.8.22")
+        self.assertEqual([r["tag"] for r in result[previous.SKIPPED]], ["v0.8.20", "v0.8.21"])
+
+    def test_newest_baseline_has_empty_list_and_original_evidence(self):
+        self.rows.pop()
+        result = self.select()
+        self.assertEqual(result.pop(previous.SKIPPED), [])
+        assets = {a["name"]: a for a in self.baseline["assets"]}
+        expected = previous.verify_manifest(self.baseline,
+            self.payloads[assets["SHA256SUMS"]["id"]], self.payloads[assets["SHA256SUMS.sig"]["id"]])
+        self.assertEqual(result, expected)
+
+    def test_missing_attestation_asset(self):
+        self.desktop["assets"].pop()
+        self.refused()
+
+    def test_other_validator_tag(self):
+        value = self.desktop_value()
+        value["validators_release"]["tag"] = "v0.8.18"
+        self.replace_desktop(value)
+        self.refused()
+
+    def test_other_validator_binary_hash(self):
+        value = self.desktop_value()
+        value["validators_release"]["binary_sha256"] = "c" * 64
+        self.replace_desktop(value)
+        self.refused()
+
+    def test_wrong_profile(self):
+        value = self.desktop_value()
+        value["profile"] = assembler.UPDATE_PROFILE
+        self.replace_desktop(value)
+        self.refused()
+
+    def test_compatibility_must_be_boolean_true(self):
+        for compatible in (False, 1, "true", None):
+            with self.subTest(compatible=compatible):
+                value = self.desktop_value()
+                value["node_compatible_with_validators"] = compatible
+                self.replace_desktop(value)
+                self.refused()
+
+    def test_attestation_uploader_must_be_bot(self):
+        self.asset()["uploader"]["login"] = "other"
+        self.refused()
+
+    def test_attestation_digest_mismatch(self):
+        self.asset()["digest"] = "sha256:" + "0" * 64
+        self.refused()
+
+    def test_attestation_size_mismatch(self):
+        self.asset()["size"] += 1
+        self.refused()
+
+    def test_missing_attestation_digest(self):
+        del self.asset()["digest"]
+        self.refused()
+
+    def test_attestation_missing_from_manifest(self):
+        self.replace_desktop(self.desktop_value(), omit_attestation=True)
+        self.refused()
+
+    def test_attestation_hash_differs_from_signed_manifest(self):
+        self.replace_desktop(self.desktop_value(), manifest_hash="0" * 64)
+        self.refused()
+
+    def test_bad_manifest_signature_with_correct_api_digest(self):
+        asset = self.asset("SHA256SUMS.sig")
+        payload = b"forged manifest signature\n"
+        asset["size"] = len(payload)
+        self.payloads[asset["id"]] = payload
+        asset["digest"] = "sha256:" + hashlib.sha256(payload).hexdigest()
+        self.refused()
+
+    def test_wrong_manifest_signature_namespace(self):
+        self.replace_desktop(self.desktop_value(), namespace="wrong")
+        self.refused()
+
+    def test_oversize_attestation_is_refused_before_download(self):
+        asset = self.asset()
+        asset["size"] = previous.MAX_ATTESTATION_BYTES + 1
+        self.refused()
+        self.assertFalse(any(p.endswith(f"/assets/{asset['id']}") for p in self.reads))
+
+    def test_actual_oversize_attestation_is_refused(self):
+        asset = self.asset()
+        self.payloads[asset["id"]] = b" " * (previous.MAX_ATTESTATION_BYTES + 1)
+        self.refused()
+
+    def test_non_object_attestation(self):
+        self.replace_desktop([self.desktop_value()])
+        self.refused()
+
+    def test_signed_malformed_json_is_refused(self):
+        self.replace_desktop(None, raw_attestation=b"{broken")
+        self.refused()
+
+    def test_signed_duplicate_json_keys_are_refused(self):
+        body = json.dumps(self.desktop_value()).encode()
+        body = body[:-1] + b', "node_compatible_with_validators": true}'
+        self.replace_desktop(None, raw_attestation=body)
+        self.refused()
+
+    def test_baseline_must_precede_candidate(self):
+        for candidate in ("v0.8.19", "v0.8.18"):
+            with self.subTest(candidate=candidate), self.assertRaisesRegex(ValueError, "precede"):
+                self.select(candidate)
+
+    def test_baseline_must_qualify(self):
+        for changes in ({"immutable": False}, {"draft": True}, {"prerelease": True},
+                        {"author": {"login": "other"}}, {"name": "other"}):
+            with self.subTest(changes=changes):
+                original = copy.deepcopy(self.baseline)
+                self.baseline.update(changes)
+                self.refused()
+                self.baseline.update(original)
+
+    def test_candidate_or_later_qualifying_release_refuses_old_handoff(self):
+        self.add_release("v0.8.21", self.desktop_value())
+        self.refused()
+
+    def test_duplicate_intervening_version_is_refused(self):
+        self.rows.append(copy.deepcopy(self.desktop))
+        self.refused()
+
+    def test_unqualifying_newer_releases_are_ignored(self):
+        self.rows.append(release("v9.0.0", immutable=False))
+        self.rows.append(release("v10.0.0", name="Legacy channel"))
+        self.assertEqual(len(self.select()[previous.SKIPPED]), 1)
+
+    def test_skipped_release_identity_must_bind_id_and_commit(self):
+        for changes in ({"id": 0}, {"id": True}, {"target_commitish": "main"}):
+            with self.subTest(changes=changes):
+                original = copy.deepcopy(self.desktop)
+                self.desktop.update(changes)
+                self.refused()
+                self.desktop.update(original)
+
+    def test_unavailable_read_refuses_selection(self):
+        with mock.patch.object(previous, "gh", side_effect=ValueError("GitHub release read failed")):
+            with self.assertRaisesRegex(ValueError, "read failed"):
+                self.select()
+
+    def test_rederived_skipped_list_must_match_every_field_and_order(self):
+        self.add_release("v0.8.21", self.desktop_value())
+        prior, skipped = previous.attestation_evidence("v0.8.19", "v0.8.22")
+        value = dict(profile=previous.PROFILE, node_compatible_with_validators=True,
+                     validators_release=prior, generated_at_unix=1000,
+                     validators_release_skipped_desktop_updates=skipped)
+        previous.verify_attestation(value, "v0.8.22", 1010)
+        altered = [[], list(reversed(skipped)), skipped[:-1], None]
+        for key, replacement in (("tag", "v0.8.18"), ("release_id", 999), ("release_id", 2.0),
+                                 ("commit", "f" * 40), ("attestation_sha256", "f" * 64)):
+            rows = copy.deepcopy(skipped)
+            rows[0][key] = replacement
+            altered.append(rows)
+        for rows in altered:
+            with self.subTest(rows=rows), self.assertRaisesRegex(ValueError, "skipped.*differs"):
+                previous.verify_attestation({**value, previous.SKIPPED: rows}, "v0.8.22", 1010)
+        del value[previous.SKIPPED]
+        with self.assertRaisesRegex(ValueError, "skipped.*differs"):
+            previous.verify_attestation(value, "v0.8.22", 1010)
+
+    def test_new_desktop_release_invalidates_old_handoff(self):
+        prior, skipped = previous.attestation_evidence("v0.8.19", "v0.8.22")
+        value = dict(profile=previous.PROFILE, node_compatible_with_validators=True,
+                     validators_release=prior, generated_at_unix=1000,
+                     validators_release_skipped_desktop_updates=skipped)
+        self.add_release("v0.8.21", self.desktop_value())
+        with self.assertRaisesRegex(ValueError, "skipped.*differs"):
+            previous.verify_attestation(value, "v0.8.22", 1010)
+
+
 class DesktopAssemblyTests(unittest.TestCase):
     def assemble(self, config, proof):
         with tempfile.TemporaryDirectory() as directory:
@@ -145,6 +412,49 @@ class DesktopAssemblyTests(unittest.TestCase):
                                    "binary_sha256": existing.CANDIDATE}):
                 return assembler.assemble(args)
 
+    def test_assembly_records_empty_or_authenticated_skip_list(self):
+        config, proof = existing.synthetic_update_inputs()
+        self.assertEqual(self.assemble(config, proof)[previous.SKIPPED], [])
+        skipped = [dict(tag="v0.8.20", release_id=2, commit="a" * 40, attestation_sha256="c" * 64)]
+        prior = dict(tag="v0.8.19", binary_sha256=existing.CANDIDATE)
+        with mock.patch.object(previous, "attestation_evidence", return_value=(prior, skipped)):
+            value = self.assemble(config, proof)
+        self.assertEqual(value["validators_release"], prior)
+        self.assertEqual(value[previous.SKIPPED], skipped)
+
+    def test_owner_reverification_compares_skips_and_preserves_legacy_empty_list(self):
+        config, proof = existing.synthetic_update_inputs()
+        owner = self.assemble(config, proof)
+        verifier = owner["release"]["checkpoint_verifier_artifact"]
+        selection = {verifier["platform"]: {"headless": {
+            "id": verifier["artifact_id"], "digest": verifier["artifact_digest"]}}}
+        skip = dict(tag="v0.8.20", release_id=2, commit="a" * 40, attestation_sha256="b" * 64)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "selection.json").write_text("{}")
+            args = Namespace(rollout_validator=existing.validator_path, selection=root / "selection.json",
+                             commit="c" * 40, run_id=1, run_attempt=1)
+            for old, new, accepted in (([], [], True), (None, [], True),
+                                       ([skip], [skip], True), ([], [skip], False),
+                                       (None, [skip], False), ([skip], [], False)):
+                with self.subTest(old=old, new=new):
+                    supplied, recomputed = copy.deepcopy(owner), copy.deepcopy(owner)
+                    if old is None:
+                        del supplied[previous.SKIPPED]
+                    else:
+                        supplied[previous.SKIPPED] = old
+                    recomputed[previous.SKIPPED] = new
+                    (root / "owner.json").write_text(json.dumps(supplied))
+                    with mock.patch.object(assembler, "assemble", return_value=recomputed), \
+                         mock.patch.object(assembler, "validate_selection", return_value=selection), \
+                         mock.patch.object(assembler, "verify_owner_verifier"):
+                        if accepted:
+                            result = assembler.validate_owner_attestation(args, root / "owner.json", now=1100)
+                            self.assertEqual(result[previous.SKIPPED], new)
+                        else:
+                            with self.assertRaisesRegex(assembler.ProfileError, "differs from independently"):
+                                assembler.validate_owner_attestation(args, root / "owner.json", now=1100)
+
     def test_all_live_hosts_run_previous_not_candidate(self):
         for offline in (0, 1, 2):
             config, proof = existing.synthetic_update_inputs(offline_count=offline)
@@ -183,6 +493,33 @@ class DesktopAssemblyTests(unittest.TestCase):
         self.assertEqual(acceptance.release_profile_for_assets(files), previous.PROFILE)
         with self.assertRaises(acceptance.AcceptanceError):
             acceptance.release_profile_for_assets(files | {"arc-existing-chain-update-attestation.json"})
+
+
+class DesktopWorkflowNotesTests(unittest.TestCase):
+    def test_release_notes_and_handoff_name_actual_baseline_and_skips(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        expression = re.search(r"skipped_tags=.*?jq -er '([^']+)'", workflow).group(1)
+        handoff_text = (ROOT / ".github/workflows/existing-chain-update-handoff.yml").read_text()
+        summary = re.search(r"jq -r '(if \.profile == .*?else empty end)'", handoff_text, re.S).group(1)
+        for tags in ([], ["v0.8.20"], ["v0.8.20", "v0.8.21"]):
+            with self.subTest(tags=tags):
+                value = dict(profile=previous.PROFILE,
+                             validators_release=dict(tag="v0.8.19", binary_sha256="b" * 64),
+                             validators_release_skipped_desktop_updates=[dict(tag=t) for t in tags])
+                expected = ", ".join(tags) if tags else "none"
+                result = subprocess.run(["jq", "-er", expression], input=json.dumps(value),
+                                        text=True, capture_output=True, check=True)
+                self.assertEqual(result.stdout.strip(), expected)
+                rendered = subprocess.run(["jq", "-r", summary], input=json.dumps(value),
+                                          text=True, capture_output=True, check=True).stdout
+                self.assertIn("Validators remain on v0.8.19", rendered)
+                self.assertIn("b" * 64, rendered)
+                self.assertIn(f"Skipped desktop updates: {expected}.", rendered)
+                value["profile"] = assembler.UPDATE_PROFILE
+                rendered = subprocess.run(["jq", "-r", summary], input=json.dumps(value),
+                                          text=True, capture_output=True, check=True).stdout
+                self.assertEqual(rendered, "")
+        self.assertIn("Skipped desktop updates: $skipped_tags.", workflow)
 
 
 class PracticeSuffixTests(unittest.TestCase):

@@ -6,9 +6,9 @@ test.describe("Visual polish smoke tests", () => {
     await clearState(page);
     await page.goto("/");
     // Hero title and three value props (one-click-join copy)
-    await expect(page.getByText("One click")).toBeVisible();
-    await expect(page.getByText("Your identity, on-chain")).toBeVisible();
-    await expect(page.getByText("Ready when you are")).toBeVisible();
+    await expect(page.getByText("Ask for free")).toBeVisible();
+    await expect(page.getByText("See who answered")).toBeVisible();
+    await expect(page.getByText("Share if you want")).toBeVisible();
 
     // Logo gradient uses our brand gradient
     const logo = page.getByTestId("logo-mark").first();

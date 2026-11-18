@@ -95,8 +95,6 @@ export function Onboarding({
   const [pendingInBackground, setPendingInBackground] = useState(false);
   const [setupSaved, setSetupSaved] = useState(false);
   const [continuing, setContinuing] = useState(false);
-  // Linux .deb and .rpm installs can't install their own updates.
-  const [packageManaged, setPackageManaged] = useState(false);
 
   // Connecting stage: elapsed time + which seed was reached
   const [connectElapsed, setConnectElapsed] = useState(0);
@@ -118,19 +116,6 @@ export function Onboarding({
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 0 });
   }, [step]);
-
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .updateInstallPolicy()
-      .then((policy) => {
-        if (!cancelled) setPackageManaged(!policy.canInstall);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   useEffect(() => {
     if (step === "identity" && !identity) {
@@ -395,7 +380,7 @@ export function Onboarding({
                   <Tagline size="md" />
                 </div>
                 <h1 className="onboarding-title">{PLAIN_COPY.setup.welcomeTitle}</h1>
-                <p className="onboarding-subtitle">{PLAIN_COPY.home.promise}</p>
+                <p className="onboarding-subtitle">{PLAIN_COPY.home.promise}<br />{PLAIN_COPY.home.explanation}</p>
 
                 <div
                   style={{
@@ -407,20 +392,18 @@ export function Onboarding({
                   {[
                     {
                       icon: Sparkles,
-                      title: "One click setup",
-                      desc: "Choose the exact ARC-compatible 7B model or observer mode. We verify every downloaded byte; assignment and rewards remain visible gates.",
+                      title: PLAIN_COPY.home.askTitle,
+                      desc: PLAIN_COPY.home.askBody,
                     },
                     {
                       icon: ShieldCheck,
-                      title: "Your identity, on-chain",
-                      desc: "A BIP-39 recovery phrase generated locally - never leaves your machine.",
+                      title: PLAIN_COPY.home.proofTitle,
+                      desc: PLAIN_COPY.home.proofBody,
                     },
                     {
                       icon: Network,
-                      title: "Ready when you are",
-                      desc: packageManaged
-                        ? PLAIN_COPY.setup.alwaysReadyPackageManaged
-                        : PLAIN_COPY.setup.alwaysReady,
+                      title: PLAIN_COPY.home.shareTitle,
+                      desc: PLAIN_COPY.home.shareBody,
                     },
                   ].map(({ icon: Icon, title, desc }) => (
                     <div

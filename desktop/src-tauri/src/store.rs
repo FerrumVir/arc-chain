@@ -58,6 +58,20 @@ impl Store {
         dir.join("store.json")
     }
 
+    /// Inspect a canonical store without recovery or writes before testing
+    /// whether a pre-single-instance desktop still owns this data directory.
+    pub fn load_for_owner_probe(dir: &Path) -> Option<Self> {
+        let file = arc_crypto::secret_file::open_private(&Self::file(dir)).ok()?;
+        let mut bytes = Zeroizing::new(Vec::new());
+        file.take(MAX_STORE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > MAX_STORE_BYTES {
+            return None;
+        }
+        serde_json::from_slice(&bytes).ok()
+    }
+
     pub fn load_from(dir: &Path) -> Self {
         Self::load_from_with_outcome(dir).0
     }

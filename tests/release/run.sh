@@ -60,4 +60,7 @@ python3 "$TEST_DIR/../../scripts/recovery/test_build_macos_package_provenance.py
 printf '# %s\n' "test_desktop_update_profile.py"
 python3 "$TEST_DIR/test_desktop_update_profile.py" || status=1
 
+printf '# %s\n' "test_npm_audit_gate.py"
+python3 -I -B "$TEST_DIR/test_npm_audit_gate.py" || status=1
+
 exit "$status"

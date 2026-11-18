@@ -182,11 +182,11 @@ export function Inference() {
   }, [draft]);
 
   return (
-    <div className="main-inner chat-screen" data-testid="inference-screen">
+    <div className={`main-inner chat-screen${turns.length === 0 ? " chat-screen-empty" : ""}`} data-testid="inference-screen">
       <div className="page-header chat-header">
         <div>
           <h1 className="page-title">{PLAIN_COPY.home.title}</h1>
-          <p className="page-subtitle">Every answer shows who served it, whether a second computer checked it, and what reached the chain.</p>
+          <p className="page-subtitle">{PLAIN_COPY.home.promise}</p>
         </div>
         <div className="chat-header-actions">
           <InfoPopover title="How this works">
@@ -307,7 +307,7 @@ export function Inference() {
           />
           <div className="composer-bar">
             <label className="composer-tokens">
-              <span>Max tokens</span>
+              <span>{PLAIN_COPY.ask.answerLength}</span>
               <input
                 className="input input-mono"
                 type="number"
@@ -363,17 +363,11 @@ function EmptyThread() {
     <div className="chat-empty">
       <h2 className="chat-empty-title">{PLAIN_COPY.home.emptyTitle}</h2>
       <ul className="chat-empty-points">
-        <li>
-          <strong>Who served it.</strong> A named community worker or coordinator on the ARC network, or your own node when it answered.
-        </li>
-        <li>
-          <strong>Whether it was checked.</strong> Marked checked only when another computer re-ran it and the agreement is authenticated.
-        </li>
-        <li>
-          <strong>What reached the chain.</strong> A computation claim or a receipt, and never more than the chain reports.
-        </li>
+        <li><strong>{PLAIN_COPY.home.askTitle}.</strong> {PLAIN_COPY.home.askBody}</li>
+        <li><strong>{PLAIN_COPY.home.proofTitle}.</strong> {PLAIN_COPY.home.proofBody}</li>
+        <li><strong>{PLAIN_COPY.home.shareTitle}.</strong> {PLAIN_COPY.home.shareBody}</li>
       </ul>
-      <p className="chat-empty-note">Each prompt is answered on its own: earlier messages are not sent along as context.</p>
+      <p className="chat-empty-note">{PLAIN_COPY.home.independentQuestions}</p>
     </div>
   );
 }

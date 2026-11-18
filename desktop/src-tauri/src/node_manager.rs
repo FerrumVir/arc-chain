@@ -402,6 +402,37 @@ fn prepare_first_launch_managed_root_at(
     Ok(Some(namespace_lock))
 }
 
+/// Only an OS lock conflict is another owner; access and I/O errors stay errors.
+#[derive(Debug, thiserror::Error)]
+#[error("ARC is already open on this computer.")]
+pub struct ManagedLifecycleContention;
+
+fn lifecycle_lock_error(error: std::io::Error) -> anyhow::Error {
+    if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+        ManagedLifecycleContention.into()
+    } else {
+        anyhow::anyhow!("cannot acquire the managed node lifecycle lock: {error}")
+    }
+}
+
+/// Advisory, non-mutating old-copy probe. Absence is not ownership: the real
+/// reconciliation path must still acquire its lease before it writes anything.
+/// Do not secure directories, create files or restore/refresh namespaces here.
+pub fn probe_existing_managed_lifecycle_owner(configured_data_dir: &str) -> anyhow::Result<()> {
+    let data_dir = resolve_data_dir(configured_data_dir);
+    validate_configured_directory_ancestry_no_link(&data_dir)?;
+    let owner_path = data_dir.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME)
+        .join(DESKTOP_LIFECYCLE_OWNER_LOCK_FILE_NAME);
+    let file = match arc_crypto::secret_file::open_private_read_write(&owner_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    file.try_lock_exclusive().map_err(lifecycle_lock_error)?;
+    fs2::FileExt::unlock(&file)?;
+    Ok(())
+}
+
 pub fn acquire_managed_lifecycle_lock(
     configured_data_dir: &str,
 ) -> anyhow::Result<ManagedLifecycleLock> {
@@ -507,12 +538,7 @@ fn acquire_managed_lifecycle_lock_for_reconciliation(
         arc_crypto::secret_file::desktop_lifecycle_owner_lock_payload(),
     )?;
     let file = arc_crypto::secret_file::open_private_read_write(&owner_path)?;
-    file.try_lock_exclusive().map_err(|error| {
-        anyhow::anyhow!(
-            "another ARC desktop currently owns the managed node lifecycle for {}: {error}",
-            data_dir.display()
-        )
-    })?;
+    file.try_lock_exclusive().map_err(lifecycle_lock_error)?;
     Ok(ManagedLifecycleLock {
         data_dir,
         _file: file,
@@ -1371,26 +1397,55 @@ pub struct NodeManager {
     desired_running: bool,
     crash_restart_policy: CrashRestartPolicy,
     update_restart_was_desired: bool,
+    /// A slow crash wait the update boundary took over. While the boundary is
+    /// held it can't fire; Abort puts it back under the same lifecycle lease,
+    /// and the one-way handoff discards it.
+    update_suspended_crash_retry: Option<SuspendedCrashRetry>,
     /// Instance-local fixture capacity; absent from production builds.
     #[cfg(test)]
     test_ram_gb: Option<u64>,
 }
 
+/// The exact recovery a slow crash wait would have run, set aside while a
+/// signed update holds the lifecycle fence.
+struct SuspendedCrashRetry {
+    plan: Option<ManagedLaunchPlan>,
+    policy: CrashRestartPolicy,
+}
+
 #[derive(Clone, Debug, Default)]
 struct CrashRestartPolicy {
     restarts_attempted: u8,
+    slow_restarts_attempted: u8,
+    auto_start_enabled: bool,
     retry_at: Option<Instant>,
 }
 
 impl CrashRestartPolicy {
     fn reset(&mut self) {
-        *self = Self::default();
+        *self = Self {
+            auto_start_enabled: self.auto_start_enabled,
+            ..Self::default()
+        };
+    }
+
+    fn slow_retry_pending(&self) -> bool {
+        self.slow_restarts_attempted > 0 && self.retry_at.is_some()
     }
 
     fn schedule_after_crash(&mut self, now: Instant) -> Option<(u8, Duration)> {
         if self.restarts_attempted >= MAX_CRASH_RESTARTS {
-            self.retry_at = None;
-            return None;
+            if !self.auto_start_enabled {
+                self.retry_at = None;
+                return None;
+            }
+            // One attempt per slow interval, never another burst of five.
+            let delay = Duration::from_secs(10 * 60)
+                .saturating_mul(1u32 << self.slow_restarts_attempted.min(3))
+                .min(Duration::from_secs(60 * 60));
+            self.slow_restarts_attempted = self.slow_restarts_attempted.saturating_add(1);
+            self.retry_at = Some(now + delay);
+            return Some((self.restarts_attempted, delay));
         }
         let exponent = self.restarts_attempted as u32;
         let delay = CRASH_RESTART_BASE_DELAY
@@ -1671,6 +1726,7 @@ impl NodeManager {
             desired_running: false,
             crash_restart_policy: CrashRestartPolicy::default(),
             update_restart_was_desired: false,
+            update_suspended_crash_retry: None,
             #[cfg(test)]
             test_ram_gb: None,
         }
@@ -1695,6 +1751,87 @@ impl NodeManager {
     pub fn clear_desired_running(&mut self) {
         self.desired_running = false;
         self.crash_restart_policy.retry_at = None;
+    }
+
+    /// Slow recovery follows the current saved auto-start preference. Explicit
+    /// Stop still clears desired_running, so enabling this cannot restart it.
+    pub fn set_crash_autostart_enabled(&mut self, enabled: bool) {
+        self.crash_restart_policy.auto_start_enabled = enabled;
+        if !enabled {
+            self.cancel_slow_crash_retry();
+        }
+    }
+
+    /// Release our own pending slow retry before a manual Start takes the
+    /// normal lifecycle lock and reconciles the durable receipt itself.
+    pub fn cancel_slow_crash_retry(&mut self) {
+        if self.child.is_none() && self.crash_restart_policy.slow_retry_pending() {
+            self.clear_desired_running();
+            self.lifecycle_lock = None;
+            self.active_launch_plan = None;
+        }
+    }
+
+    /// No node runs, and the only thing that would start one is a slow
+    /// crash retry after the fast budget ran out. Nothing is left to drain,
+    /// so a signed update may take this over instead of waiting behind it
+    /// (fast retries keep their own deferral).
+    pub fn slow_crash_wait_pending(&self) -> bool {
+        self.child.is_none()
+            && self.desired_running
+            && self.crash_restart_policy.slow_retry_pending()
+    }
+
+    /// Take a pending slow crash wait out of the supervisor's reach for an
+    /// update boundary, keeping the lifecycle lease where it is so the
+    /// boundary inherits it with no release/reacquire gap. Returns whether a
+    /// wait was taken over.
+    fn suspend_slow_crash_retry_for_update(&mut self) -> bool {
+        if !self.slow_crash_wait_pending() {
+            return false;
+        }
+        self.update_suspended_crash_retry = Some(SuspendedCrashRetry {
+            plan: self.active_launch_plan.take(),
+            policy: self.crash_restart_policy.clone(),
+        });
+        self.clear_desired_running();
+        true
+    }
+
+    /// Put a suspended slow crash wait back after the update did not happen.
+    /// The retry runs only through the supervisor's exact-plan path, so the
+    /// lifecycle lease, launch identities and authenticated recovery receipt
+    /// are all re-checked when it is due. Without the lease it fails closed
+    /// at once, and Home says the node stopped instead of promising a retry.
+    async fn restore_suspended_crash_retry(&mut self) {
+        let Some(suspended) = self.update_suspended_crash_retry.take() else {
+            return;
+        };
+        let auto_start_enabled = self.crash_restart_policy.auto_start_enabled;
+        self.crash_restart_policy = suspended.policy;
+        self.crash_restart_policy.auto_start_enabled = auto_start_enabled;
+        self.active_launch_plan = suspended.plan;
+        self.desired_running = true;
+        if self.lifecycle_lock.is_none() || self.active_launch_plan.is_none() {
+            self.fail_crash_restart(
+                "the update boundary could not return the exact launch and its lifecycle lease",
+            )
+            .await;
+            return;
+        }
+        if !auto_start_enabled {
+            self.cancel_slow_crash_retry();
+        }
+    }
+
+    pub fn crash_retry_in_secs(&self) -> Option<u64> {
+        (self.desired_running && self.crash_restart_policy.slow_retry_pending()).then(|| {
+            self.crash_restart_policy
+                .retry_at
+                .unwrap()
+                .saturating_duration_since(Instant::now())
+                .as_secs()
+        })
     }
 
     /// Reap an exited child and run one due exact-plan retry. Called only by
@@ -1965,6 +2102,21 @@ impl NodeManager {
 
     pub fn uptime_seconds(&self) -> u64 {
         self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0)
+    }
+
+    /// Do not reacquire our own lease during crash backoff or rerun setup.
+    pub fn require_idle_for_binary_check(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.lifecycle_lock.is_none() && self.child.is_none() && !self.desired_running,
+            "ARC is running or recovering your node. Stop the node before running setup again."
+        );
+        Ok(())
+    }
+
+    pub fn require_no_pending_crash_recovery(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.desired_running || self.child.is_some(),
+            "ARC is recovering your node after it stopped unexpectedly. Wait for recovery, or stop the node before starting again.");
+        Ok(())
     }
 
     pub fn is_running(&mut self) -> bool {
@@ -2553,7 +2705,7 @@ impl NodeManager {
                                 &self.logs,
                                 "warn",
                                 format!(
-                                    "arc-node crash retry {attempt}/{MAX_CRASH_RESTARTS} scheduled in {}s",
+                                    "arc-node crash retry (fast attempts {attempt}/{MAX_CRASH_RESTARTS}) scheduled in {}s",
                                     delay.as_secs()
                                 ),
                             )
@@ -2827,11 +2979,29 @@ impl NodeManager {
         // running owned node somehow lacks this post-spawn identity, do not
         // stop it: an updater failure could not restore what was running.
         let owned_was_running = self.child.is_some();
+        // An exhausted budget's slow wait is set aside like an explicit Stop
+        // (the update that may fix the crash must not wait behind it); a
+        // failed Prepare puts it back. A fast retry still defers the update.
+        let suspended = self.suspend_slow_crash_retry_for_update();
         let restart_was_desired = self.desired_running;
         anyhow::ensure!(
             !restart_was_desired || owned_was_running,
             "cannot prepare an update while exact-plan crash recovery is pending; let recovery run or explicitly stop the node first"
         );
+        let result = self
+            .prepare_update_relaunch_after_intent(owned_was_running, restart_was_desired)
+            .await;
+        if suspended && self.update_lifecycle_lock.is_none() {
+            self.restore_suspended_crash_retry().await;
+        }
+        result
+    }
+
+    async fn prepare_update_relaunch_after_intent(
+        &mut self,
+        owned_was_running: bool,
+        restart_was_desired: bool,
+    ) -> anyhow::Result<()> {
         let restart_plan = if owned_was_running {
             Some(self.active_launch_plan.clone().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -2869,8 +3039,12 @@ impl NodeManager {
     /// data directory) and no crash retry is pending: a crash whose recovery
     /// could not finish. Stop refuses that receipt by design, so the signed
     /// app update that may carry the fix takes the fenced boundary instead.
+    ///
+    /// An exhausted crash budget's slow wait also takes it: no node runs, and
+    /// the update owns the lease the retry would have used until it finishes
+    /// or aborts. A fast retry keeps the ordinary deferral.
     pub fn ordinary_update_boundary_is_fenced(&self) -> bool {
-        if self.child.is_some() || self.desired_running {
+        if self.child.is_some() || (self.desired_running && !self.slow_crash_wait_pending()) {
             return false;
         }
         let Some(data_dir) = self.managed_data_dir.as_deref() else {
@@ -2885,6 +3059,9 @@ impl NodeManager {
         // unattended update defers. The probe never waits.
         if matches!(node_data_directory_held(data_dir), Ok(true)) {
             return false;
+        }
+        if self.slow_crash_wait_pending() {
+            return true;
         }
         // An unreadable receipt closes the node as firmly as an armed one.
         arc_crypto::secret_file::desktop_shutdown_lifecycle_state(data_dir)
@@ -2922,7 +3099,7 @@ impl NodeManager {
             "the managed node is still running; quit ARC from the tray and reopen it before updating"
         );
         anyhow::ensure!(
-            !self.desired_running,
+            !self.desired_running || self.slow_crash_wait_pending(),
             "cannot prepare an update while exact-plan crash recovery is pending; let recovery run or explicitly stop the node first"
         );
         // The Stop path's v0.8.13 guard. A refused v0.7 migration can leave
@@ -2933,9 +3110,18 @@ impl NodeManager {
                 "legacy desktop node reconciliation is unresolved; refusing the update boundary: {error}"
             );
         }
+        // Nothing below can fail once a slow crash wait's own lease exists,
+        // so the wait is set aside only when this boundary is certain to hold.
+        if self.lifecycle_lock.is_some() {
+            self.suspend_slow_crash_retry_for_update();
+        }
         let mut lifecycle_lock = match self.lifecycle_lock.take() {
             Some(lock) => lock,
             None => {
+                anyhow::ensure!(
+                    !self.desired_running,
+                    "cannot prepare an update while exact-plan crash recovery is pending; let recovery run or explicitly stop the node first"
+                );
                 let data_dir = self.managed_data_dir.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("managed node data directory is not configured")
                 })?;
@@ -3172,6 +3358,9 @@ impl NodeManager {
             "updater handoff has already begun"
         );
         self.update_handoff_started = true;
+        // Past this point the old node never resumes, so neither does a
+        // slow crash wait the boundary took over.
+        self.update_suspended_crash_retry = None;
         Ok(())
     }
 
@@ -3209,8 +3398,13 @@ impl NodeManager {
             // prior state, its refusal and unresolved receipt included.
             // The handoff check at the top of this function must stay first.
             debug_assert!(!self.update_handoff_started);
-            self.update_lifecycle_lock = None;
+            let lease = self.update_lifecycle_lock.take();
             self.update_fenced = false;
+            if self.update_suspended_crash_retry.is_some() {
+                // The same lease the slow wait held goes back to it.
+                self.lifecycle_lock = lease;
+                self.restore_suspended_crash_retry().await;
+            }
             return Ok(());
         }
         anyhow::ensure!(
@@ -3244,10 +3438,15 @@ impl NodeManager {
 
         let Some(restart_plan) = self.update_restart_plan.take() else {
             // The node was already stopped before Prepare. Release only the
-            // updater fence and preserve that stopped state.
-            self.update_lifecycle_lock = None;
+            // updater fence and preserve that stopped state, or hand the
+            // lease back to the slow crash wait Prepare set aside.
+            let lease = self.update_lifecycle_lock.take();
             self.update_handoff_started = false;
             self.update_restart_was_desired = false;
+            if self.update_suspended_crash_retry.is_some() {
+                self.lifecycle_lock = lease;
+                self.restore_suspended_crash_retry().await;
+            }
             return Ok(());
         };
         let lifecycle_lock = self
@@ -5486,6 +5685,53 @@ mod tests {
     }
 
     #[test]
+    fn crash_restart_slow_backoff_caps_without_resetting_the_fast_budget() {
+        let mut policy = CrashRestartPolicy {
+            auto_start_enabled: true,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        for _ in 0..MAX_CRASH_RESTARTS {
+            policy.schedule_after_crash(now).unwrap();
+        }
+        for seconds in [600, 1200, 2400, 3600, 3600, 3600] {
+            let (_, delay) = policy.schedule_after_crash(now).unwrap();
+            assert_eq!(delay.as_secs(), seconds);
+            assert!(policy.slow_retry_pending());
+            assert!(!policy.is_due(now));
+            assert!(policy.consume_due(now + delay));
+            assert_eq!(policy.restarts_attempted, MAX_CRASH_RESTARTS);
+        }
+        policy.reset_after_stable_run(now, now - CRASH_RESTART_STABLE_RUNTIME);
+        assert_eq!(policy.schedule_after_crash(now).unwrap().1.as_secs(), 1);
+        assert!(policy.auto_start_enabled);
+    }
+
+    #[test]
+    fn crash_restart_slow_wait_is_cancelled_by_stop_preferences_or_manual_start() {
+        for action in 0..3 {
+            let mut manager = NodeManager::new();
+            manager.desired_running = true;
+            manager.crash_restart_policy.auto_start_enabled = true;
+            manager.crash_restart_policy.restarts_attempted = MAX_CRASH_RESTARTS;
+            manager
+                .crash_restart_policy
+                .schedule_after_crash(Instant::now());
+            assert!(manager.crash_retry_in_secs().is_some());
+            match action {
+                0 => manager.clear_desired_running(),
+                1 => manager.set_crash_autostart_enabled(false),
+                _ => manager.cancel_slow_crash_retry(),
+            }
+            assert!(manager.crash_retry_in_secs().is_none());
+            assert!(!manager.desired_running);
+            assert!(manager.crash_restart_policy.retry_at.is_none());
+            manager.set_crash_autostart_enabled(true);
+            assert!(!manager.desired_running);
+        }
+    }
+
+    #[test]
     fn crash_restart_budget_resets_only_after_ten_stable_minutes() {
         let mut policy = CrashRestartPolicy::default();
         let now = Instant::now();
@@ -5648,6 +5894,76 @@ mod tests {
     }
 
     #[test]
+    fn own_crash_backoff_and_setup_do_not_report_another_desktop() {
+        let mut manager = NodeManager::new();
+        manager.desired_running = true;
+        let start = manager
+            .require_no_pending_crash_recovery()
+            .unwrap_err()
+            .to_string();
+        let setup = manager
+            .require_idle_for_binary_check()
+            .unwrap_err()
+            .to_string();
+        assert!(start.contains("recovering your node"));
+        assert!(setup.contains("Stop the node"));
+        assert!(!start.contains("already open"));
+        assert!(!setup.contains("already open"));
+        manager.desired_running = false;
+        assert!(manager.require_no_pending_crash_recovery().is_ok());
+        assert!(manager.require_idle_for_binary_check().is_ok());
+    }
+
+    #[test]
+    fn existing_owner_probe_never_changes_directory_contents() {
+        fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+            fn walk(root: &Path, at: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+                for entry in std::fs::read_dir(at).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        out.insert(path.strip_prefix(root).unwrap().to_owned(), Vec::new());
+                        walk(root, &path, out);
+                    } else {
+                        out.insert(path.strip_prefix(root).unwrap().to_owned(), std::fs::read(&path).unwrap());
+                    }
+                }
+            }
+            let mut out = std::collections::BTreeMap::new();
+            walk(root, root, &mut out);
+            out
+        }
+        let root = tempfile::tempdir().unwrap();
+        // The managed data namespace deliberately rejects linked ancestry.
+        // Resolve the test's OS temp root (e.g. macOS /var -> /private/var)
+        // without relaxing that production boundary.
+        let data = root.path().canonicalize().unwrap().join("data-v3");
+        let configured = data.to_string_lossy();
+        let before = snapshot(root.path());
+        probe_existing_managed_lifecycle_owner(&configured).unwrap();
+        assert_eq!(snapshot(root.path()), before); // Absent directory/lock.
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("sentinel"), b"unchanged").unwrap();
+        let before = snapshot(root.path());
+        probe_existing_managed_lifecycle_owner(&configured).unwrap();
+        assert_eq!(snapshot(root.path()), before); // Existing directory, absent lock.
+        let owner = acquire_managed_lifecycle_lock(&configured).unwrap();
+        drop(owner);
+        let before = snapshot(root.path());
+        probe_existing_managed_lifecycle_owner(&configured).unwrap();
+        assert_eq!(snapshot(root.path()), before); // Existing unlocked lock.
+        let owner_path = data.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME)
+            .join(DESKTOP_LIFECYCLE_OWNER_LOCK_FILE_NAME);
+        let owner_bytes = std::fs::read(&owner_path).unwrap();
+        let owner = arc_crypto::secret_file::open_private_read_write(&owner_path).unwrap();
+        owner.try_lock_exclusive().unwrap();
+        let error = probe_existing_managed_lifecycle_owner(&configured).unwrap_err();
+        assert!(error.downcast_ref::<ManagedLifecycleContention>().is_some());
+        fs2::FileExt::unlock(&owner).unwrap(); // Windows forbids reading locked bytes.
+        assert_eq!(std::fs::read(owner_path).unwrap(), owner_bytes);
+        assert_eq!(snapshot(root.path()), before);
+    }
+
+    #[test]
     fn managed_lifecycle_lock_serializes_desktop_processes() {
         let root = resource_test_dir("lifecycle-lock");
         arc_crypto::secret_file::secure_private_directory_tree(&root).unwrap();
@@ -5659,11 +5975,16 @@ mod tests {
             Err(error) => error,
         };
         assert!(
-            error
-                .to_string()
-                .contains("another ARC desktop currently owns the managed node lifecycle"),
-            "an established namespace must reach the lifecycle-lock check: {error}"
+            error.downcast_ref::<ManagedLifecycleContention>().is_some(),
+            "{error}"
         );
+        assert_eq!(error.to_string(), crate::start_fence::ALREADY_OPEN);
+        assert!(!error.to_string().contains(&configured));
+        let denied =
+            lifecycle_lock_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(denied
+            .downcast_ref::<ManagedLifecycleContention>()
+            .is_none());
         drop(first);
         let second = acquire_managed_lifecycle_lock(&configured).unwrap();
         assert_ne!(first_nonce, *second.session_nonce().unwrap());
@@ -6116,7 +6437,7 @@ mod tests {
         // What the owner lock told such a Start before the refusal existed.
         let contender = contend_for_lifecycle_lock(&configured);
         assert!(
-            contender.contains("another ARC desktop currently owns the managed node lifecycle"),
+            contender.contains(crate::start_fence::ALREADY_OPEN),
             "{contender}"
         );
 
@@ -6179,7 +6500,7 @@ mod tests {
         drop(arc_crypto::secret_file::try_acquire_private_directory_namespace_lock(&data).unwrap());
         let contender = contend_for_lifecycle_lock(&configured);
         assert!(
-            contender.contains("another ARC desktop currently owns the managed node lifecycle"),
+            contender.contains(crate::start_fence::ALREADY_OPEN),
             "{contender}"
         );
         assert!(manager.prepare_fenced_update_relaunch().is_err());
@@ -6200,7 +6521,7 @@ mod tests {
         assert!(manager.lifecycle_lock.is_none());
         let contender = contend_for_lifecycle_lock(&configured);
         assert!(
-            contender.contains("another ARC desktop currently owns the managed node lifecycle"),
+            contender.contains(crate::start_fence::ALREADY_OPEN),
             "{contender}"
         );
         manager.abort_update_relaunch().await.unwrap();
@@ -6370,7 +6691,7 @@ mod tests {
         let genesis = root.join("genesis.toml");
         std::fs::write(
             &binary,
-            b"#!/bin/sh\nif [ \"${1-}\" = --help ]; then\n  printf '%s\\n' '--validator-key-file --desktop-shutdown-token-file --desktop-lifecycle-nonce'\n  exit 0\nfi\ndata_dir=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --data-dir ]; then data_dir=\"$2\"; shift 2; else shift; fi\ndone\nstarts=0\nif [ -f \"$data_dir/crash-retry-fixture-starts\" ]; then starts=$(cat \"$data_dir/crash-retry-fixture-starts\"); fi\nstarts=$((starts + 1))\nprintf '%s' \"$starts\" > \"$data_dir/crash-retry-fixture-starts\"\nif [ \"$starts\" -eq 3 ] && [ ! -f \"$data_dir/crash-retry-fixture-ack-observed\" ]; then printf bad > \"$data_dir/crash-retry-fixture-order-error\"; fi\nprintf started > \"$data_dir/crash-retry-fixture-started\"\nif [ \"$starts\" -eq 2 ]; then while [ ! -f \"$data_dir/.arc-desktop-control/request\" ]; do sleep 0.01; done; sleep 0.1; exit 0; fi\nexec sleep 60\n",
+            b"#!/bin/sh\nif [ \"${1-}\" = --help ]; then\n  printf '%s\\n' '--validator-key-file --desktop-shutdown-token-file --desktop-lifecycle-nonce'\n  exit 0\nfi\ndata_dir=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --data-dir ]; then data_dir=\"$2\"; shift 2; else shift; fi\ndone\nstarts=0\nif [ -f \"$data_dir/crash-retry-fixture-starts\" ]; then starts=$(cat \"$data_dir/crash-retry-fixture-starts\"); fi\nstarts=$((starts + 1))\nprintf '%s' \"$starts\" > \"$data_dir/crash-retry-fixture-starts\"\nif [ \"$starts\" -eq 3 ] && [ ! -f \"$data_dir/crash-retry-fixture-ack-observed\" ]; then printf bad > \"$data_dir/crash-retry-fixture-order-error\"; fi\nprintf '%s' \"$starts\" > \"$data_dir/crash-retry-fixture-started\"\nif [ \"$starts\" -eq 2 ]; then while [ ! -f \"$data_dir/.arc-desktop-control/request\" ]; do sleep 0.01; done; sleep 0.1; exit 0; fi\nexec sleep 60\n",
         )
         .unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -6580,12 +6901,10 @@ mod tests {
         report_unlowered_priority(&manager.logs, Some(pid));
         let logged = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let found = manager
-                    .logs
-                    .lock()
-                    .await
-                    .iter()
-                    .any(|entry| entry.level == "warn" && entry.message.contains("low priority"));
+                let found =
+                    manager.logs.lock().await.iter().any(|entry| {
+                        entry.level == "warn" && entry.message.contains("low priority")
+                    });
                 if found {
                     return;
                 }
@@ -6755,11 +7074,48 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn crashed_owned_child_restarts_exact_plan_under_same_lifecycle_lock() {
-        let (root, configured, mut manager, _plan) =
-            updater_resume_fixture("crash-retry-exact-launch");
+        assert_crash_retry_preserves_exact_plan(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exhausted_crash_budget_restarts_exact_plan_under_same_lifecycle_lock() {
+        assert_crash_retry_preserves_exact_plan(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_crash_fixture_start(configured: &str, expected: u8) {
+        let marker = Path::new(configured).join("crash-retry-fixture-started");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if std::fs::read_to_string(&marker).ok().as_deref() == Some(&expected.to_string()) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fixture must reach the expected launch before proceeding");
+    }
+
+    #[cfg(unix)]
+    async fn assert_crash_retry_preserves_exact_plan(slow: bool) {
+        let (root, configured, mut manager, _plan) = updater_resume_fixture(if slow {
+            "slow-crash-retry-exact-launch"
+        } else {
+            "crash-retry-exact-launch"
+        });
         manager.abort_update_relaunch().await.unwrap();
         assert!(manager.desired_running);
         let first_pid = manager.pid().unwrap();
+        // Do not kill the shell before it records launch 1: otherwise its
+        // recovery can masquerade as the first launch and sleep for a minute.
+        wait_for_crash_fixture_start(&configured, 1).await;
+        let expected_attempts = if slow { MAX_CRASH_RESTARTS } else { 1 };
+        if slow {
+            manager.set_crash_autostart_enabled(true);
+            manager.crash_restart_policy.restarts_attempted = MAX_CRASH_RESTARTS;
+        }
 
         let child = manager.child.as_mut().unwrap();
         child.start_kill().unwrap();
@@ -6767,7 +7123,11 @@ mod tests {
         manager.supervise_managed_node().await;
         assert!(manager.child.is_none());
         assert!(manager.lifecycle_lock.is_some());
-        assert_eq!(manager.crash_restart_policy.restarts_attempted, 1);
+        assert_eq!(
+            manager.crash_restart_policy.restarts_attempted,
+            expected_attempts
+        );
+        assert_eq!(manager.crash_retry_in_secs().is_some(), slow);
 
         // The real schedule is exponential; make this integration test prompt
         // while preserving the same due-retry transition.
@@ -6807,6 +7167,7 @@ mod tests {
         });
         manager.supervise_managed_node().await;
         ack_task.await.unwrap();
+        wait_for_crash_fixture_start(&configured, 3).await;
         assert!(
             !Path::new(&configured)
                 .join("crash-retry-fixture-order-error")
@@ -6817,7 +7178,7 @@ mod tests {
         assert_ne!(first_pid, second_pid);
         assert!(manager.desired_running);
         assert_eq!(
-            manager.crash_restart_policy.restarts_attempted, 1,
+            manager.crash_restart_policy.restarts_attempted, expected_attempts,
             "an internal retry must not reset the bounded restart budget"
         );
         assert!(
@@ -6856,6 +7217,10 @@ mod tests {
             .await
             .expect_err("update must defer while exact-plan automatic recovery is pending");
         assert!(error.to_string().contains("crash recovery is pending"));
+        // A fast retry is seconds away: neither boundary takes it over.
+        assert!(!manager.slow_crash_wait_pending());
+        assert!(!manager.ordinary_update_boundary_is_fenced());
+        assert!(manager.prepare_fenced_update_relaunch().is_err());
         assert!(manager.desired_running);
         assert!(manager.child.is_none());
         assert!(manager.lifecycle_lock.is_some());
@@ -6865,6 +7230,187 @@ mod tests {
         );
         assert_eq!(manager.crash_restart_policy.retry_at, retry_at);
 
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    impl NodeManager {
+        /// A slow crash wait with no launch plan, for the update entrypoint
+        /// tests in `commands`: if it ever fired, it would fail closed.
+        pub(crate) fn enter_slow_crash_wait_for_test(&mut self, configured: &str) {
+            self.configure_managed_data_dir(configured).unwrap();
+            self.lifecycle_lock = Some(acquire_managed_lifecycle_lock(configured).unwrap());
+            self.desired_running = true;
+            self.crash_restart_policy.auto_start_enabled = true;
+            self.crash_restart_policy.restarts_attempted = MAX_CRASH_RESTARTS;
+            self.crash_restart_policy
+                .schedule_after_crash(Instant::now());
+        }
+    }
+
+    /// A real crash loop on its slow schedule: the fixture's first launch is
+    /// killed after the fast budget is spent, so no node runs, the durable
+    /// receipt is armed, and the next retry is minutes away.
+    #[cfg(unix)]
+    async fn slow_crash_wait_fixture(
+        label: &str,
+    ) -> (PathBuf, String, NodeManager, ManagedLaunchPlan) {
+        let (root, configured, mut manager, plan) = updater_resume_fixture(label);
+        manager.abort_update_relaunch().await.unwrap();
+        wait_for_crash_fixture_start(&configured, 1).await;
+        manager.set_crash_autostart_enabled(true);
+        manager.crash_restart_policy.restarts_attempted = MAX_CRASH_RESTARTS;
+        let child = manager.child.as_mut().unwrap();
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        manager.supervise_managed_node().await;
+        assert!(manager.child.is_none());
+        assert!(manager.slow_crash_wait_pending());
+        assert!(manager.crash_retry_in_secs().is_some());
+        assert!(manager.lifecycle_lock.is_some());
+        (root, configured, manager, plan)
+    }
+
+    #[cfg(unix)]
+    fn fixture_launches(configured: &str) -> String {
+        std::fs::read_to_string(Path::new(configured).join("crash-retry-fixture-starts")).unwrap()
+    }
+
+    /// Review finding 1: the update that may fix a crash loop must not wait
+    /// behind the loop's slow retry. Home's Update and the unattended updater
+    /// both route this state to the fenced boundary
+    /// (`ordinary_update_boundary_is_fenced`), which takes over the wait's own
+    /// lease. The set-aside retry never launches a node, even once it is due.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn slow_crash_wait_yields_to_the_update_and_never_relaunches() {
+        let (root, configured, mut manager, _plan) =
+            slow_crash_wait_fixture("slow-crash-wait-update-handoff").await;
+        assert!(managed_shutdown_recovery_required(&configured).unwrap());
+        assert!(manager.ordinary_update_boundary_is_fenced());
+
+        manager.prepare_fenced_update_relaunch().unwrap();
+        assert!(!manager.desired_running);
+        assert!(manager.crash_retry_in_secs().is_none());
+        assert!(manager.lifecycle_lock.is_none());
+        assert!(manager.active_launch_plan.is_none());
+        assert!(manager.update_lifecycle_lock.is_some());
+        assert!(manager.refuse_start_during_update().is_err());
+        let contender = contend_for_lifecycle_lock(&configured);
+        assert_eq!(contender, crate::start_fence::ALREADY_OPEN);
+
+        // Even with the set-aside deadline long past, the supervisor launches nothing.
+        manager
+            .update_suspended_crash_retry
+            .as_mut()
+            .unwrap()
+            .policy
+            .retry_at = Some(Instant::now());
+        manager.supervise_managed_node().await;
+        manager.supervise_managed_node().await;
+        assert!(manager.child.is_none());
+        assert_eq!(fixture_launches(&configured), "1");
+
+        manager.begin_update_handoff().unwrap();
+        assert!(manager.update_suspended_crash_retry.is_none());
+        assert!(manager.abort_update_relaunch().await.is_err());
+        manager.supervise_managed_node().await;
+        assert!(manager.child.is_none());
+        assert!(!manager.desired_running);
+        assert_eq!(fixture_launches(&configured), "1");
+        // The receipt stays armed for the new version's own recovery launch.
+        assert!(managed_shutdown_recovery_required(&configured).unwrap());
+
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An update rejected before its handoff gives the slow wait back exactly:
+    /// the same lease (never released, so no other desktop got in), the same
+    /// launch plan and the same deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aborted_update_returns_the_slow_crash_wait_under_the_same_lease() {
+        let (root, configured, mut manager, plan) =
+            slow_crash_wait_fixture("slow-crash-wait-update-abort").await;
+        let retry_at = manager.crash_restart_policy.retry_at;
+        let slow_attempts = manager.crash_restart_policy.slow_restarts_attempted;
+
+        manager.prepare_fenced_update_relaunch().unwrap();
+        manager.abort_update_relaunch().await.unwrap();
+        assert!(manager.update_lifecycle_lock.is_none());
+        assert!(manager.update_suspended_crash_retry.is_none());
+        assert!(manager.desired_running);
+        assert!(manager.slow_crash_wait_pending());
+        assert!(manager.crash_retry_in_secs().is_some());
+        assert_eq!(manager.crash_restart_policy.retry_at, retry_at);
+        assert_eq!(
+            manager.crash_restart_policy.slow_restarts_attempted,
+            slow_attempts
+        );
+        assert_eq!(
+            manager.active_launch_plan.as_ref().unwrap().binary.path,
+            plan.binary.path
+        );
+        assert!(manager.lifecycle_lock.is_some());
+        let contender = contend_for_lifecycle_lock(&configured);
+        assert_eq!(contender, crate::start_fence::ALREADY_OPEN);
+        assert_eq!(fixture_launches(&configured), "1");
+
+        // Auto-start turned off during the update cancels the returned wait,
+        // as it does any slow wait.
+        manager.prepare_fenced_update_relaunch().unwrap();
+        manager.set_crash_autostart_enabled(false);
+        manager.abort_update_relaunch().await.unwrap();
+        assert!(!manager.desired_running);
+        assert!(manager.crash_retry_in_secs().is_none());
+        assert!(manager.lifecycle_lock.is_none());
+        manager.supervise_managed_node().await;
+        assert!(manager.child.is_none());
+        assert_eq!(fixture_launches(&configured), "1");
+
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The ordinary boundary (Update when a writer holds the data directory,
+    /// or a direct call) sets the slow wait aside too, instead of refusing.
+    /// With a clear receipt nothing needs recovery, so Prepare succeeds.
+    #[tokio::test]
+    async fn ordinary_update_prepare_sets_aside_a_slow_crash_wait() {
+        let root = resource_test_dir("ordinary-update-slow-crash-wait");
+        let data = root.join("data-v3");
+        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        let configured = data.to_string_lossy().into_owned();
+        let mut manager = NodeManager::new();
+        manager.enter_slow_crash_wait_for_test(&configured);
+        assert!(manager.slow_crash_wait_pending());
+        assert!(!managed_shutdown_recovery_required(&configured).unwrap());
+        // Clear receipt: only the slow wait routes this to the fenced boundary.
+        assert!(manager.ordinary_update_boundary_is_fenced());
+
+        manager.prepare_update_relaunch().await.unwrap();
+        assert!(!manager.desired_running);
+        assert!(manager.crash_retry_in_secs().is_none());
+        assert!(manager.update_lifecycle_lock.is_some());
+        assert!(manager.update_restart_plan.is_none());
+        assert!(!manager.update_restart_was_desired);
+        manager.supervise_managed_node().await;
+        assert!(manager.child.is_none());
+
+        // This synthetic wait has no exact launch plan, so the returned wait
+        // fails closed at once and Home shows a stopped node, not a promise.
+        manager.abort_update_relaunch().await.unwrap();
+        assert!(!manager.desired_running);
+        assert!(manager.crash_retry_in_secs().is_none());
+        assert!(manager
+            .crash_info
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|crash| crash.message.contains("could not return the exact launch")));
+        manager.supervise_managed_node().await;
+        assert!(manager.child.is_none());
         drop(manager);
         std::fs::remove_dir_all(root).unwrap();
     }

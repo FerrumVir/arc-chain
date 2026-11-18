@@ -13,6 +13,7 @@ export default defineConfig({
     "connection.spec.ts",
     "wallet-outcome.spec.ts",
     "node-care.spec.ts",
+    "auto-recovery.spec.ts",
   ],
   workers: 1,
   reporter: "list",

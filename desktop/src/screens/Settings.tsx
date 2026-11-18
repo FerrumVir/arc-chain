@@ -5,6 +5,8 @@ import { useEffect, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { NotAvailable } from "../components/NotAvailable";
 import { NodeCareSettings } from "../components/NodeCare";
+import { StartFailurePanel } from "../components/StartFailurePanel";
+import { classifyStartFailure } from "../lib/start-failure";
 import { StatusPill } from "../components/StatusPill";
 import { api, isTauri } from "../lib/tauri";
 import { describeConnection } from "../lib/connection";
@@ -24,6 +26,14 @@ import { setTheme, useTheme, type Theme } from "../lib/theme";
 const COMPUTE_CONTRIBUTION_MUTATION_KEY = ["compute-contribution"];
 
 export function Settings() {
+  const { data: startBlock } = useQuery({ queryKey: ["start-block"], queryFn: api.nodeStartBlock, refetchInterval: 1000 });
+  if (startBlock && ["other-desktop", "closing"].includes(classifyStartFailure(startBlock))) {
+    return <div className="main-inner" data-testid="settings-screen"><StartFailurePanel error={startBlock} /></div>;
+  }
+  return <SettingsForm />;
+}
+
+function SettingsForm() {
   const config = useAppStore((s) => s.config);
   const identity = useAppStore((s) => s.identity);
   const setOnboarded = useAppStore((s) => s.setOnboarded);
@@ -316,7 +326,9 @@ export function Settings() {
           }}
           data-testid="update-policy"
         >
-          {updatePreferencesHaveUnsavedChange
+          {updateInstallPolicy.data?.channel === "package-manager"
+            ? PLAIN_COPY.settings.packageUpdates
+            : updatePreferencesHaveUnsavedChange
             ? "Save settings to apply automatic update preferences."
             : !autoUpdate
               ? autoInstallUpdates
@@ -1023,7 +1035,7 @@ function PersistenceCard() {
   return (
     <Card style={{ marginBottom: "var(--space-6)" }} data-testid="persistence-card">
       <CardHeader
-        title="Startup readiness"
+        title={PLAIN_COPY.settings.startupTitle}
         action={
           <StatusPill
             level={running ? "live" : connection.level}
@@ -1039,48 +1051,14 @@ function PersistenceCard() {
         }}
       >
         <p style={{ marginTop: 0 }} data-testid="persistence-summary">
-          {autoStart ? (
-            <>
-              <strong>
-                ARC is configured to start the node when the app opens.
-              </strong>{" "}
-              {loginItem === true
-                ? "The OS login item is registered, so ARC can reopen after login. Check “Right now” after a reboot; process startup does not prove peers, work, or payment."
-                : loginItem === false
-                  ? "No OS login item is registered, so this setting alone cannot reopen ARC after login. Open ARC manually or repair the login item."
-                  : loginItem === undefined
-                    ? "Checking the OS login item…"
-                    : "OS login-item registration has not been verified yet. Until it is, do not assume ARC will reopen after login."}
-            </>
-          ) : (
-            <>
-              <strong>Your node does not start on its own.</strong>{" "}
-              &ldquo;Start node on app launch&rdquo; is off, so after a reboot
-              you have to start it yourself from the Dashboard. A stopped node
-              cannot serve local inference; starting it still does not
-              guarantee peers, assignment, or payment. Turn the setting on to
-              have the process resume automatically.
-            </>
-          )}
+          {!autoStart ? PLAIN_COPY.settings.startupOff
+            : loginItem === true ? PLAIN_COPY.settings.startupOn
+            : loginItem === false ? PLAIN_COPY.settings.startupUnregistered
+            : loginItem === undefined ? PLAIN_COPY.settings.startupChecking
+            : PLAIN_COPY.settings.startupUnknown}
         </p>
-
         <p data-testid="persistence-role">
-          When it does resume, it comes back as{" "}
-          {hasModel ? (
-            <>
-              a <strong>worker candidate</strong>: a model path is configured.
-              The artifact must load completely and exactly match a requested
-              model ID before the node advertises capacity. Assignment and a
-              successful mined <code>0x25</code> reward remain separate gates.
-            </>
-          ) : (
-            <>
-              an <strong>observer/router</strong>: no model is configured, so it
-              cannot execute local model inference. Downloading a complete
-              compatible artifact can enable worker mode, but does not promise
-              work or payment.
-            </>
-          )}
+          {hasModel ? PLAIN_COPY.settings.startupModel : PLAIN_COPY.settings.startupNoModel}
         </p>
 
         <div className="kv" style={{ marginTop: "var(--space-4)" }}>

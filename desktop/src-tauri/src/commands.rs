@@ -16,7 +16,7 @@ use zeroize::Zeroize as _;
 type CmdResult<T> = Result<T, String>;
 
 fn map_err<E: std::fmt::Display>(e: E) -> String {
-    e.to_string()
+    paths::redact_home_text(&e.to_string())
 }
 
 /// Hardware detection is expensive — `System::new_all()` plus, on macOS, a
@@ -51,6 +51,7 @@ pub async fn detect_hardware() -> CmdResult<HardwareInfo> {
 
 #[tauri::command]
 pub async fn generate_identity(state: State<'_, AppState>) -> CmdResult<IdentityPublic> {
+    require_settings_owner(&state).await?;
     let mut store = state.store.lock().await;
     let dir = state.data_dir.lock().await.clone();
     generate_identity_if_missing(&mut store, &dir)
@@ -177,6 +178,7 @@ pub async fn import_identity(
     state: State<'_, AppState>,
     phrase: String,
 ) -> CmdResult<IdentityPublic> {
+    require_settings_owner(&state).await?;
     state.cancel_startup_retry();
     // Restoration path: user types their 12-word phrase on a new device
     // and gets back the exact same address + signing keys.
@@ -250,6 +252,7 @@ pub async fn complete_onboarding(
     state: State<'_, AppState>,
     config: NodeConfig,
 ) -> CmdResult<()> {
+    require_settings_owner(&state).await?;
     let mut config = config;
     if takes_setup_core_default(&config) {
         // The first hardware read can block for seconds (system_profiler).
@@ -311,6 +314,7 @@ async fn save_webview_config(
     config: NodeConfig,
     save: ConfigSave,
 ) -> CmdResult<()> {
+    require_settings_owner(&state).await?;
     let auto_start;
     {
         let mut store = state.store.lock().await;
@@ -448,6 +452,7 @@ pub async fn load_data_migration_notice(
 
 #[tauri::command]
 pub async fn dismiss_data_migration_notice(state: State<'_, AppState>) -> CmdResult<()> {
+    require_settings_owner(&state).await?;
     let mut store = state.store.lock().await;
     store.data_migration_notice = None;
     let dir = state.data_dir.lock().await.clone();
@@ -465,6 +470,7 @@ pub async fn load_previous_install_notice(
 
 #[tauri::command]
 pub async fn dismiss_previous_install_notice(state: State<'_, AppState>) -> CmdResult<()> {
+    require_settings_owner(&state).await?;
     let mut store = state.store.lock().await;
     store.previous_install_notice = None;
     let dir = state.data_dir.lock().await.clone();
@@ -576,6 +582,7 @@ async fn start_node_transaction(
         if node.is_running() {
             return Ok(());
         }
+        node.require_no_pending_crash_recovery().map_err(map_err)?;
     }
     let lock_data_dir = config.data_dir.clone();
     let lifecycle_lock = tokio::task::spawn_blocking(move || {
@@ -649,9 +656,11 @@ async fn start_node_transaction(
 
 pub async fn start_node_inner(app: &AppHandle, state: &AppState) -> Result<(), String> {
     state.startup_retry_cancel.send_replace(());
+    require_start_fence(state, StartAccess::Ordinary).await?;
+    state.node.lock().await.cancel_slow_crash_retry();
     start_node_transaction(app, state, StartTransaction::Start)
         .await
-        .map_err(|failure| failure.to_string())
+        .map_err(|failure| paths::redact_home_text(&failure.to_string()))
 }
 
 pub(crate) async fn autostart_node_inner(
@@ -682,12 +691,18 @@ pub(crate) async fn recover_managed_shutdown_inner(
 ) -> Result<(), String> {
     start_node_transaction(app, state, StartTransaction::StartupRecoveryOnly)
         .await
-        .map_err(|failure| failure.to_string())
+        .map_err(|failure| paths::redact_home_text(&failure.to_string()))
+}
+
+async fn require_settings_owner(state: &AppState) -> Result<(), String> {
+    let fence = state.data_migration_error.lock().await;
+    crate::start_fence::check_settings_write(fence.as_ref(), crate::desktop_instance::closing())
 }
 
 async fn require_start_fence(state: &AppState, access: StartAccess) -> Result<(), String> {
     let fence = state.data_migration_error.lock().await.clone();
     crate::start_fence::check(fence.as_ref(), access)
+        .map_err(|error| paths::redact_home_text(&error))
 }
 
 /// Which boundary the desktop's own signed app update takes. A start refusal
@@ -732,6 +747,9 @@ pub async fn start_node(
 
 #[tauri::command]
 pub async fn stop_node(state: State<'_, AppState>) -> CmdResult<()> {
+    if state.another_desktop_owns_node().await {
+        return Err(crate::start_fence::ALREADY_OPEN.into());
+    }
     state.cancel_startup_retry();
     let mut node = state.node.lock().await;
     node.stop().await.map_err(map_err)
@@ -756,6 +774,16 @@ pub async fn prepare_update_relaunch(state: State<'_, AppState>) -> CmdResult<()
     // A wait for launch reconciliation returns here, before anything is
     // cancelled, so pressing Install while ARC recovers keeps auto-start.
     let boundary = app_update_boundary(&state).await?;
+    prepare_update_relaunch_inner(&state, boundary).await
+}
+
+/// Home's and the Dashboard's Update, after the location check. A slow crash
+/// wait (`ordinary_update_boundary_is_fenced`) takes the fenced boundary, so
+/// the update that may fix the crash installs instead of being refused.
+pub(crate) async fn prepare_update_relaunch_inner(
+    state: &AppState,
+    boundary: AppUpdateBoundary,
+) -> CmdResult<()> {
     if boundary == AppUpdateBoundary::Ordinary {
         state.cancel_startup_retry();
     }
@@ -784,9 +812,19 @@ pub async fn prepare_update_relaunch(state: State<'_, AppState>) -> CmdResult<()
 pub async fn try_prepare_auto_update_relaunch(
     state: State<'_, AppState>,
 ) -> CmdResult<crate::auto_update::PrepareResult> {
-    use crate::auto_update::{PrepareResult, RequestFence};
     refuse_update_from_wrong_location()?;
     let boundary = app_update_boundary(&state).await?;
+    try_prepare_auto_update_relaunch_inner(&state, boundary).await
+}
+
+/// The unattended Prepare after the location check. A crash-looping node is
+/// up only seconds an hour, so its slow wait takes the fenced boundary here
+/// instead of waiting for a running child to drain.
+pub(crate) async fn try_prepare_auto_update_relaunch_inner(
+    state: &AppState,
+    boundary: AppUpdateBoundary,
+) -> CmdResult<crate::auto_update::PrepareResult> {
+    use crate::auto_update::{PrepareResult, RequestFence};
     if !update_install_policy().await?.can_install {
         return Ok(PrepareResult::busy(
             "This installation is updated by its package manager",
@@ -1116,6 +1154,7 @@ async fn update_stored_config(
     state: &AppState,
     update: impl FnOnce(&mut NodeConfig) + Send,
 ) -> Result<NodeConfig, String> {
+    require_settings_owner(&state).await?;
     let mut store = state.store.lock().await;
     let config = update_stored_config_in(&mut store, update);
     let dir = state.data_dir.lock().await.clone();
@@ -1143,6 +1182,7 @@ async fn persist_promotion_if_still_consented(
     state: &AppState,
     model_path: String,
 ) -> Result<Option<NodeConfig>, String> {
+    require_settings_owner(&state).await?;
     let mut store = state.store.lock().await;
     let latest = store.config.clone().unwrap_or_default();
     if !compute_contribution_enabled(&latest) {
@@ -1188,6 +1228,7 @@ pub async fn set_compute_contribution(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> CmdResult<NodeConfig> {
+    require_settings_owner(&state).await?;
     if !enabled {
         crate::sharing_awake::set_enabled(false);
         let config = update_stored_config(&state, withdraw_compute_consent).await?;
@@ -1228,12 +1269,18 @@ pub(crate) async fn promote_consented_install_inner(
     app: &AppHandle,
     state: &AppState,
 ) -> Result<NodeConfig, String> {
-    PROMOTION_FLIGHT
+    let result = PROMOTION_FLIGHT
         .run_or_join(
             || promote_consented_install_once(app, state),
             || Err(PROMOTION_INTERRUPTED.to_string()),
         )
-        .await
+        .await;
+    let outcome = match &result {
+        Ok(_) => crate::background_promotion::TickOutcome::Promoted,
+        Err(error) => crate::background_promotion::TickOutcome::Failed(error.clone()),
+    };
+    crate::background_promotion::record_outcome(&outcome);
+    result
 }
 
 async fn promote_consented_install_once(
@@ -1304,7 +1351,18 @@ pub(crate) async fn promote_consented_install_on_startup(app: &AppHandle, state:
     if let Err(reason) =
         startup_download_gate(&config, &crate::background_promotion::SystemConditions)
     {
+        crate::background_promotion::record_outcome(
+            &crate::background_promotion::TickOutcome::Skipped(reason),
+        );
         tracing::info!(?reason, "default-enabled startup promotion deferred");
+        return;
+    }
+    if let Some(needed_bytes) = background_download_space_needed(tier_for_ram_gb(ram_gb)).await {
+        crate::background_promotion::record_outcome(
+            &crate::background_promotion::TickOutcome::Skipped(
+                crate::background_promotion::SkipReason::DiskFull { needed_bytes },
+            ),
+        );
         return;
     }
     // Preserve v0.8.19's startup recovery and shared single-flight path for
@@ -1408,6 +1466,7 @@ pub async fn set_keep_awake_while_sharing(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> CmdResult<NodeConfig> {
+    require_settings_owner(&state).await?;
     if !enabled {
         crate::sharing_awake::set_enabled(false);
     }
@@ -1452,10 +1511,21 @@ pub async fn set_prevent_sleep_during_jobs(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> CmdResult<NodeConfig> {
+    require_settings_owner(&state).await?;
     update_stored_config(&state, |config| {
         config.prevent_sleep_during_jobs = Some(enabled)
     })
     .await
+}
+
+/// Counts from the session's elected coordinator, using the existing
+/// redirect-fenced transport. Missing data is quiet and cached for 60 seconds.
+#[tauri::command]
+pub async fn fetch_worker_network(
+    state: State<'_, AppState>,
+) -> CmdResult<Option<crate::worker_network::WorkerNetwork>> {
+    let host = chain_host(&state).await;
+    Ok(crate::worker_network::fetch(&state.http, &host).await)
 }
 
 /// This machine's community worker: state and job counters, read from the
@@ -1561,7 +1631,24 @@ pub async fn reset_peer_state(
 /// returned, but in clearly separate `chain*` fields.
 #[tauri::command]
 pub async fn node_status(state: State<'_, AppState>) -> CmdResult<NodeStatus> {
-    let (port, pid, crash, worker_threads, model_unavailable) = {
+    node_status_inner(&state, crate::desktop_instance::closing()).await
+}
+
+async fn node_status_inner(state: &AppState, closing: bool) -> CmdResult<NodeStatus> {
+    if closing {
+        return Ok(NodeStatus {
+            last_error: Some("ARC is closing".into()),
+            ..NodeStatus::default()
+        });
+    }
+    let fence = state.data_migration_error.lock().await.clone();
+    if matches!(fence, Some(crate::start_fence::StartFence::OtherDesktop)) {
+        return Ok(NodeStatus {
+            last_error: crate::start_fence::check(fence.as_ref(), StartAccess::Ordinary).err(),
+            ..NodeStatus::default()
+        });
+    }
+    let (port, pid, crash, worker_threads, model_unavailable, crash_retry_in_secs) = {
         let mut node = state.node.lock().await;
         let pid = if node.is_running() { node.pid() } else { None };
         let port = node.rpc_port;
@@ -1573,7 +1660,14 @@ pub async fn node_status(state: State<'_, AppState>) -> CmdResult<NodeStatus> {
             .await
             .as_ref()
             .map(|c| c.message.clone());
-        (port, pid, crash, worker_threads, model_unavailable)
+        (
+            port,
+            pid,
+            crash,
+            worker_threads,
+            model_unavailable,
+            node.crash_retry_in_secs(),
+        )
     };
     let address = {
         let store = state.store.lock().await;
@@ -1593,6 +1687,11 @@ pub async fn node_status(state: State<'_, AppState>) -> CmdResult<NodeStatus> {
     status.worker_threads = worker_threads;
     status.cpu_cores = Some(cached_hardware().cpu_cores);
     status.model_unavailable = model_unavailable;
+    status.crash_retry_in_secs = crash_retry_in_secs;
+    let config = current_config(&state).await;
+    if needs_promotion(&config, cached_hardware().ram_gb) {
+        status.model_download_wait = crate::background_promotion::waiting_status();
+    }
     Ok(status)
 }
 
@@ -1606,6 +1705,9 @@ pub async fn node_start_block(state: State<'_, AppState>) -> CmdResult<Option<St
 }
 
 async fn start_block(state: &AppState) -> Option<String> {
+    if crate::desktop_instance::closing() {
+        return Some("ARC is closing".into());
+    }
     require_data_migration_ready(state).await.err()
 }
 
@@ -2626,7 +2728,7 @@ mod inference_retry_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Mutex;
 
-    fn test_state() -> AppState {
+    pub(super) fn test_state() -> AppState {
         AppState {
             node: Arc::new(Mutex::new(crate::node_manager::NodeManager::new())),
             store: Arc::new(Mutex::new(crate::store::Store::default())),
@@ -3270,7 +3372,7 @@ pub(crate) async fn run_inference_via_exact_production_coordinator_inner(
     .await
 }
 
-const SETTLEMENT_WRITE_UNAVAILABLE: &str = "is unavailable in the v0.8.20 recovery candidate before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not production-ready. VRF selection and server-derived replica labels are not validator approval. Free/community inference remains available.";
+const SETTLEMENT_WRITE_UNAVAILABLE: &str = "is unavailable in the v0.8.21 recovery candidate before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not production-ready. VRF selection and server-derived replica labels are not validator approval. Free/community inference remains available.";
 
 fn settlement_write_unavailable<T>(flow: &str) -> CmdResult<T> {
     Err(format!("{} {}", flow, SETTLEMENT_WRITE_UNAVAILABLE))
@@ -3483,6 +3585,7 @@ pub async fn set_worker_threads(
     state: State<'_, AppState>,
     threads: u32,
 ) -> CmdResult<ThreadsApplied> {
+    require_settings_owner(&state).await?;
     let cores = cached_hardware().cpu_cores.max(1);
     if threads == 0 || threads > cores {
         return Err(format!(
@@ -3940,6 +4043,10 @@ async fn acquire_model_download_lock(target: &Path) -> Result<std::fs::File, Str
 #[tauri::command]
 pub async fn ensure_binary(app: AppHandle, state: State<'_, AppState>) -> CmdResult<BinaryStatus> {
     require_data_migration_ready(&state).await?;
+    {
+        let node = state.node.lock().await;
+        node.require_idle_for_binary_check().map_err(map_err)?;
+    } // Downloads must not hold the mutex needed by status, Stop and tray Quit.
     let configured_data_dir = state
         .store
         .lock()
@@ -3990,7 +4097,7 @@ fn installed(path: &Path) -> BinaryStatus {
 async fn ensure_binary_inner(app: &AppHandle) -> Result<BinaryStatus, String> {
     ensure_binary_inner_classified(app)
         .await
-        .map_err(|failure| failure.to_string())
+        .map_err(|failure| paths::redact_home_text(&failure.to_string()))
 }
 
 async fn ensure_binary_inner_classified(app: &AppHandle) -> Result<BinaryStatus, StartupFailure> {
@@ -5544,18 +5651,22 @@ fn disk_shortfall(size_bytes: u64, saved_bytes: u64, available: u64) -> Option<u
     (available < needed).then_some(needed)
 }
 
-/// Whether a background retry should stop for lack of disk space. A model
+/// Free bytes needed when a background retry must wait for disk space. A model
 /// file already at its pinned size needs no download (promotion hashes and
 /// reuses it), so it is never short of space.
-async fn background_download_lacks_disk(tier: &str) -> bool {
-    let Some(spec) = tier_spec(tier) else {
-        return false;
-    };
+async fn background_download_space_needed(tier: &str) -> Option<u64> {
+    let spec = tier_spec(tier)?;
     let target = model_path_for(tier);
     let complete = tokio::fs::metadata(&target)
         .await
         .is_ok_and(|metadata| metadata.is_file() && metadata.len() == spec.size_bytes);
-    !complete && model_disk_shortfall(&target, spec).await.is_some()
+    if complete {
+        None
+    } else {
+        model_disk_shortfall(&target, spec)
+            .await
+            .map(|space| space.needed)
+    }
 }
 
 /// The production environment of a background promotion tick.
@@ -5579,7 +5690,11 @@ impl crate::background_promotion::TickEnv for BackgroundPromotionEnv<'_> {
             need,
             model_unavailable,
             model_fits: tier != "none",
-            disk_full: wants_download && background_download_lacks_disk(tier).await,
+            disk_space_needed: if wants_download {
+                background_download_space_needed(tier).await
+            } else {
+                None
+            },
         }
     }
 
@@ -6346,7 +6461,7 @@ mod release_binary_tests {
     fn unresolved_data_migration_blocks_manual_start_and_restart() {
         use crate::start_fence::{check, StartFence};
         assert!(check(None, StartAccess::Ordinary).is_ok());
-        let fence = StartFence::Refused("legacy data directory is a symbolic link".into());
+        let fence = StartFence::MigrationRefused("legacy data directory is a symbolic link".into());
         // A real refusal blocks startup's own recovery launch too.
         for access in [StartAccess::Ordinary, StartAccess::StartupRecovery] {
             let error = check(Some(&fence), access)
@@ -7690,6 +7805,41 @@ mod start_fence_tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
+    #[tokio::test]
+    async fn other_desktop_cannot_save_contribution_or_preferences() {
+        let state = state_with(Some(StartFence::OtherDesktop));
+        assert!(state.another_desktop_owns_node().await);
+        assert_eq!(
+            super::require_settings_owner(&state).await.unwrap_err(),
+            crate::start_fence::ALREADY_OPEN
+        );
+        let changed =
+            super::update_stored_config(&state, |config| config.compute_consent = Some(false))
+                .await;
+        assert!(changed.is_err());
+        assert!(state.store.lock().await.config.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_allows_preferences_and_durable_consent_withdrawal() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state_with(Some(StartFence::StartupReconciliation));
+        *state.data_dir.lock().await = directory.path().to_path_buf();
+        super::require_settings_owner(&state).await.unwrap();
+        super::update_stored_config(&state, |config| {
+            config.compute_consent = Some(true);
+            config.role = "worker".into();
+        }).await.unwrap();
+        let config = super::update_stored_config(&state, super::withdraw_compute_consent)
+            .await.unwrap();
+        assert_eq!(config.compute_consent, Some(false));
+        assert_eq!(config.role, "observer");
+        let saved = crate::store::Store::load_for_owner_probe(directory.path()).unwrap();
+        assert_eq!(saved.config.unwrap().compute_consent, Some(false));
+        // Permitting settings does not permit an ordinary node start.
+        assert!(require_start_fence(&state, StartAccess::Ordinary).await.is_err());
+    }
+
     fn state_with(fence: Option<StartFence>) -> AppState {
         AppState {
             node: Arc::new(Mutex::new(crate::node_manager::NodeManager::new())),
@@ -8018,5 +8168,121 @@ mod start_fence_tests {
             crate::node_manager::UPDATE_HOLDS_NODE,
             "ARC couldn't finish an update. Quit ARC and open it again."
         );
+    }
+}
+
+/// Review finding 1 at the IPC entrypoints: Home's Update and the unattended
+/// updater both get past an exhausted crash budget's slow wait, and the
+/// retry they set aside never launches a node.
+#[cfg(test)]
+mod slow_crash_wait_update_tests {
+    use super::*;
+
+    fn slow_wait_state(label: &str) -> (PathBuf, AppState) {
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "arc-desktop-slow-wait-update-{label}-{}",
+            std::process::id()
+        ));
+        let data = root.join("data-v3");
+        arc_crypto::secret_file::secure_private_directory_tree(&data).unwrap();
+        let state = super::inference_retry_tests::test_state();
+        state.store.try_lock().unwrap().config = Some(NodeConfig {
+            data_dir: data.to_string_lossy().into_owned(),
+            ..NodeConfig::default()
+        });
+        state
+            .node
+            .try_lock()
+            .unwrap()
+            .enter_slow_crash_wait_for_test(&data.to_string_lossy());
+        (root, state)
+    }
+
+    async fn assert_update_holds_and_nothing_relaunches(state: &AppState) {
+        let mut node = state.node.lock().await;
+        assert!(node.crash_retry_in_secs().is_none());
+        assert!(!node.slow_crash_wait_pending());
+        assert!(node.refuse_start_during_update().is_err());
+        node.supervise_managed_node().await;
+        assert!(node.pid().is_none());
+        node.begin_update_handoff().unwrap();
+        node.supervise_managed_node().await;
+        assert!(node.pid().is_none());
+    }
+
+    #[tokio::test]
+    async fn refused_or_closing_status_hides_slow_retry_without_waiting_for_node() {
+        for closing in [false, true] {
+            let (root, state) = slow_wait_state(if closing {
+                "closing-status"
+            } else {
+                "refused-status"
+            });
+            if !closing {
+                *state.data_migration_error.lock().await =
+                    Some(crate::start_fence::StartFence::OtherDesktop);
+            }
+            // A concurrent start/stop can hold this lock. Neither refusal may
+            // wait for it, expose its retry schedule, or reach any RPC host.
+            let node = state.node.lock().await;
+            assert!(node.crash_retry_in_secs().is_some());
+            let status = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                node_status_inner(&state, closing),
+            )
+            .await
+            .expect("refused status waited for the node")
+            .unwrap();
+            assert!(!status.running);
+            assert!(status.crash_retry_in_secs.is_none());
+            assert!(status.model_download_wait.is_none());
+            let expected = if closing {
+                "ARC is closing".to_owned()
+            } else {
+                crate::start_fence::check(
+                    Some(&crate::start_fence::StartFence::OtherDesktop),
+                    StartAccess::Ordinary,
+                )
+                .unwrap_err()
+            };
+            assert_eq!(status.last_error.as_deref(), Some(expected.as_str()));
+            assert!(
+                node.crash_retry_in_secs().is_some(),
+                "status mutated recovery"
+            );
+            drop(node);
+            drop(state);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn home_update_prepares_during_a_slow_crash_wait() {
+        let (root, state) = slow_wait_state("manual");
+        prepare_update_relaunch_inner(&state, AppUpdateBoundary::Ordinary)
+            .await
+            .unwrap();
+        assert_update_holds_and_nothing_relaunches(&state).await;
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unattended_update_prepares_during_a_slow_crash_wait() {
+        if !update_install_policy().await.unwrap().can_install {
+            // Package-managed Linux installs never self-update.
+            return;
+        }
+        let (root, state) = slow_wait_state("unattended");
+        let prepared = try_prepare_auto_update_relaunch_inner(&state, AppUpdateBoundary::Ordinary)
+            .await
+            .unwrap();
+        assert!(
+            matches!(prepared, crate::auto_update::PrepareResult::Prepared),
+            "{prepared:?}"
+        );
+        assert_update_holds_and_nothing_relaunches(&state).await;
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

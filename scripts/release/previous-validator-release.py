@@ -21,6 +21,9 @@ TAG = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z")
 PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPs2NAiDRXit9EM96A2GdXZgRqvXtl0lvryEAEAEjQfY"
 NAMESPACE = "arc-release-manifest-v1"
 MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_ATTESTATION_BYTES = 1024 * 1024
+SKIPPED = "validators_release_skipped_desktop_updates"
+NOT_NEWEST = "named validator release is not the newest qualifying release"
 
 
 def need(ok, message):
@@ -34,7 +37,20 @@ def version(tag):
     return tuple(map(int, match.groups()))
 
 
-def select_release(releases, tag, candidate):
+def release_identity(release):
+    need(type(release.get("id")) is int and release["id"] > 0,
+         "invalid published release ID")
+    need(re.fullmatch(r"[0-9a-f]{40}", str(release.get("target_commitish", ""))),
+         "published release must bind an exact commit")
+
+
+def select_release(releases, tag, candidate, verify_skipped=None):
+    """Select a baseline; older baselines require authenticated skip evidence.
+
+    verify_skipped(baseline, release) must raise unless the intervening release
+    is an authenticated desktop update over baseline. With no verifier, retain
+    the original newest-only selection contract.
+    """
     need(isinstance(releases, list), "release listing must be an array")
     version(tag)
     need(version(tag) < version(candidate), "validator release must precede the candidate")
@@ -46,15 +62,22 @@ def select_release(releases, tag, candidate):
                   and isinstance(r.get("author"), dict)
                   and r["author"].get("login") == "github-actions[bot]"]
     need(bool(qualifying), "no qualifying immutable bot-authored release")
-    newest = max(version(r["tag_name"]) for r in qualifying)
-    matches = [r for r in qualifying if version(r["tag_name"]) == newest]
-    need(len(matches) == 1 and matches[0]["tag_name"] == tag,
-         "named validator release is not the newest qualifying release")
+    matches = [r for r in qualifying if r["tag_name"] == tag]
+    need(len(matches) == 1, NOT_NEWEST)
     release = matches[0]
-    need(type(release.get("id")) is int and release["id"] > 0,
-         "invalid published release ID")
-    need(re.fullmatch(r"[0-9a-f]{40}", str(release.get("target_commitish", ""))),
-         "published release must bind an exact commit")
+    release_identity(release)
+    newer = sorted((r for r in qualifying if version(r["tag_name"]) > version(tag)),
+                   key=lambda r: version(r["tag_name"]))
+    # Preserve the refusal of an already published candidate or later release.
+    need(all(version(r["tag_name"]) < version(candidate) for r in newer), NOT_NEWEST)
+    need(len({r["tag_name"] for r in newer}) == len(newer), NOT_NEWEST)
+    for skipped in newer:
+        need(verify_skipped is not None, NOT_NEWEST)
+        try:
+            release_identity(skipped)
+            verify_skipped(release, skipped)
+        except (ValueError, TypeError, RecursionError, OSError, subprocess.SubprocessError) as exc:
+            raise ValueError(NOT_NEWEST) from exc
     return release
 
 
@@ -64,12 +87,13 @@ def gh(*args):
     return result.stdout
 
 
-def published_assets(release):
+def published_assets(release, desktop=False):
     rows = release.get("assets")
     need(isinstance(rows, list) and all(isinstance(a, dict) for a in rows), "invalid release assets")
     assets = {a.get("name"): a for a in rows}
     need(len(assets) == len(rows), "duplicate release asset names")
-    for name in ("SHA256SUMS", "SHA256SUMS.sig", "arc-node-linux-x86_64"):
+    names = ("SHA256SUMS", "SHA256SUMS.sig", "arc-node-linux-x86_64")
+    for name in names + ((ASSET,) if desktop else ()):
         a = assets.get(name, {})
         need(type(a.get("id")) is int and a["id"] > 0 and a.get("state") == "uploaded"
              and type(a.get("size")) is int and a["size"] > 0
@@ -82,8 +106,8 @@ def published_assets(release):
     return assets
 
 
-def verify_manifest(release, manifest, signature):
-    assets = published_assets(release)
+def verify_manifest(release, manifest, signature, attestation=None):
+    assets = published_assets(release, desktop=attestation is not None)
     for name, payload in (("SHA256SUMS", manifest), ("SHA256SUMS.sig", signature)):
         need(0 < len(payload) <= MAX_MANIFEST_BYTES and len(payload) == assets[name]["size"]
              and "sha256:" + hashlib.sha256(payload).hexdigest() == assets[name]["digest"],
@@ -108,25 +132,80 @@ def verify_manifest(release, manifest, signature):
     binary_hash = hashes.get("arc-node-linux-x86_64")
     need(binary_hash and "sha256:" + binary_hash == assets["arc-node-linux-x86_64"]["digest"],
          "previous Linux node hash is missing or differs from published asset")
-    return {"tag": release["tag_name"], "release_id": release["id"],
+    evidence = {"tag": release["tag_name"], "release_id": release["id"],
             "commit": release["target_commitish"], "binary_sha256": binary_hash,
             "manifest_sha256": hashlib.sha256(manifest).hexdigest(),
             "manifest_signature_sha256": hashlib.sha256(signature).hexdigest(),
             "manifest_namespace": NAMESPACE}
+    if attestation is not None:
+        digest = hashlib.sha256(attestation).hexdigest()
+        need(0 < len(attestation) <= MAX_ATTESTATION_BYTES
+             and len(attestation) == assets[ASSET]["size"]
+             and "sha256:" + digest == assets[ASSET]["digest"],
+             "published attestation asset size or digest differs")
+        need(hashes.get(ASSET) == digest, "attestation hash missing or differs in SHA256SUMS")
+        evidence["attestation_sha256"] = digest
+    return evidence
+
+
+def download_evidence(release, desktop=False):
+    assets = published_assets(release, desktop=desktop)
+    limits = [("SHA256SUMS", MAX_MANIFEST_BYTES), ("SHA256SUMS.sig", MAX_MANIFEST_BYTES)]
+    if desktop:
+        limits.append((ASSET, MAX_ATTESTATION_BYTES))
+    # Validate every advertised bound before downloading any of the assets.
+    for name, limit in limits:
+        need(assets[name]["size"] <= limit, "published asset exceeds size bound: " + name)
+    payloads = [gh("-H", "Accept: application/octet-stream",
+                   f"repos/{REPOSITORY}/releases/assets/{assets[name]['id']}") for name, _ in limits]
+    return verify_manifest(release, *payloads), payloads
+
+
+def read_desktop_attestation(payload):
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            need(key not in result, "duplicate desktop attestation key")
+            result[key] = value
+        return result
+
+    return json.loads(payload, object_pairs_hook=unique_object)
 
 
 def authenticate(tag, candidate):
     # Paginate the whole listing. Never trust /releases/latest (legacy channel).
     pages = json.loads(gh("--paginate", "--slurp", f"repos/{REPOSITORY}/releases?per_page=100"))
     need(isinstance(pages, list) and all(isinstance(page, list) for page in pages), "invalid release pages")
-    release = select_release([r for page in pages for r in page], tag, candidate)
-    assets = published_assets(release)
-    payloads = []
-    for name in ("SHA256SUMS", "SHA256SUMS.sig"):
-        need(assets[name]["size"] <= MAX_MANIFEST_BYTES, "published manifest asset exceeds size bound")
-        payloads.append(gh("-H", "Accept: application/octet-stream",
-                           f"repos/{REPOSITORY}/releases/assets/{assets[name]['id']}"))
-    return verify_manifest(release, *payloads)
+    prior = None
+    skipped = []
+
+    def verify_skipped(baseline, release):
+        nonlocal prior
+        if prior is None:
+            prior, _ = download_evidence(baseline)
+        evidence, payloads = download_evidence(release, desktop=True)
+        value = read_desktop_attestation(payloads[-1])
+        need(isinstance(value, dict) and value.get("profile") == PROFILE
+             and value.get("node_compatible_with_validators") is True,
+             "intervening release is not a compatible desktop update")
+        validators = value.get("validators_release")
+        need(isinstance(validators, dict) and validators.get("tag") == prior["tag"]
+             and validators.get("binary_sha256") == prior["binary_sha256"],
+             "intervening desktop update names another validator baseline")
+        skipped.append({key: evidence[key] for key in
+                        ("tag", "release_id", "commit", "attestation_sha256")})
+
+    release = select_release([r for page in pages for r in page], tag, candidate, verify_skipped)
+    if prior is None:
+        prior, _ = download_evidence(release)
+    return {**prior, SKIPPED: skipped}
+
+
+def attestation_evidence(tag, candidate):
+    """Split authenticated baseline and skips for the public attestation schema."""
+    prior = dict(authenticate(tag, candidate))
+    skipped = prior.pop(SKIPPED, [])
+    return prior, skipped
 
 
 def verify_preflight_binding(value, run_id, attempt, selection):
@@ -149,7 +228,14 @@ def verify_attestation(value, candidate, now):
          "desktop update requires explicit compatibility declaration")
     prior = value.get("validators_release")
     need(isinstance(prior, dict), "validator release attestation missing")
-    need(authenticate(prior.get("tag"), candidate) == prior, "validator release evidence differs")
+    authenticated, skipped = attestation_evidence(prior.get("tag"), candidate)
+    need(authenticated == prior, "validator release evidence differs")
+    # Legacy newest-only attestations omitted this field. Absence can only mean
+    # an empty list; it can never hide an intervening release.
+    recorded = value.get(SKIPPED, [])
+    need(isinstance(recorded, list)
+         and all(isinstance(row, dict) and type(row.get("release_id")) is int for row in recorded)
+         and recorded == skipped, "skipped desktop update evidence differs")
     observed = value.get("generated_at_unix")
     need(type(observed) in (int, float) and 0 <= now - observed <= 7200,
          "desktop update observation is stale or future-dated")

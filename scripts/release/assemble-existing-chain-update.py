@@ -378,7 +378,7 @@ def assemble(args: argparse.Namespace) -> dict:
              getattr(args, "confirm_node_compatible", False),
              "desktop profile requires Linux production artifact and independent compatibility review")
         previous = load_module(Path(__file__).with_name("previous-validator-release.py"), "previous_validator_release")
-        prior = previous.authenticate(getattr(args, "previous_release_tag", None), args.tag)
+        prior, skipped = previous.attestation_evidence(getattr(args, "previous_release_tag", None), args.tag)
     else:
         need(not getattr(args, "previous_release_tag", None) and
              not getattr(args, "confirm_node_compatible", False), "previous-release inputs require desktop profile")
@@ -426,6 +426,7 @@ def assemble(args: argparse.Namespace) -> dict:
         observation["warnings"] = [ZERO_MARGIN_WARNING]
     if prior:
         observation.update(profile=DESKTOP_PROFILE, validators_release=prior,
+                           validators_release_skipped_desktop_updates=skipped,
                            node_compatible_with_validators=True)
     return {"schema": SCHEMA, "claim": {"existing_recovered_chain_update": True,
         "original_cutover_ceremony_verified": False, "original_cutover_archive_present": False,
@@ -480,6 +481,10 @@ def validate_owner_attestation(args: argparse.Namespace, owner_path: Path, now: 
     verify_owner_verifier(args, owner_verifier)
     owner_projection = json.loads(json.dumps(owner))
     producer_projection = json.loads(json.dumps(recomputed))
+    if recomputed.get("profile") == DESKTOP_PROFILE:
+        # Legacy newest-only owner evidence can omit the empty skip list. A
+        # nonempty recomputed list still fails the full projection comparison.
+        owner_projection.setdefault("validators_release_skipped_desktop_updates", [])
     owner_projection["release"].pop("checkpoint_verifier_artifact", None)
     producer_projection["release"].pop("checkpoint_verifier_artifact", None)
     owner_api_sha256 = owner_projection["release"].pop("api_artifact_response_sha256", None)
@@ -491,6 +496,8 @@ def validate_owner_attestation(args: argparse.Namespace, owner_path: Path, now: 
          "owner attestation differs from independently reverified production artifact, checkpoint, network, or proof inputs")
     proof_key = attested_proof_key(recomputed)
     result = dict(owner)
+    if recomputed.get("profile") == DESKTOP_PROFILE:
+        result["validators_release_skipped_desktop_updates"] = recomputed["validators_release_skipped_desktop_updates"]
     result["producer_reverification"] = {
         "freshness_at_capture_unix": owner.get(proof_key, {}).get("captured_at_unix"),
         "observed_at_unix": float(generated_at),
@@ -509,7 +516,7 @@ def validate_owner_attestation(args: argparse.Namespace, owner_path: Path, now: 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--profile", choices=(UPDATE_PROFILE, DESKTOP_PROFILE), default=UPDATE_PROFILE)
-    p.add_argument("--previous-release-tag", help="newest immutable bot-authored release; desktop profile only")
+    p.add_argument("--previous-release-tag", help="actual validator baseline; newer releases must be authenticated desktop updates over it (desktop profile only)")
     p.add_argument("--confirm-node-compatible", action="store_true",
                    help="confirm an independent review found candidate node compatible with validators")
     p.add_argument("--repository", required=True); p.add_argument("--repository-root", type=Path, required=True)

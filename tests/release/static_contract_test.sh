@@ -1034,10 +1034,10 @@ release_supply_chain_and_npm_audits_are_blocking() {
     # at high on its dev-only test tooling. CI and the quality harness apply
     # the same split.
     for required in \
-        'npm --prefix "$package" audit --package-lock-only --audit-level=low' \
+        'python3 -I -B scripts/release/npm-audit-gate.py --package "$package" --level low --lock-only' \
         'if [ "$package" = sdks/typescript ]; then' \
-        'npm --prefix "$package" audit --package-lock-only --omit=dev --audit-level=low' \
-        'npm --prefix "$package" audit --package-lock-only --audit-level=high'
+        'python3 -I -B scripts/release/npm-audit-gate.py --package "$package" --level low --omit-dev --lock-only' \
+        'python3 -I -B scripts/release/npm-audit-gate.py --package "$package" --level high --lock-only'
     do
         grep -Fq -- "$required" <<<"$quality_block" || {
             printf 'release-quality does not run the shared blocking npm audit loop: %s\n' \
@@ -1045,14 +1045,14 @@ release_supply_chain_and_npm_audits_are_blocking() {
             return 1
         }
     done
-    grep -Fq -- 'npm audit --omit=dev --audit-level=low && npm audit --audit-level=high' \
+    grep -Fq -- 'python3 -I -B ../../scripts/release/npm-audit-gate.py --package . --level low --omit-dev && python3 -I -B ../../scripts/release/npm-audit-gate.py --package . --level high' \
         "$CI_WORKFLOW" || {
             printf 'CI compatibility TypeScript SDK audit drifted from the release policy\n'
             return 1
         }
     for required in \
-        'npm audit --omit=dev --audit-level=low &&' \
-        'npm audit --audit-level=high &&'
+        'python3 -I -B ../../scripts/release/npm-audit-gate.py --package . --level low --omit-dev &&' \
+        'python3 -I -B ../../scripts/release/npm-audit-gate.py --package . --level high &&'
     do
         grep -Fq -- "$required" "$QUALITY_HARNESS" || {
             printf 'quality harness TypeScript SDK audit drifted from the release policy: %s\n' \

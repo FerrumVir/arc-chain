@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, MotionConfig, motion } from "framer-motion";
+import { listen } from "@tauri-apps/api/event";
+import { isTauri } from "./lib/tauri";
 import { Sidebar } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
 import { DataMigrationBanner } from "./components/DataMigrationBanner";
@@ -81,6 +83,16 @@ function ProductionBrowserBlocker() {
 }
 
 export function App() {
+  const [closing, setClosing] = useState(false);
+  useEffect(() => {
+    if (!isTauri) return;
+    const stop = listen<boolean>("desktop-closing", () => setClosing(true));
+    return () => { void stop.then((unlisten) => unlisten()); };
+  }, []);
+  return closing ? <main role="status" className="main-inner"><h1>ARC is closing</h1><p>Please wait while your node closes.</p></main> : <RunningApp />;
+}
+
+function RunningApp() {
   const onboardedFlag = useAppStore((s) => s.onboarded);
   const config = useAppStore((s) => s.config);
   const route = useAppStore((s) => s.route);

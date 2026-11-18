@@ -9,8 +9,8 @@
 //! While the install still needs its model, a background loop calls the same
 //! promotion path every [`RETRY_INTERVAL`], and soon after the computer wakes
 //! from sleep. It ends once the install is a worker with a readable model,
-//! the user turns compute off, the computer is below the memory floor, or the
-//! disk lacks the room the download needs.
+//! the user turns compute off, or the computer is below the memory floor.
+//! A full disk is a wait, rechecked each interval.
 //!
 //! The pieces are kept apart so they can be tested without hardware or real
 //! time:
@@ -208,6 +208,9 @@ pub(crate) enum Trigger {
 pub(crate) enum SkipReason {
     OnBattery,
     MeteredNetwork,
+    DiskFull {
+        needed_bytes: u64,
+    },
     /// Another promotion is running in this process.
     InFlight,
 }
@@ -480,9 +483,6 @@ pub(crate) enum StopReason {
     Ineligible,
     /// A worker with a readable model.
     Ready,
-    /// The disk lacks the room the download needs (the bytes still to fetch
-    /// plus the 512 MiB margin).
-    DiskFull,
 }
 
 /// What the loop knows at a tick, apart from power and network.
@@ -494,7 +494,7 @@ pub(crate) struct PromotionFacts {
     /// The computer meets the memory floor for the model.
     pub model_fits: bool,
     /// Downloading the model would not fit on the disk.
-    pub disk_full: bool,
+    pub disk_space_needed: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -516,8 +516,8 @@ pub(crate) fn plan_tick(facts: PromotionFacts, conditions: &impl DownloadConditi
         PromotionNeed::Ready if !facts.model_fits => return TickPlan::Stop(StopReason::Ineligible),
         PromotionNeed::Ready | PromotionNeed::Promote => {}
     }
-    if facts.disk_full {
-        return TickPlan::Stop(StopReason::DiskFull);
+    if let Some(needed_bytes) = facts.disk_space_needed {
+        return TickPlan::Skip(SkipReason::DiskFull { needed_bytes });
     }
     match download_gate(Trigger::Background, conditions) {
         Ok(()) => TickPlan::Promote,
@@ -548,6 +548,17 @@ impl RetrySchedule {
 
     pub(crate) fn on_wake(&mut self, now: Instant) {
         self.due = self.due.min(now + AFTER_WAKE_DELAY);
+    }
+
+    pub(crate) fn on_power_change(
+        &mut self,
+        before: PowerSource,
+        after: PowerSource,
+        now: Instant,
+    ) {
+        if before == PowerSource::Battery && after == PowerSource::Mains {
+            self.due = self.due.min(now + Duration::from_secs(5));
+        }
     }
 
     pub(crate) fn after_tick(&mut self, now: Instant) {
@@ -595,6 +606,36 @@ pub(crate) async fn background_tick<E: TickEnv>(
     }
 }
 
+/// Keep only a typed reason, never a path or an arbitrary download error in
+/// the status payload. Eligibility is rechecked by node_status before display.
+static DOWNLOAD_WAIT: StdMutex<Option<crate::types::ModelDownloadWait>> = StdMutex::new(None);
+
+pub(crate) fn waiting_status() -> Option<crate::types::ModelDownloadWait> {
+    DOWNLOAD_WAIT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn wait_for_outcome(outcome: &TickOutcome) -> Option<crate::types::ModelDownloadWait> {
+    use crate::types::ModelDownloadWait;
+    match outcome {
+        TickOutcome::Skipped(SkipReason::OnBattery) => Some(ModelDownloadWait::OnBattery),
+        TickOutcome::Skipped(SkipReason::MeteredNetwork) => Some(ModelDownloadWait::MeteredNetwork),
+        TickOutcome::Skipped(SkipReason::DiskFull { needed_bytes }) => {
+            Some(ModelDownloadWait::DiskFull {
+                needed_bytes: *needed_bytes,
+            })
+        }
+        TickOutcome::Failed(_) => Some(ModelDownloadWait::Failed),
+        _ => None,
+    }
+}
+
+pub(crate) fn record_outcome(outcome: &TickOutcome) {
+    *DOWNLOAD_WAIT.lock().unwrap_or_else(|e| e.into_inner()) = wait_for_outcome(outcome);
+}
+
 // ── The loop ──────────────────────────────────────────────────────────────
 
 /// Retry promotion in the background until [`TickOutcome::ends_loop`]. Started
@@ -607,9 +648,30 @@ pub(crate) async fn run_retry_loop(app: tauri::AppHandle) {
     let mut wakes = crate::wake::subscribe();
     let mut wakes_open = true;
     let mut schedule = RetrySchedule::new(Instant::now());
+    let mut power = SystemConditions.power_source();
+    // The same OS readings used by the download gate, sampled without any
+    // dependency on a visible WebView. Detection + retry takes at most 35 s.
+    let mut power_samples = tokio::time::interval(Duration::from_secs(30));
+    power_samples.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    power_samples.tick().await;
+    if let Some(state) = app.try_state::<crate::AppState>() {
+        let env = crate::commands::BackgroundPromotionEnv {
+            app: &app,
+            state: state.inner(),
+        };
+        if let TickPlan::Skip(reason) = plan_tick(env.facts().await, &SystemConditions) {
+            record_outcome(&TickOutcome::Skipped(reason));
+        }
+    }
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(schedule.due_at())) => {}
+            _ = power_samples.tick() => {
+                let current = SystemConditions.power_source();
+                schedule.on_power_change(power, current, Instant::now());
+                power = current;
+                continue;
+            }
             changed = wakes.changed(), if wakes_open => {
                 match changed {
                     Ok(()) => schedule.on_wake(Instant::now()),
@@ -626,6 +688,7 @@ pub(crate) async fn run_retry_loop(app: tauri::AppHandle) {
             state: state.inner(),
         };
         let outcome = background_tick(&env, &SystemConditions).await;
+        record_outcome(&outcome);
         match &outcome {
             TickOutcome::Stopped(reason) => {
                 tracing::info!(?reason, "background model download retry finished");
@@ -681,7 +744,7 @@ mod tests {
             need,
             model_unavailable: false,
             model_fits: true,
-            disk_full: false,
+            disk_space_needed: None,
         }
     }
 
@@ -947,7 +1010,7 @@ mod tests {
     // ── the plan ──
 
     #[test]
-    fn the_loop_stops_on_ready_no_consent_ineligible_and_disk_full() {
+    fn the_loop_stops_on_ready_no_consent_and_ineligible_but_waits_for_disk() {
         assert_eq!(
             plan_tick(facts(PromotionNeed::Ready), &MAINS_UNMETERED),
             TickPlan::Stop(StopReason::Ready)
@@ -963,12 +1026,12 @@ mod tests {
         assert_eq!(
             plan_tick(
                 PromotionFacts {
-                    disk_full: true,
+                    disk_space_needed: Some(1024),
                     ..facts(PromotionNeed::Promote)
                 },
                 &MAINS_UNMETERED
             ),
-            TickPlan::Stop(StopReason::DiskFull)
+            TickPlan::Skip(SkipReason::DiskFull { needed_bytes: 1024 })
         );
     }
 
@@ -992,12 +1055,74 @@ mod tests {
         assert_eq!(
             plan_tick(
                 PromotionFacts {
-                    disk_full: true,
+                    disk_space_needed: Some(1024),
                     ..missing
                 },
                 &MAINS_UNMETERED
             ),
-            TickPlan::Stop(StopReason::DiskFull)
+            TickPlan::Skip(SkipReason::DiskFull { needed_bytes: 1024 })
+        );
+    }
+
+    #[tokio::test]
+    async fn full_disk_keeps_the_loop_alive_and_the_next_tick_can_download() {
+        let mut environment = env(
+            PromotionFacts {
+                disk_space_needed: Some(4096),
+                ..facts(PromotionNeed::Promote)
+            },
+            Some(Ok(())),
+        );
+        let outcome = background_tick(&environment, &MAINS_UNMETERED).await;
+        assert!(!outcome.ends_loop());
+        assert_eq!(
+            wait_for_outcome(&outcome),
+            Some(crate::types::ModelDownloadWait::DiskFull { needed_bytes: 4096 })
+        );
+        assert_eq!(environment.promotions.load(Ordering::SeqCst), 0);
+        environment.facts.disk_space_needed = None;
+        assert_eq!(
+            background_tick(&environment, &MAINS_UNMETERED).await,
+            TickOutcome::Promoted
+        );
+        assert_eq!(environment.promotions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mains_return_advances_retry_without_postponing_an_earlier_deadline() {
+        let now = Instant::now();
+        let mut schedule = RetrySchedule::new(now);
+        schedule.on_power_change(PowerSource::Unknown, PowerSource::Unknown, now);
+        assert_eq!(schedule.due_at(), now + RETRY_INTERVAL);
+        schedule.on_power_change(PowerSource::Battery, PowerSource::Mains, now);
+        assert_eq!(schedule.due_at(), now + Duration::from_secs(5));
+        schedule.on_power_change(
+            PowerSource::Battery,
+            PowerSource::Mains,
+            now + Duration::from_secs(4),
+        );
+        assert_eq!(schedule.due_at(), now + Duration::from_secs(5));
+    }
+
+    #[test]
+    fn waiting_status_is_typed_and_clears_on_success_or_ineligibility() {
+        use crate::types::ModelDownloadWait;
+        assert_eq!(
+            wait_for_outcome(&TickOutcome::Skipped(SkipReason::OnBattery)),
+            Some(ModelDownloadWait::OnBattery)
+        );
+        assert_eq!(
+            wait_for_outcome(&TickOutcome::Failed("private path".into())),
+            Some(ModelDownloadWait::Failed)
+        );
+        assert_eq!(wait_for_outcome(&TickOutcome::Promoted), None);
+        assert_eq!(
+            wait_for_outcome(&TickOutcome::Stopped(StopReason::NoConsent)),
+            None
+        );
+        assert_eq!(
+            serde_json::to_value(ModelDownloadWait::DiskFull { needed_bytes: 4096 }).unwrap(),
+            serde_json::json!({"reason": "diskFull", "neededBytes": 4096})
         );
     }
 

@@ -63,6 +63,8 @@ export interface NodeStatus {
    * until the file is back. Absent on older desktop builds.
    */
   modelUnavailable?: ModelUnavailableReason | null;
+  crashRetryInSecs?: number | null;
+  modelDownloadWait?: ModelDownloadWait | null;
 }
 
 /** Why the configured model file could not be used for this launch. */
@@ -860,4 +862,15 @@ export interface WorkerStatus {
   lastJobCompletedUnixMs: number | null;
   startedUnixMs: number | null;
   preventSleepDuringJobs: boolean | null;
+}
+
+/** Native reason a consented model download is waiting. */
+export type ModelDownloadWait =
+  | { reason: "onBattery" | "meteredNetwork" | "failed" }
+  | { reason: "diskFull"; neededBytes: number };
+/** Scoreboard counters from the elected coordinator, not a fleet census. */
+export interface WorkerNetwork {
+  count_total: number;
+  count_visible: number | null;
+  eligible_inference_workers: number | null;
 }

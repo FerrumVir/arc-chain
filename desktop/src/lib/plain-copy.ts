@@ -5,6 +5,12 @@
  */
 export const PLAIN_COPY = {
   startFailure: {
+    // Draft wording; copy approval remains a release gate.
+    otherDesktop: {
+      title: "ARC is already open on this computer.",
+      body: "Look for the ARC icon near the clock (Windows) or in the menu bar (Mac) and open it from there. You can close this window.",
+    },
+    closing: { title: "ARC is closing", body: "Please wait while your node closes." },
     /** Launch-time reconciliation is still closing the last session. */
     reconciling: {
       title: "ARC is finishing your node's last session",
@@ -45,6 +51,7 @@ export const PLAIN_COPY = {
     installing: "Installing…",
     restartArc: "Restart ARC",
     quitArc: "Quit ARC",
+    closeCopy: "Close this copy",
     tryAgain: "Try again",
     showDetails: "Show details",
     hideDetails: "Hide details",
@@ -52,6 +59,7 @@ export const PLAIN_COPY = {
     copied: "Copied",
     copyFailed: "Couldn't copy",
     startNode: "Start node",
+    shareComputer: "Share my computer",
     startAgain: "Start again",
     updateArc: "Update ARC",
     continueToArc: "Continue to ARC",
@@ -61,7 +69,15 @@ export const PLAIN_COPY = {
     navLabel: "Ask ARC",
     title: "Ask ARC",
     /** The proposal's line B: true today. */
-    promise: "Ask AI, and see who answered and whether another computer checked it.",
+    promise: "ARC is a network of computers that answer AI questions for each other.",
+    explanation: "Ask a question and one of them answers. Share your computer and it answers for others.",
+    askTitle: "Ask for free",
+    askBody: "Type a question. A computer on the network works out the answer.",
+    proofTitle: "See who answered",
+    proofBody: "ARC shows which computer answered, and whether a second computer checked it.",
+    shareTitle: "Share if you want",
+    shareBody: "Your computer can answer questions for other people. You can turn this off at any time.",
+    independentQuestions: "Each question is answered on its own. Earlier messages are not sent with it.",
     composerLabel: "Ask ARC",
     placeholder: "Ask ARC anything…",
     ask: "Ask",
@@ -69,6 +85,17 @@ export const PLAIN_COPY = {
   },
   /** The one-line node strip on Home: one sentence, at most one button. */
   nodeStrip: {
+    ready: "Your computer is ready to answer questions.",
+    computing: "Your computer is answering a question right now.",
+    preparing: "Your computer is getting ready to answer questions.",
+    sharingOff: "Your computer is not sharing.",
+    sharingIneligible: "This computer cannot share: it has less than 16 GB of memory.",
+    shareDownload: "Sharing downloads the AI model (3.80 GB) if it is not already on this computer.",
+    enablingSharing: "ARC is preparing to share. It will download the AI model (3.80 GB) if needed.",
+    reconnectingWorker: "Your computer is reconnecting before it can answer questions.",
+    answered: (n: number) => `Your computer has answered ${n} ${n === 1 ? "question" : "questions"} since it started.`,
+    online: (n: number) => `${n} ${n === 1 ? "computer is" : "computers are"} online.`,
+    registered: (n: number) => `${n} ${n === 1 ? "computer has" : "computers have"} registered.`,
     checking: "Checking your node…",
     /** Running, and the connection is not known yet (older status shapes). */
     running: "Your node is running.",
@@ -86,11 +113,20 @@ export const PLAIN_COPY = {
     starting: "Your node is starting. Loading the AI model can take a few minutes.",
     downloadingModel: (amount: string) =>
       `Your node is getting ready: downloading the AI model (${amount}).`,
+    modelWaitingBattery: "The AI model download is waiting; plug this computer in and ARC will try again.",
+    modelWaitingSpace: (amount: string) =>
+      `The AI model download needs ${amount} of free space; ARC will check again automatically.`,
+    modelWaitingFailed: "The last AI model download failed; ARC will try again automatically.",
+    modelWaitingMetered:
+      "The AI model download is waiting for a connection without a data limit; ARC will check again automatically.",
     off: "Your node is off.",
     /** Off, and no coordinator answered either: the computer is offline, not the node broken. */
     offUnreachable:
       "Your node is off, and ARC can't reach the network. Check your internet connection.",
     crashed: "Your node stopped unexpectedly.",
+    // Draft recovery copy: approval required before release.
+    crashRetry: (minutes: number) =>
+      `Your node stopped unexpectedly; ARC will try again in ${minutes} ${minutes === 1 ? "minute" : "minutes"}.`,
     updateAvailable: "A new version of ARC is ready.",
     updating: "Updating ARC. It will restart by itself in a moment.",
     /** A relaunch or install the updater couldn't finish; only a reopen clears it. */
@@ -140,6 +176,7 @@ export const PLAIN_COPY = {
   },
   /** Ask ARC: what the thread says while a question is out and when it isn't answered. */
   ask: {
+    answerLength: "Answer length",
     sending: "Sending…",
     askingNode: "Asking your node…",
     askingNetwork: "Asking the ARC network…",
@@ -161,7 +198,29 @@ export const PLAIN_COPY = {
     /** The composer's button while a question is out. */
     asking: "Asking…",
   },
+  answer: {
+    own: "Your own computer answered this.",
+    network: "A computer on the ARC network answered this.",
+    arc: "ARC's own computers answered this.",
+    served: { own: "your computer", arc: "ARC's computers", network: "the ARC network" },
+    checked: "A second computer got the same answer.",
+    reported: "ARC could not confirm a second computer checked this answer.",
+    unchecked: "No second-computer check was reported.",
+    recorded: "Recorded",
+    proof: "Show the proof",
+  },
   dashboard: {
+    questions: "Questions answered",
+    questionsInfo: "Answers accepted since this node started. These are not reward receipts.",
+    checked: "Checked by the network",
+    checkedUnavailable: "The total is not available. The node reports some checks, but does not count checks on practice questions here.",
+    online: "Computers online",
+    onlineInfo: "The latest count from the network. If the registry may include old entries, no online count is shown.",
+    uptime: "Running for",
+    uptimeInfo: "Time since this node started.",
+    advanced: "Advanced",
+    reportedChecks: "Reported checks",
+    reportedChecksInfo: "Checks reported by the network since this node started. Checks on practice questions are not included.",
     subtitleChecking: "Reading your node's status…",
     subtitleExternal: "Your node is running under launchd or systemd.",
     subtitleStarting: "Your node is starting. Loading the AI model can take a few minutes.",
@@ -190,11 +249,6 @@ export const PLAIN_COPY = {
   },
   setup: {
     welcomeTitle: "Welcome to ARC",
-    alwaysReady:
-      "It can start when ARC opens, and ARC installs updates automatically unless you turn that off in Settings. Work arrives only when assigned.",
-    /** Linux .deb and .rpm installs, which ARC can't update itself. */
-    alwaysReadyPackageManaged:
-      "It can start when ARC opens. Update ARC with the package manager you installed it with. Work arrives only when assigned.",
     /**
      * The compute step. On a computer that can run the ARC model (the tier
      * native code recommends), contributing starts on and the model downloads
@@ -251,6 +305,15 @@ export const PLAIN_COPY = {
       via ? `ARC is connected to the network via ${via} ✓` : "Your node is connected to the ARC network ✓",
   },
   settings: {
+    packageUpdates: "ARC cannot install updates for this package. Update ARC with the package manager you installed it with.",
+    startupTitle: "Starting with your computer",
+    startupOn: "ARC opens when you log in and starts your node.",
+    startupOff: "ARC does not start your node by itself. You can turn that on below.",
+    startupUnregistered: "ARC is not in your login items, so it will not open by itself after a restart.",
+    startupChecking: "ARC is checking whether it can open when you log in.",
+    startupUnknown: "ARC could not confirm whether it can open when you log in.",
+    startupModel: "Your node can answer questions after its model is ready.",
+    startupNoModel: "Your node needs a model before it can answer questions.",
     /**
      * Under Settings > Contribute compute while it is on: how much of the
      * processor AI jobs may use, at what priority, and how much memory the

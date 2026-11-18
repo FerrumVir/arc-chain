@@ -11,6 +11,25 @@
   flex-direction: column;
 }
 
+/* Leave the first explanation visible above the composer on an empty Home. */
+.chat-screen-empty {
+  --chat-band-h: 88px;
+}
+.chat-screen-empty .chat-band {
+  margin-bottom: var(--space-2);
+}
+.chat-screen-empty .chat-empty {
+  gap: var(--space-2);
+}
+/* The strip can wrap, add download guidance, or expand error details. Keep
+   the empty introduction and composer in flow at every window height. */
+.chat-screen-empty .composer,
+.chat-screen-empty .chat-band {
+  position: relative;
+  top: auto;
+  bottom: auto;
+}
+
 /* The conversation as an aqueduct (ChatAqueduct): full width of the column, above the thread. It stays in view at
    the top while the thread scrolls, as the composer does at the bottom, so the arch for a prompt is seen going up. */
 .chat-band {
@@ -936,4 +955,29 @@
 }
 .turn .answer {
   animation: arrive var(--dur-slow) var(--ease-out) both;
+}
+
+/* Short desktop windows cannot fit the illustration, answer and composer at
+   once. Let them scroll normally so the proof and empty-state copy stay reachable. */
+@media (max-height: 760px) {
+  .chat-band,
+  .composer {
+    position: relative;
+    top: auto;
+    bottom: auto;
+  }
+  .chat-screen-empty .chat-band {
+    display: none;
+  }
+  /* Put the first action before the explanation on short windows. The
+     explanation remains in flow and can be read below the question box. */
+  .chat-screen-empty .thread {
+    order: 1;
+    flex: 0;
+  }
+  .chat-screen-empty .composer {
+    margin-top: 0;
+    margin-bottom: 0;
+    padding-bottom: var(--space-4);
+  }
 }

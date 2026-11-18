@@ -647,6 +647,11 @@ jobs:
           run_test() { "$@" || failed=1; }
 
           run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
+            desktop_instance::tests -- --test-threads=1 --nocapture
+          run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
+            node_manager::tests::existing_owner_probe_never_changes_directory_contents \
+            -- --exact --test-threads=1 --nocapture
+          run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
             node_manager::tests::managed_lifecycle_lock_serializes_desktop_processes \
             -- --exact --test-threads=1 --nocapture
           run_test cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked \
@@ -669,6 +674,33 @@ jobs:
             -- --exact --test-threads=1 --nocapture
           exit "$failed"
       - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --all-targets --locked
+      - name: Build unsigned candidate MSI for single-instance acceptance
+        if: runner.os == 'Windows'
+        working-directory: desktop
+        shell: pwsh
+        env:
+          CARGO_BUILD_JOBS: '4'
+        run: |
+          npm run tauri -- build --debug --bundles msi --config '{"bundle":{"createUpdaterArtifacts":false}}' -- --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Candidate Windows packaged desktop single-instance acceptance
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $packages = @(Get-ChildItem desktop/src-tauri/target/debug/bundle/msi/*.msi)
+          if ($packages.Count -ne 1) { throw 'expected one candidate MSI' }
+          ./tests/desktop/windows-single-instance.ps1 -MsiPath $packages[0].FullName -EvidenceDirectory windows-instance-evidence
+      - name: Upload candidate Windows instance evidence
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-candidate-single-instance
+          path: |
+            windows-instance-evidence/result.json
+            windows-instance-evidence/*.stdout
+            windows-instance-evidence/*.stderr
+            windows-instance-evidence/*.log
+          if-no-files-found: warn
       - name: Clean up self-hosted runner
         if: always() && runner.environment == 'self-hosted'
         shell: bash
@@ -880,7 +912,7 @@ jobs:
       # The published SDK ships only its runtime dependencies (files: dist),
       # so those block at any severity; dev-only test tooling blocks at high.
       # Keep in step with scripts/ci_check.sh and release.yml.
-      - run: npm audit --omit=dev --audit-level=low && npm audit --audit-level=high
+      - run: python3 -I -B ../../scripts/release/npm-audit-gate.py --package . --level low --omit-dev && python3 -I -B ../../scripts/release/npm-audit-gate.py --package . --level high
       - run: npm test -- --runInBand
       - run: npm run build
       - name: Load the published CommonJS entrypoint

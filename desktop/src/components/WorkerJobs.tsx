@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { Card, CardHeader } from "./Card";
 import { Skeleton } from "./Skeleton";
+import { PLAIN_COPY } from "../lib/plain-copy";
 import { api } from "../lib/tauri";
 import { formatInt, formatRelativeTime } from "../lib/format";
 import { useAppStore } from "../lib/store";
@@ -94,7 +95,7 @@ export function WorkerJobsCard() {
               </div>
             </div>
             <div>
-              <div className="stat-label">Verified by the network</div>
+              <div className="stat-label" title={PLAIN_COPY.dashboard.reportedChecksInfo}>{PLAIN_COPY.dashboard.reportedChecks}</div>
               <div className="stat-value mono" data-testid="worker-jobs-verified">
                 {count(status.jobsVerified)}
               </div>
