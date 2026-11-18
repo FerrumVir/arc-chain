@@ -12,12 +12,6 @@ $evidence = (Resolve-Path $EvidenceDirectory).Path
 $testProfile = Join-Path $evidence 'profile'
 $target = Join-Path $evidence 'extracted'
 New-Item -ItemType Directory -Force $testProfile, $target | Out-Null
-$extract = Start-Process msiexec.exe -ArgumentList @('/a', ('"{0}"' -f $msi), '/qn',
-    ('TARGETDIR="{0}"' -f $target), '/l*v', ('"{0}"' -f (Join-Path $evidence 'msi.log'))) -Wait -PassThru
-if ($extract.ExitCode -ne 0) { throw "candidate MSI extraction failed: $($extract.ExitCode)" }
-$apps = @(Get-ChildItem $target -Recurse -File -Filter arc-desktop.exe)
-if ($apps.Count -ne 1) { throw 'expected exactly one candidate desktop' }
-$exe = $apps[0].FullName
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
@@ -33,11 +27,6 @@ $values = @{
     APPDATA = (Join-Path $testProfile 'AppData\Roaming')
     LOCALAPPDATA = (Join-Path $testProfile 'AppData\Local')
     TEMP = (Join-Path $testProfile 'Temp'); TMP = (Join-Path $testProfile 'Temp')
-}
-foreach ($key in $values.Keys) {
-    $prior[$key] = [Environment]::GetEnvironmentVariable($key)
-    New-Item -ItemType Directory -Force $values[$key] | Out-Null
-    [Environment]::SetEnvironmentVariable($key, $values[$key])
 }
 $children = [Collections.Generic.List[Diagnostics.Process]]::new()
 function Start-Copy([string] $Name, [string[]] $Arguments = @()) {
@@ -74,7 +63,39 @@ function Assert-Visible([IntPtr] $Window) {
     } while ([DateTime]::UtcNow -lt $deadline)
     throw 'original window did not become responsive, visible and un-minimized'
 }
+$desktop = $null
+$window = [IntPtr]::Zero
+$phase = 'extract'
+function Get-WindowState {
+    $responding = $null
+    $exited = $null
+    if ($null -ne $desktop) {
+        $desktop.Refresh()
+        $exited = $desktop.HasExited
+        if (-not $exited) { $responding = $desktop.Responding }
+    }
+    return [ordered]@{
+        phase = $phase
+        window_handle = $window.ToInt64()
+        visible = [ArcInstanceWindow]::IsWindowVisible($window)
+        minimized = [ArcInstanceWindow]::IsIconic($window)
+        Responding = $responding
+        owner_exited = $exited
+    }
+}
 try {
+    $extract = Start-Process msiexec.exe -ArgumentList @('/a', ('"{0}"' -f $msi), '/qn',
+        ('TARGETDIR="{0}"' -f $target), '/l*v', ('"{0}"' -f (Join-Path $evidence 'msi.log'))) -Wait -PassThru
+    if ($extract.ExitCode -ne 0) { throw "candidate MSI extraction failed: $($extract.ExitCode)" }
+    $apps = @(Get-ChildItem $target -Recurse -File -Filter arc-desktop.exe)
+    if ($apps.Count -ne 1) { throw 'expected exactly one candidate desktop' }
+    $exe = $apps[0].FullName
+    foreach ($key in $values.Keys) {
+        $prior[$key] = [Environment]::GetEnvironmentVariable($key)
+        New-Item -ItemType Directory -Force $values[$key] | Out-Null
+        [Environment]::SetEnvironmentVariable($key, $values[$key])
+    }
+    $phase = 'startup'
     $desktop = Start-Copy 'owner'
     $deadline = [DateTime]::UtcNow.AddSeconds(60)
     do {
@@ -85,16 +106,21 @@ try {
     } while ($window.ToInt64() -eq 0 -and [DateTime]::UtcNow -lt $deadline)
     if ($window.ToInt64() -eq 0) { throw 'no candidate desktop window' }
     Assert-Visible $window
+    $phase = 'minimized-second-launch'
     [void][ArcInstanceWindow]::ShowWindow($window, 6) # Minimize.
+    if (-not [ArcInstanceWindow]::IsIconic($window)) { throw 'test did not minimize owner' }
     Assert-Secondary 'second'
     Assert-OneOwner
     Assert-Visible $window
+    $phase = 'hidden-login-launch'
     [void][ArcInstanceWindow]::ShowWindow($window, 0) # Hide.
+    if ([ArcInstanceWindow]::IsWindowVisible($window)) { throw 'test did not hide owner' }
     Assert-Secondary 'login' @('--minimized')
     Assert-OneOwner
     # Allow queued main-thread work to run before declaring it stayed hidden.
     Start-Sleep -Milliseconds 750
     if ([ArcInstanceWindow]::IsWindowVisible($window)) { throw 'login copy raised the window' }
+    $phase = 'hidden-reopen'
     Assert-Secondary 'reopen'
     Assert-OneOwner
     Assert-Visible $window
@@ -107,11 +133,20 @@ try {
         source_commit = (git rev-parse HEAD)
         package_sha256 = (Get-FileHash $msi -Algorithm SHA256).Hash
         binary_sha256 = (Get-FileHash $exe -Algorithm SHA256).Hash
+        window_state = (Get-WindowState)
         owner_pid = $desktop.Id
         window_handle = $window.ToInt64()
         second_exit_zero = $true; login_stayed_hidden = $true; reopen_visible = $true
         physical_focus_verified = $false; installer_update_verified = $false
     } | ConvertTo-Json | Set-Content -Encoding utf8NoBOM (Join-Path $evidence 'result.json')
+} catch {
+    # Snapshot before cleanup so every failed assertion retains the actual
+    # HWND visibility/minimization and process responsiveness, not just a timeout.
+    [ordered]@{
+        failure = $_.Exception.Message
+        window_state = (Get-WindowState)
+    } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM (Join-Path $evidence 'result.json')
+    throw
 } finally {
     # Only children recorded by this script; never kill processes by name.
     foreach ($child in $children) {

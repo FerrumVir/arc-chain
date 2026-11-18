@@ -34,19 +34,53 @@ pub fn should_show(args: &[String]) -> bool {
     !args.iter().any(|arg| arg == "--minimized")
 }
 
+/// Restore the native state even when an external ShowWindow call has left
+/// Tao's cached visibility out of sync. All callers run on the UI thread.
+#[cfg(windows)]
+fn restore_windows_main(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, ShowWindow, SW_RESTORE, SW_SHOW};
+    let hwnd = window.hwnd()?.0;
+    // SAFETY: this is the live Tauri window's HWND, on its owning thread.
+    // ShowWindow returns the previous visibility, not success/failure.
+    unsafe {
+        ShowWindow(
+            hwnd,
+            if IsIconic(hwnd) != 0 {
+                SW_RESTORE
+            } else {
+                SW_SHOW
+            },
+        );
+    }
+    Ok(())
+}
+
 /// All explicit reopen routes use this order and the same wake signal.
 pub fn show_main(app: &tauri::AppHandle) {
+    tracing::debug!("desktop show_main entered on main thread");
     if app.try_state::<StartupFailure>().is_some() {
+        tracing::warn!("desktop show_main skipped: startup failed");
         return;
     }
     if let Some(window) = app.get_webview_window("main") {
+        #[cfg(windows)]
+        if let Err(error) = restore_windows_main(&window) {
+            tracing::warn!(%error, "desktop native restore failed");
+        }
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        tracing::info!(
+            visible = ?window.is_visible(),
+            minimized = ?window.is_minimized(),
+            "desktop show_main completed"
+        );
         crate::wake::emit_signal(app, crate::wake::SignalReason::Shown);
         if closing() {
             let _ = app.emit("desktop-closing", true);
         }
+    } else {
+        tracing::warn!("desktop show_main skipped: main window missing");
     }
 }
 
@@ -285,9 +319,15 @@ pub fn init() -> tauri::plugin::TauriPlugin<tauri::Wry> {
                     let app = app.clone();
                     std::thread::spawn(move || {
                         serve(listener, token, stopped, move |args| {
-                            if should_show(&args) {
+                            let show = should_show(&args);
+                            tracing::info!(show, "desktop authenticated handoff received");
+                            if show {
                                 let handle = app.clone();
-                                let _ = app.run_on_main_thread(move || show_main(&handle));
+                                if let Err(error) =
+                                    app.run_on_main_thread(move || show_main(&handle))
+                                {
+                                    tracing::warn!(%error, "desktop show_main dispatch failed");
+                                }
                             }
                         })
                     });
