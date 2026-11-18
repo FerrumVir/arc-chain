@@ -1,3 +1,6 @@
+> **Last changed 2026-09-02. This document is historical, not current guidance.**
+> Check behaviour in the code, and start with [AGENTS.md](AGENTS.md).
+
 # ARC Chain - Historical v0.5.3 Architecture Snapshot
 
 > **ARCHIVED — NOT AN OPERATOR RUNBOOK OR CURRENT NETWORK STATUS.** This file

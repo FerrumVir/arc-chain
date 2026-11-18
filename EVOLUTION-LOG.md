@@ -1,3 +1,6 @@
+> **Last changed 2026-09-02. This document is historical, not current guidance.**
+> Check behaviour in the code, and start with [AGENTS.md](AGENTS.md).
+
 # ARC Growth Engine - Evolution Log
 
 > **Scope note (2026-08-17).** This file is the market-intelligence log for the

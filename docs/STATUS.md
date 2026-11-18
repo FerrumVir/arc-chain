@@ -1,3 +1,6 @@
+> **Last changed 2026-09-02. This document is historical, not current guidance.**
+> Check behaviour in the code, and start with [AGENTS.md](../AGENTS.md).
+
 # ARC Chain - Status (archived 2026-04-22 snapshot)
 
 > ## ⚠ This document is largely stale. Read this box first.

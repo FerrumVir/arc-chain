@@ -1,3 +1,6 @@
+> **Last changed 2026-11-13. This document is historical, not current guidance.**
+> Check behaviour in the code, and start with [AGENTS.md](../AGENTS.md).
+
 # ARC Chain — Demo Runbook
 
 > **Recovery notice (2026-08-26):** this live-network runbook records the old

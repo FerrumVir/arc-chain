@@ -1,3 +1,6 @@
+> **Last changed 2026-10-11. This document is historical, not current guidance.**
+> Check behaviour in the code, and start with [AGENTS.md](AGENTS.md).
+
 # ARC Chain - "any model, any node, any time" execution plan (ARCHIVED)
 
 > **ARCHIVED HISTORICAL PLAN — DO NOT USE AS A RUNBOOK.** This records

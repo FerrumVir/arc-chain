@@ -1,3 +1,6 @@
+> **Last changed 2026-09-02. This document is historical, not current guidance.**
+> Check behaviour in the code, and start with [AGENTS.md](../AGENTS.md).
+
 # Testnet Investigation — Seeds Are Independent Chains, Not One Network
 
 > **Dated incident record, still directionally confirmed.** The uniform v0.7.7
