@@ -1,7 +1,0 @@
-# Custom labels of ARC's own self-hosted Mac Studio runner, so actionlint
-# accepts them in `runs-on`. GitHub adds self-hosted, macOS and ARM64 itself.
-# See docs/self-hosted-runner.md.
-self-hosted-runner:
-  labels:
-    - arc-mac-studio
-    - metal
