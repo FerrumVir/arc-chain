@@ -1134,6 +1134,9 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building ARC desktop")
         .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Ready) {
+                desktop_instance::finish_startup(app);
+            }
             #[cfg(target_os = "macos")]
             if matches!(event, tauri::RunEvent::Reopen { .. }) {
                 desktop_instance::show_main(app);

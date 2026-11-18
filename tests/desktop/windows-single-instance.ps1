@@ -97,13 +97,21 @@ try {
     }
     $phase = 'startup'
     $desktop = Start-Copy 'owner'
+    $ownerLog = Join-Path $evidence 'owner.stdout'
+    $ready = $false
     $deadline = [DateTime]::UtcNow.AddSeconds(60)
     do {
         Start-Sleep -Milliseconds 100
         $desktop.Refresh()
         if ($desktop.HasExited) { throw "owner exited during startup: $($desktop.ExitCode)" }
         $window = $desktop.MainWindowHandle
-    } while ($window.ToInt64() -eq 0 -and [DateTime]::UtcNow -lt $deadline)
+        # A native HWND can appear before WebView2 creation and app setup.
+        # Do not touch it until the owner confirms both have completed.
+        if (Test-Path $ownerLog) {
+            $ready = [bool](Select-String -Path $ownerLog -Pattern '\bdesktop ready\b' -Quiet)
+        }
+    } while ((-not $ready -or $window.ToInt64() -eq 0) -and [DateTime]::UtcNow -lt $deadline)
+    if (-not $ready) { throw 'owner did not report desktop ready within sixty seconds' }
     if ($window.ToInt64() -eq 0) { throw 'no candidate desktop window' }
     Assert-Visible $window
     $phase = 'minimized-second-launch'

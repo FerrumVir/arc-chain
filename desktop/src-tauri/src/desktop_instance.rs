@@ -10,7 +10,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -32,6 +32,62 @@ pub fn begin_closing(app: &tauri::AppHandle) {
 
 pub fn should_show(args: &[String]) -> bool {
     !args.iter().any(|arg| arg == "--minimized")
+}
+
+/// The same lock covers readiness and pending intent: a handoff racing with
+/// startup either queues once or dispatches after readiness, never falls between.
+#[derive(Default)]
+struct StartupGate(Mutex<StartupState>);
+
+#[derive(Default)]
+struct StartupState {
+    ready: bool,
+    pending_show: bool,
+}
+
+impl StartupGate {
+    fn request_show(&self) -> bool {
+        let mut state = self.0.lock().unwrap();
+        if state.ready {
+            true
+        } else {
+            state.pending_show = true;
+            false
+        }
+    }
+
+    // None means readiness was already published; Some carries queued intent.
+    fn finish(&self) -> Option<bool> {
+        let mut state = self.0.lock().unwrap();
+        if state.ready {
+            return None;
+        }
+        state.ready = true;
+        Some(std::mem::take(&mut state.pending_show))
+    }
+}
+
+/// Called on RunEvent::Ready, after application setup has returned. A managed
+/// WebviewWindow alone can survive failed native creation; querying its URL
+/// also requires the runtime's live webview. Do not log the URL itself.
+pub fn finish_startup(app: &tauri::AppHandle) {
+    if app.try_state::<StartupFailure>().is_some() {
+        return;
+    }
+    let Some(window) = app.get_webview_window("main") else {
+        tracing::error!("desktop not ready: main window missing");
+        return;
+    };
+    if let Err(error) = window.url() {
+        tracing::error!(%error, "desktop not ready: main webview unavailable");
+        return;
+    }
+    if let Some(pending_show) = app.state::<StartupGate>().finish() {
+        tracing::info!("desktop ready");
+        if pending_show {
+            show_main(app);
+        }
+    }
 }
 
 /// Restore the native state even when an external ShowWindow call has left
@@ -303,6 +359,7 @@ pub fn show_startup_failure(app: &tauri::AppHandle) -> bool {
 pub fn init() -> tauri::plugin::TauriPlugin<tauri::Wry> {
     tauri::plugin::Builder::new("single-instance")
         .setup(|app, _| {
+            app.manage(StartupGate::default());
             let args: Vec<String> = std::env::args_os()
                 .map(|s| s.to_string_lossy().into_owned())
                 .collect();
@@ -321,7 +378,9 @@ pub fn init() -> tauri::plugin::TauriPlugin<tauri::Wry> {
                         serve(listener, token, stopped, move |args| {
                             let show = should_show(&args);
                             tracing::info!(show, "desktop authenticated handoff received");
-                            if show {
+                            if show && !app.state::<StartupGate>().request_show() {
+                                tracing::info!("desktop handoff queued until ready");
+                            } else if show {
                                 let handle = app.clone();
                                 if let Err(error) =
                                     app.run_on_main_thread(move || show_main(&handle))
@@ -348,6 +407,71 @@ pub fn init() -> tauri::plugin::TauriPlugin<tauri::Wry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_clicks_coalesce_and_drain_once() {
+        let gate = StartupGate::default();
+        assert!(!gate.request_show());
+        assert!(!gate.request_show());
+        assert_eq!(gate.finish(), Some(true));
+        assert_eq!(gate.finish(), None);
+        assert!(gate.request_show());
+    }
+
+    #[test]
+    fn startup_without_a_click_does_not_raise_window() {
+        let gate = StartupGate::default();
+        assert_eq!(gate.finish(), Some(false));
+        assert!(gate.request_show());
+    }
+
+    #[test]
+    fn startup_racing_with_click_never_loses_or_duplicates_intent() {
+        for _ in 0..100 {
+            let gate = Arc::new(StartupGate::default());
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let click_gate = gate.clone();
+            let click_barrier = barrier.clone();
+            let click = std::thread::spawn(move || {
+                click_barrier.wait();
+                click_gate.request_show()
+            });
+            barrier.wait();
+            let drained = gate.finish().unwrap();
+            let dispatched = click.join().unwrap();
+            assert_ne!(drained, dispatched);
+        }
+    }
+
+    #[test]
+    fn early_authenticated_handoff_is_acknowledged_and_waits_for_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let Entry::Owner(lease, listener, token) = enter(dir.path(), &[]).unwrap() else {
+            panic!()
+        };
+        let gate = Arc::new(StartupGate::default());
+        let received_gate = gate.clone();
+        let stopped = lease.stopped.clone();
+        let (send, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            serve(listener, token, stopped, move |args| {
+                send.send(should_show(&args) && received_gate.request_show())
+                    .unwrap();
+            });
+        });
+        for args in [vec!["ARC".into()], vec!["ARC".into(), "--minimized".into()]] {
+            assert!(matches!(
+                enter(dir.path(), &args).unwrap(),
+                Entry::Forwarded
+            ));
+            assert!(!received.recv_timeout(TIMEOUT).unwrap());
+        }
+        // A login handoff must not cancel the earlier explicit click.
+        assert_eq!(gate.finish(), Some(true));
+        assert_eq!(gate.finish(), None);
+        drop(lease);
+        worker.join().unwrap();
+    }
+
     #[test]
     fn login_launch_does_not_raise_window() {
         assert!(!should_show(&["ARC".into(), "--minimized".into()]));
