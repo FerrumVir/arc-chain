@@ -467,6 +467,7 @@ test.describe("Network screen - reached from elsewhere", () => {
     page,
   }) => {
     await page.goto("/");
+    await page.getByTestId("dashboard-advanced").locator("summary").click();
     const btn = page.getByTestId("btn-open-network");
     await expect(btn).toBeVisible();
     await expect(btn).toContainText("Check the chain");

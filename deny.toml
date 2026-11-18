@@ -29,6 +29,30 @@ yanked = "deny"
 # Format:
 #   "RUSTSEC-0000-0000", # 2026-08-17 <owner>: <why not exploitable>; remove when <condition>
 ignore = [
+    # 2026-11-18; risk accepted by: TJ Dunham.
+    # chrono 0.4.45 is unmaintained, with no patched version. This is a
+    # maintenance notice, not a disclosed exploitable vulnerability; current
+    # time/formatting use does not introduce an exploit described by this notice.
+    # Remove on the dependency upgrade, no later than 2026-12-17.
+    "RUSTSEC-2026-0543",
+    # 2026-11-18; risk accepted by: TJ Dunham.
+    # zip 1.1.4 comes through candle-core 0.8.4; zip 4.6.1 through the Windows
+    # tauri-plugin-updater 2.10.1. Both disable default features, and neither
+    # locked zip entry enables AES dependencies. Consumers use ZipArchive with
+    # no password/decrypt entry API, so the AES authentication bypass is not
+    # reached. Desktop downloads verify the whole payload signature before
+    # making bytes available to install/extract.
+    # Remove on the dependency upgrade, no later than 2026-12-17.
+    "RUSTSEC-2026-0545",
+    # 2026-11-18; risk accepted by: TJ Dunham.
+    # candle-core and the Windows updater read with ZipArchive (central
+    # directory); no consumer calls ZipStreamReader, its extract/visit methods,
+    # or read_zipfile_from_stream. The local-header/central-directory mismatch
+    # path is therefore not reached. The updater authenticates the full
+    # download before unpacking. If stream extraction is introduced, require
+    # explicit header-consistency enforcement; an upgrade alone is insufficient.
+    # Remove on the dependency upgrade, no later than 2026-12-17.
+    "RUSTSEC-2026-0548",
     # 2026-08-27 ARC release engineering: paste is a build-time proc macro
     # reached only through pinned Wasmer/Candle/Revm dependencies; this
     # advisory reports maintenance status, not a vulnerability. Remove when

@@ -38,6 +38,7 @@ import type {
   UpdateInstallPolicy,
   WalletTxResult,
   WorkerStatus,
+  WorkerNetwork,
 } from "./types";
 import type {
   NativeContextView,
@@ -2147,6 +2148,10 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       if (detailed.kind !== "ok") throw new Error("the receipt is unavailable");
       return { found: true, height: Number(health.height), receipt: detailed.body } as T;
     }
+    // Browser live mode has no native session election/cache. Do not guess
+    // another origin or contact production from the test harness.
+    case "fetch_worker_network":
+      return null as T;
     case "fetch_worker_status": {
       const path = "/community/worker/status";
       const detailed = await getDetailed(path);
@@ -2615,7 +2620,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         running,
         pid: running && !external ? 42_731 : null,
         health: running ? (uptime < 8 ? "syncing" : "live") : "lite",
-        version: "0.8.20",
+        version: "0.8.21",
         peers: running ? 8 : 0,
         round: running ? 43_821 + Math.floor(uptime / 4) : 0,
         committed: running ? 43_820 + Math.floor(uptime / 4) : 0,
@@ -3033,6 +3038,8 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         path: "/mock/Downloads/arc-node-20260817-120000.log",
         lines: mockLogs.length,
       } as T;
+    case "fetch_worker_network":
+      return { count_total: 6, count_visible: 6, eligible_inference_workers: 4 } as T;
     case "fetch_worker_status": {
       const config = mockConfig ?? DEFAULT_NODE_CONFIG;
       const working =
@@ -3585,6 +3592,8 @@ export const api = {
   /** Change how many cores the node contributes. */
   setWorkerThreads: (threads: number) =>
     invoke<ThreadsApplied>("set_worker_threads", { threads }),
+  /** Cached scoreboard counts from the elected coordinator; absent on failure. */
+  fetchWorkerNetwork: () => invoke<WorkerNetwork | null>("fetch_worker_network"),
   /** This machine's community worker: state and job counters (local node only). */
   fetchWorkerStatus: () => invoke<WorkerStatus>("fetch_worker_status"),
   /**

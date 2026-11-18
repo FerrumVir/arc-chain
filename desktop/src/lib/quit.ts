@@ -15,3 +15,9 @@ export async function quitArc(): Promise<void> {
   await api.stopNode().catch(() => {});
   await exit(0).catch(() => {});
 }
+
+/** A refused copy must never stop the other process's node. */
+export async function closeThisCopy(): Promise<void> {
+  if (isTauri) await exit(0);
+  else window.location.reload();
+}

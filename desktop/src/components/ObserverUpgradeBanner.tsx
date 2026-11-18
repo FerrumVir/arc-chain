@@ -3,7 +3,7 @@ import { Loader2, Sparkles, X } from "lucide-react";
 import { api, isTauri } from "../lib/tauri";
 import { useAppStore } from "../lib/store";
 import { modelDownloadStatus } from "../lib/format";
-import type { ModelDownloadProgress, ModelTierInfo } from "../lib/types";
+import { computeContributionEnabled, type ModelDownloadProgress, type ModelTierInfo } from "../lib/types";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(0)} MB`;
@@ -45,7 +45,7 @@ export function ObserverUpgradeBanner() {
   // Show the banner only when the loaded config exists AND it's an
   // observer-style config. Don't render anything during the brief load gap.
   const isObserverConfig =
-    !!config && (config.role === "observer" || config.modelPath == null);
+    !!config && !computeContributionEnabled(config) && (config.role === "observer" || config.modelPath == null);
 
   useEffect(() => {
     if (!open || tiers.length > 0) return;

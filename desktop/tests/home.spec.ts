@@ -37,7 +37,7 @@ test.describe("Home: Ask ARC", () => {
     // Where a prompt goes, as the native route does it: to the coordinator
     // this session reads the chain from, not to this computer's node first.
     const home = page.getByTestId("inference-screen");
-    await expect(home).toContainText("A named community worker or coordinator on the ARC network");
+    await expect(home).toContainText(PLAIN_COPY.home.proofBody);
     await expect(home).not.toContainText("Your own node first");
     await page.getByRole("button", { name: "What is how this works?" }).click();
     const routeHelp = page.getByTestId("inference-route-help");
@@ -62,7 +62,7 @@ test.describe("Home: Ask ARC", () => {
     await expect(strip).toHaveAttribute("data-tone", "busy");
     await expect(strip.getByTestId("node-strip-action")).toHaveCount(0);
     await expect(strip.getByTestId("node-strip-sentence")).toHaveText(
-      PLAIN_COPY.nodeStrip.runningConnected,
+      PLAIN_COPY.nodeStrip.sharingOff + " " + PLAIN_COPY.nodeStrip.online(6),
       { timeout: 15_000 },
     );
     await expect(strip).toHaveAttribute("data-tone", "ok");

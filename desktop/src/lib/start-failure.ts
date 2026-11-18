@@ -15,6 +15,7 @@ export const NATIVE_RECONCILING = "startup reconciliation is still in progress";
  * Start and Restart while an app update ARC couldn't finish holds the node
  * (`UPDATE_HOLDS_NODE` in node_manager.rs). Only quitting ARC releases it.
  */
+export const NATIVE_OTHER_DESKTOP = "ARC is already open on this computer.";
 export const NATIVE_UPDATE_UNFINISHED =
   "ARC couldn't finish an update. Quit ARC and open it again.";
 
@@ -24,7 +25,7 @@ export const NATIVE_UPDATE_UNFINISHED =
 // phrases: a permission error during recovery is still a repair, and the
 // outdated-binary text mentions the WAL barrier it cannot prove.
 const REPAIR_PATTERN =
-  /migration preflight|could not be persisted|legacy desktop node reconciliation|legacy node reconciliation context|permission|symbolic[- ]link|not a directory|not a regular|must already exist|another ARC desktop|read-only file system|no space left|update (?:the managed node|arc-node) before/i;
+  /migration preflight|could not be persisted|legacy desktop node reconciliation|legacy node reconciliation context|permission|symbolic[- ]link|not a directory|not a regular|must already exist|read-only file system|no space left|update (?:the managed node|arc-node) before/i;
 // The previous session did not close cleanly and ARC could not finish
 // closing it.
 const DURABILITY_PATTERN =
@@ -35,13 +36,15 @@ const NETWORK_PATTERN =
   /transport failed|returned HTTP (?:408|429|5\d\d)\b|timed out|error sending request|dns error|connection (?:refused|reset)/i;
 
 export type StartFailureKind =
+  | "other-desktop"
+  | "closing"
   | "reconciling"
   | "update-unfinished"
   | "blocked"
   | "needs-repair"
   | "network"
   | "unknown";
-export type StartFailureAction = "install-update" | "restart-arc" | "quit-arc" | "try-again";
+export type StartFailureAction = "close-copy" | "install-update" | "restart-arc" | "quit-arc" | "try-again";
 
 export interface StartFailureView {
   kind: StartFailureKind;
@@ -64,6 +67,8 @@ export function isStartupReconciliationInProgress(raw: string): boolean {
 }
 
 export function classifyStartFailure(raw: string): StartFailureKind {
+  if (raw.includes(NATIVE_OTHER_DESKTOP) || raw.includes("another ARC desktop currently owns the managed node lifecycle")) return "other-desktop";
+  if (raw === "ARC is closing") return "closing";
   if (isStartupReconciliationInProgress(raw)) return "reconciling";
   if (raw.includes(NATIVE_UPDATE_UNFINISHED)) return "update-unfinished";
   // Every refusal carries the same advice, which names paths and
@@ -83,7 +88,22 @@ export function classifyStartFailure(raw: string): StartFailureKind {
  * every other character as the native side wrote it, paths included.
  */
 export function cleanFailureDetails(raw: string): string {
+  // Native diagnostics redact the actual configured home (including custom
+  // roots). These patterns also cover older errors already saved in the UI.
+  const boundary = String.raw`(?=[\\/]|[.,;:)\]}!?](?:\s|$)|\s|$)`;
+  const user = String.raw`[^\\/\r\n:;,()"']+?`;
   let text = raw.trim();
+  const roots: [string, string][] = [
+    [String.raw`(?:\\\\\?\\|//\?/)?[A-Za-z]:[\\/](?:Users|Profiles|Documents and Settings)[\\/]`, "gi"],
+    [String.raw`/(?:Users|(?:var/|usr/|export/)?home)/`, "g"],
+  ];
+  for (const [root, flags] of roots) {
+    // Prefer a complete path component so names with spaces or dots are
+    // fully removed before considering a bare home followed by prose.
+    text = text.replace(new RegExp(`${root}[^\\\\/\\r\\n]+(?=[\\\\/])`, flags), "~")
+      .replace(new RegExp(`${root}${user}${boundary}`, flags), "~");
+  }
+  text = text.replace(new RegExp(String.raw`/(?:var/)?root${boundary}`, "g"), "~");
   const first = text.indexOf(NATIVE_REFUSAL_PREFIX);
   if (first >= 0) {
     const end = first + NATIVE_REFUSAL_PREFIX.length;
@@ -124,6 +144,10 @@ export function describeStartFailure(
   const details = cleanFailureDetails(raw);
   const copy = PLAIN_COPY.startFailure;
   switch (kind) {
+    case "other-desktop":
+      return { kind, ...copy.otherDesktop, action: "close-copy", details, detailsOpen: false };
+    case "closing":
+      return { kind, ...copy.closing, action: "try-again", details, detailsOpen: false };
     case "reconciling":
       return { kind, ...copy.reconciling, action: "try-again", details, detailsOpen: false };
     case "update-unfinished":

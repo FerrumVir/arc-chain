@@ -242,6 +242,8 @@ if sys.argv[6] == "desktop-update-existing-validators-v1":
     spec = importlib.util.spec_from_file_location("previous_release", Path(sys.argv[7]) / "previous-validator-release.py")
     previous = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(previous)
+    # Re-authenticate the actual validator baseline and every skipped desktop
+    # update against the current listing, including the exact recorded skip list.
     previous.verify_attestation(v, sys.argv[3], time.time())
     previous.verify_preflight_binding(v, int(os.environ["PRETAG_RUN_ID"]),
         int(os.environ["PRETAG_RUN_ATTEMPT"]), json.loads(os.environ["PRETAG_SELECTION"]))

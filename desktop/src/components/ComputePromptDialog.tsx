@@ -174,7 +174,7 @@ export function ComputePromptDialog({ onClose }: { onClose: () => void }) {
         <div style={{ display: "flex", justifyContent: "flex-end", gap: "var(--space-3)" }}>
           <button
             type="button"
-            className="btn btn-secondary"
+            className="btn btn-primary"
             ref={notNowRef}
             onClick={onClose}
             disabled={busy}
@@ -184,7 +184,7 @@ export function ComputePromptDialog({ onClose }: { onClose: () => void }) {
           </button>
           <button
             type="button"
-            className="btn btn-primary"
+            className="btn btn-secondary"
             onClick={() => void turnOff()}
             disabled={busy}
             aria-busy={busy || undefined}

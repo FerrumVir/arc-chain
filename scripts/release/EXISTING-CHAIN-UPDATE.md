@@ -55,26 +55,50 @@ Every `--community-twin-*` and `--community-demand-*` argument must appear only 
 Pass `--profile desktop-update-existing-validators-v1 --previous-release-tag
 vX.Y.Z --confirm-node-compatible` to the owner assembler, then use the same
 `release_profile` and `previous_release_tag` inputs on
-`existing-chain-update-handoff.yml`. The named baseline must be the newest
-qualifying strict semantic version in the complete GitHub release listing:
+`existing-chain-update-handoff.yml`. The named baseline must be a qualifying
+strict semantic version in the complete GitHub release listing:
 immutable, published, not a prerelease, authored by github-actions[bot], and named
 `ARC Chain vX.Y.Z`. It must precede the candidate. Its published `SHA256SUMS` must
 verify with the installer's source-pinned release-manifest key and namespace
 `arc-release-manifest-v1`; its Linux node hash must match the published asset.
 
+Every qualifying release newer than the baseline and older than the candidate
+must be a desktop-only update over that same baseline. Each must carry
+`arc-desktop-update-attestation.json`, uploaded by github-actions[bot], with an
+API SHA-256 digest and size of at most 1 MiB. Its bytes must match both that digest
+and its entry in the release's own `SHA256SUMS`, verified with the same
+source-pinned key and namespace. Its `profile` must be
+`desktop-update-existing-validators-v1`, `node_compatible_with_validators` must
+be exactly true, and `validators_release.tag` and `binary_sha256` must match the
+authenticated baseline. Missing, malformed or unverifiable evidence refuses the
+selection with the existing newest-qualifying-release error. Duplicate baseline
+or intervening qualifying versions and a qualifying release at or beyond the
+candidate also refuse it.
+When the baseline is already newest, the existing authentication rules apply.
+
+The explicit `--confirm-node-compatible` confirmation remains mandatory. The
+independent compatibility review must compare the candidate's node against the
+validators' **actual release**, not merely the release immediately before the
+candidate. Skipping desktop releases does not establish candidate compatibility.
+
 Every live host must run exactly that previous Linux binary. All other quorum,
 checkpoint, network, artifact, and at-most-two-declared-offline rules above still
 apply. Capture retains the existing 120-second freshness check; the protected
 producer accepts owner evidence up to two hours old. Desktop release assembly
-also enforces that two-hour observation bound and re-authenticates the newest
-published baseline, so a newly published qualifying release invalidates an old
-handoff. The candidate production and checkpoint-verifier binaries remain bound
+also enforces that two-hour observation bound and re-authenticates the named
+baseline and every skipped desktop update, so a newly published qualifying
+release invalidates an old handoff. The candidate production and checkpoint-verifier binaries remain bound
 to the selected signing-preflight artifacts, independently of the validator hash.
 
 Dispatch `release.yml` explicitly with this profile and the same immutable update
 handoff ID, digest and attempt tuple. Its signed, 30-asset package substitutes
 `arc-desktop-update-attestation.json` for the ordinary update attestation. That
-asset records the previous tag, node hash, signed manifest hashes and compatibility
-declaration; release notes repeat the tag and node hash. Post-release acceptance
-recognizes the distinct asset set and still refuses legacy migration. No default,
+asset records the actual validator tag, node hash, signed manifest hashes and
+compatibility declaration. `validators_release_skipped_desktop_updates` records
+each skipped tag, release ID, commit and attestation SHA-256 in ascending version
+order, or an empty list when there are none. Verification re-derives and compares
+the entire list. Legacy newest-only attestations may omit the field only when
+the re-derived list is empty. Release notes and the handoff summary repeat the
+actual validator tag and node hash and name the skipped desktop updates (or none).
+Post-release acceptance recognizes the distinct asset set and still refuses legacy migration. No default,
 cutover behavior, ordinary update rule, signing gate or updater limit changes.

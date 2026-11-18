@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, CheckCircle2, CircleAlert, Copy, Download, Loader2, Power } from "lucide-react";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { api, isTauri } from "../lib/tauri";
-import { quitArc } from "../lib/quit";
+import { closeThisCopy, quitArc } from "../lib/quit";
 import { useAppStore } from "../lib/store";
 import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
 import {
@@ -13,17 +13,19 @@ import {
   type NodeStripTone,
 } from "../lib/node-strip";
 import { PLAIN_COPY } from "../lib/plain-copy";
-import { DEFAULT_NODE_CONFIG, type ModelDownloadProgress } from "../lib/types";
+import { DEFAULT_NODE_CONFIG, computeContributionEnabled, type ModelDownloadProgress } from "../lib/types";
 
 const COPIED_RESET_MS = 2_500;
 
 const ACTION_LABEL: Record<NodeStripAction, string> = {
+  "close-copy": PLAIN_COPY.actions.closeCopy,
   "update-arc": PLAIN_COPY.actions.updateArc,
   "restart-arc": PLAIN_COPY.actions.restartArc,
   "quit-arc": PLAIN_COPY.actions.quitArc,
   "start-node": PLAIN_COPY.actions.startNode,
   "start-again": PLAIN_COPY.actions.startAgain,
   "try-again": PLAIN_COPY.actions.tryAgain,
+  "share-computer": PLAIN_COPY.actions.shareComputer,
 };
 
 // Only the attention tone is red. Off and an update on offer are ordinary
@@ -53,8 +55,10 @@ export function NodeStatusStrip() {
   const queryClient = useQueryClient();
   const config = useAppStore((s) => s.config);
   const update = useUpdaterSnapshot();
+  const setConfig = useAppStore((s) => s.setConfig);
   const [startError, setStartError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [sharingPending, setSharingPending] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [modelProgress, setModelProgress] = useState<ModelDownloadProgress | null>(null);
   const [copied, setCopied] = useState<"idle" | "copied" | "failed">("idle");
@@ -70,6 +74,19 @@ export function NodeStatusStrip() {
     queryKey: ["status"],
     queryFn: api.nodeStatus,
     refetchInterval: 2000,
+  });
+  const { data: tier } = useQuery({
+    queryKey: ["recommended-tier"],
+    queryFn: api.recommendedTier,
+  });
+  const sharingEligible = tier == null ? undefined : tier !== "none";
+  const { data: worker } = useQuery({
+    queryKey: ["worker-status"], queryFn: api.fetchWorkerStatus,
+    refetchInterval: 5000, enabled: status?.running === true,
+  });
+  const { data: network } = useQuery({
+    queryKey: ["worker-network"], queryFn: api.fetchWorkerNetwork,
+    staleTime: 60_000, refetchInterval: 60_000, retry: false,
   });
   const { data: startBlock } = useQuery({
     queryKey: ["start-block"],
@@ -135,6 +152,11 @@ export function NodeStatusStrip() {
     update,
     modelProgress,
     connectingSeconds,
+    sharing: computeContributionEnabled(config) && sharingEligible === true,
+    sharingEligible,
+    sharingPending,
+    worker,
+    network,
   });
 
   // The native text, so a person can paste it into a report as it is.
@@ -149,6 +171,9 @@ export function NodeStatusStrip() {
   };
 
   const act = async (action: NodeStripAction) => {
+    if (action === "close-copy") { await closeThisCopy(); return; }
+    // Match Settings' memory gate before native code can persist consent.
+    if (action === "share-computer" && sharingEligible !== true) return;
     if (action === "update-arc") {
       void appUpdater.installAvailableUpdate();
       return;
@@ -168,11 +193,19 @@ export function NodeStatusStrip() {
     setBusy(true);
     setStartError(null);
     try {
+      if (action === "share-computer") {
+        setModelProgress(null);
+        setSharingPending(true);
+        setConfig(await api.setComputeContribution(true));
+        void queryClient.invalidateQueries({ queryKey: ["worker-status"] });
+        return;
+      }
       if (action === "start-again") await api.clearCrash();
       await api.startNode(config ?? DEFAULT_NODE_CONFIG);
     } catch (error) {
       setStartError(error instanceof Error ? error.message : String(error));
     } finally {
+      setSharingPending(false);
       setBusy(false);
       void queryClient.invalidateQueries({ queryKey: ["status"] });
       void queryClient.invalidateQueries({ queryKey: ["start-block"] });
@@ -218,6 +251,11 @@ export function NodeStatusStrip() {
         >
           {ACTION_LABEL[view.action]}
         </button>
+      )}
+      {view.action === "share-computer" && (
+        <span className="field-hint" style={{ flexBasis: "100%" }} data-testid="node-strip-share-note">
+          {PLAIN_COPY.nodeStrip.shareDownload}
+        </span>
       )}
       {view.details && (
         <button

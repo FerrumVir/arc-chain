@@ -18,6 +18,26 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.21 - Release-preparation snapshot (2026-11-18)
+
+> **Candidate note:** This entry records the v0.8.21 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.21.
+
+- Keep one desktop per user, reopen its window from shortcuts and the Dock, distinguish another copy from migration failures, and avoid showing home nodes as catching up.
+- Desktop keeps unfinished setup visible on login, retries lasting startup failures
+  and exhausted crash recovery with bounded backoff, and keeps model downloads
+  waiting for disk space or power with a plain reason on Home. A signed update,
+  manual or unattended, takes over a slow crash-recovery wait instead of being
+  refused. Sharing consent, the memory floor, and keep-awake defaults are
+  unchanged.
+- Desktop: explain ARC on Welcome and Home, show cached network and local work counts, simplify answer provenance and operator labels, and make proof opt-in.
+- Desktop review fixes: apply the memory gate to Home sharing, explain its model download, require routing evidence for answer attribution, and keep empty-Home text clear of the composer. Omit empty registry counts and state the package-manager update policy.
+- Desktop follow-up: preserve connection and download status regardless of sharing eligibility, distinguish seed-local inference from this computer, and put the first question box ahead of the explanation in short windows.
+
+- Allow consecutive desktop-only updates over the same authenticated validator
+  release, verifying each skipped update's signed attestation and recording the
+  skipped releases in handoff evidence and release notes.
+
 ## v0.8.20 - Release-preparation snapshot (2026-11-13)
 
 > **Candidate note:** This entry records the v0.8.20 release-preparation

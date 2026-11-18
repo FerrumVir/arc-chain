@@ -43,7 +43,7 @@ import {
   formatUptime,
 } from "../lib/format";
 import { hostLabel } from "../lib/hosts";
-import { isUnfinishedUpdate } from "../lib/node-strip";
+import { isUnfinishedUpdate, onlineComputerCount } from "../lib/node-strip";
 import { PLAIN_COPY } from "../lib/plain-copy";
 import { quitArc } from "../lib/quit";
 import { classifyStartFailure } from "../lib/start-failure";
@@ -72,6 +72,14 @@ export function Dashboard() {
     queryFn: api.nodeStatus,
     refetchInterval: 1500,
   });
+  const { data: worker } = useQuery({
+    queryKey: ["worker-status"], queryFn: api.fetchWorkerStatus, refetchInterval: 5000,
+  });
+  const { data: workerNetwork } = useQuery({
+    queryKey: ["worker-network"], queryFn: api.fetchWorkerNetwork,
+    staleTime: 60_000, refetchInterval: 60_000, retry: false,
+  });
+  const computersOnline = onlineComputerCount(workerNetwork);
   const { data: earnings } = useQuery({
     queryKey: ["earnings"],
     queryFn: api.fetchEarnings,
@@ -229,7 +237,7 @@ export function Dashboard() {
   // the chain's tip as the node reports it (the display string chainHeight above is the network overview's)
   const tipHeight = status?.chainHeight ?? null;
   const catchingUp =
-    running && localHeight != null && tipHeight != null && tipHeight - localHeight > 50;
+    running && status?.chainParticipationEnabled === true && localHeight != null && tipHeight != null && tipHeight - localHeight > 50;
   // "running" means the node's RPC already answers, so a running node that has reached nothing yet is connecting,
   // not opening its port. With no model configured (an observer) there is no model to load: that process is
   // opening its port.
@@ -316,7 +324,9 @@ export function Dashboard() {
     [],
   );
 
-  const controls = (
+  const ownershipFailure = startFailure ?? reportedStartFailure;
+  const otherDesktop = ownershipFailure != null && classifyStartFailure(String(ownershipFailure)) === "other-desktop";
+  const controls = otherDesktop ? null : (
         <div style={{ display: "flex", gap: "var(--space-2)" }}>
           {updateUnfinished ? (
             <button
@@ -545,6 +555,20 @@ export function Dashboard() {
         </div>
       )}
 
+      <div className="grid-stats" style={{ marginBottom: "var(--space-6)" }} data-testid="stat-grid">
+        <StatTile icon={Zap} label={PLAIN_COPY.dashboard.questions}
+          value={status?.running && worker?.jobsCompleted != null ? formatInt(worker.jobsCompleted) : "—"}
+          info={{ title: PLAIN_COPY.dashboard.questions, children: <p>{PLAIN_COPY.dashboard.questionsInfo}</p> }} />
+        <StatTile icon={ClipboardCheck} label={PLAIN_COPY.dashboard.checked} value="—"
+          info={{ title: PLAIN_COPY.dashboard.checked, children: <p>{PLAIN_COPY.dashboard.checkedUnavailable}</p> }} />
+        <StatTile icon={Users} label={PLAIN_COPY.dashboard.online}
+          value={computersOnline !== null ? formatInt(computersOnline) : "—"}
+          info={{ title: PLAIN_COPY.dashboard.online, children: <p>{PLAIN_COPY.dashboard.onlineInfo}</p> }} />
+        <StatTile icon={Sparkles} label={PLAIN_COPY.dashboard.uptime}
+          value={status?.running ? formatUptime(status.uptimeSeconds) : "—"}
+          info={{ title: PLAIN_COPY.dashboard.uptime, children: <p>{PLAIN_COPY.dashboard.uptimeInfo}</p> }} />
+      </div>
+
       <ObserverUpgradeBanner />
 
       <WorkerJobsCard />
@@ -696,78 +720,6 @@ export function Dashboard() {
         <ProjectedEarnings variant="tile" />
       </div>
 
-      <div
-        className="grid-stats"
-        style={{ marginBottom: "var(--space-6)" }}
-        data-testid="stat-grid"
-      >
-        <StatTile
-          icon={Wifi}
-          label="Peers"
-          value={status ? formatInt(status.peers) : <Skeleton width="2.5ch" height="0.8em" />}
-          info={{
-            title: "Peers",
-            children: <p>{PLAIN_COPY.connection.peersInfo}</p>,
-          }}
-        />
-        <StatTile
-          icon={Users}
-          label="Host validator records"
-          value={network ? formatInt(network.totalNodes) : <Skeleton width="2.5ch" height="0.8em" />}
-          info={{
-            title: "Host validator records",
-            children: (
-              <p>
-                Validator records reported by the one chain host selected for
-                this session. Treat this as host-scoped unless canonical fleet
-                agreement is independently verified.
-              </p>
-            ),
-          }}
-        />
-        <StatTile
-          icon={Waypoints}
-          label="DAG round"
-          value={status ? formatInt(status.round) : <Skeleton width="4ch" height="0.8em" />}
-          info={{
-            title: "DAG round",
-            children: (
-              <>
-                <p>
-                  This is the selected host&rsquo;s local DAG protocol round.
-                  It can advance even while that host stops sealing blocks.
-                </p>
-                <p>
-                  Round progress does not prove block finality or agreement
-                  with other sources. Check block age, hash, state root, and the
-                  composite recovery boundary before describing the chain as
-                  healthy.
-                </p>
-              </>
-            ),
-          }}
-        />
-        <StatTile
-          icon={Sparkles}
-          label="Uptime"
-          value={
-            status?.running
-              ? formatUptime(status.uptimeSeconds)
-              : "-"
-          }
-          info={{
-            title: "Uptime",
-            children: (
-              <p>
-                How long this node process has run without restart. Uptime is
-                operational evidence only; this client does not claim an
-                uptime-to-work or uptime-to-reward multiplier.
-              </p>
-            ),
-          }}
-        />
-      </div>
-
       <div className="grid-main">
         <Card>
           <CardHeader
@@ -898,6 +850,60 @@ export function Dashboard() {
           </div>
         </Card>
 
+        <details data-testid="dashboard-advanced">
+          <summary>{PLAIN_COPY.dashboard.advanced}</summary>
+      <div
+        className="grid-stats"
+        style={{ marginBottom: "var(--space-6)" }}
+        data-testid="advanced-stat-grid"
+      >
+        <StatTile
+          icon={Wifi}
+          label="Peers"
+          value={status ? formatInt(status.peers) : <Skeleton width="2.5ch" height="0.8em" />}
+          info={{
+            title: "Peers",
+            children: <p>{PLAIN_COPY.connection.peersInfo}</p>,
+          }}
+        />
+        <StatTile
+          icon={Users}
+          label="Host validator records"
+          value={network ? formatInt(network.totalNodes) : <Skeleton width="2.5ch" height="0.8em" />}
+          info={{
+            title: "Host validator records",
+            children: (
+              <p>
+                Validator records reported by the one chain host selected for
+                this session. Treat this as host-scoped unless canonical fleet
+                agreement is independently verified.
+              </p>
+            ),
+          }}
+        />
+        <StatTile
+          icon={Waypoints}
+          label="DAG round"
+          value={status ? formatInt(status.round) : <Skeleton width="4ch" height="0.8em" />}
+          info={{
+            title: "DAG round",
+            children: (
+              <>
+                <p>
+                  This is the selected host&rsquo;s local DAG protocol round.
+                  It can advance even while that host stops sealing blocks.
+                </p>
+                <p>
+                  Round progress does not prove block finality or agreement
+                  with other sources. Check block age, hash, state root, and the
+                  composite recovery boundary before describing the chain as
+                  healthy.
+                </p>
+              </>
+            ),
+          }}
+        />
+      </div>
         <Card>
           {/* Everything in this card is YOUR node, read from
               127.0.0.1:<rpcPort>. It used to be a remote seed's numbers. */}
@@ -1048,6 +1054,7 @@ export function Dashboard() {
             )}
           </button>
         </Card>
+        </details>
       </div>
 
       <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>

@@ -4,7 +4,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { isTauri } from "../lib/tauri";
 import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
 import { PLAIN_COPY } from "../lib/plain-copy";
-import { quitArc } from "../lib/quit";
+import { closeThisCopy, quitArc } from "../lib/quit";
 import { describeStartFailure } from "../lib/start-failure";
 
 const COPIED_RESET_MS = 2_500;
@@ -65,7 +65,7 @@ export function StartFailurePanel({
       );
   };
 
-  const waiting = view.kind === "reconciling";
+  const waiting = view.kind === "reconciling" || view.kind === "closing";
   return (
     <div
       data-testid={testId}
@@ -114,7 +114,11 @@ export function StartFailurePanel({
               marginTop: "var(--space-3)",
             }}
           >
-            {!showAction ? null : view.action === "install-update" ? (
+            {(!showAction && view.kind !== "other-desktop") || view.kind === "closing" ? null : view.action === "close-copy" ? (
+              <button type="button" className="btn btn-primary btn-sm" onClick={() => void closeThisCopy()} data-testid="btn-start-failure-close-copy">
+                {PLAIN_COPY.actions.closeCopy}
+              </button>
+            ) : view.action === "install-update" ? (
               <button
                 type="button"
                 className="btn btn-primary btn-sm"

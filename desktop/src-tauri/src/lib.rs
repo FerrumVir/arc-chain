@@ -1,11 +1,13 @@
 mod auto_update;
 mod background_promotion;
 mod commands;
+mod desktop_instance;
 mod hardware;
 mod identity;
 #[allow(dead_code)]
 #[path = "../../../shared/keep_awake.rs"]
 mod keep_awake;
+mod launch_visibility;
 mod legacy_upgrade;
 mod native_paid;
 mod node_care;
@@ -24,6 +26,7 @@ mod update_location;
 mod updater_channel;
 mod wake;
 mod wallet;
+mod worker_network;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,6 +38,24 @@ use zeroize::Zeroizing;
 
 const AUTOSTART_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 const AUTOSTART_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+const AUTOSTART_SLOW_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const AUTOSTART_SLOW_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+
+fn next_slow_autostart_retry_delay(current: std::time::Duration) -> std::time::Duration {
+    current.saturating_mul(2).min(AUTOSTART_SLOW_MAX_DELAY)
+}
+
+fn autostart_allowed(auto_start: bool, has_identity: bool, fenced: bool) -> bool {
+    auto_start && has_identity && !fenced
+}
+
+fn autostart_wake_deadline(
+    due: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> tokio::time::Instant {
+    due.min(now + background_promotion::AFTER_WAKE_DELAY)
+}
 
 fn next_autostart_retry_delay(current: std::time::Duration) -> std::time::Duration {
     current.saturating_mul(2).min(AUTOSTART_RETRY_MAX_DELAY)
@@ -59,12 +80,24 @@ where
 
 async fn wait_autostart_retry(
     cancel: &mut tokio::sync::watch::Receiver<()>,
+    wakes: &mut tokio::sync::watch::Receiver<u64>,
     delay: std::time::Duration,
 ) -> bool {
-    tokio::select! {
-        biased;
-        _ = cancel.changed() => false,
-        _ = tokio::time::sleep(delay) => true,
+    let mut due = tokio::time::Instant::now() + delay;
+    let mut wakes_open = true;
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.changed() => return false,
+            _ = tokio::time::sleep_until(due) => return true,
+            changed = wakes.changed(), if wakes_open => {
+                if changed.is_ok() {
+                    due = autostart_wake_deadline(due, tokio::time::Instant::now());
+                } else {
+                    wakes_open = false;
+                }
+            }
+        }
     }
 }
 
@@ -128,6 +161,10 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub async fn another_desktop_owns_node(&self) -> bool {
+        matches!(*self.data_migration_error.lock().await, Some(start_fence::StartFence::OtherDesktop))
+    }
+
     pub fn cancel_startup_retry(&self) {
         self.startup_retry_cancel.send_replace(());
     }
@@ -324,9 +361,15 @@ async fn reconcile_previous_managed_node(
                     %error,
                     "could not stop stale managed arc-node; suppressing auto-start"
                 );
-                return Err(format!(
+                if error
+                    .downcast_ref::<node_manager::ManagedLifecycleContention>()
+                    .is_some()
+                {
+                    return Err(start_fence::ALREADY_OPEN.into());
+                }
+                return Err(paths::redact_home_text(&format!(
                     "managed-node startup reconciliation failed: {error}"
-                ));
+                )));
             }
         }
         // The node just drained may have been the holder. With it gone, an
@@ -478,6 +521,7 @@ pub fn run() {
     };
 
     tauri::Builder::default()
+        .plugin(desktop_instance::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -499,6 +543,9 @@ pub fn run() {
         )
         .manage(state)
         .setup(move |app| {
+            if desktop_instance::show_startup_failure(app.handle()) {
+                return Ok(());
+            }
             // Resolve the per-platform writable dir NOW (AppHandle available).
             let resolver = app.path();
             let resolved = resolver
@@ -511,6 +558,27 @@ pub fn run() {
             // anything resolves ~/.arc.
             if let Ok(home) = resolver.home_dir() {
                 paths::set_home_fallback(home);
+            }
+
+            // An older desktop has no instance guard. Probe before defaults,
+            // migration, autostart registration or any store write.
+            if let Some(existing) = store::Store::load_for_owner_probe(&resolved) {
+                if let Some(config) = existing.config.as_ref() {
+                    if !legacy_upgrade::config_uses_v07_layout(config, &paths::home_dir()) {
+                        if let Err(error) = node_manager::probe_existing_managed_lifecycle_owner(&config.data_dir) {
+                            if error.downcast_ref::<node_manager::ManagedLifecycleContention>().is_some() {
+                                tauri::async_runtime::block_on(async {
+                                    *store.lock().await = existing;
+                                    *data_dir.lock().await = resolved;
+                                    *data_migration_error.lock().await = Some(start_fence::StartFence::OtherDesktop);
+                                });
+                                // This refused copy owns no node and installs no tray.
+                                // Closing its only window exits and releases its instance lease.
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
             }
 
             // Load existing store from the resolved dir, if any.
@@ -655,6 +723,7 @@ pub fn run() {
             // store moves into the shared mutex.
             let start_config = loaded_store.config.clone().unwrap_or_default();
             let has_identity = loaded_store.identity.is_some();
+            let has_config = loaded_store.config.is_some();
             let legacy_windows_stop = durable_legacy_stop_material(
                 migration_notice_is_durable,
                 loaded_store.data_migration_notice.clone(),
@@ -736,7 +805,12 @@ pub fn run() {
                     let Some(state) = supervisor_handle.try_state::<AppState>() else {
                         break;
                     };
-                    state.node.lock().await.supervise_managed_node().await;
+                    let auto_start = state.store.lock().await.config.as_ref()
+                        .is_some_and(|config| config.auto_start);
+                    let fenced = state.data_migration_error.lock().await.is_some();
+                    let mut node = state.node.lock().await;
+                    node.set_crash_autostart_enabled(auto_start && !fenced);
+                    node.supervise_managed_node().await;
                 }
             });
 
@@ -749,7 +823,12 @@ pub fn run() {
             // let the tray be the only surface until the user clicks it.
             // Without a tray there is no other surface, so ignore the flag.
             let launched_minimized = std::env::args().any(|a| a == "--minimized");
-            if launched_minimized && has_tray.load(std::sync::atomic::Ordering::SeqCst) {
+            if launch_visibility::hide_on_launch(
+                launched_minimized,
+                has_tray.load(std::sync::atomic::Ordering::SeqCst),
+                has_identity,
+                has_config,
+            ) {
                 if let Some(win) = app.get_webview_window("main") {
                     let _ = win.hide();
                 }
@@ -829,8 +908,20 @@ pub fn run() {
                 // exact old/detached process boundary is clear may WebView
                 // Start/Ensure/Update entrypoints mutate or spawn; a failure
                 // becomes an explicit refusal, never a stale "in progress".
-                *state.data_migration_error.lock().await =
-                    start_fence::after_startup_reconciliation(reconciliation);
+                let mut fence = state.data_migration_error.lock().await;
+                if !matches!(*fence, Some(start_fence::StartFence::MigrationRefused(_))) {
+                    *fence = start_fence::after_startup_reconciliation(reconciliation);
+                }
+                let other_desktop = matches!(*fence, Some(start_fence::StartFence::OtherDesktop));
+                drop(fence);
+                if other_desktop {
+                    state.has_tray.store(false, std::sync::atomic::Ordering::SeqCst);
+                    let app = handle.clone();
+                    let _ = handle.run_on_main_thread(move || {
+                        app.remove_tray_by_id("main");
+                        desktop_instance::show_main(&app);
+                    });
+                }
                 if !reconciled {
                     return;
                 }
@@ -854,9 +945,21 @@ pub fn run() {
                 }
 
                 let mut retry_delay = AUTOSTART_RETRY_BASE_DELAY;
+                let mut slow_retry_delay = AUTOSTART_SLOW_BASE_DELAY;
+                let mut wakes = wake::subscribe();
                 loop {
                     if startup_cancel.has_changed().unwrap_or(true) {
                         tracing::info!("auto-start cancelled by an explicit lifecycle or settings action");
+                        break;
+                    }
+                    let (auto_start, has_identity) = {
+                        let store = state.store.lock().await;
+                        (store.config.as_ref().is_some_and(|config| config.auto_start),
+                            store.identity.is_some())
+                    };
+                    // Refusals hold until restart; retrying must never bypass them.
+                    let fenced = state.data_migration_error.lock().await.is_some();
+                    if !autostart_allowed(auto_start, has_identity, fenced) {
                         break;
                     }
                     let Some(outcome) = cancellable_autostart_attempt(
@@ -884,15 +987,19 @@ pub fn run() {
                                 delay_secs = retry_delay.as_secs(),
                                 "auto-start hit a transient release-network failure; retrying"
                             );
-                            if !wait_autostart_retry(&mut startup_cancel, retry_delay).await {
+                            if !wait_autostart_retry(&mut startup_cancel, &mut wakes, retry_delay).await {
                                 tracing::info!("auto-start retry cancelled by an explicit lifecycle or settings action");
                                 break;
                             }
                             retry_delay = next_autostart_retry_delay(retry_delay);
                         }
                         Err(error) => {
-                            tracing::error!(%error, "auto-start failed permanently");
-                            break;
+                            tracing::warn!(%error, delay_secs = slow_retry_delay.as_secs(),
+                                "auto-start failed; waiting before another attempt");
+                            if !wait_autostart_retry(&mut startup_cancel, &mut wakes, slow_retry_delay).await {
+                                break;
+                            }
+                            slow_retry_delay = next_slow_autostart_retry_delay(slow_retry_delay);
                         }
                     }
                 }
@@ -924,13 +1031,17 @@ pub fn run() {
                         let _ = window.hide();
                         api.prevent_close();
                     } else {
+                        api.prevent_close();
+                        desktop_instance::begin_closing(window.app_handle());
                         sharing_awake::set_enabled(false);
                         let handle = window.app_handle().clone();
                         tauri::async_runtime::spawn(async move {
                             if let Some(state) = handle.try_state::<AppState>() {
                                 state.cancel_startup_retry();
-                                let mut node = state.node.lock().await;
-                                let _ = node.stop().await;
+                                if !state.another_desktop_owns_node().await {
+                                    let mut node = state.node.lock().await;
+                                    let _ = node.stop().await;
+                                }
                             }
                             crate::sharing_awake::set_enabled(false);
                             handle.exit(0);
@@ -975,6 +1086,7 @@ pub fn run() {
             commands::fetch_earnings_projection,
             commands::fetch_node_contribution,
             commands::fetch_worker_status,
+            commands::fetch_worker_network,
             commands::set_compute_contribution,
             commands::promote_consented_install,
             commands::set_prevent_sleep_during_jobs,
@@ -1021,7 +1133,11 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building ARC desktop")
-        .run(|_, event| {
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if matches!(event, tauri::RunEvent::Reopen { .. }) {
+                desktop_instance::show_main(app);
+            }
             if matches!(event, tauri::RunEvent::Exit) {
                 sharing_awake::set_enabled(false);
             }
@@ -1041,6 +1157,33 @@ mod startup_retry_tests {
             assert_eq!(delay, std::time::Duration::from_secs(seconds));
             delay = next_autostart_retry_delay(delay);
         }
+    }
+
+    #[test]
+    fn lasting_failures_retry_slowly_and_cap_at_two_hours() {
+        let mut delay = AUTOSTART_SLOW_BASE_DELAY;
+        for minutes in [15, 30, 60, 120, 120] {
+            assert_eq!(delay.as_secs(), minutes * 60);
+            delay = next_slow_autostart_retry_delay(delay);
+        }
+    }
+
+    #[test]
+    fn wake_advances_a_slow_retry_but_never_delays_a_due_attempt() {
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            autostart_wake_deadline(now + AUTOSTART_SLOW_BASE_DELAY, now),
+            now + std::time::Duration::from_secs(90)
+        );
+        assert_eq!(autostart_wake_deadline(now, now), now);
+    }
+
+    #[test]
+    fn disabling_autostart_missing_setup_and_start_fences_forbid_retries() {
+        assert!(autostart_allowed(true, true, false));
+        assert!(!autostart_allowed(false, true, false));
+        assert!(!autostart_allowed(true, false, false));
+        assert!(!autostart_allowed(true, true, true));
     }
 
     #[tokio::test]
@@ -1085,12 +1228,48 @@ mod startup_retry_tests {
         assert_eq!(starts.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_native_wake_interrupts_the_slow_wait_after_network_grace() {
+        let (_cancel, mut cancel_rx) = tokio::sync::watch::channel(());
+        let (wakes, mut wake_rx) = tokio::sync::watch::channel(0);
+        let task = tokio::spawn(async move {
+            wait_autostart_retry(&mut cancel_rx, &mut wake_rx, AUTOSTART_SLOW_BASE_DELAY).await
+        });
+        tokio::task::yield_now().await;
+        wakes.send_replace(1);
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(89)).await;
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(task.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_also_cancels_the_wake_grace_period() {
+        let (cancel, mut cancel_rx) = tokio::sync::watch::channel(());
+        let (wakes, mut wake_rx) = tokio::sync::watch::channel(0);
+        let task = tokio::spawn(async move {
+            wait_autostart_retry(&mut cancel_rx, &mut wake_rx, AUTOSTART_SLOW_BASE_DELAY).await
+        });
+        tokio::task::yield_now().await;
+        wakes.send_replace(1);
+        tokio::task::yield_now().await;
+        cancel.send_replace(());
+        assert!(!task.await.unwrap());
+    }
+
     #[tokio::test]
     async fn disabling_autostart_cancels_the_retry_delay() {
         let (cancel, mut receiver) = tokio::sync::watch::channel(());
         receiver.borrow_and_update();
         let task = tokio::spawn(async move {
-            wait_autostart_retry(&mut receiver, std::time::Duration::from_secs(60)).await
+            wait_autostart_retry(
+                &mut receiver,
+                &mut wake::subscribe(),
+                std::time::Duration::from_secs(60),
+            )
+            .await
         });
         tokio::task::yield_now().await;
         cancel.send_replace(());
@@ -1119,7 +1298,11 @@ mod startup_reconciliation_tests {
 
         // Needles are assembled at run time so this test's own text never
         // matches them.
-        let fence_write = ["data_migration_error", ".lock().await ="].concat();
+        let fence_write = [
+            "let mut fence = state.",
+            "data_migration_error.lock().await;",
+        ]
+        .concat();
         let resolve = ["start_fence::", "after_startup_reconciliation("].concat();
         let recover = ["commands::", "recover_managed_shutdown_inner("].concat();
 
@@ -1130,7 +1313,7 @@ mod startup_reconciliation_tests {
         assert_eq!(source.matches(&resolve).count(), 1);
         let task_write: String = source[source.find(&fence_write).unwrap()..]
             .chars()
-            .take(200)
+            .take(400)
             .collect();
         assert!(task_write.contains(&resolve));
     }

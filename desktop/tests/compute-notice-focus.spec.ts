@@ -29,9 +29,9 @@ for (const viewport of [{ width: 1280, height: 820 }, { width: 960, height: 640 
   test.describe(`Sharing notice keyboard ${viewport.width}x${viewport.height}`, () => {
     test.use({ viewport });
 
-    test.beforeEach(async ({ page }) => {
+    test.beforeEach(async ({ page, baseURL }) => {
       await page.route("**/*", (route) =>
-        new URL(route.request().url()).origin === "http://localhost:4173"
+        new URL(route.request().url()).origin === baseURL
           ? route.continue() : route.abort(),
       );
       await seedOnboarded(page);

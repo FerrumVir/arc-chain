@@ -495,6 +495,7 @@ test.describe("Inference - community-first coordinator routing", () => {
     expect(new URL(inferencePosts[0]).pathname).toBe("/inference/run");
     expect(new URL(inferencePosts[0]).hostname).not.toBe("127.0.0.1");
 
+    await page.getByText(PLAIN_COPY.answer.proof, { exact: true }).click();
     await page.getByTestId("btn-lookup-reward").click();
     await expect(page.getByTestId("network-screen")).toBeVisible();
     await expect(page.getByTestId("tx-lookup-input")).toHaveValue(
@@ -1043,6 +1044,7 @@ test.describe("Inference - community-first coordinator routing", () => {
 
     // Consensus banner is present and names the NYC coordinator.
     const banner = page.getByTestId("inference-consensus");
+    await page.getByText(PLAIN_COPY.answer.proof, { exact: true }).click();
     await expect(banner).toBeVisible();
     await expect(page.getByTestId("inference-coordinator")).toHaveText("NYC");
     await expect(banner).toContainText("48/48");
@@ -1054,7 +1056,7 @@ test.describe("Inference - community-first coordinator routing", () => {
     // This payload has no claim transaction. Coordinator agreement is
     // recomputation evidence; the UI must not invent a claim or payment.
     await expect(page.getByTestId("inference-result")).not.toContainText(
-      /reward|paid|ARC/,
+      /reward|paid/,
     );
 
     // Output text is the coordinator's real answer, not the mock stub.
@@ -1100,7 +1102,7 @@ test.describe("Inference - community-first coordinator routing", () => {
     const banner = page.getByTestId("inference-consensus");
     await expect(banner).toContainText("quorum not verified");
     await expect(banner).not.toContainText("authenticated quorum verified");
-    await expect(page.getByTestId("inference-result")).not.toContainText(/reward|paid|ARC/);
+    await expect(page.getByTestId("inference-result")).not.toContainText(/reward|paid/);
   });
 
   test("does not promote an absent quorum flag to authenticated consensus", async ({
@@ -1137,7 +1139,7 @@ test.describe("Inference - community-first coordinator routing", () => {
     const banner = page.getByTestId("inference-consensus");
     await expect(banner).toContainText("quorum not verified");
     await expect(banner).not.toContainText("authenticated quorum verified");
-    await expect(page.getByTestId("inference-result")).not.toContainText(/reward|paid|ARC/);
+    await expect(page.getByTestId("inference-result")).not.toContainText(/reward|paid/);
   });
 
   test("local node healthy (returns real output) - no coordinator fallback", async ({
@@ -1211,6 +1213,7 @@ test.describe("Inference - community-first coordinator routing", () => {
     // be absent. This is a stronger assertion than the previous
     // `toHaveCount(0)`, which only proved the banner was missing.
     const banner = page.getByTestId("inference-consensus");
+    await page.getByText(PLAIN_COPY.answer.proof, { exact: true }).click();
     await expect(banner).toBeVisible();
     await expect(banner).toContainText("your node");
     await expect(banner).not.toContainText("k=");

@@ -48,14 +48,10 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(menu_on_left_click)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => {
-                if let Some(win) = app.get_webview_window("main") {
-                    let _ = win.show();
-                    let _ = win.set_focus();
-                    let _ = win.unminimize();
-                    crate::wake::emit_signal(app, crate::wake::SignalReason::Shown);
-                }
+                crate::desktop_instance::show_main(app);
             }
             "quit" => {
+                crate::desktop_instance::begin_closing(app);
                 crate::sharing_awake::set_enabled(false);
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
@@ -64,8 +60,10 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                     // running across window close.
                     if let Some(state) = handle.try_state::<AppState>() {
                         state.cancel_startup_retry();
-                        let mut node = state.node.lock().await;
-                        let _ = node.stop().await;
+                        if !state.another_desktop_owns_node().await {
+                            let mut node = state.node.lock().await;
+                            let _ = node.stop().await;
+                        }
                     }
                     crate::sharing_awake::set_enabled(false);
                     handle.exit(0);
@@ -84,12 +82,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
             } = event
             {
                 let app = tray.app_handle();
-                if let Some(win) = app.get_webview_window("main") {
-                    let _ = win.show();
-                    let _ = win.set_focus();
-                    let _ = win.unminimize();
-                    crate::wake::emit_signal(app, crate::wake::SignalReason::Shown);
-                }
+                crate::desktop_instance::show_main(app);
             }
         })
         .icon(app.default_window_icon().cloned().unwrap_or_else(|| {
@@ -114,6 +107,13 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                 Some(s) => s,
                 None => continue,
             };
+            if matches!(
+                *state.data_migration_error.lock().await,
+                Some(crate::start_fence::StartFence::OtherDesktop)
+            ) {
+                // Reconciliation removed this refused copy's tray.
+                break;
+            }
             let port = state.node.lock().await.rpc_port;
             let url = format!("http://127.0.0.1:{}/health", port);
             let resp = state

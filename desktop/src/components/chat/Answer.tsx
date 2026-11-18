@@ -8,6 +8,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Check, ClipboardCheck, Coins, Copy, Globe, RotateCcw, Search, ShieldCheck, Sparkles, Zap } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { PLAIN_COPY } from "../../lib/plain-copy";
 import { api } from "../../lib/tauri";
 import { formatHash } from "../../lib/format";
 import { hostLabel } from "../../lib/hosts";
@@ -46,6 +47,7 @@ export function Answer({
   const result = turn.result!;
   const tid = (name: string) => (latest ? name : `${name}-earlier`);
   const lookupHash = useAppStore((s) => s.lookupHash);
+  const address = useAppStore((s) => s.identity?.address);
   const [copied, setCopied] = useState<string | null>(null);
   const [receiptPollingExhausted, setReceiptPollingExhausted] = useState(false);
   const receiptPollBudget = useRef({ key: "", attempts: 0, startedAt: 0 });
@@ -208,16 +210,19 @@ export function Answer({
   }, [authenticatedQuorum, factHeight]);
 
   // ---- the plain-language provenance: who served it, whether it was checked, what reached the chain
-  const servedBy = result.servedLocally ? "your node" : result.coordinator ? hostLabel(result.coordinator) : "the network";
   const check: CheckState = authenticatedQuorum ? "agreed" : result.consensus ? "reported" : "none";
-  const checkLine =
-    check === "agreed"
-      ? result.consensus
-        ? `Replicas agreed: k=${result.consensus.k}, ${result.consensus.unanimous}/${result.consensus.votesTotal} votes, authenticated`
-        : "A second computer re-ran it and agreed (authenticated)"
-      : check === "reported"
-        ? "Agreement reported by the coordinator, not authenticated"
-        : "Not checked by a second computer";
+  const checkLine = check === "agreed" ? PLAIN_COPY.answer.checked
+    : check === "reported" ? PLAIN_COPY.answer.reported : PLAIN_COPY.answer.unchecked;
+  const normalizedAddress = address?.replace(/^0x/i, "").toLowerCase();
+  const ownWorker = Boolean(communityWorker && normalizedAddress
+    && /^[0-9a-f]{64}$/.test(normalizedAddress)
+    && communityWorker.replace(/^0x/i, "").toLowerCase() === normalizedAddress);
+  // "local" is relative to the serving node, which may be a remote seed.
+  // Conversely, our own endpoint may delegate to remote replicas.
+  const answerSource = ownWorker || (result.routedVia === "local" && result.servedLocally)
+    ? "own"
+    : result.routedVia === "local" || result.routedVia === "sharded_seed_pipeline" ? "arc" : "network";
+  const answeredBy = PLAIN_COPY.answer[answerSource];
   const chainLine = settlement
     ? communitySettlementMessage
     : submittedAttestationTx
@@ -239,7 +244,7 @@ export function Answer({
       <header className="answer-head">
         <span className="answer-mark" aria-hidden="true" />
         <span className="answer-by">
-          {communityWorker ? `Community worker ${formatHash(communityWorker, 6)} via ${servedBy}` : `Served by ${servedBy}`}
+          {answeredBy}
         </span>
         <span className="answer-stats">
           {result.tokensGenerated} tokens · {result.inferenceMs.toLocaleString()} ms
@@ -270,17 +275,17 @@ export function Answer({
           {
             name: "Served",
             state: "done",
-            detail: `${communityWorker ? `community worker via ${servedBy}` : servedBy}${
+            detail: `${PLAIN_COPY.answer.served[answerSource]}${
               result.trace && result.trace.length > 1 ? ` · ${result.trace.length} hops` : ""
             }${turn.settledAt ? ` · ${((turn.settledAt - turn.sentAt) / 1000).toFixed(1)} s` : ""}`,
           },
           { name: "Checked", state: check === "agreed" ? "done" : "open", detail: checkLine },
-          { name: "On chain", state: confirmedCommunityReward ? "done" : settlement || submittedAttestationTx ? "wait" : "open", detail: chainLine },
+          { name: PLAIN_COPY.answer.recorded, state: confirmedCommunityReward ? "done" : settlement || submittedAttestationTx ? "wait" : "open", detail: chainLine },
         ]}
       />
 
-      <details className="evidence" open={latest || undefined}>
-        <summary>Evidence</summary>
+      <details className="evidence">
+        <summary>{PLAIN_COPY.answer.proof}</summary>
         <div className="evidence-line" data-testid={tid("inference-consensus")}>
           <Globe size={14} aria-hidden="true" />
           <span>

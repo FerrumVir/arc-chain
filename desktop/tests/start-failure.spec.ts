@@ -16,6 +16,7 @@ import {
   describeStartFailure,
   isStartupReconciliationInProgress,
   NATIVE_RECONCILING,
+  NATIVE_OTHER_DESKTOP,
   NATIVE_REFUSAL_ADVICE,
   NATIVE_REFUSAL_PREFIX,
   NATIVE_UPDATE_UNFINISHED,
@@ -35,6 +36,18 @@ const RECONCILING =
   "managed-node startup reconciliation is still in progress: ARC is checking how the previous node session ended before it starts or updates arc-node. Try again in a few seconds.";
 
 test.describe("start failure wording", () => {
+  test("legacy details hide home roots, separators and punctuation", () => {
+    for (const home of ["/Users/Jane Doe", "/home/person.name", "C:/Users/Jane Doe"]) {
+      expect(cleanFailureDetails("failed " + home + "/.arc/data")).toBe("failed ~/.arc/data");
+    }
+
+    for (const home of ["/Users/person", "/home/person", "/var/home/person", "/usr/home/person", "/export/home/person", "/root", "/var/root", "C:/Users/person", String.raw`C:\Users\person`, String.raw`\\?\C:\Users\person`, "D:/Profiles/person"]) {
+      for (const suffix of [".", ",", ")", ";", "/.arc/data", ""]) {
+        expect(cleanFailureDetails(`failed ${home}${suffix}`)).toBe(`failed ~${suffix}`);
+      }
+    }
+  });
+
   test("the v0.8.12 field error becomes one plain sentence and one action", () => {
     const view = describeStartFailure(V0812_FIELD_ERROR, { updateAvailable: false });
     expect(view.kind).toBe("blocked");
@@ -61,7 +74,6 @@ test.describe("start failure wording", () => {
     // Outside a launch refusal a restart can't help; another try can, once
     // the repair is made.
     for (const raw of [
-      "another ARC desktop currently owns the managed node lifecycle for /Users/me/.arc/data-v3: Resource temporarily unavailable (os error 35)",
       "managed data-directory parent /Volumes/arc must already exist; the installer or operator must create it before node start",
       "cannot durably secure desktop node data directory /Users/me/.arc/data-v3: Permission denied (os error 13)",
     ]) {
@@ -110,13 +122,13 @@ test.describe("start failure wording", () => {
     );
   });
 
-  test("details never rewrite anything else", () => {
+  test("details preserve diagnostics while hiding the home directory", () => {
     for (const raw of [
       "cannot open /Users/me/../shared/arc/model.gguf: permission denied",
       "release asset returned HTTP 404 Not Found for v0.8.14",
       NATIVE_REFUSAL_PREFIX + "legacy data directory is a symbolic link. " + NATIVE_REFUSAL_ADVICE,
     ]) {
-      expect(cleanFailureDetails(raw)).toBe(raw);
+      expect(cleanFailureDetails(raw)).toBe(raw.replace("/Users/me", "~"));
     }
   });
 
@@ -171,6 +183,7 @@ test.describe("start failure wording", () => {
       "utf8",
     );
     expect(startFence).toContain(`"${NATIVE_REFUSAL_PREFIX}"`);
+    expect(startFence).toContain(`"${NATIVE_OTHER_DESKTOP}"`);
     expect(startFence).toContain(`"${NATIVE_REFUSAL_ADVICE}"`);
     expect(startFence).toContain(
       `"managed-node ${NATIVE_RECONCILING}: ARC is checking how the previous node session ended`,
@@ -199,12 +212,7 @@ test.describe("start failure wording", () => {
     }
     // The same sentence Home shows from the updater's own state.
     expect(PLAIN_COPY.startFailure.updateUnfinished.title).toBe(PLAIN_COPY.nodeStrip.updateFailed);
-    // The text a Start got before, from the update's own lock, still reads as a repair.
-    expect(
-      classifyStartFailure(
-        "another ARC desktop currently owns the managed node lifecycle for /Users/me/.arc/data-v3: Resource temporarily unavailable (os error 35)",
-      ),
-    ).toBe("needs-repair");
+    expect(classifyStartFailure("another ARC desktop currently owns the managed node lifecycle for ~/.arc/data-v3: Resource temporarily unavailable (os error 35)")).toBe("other-desktop");
   });
 });
 
@@ -395,7 +403,7 @@ test.describe("node strip on Home", () => {
     // A Start pressed on the strip that fails reads the same way.
     expect(
       strip({ startError: "another ARC desktop currently owns the managed node lifecycle for /x" }),
-    ).toMatchObject({ sentence: PLAIN_COPY.startFailure.needsRepair.title, action: "try-again" });
+    ).toMatchObject({ sentence: PLAIN_COPY.startFailure.otherDesktop.title, action: "close-copy" });
   });
 
   test("a running node reads as connected once a peer or a coordinator answered, and ordinary states are never red", () => {
@@ -457,4 +465,26 @@ test.describe("node strip on Home", () => {
       expect(view.sentence).not.toMatch(/lite|syncing|degraded|0 peers|client mode/i);
     }
   });
+});
+
+const WINDOWS_FIELD_ERROR = String.raw`ARC refused to start the node because chain-data migration is not safely resolved: managed-node startup reconciliation failed: another ARC desktop currently owns the managed node lifecycle for \\?\C:\Users\<user>\.arc\data-v3: The process cannot access the file because another process has locked a portion of the file. (os error 33). Restart ARC after repairing the reported path or permissions; do not point v0.8 at the preserved legacy directory.`;
+
+test("Windows field contention uses the supplied draft and only closes this copy", () => {
+  for (const raw of [WINDOWS_FIELD_ERROR, NATIVE_OTHER_DESKTOP]) {
+    const view = describeStartFailure(raw, { updateAvailable: true });
+    expect(view).toMatchObject({
+      kind: "other-desktop", action: "close-copy", detailsOpen: false,
+      title: "ARC is already open on this computer.",
+      body: "Look for the ARC icon near the clock (Windows) or in the menu bar (Mac) and open it from there. You can close this window.",
+    });
+    expect(view.details).not.toContain("<user>");
+    expect(view.details).not.toContain(String.raw`C:\Users`);
+  }
+  const view = describeNodeStrip({
+    status: { running: true, pid: null, lastError: null },
+    startBlock: NATIVE_OTHER_DESKTOP, startError: null, modelProgress: null,
+    update: { phase: "available", canInstall: true, message: "", error: null, restartRequired: false },
+  });
+  expect(view.action).toBe("close-copy");
+  expect(view.sentence).toBe(NATIVE_OTHER_DESKTOP);
 });

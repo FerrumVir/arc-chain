@@ -35,10 +35,12 @@ pub enum StartFence {
     /// Launch-time reconciliation still owns the managed-node lifecycle. Only
     /// its own recovery launch may pass.
     StartupReconciliation,
-    /// A refusal that holds until ARC restarts: the legacy-data migration is
-    /// not durable, the shutdown receipt cannot be validated, or the startup
-    /// recovery launch failed. Nothing passes, the recovery launch included.
+    /// The shutdown receipt or recovery failed. No migration advice applies.
     Refused(String),
+    /// Only actual migration failures carry the preserved-directory advice.
+    MigrationRefused(String),
+    /// A typed OS owner-lock conflict. This copy must not mutate settings.
+    OtherDesktop,
 }
 
 /// Who is asking to pass the fence.
@@ -58,8 +60,10 @@ pub enum StartAccess {
 pub const STARTUP_RECONCILIATION_IN_PROGRESS: &str =
     "managed-node startup reconciliation is still in progress: ARC is checking how the previous node session ended before it starts or updates arc-node. Try again in a few seconds";
 
-/// The framing of every refusal. A reason that already carries it, such as a
-/// refusal recorded as the reason of another, is reported once.
+/// Stable framing for typed lifecycle-owner contention only.
+pub const ALREADY_OPEN: &str = "ARC is already open on this computer.";
+
+/// Migration advice applies only to migration failures, framed once.
 const REFUSAL_PREFIX: &str =
     "ARC refused to start the node because chain-data migration is not safely resolved: ";
 const REFUSAL_ADVICE: &str = "Restart ARC after repairing the reported path or permissions; do not point v0.8 at the preserved legacy directory.";
@@ -81,7 +85,7 @@ pub enum AppUpdateBoundary {
 /// the fence until it returns.
 pub fn at_launch(migration_failure: Option<String>) -> StartFence {
     match migration_failure {
-        Some(reason) => StartFence::Refused(reason),
+        Some(reason) => StartFence::MigrationRefused(reason),
         None => StartFence::StartupReconciliation,
     }
 }
@@ -92,6 +96,7 @@ pub fn at_launch(migration_failure: Option<String>) -> StartFence {
 pub fn after_startup_reconciliation(outcome: Result<(), String>) -> Option<StartFence> {
     match outcome {
         Ok(()) => None,
+        Err(reason) if reason == ALREADY_OPEN => Some(StartFence::OtherDesktop),
         Err(reason) => Some(StartFence::Refused(reason)),
     }
 }
@@ -104,8 +109,24 @@ pub fn check(fence: Option<&StartFence>, access: StartAccess) -> Result<(), Stri
         (Some(StartFence::StartupReconciliation), StartAccess::Ordinary) => {
             Err(format!("{STARTUP_RECONCILIATION_IN_PROGRESS}."))
         }
-        (Some(StartFence::Refused(reason)), _) => Err(refusal_message(reason)),
+        (Some(StartFence::MigrationRefused(reason)), _) => Err(refusal_message(reason)),
+        (Some(StartFence::OtherDesktop), _) => Err(ALREADY_OPEN.into()),
+        (Some(StartFence::Refused(reason)), _) => {
+            Err(format!("ARC refused to start the node: {reason}"))
+        }
     }
+}
+
+/// Settings remain writable during ordinary reconciliation, including consent
+/// withdrawal. Only a different owner or this process closing forbids writes.
+pub fn check_settings_write(fence: Option<&StartFence>, closing: bool) -> Result<(), String> {
+    if closing {
+        return Err("ARC is closing".into());
+    }
+    if matches!(fence, Some(StartFence::OtherDesktop)) {
+        return Err(ALREADY_OPEN.into());
+    }
+    Ok(())
 }
 
 fn refusal_message(reason: &str) -> String {
@@ -134,13 +155,51 @@ pub fn app_update_boundary(fence: Option<&StartFence>) -> Result<AppUpdateBounda
         Some(StartFence::StartupReconciliation) => {
             Err(format!("{STARTUP_RECONCILIATION_IN_PROGRESS}."))
         }
-        Some(StartFence::Refused(_)) => Ok(AppUpdateBoundary::Fenced),
+        Some(StartFence::OtherDesktop) => Err(ALREADY_OPEN.into()),
+        Some(StartFence::Refused(_) | StartFence::MigrationRefused(_)) => {
+            Ok(AppUpdateBoundary::Fenced)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_write_is_independent_of_start_reconciliation() {
+        for fence in [
+            None,
+            Some(StartFence::StartupReconciliation),
+            Some(StartFence::Refused("recovery".into())),
+            Some(StartFence::MigrationRefused("migration".into())),
+        ] {
+            assert!(check_settings_write(fence.as_ref(), false).is_ok());
+            assert_eq!(
+                check_settings_write(fence.as_ref(), true).unwrap_err(),
+                "ARC is closing"
+            );
+        }
+        assert_eq!(
+            check_settings_write(Some(&StartFence::OtherDesktop), false).unwrap_err(),
+            ALREADY_OPEN
+        );
+    }
+
+    #[test]
+    fn contention_and_recovery_are_not_migration_failures() {
+        let fence = after_startup_reconciliation(Err(ALREADY_OPEN.into())).unwrap();
+        assert_eq!(fence, StartFence::OtherDesktop);
+        assert_eq!(
+            check(Some(&fence), StartAccess::Ordinary),
+            Err(ALREADY_OPEN.into())
+        );
+        assert!(app_update_boundary(Some(&fence)).is_err());
+        let fence = after_startup_reconciliation(Err("shutdown receipt invalid".into())).unwrap();
+        let message = check(Some(&fence), StartAccess::Ordinary).unwrap_err();
+        assert!(!message.contains("migration"));
+        assert!(!message.contains("preserved legacy"));
+    }
 
     /// The v0.8.12 field failure. Startup recovery runs while the launch-time
     /// fence is up; it must pass it instead of refusing itself.
@@ -167,7 +226,7 @@ mod tests {
 
     #[test]
     fn refusals_block_every_caller_including_recovery() {
-        let fence = StartFence::Refused("legacy data directory is a symbolic link".into());
+        let fence = StartFence::MigrationRefused("legacy data directory is a symbolic link".into());
         for access in [StartAccess::Ordinary, StartAccess::StartupRecovery] {
             let error = check(Some(&fence), access)
                 .expect_err("a migration refusal must block every start path");
@@ -189,7 +248,7 @@ mod tests {
         let fence = at_launch(Some(
             "the protected protocol-v3 data pointer could not be persisted: disk full".into(),
         ));
-        assert!(matches!(fence, StartFence::Refused(_)));
+        assert!(matches!(fence, StartFence::MigrationRefused(_)));
         assert!(check(Some(&fence), StartAccess::StartupRecovery).is_err());
     }
 
@@ -279,8 +338,9 @@ mod tests {
     #[test]
     fn a_refusal_inside_a_refusal_is_framed_once() {
         let inner = refusal_message("managed-node startup reconciliation is still in progress");
-        let fence =
-            StartFence::Refused(format!("managed-node durability recovery failed: {inner}"));
+        let fence = StartFence::MigrationRefused(format!(
+            "managed-node durability recovery failed: {inner}"
+        ));
         let error = check(Some(&fence), StartAccess::Ordinary).unwrap_err();
         assert_eq!(error.matches(REFUSAL_PREFIX).count(), 1);
         assert_eq!(error.matches(REFUSAL_ADVICE).count(), 1);

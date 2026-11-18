@@ -12,7 +12,7 @@ on:
           - existing-recovered-chain-update-v1
           - desktop-update-existing-validators-v1
       previous_release_tag:
-        description: Newest immutable bot-authored release whose node remains on validators (desktop profile only)
+        description: Actual validator release; intervening releases must be signed desktop updates over it (desktop profile only)
         required: false
         default: ''
         type: string
@@ -139,6 +139,8 @@ jobs:
           profile_args=(--profile "$UPDATE_PROFILE")
           case "$UPDATE_PROFILE" in
             desktop-update-existing-validators-v1)
+              # Recompute both the baseline and skipped desktop releases, then
+              # compare them with the owner's independently reviewed evidence.
               [[ "$PREVIOUS_RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
               profile_args+=(--previous-release-tag "$PREVIOUS_RELEASE_TAG" --confirm-node-compatible)
               ;;
@@ -209,5 +211,9 @@ jobs:
             echo "Artifact digest: sha256:$ARTIFACT_DIGEST"
             echo "Declared offline (unobserved) validators: ${DECLARED_OFFLINE_SITE:-none; all six observed}"
             jq -r '.warnings[]?' update-handoff/arc-existing-chain-update-attestation.json
+            jq -r 'if .profile == "desktop-update-existing-validators-v1" then
+              "Validators remain on \(.validators_release.tag) (Linux node SHA256: \(.validators_release.binary_sha256)).",
+              "Skipped desktop updates: \(if (.validators_release_skipped_desktop_updates | length) == 0 then "none" else [.validators_release_skipped_desktop_updates[].tag] | join(", ") end)."
+              else empty end' update-handoff/arc-existing-chain-update-attestation.json
             echo 'The observation time is recorded in the attestation. This handoff does not prove the original cutover ceremony or authorize retirement.'
           } >> "$GITHUB_STEP_SUMMARY"

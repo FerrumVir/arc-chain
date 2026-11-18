@@ -1,6 +1,6 @@
 [package]
 name = "arc-desktop"
-version = "0.8.20"
+version = "0.8.21"
 description = "ARC Node - desktop app"
 authors = ["FerrumVir"]
 edition = "2021"
@@ -70,6 +70,7 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 
 # Tauri 2.11's Linux GTK3 stack is constrained to glib 0.18. Keep the
 # dependency version honest while applying the exact upstream fix for
