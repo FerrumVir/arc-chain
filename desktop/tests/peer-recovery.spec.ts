@@ -149,7 +149,6 @@ test("a healthy home node at height zero never catches up to the chain tip", asy
   await expect(page.getByTestId("dashboard")).not.toContainText("Catching up");
   await expect(page.getByTestId("dashboard")).not.toContainText("blocks to go");
   await expect(page.locator("#boot")).toHaveCount(0);
-  await page.screenshot({ path: "../evidence/macos-browser-home-node.png", fullPage: true });
 });
 
 test("a chain participant behind the tip still catches up", async ({ page }) => {

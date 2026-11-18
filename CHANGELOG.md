@@ -18,10 +18,12 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
-## v0.8.21 - Release-preparation snapshot (2026-11-18)
+## v0.8.22 - Release-preparation snapshot (2026-11-18)
 
-> **Candidate note:** This entry records the v0.8.21 release-preparation
-> snapshot. It does not claim publication or deployment of v0.8.21.
+v0.8.21 was tagged but never released, because its release build refused two test screenshots written into the source tree; v0.8.22 is the same update without them.
+
+> **Candidate note:** This entry records the v0.8.22 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.22.
 
 - Pin the compatibility TypeScript SDK's test dependencies to patched glob and
   minimatch releases; gate JavaScript audits with exact advisory exceptions and a
@@ -41,6 +43,10 @@ All notable changes to ARC Chain are tracked here. This project follows
 - Allow consecutive desktop-only updates over the same authenticated validator
   release, verifying each skipped update's signed attestation and recording the
   skipped releases in handoff evidence and release notes.
+
+## v0.8.21
+
+v0.8.21 was tagged, not released; see v0.8.22 for the update.
 
 ## v0.8.20 - Release-preparation snapshot (2026-11-13)
 
