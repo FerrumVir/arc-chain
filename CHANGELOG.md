@@ -23,6 +23,8 @@ All notable changes to ARC Chain are tracked here. This project follows
 > **Candidate note:** This entry records the v0.8.21 release-preparation
 > snapshot. It does not claim publication or deployment of v0.8.21.
 
+- Pin the compatibility TypeScript SDK's test dependencies to patched glob and
+  minimatch releases; the unpatched picomatch advisory still blocks JavaScript audits.
 - Keep one desktop per user, reopen its window from shortcuts and the Dock, distinguish another copy from migration failures, and avoid showing home nodes as catching up.
 - Desktop keeps unfinished setup visible on login, retries lasting startup failures
   and exhausted crash recovery with bounded backoff, and keeps model downloads
