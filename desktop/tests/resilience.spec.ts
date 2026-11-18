@@ -146,5 +146,4 @@ test("a contended copy cannot offer settings changes or claim its own running no
   await expect(page.getByTestId("settings-screen").locator("input")).toHaveCount(0);
   await expect(page.getByTestId("btn-start-failure-close-copy")).toBeVisible();
   await expect(page.locator("#boot")).toHaveCount(0);
-  await page.screenshot({ path: "../evidence/macos-browser-refused-settings.png", fullPage: true });
 });

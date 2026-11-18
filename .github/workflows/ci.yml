@@ -740,6 +740,16 @@ jobs:
       # webServer in playwright.gate.config.ts runs `npm run build && npm run
       # preview` on :4173 and CI=true turns on forbidOnly/retries/1 worker.
       - run: npx playwright test --config playwright.gate.config.ts
+      - name: Check source cleanliness after Playwright
+        working-directory: .
+        run: |
+          set -euo pipefail
+          source_status="$(git status --porcelain=v1 --untracked-files=all)"
+          if [ -n "$source_status" ]; then
+            printf '%s\n' "$source_status"
+            echo '::error::Playwright changed tracked or untracked source.'
+            exit 1
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
