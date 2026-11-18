@@ -288,6 +288,10 @@ The full account is [docs/HOW-SHARDING-WORKS.md](docs/HOW-SHARDING-WORKS.md).
   install steps name the published one. The test's comment (lines 42-46) says
   they move to a newer release in the documentation change that follows its
   publication, together with these values.
+- JavaScript audit gates use `scripts/release/npm-audit-gate.py` and the
+  dated `npm-audit-exceptions.json` policy; see the dependency audit policy in
+  `scripts/release/EXISTING-CHAIN-UPDATE.md`. Every root advisory must match
+  an unexpired exception or block at the caller's existing severity threshold.
 - A PR can stay open after its change ships through an integration commit.
   Check the code at the tag, not the PR state.
 - What changed since a tag: `git log --oneline v0.8.20..origin/main` and

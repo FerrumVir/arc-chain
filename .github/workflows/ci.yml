@@ -912,7 +912,7 @@ jobs:
       # The published SDK ships only its runtime dependencies (files: dist),
       # so those block at any severity; dev-only test tooling blocks at high.
       # Keep in step with scripts/ci_check.sh and release.yml.
-      - run: npm audit --omit=dev --audit-level=low && npm audit --audit-level=high
+      - run: python3 -I -B ../../scripts/release/npm-audit-gate.py --package . --level low --omit-dev && python3 -I -B ../../scripts/release/npm-audit-gate.py --package . --level high
       - run: npm test -- --runInBand
       - run: npm run build
       - name: Load the published CommonJS entrypoint

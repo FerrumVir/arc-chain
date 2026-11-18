@@ -102,3 +102,41 @@ the re-derived list is empty. Release notes and the handoff summary repeat the
 actual validator tag and node hash and name the skipped desktop updates (or none).
 Post-release acceptance recognizes the distinct asset set and still refuses legacy migration. No default,
 cutover behavior, ordinary update rule, signing gate or updater limit changes.
+
+## Dependency audit policy
+
+Rust release audits use `scripts/ci/run-cargo-deny.sh` and `deny.toml`. The
+ignore-list policy requires a date added, named risk owner, explanation of why
+the issue is not exploitable here, and a removal condition; re-review every
+exception at every release.
+
+JavaScript release audits use `python3 -I -B scripts/release/npm-audit-gate.py`
+with `--package <dir> --level <low|moderate|high|critical>`, plus `--omit-dev`
+and/or `--lock-only` where the caller previously used npm's corresponding flags.
+Package paths are relative to the caller's directory; the policy file is always
+`npm-audit-exceptions.json` at the script's repository root. Release builds
+check all five lockfiles at low, except the compatibility SDK: low for runtime
+dependencies and high for its development tools. CI and the local quality
+harness use the same compatibility SDK split without lock-only mode.
+
+The exceptions file follows the same policy as `deny.toml` and additionally
+requires an ISO date hard expiry. Each entry names one exact GHSA and package,
+`added`, `owner`, `reason`, `removal`, and `expires`. Remove it on the stated
+condition, no later than expiry; never extend silently. Expiry is inclusive
+through that UTC date and fails the gate the next day, even if unused. An
+unused, unexpired exception produces a warning; remove it when a patched
+release clears the advisory.
+
+The gate follows every npm `via` link to all root advisories. A finding at or
+above the threshold is excepted only when every root matches a valid entry.
+Unknown or malformed reports, unresolved causes, inconsistent counts, audit
+execution failures, and invalid or expired policies fail closed with exit 2.
+Unexcepted findings exit 1 and print their advisory, package, and installed
+paths; a successful gate exits 0. The summary counts gated package findings
+(not unique advisories); `excepted` counts fully covered findings and
+`exceptions_used` lists matched IDs. Error summaries are incomplete counts and
+must never be interpreted as a pass independently of the exit code.
+
+Run the offline saved-report tests with
+`python3 -I -B tests/release/test_npm_audit_gate.py`; they also run as part of
+`bash tests/release/run.sh`.

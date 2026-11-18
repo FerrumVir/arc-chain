@@ -157,8 +157,8 @@ compatibility_typescript_sdk() {
     (
         cd sdks/typescript &&
             npm ci &&
-            npm audit --omit=dev --audit-level=low &&
-            npm audit --audit-level=high &&
+            python3 -I -B ../../scripts/release/npm-audit-gate.py --package . --level low --omit-dev &&
+            python3 -I -B ../../scripts/release/npm-audit-gate.py --package . --level high &&
             npm test -- --runInBand &&
             npm run build &&
             node -e "const sdk=require('./dist'); if (!sdk || typeof sdk !== 'object') throw new Error('CommonJS SDK failed to load')"
