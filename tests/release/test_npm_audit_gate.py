@@ -29,7 +29,7 @@ class AuditGateTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.package = self.root / "package with spaces"
         self.package.mkdir()
         for name in ("package.json", "package-lock.json"):
