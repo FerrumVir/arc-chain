@@ -27,6 +27,25 @@ struct HeldWork {
     explore: bool,
 }
 
+/// Owned by one admitted long poll. A selection can become ineligible before
+/// the claim/bind gate; do not select that leg again during this poll. Other
+/// workers (and the next poll from this worker) may still take it.
+#[derive(Default)]
+pub(super) struct ClaimPoll {
+    refused: HashSet<String>,
+}
+
+impl ClaimPoll {
+    pub(super) fn excludes(&self, job: &str) -> bool {
+        self.refused.contains(job)
+    }
+
+    pub(super) fn refuse(&mut self, node: &NodeState, item: WorkItem) {
+        self.refused.insert(item.job_id.clone());
+        twin_dispatch::requeue_item(node, item);
+    }
+}
+
 #[derive(Default)]
 pub(super) struct RoutingState {
     /// Seconds per position, using the same alpha as the displayed latency EWMA.
@@ -210,7 +229,11 @@ pub(super) fn poll(
     node: &NodeState,
     worker: &str,
     queue: &mut Receiver<WorkItem>,
+    claim: &ClaimPoll,
 ) -> Result<Option<WorkItem>, TryRecvError> {
+    if node.community_twin.config.effective_reserve() > 0 {
+        return poll_with_reserve(node, worker, queue, claim);
+    }
     let mut state = node.community_routing.lock();
     // Temporarily take the list only inside this synchronous critical section.
     // No cancelled future can leave an item in a handler-local variable.
@@ -247,6 +270,78 @@ pub(super) fn poll(
         }
         Err(TryRecvError::Disconnected) if !state.held.is_empty() => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+/// With an explicit reserve or fan-out, examine all shared candidates without
+/// dequeuing ineligible legs on every attempt. Fan-out then tries its separate
+/// pump queue. The no-flag path above retains the original refusal response.
+fn poll_with_reserve(
+    node: &NodeState,
+    worker: &str,
+    queue: &mut Receiver<WorkItem>,
+    claim: &ClaimPoll,
+) -> Result<Option<WorkItem>, TryRecvError> {
+    let mut state = node.community_routing.lock();
+    let mut work = std::mem::take(&mut state.held);
+    let mut disconnected = false;
+    for _ in 0..queue.len().max(1) {
+        match queue.try_recv() {
+            Ok(item) => {
+                state.decisions = state.decisions.wrapping_add(1);
+                work.push(HeldWork {
+                    item,
+                    chosen: None,
+                    explore: state.decisions.is_multiple_of(4),
+                });
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                disconnected = true;
+                break;
+            }
+        }
+    }
+    let mut selected = None;
+    for mut candidate in work {
+        if candidate.item.expires_at_unix_ms <= now_unix_ms()
+            || node
+                .community_work_results
+                .as_ref()
+                .is_none_or(|m| !m.contains_key(&candidate.item.job_id))
+        {
+            continue;
+        }
+        let targeted = candidate.item.expected_worker_id.as_deref();
+        let twin = twin_dispatch::is_twin_leg(node, &candidate.item.job_id);
+        let eligible = selected.is_none()
+            && !claim.excludes(&candidate.item.job_id)
+            && if targeted.is_some() || twin {
+                targeted.is_none_or(|id| id == worker)
+                    && twin_dispatch::may_claim(node, &candidate.item.job_id, worker)
+            } else {
+                may_take(&mut state, node, worker, &mut candidate)
+            };
+        if selected.is_none() && eligible {
+            selected = Some(candidate.item);
+        } else {
+            state.held.push(candidate);
+        }
+    }
+    // Pending caller work keeps priority even if this particular worker cannot
+    // take it. The same poll has already tried the remaining caller items.
+    let callers_waiting = !state.held.is_empty();
+    drop(state);
+    if selected.is_some() {
+        return Ok(selected);
+    }
+    if !callers_waiting && let Some(item) = twin_dispatch::poll_pump(node, worker, claim) {
+        return Ok(Some(item));
+    }
+    if disconnected && !callers_waiting {
+        Err(TryRecvError::Disconnected)
+    } else {
+        Ok(None)
     }
 }
 

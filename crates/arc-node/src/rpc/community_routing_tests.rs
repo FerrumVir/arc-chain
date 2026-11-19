@@ -51,6 +51,7 @@ mod routing_tests {
             node,
             id,
             &mut *node.community_work_queue.as_ref().unwrap().lock().await,
+            &routing::ClaimPoll::default(),
         )
         .ok()
         .flatten()

@@ -231,6 +231,61 @@ The commitment binds who computed what, the comparison and the verdict. It does 
 - **Fairness.** The least-recently-served preference (section 3.2).
 - **`--community-demand-dry-run`.** Plans and logs every tick ("would dispatch …") and counts `demand_dry_run_ticks`, without dispatching. Run it before enabling the pump, per the automation dry-run rule.
 
+#### Opt-in parallel demand
+
+The defaults above remain the serial path. These coordinator flags do not enable
+`--community-demand-pump` themselves:
+
+| Flag | Default | Normalized bounds / meaning |
+| --- | --- | --- |
+| `--community-demand-max-groups N` | 1 | 1–32 open pump groups, including resolution |
+| `--community-demand-reserve-workers N` | 0 | Idle eligible workers reserved at both planning and claim; effective minimum 2 when max-groups > 1 |
+| `--community-demand-groups-per-hour N` | 30 | 1–3,600 groups/hour refill; bucket capacity `max(2, max-groups)` |
+
+Above max-groups 1, each tick fills available slots and worker capacity, subtracting
+unclaimed pump legs and the reserve before planning each twin (two workers) or
+replay (one worker). Groups run as node-owned tasks. A new tick, not a completion,
+starts replacement work. Dry runs log the number of groups and idle workers.
+
+Fan-out pump work uses its own queue (at most 64 legs), consumes no public
+inference permit, and yields to caller work at both planning and claim time.
+The caller channel remains 256 items; opt-in routing also holds candidates outside
+that channel. Current public producers are bounded by two inference permits.
+With fan-out or an explicit reserve, routing checks eligibility without recording
+refusals. A leg refused or deferred after selection is requeued once and excluded
+for the rest of that worker's long poll; other eligible work can still be served.
+Idle polling retains its 25 ms cadence. With no new flags, a refusal still returns
+the original immediate `no_work` response. Independence and diversity preferences remain;
+the pump's least-recently-served deferral is disabled only in fan-out mode.
+
+**Capacity distinction:** fan-out permits up to 32 pump groups separately from
+the original 64 caller groups, for up to 96 tracked groups. Keeping a shared
+64-group limit would reduce caller capacity when completed dispatchers leave
+resolving groups behind. The default serial path retains the shared limit of 64.
+
+There is still only one twin recompute slot. Fan-out pump recomputes use
+`try_acquire` and do not queue; they also skip while a public inference is active.
+A caller may wait for one already-running pump recompute, up to the existing
+600-second slot acquisition timeout. This does not preempt or cancel the pump.
+When a busy slot prevents a recompute, matching outputs remain twin/reference
+verified; mismatches remain unverified with no chosen output or reward. Generated
+jobs never earn rewards. Spot checks retain their 6/hour refill and burst of 2;
+the checked share can fall as throughput rises.
+
+When fan-out or a changed refill is configured, pump IDs use separate bounded
+memory. Its capacity is twice the sum of `ceil(rate * 4200 / 3600)`, the bucket
+burst, and 32 open groups: at most 8,528 IDs. The 4,200 seconds cover the maximum
+3,900-second assignment budget plus 300-second late-submit grace. An ID is removed
+only after expiry, group removal, and disappearance of its pending record. If
+cleanup is delayed and that memory fills, new pump groups are refused rather
+than evicting live IDs. Caller ring retention remains 1,024 IDs. The default
+serial pump retains its original ring behavior.
+
+The scoreboard adds `pump_groups_in_flight`, `pump_max_groups`, and
+`idle_eligible_workers`; existing fields retain their meaning. Twin stats report
+the configured refill. Release-tool suffix allowlists are unchanged; these flags
+are not authorization to update a validator.
+
 ### 6.2 Verification workload (replays)
 
 Every verified pump demo answer becomes a replay reference: the exact input, the canonical output commitment and the workers that produced it.
@@ -384,6 +439,9 @@ Say this only after steps 1–2 above, with numbers read from `twin_stats` and r
 | `--community-demand-pump` | off | coordinator: generated demand. Requires `--community-twin-execution`: replays only reuse answers that twins verified |
 | `--community-demand-dry-run` | off | coordinator: plan and log only |
 | `--community-demand-interval-secs N` | 120 | coordinator: tick (minimum 30) |
+| `--community-demand-max-groups N` | 1 | coordinator: open pump groups (1–32) |
+| `--community-demand-reserve-workers N` | 0 | coordinator: idle reserve (minimum 2 during fan-out) |
+| `--community-demand-groups-per-hour N` | 30 | coordinator: refill (1–3,600); see separate pump retention above |
 | `--community-region-probe` | off | worker: opt-in region report |
 | `--community-release-on-verification` | off | coordinator: answer the caller once shard-quorum verification passes and the settlement is journaled, with reward approvals on the settlement retry path; below a journal high-water mark and within budget only, otherwise as with the switch off (section 13) |
 

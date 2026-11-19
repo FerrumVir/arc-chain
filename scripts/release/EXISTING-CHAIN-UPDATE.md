@@ -49,8 +49,41 @@ validators' current version. The compatibility review for v0.8.20 with v0.8.19
 validators is the initial use case; selecting the profile confirms that review.
 This is a release preparation path, not authorization to restart validators.
 
-Only this desktop profile permits an optional host `argv_suffix`, exactly `["--community-twin-execution", "--community-demand-pump", "--community-demand-dry-run"]` or `["--community-twin-execution", "--community-demand-pump"]`, immediately after the pinned native tail (or after the non-native prefix when there is no native pin).
-Every `--community-twin-*` and `--community-demand-*` argument must appear only in that exact pinned suffix; unpinned, missing, reordered or extended suffixes and suffix pins under the validator update profile are refused.
+Only this desktop profile permits an optional host `argv_suffix`, immediately
+after the pinned native tail (or after the non-native prefix when there is no
+native pin). Exactly four lists are permitted. The original dry-run and active
+suffixes remain valid, unchanged:
+
+```json
+["--community-twin-execution", "--community-demand-pump", "--community-demand-dry-run"]
+["--community-twin-execution", "--community-demand-pump"]
+```
+
+The two additional suffixes pin the interval and all three fan-out values.
+Each flag and each value is a separate string argv item, in exactly this order:
+
+```json
+["--community-twin-execution", "--community-demand-pump", "--community-demand-dry-run", "--community-demand-interval-secs", "30", "--community-demand-max-groups", "32", "--community-demand-reserve-workers", "2", "--community-demand-groups-per-hour", "720"]
+["--community-twin-execution", "--community-demand-pump", "--community-demand-interval-secs", "30", "--community-demand-max-groups", "32", "--community-demand-reserve-workers", "2", "--community-demand-groups-per-hour", "720"]
+```
+
+These pin a nominal 30-second interval, at most 32 open pump groups, two
+reserved idle workers, and a 720-groups/hour token-bucket refill. The bucket
+also permits a burst of 32; this is not a strict rolling-hour cap. Dry run
+plans and logs demand without dispatching it. The owner must approve the
+exact values, per-host suffix and maintenance window before any restart or
+flag change, including a dry-run-to-active transition. An accepted evidence
+suffix is not deployment approval or proof that an older binary supports it.
+
+Every `--community-twin-*` and `--community-demand-*` argument must appear only
+in that exact pinned suffix. Unpinned, missing, reordered, extended, duplicated,
+unknown or malformed flags and values are refused, as are numeric JSON values,
+`--flag=value` forms and values other than the exact strings above. Suffix pins
+under the validator update profile or any other profile remain forbidden.
+The exact observed argv-tail comparison and all native, binary, checkpoint,
+quorum and baseline-version checks remain in force. In particular, this
+allow-list does not permit a mixed-version validator proof: every live host
+must still run the same authenticated previous-release binary required below.
 
 Pass `--profile desktop-update-existing-validators-v1 --previous-release-tag
 vX.Y.Z --confirm-node-compatible` to the owner assembler, then use the same

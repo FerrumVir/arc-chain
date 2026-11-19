@@ -18,6 +18,10 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## Unreleased
+
+- Add opt-in community demand fan-out with caller reserves and isolated pump late-result retention.
+
 ## v0.8.22 - Release-preparation snapshot (2026-11-18)
 
 v0.8.21 was tagged but never released, because its release build refused two test screenshots written into the source tree; v0.8.22 is the same update without them.

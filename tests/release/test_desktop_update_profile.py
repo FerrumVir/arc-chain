@@ -526,6 +526,12 @@ class PracticeSuffixTests(unittest.TestCase):
     SUFFIXES = (
         ["--community-twin-execution", "--community-demand-pump", "--community-demand-dry-run"],
         ["--community-twin-execution", "--community-demand-pump"],
+        ["--community-twin-execution", "--community-demand-pump", "--community-demand-dry-run",
+         "--community-demand-interval-secs", "30", "--community-demand-max-groups", "32",
+         "--community-demand-reserve-workers", "2", "--community-demand-groups-per-hour", "720"],
+        ["--community-twin-execution", "--community-demand-pump",
+         "--community-demand-interval-secs", "30", "--community-demand-max-groups", "32",
+         "--community-demand-reserve-workers", "2", "--community-demand-groups-per-hour", "720"],
     )
 
     def fixture(self, suffix, native=True):
@@ -563,7 +569,7 @@ class PracticeSuffixTests(unittest.TestCase):
             profile=profile, expected_network=config, now=1080,
             declared_offline={row["site"]: row for row in config["declared_offline"]})
 
-    def test_both_suffixes_with_and_without_native_pins_reach_assembler(self):
+    def test_all_four_suffixes_with_and_without_native_pins_reach_assembler(self):
         for suffix in self.SUFFIXES:
             for native in (False, True):
                 with self.subTest(suffix=suffix, native=native):
@@ -630,10 +636,12 @@ class PracticeSuffixTests(unittest.TestCase):
     def test_suffix_pins_fail_under_validator_default_and_unknown_profiles(self):
         for profile in (assembler.UPDATE_PROFILE, "unknown", None):
             for direct in (False, True):
-                config, proof = self.fixture(self.SUFFIXES[1])
-                with self.subTest(profile=profile, direct=direct), \
-                     self.assertRaisesRegex(existing.validator.GateError, "desktop update profile at lhr"):
-                    self.check(config, proof, profile, direct=direct)
+                for suffix in self.SUFFIXES:
+                    for native in (False, True):
+                        config, proof = self.fixture(suffix, native)
+                        with self.subTest(profile=profile, direct=direct, suffix=suffix, native=native), \
+                             self.assertRaisesRegex(existing.validator.GateError, "desktop update profile at lhr"):
+                            self.check(config, proof, profile, direct=direct)
         with self.assertRaisesRegex(existing.validator.GateError, "lhr"):
             existing.validator.validate_host_config(config)
         with self.assertRaisesRegex(existing.validator.GateError, "lhr"):
@@ -647,6 +655,46 @@ class PracticeSuffixTests(unittest.TestCase):
                     existing.validator_path, existing.CANDIDATE, now=1080,
                     declared_offline_sites=[row["site"] for row in config["declared_offline"]])
 
+    def test_fanout_suffix_rejects_each_missing_malformed_or_unpinned_value(self):
+        for suffix in self.SUFFIXES[2:]:
+            start = suffix.index("--community-demand-interval-secs")
+            invalid = [("reordered pairs", suffix[:start] + suffix[start + 2:] + suffix[start:start + 2])]
+            for index in range(start, len(suffix), 2):
+                flag, value = suffix[index:index + 2]
+                invalid.extend([
+                    (flag + " missing flag", suffix[:index] + suffix[index + 1:]),
+                    (flag + " missing value", suffix[:index + 1] + suffix[index + 2:]),
+                    (flag + " missing pair", suffix[:index] + suffix[index + 2:]),
+                    (flag + " duplicated pair", suffix[:index] + suffix[index:index + 2] + suffix[index:]),
+                    (flag + " duplicated flag", suffix[:index] + [flag] + suffix[index:]),
+                    (flag + " duplicated value", suffix[:index + 1] + [value] + suffix[index + 1:]),
+                    (flag + " equals form", suffix[:index] + [flag + "=" + value] + suffix[index + 2:]),
+                    (flag + " unknown", suffix[:index] + [flag + "-unknown"] + suffix[index + 1:]),
+                ])
+                values = ["", "0", "1", "2", "30", "32", "720", "3600", "721", "-1",
+                          "+" + value, "0" + value, value + ".0", "1e3", " " + value, value + " ",
+                          "true", "--community-demand-unknown", int(value), True, None, {}, []]
+                for bad in values:
+                    if bad != value:
+                        invalid.append((flag + " value " + repr(bad),
+                                        suffix[:index + 1] + [bad] + suffix[index + 2:]))
+            for name, bad_suffix in invalid:
+                for native in (False, True):
+                    # A matching observed tail cannot make a malformed owner pin valid.
+                    for direct in (False, True):
+                        config, proof = self.fixture(bad_suffix, native)
+                        with self.subTest(mutation=name, suffix=suffix, native=native, direct=direct), \
+                             self.assertRaisesRegex(existing.validator.GateError, "argv_suffix"):
+                            self.check(config, proof, direct=direct)
+                    # A valid pin also rejects a changed tail in either proof sample.
+                    for sample in (0, 1):
+                        config, proof = self.fixture(suffix, native)
+                        row = proof["samples"][sample]["nodes"][0]
+                        row["argv_redacted"] = row["argv_redacted"][:-len(suffix)] + bad_suffix
+                        with self.subTest(mutation=name, suffix=suffix, native=native, sample=sample), \
+                             self.assertRaisesRegex(existing.validator.GateError, "argv_suffix"):
+                            self.check(config, proof)
+
     def test_suffix_cannot_mask_native_hash_context_or_other_host_checks(self):
         mutations = {
             "binary": lambda row: row.update(binary_sha256="0" * 64),
@@ -659,19 +707,22 @@ class PracticeSuffixTests(unittest.TestCase):
             "stake": lambda row: row.update(active_stake=1),
             "height": lambda row: row.update(height=100),
         }
-        for name, mutate in mutations.items():
-            config, proof = self.fixture(self.SUFFIXES[1])
-            mutate(proof["samples"][1]["nodes"][0])
-            with self.subTest(mutation=name), self.assertRaisesRegex(existing.validator.GateError, "lhr"):
-                self.check(config, proof)
+        for suffix in self.SUFFIXES:
+            for name, mutate in mutations.items():
+                config, proof = self.fixture(suffix)
+                mutate(proof["samples"][1]["nodes"][0])
+                with self.subTest(suffix=suffix, mutation=name), self.assertRaisesRegex(existing.validator.GateError, "lhr"):
+                    self.check(config, proof)
 
     def test_unpinned_hosts_cannot_add_practice_flags(self):
-        for index in (1, 2, 3):
-            config, proof = self.fixture(self.SUFFIXES[1])
-            row = proof["samples"][1]["nodes"][index]
-            row["argv_redacted"].extend(self.SUFFIXES[1])
-            with self.subTest(site=row["site"]), self.assertRaisesRegex(existing.validator.GateError, row["site"]):
-                self.check(config, proof)
+        for suffix in self.SUFFIXES:
+            for index in (1, 2, 3):
+                config, proof = self.fixture(suffix)
+                row = proof["samples"][1]["nodes"][index]
+                row["argv_redacted"].extend(suffix)
+                with self.subTest(suffix=suffix, site=row["site"]), \
+                     self.assertRaisesRegex(existing.validator.GateError, row["site"]):
+                    self.check(config, proof)
 
 
 class ProfileBoundaryTests(unittest.TestCase):
