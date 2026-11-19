@@ -3274,11 +3274,12 @@ mod tests {
         node.community_active_jobs.remove("worker-0");
         let claimed = claim(&node, "worker-0").await;
         let job = job_of(&claimed);
-        let inner = node.community_twin.inner.lock();
-        let (group, _) = inner.leg_to_group.get(&job).unwrap();
-        assert_eq!(inner.groups[group].source, DemandSource::PublicRequest);
-        assert_eq!(inner.pump_queue.len(), 64);
-        drop(inner);
+        {
+            let inner = node.community_twin.inner.lock();
+            let (group, _) = inner.leg_to_group.get(&job).unwrap();
+            assert_eq!(inner.groups[group].source, DemandSource::PublicRequest);
+            assert_eq!(inner.pump_queue.len(), 64);
+        }
         assert_eq!(
             node.community_work_tx.as_ref().unwrap().capacity(),
             COMMUNITY_WORK_QUEUE_CAP
