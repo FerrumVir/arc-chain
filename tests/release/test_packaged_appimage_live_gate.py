@@ -38,9 +38,9 @@ def digest(raw: bytes) -> str:
 
 class ManagedVersionContract(unittest.TestCase):
     def test_matches_selected_release_and_refuses_old_or_prefix_versions(self):
-        for output in ("arc-node 0.8.22", "arc-node v0.8.22"):
+        for output in ("arc-node 0.8.23", "arc-node v0.8.23"):
             GATE.require_managed_node_version(output)
-        for output in ("arc-node 0.8.0", "arc-node 0.8.220", "arc-node 0.8.22-beta"):
+        for output in ("arc-node 0.8.0", "arc-node 0.8.230", "arc-node 0.8.23-beta"):
             with self.assertRaises(GATE.GateError):
                 GATE.require_managed_node_version(output)
 

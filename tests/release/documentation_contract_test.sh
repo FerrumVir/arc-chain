@@ -38,7 +38,7 @@ DESKTOP_DISTRIBUTION="$REPO_ROOT/desktop/DISTRIBUTION.md"
 DESKTOP_GAPS="$REPO_ROOT/desktop/PRODUCTION_GAPS.md"
 CLAUDE_GUIDE="$REPO_ROOT/CLAUDE.md"
 RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
-CANDIDATE_VERSION=0.8.22
+CANDIDATE_VERSION=0.8.23
 # README.md and the install guides name the latest PUBLISHED release: its exact
 # tag URL, pinned version and installer digest. They keep naming it until the
 # candidate is published, and move to the candidate in the documentation change
@@ -1827,11 +1827,11 @@ PY
         'repos/FerrumVir/arc-chain/deployments' \
         './shared/frontend/arc-network.json' \
         'arc.post-release-installer-canary.v1' \
-        'Already up to date at v0.8.22' \
+        'Already up to date at v0.8.23' \
         'scripts/recovery/recovery_rollout.py verify' \
         'POST-RELEASE-ACCEPTANCE.json' \
         'scripts/release/build-postrelease-public-truth.py' \
-        "public_truth_branch='arc-recovery/public-truth-v0.8.22'" \
+        "public_truth_branch='arc-recovery/public-truth-v0.8.23'" \
         'repos/FerrumVir/arc-chain/git/matching-refs/heads/$public_truth_branch' \
         'PUBLIC-TRUTH-RULESETS-BASELINE.json' \
         'PUBLIC-TRUTH-REVIEW-AUTHORIZATION.json' \
@@ -2425,8 +2425,8 @@ PY
     }
 }
 
-run_test 'workspace, desktop, and changelog agree on unreleased v0.8.22; README names published v0.8.16' candidate_version_is_consistent
-run_test 'install commands pin exact published v0.8.16 without claiming v0.8.22 is published' candidate_install_commands_are_exact_and_honest
+run_test 'workspace, desktop, and changelog agree on unreleased v0.8.23; README names published v0.8.16' candidate_version_is_consistent
+run_test 'install commands pin exact published v0.8.16 without claiming v0.8.23 is published' candidate_install_commands_are_exact_and_honest
 run_test 'README and headless guide share the same unpinned update-only commands' manual_updater_commands_are_identical
 run_test 'headless platform claims match the canonical release asset contract' headless_platform_claims_match_release_assets
 run_test 'desktop docs and generated release notes match artifacts, updater, and reward evidence' desktop_and_release_notes_match_the_artifact_and_reward_contract
