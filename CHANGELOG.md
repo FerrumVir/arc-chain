@@ -18,9 +18,20 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
-## Unreleased
+## v0.8.23 - Release-preparation snapshot (2026-11-18)
 
-- Add opt-in community demand fan-out with caller reserves and isolated pump late-result retention.
+> **Candidate note:** This entry records the v0.8.23 release-preparation
+> snapshot. It does not claim publication or deployment of v0.8.23.
+
+- Node: coordinators can run several practice demand groups at once, sized to
+  idle eligible workers, with callers first. Practice demand is off by default.
+  Three new startup flags control the fan-out: `--community-demand-max-groups`,
+  `--community-demand-reserve-workers` and `--community-demand-groups-per-hour`.
+  The twin scoreboard adds `pump_groups_in_flight`, `pump_max_groups` and
+  `idle_eligible_workers` (#258).
+- Release tooling: `update-quorum-validator.py` accepts two more exact pinned
+  practice suffixes (#258).
+- Desktop: no user-visible change.
 
 ## v0.8.22 - Release-preparation snapshot (2026-11-18)
 
