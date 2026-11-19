@@ -11,6 +11,12 @@ UPDATE_PROFILE = "existing-recovered-chain-update-v1"
 PRACTICE_SUFFIXES = (
     ["--community-twin-execution", "--community-demand-pump", "--community-demand-dry-run"],
     ["--community-twin-execution", "--community-demand-pump"],
+    ["--community-twin-execution", "--community-demand-pump", "--community-demand-dry-run",
+     "--community-demand-interval-secs", "30", "--community-demand-max-groups", "32",
+     "--community-demand-reserve-workers", "2", "--community-demand-groups-per-hour", "720"],
+    ["--community-twin-execution", "--community-demand-pump",
+     "--community-demand-interval-secs", "30", "--community-demand-max-groups", "32",
+     "--community-demand-reserve-workers", "2", "--community-demand-groups-per-hour", "720"],
 )
 
 HOST_SCHEMA = "arc.rollout.host-config.v1"
