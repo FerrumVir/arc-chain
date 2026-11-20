@@ -266,14 +266,14 @@ fn parse_python_to_ops(code: &str) -> Vec<String> {
         if i + 4 < len && chars[i] == '=' && chars[i + 1] == '=' {
             let after_eq = &code[i + 2..];
             let c1 = after_eq.trim_start().chars().next();
-            if let Some(d1) = c1.filter(|c| c.is_ascii_digit()) {
-                if let Some(assign_pos) = after_eq.find("] =") {
-                    let rhs = after_eq[assign_pos + 3..].trim_start();
-                    if let Some(d2) = rhs.chars().next().filter(|c| c.is_ascii_digit()) {
-                        let op = format!("replace_{}_{}", d1, d2);
-                        if !ops.contains(&op) {
-                            ops.push(op);
-                        }
+            if let Some(d1) = c1.filter(|c| c.is_ascii_digit())
+                && let Some(assign_pos) = after_eq.find("] =")
+            {
+                let rhs = after_eq[assign_pos + 3..].trim_start();
+                if let Some(d2) = rhs.chars().next().filter(|c| c.is_ascii_digit()) {
+                    let op = format!("replace_{}_{}", d1, d2);
+                    if !ops.contains(&op) {
+                        ops.push(op);
                     }
                 }
             }

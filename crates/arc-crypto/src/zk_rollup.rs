@@ -313,8 +313,6 @@ pub fn resolve_dispute(
         Ok(actual_root) => {
             if actual_root != batch.post_state_root {
                 DisputeResolution::ProverSlashed
-            } else if fraud.expected_root != actual_root {
-                DisputeResolution::NoFraud
             } else {
                 DisputeResolution::NoFraud
             }

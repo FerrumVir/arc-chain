@@ -177,32 +177,27 @@ impl InferenceValidatorTask {
                     snap.committee_size,
                 );
                 let in_committee = committee.iter().any(|a| a.0 == self.validator_address.0);
-                if in_committee {
-                    if let Some(worker_permit) = self.worker_execution.try_enter()
-                        && let Ok(compute_permit) = self.compute_permits.clone().try_acquire_owned()
-                    {
-                        self.voted.insert(request_id, ());
-                        let task = self.clone();
-                        let task_for_cleanup = self.clone();
-                        let snap_for_task = snap.clone();
-                        jobs.spawn(async move {
-                            if let Err(e) = task
-                                .run_inference_and_vote(
-                                    snap_for_task,
-                                    compute_permit,
-                                    worker_permit,
-                                )
-                                .await
-                            {
-                                warn!(
-                                    request_id = %hex::encode(request_id),
-                                    error = %e,
-                                    "Tier 1 vote submission failed"
-                                );
-                                task_for_cleanup.voted.remove(&request_id);
-                            }
-                        });
-                    }
+                if in_committee
+                    && let Some(worker_permit) = self.worker_execution.try_enter()
+                    && let Ok(compute_permit) = self.compute_permits.clone().try_acquire_owned()
+                {
+                    self.voted.insert(request_id, ());
+                    let task = self.clone();
+                    let task_for_cleanup = self.clone();
+                    let snap_for_task = snap.clone();
+                    jobs.spawn(async move {
+                        if let Err(e) = task
+                            .run_inference_and_vote(snap_for_task, compute_permit, worker_permit)
+                            .await
+                        {
+                            warn!(
+                                request_id = %hex::encode(request_id),
+                                error = %e,
+                                "Tier 1 vote submission failed"
+                            );
+                            task_for_cleanup.voted.remove(&request_id);
+                        }
+                    });
                 }
             }
 

@@ -627,39 +627,36 @@ impl JmtStore {
             None => return,
         };
 
-        match &node {
-            Node::Internal(internal) => {
-                if depth >= path.len() {
-                    return;
-                }
-                let nibble = path.get(depth).expect("depth within path bounds") as usize;
+        if let Node::Internal(internal) = &node {
+            if depth >= path.len() {
+                return;
+            }
+            let nibble = path.get(depth).expect("depth within path bounds") as usize;
 
-                let mut hasher = blake3::Hasher::new();
-                hasher.update(INTERNAL_NODE_DOMAIN);
-                for (i, slot) in internal.children.iter().enumerate() {
-                    if i == nibble {
-                        continue;
-                    }
-                    match slot {
-                        Some((h, _)) => {
-                            hasher.update(&h.0);
-                        }
-                        None => {
-                            hasher.update(&Hash256::ZERO.0);
-                        }
-                    }
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(INTERNAL_NODE_DOMAIN);
+            for (i, slot) in internal.children.iter().enumerate() {
+                if i == nibble {
+                    continue;
                 }
-                siblings.push(Hash256(*hasher.finalize().as_bytes()));
-
-                if let Some((_, child_ver)) = internal.children[nibble] {
-                    let child_key = NodeKey {
-                        version: child_ver,
-                        nibble_path: path.prefix(depth + 1),
-                    };
-                    self.collect_proof(child_ver, &child_key, path, depth + 1, siblings);
+                match slot {
+                    Some((h, _)) => {
+                        hasher.update(&h.0);
+                    }
+                    None => {
+                        hasher.update(&Hash256::ZERO.0);
+                    }
                 }
             }
-            Node::Leaf(_) | Node::Null => {}
+            siblings.push(Hash256(*hasher.finalize().as_bytes()));
+
+            if let Some((_, child_ver)) = internal.children[nibble] {
+                let child_key = NodeKey {
+                    version: child_ver,
+                    nibble_path: path.prefix(depth + 1),
+                };
+                self.collect_proof(child_ver, &child_key, path, depth + 1, siblings);
+            }
         }
     }
 }
@@ -774,9 +771,7 @@ impl JmtStateTree {
         current_level[0]
     }
 
-    pub fn prune_versions_before(&mut self, version: u64) {
-        if version > self.version {}
-    }
+    pub fn prune_versions_before(&mut self, _version: u64) {}
 
     pub fn len(&self) -> usize {
         self.leaves.len()

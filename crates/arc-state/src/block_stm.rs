@@ -631,14 +631,12 @@ impl SpeculativeScheduler {
                 for (account, (read_bal, read_nonce, read_from_idx)) in &res.access_set.reads {
                     if let Some((latest_bal, latest_nonce, writer_idx)) =
                         self.mv_hashmap.read(account, idx)
-                    {
-                        if writer_idx != *read_from_idx
+                        && (writer_idx != *read_from_idx
                             || latest_bal != *read_bal
-                            || latest_nonce != *read_nonce
-                        {
-                            valid = false;
-                            break;
-                        }
+                            || latest_nonce != *read_nonce)
+                    {
+                        valid = false;
+                        break;
                     }
                 }
 

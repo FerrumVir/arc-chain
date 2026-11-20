@@ -1814,10 +1814,8 @@ impl ConsensusEngine {
                     }
                 }
             }
-            if round >= reached {
-                if self.advance_round() {
-                    reached = self.current_round.load(Ordering::SeqCst);
-                }
+            if round >= reached && self.advance_round() {
+                reached = self.current_round.load(Ordering::SeqCst);
             }
         }
         if inserted == 0 && reached == start {
@@ -2358,14 +2356,13 @@ impl ConsensusEngine {
         let mut seen_authors = std::collections::HashSet::new();
 
         for hash in &round_blocks {
-            if let Some(block) = self.dag.get(hash) {
-                if seen_authors.insert(block.author)
-                    && let Some(validator) = vs.get_validator(&block.author)
-                {
-                    round_stake = round_stake
-                        .checked_add(validator.stake)
-                        .expect("unique round stake cannot exceed checked total stake");
-                }
+            if let Some(block) = self.dag.get(hash)
+                && seen_authors.insert(block.author)
+                && let Some(validator) = vs.get_validator(&block.author)
+            {
+                round_stake = round_stake
+                    .checked_add(validator.stake)
+                    .expect("unique round stake cannot exceed checked total stake");
             }
         }
 

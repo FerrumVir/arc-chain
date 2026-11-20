@@ -2196,8 +2196,6 @@ impl ConsensusManager {
                                     if advanced || block.round == round_before {
                                         self.engine.reset_round_timer();
                                     }
-                                    let peer_round = self.engine.current_round();
-                                    if last_proposed_round != Some(peer_round) {}
                                 }
                                 Err(e) => {
                                     let message = e.to_string();
@@ -3599,17 +3597,14 @@ impl ConsensusManager {
                         let tx_hashes: Vec<Hash256> =
                             transactions.iter().map(|tx| tx.hash).collect();
 
-                        if has_txs {
-                            if let Some(ref tx_chan) = outbound_tx {
-                                let serialized: Vec<Vec<u8>> = transactions
-                                    .iter()
-                                    .filter_map(|tx| bincode::serialize(tx).ok())
-                                    .collect();
-                                if !serialized.is_empty() {
-                                    let _ = tx_chan.try_send(
-                                        OutboundMessage::BroadcastTransactions(serialized),
-                                    );
-                                }
+                        if has_txs && let Some(ref tx_chan) = outbound_tx {
+                            let serialized: Vec<Vec<u8>> = transactions
+                                .iter()
+                                .filter_map(|tx| bincode::serialize(tx).ok())
+                                .collect();
+                            if !serialized.is_empty() {
+                                let _ = tx_chan
+                                    .try_send(OutboundMessage::BroadcastTransactions(serialized));
                             }
                         }
 

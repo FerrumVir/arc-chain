@@ -439,28 +439,26 @@ fn exhaustive_dfs(
             if !seen.contains(&h) {
                 seen.insert(h);
 
-                if g == target {
-                    if verify_on_all_pairs(steps, catalog, train_pairs) {
-                        let mut test_outputs = Vec::new();
-                        let mut all_ok = true;
-                        for test_in in test_inputs {
-                            if let Some(out) = apply_program(steps, catalog, test_in) {
-                                test_outputs.push(out);
-                            } else {
-                                all_ok = false;
-                                break;
-                            }
+                if g == target && verify_on_all_pairs(steps, catalog, train_pairs) {
+                    let mut test_outputs = Vec::new();
+                    let mut all_ok = true;
+                    for test_in in test_inputs {
+                        if let Some(out) = apply_program(steps, catalog, test_in) {
+                            test_outputs.push(out);
+                        } else {
+                            all_ok = false;
+                            break;
                         }
-                        if all_ok && !test_outputs.is_empty() {
-                            let result = SearchResult {
-                                program: steps.clone(),
-                                output: test_outputs[0].clone(),
-                                depth: steps.len(),
-                                fitness: 1.0,
-                            };
-                            steps.pop();
-                            return Some(result);
-                        }
+                    }
+                    if all_ok && !test_outputs.is_empty() {
+                        let result = SearchResult {
+                            program: steps.clone(),
+                            output: test_outputs[0].clone(),
+                            depth: steps.len(),
+                            fitness: 1.0,
+                        };
+                        steps.pop();
+                        return Some(result);
                     }
                 }
             }

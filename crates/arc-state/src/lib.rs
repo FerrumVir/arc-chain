@@ -8474,10 +8474,8 @@ impl StateDB {
                 if is_new {
                     structure_changed = true;
                 }
-            } else {
-                if tree.remove(key) {
-                    structure_changed = true;
-                }
+            } else if tree.remove(key) {
+                structure_changed = true;
             }
         }
 

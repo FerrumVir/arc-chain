@@ -4692,27 +4692,16 @@ fn eth_get_storage_at(node: &NodeState, params: &Value, id: &Value) -> Json<Valu
 
 fn eth_get_block_by_number(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
     let block_num = parse_block_number(node, params.get(0));
-    let full_txs = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
 
     match node.state.get_block(block_num) {
         Some(block) => {
-            let txs: Value = if full_txs {
-                json!(
-                    block
-                        .tx_hashes
-                        .iter()
-                        .map(|h| format!("0x{}", h.to_hex()))
-                        .collect::<Vec<_>>()
-                )
-            } else {
-                json!(
-                    block
-                        .tx_hashes
-                        .iter()
-                        .map(|h| format!("0x{}", h.to_hex()))
-                        .collect::<Vec<_>>()
-                )
-            };
+            let txs: Value = json!(
+                block
+                    .tx_hashes
+                    .iter()
+                    .map(|h| format!("0x{}", h.to_hex()))
+                    .collect::<Vec<_>>()
+            );
 
             eth_rpc_result(
                 id,
@@ -14305,15 +14294,10 @@ fn schedule_verified_settlement_retry(node: &NodeState, job_id: Hash256) {
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {}
             }
-            match attempt_verified_community_reward(&task_node, job_id).await {
-                Ok(_) => {}
-                Err(error) => {
-                    if let Some(mut record) =
-                        task_node.community_verified_settlements.get_mut(&job_id)
-                    {
-                        record.last_error = Some(error);
-                    }
-                }
+            if let Err(error) = attempt_verified_community_reward(&task_node, job_id).await
+                && let Some(mut record) = task_node.community_verified_settlements.get_mut(&job_id)
+            {
+                record.last_error = Some(error);
             }
         }
     });
