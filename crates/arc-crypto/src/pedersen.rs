@@ -6,27 +6,19 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 
-/// Second generator point H for Pedersen commitments.
-/// Derived deterministically so nobody knows the discrete log relationship to G.
 fn generator_h() -> RistrettoPoint {
     let mut hasher = Sha512::new();
     hasher.update(b"ARC-chain-pedersen-generator-H-v1");
     RistrettoPoint::from_hash(hasher)
 }
 
-/// A Pedersen commitment: C = v*G + r*H
-/// Hides the value v with randomness r. Homomorphic: C(a) + C(b) = C(a+b).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PedersenCommitment {
-    /// Compressed Ristretto point (32 bytes).
     pub point: [u8; 32],
-    /// The blinding factor (secret, kept by committer).
     #[serde(skip_serializing)]
     pub blinding: [u8; 32],
 }
 
-/// A proof that a Pedersen commitment contains a specific value.
-/// The committer reveals (value, blinding) and the verifier checks C == v*G + r*H.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PedersenProof {
     pub commitment: [u8; 32],
@@ -34,8 +26,6 @@ pub struct PedersenProof {
     pub blinding: [u8; 32],
 }
 
-/// Commit to a value using a Pedersen commitment.
-/// Returns the commitment and stores the blinding factor.
 pub fn commit_value(value: u64) -> PedersenCommitment {
     let h = generator_h();
     let v = Scalar::from(value);
@@ -49,7 +39,6 @@ pub fn commit_value(value: u64) -> PedersenCommitment {
     }
 }
 
-/// Commit with a known blinding factor (for deterministic testing).
 pub fn commit_value_with_blinding(value: u64, blinding: &Scalar) -> PedersenCommitment {
     let h = generator_h();
     let v = Scalar::from(value);
@@ -62,7 +51,6 @@ pub fn commit_value_with_blinding(value: u64, blinding: &Scalar) -> PedersenComm
     }
 }
 
-/// Verify that a commitment matches a revealed (value, blinding) pair.
 pub fn verify_commitment(proof: &PedersenProof) -> bool {
     let h = generator_h();
     let v = Scalar::from(proof.value);
@@ -78,18 +66,14 @@ pub fn verify_commitment(proof: &PedersenProof) -> bool {
     }
 }
 
-/// Batch-generate Pedersen commitments in parallel.
 pub fn batch_commit(values: &[u64]) -> Vec<PedersenCommitment> {
     values.par_iter().map(|v| commit_value(*v)).collect()
 }
 
-/// Batch-verify Pedersen proofs in parallel.
 pub fn batch_verify(proofs: &[PedersenProof]) -> Vec<bool> {
     proofs.par_iter().map(verify_commitment).collect()
 }
 
-/// Homomorphic addition of two commitments.
-/// commit(a) + commit(b) = commit(a + b) with combined blinding factors.
 pub fn add_commitments(a: &PedersenCommitment, b: &PedersenCommitment) -> PedersenCommitment {
     let pa = CompressedRistretto::from_slice(&a.point)
         .expect("valid point")
@@ -101,7 +85,6 @@ pub fn add_commitments(a: &PedersenCommitment, b: &PedersenCommitment) -> Peders
         .expect("decompressible");
     let sum = pa + pb;
 
-    // Blinding factors also add
     let ra = Scalar::from_bytes_mod_order(a.blinding);
     let rb = Scalar::from_bytes_mod_order(b.blinding);
     let r_sum = ra + rb;
@@ -132,7 +115,7 @@ mod tests {
         let c = commit_value(42);
         let proof = PedersenProof {
             commitment: c.point,
-            value: 43, // wrong
+            value: 43,
             blinding: c.blinding,
         };
         assert!(!verify_commitment(&proof));
@@ -150,7 +133,6 @@ mod tests {
         let cb = commit_value_with_blinding(b_val, &blinding_b);
         let c_sum = add_commitments(&ca, &cb);
 
-        // Verify the sum commitment
         let proof = PedersenProof {
             commitment: c_sum.point,
             value: a_val + b_val,
@@ -164,7 +146,6 @@ mod tests {
         let values: Vec<u64> = (0..10_000).collect();
         let commits = batch_commit(&values);
         assert_eq!(commits.len(), 10_000);
-        // Verify a random sample
         let proof = PedersenProof {
             commitment: commits[42].point,
             value: 42,

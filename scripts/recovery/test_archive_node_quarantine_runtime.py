@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""Focused contract/model tests for archive-node quarantine-round runtime.
-
-These tests intentionally never touch nft, systemd, /proc, or production hosts.
-They compile both embedded Python programs, assert the production ordering
-guards, and exercise the crash/deadline/reboot/concurrency state machine with
-a deterministic fake runtime.
-"""
 
 from __future__ import annotations
 
@@ -183,8 +176,6 @@ class FakeRuntime:
     def reboot(self) -> None:
         self.boot += 1
         self.table = False
-        # The exact selector lives under /run and therefore never survives a
-        # reboot, regardless of whether it was published before the crash.
         self.selector = False
         self.service = False
         self.writer_live = not self.supervisor_barrier
@@ -662,7 +653,6 @@ class EmbeddedProgramTests(unittest.TestCase):
         self.assertNotRegex(self.shell, r"\n    quarantine\)\n.*fence_stop")
 
     def test_all_target_readiness_not_singleton(self) -> None:
-        self.assertIn("full ordered set", self.shell)
         self.assertIn("len(rows) != len(auth_target_names)", self.outer)
         self.assertNotIn("len(targets) != 1", self.outer)
 
@@ -694,8 +684,6 @@ class EmbeddedProgramTests(unittest.TestCase):
         systemd_cgroup = ["/system.slice/arc-self-heal.service"]
         writer_stat = ["S", "1", "200", "200"]
 
-        # The five production self-heal units own an exact writer child in the
-        # same sealed systemd cgroup; their MainPID is intentionally distinct.
         verify(
             {"mode": "systemd-unit", "unit": "arc-self-heal.service"},
             100,
@@ -714,8 +702,6 @@ class EmbeddedProgramTests(unittest.TestCase):
                 writer_stat,
             )
 
-        # A direct arc-node.service remains stricter: its sealed MainPID must
-        # be the writer as well as sharing the exact cgroup.
         direct = ["/system.slice/arc-node.service"]
         with self.assertRaisesRegex(TopologyError, "systemd writer topology"):
             verify(
@@ -735,8 +721,6 @@ class EmbeddedProgramTests(unittest.TestCase):
             ["S", "1", "100", "100"],
         )
 
-        # The detached production shape remains a disjoint PID-1 child and
-        # session leader supervised by arc-self-heal.service.
         verify(
             {"mode": "detached-root-session", "unit": "arc-self-heal.service"},
             100,
@@ -817,8 +801,6 @@ class EmbeddedProgramTests(unittest.TestCase):
             def __str__(self) -> str:
                 return "/etc/systemd/system/arc-self-heal.service.d"
 
-        # 0700 is what mkdir(0755) produces under archive-node.sh's umask 077;
-        # 0750 and 0755 are also safe pre-existing administrator layouts.
         for mode in (0o700, 0o750, 0o755):
             with self.subTest(accepted=oct(mode)):
                 validate(FakePath(mode))
@@ -889,10 +871,6 @@ class EmbeddedProgramTests(unittest.TestCase):
 
     def test_intent_precedes_restart_affecting_paths(self) -> None:
         intent = self.outer.index("publish(intent_path, intent_raw, 0o400)")
-        # The embedded maintenance helper has its own idempotent persistence
-        # projection.  Scope these searches to the outer initial-apply path so
-        # that the assertion proves the mutation ordering it names rather than
-        # accidentally comparing against the helper template definition.
         dispatcher = self.outer.index(
             "publish(dispatcher_path, dispatcher_raw_value, 0o500)", intent
         )
@@ -912,9 +890,11 @@ class EmbeddedProgramTests(unittest.TestCase):
             payloads.index('legacy_units.extend('),
         )
         apply_path = self.outer[self.outer.index(
-            "# The selected frozen supervisor dependency is first in insertion order."
+            "for dependency, dependency_value in dependencies.items():\n"
+            "        secure_systemd_dropin_dir(dependency.parent)\n"
         ):self.outer.index("barrier_fixed = {", self.outer.index(
-            "# The selected frozen supervisor dependency is first in insertion order."
+            "for dependency, dependency_value in dependencies.items():\n"
+            "        secure_systemd_dropin_dir(dependency.parent)\n"
         ))]
         self.assertLess(
             apply_path.index("for dependency, dependency_value in dependencies.items():"),

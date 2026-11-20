@@ -1,12 +1,3 @@
-//! Bounded coordinator state for assignment (S1, S2, S6, S7), and the one
-//! function that turns it into placement candidates.
-//!
-//! Every collection here is bounded by the worker set: the latest lease per
-//! worker, one challenge per worker per epoch, a ring of recent probes and
-//! one transport-counter snapshot per worker, and at most one exclusion and
-//! one failure count per worker per epoch. Each `len` is a growth gauge.
-//! Nothing here performs I/O; the node feeds the books and reads candidates.
-
 use crate::lease::{self, CapabilityLease, LeaseError, LeaseRequirements};
 use crate::link::{self, LinkMeasurement, PathCounters, Probe};
 use crate::placement::{Candidate, Participant};
@@ -16,26 +7,16 @@ use crate::{Address, Hash256};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-/// Probes kept per worker; older ones fall off.
 pub const MAX_PROBES_PER_WORKER: usize = 32;
 
-/// Consecutive failed, timed-out or refused calls after which a worker is
-/// dropped for the rest of the epoch.
 pub const FAILURES_BEFORE_EXCLUSION: u32 = 3;
 
-/// What [`LeaseBook::offer`] did with a valid lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Offered {
-    /// Newer than the one held (or the first): it replaced it.
     Accepted,
-    /// Its nonce is not newer than the one held: a replay or a reordering,
-    /// ignored.
     Stale,
 }
 
-/// The latest valid lease per worker. Only a lease that passes
-/// [`lease::validate`] enters, so the book never holds more than the member
-/// set.
 #[derive(Debug, Default)]
 pub struct LeaseBook {
     leases: BTreeMap<[u8; 32], CapabilityLease>,
@@ -62,9 +43,6 @@ impl LeaseBook {
         Ok(Offered::Accepted)
     }
 
-    /// Evict the leases of workers that left the member set and of leases
-    /// expired at `height`. Returns the workers evicted, so that their
-    /// reservations and probes can be dropped too.
     pub fn retain_current(&mut self, members: &BTreeSet<[u8; 32]>, height: u64) -> Vec<Address> {
         let mut gone = Vec::new();
         self.leases.retain(|key, lease| {
@@ -94,14 +72,10 @@ impl LeaseBook {
     }
 }
 
-/// A worker's challenge in the current epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChallengeState {
-    /// Issued; the answer is due by this deadline (the caller's clock).
     InFlight { deadline: u64 },
-    /// Answered correctly in time: the rate placement may use.
     Measured { macs_per_s: u64 },
-    /// Wrong, too slow, dishonest or late: not used this epoch.
     Refused,
 }
 
@@ -113,9 +87,6 @@ pub enum ChallengeError {
     NotInFlight,
 }
 
-/// One challenge per worker per epoch: a worker cannot be made to burn
-/// compute on demand, and a refused worker is not tried again until the next
-/// epoch.
 #[derive(Debug)]
 pub struct ChallengeBook {
     epoch: u64,
@@ -134,7 +105,6 @@ impl ChallengeBook {
         self.epoch
     }
 
-    /// A different epoch clears every outcome. Returns how many were cleared.
     pub fn begin_epoch(&mut self, epoch: u64) -> usize {
         if epoch == self.epoch {
             return 0;
@@ -155,8 +125,6 @@ impl ChallengeBook {
         }
     }
 
-    /// Record the answer, as already judged by [`lease::check_challenge`].
-    /// An answer after the deadline is refused whatever it says.
     pub fn answer(
         &mut self,
         worker: &Address,
@@ -176,8 +144,6 @@ impl ChallengeBook {
         Ok(outcome)
     }
 
-    /// Challenges still in flight past their deadline become refusals.
-    /// Returns how many.
     pub fn expire(&mut self, now: u64) -> usize {
         let mut expired = 0;
         for state in self.state.values_mut() {
@@ -200,8 +166,6 @@ impl ChallengeBook {
         self.state.get(&worker.0).copied()
     }
 
-    /// Drop the outcomes of workers that left the member set. Returns how
-    /// many.
     pub fn retain_members(&mut self, members: &BTreeSet<[u8; 32]>) -> usize {
         let before = self.state.len();
         self.state.retain(|key, _| members.contains(key));
@@ -217,16 +181,11 @@ impl ChallengeBook {
     }
 }
 
-/// Recent probes and the last transport-counter snapshot per worker.
 #[derive(Debug, Default)]
 pub struct ProbeBook {
-    /// Whether these probes ran under injected conditions (tests, emulated
-    /// networks). Carried into every measurement, so placement can refuse it.
     simulated: bool,
-    /// (height recorded at, probe), oldest first.
     probes: BTreeMap<[u8; 32], VecDeque<(u64, Probe)>>,
     counters: BTreeMap<[u8; 32], PathCounters>,
-    /// Loss over the last counter window of the current connection, per mille.
     transport_loss: BTreeMap<[u8; 32], u32>,
 }
 
@@ -246,10 +205,6 @@ impl ProbeBook {
         ring.push_back((at, probe));
     }
 
-    /// Record a counter snapshot. Returns the loss over the window since the
-    /// previous snapshot of the same connection, if there is one. A
-    /// reconnect discards the old connection's figure, since it says nothing
-    /// about the new one.
     pub fn record_counters(&mut self, worker: &Address, now: PathCounters) -> Option<u32> {
         let previous = self.counters.insert(worker.0, now);
         let loss = previous
@@ -262,16 +217,11 @@ impl ProbeBook {
             None if previous.map(|p| p.generation) != Some(now.generation) => {
                 self.transport_loss.remove(&worker.0);
             }
-            // Nothing sent in the window: the last figure still stands.
             None => {}
         }
         loss
     }
 
-    /// The link as placement sees it: the probes summarised pessimistically,
-    /// measured at the height of the newest probe, with the failure rate
-    /// raised to the transport's own windowed loss when that is worse.
-    /// `None` without a successful probe.
     pub fn link(&self, worker: &Address) -> Option<LinkMeasurement> {
         let ring = self.probes.get(&worker.0)?;
         let measured_at = ring.iter().map(|(at, _)| *at).max()?;
@@ -283,8 +233,6 @@ impl ProbeBook {
         Some(measurement)
     }
 
-    /// Drop everything about workers that left the member set. Returns how
-    /// many workers were dropped.
     pub fn retain_members(&mut self, members: &BTreeSet<[u8; 32]>) -> usize {
         let before = self.probes.len();
         self.probes.retain(|key, _| members.contains(key));
@@ -293,7 +241,6 @@ impl ProbeBook {
         before - self.probes.len()
     }
 
-    /// Probes held in total (the growth gauge).
     pub fn len(&self) -> usize {
         self.probes.values().map(VecDeque::len).sum()
     }
@@ -303,23 +250,17 @@ impl ProbeBook {
     }
 }
 
-/// Why a worker is out of placement for the rest of the epoch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Exclusion {
-    /// Exact arithmetic disagreed on a checked slice or row. The first
-    /// finding of the epoch is kept as evidence.
     Fault {
         certificate: Hash256,
         stage: usize,
         expected_digest: Hash256,
         found_digest: Hash256,
     },
-    /// This many consecutive calls failed, timed out or were refused.
     Failures(u32),
 }
 
-/// Exclusions and consecutive-failure counts for the current epoch: at most
-/// one of each per worker, all cleared when the epoch changes.
 #[derive(Debug)]
 pub struct Exclusions {
     epoch: u64,
@@ -336,8 +277,6 @@ impl Exclusions {
         }
     }
 
-    /// A different epoch lets every worker back in. Returns how many
-    /// exclusions ended.
     pub fn begin_epoch(&mut self, epoch: u64) -> usize {
         if epoch == self.epoch {
             return 0;
@@ -349,10 +288,6 @@ impl Exclusions {
         ended
     }
 
-    /// Record a finding of the verification plan. A fault by a worker
-    /// excludes it; the first fault of the epoch is the evidence kept.
-    /// Returns the worker excluded, or `None` for an agreement or a finding
-    /// against the coordinator itself.
     pub fn fault(&mut self, certificate: Hash256, finding: &Finding) -> Option<Address> {
         let Finding::Fault {
             stage,
@@ -373,9 +308,6 @@ impl Exclusions {
         Some(*worker)
     }
 
-    /// A call to `worker` failed, timed out or was refused. Returns true when
-    /// this failure excludes it (the [`FAILURES_BEFORE_EXCLUSION`]th in a
-    /// row).
     pub fn call_failed(&mut self, worker: &Address) -> bool {
         if self.excluded.contains_key(&worker.0) {
             return false;
@@ -393,14 +325,10 @@ impl Exclusions {
         true
     }
 
-    /// A call to `worker` succeeded: its run of failures is over.
     pub fn call_succeeded(&mut self, worker: &Address) {
         self.failures.remove(&worker.0);
     }
 
-    /// The worker's connection was re-established and answered: lift an
-    /// exclusion for repeated failures, never one for a fault. Returns
-    /// whether one was lifted.
     pub fn forgive_failures(&mut self, worker: &Address) -> bool {
         self.failures.remove(&worker.0);
         if matches!(self.excluded.get(&worker.0), Some(Exclusion::Failures(_))) {
@@ -418,8 +346,6 @@ impl Exclusions {
         self.excluded.get(&worker.0)
     }
 
-    /// Drop the entries of workers that left the member set. Returns how
-    /// many exclusions were dropped.
     pub fn retain_members(&mut self, members: &BTreeSet<[u8; 32]>) -> usize {
         let before = self.excluded.len();
         self.excluded.retain(|key, _| members.contains(key));
@@ -427,7 +353,6 @@ impl Exclusions {
         before - self.excluded.len()
     }
 
-    /// Exclusions plus failure counts held (the growth gauge).
     pub fn len(&self) -> usize {
         self.excluded.len() + self.failures.len()
     }
@@ -437,20 +362,14 @@ impl Exclusions {
     }
 }
 
-/// What a worker offers, whoever vouches for it: another validator's signed
-/// capability lease (options b and c of the trust model), or this operator's
-/// own configuration of its machines (option a).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Offer {
     pub worker: Address,
     pub transport_id: String,
     pub ram_headroom_bytes: u64,
-    /// A claimed rate caps the measured one. `None`: the measurement alone.
     pub claimed_macs_per_s: Option<u64>,
-    /// Layers the worker holds, from its signed lease. Empty: the whole model.
     pub resident_layers: Vec<(u32, u32)>,
     pub resident_output: bool,
-    /// The digest a certificate binds for this offer.
     pub digest: Hash256,
 }
 
@@ -468,17 +387,6 @@ impl Offer {
     }
 }
 
-/// Placement candidates from offers and the books. An offer becomes a
-/// candidate only when all of the following hold; one missing any of them
-/// is left out, never guessed:
-/// - its challenge measured a rate this epoch; the rate used is capped at
-///   the offer's claim, if it makes one
-/// - it has a successful probe
-/// - it has a free call slot, which becomes its `max_concurrency`
-/// - it is not excluded
-///
-/// Returns the candidates and the digests of the offers they came from,
-/// ready for [`crate::certificate::AssignmentCertificate::issue`].
 pub fn candidates_from(
     offers: impl IntoIterator<Item = Offer>,
     challenges: &ChallengeBook,
@@ -519,7 +427,6 @@ pub fn candidates_from(
     (out, digests)
 }
 
-/// [`candidates_from`] over the leases that still validate for this job.
 pub fn candidates(
     req: &LeaseRequirements<'_>,
     leases: &LeaseBook,

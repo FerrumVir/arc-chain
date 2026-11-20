@@ -1,18 +1,3 @@
-//! ARC Chain DAG-based consensus engine.
-//!
-//! Inspired by Mysticeti (Sui), this implements a sender-sharded DAG consensus
-//! where validators concurrently propose blocks that form a directed acyclic graph.
-//! Single-shard transactions use a fast path (no full ordering), while cross-shard
-//! transactions require full DAG ordering via the commit rule.
-//!
-//! # Commit Rule (Mysticeti-inspired)
-//!
-//! A block B in round R is committed when:
-//! 1. A block C in round R+1 references B as a parent.
-//! 2. Block C is itself referenced by >= 2f+1 stake-weighted blocks in round R+2.
-//!
-//! This provides two-round latency for commit finality.
-
 use arc_crypto::{Hash256, KeyPair, Signature as CryptoSignature};
 use arc_types::{Transaction, TxBody, strict_supermajority_threshold};
 use dashmap::DashMap;
@@ -32,38 +17,22 @@ pub mod view_change;
 pub use data_availability::*;
 pub use security::*;
 
-// ── Type Aliases ─────────────────────────────────────────────────────────────
-
-/// Address is a 256-bit hash derived from a public key.
 pub type Address = Hash256;
 
-// ── Stake Tier Thresholds ────────────────────────────────────────────────────
-
-/// Minimum stake to qualify as a Spark validator (can vote, cannot produce blocks).
 pub const STAKE_SPARK: u64 = 500_000;
 
-/// Minimum stake to qualify as an Arc validator (can produce blocks).
 pub const STAKE_ARC: u64 = 5_000_000;
 
-/// Minimum stake to qualify as a Core validator (priority producer, governance).
 pub const STAKE_CORE: u64 = 50_000_000;
-
-// ── Errors ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ConsensusError {
     #[error("invalid block: {0}")]
     InvalidBlock(String),
 
-    /// A parent this node does not hold yet. Not evidence against the block:
-    /// block validation is recursive, so this is an arrival-order fact about
-    /// the local DAG. Display text is unchanged from the untyped form.
     #[error("invalid block: block {hash} has {missing} missing or wrong-round parents")]
     MissingParents { hash: Hash256, missing: usize },
 
-    /// More than one round ahead of this node. Also a fact about the local
-    /// node rather than the block; the block may become acceptable once this
-    /// node has caught up by authenticated means.
     #[error(
         "invalid block: round {round} is too far ahead (current={current}); authenticated state sync required"
     )]
@@ -102,29 +71,18 @@ pub enum ConsensusError {
     #[error("cross-shard lock expired: {0}")]
     CrossShardLockExpired(String),
 
-    /// The block passed validation, but its caller could not make it durable.
-    /// It was not published into the DAG. The owning consensus loop must stop
-    /// because its durable writer may now be poisoned.
     #[error("history block persistence failed: {0}")]
     HistoryPersistence(String),
 }
 
-// ── Stake Tier ───────────────────────────────────────────────────────────────
-
-/// Validator stake tier determining capabilities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StakeTier {
-    /// 500K ARC -- can vote on blocks, cannot produce blocks.
     Spark,
-    /// 5M ARC -- can produce blocks and vote.
     Arc,
-    /// 50M ARC -- priority block producer, governance participation.
     Core,
 }
 
 impl StakeTier {
-    /// Determine the tier from a stake amount.
-    /// Returns `None` if the stake is below the minimum Spark threshold.
     pub fn from_stake(stake: u64) -> Option<Self> {
         if stake >= STAKE_CORE {
             Some(StakeTier::Core)
@@ -137,29 +95,20 @@ impl StakeTier {
         }
     }
 
-    /// Whether this tier can produce blocks.
     pub fn can_produce_blocks(&self) -> bool {
         matches!(self, StakeTier::Arc | StakeTier::Core)
     }
 
-    /// Whether this tier can participate in governance.
     pub fn can_govern(&self) -> bool {
         matches!(self, StakeTier::Core)
     }
 }
 
-// ── Slashing ────────────────────────────────────────────────────────────────
-
-/// Slash rate for Spark validators (10%).
 pub const SLASH_RATE_SPARK: u64 = 10;
-/// Slash rate for Arc validators (20%).
 pub const SLASH_RATE_ARC: u64 = 20;
-/// Slash rate for Core validators (30%).
 pub const SLASH_RATE_CORE: u64 = 30;
-/// Number of rounds a validator can miss before liveness fault.
 pub const LIVENESS_THRESHOLD: u64 = 100;
 
-/// Types of slashable offenses.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SlashableOffense {
     DoubleSigning,
@@ -168,7 +117,6 @@ pub enum SlashableOffense {
     EquivocationDAG,
 }
 
-/// Record of a slashing event.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SlashRecord {
     pub offense: SlashableOffense,
@@ -179,40 +127,23 @@ pub struct SlashRecord {
     pub slash_amount: u64,
 }
 
-// ── Equivocation Proof ──────────────────────────────────────────────────────
-
-/// Proof that a validator proposed two different blocks in the same round.
-/// Used as evidence for slashing.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EquivocationProof {
-    /// The equivocating validator's address.
     pub author: Address,
-    /// The round in which both blocks were proposed.
     pub round: u64,
-    /// Hash of the first block seen.
     pub block1_hash: Hash256,
-    /// Hash of the conflicting second block.
     pub block2_hash: Hash256,
 }
 
-// ── Validator ────────────────────────────────────────────────────────────────
-
-/// A validator in the ARC consensus network.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Validator {
-    /// Validator address (derived from public key).
     pub address: Address,
-    /// Amount of ARC staked.
     pub stake: u64,
-    /// Tier determined by stake amount.
     pub tier: StakeTier,
-    /// Assigned shard for sender-sharded consensus.
     pub shard_assignment: u16,
 }
 
 impl Validator {
-    /// Create a new validator with automatic tier assignment.
-    /// Returns `None` if stake is below the minimum Spark threshold.
     pub fn new(address: Address, stake: u64, shard_assignment: u16) -> Option<Self> {
         let tier = StakeTier::from_stake(stake)?;
         Some(Self {
@@ -246,27 +177,17 @@ fn checked_validator_total_stake(validators: &[Validator]) -> Result<u64, Consen
     Ok(total)
 }
 
-// ── Validator Set ────────────────────────────────────────────────────────────
-
-/// The set of active validators for an epoch.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ValidatorSet {
-    /// All validators in the set.
     pub validators: Vec<Validator>,
-    /// Sum of all validator stakes.
     pub total_stake: u64,
-    /// Current epoch number.
     pub epoch: u64,
-    /// Quorum threshold: the minimum stake strictly greater than 2/3 of the
-    /// total stake.
     pub quorum: u64,
     pub slashed_total: u64,
     pub slash_history: Vec<SlashRecord>,
 }
 
 impl ValidatorSet {
-    /// Create a new validator set for the given epoch.
-    /// Computes total stake and the strict >2/3 quorum threshold.
     pub fn new(validators: Vec<Validator>, epoch: u64) -> Self {
         let total_stake = checked_validator_total_stake(&validators)
             .unwrap_or_else(|err| panic!("invalid validator set: {err}"));
@@ -281,34 +202,24 @@ impl ValidatorSet {
         }
     }
 
-    /// Look up a validator by address.
     pub fn get_validator(&self, address: &Address) -> Option<&Validator> {
         self.validators.iter().find(|v| v.address == *address)
     }
 
-    /// Check if an address belongs to a validator in the set.
     pub fn is_validator(&self, address: &Address) -> bool {
         self.get_validator(address).is_some()
     }
 
-    /// Check if an address is a block-producing validator (Arc or Core tier).
     pub fn can_produce_blocks(&self, address: &Address) -> bool {
         self.get_validator(address)
             .map(|v| v.tier.can_produce_blocks())
             .unwrap_or(false)
     }
 
-    /// Compute the fault tolerance threshold f.
-    /// In BFT: n = 3f + 1, so f = (n-1)/3 in terms of validators.
-    /// For stake-weighted: f = floor((total_stake - 1) / 3)
-    /// The quorum is total_stake - f and is strictly greater than 2/3 stake.
     pub fn fault_tolerance_stake(&self) -> u64 {
-        // f such that quorum = total_stake - f
         self.total_stake.saturating_sub(self.quorum)
     }
 
-    /// Compute the total stake for a given set of validator addresses.
-    /// Unknown and duplicate addresses are skipped.
     pub fn stake_for_addresses(&self, addresses: &[Address]) -> u64 {
         let mut seen = HashSet::with_capacity(addresses.len());
         addresses
@@ -319,22 +230,18 @@ impl ValidatorSet {
             .expect("unique validator stake cannot exceed checked total stake")
     }
 
-    /// Check if a set of validator addresses reaches quorum.
     pub fn has_quorum(&self, addresses: &[Address]) -> bool {
         self.stake_for_addresses(addresses) >= self.quorum
     }
 
-    /// Number of validators.
     pub fn len(&self) -> usize {
         self.validators.len()
     }
 
-    /// Whether the validator set is empty.
     pub fn is_empty(&self) -> bool {
         self.validators.is_empty()
     }
 
-    /// Get all validators that can produce blocks.
     pub fn block_producers(&self) -> Vec<&Validator> {
         self.validators
             .iter()
@@ -342,12 +249,10 @@ impl ValidatorSet {
             .collect()
     }
 
-    /// Get a mutable reference to a validator by address.
     pub fn get_validator_mut(&mut self, address: &Address) -> Option<&mut Validator> {
         self.validators.iter_mut().find(|v| v.address == *address)
     }
 
-    /// Get the slash rate for a given tier.
     pub fn slash_rate(tier: &StakeTier) -> u64 {
         match tier {
             StakeTier::Spark => SLASH_RATE_SPARK,
@@ -356,7 +261,6 @@ impl ValidatorSet {
         }
     }
 
-    /// Report a slashable offense and apply the penalty.
     pub fn report_offense(
         &mut self,
         offender: Address,
@@ -393,9 +297,6 @@ impl ValidatorSet {
         Ok(record)
     }
 
-    /// Actually reduce a validator's stake and recalculate totals.
-    /// If the validator drops below the minimum stake threshold (STAKE_SPARK),
-    /// they are removed from the validator set.
     pub fn apply_slash(&mut self, offender: &Address, slash_amount: u64) {
         let mut removed = false;
         if let Some(validator) = self.validators.iter_mut().find(|v| v.address == *offender) {
@@ -408,7 +309,6 @@ impl ValidatorSet {
                 );
                 removed = true;
             } else {
-                // Recalculate tier
                 validator.tier = StakeTier::from_stake(validator.stake).unwrap_or(StakeTier::Spark);
                 info!(
                     address = %offender,
@@ -421,18 +321,12 @@ impl ValidatorSet {
         if removed {
             self.validators.retain(|v| v.address != *offender);
         }
-        // Recalculate total stake and quorum
         self.total_stake = checked_validator_total_stake(&self.validators)
             .expect("slashing cannot overflow or duplicate validator stake");
         self.quorum = strict_supermajority_threshold(self.total_stake);
     }
 }
 
-// ── DAG Block ────────────────────────────────────────────────────────────────
-
-/// Exact protocol-v3 recovery domain for DAG proposals and votes. Keeping the
-/// fields explicit makes status/audit output meaningful while `domain_hash`
-/// binds chain ID, genesis, recovery epoch, validator set, and protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsensusDomain {
     pub domain_hash: Hash256,
@@ -450,33 +344,19 @@ impl ConsensusDomain {
     }
 }
 
-/// A block in the DAG. Each validator proposes one block per round,
-/// referencing parent blocks from the previous round.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DagBlock {
-    /// Block author (validator address).
     pub author: Address,
-    /// DAG round number.
     pub round: u64,
-    /// Parent block hashes from round - 1.
     pub parents: Vec<Hash256>,
-    /// Transaction hashes included in this block.
     pub transactions: Vec<Hash256>,
-    /// Block creation timestamp (unix millis).
     pub timestamp: u64,
-    /// BLAKE3 hash of the block contents.
     pub hash: Hash256,
-    /// Author's signature over the block hash.
     pub signature: Vec<u8>,
-    /// MEV Protection: BLAKE3 commitment over canonically-sorted tx hashes.
-    /// Validators verify that `ordering_commitment == BLAKE3(sorted_tx_hashes)`
-    /// where sorted means lexicographic order by tx hash bytes. This removes
-    /// proposer discretion over transaction ordering entirely, preventing MEV.
     pub ordering_commitment: Hash256,
 }
 
 impl DagBlock {
-    /// Compute the hash of this block's contents (excluding hash and signature fields).
     pub fn compute_hash(&self) -> Hash256 {
         let mut hasher = blake3::Hasher::new_derive_key("ARC-dag-block-v1");
         hasher.update(self.author.as_ref());
@@ -492,8 +372,6 @@ impl DagBlock {
         Hash256(*hasher.finalize().as_bytes())
     }
 
-    /// Protocol-v3 DAG hash. A block signed in one recovery epoch or
-    /// validator-set domain is invalid in every other domain.
     pub fn compute_hash_in_domain(&self, domain: &ConsensusDomain) -> Hash256 {
         let mut hasher = blake3::Hasher::new_derive_key("ARC-dag-block-v3");
         hasher.update(domain.domain_hash.as_ref());
@@ -512,20 +390,10 @@ impl DagBlock {
         Hash256(*hasher.finalize().as_bytes())
     }
 
-    /// Commit one exact recovery-domain DAG decision into the canonical state
-    /// block produced for it.
-    ///
-    /// The DAG hash already binds author, parents, transaction hashes,
-    /// timestamp, and ordering. Repeating the recovery domain and round here
-    /// gives the state layer a purpose-specific commitment which cannot be
-    /// replayed across chains, recovery epochs, validator sets, or DAG rounds.
     pub fn state_decision_commitment(&self, domain: &ConsensusDomain) -> Hash256 {
         Self::decision_commitment(domain, &self.hash, self.round)
     }
 
-    /// `state_decision_commitment` for an anchor known only by hash and
-    /// round - how a checkpoint's resume point is checked against the
-    /// certified header that carries it.
     pub fn decision_commitment(domain: &ConsensusDomain, anchor: &Hash256, round: u64) -> Hash256 {
         let mut hasher = blake3::Hasher::new_derive_key("ARC-dag-state-decision-v3");
         hasher.update(domain.domain_hash.as_ref());
@@ -536,14 +404,6 @@ impl DagBlock {
         Hash256(*hasher.finalize().as_bytes())
     }
 
-    /// Compute the ordering commitment for a list of transaction hashes.
-    /// This is BLAKE3 over the concatenated tx hashes in **canonical lexicographic
-    /// order**. Validators recompute this commitment by sorting the block's
-    /// transactions lexicographically and comparing - any deviation proves the
-    /// proposer reordered transactions (MEV extraction attempt).
-    ///
-    /// The input `transactions` slice MUST already be sorted lexicographically
-    /// by `Hash256` bytes; callers are responsible for sorting before calling.
     pub fn compute_ordering_commitment(transactions: &[Hash256]) -> Hash256 {
         let mut hasher = blake3::Hasher::new_derive_key("ARC-ordering-commitment-v1");
         for tx in transactions {
@@ -552,7 +412,6 @@ impl DagBlock {
         Hash256(*hasher.finalize().as_bytes())
     }
 
-    /// Verify that the stored hash matches the computed hash.
     pub fn verify_hash(&self) -> bool {
         self.hash == self.compute_hash()
     }
@@ -561,47 +420,24 @@ impl DagBlock {
         self.hash == self.compute_hash_in_domain(domain)
     }
 
-    /// Verify that the block's transactions are in canonical lexicographic order
-    /// and that the ordering commitment matches this canonical ordering.
-    ///
-    /// Returns `true` only if:
-    /// 1. The transactions are sorted lexicographically by hash bytes.
-    /// 2. The ordering commitment equals `BLAKE3(sorted_tx_hashes)`.
-    ///
-    /// This prevents MEV extraction: a proposer cannot reorder transactions
-    /// because validators independently verify the canonical sort.
     pub fn verify_ordering(&self) -> bool {
-        // Check that the block's transactions are actually in sorted order
         let is_sorted = self.transactions.windows(2).all(|w| w[0].0 <= w[1].0);
         if !is_sorted {
             return false;
         }
-        // Verify commitment matches the (already-sorted) transaction list
         self.ordering_commitment == Self::compute_ordering_commitment(&self.transactions)
     }
 }
 
-// ── Cross-Shard Receipt ──────────────────────────────────────────────────────
-
-/// Receipt proving a cross-shard transfer was committed on the source shard.
-/// The destination shard uses this receipt to credit the recipient.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CrossShardReceipt {
-    /// Source shard ID.
     pub source_shard: u16,
-    /// Block hash on the source shard containing the transaction.
     pub source_block: Hash256,
-    /// Hash of the original transaction.
     pub tx_hash: Hash256,
-    /// Transfer amount.
     pub amount: u64,
-    /// Recipient address on the destination shard.
     pub recipient: Address,
 }
 
-// ── Cross-Shard Execution Proofs ────────────────────────────────────────────
-
-/// Status of a cross-shard transaction.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CrossShardStatus {
     Locked,
@@ -609,7 +445,6 @@ pub enum CrossShardStatus {
     Aborted,
 }
 
-/// Proof of a cross-shard transaction's state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CrossShardProof {
     pub tx_hash: Hash256,
@@ -620,234 +455,86 @@ pub struct CrossShardProof {
     pub status: CrossShardStatus,
     pub lock_hash: Hash256,
     pub inclusion_proof: Vec<u8>,
-    /// Timestamp when the lock was acquired (unix millis).
-    /// Used for deadlock prevention - locks older than CROSS_SHARD_LOCK_TIMEOUT_MS
-    /// are automatically expired to prevent indefinite lock-holding.
     pub locked_at_ms: u64,
-    /// Consensus round when the lock was acquired.
-    /// Used alongside `locked_at_ms` for round-based expiry that is immune
-    /// to wall-clock skew.
     pub locked_at_round: u64,
 }
 
-// ── Finality Proof (A8: Light Client Finality Proofs) ────────────────────────
-
-/// Structural container reserved for a future canonical finality-signing
-/// protocol. Stake arithmetic alone does not authenticate its signatures.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FinalityProof {
-    /// Hash of the finalized block.
     pub block_hash: Hash256,
-    /// DAG round number.
     pub round: u64,
-    /// Block height (sequential number for the committed chain).
     pub height: u64,
-    /// Quorum signatures: (validator_address, signature_bytes).
-    /// Must represent strictly more than 2/3 of total stake.
     pub quorum_signatures: Vec<(Address, Vec<u8>)>,
-    /// Total stake that signed.
     pub signing_stake: u64,
-    /// Total stake in the validator set at the time.
     pub total_stake: u64,
 }
 
 impl FinalityProof {
-    /// Check only the structural stake threshold (>2/3 total). This does not
-    /// verify signature identities or signed-message binding.
     pub fn has_sufficient_stake(&self) -> bool {
         let quorum = strict_supermajority_threshold(self.total_stake);
         self.signing_stake >= quorum
     }
 }
 
-// ── DAG Pruning ─────────────────────────────────────────────────────────────
-
-/// Number of rounds to keep for reorg safety during DAG pruning.
 pub const PRUNE_DEPTH: u64 = 100;
 
-/// Finality certificates retained below the highest held height.
-///
-/// Twice the default DAG retention, and far above any snapshot interval, so a
-/// checkpoint can always be served from a recent snapshot's certificate.
 pub const DEFAULT_RETAINED_FINALITY_HEIGHTS: u64 = 8192;
 
-/// Certificates are pruned once every this many heights rather than on every
-/// insert, so the O(n) retain stays off the per-block path.
 const FINALITY_PRUNE_EVERY: u64 = 256;
 
-/// Default number of DAG rounds retained below the commit cursor.
-///
-/// This is the operator-facing meaning of DAG retention: **how far behind a
-/// validator may fall and still rejoin by authenticated history transfer**.
-/// Beyond it, its peers no longer hold the rounds it needs and it requires an
-/// authenticated checkpoint instead - a different trust boundary.
-///
-/// It is a resource choice, not a safety one: every block a rejoining node
-/// receives is validated exactly as if it had arrived live, so retaining more
-/// history relaxes nothing. At six validators and a few hundred bytes per
-/// block this is single-digit megabytes.
-///
-/// `PRUNE_DEPTH` remains the reorg-safety floor; retention can never go below
-/// it.
 pub const DEFAULT_RETAINED_ROUNDS: u64 = 4_096;
 
-/// Rounds of local security-detector history the engine retains.
-///
-/// `WithholdingDetector` and `StakeTracker` are appended on every accepted
-/// block, so without a bound their per-round maps grow for the whole life of
-/// the process. The widest consumer window is
-/// `WithholdingDetector::detect_withholding(100)` (`detect_double_voting` only
-/// reads the current round), so this keeps at least 9x that window resident.
-///
-/// The trigger is NOT once every `PRUNE_DEPTH` rounds. It fires once per
-/// accepted block whose round is a multiple of `PRUNE_DEPTH` -- that is, once
-/// per proposing validator on each such round -- and each firing performs an
-/// O(retained) `retain` over the full map. Budget O(V * retained) work on a
-/// trigger round, where V is the number of validators that proposed in it.
 pub const SECURITY_HISTORY_DEPTH: u64 = 10 * PRUNE_DEPTH;
 
-// ── Cross-Shard Lock Timeout ─────────────────────────────────────────────────
-
-/// Maximum time a cross-shard lock can be held before automatic expiry (30 seconds).
 const CROSS_SHARD_LOCK_TIMEOUT_MS: u64 = 30_000;
 
-// ── Propose-Verify Protocol ──────────────────────────────────────────────────
-
-/// Role of this node in the propose-verify protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeRole {
-    /// Proposer: executes transactions and produces state diffs.
     Proposer,
-    /// Verifier: applies state diffs and verifies roots match.
     Verifier,
-    /// Full: both proposes and verifies (default, backward compatible).
     Full,
 }
 
-// ── Consensus Engine ─────────────────────────────────────────────────────────
-
-/// The core DAG-based consensus engine.
-///
-/// Validators propose blocks concurrently, forming a DAG. Blocks are committed
-/// when they satisfy the two-round commit rule (Mysticeti-inspired).
 pub struct ConsensusEngine {
-    /// All known DAG blocks, indexed by hash.
     dag: DashMap<Hash256, DagBlock>,
-    /// Index: round number -> block hashes in that round.
     rounds: DashMap<u64, Vec<Hash256>>,
-    /// Committed block hashes in finalized order.
     committed: RwLock<Vec<Hash256>>,
-    /// Last DAG round that produced a committed chain block.
-    /// try_commit only looks at last_committed_round + 1, ensuring
-    /// all nodes commit rounds in the same sequential order.
     last_committed_round: AtomicU64,
-    /// Current DAG round.
     current_round: AtomicU64,
-    /// Active validator set (updated live by PeerConnected - used for
-    /// block acceptance and round advancement only).
     validator_set: RwLock<ValidatorSet>,
-    /// Frozen validator set for leader selection and commit decisions.
-    /// Updated ONLY at epoch boundaries. All nodes freeze the same set
-    /// at the same height → deterministic leader selection → same chain.
     frozen_validator_set: RwLock<ValidatorSet>,
-    /// Validators queued for the next epoch (from PeerConnected).
     pending_validators: RwLock<Vec<Validator>>,
-    /// This node's validator address.
     local_address: Address,
-    /// This node's signing keypair for block proposals.
-    /// None only in legacy test mode - production always has a keypair.
     local_keypair: Option<KeyPair>,
-    /// Testnet mode may suppress punitive slashing. Membership, round-jump,
-    /// and parent-quorum validation remain strict.
     testnet_mode: bool,
-    /// Registered validator public keys: address -> Ed25519 verifying key bytes.
     validator_keys: DashMap<Address, [u8; 32]>,
-    /// Equivocation detector: (author, round) → first block hash seen.
-    /// If a second block from the same author in the same round arrives,
-    /// legacy mode may slash it; a recovery domain preserves fixed authority
-    /// and fences any ambiguously certified leader round instead.
     author_round_blocks: DashMap<(Address, u64), Hash256>,
-    /// Data availability commitments.
     pub da_commitments: DashMap<Hash256, data_availability::DACommitment>,
-    /// Pending cross-shard locks.
     pub pending_cross_shard: DashMap<Hash256, CrossShardProof>,
-    /// Completed cross-shard proofs.
     pub completed_cross_shard: DashMap<Hash256, CrossShardProof>,
-    /// Finality proofs: block_hash -> FinalityProof. Kept empty until a
-    /// canonical finality-signing transcript is implemented.
     finality_proofs: DashMap<Hash256, FinalityProof>,
-    /// Liveness: when the current round started (for proposer failover).
     round_start: RwLock<std::time::Instant>,
-    /// Set to `true` after `force_advance_round()` for diagnostics. It never
-    /// relaxes parent membership or quorum checks. Cleared after a successful
-    /// normal `advance_round()`.
     force_advanced: std::sync::atomic::AtomicBool,
-    /// Tracks expected vs received blocks to detect withholding attacks.
     withholding_detector: parking_lot::Mutex<WithholdingDetector>,
-    /// Stores only externally certified checkpoints. It remains empty until
-    /// canonical state-root checkpoint signatures are collected.
     checkpoint_registry: parking_lot::Mutex<CheckpointRegistry>,
-    /// Tracks validator votes to detect double-voting (nothing-at-stake).
     stake_tracker: parking_lot::Mutex<StakeTracker>,
-    /// This node's role in the propose-verify protocol.
     node_role: NodeRole,
-    /// `None` preserves legacy DAG hashes. ARCCHKPT activation installs this
-    /// before any proposal, receive, or local-WAL cursor restoration.
     consensus_domain: RwLock<Option<ConsensusDomain>>,
-    /// First DAG round in a recovered consensus domain. The signed recovery
-    /// manifest certifies the source cursor, so `source_round + 1` is the one
-    /// and only non-zero round allowed to start without legacy DAG parents.
-    /// Ordinary parent rules apply to every later round; retaining this value
-    /// also permits strict replay of late bootstrap-round blocks after restart.
-    /// Domain that absence and finality transcripts are signed under.
-    ///
-    /// Separate from `consensus_domain` on purpose. `consensus_domain` is the
-    /// protocol-v3 RECOVERY domain, and its presence also switches on the
-    /// all-validator participation guard. Certificates need domain separation
-    /// on every chain, including a plain from-genesis one that has no recovery
-    /// context, so they carry their own binding.
     certificate_domain: RwLock<Option<ConsensusDomain>>,
-    /// Verified absence certificates, keyed by exact round and member. This
-    /// map is the sole authority for relaxing full participation; a local
-    /// persisted observation is not a quorum certificate. It does not affect
-    /// the commit rule or refuse late blocks.
     skip_certificates: DashMap<(u64, Address), view_change::SkipCertificate>,
-    /// Verified committed-block finality certificates, by height.
     finality_certificates: DashMap<u64, view_change::FinalityCertificate>,
-    /// Highest height with a held finality certificate.
     highest_finalized_height: AtomicU64,
-    /// Heights of finality certificates retained below the highest one.
     retained_finality_heights: AtomicU64,
-    /// How many rounds of DAG history this node keeps below the commit cursor.
-    /// See [`DEFAULT_RETAINED_ROUNDS`].
     retained_rounds: AtomicU64,
     recovery_bootstrap_round: RwLock<Option<u64>>,
-    /// A restarted node's single parentless round: its own durable commit
-    /// cursor, while it rebuilds its DAG from peers. See
-    /// [`Self::set_restart_base_round`].
     restart_base_round: RwLock<Option<u64>>,
-    /// The highest round restored from this node's own durable DAG record.
-    /// Nothing is proposed at or below it after a restart: the node may have
-    /// signed a block there that no peer ever received and that its empty
-    /// DAG no longer remembers.
     proposal_floor: AtomicU64,
-    /// True while the node rebuilds its DAG from peers (after a restart or a
-    /// late join). Reported so ingress can refuse work it cannot propose yet.
     dag_bootstrapping: std::sync::atomic::AtomicBool,
-    /// First retained round in an independently pinned, content-addressed local
-    /// recovery generation. Its missing parents are covered by that durable
-    /// checkpoint boundary only while startup replay is explicitly active.
     local_recovery_boundary_round: RwLock<Option<u64>>,
     local_recovery_replay_active: std::sync::atomic::AtomicBool,
 }
 
 impl ConsensusEngine {
-    /// Create a new consensus engine with a signing keypair.
-    ///
-    /// # Arguments
-    /// * `validator_set` - The initial validator set for this epoch.
-    /// * `local_address` - This node's validator address.
-    /// * `local_keypair` - This node's signing keypair for block proposals.
     pub fn new_with_keypair(
         validator_set: ValidatorSet,
         local_address: Address,
@@ -901,9 +588,6 @@ impl ConsensusEngine {
         }
     }
 
-    /// Create a consensus engine without a signing keypair (legacy/test mode).
-    /// Strict validation: rejects blocks from unknown validators, requires
-    /// quorum parents, enables slashing.
     pub fn new(validator_set: ValidatorSet, local_address: Address) -> Self {
         info!(
             epoch = validator_set.epoch,
@@ -953,9 +637,6 @@ impl ConsensusEngine {
         }
     }
 
-    /// Create a consensus engine in testnet mode. Consensus membership, round,
-    /// and parent-quorum checks remain strict; only punitive slashing behavior
-    /// may be suppressed for explicit test deployments.
     pub fn new_testnet(validator_set: ValidatorSet, local_address: Address) -> Self {
         info!(
             epoch = validator_set.epoch,
@@ -967,9 +648,6 @@ impl ConsensusEngine {
         engine
     }
 
-    /// Create a testnet-mode engine with a signing keypair. Testnet mode may
-    /// suppress slashing, but retains membership, round-jump, and parent-quorum
-    /// validation.
     pub fn new_testnet_with_keypair(
         validator_set: ValidatorSet,
         local_address: Address,
@@ -980,15 +658,11 @@ impl ConsensusEngine {
         engine
     }
 
-    /// Register a validator's public key for signature verification.
     pub fn register_validator_key(&self, address: Address, ed25519_pubkey: [u8; 32]) {
         self.validator_keys.insert(address, ed25519_pubkey);
         debug!(%address, "Registered validator public key");
     }
 
-    /// Install the exact recovery domain before this engine observes any DAG
-    /// state. Rebinding a live engine would make its existing signatures
-    /// ambiguous and is therefore rejected.
     pub fn install_consensus_domain(&self, domain: ConsensusDomain) -> Result<(), ConsensusError> {
         let mut active = self.consensus_domain.write();
         if let Some(existing) = active.as_ref() {
@@ -1007,9 +681,6 @@ impl ConsensusEngine {
                 "consensus recovery domain must be installed before DAG/cursor recovery".into(),
             ));
         }
-        // Check both bindings before publishing the recovery domain. A
-        // conflicting certificate domain must never leave the engine signing
-        // certificates for one epoch and accepting DAG blocks for another.
         self.install_certificate_domain(domain)?;
         *active = Some(domain);
         Ok(())
@@ -1019,13 +690,6 @@ impl ConsensusEngine {
         *self.consensus_domain.read()
     }
 
-    /// Install the cursor certified by an ARCCHKPT manifest.
-    ///
-    /// Recovery creates a new domain-separated DAG epoch. Legacy rounds do not
-    /// have hashes in that domain, so the first recovered round is deliberately
-    /// parentless. This exception is restricted to exactly
-    /// `source_consensus_round + 1` and can only be installed on an empty,
-    /// already-domain-bound engine.
     pub fn install_recovery_cursor(
         &self,
         source_consensus_round: u64,
@@ -1061,8 +725,6 @@ impl ConsensusEngine {
         }
 
         self.current_round.store(bootstrap_round, Ordering::SeqCst);
-        // This cursor means every legacy round is finalized by the signed
-        // recovery decision; try_commit must begin with the new-domain round.
         self.last_committed_round
             .store(bootstrap_round, Ordering::SeqCst);
         *active = Some(bootstrap_round);
@@ -1070,13 +732,6 @@ impl ConsensusEngine {
         Ok(bootstrap_round)
     }
 
-    /// Move an otherwise-empty recovered engine to an independently pinned
-    /// local generation boundary before replaying its bounded DAG window.
-    /// The generation manifest is verified by the node against the active
-    /// ARCCHKPT domain, validator-set commitment, and canonical state anchor
-    /// before this method is called. Network input is not started until
-    /// [`Self::finish_recovery_generation_replay`] closes the one-round parent
-    /// exception.
     pub fn install_recovery_generation_cursor(
         &self,
         retention_floor_round: u64,
@@ -1122,9 +777,6 @@ impl ConsensusEngine {
         Ok(())
     }
 
-    /// Close the local generation boundary before any transport task starts.
-    /// After this point every newly received block, including a late block at
-    /// the retained floor round, must satisfy ordinary parent availability.
     pub fn finish_recovery_generation_replay(&self) -> Result<(), ConsensusError> {
         if !self
             .local_recovery_replay_active
@@ -1137,40 +789,10 @@ impl ConsensusEngine {
         Ok(())
     }
 
-    /// Whether `round` is the exact parentless genesis round of the active
-    /// recovered DAG domain.
     pub fn is_recovery_bootstrap_round(&self, round: u64) -> bool {
         self.recovery_bootstrap_round.read().as_ref() == Some(&round)
     }
 
-    /// Let a restarted node rebuild its DAG from its own durable commit
-    /// cursor instead of from round 0.
-    ///
-    /// After a restart the DAG is empty and block validation is recursive:
-    /// a block at round R needs its parents at R-1, which bottoms out only at
-    /// round 0. So a restarted node used to ask peers for history from round
-    /// 0 - and once the chain ran past the DAG retention window, peers had
-    /// pruned it. They served their oldest retained rounds instead, all below
-    /// the node's own commit cursor, the node refused each batch as adding
-    /// nothing, and it never rejoined. Measured in a fault-free-until-then
-    /// run: killed at round 4291 with 4096 rounds retained, refused 38
-    /// batches, never caught up.
-    ///
-    /// Nothing below the cursor is needed. Every round under it is already
-    /// decided by this node's own durable record - its canonical blocks are
-    /// applied and the commit scan starts at the cursor - and deciding the
-    /// anchors at and above it needs only blocks at and above it: support for
-    /// the anchor at `r` comes from round `r + 1`, and the retroactive rule
-    /// only walks back to anchors not yet decided, all at or above the
-    /// cursor. So exactly one round, the cursor itself, is admitted without
-    /// its parents being present; every block in it must still be signed by
-    /// a committee member and carry a well-formed parent list, and every
-    /// later round is validated normally. A block forged at that round cannot
-    /// become canonical: committing it would need quorum support from honest
-    /// blocks in the next round, which only reference blocks they validated.
-    ///
-    /// Only on an empty DAG, only at the restored commit cursor, and never on
-    /// a recovery-domain engine, which has its own signed bootstrap.
     pub fn set_restart_base_round(&self, round: u64) -> Result<(), ConsensusError> {
         if round == 0
             || !self.dag.is_empty()
@@ -1187,35 +809,23 @@ impl ConsensusEngine {
         Ok(())
     }
 
-    /// Mark the DAG bootstrap as running or finished (the consensus manager
-    /// owns the bootstrap and sets this).
     pub fn set_dag_bootstrapping(&self, active: bool) {
         self.dag_bootstrapping.store(active, Ordering::SeqCst);
     }
 
-    /// True while this node is rebuilding its DAG from peers. It cannot
-    /// propose until that finishes, so work submitted to it would sit here.
     pub fn dag_bootstrapping(&self) -> bool {
         self.dag_bootstrapping.load(Ordering::SeqCst)
     }
 
-    /// The restart base round, while it is still open.
     pub fn restart_base_round(&self) -> Option<u64> {
         let base = (*self.restart_base_round.read())?;
         self.is_restart_base_round(base).then_some(base)
     }
 
-    /// Close the restart base round: from here on every block, including a
-    /// late one at that round, needs its parents present.
     pub fn close_restart_base_round(&self) {
         *self.restart_base_round.write() = None;
     }
 
-    /// The retained DAG block whose decision commitment is `proof_hash`, as
-    /// (hash, round): the anchor that produced a canonical block, found from
-    /// that block's header. Used to state a checkpoint's resume point; the
-    /// receiver checks it against the certified header, so nothing here is
-    /// trusted. A linear scan of the retained DAG - fine for a rare request.
     pub fn find_committed_anchor(
         &self,
         proof_hash: &Hash256,
@@ -1227,10 +837,6 @@ impl ConsensusEngine {
             .map(|entry| (entry.value().hash, entry.value().round))
     }
 
-    /// Whether [`Self::rebase_to`] would accept `anchor_round`, without
-    /// changing anything: the node asks before it writes the checkpoint to
-    /// its WAL, so a refusal can never leave state and cursor apart.
-    /// Returns the commit cursor the rebase would set.
     pub fn check_rebase(&self, anchor_round: u64) -> Result<u64, ConsensusError> {
         let cursor = anchor_round.checked_add(1).ok_or_else(|| {
             ConsensusError::InvalidBlock("checkpoint anchor round overflows".into())
@@ -1248,14 +854,6 @@ impl ConsensusEngine {
         Ok(cursor)
     }
 
-    /// Move to the DAG position of an adopted checkpoint.
-    ///
-    /// Everything this node held below it is irrelevant - the checkpoint's
-    /// state already includes every decision up to `anchor_round` - so the DAG
-    /// is cleared, the commit cursor becomes `anchor_round + 1`, and the
-    /// restart base round opens there so the DAG can be rebuilt from peers as
-    /// after any restart. The proposal floor is raised to the round this node
-    /// had reached: it may already have signed blocks up to there.
     pub fn rebase_to(&self, anchor_round: u64) -> Result<u64, ConsensusError> {
         let cursor = self.check_rebase(anchor_round)?;
         let reached = self.current_round.load(Ordering::SeqCst);
@@ -1274,27 +872,15 @@ impl ConsensusEngine {
         Ok(cursor)
     }
 
-    /// True for the open restart base round. It closes by itself once the
-    /// commit cursor is past it, when nothing at that round can matter.
     fn is_restart_base_round(&self, round: u64) -> bool {
         self.restart_base_round.read().as_ref() == Some(&round)
             && self.last_committed_round.load(Ordering::SeqCst) <= round.saturating_add(1)
     }
 
-    /// Recovery-domain v3 pauses unless every fixed positive-stake validator
-    /// has contributed to the round, EXCEPT where an authenticated absence
-    /// certificate excuses one for that round (`is_excused_for_round`). The
-    /// certificate is the signed replacement this guard was waiting for:
-    /// advancing on a bare quorum could permanently skip an offline
-    /// validator's leader round, advancing on a certificate cannot.
     pub fn requires_full_round_participation(&self) -> bool {
         self.consensus_domain.read().is_some()
     }
 
-    /// Whether the unique authors in a round satisfy stake quorum and the
-    /// recovery-domain absence-certificate rule. This is shared by round
-    /// advancement, block validation, and the node's pre-drain proposal gate
-    /// so those paths cannot disagree about a certified missing parent.
     fn round_participation_satisfies_quorum(
         &self,
         validator_set: &ValidatorSet,
@@ -1314,9 +900,6 @@ impl ConsensusEngine {
                     }))
     }
 
-    /// Check whether `round` contains enough authenticated parent authors for
-    /// the next proposal. Certified absences satisfy only the fixed-member
-    /// participation rule; they never contribute stake toward quorum.
     pub fn has_quorum_parents_for_round(&self, round: u64) -> bool {
         let validator_set = self.validator_set.read();
         let mut authors = HashSet::new();
@@ -1334,20 +917,14 @@ impl ConsensusEngine {
         self.round_participation_satisfies_quorum(&validator_set, round, &authors, stake)
     }
 
-    /// Get the current round number.
     pub fn current_round(&self) -> u64 {
         self.current_round.load(Ordering::SeqCst)
     }
 
-    /// Get the last committed round number.
     pub fn last_committed_round(&self) -> u64 {
         self.last_committed_round.load(Ordering::SeqCst)
     }
 
-    /// Restore round cursors from this node's authenticated local WAL.
-    ///
-    /// Network messages must never call this method. Remote round hints do not
-    /// prove skipped leader decisions or committed history.
     pub fn restore_round_from_local_wal(&self, round: u64, committed: u64) {
         if committed > round {
             warn!(
@@ -1357,10 +934,6 @@ impl ConsensusEngine {
             return;
         }
         let current = self.current_round.load(Ordering::SeqCst);
-        // The restored round may hold this node's own last proposal - signed,
-        // fsynced, and perhaps never received by anyone. After a restart the
-        // DAG is empty, so the duplicate check below would not see it, and a
-        // second, different block for that round would be an equivocation.
         self.proposal_floor.fetch_max(round, Ordering::SeqCst);
         if round > current {
             self.current_round.store(round, Ordering::SeqCst);
@@ -1374,11 +947,6 @@ impl ConsensusEngine {
         }
     }
 
-    /// Reconstruct exactly one canonical decision from the authenticated local
-    /// recovery DAG. This shares the live commit rule, so absent leader rounds
-    /// are passed only when a later certified anchor's causal history decides
-    /// them. Absence certificates by themselves never authorize a commit skip.
-    /// No live pruning/slashing runs while startup is validating the history.
     pub fn restore_next_recovery_commit_from_local_wal(&self) -> Result<DagBlock, ConsensusError> {
         if self.consensus_domain.read().is_none()
             || !self.local_recovery_replay_active.load(Ordering::SeqCst)
@@ -1397,8 +965,6 @@ impl ConsensusEngine {
             })
     }
 
-    /// Match a durable commit record against the next actual consensus
-    /// decision. Startup aborts on any mismatch before networking can start.
     pub fn restore_recovery_commit_from_local_wal(
         &self,
         block_hash: Hash256,
@@ -1413,10 +979,6 @@ impl ConsensusEngine {
         Ok(self.last_committed_round())
     }
 
-    /// Record an unauthenticated peer round hint without mutating consensus
-    /// state. A future state-sync protocol may use the hint to request a
-    /// checkpoint, but only verified checkpoint/quorum evidence can move the
-    /// round or commit cursors.
     pub fn observe_untrusted_round_hint(&self, round: u64, committed: u64) {
         debug!(
             hinted_round = round,
@@ -1427,12 +989,10 @@ impl ConsensusEngine {
         );
     }
 
-    /// Get the frozen validator set (used for leader selection and commit decisions).
     pub fn frozen_validator_set(&self) -> parking_lot::RwLockReadGuard<'_, ValidatorSet> {
         self.frozen_validator_set.read()
     }
 
-    /// Queue a validator for the next epoch.
     pub fn queue_validator(&self, validator: Validator) {
         let mut pending = self.pending_validators.write();
         if !pending.iter().any(|v| v.address == validator.address) {
@@ -1440,22 +1000,13 @@ impl ConsensusEngine {
         }
     }
 
-    /// Transition to a new epoch: freeze the current validator set + pending.
-    /// All nodes call this at the same committed height → deterministic.
-    /// Uses clone + swap to avoid holding write lock during merge (prevents
-    /// deadlock with RPC threads reading frozen_validator_set).
     pub fn freeze_epoch(&self) {
-        // Clone data under short read locks
         let (validators, pending, old_epoch) = {
             let vs = self.validator_set.read();
             let pv = self.pending_validators.read();
             (vs.validators.clone(), pv.clone(), vs.epoch)
         };
-        // Locks released here
 
-        // Merge without holding any locks. Pending membership must come from
-        // an authenticated governance path; transport discovery is never
-        // queued here.
         let mut all = validators;
         for pv in &pending {
             if let Some(existing) = all.iter_mut().find(|v| v.address == pv.address) {
@@ -1477,20 +1028,15 @@ impl ConsensusEngine {
             "Epoch transition: frozen validator set updated"
         );
 
-        // Short write locks. Active validation and deterministic leader/commit
-        // selection move to the exact same canonical epoch set.
         *self.validator_set.write() = new_set.clone();
         *self.frozen_validator_set.write() = new_set;
         self.pending_validators.write().clear();
     }
 
-    /// Get a snapshot of the validator set.
     pub fn validator_set(&self) -> ValidatorSet {
         self.validator_set.read().clone()
     }
 
-    /// Add a validator to the active set.
-    /// Returns error if stake is below minimum threshold.
     pub fn join_validator(
         &self,
         address: Address,
@@ -1529,7 +1075,6 @@ impl ConsensusEngine {
         Ok(())
     }
 
-    /// Remove a validator from the active set.
     pub fn leave_validator(&self, address: &Address) -> Result<u64, ConsensusError> {
         let mut vs = self.validator_set.write();
         let stake = vs
@@ -1544,7 +1089,6 @@ impl ConsensusEngine {
         Ok(stake)
     }
 
-    /// Update a validator's stake amount.
     pub fn update_validator_stake(
         &self,
         address: &Address,
@@ -1581,8 +1125,6 @@ impl ConsensusEngine {
         }
     }
 
-    /// Transition to a new epoch.
-    /// Recalculates the validator set, distributes rewards, and advances the epoch number.
     pub fn epoch_transition(&self) -> u64 {
         let mut vs = self.validator_set.write();
         vs.epoch += 1;
@@ -1599,18 +1141,14 @@ impl ConsensusEngine {
         new_epoch
     }
 
-    /// Returns `true` if the current round was reached via `force_advance_round()`.
-    /// This is diagnostic only; parent quorum checks remain strict.
     pub fn is_force_advanced(&self) -> bool {
         self.force_advanced.load(Ordering::SeqCst)
     }
 
-    /// Get a block from the DAG by hash.
     pub fn get_block(&self, hash: &Hash256) -> Option<DagBlock> {
         self.dag.get(hash).map(|r| r.value().clone())
     }
 
-    /// Get all block hashes for a given round.
     pub fn blocks_in_round(&self, round: u64) -> Vec<Hash256> {
         self.rounds
             .get(&round)
@@ -1618,27 +1156,14 @@ impl ConsensusEngine {
             .unwrap_or_default()
     }
 
-    /// Get the list of committed block hashes.
     pub fn committed_blocks(&self) -> Vec<Hash256> {
         self.committed.read().clone()
     }
 
-    /// Total number of blocks in the DAG.
     pub fn dag_size(&self) -> usize {
         self.dag.len()
     }
 
-    /// Propose a new DAG block for the current round.
-    ///
-    /// The block references >= 2f+1 parent blocks from the previous round.
-    /// If this is round 0, there are no parents.
-    ///
-    /// # Arguments
-    /// * `transactions` - Transaction hashes to include in this block.
-    /// * `timestamp` - Block creation timestamp (unix millis).
-    ///
-    /// # Returns
-    /// The newly created DAG block (also inserted into the local DAG).
     pub fn propose_block(
         &self,
         transactions: Vec<Hash256>,
@@ -1646,7 +1171,6 @@ impl ConsensusEngine {
     ) -> Result<DagBlock, ConsensusError> {
         let vs = self.validator_set.read();
 
-        // Only block producers (Arc/Core tier) can propose
         if !vs.can_produce_blocks(&self.local_address) {
             return Err(ConsensusError::NotValidator);
         }
@@ -1656,30 +1180,20 @@ impl ConsensusEngine {
             .author_round_blocks
             .contains_key(&(self.local_address, round))
         {
-            // In particular, this prevents a restart from signing a second
-            // block after the first proposal was restored from local WAL.
             return Err(ConsensusError::DuplicateBlock);
         }
         let floor = self.proposal_floor.load(Ordering::SeqCst);
         if floor > 0 && round <= floor {
-            // See `proposal_floor`: this node may already have signed here.
             return Err(ConsensusError::DuplicateBlock);
         }
 
-        // Collect parents from the previous round (round - 1).
-        // For round 0, there are no parents.
         let parents = if round == 0 || self.is_recovery_bootstrap_round(round) {
             Vec::new()
         } else {
             let prev_round = round - 1;
             let mut prev_hashes = self.blocks_in_round(prev_round);
-            // Arrival order is transport-dependent. Select one deterministic
-            // block per author and sign parents in canonical hash order.
             prev_hashes.sort_by_key(|hash| hash.0);
 
-            // Collect all available parents from the previous round.
-            // The validator should have enough (>= 2f+1) since advance_round
-            // was called to move us here.
             let mut selected_parents = Vec::new();
             let mut accumulated_stake = 0u64;
             let mut seen_parent_authors = HashSet::new();
@@ -1696,10 +1210,6 @@ impl ConsensusEngine {
                 }
             }
 
-            // A local timeout or testnet flag is still not a quorum
-            // certificate. The only thing that excuses a missing fixed
-            // validator parent is an authenticated quorum skip certificate for
-            // that exact round. Late blocks may still be committed.
             if !self.round_participation_satisfies_quorum(
                 &vs,
                 prev_round,
@@ -1714,9 +1224,6 @@ impl ConsensusEngine {
 
         drop(vs);
 
-        // MEV Protection: enforce canonical lexicographic ordering of tx hashes.
-        // This removes proposer discretion - transactions MUST be ordered by hash,
-        // not by the proposer's chosen (potentially MEV-extracting) sequence.
         let mut transactions = transactions;
         transactions.sort_by_key(|a| a.0);
 
@@ -1736,7 +1243,6 @@ impl ConsensusEngine {
             None => block.compute_hash(),
         };
 
-        // Sign the block hash with our keypair (if available)
         if let Some(ref keypair) = self.local_keypair {
             match keypair.sign(&block.hash) {
                 Ok(sig) => {
@@ -1758,17 +1264,14 @@ impl ConsensusEngine {
             "Proposed DAG block"
         );
 
-        // Insert into our own DAG
         self.insert_block_into_dag(&block);
         self.author_round_blocks
             .insert((block.author, block.round), block.hash);
 
-        // Create DA commitment for this block
         let block_data = bincode::serialize(&block.transactions).unwrap_or_default();
         let commitment = data_availability::create_da_commitment(&block_data, block.hash);
         self.store_da_commitment(commitment);
 
-        // Report that we expected and produced a block in this round
         {
             let mut wd = self.withholding_detector.lock();
             wd.report_expected(self.local_address, round);
@@ -1779,25 +1282,10 @@ impl ConsensusEngine {
         Ok(block)
     }
 
-    /// Receive and validate a DAG block from another validator.
-    ///
-    /// Validates:
-    /// 1. Author is a known validator who can produce blocks.
-    /// 2. Block is not a duplicate.
-    /// 3. Hash is correct.
-    /// 4. Round is not in the future (at most current_round + 1).
-    /// 5. Parents are from the correct round (round - 1) and exist in our DAG.
-    /// 6. For round > 0, block has >= 2f+1 parent stake.
-    ///
-    /// # Returns
-    /// `Ok(())` if the block was accepted, or an appropriate error.
     pub fn receive_block(&self, block: &DagBlock) -> Result<(), ConsensusError> {
         self.receive_block_inner(block, false)
     }
 
-    /// True when `block` is authored and signed by a committee member and
-    /// its hash matches its contents - the checks a block must pass before
-    /// it may count as evidence about another block.
     fn is_authentic_committee_block(&self, block: &DagBlock) -> bool {
         if !self.validator_set.read().can_produce_blocks(&block.author) {
             return false;
@@ -1824,9 +1312,6 @@ impl ConsensusEngine {
         true
     }
 
-    /// `receive_block`, optionally excusing missing parents at the open
-    /// restart base round. Only `import_history` passes `true`, and only for
-    /// base-round blocks the same batch shows honest support for.
     fn receive_block_inner(
         &self,
         block: &DagBlock,
@@ -1843,18 +1328,14 @@ impl ConsensusEngine {
     ) -> Result<(), ConsensusError> {
         let vs = self.validator_set.read();
 
-        // 1. Author must be a registered validator that can produce blocks.
-        // Testnet mode cannot substitute for authenticated membership.
         if !vs.can_produce_blocks(&block.author) {
             return Err(ConsensusError::NotValidator);
         }
 
-        // 2. Check for duplicates
         if self.dag.contains_key(&block.hash) {
             return Err(ConsensusError::DuplicateBlock);
         }
 
-        // 3. Verify hash integrity
         let valid_hash = match self.consensus_domain.read().as_ref() {
             Some(domain) => block.verify_hash_in_domain(domain),
             None => block.verify_hash(),
@@ -1865,9 +1346,6 @@ impl ConsensusEngine {
             ));
         }
 
-        // 3b. MEV Protection: verify transactions are in canonical lexicographic
-        //     order and that the ordering commitment matches this sorted sequence.
-        //     This prevents proposers from reordering transactions for MEV.
         if !block.verify_ordering() {
             return Err(ConsensusError::MevOrderingViolation(format!(
                 "block {} by {} has transactions not in canonical lexicographic order \
@@ -1876,11 +1354,9 @@ impl ConsensusEngine {
             )));
         }
 
-        // 3c. Verify block signature - author must have signed the block hash
         if !block.signature.is_empty() {
             let sig: CryptoSignature = bincode::deserialize(&block.signature)
                 .map_err(|_| ConsensusError::InvalidSignature)?;
-            // verify() checks: (a) pubkey in sig derives to block.author, (b) sig is valid
             sig.verify(&block.hash, &block.author).map_err(|_| {
                 warn!(
                     author = %block.author,
@@ -1889,7 +1365,6 @@ impl ConsensusEngine {
                 );
                 ConsensusError::InvalidSignature
             })?;
-            // If we have a registered key, cross-check it matches the signature's pubkey
             if let Some(registered_key) = self.validator_keys.get(&block.author)
                 && let CryptoSignature::Ed25519 { public_key, .. } = &sig
                 && public_key != registered_key.value()
@@ -1901,14 +1376,9 @@ impl ConsensusEngine {
                 return Err(ConsensusError::InvalidSignature);
             }
         } else if self.local_keypair.is_some() {
-            // Production mode: reject unsigned blocks
             return Err(ConsensusError::InvalidSignature);
         }
-        // else: legacy/test mode - accept unsigned blocks
 
-        // 4. A peer block may advance at most one round. Larger catch-up needs
-        // an independently authenticated checkpoint/state-sync path; even a
-        // correctly signed block does not certify skipped leaders or commits.
         let current = self.current_round.load(Ordering::SeqCst);
         let round_gap = block.round.saturating_sub(current);
         if round_gap > 1 {
@@ -1918,19 +1388,13 @@ impl ConsensusEngine {
             });
         }
 
-        // 5. Parent validation
         if block.round == 0 || self.is_recovery_bootstrap_round(block.round) {
-            // Round 0 and the exact recovery-domain bootstrap round have no
-            // parents. The latter is certified by the signed ARCCHKPT cursor.
             if !block.parents.is_empty() {
                 return Err(ConsensusError::InvalidBlock(
                     "bootstrap block must not have parents".into(),
                 ));
             }
         } else if base_exception && self.is_restart_base_round(block.round) {
-            // A restarted node's own durable commit cursor: its parents are
-            // below everything this node still has to decide. See
-            // `set_restart_base_round`. The list must still be well formed.
             if block.parents.is_empty()
                 || block.parents.contains(&Hash256::ZERO)
                 || block.parents.iter().copied().collect::<HashSet<_>>().len()
@@ -1943,10 +1407,6 @@ impl ConsensusEngine {
         } else if self.local_recovery_replay_active.load(Ordering::SeqCst)
             && self.local_recovery_boundary_round.read().as_ref() == Some(&block.round)
         {
-            // A content-addressed, externally pinned local generation is the
-            // trust boundary for exactly its oldest retained round. Original
-            // parent hashes stay in the signed block hash for audit, but their
-            // block bodies were compacted into the prior canonical baseline.
             if block.parents.is_empty()
                 || block.parents.contains(&Hash256::ZERO)
                 || block.parents.iter().copied().collect::<HashSet<_>>().len()
@@ -1958,8 +1418,6 @@ impl ConsensusEngine {
                 ));
             }
         } else {
-            // All parents must exist in our DAG and be from round - 1. A block
-            // signature proves authorship, not a parent quorum or sync state.
             let expected_parent_round = block.round - 1;
             let mut parent_stake = 0u64;
             let mut missing_parents = 0usize;
@@ -1994,10 +1452,6 @@ impl ConsensusEngine {
             }
 
             let parent_round = block.round.saturating_sub(1);
-            // A local timeout or testnet flag is still not a parent
-            // certificate. Recovery blocks must carry one known prior-round
-            // parent author for every fixed positive-stake validator that an
-            // authenticated skip certificate has not excused for that round.
             if !self.round_participation_satisfies_quorum(
                 &vs,
                 parent_round,
@@ -2010,12 +1464,8 @@ impl ConsensusEngine {
 
         drop(vs);
 
-        // Authentication, ordering, round bounds and parent authority have
-        // passed. Make history and its exact preimages durable before any
-        // DAG/author index or side tracker can observe the new block.
         persist(block)?;
 
-        // 7. Equivocation detection: same author must not have two blocks in the same round
         let key = (block.author, block.round);
         if let Some(equivocation) = self.detect_equivocation(block) {
             let evidence =
@@ -2029,20 +1479,12 @@ impl ConsensusEngine {
             );
 
             if self.consensus_domain.read().is_some() {
-                // Protocol-v3 membership and voting power come exclusively
-                // from the signed recovery checkpoint. Applying a slash while
-                // receiving the second of two equivocations makes stake depend
-                // on message arrival order and can make honest validators use
-                // different parent/quorum thresholds. Retain both signed
-                // blocks as evidence; the commit rule below deterministically
-                // fences the ambiguous round without mutating authority.
                 warn!(
                     offender = %block.author,
                     evidence = %evidence,
                     "Domain-bound equivocation retained as evidence; validator authority is unchanged"
                 );
             } else {
-                // Preserve legacy behavior outside a recovery domain.
                 let mut vs = self.validator_set.write();
                 if let Ok(record) = vs.report_offense(
                     block.author,
@@ -2056,16 +1498,10 @@ impl ConsensusEngine {
                         slash_amount = record.slash_amount,
                         "Slash applied for DAG equivocation"
                     );
-                    // Actually reduce the validator's stake via enforce_slash
                     vs.apply_slash(&block.author, record.slash_amount);
                 }
             }
-            // Still insert the equivocating block (the DAG handles it)
-            // so domain-bound commit can detect and fence ambiguity.
         } else {
-            // Atomic insert-if-absent: use entry() API to avoid TOCTOU race
-            // where two concurrent receive_block calls both pass contains_key
-            // and insert different blocks for the same (author, round).
             use dashmap::mapref::entry::Entry;
             match self.author_round_blocks.entry(key) {
                 Entry::Vacant(e) => {
@@ -2073,7 +1509,6 @@ impl ConsensusEngine {
                 }
                 Entry::Occupied(e) => {
                     if *e.get() != block.hash {
-                        // Late-detected equivocation (lost the TOCTOU race)
                         warn!(
                             author = %block.author,
                             round = block.round,
@@ -2086,18 +1521,12 @@ impl ConsensusEngine {
             }
         }
 
-        // All checks passed: insert
         self.insert_block_into_dag(block);
 
-        // Track received block for withholding detection
         {
             let mut wd = self.withholding_detector.lock();
             wd.report_received(block.author, block.round);
         }
-        // Track vote for double-voting detection.
-        // Skip if this author already has a different block in this round
-        // (equivocation), since that case is already handled above by
-        // detect_equivocation() and we don't want to double-slash.
         let is_equivocation = self
             .author_round_blocks
             .get(&(block.author, block.round))
@@ -2106,7 +1535,6 @@ impl ConsensusEngine {
         if !is_equivocation {
             let mut st = self.stake_tracker.lock();
             st.report_vote(block.author, block.round, *block.hash.as_bytes());
-            // Check for double voting in this round
             let evidence = st.detect_double_voting(block.round);
             if !evidence.is_empty() {
                 for dv in &evidence {
@@ -2139,8 +1567,6 @@ impl ConsensusEngine {
         Ok(())
     }
 
-    /// Return the unique-certifier stake of one valid two-round commit
-    /// certificate, or `None` when no such certificate is locally available.
     fn two_round_commit_support(
         &self,
         block_hash: &Hash256,
@@ -2175,13 +1601,6 @@ impl ConsensusEngine {
         None
     }
 
-    // ── Authenticated round skip and finality ───────────────────────────────
-
-    /// Verify and register an absence certificate.
-    ///
-    /// Excuse the named member from this round's full-participation
-    /// requirement only after verifying the frozen committee's quorum. Late
-    /// blocks remain admissible, and the commit rule is unchanged.
     pub fn register_skip_certificate(
         &self,
         certificate: view_change::SkipCertificate,
@@ -2206,20 +1625,10 @@ impl ConsensusEngine {
         Ok(signing)
     }
 
-    /// A validator is excused from the recovery domain's full-participation
-    /// requirement for exactly the round an authenticated skip certificate
-    /// covers it for. This is the replacement for the blanket all-validator
-    /// guard: participation is still required from everyone the committee has
-    /// not certified as absent, and the certificate is what makes "absent"
-    /// something a node proves rather than assumes.
     fn is_excused_for_round(&self, round: u64, address: &Address) -> bool {
         self.skip_certificates.contains_key(&(round, *address))
     }
 
-    /// Bind the domain that absence and finality transcripts are signed under.
-    ///
-    /// Idempotent for the same domain; rebinding to a different one is refused,
-    /// because the signatures already emitted would become ambiguous.
     pub fn install_certificate_domain(
         &self,
         domain: ConsensusDomain,
@@ -2237,22 +1646,14 @@ impl ConsensusEngine {
         }
     }
 
-    /// The domain absence and finality certificates are bound to.
     pub fn certificate_domain(&self) -> Option<ConsensusDomain> {
         *self.certificate_domain.read()
     }
 
-    /// This validator's signing key, when the engine was built with one.
-    ///
-    /// Exposed so the node's absence/finality signing path can use exactly the
-    /// key that signs this engine's blocks; a second key would make the two
-    /// identities diverge.
     pub fn local_keypair(&self) -> Option<&KeyPair> {
         self.local_keypair.as_ref()
     }
 
-    /// True when a verified absence certificate covers this member in this
-    /// round.
     pub fn has_skip_certificate(&self, round: u64, absentee: &Address) -> bool {
         self.skip_certificates.contains_key(&(round, *absentee))
     }
@@ -2267,27 +1668,10 @@ impl ConsensusEngine {
             .map(|c| c.value().clone())
     }
 
-    /// True when a member is excused from this round's participation
-    /// requirement. Informational; nothing in the commit rule consults it.
     pub fn is_certified_absent(&self, round: u64, member: &Address) -> bool {
         self.has_skip_certificate(round, member)
     }
 
-    /// Import a contiguous, ascending run of history from a peer.
-    ///
-    /// This is the ONLY path that may carry a node forward by more than one
-    /// round, and it is not a shortcut around the guard that forbids that. The
-    /// guard exists so a peer cannot teleport a node to a tip it has no
-    /// evidence for; a contiguous run of signed blocks whose parents carry
-    /// quorum stake IS that evidence, and it is exactly what the node would
-    /// have received had it been online. Nothing here trusts a peer's claimed
-    /// height, a diagnostic snapshot, or an unsigned summary.
-    ///
-    /// Rejects, without importing anything: a run that does not start at the
-    /// round this node is actually waiting for, a gap or a step backwards, a
-    /// round whose blocks do not carry quorum stake from distinct known
-    /// authors, and any individual block the normal validation refuses. Returns
-    /// the round this node reached.
     pub fn import_history(
         &self,
         blocks: &[DagBlock],
@@ -2296,13 +1680,6 @@ impl ConsensusEngine {
         self.import_history_with_persistence(blocks, max_rounds, |_| Ok(()))
     }
 
-    /// Import through the ordinary history validation, making each newly
-    /// accepted block durable before DAG insertion, round advance or children.
-    /// A persistence failure is fatal to the caller, rather than the ordinary
-    /// peer-validation stop that retains a successfully imported prefix.
-    /// Duplicates and DAG-invalid blocks never reach `persist`. The hook may
-    /// refuse missing/invalid preimages with an ordinary validation error;
-    /// storage failures must use `HistoryPersistence` to stop immediately.
     pub fn import_history_with_persistence(
         &self,
         blocks: &[DagBlock],
@@ -2318,12 +1695,6 @@ impl ConsensusEngine {
         for block in blocks {
             by_round.entry(block.round).or_default().push(block);
         }
-        // A restarting node needs nothing below its base round - it is this
-        // node's own commit cursor, and every round under it is already
-        // decided here. Peers may still serve from lower down, and the import
-        // stops at the first block it cannot validate: left in, those rounds'
-        // missing parents stopped it before it ever reached the base (seen
-        // live: base 296, a batch from 294, every batch refused).
         let base = self.restart_base_round();
         if let Some(base) = base {
             by_round.retain(|round, _| *round >= base);
@@ -2332,14 +1703,6 @@ impl ConsensusEngine {
                     "history is entirely below this node's commit cursor".into(),
                 ));
             }
-            // A base-round block is admitted without its parents, so it has to
-            // earn that some other way: authentic next-round blocks in this
-            // batch, from at least f+1 stake of distinct authors, must name it.
-            // At least one of those is honest, and an honest validator only
-            // references a block it validated. Without this a single byzantine
-            // peer could hand a restarting node a fabricated base block and a
-            // private chain on top of it, and the node's own proposals would
-            // then reference blocks nobody else can validate - shutting it out.
             if let Some(base_blocks) = by_round.get(&base) {
                 let vs = self.validator_set.read();
                 let one_honest = vs.total_stake.saturating_sub(vs.quorum).saturating_add(1);
@@ -2389,7 +1752,6 @@ impl ConsensusEngine {
                 last.saturating_sub(first)
             )));
         }
-        // Contiguity: every round from the first to the last must be present.
         for round in first..=last {
             if !by_round.contains_key(&round) {
                 return Err(ConsensusError::InvalidBlock(format!(
@@ -2401,22 +1763,6 @@ impl ConsensusEngine {
             let vs = self.validator_set.read();
             vs.quorum
         };
-        // Each round must carry quorum stake from distinct known authors before
-        // this node will step over it. A round that does not is the point where
-        // the import stops, not a reason to discard the rounds before it.
-        //
-        // This used to `return Err` - rejecting the WHOLE run - while this
-        // comment said "stops". The difference is a permanent halt. A history
-        // response always includes the live tip, and at a stalled tip that
-        // round is below quorum by definition, so every response a lagging node
-        // was sent was refused in full. The R8 soak self-test hit exactly that
-        // at N=4: one crashed validator plus one slow one, the restarted node
-        // refusing the same response 118 times, and the two nodes whose blocks
-        // the tip round needed unable ever to reach it.
-        //
-        // Truncating is exactly as safe as refusing: a thin round is never
-        // stepped OVER, because nothing at or above it is imported. What changes
-        // is only that the complete rounds before it are kept.
         let mut first_thin: Option<u64> = None;
         for (round, round_blocks) in &by_round {
             let vs = self.validator_set.read();
@@ -2435,7 +1781,6 @@ impl ConsensusEngine {
             if stake < quorum && !excused {
                 first_thin = Some(*round);
                 if *round == first {
-                    // Nothing before it to keep, so this is a refusal after all.
                     return Err(ConsensusError::InvalidBlock(format!(
                         "history round {round} carries {stake} stake, below quorum {quorum}"
                     )));
@@ -2446,18 +1791,6 @@ impl ConsensusEngine {
         if let Some(thin) = first_thin {
             by_round.retain(|round, _| *round < thin);
         }
-        // Apply in ascending round order, advancing one round at a time so the
-        // ordinary per-block validation applies to every single block.
-        //
-        // A block this node cannot validate stops the import AT THAT ROUND and
-        // keeps everything already applied. Aborting the whole run instead
-        // would throw away good rounds because of one later one, and the node
-        // would ask for the same range again and fail at the same place - which
-        // is exactly what the fixture showed: 162 requests, 1 import, and a
-        // node pinned at round 77 while its peers reached 838. Nothing is
-        // weakened by stopping early: every applied block passed the same
-        // validation as a live one, and `advance_round` still re-checks stake
-        // and participation for each round.
         let mut reached = start;
         let mut inserted = 0usize;
         'rounds: for (round, round_blocks) in by_round {
@@ -2482,18 +1815,11 @@ impl ConsensusEngine {
                 }
             }
             if round >= reached {
-                // advance_round re-checks stake and participation itself.
                 if self.advance_round() {
                     reached = self.current_round.load(Ordering::SeqCst);
                 }
             }
         }
-        // Progress is blocks INSERTED, not the round cursor moving. A node that
-        // restarted has a round cursor far ahead of its empty DAG, so the
-        // history it needs is all BELOW that cursor: it fills the DAG in from
-        // round 0 without the cursor moving at all. Judging that run a failure
-        // is what made a restarted node re-request the same range 267 times and
-        // import nothing.
         if inserted == 0 && reached == start {
             return Err(ConsensusError::InvalidBlock(
                 "history added nothing this node did not already have".into(),
@@ -2509,16 +1835,11 @@ impl ConsensusEngine {
         Ok(reached)
     }
 
-    /// Commit support for a specific block at a round, as the two-round rule
-    /// computes it. `None` means no child of it reaches quorum support in this
-    /// node's view, which is the observation a `NoQuorumSupport` attestation is
-    /// made from.
     pub fn leader_commit_support(&self, block_hash: &Hash256, round: u64) -> Option<u64> {
         let vs = self.frozen_validator_set.read();
         self.two_round_commit_support(block_hash, round, &vs)
     }
 
-    /// Verify and store a committed-block finality certificate.
     pub fn register_finality_certificate(
         &self,
         certificate: view_change::FinalityCertificate,
@@ -2530,12 +1851,6 @@ impl ConsensusEngine {
             let vs = self.frozen_validator_set.read();
             certificate.verify(&domain, &vs)?
         };
-        // A second certificate at a height this node already holds one for is
-        // only benign when it names the same block. When it does not, a quorum
-        // certified two different blocks at one height - and because any two
-        // quorums intersect in more than f validators, some validator signed
-        // both. Overwriting the held certificate would erase the proof, so the
-        // conflict is returned to the caller to record and alarm on.
         if let Some(held) = self.finality_certificates.get(&certificate.height)
             && held.block_hash != certificate.block_hash
         {
@@ -2551,13 +1866,6 @@ impl ConsensusEngine {
             .highest_finalized_height
             .fetch_max(height, Ordering::AcqRel)
             .max(height);
-        // Bounded retention. A certificate is ~1.2 KB and one forms per
-        // height, so an unpruned map grows by roughly half a gigabyte per node
-        // per day at the fixture's block rate. The window still covers every
-        // height a checkpoint can be served from (snapshots are taken far more
-        // often than this) and every height a conflict could plausibly be
-        // re-offered for; a conflicting certificate for a height below it can
-        // no longer be compared, which is the price of a bounded node.
         if height.is_multiple_of(FINALITY_PRUNE_EVERY) {
             let floor = highest.saturating_sub(self.retained_finality_heights());
             self.finality_certificates.retain(|h, _| *h >= floor);
@@ -2565,35 +1873,24 @@ impl ConsensusEngine {
         Ok(signing)
     }
 
-    /// The highest height this node holds a quorum finality certificate for,
-    /// or `None` if it holds none. Finality lag is the committed height minus
-    /// this.
     pub fn highest_finalized_height(&self) -> Option<u64> {
         let h = self.highest_finalized_height.load(Ordering::Acquire);
         (h > 0 || self.finality_certificates.contains_key(&0)).then_some(h)
     }
 
-    /// How many heights of finality certificates this node keeps.
     pub fn retained_finality_heights(&self) -> u64 {
         self.retained_finality_heights.load(Ordering::Acquire)
     }
 
-    /// Set the finality-certificate retention window. Never below the prune
-    /// interval, so a prune can never empty the map it is bounding.
     pub fn set_retained_finality_heights(&self, heights: u64) {
         self.retained_finality_heights
             .store(heights.max(FINALITY_PRUNE_EVERY), Ordering::Release);
     }
 
-    /// How many finality certificates are currently held (for bounded-growth
-    /// checks and diagnostics).
     pub fn finality_certificate_count(&self) -> usize {
         self.finality_certificates.len()
     }
 
-    /// Entry counts of every collection the engine holds. A day-long run
-    /// needs every one of these flat once retention is reached; one that
-    /// climbs with height is a leak, and this names it.
     pub fn memory_gauges(&self) -> Vec<(&'static str, u64)> {
         let withholding = self.withholding_detector.lock().entry_count();
         let (stake_votes, penalties) = self.stake_tracker.lock().sizes();
@@ -2627,7 +1924,6 @@ impl ConsensusEngine {
         .collect()
     }
 
-    /// The block this node holds a quorum finality certificate for at `height`.
     pub fn finalized_block_at(&self, height: u64) -> Option<Hash256> {
         self.finality_certificates
             .get(&height)
@@ -2640,19 +1936,10 @@ impl ConsensusEngine {
             .map(|c| c.value().clone())
     }
 
-    /// The commitment over the exact frozen committee, which every certificate
-    /// carries so it cannot be replayed against a different membership.
     pub fn frozen_validator_set_hash(&self) -> Hash256 {
         view_change::validator_set_hash(&self.frozen_validator_set.read())
     }
 
-    /// Is `target` in the causal history of `from`?
-    ///
-    /// Walks parents breadth-first, never below `floor_round`, so the work is
-    /// bounded by the rounds between them. This is what makes a retroactive
-    /// anchor decision deterministic: every honest node that holds `from` also
-    /// holds its whole causal history, because a block cannot be validated
-    /// without its parents, so they all compute the same answer.
     fn causal_history_contains(&self, from: &Hash256, target: &Hash256, floor_round: u64) -> bool {
         if from == target {
             return true;
@@ -2679,16 +1966,6 @@ impl ConsensusEngine {
         false
     }
 
-    /// Try to commit blocks using the two-round commit rule.
-    ///
-    /// # Commit Rule
-    ///
-    /// A block B in round R is committed when:
-    /// 1. There exists a block C in round R+1 that has B as a parent.
-    /// 2. C is referenced by blocks in round R+2 with total stake >= 2f+1 (quorum).
-    ///
-    /// # Returns
-    /// Newly committed blocks in causal order.
     pub fn try_commit(&self) -> Vec<DagBlock> {
         self.try_commit_limited(usize::MAX, true)
     }
@@ -2698,18 +1975,14 @@ impl ConsensusEngine {
         maximum_blocks: usize,
         maintain_live_state: bool,
     ) -> Vec<DagBlock> {
-        // Before first epoch freeze (epoch=0), DON'T commit - wait for
-        // the validator set to stabilize. This prevents nodes from
-        // committing their own blocks with a 1-validator frozen set.
         let vs = self.frozen_validator_set.read();
         if vs.epoch == 0 {
-            return Vec::new(); // Wait for first freeze
+            return Vec::new();
         }
         let current = self.current_round.load(Ordering::SeqCst);
         let mut newly_committed = Vec::new();
         let domain_bound = self.consensus_domain.read().is_some();
 
-        // We need at least round 2 to have any commits (R, R+1, R+2 pattern)
         if current < 2 {
             return newly_committed;
         }
@@ -2719,13 +1992,6 @@ impl ConsensusEngine {
             committed.iter().copied().collect()
         };
 
-        // Leader selection uses the genesis validator set (round 0 block authors)
-        // or, for later rounds, the authors who produced blocks in the PREVIOUS
-        // round. This is deterministic because all nodes see the same DAG blocks
-        // (eventually), so they compute the same set of authors per round.
-
-        // Cache frozen validator addresses ONCE (same for all rounds).
-        // Old code re-read + re-sorted on every round iteration - O(n*k log k).
         let frozen_vals = {
             let fvs = self.frozen_validator_set.read();
             let mut addrs: Vec<Address> = fvs.validators.iter().map(|v| v.address).collect();
@@ -2733,14 +1999,9 @@ impl ConsensusEngine {
             addrs
         };
 
-        // Scan uncommitted rounds. Start from last_committed_round to skip
-        // rounds that are already finalized (was scanning from 0 every time).
         let scan_start = self.last_committed_round.load(Ordering::SeqCst);
         let scan_end = current.saturating_sub(2);
 
-        // Every block this node holds from a round's deterministic leader.
-        // More than one means the leader equivocated, which the recovery domain
-        // fences rather than resolves.
         let anchors_of = |round: u64| -> Vec<Hash256> {
             let Some(leader) = frozen_vals.get(round as usize % frozen_vals.len().max(1)) else {
                 return Vec::new();
@@ -2774,13 +2035,6 @@ impl ConsensusEngine {
                 );
                 break;
             }
-            // Every block this node holds from the leader is checked, not just
-            // the lowest hash. With an equivocating leader the lowest-hash twin
-            // can be the UNcertified one: taking only it, a node that held both
-            // twins skipped the round while nodes holding only the certified
-            // twin committed it - a fork. Exactly one certified candidate is
-            // committed; two are fenced, as the recovery domain already does,
-            // because neither can then be committed identically everywhere.
             let certified_all: Vec<(Hash256, u64)> = anchor_candidates
                 .iter()
                 .filter_map(|hash| {
@@ -2798,7 +2052,6 @@ impl ConsensusEngine {
             }
             let certified = certified_all.first().copied();
 
-            // Straightforward case: this round's anchor is certified here.
             if let Some((hash, supporting_stake)) = certified {
                 if !committed_set.contains(&hash)
                     && let Some(block) = self.dag.get(&hash)
@@ -2821,24 +2074,11 @@ impl ConsensusEngine {
                 continue;
             }
 
-            // Undecided in this view. A LATER certified anchor decides it, and
-            // decides it identically on every honest node, because the decision
-            // is read from that anchor's causal history rather than from local
-            // timing or a local absence.
-            //
-            // The decider must be at least three rounds later. An anchor at
-            // r2 references r2-1 blocks carrying quorum stake, so only from
-            // r2 >= r+3 does its history necessarily reach round r+2 - the
-            // round whose quorum would have certified r's anchor. Two quorums
-            // intersect, so a certified anchor is in EVERY later anchor's
-            // history, and this rule can therefore never skip a round another
-            // node committed.
             let mut decider = None;
             let mut ambiguous_ahead = false;
             for r2 in (r + 3)..=scan_end {
                 let candidates = anchors_of(r2);
                 if domain_bound && candidates.len() > 1 {
-                    // An equivocating leader ahead cannot decide anything.
                     ambiguous_ahead = true;
                     break;
                 }
@@ -2860,15 +2100,9 @@ impl ConsensusEngine {
                 break;
             }
             let Some((decider_round, decider_hash)) = decider else {
-                // Nothing decides this round yet. Waiting is the only safe
-                // action: a locally empty or locally uncertified round may be
-                // committed in another honest view.
                 break;
             };
 
-            // The decider's history decides among ALL of this round's
-            // candidates: exactly one in it is committed, none is a skip, and
-            // more than one cannot be decided identically, so it fences.
             let in_history: Vec<Hash256> = anchor_candidates
                 .iter()
                 .filter(|hash| self.causal_history_contains(&decider_hash, hash, r))
@@ -2909,7 +2143,6 @@ impl ConsensusEngine {
             r += 1;
         }
 
-        // Add newly committed blocks to the committed list
         if !newly_committed.is_empty() {
             let mut committed = self.committed.write();
             for block in &newly_committed {
@@ -2923,14 +2156,8 @@ impl ConsensusEngine {
             return newly_committed;
         }
 
-        // Drop the read lock before security checks that may need write access
         drop(vs);
 
-        // A checkpoint is trusted only after a strict validator identity +
-        // stake supermajority signs its canonical state-root transcript. This
-        // engine does not yet collect those signatures or receive a canonical
-        // state root from the state layer, so checkpoint intervals deliberately
-        // remain unregistered rather than manufacturing an unsigned anchor.
         if !newly_committed.is_empty() {
             let max_round = newly_committed.iter().map(|b| b.round).max().unwrap_or(0);
             if max_round % security::CHECKPOINT_INTERVAL == 0 && max_round > 0 {
@@ -2940,7 +2167,6 @@ impl ConsensusEngine {
                 );
             }
 
-            // Run withholding detection periodically (every 100 rounds)
             if max_round % 100 == 0 {
                 let wd = self.withholding_detector.lock();
                 let reports = wd.detect_withholding(100);
@@ -2965,36 +2191,19 @@ impl ConsensusEngine {
             }
         }
 
-        // Auto-prune old DAG data after successful commits
         if !newly_committed.is_empty() {
             self.prune_old_rounds();
-            // A4: Also prune via committed round for explicit memory bounds
             if let Some(max_committed) = newly_committed.iter().map(|b| b.round).max() {
                 self.prune_below_round(max_committed);
             }
         }
 
-        // A6: Expire stale cross-shard locks to prevent deadlocks
         self.expire_stale_locks();
         self.expire_stale_locks_with_timeout(30);
 
         newly_committed
     }
 
-    /// Bound the local security detectors to [`SECURITY_HISTORY_DEPTH`] rounds.
-    ///
-    /// `report_received`/`report_vote` are called for every accepted block and
-    /// `report_expected` for every local proposal, but nothing pruned either
-    /// map outside their own unit tests. A node that keeps advancing rounds
-    /// without committing therefore accumulated one entry per (author, round)
-    /// forever, and `detect_double_voting` rescans the whole vote map on every
-    /// received block. Driving this from the block round rather than from a
-    /// commit keeps it bounded even while the commit cursor is stalled.
-    ///
-    /// Cost: this is reached once per accepted block, so on a round that is a
-    /// multiple of `PRUNE_DEPTH` it runs once per proposing validator, each
-    /// doing an O(retained) `retain` over both maps -- O(V * retained) for the
-    /// round, not a single sweep.
     fn prune_security_history(&self, round: u64) {
         if !round.is_multiple_of(PRUNE_DEPTH) {
             return;
@@ -3006,12 +2215,6 @@ impl ConsensusEngine {
         self.stake_tracker.lock().prune_votes(before_round);
     }
 
-    /// The first round at or above `from` for which this node holds no blocks,
-    /// scanning at most `limit` rounds.
-    ///
-    /// This is where a node filling its DAG in has to ask next. Asking from a
-    /// fixed point instead would either re-request what it already has or skip
-    /// the gap it still needs.
     pub fn first_missing_round(&self, from: u64, limit: u64) -> u64 {
         let end = from.saturating_add(limit);
         let mut round = from;
@@ -3024,16 +2227,6 @@ impl ConsensusEngine {
         end
     }
 
-    /// True when this node holds no DAG blocks at all.
-    ///
-    /// The case that matters is a restart: block validation is recursive -
-    /// inserting a block at round R requires its parents at R-1 - so a node
-    /// whose DAG is empty can only be bootstrapped from round 0, where parents
-    /// are empty by definition. Asking for history from anywhere else produces
-    /// a run whose first round can never be validated.
-    /// The parents of `block` this node does not hold, or `None` if any
-    /// parent it DOES hold is from the wrong round - which makes the block
-    /// malformed rather than early, so it must never be held for later.
     pub fn absent_parents(&self, block: &DagBlock) -> Option<Vec<Hash256>> {
         let expected = block.round.checked_sub(1)?;
         let mut absent = Vec::new();
@@ -3047,7 +2240,6 @@ impl ConsensusEngine {
         Some(absent)
     }
 
-    /// How many blocks the DAG currently holds (diagnostics).
     pub fn dag_block_count(&self) -> usize {
         self.dag.len()
     }
@@ -3056,15 +2248,10 @@ impl ConsensusEngine {
         self.dag.is_empty()
     }
 
-    /// How many rounds of DAG history this node retains below the commit
-    /// cursor, and therefore how far behind a peer may fall and still rejoin by
-    /// history transfer.
     pub fn retained_rounds(&self) -> u64 {
         self.retained_rounds.load(Ordering::Relaxed)
     }
 
-    /// Set DAG retention. Clamped up to `PRUNE_DEPTH`, which is the reorg
-    /// safety floor and is not an operator choice.
     pub fn set_retained_rounds(&self, rounds: u64) {
         let clamped = rounds.max(PRUNE_DEPTH);
         if clamped != rounds {
@@ -3077,30 +2264,18 @@ impl ConsensusEngine {
         self.retained_rounds.store(clamped, Ordering::Relaxed);
     }
 
-    /// Prune DAG data older than the retained window behind the current round.
-    /// Keeps recent rounds for reorg safety. Removes blocks, round index entries,
-    /// committed hashes, and author-round tracking for pruned rounds.
     fn prune_old_rounds(&self) {
         let current = self.current_round.load(Ordering::SeqCst);
         let retained = self.retained_rounds();
         if current <= retained {
             return;
         }
-        // Never prune at or above the commit cursor. `try_commit` scans from
-        // `last_committed_round` and needs rounds r, r+1 and r+2 to certify a
-        // leader. The DAG round runs far ahead of the commit cursor whenever a
-        // leader certificate is late, so `current - PRUNE_DEPTH` alone deletes
-        // the exact rounds the scan has not passed yet. `blocks_in_round`
-        // then returns empty at `scan_start`, the scan breaks there on every
-        // later call, and the commit cursor is fenced permanently while
-        // `advance_round` keeps turning rounds.
         let prune_below =
             (current - retained).min(self.last_committed_round.load(Ordering::SeqCst));
 
         let mut pruned_blocks = 0usize;
         let mut pruned_rounds = 0usize;
 
-        // Collect rounds to prune
         let rounds_to_prune: Vec<u64> = self
             .rounds
             .iter()
@@ -3109,7 +2284,6 @@ impl ConsensusEngine {
             .collect();
 
         for round in &rounds_to_prune {
-            // Remove blocks in this round from the DAG
             if let Some((_, block_hashes)) = self.rounds.remove(round) {
                 for hash in &block_hashes {
                     self.dag.remove(hash);
@@ -3118,7 +2292,6 @@ impl ConsensusEngine {
                 pruned_rounds += 1;
             }
 
-            // Clean up author_round_blocks entries for this round
             let keys_to_remove: Vec<(Address, u64)> = self
                 .author_round_blocks
                 .iter()
@@ -3130,13 +2303,11 @@ impl ConsensusEngine {
             }
         }
 
-        // Prune old committed hashes (keep only those still in DAG)
         if pruned_blocks > 0 {
             let mut committed = self.committed.write();
             committed.retain(|hash| self.dag.contains_key(hash));
         }
 
-        // Prune finality proofs for blocks no longer in DAG
         if pruned_blocks > 0 {
             let stale_proofs: Vec<Hash256> = self
                 .finality_proofs
@@ -3147,7 +2318,6 @@ impl ConsensusEngine {
             for h in &stale_proofs {
                 self.finality_proofs.remove(h);
             }
-            // Prune DA commitments and cross-shard proofs for pruned blocks
             let stale_da: Vec<Hash256> = self
                 .da_commitments
                 .iter()
@@ -3179,24 +2349,16 @@ impl ConsensusEngine {
         }
     }
 
-    /// Advance to the next round.
-    ///
-    /// Called when >= 2f+1 stake-weighted blocks have been received for the current round,
-    /// indicating enough validators have participated and it is safe to proceed.
-    ///
-    /// Returns `true` if the round was advanced, `false` if quorum was not met.
     pub fn advance_round(&self) -> bool {
         let current = self.current_round.load(Ordering::SeqCst);
         let vs = self.validator_set.read();
 
-        // Compute stake of blocks in the current round
         let round_blocks = self.blocks_in_round(current);
         let mut round_stake = 0u64;
         let mut seen_authors = std::collections::HashSet::new();
 
         for hash in &round_blocks {
             if let Some(block) = self.dag.get(hash) {
-                // Only count each author once per round
                 if seen_authors.insert(block.author)
                     && let Some(validator) = vs.get_validator(&block.author)
                 {
@@ -3215,8 +2377,6 @@ impl ConsensusEngine {
                 return false;
             };
             self.current_round.store(new_round, Ordering::SeqCst);
-            // Normal quorum-based advance clears the force-advanced flag,
-            // restoring strict parent validation for subsequent rounds.
             self.force_advanced.store(false, Ordering::SeqCst);
             self.reset_round_timer();
             debug!(
@@ -3239,10 +2399,6 @@ impl ConsensusEngine {
         }
     }
 
-    /// Deterministic shard assignment for an address.
-    ///
-    /// Uses the first 8 bytes of the address as a u64, mod num_shards.
-    /// This ensures the same address always maps to the same shard.
     pub fn shard_of(address: &Address, num_shards: u16) -> u16 {
         if num_shards == 0 {
             return 0;
@@ -3254,21 +2410,8 @@ impl ConsensusEngine {
         (val % num_shards as u64) as u16
     }
 
-    /// Determine if a transaction needs full DAG-ordered consensus (cross-shard)
-    /// or can use the fast path (single-shard).
-    ///
-    /// Cross-shard transactions involve sender and recipient on different shards,
-    /// requiring full ordering to prevent double-spends across shard boundaries.
-    ///
-    /// # Arguments
-    /// * `tx` - The transaction to check.
-    /// * `num_shards` - Total number of shards.
-    ///
-    /// # Returns
-    /// `true` if full consensus ordering is needed (cross-shard), `false` for fast path.
     pub fn needs_full_consensus(tx: &Transaction, num_shards: u16) -> bool {
         if num_shards <= 1 {
-            // Single shard: everything is same-shard, fast path
             return false;
         }
 
@@ -3299,90 +2442,48 @@ impl ConsensusEngine {
                 let contract_shard = Self::shard_of(&body.contract, num_shards);
                 sender_shard != contract_shard
             }
-            TxBody::MultiSig(body) => {
-                // MultiSig needs full consensus if any signer is on a different shard
-                body.signers
-                    .iter()
-                    .any(|signer| Self::shard_of(signer, num_shards) != sender_shard)
-            }
-            TxBody::DeployContract(_) => {
-                // Contract deployment is local to the sender's shard
-                false
-            }
-            TxBody::RegisterAgent(_) => {
-                // Agent registration is local
-                false
-            }
+            TxBody::MultiSig(body) => body
+                .signers
+                .iter()
+                .any(|signer| Self::shard_of(signer, num_shards) != sender_shard),
+            TxBody::DeployContract(_) => false,
+            TxBody::RegisterAgent(_) => false,
             TxBody::JoinValidator(_)
             | TxBody::LeaveValidator
             | TxBody::ClaimRewards
-            | TxBody::UpdateStake(_) => {
-                // Validator management transactions are global (affect consensus state)
-                false
-            }
-            TxBody::Governance(_) => {
-                // Governance transactions are global
-                false
-            }
-            TxBody::BridgeLock(_) | TxBody::BridgeMint(_) => {
-                // Bridge transactions are global (cross-chain)
-                false
-            }
-            TxBody::BatchSettle(_) => false, // Local to sender's shard
+            | TxBody::UpdateStake(_) => false,
+            TxBody::Governance(_) => false,
+            TxBody::BridgeLock(_) | TxBody::BridgeMint(_) => false,
+            TxBody::BatchSettle(_) => false,
             TxBody::ChannelOpen(body) => {
                 let cp_shard = Self::shard_of(&body.counterparty, num_shards);
                 sender_shard != cp_shard
             }
-            TxBody::ChannelClose(_) => false, // Escrow is deterministic
-            TxBody::ChannelDispute(_) => false, // Escrow is deterministic
-            TxBody::ShardProof(_) => false,   // Shard-local proof recording
-            TxBody::InferenceAttestation(_) => false, // Escrow is local to sender's shard
-            // Pays from the shared treasury to an arbitrary worker and writes
-            // a global replay marker, so it must use fully ordered consensus.
+            TxBody::ChannelClose(_) => false,
+            TxBody::ChannelDispute(_) => false,
+            TxBody::ShardProof(_) => false,
+            TxBody::InferenceAttestation(_) => false,
             TxBody::CommunityInferenceReward(_) => true,
-            TxBody::InferenceChallenge(_) => false, // Resolved on attestation's shard
-            TxBody::InferenceRegister(_) => false,  // Local to sender's shard
-            // Milestone B: escrow accounts are derived from request_id via
-            // a deterministic hash, so they live on the sender's shard
-            // alongside the payer account. Release touches proposer +
-            // replicas + treasury but the state transition itself is
-            // escrow-local; cross-shard crediting is handled by the
-            // per-tx execution path, not the shard router.
+            TxBody::InferenceChallenge(_) => false,
+            TxBody::InferenceRegister(_) => false,
             TxBody::InferenceEscrowOpen(_) => false,
             TxBody::InferenceEscrowRelease(_) => false,
             TxBody::InferenceEscrowRefund(_) => false,
-            // Milestones C / D / E: all these new tx types are
-            // deterministic-registry writes that live on the sender's
-            // shard (registry account derived from model_id / pubkey /
-            // request_id). No cross-shard routing needed.
             TxBody::ModelRegistration(_) => false,
             TxBody::ModelRequest(_) => false,
             TxBody::ShardCoverageClaim(_) => false,
             TxBody::CapacityAdvertisement(_) => false,
             TxBody::ShardAssignmentProposal(_) => false,
-            // Faucet drains touch the shared pool account; signer is the
-            // local validator. Pool lives on a deterministic shard but the
-            // recipient is arbitrary — treat as same-shard since the pool
-            // is the dominant access (recipient is just credited).
             TxBody::FaucetClaim(_) => false,
-            // Tier 1 inference txs all reference a deterministic escrow
-            // address derived from request_id — that escrow lives on a
-            // single shard, so treat as same-shard for routing.
             TxBody::InferenceRequest(_) => false,
             TxBody::InferenceVote(_) => false,
             TxBody::InferenceFinalize(_) => false,
-            // Candidate native protocol-4 transitions are globally ordered
-            // because they freeze the validator set and may credit multiple
-            // payees. They are rejected unless the private activation gate is
-            // present in state.
             TxBody::NativeInferenceRequest(_)
             | TxBody::NativeInferenceFinalize(_)
             | TxBody::NativeInferenceRefund(_) => true,
         }
     }
 
-    /// Update the validator set from an authenticated epoch transition.
-    /// Reject forged cached totals/quorum and duplicate identities.
     pub fn update_validator_set(&self, new_set: ValidatorSet) -> Result<(), ConsensusError> {
         let canonical_total = checked_validator_total_stake(&new_set.validators)?;
         let canonical_quorum = strict_supermajority_threshold(canonical_total);
@@ -3401,49 +2502,22 @@ impl ConsensusEngine {
         Ok(())
     }
 
-    // ── Liveness Hardening (C3) ─────────────────────────────────────────────
-
-    /// Proposer failover timeout in milliseconds.
-    /// If the current round hasn't advanced within this time, the next
-    /// validator in rotation can take over as proposer.
     const PROPOSER_TIMEOUT_MS: u128 = 100;
 
-    /// View-change timeout in milliseconds.
-    /// If the round is stalled for this long, request collection of a quorum
-    /// view-change certificate. The timer alone cannot advance the view.
-    /// 5000ms for global testnet (100-300ms cross-continent RTT needs margin).
-    /// Production with optimized networking: 500-1000ms.
     const VIEW_CHANGE_TIMEOUT_MS: u128 = 5_000;
 
-    /// Check if the current round's proposer has timed out.
-    ///
-    /// Returns `true` if the current round has been active for longer than
-    /// `PROPOSER_TIMEOUT_MS`, indicating the expected proposer may be offline
-    /// and the next validator should take over.
     pub fn is_proposer_timed_out(&self) -> bool {
         self.round_start.read().elapsed().as_millis() > Self::PROPOSER_TIMEOUT_MS
     }
 
-    /// Check if a certified view-change attempt is needed.
-    ///
-    /// Returns `true` if the round has been stalled for longer than
-    /// `VIEW_CHANGE_TIMEOUT_MS`. This is only a request to collect a quorum
-    /// view-change certificate. A caller must not advance consensus state from
-    /// this local timer alone.
     pub fn needs_view_change(&self) -> bool {
         self.round_start.read().elapsed().as_millis() > Self::VIEW_CHANGE_TIMEOUT_MS
     }
 
-    /// Reset the round timer (called after advancing to a new round).
     pub fn reset_round_timer(&self) {
         *self.round_start.write() = std::time::Instant::now();
     }
 
-    /// Advance the local view after a timeout without weakening block safety.
-    ///
-    /// This moves only the local view and sets a diagnostic flag. Proposals and
-    /// received blocks still require complete, quorum-weighted parents. A
-    /// timeout is not a quorum view-change certificate.
     pub fn force_advance_round(&self) {
         let Ok(old) =
             self.current_round
@@ -3467,11 +2541,6 @@ impl ConsensusEngine {
         );
     }
 
-    /// Returns the fraction of total stake that is "online" (has proposed a
-    /// block within the last N rounds).
-    ///
-    /// The caller can use this to alert if online stake drops near the >2/3
-    /// quorum threshold - a warning that the network is close to stalling.
     pub fn online_stake_fraction(&self, lookback_rounds: u64) -> f64 {
         let current = self.current_round.load(Ordering::SeqCst);
         let vs = self.validator_set.read();
@@ -3508,11 +2577,6 @@ impl ConsensusEngine {
         online_stake as f64 / vs.total_stake as f64
     }
 
-    /// Reset the DAG for a validator set transition.
-    ///
-    /// Called when switching between single-validator and multi-validator mode.
-    /// Previous blocks were already executed (fast path or DAG commit), so the
-    /// DAG can be cleared and round tracking restarted from 0.
     pub fn reset_dag(&self) {
         let old_round = self.current_round.swap(0, Ordering::SeqCst);
         let dag_size = self.dag.len();
@@ -3530,21 +2594,16 @@ impl ConsensusEngine {
         );
     }
 
-    // ── Internal helpers ─────────────────────────────────────────────────────
-
-    /// Insert a block into the DAG and the round index.
     fn insert_block_into_dag(&self, block: &DagBlock) {
         self.dag.insert(block.hash, block.clone());
         self.rounds.entry(block.round).or_default().push(block.hash);
     }
 
-    /// Store a DA commitment.
     pub fn store_da_commitment(&self, commitment: data_availability::DACommitment) {
         self.da_commitments
             .insert(commitment.block_hash, commitment);
     }
 
-    /// Get a DA commitment by block hash.
     pub fn get_da_commitment(
         &self,
         block_hash: &Hash256,
@@ -3554,7 +2613,6 @@ impl ConsensusEngine {
             .map(|r| r.value().clone())
     }
 
-    /// Lock a cross-shard transaction.
     pub fn lock_cross_shard(
         &self,
         tx_hash: Hash256,
@@ -3596,7 +2654,6 @@ impl ConsensusEngine {
         Ok(proof)
     }
 
-    /// Commit a locked cross-shard transaction.
     pub fn commit_cross_shard(&self, tx_hash: Hash256) -> Result<CrossShardProof, ConsensusError> {
         let (_, mut proof) = self.pending_cross_shard.remove(&tx_hash).ok_or_else(|| {
             ConsensusError::CrossShardLockNotFound(format!("tx {} not found in pending", tx_hash))
@@ -3606,7 +2663,6 @@ impl ConsensusEngine {
         Ok(proof)
     }
 
-    /// Abort a locked cross-shard transaction.
     pub fn abort_cross_shard(&self, tx_hash: Hash256) -> Result<CrossShardProof, ConsensusError> {
         let (_, mut proof) = self.pending_cross_shard.remove(&tx_hash).ok_or_else(|| {
             ConsensusError::CrossShardLockNotFound(format!("tx {} not found in pending", tx_hash))
@@ -3616,8 +2672,6 @@ impl ConsensusEngine {
         Ok(proof)
     }
 
-    /// Atomically lock a batch of cross-shard transactions.
-    /// If any lock fails, all previously locked transactions in this batch are aborted.
     pub fn atomic_cross_shard_batch(
         &self,
         tx_hashes: Vec<Hash256>,
@@ -3630,7 +2684,6 @@ impl ConsensusEngine {
             match self.lock_cross_shard(*tx_hash, src, tgt, batch_block, 0) {
                 Ok(proof) => proofs.push(proof),
                 Err(e) => {
-                    // Abort all previously locked transactions in this batch
                     for prev_proof in &proofs {
                         let _ = self.abort_cross_shard(prev_proof.tx_hash);
                     }
@@ -3644,7 +2697,6 @@ impl ConsensusEngine {
         Ok(proofs)
     }
 
-    /// Get counts of (pending, completed) cross-shard transactions.
     pub fn cross_shard_stats(&self) -> (usize, usize) {
         (
             self.pending_cross_shard.len(),
@@ -3652,20 +2704,13 @@ impl ConsensusEngine {
         )
     }
 
-    // ── A6: Cross-Shard Deadlock Prevention ─────────────────────────────────
-
-    /// Expire cross-shard locks that have been held longer than the timeout.
-    /// Prevents deadlocks from slow or crashed shards holding locks indefinitely.
-    /// Should be called on every `try_commit()` cycle.
-    ///
-    /// Returns the number of locks expired.
     pub fn expire_stale_locks(&self) -> usize {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         let current_round = self.current_round.load(Ordering::SeqCst);
-        const MAX_LOCK_ROUNDS: u64 = 100; // locks expire after 100 rounds regardless of wall time
+        const MAX_LOCK_ROUNDS: u64 = 100;
 
         let expired: Vec<Hash256> = self
             .pending_cross_shard
@@ -3700,19 +2745,6 @@ impl ConsensusEngine {
         count
     }
 
-    // ── A8: Finality Proof Generation ───────────────────────────────────────
-
-    /// Export a finality proof for a committed block, if a verified
-    /// certificate over that exact block exists.
-    ///
-    /// The signatures are over the dedicated, domain-separated finality
-    /// transcript (`view_change::FINALITY_VOTE_DOMAIN`), never re-labelled DAG
-    /// block signatures: a DAG signature authorises its own block's hash, and
-    /// presenting those bytes as evidence about another block would be
-    /// invalid. A caller holding only the frozen committee can re-verify the
-    /// underlying certificate with
-    /// [`view_change::FinalityCertificate::verify`]; this projection exists for
-    /// the existing light-client shape and carries the same signatures.
     pub fn generate_finality_proof(
         &self,
         block_hash: &Hash256,
@@ -3728,8 +2760,6 @@ impl ConsensusEngine {
         let mut signing_stake = 0u64;
         for vote in &certificate.votes {
             let validator = vs.get_validator(&vote.voter)?;
-            // Re-verify at export: a stored certificate is not a licence to
-            // publish signatures nobody checked on the way out.
             if vote
                 .signature
                 .verify(&vote.transcript(), &vote.voter)
@@ -3753,28 +2783,13 @@ impl ConsensusEngine {
         })
     }
 
-    /// Get a stored finality proof by block hash.
     pub fn get_finality_proof(&self, block_hash: &Hash256) -> Option<FinalityProof> {
         self.finality_proofs
             .get(block_hash)
             .map(|r| r.value().clone())
     }
 
-    // ── A4: DAG Pruning / Memory Bounds ──────────────────────────────────────
-
-    /// Prune DAG blocks and round data older than `committed_round - PRUNE_DEPTH`.
-    ///
-    /// Keeps PRUNE_DEPTH rounds of history for reorg safety. If `committed_round`
-    /// is less than PRUNE_DEPTH, no pruning occurs. Returns the number of
-    /// blocks pruned.
     pub fn prune_below_round(&self, committed_round: u64) -> usize {
-        // Retention, not the reorg floor. This is the prune path that actually
-        // runs on a live node, and it decides how far back a rejoining peer can
-        // still be served - so it has to honour the same setting
-        // `prune_old_rounds` does. It previously used PRUNE_DEPTH directly,
-        // which kept 100 rounds no matter what retention said, and a restarted
-        // node asking for round 0 was told "Cannot serve" 162 times while the
-        // configured window was 4096.
         let retained = self.retained_rounds();
         if committed_round < retained {
             return 0;
@@ -3783,7 +2798,6 @@ impl ConsensusEngine {
 
         let mut pruned_count = 0usize;
 
-        // Collect rounds to prune (anything strictly below the cutoff)
         let rounds_to_prune: Vec<u64> = self
             .rounds
             .iter()
@@ -3799,7 +2813,6 @@ impl ConsensusEngine {
                 }
             }
 
-            // Clean up author_round_blocks entries for this round
             let keys_to_remove: Vec<(Address, u64)> = self
                 .author_round_blocks
                 .iter()
@@ -3811,15 +2824,9 @@ impl ConsensusEngine {
             }
         }
 
-        // The other round-keyed maps age out on the same horizon. They were
-        // never pruned at all: skip certificates accumulated one entry per
-        // certified (round, member) for the life of
-        // the process, which a day-long soak would have turned into a slow
-        // leak with nothing else wrong.
         self.skip_certificates
             .retain(|(round, _), _| *round >= cutoff);
 
-        // Prune committed hashes that are no longer in the DAG
         if pruned_count > 0 {
             let mut committed = self.committed.write();
             committed.retain(|hash| self.dag.contains_key(hash));
@@ -3834,14 +2841,6 @@ impl ConsensusEngine {
         pruned_count
     }
 
-    // ── A3: Slashing Enforcement - Equivocation Detection ────────────────────
-
-    /// Check if the given block constitutes equivocation (same author already
-    /// proposed a different block in the same round).
-    ///
-    /// Returns an `EquivocationProof` if the author already has a block in
-    /// this round with a different hash, or `None` if this is the first block
-    /// from that author in this round.
     pub fn detect_equivocation(&self, block: &DagBlock) -> Option<EquivocationProof> {
         let key = (block.author, block.round);
         if let Some(existing_hash) = self.author_round_blocks.get(&key)
@@ -3857,13 +2856,6 @@ impl ConsensusEngine {
         None
     }
 
-    /// Enforce a slash: actually reduce the validator's stake and potentially
-    /// remove them from the validator set.
-    ///
-    /// If the validator's stake falls below `STAKE_SPARK` (500,000 ARC), they
-    /// are removed from the validator set entirely.
-    ///
-    /// Returns `true` if the validator was removed from the set.
     pub fn enforce_slash(&self, offender: &Address, amount: u64) -> bool {
         let mut vs = self.validator_set.write();
         let was_present = vs.get_validator(offender).is_some();
@@ -3877,7 +2869,6 @@ impl ConsensusEngine {
 
         vs.apply_slash(offender, amount);
 
-        // Check if the validator was removed (no longer in set)
         let still_present = vs.get_validator(offender).is_some();
         let removed = was_present && !still_present;
 
@@ -3898,22 +2889,13 @@ impl ConsensusEngine {
         removed
     }
 
-    // ── A6: Cross-Shard Deadlock Prevention (parameterized timeout) ──────────
-
-    /// Expire cross-shard locks that have been held longer than `timeout_secs`.
-    ///
-    /// Finds all `CrossShardProof` entries in `pending_cross_shard` where
-    /// `locked_at_ms` is older than the given timeout, aborts those transactions,
-    /// and moves them to `completed_cross_shard`.
-    ///
-    /// Returns the number of locks expired.
     pub fn expire_stale_locks_with_timeout(&self, timeout_secs: u64) -> usize {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
         let current_round = self.current_round.load(Ordering::SeqCst);
-        const MAX_LOCK_ROUNDS: u64 = 100; // locks expire after 100 rounds regardless of wall time
+        const MAX_LOCK_ROUNDS: u64 = 100;
 
         let timeout_ms = timeout_secs * 1000;
 
@@ -3953,20 +2935,14 @@ impl ConsensusEngine {
         count
     }
 
-    // ── Propose-Verify Protocol ──────────────────────────────────────────────
-
-    /// Set this node's role in the propose-verify protocol.
     pub fn set_node_role(&mut self, role: NodeRole) {
         self.node_role = role;
     }
 
-    /// Get this node's role.
     pub fn node_role(&self) -> NodeRole {
         self.node_role
     }
 
-    /// Submit a fraud proof when a proposer's state diff doesn't match.
-    /// The proposer is slashed and the block is rejected.
     pub fn submit_fraud_proof(
         &self,
         block_hash: Hash256,
@@ -3999,34 +2975,25 @@ impl ConsensusEngine {
         Ok(record)
     }
 
-    // ── Security Module Accessors ───────────────────────────────────────────
-
-    /// Get a reference to the withholding detector.
     pub fn withholding_detector(&self) -> &parking_lot::Mutex<WithholdingDetector> {
         &self.withholding_detector
     }
 
-    /// Get a reference to the checkpoint registry.
     pub fn checkpoint_registry(&self) -> &parking_lot::Mutex<CheckpointRegistry> {
         &self.checkpoint_registry
     }
 
-    /// Get a reference to the stake tracker.
     pub fn stake_tracker(&self) -> &parking_lot::Mutex<StakeTracker> {
         &self.stake_tracker
     }
 }
 
-// ── Cross-Shard Utilities ───────────────────────────────────────────────────
-
-/// Deterministically assign an address to a shard.
 pub fn assign_shard(address: &Hash256, num_shards: u16) -> u16 {
     let bytes = address.as_bytes();
     let val = u16::from_le_bytes([bytes[0], bytes[1]]);
     val % num_shards
 }
 
-/// Check if a transaction between two addresses is cross-shard.
 pub fn is_cross_shard(from: &Hash256, to: &Hash256, num_shards: u16) -> bool {
     if num_shards <= 1 {
         return false;
@@ -4037,20 +3004,15 @@ pub fn is_cross_shard(from: &Hash256, to: &Hash256, num_shards: u16) -> bool {
 #[cfg(test)]
 mod formal_proofs;
 
-// ── Tests ────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use arc_crypto::hash_bytes;
 
-    /// Create a deterministic test address from a byte.
     fn test_addr(n: u8) -> Address {
         hash_bytes(&[n])
     }
 
-    /// Create a test validator set with the given number of Arc-tier validators.
-    /// Each validator has 5_000_000 stake (Arc tier).
     fn test_validator_set(n: usize) -> ValidatorSet {
         let validators: Vec<Validator> = (0..n)
             .map(|i| {
@@ -4060,20 +3022,16 @@ mod tests {
         ValidatorSet::new(validators, 1)
     }
 
-    /// Create a test validator set with mixed tiers.
     fn mixed_validator_set() -> ValidatorSet {
         let validators = vec![
-            Validator::new(test_addr(0), STAKE_CORE, 0).unwrap(), // Core: 50M
-            Validator::new(test_addr(1), STAKE_ARC, 1).unwrap(),  // Arc: 5M
-            Validator::new(test_addr(2), STAKE_ARC, 0).unwrap(),  // Arc: 5M
-            Validator::new(test_addr(3), STAKE_SPARK, 1).unwrap(), // Spark: 500K
+            Validator::new(test_addr(0), STAKE_CORE, 0).unwrap(),
+            Validator::new(test_addr(1), STAKE_ARC, 1).unwrap(),
+            Validator::new(test_addr(2), STAKE_ARC, 0).unwrap(),
+            Validator::new(test_addr(3), STAKE_SPARK, 1).unwrap(),
         ];
         ValidatorSet::new(validators, 1)
     }
 
-    /// Helper: Create a DAG block directly (bypassing propose_block) for test scaffolding.
-    /// Transactions are sorted into canonical lexicographic order to match the
-    /// MEV-protection scheme enforced by `verify_ordering()`.
     fn make_block(
         author: Address,
         round: u64,
@@ -4111,21 +3069,15 @@ mod tests {
         block
     }
 
-    // ── 1. Validator Set Management ──────────────────────────────────────────
-
     #[test]
     fn test_validator_set_creation_and_quorum() {
         let vs = test_validator_set(4);
-        // 4 validators * 5M = 20M total stake
         assert_eq!(vs.total_stake, 4 * STAKE_ARC);
         assert_eq!(vs.len(), 4);
         assert_eq!(vs.epoch, 1);
-        // quorum = floor(2/3 * 20M) + 1 = 13_333_334
         assert_eq!(vs.quorum, strict_supermajority_threshold(vs.total_stake));
         assert!(vs.quorum > vs.total_stake * 2 / 3);
-        // 3 validators have 15M stake, which should exceed quorum (~13.3M)
         assert!(vs.has_quorum(&[test_addr(0), test_addr(1), test_addr(2)]));
-        // 2 validators have 10M stake, which should NOT exceed quorum (~13.3M)
         assert!(!vs.has_quorum(&[test_addr(0), test_addr(1)]));
     }
 
@@ -4222,25 +3174,19 @@ mod tests {
     #[test]
     fn test_mixed_validator_set_permissions() {
         let vs = mixed_validator_set();
-        // Total: 50M + 5M + 5M + 500K = 60_500_000
         assert_eq!(vs.total_stake, STAKE_CORE + 2 * STAKE_ARC + STAKE_SPARK);
 
-        // Core and Arc can produce; Spark cannot
-        assert!(vs.can_produce_blocks(&test_addr(0))); // Core
-        assert!(vs.can_produce_blocks(&test_addr(1))); // Arc
-        assert!(vs.can_produce_blocks(&test_addr(2))); // Arc
-        assert!(!vs.can_produce_blocks(&test_addr(3))); // Spark
+        assert!(vs.can_produce_blocks(&test_addr(0)));
+        assert!(vs.can_produce_blocks(&test_addr(1)));
+        assert!(vs.can_produce_blocks(&test_addr(2)));
+        assert!(!vs.can_produce_blocks(&test_addr(3)));
 
-        // Unknown address
         assert!(!vs.can_produce_blocks(&test_addr(99)));
         assert!(!vs.is_validator(&test_addr(99)));
 
-        // Block producers list
         let producers = vs.block_producers();
-        assert_eq!(producers.len(), 3); // Core + 2 Arc
+        assert_eq!(producers.len(), 3);
     }
-
-    // ── 1b. Dynamic Validator Set Management ─────────────────────────────────
 
     #[test]
     fn test_join_validator() {
@@ -4248,7 +3194,6 @@ mod tests {
         let vs = ValidatorSet::new(validators, 1);
         let engine = ConsensusEngine::new(vs, test_addr(1));
 
-        // Join a new validator
         let result = engine.join_validator(test_addr(2), STAKE_ARC, [2u8; 32], 1);
         assert!(result.is_ok());
 
@@ -4278,13 +3223,7 @@ mod tests {
         let vs = ValidatorSet::new(validators, 1);
         let engine = ConsensusEngine::new(vs, test_addr(1));
 
-        // Try to join with insufficient stake
-        let result = engine.join_validator(
-            test_addr(2),
-            100, // Below STAKE_SPARK
-            [2u8; 32],
-            1,
-        );
+        let result = engine.join_validator(test_addr(2), 100, [2u8; 32], 1);
         assert!(result.is_err());
     }
 
@@ -4361,16 +3300,9 @@ mod tests {
         let vs = ValidatorSet::new(validators, 1);
         let engine = ConsensusEngine::new(vs, test_addr(1));
 
-        let result = engine.join_validator(
-            test_addr(1), // Already in set
-            STAKE_ARC,
-            [1u8; 32],
-            0,
-        );
+        let result = engine.join_validator(test_addr(1), STAKE_ARC, [1u8; 32], 0);
         assert!(result.is_err());
     }
-
-    // ── 2. Block Proposal ────────────────────────────────────────────────────
 
     #[test]
     fn test_propose_block_round_zero() {
@@ -4385,13 +3317,12 @@ mod tests {
 
         assert_eq!(block.author, test_addr(0));
         assert_eq!(block.round, 0);
-        assert!(block.parents.is_empty()); // Round 0 has no parents
+        assert!(block.parents.is_empty());
         assert_eq!(block.transactions.len(), 2);
         assert_eq!(block.timestamp, 1000);
         assert_ne!(block.hash, Hash256::ZERO);
         assert!(block.verify_hash());
 
-        // Block should be in the DAG
         assert_eq!(engine.dag_size(), 1);
         assert_eq!(engine.blocks_in_round(0).len(), 1);
     }
@@ -4664,21 +3595,18 @@ mod tests {
     #[test]
     fn test_propose_block_spark_tier_rejected() {
         let vs = mixed_validator_set();
-        let spark_addr = test_addr(3); // Spark tier
+        let spark_addr = test_addr(3);
         let engine = ConsensusEngine::new(vs, spark_addr);
 
         let result = engine.propose_block(vec![], 1000);
         assert_eq!(result.unwrap_err(), ConsensusError::NotValidator);
     }
 
-    // ── 3. Block Receipt ─────────────────────────────────────────────────────
-
     #[test]
     fn test_receive_valid_block() {
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
-        // Create and receive a block from validator 1
         let block = make_block(test_addr(1), 0, vec![], vec![hash_bytes(b"tx1")], 1000);
         engine
             .receive_block(&block)
@@ -4706,7 +3634,6 @@ mod tests {
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
-        // Address 99 is not in the validator set
         let block = make_block(test_addr(99), 0, vec![], vec![], 1000);
         let result = engine.receive_block(&block);
         assert_eq!(result.unwrap_err(), ConsensusError::NotValidator);
@@ -4718,7 +3645,6 @@ mod tests {
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
         let mut block = make_block(test_addr(1), 0, vec![], vec![], 1000);
-        // Corrupt the hash
         block.hash = Hash256::ZERO;
 
         let result = engine.receive_block(&block);
@@ -4763,7 +3689,6 @@ mod tests {
             engine.receive_block(&missing),
             Err(ConsensusError::MissingParents { missing: 1, .. })
         ));
-        // An absent parent is an arrival-order fact: the block may be held.
         assert_eq!(
             engine.absent_parents(&missing),
             Some(vec![hash_bytes(b"missing-parent")])
@@ -4777,8 +3702,6 @@ mod tests {
             engine.receive_block(&wrong_round),
             Err(ConsensusError::MissingParents { .. })
         ));
-        // A PRESENT parent from the wrong round makes the block malformed, so
-        // it must never be classified as merely early.
         assert_eq!(engine.absent_parents(&wrong_round), None);
         assert_eq!(
             engine.current_round(),
@@ -4835,8 +3758,6 @@ mod tests {
         assert_eq!(engine.current_round(), 0);
         assert_eq!(engine.last_committed_round(), 0);
     }
-
-    // ── 4. Commit Rule ───────────────────────────────────────────────────────
 
     fn install_certified_leader_equivocation(
         engine: &ConsensusEngine,
@@ -4895,9 +3816,6 @@ mod tests {
         }
         assert!(engine.advance_round());
 
-        // Every round-one block references both leader equivocations and one
-        // block from every other author. Each equivocation therefore has
-        // children, while parent stake is counted once per unique author.
         let mut round_zero_parents: Vec<_> = round_zero.iter().map(|block| block.hash).collect();
         round_zero_parents.sort_by_key(|hash| hash.0);
         let mut round_one: Vec<_> = validators
@@ -4923,8 +3841,6 @@ mod tests {
         }
         assert!(engine.advance_round());
 
-        // Five equal-stake certifiers suffice; all six are supplied so both
-        // equivocating leader hashes independently satisfy the old rule.
         let mut round_one_parents: Vec<_> = round_one.iter().map(|block| block.hash).collect();
         round_one_parents.sort_by_key(|hash| hash.0);
         let mut round_two: Vec<_> = validators
@@ -5003,15 +3919,6 @@ mod tests {
         assert_eq!(engine_reverse.validator_set().total_stake, 6 * STAKE_ARC);
     }
 
-    /// Drive `rounds` rounds of a synthetic DAG with `n` equal-stake authors
-    /// and return how many blocks committed.
-    ///
-    /// No network, no node process, no timing. `link_all` selects whether each
-    /// proposal references every block of the previous round or exactly a
-    /// quorum of them (the minimum a proposer waits for), rotating which ones.
-    /// `missing` names an author whose blocks are never delivered locally from
-    /// round `missing_from` onward, modelling a node whose block did not
-    /// arrive before its peers advanced.
     fn commits_over_rounds(
         n: usize,
         rounds: u64,
@@ -5031,7 +3938,7 @@ mod tests {
                     && author == absent
                     && round >= from
                 {
-                    continue; // this author's block never reaches the local view
+                    continue;
                 }
                 let parents: Vec<Hash256> = if previous.is_empty() {
                     Vec::new()
@@ -5054,7 +3961,7 @@ mod tests {
                 current.push(block.hash);
             }
             if !engine.advance_round() {
-                break; // no quorum this round; the caller asserts on the count
+                break;
             }
             committed += engine.try_commit().len();
             previous = current;
@@ -5062,7 +3969,6 @@ mod tests {
         committed
     }
 
-    /// The deterministic round leader, as `try_commit` computes it.
     fn leader_index_for_round(n: usize, round: u64) -> usize {
         let mut order: Vec<(Address, usize)> = (0..n).map(|i| (test_addr(i as u8), i)).collect();
         order.sort_by_key(|(address, _)| address.0);
@@ -5071,12 +3977,6 @@ mod tests {
 
     #[test]
     fn commit_rule_commits_at_every_committee_size_when_every_leader_block_is_present() {
-        // The live sweep (scripts/arc-committee-size-sweep.sh) saw four and
-        // five validators advance DAG rounds indefinitely with committed height
-        // flat. This isolates the commit rule itself: with every author's block
-        // present locally, every committee size commits - whether proposals
-        // carry all parents or only a quorum of them. So the rule is not what
-        // stalls, and the next test shows what does.
         for n in 2..=5 {
             for link_all in [true, false] {
                 let committed = commits_over_rounds(n, 8, link_all, None);
@@ -5090,15 +3990,6 @@ mod tests {
 
     #[test]
     fn commit_rule_passes_a_missing_anchor_once_a_later_anchor_decides_it() {
-        // This used to be the defect: a committee whose quorum is smaller than
-        // its membership (equal stake, n >= 4) could advance a round without
-        // one member's block, and if that member was the round's deterministic
-        // leader the commit cursor stopped there for good.
-        //
-        // The cursor now passes such a round, but only once a LATER anchor is
-        // certified, and only because that anchor's causal history - which is
-        // identical on every node that holds it - does not contain the missing
-        // one. No timing, no local absence and no vote is involved.
         for n in 4..=5usize {
             let absent = leader_index_for_round(n, 2);
             let committed = commits_over_rounds(n, 12, false, Some((absent, 2)));
@@ -5114,8 +4005,6 @@ mod tests {
             );
         }
         for n in 2..=3usize {
-            // Quorum IS the whole committee here, so dropping a member stops
-            // round advancement outright and there is nothing to decide.
             assert_eq!(
                 commits_over_rounds(n, 12, false, Some((leader_index_for_round(n, 2), 2))),
                 commits_over_rounds(n, 2, false, None),
@@ -5130,7 +4019,6 @@ mod tests {
         assert_eq!(engine.retained_rounds(), DEFAULT_RETAINED_ROUNDS);
         engine.set_retained_rounds(50_000);
         assert_eq!(engine.retained_rounds(), 50_000);
-        // Below the reorg-safety floor is not an operator choice.
         engine.set_retained_rounds(1);
         assert_eq!(engine.retained_rounds(), PRUNE_DEPTH);
         engine.set_retained_rounds(0);
@@ -5139,9 +4027,6 @@ mod tests {
 
     #[test]
     fn retention_decides_how_far_back_history_can_be_served() {
-        // The whole point of the setting: a peer that fell this far behind can
-        // still be served, and one that fell further cannot. Built as a pure
-        // DAG so it needs no network.
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
         engine.set_retained_rounds(PRUNE_DEPTH);
@@ -5168,13 +4053,10 @@ mod tests {
             cursor > PRUNE_DEPTH,
             "the chain must have committed past the window"
         );
-        // Recent rounds are still servable.
         assert!(
             !engine.blocks_in_round(cursor - 1).is_empty(),
             "a round just below the cursor must still be retained"
         );
-        // Rounds far below the retention window are gone, which is exactly the
-        // condition that makes an authenticated checkpoint necessary.
         assert!(
             engine.blocks_in_round(0).is_empty(),
             "round 0 should have been pruned once the cursor passed the window"
@@ -5183,11 +4065,6 @@ mod tests {
 
     #[test]
     fn a_certified_anchor_is_never_skipped_by_the_retroactive_rule() {
-        // The safety property the retroactive rule rests on: an anchor that any
-        // node could certify is in EVERY later anchor's causal history, because
-        // its supporters and the later anchor's parents are two quorums and
-        // they intersect. If this ever fails, one node commits a round another
-        // skips.
         let n = 4usize;
         let vs = test_validator_set(n);
         let engine = ConsensusEngine::new(vs.clone(), test_addr(0));
@@ -5213,8 +4090,6 @@ mod tests {
             assert!(engine.advance_round());
             previous = current;
         }
-        // Every certified anchor must appear in the causal history of every
-        // later anchor.
         for (round, hash) in &anchors {
             if engine.leader_commit_support(hash, *round).is_none() {
                 continue;
@@ -5234,15 +4109,12 @@ mod tests {
 
     #[test]
     fn test_commit_rule_two_round() {
-        // Setup: 4 validators with equal 5M stake each (total 20M, quorum ~13.3M)
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
-        // Round 0: Block B from validator 0
         let block_b = make_block(test_addr(0), 0, vec![], vec![hash_bytes(b"tx_b")], 100);
         engine.receive_block(&block_b).unwrap();
 
-        // Also insert blocks from validators 1, 2, 3 in round 0 (needed for round 1 parents)
         let b1 = make_block(test_addr(1), 0, vec![], vec![], 101);
         let b2 = make_block(test_addr(2), 0, vec![], vec![], 102);
         let b3 = make_block(test_addr(3), 0, vec![], vec![], 103);
@@ -5250,21 +4122,18 @@ mod tests {
         engine.receive_block(&b2).unwrap();
         engine.receive_block(&b3).unwrap();
 
-        // Advance to round 1
         assert!(engine.advance_round());
         assert_eq!(engine.current_round(), 1);
 
-        // Round 1: Block C from validator 1, referencing B (and enough parents for quorum)
         let block_c = make_block(
             test_addr(1),
             1,
-            vec![block_b.hash, b1.hash, b2.hash], // References B + others for quorum
+            vec![block_b.hash, b1.hash, b2.hash],
             vec![hash_bytes(b"tx_c")],
             200,
         );
         engine.receive_block(&block_c).unwrap();
 
-        // Also need more round 1 blocks to advance
         let c2 = make_block(
             test_addr(2),
             1,
@@ -5282,16 +4151,12 @@ mod tests {
         engine.receive_block(&c2).unwrap();
         engine.receive_block(&c3).unwrap();
 
-        // Advance to round 2
         assert!(engine.advance_round());
         assert_eq!(engine.current_round(), 2);
 
-        // No commits yet (need round 2 blocks referencing C)
         let committed = engine.try_commit();
         assert!(committed.is_empty());
 
-        // Round 2: Blocks from validators 0, 2, 3 referencing C
-        // Need >= quorum (3 * 5M = 15M >= ~13.3M)
         let d0 = make_block(
             test_addr(0),
             2,
@@ -5317,14 +4182,12 @@ mod tests {
         engine.receive_block(&d2).unwrap();
         engine.receive_block(&d3).unwrap();
 
-        // Now try_commit should commit block B
         let committed = engine.try_commit();
         assert!(
             committed.iter().any(|b| b.hash == block_b.hash),
             "Block B should be committed"
         );
 
-        // Verify it is in the committed list
         let committed_list = engine.committed_blocks();
         assert!(committed_list.contains(&block_b.hash));
     }
@@ -5334,7 +4197,6 @@ mod tests {
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
-        // Round 0: blocks from all 4 validators
         let b0 = make_block(test_addr(0), 0, vec![], vec![], 100);
         let b1 = make_block(test_addr(1), 0, vec![], vec![], 101);
         let b2 = make_block(test_addr(2), 0, vec![], vec![], 102);
@@ -5345,7 +4207,6 @@ mod tests {
         engine.receive_block(&b3).unwrap();
         engine.advance_round();
 
-        // Round 1: block C references B0
         let c1 = make_block(
             test_addr(1),
             1,
@@ -5372,7 +4233,6 @@ mod tests {
         engine.receive_block(&c3).unwrap();
         engine.advance_round();
 
-        // Round 2: Only 1 block references C1 (5M stake < quorum ~13.3M)
         let d0 = make_block(
             test_addr(0),
             2,
@@ -5382,10 +4242,7 @@ mod tests {
         );
         engine.receive_block(&d0).unwrap();
 
-        // Should NOT commit B0 since only 1 validator in R+2 references C1
         let committed = engine.try_commit();
-        // d0 references c1, and d0 has stake 5M, which is < quorum ~13.3M
-        // So b0 should NOT be committed
         let b0_committed = committed.iter().any(|b| b.hash == b0.hash);
         assert!(
             !b0_committed,
@@ -5421,18 +4278,14 @@ mod tests {
         assert_eq!(engine.last_committed_round(), 0);
     }
 
-    // ── 5. Round Advancement ─────────────────────────────────────────────────
-
     #[test]
     fn test_advance_round_requires_quorum() {
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
-        // No blocks yet: cannot advance
         assert!(!engine.advance_round());
         assert_eq!(engine.current_round(), 0);
 
-        // Add 2 blocks (10M stake < quorum ~13.3M): still cannot advance
         let b0 = make_block(test_addr(0), 0, vec![], vec![], 100);
         let b1 = make_block(test_addr(1), 0, vec![], vec![], 101);
         engine.receive_block(&b0).unwrap();
@@ -5440,7 +4293,6 @@ mod tests {
         assert!(!engine.advance_round());
         assert_eq!(engine.current_round(), 0);
 
-        // Add a third block (15M >= ~13.3M): now we can advance
         let b2 = make_block(test_addr(2), 0, vec![], vec![], 102);
         engine.receive_block(&b2).unwrap();
         assert!(engine.advance_round());
@@ -5449,29 +4301,22 @@ mod tests {
 
     #[test]
     fn test_advance_round_deduplicates_authors() {
-        // If the same author submits multiple blocks in one round,
-        // their stake should only count once.
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
-        // Two blocks from the same author (validator 0)
         let b0a = make_block(test_addr(0), 0, vec![], vec![hash_bytes(b"a")], 100);
         let b0b = make_block(test_addr(0), 0, vec![], vec![hash_bytes(b"b")], 101);
         engine.receive_block(&b0a).unwrap();
         engine.receive_block(&b0b).unwrap();
 
-        // Only 5M effective stake (one author): cannot advance
         assert!(!engine.advance_round());
 
-        // Add blocks from two more validators -> 15M >= quorum
         let b1 = make_block(test_addr(1), 0, vec![], vec![], 102);
         let b2 = make_block(test_addr(2), 0, vec![], vec![], 103);
         engine.receive_block(&b1).unwrap();
         engine.receive_block(&b2).unwrap();
         assert!(engine.advance_round());
     }
-
-    // ── 6. Shard Assignment ──────────────────────────────────────────────────
 
     #[test]
     fn test_shard_assignment_deterministic() {
@@ -5480,13 +4325,11 @@ mod tests {
         let shard2 = ConsensusEngine::shard_of(&addr, 8);
         assert_eq!(shard1, shard2, "shard assignment must be deterministic");
 
-        // Must be within range
         assert!(shard1 < 8);
     }
 
     #[test]
     fn test_shard_assignment_distributes() {
-        // Check that different addresses get (potentially) different shards
         let num_shards = 4u16;
         let mut shard_counts = vec![0u32; num_shards as usize];
 
@@ -5497,8 +4340,6 @@ mod tests {
             shard_counts[shard as usize] += 1;
         }
 
-        // Every shard should have at least some assignments (probabilistic, but
-        // 100 addresses across 4 shards should cover all of them)
         for (shard_id, &count) in shard_counts.iter().enumerate() {
             assert!(
                 count > 0,
@@ -5510,28 +4351,22 @@ mod tests {
 
     #[test]
     fn test_shard_of_single_shard() {
-        // With 1 shard, everything maps to shard 0
         let addr = test_addr(42);
         assert_eq!(ConsensusEngine::shard_of(&addr, 1), 0);
     }
 
     #[test]
     fn test_shard_of_zero_shards() {
-        // Edge case: 0 shards returns 0
         let addr = test_addr(42);
         assert_eq!(ConsensusEngine::shard_of(&addr, 0), 0);
     }
 
-    // ── 7. Cross-Shard Detection ─────────────────────────────────────────────
-
     #[test]
     fn test_same_shard_transfer_fast_path() {
-        // Find two addresses that hash to the same shard
         let num_shards = 4u16;
         let from_addr = test_addr(0);
         let from_shard = ConsensusEngine::shard_of(&from_addr, num_shards);
 
-        // Search for a `to` address on the same shard
         let mut to_addr = Hash256::ZERO;
         for i in 1..=255u8 {
             let candidate = test_addr(i);
@@ -5551,7 +4386,6 @@ mod tests {
 
     #[test]
     fn test_cross_shard_transfer_full_consensus() {
-        // Find two addresses on different shards
         let num_shards = 4u16;
         let from_addr = test_addr(0);
         let from_shard = ConsensusEngine::shard_of(&from_addr, num_shards);
@@ -5575,7 +4409,6 @@ mod tests {
 
     #[test]
     fn test_single_shard_always_fast_path() {
-        // With only 1 shard, everything is fast path
         let from_addr = test_addr(0);
         let to_addr = test_addr(1);
         let tx = Transaction::new_transfer(from_addr, to_addr, 1000, 0);
@@ -5604,8 +4437,6 @@ mod tests {
         );
     }
 
-    // ── 8. Cross-Shard Receipt ───────────────────────────────────────────────
-
     #[test]
     fn test_cross_shard_receipt_construction() {
         let receipt = CrossShardReceipt {
@@ -5622,8 +4453,6 @@ mod tests {
         assert_ne!(receipt.source_block, Hash256::ZERO);
         assert_ne!(receipt.tx_hash, Hash256::ZERO);
     }
-
-    // ── 9. DAG Block Hash Integrity ──────────────────────────────────────────
 
     #[test]
     fn test_dag_block_hash_deterministic() {
@@ -5651,14 +4480,11 @@ mod tests {
         );
     }
 
-    // ── 10. Full Multi-Round Integration ─────────────────────────────────────
-
     #[test]
     fn test_full_three_round_lifecycle() {
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
-        // ── Round 0: All validators propose ──
         let r0_b0 = engine
             .propose_block(vec![hash_bytes(b"r0_tx0")], 100)
             .unwrap();
@@ -5674,8 +4500,7 @@ mod tests {
         assert!(engine.advance_round());
         assert_eq!(engine.current_round(), 1);
 
-        // ── Round 1: All validators propose, referencing round 0 ──
-        let all_r0 = vec![r0_b0.hash, r0_b1.hash, r0_b2.hash]; // quorum-worth of parents
+        let all_r0 = vec![r0_b0.hash, r0_b1.hash, r0_b2.hash];
         let r1_b0 = engine
             .propose_block(vec![hash_bytes(b"r1_tx0")], 200)
             .unwrap();
@@ -5695,7 +4520,6 @@ mod tests {
         assert!(engine.advance_round());
         assert_eq!(engine.current_round(), 2);
 
-        // ── Round 2: All validators propose, referencing round 1 ──
         let all_r1 = vec![r1_b0.hash, r1_b1.hash, r1_b2.hash];
         let _r2_b0 = engine
             .propose_block(vec![hash_bytes(b"r2_tx0")], 300)
@@ -5715,26 +4539,19 @@ mod tests {
 
         assert_eq!(engine.dag_size(), 12);
 
-        // ── Commit check ──
-        // Round 0 blocks that are parents of round 1 blocks that are referenced
-        // by >= quorum in round 2 should be committed.
         let committed = engine.try_commit();
         assert!(
             !committed.is_empty(),
             "should have committed at least one block from round 0"
         );
 
-        // The committed set should only contain round 0 blocks
         for block in &committed {
             assert_eq!(block.round, 0);
         }
 
-        // Committed list should be persisted
         let committed_list = engine.committed_blocks();
         assert!(!committed_list.is_empty());
     }
-
-    // ── 11. Validator Set Update ─────────────────────────────────────────────
 
     #[test]
     fn test_update_validator_set() {
@@ -5744,7 +4561,6 @@ mod tests {
         assert_eq!(engine.validator_set().epoch, 1);
         assert_eq!(engine.validator_set().len(), 4);
 
-        // Update to a new epoch with 6 validators
         let new_vs = ValidatorSet::new(
             (0..6)
                 .map(|i| Validator::new(test_addr(i as u8), STAKE_ARC, i as u16).unwrap())
@@ -5773,8 +4589,6 @@ mod tests {
         assert_eq!(after.total_stake, before.total_stake);
         assert_eq!(after.quorum, before.quorum);
     }
-
-    // ── 12. Cross-Shard Execution Proofs ────────────────────────────────────
 
     #[test]
     fn test_cross_shard_assign_shard_deterministic() {
@@ -5939,8 +4753,6 @@ mod tests {
         assert_eq!(engine.cross_shard_stats(), (1, 1));
     }
 
-    // ── 13. MEV Protection - Fair Ordering (A7) ─────────────────────────────
-
     #[test]
     fn test_ordering_commitment_deterministic() {
         let txs = vec![hash_bytes(b"tx1"), hash_bytes(b"tx2"), hash_bytes(b"tx3")];
@@ -5984,10 +4796,8 @@ mod tests {
         let txs = vec![hash_bytes(b"tx1"), hash_bytes(b"tx2")];
         let mut block = make_block(test_addr(1), 0, vec![], txs, 1000);
 
-        // Tamper with the ordering commitment (simulate reordering)
         block.ordering_commitment =
             DagBlock::compute_ordering_commitment(&[hash_bytes(b"tx2"), hash_bytes(b"tx1")]);
-        // Recompute hash with tampered commitment
         block.hash = block.compute_hash();
 
         let result = engine.receive_block(&block);
@@ -5999,20 +4809,15 @@ mod tests {
 
     #[test]
     fn test_block_rejects_unsorted_transactions() {
-        // Manually construct a block with transactions NOT in canonical order.
-        // Even if the ordering commitment matches the unsorted list, the block
-        // must be rejected because transactions are not lexicographically sorted.
         let tx_a = hash_bytes(b"aaa");
         let tx_b = hash_bytes(b"bbb");
 
-        // Determine actual sort order of these hashes
         let (first, second) = if tx_a.0 <= tx_b.0 {
             (tx_a, tx_b)
         } else {
             (tx_b, tx_a)
         };
 
-        // Put them in REVERSE canonical order
         let unsorted = vec![second, first];
         let commitment = DagBlock::compute_ordering_commitment(&unsorted);
         let mut block = DagBlock {
@@ -6027,8 +4832,6 @@ mod tests {
         };
         block.hash = block.compute_hash();
 
-        // The commitment matches the transactions as-stored, but the
-        // transactions are NOT in sorted order, so verify_ordering must fail.
         assert!(
             !block.verify_ordering(),
             "block with unsorted transactions must fail ordering verification"
@@ -6037,8 +4840,6 @@ mod tests {
 
     #[test]
     fn test_propose_block_sorts_transactions() {
-        // propose_block should sort transactions into canonical order
-        // regardless of the caller's input order.
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
@@ -6046,11 +4847,9 @@ mod tests {
         let tx_b = hash_bytes(b"bravo");
         let tx_c = hash_bytes(b"charlie");
 
-        // Sort to get canonical order
         let mut expected = vec![tx_a, tx_b, tx_c];
         expected.sort_by_key(|tx| tx.0);
 
-        // Feed them in reverse canonical order
         let reversed: Vec<Hash256> = expected.iter().rev().copied().collect();
 
         let block = engine.propose_block(reversed, 1000).unwrap();
@@ -6064,8 +4863,6 @@ mod tests {
             "proposed block must pass ordering verification"
         );
     }
-
-    // ── 14. Cross-Shard Deadlock Prevention (A6) ────────────────────────────
 
     #[test]
     fn test_cross_shard_lock_has_timestamp() {
@@ -6092,7 +4889,6 @@ mod tests {
             .lock_cross_shard(tx, 0, 1, hash_bytes(b"block"), 0)
             .unwrap();
 
-        // Just locked - should not be expired
         let expired = engine.expire_stale_locks();
         assert_eq!(expired, 0, "fresh lock should not be expired");
         assert_eq!(engine.cross_shard_stats(), (1, 0));
@@ -6108,25 +4904,21 @@ mod tests {
             .lock_cross_shard(tx, 0, 1, hash_bytes(b"block"), 0)
             .unwrap();
 
-        // Manually set the lock timestamp to 60 seconds ago
         if let Some(mut entry) = engine.pending_cross_shard.get_mut(&tx) {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64;
-            entry.locked_at_ms = now_ms - 60_000; // 60 seconds ago
+            entry.locked_at_ms = now_ms - 60_000;
         }
 
         let expired = engine.expire_stale_locks();
         assert_eq!(expired, 1, "stale lock should be expired");
         assert_eq!(engine.cross_shard_stats(), (0, 1));
 
-        // Check it was aborted
         let proof = engine.completed_cross_shard.get(&tx).unwrap();
         assert_eq!(proof.status, CrossShardStatus::Aborted);
     }
-
-    // ── 15. Finality Proofs (A8) ────────────────────────────────────────────
 
     #[test]
     fn test_finality_proof_sufficient_stake() {
@@ -6187,7 +4979,6 @@ mod tests {
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
-        // Build 3-round DAG identical to test_commit_rule_two_round
         let block_b = make_block(test_addr(0), 0, vec![], vec![hash_bytes(b"tx_b")], 100);
         let b1 = make_block(test_addr(1), 0, vec![], vec![], 101);
         let b2 = make_block(test_addr(2), 0, vec![], vec![], 102);
@@ -6249,7 +5040,6 @@ mod tests {
         engine.receive_block(&d2).unwrap();
         engine.receive_block(&d3).unwrap();
 
-        // Commit
         let committed = engine.try_commit();
         assert!(!committed.is_empty());
 
@@ -6266,25 +5056,20 @@ mod tests {
         );
     }
 
-    // ── 16. DAG Pruning / Memory Bounds (A4) ─────────────────────────────────
-
     #[test]
     fn test_dag_pruning_removes_old_rounds() {
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
-        // Insert blocks in rounds 0 through 110
         for round in 0..=110u64 {
             for v in 0..4u8 {
                 let parents = if round == 0 {
                     vec![]
                 } else {
-                    // Use at least one parent from the previous round
                     engine.blocks_in_round(round - 1)
                 };
                 let block =
                     make_block(test_addr(v), round, parents, vec![], round * 100 + v as u64);
-                // Insert directly into DAG (bypass validation for test scaffolding)
                 engine.dag.insert(block.hash, block.clone());
                 engine.rounds.entry(round).or_default().push(block.hash);
                 engine
@@ -6296,22 +5081,16 @@ mod tests {
         let initial_dag_size = engine.dag_size();
         assert!(initial_dag_size > 0);
 
-        // Retention decides the cutoff, not a hardcoded depth. With the
-        // default 4096 rounds nothing here is old enough to prune, which is
-        // the point: this is the path that determines how far back a
-        // rejoining peer can still be served.
         assert_eq!(
             engine.prune_below_round(110),
             0,
             "with the default retention, 110 rounds of history are all still needed"
         );
 
-        // Ask for a 100-round window explicitly and the old behaviour returns.
         engine.set_retained_rounds(100);
         let pruned = engine.prune_below_round(110);
         assert!(pruned > 0, "should have pruned some blocks");
 
-        // Rounds 0..9 should be gone
         for round in 0..10u64 {
             assert!(
                 engine.blocks_in_round(round).is_empty(),
@@ -6320,7 +5099,6 @@ mod tests {
             );
         }
 
-        // Round 10 and above should still exist
         assert!(
             !engine.blocks_in_round(10).is_empty(),
             "round 10 should still exist"
@@ -6334,7 +5112,6 @@ mod tests {
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
-        // Insert blocks in rounds 0 through 50
         for round in 0..=50u64 {
             let block = make_block(
                 test_addr(0),
@@ -6353,7 +5130,6 @@ mod tests {
 
         let initial_size = engine.dag_size();
 
-        // committed_round = 50, which is < PRUNE_DEPTH (100), so nothing should be pruned
         let pruned = engine.prune_below_round(50);
         assert_eq!(
             pruned, 0,
@@ -6361,7 +5137,6 @@ mod tests {
         );
         assert_eq!(engine.dag_size(), initial_size);
 
-        // All rounds should still exist
         for round in 0..=50u64 {
             assert!(
                 !engine.blocks_in_round(round).is_empty(),
@@ -6376,9 +5151,6 @@ mod tests {
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
-        // Rounds 0..=2, every validator, each block referencing every block of
-        // the previous round. Round 0's leader is therefore certified by the
-        // two-round rule as soon as round 2 exists.
         for round in 0..=2u64 {
             let parents = if round == 0 {
                 Vec::new()
@@ -6401,9 +5173,6 @@ mod tests {
         }
         assert_eq!(engine.current_round(), 2);
 
-        // The DAG round keeps turning while the commit cursor waits for the
-        // round-3 certifiers that would finish round 1's certificate. This is
-        // the live failure shape: dag_round far ahead of dag_committed.
         for _ in 0..=PRUNE_DEPTH {
             engine.force_advance_round();
         }
@@ -6413,11 +5182,6 @@ mod tests {
         assert_eq!(committed.len(), 1, "round 0 leader must commit");
         assert_eq!(engine.last_committed_round(), 1);
 
-        // Post-commit pruning used `current_round - PRUNE_DEPTH`, which deletes
-        // the rounds the commit cursor has NOT passed yet. Once round 1 is gone
-        // `try_commit` breaks on an empty `blocks_in_round(scan_start)` on every
-        // later call, so the node advances rounds forever and never commits
-        // again.
         assert!(
             !engine.blocks_in_round(1).is_empty(),
             "round 1 is the commit cursor and must survive pruning"
@@ -6427,7 +5191,6 @@ mod tests {
             "round 2 certifies round 1 and must survive pruning"
         );
 
-        // Liveness: the late round-3 certifiers complete round 1's certificate.
         let round3_parents = engine.blocks_in_round(2);
         assert_eq!(round3_parents.len(), 4);
         for v in 0..4u8 {
@@ -6469,9 +5232,6 @@ mod tests {
             assert!(engine.advance_round());
         }
 
-        // Both detectors are appended on every accepted block. Nothing pruned
-        // them outside their own unit tests, so a node that keeps advancing
-        // rounds without committing grew them for the life of the process.
         let bound = (SECURITY_HISTORY_DEPTH + PRUNE_DEPTH) as usize;
         let retained_votes = engine.stake_tracker().lock().retained_vote_rounds();
         assert!(
@@ -6484,29 +5244,22 @@ mod tests {
             "withholding detector retained {retained_observations} observations over {rounds} rounds (bound {bound})"
         );
 
-        // The retained window must still cover every consumer: withholding uses
-        // a 100-round window and double-vote detection uses the current round.
         assert!(
             retained_votes >= PRUNE_DEPTH as usize,
             "retention must not fall below the widest detector window"
         );
     }
 
-    // ── 17. Equivocation Detection & Slashing (A3) ──────────────────────────
-
     #[test]
     fn test_equivocation_detected_same_round() {
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
-        // First block from validator 1 in round 0
         let block1 = make_block(test_addr(1), 0, vec![], vec![hash_bytes(b"tx_a")], 1000);
         engine.receive_block(&block1).unwrap();
 
-        // Second (different) block from validator 1 in round 0 - equivocation!
         let block2 = make_block(test_addr(1), 0, vec![], vec![hash_bytes(b"tx_b")], 1001);
 
-        // detect_equivocation should find it
         let proof = engine.detect_equivocation(&block2);
         assert!(
             proof.is_some(),
@@ -6525,12 +5278,9 @@ mod tests {
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
-        // Block from validator 1 in round 0
         let block1 = make_block(test_addr(1), 0, vec![], vec![hash_bytes(b"tx_a")], 1000);
         engine.receive_block(&block1).unwrap();
 
-        // Block from validator 1 in round 1 - different round, NOT equivocation
-        // Need to set up parent references properly
         let block2 = make_block(
             test_addr(1),
             1,
@@ -6539,8 +5289,6 @@ mod tests {
             1001,
         );
 
-        // Insert block2's author+round into author_round_blocks for detection
-        // (normally receive_block would do this, but we test detect_equivocation directly)
         let proof = engine.detect_equivocation(&block2);
         assert!(
             proof.is_none(),
@@ -6555,9 +5303,8 @@ mod tests {
 
         let target = test_addr(1);
         let initial_stake = engine.validator_set().get_validator(&target).unwrap().stake;
-        assert_eq!(initial_stake, STAKE_ARC); // 5,000,000
+        assert_eq!(initial_stake, STAKE_ARC);
 
-        // Slash 1,000,000 ARC - should reduce stake but not remove
         let removed = engine.enforce_slash(&target, 1_000_000);
         assert!(
             !removed,
@@ -6576,14 +5323,12 @@ mod tests {
         let target = test_addr(1);
         assert!(engine.validator_set().is_validator(&target));
 
-        // Slash the entire stake - should remove the validator
         let removed = engine.enforce_slash(&target, STAKE_ARC);
         assert!(
             removed,
             "validator should be removed when stake falls below STAKE_SPARK"
         );
 
-        // Validator should no longer be in the set
         assert!(
             !engine.validator_set().is_validator(&target),
             "removed validator should not be in the set"
@@ -6595,8 +5340,6 @@ mod tests {
         );
     }
 
-    // ── 18. Cross-Shard Lock Expiry (A6) ────────────────────────────────────
-
     #[test]
     fn test_cross_shard_lock_expiry() {
         let vs = test_validator_set(4);
@@ -6607,7 +5350,6 @@ mod tests {
             .lock_cross_shard(tx, 0, 1, hash_bytes(b"block"), 0)
             .unwrap();
 
-        // Manually set the lock timestamp to 60 seconds ago (well past 30s timeout)
         if let Some(mut entry) = engine.pending_cross_shard.get_mut(&tx) {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -6616,12 +5358,10 @@ mod tests {
             entry.locked_at_ms = now_ms - 60_000;
         }
 
-        // Expire with 30-second timeout
         let expired = engine.expire_stale_locks_with_timeout(30);
         assert_eq!(expired, 1, "stale lock should be expired with 30s timeout");
         assert_eq!(engine.cross_shard_stats(), (0, 1));
 
-        // Verify it was aborted
         let proof = engine.completed_cross_shard.get(&tx).unwrap();
         assert_eq!(proof.status, CrossShardStatus::Aborted);
     }
@@ -6636,7 +5376,6 @@ mod tests {
             .lock_cross_shard(tx, 0, 1, hash_bytes(b"block"), 0)
             .unwrap();
 
-        // Lock was just created - should NOT be expired even with a short timeout
         let expired = engine.expire_stale_locks_with_timeout(30);
         assert_eq!(expired, 0, "fresh lock should not be expired");
         assert_eq!(engine.cross_shard_stats(), (1, 0));
@@ -6653,7 +5392,6 @@ mod tests {
         let vs = ValidatorSet::new(validators, 1);
         let engine = ConsensusEngine::new(vs, test_addr(1));
 
-        // Verify modules are accessible
         let wd = engine.withholding_detector().lock();
         assert_eq!(wd.detect_withholding(100).len(), 0);
         drop(wd);
@@ -6665,8 +5403,6 @@ mod tests {
         let st = engine.stake_tracker().lock();
         assert!(st.all_penalties().is_empty());
     }
-
-    // ── Propose-Verify Protocol ─────────────────────────────────────────────
 
     #[test]
     fn test_node_role_default() {
@@ -6691,8 +5427,6 @@ mod tests {
         engine.set_node_role(NodeRole::Full);
         assert_eq!(engine.node_role(), NodeRole::Full);
     }
-
-    // ── Fresh-boot catch-up safety ─────────────────────────────────────
 
     #[test]
     fn fresh_boot_rejects_far_ahead_signed_block() {
@@ -6725,24 +5459,15 @@ mod tests {
 
     #[test]
     fn established_node_rejects_block_beyond_max_jump() {
-        // Same scenario but engine already has current_round > 0. The
-        // protective max-jump cap stays in effect: a malicious peer
-        // can't lie about round=u64::MAX and pin us there.
         let validators = vec![
             Validator::new(test_addr(1), STAKE_ARC, 0).unwrap(),
             Validator::new(test_addr(2), STAKE_ARC, 1).unwrap(),
         ];
         let vs = ValidatorSet::new(validators, 1);
         let engine = ConsensusEngine::new(vs, test_addr(1));
-        engine.restore_round_from_local_wal(100, 0); // established, current=100
+        engine.restore_round_from_local_wal(100, 0);
 
-        let block = make_block(
-            test_addr(2),
-            10_000_000, // jump = 9_999_900 > 1M cap
-            vec![],
-            vec![],
-            1_700_000_000_000,
-        );
+        let block = make_block(test_addr(2), 10_000_000, vec![], vec![], 1_700_000_000_000);
         let result = engine.receive_block(&block);
         assert!(
             result.is_err(),
@@ -6759,15 +5484,12 @@ mod tests {
 
     #[test]
     fn restore_round_from_local_wal_is_idempotent_when_lower() {
-        // Local WAL restoration when current >= N is a no-op. Prevents a
-        // stale dag-wal segment from clobbering an in-memory advance.
         let validators = vec![Validator::new(test_addr(1), STAKE_ARC, 0).unwrap()];
         let vs = ValidatorSet::new(validators, 1);
         let engine = ConsensusEngine::new(vs, test_addr(1));
         engine.restore_round_from_local_wal(500, 400);
         assert_eq!(engine.current_round(), 500);
 
-        // Try to "rewind" to 100 — should be ignored.
         engine.restore_round_from_local_wal(100, 50);
         assert_eq!(
             engine.current_round(),
@@ -6823,7 +5545,6 @@ mod tests {
 
         let vs = engine.validator_set();
         let slashed = vs.get_validator(&test_addr(2));
-        // After slashing, validator should have reduced stake
         if let Some(v) = slashed {
             assert!(v.stake < STAKE_ARC);
         }

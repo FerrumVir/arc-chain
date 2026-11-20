@@ -1,21 +1,3 @@
-//! Perplexity of the canonical integer profile, measured the way llama.cpp's
-//! `llama-perplexity` measures it, so the two numbers are comparable on the
-//! same GGUF and text (M4).
-//!
-//! Method (llama.cpp `perplexity()`): tokenize the whole text once with BOS;
-//! cut `n_ctx`-token chunks; replace each chunk's first token with BOS; run
-//! the chunk; score positions `n_ctx/2 .. n_ctx-2`, where the logits at `j`
-//! predict token `j+1`. PPL = exp(mean negative log-likelihood).
-//!
-//! The model runs the canonical profile end to end: the interleaved-RoPE
-//! loader, integer forward, Q16 logits. Only the measurement (log-softmax of
-//! the logits) uses f64, as every perplexity tool does.
-//!
-//! Usage:
-//!   cargo run -p arc-inference --example canonical_perplexity --features candle --release -- \
-//!     --model /path/model.gguf --text wiki.test.raw [--ctx 512] [--chunks 20] \
-//!     [--tokens-out tokens.txt] [--json-out result.json]
-
 use arc_inference::cached_integer_model::{
     GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, KVCache,
     load_cached_model_canonical_i8_interleaved_rope,
@@ -36,7 +18,6 @@ fn arg(args: &[String], name: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
-/// Negative log-likelihood of `target` under Q16 logits, in f64.
 fn nll(logits: &[i64], target: u32) -> f64 {
     let max = logits.iter().copied().max().unwrap_or(0) as f64 / Q16;
     let sum: f64 = logits.iter().map(|&x| (x as f64 / Q16 - max).exp()).sum();
@@ -89,8 +70,6 @@ fn main() {
         let mut window = tokens[chunk * n_ctx..(chunk + 1) * n_ctx].to_vec();
         window[0] = bos;
         let mut cache = KVCache::new(model.config.n_layers);
-        // Every position's logits are needed. Batched prefill returns them all
-        // bit-identically (M7); fall back to token-at-a-time if it refuses.
         let logits: Vec<Vec<i64>> = model
             .prefill_canonical_i8_batched(&window, &mut cache, 64, true)
             .unwrap_or_else(|| {

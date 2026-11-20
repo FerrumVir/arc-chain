@@ -1,8 +1,3 @@
-"""FIXTURE tests for scripts/benchmarks/native_request_latency.py (M8).
-
-Every record below is synthetic: it has the shape soak_native_load writes,
-with round numbers so each figure in the report can be checked exactly.
-"""
 import importlib.util
 import json
 import os

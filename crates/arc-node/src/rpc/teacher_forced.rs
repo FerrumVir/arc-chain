@@ -1,10 +1,6 @@
-//! Optional claim acceleration. Only the existing sequential verifier may
-//! reject a claim; every failure here is an instruction to fall back.
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// Process-lifetime counters are emitted in structured logs, outside the frozen
-// desktop response schemas. Candidate counters count validated candidates.
 static COUNTERS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 fn count(index: usize, event: &'static str) {
     let total = COUNTERS[index].fetch_add(1, Ordering::Relaxed) + 1;
@@ -35,8 +31,6 @@ fn candidate(
         count(6, "candidate_reencoded");
         return Some(tokens);
     }
-    // Some tokenizers encode a displayed EOS piece as ordinary text. Try
-    // stripping precisely that trailing piece and appending its token ID.
     for &eos in &model.config.eos_tokens {
         let piece = model.decode(&[eos]);
         if !piece.is_empty()
@@ -139,7 +133,6 @@ pub(super) async fn run_teacher_forced_pipeline(
                     last_token: false,
                 };
                 let out = pipeline_hop(&node, &mut replicas, strategy, &req, true).await?;
-                // Check at the terminal worker, before accepting more positions.
                 if i == hops - 1
                     && item.position >= first_output
                     && out.token_id != Some(claimed[k])
@@ -220,8 +213,6 @@ pub(super) async fn run_teacher_forced_pipeline(
         if seen != positions { return Err("incomplete teacher-forced pipeline".into()); }
         Ok(())
     }.await;
-    // On refusal, mismatch or timeout, stop issuance and observe every task's
-    // exit before the caller cleans caches or starts a sequential fallback.
     feeder.shutdown().await;
     workers.shutdown().await;
     result?;

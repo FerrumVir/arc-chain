@@ -1,22 +1,4 @@
 #!/usr/bin/env python3
-"""
-Deterministic On-Chain Inference Proof Generator
-
-Sends 100+ inference requests to ARM (Mac Studio) and x86 (Vultr) nodes,
-verifying identical output hashes across platforms. Every request creates
-an InferenceAttestation TX finalized through 9-node DAG consensus.
-
-Usage:
-    python3 scripts/prove_determinism.py \
-        --arm http://localhost:9090 \
-        --x86 http://149.28.32.76:9090 \
-        --output determinism-proof
-
-Output:
-    determinism-proof.jsonl    — per-run results
-    determinism-summary.md     — formatted table
-    attestation-txs.txt        — all TX hashes
-"""
 
 import json
 import sys
@@ -27,10 +9,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 
-# ─── Prompt Corpus: 100+ real-world prompts across 8-1024 tokens ────────────
-
 PROMPTS = [
-    # Math/Logic (15 prompts, 8-16 tokens)
     {"prompt": "What is 17 times 23?", "max_tokens": 8, "category": "math"},
     {"prompt": "Is 97 a prime number?", "max_tokens": 8, "category": "math"},
     {"prompt": "What is the square root of 144?", "max_tokens": 8, "category": "math"},
@@ -47,7 +26,6 @@ PROMPTS = [
     {"prompt": "What is the LCM of 12 and 18?", "max_tokens": 16, "category": "math"},
     {"prompt": "Convert 0.75 to a fraction", "max_tokens": 16, "category": "math"},
 
-    # Factual Q&A (15 prompts, 16-32 tokens)
     {"prompt": "What is the capital of France?", "max_tokens": 16, "category": "factual"},
     {"prompt": "Who wrote Romeo and Juliet?", "max_tokens": 16, "category": "factual"},
     {"prompt": "What is the boiling point of water in Celsius?", "max_tokens": 16, "category": "factual"},
@@ -64,7 +42,6 @@ PROMPTS = [
     {"prompt": "What element has atomic number 6?", "max_tokens": 32, "category": "factual"},
     {"prompt": "What is the longest river in the world?", "max_tokens": 32, "category": "factual"},
 
-    # Explanations (15 prompts, 64-128 tokens)
     {"prompt": "Explain how photosynthesis works", "max_tokens": 64, "category": "explanation"},
     {"prompt": "How does TCP/IP networking work?", "max_tokens": 64, "category": "explanation"},
     {"prompt": "Explain the difference between RAM and ROM", "max_tokens": 64, "category": "explanation"},
@@ -81,7 +58,6 @@ PROMPTS = [
     {"prompt": "How does the internet work?", "max_tokens": 128, "category": "explanation"},
     {"prompt": "Explain the greenhouse effect", "max_tokens": 128, "category": "explanation"},
 
-    # Code generation (15 prompts, 128-256 tokens)
     {"prompt": "Write a Python function to compute fibonacci numbers", "max_tokens": 128, "category": "code"},
     {"prompt": "Write a SQL query to find the top 10 customers by revenue", "max_tokens": 128, "category": "code"},
     {"prompt": "Write a JavaScript function to sort an array", "max_tokens": 128, "category": "code"},
@@ -98,7 +74,6 @@ PROMPTS = [
     {"prompt": "Write a Python function to flatten a nested list", "max_tokens": 128, "category": "code"},
     {"prompt": "Write a function to find duplicates in an array", "max_tokens": 128, "category": "code"},
 
-    # Creative writing (10 prompts, 256-512 tokens)
     {"prompt": "Write a haiku about the ocean at sunset", "max_tokens": 256, "category": "creative"},
     {"prompt": "Write the opening paragraph of a mystery novel", "max_tokens": 256, "category": "creative"},
     {"prompt": "Compose a short poem about artificial intelligence", "max_tokens": 256, "category": "creative"},
@@ -110,7 +85,6 @@ PROMPTS = [
     {"prompt": "Write a dialogue between two philosophers about time", "max_tokens": 512, "category": "creative"},
     {"prompt": "Write a news article from the year 2100", "max_tokens": 512, "category": "creative"},
 
-    # Long-form (10 prompts, 512-1024 tokens)
     {"prompt": "Write an essay about the impact of climate change on agriculture", "max_tokens": 512, "category": "longform"},
     {"prompt": "Explain quantum computing from first principles", "max_tokens": 512, "category": "longform"},
     {"prompt": "Write a comprehensive guide to starting a business", "max_tokens": 1024, "category": "longform"},
@@ -122,7 +96,6 @@ PROMPTS = [
     {"prompt": "Write about the future of renewable energy", "max_tokens": 1024, "category": "longform"},
     {"prompt": "Explain how machine learning differs from traditional programming", "max_tokens": 512, "category": "longform"},
 
-    # Edge cases (10 prompts, 8-64 tokens)
     {"prompt": "A", "max_tokens": 8, "category": "edge"},
     {"prompt": "", "max_tokens": 8, "category": "edge"},
     {"prompt": "Hello", "max_tokens": 8, "category": "edge"},
@@ -134,7 +107,6 @@ PROMPTS = [
     {"prompt": "NULL", "max_tokens": 8, "category": "edge"},
     {"prompt": "   ", "max_tokens": 8, "category": "edge"},
 
-    # Repeat tests (10 identical prompts for within-platform determinism)
     {"prompt": "What color is the sky?", "max_tokens": 32, "category": "repeat"},
     {"prompt": "What color is the sky?", "max_tokens": 32, "category": "repeat"},
     {"prompt": "What color is the sky?", "max_tokens": 32, "category": "repeat"},
@@ -149,7 +121,6 @@ PROMPTS = [
 
 
 def send_inference(url, prompt, max_tokens, timeout=600):
-    """Send inference request and return parsed response."""
     payload = json.dumps({
         "input": prompt,
         "max_tokens": max_tokens,
@@ -216,7 +187,6 @@ def main():
             display = prompt[:50] + "..." if len(prompt) > 50 else prompt
             print(f"[{idx+1}/{total}] {category:12s} ({max_tok:4d} tok) \"{display}\"", end="", flush=True)
 
-            # Run on ARM
             arm_result = send_inference(args.arm, prompt, max_tok)
             if not arm_result.get("success"):
                 print(f" ARM_ERROR: {arm_result.get('error', 'unknown')}")
@@ -233,7 +203,6 @@ def main():
             arm_ms = arm_result.get("inference", {}).get("ms_per_token", 0)
             arm_tokens = arm_result.get("inference", {}).get("tokens_generated", 0)
 
-            # Run on x86
             x86_result = send_inference(args.x86, prompt, max_tok)
             if not x86_result.get("success"):
                 print(f" x86_ERROR: {x86_result.get('error', 'unknown')}")
@@ -288,12 +257,10 @@ def main():
             if x86_tx:
                 tx_hashes.append(x86_tx)
 
-    # Write TX hashes
     with open(tx_file, "w") as tf:
         for tx in tx_hashes:
             tf.write(tx + "\n")
 
-    # Write summary
     with open(summary_file, "w") as sf:
         sf.write(f"# Deterministic On-Chain Inference Proof\n\n")
         sf.write(f"**Date:** {timestamp}\n")
@@ -301,7 +268,6 @@ def main():
         sf.write(f"**x86 node:** {args.x86}\n\n")
         sf.write(f"## Results: {passed}/{total} MATCH, {failed} MISMATCH, {errors} ERROR\n\n")
 
-        # Per-category breakdown
         categories = {}
         for r in all_results:
             cat = r["category"]
@@ -321,7 +287,6 @@ def main():
             sf.write(f"| {cat} | {counts['total']} | {counts['match']} | {counts['mismatch']} | {counts['error']} |\n")
         sf.write(f"| **Total** | **{total}** | **{passed}** | **{failed}** | **{errors}** |\n\n")
 
-        # Full results table
         sf.write("## Detailed Results\n\n")
         sf.write("| # | Category | Tokens | ARM Hash | x86 Hash | Match | ARM ms/tok | x86 ms/tok |\n")
         sf.write("|---|----------|--------|----------|----------|-------|------------|------------|\n")

@@ -1,22 +1,5 @@
 name: Determinism proof
 
-# Public, reproducible evidence that ARC's canonical per-row INT8 engine gives
-# byte-identical output for a real 7B model (Llama-2-7B-Chat Q4_K_M, pinned by
-# SHA-256) on four CPU platforms: Apple Silicon macOS, Intel macOS, Linux
-# x86_64 and Windows x86_64. Each platform runs the scalar projection kernel
-# and the SIMD limb kernel (NEON dotprod on arm64, AVX2 on x86_64) in separate
-# jobs. The driver pins the SIMD jobs to that base kernel, so the wider SMMLA
-# and VNNI kernels that v0.8.12 can select do not replace it.
-#
-# Every leg writes a platform-independent transcript: the BLAKE3 of the exact
-# logits and K/V rows at every forward position plus every generated token ID.
-# The compare job is green only if every transcript has the same SHA-256. CPU
-# only; GPU backends are not covered. docs/determinism-proof.md explains the
-# scope and how to run the same check on your own machine.
-#
-# Cost control: a pull request runs this only when it changes the proof's own
-# files AND carries the `determinism-proof` label, so ordinary CI never runs it.
-# workflow_dispatch works once this file is on the default branch.
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
@@ -29,8 +12,6 @@ on:
 permissions:
   contents: read
 
-# One run per commit: a newer commit's run does not cancel or wait behind an
-# older run's long macOS legs. Duplicate triggers for the same commit queue.
 concurrency:
   group: determinism-proof-${{ github.event.pull_request.number || github.ref }}-${{ github.sha }}
   cancel-in-progress: false
@@ -38,21 +19,12 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # Workload. Empty PROOF_PROMPT_LIMIT means every prompt in prompts.json. The
-  # published expected hash is for all 16 prompts x 32 new tokens.
   PROOF_PROMPT_LIMIT: ""
   PROOF_MAX_NEW_TOKENS: "32"
-  # Pinned model: the same bytes as arc-node's TESTNET_MODEL_SHA256 and
-  # docs/protocol/packages/llama-2-7b-q4km.manifest.json.
   MODEL_URL: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf
   MODEL_SHA256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa
   MODEL_BYTES: "4081004224"
   MODEL_FILE: .determinism-proof-model/llama-2-7b-chat.Q4_K_M.gguf
-  # The model is downloaded on every run and is not kept in the Actions cache.
-  # On 2026-10-06 the repository cache already held 10.05 GB of ordinary CI
-  # caches against its 10 GB budget, so a 4 GB entry would evict them and slow
-  # normal CI. Caching would also need actions/cache added to the reviewed
-  # GitHub-action allowlist in tests/release/static_contract_test.sh.
 
 jobs:
   run:
@@ -66,14 +38,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macos-15 is Apple Silicon with 7 GB of RAM, less than the ~7.3 GiB
-        # resident INT8 model, so it swaps: the smoke run measured ~57 s per
-        # forward there, against ~1 s on the x86 runners. Each of its kernels
-        # therefore runs as six parallel prompt shards (at most ~155 forwards,
-        # ~2.5 h each). Every prompt starts from an empty KV cache, and the
-        # compare job joins the shard transcripts into the exact bytes a single
-        # run writes. The driver checks its deadline between prompts, so the
-        # deadline leaves a 30-minute margin inside the run step's timeout.
         include:
           - {runner: macos-15, kernel: scalar, shard: "0/6", shard_tag: 1of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
           - {runner: macos-15, kernel: scalar, shard: "1/6", shard_tag: 2of6, job_timeout: 355, run_timeout: 300, deadline_seconds: 16200}
@@ -99,7 +63,7 @@ jobs:
       SHARD: ${{ matrix.shard }}
       DEADLINE_SECONDS: ${{ matrix.deadline_seconds }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -157,7 +121,7 @@ jobs:
           fi
           echo "model verified: sha256 $actual, $size bytes"
 
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-03-16
 
@@ -243,7 +207,7 @@ jobs:
 
       - name: Upload this leg's evidence (never the model)
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: determinism-proof-leg-${{ matrix.runner }}-${{ matrix.kernel }}-${{ matrix.shard_tag }}
           path: ${{ runner.temp }}/determinism-proof/
@@ -262,13 +226,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
       - name: Download every leg's evidence
         continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: determinism-proof-leg-*
           path: ${{ runner.temp }}/legs
@@ -289,7 +253,7 @@ jobs:
 
       - name: Upload the cross-platform evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: determinism-proof-evidence
           path: |

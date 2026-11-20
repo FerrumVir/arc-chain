@@ -1,16 +1,6 @@
-//! AI Agent Lifecycle Framework
-//!
-//! Full lifecycle management for on-chain AI agents: registration, state
-//! transitions, action execution, memory read/write, funding, and termination.
-
 use std::collections::HashMap;
 use std::fmt;
 
-// ---------------------------------------------------------------------------
-// Core identity
-// ---------------------------------------------------------------------------
-
-/// Unique 32-byte identifier for an agent.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AgentId(pub [u8; 32]);
 
@@ -26,11 +16,6 @@ impl fmt::Display for AgentId {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Agent state machine
-// ---------------------------------------------------------------------------
-
-/// Lifecycle state of an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentState {
     Created,
@@ -54,22 +39,12 @@ impl fmt::Display for AgentState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
-/// Per-agent configuration controlling resource limits and permissions.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    /// Maximum gas an agent may consume per single action.
     pub max_gas_per_action: u64,
-    /// Maximum number of actions the agent may execute in one block.
     pub max_actions_per_block: u32,
-    /// Whitelist of contract addresses the agent is permitted to call.
     pub allowed_contracts: Vec<[u8; 32]>,
-    /// Whether the registry should auto-fund the agent when balance is low.
     pub auto_fund: bool,
-    /// Upper bound on the agent's memory store (bytes).
     pub memory_limit_bytes: u64,
 }
 
@@ -80,16 +55,11 @@ impl Default for AgentConfig {
             max_actions_per_block: 10,
             allowed_contracts: Vec::new(),
             auto_fund: false,
-            memory_limit_bytes: 1_048_576, // 1 MiB
+            memory_limit_bytes: 1_048_576,
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Agent
-// ---------------------------------------------------------------------------
-
-/// A registered on-chain AI agent.
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub id: AgentId,
@@ -104,11 +74,6 @@ pub struct Agent {
     pub balance: u64,
 }
 
-// ---------------------------------------------------------------------------
-// Actions
-// ---------------------------------------------------------------------------
-
-/// The type of action an agent executes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionType {
     ContractCall,
@@ -120,7 +85,6 @@ pub enum ActionType {
     Custom(String),
 }
 
-/// Outcome of an executed action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionResult {
     Success(Vec<u8>),
@@ -130,7 +94,6 @@ pub enum ActionResult {
     RateLimited,
 }
 
-/// A discrete action taken by an agent.
 #[derive(Debug, Clone)]
 pub struct AgentAction {
     pub agent_id: AgentId,
@@ -142,11 +105,6 @@ pub struct AgentAction {
     pub result: ActionResult,
 }
 
-// ---------------------------------------------------------------------------
-// Memory
-// ---------------------------------------------------------------------------
-
-/// A single key-value entry in an agent's memory store.
 #[derive(Debug, Clone)]
 pub struct MemoryEntry {
     pub key: String,
@@ -155,7 +113,6 @@ pub struct MemoryEntry {
     pub access_count: u64,
 }
 
-/// Bounded key-value memory store for an agent.
 #[derive(Debug, Clone)]
 pub struct AgentMemory {
     pub agent_id: AgentId,
@@ -174,12 +131,9 @@ impl AgentMemory {
         }
     }
 
-    /// Write or overwrite a key. Returns `Err` if the write would exceed the
-    /// memory limit.
     pub fn write(&mut self, key: String, value: Vec<u8>, timestamp: u64) -> Result<(), AgentError> {
         let new_size = key.len() + value.len();
 
-        // Check if key already exists - reclaim old size first.
         if let Some(pos) = self.entries.iter().position(|e| e.key == key) {
             let old = &self.entries[pos];
             let old_size = old.key.len() + old.value.len();
@@ -206,7 +160,6 @@ impl AgentMemory {
         Ok(())
     }
 
-    /// Read a value by key, incrementing the access counter.
     pub fn read(&mut self, key: &str) -> Option<Vec<u8>> {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.key == key) {
             entry.access_count += 1;
@@ -217,11 +170,6 @@ impl AgentMemory {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
-
-/// Errors produced by [`AgentRegistry`] operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentError {
     NotFound,
@@ -251,12 +199,6 @@ impl fmt::Display for AgentError {
 
 impl std::error::Error for AgentError {}
 
-// ---------------------------------------------------------------------------
-// Registry
-// ---------------------------------------------------------------------------
-
-/// Central registry managing all agents, their state, memory, and action
-/// history.
 pub struct AgentRegistry {
     agents: HashMap<AgentId, Agent>,
     memory: HashMap<AgentId, AgentMemory>,
@@ -264,7 +206,6 @@ pub struct AgentRegistry {
 }
 
 impl AgentRegistry {
-    /// Create a new empty registry.
     pub fn new() -> Self {
         Self {
             agents: HashMap::new(),
@@ -273,7 +214,6 @@ impl AgentRegistry {
         }
     }
 
-    /// Register a new agent. Fails if the ID is already taken.
     pub fn register(&mut self, agent: Agent) -> Result<AgentId, AgentError> {
         if self.agents.contains_key(&agent.id) {
             return Err(AgentError::AlreadyExists);
@@ -285,27 +225,16 @@ impl AgentRegistry {
         Ok(id)
     }
 
-    /// Look up an agent by ID.
     pub fn get(&self, id: &AgentId) -> Option<&Agent> {
         self.agents.get(id)
     }
 
-    /// Transition an agent to a new lifecycle state.
-    ///
-    /// Allowed transitions:
-    /// - Created -> Active
-    /// - Active -> Paused | Suspended | OutOfFunds | Terminated
-    /// - Paused -> Active | Terminated
-    /// - Suspended -> Active | Terminated
-    /// - OutOfFunds -> Active (after funding) | Terminated
-    /// - Terminated -> (none - terminal)
     pub fn update_state(&mut self, id: &AgentId, state: AgentState) -> Result<(), AgentError> {
         let agent = self.agents.get_mut(id).ok_or(AgentError::NotFound)?;
         if agent.state == AgentState::Terminated {
             return Err(AgentError::Terminated);
         }
 
-        // Validate transition.
         let valid = matches!(
             (&agent.state, &state),
             (AgentState::Created, AgentState::Active)
@@ -329,14 +258,11 @@ impl AgentRegistry {
         Ok(())
     }
 
-    /// Execute an action on behalf of an agent. Validates state, balance, rate
-    /// limits, and contract whitelist before executing.
     pub fn execute_action(
         &mut self,
         id: &AgentId,
         action: AgentAction,
     ) -> Result<ActionResult, AgentError> {
-        // Pre-flight checks.
         let agent = self.agents.get(id).ok_or(AgentError::NotFound)?;
 
         if agent.state == AgentState::Terminated {
@@ -346,26 +272,21 @@ impl AgentRegistry {
             return Err(AgentError::InvalidState);
         }
 
-        // Rate limit.
         let count = self.actions_this_block.entry(*id).or_insert(0);
         if *count >= agent.config.max_actions_per_block {
             return Err(AgentError::RateLimited);
         }
 
-        // Gas budget.
         if action.gas_used > agent.config.max_gas_per_action {
             return Ok(ActionResult::OutOfGas);
         }
 
-        // Balance check.
         if agent.balance < action.gas_used {
-            // Transition to OutOfFunds.
             let agent_mut = self.agents.get_mut(id).unwrap();
             agent_mut.state = AgentState::OutOfFunds;
             return Err(AgentError::OutOfFunds);
         }
 
-        // Contract whitelist (only for ContractCall).
         if action.action_type == ActionType::ContractCall
             && !agent.config.allowed_contracts.is_empty()
             && !agent.config.allowed_contracts.contains(&action.target)
@@ -373,7 +294,6 @@ impl AgentRegistry {
             return Ok(ActionResult::Unauthorized);
         }
 
-        // Execute - deduct gas, record action.
         let agent_mut = self.agents.get_mut(id).unwrap();
         agent_mut.balance = agent_mut.balance.saturating_sub(action.gas_used);
         agent_mut.total_actions += 1;
@@ -382,12 +302,10 @@ impl AgentRegistry {
         Ok(action.result.clone())
     }
 
-    /// Get the memory store for an agent.
     pub fn get_memory(&self, id: &AgentId) -> Option<&AgentMemory> {
         self.memory.get(id)
     }
 
-    /// Write a key-value pair into an agent's memory.
     pub fn write_memory(
         &mut self,
         id: &AgentId,
@@ -403,23 +321,18 @@ impl AgentRegistry {
         Ok(())
     }
 
-    /// Read a value from an agent's memory by key.
     pub fn read_memory(&mut self, id: &AgentId, key: &str) -> Option<Vec<u8>> {
         self.memory.get_mut(id).and_then(|m| m.read(key))
     }
 
-    /// List all agents owned by a given address.
     pub fn list_by_owner(&self, owner: [u8; 32]) -> Vec<&Agent> {
         self.agents.values().filter(|a| a.owner == owner).collect()
     }
 
-    /// Permanently terminate an agent.
     pub fn terminate(&mut self, id: &AgentId) -> Result<(), AgentError> {
         self.update_state(id, AgentState::Terminated)
     }
 
-    /// Add funds to an agent's balance. If the agent was `OutOfFunds`,
-    /// transitions it back to `Active`.
     pub fn fund(&mut self, id: &AgentId, amount: u64) -> Result<(), AgentError> {
         let agent = self.agents.get_mut(id).ok_or(AgentError::NotFound)?;
         if agent.state == AgentState::Terminated {
@@ -432,7 +345,6 @@ impl AgentRegistry {
         Ok(())
     }
 
-    /// Reset per-block action counters. Should be called at block boundaries.
     pub fn reset_block_counters(&mut self) {
         self.actions_this_block.clear();
     }
@@ -443,10 +355,6 @@ impl Default for AgentRegistry {
         Self::new()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -507,18 +415,14 @@ mod tests {
         reg.register(make_agent(1, "a")).unwrap();
         let id = make_id(1);
 
-        // Created -> Active
         reg.update_state(&id, AgentState::Active).unwrap();
         assert_eq!(reg.get(&id).unwrap().state, AgentState::Active);
 
-        // Active -> Paused
         reg.update_state(&id, AgentState::Paused).unwrap();
         assert_eq!(reg.get(&id).unwrap().state, AgentState::Paused);
 
-        // Paused -> Active
         reg.update_state(&id, AgentState::Active).unwrap();
 
-        // Active -> Terminated
         reg.update_state(&id, AgentState::Terminated).unwrap();
         assert_eq!(reg.get(&id).unwrap().state, AgentState::Terminated);
     }
@@ -529,7 +433,6 @@ mod tests {
         reg.register(make_agent(1, "a")).unwrap();
         let id = make_id(1);
 
-        // Created -> Paused is not valid
         let err = reg.update_state(&id, AgentState::Paused).unwrap_err();
         assert_eq!(err, AgentError::InvalidState);
     }
@@ -613,7 +516,7 @@ mod tests {
 
         let mut action = make_action(1, 10);
         action.action_type = ActionType::ContractCall;
-        action.target = [0xCC; 32]; // Not on whitelist
+        action.target = [0xCC; 32];
         let result = reg.execute_action(&id, action).unwrap();
         assert_eq!(result, ActionResult::Unauthorized);
     }
@@ -638,11 +541,9 @@ mod tests {
         reg.register(agent).unwrap();
         let id = make_id(1);
 
-        // "key1" (4 bytes) + value (4 bytes) = 8 bytes - fits
         reg.write_memory(&id, "key1".to_string(), vec![0; 4])
             .unwrap();
 
-        // "key2" (4 bytes) + value (4 bytes) = 8 more bytes - exceeds limit of 10
         let err = reg
             .write_memory(&id, "key2".to_string(), vec![0; 4])
             .unwrap_err();
@@ -688,7 +589,6 @@ mod tests {
         reg.terminate(&id).unwrap();
         assert_eq!(reg.get(&id).unwrap().state, AgentState::Terminated);
 
-        // Cannot fund a terminated agent.
         let err = reg.fund(&id, 100).unwrap_err();
         assert_eq!(err, AgentError::Terminated);
     }
@@ -709,7 +609,6 @@ mod tests {
         );
 
         reg.reset_block_counters();
-        // Should succeed again.
         reg.execute_action(&id, make_action(1, 10)).unwrap();
     }
 
@@ -718,7 +617,6 @@ mod tests {
         let mut reg = AgentRegistry::new();
         reg.register(make_agent(1, "a")).unwrap();
         let id = make_id(1);
-        // Agent is still in Created state.
         let err = reg.execute_action(&id, make_action(1, 10)).unwrap_err();
         assert_eq!(err, AgentError::InvalidState);
     }
@@ -731,16 +629,13 @@ mod tests {
         reg.register(agent).unwrap();
         let id = make_id(1);
 
-        // "abc" (3) + value (5) = 8
         reg.write_memory(&id, "abc".to_string(), vec![0; 5])
             .unwrap();
-        // Overwrite with smaller value - should free space.
         reg.write_memory(&id, "abc".to_string(), vec![0; 2])
             .unwrap();
         let val = reg.read_memory(&id, "abc").unwrap();
         assert_eq!(val.len(), 2);
 
-        // Memory total should now be 3 + 2 = 5, so we can write more.
         reg.write_memory(&id, "xyz".to_string(), vec![0; 10])
             .unwrap();
     }

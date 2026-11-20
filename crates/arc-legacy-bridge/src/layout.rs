@@ -1,27 +1,3 @@
-//! Where the legacy install lives and where the bridge writes.
-//!
-//! The launcher always runs as `<ARC dir>/bin/arc-node` because that is the
-//! only file v0.7 updaters replace. Everything the bridge creates lives under
-//! `<ARC dir>/legacy-bridge/`:
-//!
-//! ```text
-//! legacy-bridge/
-//!   bridge.log                       append-only, no secrets
-//!   releases/<tag>/...               pinned, verified v0.8 assets (shared cache)
-//!   nodes/<kind>-<fingerprint>/      one per v0.7 data directory
-//!     identity/validator-key.json    fresh Ed25519 identity, created by arc-cli
-//!     data/                          fresh v0.8 data directory
-//!     home/                          HOME for the node: hides model auto-discovery
-//!     v0.7-data-archive-NNNN.json    stat-only record of the untouched v0.7 data
-//!     bridge-state.json              what was started, and why
-//!     compute-consent, compute-model.json  (headless only, operator-written)
-//! ```
-//!
-//! For a headless install the v0.7 data directory is `<ARC dir>/data`, a
-//! sibling of `legacy-bridge/`. The desktop's v0.7 data directory is the ARC
-//! dir itself, so `bin/`, `models/`, `legacy-bridge/`, and the v0.8 desktop's
-//! own `data-v3*` directories are excluded from its archive record.
-
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -97,8 +73,6 @@ impl Layout {
         self.node_dir.join("compute-model.json")
     }
 
-    /// Top-level names inside the v0.7 data directory that are not v0.7 node
-    /// state and are therefore left out of the archive record.
     pub fn is_excluded_top_level(&self, name: &str) -> bool {
         self.legacy_data_dir_is_root
             && (DESKTOP_EXCLUDED_TOP_LEVEL.contains(&name)
@@ -106,7 +80,6 @@ impl Layout {
     }
 }
 
-/// `<ARC dir>` for a launcher at `<ARC dir>/bin/arc-node[.exe]`.
 pub fn root_for_launcher(launcher: &Path) -> Result<PathBuf> {
     let launcher = canonical_or_lexical(launcher);
     let file_name = launcher
@@ -136,7 +109,6 @@ pub fn resolve(launcher: &Path, invocation: &LegacyInvocation, cwd: &Path) -> Re
     let given = if invocation.data_dir.is_absolute() {
         invocation.data_dir.clone()
     } else {
-        // v0.7 resolved a relative --data-dir against its working directory.
         cwd.join(&invocation.data_dir)
     };
     let legacy = canonical_or_lexical(&given);
@@ -157,8 +129,6 @@ pub fn resolve(launcher: &Path, invocation: &LegacyInvocation, cwd: &Path) -> Re
             }
         }
         LegacyKind::Desktop => {
-            // The desktop default is "~/.arc". Windows builds without HOME set
-            // resolved it to ".arc" relative to the app's working directory.
             let default_name = legacy.file_name().and_then(|name| name.to_str()) == Some(".arc");
             if !legacy_data_dir_is_root && !default_name {
                 return Err(exit::refused(format!(
@@ -186,7 +156,6 @@ pub fn resolve(launcher: &Path, invocation: &LegacyInvocation, cwd: &Path) -> Re
     })
 }
 
-/// Rebuild the layout of an already bridged node for an operator command.
 pub fn from_existing_node(
     launcher: &Path,
     node_dir: &Path,
@@ -227,9 +196,6 @@ pub fn canonical_or_lexical(path: &Path) -> PathBuf {
         .unwrap_or_else(|| path.to_path_buf())
 }
 
-/// Windows canonicalization returns `\\?\C:\...`. Use the ordinary `C:\...`
-/// spelling for drive paths so the node, arc-cli, and messages see the same
-/// paths the v0.7 desktop used. Other platforms are unchanged.
 fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
     if cfg!(windows) {
         let text = path.to_string_lossy().into_owned();
@@ -243,11 +209,6 @@ fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
     path
 }
 
-/// Create every directory the bridge owns, private to the current user.
-///
-/// The fresh v0.8 data directory is deliberately not created here: the node
-/// creates it itself with its own durable, owner-only directory routine and
-/// binds it to the network on first use (`genesis.network-hash`).
 pub fn prepare(layout: &Layout) -> Result<()> {
     for dir in [
         layout.bridge_dir.clone(),
@@ -301,7 +262,6 @@ fn create_dir_private(path: &Path) -> io::Result<()> {
 #[cfg(unix)]
 fn check_owner_and_mode(path: &Path, metadata: &fs::Metadata) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-    // SAFETY: geteuid has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
     if metadata.uid() != euid {
         return Err(exit::refused(format!(
@@ -323,7 +283,6 @@ fn check_owner_and_mode(_path: &Path, _metadata: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 
-/// Write a file by renaming a fully written sibling over it.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let name = path
         .file_name()
@@ -345,8 +304,6 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::rename(&temporary, path).with_context(|| format!("cannot replace {}", path.display()))
 }
 
-/// Holds the bridge-wide lock; released on drop (and on Unix exec, because
-/// Rust opens files close-on-exec).
 pub struct BridgeLock {
     _file: File,
 }
@@ -388,9 +345,6 @@ fn data_dir_spellings(layout: &Layout, invocation: &LegacyInvocation) -> Vec<Str
     spellings
 }
 
-/// True for a released v0.7 `arc-node` command line using one of `data_dirs`.
-/// v0.7 always passed `--validator-seed`; the v0.8 node the bridge starts
-/// never does, so a bridged process can never match.
 pub fn is_legacy_node_command(args: &[String], data_dirs: &[String]) -> bool {
     let Some(program) = args.first() else {
         return false;
@@ -418,9 +372,6 @@ pub fn is_legacy_node_command(args: &[String], data_dirs: &[String]) -> bool {
     separate || joined
 }
 
-/// Best-effort check that no v0.7 node still runs on the legacy data
-/// directory. Supervisors stop the old process before they start the bridge
-/// in its place; this catches a second, unsupervised copy.
 #[cfg(target_os = "linux")]
 pub fn live_legacy_node(layout: &Layout, invocation: &LegacyInvocation) -> Option<u32> {
     let own = std::process::id();
@@ -482,8 +433,6 @@ pub fn live_legacy_node(layout: &Layout, invocation: &LegacyInvocation) -> Optio
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn live_legacy_node(layout: &Layout, invocation: &LegacyInvocation) -> Option<u32> {
-    // The v0.7 desktop stops its child before starting another, and released
-    // v0.7 had no Windows service. Nothing else can hold this data directory.
     let _ = data_dir_spellings(layout, invocation);
     None
 }
@@ -495,7 +444,6 @@ pub mod test_support {
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
-    /// A unique, canonical temporary directory removed on drop.
     pub struct TempDir(PathBuf);
 
     impl TempDir {
@@ -521,7 +469,6 @@ pub mod test_support {
         }
     }
 
-    /// `<root>/bin/arc-node[.exe]` with an empty launcher file.
     pub fn fake_arc_dir(root: &Path) -> PathBuf {
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();

@@ -24,8 +24,6 @@ test.describe("Settings", () => {
     await page.goto("/");
     page.once("dialog", (d) => d.accept());
     await page.getByTestId("nav-settings").click();
-    // The identity card says where this computer keeps the recovery phrase,
-    // instead of claiming it is not stored (store.rs writes it to store.json).
     const storage = page.getByTestId("recovery-phrase-storage");
     await expect(storage).toContainText("This app keeps a plain-text copy on this computer only");
     await expect(storage).toContainText("store.json");
@@ -33,7 +31,6 @@ test.describe("Settings", () => {
     await expect(storage).toContainText("never sends it over the network");
     await expect(storage).toContainText("Write the phrase down, keep it offline, and keep this computer secure.");
     await expect(page.getByText("We don't store it")).toHaveCount(0);
-    // A core count set here before the reset.
     await page.getByTestId("slider-worker-threads").fill("12");
     await page.getByTestId("btn-apply-threads").click();
     await expect(page.getByTestId("threads-result")).toContainText("12 cores");
@@ -41,8 +38,6 @@ test.describe("Settings", () => {
     await expect(page.getByTestId("onboarding")).toBeVisible();
     await expect(page.getByTestId("step-welcome")).toBeVisible();
 
-    // Setup again, leaving Contribute compute on: the count chosen before
-    // is kept instead of the quarter a new install gets.
     await page.getByTestId("btn-continue-welcome").click();
     await page.getByTestId("btn-reveal-seed").click();
     await page.getByTestId("btn-continue-identity").click();
@@ -64,8 +59,6 @@ test.describe("Settings", () => {
     await page.goto("/");
     await page.getByTestId("nav-settings").click();
     await page.getByTestId("btn-check-update").click();
-    // A browser preview cannot verify a native signed bundle. It must not
-    // claim "latest" merely because the updater plugin is unavailable.
     await expect(page.getByTestId("update-status")).toHaveAttribute(
       "data-update-phase",
       "unsupported",
@@ -112,9 +105,6 @@ test.describe("Settings", () => {
       "background checks are off",
     );
 
-    // `seedOnboarded` is an init script and intentionally rewrites the fixture
-    // on every reload, so inspect the same persisted blob the app will read on
-    // its next real launch instead of having the fixture overwrite it first.
     const persistedAutoUpdate = await page.evaluate(() => {
       const raw = localStorage.getItem("arc-desktop-state-v1");
       return raw ? JSON.parse(raw).config?.autoUpdate : null;
@@ -127,10 +117,6 @@ test.describe("Settings", () => {
   test("unattended installs default on and can be turned off", async ({
     page,
   }) => {
-    // Persisted desktop preferences from older releases have no separate
-    // auto-install bit. From v0.8.14 a missing value hydrates as the new
-    // default (native code also turns it on once for older stores), so a
-    // fix reaches the desktop without a click.
     await page.addInitScript(() => {
       const raw = localStorage.getItem("arc-desktop-state-v1");
       if (!raw) return;
@@ -146,7 +132,6 @@ test.describe("Settings", () => {
       "may install and restart ARC automatically",
     );
 
-    // Turning it off still sticks, and checking stays on.
     await autoInstall.uncheck();
     await expect(page.getByTestId("update-policy")).toContainText(
       "Save settings to apply automatic update preferences",
@@ -170,27 +155,20 @@ test.describe("Settings", () => {
     await page.goto("/");
     await page.getByTestId("nav-settings").click();
     await page.getByTestId("input-rpc-port").fill("9500");
-    // The old hint promised P2P tracked RPC automatically. It never did.
     await expect(page.getByTestId("input-p2p-port")).toHaveValue("9091");
   });
 
   test("rpc port defaults to the port the node actually binds", async ({
     page,
   }) => {
-    // Onboarded but with no stored config - the fallback path. (Clearing
-    // localStorage outright would also clear `onboarded`, so the app would
-    // render the wizard and Settings would never mount.)
     await seedOnboardedWithoutConfig(page);
     await page.goto("/");
     await page.getByTestId("nav-settings").click();
-    // Must be 9090, the port the node actually binds - not the old 9944.
     await expect(page.getByTestId("input-rpc-port")).toHaveValue("9090");
     await expect(page.getByTestId("input-p2p-port")).toHaveValue("9091");
   });
 
   test("save works even when no config is stored", async ({ page }) => {
-    // `save()` used to `if (!config) return;` - so on this exact state the
-    // button did nothing and never showed its Saved confirmation.
     await seedOnboardedWithoutConfig(page);
     await page.goto("/");
     await page.getByTestId("nav-settings").click();
@@ -203,7 +181,6 @@ test.describe("Settings", () => {
     await page.getByTestId("nav-settings").click();
     const slider = page.getByTestId("slider-worker-threads");
     await expect(slider).toBeVisible();
-    // Bounded by the machine's detected core count (24 in the mock).
     await expect(slider).toHaveAttribute("max", "24");
     await slider.fill("6");
     await expect(page.getByTestId("worker-threads-value")).toHaveText("6 / 24");

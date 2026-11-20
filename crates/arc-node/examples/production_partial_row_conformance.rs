@@ -1,6 +1,3 @@
-//! Offline integration gate for the actual private production RowCohort.
-//! No activation, qualification flag, chain clock, payment, or public worker.
-
 use arc_crypto::Hash256;
 use arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE as PROFILE;
 use arc_inference::low_residency::{CanonicalRowSource, load_low_residency_model};
@@ -12,8 +9,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-// An offline, constant observation supplied to the real placement API. It is
-// never a claimed chain height and does not age a simulated online history.
 const OFFLINE_HEIGHT: u64 = 1;
 const MAX_METADATA_BYTES: u64 = 1 << 20;
 

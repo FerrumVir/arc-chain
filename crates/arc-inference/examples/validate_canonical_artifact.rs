@@ -1,8 +1,3 @@
-//! Bounded validation of one real GGUF through the canonical ARC INT8 executor.
-//!
-//! Usage: cargo run -p arc-inference --example validate_canonical_artifact \
-//!   --features candle --release -- --model /absolute/path/model.gguf [--max-tokens 8]
-
 use arc_inference::cached_integer_model::{
     CANONICAL_REWARD_INFERENCE_PROFILE, GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
     load_cached_model_canonical_i8, load_cached_model_canonical_i8_interleaved_rope,
@@ -124,8 +119,6 @@ fn main() {
     let mut reported_hashes_match = true;
     let mut quality_gate_passed = true;
     for (case_name, user_prompt, expected_answers) in run_cases {
-        // This reference diagnostic deliberately uses minimal Llama-2
-        // instruction syntax and injects no uncommitted system message.
         let templated = if reference_minimal_case {
             format!("[INST] {user_prompt} [/INST]")
         } else {

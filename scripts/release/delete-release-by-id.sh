@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Delete only a GitHub release object created by the current publisher.
-# The protected tag is intentionally not addressed or removed.
 set -Eeuo pipefail
 
 if [ "$#" -ne 2 ]; then

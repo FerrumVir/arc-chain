@@ -12,8 +12,6 @@ import {
   type UpdateDownloadEvent,
 } from "./update-controller";
 
-// Native release discovery and manifest checks are bounded to 30 seconds;
-// payload downloads get a separate bounded window below.
 const DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
 
 interface NativeUpdateMetadata {
@@ -25,12 +23,6 @@ interface NativeUpdateMetadata {
   rawJson: Record<string, unknown>;
 }
 
-/**
- * Resolve the ARC v0.8+ desktop channel natively. The Rust command selects an
- * immutable exact-tag GitHub release and creates Tauri's own Update resource;
- * download/install below therefore retains Tauri's embedded-key signature
- * verification and never depends on GitHub's legacy global `latest` pointer.
- */
 async function checkArcUpdate(): Promise<TauriUpdate | null> {
   const metadata = await invoke<NativeUpdateMetadata | null>(
     "check_arc_update",
@@ -41,9 +33,6 @@ async function checkArcUpdate(): Promise<TauriUpdate | null> {
 export const appUpdater = createUpdateController({
   supported: isTauri,
   check: async () => {
-    // Resolve the local install policy first. If that native command fails,
-    // no Tauri Update resource has been allocated and therefore no orphaned
-    // resource ID can survive a rejected parallel branch.
     const policy = await api.updateInstallPolicy();
     const update = await checkArcUpdate();
     if (!update) return null;
@@ -69,9 +58,6 @@ export const appUpdater = createUpdateController({
   relaunch: tauriRelaunch,
 });
 
-// The native shell drives the schedule (`wake.rs`): a hidden WebView's own
-// timers may be throttled on Windows and Linux, and only native code sees a
-// wake from sleep. `signal` ignores everything while automatic checks are off.
 if (isTauri) {
   void listenForAppSignals((signal) => appUpdater.signal(signal));
 }

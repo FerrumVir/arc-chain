@@ -1,15 +1,7 @@
-//! Object extraction and manipulation primitives.
-
 use crate::primitives::grid::mostcolor;
 use crate::{Color, Grid, Object, Pos, PosSet};
 use std::collections::{BTreeSet, VecDeque};
 
-/// Extract connected-component objects from a grid.
-///
-/// Parameters:
-/// - `univalued`: if true, each object has one color. If false, multi-color.
-/// - `diagonal`: if true, 8-connected. If false, 4-connected.
-/// - `without_bg`: if true, ignore background (most common) color.
 pub fn objects(grid: &Grid, univalued: bool, diagonal: bool, without_bg: bool) -> Vec<Object> {
     let h = grid.len();
     if h == 0 {
@@ -36,7 +28,6 @@ pub fn objects(grid: &Grid, univalued: bool, diagonal: bool, without_bg: bool) -
                 continue;
             }
 
-            // BFS to find connected component
             let mut cells = BTreeSet::new();
             let mut queue = VecDeque::new();
             queue.push_back((r, c));
@@ -45,7 +36,6 @@ pub fn objects(grid: &Grid, univalued: bool, diagonal: bool, without_bg: bool) -
             while let Some((cr, cc)) = queue.pop_front() {
                 cells.insert((grid[cr][cc], (cr, cc)));
 
-                // Neighbors
                 let neighbors: Vec<(usize, usize)> = if diagonal {
                     vec![
                         (cr.wrapping_sub(1), cc),
@@ -90,7 +80,6 @@ pub fn objects(grid: &Grid, univalued: bool, diagonal: bool, without_bg: bool) -
     result
 }
 
-/// Filter objects by color.
 pub fn colorfilter(objs: &[Object], color: Color) -> Vec<Object> {
     objs.iter()
         .filter(|o| o.primary_color() == color)
@@ -98,22 +87,18 @@ pub fn colorfilter(objs: &[Object], color: Color) -> Vec<Object> {
         .collect()
 }
 
-/// Filter objects by size.
 pub fn sizefilter(objs: &[Object], size: usize) -> Vec<Object> {
     objs.iter().filter(|o| o.size() == size).cloned().collect()
 }
 
-/// Select largest object.
 pub fn argmax_size(objs: &[Object]) -> Option<&Object> {
     objs.iter().max_by_key(|o| o.size())
 }
 
-/// Select smallest object.
 pub fn argmin_size(objs: &[Object]) -> Option<&Object> {
     objs.iter().min_by_key(|o| o.size())
 }
 
-/// Bounding box of an object's positions.
 pub fn bbox(obj: &Object) -> (usize, usize, usize, usize) {
     let positions = obj.positions();
     if positions.is_empty() {
@@ -126,13 +111,11 @@ pub fn bbox(obj: &Object) -> (usize, usize, usize, usize) {
     (min_r, min_c, max_r, max_c)
 }
 
-/// Extract the smallest subgrid containing an object.
 pub fn subgrid(obj: &Object, grid: &Grid) -> Grid {
     let (min_r, min_c, max_r, max_c) = bbox(obj);
     crate::primitives::grid::crop(grid, min_r, min_c, max_r - min_r + 1, max_c - min_c + 1)
 }
 
-/// Delta: bounding box positions MINUS object positions (holes).
 pub fn delta(obj: &Object) -> PosSet {
     let (min_r, min_c, max_r, max_c) = bbox(obj);
     let positions = obj.positions();
@@ -147,7 +130,6 @@ pub fn delta(obj: &Object) -> PosSet {
     result
 }
 
-/// Backdrop: all positions in the bounding box.
 pub fn backdrop(obj: &Object) -> PosSet {
     let (min_r, min_c, max_r, max_c) = bbox(obj);
     let mut result = PosSet::new();
@@ -159,14 +141,12 @@ pub fn backdrop(obj: &Object) -> PosSet {
     result
 }
 
-/// Cover: erase an object from the grid (fill with background).
 pub fn cover(grid: &Grid, obj: &Object) -> Grid {
     let bg = mostcolor(grid);
     let positions = obj.positions();
     crate::primitives::grid::fill(grid, bg, &positions)
 }
 
-/// Paint an object onto a grid.
 pub fn paint(grid: &Grid, obj: &Object) -> Grid {
     let mut out = grid.clone();
     let h = out.len();
@@ -179,7 +159,6 @@ pub fn paint(grid: &Grid, obj: &Object) -> Grid {
     out
 }
 
-/// Box: outline of the bounding box.
 pub fn obj_box(obj: &Object) -> PosSet {
     let (min_r, min_c, max_r, max_c) = bbox(obj);
     let mut result = PosSet::new();
@@ -194,7 +173,6 @@ pub fn obj_box(obj: &Object) -> PosSet {
     result
 }
 
-/// Corners of the bounding box.
 pub fn corners(obj: &Object) -> PosSet {
     let (min_r, min_c, max_r, max_c) = bbox(obj);
     let mut result = PosSet::new();
@@ -205,7 +183,6 @@ pub fn corners(obj: &Object) -> PosSet {
     result
 }
 
-/// Inbox: inner border of bounding box.
 pub fn inbox(obj: &Object) -> PosSet {
     let (min_r, min_c, max_r, max_c) = bbox(obj);
     if max_r <= min_r + 1 || max_c <= min_c + 1 {
@@ -227,7 +204,6 @@ pub fn inbox(obj: &Object) -> PosSet {
     result
 }
 
-/// Outbox: outer border of bounding box.
 pub fn outbox(obj: &Object) -> PosSet {
     let (min_r, min_c, max_r, max_c) = bbox(obj);
     let or = if min_r > 0 { min_r - 1 } else { 0 };
@@ -246,7 +222,6 @@ pub fn outbox(obj: &Object) -> PosSet {
     result
 }
 
-/// Shift an object by (dr, dc).
 pub fn shift(obj: &Object, dr: isize, dc: isize) -> Object {
     let cells = obj
         .cells
@@ -264,14 +239,12 @@ pub fn shift(obj: &Object, dr: isize, dc: isize) -> Object {
     Object { cells }
 }
 
-/// Move object on grid: cover old position, paint at new position.
 pub fn move_obj(grid: &Grid, obj: &Object, dr: isize, dc: isize) -> Grid {
     let covered = cover(grid, obj);
     let shifted = shift(obj, dr, dc);
     paint(&covered, &shifted)
 }
 
-/// Merge multiple objects into one.
 pub fn merge_objects(objs: &[Object]) -> Object {
     let mut cells = BTreeSet::new();
     for obj in objs {
@@ -280,35 +253,29 @@ pub fn merge_objects(objs: &[Object]) -> Object {
     Object { cells }
 }
 
-/// Height of an object.
 pub fn obj_height(obj: &Object) -> usize {
     let (min_r, _, max_r, _) = bbox(obj);
     max_r - min_r + 1
 }
 
-/// Width of an object.
 pub fn obj_width(obj: &Object) -> usize {
     let (_, min_c, _, max_c) = bbox(obj);
     max_c - min_c + 1
 }
 
-/// Connect two positions with a line.
 pub fn connect(a: (usize, usize), b: (usize, usize)) -> PosSet {
     let mut result = PosSet::new();
     if a.0 == b.0 {
-        // Horizontal line
         let (start, end) = if a.1 <= b.1 { (a.1, b.1) } else { (b.1, a.1) };
         for c in start..=end {
             result.insert((a.0, c));
         }
     } else if a.1 == b.1 {
-        // Vertical line
         let (start, end) = if a.0 <= b.0 { (a.0, b.0) } else { (b.0, a.0) };
         for r in start..=end {
             result.insert((r, a.1));
         }
     } else {
-        // Diagonal
         let dr: isize = if b.0 > a.0 { 1 } else { -1 };
         let dc: isize = if b.1 > a.1 { 1 } else { -1 };
         let mut r = a.0 as isize;
@@ -327,7 +294,6 @@ pub fn connect(a: (usize, usize), b: (usize, usize)) -> PosSet {
     result
 }
 
-/// Shoot a ray from a position in a direction (up to 30 cells).
 pub fn shoot(start: (usize, usize), dr: isize, dc: isize) -> PosSet {
     let mut result = PosSet::new();
     let mut r = start.0 as isize;
@@ -342,7 +308,6 @@ pub fn shoot(start: (usize, usize), dr: isize, dc: isize) -> PosSet {
     result
 }
 
-/// Neighbors: 4-adjacent positions.
 pub fn dneighbors(pos: (usize, usize)) -> PosSet {
     let mut result = PosSet::new();
     let (r, c) = pos;
@@ -357,7 +322,6 @@ pub fn dneighbors(pos: (usize, usize)) -> PosSet {
     result
 }
 
-/// Neighbors: 8-adjacent positions.
 pub fn neighbors(pos: (usize, usize)) -> PosSet {
     let mut result = dneighbors(pos);
     let (r, c) = pos;
@@ -374,7 +338,6 @@ pub fn neighbors(pos: (usize, usize)) -> PosSet {
     result
 }
 
-/// All neighbor positions of all cells in a position set.
 pub fn mapply_neighbors(positions: &PosSet) -> PosSet {
     let mut result = PosSet::new();
     for &pos in positions {
@@ -383,7 +346,6 @@ pub fn mapply_neighbors(positions: &PosSet) -> PosSet {
     result
 }
 
-/// All 4-neighbor positions of all cells in a position set.
 pub fn mapply_dneighbors(positions: &PosSet) -> PosSet {
     let mut result = PosSet::new();
     for &pos in positions {
@@ -400,17 +362,15 @@ mod tests {
     fn test_objects_extraction() {
         let grid = vec![vec![0, 1, 0], vec![0, 1, 0], vec![0, 0, 2]];
         let objs = objects(&grid, true, false, true);
-        assert_eq!(objs.len(), 2); // object of color 1 and object of color 2
+        assert_eq!(objs.len(), 2);
     }
 
     #[test]
     fn test_delta() {
-        // 2x2 object with one hole
         let mut cells = BTreeSet::new();
         cells.insert((1, (0, 0)));
         cells.insert((1, (0, 1)));
         cells.insert((1, (1, 0)));
-        // (1,1) is the hole
         let obj = Object { cells };
         let d = delta(&obj);
         assert!(d.contains(&(1, 1)));

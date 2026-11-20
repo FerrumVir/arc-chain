@@ -1,6 +1,3 @@
-// Parts the app's engravings share, cut in the site's manner (see lib/engrave.ts): coursed ashlar with
-// pillowed blocks, hatched bands, arched openings, and the dashed lines of work not yet built.
-
 import { Plate, clamp, fbm, hash, mix, pillow, rng, type Pt } from "./engrave";
 
 export function rect(x0: number, y0: number, x1: number, y1: number): Pt[] {
@@ -9,7 +6,6 @@ export function rect(x0: number, y0: number, x1: number, y1: number): Pt[] {
 export function closed(p: Pt[]): Pt[] {
   return p.concat([p[0]]);
 }
-// an arch-headed opening from the ground up
 export function opening(L: number, R: number, spring: number, ground: number): Pt[] {
   const r = (R - L) / 2, c = (L + R) / 2, pts: Pt[] = [[L, ground], [L, spring]];
   for (let k = 1; k < 16; k++) { const a = Math.PI - (k / 16) * Math.PI; pts.push([c + Math.cos(a) * r, spring - Math.sin(a) * r]); }
@@ -26,7 +22,6 @@ export function dashed(pl: Plate, pts: Pt[], w: number, on = 3, off = 3) {
   }
 }
 
-/** Coursed ashlar over a box, clipped to an outline with holes: one hatch, each block pillowed. */
 export function masonry(pl: Plate, outer: Pt[], holes: Pt[][], box: [number, number, number, number], o: { course?: number; block?: number; tone?: number; seed?: number } = {}) {
   const [x0, y0, x1, y1] = box, course = o.course ?? 5.4, block = o.block ?? 11, tone = o.tone ?? 0, seed = o.seed ?? 1;
   pl.maskHoles([outer, ...holes]);
@@ -55,7 +50,6 @@ export function band(pl: Plate, x0: number, x1: number, y0: number, y1: number, 
 }
 
 
-/** An engraver's sky: long level strokes, sparse, thinning toward the horizon. */
 export function sky(pl: Plate, W: number, y0: number, y1: number, seed = 5) {
   const rs = rng(seed);
   for (let y = y0; y < y1; y += 3.1) {
@@ -68,7 +62,6 @@ export function sky(pl: Plate, W: number, y0: number, y1: number, seed = 5) {
   }
 }
 
-/** Far hills along a horizon, lightly hatched down to the ground line. */
 export function hills(pl: Plate, W: number, base: number, ground: number) {
   const hill = (x: number) => base - 7 * Math.sin((x / W) * 6.3 + 1) - 4 * Math.sin((x / W) * 17 + 2) - 2 * Math.sin((x / W) * 41);
   const hp: Pt[] = [];
@@ -77,7 +70,6 @@ export function hills(pl: Plate, W: number, base: number, ground: number) {
   pl.line(hp, 0.34, 5);
 }
 
-/** A ground line with a few strokes of earth under it. */
 export function ground(pl: Plate, W: number, y: number, seed = 3) {
   pl.line([[0, y], [W, y]], 0.55, 2);
   const r = rng(seed);

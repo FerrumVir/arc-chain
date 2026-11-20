@@ -66,7 +66,6 @@ def load_results(results_dir: Path) -> dict[tuple[str, str], list[dict]]:
 
 
 def split_transcript(data: bytes) -> tuple[list[str], list[str], str]:
-    """Return (header lines, prompt block lines, terminator) of one transcript."""
     lines = data.decode("utf-8").split("\n")
     if lines and lines[-1] == "":
         lines.pop()
@@ -78,7 +77,6 @@ def split_transcript(data: bytes) -> tuple[list[str], list[str], str]:
 
 
 def assemble(group: list[dict]) -> tuple[bytes | None, list[str]]:
-    """Join one pair's shards into the single-run transcript bytes."""
     problems: list[str] = []
     shards: dict[int, tuple[int, dict]] = {}
     for result in group:

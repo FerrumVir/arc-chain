@@ -1,19 +1,7 @@
-//! Off-chain bilateral payment channel state machine.
-//!
-//! Provides a pure-Rust, no-async `ChannelStateMachine` for managing off-chain
-//! state transitions between two parties. Signing uses:
-//!
-//!   BLAKE3("arc-channel-state-v1" || channel_id || nonce || balances)
-//!
-//! Conservation invariant: `opener_bal + counterparty_bal == total_deposit`
-//! is enforced at every state transition.
-
 use arc_crypto::Hash256;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-// ─── Errors ──────────────────────────────────────────────────────────────────
 
 #[derive(Error, Debug)]
 pub enum ChannelError {
@@ -40,20 +28,12 @@ pub enum ChannelError {
     NotAuthorized(String),
 }
 
-// ─── Types ───────────────────────────────────────────────────────────────────
-
-/// Channel lifecycle states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChannelState {
-    /// Channel created but not yet funded on-chain.
     Opening,
-    /// Channel is open and active. Off-chain state updates are possible.
     Open,
-    /// One party has initiated a cooperative close.
     Closing,
-    /// A dispute has been submitted on-chain. Challenge period active.
     Disputed,
-    /// Channel is closed. No further operations.
     Closed,
 }
 
@@ -69,21 +49,17 @@ impl std::fmt::Display for ChannelState {
     }
 }
 
-/// A signed channel state commitment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateCommitment {
     pub channel_id: Hash256,
     pub nonce: u64,
     pub opener_balance: u64,
     pub counterparty_balance: u64,
-    /// Signature from the party that proposed this state.
     pub proposer_sig: Vec<u8>,
-    /// Signature from the party that accepted this state (None if pending).
     pub acceptor_sig: Option<Vec<u8>>,
 }
 
 impl StateCommitment {
-    /// Compute the signing payload for this state.
     pub fn signing_payload(&self) -> Vec<u8> {
         let mut payload = Vec::with_capacity(32 + 8 + 8 + 8 + 22);
         payload.extend_from_slice(b"arc-channel-state-v1");
@@ -95,57 +71,31 @@ impl StateCommitment {
         hash.as_bytes().to_vec()
     }
 
-    /// Check if both parties have signed.
     pub fn is_fully_signed(&self) -> bool {
         self.acceptor_sig.is_some()
     }
 }
 
-/// Role of a party in the channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Opener,
     Counterparty,
 }
 
-// ─── State Machine ───────────────────────────────────────────────────────────
-
-/// Pure-Rust off-chain channel state machine.
-///
-/// Manages the lifecycle of a bilateral payment channel:
-/// - `propose_state`: Propose a new state (e.g., after a payment)
-/// - `receive_state`: Validate and accept a proposed state from counterparty
-/// - `pay`: Convenience method to transfer funds to counterparty
-/// - `close`: Initiate cooperative close
-/// - `dispute`: Generate dispute transaction for on-chain submission
 pub struct ChannelStateMachine {
-    /// Unique channel identifier.
     pub channel_id: Hash256,
-    /// This party's role.
     pub role: Role,
-    /// Current channel state.
     pub state: ChannelState,
-    /// Total deposit locked in the channel.
     pub total_deposit: u64,
-    /// Current opener balance.
     pub opener_balance: u64,
-    /// Current counterparty balance.
     pub counterparty_balance: u64,
-    /// Monotonically increasing state nonce.
     pub nonce: u64,
-    /// This party's signing key.
     signing_key: SigningKey,
-    /// Counterparty's verifying key.
     counterparty_vk: VerifyingKey,
-    /// History of signed state commitments (most recent last).
     pub history: Vec<StateCommitment>,
 }
 
 impl ChannelStateMachine {
-    /// Create a new channel state machine.
-    ///
-    /// The opener creates the channel with the full deposit.
-    /// After on-chain ChannelOpen confirms, the channel transitions to Open.
     pub fn new(
         channel_id: Hash256,
         role: Role,
@@ -172,7 +122,6 @@ impl ChannelStateMachine {
         }
     }
 
-    /// Mark the channel as open (call after on-chain ChannelOpen confirms).
     pub fn confirm_open(&mut self) -> Result<(), ChannelError> {
         if self.state != ChannelState::Opening {
             return Err(ChannelError::WrongState {
@@ -184,9 +133,6 @@ impl ChannelStateMachine {
         Ok(())
     }
 
-    /// Transfer `amount` from this party to the counterparty.
-    ///
-    /// Returns a signed state commitment to send to the counterparty.
     pub fn pay(&mut self, amount: u64) -> Result<StateCommitment, ChannelError> {
         if self.state != ChannelState::Open {
             return Err(ChannelError::WrongState {
@@ -225,9 +171,6 @@ impl ChannelStateMachine {
         self.propose_state(new_opener, new_counter)
     }
 
-    /// Propose a new state with arbitrary balances.
-    ///
-    /// Returns a half-signed commitment. Send to counterparty for co-signing.
     pub fn propose_state(
         &mut self,
         opener_balance: u64,
@@ -240,7 +183,6 @@ impl ChannelStateMachine {
             });
         }
 
-        // Conservation check
         if opener_balance + counterparty_balance != self.total_deposit {
             return Err(ChannelError::ConservationViolation {
                 opener_bal: opener_balance,
@@ -260,7 +202,6 @@ impl ChannelStateMachine {
             acceptor_sig: None,
         };
 
-        // Sign the commitment
         let payload = commitment.signing_payload();
         let sig = self.signing_key.sign(&payload);
         commitment.proposer_sig = sig.to_bytes().to_vec();
@@ -268,9 +209,6 @@ impl ChannelStateMachine {
         Ok(commitment)
     }
 
-    /// Receive and validate a state commitment from the counterparty.
-    ///
-    /// If valid, co-signs and updates local state. Returns the fully-signed commitment.
     pub fn receive_state(
         &mut self,
         mut commitment: StateCommitment,
@@ -282,12 +220,10 @@ impl ChannelStateMachine {
             });
         }
 
-        // Validate channel_id
         if commitment.channel_id != self.channel_id {
             return Err(ChannelError::NotAuthorized("channel_id mismatch".into()));
         }
 
-        // Validate nonce is strictly increasing
         if commitment.nonce <= self.nonce {
             return Err(ChannelError::NonceNotIncreasing {
                 current: self.nonce,
@@ -295,7 +231,6 @@ impl ChannelStateMachine {
             });
         }
 
-        // Conservation check
         if commitment.opener_balance + commitment.counterparty_balance != self.total_deposit {
             return Err(ChannelError::ConservationViolation {
                 opener_bal: commitment.opener_balance,
@@ -304,7 +239,6 @@ impl ChannelStateMachine {
             });
         }
 
-        // Verify counterparty's signature
         let payload = commitment.signing_payload();
         if commitment.proposer_sig.len() != 64 {
             return Err(ChannelError::InvalidSignature);
@@ -317,11 +251,9 @@ impl ChannelStateMachine {
             .verify_strict(&payload, &sig)
             .map_err(|_| ChannelError::InvalidSignature)?;
 
-        // Co-sign
         let my_sig = self.signing_key.sign(&payload);
         commitment.acceptor_sig = Some(my_sig.to_bytes().to_vec());
 
-        // Update local state
         self.nonce = commitment.nonce;
         self.opener_balance = commitment.opener_balance;
         self.counterparty_balance = commitment.counterparty_balance;
@@ -330,15 +262,11 @@ impl ChannelStateMachine {
         Ok(commitment)
     }
 
-    /// Finalize a proposed state after receiving the counterparty's co-signature.
-    ///
-    /// Call this on the proposer side after getting back the fully-signed commitment.
     pub fn finalize_state(&mut self, commitment: &StateCommitment) -> Result<(), ChannelError> {
         if !commitment.is_fully_signed() {
             return Err(ChannelError::InvalidSignature);
         }
 
-        // Verify the acceptor signature
         let payload = commitment.signing_payload();
         let acceptor_sig_bytes = commitment.acceptor_sig.as_ref().unwrap();
         if acceptor_sig_bytes.len() != 64 {
@@ -352,7 +280,6 @@ impl ChannelStateMachine {
             .verify_strict(&payload, &sig)
             .map_err(|_| ChannelError::InvalidSignature)?;
 
-        // Update local state
         self.nonce = commitment.nonce;
         self.opener_balance = commitment.opener_balance;
         self.counterparty_balance = commitment.counterparty_balance;
@@ -361,7 +288,6 @@ impl ChannelStateMachine {
         Ok(())
     }
 
-    /// Initiate cooperative close. Returns the final state for on-chain submission.
     pub fn close(&mut self) -> Result<StateCommitment, ChannelError> {
         if self.state != ChannelState::Open {
             return Err(ChannelError::WrongState {
@@ -372,7 +298,6 @@ impl ChannelStateMachine {
 
         self.state = ChannelState::Closing;
 
-        // The close commitment uses the current balances
         let mut commitment = StateCommitment {
             channel_id: self.channel_id,
             nonce: self.nonce,
@@ -389,11 +314,7 @@ impl ChannelStateMachine {
         Ok(commitment)
     }
 
-    /// Generate a dispute transaction for on-chain submission.
-    ///
-    /// Uses the latest fully-signed state from history.
     pub fn dispute(&self) -> Result<StateCommitment, ChannelError> {
-        // Find the latest fully-signed state
         let latest = self
             .history
             .iter()
@@ -407,12 +328,10 @@ impl ChannelStateMachine {
         Ok(latest.clone())
     }
 
-    /// Mark channel as closed (after on-chain close/dispute resolution).
     pub fn confirm_closed(&mut self) {
         self.state = ChannelState::Closed;
     }
 
-    /// Get this party's current balance.
     pub fn my_balance(&self) -> u64 {
         match self.role {
             Role::Opener => self.opener_balance,
@@ -420,7 +339,6 @@ impl ChannelStateMachine {
         }
     }
 
-    /// Get the counterparty's current balance.
     pub fn their_balance(&self) -> u64 {
         match self.role {
             Role::Opener => self.counterparty_balance,
@@ -459,23 +377,19 @@ mod tests {
     fn test_channel_lifecycle() {
         let (mut opener, mut counter) = setup_channel();
 
-        // Confirm open
         opener.confirm_open().unwrap();
         counter.confirm_open().unwrap();
         assert_eq!(opener.state, ChannelState::Open);
 
-        // Opener pays counterparty 100
         let commitment = opener.pay(100).unwrap();
         assert_eq!(commitment.opener_balance, 999_900);
         assert_eq!(commitment.counterparty_balance, 100);
 
-        // Counterparty receives and co-signs
         let signed = counter.receive_state(commitment).unwrap();
         assert!(signed.is_fully_signed());
         assert_eq!(counter.opener_balance, 999_900);
         assert_eq!(counter.counterparty_balance, 100);
 
-        // Opener finalizes
         opener.finalize_state(&signed).unwrap();
         assert_eq!(opener.opener_balance, 999_900);
         assert_eq!(opener.nonce, 1);
@@ -497,7 +411,6 @@ mod tests {
             assert_eq!(opener.counterparty_balance, i * 10);
         }
 
-        // After 100 payments of 10: opener has 999,000, counter has 1,000
         assert_eq!(opener.my_balance(), 999_000);
         assert_eq!(counter.my_balance(), 1_000);
     }
@@ -508,17 +421,14 @@ mod tests {
         opener.confirm_open().unwrap();
         counter.confirm_open().unwrap();
 
-        // Opener pays 500
         let c1 = opener.pay(500).unwrap();
         let s1 = counter.receive_state(c1).unwrap();
         opener.finalize_state(&s1).unwrap();
 
-        // Counterparty pays back 200
         let c2 = counter.pay(200).unwrap();
         let s2 = opener.receive_state(c2).unwrap();
         counter.finalize_state(&s2).unwrap();
 
-        // Net: opener paid 300
         assert_eq!(opener.opener_balance, 999_700);
         assert_eq!(opener.counterparty_balance, 300);
     }
@@ -528,7 +438,6 @@ mod tests {
         let (mut opener, _) = setup_channel();
         opener.confirm_open().unwrap();
 
-        // Try to create money
         let result = opener.propose_state(1_000_001, 0);
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -543,12 +452,10 @@ mod tests {
         opener.confirm_open().unwrap();
         counter.confirm_open().unwrap();
 
-        // First payment
         let c1 = opener.pay(100).unwrap();
         let s1 = counter.receive_state(c1).unwrap();
         opener.finalize_state(&s1).unwrap();
 
-        // Try to replay old state (nonce 1 again)
         let mut replay = s1.clone();
         replay.acceptor_sig = None;
         let result = counter.receive_state(replay);
@@ -574,14 +481,12 @@ mod tests {
         opener.confirm_open().unwrap();
         counter.confirm_open().unwrap();
 
-        // Make several payments
         for _ in 0..5 {
             let c = opener.pay(100).unwrap();
             let s = counter.receive_state(c).unwrap();
             opener.finalize_state(&s).unwrap();
         }
 
-        // Dispute should return nonce 5
         let dispute = opener.dispute().unwrap();
         assert_eq!(dispute.nonce, 5);
         assert_eq!(dispute.opener_balance, 999_500);
@@ -602,16 +507,13 @@ mod tests {
     fn test_wrong_state_errors() {
         let (mut opener, _) = setup_channel();
 
-        // Can't pay before open
         assert!(opener.pay(100).is_err());
 
-        // Can't close before open
         assert!(opener.close().is_err());
 
         opener.confirm_open().unwrap();
         opener.close().unwrap();
 
-        // Can't pay after closing
         assert!(opener.pay(100).is_err());
     }
 
@@ -622,7 +524,6 @@ mod tests {
         counter.confirm_open().unwrap();
 
         let mut commitment = opener.pay(100).unwrap();
-        // Tamper with the signature
         commitment.proposer_sig[0] ^= 0xFF;
 
         let result = counter.receive_state(commitment);

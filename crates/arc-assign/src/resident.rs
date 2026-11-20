@@ -1,8 +1,3 @@
-//! Private fixed-residency placement. Additive contract: no v1/v2 lease,
-//! candidate, policy or certificate bytes change. Every primary row is owned
-//! by exactly one configured worker; measured rates never move its boundary.
-//! This is operator-trusted compute with canonical checks, not public proof.
-
 use crate::certificate::{AssignmentCertificate, policy_hash_v2};
 use crate::placement::{Candidate, Participant, Placement, Policy, Slice, Stage, StagePlan};
 use crate::verify::{VerificationPlan, VerificationRule};
@@ -32,10 +27,6 @@ pub struct WorkerResidency {
     pub ranges: Vec<ResidentRange>,
 }
 
-/// New authorization semantics: fixed remote ownership, no fallback, each
-/// owner's first row checked canonically, configured seeded duplicates checked
-/// canonically, and the existing seeded per-stage spot checks retained.
-/// Canonical verification reads local artifact rows and consumes real CPU/I/O.
 pub fn policy_hash(policy: &Policy, rule: &VerificationRule) -> Hash256 {
     digest(
         POLICY_DOMAIN,
@@ -47,9 +38,6 @@ pub fn policy_hash(policy: &Policy, rule: &VerificationRule) -> Hash256 {
     )
 }
 
-/// Validate complete ownership before connecting, without claiming readiness.
-/// Initially each worker owns one nonempty interval of EVERY projection. This
-/// intentionally excludes mixed layer bundles and replica/checker-only offers.
 pub fn validate_layout(
     stages: &[Stage],
     residency: &[WorkerResidency],
@@ -217,15 +205,11 @@ pub fn place(
     Ok(Placement {
         workers,
         stages: plans,
-        // Fixed ownership is a capacity decision, never a speed prediction.
-        // Zero means unavailable; local canonical I/O/verification is unmeasured.
         predicted_token_us: 0,
         coordinator_only_token_us: 0,
     })
 }
 
-/// Independent audit envelope; its inner version 3 is deliberately unsupported
-/// by the legacy AssignmentCertificate verifier. Never serialize this as v1/v2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResidentCertificate {
@@ -284,8 +268,6 @@ impl ResidentCertificate {
             &self.assignment.placement,
             &self.assignment.verification,
         );
-        // Disjoint owners cannot duplicate one another's rows. Under this new
-        // policy every selected duplicate is computed by the canonical source.
         for duplicate in &mut checks.duplicates {
             duplicate.checker = Participant::Coordinator;
         }
@@ -480,7 +462,7 @@ mod tests {
                 2 => changed[1].ranges[0].row_end = 7,
                 3 => {
                     changed[1].ranges.pop();
-                } // output head is mandatory
+                }
                 4 => changed[1].ranges[0].row_start = 6,
                 5 => changed[1].worker = changed[0].worker,
                 6 => changed[1].manifest_hash = changed[0].manifest_hash,

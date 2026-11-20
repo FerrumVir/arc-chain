@@ -1,12 +1,3 @@
-//! Verification for the compact public projection of a protected ARCCHKPT.
-//!
-//! The full checkpoint remains in the protected recovery handoff.  A release
-//! descriptor is safe to use as the community-node retirement trust surface
-//! only if it contains enough of `RecoveryManifest` to recompute the exact
-//! validator-signed hash.  Treating a manifest hash and human-readable fields
-//! as two unrelated assertions would let a valid certificate decorate a false
-//! height, root, or transition projection.
-
 use crate::config;
 use anyhow::{Context, Result, ensure};
 use arc_crypto::{Hash256, Signature, hash_bytes};
@@ -134,9 +125,6 @@ struct DescriptorCanonicalSource {
     legacy_dag_wal_namespace_sha256: String,
 }
 
-/// JSON must contain the activation field even when its value is `null`.
-/// The explicit deserializer prevents serde's ordinary missing-`Option`
-/// fallback from weakening the descriptor's exact-schema contract.
 fn deserialize_explicit_optional_u64<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<u64>, D::Error>
@@ -717,9 +705,6 @@ pub(crate) fn verify_and_print(descriptor_path: &Path, genesis_path: &Path) -> R
     Ok(())
 }
 
-/// Verify the self-contained, validator-certified cutover descriptor for the
-/// local retirement protocol. The release binding independently pins these
-/// exact bytes; this check supplies the cryptographic and fixed-network layer.
 pub(crate) fn verify_for_retirement(descriptor_path: &Path) -> Result<VerifiedDescriptorSummary> {
     let descriptor = read_descriptor(descriptor_path)?;
     verify_descriptor(&descriptor, None)

@@ -1,4 +1,3 @@
-//! Coordinator-only scheduling. No worker timing or wire fields are trusted here.
 use super::*;
 use tokio::sync::mpsc::{Receiver, error::TryRecvError};
 use tokio::time::Instant as TokioInstant;
@@ -27,9 +26,6 @@ struct HeldWork {
     explore: bool,
 }
 
-/// Owned by one admitted long poll. A selection can become ineligible before
-/// the claim/bind gate; do not select that leg again during this poll. Other
-/// workers (and the next poll from this worker) may still take it.
 #[derive(Default)]
 pub(super) struct ClaimPoll {
     refused: HashSet<String>,
@@ -48,11 +44,8 @@ impl ClaimPoll {
 
 #[derive(Default)]
 pub(super) struct RoutingState {
-    /// Seconds per position, using the same alpha as the displayed latency EWMA.
     seconds_per_position: HashMap<String, f64>,
     assigned: HashSet<String>,
-    /// None invalidates reservations opened before a decline. Only a new
-    /// admitted long-poll turns this back on; the active map remains authoritative.
     claims: HashMap<String, Option<Hash256>>,
     held: Vec<HeldWork>,
     decisions: u64,
@@ -132,8 +125,6 @@ pub(super) fn record_accepted(
     let Ok(preflight) = model.preflight_generation(pending.routing.prompt_len, tokens) else {
         return;
     };
-    // Retrying a transient verification failure must not charge the worker for
-    // the coordinator's previous verification attempt or retry delay.
     let end = pending.first_submit_at.unwrap_or(submit_arrived);
     record(
         &mut node.community_routing.lock(),
@@ -150,8 +141,6 @@ fn waiting(
     excluded: Option<&str>,
 ) -> Vec<String> {
     let model = model.and_then(|m| parse_hash256_hex(m, "model_id").ok());
-    // Do not nest registry locks inside active-job shard locks: capacity
-    // readers visit these maps in the opposite order.
     let candidates: Vec<String> = node
         .community_active_jobs
         .iter()
@@ -223,8 +212,6 @@ fn choose(state: &RoutingState, workers: &mut [String], explore: bool) -> Option
     workers.first().cloned()
 }
 
-/// Called with the queue locked, without any await until an item is either
-/// back in shared held state or returned to the synchronous claim/bind path.
 pub(super) fn poll(
     node: &NodeState,
     worker: &str,
@@ -235,8 +222,6 @@ pub(super) fn poll(
         return poll_with_reserve(node, worker, queue, claim);
     }
     let mut state = node.community_routing.lock();
-    // Temporarily take the list only inside this synchronous critical section.
-    // No cancelled future can leave an item in a handler-local variable.
     let held = std::mem::take(&mut state.held);
     let mut selected = None;
     for mut work in held {
@@ -251,7 +236,6 @@ pub(super) fn poll(
     }
     match queue.try_recv() {
         Ok(item) => {
-            // Targeted probes and twin legs retain their original claim path.
             if item.expected_worker_id.is_some() || twin_dispatch::is_twin_leg(node, &item.job_id) {
                 return Ok(Some(item));
             }
@@ -273,9 +257,6 @@ pub(super) fn poll(
     }
 }
 
-/// With an explicit reserve or fan-out, examine all shared candidates without
-/// dequeuing ineligible legs on every attempt. Fan-out then tries its separate
-/// pump queue. The no-flag path above retains the original refusal response.
 fn poll_with_reserve(
     node: &NodeState,
     worker: &str,
@@ -328,8 +309,6 @@ fn poll_with_reserve(
             state.held.push(candidate);
         }
     }
-    // Pending caller work keeps priority even if this particular worker cannot
-    // take it. The same poll has already tried the remaining caller items.
     let callers_waiting = !state.held.is_empty();
     drop(state);
     if selected.is_some() {
@@ -351,7 +330,7 @@ fn may_take(state: &mut RoutingState, node: &NodeState, worker: &str, work: &mut
         .as_ref()
         .and_then(|m| m.get(&work.item.job_id))
     else {
-        return true; // Existing claim path reports job_expired.
+        return true;
     };
     if work.item.expires_at_unix_ms <= now_unix_ms() {
         return true;

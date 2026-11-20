@@ -168,10 +168,6 @@ CADDY_LINUX_AMD64_SHA256 = "b7105518e3ed1c0761f232e44fc09345535533c9cb0abf0e1280
 TLS_MAX_LEAF_LIFETIME_SECONDS = 160 * 60 * 60
 TLS_MIN_REMAINING_VALIDITY_SECONDS = 48 * 60 * 60
 TLS_RENEWAL_WINDOW_RATIO = 0.5
-# Uniform Ubuntu 24.04 (Noble) production fleet security boundary.  The
-# interlock lives in nginx auth_request specifically to avoid Caddy
-# GHSA-6365-7ppr-5r92; never accept an unversioned apt candidate or a binary
-# that merely reports the expected version string.
 NGINX_PACKAGE_VERSION = "1.24.0-2ubuntu7.17"
 NGINX_LINUX_AMD64_SHA256 = "1f16b72bea2f44e5d04fe6cf9e3e4b0dec53a82c50c7c1533c302a8ecaeccacf"
 RECOVERY_PROBE_PREFIX = b"ARC-RCV-PROBE1\0\0"
@@ -212,27 +208,15 @@ SOURCE_ONLY_NOT_PUBLIC_PATHS = (
     "/community/reward_approval/{job_id}",
     "/eth",
 )
-# Must match `MAX_TX_SUBMIT_BATCH_SIZE` in `crates/arc-node/src/rpc.rs`.
-# The rollout probes one item beyond this bound through every public TLS
-# gateway so a stale/unbounded node binary cannot pass production promotion.
 PUBLIC_TX_SUBMIT_BATCH_MAX_ITEMS = 64
 PUBLIC_INFERENCE_TIMEOUT_SECONDS = 4000
-# Background admission closes at SIGTERM. Already-owned community work keeps
-# its 300-second crash/late-submit grace, then task joins and the WAL durability
-# barrier retain another two minutes before systemd may SIGKILL the validator.
 COMMUNITY_LATE_SUBMIT_GRACE_SECONDS = 300
 NODE_GRACEFUL_STOP_TIMEOUT_SECONDS = (
     PUBLIC_INFERENCE_TIMEOUT_SECONDS + COMMUNITY_LATE_SUBMIT_GRACE_SECONDS + 120
 )
-# `systemctl stop/restart` waits for the unit's TimeoutStopSec before it can
-# return. The local SSH watchdog must remain outside that complete durability
-# window, including RestartSec=2 and remote scheduling/transport slack.
 NODE_SERVICE_START_TIMEOUT_SECONDS = 90
 NODE_SERVICE_STOP_TIMEOUT_SECONDS = NODE_GRACEFUL_STOP_TIMEOUT_SECONDS + 60
 NODE_SERVICE_RESTART_TIMEOUT_SECONDS = NODE_GRACEFUL_STOP_TIMEOUT_SECONDS + 60
-# Rollback may restore the validator and the four lightweight gateway/archive
-# units serially. Preserve one full validator drain plus a bounded five-minute
-# allowance rather than abandoning an in-progress remote systemd transaction.
 PRODUCTION_ROLLBACK_TIMEOUT_SECONDS = NODE_GRACEFUL_STOP_TIMEOUT_SECONDS + 300
 VALIDATOR_APPROVAL_TIMEOUT_SECONDS = 1500
 WORKER_SUBMIT_TIMEOUT_SECONDS = 2700
@@ -289,7 +273,7 @@ PRETAG_DESKTOP_FILES = {
 
 
 class RolloutError(RuntimeError):
-    """A fail-closed manifest, preflight, or rollout error."""
+    pass
 
 
 def fail(message: str) -> NoReturn:
@@ -394,8 +378,6 @@ def require_keys(value: Any, field: str, required: Iterable[str], optional: Iter
 
 
 def validate_embedded_legacy_dag_round(value: Any, label: str) -> dict[str, Any]:
-    """Validate the self-contained durable DAG cursor proof."""
-
     proof = require_keys(
         value,
         label,
@@ -483,8 +465,6 @@ def validate_live_observation_selection(
     freeze_plan_sha256: str,
     capture_id: str,
 ) -> dict[str, Any]:
-    """Validate the complete canary-bound live-observation provenance object."""
-
     label = "legacy maintenance live-observation selection"
     def one_hash(raw: Any, field: str) -> str:
         if not isinstance(raw, str) or LOWER_HEX_32_RE.fullmatch(raw) is None:
@@ -620,8 +600,6 @@ def validate_public_tls_evidence(
     phase: str,
     now_unix: int | None = None,
 ) -> dict[str, Any]:
-    """Validate one exact, freshly verified public IPv4 leaf-certificate proof."""
-
     evidence = require_keys(
         value,
         f"{node} public TLS evidence",
@@ -725,14 +703,6 @@ def absolute_path(value: Any, field: str) -> str:
 
 
 def systemd_literal(value: str, field: str) -> str:
-    """Require one literal systemd argv/environment token.
-
-    Percent is never literal in an ``ExecStart=`` or ``Environment=`` line:
-    systemd expands it as a unit specifier before the process starts.  Reject it
-    while the rollout manifest is still read-only so the sealed argv cannot name
-    one path during import and a different path at service startup.
-    """
-
     if "%" in value:
         fail(f"{field} must not contain systemd percent specifiers")
     if not SAFE_REMOTE_RE.fullmatch(value):
@@ -963,8 +933,6 @@ def validate_protected_pretag_window_set(
 def verify_macos_canary_acceptance(
     manifest: Mapping[str, Any], stage_payloads: Mapping[str, bytes]
 ) -> dict[str, Any]:
-    """Bind the reward gate to the one live-tested pre-tag macOS worker."""
-
     payload = stage_payloads.get("macos_canary_acceptance")
     if payload is None:
         fail("production stage omitted the macOS canary acceptance receipt")
@@ -1381,7 +1349,7 @@ def validate_manifest(
         finalization_values = [archive[field] for field in ARCHIVE_FINALIZATION_FIELDS]
         zeros = "0" * 64
         if all(value == zeros for value in finalization_values):
-            pass  # exact prearchive form, sealed before any remote archive exists
+            pass
         elif any(value == zeros for value in finalization_values):
             fail("manifest.archive finalization roots must be either all-zero prearchive or all nonzero")
         elif prearchive_projection_digest(manifest) != archive["prearchive_rollout_sha256"]:
@@ -2195,8 +2163,6 @@ def verify_artifacts(manifest: Mapping[str, Any]) -> None:
 def verify_production_input_stage(
     manifest: Mapping[str, Any],
 ) -> tuple[dict[str, dict[str, Any]], dict[str, bytes]]:
-    """Verify the builder's one create-only semantic input tree in full."""
-
     artifacts = manifest["artifacts"]
     artifact_paths = [Path(item["path"]) for item in artifacts.values()]
     if not artifact_paths:
@@ -2426,15 +2392,6 @@ def verify_legacy_maintenance_stage_payloads(
     stage_rows: Mapping[str, Mapping[str, Any]],
     payloads: Mapping[str, bytes],
 ) -> None:
-    """Re-derive the legacy/v3 continuity roots from the immutable input stage.
-
-    The manifest's hashes are necessary but not sufficient: the standalone
-    evidence bundle, boundary, and offline-stop receipt must name the same
-    canonical objects.  This validator keeps those small semantic payloads in
-    the same no-follow read transaction as the stage inventory and rejects a
-    hash-valid collection assembled from different captures.
-    """
-
     artifacts = manifest["artifacts"]
     provenance = manifest["provenance"]
     archive = manifest["archive"]
@@ -4305,7 +4262,6 @@ def verify_legacy_maintenance_stage_payloads(
 def load_legacy_interlock_interpreters(
     manifest: Mapping[str, Any],
 ) -> dict[str, dict[str, Any]]:
-    """Reload the six bundle-pinned host interpreters without ambient lookup."""
     if manifest["mode"] != "production":
         return {}
     artifact = manifest["artifacts"]["legacy_maintenance_evidence_bundle"]
@@ -4605,13 +4561,6 @@ def validate_validator_key_receipt_chain_value(
 def validate_validator_installed_key_proof(
     value: Any, manifest: Mapping[str, Any]
 ) -> dict[str, Any]:
-    """Validate the fresh, challenged six-host installed-key observation.
-
-    The proof deliberately binds immutable stage/receipt roots instead of the
-    final manifest digest, so a builder can obtain it from a provisional
-    manifest and then add it to final provenance without a hash cycle.
-    """
-
     proof = require_keys(
         value,
         "manifest.provenance.validator_installed_key_proof",
@@ -4700,8 +4649,6 @@ def validate_validator_installed_key_proof(
 def validate_validator_receipt_chain(
     manifest: Mapping[str, Any], payloads: Mapping[str, bytes]
 ) -> dict[str, Any]:
-    """Validate and sanitize the staged restore -> install fixed-six key chain."""
-
     def canonical_object(name: str, label: str) -> dict[str, Any]:
         raw = payloads[name]
         try:
@@ -4982,7 +4929,6 @@ def _read_canonical_read_only_json(path: Path, label: str) -> tuple[dict[str, An
 def load_legacy_archive_fork_nodes(
     rollout: "RecoveryRollout", archive_manifest_path: Path, complete_path: Path
 ) -> list[dict[str, str]]:
-    """Authenticate the exact archived node classification before config generation."""
     archive = rollout.manifest["archive"]
     manifest, _, manifest_sha = _read_canonical_read_only_json(
         archive_manifest_path, "ARCHIVE-MANIFEST.json"
@@ -5129,7 +5075,6 @@ def parse_legacy_archive_inventory(
     capture_id: str,
     rollout_manifest_sha256: str,
 ) -> dict[str, str]:
-    """Validate the small Drive object that binds a fork's local binding tree."""
     try:
         text = payload.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -5203,18 +5148,12 @@ def write_frontend_config(
     sidecar = output_path.with_name(output_path.name + ".sha256")
     if output_path.exists() or sidecar.exists():
         fail("frontend config or checksum already exists; refusing replacement")
-    # A recovered config is the publication/reopen artifact. Never create it
-    # from sealed metadata alone: repeat the live H/H+1, liveness, convergence,
-    # visible-height, and reward-policy gates immediately before writing it.
     if rollout.manifest["checks"]["reward"]["mode"] == "receipt":
         if reward_evidence is None:
             fail("receipt-mode frontend publication requires --reward-evidence with two distinct mined receipts")
         validate_distinct_receipt_evidence(reward_evidence)
     elif reward_evidence is not None:
         fail("--reward-evidence is permitted only for a receipt-mode frontend publication")
-    # Bind every published checkpoint identity to the exact sealed ARCCHKPT
-    # inspected in this process.  Artifact SHA verification alone cannot prove
-    # the inner payload root that the public recovery projection exposes.
     rollout.verify_checkpoint()
     archive = rollout.manifest["archive"]
     finalized = all(archive[field] != "0" * 64 for field in ARCHIVE_FINALIZATION_FIELDS)
@@ -5246,9 +5185,6 @@ def write_frontend_config(
         if archive_manifest_path is not None or archive_complete_path is not None:
             fail("prearchive frontend publication cannot accept finalized archive files")
         legacy_archive_nodes = []
-    # Remote archive verification can be long. Sample the live chain and
-    # reward gates only after it, leaving the shortest possible gap before the
-    # create-only publication bytes and their live archive provenance probes.
     rollout.verify_live(reward_evidence)
     payload = canonical_bytes(rollout.frontend_config(legacy_archive_nodes))
     digest = sha256_bytes(payload)
@@ -5304,7 +5240,6 @@ def run_checked(
 def run_checked_bytes(
     argv: Sequence[str], *, timeout: int = 120, env: Mapping[str, str] | None = None
 ) -> subprocess.CompletedProcess[bytes]:
-    """Run a bounded-output command without implicit text decoding."""
     try:
         result = subprocess.run(
             list(argv),
@@ -5337,8 +5272,6 @@ class ReceiptEvidence:
 
 @dataclass(frozen=True, order=True)
 class CanonicalEarningsReceipt:
-    """The consensus fields that make one historical 0x25 row immutable."""
-
     block_height: int
     index: int
     tx_hash: str
@@ -5606,8 +5539,6 @@ class RewardEvidenceBundle:
 
 @dataclass(frozen=True, order=True)
 class CanonicalRewardCutoff:
-    """Inclusive canonical transaction position covered by rollout acceptance."""
-
     block_height: int
     index: int
     block_hash: str
@@ -5753,7 +5684,6 @@ def parse_reward_progress_payload(
 def parse_reward_evidence_payload(
     payload: bytes, expected_rollout_sha256: str
 ) -> RewardEvidenceBundle:
-    """Parse only the unique canonical byte representation for this rollout."""
     try:
         body = require_keys(
             json.loads(payload.decode("utf-8")),
@@ -5845,20 +5775,10 @@ class RecoveryRollout:
         self.production_known_hosts: Path | None = None
         self.production_ssh_identity: Path | None = None
         self.production_transport_pins: dict[str, str] = {}
-        # True until this transaction replaces the pre-existing edge.  Once
-        # the staged maintenance Caddyfile is installed, all semantic probes
-        # use authenticated SSH+loopback until the six-node promotion gate
-        # atomically installs the separately hashed live Caddyfile.
         self.production_public_gate_open = True
         self.public_gate_intent_sha256: str | None = None
         self.public_gate_receipt_sha256: str | None = None
         self.legacy_interlock_interpreters: dict[str, dict[str, Any]] = {}
-        # Crossing the capture-bound network-retirement boundary is
-        # intentionally one way: the legacy writer/start barriers remain in
-        # force, but the owned full-host quarantine is removed so Caddy/ACME
-        # and v3 QUIC can operate.  A rollback after this point may only
-        # converge on the sealed maintenance edge; it must never resurrect
-        # legacy nginx or a v0.7 writer.
         self.production_quarantine_retired: set[str] = set()
         self.production_gateway_security_receipts: dict[str, dict[str, Any]] = {}
         self.production_tls_evidence: dict[str, dict[str, dict[str, Any]]] = {
@@ -6105,8 +6025,6 @@ class RecoveryRollout:
     def _validate_finalized_reward_evidence(
         self, expected_sha256: str
     ) -> str:
-        """Re-prove the immutable receipt bundle and its exact sidecar read-only."""
-
         if self.checks["reward"]["mode"] != "receipt":
             fail("finalized reward-evidence validation is receipt-mode only")
         if self.reward_evidence_output is None:
@@ -6155,7 +6073,6 @@ class RecoveryRollout:
         return digest
 
     def configure_production_transport(self) -> None:
-        """Freeze every production transport input into one non-inheriting contract."""
         if self.manifest["mode"] != "production" or self.production_transport_ready:
             return
         rows, payloads = verify_production_input_stage(self.manifest)
@@ -6377,8 +6294,6 @@ class RecoveryRollout:
         return value
 
     def _rollback_journal_bind(self, name: str, value: Mapping[str, Any]) -> str:
-        """Create one deterministic journal root or exact-match its retry."""
-
         if self.rollback_journal is None:
             fail("rollback journal is unavailable")
         path = self.rollback_journal / name
@@ -6397,13 +6312,6 @@ class RecoveryRollout:
         *,
         node: Mapping[str, Any] | None = None,
     ) -> None:
-        """Durably bracket every forward mutation phase.
-
-        These records are deliberately create-only.  Their contents are not a
-        resume cursor: once HEADER exists without SUCCESS, a later process can
-        only restore the original HEADER baselines.  The records instead make
-        the exact crash boundary independently auditable.
-        """
         if not (1 <= sequence <= 999):
             fail("rollback journal forward sequence is outside its fixed range")
         if re.fullmatch(r"[A-Z][A-Z0-9-]{0,47}", phase) is None:
@@ -6425,8 +6333,6 @@ class RecoveryRollout:
         )
 
     def _retirement_boundary_started(self) -> bool:
-        """Return whether the one-way legacy network handoff is durable."""
-
         if self.rollback_journal is None:
             return bool(self.production_quarantine_retired)
         path = self.rollback_journal / "FORWARD-003-QUARANTINE-RETIRE-STARTED.json"
@@ -6754,7 +6660,6 @@ class RecoveryRollout:
             fail("existing production success reward-evidence root differs")
 
     def reserve_rollback_journal(self) -> str:
-        """Create and fsync the immutable rollback transaction before mutation."""
         if self.manifest["mode"] != "production" or self.rollback_journal_reserved:
             return self.rollback_journal_state
         if self.rollback_journal is None:
@@ -6919,14 +6824,6 @@ class RecoveryRollout:
     def _legacy_archive_sources(
         self, archived_forks: Sequence[Mapping[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Derive alternate-source config only from a live, pinned provenance proof.
-
-        The URL is routing metadata. Every archive identity/content field comes
-        from the archive server after it has verified its local immutable
-        COMPLETE -> ARCHIVE-MANIFEST -> inventory -> binding-index -> binding
-        -> ARCCHKPT chain, and the two out-of-band roots are cross-checked
-        against this finalized rollout manifest here.
-        """
         if not archived_forks:
             return []
         archive = self.manifest["archive"]
@@ -6976,8 +6873,6 @@ class RecoveryRollout:
             requested_node = archived_fork.get("node", "")
             if requested_node not in validators_by_name:
                 fail("legacy archive node is not a sealed rollout validator")
-            # Reuse the node's already sealed HTTPS origin/certificate. The
-            # only permitted archive routing suffix is derived, never supplied.
             base_url = (
                 validators_by_name[requested_node]["rpc_url"]
                 + f"/legacy/{requested_node}"
@@ -7118,12 +7013,6 @@ class RecoveryRollout:
     def frontend_config(
         self, archived_forks: Sequence[Mapping[str, str]] = ()
     ) -> dict[str, Any]:
-        """Derive the public recovered-network config from the sealed manifest.
-
-        The six v3 validators retain and serve blocks 0..H from the checkpoint
-        payload, so the selected primary is intentionally both the historical
-        and continuation source. No synthetic legacy API is invented.
-        """
         if self.manifest["mode"] != "production":
             fail("recovered frontend config requires a production rollout manifest")
         checkpoint_identity = self.verified_checkpoint_identity
@@ -7292,10 +7181,6 @@ class RecoveryRollout:
         history_args: list[str] = []
         if self.manifest["mode"] == "production":
             inference_args = ["--model", node["model_path"]]
-            # Every public host can be selected by the desktop's fresh-host
-            # resolver. Keep the exact mined 0x25 receipt history on all six
-            # so earnings and 24-hour projections cannot depend on which
-            # healthy replica answers first.
             history_args = ["--archive"]
             for start, end in node["shard_ranges"]:
                 inference_args.extend(("--shard-range", f"{start}:{end}"))
@@ -7526,9 +7411,6 @@ class RecoveryRollout:
             maximum=1024 * 1024,
         )
         try:
-            # Rclone persists a refreshed OAuth token to its config.  Keep that
-            # expected write, plus any HOME-relative cache, inside one private
-            # disposable root so a plan never changes operator credentials.
             with tempfile.TemporaryDirectory(
                 prefix="arc-recovery-rclone-read-"
             ) as temporary:
@@ -7570,8 +7452,6 @@ class RecoveryRollout:
                     env=rclone_environment,
                 ).stdout
         finally:
-            # Re-prove the immutable operator inputs even when rclone or
-            # temporary-root cleanup fails closed.
             self._assert_production_rclone_transport()
         payload = output
         if len(payload) > max_bytes:
@@ -7587,15 +7467,6 @@ class RecoveryRollout:
         *,
         binding_index_sha256: str,
     ) -> dict[str, Any]:
-        """Read the immutable fork identity from its stopped, hash-bound tree.
-
-        The public archive process independently validates these same objects,
-        but its ``/provenance`` response is not itself an out-of-band trust
-        root.  Capture an expected projection here so publication can compare
-        every live field with the exact binding index, binding, and ARCCHKPT
-        retained on the stopped validator.
-        """
-
         archive = self.manifest["archive"]
         expected_index = bare_hash(
             binding_index_sha256,
@@ -7763,8 +7634,6 @@ arc_semantic_python_revalidate
     def _enrich_legacy_archive_fork_rows(
         self, fork_rows: Sequence[Mapping[str, str]]
     ) -> dict[str, dict[str, Any]]:
-        """Resolve every fork row through its hash-pinned inventory and binding."""
-
         archive = self.manifest["archive"]
         validators_by_name = {node["name"]: node for node in self.validators}
         deployments: dict[str, dict[str, Any]] = {}
@@ -7804,13 +7673,6 @@ arc_semantic_python_revalidate
         return deployments
 
     def load_production_archive_metadata(self) -> None:
-        """Fetch only hash-pinned small metadata needed to deploy fork readers.
-
-        ``verify_production_archive`` authenticates the complete remote object
-        set first. Every byte fetched again here is independently compared with
-        the finalized rollout roots, so a mutable remote cannot redirect the
-        subsequent local-disk deployment.
-        """
         if self.manifest["mode"] != "production":
             fail("legacy archive deployment metadata is production-only")
         archive = self.manifest["archive"]
@@ -7930,7 +7792,6 @@ arc_semantic_python_revalidate
         *,
         timeout: int = 180,
     ) -> str:
-        """Stream an observational probe without creating a remote helper file."""
         for value in args:
             if not SAFE_REMOTE_RE.fullmatch(value):
                 fail(f"unsafe remote argument for {node['name']}: {value!r}")
@@ -8677,7 +8538,6 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
         data: bytes | None = None,
         timeout: int = 20,
     ) -> tuple[int, Mapping[str, str]]:
-        """Probe one exact public URL without following it into a trusted result."""
         if not path.startswith("/") or path.startswith("//"):
             fail(f"HTTP path must be source-relative: {path}")
         url = node["rpc_url"] + path
@@ -8710,7 +8570,6 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
             ) from error
 
     def _prove_legacy_archive_browser_contract(self, node: Mapping[str, Any]) -> None:
-        """Require GET-only routing and exact Pages-only browser readability."""
         for method in ("HEAD", "POST", "OPTIONS"):
             status, _ = self._http_status_headers(
                 node, "/provenance", method=method, origin=PUBLIC_BROWSER_ORIGIN
@@ -8741,8 +8600,6 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
             node, "/provenance", method="GET", origin="https://attacker.invalid"
         )
         leaked_origin = headers.get("Access-Control-Allow-Origin")
-        # A public GET may still return 200 to curl. Browsers must be unable to
-        # expose it to an unsealed origin: no wildcard and no attacker echo.
         if status not in {200, 403, 404} or leaked_origin is not None:
             fail(f"{node['name']} archive allowed an unsealed browser origin")
 
@@ -9108,7 +8965,6 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
         return sorted(candidates)
 
     def capture_reward_earnings_baselines(self) -> None:
-        """Seal six-replica all-v3 history before a canary can be submitted."""
         if self.reward_earnings_baselines:
             return
         baselines: list[RewardEarningsBaseline] = []
@@ -9136,7 +8992,6 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
         )
 
     def reprove_reward_earnings_baselines_before_probe(self) -> None:
-        """Close the crash/resume gap immediately before probe ordinal one."""
         if not self.reward_earnings_baselines:
             fail("pre-canary reward earnings baseline has not been sealed")
         selectable = set(self._reward_baseline_candidate_workers())
@@ -9603,9 +9458,6 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
     def prove_two_reward_receipts(self) -> list[ReceiptEvidence]:
         if self.checks["reward"]["mode"] != "receipt":
             return []
-        # This durable six-replica snapshot is deliberately before the first
-        # probe invocation. A resumed journal reuses it instead of moving the
-        # baseline forward to include a canary that already reached consensus.
         self.capture_reward_earnings_baselines()
         evidence = list(self.reward_evidence_progress)
         if not evidence:
@@ -9618,10 +9470,6 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
             self.prove_reward_receipt(item, ordinal)
             for ordinal, item in enumerate(evidence, 1)
         ]
-        # Prove the first transaction mined before submitting the second. The
-        # consensus policy permits one reward per block. Each discovered
-        # transaction is fsynced into the 0/1/2 journal before its mined proof,
-        # so every later crash window resumes without issuing a new identity.
         for ordinal in range(len(evidence) + 1, 3):
             item = self.obtain_receipt_evidence(ordinal)
             if item is None:
@@ -9636,7 +9484,6 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
         return evidence
 
     def prove_or_resume_two_reward_receipts(self) -> list[ReceiptEvidence]:
-        """Issue fresh probes only when no finalized evidence can be resumed."""
         if self.checks["reward"]["mode"] != "receipt":
             return []
         if self.existing_reward_evidence is None:
@@ -9720,7 +9567,6 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
         *,
         payload_mode: int = 0o444,
     ) -> None:
-        """Atomically replace only the exact reservation inode owned by this run."""
         current, mode = self._read_open_regular(
             reservation_fd, path, max(len(expected), len(payload))
         )
@@ -9750,9 +9596,6 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
             os.close(temporary_fd)
             temporary_fd = -1
 
-            # Re-prove the visible path still names the exact reservation
-            # immediately before the atomic rename. The output directory is
-            # operator-controlled; no pre-existing non-reservation is replaced.
             visible = path.lstat()
             if (
                 stat.S_ISLNK(visible.st_mode)
@@ -9935,14 +9778,6 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
         )  # type: ignore[return-value]
 
     def reserve_reward_evidence_output(self) -> None:
-        """Reserve and preallocate both create-only outputs before mutation.
-
-        Exact untouched reservations and exact finalized bytes are safely
-        resumable. A crash after publishing the JSON but before publishing its
-        sidecar is completed from that canonical JSON without issuing another
-        reward. Anything else is refused rather than overwritten. Plan-only
-        never calls this method.
-        """
         if self.checks["reward"]["mode"] != "receipt":
             return
         if (
@@ -10176,8 +10011,6 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
             ):
                 fail("reward evidence sidecar does not bind the finalized JSON")
 
-            # A crash can occur after exact final bytes are fsynced but before
-            # the final chmod. Only those exact bytes may be repaired.
             for index, path in enumerate(paths):
                 if descriptors[index] < 0:
                     continue
@@ -10226,21 +10059,11 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
                 for ordinal, item in enumerate(evidence, 1)
             ]
             self.prove_reward_projection(evidence, receipt_blocks)
-        # Re-check immediately before a caller may treat verification as a
-        # publication signal; missing/lagging replicas fail closed.
         self.prove_visible_height_continuity()
 
     def prove_reward_history_survives_production_restarts(
         self, evidence: Sequence[ReceiptEvidence]
     ) -> None:
-        """Restart every public replica and re-prove the exact mined history.
-
-        Desktop host selection may choose any fresh validator, so archive
-        durability is a six-replica contract.  The first restart pass happens
-        before reward canaries exist and cannot prove their persistence; this
-        second pass is intentionally after both distinct 0x25 receipts are
-        mined and sealed.
-        """
         if self.manifest["mode"] != "production":
             fail("reward-history restart proof is production-only")
         validate_distinct_receipt_evidence(evidence)
@@ -10349,7 +10172,7 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
             for node in reversed(self.validators):
                 try:
                     self.stop_local(node, strict=False)
-                except Exception as error:  # best-effort shutdown, data is preserved
+                except Exception as error:
                     self.say(f"WARN local shutdown {node['name']}: {error}")
         if complete:
             self.say(f"COMPLETE local rehearsal; processes stopped cleanly; data/logs preserved at {run_dir.parent}")
@@ -10425,14 +10248,6 @@ test "$(sha256sum /proc/self/fd/8 | cut -d' ' -f1)" = "$python_sha"
     def remote_semantic_python_prelude(
         self, node: Mapping[str, Any], *, descriptor: int = 9
     ) -> str:
-        """Open the exact bundle-pinned host interpreter for one SSH script.
-
-        Security-semantic remote Python must never resolve through PATH or load
-        host/user Python configuration.  The descriptor remains open across
-        every isolated invocation, so a pathname replacement cannot change the
-        interpreter used midway through a production transaction.
-        """
-
         if descriptor not in range(3, 10):
             fail("semantic interpreter descriptor is outside the reviewed range")
         interpreter = self.late_fork_interlock_interpreter(node)
@@ -10673,14 +10488,6 @@ WantedBy=multi-user.target
 """
 
     def maintenance_caddyfile(self, node: Mapping[str, Any]) -> str:
-        """TLS edge used until the all-six continuity proof is durable.
-
-        Validator-only control traffic remains available from the exact fixed
-        fleet, while every ordinary public route returns a deterministic 503.
-        The live allowlist is staged under a different hash and cannot become
-        active merely because Caddy or the host reboots.
-        """
-
         validator_ips = " ".join(peer["host"] for peer in self.validators)
         public_filter = self.caddy_unix_upstream(self.filter_public_socket(node))
         status_proxy = f"""reverse_proxy {public_filter} {{
@@ -11153,16 +10960,6 @@ http {{
     def validate_gateway_security_contract(
         maintenance: str, live: str, rpc_filter: str
     ) -> None:
-        """Reject unsafe generated proxy combinations before remote staging.
-
-        Caddy v2.11.4 is deliberately retained only with the vulnerable
-        ``forward_auth``+``reverse_proxy`` composition removed completely.
-        The fail-closed interlock is enforced by nginx ``auth_request`` at the
-        sole loopback upstream instead, so Caddy can never race two upstream
-        selections.  The admin API and dynamic/content-serving handlers stay
-        disabled in both public configurations.
-        """
-
         for label, config in (("maintenance Caddy", maintenance), ("live Caddy", live)):
             if config.count("admin off") != 1:
                 fail(f"{label} must disable the Caddy admin API exactly once")
@@ -11180,9 +10977,6 @@ http {{
             fail("RPC filter does not bind every active upstream class to the interlock")
         proxy_count = rpc_filter.count("proxy_pass http://")
         auth_count = rpc_filter.count("auth_request /__arc_interlock_gate;")
-        # There is one unauthenticated status proxy on the public filter.  It
-        # exposes only the interlock's own fail-closed status and cannot mutate
-        # or reach either application origin.
         status_proxy_count = rpc_filter.count("gate.sock:/maintenance/status;")
         if (
             proxy_count not in {10, 12}
@@ -11190,11 +10984,6 @@ http {{
             or auth_count != proxy_count - gate_proxy_count - status_proxy_count
         ):
             fail("RPC filter omits the fail-closed interlock from a public upstream class")
-        # Nginx configuration is generated locally, but future template edits
-        # must still fail closed.  Inspect every complete location block and
-        # require exactly one auth_request whenever it proxies anywhere other
-        # than the internal interlock subrequest itself.  Exact total counts
-        # above prevent moving/duplicating an auth_request between locations.
         lines = rpc_filter.splitlines()
         for line in lines:
             if "{64}" in line and line.lstrip().startswith("location ~ "):
@@ -11771,12 +11560,6 @@ arc_semantic_python_revalidate
         name: str,
         expected_sha256: str,
     ) -> None:
-        """Create one rollout file or compare an existing same-rollout inode.
-
-        SCP never targets the final path, so a resume cannot truncate a live
-        validator, Caddy binary, config, or unit. The exact manifest/tool-bound
-        digest decides whether a pre-existing final file is reusable.
-        """
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", name):
             fail(f"unsafe rollout staging name: {name!r}")
         expected = bare_hash(expected_sha256, f"staged rollout {name} sha256")
@@ -12155,7 +11938,6 @@ arc_semantic_python_revalidate
         self.say(f"PASS {node['name']} staged exact artifacts and imported checkpoint into fresh data")
 
     def _install_late_fork_interlock(self, node: Mapping[str, Any]) -> None:
-        """Install and prove the capture-bound fail-closed publication monitor."""
         root = node["remote_root"]
         monitor_root = self.late_fork_interlock_root(node)
         service = self.late_fork_interlock_service_name(node)
@@ -12365,17 +12147,6 @@ printf '%s\n' "$body"
     def _retire_legacy_network_quarantine(
         self, node: Mapping[str, Any]
     ) -> dict[str, Any]:
-        """Cross the capture-bound one-way network handoff on one host.
-
-        ``archive-node.sh`` owns the destructive details and its durable
-        remote journal.  This wrapper re-hashes that exact helper immediately
-        before execution, accepts only the canonical receipt, and appends the
-        receipt separately to the operator rollback journal.  The retained
-        legacy start barriers are deliberately distinct from the retired nft
-        quarantine: they continue to make a v0.7 restart impossible while
-        freeing the public/QUIC ports required by Caddy and v3.
-        """
-
         archive = self.manifest["archive"]
         helper_sha = archive["remote_helper_sha256"]
         helper = f"/root/.arc-recovery-helpers/{helper_sha}/archive-node.sh"
@@ -13179,8 +12950,6 @@ printf '%s' "$payload"
     def _prove_public_tls_evidence(
         self, node: Mapping[str, Any], *, phase: str
     ) -> dict[str, Any]:
-        """Freshly prove the exact public IPv4 leaf and HTTPS edge over TLS."""
-
         if phase not in {"preflight", "post-rollout"}:
             fail("public TLS evidence phase is unsupported")
         root = node["remote_root"]
@@ -13534,9 +13303,6 @@ arc_semantic_python_revalidate
         self.say("PASS every reachable production edge is durably maintenance-only")
 
     def open_public_gate(self) -> str:
-        # Complete-archive verification belongs before this method.  Once the
-        # final advancing proof starts, no potentially long-running task may
-        # separate that proof from the host-local promotion checks below.
         self.wait_nodes_ready()
         self.prove_production_runtime_inventory()
         self.prove_boundary()
@@ -13593,16 +13359,11 @@ arc_semantic_python_revalidate
                 fail("PUBLIC_GATE_OPEN_INCOMPLETE: " + "; ".join(failures))
             if set(receipts) != {node["name"] for node in self.validators}:
                 fail("public gate promotion receipt set is not the exact six")
-            # Keep semantic checks on authenticated SSH+loopback until every
-            # edge has switched. Any post-switch mismatch returns every
-            # reachable edge to maintenance before success is recorded.
             self.wait_nodes_ready()
             self.prove_boundary()
             post_promotion = self.wait_convergence(minimum_height=final[0])
             if post_promotion[0] < final[0]:
                 fail("post-promotion convergence fell below the promotion commitment")
-            # Host receipts contain identical commitment/config roots; preserve
-            # fleet order separately so a missing or duplicated result is visible.
             receipt = {
                 "schema": "arc.recovery.public-gate-open-receipt.v2",
                 "rollout_manifest_sha256": self.digest,
@@ -13646,12 +13407,6 @@ arc_semantic_python_revalidate
             "stop": NODE_SERVICE_STOP_TIMEOUT_SECONDS,
             "restart": NODE_SERVICE_RESTART_TIMEOUT_SECONDS,
         }[action]
-        # A successful systemctl return is not a sufficient start boundary:
-        # Type=simple returns before Rust necessarily binds QUIC/RPC. Poll within
-        # the reviewed lifecycle timeout and require two consecutive samples
-        # with one stable MainPID owning the sole UDP row and exact protected
-        # Unix RPC socket. Foreign/duplicate rows fail immediately; an absent
-        # listener may only consume the deadline.
         self.ssh(
             node,
             r'''set -eu
@@ -13790,14 +13545,6 @@ test -z "$(ss -H -ltnp | awk -v port="$retired_rpc_port" '$4 ~ (":" port "$") {p
             fail(f"{node['name']} maintenance TLS probe differs: HTTP {probe_status}")
 
     def _prove_public_browser_contract(self, node: Mapping[str, Any]) -> None:
-        """Exercise the browser contract at the public TLS edge.
-
-        OPTIONS must terminate at Caddy with no node proxy. Public GET/POST
-        routes expose CORS only to the exact GitHub Pages origin. The flat
-        transfer route must reach the node and reject an unsigned payload,
-        while validator-only approval and shard routes expose no browser CORS.
-        """
-
         def request(
             method: str,
             path: str,
@@ -13867,11 +13614,6 @@ test -z "$(ss -H -ltnp | awk -v port="$retired_rpc_port" '$4 ~ (":" port "$") {p
         status, headers, _ = request("GET", "/network/info", origin=PUBLIC_BROWSER_ORIGIN)
         require_allowed(status, headers, 200)
 
-        # Readiness is the mutation-free pre-dispatch contract used by every
-        # v0.8.0 client before it spends its one inference POST.  Prove the
-        # route traverses both gateway layers and is the exact reviewed shape;
-        # otherwise a seemingly healthy edge would make all clients fail
-        # closed before submitting useful work.
         status, headers, response_body = request(
             "GET", "/inference/readiness", origin=PUBLIC_BROWSER_ORIGIN
         )
@@ -13922,13 +13664,6 @@ test -z "$(ss -H -ltnp | awk -v port="$retired_rpc_port" '$4 ~ (":" port "$") {p
         if model_id != f"0x{CANONICAL_MODEL_BLAKE3}":
             fail(f"{node['name']} inference readiness route has the wrong canonical model identity")
 
-        # The SDKs use the flat /tx/submit and /tx/submit_batch wire contracts.
-        # Exercise both through the public TLS gateway with an intentionally
-        # unsigned transfer. The single route's signing guidance and the batch
-        # handler's zero-accepted rejection prove each route reached the node
-        # while also proving unsigned mutation is still rejected. A gateway
-        # 404, an accepted transaction, or a generic proxy failure stops the
-        # rollout.
         probe_from = hashlib.sha256(
             f"arc-gateway-unsigned-probe:{self.manifest['rollout_id']}:{node['name']}:from".encode()
         ).hexdigest()
@@ -14544,12 +14279,8 @@ printf 'public_80_count=%s\npublic_443_count=%s\n' "$expected_80_count" "$expect
         node: Mapping[str, Any],
         maintenance_intent_sha256: str,
     ) -> dict[str, Any]:
-        """Finish the one-way handoff and prove a fail-closed maintenance edge."""
-
         retirement = self._retire_legacy_network_quarantine(node)
         retirement_sha = sha256_bytes(canonical_bytes(retirement))
-        # This installer is explicitly in post-retirement mode: its own error
-        # trap cannot restore nginx or a legacy service baseline.
         self._install_gateway_and_unit(node, retirement_committed=True)
         self._set_public_gate_config(
             node,
@@ -14930,12 +14661,6 @@ printf 'legacy_start_barrier_active=1\nquarantine_retired=1\n'
         )
 
     def _resume_existing_rollback_journal(self) -> bool:
-        """Handle a previously fsynced transaction without forward resumption.
-
-        Returns True only when a strict prior SUCCESS receipt proves the whole
-        rollout already completed.  Every nonterminal journal is restored from
-        its original v2 HEADER baselines before any new forward operation.
-        """
         state = self.reserve_rollback_journal()
         if state == "success":
             self.say("PASS existing durable SUCCESS receipt proves this exact production rollout is complete")
@@ -15027,8 +14752,6 @@ printf 'legacy_start_barrier_active=1\nquarantine_retired=1\n'
         self.rollback_journal_state = "success"
 
     def execute_production(self) -> None:
-        # Re-hash every executing rollout/archive component after authorization
-        # and immediately before the first remote mutation.
         self.verify_execution_provenance()
         if (
             self.rollback_journal is not None
@@ -15045,10 +14768,6 @@ printf 'legacy_start_barrier_active=1\nquarantine_retired=1\n'
         live_archive_hash = self.verify_production_archive(verify_live_captures=True)
         if live_archive_hash != self.manifest["archive"]["archive_manifest_sha256"]:
             fail("live capture verification returned a different archive root")
-        # The complete Drive/live-capture verifier can be long. Re-run the
-        # lightweight host/DNS/model/listener checks and replace the service
-        # baseline immediately afterward so rollback never restores stale
-        # activity observed hours before the first mutation.
         self.production_service_baseline.clear()
         self.production_public_listener_baseline.clear()
         self._preflight_production()
@@ -15072,11 +14791,6 @@ printf 'legacy_start_barrier_active=1\nquarantine_retired=1\n'
             for node in self.validators:
                 self._install_late_fork_interlock(node)
             self._rollback_journal_event(2, "INTERLOCK-INSTALL", "COMPLETE")
-            # This is the irreversible network ownership handoff.  The exact
-            # maintenance monitor is live first; then every host removes only
-            # the capture-owned nft table while permanently retaining both
-            # legacy restart barriers.  From STARTED onward, rollback is
-            # maintenance-only and may never restore the v0.7 public edge.
             self._rollback_journal_event(3, "QUARANTINE-RETIRE", "STARTED")
             retirement_receipts: dict[str, dict[str, Any]] = {}
             with concurrent.futures.ThreadPoolExecutor(
@@ -15153,11 +14867,6 @@ printf 'legacy_start_barrier_active=1\nquarantine_retired=1\n'
                     ],
                 },
             )
-            # This is the final TLS boundary before any v3 process starts.
-            # A fresh direct-IP handshake must validate against the public CA
-            # store, match the exact IPv4 SAN, and leave at least 48 hours on
-            # the <=160-hour short-lived leaf.  It deliberately does not claim
-            # that certificate renewal was observed during this rollout.
             self._prove_public_tls_fleet(phase="preflight")
             self._rollback_journal_event(4, "GATEWAY-INSTALL", "COMPLETE")
             for node in self.validators:
@@ -15227,10 +14936,6 @@ printf 'legacy_start_barrier_active=1\nquarantine_retired=1\n'
             if rollback_cause is not original:
                 raise rollback_cause from original
             raise
-        # SUCCESS is the terminal commit record.  It is intentionally outside
-        # the rollback-catching region: once its create-only fsynced bytes
-        # exist, this transaction must never subsequently restore the old
-        # fleet and leave contradictory terminal claims.
         self._write_production_success_receipt()
         self.say("COMPLETE production rollout; all six v3 validators remain enabled and running")
 
@@ -15406,11 +15111,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             and args.rollback_journal is not None
             and (args.rollback_journal.exists() or args.rollback_journal.is_symlink())
         ):
-            # Crash recovery cannot depend on a normal production preflight:
-            # that preflight may correctly reject the deliberately partial
-            # forward state left by SIGKILL or power loss.  Authenticate the
-            # exact sealed transaction and GO tuple, then use only the original
-            # baselines fsynced in the existing journal HEADER.
             sealed_archive_hash = manifest["archive"]["archive_manifest_sha256"]
             require_go(
                 manifest,
@@ -15479,9 +15179,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.archive_manifest_sha256,
             archive_manifest_sha256,
         )
-        # Execute-only: reserve and fsync both create-only evidence outputs
-        # before the first local or remote mutation. Plan-only remains
-        # recovery-state read-only.
         rollout.reserve_reward_evidence_output()
         rollout.execute()
         return 0

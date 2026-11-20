@@ -1,9 +1,3 @@
-//! Shared, private Unix-socket service for immutable canonical row bundles.
-//! Each SSH relay carries the row protocol to one resident bundle, with an
-//! initial manifest-pin handshake when the bundle uses verified startup pins;
-//! connections never reload weights. This is deliberately not a public TCP
-//! endpoint and does not cache projections or generation results.
-
 use crate::cached_integer_model::{
     GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, I8Weights, matmul_i8_canonical_row_range,
 };
@@ -51,7 +45,6 @@ fn read_short(file: &mut impl Read) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Exactly one loaded bundle. All connections borrow these same row heaps.
 pub struct SharedRowBundle {
     artifact: Hash256,
     worker_id: String,
@@ -59,20 +52,13 @@ pub struct SharedRowBundle {
     serialized_bytes: usize,
     largest_file: usize,
     manifest_hash: Option<Hash256>,
-    // An exclusive nonblocking directory lock prevents a second daemon
-    // from preparing another heap for this same bundle, even at a different socket.
     _directory_lease: std::fs::File,
 }
 impl SharedRowBundle {
-    /// Preflight the complete aggregate before allocating any row weights.
-    /// Legacy mode checks ARCROW01 identities and bounds, without content
-    /// digests. Partial cohorts require `load_pinned` instead.
     pub fn load(directory: &Path, expected: Hash256) -> io::Result<Self> {
         Self::load_inner(directory, expected, None)
     }
 
-    /// Verify the pinned manifest and hash the exact stream decoded into each
-    /// retained matrix. Pinned bundles require a matching connection handshake.
     pub fn load_pinned(
         directory: &Path,
         expected: Hash256,
@@ -92,8 +78,6 @@ impl SharedRowBundle {
         if !lease.metadata()?.is_dir() {
             return Err(invalid("row bundle path is not a directory"));
         }
-        // SAFETY: the descriptor remains owned by `lease`; flock neither
-        // dereferences pointers nor changes the underlying artifact files.
         if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -324,8 +308,6 @@ impl SharedRowBundle {
             return Err(invalid("projection input shape"));
         }
         let mut values = vec![0; a.row_end - a.row_start];
-        // A deadline is checked between bounded row chunks, so an expired
-        // client cannot monopolize the single compute slot indefinitely.
         for (chunk, out) in values.chunks_mut(ROW_COMPUTE_CHUNK_ROWS).enumerate() {
             if shutdown.load(Ordering::Relaxed) || Instant::now() >= deadline {
                 return Err(timed_out());
@@ -462,9 +444,6 @@ impl SharedRowService {
             max_clients: self.limits.max_clients,
         }
     }
-    /// Nonblocking accept is solely for bounded graceful shutdown. There are
-    /// at most max_clients connection tasks and queued requests; each client
-    /// has at most one decoded frame waiting for the one compute slot.
     pub fn serve(
         self: &Arc<Self>,
         listener: UnixListener,
@@ -516,8 +495,6 @@ impl SharedRowService {
                 Err(e) => return Err(e),
             }
         }
-        // Active streams check cancellation at most 100 ms apart, including
-        // idle clients. Row kernels check it every <=32 rows.
         for thread in threads {
             let _ = thread.join();
         }
@@ -569,8 +546,6 @@ impl SharedRowService {
                 needs_pin = false;
                 continue;
             }
-            // Legacy/unpinned services and repeat handshakes refuse through
-            // the existing row decoder; no connection can switch bundles.
             let request = decode_row_request(&frame).map_err(|e| invalid(e.to_string()))?;
             drop(frame);
             let deadline = Instant::now() + self.limits.call_timeout;
@@ -701,9 +676,6 @@ fn write_all_until(
     Ok(())
 }
 
-/// Bind only beneath a directory owned by this uid with mode 0700 (or more
-/// restrictive), and set the socket itself to 0600. Existing paths are never
-/// unlinked by startup. The operator explicitly handles a stale old socket.
 pub struct PrivateRowSocket {
     path: PathBuf,
     inode: u64,
@@ -717,7 +689,6 @@ impl PrivateRowSocket {
             .parent()
             .ok_or_else(|| invalid("row socket has no parent"))?;
         let metadata = std::fs::symlink_metadata(parent)?;
-        // SAFETY: geteuid reads this process's uid and has no pointer inputs.
         if !metadata.is_dir()
             || metadata.uid() != unsafe { libc::geteuid() }
             || metadata.permissions().mode() & 0o077 != 0
@@ -746,9 +717,6 @@ impl Drop for PrivateRowSocket {
     }
 }
 
-// The private directory/socket mode is the access boundary. Also bind both
-// ends to this uid, so replacing an ancestor path cannot redirect a relay's
-// activations to another local user.
 fn require_same_uid(stream: &UnixStream) -> io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -758,8 +726,6 @@ fn require_same_uid(stream: &UnixStream) -> io::Result<()> {
             gid: 0,
         };
         let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        // SAFETY: both output buffers have the exact sizes supplied, the
-        // connected descriptor is live, and getsockopt retains no pointer.
         let status = unsafe {
             libc::getsockopt(
                 stream.as_raw_fd(),
@@ -792,7 +758,6 @@ fn require_same_uid(stream: &UnixStream) -> io::Result<()> {
     {
         let mut uid: libc::uid_t = 0;
         let mut gid: libc::gid_t = 0;
-        // SAFETY: live stream and valid uid/gid output pointers.
         if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -822,9 +787,6 @@ fn require_same_uid(stream: &UnixStream) -> io::Result<()> {
     }
 }
 
-/// SSH invokes this relay, which copies only protocol bytes. It creates no
-/// resident rows. A detached stdin task lets a daemon disconnect terminate
-/// the relay even if the SSH input pipe remains open; process exit reaps it.
 pub fn relay(socket: &Path) -> io::Result<()> {
     let mut stream = UnixStream::connect(socket)?;
     require_same_uid(&stream)?;
@@ -870,7 +832,6 @@ mod tests {
         assert_eq!(matmul_chunk_count(31), 1);
         assert_eq!(matmul_chunk_count(32), 1);
         assert_eq!(matmul_chunk_count(33), 2);
-        // Three separate successful RPCs; count each RPC's executed row chunks.
         let multi_rpc_chunks: u64 = [31, 32, 33].into_iter().map(matmul_chunk_count).sum();
         assert_eq!(multi_rpc_chunks, 4);
     }
@@ -912,8 +873,6 @@ mod tests {
             } else {
                 SharedRowBundle::load(&rows, Hash256([7; 32])).unwrap()
             };
-            // A second instance cannot prepare duplicate resident heaps for
-            // this directory, even if it would choose a different socket.
             assert!(SharedRowBundle::load(&rows, Hash256([7; 32])).is_err());
             let service = SharedRowService::new(bundle, limits).unwrap();
             let socket = directory.join("s");
@@ -1037,7 +996,7 @@ mod tests {
             .project(&call, Instant::now() + Duration::from_secs(1), &cancel)
             .unwrap();
         let mut corrupted = original.clone();
-        *corrupted.last_mut().unwrap() ^= 1; // Identical header, size and scales.
+        *corrupted.last_mut().unwrap() ^= 1;
         std::fs::write(&fixture.file, &corrupted).unwrap();
         assert_eq!(
             bundle
@@ -1051,8 +1010,6 @@ mod tests {
             error.to_string().contains("loaded row bytes differ"),
             "{error}"
         );
-        // Legacy mode intentionally has no content pin; identical corrupt
-        // header/length remains parseable, demonstrating the actual gap.
         drop(SharedRowBundle::load(&fixture.rows, Hash256([7; 32])).unwrap());
         std::fs::write(&fixture.file, original).unwrap();
         assert!(fixture.load(&value).is_ok());
@@ -1125,7 +1082,6 @@ mod tests {
         );
         let mut no_pin = running.connect();
         let row = encode_row_request(&request("fixture", Hash256([2; 32]))).unwrap();
-        // Reject the ordinary row frame before accepting/allocating its body.
         no_pin.write_all(&(row.len() as u32).to_le_bytes()).unwrap();
         match no_pin.read(&mut [0]) {
             Ok(0) => {}
@@ -1208,8 +1164,6 @@ mod tests {
         let b = request("fixture", Hash256([2; 32]));
         send(&mut first, &a);
         let first = answer(&mut first);
-        // Connections must not reload. The second client still uses the same
-        // verified in-memory rows after the source file is no longer usable.
         std::fs::write(&running.file, b"not a row file").unwrap();
         send(&mut second, &b);
         let second = answer(&mut second);
@@ -1271,8 +1225,6 @@ mod tests {
         let mut excess = running.connect();
         assert_eq!(excess.read(&mut [0]).unwrap(), 0);
         assert_eq!(running.service.stats().rejected_clients, 1);
-        // A length prefix without its payload expires rather than keeping a
-        // queue slot alive with an incomplete frame.
         first.write_all(&100u32.to_le_bytes()).unwrap();
         assert_eq!(first.read(&mut [0]).unwrap(), 0);
         drop(first);

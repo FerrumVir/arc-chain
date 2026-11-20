@@ -32,7 +32,6 @@ import type {
   PreviousInstallNotice as PreviousInstallNoticeData,
 } from "./lib/types";
 
-// If the native store never answers, stop waiting and show what the local state says.
 const BOOT_TIMEOUT_MS = 4_000;
 
 const SCREENS = {
@@ -108,12 +107,9 @@ function RunningApp() {
     useState<PreviousInstallNoticeData | null>(null);
   const [legacyQuestion, setLegacyQuestion] =
     useState<LegacyComputeQuestion | null>(null);
-  // The one-time compute question for an install from before the default.
   const [computePrompt, setComputePrompt] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
 
-  // The launch screen (index.html) stays up until the saved identity and config have loaded. Deciding between the
-  // wizard and the app before then showed returning users "Welcome to Arc" until the native store replied.
   const ready = configHydrated || bootTimedOut || isBlockedProductionBrowser;
   useEffect(() => {
     const timer = window.setTimeout(() => setBootTimedOut(true), BOOT_TIMEOUT_MS);
@@ -123,9 +119,6 @@ function RunningApp() {
     if (ready) void dismissBootSplash().then(() => setBootDismissed(true));
   }, [ready]);
 
-  // The wizard stages identity/config before downloading and starting the
-  // node. Those drafts must not unmount it while setup can still fail.
-  // Native-store hydration below restores completion for existing installs.
   const onboarded = onboardedFlag;
 
   useEffect(() => {
@@ -152,9 +145,6 @@ function RunningApp() {
       if (active) setPreviousInstall(loadedPreviousInstall);
       if (active) setLegacyQuestion(loadedQuestion);
       if (active) setConfigHydrated(true);
-      // Claim only once the main window is visible. The dialog acknowledges
-      // after mounting, so a hidden launch or interrupted claim cannot spend
-      // an unseen notice. Native startup has already resolved the default.
       if (active && (onboardedFlag || (loadedIdentity && loadedConfig))) {
         stopWaitingToBeSeen = api.whenMainWindowSeen(() => {
           void api.claimComputePrompt().then(
@@ -173,9 +163,6 @@ function RunningApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Wait for the native store to hydrate so stale localStorage preferences
-  // cannot start checks or unattended installs that persisted config disabled.
-  // The singleton scheduler owns one startup timer and one daily interval.
   useEffect(() => {
     const autoChecksEnabled =
       configHydrated && config?.autoUpdate === true;
@@ -193,12 +180,10 @@ function RunningApp() {
     return <ProductionBrowserBlocker />;
   }
 
-  // Still under the launch screen: render nothing rather than guess.
   if (!ready) return null;
 
   const Screen = SCREENS[route];
 
-  // reducedMotion="user": every framer-motion animation below follows the OS "reduce motion" setting.
   return (
     <MotionConfig reducedMotion="user">
       <AnimatePresence mode="wait" initial={false}>
@@ -259,8 +244,6 @@ function RunningApp() {
                     onDismissed={() => setPreviousInstall(null)}
                   />
                 )}
-                {/* Screen changes: a short exit, then the new screen from the top. The main area scrolls, so without
-                    the reset a screen could open part-way down. */}
                 <AnimatePresence
                   mode="wait"
                   onExitComplete={() => mainRef.current?.scrollTo({ top: 0 })}

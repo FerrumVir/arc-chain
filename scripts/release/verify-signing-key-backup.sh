@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Independently restore-test a downloaded encrypted ARC signing-key backup
-# against the public identities committed in the exact release source tree.
 set +x
 set -Eeuo pipefail
 ulimit -c 0
@@ -12,11 +10,6 @@ die() {
     exit 1
 }
 
-# OpenSSH preserves an optional private-key comment in `ssh-keygen -y`
-# output. Comments are metadata rather than key identity, so compare the
-# validated algorithm and key blob only. Keep this parser identical to the
-# protected preflight policy: exactly one Ed25519 record, with either no
-# comment or the provisioned manifest-key comment, is accepted.
 canonicalize_manifest_public_key() {
     local input_path="$1"
     local output_path="$2"
@@ -98,9 +91,6 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-# Install the exact locked signer and compile the isolated public-key verifier
-# before any private bytes are decrypted. No dependency resolution, builds, or
-# network-capable package command runs while plaintext signing keys exist.
 npm ci --prefix "$REPO_ROOT/desktop" --ignore-scripts >/dev/null
 TAURI_SIGNER="$REPO_ROOT/desktop/node_modules/@tauri-apps/cli/tauri.js"
 [ -f "$TAURI_SIGNER" ] && [ ! -L "$TAURI_SIGNER" ] && [ -x "$TAURI_SIGNER" ] \

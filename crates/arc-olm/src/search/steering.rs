@@ -1,30 +1,15 @@
-//! Neural steering model for guided beam search.
-//!
-//! A 3-layer MLP with per-type output heads that scores operations
-//! based on grid features. Trained on the 400 known Hodel solutions.
-//! All inference is integer arithmetic (f32 weights, integer features).
-
 use crate::Grid;
 use crate::primitives::{grid, object};
 use crate::search::enumerate::{DagType, DagValue};
 use std::path::Path;
 
-// ---------------------------------------------------------------------------
-// Feature extraction (64 dims)
-// ---------------------------------------------------------------------------
-
-/// Extract 32-dimensional features from a single grid.
 fn grid_features(g: &Grid) -> Vec<f32> {
-    // Keep the integer dimensions around: the square/diagonal-symmetry checks below
-    // are asking "is this grid square?", which is an exact integer question, not a
-    // floating-point one.
     let h_cells = g.len();
     let w_cells = if g.is_empty() { 0 } else { g[0].len() };
     let h = h_cells as f32;
     let w = w_cells as f32;
     let total = h * w;
 
-    // Color histogram (10 values, normalized to 0-1)
     let mut hist = [0f32; 10];
     for row in g {
         for &c in row {
@@ -39,7 +24,6 @@ fn grid_features(g: &Grid) -> Vec<f32> {
         }
     }
 
-    // Background color (most common)
     let bg = hist
         .iter()
         .enumerate()
@@ -47,16 +31,13 @@ fn grid_features(g: &Grid) -> Vec<f32> {
         .map(|(i, _)| i)
         .unwrap_or(0);
 
-    // Unique colors
     let n_colors = hist.iter().filter(|&&c| c > 0.0).count() as f32;
 
-    // Object count (simple 4-connected, skip bg)
     let objs = object::objects(g, true, false, true);
     let n_objs = objs.len() as f32;
     let max_obj_size = objs.iter().map(|o| o.size()).max().unwrap_or(0) as f32;
     let min_obj_size = objs.iter().map(|o| o.size()).min().unwrap_or(0) as f32;
 
-    // Symmetry checks (fast)
     let sym_h = if *g == grid::hmirror(g) { 1.0 } else { 0.0 };
     let sym_v = if *g == grid::vmirror(g) { 1.0 } else { 0.0 };
     let sym_d = if h_cells == w_cells && *g == grid::dmirror(g) {
@@ -69,14 +50,13 @@ fn grid_features(g: &Grid) -> Vec<f32> {
     let is_square = if h_cells == w_cells { 1.0 } else { 0.0 };
     let bg_frac = hist[bg];
 
-    // Assemble 32-dim vector
     let mut feats = Vec::with_capacity(32);
-    feats.push(h / 30.0); // normalized height
-    feats.push(w / 30.0); // normalized width
-    feats.extend_from_slice(&hist); // 10 color histogram values
+    feats.push(h / 30.0);
+    feats.push(w / 30.0);
+    feats.extend_from_slice(&hist);
     feats.push(n_colors / 10.0);
     feats.push(bg as f32 / 9.0);
-    feats.push(n_objs / 20.0); // normalized object count
+    feats.push(n_objs / 20.0);
     feats.push(max_obj_size / total.max(1.0));
     feats.push(min_obj_size / total.max(1.0));
     feats.push(sym_h);
@@ -85,7 +65,6 @@ fn grid_features(g: &Grid) -> Vec<f32> {
     feats.push(sym_r);
     feats.push(is_square);
     feats.push(bg_frac);
-    // Pad to 32
     while feats.len() < 32 {
         feats.push(0.0);
     }
@@ -93,12 +72,6 @@ fn grid_features(g: &Grid) -> Vec<f32> {
     feats
 }
 
-/// Extract a 64-dimensional feature vector from the current DAG state
-/// and the target grid.
-///
-/// Layout: `[grid_features(current) | grid_features(target)]`
-///
-/// If `current` is not a Grid variant, the first 32 dims are zero.
 pub fn extract_features(current: &DagValue, target: &Grid, _current_type: &DagType) -> Vec<f32> {
     let current_feats = match current {
         DagValue::Grid(g) => grid_features(g),
@@ -112,34 +85,23 @@ pub fn extract_features(current: &DagValue, target: &Grid, _current_type: &DagTy
     features
 }
 
-// ---------------------------------------------------------------------------
-// Model structure
-// ---------------------------------------------------------------------------
-
-/// Weight matrix stored as f32 (simple, fast enough for 138K params).
 pub struct WeightMatrix {
-    pub weights: Vec<f32>, // row-major [n_rows x n_cols]
-    pub bias: Vec<f32>,    // [n_rows]
+    pub weights: Vec<f32>,
+    pub bias: Vec<f32>,
     pub n_rows: usize,
     pub n_cols: usize,
 }
 
-/// Per-type output head.
 pub struct TypeHead {
     pub weights: WeightMatrix,
     pub prim_names: Vec<String>,
 }
 
-/// The steering model: a 3-layer MLP with per-type output heads.
 pub struct SteeringModel {
-    pub layer1: WeightMatrix, // hidden1 x input
-    pub layer2: WeightMatrix, // hidden2 x hidden1
-    pub heads: Vec<TypeHead>, // one per DagType (Grid=0, Objects=1, ...)
+    pub layer1: WeightMatrix,
+    pub layer2: WeightMatrix,
+    pub heads: Vec<TypeHead>,
 }
-
-// ---------------------------------------------------------------------------
-// Binary helpers
-// ---------------------------------------------------------------------------
 
 fn read_u32(data: &[u8], cursor: &mut usize) -> u32 {
     let val = u32::from_le_bytes([
@@ -192,16 +154,11 @@ fn read_weight_matrix(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Matrix operations
-// ---------------------------------------------------------------------------
-
 fn matmul(matrix: &WeightMatrix, input: &[f32]) -> Vec<f32> {
     let mut output = vec![0.0f32; matrix.n_rows];
     for (i, out) in output.iter_mut().enumerate() {
         let mut sum = matrix.bias[i];
         let row_start = i * matrix.n_cols;
-        // `take(n_cols)` on `input` gives exactly the old `0..n_cols.min(input.len())`.
         for (j, &x) in input.iter().enumerate().take(matrix.n_cols) {
             sum += matrix.weights[row_start + j] * x;
         }
@@ -210,21 +167,9 @@ fn matmul(matrix: &WeightMatrix, input: &[f32]) -> Vec<f32> {
     output
 }
 
-// ---------------------------------------------------------------------------
-// Model loading
-// ---------------------------------------------------------------------------
-
 impl SteeringModel {
-    /// Load from binary file produced by `train_steering.py`.
-    ///
-    /// Binary format:
-    /// - 4 bytes magic: `STMD`
-    /// - u32: version, input_dim, h1, h2, num_heads
-    /// - per head: u32 dim, u32 name_len, name bytes
-    /// - weight matrices: layer1, layer2, then per-head weights + vocab
     pub fn load(path: &Path) -> Option<Self> {
         let data = std::fs::read(path).ok()?;
-        // Read header: magic + dimensions
         if data.len() < 24 {
             return None;
         }
@@ -233,14 +178,12 @@ impl SteeringModel {
         }
         let mut cursor = 4;
 
-        // Read u32 values: version, input_dim, h1, h2, num_heads
         let _version = read_u32(&data, &mut cursor);
         let input_dim = read_u32(&data, &mut cursor) as usize;
         let h1 = read_u32(&data, &mut cursor) as usize;
         let h2 = read_u32(&data, &mut cursor) as usize;
         let num_heads = read_u32(&data, &mut cursor) as usize;
 
-        // Read head configs
         let mut head_configs = Vec::new();
         for _ in 0..num_heads {
             let dim = read_u32(&data, &mut cursor) as usize;
@@ -253,7 +196,6 @@ impl SteeringModel {
             head_configs.push((name, dim));
         }
 
-        // Read weight matrices
         let layer1 = read_weight_matrix(&data, &mut cursor, h1, input_dim)?;
         let layer2 = read_weight_matrix(&data, &mut cursor, h2, h1)?;
 
@@ -266,7 +208,6 @@ impl SteeringModel {
             });
         }
 
-        // Read vocab section (newline-separated strings per head)
         for head in &mut heads {
             if cursor + 4 > data.len() {
                 break;
@@ -292,23 +233,14 @@ impl SteeringModel {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Forward pass
-// ---------------------------------------------------------------------------
-
 impl SteeringModel {
-    /// Score operations for the given state and type.
-    /// Returns `(primitive_name, score)` pairs sorted by descending score.
     pub fn score_operations(&self, features: &[f32], current_type: &DagType) -> Vec<(String, f32)> {
-        // Layer 1: matmul + ReLU
         let h1 = matmul(&self.layer1, features);
         let h1: Vec<f32> = h1.into_iter().map(|x| x.max(0.0)).collect();
 
-        // Layer 2: matmul + ReLU
         let h2 = matmul(&self.layer2, &h1);
         let h2: Vec<f32> = h2.into_iter().map(|x| x.max(0.0)).collect();
 
-        // Select type head
         let head_idx = match current_type {
             DagType::Grid => 0,
             DagType::Objects => 1,
@@ -325,7 +257,6 @@ impl SteeringModel {
         let head = &self.heads[head_idx];
         let logits = matmul(&head.weights, &h2);
 
-        // Pair with names, sort descending
         let mut scored: Vec<(String, f32)> = head
             .prim_names
             .iter()
@@ -337,11 +268,6 @@ impl SteeringModel {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/// Convenience function: extract features and score operations in one call.
 pub fn steer(
     model: &SteeringModel,
     current: &DagValue,

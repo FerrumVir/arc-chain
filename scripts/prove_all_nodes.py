@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-"""
-Full Multi-Node Deterministic Inference Proof
-
-For each prompt: runs inference on ALL live nodes simultaneously,
-verifies ALL output hashes are identical, checks consensus height
-alignment before and after. Undeniable proof.
-
-Outputs:
-  - Per-prompt: every node's hash, ms/tok, TX hash
-  - Consensus verification: all heights aligned
-  - Summary: N prompts × M nodes = N×M total proofs
-"""
 
 import json, sys, time, urllib.request, urllib.error
 from datetime import datetime
@@ -21,13 +9,9 @@ NODES = [
     ("AMS", "136.244.109.1"),
     ("LHR", "104.238.171.11"),
     ("SGP", "149.28.153.31"),
-    # ("SAO", "216.238.120.27"),  # excluded: OOM with 7B
-    # ("NRT", "202.182.107.41"),  # excluded: not deployed
-    # ("JNB", "139.84.237.49"),  # excluded: not deployed
 ]
 
 PROMPTS = [
-    # Math (8-16 tok)
     {"prompt": "What is 17 times 23?", "max_tokens": 8, "cat": "math"},
     {"prompt": "Is 97 a prime number?", "max_tokens": 8, "cat": "math"},
     {"prompt": "What is the square root of 144?", "max_tokens": 8, "cat": "math"},
@@ -38,7 +22,6 @@ PROMPTS = [
     {"prompt": "What is the factorial of 5?", "max_tokens": 8, "cat": "math"},
     {"prompt": "How many sides does a hexagon have?", "max_tokens": 8, "cat": "math"},
     {"prompt": "What is 256 divided by 16?", "max_tokens": 8, "cat": "math"},
-    # Factual (16-32 tok)
     {"prompt": "What is the capital of France?", "max_tokens": 16, "cat": "factual"},
     {"prompt": "Who wrote Romeo and Juliet?", "max_tokens": 16, "cat": "factual"},
     {"prompt": "What is the boiling point of water in Celsius?", "max_tokens": 16, "cat": "factual"},
@@ -49,7 +32,6 @@ PROMPTS = [
     {"prompt": "What element has atomic number 6?", "max_tokens": 32, "cat": "factual"},
     {"prompt": "How many bones are in the human body?", "max_tokens": 32, "cat": "factual"},
     {"prompt": "What is the speed of light in meters per second?", "max_tokens": 32, "cat": "factual"},
-    # Explanations (64-128 tok)
     {"prompt": "Explain how photosynthesis works", "max_tokens": 64, "cat": "explain"},
     {"prompt": "How does TCP/IP networking work?", "max_tokens": 64, "cat": "explain"},
     {"prompt": "Explain what a blockchain is", "max_tokens": 64, "cat": "explain"},
@@ -58,7 +40,6 @@ PROMPTS = [
     {"prompt": "How does the internet work?", "max_tokens": 128, "cat": "explain"},
     {"prompt": "Explain the greenhouse effect", "max_tokens": 128, "cat": "explain"},
     {"prompt": "How do computers store data?", "max_tokens": 128, "cat": "explain"},
-    # Code (128-256 tok)
     {"prompt": "Write a Python function to compute fibonacci numbers", "max_tokens": 128, "cat": "code"},
     {"prompt": "Write a JavaScript function to sort an array", "max_tokens": 128, "cat": "code"},
     {"prompt": "Write a Python function to check if a string is a palindrome", "max_tokens": 128, "cat": "code"},
@@ -66,23 +47,19 @@ PROMPTS = [
     {"prompt": "Write a Rust function to parse a CSV file", "max_tokens": 256, "cat": "code"},
     {"prompt": "Write a Python class for a binary search tree", "max_tokens": 256, "cat": "code"},
     {"prompt": "Write a Python decorator for caching", "max_tokens": 256, "cat": "code"},
-    # Creative (256-512 tok)
     {"prompt": "Write a haiku about the ocean at sunset", "max_tokens": 256, "cat": "creative"},
     {"prompt": "Write the opening paragraph of a mystery novel", "max_tokens": 256, "cat": "creative"},
     {"prompt": "Write a motivational speech about perseverance", "max_tokens": 512, "cat": "creative"},
     {"prompt": "Write a fairy tale about a robot who learns to dream", "max_tokens": 512, "cat": "creative"},
     {"prompt": "Describe an alien civilization discovering Earth", "max_tokens": 512, "cat": "creative"},
-    # Long-form (512-1024 tok)
     {"prompt": "Write an essay about the impact of climate change on agriculture", "max_tokens": 512, "cat": "longform"},
     {"prompt": "Explain quantum computing from first principles", "max_tokens": 512, "cat": "longform"},
     {"prompt": "Write a comprehensive guide to starting a business", "max_tokens": 1024, "cat": "longform"},
     {"prompt": "Explain the history and future of space exploration", "max_tokens": 1024, "cat": "longform"},
     {"prompt": "Write about the ethical implications of artificial intelligence", "max_tokens": 1024, "cat": "longform"},
-    # Edge cases
     {"prompt": "A", "max_tokens": 8, "cat": "edge"},
     {"prompt": "Hello", "max_tokens": 8, "cat": "edge"},
     {"prompt": "The quick brown fox jumps over the lazy dog", "max_tokens": 32, "cat": "edge"},
-    # Repeat (same prompt 5x)
     {"prompt": "What color is the sky?", "max_tokens": 32, "cat": "repeat"},
     {"prompt": "What color is the sky?", "max_tokens": 32, "cat": "repeat"},
     {"prompt": "What color is the sky?", "max_tokens": 32, "cat": "repeat"},
@@ -119,7 +96,6 @@ def check_consensus(live_nodes):
 def main():
     timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # Discover live nodes
     print("=== ARC Chain Multi-Node Determinism Proof ===")
     print(f"Started: {timestamp}")
     print()
@@ -155,10 +131,8 @@ def main():
             cat = p["cat"]
             display = prompt[:40] + "..." if len(prompt) > 40 else prompt
 
-            # Check consensus BEFORE
             heights_before = check_consensus(live)
 
-            # Run inference on ALL nodes in parallel
             node_results = {}
             with ThreadPoolExecutor(max_workers=len(live)) as ex:
                 futures = {ex.submit(inference, ip, prompt, max_tok): (name, ip) for name, ip in live}
@@ -166,11 +140,9 @@ def main():
                     name, ip = futures[f]
                     node_results[name] = f.result()
 
-            # Check consensus AFTER
             time.sleep(2)
             heights_after = check_consensus(live)
 
-            # Compare all hashes
             hashes = {}
             tx_hashes = {}
             ms_per_tok = {}
@@ -205,10 +177,9 @@ def main():
 
             print(f"[{idx+1}/{len(PROMPTS)}] {cat:10s} ({max_tok:4d}tok) \"{display}\" → {badge} hash:{the_hash} ms/tok:[{speeds}]")
 
-            # Consensus check
             h_before = list(heights_before.values())
             h_after = list(heights_after.values())
-            consensus_aligned = len(set(h_before)) <= 2 and len(set(h_after)) <= 2  # within 1 block
+            consensus_aligned = len(set(h_before)) <= 2 and len(set(h_after)) <= 2
             if not consensus_aligned:
                 print(f"  ⚠ Consensus spread: before={h_before} after={h_after}")
 
@@ -226,7 +197,6 @@ def main():
             rf.flush()
             all_results.append(record)
 
-    # Write summary
     with open(summary_file, "w") as sf:
         sf.write(f"# Multi-Node Deterministic Inference Proof\n\n")
         sf.write(f"**Date:** {timestamp}\n")

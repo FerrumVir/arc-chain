@@ -2,9 +2,6 @@ import { Info, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
-// An accessible, click-to-open info popover. Used for in-context explainers
-// (e.g. "what is an attestation?"). Keyboard accessible (Enter/Space to open,
-// Esc to close). Click-outside dismisses.
 export function InfoPopover({
   title,
   children,

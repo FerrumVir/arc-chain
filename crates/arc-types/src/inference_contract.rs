@@ -1,10 +1,3 @@
-//! Inactive, versioned native inference contract primitives.
-//!
-//! This module is deliberately pure: it validates commitments and signatures
-//! and returns a settlement delta for a future state adapter. It does not
-//! mutate balances, activate a transaction body, persist a marker, or claim
-//! crash-safe exactly-once behavior.
-
 use arc_crypto::signature::{KeyPair, Signature, SignatureError};
 use arc_crypto::{Hash256, hash_bytes};
 use serde::{Deserialize, Serialize};
@@ -162,8 +155,6 @@ impl ValidatorMember {
     }
 }
 
-/// Validate the state-provided frozen member list and return its checked total.
-/// The state adapter must source this list from the trusted validator registry.
 pub fn validate_members(members: &[ValidatorMember]) -> Result<u64, InferenceContractError> {
     if members.is_empty() || members.len() > MAX_COMMITTEE_MEMBERS {
         return Err(InferenceContractError::InvalidCommittee);
@@ -197,8 +188,6 @@ pub fn validator_set_commitment(
 }
 
 impl InferenceJob {
-    /// Fixed-width, explicit little-endian encoding. No serde or map ordering
-    /// is part of the wire commitment.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut encoded = Vec::with_capacity(3 * 32 + 8 * 32 + 4 * 2 + 8 * 2);
         encoded.extend_from_slice(&self.version.to_le_bytes());
@@ -394,7 +383,6 @@ fn validate_certificate(
 }
 
 fn arc_types_threshold(total_stake: u64) -> u64 {
-    // Reuse the crate-wide overflow-safe strict >2/3 rule.
     crate::strict_supermajority_threshold(total_stake)
 }
 

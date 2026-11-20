@@ -44,7 +44,6 @@ def camel(name: str) -> str:
 
 
 def struct_fields(source: str, name: str) -> tuple[list[str], bool]:
-    """Field names of `pub struct <name>` and whether it is camelCase on the wire."""
     match = re.search(
         r"((?:#\[[^\]]*\]\s*)*)pub struct " + re.escape(name) + r"\s*\{(.*?)\n\}",
         source,
@@ -78,8 +77,6 @@ def check_stores(repo: Path) -> list[str]:
         defaults = re.findall(r'data_dir:\s*"([^"]*)"', types)
         if defaults != ["~/.arc"]:
             errors.append(f"{tag}: NodeConfig default data_dir is {defaults}")
-        # Every place the UI builds a config must write the literal "~/.arc";
-        # nothing may let the user pick another data directory.
         tree = subprocess.run(
             ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", tag, "desktop/src"],
             capture_output=True,

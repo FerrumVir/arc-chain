@@ -1,5 +1,3 @@
-//! `arc balance <address>` - query an account's balance and nonce.
-
 use crate::rpc::RpcClient;
 use anyhow::Result;
 
@@ -10,7 +8,6 @@ pub async fn run(rpc: &RpcClient, address: &str) -> Result<()> {
     let data = match rpc.get_account(address).await {
         Ok(d) => d,
         Err(e) => {
-            // 404 means account doesn't exist yet - show zero balance
             let msg = format!("{:#}", e);
             if msg.contains("404") {
                 let short_addr = if address.len() > 16 {
@@ -44,7 +41,6 @@ pub async fn run(rpc: &RpcClient, address: &str) -> Result<()> {
     Ok(())
 }
 
-/// Format a raw balance with thousand separators.
 fn format_amount(amount: u64) -> String {
     let s = amount.to_string();
     let mut result = String::new();

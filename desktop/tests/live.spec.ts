@@ -1,14 +1,3 @@
-// End-to-end tests against one exact recovered production validator. The
-// runbook exposes that validator's private Unix RPC socket only through an
-// authenticated, host-key-pinned SSH forward on 127.0.0.1:ARC_LIVE_PORT.
-//
-// Run only through the native-macOS desktop-live phase in
-// scripts/recovery/README.md. That phase supplies the complete sealed input,
-// runtime, host-key, Unix-socket, and source bindings required by the config.
-//
-// Each test sets window.__ARC_LIVE__ = 9090 before page load so the app bypasses
-// the mock layer and hits the node's real HTTP endpoints.
-
 import { expect, test } from "@playwright/test";
 import { clearState, seedOnboarded } from "./helpers";
 
@@ -56,9 +45,6 @@ test.describe("Authenticated production validator forward - real data", () => {
 
     await page.getByTestId("btn-continue-welcome").click();
     await expect(page.getByTestId("step-identity")).toBeVisible();
-    // Never persist recovery words in a Playwright artifact. Capture only the
-    // deliberately blurred pre-reveal state, then reveal solely to satisfy the
-    // onboarding acknowledgement and continue without another screenshot.
     await page.screenshot({ path: testInfo.outputPath("live-02-identity.png") });
     await page.getByTestId("btn-reveal-seed").click();
     await page.getByTestId("btn-continue-identity").click();
@@ -71,10 +57,6 @@ test.describe("Authenticated production validator forward - real data", () => {
     await page.screenshot({ path: testInfo.outputPath("live-03-launch.png") });
     await page.getByTestId("btn-launch").click();
 
-    // Setup lands on Home (Ask ARC). Landing alone is not evidence that the
-    // real node answered. Require non-zero committed chain progress and at
-    // least one live peer before a screenshot or receipt can represent this
-    // first-launch path as healthy.
     await expect(page.getByTestId("inference-screen")).toBeVisible({ timeout: 10_000 });
     await page.getByTestId("nav-dashboard").click();
     await expect(page.getByTestId("dashboard")).toBeVisible({ timeout: 10_000 });
@@ -102,10 +84,6 @@ test.describe("Authenticated production validator forward - real data", () => {
     await injectLive(page);
     await page.goto("/");
 
-    // Values drift, but a live post-cutover node must expose non-zero chain
-    // progress, peers, and genuine activity. Exact canary identity is checked
-    // below through the unbounded confirmed-receipt index and direct lookup;
-    // it must not depend on being among the newest dashboard rows.
     const committed = page.getByTestId("node-block-height");
     await expect.poll(async () => {
       const digits = (await committed.textContent() ?? "").replace(/[^\d]/g, "");
@@ -119,8 +97,6 @@ test.describe("Authenticated production validator forward - real data", () => {
       return Number(digits);
     }, { timeout: 60_000 }).toBeGreaterThan(0);
 
-    // The dashboard limit is intentionally small, so require real canonical
-    // activity without assuming the sealed canary is still in its newest rows.
     const feed = page.getByTestId("attestation-feed");
     await expect(feed).toBeVisible();
     await expect.poll(() => feed.locator("[data-tx-hash]").count(), {

@@ -1,10 +1,3 @@
-"""
-ARC Chain SDK — Data types.
-
-Typed dataclasses matching the ARC Chain RPC response shapes.
-All fields use snake_case to match the JSON keys returned by the node.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -13,8 +6,6 @@ from typing import Any, Dict, List, Optional
 
 @dataclass
 class Account:
-    """An on-chain account."""
-
     address: str
     balance: int
     nonce: int
@@ -34,8 +25,6 @@ class Account:
 
 @dataclass
 class BlockHeader:
-    """Block header fields."""
-
     height: int
     hash: str
     parent_hash: str
@@ -62,8 +51,6 @@ class BlockHeader:
 
 @dataclass
 class Block:
-    """A block on the ARC Chain."""
-
     header: BlockHeader
     hash: str
     tx_hashes: List[str] = field(default_factory=list)
@@ -83,8 +70,6 @@ class Block:
 
 @dataclass
 class EventLog:
-    """An event log emitted during contract execution."""
-
     address: str
     topics: List[str]
     data: str
@@ -106,8 +91,6 @@ class EventLog:
 
 @dataclass
 class Receipt:
-    """Transaction receipt (result of execution)."""
-
     tx_hash: str
     block_height: int
     block_hash: str
@@ -136,8 +119,6 @@ class Receipt:
 
 @dataclass
 class ChainInfo:
-    """Chain information returned by /info."""
-
     chain: str
     version: str
     block_height: int
@@ -159,8 +140,6 @@ class ChainInfo:
 
 @dataclass
 class ChainStats:
-    """Chain statistics returned by /stats."""
-
     chain: str
     version: str
     block_height: int
@@ -186,8 +165,6 @@ class ChainStats:
 
 @dataclass
 class HealthInfo:
-    """Node health returned by /health."""
-
     status: str
     version: str
     height: int
@@ -207,8 +184,6 @@ class HealthInfo:
 
 @dataclass
 class NodeInfo:
-    """Node info returned by /node/info."""
-
     validator: str
     stake: int
     tier: str
@@ -230,8 +205,6 @@ class NodeInfo:
 
 @dataclass
 class SubmitResult:
-    """Result of a transaction submission."""
-
     tx_hash: str
     status: str
 
@@ -245,8 +218,6 @@ class SubmitResult:
 
 @dataclass
 class BatchResult:
-    """Result of a batch transaction submission."""
-
     accepted: int
     rejected: int
     tx_hashes: List[str]

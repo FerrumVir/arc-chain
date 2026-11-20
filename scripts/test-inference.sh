@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-# ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain - Local Inference Smoke Test
-#
-# Runs inference on an explicitly loopback-only development node and displays
-# the endpoint's returned result/attestation fields. It is not payment proof.
-#
-# Usage:
-#   ./scripts/test-inference.sh                         # Test your local node
-#   ./scripts/test-inference.sh "What is 2+2?"          # Custom prompt
-#   ./scripts/test-inference.sh "Hi" 127.0.0.1:19090   # Another local port
-# ─────────────────────────────────────────────────────────────────────────────
 set -e
 
 PROMPT="${1:-What is the capital of France?}"
@@ -50,7 +39,6 @@ if [ -z "$RESPONSE" ]; then
     exit 1
 fi
 
-# Parse with python for clean output
 echo "$RESPONSE" | python3 -c "
 import sys, json
 try:

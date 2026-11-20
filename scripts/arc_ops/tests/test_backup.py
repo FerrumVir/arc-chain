@@ -1,5 +1,3 @@
-"""Backup/verify/restore on synthetic data directories; no node."""
-
 import fcntl
 import io
 import json
@@ -45,11 +43,6 @@ class Backup(unittest.TestCase):
                 self.assertEqual(a.read(), b.read())
 
     def test_a_private_file_keeps_mode_0600_through_a_restore(self):
-        """The node refuses its own store if a private file is not exactly
-        0600, so a restore that only round-trips bytes produces a directory no
-        node will open. A real drill caught this: the restored lock file came
-        back 0644 and the restarted validator exited with
-        "private file ... must have mode 0600 (found 0644)"."""
         src = data_dir()
         private = os.path.join(src, ".arc-private-directory-namespace-test.lock")
         with open(private, "w") as fh:
@@ -72,8 +65,6 @@ class Backup(unittest.TestCase):
             stat.S_IMODE(os.stat(os.path.join(dest, "genesis.network-hash")).st_mode), 0o644)
 
     def test_a_widened_mode_in_the_manifest_is_refused(self):
-        """An archive whose manifest disagrees with its own member mode is not
-        restored: that is the only way a private file could be widened."""
         src = data_dir()
         private = os.path.join(src, ".arc-private-namespace.lock")
         with open(private, "w") as fh:
@@ -104,7 +95,7 @@ class Backup(unittest.TestCase):
     def test_a_running_node_is_refused(self):
         src = data_dir()
         fd = os.open(os.path.join(src, ".arc-node.lock"), os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # the "running node"
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
             with self.assertRaises(bk.NodeRunning):
                 bk.backup(src, os.path.join(tempfile.mkdtemp(), "b.tar.gz"))
@@ -116,7 +107,6 @@ class Backup(unittest.TestCase):
         src = data_dir()
         out = os.path.join(tempfile.mkdtemp(), "b.tar.gz")
         bk.backup(src, out)
-        # Rewrite the archive with one member's bytes changed.
         bad = out + ".bad"
         with tarfile.open(out, "r:gz") as tin, tarfile.open(bad, "w:gz") as tout:
             for member in tin.getmembers():

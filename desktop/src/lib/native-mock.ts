@@ -1,20 +1,3 @@
-// Browser-preview model of a native-inference chain for the native paid-request
-// panel. A test seam only: `mockInvoke` consults it, never the Tauri app or a
-// production bundle (both refuse to mock), and only after a test sets
-// `window.__ARC_MOCK_NATIVE__`. Without that flag the mock host is not a
-// protocol-4 chain and the panel stays hidden, as it would on a real one.
-//
-// It follows the chain's rules closely enough to exercise the screen: one
-// transaction per account nonce, reservation at admission, settlement
-// credits that add up to the reservation, refunds only at or past expiry.
-// State lives in sessionStorage so a reload (the app "restarting") finds the
-// same chain and journal, as the native journal would.
-//
-// Prompt markers choose a path: "[expire]" is admitted but never certified,
-// "[drop]" is never admitted. Both jump the height to the expiry so a test
-// does not wait for hundreds of blocks. "[hold]" stays in the mempool,
-// neither admitted nor expired, for as long as the test needs.
-
 import type {
   NativeContextView,
   NativeJournalEntry,
@@ -75,7 +58,6 @@ function load(): MockChain {
     const raw = window.sessionStorage.getItem(STORAGE_KEY);
     if (raw) return JSON.parse(raw) as MockChain;
   } catch {
-    // Storage unavailable: a chain that forgets on reload is still a chain.
   }
   return fresh();
 }
@@ -84,7 +66,6 @@ function save(chain: MockChain): void {
   try {
     window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(chain));
   } catch {
-    // See `load`.
   }
 }
 
@@ -94,7 +75,6 @@ function randomHex(bytes: number): string {
   return Array.from(values, (value) => value.toString(16).padStart(2, "0")).join("");
 }
 
-/** Exact decimal ARC to base units, as wallet.rs::parse_arc_amount does. */
 function parseArc(input: string): number {
   const value = input.trim();
   if (!/^\d*(\.\d{1,9})?$/.test(value) || value === "" || value === ".") {
@@ -123,7 +103,6 @@ function journalEntry(chain: MockChain, txHash: string): NativeJournalEntry | un
   return chain.journal.find((entry) => entry.txHash === txHash);
 }
 
-/** Mirror of `Journal::settle`: bytes that can no longer be admitted are released. */
 function settleJournal(chain: MockChain): void {
   for (const entry of chain.journal) {
     if (entry.resubmittable && (chain.nonce > entry.nonce || chain.height >= entry.expiresAt)) {
@@ -271,7 +250,6 @@ function submit(args: SubmitArgs): NativeSubmitResult {
   };
 }
 
-/** One receipt read advances the mock chain by a block. */
 function receipt(requestId: string): NativeReceiptView {
   const chain = load();
   chain.height += 1;
@@ -285,9 +263,7 @@ function receipt(requestId: string): NativeReceiptView {
     if (request.behaviour === "drop") {
       if (request.polls >= 2) chain.height = Math.max(chain.height, request.expiresAt);
     } else if (request.behaviour === "hold") {
-      // Still in a mempool.
     } else if (chain.height < request.expiresAt) {
-      // Admission: the reservation leaves the balance, the nonce is used.
       request.status = "Pending";
       request.admittedAt = chain.height;
       chain.balance -= request.reserve;
@@ -396,7 +372,6 @@ function resubmit(txHash: string): NativeSubmitResult {
       "this transaction can no longer be admitted (its nonce was used or it expired); its receipt decides the outcome",
     );
   }
-  // The mock node still holds it.
   return {
     kind: entry.kind,
     requestId: entry.requestId,
@@ -410,7 +385,6 @@ function resubmit(txHash: string): NativeSubmitResult {
   };
 }
 
-/** The native mock's wallet balance, in the `fetch_balance` shape. */
 export function nativeMockBalance(): Record<string, unknown> {
   const chain = load();
   return {
@@ -423,21 +397,12 @@ export function nativeMockBalance(): Record<string, unknown> {
   };
 }
 
-/**
- * A wallet transfer on the browser chain. Like a real protocol-4 node, which
- * refuses any non-native transaction (decision D13), it can never be
- * included, and the Rust transfer path refuses before signing.
- */
 export function mockNativeTransfer(): never {
   throw new Error(
     "this chain carries only native paid-inference transactions, so a transfer can never be included; nothing was signed",
   );
 }
 
-/**
- * Answer a native command, or `undefined` when `cmd` is not one. With the
- * seam off, the host is simply not a protocol-4 chain.
- */
 export function mockNativeInvoke(cmd: string, args: unknown): unknown {
   if (!cmd.startsWith("native_")) return undefined;
   if (!nativeMockEnabled()) {

@@ -1,5 +1,3 @@
-"""Fast tests for the growth fitter. Synthetic records, no nodes."""
-
 import json
 import os
 import sys
@@ -36,7 +34,7 @@ class Report(unittest.TestCase):
             t = 1000.0 + 15 * i
             h = 100 * i
             inc = 1 if (restart and i >= 20) else 0
-            base = 0 if inc == 0 else 5000  # a restart resets in-memory sizes
+            base = 0 if inc == 0 else 5000
             diag.append({"t": t, "node": 0, "incarnation": inc,
                          "diag": {"height": h, "engine_da_commitments": base + 3 * h,
                                   "engine_dag_blocks": 4000, "state_blocks": h,

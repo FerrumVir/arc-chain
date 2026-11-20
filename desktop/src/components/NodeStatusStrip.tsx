@@ -28,8 +28,6 @@ const ACTION_LABEL: Record<NodeStripAction, string> = {
   "share-computer": PLAIN_COPY.actions.shareComputer,
 };
 
-// Only the attention tone is red. Off and an update on offer are ordinary
-// states and take the muted and info colours; connected is green.
 const TONE_ICON: Record<NodeStripTone, typeof CheckCircle2> = {
   ok: CheckCircle2,
   busy: Loader2,
@@ -45,12 +43,6 @@ const TONE_COLOR: Record<NodeStripTone, string> = {
   idle: "var(--text-muted)",
 };
 
-/**
- * Home's one-line node strip: the node's state in one sentence and its one
- * fix. It reads only things that answer while the node is down, blocked,
- * starting or updating (the start fence, the node status, the updater), so
- * the chat below stays usable and this line says what to do about the node.
- */
 export function NodeStatusStrip() {
   const queryClient = useQueryClient();
   const config = useAppStore((s) => s.config);
@@ -94,8 +86,6 @@ export function NodeStatusStrip() {
     refetchInterval: 5000,
   });
 
-  // A consented install can still be downloading its model after setup, with
-  // the node already running.
   useEffect(() => {
     if (!isTauri) return;
     let unlisten: (() => void) | undefined;
@@ -115,18 +105,12 @@ export function NodeStatusStrip() {
     };
   }, []);
 
-  // A download that stops reporting without a final event (it failed, or the
-  // computer slept through it) must not leave "downloading" on Home. The line
-  // goes when nothing has been reported for a while, and the next report
-  // brings it back.
   useEffect(() => {
     if (!modelProgress || modelProgress.done) return;
     const timer = window.setTimeout(() => setModelProgress(null), MODEL_PROGRESS_STALE_MS);
     return () => window.clearTimeout(timer);
   }, [modelProgress]);
 
-  // How long the running node has had nothing answering. The strip re-renders
-  // once a second while that lasts, so the sentence can change at the mark.
   const connecting =
     status?.running === true &&
     (status.health === "syncing" || status.health === "offline") &&
@@ -159,9 +143,7 @@ export function NodeStatusStrip() {
     network,
   });
 
-  // The native text, so a person can paste it into a report as it is.
   const copyDetails = (details: string) => {
-    // Without a clipboard API the call throws before returning a promise.
     void Promise.resolve()
       .then(() => navigator.clipboard.writeText(details))
       .then(
@@ -172,14 +154,12 @@ export function NodeStatusStrip() {
 
   const act = async (action: NodeStripAction) => {
     if (action === "close-copy") { await closeThisCopy(); return; }
-    // Match Settings' memory gate before native code can persist consent.
     if (action === "share-computer" && sharingEligible !== true) return;
     if (action === "update-arc") {
       void appUpdater.installAvailableUpdate();
       return;
     }
     if (action === "restart-arc") {
-      // Relaunching runs launch reconciliation again, which a refusal needs.
       if (isTauri) void relaunch();
       else window.location.reload();
       return;
@@ -284,7 +264,6 @@ export function NodeStatusStrip() {
               : PLAIN_COPY.actions.copyDetails}
         </button>
       )}
-      {/* The copy result, announced on its own. */}
       <span className="sr-only" aria-live="polite">
         {copied === "copied"
           ? PLAIN_COPY.actions.copied

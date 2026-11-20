@@ -1,12 +1,3 @@
-//! Portable private-cohort row worker.  Build directly on a sidecar host:
-//! `cargo build -p arc-inference --example tensor_row_stdio_worker --release`.
-//!
-//! It has no network listener.  Its only transport is length-prefixed frames
-//! over stdin/stdout, intended to be reached through a persistent SSH session
-//! configured with StrictHostKeyChecking=yes and a pinned known_hosts file.
-//! The coordinator validates response call/input commitments and exact row
-//! coverage; this worker validates its immutable row-file identity and shape.
-
 use arc_inference::cached_integer_model::{I8Weights, matmul_i8_canonical_row_range};
 use blake3::Hasher;
 use std::convert::TryInto;
@@ -15,7 +6,6 @@ use std::io::{self, Read, Write};
 
 const FILE_MAGIC: &[u8; 8] = b"ARCROW01";
 const FRAME_MAGIC: &[u8; 8] = b"ARCTP001";
-/// Responses carry their own magic, so a request can never be read as one.
 const RESPONSE_MAGIC: &[u8; 8] = b"ARCTR001";
 const MAX_FILE: usize = 1_073_741_824;
 const MAX_FRAME: usize = 4 * 1024 * 1024;
@@ -245,9 +235,6 @@ fn main() -> io::Result<()> {
         let worker = take(&mut b, worker_len)?;
         let count = u32v(&mut b)?;
 
-        // Identity stays bound to this immutable row file; the shared
-        // canonical row-range kernel supplies bounds, overflow checks and the
-        // same opt-in SIMD dispatch used by coordinator projections.
         let shard = shards
             .iter()
             .find(|s| {

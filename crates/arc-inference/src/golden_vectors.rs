@@ -1,11 +1,3 @@
-//! Cross-platform known-answer vectors for the production integer engine.
-//!
-//! These tests deliberately do not calculate their expectations from a second
-//! run. The model recipe, input tokens, output tokens, and BLAKE3 digests are
-//! committed in `tests/fixtures/integer_inference_kat.json`. A platform whose
-//! SIMD, Rayon, attention, or shard path changes even one output bit fails
-//! against the same reviewed constants.
-
 use crate::cached_integer_model::{
     ArithmeticProfile, CachedIntegerModel, CachedLayer, I8Weights, KVCache, ModelConfig,
     ShardInput, ShardOutput,
@@ -15,8 +7,6 @@ use arc_crypto::hash_bytes;
 use rayon::ThreadPoolBuilder;
 use serde::Deserialize;
 
-// Every execution mode (one pass, chunked, restored prefix, speculative,
-// stage splits, thread counts) held to the token-by-token run on this model.
 mod execution_modes;
 
 const FIXTURE_JSON: &str = include_str!("../tests/fixtures/integer_inference_kat.json");
@@ -64,9 +54,6 @@ struct ShardSequenceResult {
     hidden_hashes: Vec<String>,
 }
 
-/// Fixed integer generator used only to materialize the synthetic weights.
-/// Wrapping arithmetic and byte extraction have identical semantics on every
-/// Rust target; no host float, RNG implementation, or endianness is involved.
 struct FixtureRng(u64);
 
 impl FixtureRng {
@@ -116,9 +103,6 @@ fn parse_seed(seed: &str) -> u64 {
 }
 
 fn fixed_rope_tables(d_head: usize, max_seq: usize) -> (Vec<i64>, Vec<i64>) {
-    // Q16 samples of a unit circle at multiples of pi/8. Each RoPE pair uses a
-    // different integer multiple of that angle, giving non-trivial positions
-    // without computing sin/cos through platform libm during test setup.
     const COS: [i64; 16] = [
         65_536, 60_547, 46_341, 25_080, 0, -25_080, -46_341, -60_547, -65_536, -60_547, -46_341,
         -25_080, 0, 25_080, 46_341, 60_547,
@@ -185,7 +169,6 @@ fn build_fixture_model(fixture: &GoldenFixture) -> CachedIntegerModel {
             d_head,
             d_kv,
             vocab_size: fixture.vocab_size,
-            // round(2^16 / sqrt(8)); the fixture fixes d_head=8.
             attn_scale: 23_170,
             rope_cos,
             rope_sin,
@@ -369,9 +352,6 @@ fn golden_cached_integer_whole_model_is_thread_count_independent() {
     assert_eq!(fixture.name, "cached-integer-i8-i16-v1");
     let expected = expected_sequence(&fixture);
 
-    // Exercise the exact production compute primitive under the widths users
-    // can select with --threads / POST /node/threads. A scheduler or reduction
-    // change must never alter tokens, logits, or KV-cache bytes.
     for threads in [1, 2, 4] {
         let pool = ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -478,13 +458,6 @@ fn golden_cached_integer_autoregressive_output_matches_known_answer() {
         );
     }
 }
-
-// ── Operator vectors from the independent reference ─────────────────────────
-//
-// `integer_operator_kat.json` is produced by `scripts/arc_conformance`, a
-// Python executor written from docs/protocol/integer-profile-contract-v1.md.
-// These tests hold the engine to it, so agreement is between two separately
-// written implementations rather than a run compared with its own output.
 
 const OPERATOR_JSON: &str = include_str!("../tests/fixtures/integer_operator_kat.json");
 
@@ -624,8 +597,6 @@ fn integer_operators_match_the_independent_reference() {
     }
 }
 
-/// The interleaved-RoPE profile vectors from the independent reference, run on
-/// a `threads`-wide pool. With `kernel`, also checks which kernel ran.
 fn assert_interleaved_reference(
     doc: &serde_json::Value,
     fixture: &GoldenFixture,
@@ -693,27 +664,12 @@ fn interleaved_profile_and_generation_v2_match_the_independent_reference() {
     }
 }
 
-// ── Both projection kernels against the same reviewed constants ─────────────
-//
-// The tests above run whichever kernel this process chose: by default the limb
-// kernel where the CPU has one (AVX2 on x86-64, NEON dotprod on arm64) and the
-// scalar kernel elsewhere. The tests below force each kernel in turn, at every
-// thread count from 1 to 4, and hold both to the same committed digests. A
-// per-thread census shows that the vectorised leg ran the vectorised kernel
-// for every projection, with no fallback to scalar.
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kernel {
     Scalar,
     Vectorised,
 }
 
-/// The scalar kernel always, and the limb kernel when this CPU has one (AVX2
-/// on x86-64, NEON dotprod on arm64).
-///
-/// The golden-vector workflow sets `ARC_GOLDEN_REQUIRE_VECTORISED=1` on every
-/// runner, all of which have a limb kernel. A CI leg that lacked one would then
-/// fail here instead of quietly testing the scalar kernel alone.
 fn kernels() -> &'static [Kernel] {
     if crate::canonical_simd::dotprod_available() {
         &[Kernel::Scalar, Kernel::Vectorised]
@@ -727,9 +683,6 @@ fn kernels() -> &'static [Kernel] {
     }
 }
 
-/// Keeps one kernel selected process-wide until dropped, then restores the
-/// previous choice. It holds the kernel-switch lock, so no other test changes
-/// the kernel meanwhile.
 struct ForcedKernel {
     previous: bool,
     _switch: std::sync::MutexGuard<'static, ()>,
@@ -745,8 +698,6 @@ fn force_kernel(kernel: Kernel) -> ForcedKernel {
     let switch = crate::canonical_simd::kernel_switch_guard();
     let previous = crate::canonical_simd::fast_canonical_kernel_enabled();
     crate::canonical_simd::set_fast_canonical_kernel(kernel == Kernel::Vectorised);
-    // Names the instruction set in CI logs (`--nocapture`): avx2-limb,
-    // neon-sdot-limb or scalar-i8xi64.
     eprintln!(
         "golden: {kernel:?} leg runs {}",
         crate::canonical_simd::effective_kernel_name()
@@ -757,9 +708,6 @@ fn force_kernel(kernel: Kernel) -> ForcedKernel {
     }
 }
 
-/// Check, and reset, this thread's projection census for one leg. The scalar
-/// leg must never reach the vectorised kernel. The vectorised leg must run
-/// every projection on it, `expected` of them when the count is known.
 fn assert_projections_ran_on(kernel: Kernel, expected: Option<u64>, case: &str) {
     let [attempted, accepted, refused] = crate::canonical_simd::take_thread_census();
     match kernel {
@@ -785,12 +733,8 @@ fn assert_projections_ran_on(kernel: Kernel, expected: Option<u64>, case: &str) 
 fn golden_both_kernels_match_the_kat_on_every_thread_count() {
     let fixture = fixture();
     let expected = expected_sequence(&fixture);
-    // Seven projections per layer reach the kernel switch. The fixture's
-    // 23-row LM head is below `matmul_i8`'s 256-row cutover, so it never does.
     let per_forward = 7 * fixture.n_layers as u64;
     let sequence = per_forward * fixture.sequence_tokens.len() as u64;
-    // Legacy generation, as a community worker runs it: one BOS forward, one
-    // per prompt token and one per generated token (the fixture has no EOS).
     let forwards =
         1 + fixture.generation_prompt.len() as u64 + u64::from(fixture.generation_max_tokens);
     let generation = per_forward * forwards;
@@ -804,8 +748,6 @@ fn golden_both_kernels_match_the_kat_on_every_thread_count() {
                 .expect("determinism test pool");
             pool.install(|| {
                 let case = format!("{kernel:?} kernel, {threads} threads");
-                // The canonical I8 profile that community workers and
-                // validator shards run: no I16 promotion.
                 let model = build_fixture_model(&fixture);
                 assert!(model.has_canonical_i8_profile());
                 let _ = crate::canonical_simd::take_thread_census();
@@ -827,7 +769,6 @@ fn golden_both_kernels_match_the_kat_on_every_thread_count() {
                 );
                 assert_projections_ran_on(kernel, Some(sequence), &format!("{case}, three shards"));
 
-                // The call a community worker makes for an assigned job.
                 let (tokens, hash) = model
                     .try_generate(
                         &fixture.generation_prompt,
@@ -898,10 +839,6 @@ fn golden_interleaved_profile_matches_the_reference_on_both_kernels() {
 
 #[cfg(feature = "candle")]
 mod gguf_preparation {
-    //! A tiny Llama GGUF, written with candle and loaded by the production
-    //! canonical loader, must prepare to the state the contract's §8 rules
-    //! produce in the independent reference, and then run identically.
-
     use super::*;
     use crate::cached_integer_model::{
         GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, load_cached_model_canonical_i8_interleaved_rope,
@@ -920,7 +857,6 @@ mod gguf_preparation {
             self.0
         }
 
-        // k / 2^22 with |k| < 2^23: exact in f32.
         fn weight(&mut self) -> f32 {
             ((self.next_u64() >> 40) as i64 - (1 << 23)) as f32 / (1u32 << 22) as f32
         }
@@ -969,7 +905,6 @@ mod gguf_preparation {
             tensors.push(norm(&mut rng, format!("{p}.attn_norm.weight"), d));
             tensors.push(norm(&mut rng, format!("{p}.ffn_norm.weight"), d));
         }
-        // Token 0's embedding row is all zero, as in the reference recipe.
         tensors[0].2[..d].fill(0.0);
         let order: Vec<&str> = tensors.iter().map(|(name, _, _)| name.as_str()).collect();
         let expected: Vec<&str> = section["recipe"]["tensor_order"]

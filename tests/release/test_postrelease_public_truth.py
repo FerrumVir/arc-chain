@@ -1155,9 +1155,6 @@ class PublicTruthTests(unittest.TestCase):
                 TRUTH.validate_network(config, self.fixture.source_sha, self.fixture.manifest)
 
     def test_exact_projection_rejects_coordinated_candidate_checkpoint_mutations(self) -> None:
-        # The sealed rollout schema intentionally does not duplicate this
-        # candidate-specific identity. The final verifier derives every fork
-        # row from immutable archive provenance and compares complete bytes.
         for field in (
             "checkpointSha256",
             "checkpointManifestHash",

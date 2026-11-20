@@ -31,7 +31,6 @@ import {
 const STEPS = ["welcome", "identity", "model", "launch"] as const;
 type Step = (typeof STEPS)[number];
 
-/** Twelve dummy words, shown blurred before the user asks to reveal. */
 const PLACEHOLDER_PHRASE =
   "•••••• •••••• •••••• •••••• •••••• •••••• •••••• •••••• •••••• •••••• •••••• ••••••";
 
@@ -49,14 +48,12 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
 }
 
-// How long "Connected via … ✓" stays up before the app takes over.
 const CONNECTED_PAUSE_MS = 1_400;
 
 export function Onboarding({
   previousInstall = null,
   onPreviousInstallDismissed,
 }: {
-  /** Launch set node data from an earlier install aside; say so during setup. */
   previousInstall?: PreviousInstallNoticeData | null;
   onPreviousInstallDismissed?: () => void;
 } = {}) {
@@ -66,13 +63,9 @@ export function Onboarding({
   const [identityAttempt, setIdentityAttempt] = useState(0);
   const [copied, setCopied] = useState(false);
   const [seedShown, setSeedShown] = useState(false);
-  // Held in component state only, for as long as this screen is mounted.
-  // Never written to the zustand store, and therefore never persisted to
-  // localStorage — see `scrubIdentity` in lib/store.ts for the history.
   const [seedPhrase, setSeedPhrase] = useState<string | null>(null);
   const [seedError, setSeedError] = useState<string | null>(null);
 
-  // Model picker state — populated when entering the "model" step.
   const [tiers, setTiers] = useState<ModelTierInfo[]>([]);
   const [tiersLoaded, setTiersLoaded] = useState(false);
   const [tiersError, setTiersError] = useState<string | null>(null);
@@ -87,16 +80,11 @@ export function Onboarding({
   const [modelProgress, setModelProgress] =
     useState<ModelDownloadProgress | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
-  // The wizard's answers, and whether native code has saved them. "Continue
-  // to ARC" after a failed start saves them first if needed, so ARC opens on
-  // Home next time too.
   const [pendingConfig, setPendingConfig] = useState<NodeConfig | null>(null);
-  // Whether those answers download the model in the background after setup.
   const [pendingInBackground, setPendingInBackground] = useState(false);
   const [setupSaved, setSetupSaved] = useState(false);
   const [continuing, setContinuing] = useState(false);
 
-  // Connecting stage: elapsed time + which seed was reached
   const [connectElapsed, setConnectElapsed] = useState(0);
   const [connectedVia, setConnectedVia] = useState<string | null>(null);
   const connectTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -110,8 +98,6 @@ export function Onboarding({
   const next = () => setStep(STEPS[Math.min(stepIndex + 1, STEPS.length - 1)]);
   const back = () => setStep(STEPS[Math.max(stepIndex - 1, 0)]);
 
-  // The steps scroll when the window is shorter than a step (the app allows
-  // 960x640), so a step's action is never cut off. Each step starts at its top.
   const scrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 0 });
@@ -127,11 +113,6 @@ export function Onboarding({
     }
   }, [step, identity, identityAttempt]);
 
-  // Load the network-compatible model and mark it recommended only when local
-  // RAM is sufficient. Where it is recommended, contributing compute starts
-  // on (the step says what that does, and the switch or Skip turns it off).
-  // Below the memory floor (`recommended_tier` is "none") the step starts on
-  // observer/router mode, as it always has there.
   useEffect(() => {
     if (step !== "model" || tiers.length > 0) return;
     let cancelled = false;
@@ -154,10 +135,6 @@ export function Onboarding({
     };
   }, [step, tiers.length, tiersAttempt]);
 
-  // Subscribe to model-download-progress events from the Rust side. Outside
-  // a Tauri shell (dev / browser preview) the mock just resolves the
-  // download() call instantly without progress events, so the listener is a
-  // no-op and the UI shows the "starting" stage straight after.
   useEffect(() => {
     if (!isTauri) return;
     let unlisten: (() => void) | undefined;
@@ -176,13 +153,6 @@ export function Onboarding({
     };
   }, []);
 
-  // The model download after setup, for a setup that contributes compute on
-  // a computer that can run the model. It is the same native path a
-  // consented install takes at launch (promote_consented_install): reuse or
-  // download the model, check its pinned SHA-256, record worker mode only if
-  // compute is still on, and restart a running node as a worker. It goes on
-  // after this screen is gone; a failure leaves compute on, and the next
-  // launch tries again.
   const downloadModelInBackground = () => {
     void api.promoteConsentedInstall().then(
       (saved) => setStoreConfig(saved),
@@ -196,18 +166,10 @@ export function Onboarding({
     setLaunchError(null);
     setStoreIdentity(identity);
 
-    // The switch's answer: the model tier (on) or "skip" (off). On a
-    // computer that can run the model the step starts on, and that model
-    // downloads in the background after setup. A model chosen below the
-    // memory floor downloads here first, as before: the native promotion
-    // refuses those computers.
     const tier = selectedTier ?? "skip";
     const wantsModel = tier !== "skip";
     const inBackground = wantsModel && tier === recommendedTier;
     setPendingInBackground(inBackground);
-    // Saved by "Continue to ARC" if the start fails before the native save.
-    // A "yes" to running jobs is kept even without the model yet: native code
-    // finishes a consented install when the node next starts.
     setPendingConfig({
       ...DEFAULT_NODE_CONFIG,
       role: "observer",
@@ -216,15 +178,9 @@ export function Onboarding({
     });
 
     try {
-      // 1. Download the exact production-compatible 7B artifact first only
-      //    when it was chosen below the memory floor; progress is surfaced
-      //    through the modelProgress event. With it on, the node starts as
-      //    an observer and the model follows in the background (step 5).
       let modelPath: string | null = null;
       if (wantsModel && !inBackground) {
         setLaunchStage("model");
-        // If the user previously downloaded this tier (re-running onboarding,
-        // re-install on same disk), skip straight to the path.
         const existing = await api.existingModelForTier(tier);
         if (existing) {
           modelPath = existing;
@@ -233,14 +189,6 @@ export function Onboarding({
         }
       }
 
-      // 2. Build the config now that we know whether we have a model. Worker
-      //    role + modelPath set makes the node eligible to advertise an exact,
-      //    fully loaded artifact. It does not promise assignment or payment.
-      //    No model means observer/router mode with no local model execution.
-      //    Continuing with the switch on is the user's consent to run ARC
-      //    jobs on this computer (the step says what that does); switching it
-      //    off or choosing Skip is an explicit no. A consenting setup also
-      //    gets the default core cap natively (complete_onboarding).
       const config: NodeConfig = {
         ...DEFAULT_NODE_CONFIG,
         role: modelPath ? "worker" : "observer",
@@ -250,22 +198,13 @@ export function Onboarding({
       setStoreConfig(config);
       setPendingConfig(config);
 
-      // 3. Download the arc-node binary if it isn't already there.
       setLaunchStage("downloading");
       await api.ensureBinary();
-      // Onboarding's own save: it records the compute choice made above. A
-      // plain `saveConfig` keeps the stored contribution state once a config
-      // exists (commands.rs), so a re-run wizard has to go this way.
       await api.completeOnboarding(config);
       setSetupSaved(true);
-      // The native save keeps answers the wizard never asks, such as
-      // unattended installs after "Reset onboarding". Take back what it
-      // stored so Settings and the updater see the same values.
       const stored = await api.loadConfig().catch(() => null);
       if (stored) setStoreConfig(stored);
 
-      // 4. Start the node + wait for either real peers OR a coordinator
-      //    fallback (Lite mode survives residential UDP blocks).
       setLaunchStage("starting");
       await api.startNode(config);
       setLaunchStage("connecting");
@@ -282,10 +221,8 @@ export function Onboarding({
       }
       if (joinResult) {
         setConnectedVia(joinResult.via ?? null);
-        // The finish line used to be skipped: onboarding ended in the same tick the confirmation would have shown.
         await new Promise((resolve) => setTimeout(resolve, CONNECTED_PAUSE_MS));
       }
-      // 5. With compute on, the model downloads now, in the background.
       if (inBackground) downloadModelInBackground();
       setRoute("inference");
       setOnboarded(true);
@@ -306,9 +243,6 @@ export function Onboarding({
     }
   };
 
-  // Setup never traps: the chat and wallet work without the node, and the
-  // strip on Home carries the node's fix. The answers are saved first if the
-  // failure came before the native save.
   const continueToArc = async () => {
     setContinuing(true);
     let saved = setupSaved;
@@ -322,8 +256,6 @@ export function Onboarding({
         setStoreConfig(pendingConfig);
       }
     }
-    // Saved with compute on: the model download needs no running node, and
-    // once the model is ready the node's next start is as a worker.
     if (saved && pendingInBackground) downloadModelInBackground();
     setRoute("inference");
     setOnboarded(true);
@@ -332,8 +264,6 @@ export function Onboarding({
   const launchTier = tiers.find((tier) => tier.id === selectedTier);
   const launchModelSize = launchTier ? formatBytes(launchTier.sizeBytes) : null;
 
-  // The Contribute compute switch selects the recommended tier, or below the
-  // memory floor the tier offered there, and "skip" when it is off.
   const switchTier =
     tiers.find((tier) => tier.id === recommendedTier)?.id ?? tiers[0]?.id ?? null;
   const contributing = selectedTier !== null && selectedTier !== "skip";
@@ -581,9 +511,6 @@ export function Onboarding({
                           position: "relative",
                         }}
                       >
-                        {/* Twelve blurred placeholders until the user asks
-                            to see the phrase; the real words are fetched
-                            from Rust at that moment. */}
                         {(seedPhrase ?? PLACEHOLDER_PHRASE)
                           .split(" ")
                           .map((word, i) => (
@@ -618,9 +545,6 @@ export function Onboarding({
                           <button
                             className="btn btn-secondary btn-sm"
                             onClick={async () => {
-                              // Fetch on demand. The phrase crosses the IPC
-                              // boundary exactly here, on an explicit user
-                              // action, and goes no further.
                               try {
                                 setSeedError(null);
                                 setSeedPhrase(await api.revealSeedPhrase());
@@ -998,8 +922,6 @@ export function Onboarding({
                   </div>
                 )}
 
-                {/* The buttons below carry the actions: Continue to ARC first,
-                    Try again second. The strip on Home carries the node's fix. */}
                 {launchError && (
                   <>
                     <StartFailurePanel
@@ -1062,18 +984,6 @@ export function Onboarding({
   );
 }
 
-/**
- * What contributing compute means, shown on the compute step above the
- * choices, so it is read before setup goes on. Each sentence states only
- * what the node and this app do: worker flags only with the model, a core
- * cap of a quarter of the logical cores from setup unless one is stored
- * (commands.rs default_worker_threads; node_manager.rs passes it as
- * RAYON_NUM_THREADS and --threads), and keep-awake only when switched on
- * (node_manager.rs); jobs are a prompt in and generated text out
- * (crates/arc-node/src/rpc.rs WorkItem and WorkResult); close-to-tray and the
- * login item (lib.rs); the keep-awake guard is held per job
- * (crates/arc-node/src/community_worker.rs).
- */
 function ContributionDisclosure() {
   return (
     <div
@@ -1139,9 +1049,6 @@ const SEEDS = [
   { label: "SGP", ip: "149.28.153.31" },
 ];
 
-// Plain words for the wait. A community node joins through a coordinator, so
-// there is no handshake or peer step to narrate; the seed chips below show
-// the coordinators being tried.
 function connectingPhaseMessage(elapsed: number): string {
   if (elapsed < 25) return PLAIN_COPY.setup.connecting;
   if (elapsed < 45) return PLAIN_COPY.setup.connectingStill;
@@ -1158,7 +1065,6 @@ function ConnectingStatus({
   const activeSeedIdx = Math.floor(elapsed / 3) % SEEDS.length;
 
   if (connectedVia) {
-    // "p2p" is the join through a peer; a coordinator is named by its city.
     const label =
       connectedVia === "p2p"
         ? null
@@ -1185,7 +1091,6 @@ function ConnectingStatus({
         </span>
       </span>
 
-      {/* Seed node status row */}
       <span
         style={{
           display: "flex",
@@ -1230,22 +1135,6 @@ function ConnectingStatus({
   );
 }
 
-/**
- * Poll until the LOCAL node is genuinely online.
- *
- * This used to return on the first poll, every time. `node_status` resolved
- * to a remote seed reporting 8 peers, so `s.running && s.peers >= 1` was
- * satisfied instantly — typically before arc-node had even bound its RPC
- * port. Onboarding then reported "Connected via p2p" and claimed the faucet
- * regardless of whether the local node had started at all, so a user whose
- * node failed outright still finished setup with a green checkmark. The 90s
- * timeout, the seed-cycling animation and the coordinator-fallback branch
- * were all unreachable.
- *
- * `s.running` is now genuinely local, and success additionally requires
- * either a real peer or a reachable coordinator — the local RPC answering on
- * its own only means the process started, not that it joined anything.
- */
 async function waitForPeer({
   timeoutMs,
 }: {
@@ -1257,13 +1146,9 @@ async function waitForPeer({
       const s = await api.nodeStatus();
       if (s.running) {
         if (s.peers >= 1) return { via: "p2p" };
-        // Local node is up but unpeered. A reachable public seed still
-        // makes the app fully usable (client mode), so that counts as
-        // joined — but only alongside a running local node.
         if (s.coordinatorUrl) return { via: s.coordinatorUrl };
       }
     } catch {
-      /* retry */
     }
     await new Promise((r) => setTimeout(r, 2000));
   }

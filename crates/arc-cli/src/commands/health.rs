@@ -1,5 +1,3 @@
-//! `arc health` - validate and print the node readiness status.
-
 use crate::rpc::RpcClient;
 use anyhow::{Result, bail};
 use serde_json::Value;

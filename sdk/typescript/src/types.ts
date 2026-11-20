@@ -1,27 +1,13 @@
-// ─── @arc-chain/sdk - Type Definitions ────────────────────────
-// Complete TypeScript types for the ARC Chain RPC API.
-// Covers all endpoints, all 37 transaction body variants,
-// block structures, account state, validators, contracts,
-// light client, faucet, and ETH JSON-RPC compatibility.
-
 import type { U64 } from "./u64.js";
 export type { U64 } from "./u64.js";
 
-// ─── Primitives ──────────────────────────────────────────────
-
-/** 64-character hex-encoded BLAKE3 hash (no 0x prefix on the native API). */
 export type Hash256 = string;
 
-/** 64-character hex-encoded account/validator address. */
 export type Address = string;
 
-/** Hex-encoded bytes without a required prefix. */
 export type HexString = string;
 
-/** Hex-encoded bytes with the `0x` prefix used by selected RPC projections. */
 export type PrefixedHexString = `0x${string}`;
-
-// ─── Health & Info ───────────────────────────────────────────
 
 export interface HealthResponse {
   status: string;
@@ -65,8 +51,6 @@ export interface StatsResponse {
   indexed_hashes: number;
   indexed_receipts: number;
 }
-
-// ─── Blocks ─────────────────────────────────────────────────
 
 export interface BlockHeader {
   height: number;
@@ -121,8 +105,6 @@ export interface BlockTxsResponse {
   transactions: BlockTxEntry[];
 }
 
-// ─── Merkle Proofs ──────────────────────────────────────────
-
 export interface MerkleProofSibling {
   hash: Hash256;
   is_left: boolean;
@@ -148,8 +130,6 @@ export interface BlockProofsResponse {
     root: Hash256;
   }>;
 }
-
-// ─── Transactions ───────────────────────────────────────────
 
 export interface TxReceipt {
   tx_hash: Hash256;
@@ -196,14 +176,6 @@ export interface FullTransaction {
   gas_used?: U64;
 }
 
-/**
- * A signed transfer projection that can be normalized to `POST /tx/submit`.
- *
- * `FullTransaction` is the broad read model returned by `/tx/{hash}/full` and
- * is not itself a write contract.  Keeping this transfer-only type separate
- * prevents callers from accidentally POSTing the nested read projection to
- * the node's flat transfer adapter.
- */
 export interface SignedTransferTransaction
   extends Omit<FullTransaction, "tx_type" | "body" | "signature"> {
   tx_type: "Transfer";
@@ -214,7 +186,6 @@ export interface SignedTransferTransaction
       signature: string;
     };
   };
-  /** Exact domain advertised by `/network/info`; null on pre-v3 chains. */
   transaction_domain: PrefixedHexString | null;
 }
 
@@ -228,8 +199,6 @@ export interface TxSubmitBatchResponse {
   rejected: number;
   tx_hashes: Hash256[];
 }
-
-// ─── Transaction Body Variants (0x01 through 0x25) ─────────
 
 export interface TransferBody {
   type: "Transfer";
@@ -456,7 +425,6 @@ export interface ModelRequestBody {
   max_wait_secs: number;
 }
 
-/** Inclusive start/end layer range serialized by the RPC as a JSON tuple. */
 export type LayerRange = [number, number];
 
 export interface ShardCoverageClaimBody {
@@ -535,7 +503,6 @@ export interface CommunityInferenceRewardBody {
   worker_attestation_hash: Hash256;
 }
 
-/** Discriminated union of all 37 ARC Chain transaction body projections. */
 export type TransactionBody =
   | TransferBody
   | SettleBody
@@ -575,10 +542,7 @@ export type TransactionBody =
   | InferenceFinalizeBody
   | CommunityInferenceRewardBody;
 
-/** String literal union of all transaction type discriminators. */
 export type TransactionType = TransactionBody["type"];
-
-// ─── Accounts ───────────────────────────────────────────────
 
 export interface Account {
   address: Address;
@@ -595,8 +559,6 @@ export interface AccountTxs {
   tx_hashes: Hash256[];
 }
 
-// ─── Validators ─────────────────────────────────────────────
-
 export interface ValidatorInfo {
   address: Address;
   stake: U64;
@@ -608,8 +570,6 @@ export interface ValidatorsResponse {
   total_stake: U64;
   count: number;
 }
-
-// ─── Contracts ──────────────────────────────────────────────
 
 export interface ContractInfo {
   address: Address;
@@ -632,8 +592,6 @@ export interface ContractCallResult {
   error?: string;
 }
 
-// ─── Light Client ───────────────────────────────────────────
-
 export interface LightSnapshot {
   height: number;
   state_root: Hash256;
@@ -648,8 +606,6 @@ export interface SyncSnapshotInfo {
   state_root: Hash256;
   account_count: number;
 }
-
-// ─── Faucet ─────────────────────────────────────────────────
 
 export interface FaucetClaimResponse {
   tx_hash: Hash256;
@@ -670,8 +626,6 @@ export interface FaucetHealth {
   faucet_address: Address;
 }
 
-// ─── ETH JSON-RPC ───────────────────────────────────────────
-
 export interface JsonRpcRequest {
   jsonrpc: "2.0";
   method: string;
@@ -691,8 +645,6 @@ export interface JsonRpcError {
   message: string;
   data?: unknown;
 }
-
-// ─── Client Options ─────────────────────────────────────────
 
 export interface BlocksQueryOptions {
   from?: number;
@@ -720,11 +672,9 @@ export interface TxSubmitPayload {
   tx_type?: "Transfer";
   signature: string;
   public_key: string;
-  /** Exact domain used by the signer; checked locally and never sent. */
   transaction_domain: PrefixedHexString | null;
 }
 
-/** Minimal recovery metadata required to bind transaction signatures. */
 export interface TransactionDomainInfo {
   protocol_version?: string | null;
   recovery_active?: boolean;

@@ -1,16 +1,6 @@
-// The Network screen — "check the chain any time".
-//
-// Assertions are on format, presence and copy, never on magnitude. The two
-// things most worth locking down are the stall warning (because `/health`
-// cannot give it, and four of six live seeds are stopped while reporting ok)
-// and the not-found-vs-invalid distinction in the lookup (because calling a
-// pending attestation "invalid" would send a user hunting a bug that isn't
-// there).
-
 import { expect, test } from "@playwright/test";
 import { seedMockOverrides, seedOnboarded } from "./helpers";
 
-/** The mock's overview, as a base for targeted overrides. */
 const OVERVIEW = {
   sourceHost: "http://140.82.16.112:9090",
   unavailable: null,
@@ -51,7 +41,6 @@ test.describe("Network screen - identity and attribution", () => {
     await gotoNetwork(page);
     const identity = page.getByTestId("network-identity");
     await expect(identity).toContainText("arc-testnet-1");
-    // Attribution: every figure on this screen belongs to one pinned host.
     await expect(identity).toContainText("LAX");
   });
 
@@ -70,7 +59,6 @@ test.describe("Network screen - identity and attribution", () => {
     await gotoNetwork(page);
     const identity = page.getByTestId("network-identity");
     await expect(identity).toContainText("Network name unknown");
-    // It must still say which host it is reading.
     await expect(identity).toContainText("140.82.16.112");
   });
 
@@ -94,7 +82,6 @@ test.describe("Network screen - identity and attribution", () => {
     await gotoNetwork(page);
     const btn = page.getByTestId("btn-open-raw-json");
     await expect(btn).toBeVisible();
-    // Not "explorer" — it opens a block header as JSON, and says so.
     await expect(btn).toContainText("Raw block JSON");
     await expect(btn).not.toContainText(/explorer/i);
   });
@@ -133,8 +120,6 @@ test.describe("Network screen - stalled block production", () => {
     const banner = page.getByTestId("not-sealing-banner");
     await expect(banner).toBeVisible();
     await expect(banner).toContainText("not sealing blocks");
-    // The reason `/health` cannot be trusted here has to be stated, or the
-    // user will believe the green pill over this banner.
     await expect(banner).toContainText("DAG round keeps advancing");
     await expect(banner).toContainText(
       "cannot mine a new claim or reward receipt",
@@ -145,9 +130,6 @@ test.describe("Network screen - stalled block production", () => {
     page,
   }) => {
     await seedMockOverrides(page, {
-      // 400s is past the warn threshold and short of the stall threshold, and
-      // this host has NOT declared itself stopped. Both conditions matter: the
-      // host's own verdict alone is enough to escalate to "not sealing".
       fetch_network_overview: {
         ...OVERVIEW,
         lastBlockAgeSecs: 400,
@@ -163,8 +145,6 @@ test.describe("Network screen - stalled block production", () => {
     page,
   }) => {
     await seedMockOverrides(page, {
-      // Only 400s old — well short of the hour-long stall threshold — but the
-      // host says it is not producing. Its word is enough.
       fetch_network_overview: {
         ...OVERVIEW,
         lastBlockAgeSecs: 400,
@@ -176,7 +156,6 @@ test.describe("Network screen - stalled block production", () => {
     await gotoNetwork(page);
     const banner = page.getByTestId("not-sealing-banner");
     await expect(banner).toBeVisible();
-    // The host's basis is quoted rather than paraphrased.
     await expect(banner).toContainText("block_production_fresh_secs");
   });
 
@@ -204,7 +183,6 @@ test.describe("Network screen - validators, height, peers", () => {
     page,
   }) => {
     await gotoNetwork(page);
-    // Format, not magnitude: "N / M".
     await expect(page.getByTestId("net-stat-validators")).toHaveText(
       /^[\d,]+ \/ [\d,]+$/,
     );
@@ -217,8 +195,6 @@ test.describe("Network screen - validators, height, peers", () => {
     const split = page.getByTestId("validator-split");
     await expect(split).toContainText("hold stake above zero");
     await expect(split).toContainText("cannot lead a round");
-    // The default fixture has the host reporting the split itself, so the copy
-    // must attribute it to the host and name the threshold it used.
     await expect(split).toContainText("Reported by this host");
     await expect(split).toContainText("stake or more");
   });
@@ -227,9 +203,6 @@ test.describe("Network screen - validators, height, peers", () => {
     page,
   }) => {
     await seedMockOverrides(page, {
-      // An older host: /network/info absent, so the active count is counted
-      // from /validators by taking stake > 0 — an approximation of the real
-      // min_active_stake threshold, and it must not be passed off as reported.
       fetch_network_overview: {
         ...OVERVIEW,
         validatorSplitDerived: true,
@@ -282,14 +255,12 @@ test.describe("Network screen - validators, height, peers", () => {
     await expect(page.getByTestId("overview-unavailable")).toContainText(
       "Could not reach",
     );
-    // A host that cannot answer is not a host reporting zero.
     await expect(page.getByTestId("net-stat-block-height")).toHaveText("—");
     await expect(page.getByTestId("net-stat-peers")).toHaveText("—");
   });
 });
 
 test.describe("Network screen - transaction lookup", () => {
-  // Mined in the mock: the first mock attestation's hash.
   const MINED = "0xe0c73bb8a4446f23a62033001cb22e1e9298d5ce1cfea8111762c1ca2833f67d";
   const WELL_FORMED_UNKNOWN = `0x${"9".repeat(64)}`;
 
@@ -333,8 +304,6 @@ test.describe("Network screen - transaction lookup", () => {
     const notFound = page.getByTestId("tx-status-not-found");
     await expect(notFound).toBeVisible();
     await expect(notFound).toContainText("Not in a block yet");
-    // The distinction that matters: a pending attestation returns not-found,
-    // so this must not be presented as a bad hash.
     await expect(notFound).toContainText("waiting in the mempool");
     await expect(notFound).toContainText("does not mean the hash is invalid");
     await expect(page.getByTestId("tx-status-invalid")).toHaveCount(0);
@@ -412,9 +381,7 @@ test.describe("Network screen - blocks and attestations", () => {
     await expect(list).toBeVisible();
     const items = list.locator(".feed-item");
     expect(await items.count()).toBeGreaterThan(0);
-    // Format only.
     await expect(items.first()).toContainText(/Block #[\d,]+/);
-    // Newest first.
     const heights = await list.locator(".feed-item-title").allInnerTexts();
     const nums = heights.map((h) => Number(h.replace(/[^\d]/g, "")));
     const sorted = [...nums].sort((a, b) => b - a);
@@ -429,7 +396,6 @@ test.describe("Network screen - blocks and attestations", () => {
 
   test("a block expands to its transactions on demand", async ({ page }) => {
     await gotoNetwork(page);
-    // The first mock block that reports a non-zero tx_count.
     const expander = page.getByTestId("btn-expand-block-123469");
     await expect(expander).toBeVisible();
     await expander.click();
@@ -442,10 +408,7 @@ test.describe("Network screen - blocks and attestations", () => {
     await gotoNetwork(page);
     const note = page.getByTestId("padding-filtered-note");
     await expect(note).toBeVisible();
-    // The mock carries exactly one `tx_type: "Other"` padding row.
     await expect(note).toContainText("1 row from LAX was not an inference record");
-    // Five of six fixtures are real inference records: three mined 0x16
-    // computations and two distinct mined 0x25 reward receipts.
     await expect(
       page.getByTestId("recent-inference").locator(".feed-item"),
     ).toHaveCount(5);
@@ -490,7 +453,6 @@ test.describe("Network screen - reached from elsewhere", () => {
     });
     await expect(lookupBtn).toBeVisible();
     await lookupBtn.click();
-    // Navigates to Network AND runs the lookup, prefilled.
     await expect(page.getByTestId("network-screen")).toBeVisible();
     await expect(page.getByTestId("tx-lookup-input")).toHaveValue(expectedTx);
     await expect(page.getByTestId("tx-lookup-result"))

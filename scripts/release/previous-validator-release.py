@@ -45,12 +45,6 @@ def release_identity(release):
 
 
 def select_release(releases, tag, candidate, verify_skipped=None):
-    """Select a baseline; older baselines require authenticated skip evidence.
-
-    verify_skipped(baseline, release) must raise unless the intervening release
-    is an authenticated desktop update over baseline. With no verifier, retain
-    the original newest-only selection contract.
-    """
     need(isinstance(releases, list), "release listing must be an array")
     version(tag)
     need(version(tag) < version(candidate), "validator release must precede the candidate")
@@ -68,7 +62,6 @@ def select_release(releases, tag, candidate, verify_skipped=None):
     release_identity(release)
     newer = sorted((r for r in qualifying if version(r["tag_name"]) > version(tag)),
                    key=lambda r: version(r["tag_name"]))
-    # Preserve the refusal of an already published candidate or later release.
     need(all(version(r["tag_name"]) < version(candidate) for r in newer), NOT_NEWEST)
     need(len({r["tag_name"] for r in newer}) == len(newer), NOT_NEWEST)
     for skipped in newer:
@@ -153,7 +146,6 @@ def download_evidence(release, desktop=False):
     limits = [("SHA256SUMS", MAX_MANIFEST_BYTES), ("SHA256SUMS.sig", MAX_MANIFEST_BYTES)]
     if desktop:
         limits.append((ASSET, MAX_ATTESTATION_BYTES))
-    # Validate every advertised bound before downloading any of the assets.
     for name, limit in limits:
         need(assets[name]["size"] <= limit, "published asset exceeds size bound: " + name)
     payloads = [gh("-H", "Accept: application/octet-stream",
@@ -173,7 +165,6 @@ def read_desktop_attestation(payload):
 
 
 def authenticate(tag, candidate):
-    # Paginate the whole listing. Never trust /releases/latest (legacy channel).
     pages = json.loads(gh("--paginate", "--slurp", f"repos/{REPOSITORY}/releases?per_page=100"))
     need(isinstance(pages, list) and all(isinstance(page, list) for page in pages), "invalid release pages")
     prior = None
@@ -202,7 +193,6 @@ def authenticate(tag, candidate):
 
 
 def attestation_evidence(tag, candidate):
-    """Split authenticated baseline and skips for the public attestation schema."""
     prior = dict(authenticate(tag, candidate))
     skipped = prior.pop(SKIPPED, [])
     return prior, skipped
@@ -230,8 +220,6 @@ def verify_attestation(value, candidate, now):
     need(isinstance(prior, dict), "validator release attestation missing")
     authenticated, skipped = attestation_evidence(prior.get("tag"), candidate)
     need(authenticated == prior, "validator release evidence differs")
-    # Legacy newest-only attestations omitted this field. Absence can only mean
-    # an empty list; it can never hide an intervening release.
     recorded = value.get(SKIPPED, [])
     need(isinstance(recorded, list)
          and all(isinstance(row, dict) and type(row.get("release_id")) is int for row in recorded)

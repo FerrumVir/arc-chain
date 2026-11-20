@@ -1,14 +1,3 @@
-//! End-to-end safety test for Tier 1 on-chain inference identity.
-//!
-//! Pipeline exercised:
-//!   1. apply `InferenceRequest` → escrow locks max_reward, status=Open
-//!   2. spawn `InferenceValidatorTask` without a committed model artifact
-//!   3. task derives committee membership but abstains instead of fabricating
-//!      a deterministic stub vote for an artifact it did not execute
-//!
-//! Real-model execution is covered by the Candle path with an operator-provided
-//! artifact; CI intentionally does not download a multi-gigabyte GGUF.
-
 use std::sync::Arc;
 
 use arc_crypto::{Hash256, KeyPair, hash_bytes};
@@ -56,7 +45,6 @@ fn build_request_tx(
 
 #[tokio::test]
 async fn tier1_without_an_exact_loaded_artifact_abstains() {
-    // ── 1. Set up state with one validator who is also the requester ──
     let kp = KeyPair::generate_ed25519();
     let validator = kp.address();
     let state = Arc::new(StateDB::with_genesis(&[(validator, 1_000_000)]));
@@ -64,7 +52,6 @@ async fn tier1_without_an_exact_loaded_artifact_abstains() {
 
     let mempool = Arc::new(Mempool::new(1024));
 
-    // ── 2. Apply the InferenceRequest tx directly via execute_block ──
     let req_id = [42u8; 32];
     let tx = build_request_tx(validator, 0, req_id, 100, 1, 20);
     let (_, receipts) = state.execute_block(&[tx], validator).unwrap();
@@ -73,23 +60,20 @@ async fn tier1_without_an_exact_loaded_artifact_abstains() {
     let escrow = state.get_account(&escrow_addr).unwrap();
     assert_eq!(escrow.code_hash.0[0], TIER1_STATUS_OPEN);
 
-    // ── 3. Spawn without an engine/commitment. This must never vote. ──
     let task = InferenceValidatorTask::new(
         state.clone(),
         mempool.clone(),
         validator,
         kp.clone(),
-        None, // no candle engine
-        None, // no tokenizer
-        None, // no model_id
+        None,
+        None,
+        None,
     );
     let task = Arc::new(task);
 
     let tick_task = task.clone();
     let handle = tokio::spawn(async move { InferenceValidatorTask::run_arc(tick_task).await });
 
-    // Allow several 500ms ticks. A legacy implementation inserted a synthetic
-    // InferenceVote here despite having no model bytes.
     let vote_tx = wait_for_mempool_tx(
         &mempool,
         |tx| matches!(tx.tx_type, TxType::InferenceVote),
@@ -103,8 +87,6 @@ async fn tier1_without_an_exact_loaded_artifact_abstains() {
     assert_eq!(escrow_after_ticks.balance, 100);
 }
 
-/// Drain the mempool until a tx matching `predicate` is observed or the
-/// deadline elapses. Returns the matched tx; other txs are silently re-inserted.
 async fn wait_for_mempool_tx(
     mempool: &Arc<Mempool>,
     predicate: impl Fn(&Transaction) -> bool,
@@ -125,7 +107,6 @@ async fn wait_for_mempool_tx(
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    // Restore non-matching txs so the caller can keep looking for more.
     for o in others.drain(..) {
         let _ = mempool.insert(o);
     }

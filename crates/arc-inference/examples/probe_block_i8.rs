@@ -1,12 +1,8 @@
-// Real-Llama probe for the new block-wise INT8 path.
-// Measures: block_i8 quantize + matmul vs f32 ground truth vs the old
-// per-row I8 path, on the actual tensors that produced the 107-PPL ceiling.
 use arc_inference::block_i8::{BLOCK_SIZE, BlockI8Weights, matmul_block_i8};
 use arc_inference::cached_integer_model::I8Weights;
 use candle_core::{Device, quantized::gguf_file};
 
 const ONE: i64 = 1 << 16;
-/// `$HOME/.arc-models/llama-2-7b.gguf`, resolved at run time.
 fn model_path() -> String {
     let home = std::env::var("HOME").expect("HOME is set");
     format!("{home}/.arc-models/llama-2-7b.gguf")
@@ -82,7 +78,6 @@ fn probe(name: &str, rows: usize, cols: usize) {
     let f = extract_f32(name);
     assert_eq!(f.len(), rows * cols);
 
-    // Realistic Q16 input ~ N(0, 0.7)
     let mut s: u64 = 42;
     let input_f32: Vec<f32> = (0..cols)
         .map(|_| {

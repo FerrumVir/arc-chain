@@ -1,9 +1,3 @@
-//! Write-Ahead Log (WAL) for ARC Chain state persistence.
-//!
-//! Every state mutation is journaled to an append-only file BEFORE acknowledging.
-//! Sequential writes only - never seeks, never reads during execution.
-//! The async writer batches entries and flushes to SSD periodically.
-
 use crate::recovery::RecoveryContext;
 use arc_crypto::Hash256;
 use arc_types::inference_contract::{
@@ -21,9 +15,6 @@ use std::thread;
 
 #[cfg(windows)]
 fn move_file_create_only_write_through(source: &Path, destination: &Path) -> std::io::Result<()> {
-    // No REPLACE_EXISTING flag: WAL segments and quarantines are immutable,
-    // create-only namespace publications. WRITE_THROUGH closes the Windows
-    // power-loss gap where no documented parent-directory fsync exists.
     arc_crypto::secret_file::windows_move_path_write_through(source, destination, false)
 }
 
@@ -79,11 +70,6 @@ fn wal_namespace_rebarrier_path(path: &Path) -> std::io::Result<PathBuf> {
     Ok(path.with_file_name(format!(".{file_name}.namespace-rebarrier")))
 }
 
-/// Select the exact live or interrupted-write-through WAL namespace for a
-/// read-only legacy capture. Capture must never repair the source directory:
-/// operators rely on it remaining byte-for-byte and name-for-name unchanged.
-/// A staged-only name is nevertheless valid evidence that the previous writer
-/// completed the file bytes and was interrupted while rebarriering its name.
 pub(crate) fn select_read_only_wal_path(path: &Path) -> std::io::Result<PathBuf> {
     fn validate_candidate(path: &Path) -> std::io::Result<bool> {
         match fs::symlink_metadata(path) {
@@ -94,8 +80,6 @@ pub(crate) fn select_read_only_wal_path(path: &Path) -> std::io::Result<PathBuf>
                         format!("legacy WAL namespace is not a regular non-symlink file: {path:?}"),
                     ));
                 }
-                // Validate ownership through an O_NOFOLLOW/OPEN_REPARSE_POINT
-                // handle without tightening or otherwise mutating permissions.
                 drop(arc_crypto::secret_file::open_owned_nofollow_read(path)?);
                 Ok(true)
             }
@@ -161,9 +145,6 @@ fn restore_exact_wal_namespace_rebarrier(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Restore exact ARC WAL names left in the deterministic Windows
-/// write-through intermediate before any reader performs height discovery.
-/// On Unix this also makes manually interrupted test fixtures deterministic.
 pub fn restore_interrupted_wal_namespace_rebarriers(directory: &Path) -> std::io::Result<()> {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -218,9 +199,6 @@ fn wal_create_staging_target(name: &str) -> Option<&str> {
     (!target.is_empty()).then_some(target)
 }
 
-/// Reclaim only create staging files bound to this exact WAL target. Keeping
-/// cleanup target-scoped makes direct `WalWriter::new` safe without treating
-/// another writer's in-flight staging as ours.
 fn cleanup_create_staging_for_target(path: &Path) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let target = path
@@ -278,18 +256,12 @@ fn rebarrier_existing_append_file_durably(path: &Path) -> std::io::Result<File> 
 fn open_existing_append_file_durably(path: &Path) -> std::io::Result<File> {
     #[cfg(windows)]
     {
-        // Move through one deterministic, recoverable sibling and back. Both
-        // moves are write-through and O(1), so even an unbounded legacy WAL is
-        // never copied. State/recovery and segmented-WAL startup restore the
-        // exact intermediate before deciding whether a live WAL exists.
         rebarrier_existing_append_file_durably(path)
     }
     #[cfg(not(windows))]
     {
         let file = arc_crypto::secret_file::open_private_append_owned_migration(path)?;
         file.sync_all()?;
-        // Repeating the parent barrier is required when a prior create made
-        // the name visible but reported a late directory-fsync failure.
         WalWriter::sync_parent_directory(path)?;
         Ok(file)
     }
@@ -344,10 +316,6 @@ fn remove_wal_tombstone_best_effort(path: &Path) {
     if let Err(error) = fs::remove_file(path)
         && error.kind() != std::io::ErrorKind::NotFound
     {
-        // The live segment name has already been durably retired. Antivirus,
-        // backup software, or a still-closing reader can temporarily deny
-        // deletion on Windows; the exact private tombstone is ignored by WAL
-        // discovery and will be retried at the next startup.
         tracing::warn!(
             path = %path.display(),
             %error,
@@ -395,10 +363,6 @@ where
 {
     use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
 
-    // Antivirus, backup, and indexing software can briefly open a just-closed
-    // WAL segment without FILE_SHARE_DELETE. Retry only those two transient
-    // Windows errors. Namespace conflicts, permission errors, and every other
-    // failure remain fail-closed.
     let mut last_transient = None;
     for attempt in 0..WINDOWS_WAL_RETIREMENT_MOVE_ATTEMPTS {
         match move_once() {
@@ -453,30 +417,16 @@ fn durably_remove_wal_segment(path: &Path) -> std::io::Result<()> {
     }
 }
 
-// ── WAL Types ───────────────────────────────────────────────────────────────
-
-/// Contract storage as carried in a snapshot: `(contract_address, [(key, value)])`.
-///
-/// A named alias for the shape used by `Snapshot::storage` and by the
-/// `StateDB` snapshot exporters, so the same nested tuple is spelled once.
 pub type ContractStorage = Vec<(Address, Vec<(Hash256, Vec<u8>)>)>;
 
-/// A single WAL entry recording one state mutation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WalEntry {
-    /// Block height this mutation belongs to.
     pub block_height: u64,
-    /// Monotonic sequence number within the WAL.
     pub sequence: u64,
-    /// The state operation.
     pub op: WalOp,
-    /// CRC32 checksum of the serialized (block_height, sequence, op).
     pub checksum: u32,
 }
 
-/// A physically incomplete final frame that may be discarded only after a
-/// caller has independently validated an earlier complete block checkpoint or
-/// an authenticated recovery base that precedes the first WAL byte.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RepairableWalTail {
     TruncatedFrameLength,
@@ -492,12 +442,6 @@ impl RepairableWalTail {
     }
 }
 
-/// Strictly decoded state-WAL prefix plus its exact physical frame offsets.
-///
-/// Complete malformed frames are errors, never repairable tails. Only an EOF
-/// in the final frame is classified as repairable, and the recovery layer must
-/// still prove that `entries` contain an earlier complete block checkpoint
-/// before it may truncate anything.
 #[derive(Debug)]
 pub(crate) struct RepairableWalRead {
     pub(crate) entries: Vec<WalEntry>,
@@ -507,7 +451,6 @@ pub(crate) struct RepairableWalRead {
     pub(crate) torn_tail: Option<RepairableWalTail>,
 }
 
-/// Streaming result for a repairable WAL prefix inspection.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RepairableWalSummary {
     pub(crate) entry_count: u64,
@@ -516,69 +459,28 @@ pub(crate) struct RepairableWalSummary {
     pub(crate) torn_tail: Option<RepairableWalTail>,
 }
 
-/// State operations that the WAL records.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WalOp {
-    /// Set or update an account.
     SetAccount(Address, Account),
-    /// Set a storage key-value pair for a contract.
     SetStorage(Address, Hash256, Vec<u8>),
-    /// Delete a storage key for a contract.
     DeleteStorage(Address, Hash256),
-    /// Store a finalized block.
     SetBlock(u64, Block),
-    /// Store a transaction receipt.
     SetReceipt(Hash256, TxReceipt),
-    /// Store agent info (agent_address, name, endpoint, capabilities).
     SetAgent(Address, String, String, Vec<u8>),
-    /// Store contract WASM bytecode.
     SetContract(Address, Vec<u8>),
-    /// Checkpoint: marks a consistent state root at this point.
-    /// Used for crash recovery - replay starts from the last checkpoint.
     Checkpoint(Hash256),
-    /// Store a DAG consensus block (hash → serialized DagBlock).
-    /// Enables consensus state recovery after restart.
     SetDagBlock(Hash256, Vec<u8>),
-    /// Record a DAG round advancement (current round number).
     SetDagRound(u64),
-    /// Record a DAG block commit (hash of committed block).
     CommitDagBlock(Hash256),
-    /// Persist a full transaction body for restart-safe receipt/explorer state.
     SetFullTransaction(Hash256, Box<Transaction>),
-    /// Persist EVM event logs associated with one canonical block.
     SetEventLogs(u64, Vec<EventLog>),
-    /// Persist one identity-registry update.
     SetIdentity(Address, Identity),
-    /// Persist the complete active validator map and staking pool atomically at
-    /// a block boundary. Appended at the end to retain legacy enum indexes.
     SetValidatorState(Vec<(Address, u64)>, u64),
-    /// Persist the authenticated protocol-v3 recovery domain and its
-    /// genesis-committed community-reward activation height. Kept at the end
-    /// so every historical bincode enum discriminant remains stable.
     SetRecoveryContext(RecoveryContext, Option<u64>),
-    /// One bounded isolated-inference transition. Kept last so legacy
-    /// bincode enum discriminants remain unchanged. The state adapter writes
-    /// this record before publishing replacements to in-memory state.
     InferenceTransition(Box<InferenceTransitionRecord>),
-    /// Adopt a certified checkpoint: replace the state with the record's and
-    /// continue the chain from its tip. Last, so every older discriminant is
-    /// unchanged; a binary that predates it cannot decode a rebased WAL and
-    /// refuses to replay it - the intended fail-closed result.
     Rebase(Box<RebaseRecord>),
 }
 
-/// A certified checkpoint this node adopted (see `StateDB::rebase_onto_checkpoint`).
-///
-/// `state` is the checkpoint's snapshot payload - the state plus its recent
-/// history window - and `tip` the block at `height`, whose header binds the
-/// state root the committee certified. Replay installs it; WAL validation
-/// restarts block contiguity and parent linkage from `tip`.
-///
-/// It also carries the DAG anchor that produced `tip`. The commit cursor a
-/// node resumes from after adopting is `anchor_round + 1`, and it must be
-/// durable in the SAME record as the state: written separately, a crash
-/// between the two would restart the node on the new state with its old
-/// cursor, and it would re-apply old anchors as new heights.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RebaseRecord {
     pub height: u64,
@@ -619,42 +521,26 @@ pub enum InferenceTransitionStatus {
     Refunded,
 }
 
-/// An admitted append whose sequence is already linearized with every WAL
-/// barrier, but whose checksum and final encoding are left to the sole writer.
 struct PendingWalEntry {
     block_height: u64,
     sequence: u64,
     op: WalOp,
 }
 
-/// Internal command for the WAL background thread.
 enum WalCommand {
-    /// Append an entry to the WAL. Boxed: a pending entry dwarfs the other
-    /// variants, and every message through the channel would otherwise be
-    /// sized for it. The writer seals the ordinary `WalEntry`, so the on-disk
-    /// format is unchanged.
     Append(Box<PendingWalEntry>),
-    /// Flush all pending writes and fsync.
     Sync(channel::Sender<Result<(), WalError>>),
-    /// Rotate: close the current segment, open a new one.
     Rotate(channel::Sender<Result<(), WalError>>),
-    /// Shutdown the writer thread.
     Shutdown(channel::Sender<Result<(), WalError>>),
     #[cfg(test)]
     Disconnect,
 }
 
-/// Serializes sequence assignment and command admission. A stronger atomic
-/// ordering cannot make a sequence reservation and a later channel send one
-/// operation; this short gate makes their order identical without doing WAL
-/// serialization on execution threads.
 struct WalAdmission {
     next_sequence: u64,
     accepting: bool,
 }
 
-/// Stable file identity captured around startup validation. Size alone cannot
-/// detect an in-place same-length rewrite or a pathname swap to another inode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WalFileIdentity {
     len: u64,
@@ -721,8 +607,6 @@ fn windows_wal_file_identity(file: &File) -> std::io::Result<(u32, u64)> {
     };
 
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: `file` owns a live handle and `information` is a correctly
-    // sized writable output buffer for this synchronous identity query.
     if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -731,9 +615,6 @@ fn windows_wal_file_identity(file: &File) -> std::io::Result<(u32, u64)> {
     Ok((information.dwVolumeSerialNumber, file_index))
 }
 
-/// A fatal WAL writer failure. The first failure is retained for the lifetime
-/// of the writer so callers cannot accidentally resume after durability was
-/// lost.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WalError {
     operation: &'static str,
@@ -762,12 +643,10 @@ impl WalError {
         }
     }
 
-    /// The operation that first made the WAL unhealthy.
     pub fn operation(&self) -> &'static str {
         self.operation
     }
 
-    /// The underlying I/O error category.
     pub fn kind(&self) -> std::io::ErrorKind {
         self.kind
     }
@@ -849,10 +728,6 @@ impl WalFaultInjector {
     }
 }
 
-// ── WAL Writer ──────────────────────────────────────────────────────────────
-
-/// Non-blocking WAL writer. Sends entries to a background thread that batches
-/// and flushes writes. Execution threads are never blocked by I/O.
 pub struct WalWriter {
     sender: Sender<WalCommand>,
     admission: Mutex<WalAdmission>,
@@ -861,24 +736,17 @@ pub struct WalWriter {
     #[cfg(test)]
     faults: Arc<WalFaultInjector>,
     is_null: bool,
-    /// Directory containing WAL segment files.
     wal_dir: PathBuf,
 }
 
 impl WalWriter {
-    /// Create a new WAL writer that writes to the given file path.
-    /// Spawns a background thread for async I/O.
     pub fn new(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = open_or_create_append_file_durably(&path)?;
-        // Derive the sequence from the exact append handle retained by the
-        // writer. Validating through a second pathname open would permit a
-        // same-owner replacement to make startup validate one file while
-        // durable acknowledgements later target an unlinked or different one.
         let mut expected_sequence = Some(0u64);
         Self::validate_existing_segment_handle(&path, &file, &mut expected_sequence)?;
         let seq = expected_sequence.unwrap_or(0);
-        let mut writer = BufWriter::with_capacity(256 * 1024, file); // 256KB buffer
+        let mut writer = BufWriter::with_capacity(256 * 1024, file);
 
         let (sender, receiver): (Sender<WalCommand>, Receiver<WalCommand>) = channel::unbounded();
         let failure = Arc::new(OnceLock::new());
@@ -886,7 +754,6 @@ impl WalWriter {
         let faults = Arc::new(WalFaultInjector::new());
         let faults_clone = faults.clone();
 
-        // The WAL directory is the parent of the WAL file path.
         let wal_dir = path
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -922,10 +789,6 @@ impl WalWriter {
         })
     }
 
-    /// Create a new WAL writer that writes segmented files in a directory.
-    /// Segment naming: `wal-{segment_number:08}.bin`
-    /// Spawns a background thread for async I/O.
-    /// Automatically rotates when segment exceeds `max_segment_size`.
     pub fn with_segments(
         wal_dir: impl AsRef<Path>,
         max_segment_size: u64,
@@ -935,11 +798,6 @@ impl WalWriter {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        // Preserve the public constructor's support for a nested, initially
-        // absent path, then serialize the semantic segmented-WAL leaf itself.
-        // The outer namespace guard restores a Windows write-through
-        // intermediate before an absent-name check can create an empty split
-        // directory beside the historical segments.
         match fs::symlink_metadata(parent) {
             Ok(_) if parent.is_dir() => {}
             Ok(_) => {
@@ -972,18 +830,11 @@ impl WalWriter {
                 ));
             }
         }
-        // Always tighten and rebarrier the leaf while the parent-sibling lock
-        // remains held. This covers both a restored staged-only history and a
-        // retry after directory creation became visible before its barrier.
         arc_crypto::secret_file::create_private_directory_tree(&wal_dir)?;
         namespace_lock.rebarrier_existing()?;
         restore_interrupted_wal_namespace_rebarriers(&wal_dir)?;
         cleanup_removed_wal_tombstones(&wal_dir)?;
 
-        // Open the selected tail while the directory namespace lock is held,
-        // then validate the complete namespace with that exact retained
-        // append handle. This binds both the sequence watermark and the path
-        // identity to the file that the writer thread will actually use.
         let (segment_number, seg_path) = Self::find_latest_segment(&wal_dir)?;
         let file = open_or_create_append_file_durably(&seg_path)?;
         let seq = Self::count_entries_in_dir_with_append_handle(&wal_dir, &seg_path, &file)?;
@@ -1025,8 +876,6 @@ impl WalWriter {
         })
     }
 
-    /// Create a "null" WAL writer that discards all entries.
-    /// Used for benchmarks and tests that don't need persistence.
     pub fn null() -> Self {
         let (sender, _receiver) = channel::unbounded();
         Self {
@@ -1044,33 +893,23 @@ impl WalWriter {
         }
     }
 
-    /// Next successfully admitted WAL sequence number.
-    ///
-    /// This is an enqueue watermark, not a durability watermark. Call `sync`
-    /// before relying on the corresponding entries being fsynced.
     pub fn sequence(&self) -> u64 {
         self.admission.lock().next_sequence
     }
 
-    /// Returns true if this WAL writer is active (not null).
     #[inline]
     pub fn is_active(&self) -> bool {
         self.handle.is_some()
     }
 
-    /// Directory containing this writer's WAL file or segments.
-    ///
-    /// A null writer has no persistence target and therefore returns `None`.
     pub fn directory(&self) -> Option<&Path> {
         (!self.is_null).then_some(self.wal_dir.as_path())
     }
 
-    /// Return the first fatal writer failure, if persistence is unhealthy.
     pub fn failure(&self) -> Option<WalError> {
         self.failure.get().cloned()
     }
 
-    /// Fail if the writer has lost its durability guarantee.
     pub fn check_health(&self) -> Result<(), WalError> {
         if self.is_null {
             return Ok(());
@@ -1093,7 +932,6 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Non-blocking. Sends an entry to the background writer.
     pub fn append(&self, op: WalOp, block_height: u64) {
         self.append_with_admission_hook(op, block_height, || {});
     }
@@ -1102,7 +940,6 @@ impl WalWriter {
     where
         F: FnOnce(),
     {
-        // Null WAL: no writer thread, no handle → skip serialize/send entirely
         if self.is_null {
             return;
         }
@@ -1143,8 +980,6 @@ impl WalWriter {
         }
     }
 
-    /// Blocks until all pending entries are fsynced to disk.
-    /// Call at block boundaries for durability guarantees.
     pub fn sync(&self) -> Result<(), WalError> {
         if self.is_null {
             return Ok(());
@@ -1173,8 +1008,6 @@ impl WalWriter {
         })?
     }
 
-    /// Request the writer thread to rotate: close the current segment file
-    /// and open a new one. Blocks until rotation is complete.
     pub fn rotate(&self) -> Result<(), WalError> {
         if self.is_null {
             return Ok(());
@@ -1203,8 +1036,6 @@ impl WalWriter {
         })?
     }
 
-    /// Delete WAL segment files whose entries are all before the given sequence number.
-    /// Keeps at least `min_retain` segments for safety (defaults to 2 if 0 is given).
     pub fn delete_segments_before(&self, wal_sequence: u64) -> std::io::Result<u32> {
         self.delete_segments_before_with_admission_hook(wal_sequence, || {})
     }
@@ -1221,12 +1052,6 @@ impl WalWriter {
             return Ok(0);
         }
 
-        // Keep the admission gate from the durability barrier through the
-        // namespace mutation. Every earlier append/rotation is complete when
-        // Sync acknowledges, and no later command can be enqueued until the
-        // complete validated prefix has been retired durably. Releasing this
-        // lock before the scan would let an append-triggered auto-rotation
-        // create a new segment while namespace validation/deletion is active.
         let admission = self.admission.lock();
         self.check_admission(&admission)
             .map_err(|error| std::io::Error::new(error.kind(), error))?;
@@ -1255,11 +1080,6 @@ impl WalWriter {
         Self::delete_segments_before_live_writer_fenced(&self.wal_dir, wal_sequence, 2)
     }
 
-    /// Offline-only static version: scan an inactive `wal_dir` for segment
-    /// files, read each segment's last entry sequence, and delete segments
-    /// whose entries are all before `wal_sequence`. Keeps at least
-    /// `min_retain` segments. Live writers must use `delete_segments_before`
-    /// so append and rotation admission is fenced for the complete operation.
     pub fn delete_segments_before_in_dir(
         wal_dir: &Path,
         wal_sequence: u64,
@@ -1268,10 +1088,6 @@ impl WalWriter {
         Self::delete_segments_before_in_dir_inner(wal_dir, wal_sequence, min_retain, false)
     }
 
-    /// The admission lock and successful Sync acknowledgement must remain in
-    /// force for this complete call. On Windows only the final segment uses a
-    /// read-only opener compatible with the still-live append handle; every
-    /// offline/recovery reader retains its exclusive fail-closed open.
     fn delete_segments_before_live_writer_fenced(
         wal_dir: &Path,
         wal_sequence: u64,
@@ -1295,8 +1111,6 @@ impl WalWriter {
             return Ok(0);
         }
 
-        // For each segment, find the last entry's sequence number.
-        // A segment is deletable if its last entry sequence < wal_sequence.
         let mut deletable: Vec<PathBuf> = Vec::new();
         let mut last_nonempty_segment = None;
         let first_segment = segments
@@ -1306,8 +1120,6 @@ impl WalWriter {
         let mut expected_sequence = (first_segment == 0).then_some(0);
         let mut within_deletable_prefix = true;
         for (segment_index, seg_path) in segments.iter().enumerate() {
-            // Pruning is destructive, so a corrupt frame or cross-segment
-            // sequence gap must abort before any namespace entry is removed.
             #[cfg(windows)]
             let entries = if live_writer_fenced && segment_index + 1 == segments.len() {
                 read_wal_strict_live_writer_segment(seg_path, &mut expected_sequence)?
@@ -1327,27 +1139,16 @@ impl WalWriter {
             if within_deletable_prefix && segment_is_before_cutoff {
                 deletable.push(seg_path.clone());
             } else {
-                // Segment names are a contiguous namespace. Once one retained
-                // segment reaches the cutoff, deleting a later empty segment
-                // would punch a gap into that namespace and make restart fail.
                 within_deletable_prefix = false;
             }
         }
 
-        // A retained non-empty entry is the only durable source of the next
-        // global sequence after prefix pruning. If every sequence-bearing
-        // segment were removed while two later empty rotations happened to be
-        // retained, restart would have no watermark and could reuse sequence
-        // zero. Keep the final non-empty segment whenever it is still part of
-        // the otherwise-deletable prefix; later empty segments remain
-        // contiguous and can receive the next append safely.
         if let Some(last_nonempty_segment) = last_nonempty_segment
             && last_nonempty_segment < deletable.len()
         {
             deletable.truncate(last_nonempty_segment);
         }
 
-        // Never delete so many that fewer than min_retain segments remain.
         let max_deletable = segments.len().saturating_sub(min_retain);
         let to_delete = deletable.len().min(max_deletable);
 
@@ -1359,7 +1160,6 @@ impl WalWriter {
         Ok(deleted)
     }
 
-    /// Shut down the WAL writer, flushing and fsyncing all remaining entries.
     pub fn shutdown(&mut self) -> Result<(), WalError> {
         if self.is_null || self.handle.is_none() {
             return self.failure().map_or(Ok(()), Err);
@@ -1405,10 +1205,6 @@ impl WalWriter {
         })
     }
 
-    /// The background writer loop. Receives entries, writes them, and flushes
-    /// each drained batch. Any failure is fatal and permanently latched.
-    /// Handles Rotate commands by closing the current file and opening a new segment.
-    /// When `max_segment_size > 0`, automatically rotates after the segment exceeds that size.
     fn writer_loop(
         writer: &mut BufWriter<File>,
         receiver: &Receiver<WalCommand>,
@@ -1419,11 +1215,8 @@ impl WalWriter {
         max_segment_size: u64,
     ) {
         let mut segment_number = initial_segment;
-        // Determine if we are in segmented mode (wal_path is a directory)
-        // or legacy mode (wal_path is a file).
         let is_dir = wal_path.is_dir();
 
-        // Track bytes written to the current segment for auto-rotation.
         let mut bytes_written: u64 = writer.get_ref().metadata().map(|m| m.len()).unwrap_or(0);
 
         let mut deferred = None;
@@ -1451,8 +1244,6 @@ impl WalWriter {
                         }
                     }
 
-                    // Drain append commands into one buffered write batch, but
-                    // preserve command ordering by deferring the first barrier.
                     loop {
                         match receiver.try_recv() {
                             Ok(WalCommand::Append(pending)) => {
@@ -1637,8 +1428,6 @@ impl WalWriter {
             .map_err(|error| WalError::io("fsync", &error))
     }
 
-    /// Perform a segment rotation: flush + fsync the current writer, then
-    /// replace it with a new segment file.
     fn do_rotate(
         writer: &mut BufWriter<File>,
         wal_path: &Path,
@@ -1651,7 +1440,6 @@ impl WalWriter {
             .check(WalFaultPoint::Rotation)
             .map_err(|error| WalError::io("rotation", &error))?;
 
-        // Determine the directory and new segment number
         let next_segment = segment_number.checked_add(1).ok_or_else(|| {
             WalError::message(
                 "rotation",
@@ -1673,8 +1461,6 @@ impl WalWriter {
             dir.join(format!("wal-{next_segment:08}.bin"))
         };
 
-        // A new segment must never silently reuse a stale file. Persist its
-        // directory entry before allowing the rotation barrier to succeed.
         let file = create_new_append_file_durably(&new_path)
             .map_err(|error| WalError::io("rotation open", &error))?;
 
@@ -1721,7 +1507,6 @@ impl WalWriter {
         }
     }
 
-    /// Derive the next sequence across a complete, contiguous segment set.
     #[cfg(all(test, windows))]
     fn count_entries_in_dir(dir: &Path) -> std::io::Result<u64> {
         Self::count_entries_in_dir_inner(dir, None)
@@ -1749,10 +1534,6 @@ impl WalWriter {
                 format!("WAL append target is not the final canonical segment: {append_path:?}"),
             ));
         }
-        // Prefix pruning intentionally leaves the first retained entry with a
-        // non-zero sequence only when segment zero is itself absent. If segment
-        // zero exists, it remains the genesis of the stream and must start at
-        // sequence zero.
         let mut expected_sequence = (first_segment == 0).then_some(0);
         for segment in segments {
             if let Some((append_path, append_file)) = append
@@ -1932,11 +1713,6 @@ impl WalWriter {
         }
         #[cfg(windows)]
         {
-            // Rebind the final pathname while the exclusive append handle is
-            // deliberately live.  The identity-only probe shares writes so
-            // Windows can open it alongside that handle; the writer itself
-            // still omits FILE_SHARE_WRITE and therefore excludes a second
-            // writer.
             let final_path_file =
                 arc_crypto::secret_file::open_owned_nofollow_identity_probe(path)?;
             if windows_wal_file_identity(file)? != original_file_identity
@@ -1952,8 +1728,6 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Find the latest valid segment file in a directory, returning (segment_number, path).
-    /// If no segments exist, returns (0, dir/wal-00000000.bin).
     fn find_latest_segment(dir: &Path) -> std::io::Result<(u64, PathBuf)> {
         let segments = Self::list_segments_strict(dir)?;
         Self::validate_segment_namespace(&segments)?;
@@ -1965,7 +1739,6 @@ impl WalWriter {
         Ok((0, dir.join("wal-00000000.bin")))
     }
 
-    /// List all WAL segment files in a directory, sorted by name.
     fn list_segments(dir: &Path) -> Vec<PathBuf> {
         let mut segments = Vec::new();
         if let Ok(entries) = fs::read_dir(dir) {
@@ -1983,10 +1756,6 @@ impl WalWriter {
         segments
     }
 
-    /// Fallible segment discovery for startup and strict replay. Every
-    /// directory-open and per-entry error is part of the durability result;
-    /// silently treating a partial enumeration as a complete WAL namespace
-    /// could derive a false sequence watermark.
     fn list_segments_strict(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         let mut segments = Vec::new();
         for entry in fs::read_dir(dir)? {
@@ -2009,7 +1778,6 @@ impl WalWriter {
         Ok(segments)
     }
 
-    /// Parse the segment number from a segment file path like `wal-00000003.bin`.
     fn parse_segment_number(path: &Path) -> Option<u64> {
         let name = path.file_name()?.to_str()?;
         let stripped = name.strip_prefix("wal-")?.strip_suffix(".bin")?;
@@ -2028,10 +1796,6 @@ impl Drop for WalWriter {
     }
 }
 
-// ── WAL Reader (for crash recovery) ─────────────────────────────────────────
-
-// Matches arc-bincode's compatibility ceiling. Length headers are rejected
-// before allocation, so a corrupt u32 cannot request an unbounded buffer.
 const MAX_WAL_ENTRY_BYTES: usize = 256 * 1024 * 1024;
 const MAX_WAL_SEGMENT_NUMBER: u64 = 99_999_999;
 
@@ -2085,13 +1849,6 @@ fn finish_repairable_visit(
     })
 }
 
-/// Strictly read the longest physically complete state-WAL prefix.
-///
-/// This deliberately differs from [`read_wal`]: an invalid length, encoding,
-/// checksum, or sequence is always fatal. A short final length/payload is
-/// merely classified for the recovery layer, which may repair it only after
-/// independently proving an earlier block checkpoint (or signed byte-zero
-/// recovery base) and replayed state root.
 pub(crate) fn read_repairable_wal_prefix(
     path: impl AsRef<Path>,
 ) -> std::io::Result<RepairableWalRead> {
@@ -2111,8 +1868,6 @@ pub(crate) fn read_repairable_wal_prefix(
     })
 }
 
-/// Validate a repairable WAL prefix and stream each complete entry to `visitor`.
-/// The visitor runs only after frame decoding, checksum, and sequence validation.
 pub(crate) fn visit_repairable_wal_prefix(
     path: impl AsRef<Path>,
     mut visitor: impl FnMut(WalEntry, u64) -> std::io::Result<()>,
@@ -2329,8 +2084,6 @@ pub(crate) fn verify_wal_file_identity(
     Ok(())
 }
 
-/// Hash a stable WAL's complete expected contents and one prefix in a single
-/// read. The prefix digest is returned only after the full-file hash matches.
 pub(crate) fn hash_wal_identity_and_prefix(
     path: impl AsRef<Path>,
     expected_bytes: u64,
@@ -2408,11 +2161,6 @@ pub(crate) fn hash_wal_identity_and_prefix(
     Ok(prefix_hasher.finalize())
 }
 
-/// Durably preserve an exact rejected WAL suffix, then truncate the active WAL.
-///
-/// Quarantine publication happens before truncation. A crash before publication
-/// leaves the active WAL untouched; a crash after publication can safely retry
-/// against the content-addressed evidence file.
 pub(crate) fn quarantine_and_truncate_wal_tail(
     path: impl AsRef<Path>,
     accepted_prefix_bytes: u64,
@@ -2455,20 +2203,11 @@ pub(crate) fn quarantine_and_truncate_wal_tail(
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let quarantine_path = parent.join(format!("{file_name}.quarantine-{}.bin", tail_hash.to_hex()));
 
-    // A Windows crash may leave the exact quarantine temporarily renamed to
-    // its deterministic namespace-rebarrier sibling. Restore that evidence
-    // before deciding whether another tail-sized copy must be allocated.
     #[cfg(windows)]
     restore_exact_wal_namespace_rebarrier(&quarantine_path)?;
 
     if quarantine_path.exists() {
         verify_quarantine_file(&quarantine_path, tail_bytes, tail_hash)?;
-        // Quarantines created before the private-file hardening may still be
-        // owner-controlled but inherit a broader mode/DACL. Open through the
-        // no-follow migration path so the retry both tightens that boundary
-        // and obtains the write-capable handle required by FlushFileBuffers
-        // on Windows. `File::open(...).sync_all()` is read-only there and can
-        // otherwise make a post-publication crash unrecoverable.
         drop(arc_crypto::secret_file::open_private_append_owned_migration(&quarantine_path)?);
         let quarantine_file = arc_crypto::secret_file::open_private_read_write(&quarantine_path)?;
         quarantine_file.sync_all()?;
@@ -2479,9 +2218,6 @@ pub(crate) fn quarantine_and_truncate_wal_tail(
         }
         #[cfg(windows)]
         {
-            // Rebarrier the already-verified immutable evidence in O(1)
-            // namespace space. Recopying a multi-gigabyte tail here can make
-            // an otherwise recoverable nearly-full node permanently fail.
             let staging = wal_namespace_rebarrier_path(&quarantine_path)?;
             move_file_create_only_write_through(&quarantine_path, &staging)?;
             move_file_create_only_write_through(&staging, &quarantine_path)?;
@@ -2550,7 +2286,6 @@ pub(crate) fn quarantine_and_truncate_wal_tail(
     Ok(quarantine_path)
 }
 
-/// Read all entries from a WAL file. Used during crash recovery.
 pub fn read_wal(path: impl AsRef<Path>) -> Vec<WalEntry> {
     let file = match File::open(path.as_ref()) {
         Ok(f) => f,
@@ -2598,13 +2333,12 @@ pub fn read_wal(path: impl AsRef<Path>) -> Vec<WalEntry> {
             }
         };
         if reader.read_exact(&mut data).is_err() {
-            break; // Truncated entry - stop here (crash mid-write)
+            break;
         }
         offset = frame_end;
 
         match bincode::deserialize_limited_exact::<WalEntry, MAX_WAL_ENTRY_BYTES>(&data) {
             Ok(entry) => {
-                // Verify checksum
                 let payload =
                     bincode::serialize(&(&entry.block_height, &entry.sequence, &entry.op))
                         .unwrap_or_default();
@@ -2616,7 +2350,7 @@ pub fn read_wal(path: impl AsRef<Path>) -> Vec<WalEntry> {
                         "WAL entry {} has invalid checksum, stopping replay",
                         entries.len()
                     );
-                    break; // Corrupted entry - stop here
+                    break;
                 }
             }
             Err(_) => {
@@ -2628,11 +2362,6 @@ pub fn read_wal(path: impl AsRef<Path>) -> Vec<WalEntry> {
     entries
 }
 
-/// Strict WAL reader for recovery-mode startup.
-///
-/// Unlike [`read_wal`], this never treats corruption or a torn final frame as
-/// a successful prefix. ARCCHKPT nodes fail closed so a restart cannot expose
-/// partially replayed consensus state as canonical.
 pub fn read_wal_strict(path: impl AsRef<Path>) -> std::io::Result<Vec<WalEntry>> {
     let mut expected_sequence = Some(0u64);
     read_wal_strict_segment(path.as_ref(), &mut expected_sequence)
@@ -2741,7 +2470,6 @@ fn read_wal_strict_segment_from_file(
     Ok(entries)
 }
 
-/// Read all entries from all WAL segment files in a directory, in order.
 pub fn read_wal_dir(dir: impl AsRef<Path>) -> Vec<WalEntry> {
     let segments = WalWriter::list_segments(dir.as_ref());
     let mut all_entries = Vec::new();
@@ -2751,11 +2479,6 @@ pub fn read_wal_dir(dir: impl AsRef<Path>) -> Vec<WalEntry> {
     all_entries
 }
 
-/// Strictly read every segmented WAL entry with one continuous sequence.
-///
-/// Recovery-domain DAG startup uses this instead of [`read_wal_dir`] so a
-/// corrupt/torn frame, a missing segment, or a cross-segment sequence gap
-/// aborts startup rather than silently accepting a valid-looking prefix.
 pub fn read_wal_dir_strict(dir: impl AsRef<Path>) -> std::io::Result<Vec<WalEntry>> {
     let segments = WalWriter::list_segments_strict(dir.as_ref())?;
     WalWriter::validate_segment_namespace(&segments)?;
@@ -2790,11 +2513,6 @@ pub fn read_wal_dir_strict(dir: impl AsRef<Path>) -> std::io::Result<Vec<WalEntr
     Ok(all_entries)
 }
 
-/// A bounded, fail-closed view of the durable tail of a segmented legacy DAG
-/// WAL.  Legacy startup historically derives its resume cursor from the last
-/// three segments so an empty post-rotation segment cannot hide the preceding
-/// round.  Recovery uses the same bounded window, while additionally requiring
-/// a contiguous segment namespace and strict frame/checksum/sequence decoding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StrictWalTailInspection {
     pub first_segment: u64,
@@ -2806,14 +2524,6 @@ pub struct StrictWalTailInspection {
     pub source_consensus_round: u64,
 }
 
-/// Strictly inspect the bounded legacy DAG-WAL tail used to derive a recovery
-/// consensus cursor.
-///
-/// Unlike [`latest_block_height_in_wal_dir`], this is fallible: namespace
-/// gaps, malformed frames, checksum failures, and sequence discontinuities in
-/// the inspected tail abort the operation.  Only the final three segments are
-/// decoded, matching the bounded legacy restart rule and avoiding an
-/// unbounded replay of historical DAG traffic during an offline cutover.
 pub fn inspect_wal_dir_tail_strict(
     dir: impl AsRef<Path>,
 ) -> std::io::Result<StrictWalTailInspection> {
@@ -2903,19 +2613,7 @@ pub fn inspect_wal_dir_tail_strict(
     })
 }
 
-/// Find the highest `block_height` recorded in any WAL segment under `dir`.
-///
-/// Reads only the most recent segment (segments are append-only, sorted by
-/// segment number, and rotation only happens when the previous segment is
-/// full — so the highest block_height is always in the last one). This is
-/// the dag-wal recovery primitive: at boot, find where we left off, hand
-/// that round number to consensus.set_initial_round, resume mid-stream.
-///
-/// Returns 0 if `dir` is empty, missing, or contains no parseable entries.
-/// Bounded memory: reads at most one segment (default 64 MB).
 pub fn latest_block_height_in_wal_dir(dir: impl AsRef<Path>) -> u64 {
-    // Inline the same segment listing logic as WalWriter::list_segments —
-    // we can't call the private helper from this free function.
     let mut segments: Vec<PathBuf> = Vec::new();
     if let Ok(entries) = fs::read_dir(dir.as_ref()) {
         for entry in entries.flatten() {
@@ -2930,14 +2628,6 @@ pub fn latest_block_height_in_wal_dir(dir: impl AsRef<Path>) -> u64 {
     }
     segments.sort();
 
-    // Walk segments newest-to-oldest and return the first non-zero max we
-    // find. Rotation creates a new empty segment after the previous one
-    // fills, so the very last segment can legitimately be empty — without
-    // this fallback we'd return 0 and miss the recovery.
-    //
-    // Bound the scan to the last 3 segments (≤192 MB at default 64 MB
-    // segment size) so we never read the full multi-GB history just to
-    // find a round number.
     const MAX_SEGMENTS_TO_SCAN: usize = 3;
     let scan_count = segments.len().min(MAX_SEGMENTS_TO_SCAN);
     for seg in segments.iter().rev().take(scan_count) {
@@ -2949,7 +2639,6 @@ pub fn latest_block_height_in_wal_dir(dir: impl AsRef<Path>) -> u64 {
     0
 }
 
-/// Read WAL entries starting from a given sequence number (for replay after snapshot).
 pub fn read_wal_from(path: impl AsRef<Path>, from_sequence: u64) -> Vec<WalEntry> {
     read_wal(path)
         .into_iter()
@@ -2957,8 +2646,6 @@ pub fn read_wal_from(path: impl AsRef<Path>, from_sequence: u64) -> Vec<WalEntry
         .collect()
 }
 
-/// Find the last checkpoint in a WAL file.
-/// Returns (sequence, state_root) of the last checkpoint.
 pub fn find_last_checkpoint(path: impl AsRef<Path>) -> Option<(u64, Hash256)> {
     let entries = read_wal(path);
     entries.iter().rev().find_map(|e| match &e.op {
@@ -2967,27 +2654,17 @@ pub fn find_last_checkpoint(path: impl AsRef<Path>) -> Option<(u64, Hash256)> {
     })
 }
 
-// ── Snapshot ────────────────────────────────────────────────────────────────
-
-/// Full state snapshot for fast node bootstrap and crash recovery.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
-    /// Block height at which this snapshot was taken.
     pub block_height: u64,
-    /// State root hash at this snapshot.
     pub state_root: Hash256,
-    /// WAL sequence number at the time of snapshot.
     pub wal_sequence: u64,
-    /// All accounts sorted by address.
     pub accounts: Vec<(Address, Account)>,
-    /// Contract storage: (contract_address, [(key, value)])
     pub storage: ContractStorage,
-    /// Contract bytecode cache: (address, wasm_bytes)
     pub contracts: Vec<(Address, Vec<u8>)>,
 }
 
 impl Snapshot {
-    /// Write snapshot to disk as LZ4-compressed bincode.
     pub fn write_to(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let data = bincode::serialize(self).map_err(std::io::Error::other)?;
         let compressed = lz4_flex::compress_prepend_size(&data);
@@ -2998,7 +2675,6 @@ impl Snapshot {
         Ok(())
     }
 
-    /// Read snapshot from an LZ4-compressed bincode file.
     pub fn read_from(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let mut file = File::open(path)?;
         let mut compressed = Vec::new();
@@ -3012,19 +2688,11 @@ impl Snapshot {
     }
 }
 
-// ── Snapshot Config ─────────────────────────────────────────────────────────
-
-/// Configuration for snapshot frequency and state rent.
 pub struct PersistenceConfig {
-    /// Take a snapshot every N blocks (default: 10,000).
     pub snapshot_interval: u64,
-    /// WAL file path.
     pub wal_path: PathBuf,
-    /// Snapshot directory path.
     pub snapshot_dir: PathBuf,
-    /// Maximum WAL segment file size in bytes before rotation (default: 256MB).
     pub max_wal_segment_size: u64,
-    /// Minimum number of WAL segments to retain after cleanup (default: 2).
     pub wal_retention_segments: u32,
 }
 
@@ -3034,13 +2702,11 @@ impl Default for PersistenceConfig {
             snapshot_interval: 10_000,
             wal_path: PathBuf::from("data/wal.bin"),
             snapshot_dir: PathBuf::from("data/snapshots"),
-            max_wal_segment_size: 268_435_456, // 256 MB
+            max_wal_segment_size: 268_435_456,
             wal_retention_segments: 2,
         }
     }
 }
-
-// ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -3702,9 +3368,6 @@ mod tests {
     fn existing_late_visible_wal_is_tightened_rebarriered_and_appended() {
         let dir = tmp_dir("existing_late_visible_wal");
         let path = dir.join("state.wal");
-        // Deliberately publish only the file itself. This models a create that
-        // became visible before its parent-directory durability barrier
-        // reported a late failure.
         let file = arc_crypto::secret_file::create_new_private(&path).unwrap();
         file.sync_all().unwrap();
         drop(file);
@@ -3847,9 +3510,6 @@ mod tests {
 
         let tail_hash = blake3::hash(rejected);
         let quarantine = dir.join(format!("state.wal.quarantine-{}.bin", tail_hash.to_hex()));
-        // Model a quarantine that became visible before the active WAL was
-        // truncated. Legacy versions also created this owner-controlled file
-        // without ARC's final private mode/DACL.
         fs::write(&quarantine, rejected).unwrap();
         #[cfg(unix)]
         {
@@ -3912,7 +3572,6 @@ mod tests {
         let entries = read_wal(&path);
         assert_eq!(entries.len(), 1);
 
-        // Verify the checksum is valid
         let entry = &entries[0];
         let payload =
             bincode::serialize(&(&entry.block_height, &entry.sequence, &entry.op)).unwrap();
@@ -3964,7 +3623,7 @@ mod tests {
         }
 
         let entries = read_wal_from(&path, 3);
-        assert_eq!(entries.len(), 2); // sequences 3 and 4
+        assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].sequence, 3);
         assert_eq!(entries[1].sequence, 4);
 
@@ -3975,9 +3634,7 @@ mod tests {
     fn wal_null_writer() {
         let writer = WalWriter::null();
         assert_eq!(writer.directory(), None);
-        // Should not panic or error
         writer.append(WalOp::Checkpoint(Hash256::ZERO), 0);
-        // Sync on null writer is a no-op
         writer.sync().unwrap();
     }
 
@@ -4127,7 +3784,6 @@ mod tests {
         let path = tmp_path("snapshot_compress.snap");
         let _ = fs::remove_file(&path);
 
-        // Create a snapshot with 1000 accounts
         let accounts: Vec<(Address, Account)> = (0..1000u32)
             .map(|i| {
                 let addr = hash_bytes(&i.to_le_bytes());
@@ -4148,7 +3804,6 @@ mod tests {
         snapshot.write_to(&path).expect("write");
         let compressed_size = fs::metadata(&path).unwrap().len() as usize;
 
-        // LZ4 should compress account data well (repetitive structure)
         assert!(
             compressed_size < raw_size,
             "compressed {} should be < raw {}",
@@ -4185,8 +3840,6 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    // ── New tests for WAL rotation ──────────────────────────────────────────
-
     #[test]
     fn wal_rotation_creates_new_segments() {
         let dir = tmp_dir("wal_rotation_segments");
@@ -4194,7 +3847,6 @@ mod tests {
         {
             let writer = WalWriter::with_segments(&dir, 1024 * 1024).expect("create segmented wal");
 
-            // Write some entries to segment 0
             for i in 0..5u64 {
                 writer.append(
                     WalOp::SetAccount(
@@ -4206,10 +3858,8 @@ mod tests {
             }
             writer.sync().unwrap();
 
-            // Rotate to segment 1
             writer.rotate().unwrap();
 
-            // Write more entries to segment 1
             for i in 5..10u64 {
                 writer.append(
                     WalOp::SetAccount(
@@ -4221,15 +3871,12 @@ mod tests {
             }
             writer.sync().unwrap();
 
-            // Rotate again to segment 2
             writer.rotate().unwrap();
 
-            // Write to segment 2
             writer.append(WalOp::Checkpoint(hash_bytes(b"root")), 2);
             writer.sync().unwrap();
         }
 
-        // Verify segment files exist
         let segments = WalWriter::list_segments(&dir);
         assert!(
             segments.len() >= 3,
@@ -4237,17 +3884,14 @@ mod tests {
             segments.len()
         );
 
-        // Verify we can read entries from segment 0
         let seg0 = dir.join("wal-00000000.bin");
         let entries0 = read_wal(&seg0);
         assert_eq!(entries0.len(), 5);
 
-        // Verify we can read entries from segment 1
         let seg1 = dir.join("wal-00000001.bin");
         let entries1 = read_wal(&seg1);
         assert_eq!(entries1.len(), 5);
 
-        // Verify segment 2 has the checkpoint
         let seg2 = dir.join("wal-00000002.bin");
         let entries2 = read_wal(&seg2);
         assert_eq!(entries2.len(), 1);
@@ -4263,7 +3907,6 @@ mod tests {
         {
             let writer = WalWriter::with_segments(&dir, 1024 * 1024).expect("create segmented wal");
 
-            // Segment 0: entries 0..4
             for i in 0..5u64 {
                 writer.append(
                     WalOp::SetAccount(
@@ -4276,7 +3919,6 @@ mod tests {
             writer.sync().unwrap();
             writer.rotate().unwrap();
 
-            // Segment 1: entries 5..9
             for i in 5..10u64 {
                 writer.append(
                     WalOp::SetAccount(
@@ -4289,7 +3931,6 @@ mod tests {
             writer.sync().unwrap();
             writer.rotate().unwrap();
 
-            // Segment 2: entries 10..14
             for i in 10..15u64 {
                 writer.append(
                     WalOp::SetAccount(
@@ -4302,7 +3943,6 @@ mod tests {
             writer.sync().unwrap();
             writer.rotate().unwrap();
 
-            // Segment 3: entries 15..19
             for i in 15..20u64 {
                 writer.append(
                     WalOp::SetAccount(
@@ -4315,20 +3955,15 @@ mod tests {
             writer.sync().unwrap();
         }
 
-        // Before deletion: 4 segments (0, 1, 2, 3)
         let segments_before = WalWriter::list_segments(&dir);
         assert_eq!(segments_before.len(), 4);
 
-        // Delete segments with entries all before sequence 10.
-        // Segment 0 (last seq = 4) and segment 1 (last seq = 9) qualify.
-        // But we keep at least 2, so we can delete at most 2 (4 - 2 = 2).
         let deleted = WalWriter::delete_segments_before_in_dir(&dir, 10, 2).unwrap();
         assert_eq!(deleted, 2);
 
         let segments_after = WalWriter::list_segments(&dir);
         assert_eq!(segments_after.len(), 2);
 
-        // Remaining segments should be 2 and 3
         assert!(
             segments_after[0]
                 .file_name()
@@ -4510,8 +4145,6 @@ mod tests {
         let destination = dir.join(".wal-00000000.bin.removed-test.tmp");
         fs::write(&source, b"immutable WAL segment").unwrap();
 
-        // Deliberately omit FILE_SHARE_DELETE so MoveFileExW must return a
-        // sharing violation until this independently owned handle closes.
         let mut blocker = Some(
             OpenOptions::new()
                 .read(true)
@@ -4592,7 +4225,6 @@ mod tests {
         {
             let writer = WalWriter::with_segments(&dir, 1024 * 1024).expect("create segmented wal");
 
-            // Write entries 0..2 in segment 0
             for i in 0..3u64 {
                 writer.append(
                     WalOp::SetAccount(
@@ -4605,7 +4237,6 @@ mod tests {
             writer.sync().unwrap();
             writer.rotate().unwrap();
 
-            // Write entries 3..5 in segment 1
             for i in 3..6u64 {
                 writer.append(
                     WalOp::SetAccount(
@@ -4618,7 +4249,6 @@ mod tests {
             writer.sync().unwrap();
             writer.rotate().unwrap();
 
-            // Write entries 6..8 in segment 2
             for i in 6..9u64 {
                 writer.append(
                     WalOp::SetAccount(
@@ -4631,11 +4261,9 @@ mod tests {
             writer.sync().unwrap();
         }
 
-        // Read all entries across segments
         let all_entries = read_wal_dir(&dir);
         assert_eq!(all_entries.len(), 9);
 
-        // Verify sequences are continuous across segments
         for (i, entry) in all_entries.iter().enumerate() {
             assert_eq!(
                 entry.sequence, i as u64,
@@ -4646,8 +4274,6 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
-
-    // ── v0.7.0 dag-wal recovery helper tests ───────────────────────────
 
     #[test]
     fn latest_block_height_returns_zero_for_missing_dir() {
@@ -4666,31 +4292,14 @@ mod tests {
     #[test]
     fn latest_block_height_returns_max_in_latest_segment() {
         let dir = tmp_dir("latest_height");
-        // Force tiny segments so we span multiple files. Append entries with
-        // increasing block_height and ensure latest_block_height_in_wal_dir
-        // returns the max.
         {
             let writer = WalWriter::with_segments(&dir, 1024).expect("create");
             for h in 0u64..200 {
                 writer.append(WalOp::Checkpoint(Hash256::ZERO), h);
             }
             writer.sync().unwrap();
-            // Drop the writer so the bg thread flushes before we read.
             drop(writer);
         }
-        // Latest segment has the largest block_height. With tiny segments
-        // and rotation-on-overflow, the auto-rotated final segment may be
-        // empty (rotation happens AFTER the final write that filled the
-        // segment lands in the previous one). So we read the latest
-        // NON-EMPTY segment by walking backward — which the helper does
-        // by virtue of taking max() over read_wal of the latest file (or
-        // returning 0 and falling back is acceptable too). Either way the
-        // helper should produce the actual max we wrote.
-        //
-        // For this test we relax the assertion: the helper must return
-        // SOME value > 0 (proving it read something), and that value must
-        // be ≤ 199 (the max we ever wrote). Detecting "exactly 199" relies
-        // on rotation timing which is implementation-defined.
         let latest = latest_block_height_in_wal_dir(&dir);
         assert_eq!(
             latest, 199,
@@ -4743,7 +4352,6 @@ mod tests {
 
     #[test]
     fn latest_block_height_handles_unsorted_entries_within_segment() {
-        // Write entries in non-monotonic order; helper still finds the max.
         let dir = tmp_dir("latest_unsorted");
         {
             let writer = WalWriter::with_segments(&dir, 64 * 1024 * 1024).expect("create");

@@ -24,12 +24,9 @@ use tower_http::cors::CorsLayer;
 
 mod community_routing;
 mod teacher_forced;
-/// Twin execution v0 orchestration (coordinator-side, off by default).
 mod twin_dispatch;
 use teacher_forced::try_teacher_forced_community_output;
 
-/// Exact transport for the primary ARC HTTP API. Production validators use a
-/// Unix socket so a crashed origin cannot be replaced by a local TCP binder.
 #[derive(Clone, Debug)]
 pub enum RpcListen {
     Tcp(String),
@@ -56,61 +53,26 @@ impl
     > for RpcPeerAddr
 {
     fn connect_info(_stream: axum::serve::IncomingStream<'_, tokio::net::UnixListener>) -> Self {
-        // Requests on the sealed production origin socket have already crossed
-        // the reviewed nginx filter. Treat that authenticated local transport
-        // like the prior loopback hop; signed route payloads and the explicit
-        // configured-origin allowlist remain the authorization boundaries.
         Self(SocketAddr::from(([127, 0, 0, 1], 0)))
     }
 }
 
-/// Faucet configuration.
 const FAUCET_CLAIM_AMOUNT: u64 = arc_types::economics::ARC_BASE_UNITS;
 const FAUCET_RATE_LIMIT_SECS: u64 = 60 * 60;
 const FAUCET_GLOBAL_RATE_LIMIT: usize = 100;
 const FAUCET_PENDING_TTL_SECS: u64 = 5 * 60;
 
-/// Every public transaction ingress consumes the same atomic per-sender
-/// allowance. Keeping this policy in one helper prevents concurrent requests
-/// and the batch endpoint from racing or bypassing the advertised 10 tx/s
-/// ceiling.
 const TX_SENDER_MIN_INTERVAL: Duration = Duration::from_millis(100);
-/// Match the production gateway's one-megabyte mutation ceiling so a node
-/// exposed directly cannot allocate the router-wide 256 MiB maximum before
-/// the logical batch cap runs.
 const PUBLIC_TX_SUBMISSION_BODY_LIMIT_BYTES: usize = 1024 * 1024;
-/// A tokenize request carries one prompt: the text limit plus JSON framing.
 const NATIVE_TOKENIZE_BODY_LIMIT_BYTES: usize = 64 * 1024;
-/// Longest prompt text tokenized. The score-merge encoder is quadratic in the
-/// text, and a 4,096-position context cannot use a longer prompt anyway.
 const NATIVE_TOKENIZE_MAX_TEXT_BYTES: usize = 16 * 1024;
-/// One tokenization at a time per node: it runs on a blocking thread, never
-/// on the async runtime that carries RPC and consensus transport, and a
-/// second caller is told to retry rather than queued.
 static NATIVE_TOKENIZE_PERMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-/// Bound signature verification and admission work before iterating over any
-/// batch item. The public gateway also proves this exact contract during a
-/// production rollout.
 const MAX_TX_SUBMIT_BATCH_SIZE: usize = 64;
 
-/// Fixed amount transferred by one successfully mined, threshold-authorized
-/// `CommunityInferenceReward` (0x25). A raw `InferenceAttestation` (0x16)
-/// never earns this amount. The desktop reads the rate from RPC rather than
-/// hardcoding it, while readiness fields separately disclose whether secure
-/// reward issuance is actually available.
-///
-/// DERIVED from the single on-chain source of truth
-/// (`arc_types::economics::INFERENCE_ATTESTATION_REWARD`, in base units) so
-/// the number shown here and the value actually credited on-chain when an
-/// authorized reward applies can never drift apart. Change the reward by
-/// tuning that one constant.
 const REWARD_PER_ATTESTATION_ARC: f64 = arc_types::economics::INFERENCE_ATTESTATION_REWARD as f64
     / arc_types::economics::ARC_BASE_UNITS as f64;
 const EARNINGS_HISTORY_DOMAIN: &str = "all canonical 0x25 reward domains since the v3 recovery boundary; historical rows retain their own recovery_epoch, validator_set_id, and transaction_domain";
 
-/// The peer-authenticated approval collector is compiled in. Runtime
-/// readiness still fails closed unless the exact six-validator committee,
-/// model, activation, and local validator key prerequisites are present.
 const COMMUNITY_REWARD_APPROVAL_COLLECTION_READY: bool = true;
 const COMMUNITY_REWARD_APPROVE_PATH: &str = "/internal/community/reward/approve";
 pub const SHARD_ANNOUNCE_PATH: &str = "/shards/announce";
@@ -118,17 +80,11 @@ const FORWARD_SHARD_PATH: &str = "/inference/forward_shard";
 const CLEANUP_SHARD_PATH: &str = "/inference/cleanup_shard";
 const FREE_SHARDED_REQUEST_ID_DOMAIN: &str = "ARC-free-sharded-request-id-v3";
 const FREE_CONSENSUS_REQUEST_ID_DOMAIN: &str = "ARC-free-consensus-request-id-v3";
-/// The fastest reviewed production consensus loop can advance once per 50 ms
-/// tick. Reward expiry is a block height, so sizing it from the observed
-/// average block cadence would let a valid maximum-size public request expire
-/// while its five-of-six approval was still in flight during a fast epoch.
 const FASTEST_REVIEWED_CONSENSUS_TICK_MS: u64 = 50;
 const COMMUNITY_REWARD_INCLUSION_MARGIN_SECS: u64 = 5 * 60;
 const COMMUNITY_REWARD_EXPIRY_MIN_BLOCKS: u64 =
     ((PUBLIC_INFERENCE_REQUEST_TIMEOUT_SECS + COMMUNITY_REWARD_INCLUSION_MARGIN_SECS) * 1_000)
         .div_ceil(FASTEST_REVIEWED_CONSENSUS_TICK_MS);
-/// One block beyond the complete public request budget plus a five-minute
-/// inclusion margin, even if every 50 ms consensus tick seals a block.
 const COMMUNITY_REWARD_EXPIRY_BLOCKS: u64 = COMMUNITY_REWARD_EXPIRY_MIN_BLOCKS + 1;
 
 #[inline]
@@ -136,61 +92,22 @@ fn below_policy_minimum(value: u64, minimum: u64) -> bool {
     value < minimum
 }
 
-/// Bond posted only by the local `InferenceAttestation` path, in base units.
-/// Community-worker reward certificates use a protocol-fixed zero bond and
-/// are paid exclusively by a separate `CommunityInferenceReward` transaction.
 pub const DEFAULT_ATTESTATION_BOND: u64 = 1_000;
 
-/// Challenge period, in blocks, on an auto-submitted `InferenceAttestation`.
-/// Same story as the bond: previously a duplicated `100` literal.
 pub const DEFAULT_ATTESTATION_CHALLENGE_PERIOD_BLOCKS: u64 = 100;
 
-/// One ceiling shared by `/inference/run`, community assignments, and their
-/// independent verifier. Keeping these contracts identical prevents the
-/// coordinator from issuing work its own worker must reject.
 pub const INFERENCE_RUN_MAX_TOKENS: u32 = 256;
 
-/// How recently this node must have sealed a block for `/network/info` to
-/// report `is_block_producing: true`.
-///
-/// Sized for the observed live failure, not for theory: four of six seeds have
-/// not sealed a block in ~6 days while `GET /health` still answers `"ok"`,
-/// because DAG rounds keep advancing without blocks. At the ~400 ms target
-/// block time, 120 s is 300 missed blocks — far past any plausible hiccup, and
-/// far short of the 6-day stall the desktop needs to surface.
 pub const BLOCK_PRODUCTION_FRESH_SECS: u64 = 120;
 
-/// How many blocks back `/network/info` scans for a block sealed by THIS
-/// node's validator address. Bounded so the handler stays O(1)-ish on a node
-/// with a 135 K-block store.
 pub const SELF_PRODUCED_SCAN_BLOCKS: u64 = 512;
 
-/// Ring capacity for this node's own measured `forward_shard` compute times.
-/// Display-only, in-memory, and bounded: `/node/contribution` reports mean and
-/// p50 over these samples so "more cores → more throughput" can be shown with
-/// measurements instead of a fabricated earnings-per-core figure.
 pub const OWN_COMPUTE_SAMPLE_CAP: usize = 256;
-/// Process-local inference observation retention. Public APIs expose only
-/// commitments, never prompt/output text, and the bounded window prevents a
-/// long-running public coordinator from retaining arbitrary request data.
 const INFERENCE_RESULT_CAP: usize = 512;
 const INFERENCE_RESULT_TTL_MS: u64 = 60 * 60 * 1_000;
 const INFERENCE_ACTIVITY_PAGE_MAX: usize = 100;
 const PUBLIC_INFERENCE_CONCURRENCY: usize = 2;
-// One strict verification hop fans out to all three holders of a range.  A
-// holder must therefore be able to queue overlapping verifier traffic rather
-// than rejecting the third request before it has even reached the compute
-// pool.  The separate approval semaphore below keeps whole recomputations
-// bounded; this reserve is the width of one production replica set.
 const VALIDATOR_SHARD_CONCURRENCY: usize = 3;
-// Six checks x three held ranges = 18 outstanding requests. Reserve another
-// 18 for public sharded/consensus work, two coordinator jobs, a twin check,
-// and background approval retries. Compute stays at three; sibling ranges
-// can occupy permits while waiting for the same request's KV mutex.
-// A check uses one KV cache per holder, not per range. Six checks plus two
-// public jobs, two coordinator jobs, a twin and a retry use 12 of 32 caches.
-// One signer with one approval plus those local sources uses seven of eight;
-// the fast namespace is cleaned before its sequential fallback starts.
 const VALIDATOR_SHARD_QUEUE_CAP: usize = 36;
 const VALIDATOR_SHARD_QUEUE_TIMEOUT_SECS: u64 = 120;
 const VALIDATOR_SHARD_REQUEST_ID_MAX_BYTES: usize = 128;
@@ -200,25 +117,14 @@ const VALIDATOR_SHARD_KV_CACHE_TTL_SECS: u64 = 10 * 60;
 const VALIDATOR_RPC_AUDIENCE_TTL_SECS: u64 = 60;
 const COMMUNITY_APPROVAL_RECOMPUTE_CONCURRENCY: usize = 1;
 const COMMUNITY_APPROVAL_QUEUE_CAP: usize = 6;
-// Includes the bounded cleanup barrier, leaving room for a full fallback.
 const COMMUNITY_FAST_VERIFY_TIMEOUT_SECS: u64 = 340;
 const COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS: u64 = 1_500;
 pub const COMMUNITY_SUBMIT_REQUEST_TIMEOUT_SECS: u64 = 2_700;
 pub const PUBLIC_INFERENCE_REQUEST_TIMEOUT_SECS: u64 = 4_000;
 const COMMUNITY_LATE_SUBMIT_GRACE_SECS: u64 = 5 * 60;
 const VERIFIED_SETTLEMENT_CAP: usize = 256;
-/// `--community-release-on-verification` answers before the reward approvals
-/// only while fewer unpaid settlements than this are journaled: 192, three
-/// quarters of `VERIFIED_SETTLEMENT_CAP`. At or above it every job settles
-/// inline again, so each one holds one of the two public permits through its
-/// approvals and intake slows to the approval rate, as with the switch off.
-/// The 64 entries left absorb what is already in flight when the mark is
-/// crossed and the paths that always journal inline (twin legs, recovery
-/// probes), well before the cap at which no mode can journal a reward.
 const VERIFIED_SETTLEMENT_RELEASE_HIGH_WATER: u64 = VERIFIED_SETTLEMENT_CAP as u64 * 3 / 4;
 
-/// Authenticated community-mutation wire contract. V3 nodes deliberately do
-/// not accept the legacy unsigned bodies.
 pub const COMMUNITY_AUTH_VERSION: u8 = 1;
 pub const COMMUNITY_REGISTER_PATH: &str = "/community/register";
 pub const COMMUNITY_HEARTBEAT_PATH: &str = "/community/heartbeat";
@@ -226,23 +132,14 @@ pub const COMMUNITY_CLAIM_WORK_PATH: &str = "/community/claim_work";
 pub const COMMUNITY_SUBMIT_WORK_PATH: &str = "/community/submit_work";
 const COMMUNITY_AUTH_DOMAIN: &[u8] = b"ARC-community-http-mutation-v1\0";
 const COMMUNITY_AUTH_MAX_CLOCK_SKEW_MS: u64 = 120_000;
-// One extra millisecond closes the exact-boundary case where a maximally
-// future-dated request is still accepted while its cache entry is pruned.
 const COMMUNITY_AUTH_REPLAY_RETENTION_MS: u64 = COMMUNITY_AUTH_MAX_CLOCK_SKEW_MS * 2 + 1;
 const COMMUNITY_AUTH_REPLAY_CACHE_MAX: usize = 65_536;
-// A maximum-size verified generation signs one request per range/replica and
-// token position. During the 241-second replay window that legitimately
-// exceeds the worker-mutation cache's small per-identity volume; active
-// validators therefore receive a separate, still-hard-bounded nonce domain.
 const COMMUNITY_VALIDATOR_REPLAY_CACHE_MAX: usize = 98_304;
 const COMMUNITY_AUTH_REPLAYS_PER_IDENTITY_MAX: usize = 64;
 const COMMUNITY_VALIDATOR_REPLAYS_PER_IDENTITY_MAX: usize = 16_384;
 const COMMUNITY_MUTATION_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const COMMUNITY_SUBMIT_BODY_LIMIT_BYTES: usize = 128 * 1024;
 const COMMUNITY_APPROVAL_BODY_LIMIT_BYTES: usize = 256 * 1024;
-// Canonical GGUF proof: 32,000-token vocabulary, maximum UTF-8/JSON token
-// width 48 bytes. At 256 generated tokens the exact maximum is 12,288 bytes;
-// 16 KiB leaves representation headroom while rejecting impossible outputs.
 const COMMUNITY_RESULT_OUTPUT_MAX_BYTES: usize = 16 * 1024;
 const COMMUNITY_RPC_BASE_MAX: usize = 64;
 const COMMUNITY_RPC_BASE_MAX_BYTES: usize = 2_048;
@@ -257,13 +154,6 @@ fn is_validator_authenticated_path(path: &str) -> bool {
     )
 }
 
-/// Validate and canonicalize operator-configured RPC origins.
-///
-/// Community requests carry signed prompts, results, and validator approval
-/// payloads. Signatures provide integrity but not confidentiality, so a
-/// production remote origin must use HTTPS. Plain HTTP is accepted only for
-/// loopback or behind the explicit disposable-dev override. Redirects are
-/// disabled on the clients that consume these bases.
 pub fn validate_community_rpc_bases(
     raw_bases: &[String],
     allow_insecure_remote_http_for_dev: bool,
@@ -345,7 +235,6 @@ pub fn validate_community_rpc_bases(
 }
 
 struct CommunityReplayCache {
-    /// (worker address, request nonce) -> server-time expiry in Unix ms.
     seen: HashMap<(Hash256, Hash256), u64>,
     next_prune_unix_ms: u64,
     max_entries: usize,
@@ -378,8 +267,6 @@ impl CommunityReplayCache {
         }
     }
 
-    /// Check-and-insert occurs under one mutex in the caller, making duplicate
-    /// concurrent requests an atomic first-writer-wins operation.
     fn accept(
         &mut self,
         worker: Hash256,
@@ -413,389 +300,138 @@ impl CommunityReplayCache {
     }
 }
 
-/// Chain identity as DECLARED by a genesis file, when the node was started
-/// with one. Deliberately `Option`al everywhere downstream: a node booted
-/// without `--genesis` genuinely does not know its network's declared name,
-/// and `/network/info` reports that as null-plus-reason rather than guessing
-/// (and never invents the word "mainnet").
 #[derive(Debug, Clone)]
 pub struct ChainIdentity {
-    /// `chain.name` verbatim from the genesis TOML.
     pub name: String,
-    /// `chain.chain_id` from the genesis TOML (defaults to `0x415243`).
     pub chain_id: String,
 }
 
-/// Shared node state passed to all handlers.
 #[derive(Clone)]
 pub struct NodeState {
     pub state: Arc<StateDB>,
     pub mempool: Arc<Mempool>,
     pub validator_address: Hash256,
-    /// Validator keypair for signing coordinator-internal transactions such
-    /// as inference attestations. Public paid-inference handlers never use it.
-    /// Optional only for test fixtures; production paths always have it.
     pub validator_keypair: Option<Arc<arc_crypto::KeyPair>>,
-    /// Local issuance/ingress switch for v1 rewards. Consensus additionally
-    /// requires the genesis-committed activation height in `StateDB`; both
-    /// gates must be open before this node reports rewards enabled.
     pub community_rewards_v1_enabled: bool,
-    /// Coordinator switch `--community-release-on-verification`, off by
-    /// default. When set, a verified single-worker community job takes one of
-    /// two paths once its authenticated shard-quorum recomputation passes:
-    /// - Its settlement is journaled and the answer goes to the waiting
-    ///   `/inference/run` caller at once; the five-of-six reward approvals
-    ///   then run on the existing settlement retry loop.
-    /// - The journal is at `VERIFIED_SETTLEMENT_RELEASE_HIGH_WATER`, the
-    ///   reward is beyond this coordinator's budget once its unpaid journaled
-    ///   rewards count, or the settlement could not be journaled: the job
-    ///   settles inline before the answer, exactly as with the switch off.
     pub community_release_on_verification: bool,
-    /// Whether the last check under `--community-release-on-verification`
-    /// found the journal at its high-water mark, so each crossing is logged
-    /// once instead of once per job.
     community_release_above_high_water: Arc<std::sync::atomic::AtomicBool>,
     pub stake: u64,
     pub tier: StakeTier,
     pub boot_time: Instant,
     pub peer_count: Arc<AtomicU32>,
     pub transport_wire_policy: Arc<arc_net::transport::TransportWirePolicy>,
-    /// Faucet rate limiter: address → last claim time.
-    /// DashMap so faucet handler never blocks the tokio runtime under load.
     pub faucet_claims: Arc<dashmap::DashMap<[u8; 32], Instant>>,
-    /// Total faucet claims since boot.
     pub faucet_claims_total: Arc<AtomicU32>,
-    /// At most one validator-signed faucet transaction may be pending per
-    /// node. This prevents concurrent claims from signing the same validator
-    /// nonce; it is cleared after a real receipt or a bounded stale timeout.
     pub faucet_pending: Arc<tokio::sync::Mutex<Option<(Hash256, Instant)>>>,
-    /// Cached INT8 inference model (if --model was provided).
     pub inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>>,
-    /// Candle GGUF float inference engine (coherent output).
     pub candle_engine: Option<Arc<arc_inference::candle_backend::GgufEngine>>,
-    /// Model ID for candle engine.
     pub candle_model_id: Option<arc_crypto::Hash256>,
-    /// Streaming BLAKE3 commitment of every byte in the source `--model`
-    /// artifact. This is the only identity accepted for inference routing,
-    /// shard execution, caches, verification, and attestations.
     pub model_artifact_id: Option<arc_crypto::Hash256>,
-    /// Live DAG validator set (updated by consensus loop via PeerConnected).
-    /// The live consensus engine, when this process runs one.
-    ///
-    /// Needed so the RPC can serve a finality CERTIFICATE rather than a claim
-    /// about one. A node's own observation that it committed a block and a
-    /// quorum's signed statement that the block is final are different facts,
-    /// and only the second is checkable by someone who does not trust this
-    /// node.
     pub consensus_engine: Option<Arc<arc_consensus::ConsensusEngine>>,
     pub dag_validators: SharedValidators,
-    /// Per-sender rate limiter for tx submission: sender_address → last submit time.
-    /// Limits to 10 tx/sec per sender to prevent mempool flood DoS.
     pub tx_rate_limit: Arc<dashmap::DashMap<[u8; 32], Instant>>,
-    /// DAG consensus round (updated by consensus loop).
     pub dag_round: Arc<AtomicU64>,
-    /// DAG committed block count (updated by consensus loop).
     pub dag_committed: Arc<AtomicU64>,
-    /// Cryptographically random per-boot namespace for community job IDs.
-    /// The monotonic counter alone restarts at zero, which previously made
-    /// identical prompts reuse an already-paid job marker after a reboot.
     pub community_job_epoch: Hash256,
-    /// Cryptographically random per-process namespace for free sharded request
-    /// IDs. It is independent from the community reward namespace so IDs from
-    /// different trust/settlement domains can never alias by construction.
     inference_request_epoch: Hash256,
-    /// Shared by every cloned `NodeState`; atomic allocation makes simultaneous
-    /// sharded/consensus handlers unique even when their prompts are identical.
     inference_request_counter: Arc<AtomicU64>,
-    /// Inference results indexed by attestation tx hash - for explorer display.
     pub inference_results: Arc<dashmap::DashMap<String, Value>>,
-    /// Serializes TTL/cap eviction with insertion so concurrent requests
-    /// cannot overshoot the process-local observation bound.
     inference_results_gate: Arc<parking_lot::Mutex<()>>,
-    /// Public whole-prompt/coordinator admission is isolated from the
-    /// inter-validator shard reserve. Saturating public inference must not
-    /// consume the compute permits reward verification needs.
     public_inference_permits: Arc<tokio::sync::Semaphore>,
     validator_shard_permits: Arc<tokio::sync::Semaphore>,
     validator_shard_queue_permits: Arc<tokio::sync::Semaphore>,
-    /// Whole validator-side reward recomputations are intentionally serialized.
-    /// Each one already fans out to three holders per range, so allowing every
-    /// coordinator to start one concurrently creates a multiplicative shard
-    /// storm and makes five-of-six approval impossible under load.
     community_approval_permits: Arc<tokio::sync::Semaphore>,
-    /// Bounds parsed 256-KiB approval bodies waiting behind the single
-    /// recomputation permit. Without this outer admission gate, a validator
-    /// key could retain an unbounded number of long-lived HTTP tasks.
     community_approval_queue_permits: Arc<tokio::sync::Semaphore>,
-    /// Pipeline-parallel sharding: every layer range this node holds.
-    /// Set from repeated --shard-range flags (or the deprecated single
-    /// --shard-start/--shard-end pair). Empty = non-shard-holder (validator
-    /// or coordinator role only). Each entry is announced as an independent
-    /// replica so the coordinator treats multi-range nodes naturally.
     pub shard_infos: Vec<ShardInfo>,
-    /// The same ranges announced under the GGUF interleaved-RoPE profile and
-    /// served from `interleaved_rope_qk`. Empty unless this holder verifies
-    /// that profile (`--community-verify-profiles`).
     pub interleaved_rope_shard_infos: Vec<ShardInfo>,
-    /// The interleaved-RoPE Q/K rows of this holder's resident layers.
     interleaved_rope_qk: Option<Arc<arc_inference::cached_integer_model::InterleavedRopeQk>>,
-    /// `--community-verify-profiles`: the legacy profile only, unless the
-    /// operator adds the interleaved-RoPE profile.
     community_verify_profiles: CommunityVerifyProfiles,
-    /// Per-request KV cache for sharded inference. Key: request_id (Hash256 hex).
-    /// Each entry is an Arc<Mutex<KVCache>> so handlers can clone the Arc and
-    /// release the DashMap shard lock immediately.
     pub shard_kv_caches: Arc<
         dashmap::DashMap<
             String,
             Arc<std::sync::Mutex<arc_inference::cached_integer_model::KVCache>>,
         >,
     >,
-    /// Admission metadata for the stateful KV caches.  The map is bounded
-    /// globally and per authenticated validator and ages out abandoned
-    /// request IDs; `shard_kv_cache_gate` makes prune/count/insert atomic.
     shard_kv_cache_metadata: Arc<dashmap::DashMap<String, ShardKvCacheMetadata>>,
     shard_kv_cache_gate: Arc<parking_lot::Mutex<()>>,
-    /// Recently verified RPC audience for each canonical shard origin.  It is
-    /// learned either from a signed announcement or `/network/info`, and is
-    /// short-lived so topology/key/domain changes fail closed promptly.
     shard_rpc_audiences: Arc<dashmap::DashMap<String, ValidatorRpcAudience>>,
-    /// Network-wide shard registry (gossiped via /shards/announce).
-    /// Maps node socket addr → (ShardInfo, last-seen Instant). Entries older
-    /// than SHARD_REGISTRY_TTL_SECS (60s) are considered stale and dropped
-    /// at read time. This prevents stale entries from nodes that USED to
-    /// hold a shard but no longer do (e.g. after `arc-node` restarts without
-    /// --shard-start/--shard-end flags) from polluting the pipeline walker.
     pub shard_registry: Arc<dashmap::DashMap<String, (ShardInfo, std::time::Instant)>>,
-    /// Per-replica rolling EWMA of forward_shard hop latency (ms). Keyed by
-    /// socket_addr. Populated after every successful hop; consumed by the
-    /// coordinator to sort replica lists ascending before picking primary
-    /// (run_sharded) or the top-k (run_consensus). Does not affect output
-    /// determinism - only WHICH replica answers, not WHAT it answers.
-    /// Closes #29.
     pub latency_stats: Arc<dashmap::DashMap<String, LatencyEWMA>>,
-    /// Total sharded inference runs served by this node since boot.
-    /// Incremented every time /inference/run_sharded completes successfully.
     pub sharded_runs_total: Arc<AtomicU64>,
-    /// Total bytes of activations forwarded between shards since boot.
     pub sharded_bytes_total: Arc<AtomicU64>,
-    /// Monotonic in-process counter, used ONLY to derive unique community
-    /// job ids.
-    ///
-    /// It is deliberately no longer mixed into transaction nonces. It used to
-    /// be added to the account's state nonce for every InferenceAttestation,
-    /// but it accumulates forever — including across txs that never land — so
-    /// after the first attestation applied, state advanced AND the counter
-    /// advanced, and every later tx carried state+2 and failed InvalidNonce.
-    /// Transaction nonces now come from account state on each submission; see
-    /// `submit_inference_attestation`.
     pub attestation_nonce: Arc<AtomicU64>,
-    /// Network-wide deterministic inference cache. Same prompt + same model
-    /// returns the cached output_tokens in O(1), proven correct by the
-    /// integer engine's determinism. Survives the full coordinator session
-    /// (until eviction). The cache hit count is exposed in the response.
     pub inference_cache: Arc<arc_inference::distributed::DistributedCache>,
-    /// Community worker registry - nodes that volunteered HTTP-based
-    /// inference compute. Keyed by worker_id (self-chosen), value is the
-    /// registration record + last-seen Instant for TTL pruning. Workers
-    /// are pure outbound-HTTP contributors (POST to register, POST to
-    /// heartbeat, long-poll for work). They never need inbound
-    /// connectivity so they work behind any NAT / residential firewall.
     pub community_workers: Arc<dashmap::DashMap<String, (CommunityWorker, std::time::Instant)>>,
-    /// Serializes prune/cap/insert so concurrent fresh-key registrations
-    /// cannot overshoot the hard registry bound.
     community_registration_gate: Arc<parking_lot::Mutex<()>>,
-    /// Atomically consumed nonces for authenticated community HTTP mutations.
-    /// Bounded and pruned by server time; shared by every authenticated
-    /// community mutation route, including validator reward approvals.
     community_request_replays: Arc<parking_lot::Mutex<CommunityReplayCache>>,
-    /// Validator approvals have their own bounded anti-replay domain so a
-    /// flood of untrusted worker identities cannot starve quorum traffic.
     community_validator_request_replays: Arc<parking_lot::Mutex<CommunityReplayCache>>,
-    /// A validator signs at most one semantic commitment for a job and one
-    /// job for a worker certificate during this process lifetime.
     community_reward_approval_jobs: Arc<dashmap::DashMap<Hash256, Hash256>>,
     community_reward_approval_certificates: Arc<dashmap::DashMap<Hash256, Hash256>>,
-    /// Coordinator-side idempotency cache for rewards accepted into mempool.
     community_reward_submissions: Arc<dashmap::DashMap<Hash256, CommunityRewardSubmission>>,
-    /// Independently verified completions awaiting approval/mempool settlement.
-    /// This bounded retry journal decouples earned-work liveness from the
-    /// worker's HTTP connection and makes fresh submits idempotent before a
-    /// transaction reaches the mempool.
     community_verified_settlements: Arc<dashmap::DashMap<Hash256, VerifiedCommunitySettlement>>,
     community_verified_settlements_gate: Arc<parking_lot::Mutex<()>>,
     community_settlement_journal_dir: Option<Arc<std::path::PathBuf>>,
-    /// Community work dispatch: sender side. The coordinator pushes WorkItems
-    /// here when it wants community nodes to run forward_shard. This is the
-    /// "producer" half of an mpsc channel - wire it up in main.rs when
-    /// starting a coordinator.
-    /// Multi-model shard registry (from distributed.rs). Tracks shards
-    /// per-model for multi-model routing. Populated alongside the flat
-    /// shard_registry for backward compatibility.
     pub multi_model_registry: Arc<arc_inference::distributed::ShardRegistry>,
-    /// Inference verification manager - commit-challenge system for
-    /// economically-secured inference. Providers commit result_hash + bond;
-    /// challengers can dispute with their own bond.
     pub verification_manager: Arc<std::sync::Mutex<arc_vm::inference_verify::VerificationManager>>,
-    /// Revenue split configuration - 40% proposers, 25% verifiers, 15% observers, 20% treasury.
     pub revenue_config: RoleRevenueConfig,
     pub community_work_tx: Option<Arc<tokio::sync::mpsc::Sender<WorkItem>>>,
-    /// Community work dispatch: receiver side. Wrapped in a tokio::Mutex so
-    /// multiple claim_work handlers can await concurrently (only one wins
-    /// each item). The long-poll handler calls `recv()` with a timeout.
     pub community_work_queue:
         Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<WorkItem>>>>,
-    /// Pending community work keyed by job id. Keeping the original work item
-    /// and the worker assignment beside the response channel lets
-    /// `/community/submit_work` prove that a result belongs to a real,
-    /// coordinator-issued job before it updates counters or submits a
-    /// reward-bearing attestation.
     pub community_work_results: Option<Arc<dashmap::DashMap<String, PendingCommunityWork>>>,
-    /// At most one destructively claimed job per worker across concurrent
-    /// seed-poll requests. Value is the assigned job id; an empty value means
-    /// a claim long-poll currently holds the worker's reservation.
     pub community_active_jobs: Arc<dashmap::DashMap<String, String>>,
     community_routing: Arc<parking_lot::Mutex<community_routing::RoutingState>>,
-    /// Twin execution, region tags and generated demand. Every switch in its
-    /// configuration defaults to off; see `docs/twin-execution.md`.
     community_twin: Arc<twin_dispatch::CommunityTwinState>,
-    /// Shared outbound HTTP client for ALL coordinator→shard traffic.
-    /// Built once at boot so the keep-alive connection pool survives across
-    /// requests. Previously every /inference/run_sharded and
-    /// /inference/run_consensus call built its own `reqwest::Client`, which
-    /// owns the pool — so it was dropped at the end of every request and each
-    /// replica paid a fresh TCP handshake on the first hop of every request
-    /// (40 ms LAX … 215 ms SGP from the probe host).
     pub inference_http: reqwest::Client,
-    /// Sharded runs served from the deterministic cache. Kept SEPARATE from
-    /// `sharded_runs_total`: a cache hit performs no pipeline walk, and
-    /// counting it as a run inflated every "distributed inference served"
-    /// figure the dashboard shows.
     pub sharded_cache_hits: Arc<AtomicU64>,
-    /// Provenance of the ORIGINAL sharded run behind each cache key, keyed by
-    /// cache-key hex. Lets a cache hit return the real attestation tx, input
-    /// hash, shard trace and original wall time instead of zeros/empties.
     pub sharded_run_meta: Arc<dashmap::DashMap<String, Value>>,
-    /// Dedicated rayon pool for local inference compute, rebuildable at
-    /// runtime via POST /node/threads.
-    ///
-    /// `None` means "use rayon's implicit global pool", which is sized from
-    /// `available_parallelism()` unless `RAYON_NUM_THREADS` is set in the
-    /// environment. We default to None so a node that never touches
-    /// /node/threads spawns exactly the threads it did before, and so the
-    /// second `build_node_state` call (the ETH RPC server) doesn't double the
-    /// process's worker threads.
     pub compute_pool: Arc<parking_lot::RwLock<Option<Arc<rayon::ThreadPool>>>>,
-    /// Width of `compute_pool`. 0 = no dedicated pool (rayon global).
     pub compute_threads: Arc<AtomicU32>,
-    /// Explicit shard RPC base URLs this node may contact. These come from
-    /// --shard-hosts, never P2P bootstrap addresses. Remote topology is never
-    /// imported from their read-only views; holders must announce directly.
     pub seed_rpc_addrs: Arc<Vec<String>>,
-    /// Explicit, validated base URLs for authenticated community mutations
-    /// and validator reward approvals. These never derive from P2P peers.
     pub community_rpc_bases: Arc<Vec<String>>,
-    /// Chain identity declared by the `--genesis` file, if one was supplied.
-    /// `None` on a node started without `--genesis`: `/network/info` then
-    /// reports the name and chain_id as null with a reason, since the only
-    /// thing such a node actually knows about its chain is its genesis hash.
     pub chain_identity: Option<ChainIdentity>,
-    /// What this node's protocol-4 native worker executes, when it runs one.
-    /// Published by `/native-inference/context` and used by
-    /// `/native-inference/tokenize`; admission never consults it.
     pub native_serving: Option<Arc<crate::native_inference::NativeServing>>,
     pub native_request_admission: Arc<crate::native_inference::NativeRequestAdmission>,
-    /// Process lifecycle receiver installed by `serve`. Node-owned tasks that
-    /// can mutate the settlement journal or mempool stop on this signal and are
-    /// joined before `serve` returns to main's final WAL barrier.
     runtime_shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     runtime_tasks: Arc<parking_lot::Mutex<tokio::task::JoinSet<()>>>,
-    /// Ring of this node's OWN measured `forward_shard` compute times (ms),
-    /// newest last, capped at `OWN_COMPUTE_SAMPLE_CAP`.
-    ///
-    /// `latency_stats` cannot answer "how fast is this node's own compute":
-    /// it is an EWMA of round-trip times to OTHER replicas, it holds one
-    /// smoothed scalar rather than samples (so no percentile is derivable from
-    /// it), and it contains no entry for this node at all unless this node
-    /// dialled itself. These are real per-hop measurements taken by the local
-    /// shard handler, which is what `/node/contribution` needs to report a
-    /// mean and a p50 honestly. Display-only; never consensus input.
     pub own_compute_ms: Arc<parking_lot::Mutex<std::collections::VecDeque<u64>>>,
-    /// Test-only explicit pipeline lets endpoint tests exercise authenticated
-    /// HTTP shard recomputation without weakening production's loopback/stub
-    /// rejection or depending on a CI host's routable interface address.
     #[cfg(test)]
     community_verification_pipeline_override: Option<Vec<PipelineHop>>,
-    /// Pauses a candidate query immediately before its first publication read.
     #[cfg(test)]
     state_lock_order_pause: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
-/// Rolling EWMA of forward_shard hop latency for a single replica socket.
-/// `ms` is the smoothed latency in milliseconds; `count` is the number of
-/// samples folded in; `last_updated` is used for the /inference/latency_stats
-/// endpoint (freshness display). Created on first successful hop.
 #[derive(Debug, Clone)]
 pub struct LatencyEWMA {
     pub ms: f64,
     pub count: u64,
     pub last_updated: std::time::Instant,
-    /// True when this figure came from a cheap GET /health probe rather than
-    /// a real forward_shard hop. Probe RTT is not comparable to hop latency
-    /// (no compute, no activation payload), so it is only ever used to
-    /// REPLACE a value we've decided is poisoned — never blended into one.
-    /// The first real hop clears the flag.
     pub probe_only: bool,
 }
 
-/// Describes which slice of a model a node holds.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShardInfo {
-    /// First layer index (inclusive).
     pub start_layer: usize,
-    /// Last layer index (exclusive).
     pub end_layer: usize,
-    /// Total layer count of the full model (so dashboard can compute %).
     pub total_layers: usize,
-    /// Model identifier (hex of model_id hash).
     pub model_id: String,
-    /// Human-readable model name (from GGUF metadata).
     pub model_name: String,
-    /// Exact integer dispatch profile used by this shard. Protocol-v3
-    /// coordinators bind this field together with `model_id`; legacy
-    /// announcements deserialize to an empty value and are ineligible.
     #[serde(default)]
     pub execution_profile: String,
-    /// Memory used by the layers held on this node, in MB.
     pub memory_mb: usize,
-    /// Memory the FULL model would use, in MB.
     pub full_model_mb: usize,
-    /// Public socket of this node (for the next shard to forward to).
     pub socket_addr: String,
-    /// Friendly node name (NYC, LAX, ...).
     pub node_name: String,
 }
 
-/// `--community-verify-profiles` short name of today's live community reward
-/// profile (`CANONICAL_REWARD_INFERENCE_PROFILE`, split-half RoPE).
 pub const COMMUNITY_PROFILE_LEGACY_SPLIT_HALF: &str = "legacy-split-half";
-/// `--community-verify-profiles` short name of the GGUF interleaved-RoPE
-/// profile (`GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE`).
 pub const COMMUNITY_PROFILE_ROPE_INTERLEAVED_V1: &str = "rope-interleaved-v1";
 
-/// The community reward profiles this validator verifies
-/// (`--community-verify-profiles`, stage 1 of the live-profile switch).
-/// The legacy profile is always verified. The interleaved-RoPE profile is
-/// opt-in; with it off, every check below is exactly the legacy-only check.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CommunityVerifyProfiles {
     interleaved_rope: bool,
 }
 
 impl CommunityVerifyProfiles {
-    /// Parse a comma-separated list of short profile names. The legacy
-    /// profile must stay listed: live jobs use it, and retiring it is a later
-    /// decision that needs the issue side first.
     pub fn parse(list: &str) -> Result<Self, String> {
         let mut legacy = false;
         let mut interleaved_rope = false;
@@ -823,12 +459,10 @@ impl CommunityVerifyProfiles {
         Ok(Self { interleaved_rope })
     }
 
-    /// Whether the interleaved-RoPE profile is verified here.
     pub fn interleaved_rope(&self) -> bool {
         self.interleaved_rope
     }
 
-    /// The exact profile id when this validator verifies `profile`.
     fn verified(&self, profile: &str) -> Option<&'static str> {
         use arc_inference::cached_integer_model::{
             CANONICAL_REWARD_INFERENCE_PROFILE, GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
@@ -843,21 +477,13 @@ impl CommunityVerifyProfiles {
     }
 }
 
-/// What `serve` needs for `--community-verify-profiles`. The default is the
-/// legacy profile only, with no Q/K copy and no extra announcements.
 #[derive(Default)]
 pub struct CommunityProfileServing {
     pub verify: CommunityVerifyProfiles,
-    /// The interleaved-RoPE Q/K rows of this shard holder's resident layers.
     pub interleaved_rope_qk: Option<Arc<arc_inference::cached_integer_model::InterleavedRopeQk>>,
-    /// This holder's ranges announced under the interleaved-RoPE profile.
     pub interleaved_rope_shard_infos: Vec<ShardInfo>,
 }
 
-/// Shard-registry key for one announcement. Every profile except the
-/// interleaved-RoPE one keeps the historical `socket#start-end` key, so the
-/// registry is unchanged until a holder announces that profile. Its entries
-/// then sit beside the same holder's legacy entries instead of replacing them.
 fn shard_registry_key(shard: &ShardInfo) -> String {
     let key = format!(
         "{}#{}-{}",
@@ -872,9 +498,6 @@ fn shard_registry_key(shard: &ShardInfo) -> String {
     }
 }
 
-/// Per-request KV-cache key on a shard holder. The legacy profile keeps the
-/// caller's request id. The interleaved-RoPE profile caches different K rows,
-/// so it gets its own entry, and one request can never mix the two.
 fn shard_kv_cache_key(request_id: &str, execution_profile: &str) -> String {
     if execution_profile
         == arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
@@ -885,9 +508,6 @@ fn shard_kv_cache_key(request_id: &str, execution_profile: &str) -> String {
     }
 }
 
-/// Bytes a shard holder keeps resident for its layer weights, in the
-/// `I8Weights::memory_bytes` accounting the node has always announced. It
-/// includes the interleaved-RoPE Q/K copy when one is loaded.
 pub fn shard_resident_weight_bytes(
     model: &arc_inference::cached_integer_model::CachedIntegerModel,
     interleaved_rope_qk: Option<&arc_inference::cached_integer_model::InterleavedRopeQk>,
@@ -909,10 +529,6 @@ pub fn shard_resident_weight_bytes(
     layers + interleaved_rope_qk.map_or(0, |copy| copy.memory_bytes())
 }
 
-/// Announcements for this node's held ranges: the legacy list, as before,
-/// and the same ranges under the interleaved-RoPE profile when its Q/K copy
-/// is resident. Memory counts the copy, so each entry reports what this
-/// holder keeps resident for that range.
 pub fn shard_announcements(
     model: &arc_inference::cached_integer_model::CachedIntegerModel,
     ranges: &[(usize, usize)],
@@ -956,61 +572,29 @@ pub fn shard_announcements(
     (legacy, interleaved_rope)
 }
 
-/// A community worker: an arc-node running with --community-mode that
-/// registered via outbound HTTP POST. Workers contribute compute by
-/// polling /community/claim_work and POSTing results back. They do NOT
-/// participate in consensus or hold shards - they're pure volunteer
-/// compute providers. Their entries in the registry are TTL-pruned if
-/// they stop heartbeating.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommunityWorker {
-    /// Self-chosen worker ID (hex of validator pubkey or a uuid).
     pub worker_id: String,
-    /// Public display label, as produced by [`community_public_name`]: a
-    /// validated operator-chosen nickname, otherwise `node-` plus a short hash
-    /// of the worker's public key. Never a hostname or other machine metadata.
     pub name: String,
-    /// What this worker can do. For now: just "inference".
     pub capabilities: Vec<String>,
-    /// Model they can serve (matches coordinator's model_name exactly).
     pub model: Option<String>,
-    /// Exact model identity hash. Human-readable model names are display-only;
-    /// dispatch eligibility is always decided with this commitment.
     #[serde(default)]
     pub model_id: Option<String>,
-    /// Exact whole-model arithmetic profile. Reward work is dispatched only to
-    /// workers pinned to the canonical per-row INT8 profile.
     #[serde(default)]
     pub execution_profile: Option<String>,
-    /// OS + arch, for dashboard display.
     pub platform: String,
-    /// Unix timestamp of first registration (for "joined at").
     pub registered_at: u64,
-    /// Monotonic counter of work units completed (success only).
     pub work_completed: u64,
-    /// v0.7.0 scoring stats — populated by submit_work as jobs come in.
-    /// Used to rank workers in the /workers/scoreboard endpoint and
-    /// (in a future release) to bias dispatch toward higher-scoring
-    /// workers via per-worker job lanes.
-    /// Total successful submissions.
     #[serde(default)]
     pub success_count: u64,
-    /// Total submissions reporting failure.
     #[serde(default)]
     pub failure_count: u64,
-    /// Sum of total_ms across every successful submission. Average
-    /// latency per job = sum_total_ms_success / success_count when
-    /// success_count > 0.
     #[serde(default)]
     pub sum_total_ms_success: u64,
-    /// Last total_ms reported (most-recent latency datapoint).
     #[serde(default)]
     pub last_total_ms: u64,
 }
 
-/// Community worker TTL. Workers that haven't heartbeated within this
-/// window are pruned. Heartbeat interval is 15s, TTL is 90s, so a
-/// worker survives 5 missed heartbeats before being evicted.
 pub const COMMUNITY_WORKER_TTL_SECS: u64 = 90;
 const COMMUNITY_WORKER_REGISTRY_MAX: usize = 1_024;
 const COMMUNITY_WORKER_NAME_MAX_BYTES: usize = 96;
@@ -1019,18 +603,10 @@ const COMMUNITY_WORKER_MODEL_MAX_BYTES: usize = 128;
 const COMMUNITY_WORKER_CAPABILITIES_MAX: usize = 16;
 const COMMUNITY_WORKER_CAPABILITY_MAX_BYTES: usize = 32;
 
-/// Longest operator-chosen nickname shown on public worker scoreboards.
 pub const COMMUNITY_NICKNAME_MAX_BYTES: usize = 48;
 
-/// Hex characters of the worker address shown in the default public label.
 const COMMUNITY_DEFAULT_NAME_HEX_CHARS: usize = 8;
 
-/// The privacy-safe default public label for a community worker: `node-`
-/// plus the first eight hex characters of its address. A worker's address is
-/// the BLAKE3 hash of its public key, so the label is a short hash of the
-/// public key, stable for the life of the key, and lets an operator find
-/// their own row by address prefix. It is never derived from the hostname,
-/// user name, data directory, or any other machine metadata.
 pub fn community_default_public_name(worker_id: &str) -> String {
     let trimmed = worker_id.trim();
     let bare = trimmed
@@ -1039,22 +615,11 @@ pub fn community_default_public_name(worker_id: &str) -> String {
         .unwrap_or(trimmed);
     let digest_hex = match Hash256::from_hex(bare) {
         Ok(address) => address.to_hex(),
-        // Non-address IDs only exist in legacy or test registrations. Hash
-        // them so the label still reveals nothing beyond the ID itself.
         Err(_) => arc_crypto::hash_bytes(trimmed.as_bytes()).to_hex(),
     };
     format!("node-{}", &digest_hex[..COMMUNITY_DEFAULT_NAME_HEX_CHARS])
 }
 
-/// Accept an operator-chosen nickname for public display, or say why not.
-///
-/// A nickname is 1-48 ASCII letters, digits, spaces, `-` or `_`, starting and
-/// ending with a letter or digit. The narrow alphabet keeps markup, control,
-/// bidi-override, and look-alike characters off every validator's public
-/// scoreboard, and excludes the `.` and `(` of the legacy `name (hostname)`
-/// registrations. Names shaped like an operating system's default computer
-/// name are refused as well, because a person's first name is usually part
-/// of one ("Ada's MacBook Pro" becomes `Adas-MacBook-Pro`).
 pub fn validate_community_nickname(nickname: &str) -> Result<(), &'static str> {
     if nickname.is_empty() {
         return Err("nickname is empty");
@@ -1080,10 +645,6 @@ pub fn validate_community_nickname(nickname: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Default computer names that operating systems derive from the owner's
-/// name or that identify a specific machine: Apple's `<Name>s-MacBook-Pro`,
-/// `<Name>s-MBP`, `<Name>s-iMac`, `<Name>s-Mac-mini`; Windows' random
-/// `DESKTOP-XXXXXXX` / `LAPTOP-XXXXXXXX` and the older `<NAME>-PC`.
 fn looks_like_default_computer_name(nickname: &str) -> bool {
     const DEVICE_TOKENS: &[&str] = &[
         "macbook",
@@ -1121,26 +682,12 @@ fn looks_like_default_computer_name(nickname: &str) -> bool {
     tokens.len() >= 2 && tokens.last() == Some(&"pc")
 }
 
-/// The label a community worker is shown under on every public surface.
-///
-/// Returns the requested nickname when [`validate_community_nickname`]
-/// accepts it, and the worker's [`community_default_public_name`] otherwise.
-/// A nickname shaped like a default label (`node-` plus eight hex characters)
-/// is kept only when it is this worker's own default, so one worker cannot
-/// impersonate another's row.
-///
-/// Validators apply this when a worker registers and again whenever the
-/// registry is served, so a name stored before this rule existed (for example
-/// `arc-1a2b3c4d (Adas-MacBook-Pro.local)`) is never published.
 pub fn community_public_name(worker_id: &str, requested: &str) -> String {
     let default_name = community_default_public_name(worker_id);
     let nickname = requested.trim();
     if validate_community_nickname(nickname).is_err() {
         return default_name;
     }
-    // Compare case-folded, with `_` and spaces read as `-`, so look-alikes
-    // such as `Node-DeadBeef` or `node_deadbeef` cannot pass for another
-    // worker's default label either.
     let folded = nickname.to_ascii_lowercase().replace(['_', ' '], "-");
     let reserved_shape = folded.strip_prefix("node-").is_some_and(|suffix| {
         suffix.len() == COMMUNITY_DEFAULT_NAME_HEX_CHARS
@@ -1152,15 +699,8 @@ pub fn community_public_name(worker_id: &str, requested: &str) -> String {
     nickname.to_string()
 }
 
-/// Time a shard registry entry is considered fresh. Entries older than this
-/// are dropped at read time. Must be greater than the shard announcement
-/// broadcast interval (15s) with generous slack so a single lost announcement
-/// doesn't prune a live shard.
 pub const SHARD_REGISTRY_TTL_SECS: u64 = 60;
 
-/// Observe only fresh shard entries without changing the registry. Read-only
-/// preflight endpoints use this view so an HTTP GET cannot perform TTL cleanup
-/// or race a concurrent signed shard refresh.
 fn fresh_shards_snapshot(
     registry: &dashmap::DashMap<String, (ShardInfo, std::time::Instant)>,
 ) -> Vec<ShardInfo> {
@@ -1175,9 +715,6 @@ fn fresh_shards_snapshot(
         .collect()
 }
 
-/// Collect fresh shard entries, pruning stale ones that haven't been
-/// re-announced within SHARD_REGISTRY_TTL_SECS. Called by the pipeline walker
-/// and by the /shards GET endpoint so neither sees ghosts.
 fn fresh_shards(
     registry: &dashmap::DashMap<String, (ShardInfo, std::time::Instant)>,
 ) -> Vec<ShardInfo> {
@@ -1194,8 +731,6 @@ fn fresh_shards(
         }
     }
     for key in expired_keys {
-        // A signed announcement can refresh an entry after the scan. Remove
-        // only if the value is still expired while its shard lock is held.
         registry.remove_if(&key, |_, (_, timestamp)| {
             now.duration_since(*timestamp) > ttl
         });
@@ -1203,33 +738,15 @@ fn fresh_shards(
     keep
 }
 
-/// Rolling EWMA weight for new samples. α = 0.2 gives recent hops meaningful
-/// pull while keeping a multi-sample memory - a single outlier won't steal
-/// primary, but a sustained shift in latency rebalances within ~5-10 hops.
 const LATENCY_ALPHA: f64 = 0.2;
 
-/// How long a latency sample stays authoritative. Past this age the sample
-/// is treated as UNKNOWN rather than as fact.
-///
-/// Without this the map was insert-only: nothing ever removed, decayed or
-/// re-measured an entry. Live evidence (2026-08-16): every seed's table
-/// showed ages of 37,000-39,000 seconds — samples over ten hours old — and
-/// they still drove replica ordering. Worse, the ordering was
-/// self-reinforcing: run_sharded only ever dialled replicas[0], so a replica
-/// demoted by one bad sample received no further samples and could never
-/// climb back. LHR sat at an EWMA of 37,276 ms across all six seeds while
-/// its own recorded hops were 180-410 ms.
 pub const LATENCY_STALE_SECS: u64 = 300;
 
-/// Interval between background GET /health probes of known replica sockets.
 pub const LATENCY_PROBE_INTERVAL_SECS: u64 = 60;
 
-/// A recorded EWMA above this, AND more than `LATENCY_POISON_RATIO` times the
-/// replica's measured health RTT, is treated as poisoned rather than slow.
 pub const LATENCY_POISON_FLOOR_MS: f64 = 5_000.0;
 pub const LATENCY_POISON_RATIO: f64 = 20.0;
 
-/// Fold a real forward_shard hop observation into the EWMA for `socket`.
 pub fn record_latency(stats: &dashmap::DashMap<String, LatencyEWMA>, socket: &str, hop_ms: u64) {
     let hop = hop_ms as f64;
     let now = std::time::Instant::now();
@@ -1237,10 +754,6 @@ pub fn record_latency(stats: &dashmap::DashMap<String, LatencyEWMA>, socket: &st
         .entry(socket.to_string())
         .and_modify(|e| {
             if e.probe_only {
-                // The stored value was a health-probe placeholder, not a hop.
-                // Replace rather than blend — mixing a ~200 ms probe RTT into
-                // a hop EWMA would understate the hop cost for several
-                // dispatches.
                 e.ms = hop;
                 e.count = 1;
                 e.probe_only = false;
@@ -1258,8 +771,6 @@ pub fn record_latency(stats: &dashmap::DashMap<String, LatencyEWMA>, socket: &st
         });
 }
 
-/// Record a health-probe RTT as a PROVISIONAL latency for a socket we have no
-/// fresh hop sample for. Never overwrites a fresh hop measurement.
 pub fn record_probe_latency(
     stats: &dashmap::DashMap<String, LatencyEWMA>,
     socket: &str,
@@ -1282,9 +793,6 @@ pub fn record_probe_latency(
         });
 }
 
-/// The latency we are willing to ACT on for this replica, or `None` when we
-/// genuinely don't know. Ageing happens here rather than by mutating the map,
-/// so /inference/latency_stats can still show the raw sample and its age.
 pub fn effective_latency_ms(stat: &LatencyEWMA) -> Option<f64> {
     if stat.last_updated.elapsed().as_secs() >= LATENCY_STALE_SECS {
         None
@@ -1293,10 +801,6 @@ pub fn effective_latency_ms(stat: &LatencyEWMA) -> Option<f64> {
     }
 }
 
-/// Sort a replica bucket by *fresh* EWMA latency ascending. Replicas with no
-/// usable sample — never measured, or measured too long ago to trust — are
-/// placed AFTER measured ones but keep their insertion order, so an unknown
-/// replica is never starved of its next try.
 pub fn sort_replicas_by_latency(
     replicas: &mut [ShardInfo],
     stats: &dashmap::DashMap<String, LatencyEWMA>,
@@ -1317,28 +821,11 @@ pub fn sort_replicas_by_latency(
     });
 }
 
-/// Decide whether a recorded EWMA should be discarded in favour of a fresh
-/// health-probe RTT. Pure function so the policy is unit-testable.
-///
-/// A node can be genuinely slow, and we must not erase that. But an EWMA of
-/// 37 seconds against a socket that answers /health in 200 ms is not "slow" —
-/// it is a fossil from an incident that ended hours ago, and because the
-/// router never re-dials a demoted replica it would never be corrected.
 pub fn probe_supersedes_recorded(recorded_ms: f64, probe_ms: u64) -> bool {
     recorded_ms > LATENCY_POISON_FLOOR_MS
         && recorded_ms > LATENCY_POISON_RATIO * (probe_ms.max(1) as f64)
 }
 
-// ─── Runtime compute-pool control ──────────────────────────────────────────
-
-/// Run `f` on this node's dedicated rayon pool when one is configured, else
-/// on rayon's implicit global pool.
-///
-/// Everything inside `f` — including the `into_par_iter()` over attention
-/// heads in `forward_shard_token` and the `par_chunks_mut` inside every
-/// matmul — picks up the installed pool, because rayon resolves the current
-/// pool from the calling thread. That is what makes POST /node/threads
-/// actually move CPU utilisation instead of just changing a number.
 pub fn install_on_compute_pool<R, F>(node: &NodeState, f: F) -> R
 where
     F: FnOnce() -> R + Send,
@@ -1351,15 +838,6 @@ where
     }
 }
 
-/// The node's dedicated inference pool, as a handle that work started before
-/// the RPC server can hold.
-///
-/// main.rs spawns the community worker loop before `serve` builds the
-/// `NodeState`, so the loop cannot reach `node.compute_pool`. It holds this
-/// handle instead, and `serve` attaches the same handle to the node. As a
-/// result, `--threads`, `[inference] threads` and `POST /node/threads` size the
-/// pool that community jobs run on. With none of them set, `install` runs the
-/// job on the calling thread with rayon's global pool, exactly as before.
 #[derive(Clone, Default)]
 pub struct ComputePool {
     pool: Arc<parking_lot::RwLock<Option<Arc<rayon::ThreadPool>>>>,
@@ -1367,8 +845,6 @@ pub struct ComputePool {
 }
 
 impl ComputePool {
-    /// Run `f` on the dedicated pool when one is configured, else on the
-    /// calling thread, where rayon work goes to its global pool.
     pub fn install<R, F>(&self, f: F) -> R
     where
         F: FnOnce() -> R + Send,
@@ -1381,18 +857,12 @@ impl ComputePool {
         }
     }
 
-    /// Make `node`'s pool controls and local compute use this same pool.
     fn attach(&self, node: &mut NodeState) {
         node.compute_pool = self.pool.clone();
         node.compute_threads = self.threads.clone();
     }
 }
 
-/// Build (or rebuild) the dedicated compute pool at `threads` width.
-///
-/// `threads == 0` drops the dedicated pool and returns the node to rayon's
-/// global pool. The old pool is dropped once the last in-flight `install()`
-/// releases its Arc, so a rebuild never interrupts a request already running.
 pub fn set_compute_threads(node: &NodeState, threads: usize) -> Result<usize, String> {
     if threads == 0 {
         *node.compute_pool.write() = None;
@@ -1413,8 +883,6 @@ pub fn set_compute_threads(node: &NodeState, threads: usize) -> Result<usize, St
     Ok(threads)
 }
 
-/// Threads rayon's GLOBAL pool will use: `RAYON_NUM_THREADS` when set and
-/// parseable, otherwise the machine's available parallelism.
 pub fn rayon_global_width() -> usize {
     std::env::var("RAYON_NUM_THREADS")
         .ok()
@@ -1427,39 +895,35 @@ pub fn rayon_global_width() -> usize {
         })
 }
 
-// ─── Shared pipeline assembly ──────────────────────────────────────────────
-
-/// One hop of the pipeline: the layer range, plus every replica that can
-/// serve it, ordered best-first.
 pub type PipelineHop = ((usize, usize), Vec<ShardInfo>);
 
-/// Why the shard registry could not be turned into a runnable pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PipelineError {
-    /// The coordinator has no commitment for its source model artifact.
     ModelIdentityUnavailable,
-    /// Shards exist, but none commit to the coordinator's exact artifact.
-    NoMatchingModel { model_id: Hash256 },
-    /// Exact-artifact shards exist, but none advertise the required execution
-    /// profile (or every matching announcement omitted/invalidated it).
-    NoMatchingExecutionProfile { execution_profile: String },
-    /// Exact-artifact shards advertise profiles, but no one profile covers the
-    /// model end-to-end. Combining them would corrupt hidden-state semantics.
-    NoCompleteExecutionProfile { profiles: Vec<String> },
-    /// Registry is empty (or every entry was a stub).
+    NoMatchingModel {
+        model_id: Hash256,
+    },
+    NoMatchingExecutionProfile {
+        execution_profile: String,
+    },
+    NoCompleteExecutionProfile {
+        profiles: Vec<String>,
+    },
     NoShards,
-    /// A shard reached an authenticated/readiness path without the validator
-    /// identity bound by its signed announcement.
-    MissingValidatorIdentity { node: String, addr: String },
-    /// Coverage stops before the model does.
+    MissingValidatorIdentity {
+        node: String,
+        addr: String,
+    },
     Gap {
         expected: usize,
         got: (usize, usize),
         node: String,
         addr: String,
     },
-    /// Coverage ran out before reaching n_layers.
-    Incomplete { covered: usize, total: usize },
+    Incomplete {
+        covered: usize,
+        total: usize,
+    },
 }
 
 impl std::fmt::Display for PipelineError {
@@ -1512,8 +976,6 @@ impl std::fmt::Display for PipelineError {
 }
 
 impl PipelineError {
-    /// The error for a public response: the same text without shard node
-    /// names or socket addresses. Callers log the full `Display` text.
     fn public_message(&self) -> String {
         match self {
             PipelineError::MissingValidatorIdentity { .. } => {
@@ -1528,9 +990,6 @@ impl PipelineError {
     }
 }
 
-/// What a public caller sees when the validator shard pipeline fails while it
-/// runs. The error names shard holders, their socket addresses and request
-/// URLs, so its detail goes to this node's log only.
 const SHARD_PIPELINE_FAILED: &str = "the validator shard pipeline could not complete this request; the detail is in this node's log";
 
 fn public_pipeline_run_error(request_id: &str, error: String) -> (StatusCode, Json<ApiError>) {
@@ -1538,12 +997,8 @@ fn public_pipeline_run_error(request_id: &str, error: String) -> (StatusCode, Js
     api_error(StatusCode::BAD_GATEWAY, SHARD_PIPELINE_FAILED)
 }
 
-/// The worker's answer when its result could not be verified yet. The
-/// verifier's reason goes to this coordinator's log.
 const COMMUNITY_VERIFICATION_UNAVAILABLE: &str = "community result could not complete independent verification and remains retryable; the detail is in the coordinator's log";
 
-/// The public text for a pipeline that could not be assembled. The full
-/// error, with shard node names and socket addresses, goes to this node's log.
 fn public_pipeline_assembly_reason(error: PipelineError) -> String {
     tracing::warn!(%error, "validator shard pipeline could not be assembled");
     error.public_message()
@@ -1556,11 +1011,6 @@ fn public_pipeline_assembly_error(error: PipelineError) -> (StatusCode, Json<Api
     )
 }
 
-/// Signed shard announcements retain the authenticated validator identity in
-/// the registry's `node_name` field. That field is also serialized by the
-/// legacy `/shards` view, so live callers must treat it as the canonical ID;
-/// human-readable names remain valid only for the legacy/free compatibility
-/// helper and cannot enter readiness or reward verification.
 fn parse_canonical_shard_validator_identity(value: &str) -> Option<Hash256> {
     let identity = parse_hash256_hex(value, "shard validator identity").ok()?;
     (value == format!("0x{}", identity.to_hex())).then_some(identity)
@@ -1571,49 +1021,6 @@ fn bind_shard_registry_identity(mut shard: ShardInfo, validator: Hash256) -> Sha
     shard
 }
 
-/// Turn a flat list of announced shards into a runnable pipeline: one entry
-/// per layer range in walk order, each carrying its full replica list ordered
-/// best-first.
-///
-/// This is THE pipeline planner. /inference/run_sharded, /inference/run_consensus
-/// and /inference/auto all call it, because three separate implementations of
-/// this logic is exactly how the live network ended up with three different
-/// answers to "is the pipeline complete?":
-///
-///   - run_sharded had the repaired version (commit 30b3113).
-///   - run_consensus — the endpoint the desktop actually calls — still had the
-///     pre-30b3113 version: it PRESERVED a stub-only bucket instead of dropping
-///     it, and its coverage walk had no overlap skip. That is the source of
-///     "Pipeline gap: expected layer 32 next, got [28, 30)" on every coordinator
-///     whenever the retired SAO/JNB shards were still registered.
-///   - /inference/auto walked the raw replica list with no dedupe at all, so on
-///     a 3x-replicated network the second [0, 6) replica made `contiguous`
-///     false immediately. `has_full_pipeline` was therefore false for ANY
-///     replication factor > 1 and /inference/auto never once took its own
-///     documented best path.
-///
-/// Steps, in order:
-///   1. bucket announcements by (start_layer, end_layer);
-///   2. dedupe per authenticated validator identity inside each bucket,
-///      preferring a routable addr over a stub (a rebooted coordinator's
-///      self-announce and the gossiped copy land under different registry
-///      keys);
-///   3. drop stub addrs UNCONDITIONALLY, then drop buckets left empty. The old
-///      run_consensus kept a stub "as a fallback" when no routable replica
-///      existed — that is how a community worker announcing 127.0.0.1:9090
-///      with an off-grid [0, 8) range became the only candidate for layer 0
-///      and walked the pipeline off the rails. Honest failure beats fake
-///      liveness;
-///   4. order each bucket by fresh EWMA latency;
-///   5. greedy contiguous cover from layer 0, skipping any range that starts
-///      inside already-covered territory (an off-grid [0, 8) alongside the
-///      standard [0, 6)/[6, 12) tiling must not manufacture a false gap).
-///
-/// The returned Vec IS the pipeline: callers index prefill workers, the decode
-/// loop, the trace and cleanup off this one vector. Previously run_sharded
-/// built a filtered `pipeline` for some of those and indexed the UNFILTERED
-/// `pipeline_ranges` for the others, so any off-grid range silently shifted
-/// the walk by one hop.
 pub fn assemble_pipeline(
     announced: Vec<ShardInfo>,
     stats: &dashmap::DashMap<String, LatencyEWMA>,
@@ -1621,10 +1028,6 @@ pub fn assemble_pipeline(
     assemble_pipeline_with_identity_policy(announced, stats, false)
 }
 
-/// Assemble a pipeline while optionally requiring the validator identity that
-/// was bound by `/shards/announce`. The public helper retains its historical
-/// display-name compatibility for local/free tests and observers; all live
-/// readiness and reward verification paths use the strict variant.
 fn assemble_pipeline_with_identity_policy(
     announced: Vec<ShardInfo>,
     stats: &dashmap::DashMap<String, LatencyEWMA>,
@@ -1677,8 +1080,6 @@ fn assemble_pipeline_with_identity_policy(
             .collect();
     }
 
-    // BTreeMap already iterates in (start, end) order, so the SHORTEST range
-    // beginning at each layer is seen first.
     let candidates: Vec<PipelineHop> = by_range
         .into_iter()
         .map(|(range, replicas)| {
@@ -1700,8 +1101,6 @@ fn assemble_pipeline_with_identity_policy(
             break;
         }
         if start < covered_to {
-            // Overlaps a range we already took: a duplicate, or an off-grid
-            // alternative we chose not to walk.
             continue;
         }
         if start != covered_to {
@@ -1724,8 +1123,6 @@ fn assemble_pipeline_with_identity_policy(
     Ok(chosen)
 }
 
-/// Filter announcements by exact artifact commitment before planning. Invalid
-/// or legacy shape-derived IDs are ineligible rather than silently co-mingled.
 pub fn assemble_pipeline_for_model(
     announced: Vec<ShardInfo>,
     expected_model_id: Hash256,
@@ -1735,19 +1132,12 @@ pub fn assemble_pipeline_for_model(
         .map(|selection| selection.hops)
 }
 
-/// A runnable pipeline whose every replica commits to one exact arithmetic
-/// profile. Keeping the profile beside the hop vector prevents callers from
-/// accidentally dropping the identity after planning and then reporting the
-/// coordinator's local tokenizer profile instead.
 #[derive(Debug, Clone)]
 pub struct ProfileBoundPipeline {
     pub hops: Vec<PipelineHop>,
     pub execution_profile: String,
 }
 
-/// Filter by exact source artifact, then plan each execution profile in
-/// isolation. A pipeline is returned only when one profile covers every layer;
-/// ranges from I8/I16/Q4/etc. are never welded into one walk.
 pub fn assemble_profile_bound_pipeline_for_model(
     announced: Vec<ShardInfo>,
     expected_model_id: Hash256,
@@ -1838,8 +1228,6 @@ fn assemble_profile_bound_pipeline_for_model_with_identity_policy(
     Err(PipelineError::NoCompleteExecutionProfile { profiles })
 }
 
-/// `assemble_pipeline` against this node's live registry, restricted to this
-/// coordinator's exact source artifact.
 pub fn assemble_pipeline_for(node: &NodeState) -> Result<Vec<PipelineHop>, PipelineError> {
     assemble_profile_bound_pipeline_for(node, None).map(|selection| selection.hops)
 }
@@ -1860,11 +1248,6 @@ pub fn assemble_profile_bound_pipeline_for(
     )
 }
 
-/// Build a `NodeState` from components.
-// These are the node's runtime handles, not a parameter list that wants
-// grouping: four of them are `Option<Arc<..>>` and two are `Hash256`, so
-// collapsing them into a struct trades a compiler-checked positional error
-// for a silent field mix-up at every call site. Kept explicit on purpose.
 #[allow(clippy::too_many_arguments)]
 pub fn build_node_state(
     state: Arc<StateDB>,
@@ -1939,8 +1322,6 @@ pub fn build_node_state(
         sharded_runs_total: Arc::new(AtomicU64::new(0)),
         sharded_bytes_total: Arc::new(AtomicU64::new(0)),
         attestation_nonce: Arc::new(AtomicU64::new(0)),
-        // 10_000-entry deterministic cache for sharded inference results.
-        // LRU eviction by hit_count when full.
         inference_cache: Arc::new(arc_inference::distributed::DistributedCache::new(10_000)),
         multi_model_registry: Arc::new(arc_inference::distributed::ShardRegistry::new()),
         verification_manager: Arc::new(std::sync::Mutex::new(
@@ -1961,11 +1342,6 @@ pub fn build_node_state(
         community_verified_settlements: Arc::new(dashmap::DashMap::new()),
         community_verified_settlements_gate: Arc::new(parking_lot::Mutex::new(())),
         community_settlement_journal_dir,
-        // Community work dispatch — bounded mpsc with 256-slot buffer. New
-        // jobs that arrive when 256 are already queued get backpressure
-        // (the dispatcher in /inference/run awaits .send().await). Workers
-        // long-poll the receiver in claim_work; multiple handlers race for
-        // each item via the tokio Mutex.
         community_work_tx: None,
         community_work_queue: None,
         community_work_results: None,
@@ -1974,11 +1350,6 @@ pub fn build_node_state(
         community_twin: Arc::new(twin_dispatch::CommunityTwinState::new(
             crate::twin::TwinConfig::default(),
         )),
-        // One client, one connection pool, for the life of the process.
-        // `pool_idle_timeout` is deliberately longer than the 15 s shard
-        // announcement tick so an idle inter-seed connection survives between
-        // requests. Falls back to a default client if the builder ever fails
-        // (it can't in practice — no TLS backend selection happens here).
         inference_http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::none())
@@ -1992,8 +1363,6 @@ pub fn build_node_state(
         compute_threads: Arc::new(AtomicU32::new(0)),
         seed_rpc_addrs: Arc::new(Vec::new()),
         community_rpc_bases: Arc::new(Vec::new()),
-        // No genesis file is visible from here; `serve` overwrites this when
-        // main.rs was given --genesis.
         chain_identity: None,
         native_serving: None,
         native_request_admission: Arc::new(
@@ -2011,10 +1380,6 @@ pub fn build_node_state(
     }
 }
 
-/// Push `v` onto a bounded sample ring, evicting the oldest first so the ring
-/// always holds the most RECENT `cap` measurements. Split out from
-/// `record_own_compute_ms` so the eviction policy is unit-testable without
-/// constructing a whole `NodeState`.
 fn push_bounded(ring: &mut std::collections::VecDeque<u64>, v: u64, cap: usize) {
     if cap == 0 {
         return;
@@ -2025,8 +1390,6 @@ fn push_bounded(ring: &mut std::collections::VecDeque<u64>, v: u64, cap: usize) 
     ring.push_back(v);
 }
 
-/// Record one of THIS node's own `forward_shard` compute measurements.
-/// Keeps at most `OWN_COMPUTE_SAMPLE_CAP` samples, evicting oldest first.
 fn record_own_compute_ms(node: &NodeState, compute_ms: u64) {
     push_bounded(
         &mut node.own_compute_ms.lock(),
@@ -2035,8 +1398,6 @@ fn record_own_compute_ms(node: &NodeState, compute_ms: u64) {
     );
 }
 
-/// Arithmetic mean of `samples`. `None` for an empty slice — an average of no
-/// measurements is not zero, it is unknown.
 fn mean_u64(samples: &[u64]) -> Option<f64> {
     if samples.is_empty() {
         return None;
@@ -2045,9 +1406,6 @@ fn mean_u64(samples: &[u64]) -> Option<f64> {
     Some(sum as f64 / samples.len() as f64)
 }
 
-/// Median (p50) of `samples`. For an even sample count this returns the LOWER
-/// of the two middle values rather than interpolating, so the reported figure
-/// is always a value that was actually measured. `None` for an empty slice.
 fn p50_u64(samples: &[u64]) -> Option<u64> {
     if samples.is_empty() {
         return None;
@@ -2057,13 +1415,6 @@ fn p50_u64(samples: &[u64]) -> Option<u64> {
     Some(sorted[(sorted.len() - 1) / 2])
 }
 
-/// How many more verified community-job rewards the treasury can still pay:
-/// `floor(treasury_balance / reward_per_attestation)`.
-///
-/// The reward is a TRANSFER out of a finite treasury, not an emission, so a
-/// projection that ignores the remaining pool is dishonest — this is the term
-/// that makes "you will earn X/day forever" false. `None` when the reward per
-/// attestation is zero, where the quotient is undefined rather than infinite.
 pub fn rewards_remaining(treasury_balance: u64, reward_per_attestation: u64) -> Option<u64> {
     if reward_per_attestation == 0 {
         return None;
@@ -2071,29 +1422,15 @@ pub fn rewards_remaining(treasury_balance: u64, reward_per_attestation: u64) -> 
     Some(treasury_balance / reward_per_attestation)
 }
 
-/// Registered-vs-active split of a validator set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatorSplit {
-    /// Every entry in the set, including zero-stake ones.
     pub registered: usize,
-    /// Entries whose stake meets `min_active_stake`.
     pub active: usize,
-    /// Entries carrying exactly zero stake.
     pub zero_stake: usize,
-    /// Sum of all stake in the set.
     pub total_stake: u64,
-    /// Sum of stake across active entries only.
     pub active_stake: u64,
 }
 
-/// Split a validator set into registered vs active at `min_active_stake`.
-///
-/// Exists because `/validators`, `/health` and `/stats` all report
-/// `dag_validators.len()`, which counts zero-stake peers. On the live network
-/// that inflates the set by 4 of 14: those peers cannot vote and cannot
-/// produce, so every count derived from the raw length overstates the network.
-/// A zero `min_active_stake` still leaves zero-stake entries inactive — a
-/// validator with no stake at risk is not securing anything.
 pub fn split_validators(validators: &[(Hash256, u64)], min_active_stake: u64) -> ValidatorSplit {
     let mut split = ValidatorSplit {
         registered: validators.len(),
@@ -2116,18 +1453,6 @@ pub fn split_validators(validators: &[(Hash256, u64)], min_active_stake: u64) ->
     split
 }
 
-/// Observed attestation rate, in attestations per day, measured from the block
-/// TIMESTAMPS of the first and last attestation this node can see.
-///
-/// Returns `Err(reason)` — never a number — whenever the rate is not
-/// computable. No assumed block time is involved: a nominal 400 ms block time
-/// applied to a chain that has sealed nothing for six days would manufacture a
-/// throughput figure out of a stall.
-///
-/// `n` attestations spanning the window define `n - 1` intervals, so the rate
-/// is `(n - 1) / elapsed_days`. Using `n / elapsed_days` would overstate the
-/// rate by a full interval, which matters most at the low counts real workers
-/// have (2 attestations would read as double the observed rate).
 const MIN_REWARD_RATE_RECEIPTS: u64 = 3;
 const MIN_REWARD_RATE_WINDOW_MS: u64 = 86_400_000;
 
@@ -2168,24 +1493,10 @@ pub fn attestations_per_day_observed(
     Ok((count - 1) as f64 * 86_400_000.0 / elapsed_ms as f64)
 }
 
-/// The most recent block actually PRESENT in this node's block store.
-///
-/// Not the same as `get_block(state.height())`, and the difference is not
-/// theoretical: on a chain sealing blocks every ~100 ms, the height counter
-/// advances before the block body is inserted, so a direct lookup at `height()`
-/// misses most of the time. A producing node then reports no block hash, no
-/// block timestamp and a null age — i.e. it looks exactly like a stalled one,
-/// which is the single distinction `/network/info` exists to make. Non-archive
-/// pruning can also leave the newest retained block below `height()`.
-///
-/// Scans back at most `SELF_PRODUCED_SCAN_BLOCKS` and returns the first block
-/// found, so the reported height/hash/timestamp always describe a real block.
 fn latest_available_block(node: &NodeState) -> Option<Block> {
     latest_available_block_at(node, node.state.height())
 }
 
-/// Select the newest extant block at or below the observed height. Keeping
-/// the bound explicit makes the reserved-height window deterministic to test.
 fn latest_available_block_at(node: &NodeState, h: u64) -> Option<Block> {
     let floor = h.saturating_sub(SELF_PRODUCED_SCAN_BLOCKS);
     let mut i = h;
@@ -2200,8 +1511,6 @@ fn latest_available_block_at(node: &NodeState, h: u64) -> Option<Block> {
     }
 }
 
-/// Wall-clock unix milliseconds, for display-only age math. Never consensus
-/// input: nothing derived from this reaches a block, a hash or a vote.
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2209,10 +1518,6 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Remove request/response content recursively before retention or public
-/// serialization. Hash commitments and operational timing remain useful to
-/// the explorer; raw prompts, generated text and token arrays do not belong in
-/// a process-wide public activity feed.
 fn public_inference_metadata(mut value: Value) -> Value {
     fn scrub(value: &mut Value) {
         match value {
@@ -2277,9 +1582,6 @@ fn retain_inference_result(node: &NodeState, record_id: String, value: Value) {
     node.inference_results.insert(record_id, safe);
 }
 
-/// Age in seconds of a unix-millis timestamp, saturating at zero. `None` when
-/// the timestamp is zero (absent) or lies in the future by more than a second
-/// — a negative age is a clock disagreement, not an age.
 fn age_secs_from_ms(ts_ms: u64) -> Option<u64> {
     if ts_ms == 0 {
         return None;
@@ -2291,21 +1593,6 @@ fn age_secs_from_ms(ts_ms: u64) -> Option<u64> {
     Some(now.saturating_sub(ts_ms) / 1_000)
 }
 
-/// An explorer link for an attestation tx, and the reason when there isn't one.
-///
-/// Returns `(explorer_url, unavailable_reason)`. The URL is non-null ONLY when
-/// the transaction actually exists in a block on this node.
-///
-/// This used to be an unconditional `format!("/tx/0x{hash}")`, emitted the
-/// instant the tx was inserted into the mempool. On a chain that is not sealing
-/// blocks that link never resolves: `/tx/{hash}` answers
-/// `{"error":"Transaction ... not found"}` forever, so the demo handed the
-/// caller a receipt for a transaction that did not exist and never would. A
-/// link that is not yet valid is not a link — it is an invented fact, and the
-/// caller cannot tell the difference from a real one.
-///
-/// When the chain is stalled this says so explicitly rather than saying
-/// "pending", because "pending" implies it is coming.
 fn explorer_url_for(
     node: &NodeState,
     tx_hash: &arc_crypto::Hash256,
@@ -2327,8 +1614,6 @@ fn explorer_url_for(
         );
     }
 
-    // Submitted, not yet in a block. Whether it ever will be depends on this
-    // chain still sealing — which is a fact we hold, so state it.
     let chain_advancing = latest_available_block(node)
         .and_then(|b| age_secs_from_ms(b.header.timestamp))
         .map(|age| age <= BLOCK_PRODUCTION_FRESH_SECS);
@@ -2352,17 +1637,8 @@ fn explorer_url_for(
     (Value::Null, Some(reason))
 }
 
-/// Capacity of the community work mpsc. Each slot is a single whole-prompt
-/// job; under heavy load the dispatcher's `.send().await` provides natural
-/// backpressure without unbounded memory growth.
 const COMMUNITY_WORK_QUEUE_CAP: usize = 256;
 
-/// Start the RPC server.
-// Same reasoning as `build_node_state`, more so: this is the single process
-// entry point for the RPC layer and several parameters share a type
-// (`Option<Arc<AtomicU64>>` twice, `Vec<String>`/`Vec<ShardInfo>`). A params
-// struct would compile just as happily with two of them transposed, which is
-// exactly the failure this signature makes impossible.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     listen: RpcListen,
@@ -2382,42 +1658,18 @@ pub async fn serve(
     dag_committed: Option<Arc<AtomicU64>>,
     consensus_engine: Option<Arc<arc_consensus::ConsensusEngine>>,
     shard_infos: Vec<ShardInfo>,
-    // seed_rpc_addrs: configured absolute RPC origins used only to authorize
-    //   destinations subsequently bound by signed shard announcements. Seed
-    //   reads never import or refresh live topology.
     seed_rpc_addrs: Vec<String>,
-    // Validated absolute http(s) origins for community/reward traffic.
-    // Remote production origins are HTTPS; plaintext is loopback/dev only.
     community_rpc_bases: Vec<String>,
-    // compute_threads: dedicated inference-pool width; 0 = rayon's global pool.
     compute_threads: usize,
-    // compute_pool: the pool handle the community worker loop already holds.
-    //   The node's pool controls (`compute_threads`, POST /node/threads) size
-    //   this same pool, so they apply to community jobs too.
     compute_pool: ComputePool,
-    // chain_identity: the genesis file's declared chain name / chain_id, when
-    //   the node was started with --genesis. Surfaced by GET /network/info so
-    //   the desktop never has to guess which chain it is talking to.
     chain_identity: Option<ChainIdentity>,
-    // Local issuance half of the two-part rollout gate. Consensus activation
-    // comes from canonical genesis and is enforced independently by StateDB.
     community_rewards_v1_enabled: bool,
-    // native_serving: what this node's protocol-4 native worker executes,
-    //   when it runs one (context/tokenize endpoints only).
     native_serving: Option<Arc<crate::native_inference::NativeServing>>,
     native_request_admission: Arc<crate::native_inference::NativeRequestAdmission>,
-    // When present, stop accepting new RPC work after the lifecycle owner
-    // sends `true` and let Axum drain every active handler before returning.
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     transport_wire_policy: Arc<arc_net::transport::TransportWirePolicy>,
-    // Twin execution v0 and generated community demand
-    // (docs/twin-execution.md). Every switch defaults to off.
     community_twin: crate::twin::TwinConfig,
-    // Answer a verified single-worker community job before its reward
-    // approvals (`--community-release-on-verification`). Defaults to off.
     community_release_on_verification: bool,
-    // --community-verify-profiles (stage 1 of the live-profile switch).
-    // The default verifies, serves and announces the legacy profile only.
     community_profiles: CommunityProfileServing,
 ) -> anyhow::Result<()> {
     if community_rewards_v1_enabled && state.community_rewards_v1_activation_height().is_none() {
@@ -2438,7 +1690,6 @@ pub async fn serve(
         candle_model_id,
         model_artifact_id,
     );
-    // Before anything clones the node: every clone must share this pool.
     compute_pool.attach(&mut node);
     node.runtime_shutdown = shutdown.clone();
     node.transport_wire_policy = transport_wire_policy;
@@ -2470,15 +1721,6 @@ pub async fn serve(
         node.dag_committed = c;
     }
 
-    // ── Community work dispatch wiring ──────────────────────────────────
-    // Every node's RPC server now exposes a real mpsc-backed work queue.
-    // Producers (the smart router in /inference/run, task 2 of v0.7.0)
-    // push WorkItems via `community_work_tx`; consumers
-    // (/community/claim_work long-pollers) drain via `community_work_queue`.
-    // Results land back via the `community_work_results` oneshot map
-    // keyed by job_id. Pre-v0.7.0 these were `None` so claim_work always
-    // returned 503 — that's why every community worker reported 0
-    // attestations forever.
     let (work_tx, work_rx) = tokio::sync::mpsc::channel::<WorkItem>(COMMUNITY_WORK_QUEUE_CAP);
     node.community_work_tx = Some(Arc::new(work_tx));
     node.community_work_queue = Some(Arc::new(tokio::sync::Mutex::new(work_rx)));
@@ -2501,10 +1743,6 @@ pub async fn serve(
     }
     node.seed_rpc_addrs = Arc::new(seed_rpc_addrs);
     node.community_rpc_bases = Arc::new(community_rpc_bases);
-    // Seed the local registry with every range this node holds so /shards
-    // reports the full picture the moment RPC comes up. The registry is
-    // keyed by (socket_addr + range) so two entries with the same socket but
-    // different ranges coexist.
     for si in shard_infos.iter().chain(&interleaved_rope_shard_infos) {
         let key = shard_registry_key(si);
         node.shard_registry.insert(
@@ -2516,10 +1754,6 @@ pub async fn serve(
         );
     }
     if !shard_infos.is_empty() {
-        // Local configured shards are process-owned state, so refresh their
-        // TTL directly. This avoids a self-HTTP dependency and works equally
-        // for TCP development listeners and sealed production Unix listeners.
-        // Remote registries still accept only signed direct-holder announces.
         let refresh_registry = node.shard_registry.clone();
         let refresh_infos: Vec<ShardInfo> = shard_infos
             .iter()
@@ -2574,11 +1808,8 @@ pub async fn serve(
             }
         }
     });
-    // Rate-limited public demo and replay jobs for idle workers, when the
-    // operator enabled the demand pump.
     twin_dispatch::spawn_community_demand_pump(&node);
 
-    // ── Dedicated inference compute pool ────────────────────────────────
     if compute_threads > 0 {
         match set_compute_threads(&node, compute_threads) {
             Ok(n) => tracing::info!("Inference compute pool: {} threads (--threads)", n),
@@ -2596,18 +1827,6 @@ pub async fn serve(
         );
     }
 
-    // ── Background replica latency refresher ────────────────────────────
-    // The EWMA map used to be insert-only, so one bad incident pinned a
-    // replica's ordering forever: run_sharded only dialled replicas[0], the
-    // demoted replica received no further samples, and nothing ever
-    // re-measured it. LHR carried an EWMA of 37,276 ms on all six seeds
-    // while answering its own hops in 180-410 ms.
-    //
-    // This task GETs /health (read-only, no side effects) on every socket in
-    // the registry once a minute. It never invents a hop latency: a probe RTT
-    // is only used to (a) provide a provisional ordering hint for a replica we
-    // have no hop sample for at all, or (b) evict a recorded EWMA that the
-    // probe proves is a fossil. See `probe_supersedes_recorded`.
     {
         let probe_node = node.clone();
         let mut probe_shutdown = node.runtime_shutdown.clone();
@@ -2649,9 +1868,6 @@ pub async fn serve(
                         .map(|r| r.status().is_success())
                         .unwrap_or(false);
                     if !ok {
-                        // Unreachable: leave the recorded value alone. The
-                        // hop path's failover already handles a dead replica,
-                        // and inventing a latency for it would be a lie.
                         continue;
                     }
                     let probe_ms = t0.elapsed().as_millis() as u64;
@@ -2672,7 +1888,7 @@ pub async fn serve(
                                  reset to a provisional probe value so it can be re-measured"
                             );
                         }
-                        Some((_, false)) => { /* plausible hop sample: keep it */ }
+                        Some((_, false)) => {}
                         _ => record_probe_latency(&probe_node.latency_stats, &socket, probe_ms),
                     }
                 }
@@ -2685,15 +1901,10 @@ pub async fn serve(
         .route("/health", get(health))
         .route("/info", get(chain_info))
         .route("/node/info", get(node_info))
-        // Runtime inference width. GET reports the current pool; POST
-        // rebuilds it live, which is how an operator "adds two cores"
-        // mid-demo without restarting the node.
         .route(
             "/node/threads",
             get(get_node_threads).post(set_node_threads),
         )
-        // Additive honest-projection routes (v0.7.11+). Absent on every live
-        // seed (v0.7.2 / v0.7.9) — clients must treat 404 as "unknown".
         .route("/network/info", get(network_info))
         .route("/node/contribution", get(node_contribution))
         .route("/block/latest", get(get_latest_block))
@@ -2708,13 +1919,7 @@ pub async fn serve(
             post(submit_signed_tx)
                 .layer(DefaultBodyLimit::max(PUBLIC_TX_SUBMISSION_BODY_LIMIT_BYTES)),
         )
-        // Protocol-4 is activated only by a fresh, private genesis. Its
-        // request/finalize/refund envelopes still use the shared signed
-        // transaction ingress; this receipt view is read-only evidence of
-        // canonical settlement, never a finality claim.
         .route("/native-inference/context", get(native_inference_context))
-        // Read-only: this operator's row cohort, its bounded books and the
-        // recent placements (the node's own audit record, not consensus).
         .route("/assignment/cohort", get(assignment_cohort))
         .route(
             "/native-inference/tokenize",
@@ -2740,49 +1945,28 @@ pub async fn serve(
         .route("/tx/{hash}/full", get(get_full_transaction))
         .route("/contract/{address}", get(get_contract_info))
         .route("/contract/{address}/call", post(call_contract))
-        // Agents (Synths)
         .route("/agents", get(get_agents))
-        // Faucet (testnet token dispensing)
         .route("/faucet/claim", post(faucet_claim))
         .route("/faucet/status", get(faucet_status))
-        // Light Client Finality Proofs (A8)
         .route("/light/snapshot", get(light_snapshot))
         .route("/finality/latest", get(get_finality_latest))
         .route("/finality/{height}", get(get_finality_certificate))
         .route("/consensus/diagnostics", get(consensus_diagnostics))
-        // State Sync Protocol (A5) - snapshot bootstrap for new nodes
         .route("/sync/snapshot", get(sync_snapshot))
         .route("/sync/snapshot/info", get(sync_snapshot_info))
-        // Chunked State Sync - parallel chunk download for fast catch-up
         .route("/sync/manifest", get(sync_manifest))
         .route("/sync/chunk/{index}", get(sync_chunk))
         .route("/sync/status", get(sync_status))
-        // DAG round sync - allows new nodes to start at the right round
         .route("/sync/dag_state", get(sync_dag_state))
-        // Inference - run model and record attestation on-chain
         .route("/inference/run", post(inference_run))
-        // A mutation-free admission snapshot used by clients before they
-        // choose an inference write origin.  Once a client begins the POST it
-        // must treat every transport/status/parse failure as ambiguous and
-        // must not fall through to another coordinator.  Keeping this route
-        // beside `/inference/run` and deriving it from the same routing facts
-        // prevents a known observer/no-model state from consuming that
-        // one-write budget.
         .route(
             "/inference/readiness",
             get(inference_readiness).layer(DefaultBodyLimit::max(0)),
         )
         .route("/inference/attestations", get(inference_list_attestations))
         .route("/inference/results", get(inference_list_results))
-        // Per-worker earnings derived only from successful on-chain
-        // CommunityInferenceReward receipts (tx 0x25), never raw worker
-        // attestations (tx 0x16) or a synthesized count*2.5 estimate.
         .route("/worker/earnings/{address}", get(worker_earnings))
-        // v0.7.0: live community-worker leaderboard. Reads the in-memory
-        // CommunityWorker registry; no chain query. Sorted by composite
-        // score (success rate * 1000 - avg_ms). Dashboard renders this.
         .route("/workers/scoreboard", get(workers_scoreboard))
-        // Pipeline-parallel sharded inference
         .route("/inference/run_sharded", post(inference_run_sharded))
         .route("/inference/run_consensus", post(inference_run_consensus))
         .route(
@@ -2791,56 +1975,36 @@ pub async fn serve(
                 .layer(DefaultBodyLimit::max(MAX_FORWARD_SHARD_REQUEST_BYTES)),
         )
         .route("/inference/cleanup_shard", post(inference_cleanup_shard))
-        // Tier 1 status remains readable, but public writes fail closed until
-        // committee/VRF authorization and exact-artifact execution are bound
-        // end to end. The submit route is intentionally retained so clients
-        // receive an explicit 503 instead of mistaking a 404 for skew.
         .route("/inference/onchain/submit", post(inference_onchain_submit))
         .route(
             "/inference/onchain/result/{request_id}",
             get(inference_onchain_result),
         )
-        // Deterministic inference cache introspection
         .route("/inference/cache_stats", get(inference_cache_stats))
         .route("/inference/latency_stats", get(inference_latency_stats))
         .route("/inference/cache_check", post(inference_cache_check))
-        // Shard registry - discovery + announcement
         .route("/shards", get(get_shards))
         .route("/shards/announce", post(announce_shard))
-        // Multi-model registry - list all models and per-model shards
         .route("/models", get(get_models))
         .route("/models/shards", get(get_model_shards))
-        // Auto-sharding - compute optimal shard plan for a model
         .route("/shards/auto_plan", post(compute_auto_shard_plan))
-        // Auto-join: node with model asks coordinator for shard assignment
         .route("/shards/join", post(shard_join))
-        // Auto-routing inference: automatically picks best path
         .route("/inference/auto", post(inference_auto))
-        // Inference verification - commit-challenge system
         .route("/inference/commit", post(inference_commit))
         .route("/inference/challenge", post(inference_challenge))
         .route(
             "/inference/verification_status",
             get(inference_verification_status),
         )
-        // Revenue split info
         .route("/economics/revenue_split", get(get_revenue_split))
         .route("/economics/rewards", get(economics_rewards))
-        // Milestone C: read-only registry + demand discovery. Workers use
-        // these to discover what models exist and what ranges are open
-        // for the taking. Writes go through /tx/submit_signed like any
-        // other chain mutation - no dedicated POST endpoints needed for
-        // the MVP.
         .route("/models/registry", get(list_model_registry))
         .route("/models/open_requests", get(list_open_model_requests))
-        // Milestone D: capacity advertisement discovery + per-node
-        // assignment long-poll. Also read-only from the state.
         .route(
             "/capacity/advertisements",
             get(list_capacity_advertisements),
         )
         .route("/assignments/for_me", get(get_assignment_for_me))
-        // Community worker registration (HTTP-only, works behind NAT)
         .route(
             COMMUNITY_REGISTER_PATH,
             post(community_register_signed)
@@ -2852,13 +2016,10 @@ pub async fn serve(
                 .layer(DefaultBodyLimit::max(COMMUNITY_MUTATION_BODY_LIMIT_BYTES)),
         )
         .route("/community/list", get(community_list))
-        // This node's own community worker: state and job counters for the
-        // desktop app. Validators run no worker and answer 404.
         .route(
             crate::community_worker::COMMUNITY_WORKER_STATUS_PATH,
             get(community_worker_status),
         )
-        // Community inference work dispatch (long-poll claim + submit)
         .route(
             COMMUNITY_CLAIM_WORK_PATH,
             post(community_claim_work_signed)
@@ -2884,9 +2045,6 @@ pub async fn serve(
             get(community_reward_approval_status),
         )
         .route("/community/reward_policy", get(community_reward_policy))
-        // Twin execution v0 (docs/twin-execution.md): a worker's signed
-        // region report and read-only twin views. The sealed production
-        // gateway must allowlist these paths before they are public.
         .route(
             crate::twin::COMMUNITY_REGION_PATH,
             post(twin_dispatch::community_region_signed)
@@ -2904,28 +2062,16 @@ pub async fn serve(
             "/community/twin/{job_id}",
             get(twin_dispatch::community_twin_receipt),
         )
-        // Off-chain channel relay (WebSocket-style via long-poll for simplicity)
         .route("/channel/{channel_id}/relay", post(channel_relay))
         .route("/channel/{channel_id}/state", get(channel_state))
-        // ETH-compatible JSON-RPC (MetaMask, Hardhat, Foundry)
         .route("/eth", post(eth_json_rpc))
-        .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256 MB
-        // CORS is not an authorization boundary. Public reads remain broadly
-        // accessible; community mutations independently require signed PoP.
+        .layer(DefaultBodyLimit::max(256 * 1024 * 1024))
         .layer(CorsLayer::permissive())
         .with_state(node.clone());
 
-    // into_make_service_with_connect_info lets handlers extract
-    // RpcPeerAddr. announce_shard uses the real TCP peer to override stub
-    // `0.0.0.0:*` socket_addrs in shard announcements with the peer's real
-    // source IP. The production UDS path receives a loopback sentinel because
-    // nginx is the sealed peer; explicit origin configuration and signatures
-    // remain mandatory before a shard destination is accepted.
     let lifecycle_supervised = shutdown.is_some();
     let server_result = match listen {
         RpcListen::Tcp(address) => {
-            // SO_REUSEADDR: allow immediate rebind after process restart.
-            // Without this, the port stays in TIME_WAIT after a kill.
             let socket = tokio::net::TcpSocket::new_v4()?;
             socket.set_reuseaddr(true)?;
             socket.bind(address.parse()?)?;
@@ -2959,10 +2105,6 @@ pub async fn serve(
         }
     };
     if lifecycle_supervised {
-        // Axum has drained all accepted handlers, but a disconnected client can
-        // drop a spawn_blocking JoinHandle without stopping its CPU closure.
-        // Join node-owned journal/retry tasks and acquire every compute permit
-        // before returning to main's final StateDB WAL barrier.
         join_node_runtime_tasks(&node).await?;
         wait_for_inference_compute_barrier(&node).await?;
     }
@@ -3005,8 +2147,6 @@ where
     if node.runtime_shutdown.is_some() {
         node.runtime_tasks.lock().spawn(future);
     } else {
-        // Compatibility for unit fixtures and embedders that intentionally run
-        // a server without a lifecycle receiver.
         std::mem::drop(tokio::spawn(future));
     }
 }
@@ -3023,8 +2163,6 @@ async fn join_node_runtime_tasks(node: &NodeState) -> anyhow::Result<()> {
 }
 
 async fn wait_for_inference_compute_barrier(node: &NodeState) -> anyhow::Result<()> {
-    // Acquire outer whole-request permits first. Existing public/approval work
-    // may still need shard permits; reversing this order can deadlock shutdown.
     let public = node
         .public_inference_permits
         .clone()
@@ -3047,8 +2185,6 @@ async fn wait_for_inference_compute_barrier(node: &NodeState) -> anyhow::Result<
     Ok(())
 }
 
-/// Start an ETH-compatible JSON-RPC server on a separate port.
-/// Handles only the `/` POST endpoint for MetaMask, Hardhat, Foundry, etc.
 pub async fn serve_eth(
     addr: &str,
     node: NodeState,
@@ -3056,14 +2192,9 @@ pub async fn serve_eth(
 ) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", post(eth_json_rpc))
-        // CORS: permissive is correct for a public blockchain RPC node.
-        // All major L1s (Ethereum, Solana, Sui) use permissive CORS for RPC.
-        // There are no authenticated endpoints to protect.
         .layer(CorsLayer::permissive())
         .with_state(node);
 
-    // SO_REUSEADDR: allow immediate rebind after process restart.
-    // Without this, the port stays in TIME_WAIT for 60s after kill.
     let socket = tokio::net::TcpSocket::new_v4()?;
     socket.set_reuseaddr(true)?;
     socket.bind(addr.parse()?)?;
@@ -3086,13 +2217,11 @@ async fn index() -> &'static str {
     )
 }
 
-/// JSON error response body returned by endpoints that fail with 4xx/5xx.
 #[derive(Debug, Serialize)]
 struct ApiError {
     error: String,
 }
 
-/// Helper to create a (StatusCode, Json<ApiError>) pair.
 fn api_error(code: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ApiError>) {
     (code, Json(ApiError { error: msg.into() }))
 }
@@ -3106,72 +2235,32 @@ fn paid_inference_unavailable() -> (StatusCode, Json<ApiError>) {
     )
 }
 
-// ---------------------------------------------------------------------------
-// Health & Node Info
-// ---------------------------------------------------------------------------
-
 #[derive(Serialize)]
 struct HealthResponse {
     status: String,
     version: String,
     height: u64,
     peers: u32,
-    /// True only when this process actually owns a running consensus engine.
-    /// Community clients intentionally serve HTTP without joining chain transport.
     chain_participation_enabled: bool,
-    /// Explicit compatibility restriction, independent of block liveness.
     legacy_v3_wire: bool,
-    /// Whether this transport can send history/checkpoint/certificate/native
-    /// extensions. This is a capability, never a quorum-finality claim.
     extended_consensus_wire_enabled: bool,
-    /// Intentionally suppressed send requests; these were not delivered.
     wire_messages_suppressed: u64,
     uptime_secs: u64,
     dag_round: u64,
     dag_committed: u64,
     validators: usize,
-    /// Age of the newest block this node holds, from that block's own header
-    /// timestamp. `null` only when the node holds no block at all (or the
-    /// header timestamp is unreadable) — which is "unknown", not "fresh".
     last_block_age_secs: Option<u64>,
-    /// Whether the chain this node serves is still sealing blocks.
-    /// `null` when `last_block_age_secs` is unknown.
     chain_advancing: Option<bool>,
-    /// True while this node rebuilds its DAG from peers after a restart or a
-    /// late join. It accepts no submissions then (they would sit unproposed).
     dag_bootstrapping: bool,
-    /// Populated only when `status != "ok"`, so an operator reading a
-    /// degraded response is told what specifically is degraded.
     #[serde(skip_serializing_if = "Option::is_none")]
     degraded_reason: Option<String>,
-    /// SHA-256 of this process's executable: the digest a build-provenance
-    /// record names, so evidence can be tied to one exact build.
     #[serde(skip_serializing_if = "Option::is_none")]
     binary_sha256: Option<&'static str>,
-    /// Behaviour-changing cargo features this binary was built with.
     features: Vec<&'static str>,
 }
 
-/// How stale the newest block must be before `/health` calls the node
-/// degraded.
-///
-/// Deliberately NOT [`BLOCK_PRODUCTION_FRESH_SECS`] (120 s). That constant is
-/// the freshness window `/network/info` reports against, and it is far tighter
-/// than this network's real cadence: measured over 10.3 h on 2026-08-18/19,
-/// NYC sealed 50 blocks (~12 min/block) and LAX 108 (~5.7 min/block). Driving
-/// the top-level `status` field off a 120 s window would mark both of the only
-/// seeds that ARE sealing as degraded, which is a worse lie than the one this
-/// replaced and would train operators to ignore the field.
-///
-/// 30 minutes cleanly separates "slow but sealing" (≤ ~12 min) from the
-/// failure this exists to catch (the four seeds stalled for ~8 days).
 pub const HEALTH_STALL_SECS: u64 = 1_800;
 
-/// Map block liveness to a `/health` status. Pure, so both directions are
-/// testable without standing up a block-producing node.
-///
-/// Unknown age is NOT treated as healthy: a node that cannot say when it last
-/// sealed a block must not answer `"ok"`.
 fn health_status_from(
     chain_advancing: Option<bool>,
     last_block_age_secs: Option<u64>,
@@ -3196,33 +2285,14 @@ fn health_status_from(
     }
 }
 
-/// `status` is NOT hardcoded `"ok"`.
-///
-/// It used to be, and that is precisely what let four seeds sit for eight days
-/// answering `{"status":"ok","syncing":false}` while sealing no blocks: DAG
-/// rounds and block commits are separate paths, so `dag_round` kept advancing
-/// and every liveness check on the network read green. A monitor, a dashboard
-/// or a desktop client polling `/health` had no field that could tell it
-/// otherwise.
-///
-/// `status` is `"ok"` only when this node's newest block is younger than
-/// [`BLOCK_PRODUCTION_FRESH_SECS`]. A stalled chain reports `"degraded"` with
-/// a reason. Callers that treat any non-`"ok"` status as "do not route chain
-/// reads here" get the correct behaviour for free; callers that only check for
-/// the string `"ok"` now fail closed instead of open.
 async fn health(AxumState(node): AxumState<NodeState>) -> Json<HealthResponse> {
     let validators = node.dag_validators.read().len();
-    // Periodic cleanup: evict stale tx rate limit entries (>60s old)
     if node.tx_rate_limit.len() > 1000 {
         node.tx_rate_limit.retain(|_, v| v.elapsed().as_secs() < 60);
     }
 
-    // The newest block that actually EXISTS here — see `latest_available_block`:
-    // looking up `height()` directly reports a producing node as blockless.
     let last_block_age_secs =
         latest_available_block(&node).and_then(|b| age_secs_from_ms(b.header.timestamp));
-    // Judged against HEALTH_STALL_SECS, not BLOCK_PRODUCTION_FRESH_SECS — see
-    // that constant for why 120 s would flag the healthy seeds as degraded.
     let chain_advancing = last_block_age_secs.map(|age| age <= HEALTH_STALL_SECS);
 
     let (status, degraded_reason) = health_status_from(chain_advancing, last_block_age_secs);
@@ -3260,8 +2330,6 @@ struct NodeInfoResponse {
     height: u64,
     version: String,
     mempool_size: usize,
-    /// The canonical INT8 projection kernels this process runs, as
-    /// `GET /node/threads` reports them under `kernels`.
     kernels: Value,
 }
 
@@ -3276,10 +2344,6 @@ async fn node_info(AxumState(node): AxumState<NodeState>) -> Json<NodeInfoRespon
         kernels: kernel_report_json(&node),
     })
 }
-
-// ---------------------------------------------------------------------------
-// Chain Info
-// ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
 struct ChainInfoResponse {
@@ -3302,10 +2366,6 @@ async fn chain_info(AxumState(node): AxumState<NodeState>) -> Json<ChainInfoResp
     })
 }
 
-// ---------------------------------------------------------------------------
-// Block & Account endpoints
-// ---------------------------------------------------------------------------
-
 async fn get_latest_block(
     AxumState(node): AxumState<NodeState>,
 ) -> Result<Json<Block>, StatusCode> {
@@ -3314,8 +2374,6 @@ async fn get_latest_block(
 
 fn latest_block_at(node: &NodeState, observed_height: u64) -> Result<Json<Block>, StatusCode> {
     latest_available_block_at(node, observed_height)
-        // Preserve the endpoint's existing contract: the genesis block is
-        // not exposed as a produced "latest" block.
         .filter(|block| block.header.height != 0)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
@@ -3351,30 +2409,17 @@ async fn get_account(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Transaction submission
-// ---------------------------------------------------------------------------
-
 #[derive(Deserialize)]
 struct SubmitTxRequest {
     from: String,
     to: String,
     amount: u64,
     nonce: u64,
-    /// Protocol-v3 transfers pay the consensus minimum fee (currently one
-    /// base unit). The fee is part of the signed transaction domain and must
-    /// therefore be supplied before signature verification.
     #[serde(default)]
     fee: u64,
-    /// Accepted for wire compatibility with the TypeScript SDK, which documents
-    /// `tx_type` as an optional field on this request. `submit_tx` only ever
-    /// builds a transfer, so the value is parsed and then ignored — dropping the
-    /// field would not change that, it would just hide the mismatch.
     #[allow(dead_code)]
     tx_type: Option<String>,
-    /// Ed25519 signature (128-char hex, optional). Required for mainnet.
     signature: Option<String>,
-    /// Ed25519 public key (64-char hex, required with signature).
     public_key: Option<String>,
 }
 
@@ -3384,12 +2429,6 @@ struct SubmitTxResponse {
     status: String,
 }
 
-/// Atomically consume one sender's public submission allowance.
-///
-/// A separate `get` followed by `insert` lets concurrent requests observe the
-/// same old timestamp and all enter the mempool. DashMap's occupied entry guard
-/// serializes the check-and-update for one sender while leaving unrelated
-/// senders independent.
 fn consume_tx_sender_allowance(node: &NodeState, sender: &Hash256) -> bool {
     consume_tx_sender_allowance_at(node, sender, Instant::now())
 }
@@ -3426,10 +2465,6 @@ async fn submit_tx(
         }
     } && node.state.native_migration().is_none()
     {
-        // A PRIVATE protocol-4 chain carries only native work, so an
-        // unsigned submission here can never execute. A MIGRATED chain keeps
-        // every family it had, and refusing them at this endpoint would turn
-        // the migration into exactly the outage it exists to avoid.
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "private protocol-4 accepts only signed native inference transactions".to_string(),
@@ -3440,15 +2475,12 @@ async fn submit_tx(
     let to = Hash256::from_hex(&req.to)
         .map_err(|_| (StatusCode::BAD_REQUEST, "invalid to address".to_string()))?;
 
-    // Check if a signature was provided
     if let Some(ref sig_hex) = req.signature
         && let Some(ref pubkey_hex) = req.public_key
     {
-        // Build signed transaction
         let mut tx = Transaction::new_transfer(from, to, req.amount, req.nonce);
         tx.fee = req.fee;
 
-        // Parse signature and public key
         let sig_bytes = hex::decode(sig_hex)
             .map_err(|_| (StatusCode::BAD_REQUEST, "invalid signature hex".to_string()))?;
         let pk_bytes = hex::decode(pubkey_hex).map_err(|_| {
@@ -3477,14 +2509,12 @@ async fn submit_tx(
             None => tx.compute_hash(),
         };
 
-        // Verify signature before accepting
         node.state.verify_transaction_signature(&tx).map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
                 "signature verification failed".to_string(),
             )
         })?;
-        // Mark as pre-verified so block execution can skip re-verification.
         tx.sig_verified = true;
 
         if node.state.active_protocol_version().major == 3 {
@@ -3513,8 +2543,6 @@ async fn submit_tx(
         }));
     }
 
-    // No signature provided - reject. Unsigned transfers are a security hole
-    // (anyone could drain any account). Require a signature for all transfers.
     Err((
         StatusCode::BAD_REQUEST,
         "Signature required. Sign the complete transfer and provide both 'signature' and 'public_key'; see sdk/typescript/README.md#transactions."
@@ -3549,15 +2577,11 @@ async fn submit_batch(
         }
     } && node.state.native_migration().is_none()
     {
-        // As in `submit_tx`: only a private protocol-4 chain refuses these.
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "private protocol-4 accepts only signed native inference transactions",
         ));
     }
-    // Reject before parsing addresses, verifying signatures, consulting state,
-    // or mutating the sender limiter/mempool. This is both the resource bound
-    // and the externally probed public contract.
     if req.transactions.len() > MAX_TX_SUBMIT_BATCH_SIZE {
         return Err(api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -3652,19 +2676,6 @@ fn signed_transfer_from_request_in_domain(
     Ok(tx)
 }
 
-// ---------------------------------------------------------------------------
-// Signed transaction submission (for CLI / external signers)
-// ---------------------------------------------------------------------------
-
-/// Paid inference writes remain dark at every public transaction ingress.
-///
-/// The legacy escrow flow pays identifiers derived from unauthenticated shard
-/// labels, while Tier 1 committee/VRF authorization is not yet complete.  It
-/// is therefore unsafe to accept *any* transaction that can open, advance, or
-/// release either protocol.  Check both the envelope and the body so a
-/// type/body mismatch cannot disguise a restricted write.  Refunds are
-/// intentionally excluded: a payer must retain a recovery path for funds
-/// locked by an older release.
 fn uses_unready_paid_inference_protocol(tx: &Transaction) -> bool {
     fn restricted(tx_type: TxType) -> bool {
         matches!(
@@ -3680,13 +2691,6 @@ fn uses_unready_paid_inference_protocol(tx: &Transaction) -> bool {
     restricted(tx.tx_type) || restricted(tx.body.tx_type())
 }
 
-/// True when this chain admits ONLY native-inference transactions - a private
-/// protocol-4 chain, whose blocks carry one native transition and nothing
-/// else, so anything else submitted here can never execute.
-///
-/// A MIGRATED chain has a binding too, and keeps every transaction family it
-/// had. It is never "native only", and refusing its ordinary traffic at
-/// ingress would reject exactly what the migration exists to preserve.
 pub(crate) fn admits_only_native_transactions(state: &arc_state::StateDB) -> bool {
     state.native_inference_context().is_some() && state.native_migration().is_none()
 }
@@ -3705,12 +2709,7 @@ fn is_native_inference_transaction(tx: &Transaction) -> bool {
     )
 }
 
-/// Only direct local operator requests may use local control routes.
 fn is_direct_loopback_operator(peer_addr: SocketAddr, headers: &axum::http::HeaderMap) -> bool {
-    // Not the operator's own when: a same-host reverse proxy forwarded it
-    // (deploy/nginx.conf forwards /rpc/ from 127.0.0.1 and marks what it
-    // forwards); a browser page sent it (browsers add Origin or Sec-Fetch-*);
-    // or it reached this port under another name (DNS rebinding).
     let proxied = ["x-forwarded-for", "x-real-ip", "forwarded"]
         .iter()
         .any(|name| headers.contains_key(*name));
@@ -3725,14 +2724,6 @@ fn is_direct_loopback_operator(peer_addr: SocketAddr, headers: &axum::http::Head
     peer_addr.ip().is_loopback() && !proxied && !from_a_page && named_here
 }
 
-/// This node's row cohort (`crate::row_cohort`): its machines, the bounded
-/// books and the recent placement records, for the operator. Machine names,
-/// measured rates and request timing describe the operator's own
-/// infrastructure, so only a direct loopback caller is answered: 404
-/// otherwise, as when the node runs no cohort, including anything a proxy
-/// forwarded. On the sealed production origin every request arrives through
-/// the nginx filter as loopback; that filter's route allowlist, which ends in
-/// `return 404`, does not include `/assignment/`.
 async fn assignment_cohort(
     AxumState(node): AxumState<NodeState>,
     ConnectInfo(RpcPeerAddr(peer_addr)): ConnectInfo<RpcPeerAddr>,
@@ -3749,9 +2740,6 @@ async fn assignment_cohort(
     Ok(Json(cohort.view()))
 }
 
-/// Publicly describable, read-only protocol-4 activation binding.  Activation
-/// itself deliberately has no HTTP route: it can only occur at fresh private
-/// genesis through StateDB's durable activation path.
 async fn native_inference_context(
     AxumState(node): AxumState<NodeState>,
 ) -> Result<Json<Value>, StatusCode> {
@@ -3782,8 +2770,6 @@ async fn native_inference_context(
             "address": member.address.to_hex(), "stake": member.stake,
         })).collect::<Vec<_>>(),
         "allowed_execution_count": context.allowed_executions.len(),
-        // Everything a client needs to build a job the chain can admit. The
-        // chain still judges every request by its own rules.
         "allowed_executions": context.allowed_executions.iter().map(|execution| json!({
             "model_hash": execution.model_hash.to_hex(),
             "profile_hash": execution.profile_hash.to_hex(),
@@ -3791,7 +2777,6 @@ async fn native_inference_context(
             "assignment_hash": execution.assignment_hash.to_hex(),
         })).collect::<Vec<_>>(),
         "contract_version": arc_types::inference_contract::INFERENCE_CONTRACT_VERSION,
-        // Commit-time selection rule fixed at activation (decision D20).
         "selection_rule": context.selection_rule.as_str(),
         "height": node.state.height(),
         "limits": {
@@ -3801,7 +2786,6 @@ async fn native_inference_context(
             "request_gas_limit": arc_types::transaction::gas_costs::NATIVE_INFERENCE_REQUEST,
             "refund_gas_limit": arc_types::transaction::gas_costs::NATIVE_INFERENCE_REFUND,
         },
-        // This node only: another member may run a different executor build.
         "serving": node.native_serving.as_deref().map(|serving| json!({
             "executor": serving.executor.as_str(),
             "requires_complete_row_coverage": serving.row_cohort.as_ref().is_some_and(|cohort| cohort.is_low_residency()),
@@ -3809,7 +2793,6 @@ async fn native_inference_context(
             "input_format": serving.executor.input_format(),
             "tokenizer_profile": serving.tokenizer.as_ref().map(|tokenizer| tokenizer.profile()),
             "tokenize_endpoint": serving.tokenizer.is_some(),
-            // 1 BOS + prompt + max_tokens must fit, or this node never votes.
             "max_positions": serving.max_positions,
         })),
         "node_version": env!("CARGO_PKG_VERSION"),
@@ -3821,11 +2804,6 @@ struct NativeTokenizeRequest {
     text: String,
 }
 
-/// Tokenize a prompt with the tokenizer read from the artifact this node's
-/// canonical executor runs, returning exactly the input bytes that executor
-/// accepts. A convenience for clients that hold no tokenizer: the requester
-/// signs the returned bytes, so a client that does not trust this node must
-/// tokenize for itself. Served only by a node running the canonical executor.
 async fn native_inference_tokenize(
     AxumState(node): AxumState<NodeState>,
     Json(request): Json<NativeTokenizeRequest>,
@@ -3871,9 +2849,6 @@ async fn native_inference_tokenize(
     let text = request.text;
     let worker = serving.clone();
     let worker_execution_for_compute = worker_execution_permit.clone();
-    // The permit moves into the blocking task. A client that disconnects
-    // drops this handler but not the tokenization, so the permit must be
-    // released when the work ends, not when the connection does.
     let tokens = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _worker_execution_permit = worker_execution_for_compute;
@@ -3901,9 +2876,6 @@ async fn native_inference_tokenize(
     })))
 }
 
-/// Return the persisted request-keyed receipt.  `observed_status` describes
-/// local canonical StateDB observation only; consensus-finality proofs remain
-/// a later milestone and are not implied by this endpoint.
 async fn native_inference_receipt(
     AxumState(node): AxumState<NodeState>,
     AxumPath(request_id): AxumPath<String>,
@@ -3954,9 +2926,6 @@ async fn native_inference_receipt(
         })).collect::<Vec<_>>(),
         "expires_at": metadata.request.job.expires_at,
         "requester": metadata.request.job.requester.to_hex(),
-        // The certified output bytes (empty until finalized). The text is
-        // display only, from this node's tokenizer when it holds one: the
-        // certificate commits to the bytes, not to the text.
         "output_hex": hex::encode(&metadata.output),
         "output_text": node
             .native_serving
@@ -3966,9 +2935,6 @@ async fn native_inference_receipt(
     })))
 }
 
-/// Why `/tx/submit_signed` refused a transaction. Most refusals carry only a
-/// status; the native-inference preflight also says which admission rule
-/// failed, so a client can tell "not yet" (a future nonce) from "never".
 #[derive(Debug)]
 pub(crate) struct SubmitRefusal {
     status: StatusCode,
@@ -4006,18 +2972,12 @@ async fn submit_signed_tx(
     AxumState(node): AxumState<NodeState>,
     Json(mut tx): Json<Transaction>,
 ) -> Result<Json<SubmitTxResponse>, SubmitRefusal> {
-    // `sig_verified` is a process-local cache hint, never caller authority.
-    // Its wire deserializer now forces false; verify both type/body integrity
-    // and the cryptographic signature before anything enters the mempool.
     tx.sig_verified = false;
     if node
         .consensus_engine
         .as_ref()
         .is_some_and(|engine| engine.dag_bootstrapping())
     {
-        // A restarted or late-joining validator cannot propose until its DAG
-        // is rebuilt; a transaction accepted now would sit in this mempool,
-        // unannounced, while the client waits. Say so, so it goes elsewhere.
         return Err(SubmitRefusal::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "this node is rebuilding its DAG from its peers and cannot propose yet; \
@@ -4030,9 +2990,6 @@ async fn submit_signed_tx(
     if let TxBody::WasmCall(body) = &tx.body
         && node.state.is_evm_contract(&body.contract)
     {
-        // Read-only eth_call remains available. State-changing EVM calls are
-        // rejected at ingress as well as by the canonical executor so clients
-        // never receive a misleading pending transaction for a disabled path.
         return Err(StatusCode::SERVICE_UNAVAILABLE.into());
     }
     if node.state.verify_transaction_signature(&tx).is_err() {
@@ -4044,12 +3001,6 @@ async fn submit_signed_tx(
             "new native requests are closed on this node: operator opt-in and a ready native runtime are required",
         ));
     }
-    // A PRIVATE protocol-4 chain's committee is frozen by its binding. The
-    // executor refuses a registry change too (so a transaction that slips in
-    // another way fails with a receipt instead of wedging every later block);
-    // refusing it here tells the submitter now, rather than via a failed
-    // receipt later. A migrated chain has versioned bindings and is not
-    // frozen, which the state's own guard decides.
     if arc_state::StateDB::is_registry_change(&tx)
         && node
             .state
@@ -4058,14 +3009,6 @@ async fn submit_signed_tx(
     {
         return Err(StatusCode::CONFLICT.into());
     }
-    // A PRIVATE protocol-4 block carries only a native-inference transaction,
-    // so anything else can never be included there. Accepting it would hand
-    // the client a hash for a transaction that will never exist - refuse it
-    // here, as `submit_tx` already does.
-    //
-    // A MIGRATED chain is not that chain: it keeps every transaction family
-    // it had, so refusing them here would reject the traffic the migration
-    // exists to preserve, at the very first step the user reaches.
     if admits_only_native_transactions(&node.state)
         && !arc_state::StateDB::is_native_inference_transaction(&tx)
     {
@@ -4076,10 +3019,6 @@ async fn submit_signed_tx(
             Ok(Some(context)) => context,
             Ok(None) | Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE.into()),
         };
-        // This pure preflight is the same state admission used by the
-        // canonical executor. It rejects type/body disguises, stale nonce,
-        // unfrozen members, bad certificates, expired requests and every
-        // non-private activation before the mempool mutates.
         if let Err(error) = node
             .state
             .validate_native_inference_transaction_admission_next(&tx, &context)
@@ -4095,17 +3034,8 @@ async fn submit_signed_tx(
         Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE.into()),
     } && node.state.native_migration().is_none()
     {
-        // Private protocol-4 blocks permit one native transition only. A
-        // migrated chain admits its ordinary families, and they fall through
-        // to the v3 admission check below - which now runs, because a
-        // migrated chain reports protocol 3.
         return Err(StatusCode::SERVICE_UNAVAILABLE.into());
     }
-    // The issuance switch gates every public mempool ingress, not just the
-    // coordinator helper. Otherwise a caller holding any validator key could
-    // bypass the disabled coordinator path by POSTing 0x25 directly here.
-    // Consensus validation remains the ultimate boundary; this is defense in
-    // depth and keeps a dark deployment dark at the RPC edge.
     if tx.tx_type == TxType::CommunityInferenceReward
         && !community_rewards_v1_protocol_active(&node)
     {
@@ -4160,10 +3090,6 @@ async fn submit_signed_tx(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Validators endpoint
-// ---------------------------------------------------------------------------
-
 #[derive(Serialize)]
 struct ValidatorInfoResponse {
     address: String,
@@ -4179,8 +3105,6 @@ struct ValidatorsResponse {
 }
 
 async fn get_validators(AxumState(node): AxumState<NodeState>) -> Json<ValidatorsResponse> {
-    // Show live DAG validator set (updated by consensus loop via PeerConnected).
-    // Falls back to staked accounts from state if DAG set is single-validator.
     let dag_vals = node.dag_validators.read().clone();
     let mut validators: Vec<ValidatorInfoResponse> = dag_vals
         .iter()
@@ -4196,7 +3120,6 @@ async fn get_validators(AxumState(node): AxumState<NodeState>) -> Json<Validator
         })
         .collect();
 
-    // Sort by stake descending
     validators.sort_by_key(|v| std::cmp::Reverse(v.stake));
     let total_stake: u64 = validators.iter().map(|v| v.stake).sum();
     let count = validators.len();
@@ -4207,10 +3130,6 @@ async fn get_validators(AxumState(node): AxumState<NodeState>) -> Json<Validator
         count,
     })
 }
-
-// ---------------------------------------------------------------------------
-// Agents (Synths) endpoint
-// ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
 struct AgentInfoResponse {
@@ -4233,14 +3152,12 @@ struct AgentsListResponse {
 }
 
 async fn get_agents(AxumState(node): AxumState<NodeState>) -> Json<AgentsListResponse> {
-    // Scan full_transactions for RegisterAgent transactions and build agent list.
     let mut agents: Vec<AgentInfoResponse> = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
 
     for entry in node.state.full_transactions.iter() {
         let tx = entry.value();
         if let TxBody::RegisterAgent(body) = &tx.body {
-            // Deduplicate by agent name (latest registration wins)
             if seen_names.contains(&body.agent_name) {
                 continue;
             }
@@ -4273,10 +3190,6 @@ async fn get_agents(AxumState(node): AxumState<NodeState>) -> Json<AgentsListRes
     let count = agents.len();
     Json(AgentsListResponse { agents, count })
 }
-
-// ---------------------------------------------------------------------------
-// Faucet endpoints
-// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct FaucetClaimRequest {
@@ -4333,7 +3246,6 @@ async fn faucet_claim(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<FaucetClaimRequest>,
 ) -> Result<Json<FaucetClaimResponse>, (StatusCode, Json<FaucetErrorResponse>)> {
-    // Parse recipient address
     let to = Hash256::from_hex(&req.address).map_err(|_| {
         (
             StatusCode::BAD_REQUEST,
@@ -4343,10 +3255,6 @@ async fn faucet_claim(
         )
     })?;
 
-    // Reject aliases before rate-limit bookkeeping, validator nonce reads,
-    // signing, or mempool insertion. In particular recipient==faucet_pool
-    // would otherwise make the debit and credit touch the same map key; the
-    // state machine also enforces this invariant independently at execution.
     if faucet_recipient_has_system_collision(&node.state, &to) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -4370,10 +3278,6 @@ async fn faucet_claim(
             }),
         ));
     }
-    // A faucet claim is an ordinary transfer, which a PRIVATE protocol-4
-    // block can never carry. Refuse it rather than return a hash that will
-    // never land. A migrated chain still carries faucet claims, so this does
-    // not apply there.
     if admits_only_native_transactions(&node.state) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4409,9 +3313,6 @@ async fn faucet_claim(
         ));
     }
 
-    // Rate limiting: check if this address claimed recently.
-    // Global rate limit: 100 accepted submissions per minute.
-    // DashMap iter is lock-free per shard so this never blocks the runtime.
     {
         let total = node.faucet_claims_total.load(Ordering::Relaxed);
         if total >= FAUCET_GLOBAL_RATE_LIMIT as u32 {
@@ -4432,7 +3333,6 @@ async fn faucet_claim(
         }
     }
 
-    // Per-address rate limit
     if let Some(entry) = node.faucet_claims.get(&to.0) {
         let elapsed = entry.value().elapsed().as_secs();
         if elapsed < FAUCET_RATE_LIMIT_SECS {
@@ -4449,9 +3349,6 @@ async fn faucet_claim(
         }
     }
 
-    // Serialize faucet writes per validator. Two concurrent requests signed
-    // with the same account nonce would both be accepted by the old handler,
-    // while at most one could ever execute canonically.
     let mut pending = node.faucet_pending.lock().await;
     if let Some((pending_hash, submitted_at)) = *pending {
         if node.state.get_receipt(&pending_hash.0).is_some() {
@@ -4469,8 +3366,6 @@ async fn faucet_claim(
                 }),
             ));
         } else {
-            // It was neither mined nor retained by the mempool for a bounded
-            // interval. Re-read canonical nonce and allow a clean retry.
             *pending = None;
         }
     }
@@ -4502,9 +3397,6 @@ async fn faucet_claim(
         ));
     }
 
-    // Construct and sign only. Consensus execution is the sole code path
-    // allowed to debit the pool, credit the recipient, advance the nonce,
-    // create history, or emit a receipt.
     let nonce = node
         .state
         .get_account(&validator_addr)
@@ -4544,7 +3436,6 @@ async fn faucet_claim(
     drop(pending);
     let hash = tx_hash.to_hex();
 
-    // Record claim time + evict stale entries to prevent unbounded growth
     node.faucet_claims.insert(to.0, Instant::now());
     if node.faucet_claims.len() > 10_000 {
         node.faucet_claims
@@ -4580,13 +3471,7 @@ async fn faucet_status(AxumState(node): AxumState<NodeState>) -> Json<FaucetStat
     })
 }
 
-// ---------------------------------------------------------------------------
-// Proof & query endpoints
-// ---------------------------------------------------------------------------
-
-/// Parse a 64-char hex string into a [u8; 32] array.
 fn parse_hash(hex_str: &str) -> Result<[u8; 32], (StatusCode, Json<ApiError>)> {
-    // Accept both forms: with or without "0x" prefix.
     let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     Hash256::from_hex(stripped).map(|h| h.0).map_err(|_| {
         api_error(
@@ -4596,18 +3481,14 @@ fn parse_hash(hex_str: &str) -> Result<[u8; 32], (StatusCode, Json<ApiError>)> {
     })
 }
 
-/// GET /tx/{hash} - Look up a transaction receipt by its hash.
-/// Falls back to on-demand reconstruction for benchmark transactions.
 async fn get_transaction(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(hash): axum::extract::Path<String>,
 ) -> Result<Json<TxReceipt>, (StatusCode, Json<ApiError>)> {
     let tx_hash = parse_hash(&hash)?;
-    // Try indexed receipts first
     if let Some(receipt) = node.state.get_receipt(&tx_hash) {
         return Ok(Json(receipt));
     }
-    // Fall back to on-demand reconstruction for benchmark txs
     node.state
         .get_benchmark_receipt_by_hash(&tx_hash)
         .map(Json)
@@ -4619,15 +3500,12 @@ async fn get_transaction(
         })
 }
 
-/// GET /tx/{hash}/proof - Return a full verification bundle for a transaction.
-/// For benchmark transactions, reconstructs the Merkle tree on-demand (~130ms).
 async fn get_tx_proof(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(hash): axum::extract::Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let tx_hash = parse_hash(&hash)?;
 
-    // Try indexed receipt with stored proof first
     if let Some(receipt) = node.state.get_receipt(&tx_hash)
         && let Some(ref proof_bytes) = receipt.inclusion_proof
         && let Ok(merkle_proof) = bincode::deserialize::<MerkleProof>(proof_bytes)
@@ -4657,7 +3535,6 @@ async fn get_tx_proof(
         })));
     }
 
-    // Fall back to on-demand proof reconstruction for benchmark txs
     let (height, idx) = node.state.get_tx_location(&tx_hash).ok_or_else(|| {
         api_error(
             StatusCode::NOT_FOUND,
@@ -4706,7 +3583,6 @@ async fn get_tx_proof(
     })))
 }
 
-/// GET /block/{height}/proofs - Return all Merkle proofs for transactions in a block.
 async fn get_block_proofs(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(height): axum::extract::Path<u64>,
@@ -4749,7 +3625,6 @@ async fn get_block_proofs(
     })))
 }
 
-/// Query parameters for paginated block listing.
 #[derive(Deserialize)]
 struct BlocksQuery {
     from: Option<u64>,
@@ -4757,7 +3632,6 @@ struct BlocksQuery {
     limit: Option<usize>,
 }
 
-/// GET /blocks?from=0&to=100&limit=20 - Paginated block listing.
 async fn get_blocks(
     AxumState(node): AxumState<NodeState>,
     Query(params): Query<BlocksQuery>,
@@ -4793,8 +3667,6 @@ async fn get_blocks(
     }))
 }
 
-/// GET /block/{height}/txs?offset=0&limit=100 - Paginated transaction listing for a block.
-/// Reconstructs benchmark transactions on-demand from deterministic parameters.
 #[derive(Deserialize)]
 struct BlockTxsQuery {
     offset: Option<u32>,
@@ -4816,7 +3688,6 @@ async fn get_block_txs(
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(100).min(1000);
 
-    // Try existing tx_hashes first (normal blocks)
     if !block.tx_hashes.is_empty() {
         let end = (offset + limit).min(block.header.tx_count);
         let txs: Vec<Value> = (offset..end)
@@ -4839,7 +3710,6 @@ async fn get_block_txs(
         })));
     }
 
-    // Reconstruct benchmark transactions on-demand
     let txs = node.state.get_benchmark_block_txs(height, offset, limit);
     let tx_list: Vec<Value> = txs
         .iter()
@@ -4873,7 +3743,6 @@ async fn get_block_txs(
     })))
 }
 
-/// GET /account/{address}/txs - Return transaction hashes involving an account.
 async fn get_account_txs(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(address): axum::extract::Path<String>,
@@ -4890,7 +3759,6 @@ async fn get_account_txs(
     })))
 }
 
-/// GET /stats - Basic chain statistics.
 async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let indexed_receipts = node.state.receipts.len();
     let indexed_hashes = node.state.tx_index.len();
@@ -4924,20 +3792,12 @@ async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
         "validators": validators,
         "connected_peers": peers,
         "uptime_secs": uptime,
-        // Real pipeline walks only. Cache hits are counted separately —
-        // folding them in here is what inflated every "distributed inference
-        // served" figure the dashboard showed.
         "sharded_runs_total": sharded_runs,
         "sharded_cache_hits_total": node.sharded_cache_hits.load(Ordering::Relaxed),
         "sharded_bytes_total": sharded_bytes,
     }))
 }
 
-// ---------------------------------------------------------------------------
-// State Sync Protocol (A5) - snapshot bootstrap for new nodes
-// ---------------------------------------------------------------------------
-
-/// Returns metadata about the latest snapshot available for sync.
 async fn sync_snapshot_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let height = node.state.height();
     let state_root = node.state.get_state_root();
@@ -4950,8 +3810,6 @@ async fn sync_snapshot_info(AxumState(node): AxumState<NodeState>) -> Json<Value
     }))
 }
 
-/// Stream the full state snapshot as LZ4-compressed bincode.
-/// New nodes download this to bootstrap without replaying from genesis.
 async fn sync_snapshot(
     AxumState(node): AxumState<NodeState>,
 ) -> Result<axum::response::Response, StatusCode> {
@@ -4975,12 +3833,6 @@ async fn sync_snapshot(
         .into_response())
 }
 
-// ---------------------------------------------------------------------------
-// Light Client Proofs (A8)
-// ---------------------------------------------------------------------------
-
-/// GET /light/snapshot - Returns a lightweight snapshot for light client bootstrapping:
-/// current height, state root, account count, total supply, latest block hash.
 async fn light_snapshot(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let snap = node.state.generate_light_snapshot();
     Json(json!({
@@ -4992,12 +3844,6 @@ async fn light_snapshot(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     }))
 }
 
-// ---------------------------------------------------------------------------
-// Chunked State Sync - parallel chunk download for fast catch-up
-// ---------------------------------------------------------------------------
-
-/// GET /sync/manifest - Returns the snapshot manifest (height, chunk count,
-/// state root, accounts) so a syncing node can plan parallel chunk downloads.
 async fn sync_manifest(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let manifest = node.state.export_snapshot_manifest();
     Json(json!({
@@ -5010,16 +3856,6 @@ async fn sync_manifest(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     }))
 }
 
-/// GET /sync/chunk/:index - Returns a single snapshot chunk by index.
-/// Each chunk contains ~1000 accounts with a BLAKE3 integrity proof.
-///
-/// Serializes the canonical `StateSnapshot` struct so `state_sync::fetch_chunk`
-/// (which calls `resp.json::<StateSnapshot>()`) can decode it directly. A prior
-/// version hand-rolled a different JSON shape — accounts as
-/// `[{address, balance, nonce}]` instead of `[[hex, full_account]]` — and
-/// stripped `code_hash`/`storage_root`/`staked_balance`/`chunk_proof`, which
-/// broke every state-sync attempt with "error decoding response body" and
-/// stranded fresh-state nodes (e.g. LHR after `--reset-state`) at round 0.
 async fn sync_chunk(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(index): axum::extract::Path<u32>,
@@ -5032,8 +3868,6 @@ async fn sync_chunk(
     Ok(Json(chunk))
 }
 
-/// GET /sync/status - Returns whether this node can serve snapshots and
-/// information about the latest available snapshot.
 async fn sync_status(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let manifest = node.state.export_snapshot_manifest();
     Json(json!({
@@ -5048,11 +3882,6 @@ async fn sync_status(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     }))
 }
 
-/// GET /finality/latest - the highest height this node holds a quorum finality
-/// certificate for, next to its committed height, so finality lag is one read.
-///
-/// This is a node's own view. Anyone who does not trust it should fetch
-/// `/finality/{height}` and verify the certificate.
 async fn get_finality_latest(
     AxumState(node): AxumState<NodeState>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
@@ -5074,11 +3903,6 @@ async fn get_finality_latest(
     })))
 }
 
-/// GET /consensus/diagnostics - bounded process-wide consensus counters.
-///
-/// Fixed-size atomics: they answer "where did the time go" for a throughput
-/// question without a log line per event, and cost the same after a day as
-/// after a minute.
 async fn consensus_diagnostics(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let mut map = crate::consensus_diagnostics::DIAG.snapshot();
     map.extend(crate::consensus_diagnostics::inbound_snapshot());
@@ -5108,17 +3932,6 @@ async fn consensus_diagnostics(AxumState(node): AxumState<NodeState>) -> Json<Va
     Json(Value::Object(map))
 }
 
-/// GET /finality/{height} - the quorum finality certificate for a height.
-///
-/// This is deliberately a different endpoint from `/block/{height}`. That one
-/// reports what THIS node committed - a local observation, believable only to
-/// someone who already trusts this node. This one returns a committee's signed
-/// statement, which a client can check for itself against the validator set
-/// and the chain domain without trusting the server at all.
-///
-/// A 404 means "this node holds no certificate at that height", which is not
-/// the same as "the block is not final": certificates are gossiped and this
-/// node may simply not have assembled one.
 async fn get_finality_certificate(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(height): axum::extract::Path<u64>,
@@ -5139,16 +3952,11 @@ async fn get_finality_certificate(
         ));
     };
     let set = engine.frozen_validator_set();
-    // Re-verify on the way out. A stored certificate is not a licence to
-    // publish signatures nobody checked, and a client that cannot verify
-    // should be told by the server that the server could not either.
     let domain = engine.certificate_domain();
     let signing_stake = match domain.as_ref() {
         Some(domain) => certificate.verify(domain, &set).ok(),
         None => None,
     };
-    // Hex rather than base64: the rest of this API is hex, and the point is
-    // that a client can decode and verify it, not that it is compact.
     let encoded = bincode::serialize(&certificate)
         .ok()
         .map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
@@ -5163,9 +3971,6 @@ async fn get_finality_certificate(
         "signing_stake": signing_stake,
         "quorum": set.quorum,
         "total_stake": set.total_stake,
-        // What the client should do with this: verify the encoded certificate
-        // against the committee and domain it independently trusts. The fields
-        // above are a convenience, not the proof.
         "certificate_bincode_hex": encoded,
         "verified_by_server": signing_stake.is_some(),
         "note": "a node-observed commit and a verified quorum certificate are \
@@ -5174,9 +3979,6 @@ async fn get_finality_certificate(
     })))
 }
 
-/// GET /sync/dag_state - Returns the current DAG consensus round state.
-/// Used by new nodes to start at the right round instead of round 0.
-/// This prevents permanent partition from genesis round mismatch.
 async fn sync_dag_state(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let current_round = node.dag_round.load(std::sync::atomic::Ordering::Relaxed);
     let last_committed_round = node
@@ -5192,12 +3994,6 @@ async fn sync_dag_state(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     }))
 }
 
-// ---------------------------------------------------------------------------
-// Full transaction & contract endpoints
-// ---------------------------------------------------------------------------
-
-/// GET /tx/{hash}/full - Return the full transaction body with type-specific fields.
-/// Falls back to on-demand reconstruction for benchmark transactions.
 async fn get_full_transaction(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(hash): axum::extract::Path<String>,
@@ -5563,7 +4359,6 @@ async fn get_full_transaction(
     Ok(Json(result))
 }
 
-/// GET /contract/{address} - Return contract info.
 async fn get_contract_info(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(address): axum::extract::Path<String>,
@@ -5588,7 +4383,6 @@ async fn get_contract_info(
     })))
 }
 
-/// POST /contract/{address}/call - Read-only contract call.
 #[derive(Deserialize)]
 struct ContractCallRequest {
     function: String,
@@ -5649,7 +4443,6 @@ async fn call_contract(
         }
     };
 
-    // Read-only: storage writes are buffered but never flushed to StateDB
     match vm.execute_with_state(&module, &req.function, &[], &context, &node.state) {
         Ok(result) => Ok(Json(json!({
             "success": result.success,
@@ -5671,18 +4464,8 @@ async fn call_contract(
     }
 }
 
-// ---------------------------------------------------------------------------
-// ETH-Compatible JSON-RPC
-// ---------------------------------------------------------------------------
-// Implements the Ethereum JSON-RPC specification so that MetaMask, Hardhat,
-// Foundry, and other EVM tooling can interact with ARC Chain unchanged.
-// Endpoint: POST /eth
-// Protocol: JSON-RPC 2.0
-
-/// ARC Chain ID (unique, registered-style). 0x415243 = "ARC" in ASCII.
 const ARC_CHAIN_ID: u64 = 0x415243;
 
-/// Standard ETH JSON-RPC request.
 #[derive(Deserialize)]
 struct EthRpcRequest {
     #[allow(dead_code)]
@@ -5708,7 +4491,6 @@ fn eth_rpc_result(id: &Value, result: Value) -> Json<Value> {
     }))
 }
 
-/// Main ETH JSON-RPC dispatcher.
 async fn eth_json_rpc(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<EthRpcRequest>,
@@ -5723,13 +4505,13 @@ async fn eth_json_rpc(
             &req.id,
             json!(format!("ARC/v{}", env!("CARGO_PKG_VERSION"))),
         ),
-        "eth_gasPrice" => eth_rpc_result(&req.id, json!("0x0")), // Zero-fee chain
+        "eth_gasPrice" => eth_rpc_result(&req.id, json!("0x0")),
         "net_listening" => eth_rpc_result(&req.id, json!(true)),
         "net_peerCount" => {
             let peers = node.peer_count.load(Ordering::Relaxed);
             eth_rpc_result(&req.id, json!(format!("0x{:x}", peers)))
         }
-        "eth_syncing" => eth_rpc_result(&req.id, json!(false)), // Always synced
+        "eth_syncing" => eth_rpc_result(&req.id, json!(false)),
         "eth_mining" => eth_rpc_result(&req.id, json!(false)),
         "eth_hashrate" => eth_rpc_result(&req.id, json!("0x0")),
         "eth_accounts" => eth_rpc_result(&req.id, json!([])),
@@ -5796,7 +4578,6 @@ async fn eth_json_rpc(
     }
 }
 
-/// Parse a hex-encoded 20-byte ETH address, returning a 32-byte ARC address.
 fn parse_eth_address(hex_str: &str) -> Result<Address, ()> {
     let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     if hex_str.len() != 40 {
@@ -5808,7 +4589,6 @@ fn parse_eth_address(hex_str: &str) -> Result<Address, ()> {
     Ok(Hash256(addr))
 }
 
-/// Parse block number parameter ("latest", "earliest", "pending", or hex number).
 fn parse_block_number(node: &NodeState, param: Option<&Value>) -> u64 {
     match param.and_then(|v| v.as_str()) {
         None | Some("latest") | Some("pending") => node.state.height().saturating_sub(1),
@@ -5917,7 +4697,6 @@ fn eth_get_block_by_number(node: &NodeState, params: &Value, id: &Value) -> Json
     match node.state.get_block(block_num) {
         Some(block) => {
             let txs: Value = if full_txs {
-                // Full tx objects would go here; for now return hashes with 0x prefix
                 json!(
                     block
                         .tx_hashes
@@ -6102,7 +4881,6 @@ fn eth_get_tx_receipt(node: &NodeState, params: &Value, id: &Value) -> Json<Valu
     }
 }
 
-/// eth_getLogs - returns event logs matching a filter.
 fn eth_get_logs(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
     let filter = match params.get(0) {
         Some(f) => f,
@@ -6152,7 +4930,7 @@ fn eth_get_logs(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
         .unwrap_or_default();
 
     let mut result_logs: Vec<Value> = Vec::new();
-    let max_height = to_block.min(from_block + 10_000); // Cap range
+    let max_height = to_block.min(from_block + 10_000);
 
     for height in from_block..=max_height {
         let logs = node
@@ -6162,13 +4940,11 @@ fn eth_get_logs(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
             .map(|entry| entry.value().clone());
         if let Some(logs) = logs {
             for log in logs.iter() {
-                // Address filter
                 if let Some(ref addrs) = address_filter
                     && !addrs.iter().any(|a| a.0 == log.address.0)
                 {
                     continue;
                 }
-                // Topic filter
                 let mut topic_match = true;
                 for (i, filter_topic) in topic_filters.iter().enumerate() {
                     if let Some(expected) = filter_topic
@@ -6267,24 +5043,8 @@ fn eth_call(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// eth_sendRawTransaction - accept RLP-encoded Ethereum transactions
-// ---------------------------------------------------------------------------
-// Decodes signed Ethereum transactions (legacy format), recovers the sender
-// via secp256k1 ecrecover, converts to an ARC Transaction, and inserts into
-// the mempool. Returns the Keccak-256 transaction hash (Ethereum-style).
-
-/// Minimal RLP decoder - just enough to parse Ethereum legacy transactions.
-///
-/// RLP encoding rules:
-///   - Single byte in [0x00, 0x7f]: the byte itself is its RLP encoding
-///   - [0x80, 0xb7]: short string, length = first_byte - 0x80
-///   - [0xb8, 0xbf]: long string, length-of-length = first_byte - 0xb7
-///   - [0xc0, 0xf7]: short list, payload length = first_byte - 0xc0
-///   - [0xf8, 0xff]: long list, length-of-length = first_byte - 0xf7
 #[allow(dead_code)]
 mod rlp {
-    /// An RLP-decoded item: either raw bytes or a list of items.
     #[derive(Debug, Clone)]
     pub enum RlpItem {
         Bytes(Vec<u8>),
@@ -6292,7 +5052,6 @@ mod rlp {
     }
 
     impl RlpItem {
-        /// Extract as byte slice. Returns error if this is a List.
         pub fn as_bytes(&self) -> Result<&[u8], String> {
             match self {
                 RlpItem::Bytes(b) => Ok(b),
@@ -6300,7 +5059,6 @@ mod rlp {
             }
         }
 
-        /// Extract as list. Returns error if this is Bytes.
         pub fn as_list(&self) -> Result<&[RlpItem], String> {
             match self {
                 RlpItem::List(items) => Ok(items),
@@ -6309,8 +5067,6 @@ mod rlp {
         }
     }
 
-    /// Decode a single RLP item from `data` starting at `offset`.
-    /// Returns `(item, bytes_consumed)`.
     pub fn decode(data: &[u8], offset: usize) -> Result<(RlpItem, usize), String> {
         if offset >= data.len() {
             return Err("RLP: unexpected end of data".into());
@@ -6319,10 +5075,8 @@ mod rlp {
         let prefix = data[offset];
 
         if prefix < 0x80 {
-            // Single byte
             Ok((RlpItem::Bytes(vec![prefix]), 1))
         } else if prefix <= 0xb7 {
-            // Short string: 0-55 bytes
             let len = (prefix - 0x80) as usize;
             if offset + 1 + len > data.len() {
                 return Err("RLP: short string overflow".into());
@@ -6330,7 +5084,6 @@ mod rlp {
             let bytes = data[offset + 1..offset + 1 + len].to_vec();
             Ok((RlpItem::Bytes(bytes), 1 + len))
         } else if prefix <= 0xbf {
-            // Long string: length encoded in next N bytes
             let len_of_len = (prefix - 0xb7) as usize;
             if offset + 1 + len_of_len > data.len() {
                 return Err("RLP: long string length overflow".into());
@@ -6342,7 +5095,6 @@ mod rlp {
             let bytes = data[offset + 1 + len_of_len..offset + 1 + len_of_len + len].to_vec();
             Ok((RlpItem::Bytes(bytes), 1 + len_of_len + len))
         } else if prefix <= 0xf7 {
-            // Short list: total payload 0-55 bytes
             let payload_len = (prefix - 0xc0) as usize;
             if offset + 1 + payload_len > data.len() {
                 return Err("RLP: short list overflow".into());
@@ -6350,7 +5102,6 @@ mod rlp {
             let items = decode_list_payload(data, offset + 1, payload_len)?;
             Ok((RlpItem::List(items), 1 + payload_len))
         } else {
-            // Long list: length encoded in next N bytes
             let len_of_len = (prefix - 0xf7) as usize;
             if offset + 1 + len_of_len > data.len() {
                 return Err("RLP: long list length overflow".into());
@@ -6364,7 +5115,6 @@ mod rlp {
         }
     }
 
-    /// Decode all items within a list payload.
     fn decode_list_payload(
         data: &[u8],
         start: usize,
@@ -6380,7 +5130,6 @@ mod rlp {
         Ok(items)
     }
 
-    /// Read a big-endian unsigned integer from a byte slice (1-8 bytes).
     fn read_be_uint(bytes: &[u8]) -> usize {
         let mut result: usize = 0;
         for &b in bytes {
@@ -6389,7 +5138,6 @@ mod rlp {
         result
     }
 
-    /// Encode a single byte-string item as RLP.
     pub fn encode_bytes(data: &[u8]) -> Vec<u8> {
         if data.len() == 1 && data[0] < 0x80 {
             vec![data[0]]
@@ -6406,7 +5154,6 @@ mod rlp {
         }
     }
 
-    /// Encode a list of already-encoded items as an RLP list.
     pub fn encode_list(encoded_items: &[Vec<u8>]) -> Vec<u8> {
         let payload: Vec<u8> = encoded_items
             .iter()
@@ -6425,7 +5172,6 @@ mod rlp {
         }
     }
 
-    /// Convert a usize to minimal big-endian bytes.
     fn to_be_bytes(val: usize) -> Vec<u8> {
         if val == 0 {
             return vec![0];
@@ -6438,10 +5184,8 @@ mod rlp {
         bytes[first_nonzero..].to_vec()
     }
 
-    /// Encode a u64 as an RLP byte string (minimal big-endian, no leading zeros).
     pub fn encode_u64(val: u64) -> Vec<u8> {
         if val == 0 {
-            // RLP encoding of zero is the empty byte string
             encode_bytes(&[])
         } else {
             let bytes = val.to_be_bytes();
@@ -6453,19 +5197,15 @@ mod rlp {
         }
     }
 
-    /// Encode a u256 (represented as a 32-byte big-endian slice) as an RLP byte string.
     pub fn encode_u256(bytes: &[u8]) -> Vec<u8> {
-        // Strip leading zeros
         let first_nonzero = bytes.iter().position(|&b| b != 0);
         match first_nonzero {
             Some(idx) => encode_bytes(&bytes[idx..]),
-            None => encode_bytes(&[]), // all zeros = empty
+            None => encode_bytes(&[]),
         }
     }
 }
 
-/// Parse a big-endian byte slice into a u64.
-/// Handles 0 to 8 bytes. Returns 0 for empty slices.
 fn be_bytes_to_u64(bytes: &[u8]) -> u64 {
     let mut result: u64 = 0;
     for &b in bytes {
@@ -6474,8 +5214,6 @@ fn be_bytes_to_u64(bytes: &[u8]) -> u64 {
     result
 }
 
-/// Parse a big-endian byte slice into a u128.
-/// Handles 0 to 16 bytes. Returns 0 for empty slices.
 fn be_bytes_to_u128(bytes: &[u8]) -> u128 {
     let mut result: u128 = 0;
     for &b in bytes {
@@ -6484,7 +5222,6 @@ fn be_bytes_to_u128(bytes: &[u8]) -> u128 {
     result
 }
 
-/// Compute Keccak-256 hash of data.
 fn keccak256(data: &[u8]) -> [u8; 32] {
     use sha3::{Digest, Keccak256};
     let mut hasher = Keccak256::new();
@@ -6495,27 +5232,7 @@ fn keccak256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Process `eth_sendRawTransaction`.
-///
-/// Accepts an RLP-encoded signed Ethereum transaction (legacy format):
-///   `[nonce, gasPrice, gasLimit, to, value, data, v, r, s]`
-///
-/// Steps:
-///   1. Hex-decode params[0]
-///   2. RLP-decode the 9-field list
-///   3. Reconstruct the unsigned tx RLP for signing hash:
-///      `RLP([nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0])`
-///   4. Keccak-256 hash that → signing hash
-///   5. Recover the secp256k1 public key from (r, s, v) + signing hash
-///   6. Derive the ARC address (BLAKE3 of uncompressed pubkey)
-///   7. Build an ARC `Transaction` (Transfer or WasmCall) and insert into mempool
-///   8. Return the Keccak-256 hash of the full signed RLP (Ethereum tx hash)
 fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
-    // Refuse what can never be included, as `/tx/submit_signed` does. A
-    // protocol-4 chain admits native inference only, and protocol v3 requires a
-    // signed minimum fee this Ethereum-shaped transfer never carries (its fee
-    // is 0). Accepting either would hand the caller a hash for a transaction
-    // that the next proposal drops.
     if node.state.active_protocol_version().major >= 3 {
         return eth_rpc_error(
             id,
@@ -6524,7 +5241,6 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
              submit a signed ARC transaction to /tx/submit_signed",
         );
     }
-    // --- 1. Extract and hex-decode the raw transaction ---
     let raw_hex = match params.get(0).and_then(|v| v.as_str()) {
         Some(h) => h,
         None => return eth_rpc_error(id, -32602, "Missing raw transaction parameter"),
@@ -6535,7 +5251,6 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
         Err(_) => return eth_rpc_error(id, -32602, "Invalid hex encoding"),
     };
 
-    // --- 2. RLP-decode the transaction ---
     let (item, _) = match rlp::decode(&raw_bytes, 0) {
         Ok(r) => r,
         Err(e) => return eth_rpc_error(id, -32602, &format!("RLP decode error: {}", e)),
@@ -6546,7 +5261,6 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
         _ => return eth_rpc_error(id, -32602, "Expected RLP list for transaction"),
     };
 
-    // Legacy transactions have exactly 9 fields
     if fields.len() != 9 {
         return eth_rpc_error(
             id,
@@ -6558,7 +5272,6 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
         );
     }
 
-    // --- Extract fields (all must be byte items, not nested lists) ---
     macro_rules! rlp_bytes {
         ($idx:expr, $name:expr) => {
             match fields[$idx].as_bytes() {
@@ -6587,7 +5300,6 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
     let gas_limit = be_bytes_to_u64(gas_limit_bytes);
     let _gas_price = be_bytes_to_u128(gas_price_bytes);
 
-    // Value: ETH uses 256-bit, ARC uses u64. Clamp to u64::MAX.
     let value_u128 = be_bytes_to_u128(value_bytes);
     let value: u64 = if value_u128 > u64::MAX as u128 {
         u64::MAX
@@ -6595,27 +5307,18 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
         value_u128 as u64
     };
 
-    // v: EIP-155 encodes chainId into v. For ARC (chainId = 0x415243):
-    //   v = chainId * 2 + 35 + recovery_id(0 or 1)
-    //   => v = 0x415243 * 2 + 35 + {0,1} = 8537639 or 8537640
-    // Pre-EIP-155: v = 27 or 28
     let v = be_bytes_to_u64(v_bytes);
 
     let (recovery_id_byte, chain_id_for_signing) = if v >= 35 {
-        // EIP-155: chain_id = (v - 35) / 2, recovery_id = (v - 35) % 2
         let chain_id = (v - 35) / 2;
         let rec_id = ((v - 35) % 2) as u8;
         (rec_id, Some(chain_id))
     } else if v == 27 || v == 28 {
-        // Pre-EIP-155
         ((v - 27) as u8, None)
     } else {
         return eth_rpc_error(id, -32602, &format!("Invalid v value: {}", v));
     };
 
-    // --- 3. Reconstruct the unsigned transaction RLP for the signing hash ---
-    // EIP-155: hash(RLP([nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0]))
-    // Pre-EIP-155: hash(RLP([nonce, gasPrice, gasLimit, to, value, data]))
     let unsigned_rlp = {
         let mut items: Vec<Vec<u8>> = vec![
             rlp::encode_bytes(nonce_bytes),
@@ -6627,16 +5330,14 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
         ];
         if let Some(cid) = chain_id_for_signing {
             items.push(rlp::encode_u64(cid));
-            items.push(rlp::encode_bytes(&[])); // 0
-            items.push(rlp::encode_bytes(&[])); // 0
+            items.push(rlp::encode_bytes(&[]));
+            items.push(rlp::encode_bytes(&[]));
         }
         rlp::encode_list(&items)
     };
 
     let signing_hash = keccak256(&unsigned_rlp);
 
-    // --- 4. Recover secp256k1 public key ---
-    // Build 32-byte zero-padded r and s
     let mut r_padded = [0u8; 32];
     if r_bytes.len() <= 32 {
         r_padded[32 - r_bytes.len()..].copy_from_slice(r_bytes);
@@ -6674,18 +5375,14 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
         Err(_) => return eth_rpc_error(id, -32602, "Failed to recover sender public key"),
     };
 
-    // --- 5. Derive ARC address from recovered public key ---
-    // ARC uses BLAKE3(uncompressed_pubkey_64_bytes) for secp256k1 addresses
     let uncompressed = recovered_vk.to_encoded_point(false);
     let point_bytes = uncompressed.as_bytes();
     let sender_address = arc_crypto::address_from_secp256k1_pubkey(&point_bytes[1..65]);
 
-    // --- 6. Parse the "to" address ---
     let is_contract_creation = to_bytes.is_empty() && !data_bytes.is_empty();
     let to_address = if to_bytes.is_empty() {
         Hash256::ZERO
     } else if to_bytes.len() == 20 {
-        // Standard 20-byte ETH address → pad to 32-byte ARC address
         let mut addr = [0u8; 32];
         addr[..20].copy_from_slice(to_bytes);
         Hash256(addr)
@@ -6697,25 +5394,18 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
         );
     };
 
-    // --- 7. Build the ARC Transaction ---
     let mut sig_65 = Vec::with_capacity(65);
     sig_65.extend_from_slice(&rs_bytes);
     sig_65.push(recovery_id_byte);
     let secp_sig = arc_crypto::Signature::Secp256k1 { signature: sig_65 };
 
     let arc_tx = if is_contract_creation {
-        // The historical gateway executed EVM deployment directly against
-        // this node, then submitted an unrelated Transfer as its supposed
-        // on-chain record. That can never be replayed by peers and forks
-        // state. Fail closed until the protocol has a canonical EVM-deploy
-        // transaction that every validator executes inside block commit.
         return eth_rpc_error(
             id,
             -32004,
             "EVM contract creation is unavailable until canonical block-executed deployment is activated; no state was changed",
         );
     } else if data_bytes.is_empty() {
-        // Simple value transfer
         let mut tx = Transaction::new_transfer(sender_address, to_address, value, nonce);
         tx.gas_limit = gas_limit;
         tx.signature = secp_sig;
@@ -6729,18 +5419,15 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
         );
     };
 
-    // --- 8. Insert into mempool ---
     if let Err(e) = node.mempool.insert(arc_tx) {
         return eth_rpc_error(id, -32000, &format!("Mempool rejected transaction: {}", e));
     }
 
-    // --- 9. Return the Ethereum-style tx hash (Keccak-256 of the full signed RLP) ---
     let eth_tx_hash = keccak256(&raw_bytes);
     eth_rpc_result(id, json!(format!("0x{}", hex::encode(eth_tx_hash))))
 }
 
 fn eth_estimate_gas(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
-    // Run the same as eth_call and return gas used
     let call_obj = match params.get(0) {
         Some(obj) => obj,
         None => return eth_rpc_error(id, -32602, "Missing call object"),
@@ -6782,24 +5469,12 @@ fn eth_estimate_gas(node: &NodeState, params: &Value, id: &Value) -> Json<Value>
     eth_rpc_result(id, json!(format!("0x{:x}", gas_estimate)))
 }
 
-// ─── Off-Chain Channel Relay ─────────────────────────────────────────────────
-
-/// Relay a channel state message to the counterparty via HTTP long-poll.
-///
-/// This is a simple relay: the node stores the latest message per channel
-/// and the counterparty polls for it. For production, this would be upgraded
-/// to a WebSocket endpoint.
-///
-/// POST /channel/{channel_id}/relay
-/// Body: arbitrary JSON (state commitment, payment, etc.)
 async fn channel_relay(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(channel_id): axum::extract::Path<String>,
     Json(message): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    // Store message in a per-channel relay buffer.
-    // In production, this would fan out to connected WebSocket clients.
-    let _ = &node; // Node state available for future auth/rate-limiting
+    let _ = &node;
     let _ = &channel_id;
     let _ = &message;
 
@@ -6810,14 +5485,10 @@ async fn channel_relay(
     })))
 }
 
-/// Query the latest relayed state for a channel.
-///
-/// GET /channel/{channel_id}/state
 async fn channel_state(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(channel_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    // Look up channel escrow on-chain
     let escrow_input = [
         b"arc-channel".as_slice(),
         &hex::decode(&channel_id).unwrap_or_default(),
@@ -6844,64 +5515,18 @@ async fn channel_state(
     }
 }
 
-// ─── Inference Endpoints ─────────────────────────────────────────────────────
-
-/// How long /inference/run waits for a community worker to return a
-/// completed job before giving up and falling through to the local
-/// model. Scales with `max_tokens` so a 4-token autocomplete doesn't
-/// have to budget for a 13B + 64-token chat completion. Floor is
-/// `MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS` so short generations still
-/// get one claim-poll cycle.
-///
-/// Observed 2026-06-04 on the testnet: a fixed 60s ceiling produced
-/// p50=67.8s end-to-end on a 4-token request because 97/100 calls
-/// waited the full timeout before falling back to local. The math:
-/// 4 tokens × ~3.3 s/tok = ~13s real work, so the budget should be
-/// ~15s not 60s. A successful result is now independently recomputed by a
-/// shard quorum before this timer completes, so the budget covers two
-/// inference passes (worker + verifier), one claim-poll window, and network
-/// headroom. The cap prevents an abandoned request from living forever.
 const MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 45;
-// One internal BOS + one prompt token + 256 outputs = 258 positions. Three
-// observed 3.3s/position passes x 1.5 headroom + a 30s claim window = 3,862s.
-// Keep the protocol budget below the reviewed 4,000s public/client ceiling
-// while never truncating a valid maximum-size job.
 const MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 3_900;
-/// Community verification contacts this many replicas of each layer range,
-/// or every replica of a range that has fewer live holders (never fewer
-/// than `COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED`).
 const COMMUNITY_VERIFICATION_REPLICAS: usize = 3;
-/// Distinct authenticated active-validator signatures that must agree on
-/// every range and position, whatever the number of replicas contacted.
 const COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED: usize = 2;
-/// Verification method labels: every range verified 2-of-3, every range
-/// verified 2-of-2 (two live replicas), or a mix of the two.
 const COMMUNITY_VERIFICATION_METHOD_2_OF_3: &str = "authenticated_shard_quorum_2_of_3_per_range";
 const COMMUNITY_VERIFICATION_METHOD_2_OF_2: &str = "authenticated_shard_quorum_2_of_2_per_range";
 const COMMUNITY_VERIFICATION_METHOD_MIXED: &str =
     "authenticated_shard_quorum_2_of_3_or_2_of_2_per_range";
-/// Response header on `GET /inference/readiness`: `ready`, or the reason
-/// code for which `community_dispatch_ready` is false. It is a header rather
-/// than a body field because released clients accept only the nine-field
-/// `arc.inference.readiness.v1` body.
 const COMMUNITY_DISPATCH_HEADER: &str = "x-arc-community-dispatch";
-/// Public text for a community route withheld because its result could not
-/// be verified now; the reason code is in `COMMUNITY_DISPATCH_HEADER`.
 const COMMUNITY_RESULTS_UNVERIFIABLE: &str =
     "community results cannot be independently verified on this coordinator right now";
 
-/// Compute the per-request community dispatch timeout from the complete
-/// generation context, not merely the requested output length. A long prompt
-/// performs the same expensive forwards as generated tokens; ignoring it let
-/// an assignment enter the queue with a 45-second deadline even when the
-/// worker and verifier needed thousands of prompt positions.
-///
-/// ~3.3s/position is the observed worker EWMA. The worker, coordinator
-/// verifier, and parallel peer approval phase can span three inference passes
-/// on the critical path, so budget 3× compute plus 50% headroom and one
-/// 30-second claim window. Contexts that cannot finish inside the reviewed
-/// public budget are rejected before enqueue, allowing a safe local/sharded
-/// fallback instead of creating work guaranteed to time out.
 fn community_dispatch_timeout_secs(required_positions: usize) -> Result<u64, String> {
     let per_token_ms: u64 = 3300;
     let positions = u64::try_from(required_positions)
@@ -6917,22 +5542,12 @@ fn community_dispatch_timeout_secs(required_positions: usize) -> Result<u64, Str
     Ok(est_secs.max(MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS))
 }
 
-/// True only while `worker_id` holds an ASSIGNED community job on this
-/// coordinator. Every worker long-polls `/community/claim_work` on all
-/// coordinators at once, and each pending long-poll keeps an EMPTY
-/// reservation in `community_active_jobs` until work arrives
-/// (`CommunityClaimReservation`); `commit` replaces it with the job id.
-/// A worker that is merely waiting for work is idle and is exactly the
-/// worker dispatch should target, so an empty reservation is not "busy".
 fn worker_has_assigned_community_job(node: &NodeState, worker_id: &str) -> bool {
     node.community_active_jobs
         .get(worker_id)
         .is_some_and(|job_id| !job_id.value().is_empty())
 }
 
-/// Count community workers that haven't expired their TTL and advertise
-/// the "inference" capability. Used by the smart router to decide
-/// whether to dispatch externally or run locally.
 fn live_inference_worker_count(node: &NodeState) -> usize {
     let Ok((_, coordinator_model_id)) = exact_model_identity(node) else {
         return 0;
@@ -6980,16 +5595,10 @@ fn exact_live_inference_worker(node: &NodeState, expected_worker: &str) -> bool 
             == Some(coordinator_model_id)
 }
 
-/// Consensus activation plus the operator's local ingress/issuance switch.
-/// This is enough to accept an already-threshold-authorized external 0x25,
-/// but not enough for this coordinator to create one.
 fn community_rewards_v1_protocol_active(node: &NodeState) -> bool {
     node.community_rewards_v1_enabled && node.state.community_rewards_v1_active()
 }
 
-/// End-to-end local issuance readiness. Public RPC/UI fields named `enabled`
-/// use this stronger definition so an activated but non-issuing deployment
-/// can never advertise rewards as available.
 fn community_rewards_v1_effective(node: &NodeState) -> bool {
     community_rewards_v1_protocol_active(node) && reward_approval_prerequisites(node).is_ok()
 }
@@ -7144,16 +5753,7 @@ fn community_job_id(
     .to_hex()
 }
 
-/// Turn the caller's rollout-bound recovery probe identity into the existing
-/// assignment commitment fields without reusing the process boot epoch or
-/// monotonic nonce. This makes the resulting job id stable across coordinator
-/// restarts while keeping the consensus-level job derivation unchanged.
 fn recovery_probe_assignment(probe_id: Hash256) -> (Hash256, u64) {
-    // The rollout-derived probe id is itself the signed assignment epoch.
-    // State recognizes its fixed namespace and enforces a second marker keyed
-    // only by this id, preventing the same rollout/ordinal from being paid by
-    // a different coordinator.  Keeping it in the existing field preserves
-    // historical bincode compatibility.
     let assignment_epoch = probe_id;
     let mut nonce = blake3::Hasher::new_derive_key("ARC-recovery-reward-probe-nonce-v1");
     nonce.update(probe_id.as_ref());
@@ -7163,9 +5763,6 @@ fn recovery_probe_assignment(probe_id: Hash256) -> (Hash256, u64) {
     (assignment_epoch, u64::from_le_bytes(bytes))
 }
 
-/// Find the one job already bound to a restart-stable recovery assignment.
-/// Multiple job ids under one assignment mean the idempotency contract was
-/// violated or tampered with and must fail closed.
 fn recovery_probe_existing_job(
     node: &NodeState,
     assignment_epoch: Hash256,
@@ -7294,9 +5891,6 @@ impl CommunityDispatchError {
         }
     }
 
-    /// An authenticated `declined=true` response consumes the assignment but
-    /// explicitly proves the worker did not start computation. It is the only
-    /// post-claim outcome for which a local pass cannot race late worker work.
     fn declined(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -7308,12 +5902,6 @@ impl CommunityDispatchError {
         Self::after_enqueue(message)
     }
 
-    /// The dispatcher withdrew an assignment that could no longer be served:
-    /// nobody claimed it within a full claim window, or the worker holding it
-    /// stopped heartbeating. The pending record is removed before this error
-    /// exists, so a later `/community/submit_work` for the job is rejected as
-    /// unknown work exactly as after a dispatcher timeout, and no late worker
-    /// result can race the caller's local or sharded pass.
     fn withdrawn(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -7333,57 +5921,18 @@ impl std::fmt::Display for CommunityDispatchError {
     }
 }
 
-/// How long `/inference/run` leaves an assignment unclaimed before it
-/// withdraws it and lets the caller fall back to this seed's own pipeline.
-///
-/// Every idle worker keeps a `/community/claim_work` long-poll open on every
-/// coordinator and re-polls 500 ms after each empty window, so an idle worker
-/// dequeues new work within about a second. An assignment still unclaimed
-/// after one full claim window has no idle worker on this coordinator: every
-/// registered worker is computing or settling a job, for this coordinator or
-/// another one, or has gone away without expiring from the registry yet. Such
-/// a request used to stay queued until a worker freed up, for as long as the
-/// whole compute budget (45 s to 65 min, `community_dispatch_timeout_secs`),
-/// and answered 504 if none did, without using the sharded pipeline that was
-/// ready the whole time. It is now withdrawn after one window and answered by
-/// this seed's own pipeline.
-///
-/// The trade-off: under a burst, requests queued behind one busy worker are no
-/// longer served in sequence by that worker as it frees up; they fall back
-/// after 30 s instead. The item each leaves in the queue is discarded as
-/// `job_expired` by the next worker that dequeues it.
 const COMMUNITY_UNCLAIMED_WITHDRAW_SECS: u64 = COMMUNITY_CLAIM_TIMEOUT_SECS;
 
-/// How often a waiting dispatcher re-reads its pending assignment and the
-/// assigned worker's registration. One `DashMap` lookup per tick.
 const COMMUNITY_ASSIGNMENT_WATCH_INTERVAL_MS: u64 = 1_000;
 
-/// The bounded waits `/inference/run` applies to one community assignment on
-/// top of the protocol compute budget.
 #[derive(Clone, Copy, Debug)]
 struct CommunityDispatchWindows {
-    /// Withdraw an assignment nobody has claimed after this long. `None`
-    /// waits for the whole compute budget.
     unclaimed_withdraw: Option<std::time::Duration>,
-    /// Withdraw a claimed assignment once its worker has been absent from the
-    /// registry, or unheard from, for longer than `COMMUNITY_WORKER_TTL_SECS`.
-    /// Safety comes from removing the pending record, not from the registry:
-    /// `community_submit_work` checks only that the worker is registered,
-    /// never its TTL, and stale registrations are pruned lazily, so the
-    /// worker's late submit is rejected only because its job has no pending
-    /// record any more. The trade-off is that a worker whose heartbeats to
-    /// this coordinator fail for 90 s while it is computing loses that job and
-    /// its reward, where before its result was still paid if it arrived inside
-    /// the budget; workers do not retry the resulting 404.
     withdraw_unregistered_worker: bool,
-    /// How often the pending assignment is re-read while waiting.
     watch_interval: std::time::Duration,
 }
 
 impl CommunityDispatchWindows {
-    /// Public jobs get both bounds. A sealed recovery probe targets one exact
-    /// canary worker and its rollout tooling reads the settlement from the
-    /// same response, so it keeps the unbounded protocol wait.
     fn protocol(recovery_probe: bool) -> Self {
         Self {
             unclaimed_withdraw: (!recovery_probe)
@@ -7396,23 +5945,11 @@ impl CommunityDispatchWindows {
     }
 }
 
-/// Why a waiting dispatcher withdrew its pending assignment early.
 enum AbandonedAssignment {
-    /// No worker dequeued the job within the unclaimed window.
     Unclaimed,
-    /// The named worker claimed the job and then disappeared from the
-    /// registry for longer than the worker TTL.
     WorkerUnregistered(String),
 }
 
-/// Withdraw an assignment this coordinator will no longer wait for, so its
-/// caller can fall back safely. The pending record is removed first: a later
-/// `/community/submit_work` for the job then fails as unknown work, exactly as
-/// after a dispatcher timeout, and the queued item is discarded as expired by
-/// the next worker that dequeues it. Returns `None` while the assignment can
-/// still complete, including while an authenticated submit is being verified
-/// (the registry timestamp is refreshed only after settlement, so a long
-/// verification must never look like a dead worker).
 fn withdraw_abandoned_assignment(
     node: &NodeState,
     results: &dashmap::DashMap<String, PendingCommunityWork>,
@@ -7420,8 +5957,6 @@ fn withdraw_abandoned_assignment(
     windows: CommunityDispatchWindows,
     unclaimed_deadline: Option<tokio::time::Instant>,
 ) -> Option<AbandonedAssignment> {
-    // Copy out and release the entry before any removal below; `remove_if`
-    // takes the same shard lock.
     let (assigned_worker, submitting) = {
         let pending = results.get(job_id)?;
         (pending.assigned_worker.clone(), pending.submitting)
@@ -7431,10 +5966,6 @@ fn withdraw_abandoned_assignment(
             if unclaimed_deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline) {
                 return None;
             }
-            // A claim that lands between the read above and this removal
-            // keeps the job: the predicate re-reads the assignment under the
-            // entry lock, and `community_claim_work` binds the worker under
-            // that same lock.
             results
                 .remove_if(job_id, |_, pending| pending.assigned_worker.is_none())
                 .map(|_| AbandonedAssignment::Unclaimed)
@@ -7454,22 +5985,12 @@ fn withdraw_abandoned_assignment(
                 !pending.submitting
                     && pending.assigned_worker.as_deref() == Some(worker_id.as_str())
             })?;
-            // The worker's single-capacity slot on this coordinator must not
-            // stay reserved for a job it can never submit.
             release_active_community_job_from_map(&node.community_active_jobs, &worker_id, job_id);
             Some(AbandonedAssignment::WorkerUnregistered(worker_id))
         }
     }
 }
 
-/// Push a whole-prompt job onto the community work queue and await the
-/// result via oneshot. Returns Err when there's no queue, no worker
-/// claims the job in time, the worker reports failure, or the result
-/// channel breaks.
-///
-/// On success the returned outcome carries the worker output plus the
-/// coordinator-created verification and settlement evidence. Those latter
-/// fields never cross the worker-controlled request boundary.
 async fn dispatch_to_community_worker_with_probe(
     node: &NodeState,
     input: String,
@@ -7491,8 +6012,6 @@ async fn dispatch_to_community_worker_with_probe(
     .await
 }
 
-/// `dispatch_to_community_worker_with_probe` with explicit wait bounds, so
-/// tests can exercise the withdrawal paths without the protocol's 30 s window.
 async fn dispatch_to_community_worker_with_windows(
     node: &NodeState,
     input: String,
@@ -7578,10 +6097,6 @@ async fn dispatch_to_community_worker_with_windows(
         .clone();
 
     loop {
-        // Normal public inference uses the boot epoch plus a monotonic nonce so
-        // concurrent identical prompts remain distinct. A sealed recovery probe
-        // instead uses its domain-separated rollout/ordinal identity so a retry
-        // after either process restarts reproduces the exact same job commitment.
         let (assignment_epoch, nonce) = recovery_probe_id
             .map(recovery_probe_assignment)
             .unwrap_or_else(|| {
@@ -7630,9 +6145,6 @@ async fn dispatch_to_community_worker_with_windows(
         };
 
         let (osh_tx, mut osh_rx) = tokio::sync::oneshot::channel::<CommunityDispatchOutcome>();
-        // Serialize the scan+insert only for deterministic recovery probes. This
-        // closes the concurrent same-ID and same-probe/different-semantics races
-        // without holding a synchronous guard across an await.
         let probe_gate = recovery_probe_id.map(|_| node.community_verified_settlements_gate.lock());
         if recovery_probe_id.is_some() {
             match recovery_probe_existing_job(node, assignment_epoch) {
@@ -7681,20 +6193,12 @@ async fn dispatch_to_community_worker_with_windows(
         };
 
         if let Err(e) = tx.try_send(item) {
-            // Enqueue is part of the bounded admission decision. Waiting for a
-            // queue slot here let 257+ concurrent public requests hang forever
-            // before their dispatch timeout even started. A saturated/closed
-            // queue now fails immediately and the smart router can use its local
-            // fallback without growing the pending map.
             results.remove(&job_id);
             return Err(CommunityDispatchError::before_enqueue(format!(
                 "community queue unavailable: {e}"
             )));
         }
 
-        // Wait for the result inside the protocol compute budget, re-reading the
-        // assignment every `watch_interval` so an assignment that can no longer be
-        // served is withdrawn instead of holding the caller for the whole budget.
         let timeout = tokio::time::Duration::from_secs(timeout_secs);
         let deadline = tokio::time::Instant::now() + timeout;
         let unclaimed_deadline = windows
@@ -7703,8 +6207,6 @@ async fn dispatch_to_community_worker_with_windows(
         let received = loop {
             let next_watch = tokio::time::Instant::now() + windows.watch_interval;
             tokio::select! {
-                // A result that is already there must never lose to the watch
-                // tick or the deadline.
                 biased;
                 received = &mut osh_rx => break Some(received),
                 _ = tokio::time::sleep_until(next_watch.min(deadline)) => {}
@@ -7786,10 +6288,6 @@ async fn dispatch_to_community_worker_with_windows(
                         CommunityDispatchError::after_enqueue(err)
                     });
                 }
-                // Keep the existing worker-reported display metric. Routing uses
-                // separate coordinator timing. Keyed by
-                // worker_id so it's distinguishable from the seed-to-seed
-                // forward_shard latency table.
                 record_latency(
                     &node.latency_stats,
                     &format!("worker:{}", outcome.result.worker_id),
@@ -7797,13 +6295,9 @@ async fn dispatch_to_community_worker_with_windows(
                 );
                 Ok(outcome)
             }
-            Some(Err(_)) => {
-                // oneshot sender dropped without sending — the worker
-                // disconnected mid-job or the queue purged us.
-                Err(CommunityDispatchError::after_enqueue(
-                    "worker disconnected before completing job",
-                ))
-            }
+            Some(Err(_)) => Err(CommunityDispatchError::after_enqueue(
+                "worker disconnected before completing job",
+            )),
             None => {
                 community_routing::record_timeout(
                     node,
@@ -7812,9 +6306,6 @@ async fn dispatch_to_community_worker_with_windows(
                     timeout_secs,
                     generation_preflight.required_positions,
                 );
-                // The drop guard removes an unclaimed job immediately and gives an
-                // already-claimed worker a bounded grace window to submit and
-                // settle without its public caller remaining connected.
                 Err(CommunityDispatchError::timed_out(format!(
                     "no worker completed within {}s",
                     timeout_secs
@@ -7835,41 +6326,13 @@ async fn dispatch_to_community_worker(
         .await
 }
 
-/// Tier 1 write ingress is intentionally unavailable.
-///
-/// The endpoint returns 503 before reading node state, using a validator key,
-/// or touching the mempool. Read-only result lookup remains available for
-/// historical requests. `/tx/submit_signed` independently rejects the same
-/// transaction family so this boundary cannot be bypassed.
 async fn inference_onchain_submit(
     AxumState(_node): AxumState<NodeState>,
     _body: Option<Json<Value>>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    // Deliberately no readiness boolean or operator override: changing a flag
-    // must never revive the removed validator self-signing oracle or the
-    // insufficiently validated caller relay. Re-enable this endpoint only
-    // with a new implementation after committee membership is authenticated
-    // end to end, exact model artifacts are consensus-bound, and signed
-    // requests pass the same semantic validation at every ingress.
     Err(paid_inference_unavailable())
 }
 
-/// Poll the on-chain status of a Tier 1 inference request.
-///
-/// GET /inference/onchain/result/:request_id
-///
-/// Returns: {
-///   "request_id": "0x...",
-///   "status": "Open" | "Voting" | "Finalized" | "Refunded",
-///   "vote_count": 3,
-///   "committee_size": 5,
-///   "anchor_height": 123,
-///   "deadline_blocks": 20,
-///   "votes": [{"voter": "0x...", "output_hash": "0x..."}],
-///   "output_hash": "0x..." | null,      // final, when Finalized
-///   "output_blob": "..." | null,        // utf-8 if first voter attached
-///   "max_reward": 10
-/// }
 async fn inference_onchain_result(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(request_id_str): axum::extract::Path<String>,
@@ -7908,7 +6371,6 @@ async fn inference_onchain_result(
         _ => "Unknown",
     };
 
-    // The final output_hash is stored after Finalize succeeds.
     let final_output_hash = node
         .state
         .get_storage(
@@ -7929,9 +6391,6 @@ async fn inference_onchain_result(
         &arc_crypto::hash_bytes(b"tier1.output_blob"),
     );
 
-    // Decode token-id bytes (little-endian u32) back to text via the
-    // local tokenizer. The blob is the same bytes the candle backend
-    // hashed (see candle_backend.rs: `generated_tokens.iter().flat_map(|t| t.to_le_bytes())`).
     let output_text = output_blob.as_ref().and_then(|bytes| {
         if bytes.is_empty() || bytes.len() % 4 != 0 {
             return None;
@@ -7969,22 +6428,6 @@ async fn inference_onchain_result(
     })))
 }
 
-/// Run inference through a community worker (preferred when any are online)
-/// or the local model (fallback). A community result can earn only through a
-/// worker-signed certificate wrapped by the coordinator in a gated,
-/// validator-authorized reward transaction.
-///
-/// POST /inference/run
-/// Body: { "input": "What is 2+2?", "max_tokens": 64, "bond": 1000,
-///         "force_local": false }
-///
-/// `force_local: true` skips the community dispatch and runs the
-/// request on the local model only. Used by benchmarks and by the
-/// rolling-upgrade verifier to confirm the seed's own engine still
-/// serves correctly without depending on network state.
-///
-/// Returns the query, response text, output hash, ms/token, attestation
-/// TX, and a `routed_via` field ("community:<worker_id>" | "local").
 #[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 struct InferenceReadinessResponse {
@@ -7997,34 +6440,23 @@ struct InferenceReadinessResponse {
     model_id: Option<String>,
     required_community_execution_profile: &'static str,
     mutation_free_observation: bool,
-    /// Why community dispatch is not ready, or `None` when it is. Served in
-    /// `COMMUNITY_DISPATCH_HEADER`, never in this body.
     #[serde(skip)]
     community_dispatch_blocked: Option<CommunityDispatchBlocked>,
 }
 
 impl InferenceReadinessResponse {
-    /// `ready`, or the machine-readable reason community dispatch is not.
     fn community_dispatch_status(&self) -> &'static str {
         self.community_dispatch_blocked
             .map_or("ready", CommunityDispatchBlocked::code)
     }
 }
 
-/// Why `/inference/readiness` reports `community_dispatch_ready: false`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommunityDispatchBlocked {
-    /// This node has no exact model artifact identity or no tokenizer.
     ModelIdentityUnavailable,
-    /// No idle community worker serves this model under the reward profile.
     NoEligibleWorkers,
-    /// This node runs no community work queue.
     WorkQueueUnavailable,
-    /// The validator shard pipeline that verifies community results cannot
-    /// be assembled for this model under the reward profile.
     VerificationPipelineUnavailable,
-    /// A layer range has fewer distinct live validator replicas than the
-    /// signatures one verification quorum needs.
     VerificationReplicasBelowQuorum,
 }
 
@@ -8039,7 +6471,6 @@ impl CommunityDispatchBlocked {
         }
     }
 
-    /// Workers could take the job, but its result could not be verified.
     fn is_verification(self) -> bool {
         matches!(
             self,
@@ -8049,18 +6480,10 @@ impl CommunityDispatchBlocked {
 }
 
 fn inference_readiness_snapshot(node: &NodeState) -> InferenceReadinessResponse {
-    // `live_inference_worker_count` already requires the coordinator's exact
-    // artifact identity plus the canonical reward execution profile, and
-    // excludes expired/busy workers.  The sender handle is the other fact
-    // required before `/inference/run` can enqueue a community assignment.
     let eligible_workers = live_inference_worker_count(node);
     let exact_model = exact_model_identity(node)
         .ok()
         .map(|(_, model_id)| model_id);
-    // A community job is dispatched only when its result could be verified
-    // now: the verifier's own pipeline and replica plan, read here without
-    // pruning the shard registry, must give every layer range at least two
-    // distinct replicas.
     let community_dispatch_blocked = if exact_model.is_none() {
         Some(CommunityDispatchBlocked::ModelIdentityUnavailable)
     } else if eligible_workers == 0 {
@@ -8077,21 +6500,12 @@ fn inference_readiness_snapshot(node: &NodeState) -> InferenceReadinessResponse 
         .map(|(blocked, _)| blocked)
     };
     let community_dispatch_ready = community_dispatch_blocked.is_none();
-    // A worker counts only while a job could be dispatched to it, so this
-    // stays 0 whenever community dispatch is not ready. Released clients
-    // reject a body where `community_dispatch_ready` differs from
-    // `live_community_workers > 0`.
     let live_community_workers = if community_dispatch_ready {
         eligible_workers
     } else {
         0
     };
 
-    // These mirror the two non-community branches in `inference_run`: a
-    // complete local model, or a partial local model backed by an actually
-    // assemblable profile-bound shard pipeline.  Requiring exact_model keeps
-    // the read preflight from green-lighting a write that the handler must
-    // reject before execution for missing/mismatched artifact provenance.
     let local_model_ready = exact_model.is_some()
         && node.inference_model.as_ref().is_some_and(|model| {
             (node.candle_engine.is_some() && node.candle_model_id == exact_model)
@@ -8126,14 +6540,6 @@ fn inference_readiness_snapshot(node: &NodeState) -> InferenceReadinessResponse 
     }
 }
 
-/// GET /inference/readiness
-///
-/// This endpoint is intentionally authentication-free and read-only.  It
-/// neither allocates a job ID nor touches the assignment registry, shard
-/// registry, mempool, or inference permit. Its only purpose is to let a client
-/// reject a known unavailable origin *before* spending its single inference
-/// POST. The `x-arc-community-dispatch` header says `ready`, or why
-/// `community_dispatch_ready` is false.
 async fn inference_readiness(
     AxumState(node): AxumState<NodeState>,
 ) -> (HeaderMap, Json<InferenceReadinessResponse>) {
@@ -8146,16 +6552,11 @@ async fn inference_readiness(
     (headers, Json(readiness))
 }
 
-// Exact source-artifact BLAKE3 from docs/determinism-proof.md. The base
-// Llama-2 model shares general.name with Chat, so metadata is not an identity.
 const LLAMA2_CHAT_ARTIFACT_ID: Hash256 = Hash256([
     0x93, 0x4e, 0xfc, 0x12, 0xa2, 0xed, 0x83, 0x72, 0xa9, 0x44, 0xe5, 0xaa, 0xed, 0xf0, 0x59, 0xa8,
     0xa0, 0xf4, 0x2c, 0x09, 0x06, 0xf6, 0xb2, 0xf1, 0xfb, 0x36, 0x26, 0xbd, 0xeb, 0x1f, 0xfa, 0x67,
 ]);
 
-/// Coordinator-only override for the pinned Chat GGUF, which has no template
-/// metadata. None retains each caller's existing behavior. Workers and
-/// verification tokenize the dispatched text directly; BOS stays a token.
 fn coordinator_chat_input(
     text: &str,
     chat_template_enabled: bool,
@@ -8168,11 +6569,6 @@ fn coordinator_chat_input(
     .then(|| format!("[INST] {text} [/INST]"))
 }
 
-/// Frozen copy of desktop v0.8.14-v0.8.17's
-/// `inference_prompt_token_upper_bound` (desktop/src-tauri/src/commands.rs).
-/// Those clients budget the ORIGINAL input: SentencePiece's leading marker
-/// costs three UTF-8 bytes, and each ASCII space becomes another marker.
-/// Keep this bound even if a future desktop changes its timeout calculation.
 fn legacy_desktop_prompt_bound(prompt: &str) -> u64 {
     const SENTENCEPIECE_MARKER_BYTES: u64 = 3;
 
@@ -8238,7 +6634,6 @@ async fn inference_run(
         .and_then(|v| v.as_str())
         .unwrap_or("Hello, world!");
 
-    // Validate input: reject null bytes, enforce max length
     if input_text.len() > 32_768 {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
@@ -8260,8 +6655,6 @@ async fn inference_run(
         .get("public_demo")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    // Without the tokenizer we cannot preserve older desktops' deadline.
-    // Public demo retains its existing, separate metadata-template path.
     let chat_input = node
         .inference_model
         .as_ref()
@@ -8283,9 +6676,6 @@ async fn inference_run(
         ));
     }
     let max_tokens = requested_max_tokens.min(u64::from(INFERENCE_RUN_MAX_TOKENS)) as u32;
-    // Apply once before job-ID derivation, dispatch, or any fallback. Exact
-    // wrapped positions must fit the original desktop budget, leaving its
-    // full 60-second response headroom. A rejected request cannot fall back.
     let max_tokens = if let Some(wrapped) = chat_input.as_deref() {
         chat_format_max_tokens(
             node.inference_model
@@ -8374,29 +6764,6 @@ async fn inference_run(
         }
     };
 
-    // ── Smart router: prefer community workers when any are online ──────
-    //
-    // The chain's design promise is "every device is a node, traffic
-    // auto-routes to the most efficient worker." Concretely: when a
-    // community worker has the model loaded and is idle, the seed
-    // dispatches to them; the seed's own model is the fallback when no
-    // worker can serve the job.
-    //
-    // Routing order:
-    //   1. force_local=true  → skip dispatch, run on this seed.
-    //   2. ≥1 live worker    → push WorkItem and wait within the protocol
-    //                          budget for compute + independent verification.
-    //   3. Pre-enqueue fail  → fall through to local model. Once claimed,
-    //                          never start a duplicate late local pass.
-    //   4. No local model    → return a 200 with success=false explaining
-    //                          why (workers all timed out, no model loaded).
-    //
-    // Community workers sign the exact model/input/output commitments. The
-    // seed binds that certificate to its pending assignment and, after the
-    // fleet-wide activation gate is enabled, submits a replay-marked reward.
-    // Use the same mutation-free snapshot served by GET
-    // `/inference/readiness`; this is the shared source of truth for the
-    // pre-dispatch client gate and the handler's routing facts.
     let readiness = inference_readiness_snapshot(&node);
     let live_workers = readiness.live_community_workers;
     let recovery_expected_job = if let Some(probe_id) = recovery_probe_id {
@@ -8443,9 +6810,6 @@ async fn inference_run(
             "sealed recovery probe coordinator cannot dispatch to the exact accepted canary worker",
         ));
     }
-    // A recovery probe exists to prove the community path. It never falls
-    // through to this node's own inference, so refuse it outright while a
-    // community result could not be verified.
     if recovery_probe_id.is_some() && !readiness.community_dispatch_ready {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -8455,8 +6819,6 @@ async fn inference_run(
             ),
         ));
     }
-    // Public demo: a caller-labelled public, testnet-only prompt that is
-    // always run by two independent community workers (twin execution).
     let max_tokens = if public_demo {
         if force_local || recovery_probe_id.is_some() {
             return Err(api_error(
@@ -8487,10 +6849,6 @@ async fn inference_run(
     } else {
         max_tokens
     };
-    // Community dispatch waits for a verified result. When none could be
-    // verified now, skip the community and serve this request below exactly
-    // as when no worker is eligible, instead of holding the caller until the
-    // dispatch deadline.
     if !force_local
         && let Some(blocked) = readiness.community_dispatch_blocked
         && blocked.is_verification()
@@ -8638,9 +6996,6 @@ async fn inference_run(
                     "verification": verification,
                     "settlement": settlement,
                 });
-                // Present only when `--community-release-on-verification`
-                // answered before the reward approvals; absent otherwise, so
-                // the default response is unchanged.
                 if let Some(answer_release) = answer_release {
                     response["answer_release"] = answer_release;
                 }
@@ -8685,9 +7040,6 @@ async fn inference_run(
                         ),
                     ));
                 }
-                // Every fallback-safe outcome lands here: a refusal before
-                // enqueue, an authenticated decline, or a withdrawal (which
-                // is logged with its job where it happens).
                 tracing::warn!(
                     workers = live_workers,
                     "community dispatch did not serve this request; falling back to this seed's own inference: {}",
@@ -8696,8 +7048,6 @@ async fn inference_run(
             }
         }
     }
-    // A public demo prompt only ever runs on two community workers; it never
-    // falls through to this coordinator's own model.
     if public_demo {
         return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -8705,7 +7055,6 @@ async fn inference_run(
         ));
     }
 
-    // Check if we have a loaded model (prefer candle float backend for quality)
     let model = match &node.inference_model {
         Some(m) => m.clone(),
         None => {
@@ -8724,20 +7073,6 @@ async fn inference_run(
     let (model_id_data, model_id_hash) =
         exact_model_identity(&node).map_err(|e| api_error(StatusCode::SERVICE_UNAVAILABLE, e))?;
 
-    // Partial-model guard: shard-holder seeds only have 3/32 layers loaded
-    // locally, so model.generate(...) produces structured garbage rather
-    // than a real completion. Route to the cross-seed sharded pipeline
-    // instead — that's the path the dashboard demo already exercises and
-    // it returns coherent output. Verified on testnet 2026-06-04: a 3/32
-    // local path produced `" nobody' Begriffe an"` 100% of the time
-    // while the sharded path produced `" George Washington."` for a
-    // historical-fact prompt.
-    //
-    // Only the candle (full Q4 float) path is allowed to skip sharded —
-    // it loads the entire model regardless of --shard-range flags. The
-    // pure-integer path runs against `model.layers` which is what
-    // load_cached_model_ranges populates with `.is_loaded()=false`
-    // sentinels for non-held layers.
     let candle_is_complete =
         node.candle_engine.is_some() && node.candle_model_id == Some(model_id_hash);
     let local_is_complete = candle_is_complete || model.has_all_transformer_layers();
@@ -8764,16 +7099,9 @@ async fn inference_run(
             model.layers.len()
         );
         let sharded_body = json!({
-            // Already wrapped at this coordinator; sharded defaults to no template.
             "input": dispatched_input,
             "max_tokens": max_tokens,
         });
-        // Reuse the live sharded handler instead of duplicating its
-        // tokenize → forward → cache → decode logic. If it succeeds the
-        // dashboard shape is the same as a normal sharded response; if
-        // it fails (no covering pipeline, all seeds down, etc.) surface
-        // the underlying error so the caller can see *why* local fallback
-        // was unsafe.
         let Json(mut response) =
             inference_run_sharded(AxumState(node.clone()), Json(sharded_body)).await?;
         response["routed_via"] = json!("sharded_seed_pipeline");
@@ -8793,10 +7121,8 @@ async fn inference_run(
 
     let start = std::time::Instant::now();
 
-    // Preserve the legacy metadata template unless the pinned Chat override applies.
     let templated_input = chat_input.unwrap_or_else(|| model.apply_chat_template(input_text));
 
-    // Encode templated text to tokens using the tokenizer
     let prompt_tokens = model.encode(&templated_input);
     let encode_ms = start.elapsed().as_millis() as u64;
 
@@ -8807,19 +7133,9 @@ async fn inference_run(
         }))));
     }
 
-    // Candle consumes the complete prompt tensor and therefore needs the BOS
-    // supplied here. `CachedIntegerModel::try_generate` owns its internal BOS
-    // forward, so its caller must retain the raw tokenizer output; prepending
-    // here as well made local/community execution see two BOS tokens while the
-    // sharded pipeline saw one.
     let mut tokens_with_bos = vec![model.config.bos_token];
     tokens_with_bos.extend(&prompt_tokens);
 
-    // Admit the complete engine-specific context before any KV-cache or
-    // spawn_blocking compute begins. The exact boundary is valid; one extra
-    // tokenizer-expanded position is a client error rather than a late
-    // tensor/RoPE failure. Both engines repeat this check at their execution
-    // boundary for defense in depth.
     if node.candle_engine.is_some() && node.candle_model_id.is_some() {
         arc_inference::candle_backend::GgufEngine::preflight_generation_for_context(
             tokens_with_bos.len(),
@@ -8843,14 +7159,6 @@ async fn inference_run(
             })?;
     }
 
-    // Run inference - use candle float backend if available, else integer engine
-    // Both engines' `generate` is a fully synchronous prefill + decode loop
-    // over max_tokens, so calling it directly from the async handler pinned a
-    // tokio worker thread for tens of seconds. With the default
-    // worker_threads == core count, a handful of concurrent /inference/run
-    // calls occupied every runtime thread and stalled DAG gossip, consensus
-    // and all other RPC on the node. Both paths now go through
-    // spawn_blocking, and inside it through the configurable compute pool.
     let (generated_tokens, output_hash, engine_name) =
         if let (Some(engine), Some(mid)) = (&node.candle_engine, &node.candle_model_id) {
             if *mid != model_id_hash {
@@ -8859,7 +7167,6 @@ async fn inference_run(
                     "candle engine identity does not match the exact source artifact commitment",
                 ));
             }
-            // Candle Q4 float backend - coherent output, deterministic on same arch
             let engine_c = engine.clone();
             let mid_c = *mid;
             let toks = tokens_with_bos.clone();
@@ -8897,13 +7204,6 @@ async fn inference_run(
                 "candle Q4 (float, deterministic per-arch)",
             )
         } else {
-            // Integer engine — bit-identical across architectures. Precision
-            // label comes from the model itself so it tracks the dispatch
-            // chain (I16 / block-I8 / Q4 / per-row I8 / ternary / hybrid)
-            // instead of hardcoding "INT8 integer". When the loader populates
-            // I16 (default 2026-06-04+) this reports "INT16 integer …";
-            // before that it reported "INT8" even when block-I8 was actually
-            // running. Honest labels matter for "is INT16 working" debugging.
             let model_c = model.clone();
             let toks = prompt_tokens.clone();
             let pool_node = node.clone();
@@ -8930,19 +7230,10 @@ async fn inference_run(
     let tokens_generated = generated_tokens.len() as u64;
     let ms_per_token = inference_ms.checked_div(tokens_generated).unwrap_or(0);
 
-    // Decode output tokens to text
     let output_text = model.decode(&generated_tokens);
 
     let input_hash = arc_crypto::hash_bytes(input_text.as_bytes());
 
-    // Create + sign the InferenceAttestation transaction.
-    //
-    // The nonce comes from account state on every submission. It used to be
-    // `state_nonce + attestation_nonce.fetch_add(1)`, an in-process counter
-    // that accumulates forever — including across txs that never land — so
-    // once the first attestation applied, state advanced AND the counter
-    // advanced and every subsequent tx carried state+2. See
-    // `submit_inference_attestation` for the full postmortem.
     let (tx_hash, attestation_status) = submit_or_relay_attestation(
         &node,
         model_id_hash,
@@ -8953,7 +7244,6 @@ async fn inference_run(
     )
     .await;
 
-    // Store inference result for explorer display
     let tx_hash_hex = format!("0x{}", hex::encode(tx_hash.0));
     let (explorer_url, explorer_url_unavailable_reason) =
         explorer_url_for(&node, &tx_hash, &attestation_status);
@@ -9003,20 +7293,6 @@ async fn inference_run(
     }))))
 }
 
-/// Per-worker earnings, derived from successful on-chain
-/// CommunityInferenceReward receipts.
-///
-/// GET /worker/earnings/:address
-///
-/// Raw worker attestations never imply payment. This endpoint counts only
-/// validator-authorized reward transactions whose execution receipt exists
-/// and succeeded, and attributes them to the explicit worker field.
-///
-/// Replaces the desktop's pre-v0.7 client-side synthesis from
-/// /inference/results, which conflated "this seed's local inference
-/// cache" with "what this address earned across the network." A worker
-/// behind NAT could earn a thousand attestations and the local cache
-/// would still show 0.
 async fn worker_earnings(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(address_hex): axum::extract::Path<String>,
@@ -9045,7 +7321,6 @@ async fn worker_earnings(
     let mut confirmed_receipts: Vec<(u64, u32, [u8; 32], Value)> = Vec::new();
     let mut successful_job_ids = HashSet::new();
 
-    // Release the iterator and every shard guard before reading published state.
     let candidates: Vec<_> = node
         .state
         .full_transactions
@@ -9132,15 +7407,8 @@ async fn worker_earnings(
         .map(|(_, _, _, receipt)| receipt)
         .collect();
 
-    // Every successful reward receipt transfers the fixed protocol amount.
-    // This retained-window total can undercount older history on non-archive
-    // nodes, but it never counts pending or failed transaction bodies.
     let estimated_total_arc = count as f64 * REWARD_PER_ATTESTATION_ARC;
 
-    // The address's ACTUAL on-chain balance. It is not lifetime earnings: the
-    // wallet can receive, spend, or transfer ARC for unrelated reasons. Surface
-    // it beside the retained reward-receipt total so the UI can label each
-    // quantity honestly rather than pretending either reconciles the other.
     let onchain_balance: u64 = node
         .state
         .get_account(&want)
@@ -9148,14 +7416,6 @@ async fn worker_earnings(
         .unwrap_or(0);
     let onchain_balance_arc = onchain_balance as f64 / arc_types::economics::ARC_BASE_UNITS as f64;
 
-    // ── Observed rate, measured from real block timestamps ────────────────
-    //
-    // Everything a client needs to project a rate, or to know it cannot. The
-    // window is bounded by the first and last attestation THIS NODE can see,
-    // and its length is read from those blocks' own header timestamps — no
-    // nominal block time is assumed anywhere. That matters concretely: at a
-    // notional 400 ms/block, four of the six live seeds would report brisk
-    // throughput across a window in which they sealed nothing for six days.
     let block_ts = |h: Option<u64>| -> Option<u64> {
         h.and_then(|h| node.state.get_block(h))
             .map(|b| b.header.timestamp)
@@ -9164,7 +7424,6 @@ async fn worker_earnings(
     let first_ts = block_ts(first_block);
     let last_ts = block_ts(last_block);
     let blocks_observed = match (first_block, last_block) {
-        // Inclusive span: a single attestation spans one block, not zero.
         (Some(f), Some(l)) if l >= f => Some(l - f + 1),
         _ => None,
     };
@@ -9221,16 +7480,6 @@ async fn worker_earnings(
         )
     };
 
-    // "Today" is null, not invented.
-    //
-    // This used to report `round(count * 0.12)` attestations as today's, and
-    // derive today_arc from that. It is a fabrication with no relationship to
-    // when anything happened: a worker with one lifetime attestation reported
-    // identical Today and Lifetime; a worker with a hundred reported twelve
-    // today regardless of whether any of them were from this week. Computing
-    // it honestly needs a block_height → timestamp join this endpoint does
-    // not have yet, so until then the field says "unknown" by being null and
-    // the reason ships alongside it.
     let earnings_history_note = if history_complete_since_recovery {
         "archive gross rewards since the v3 recovery boundary = successful \
          CommunityInferenceReward receipts × reward_per_attestation_arc; this is complete \
@@ -9255,17 +7504,13 @@ async fn worker_earnings(
         "confirmed_gross_earnings_base": confirmed_gross_base,
         "confirmed_gross_earnings_arc": confirmed_gross_base
             .map(|value| value as f64 / arc_types::economics::ARC_BASE_UNITS as f64),
-        // Actual wallet balance, not an earnings total.
         "onchain_balance": onchain_balance,
         "onchain_balance_arc": onchain_balance_arc,
-        // Count-based estimate of gross reward earned (clearly labeled).
         "estimated_total_arc": estimated_total_arc,
         "estimated_total_arc_note": earnings_history_note,
         "history_scope": earnings_history_scope,
         "history_domain": EARNINGS_HISTORY_DOMAIN,
         "history_complete_since_recovery": history_complete_since_recovery,
-        // Back-compat alias for pre-existing clients; same value as the
-        // estimate above, and NOT the reconciled balance.
         "total_arc": estimated_total_arc,
         "today_arc": Value::Null,
         "today_attestations": Value::Null,
@@ -9295,15 +7540,11 @@ async fn worker_earnings(
         "community_rewards_v1_note": community_rewards_v1_readiness_note(&node),
         "validator_set_size_required": arc_types::transaction::COMMUNITY_REWARD_VALIDATOR_SET_SIZE,
         "validator_approvals_required": arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED,
-        // Base units too, so a client can do the whole projection in integers
-        // and never round. Same constant arc-state credits on apply.
         "reward_per_attestation_base": arc_types::economics::INFERENCE_ATTESTATION_REWARD,
         "last_reward_block": last_block,
         "last_reward_tx_hash": last_tx_hash,
-        // Backward-compatible aliases for desktop versions predating 0x25.
         "last_attestation_block": last_block,
         "last_attestation_tx_hash": last_tx_hash,
-        // ── Observed window + rate (v0.7.11+, additive) ───────────────────
         "first_attestation_block": first_block,
         "blocks_observed": blocks_observed,
         "blocks_observed_unavailable_reason": if blocks_observed.is_none() {
@@ -9331,30 +7572,11 @@ async fn worker_earnings(
              hours, not a forecast. It says nothing about future work available, and any \
              projection built on it must also respect /economics/rewards.rewards_remaining — \
              the treasury funding these rewards is finite.",
-        // The index is rebuilt from the durable WAL on restart. Non-archive
-        // nodes can still prune both the in-memory rows and old WAL segments;
-        // archive nodes retain them as an operator-enforced history contract.
         "source": "scan of this node's in-memory full_transactions map",
         "archive_mode": node.state.archive_mode,
     })))
 }
 
-/// Live community-worker leaderboard. Reads only in-memory state
-/// (no chain query) so it's cheap to poll from the dashboard.
-///
-/// GET /workers/scoreboard?limit=50
-///
-/// Returns workers sorted by composite score:
-///   score = (success_rate * 1000) − avg_ms_per_job
-///
-/// Workers with no successful submissions yet get score = 0 (not -∞)
-/// and sort to the bottom but stay visible — fresh workers shouldn't
-/// disappear from the board until they actively fail.
-///
-/// In v0.8 this endpoint will additionally drive per-worker dispatch
-/// priority. v0.7.0 phase 1 keeps the FIFO mpsc; this is the
-/// observability hook that the worker-targeted-lane refactor will
-/// build on.
 async fn workers_scoreboard(
     AxumState(node): AxumState<NodeState>,
     Query(params): Query<HashMap<String, String>>,
@@ -9386,8 +7608,6 @@ async fn workers_scoreboard(
         avg_ms_per_job: f64,
         last_total_ms: u64,
         score: f64,
-        /// Twin execution tallies and the coarse region tag. Omitted while
-        /// twin execution and the demand pump are both off.
         #[serde(skip_serializing_if = "Option::is_none")]
         twin: Option<twin_dispatch::WorkerTwinRow>,
     }
@@ -9413,11 +7633,6 @@ async fn workers_scoreboard(
         } else {
             0.0
         };
-        // Composite score: heavily weight success_rate, penalize slow
-        // workers. Scale chosen so a 100% success-rate worker at 100ms
-        // beats a 50%-rate worker at 50ms (1000 - 100 = 900 vs 500 - 50
-        // = 450). Workers with no completed jobs yet get score 0 (visible
-        // but ranked last among visible workers).
         let score = if w.success_count == 0 {
             0.0
         } else {
@@ -9425,8 +7640,6 @@ async fn workers_scoreboard(
         };
         rows.push(WorkerScore {
             worker_id: w.worker_id.clone(),
-            // Re-derived on every read: a label stored before this rule (a
-            // legacy `name (hostname)` registration) must never be served.
             name: community_public_name(&w.worker_id, &w.name),
             platform: w.platform.clone(),
             capabilities: w.capabilities.clone(),
@@ -9511,9 +7724,6 @@ fn inference_payload_for_attestation(
             "chain_commitments_only"
         }),
     );
-    // InferenceAttestation commits hashes, not prompt/output text. Even when
-    // this node can enrich a mined row from local memory, the API must not
-    // imply that display text itself was stored in the receipt or block.
     inference.insert("display_text_on_chain".to_string(), json!(false));
     inference
         .entry("model".to_string())
@@ -9529,17 +7739,6 @@ fn local_inference_for_hash(node: &NodeState, hash: &[u8; 32]) -> Option<Value> 
         .map(|entry| public_inference_metadata(entry.value().clone()))
 }
 
-/// List inference activity visible to this node without conflating an
-/// in-memory computation with a mined transaction.
-///
-/// `activities` contains both explicitly labelled local observations and
-/// receipt-backed transactions. `attestations` is the compatibility view and
-/// contains successful mined computation activity: legacy 0x16
-/// `InferenceAttestation` receipts and protocol-v3 0x25
-/// `CommunityInferenceReward` receipts. Callers must inspect `record_kind`,
-/// `paid`, and `earned`; only successful 0x25 rows are payment evidence.
-///
-/// GET /inference/attestations?limit=10
 async fn inference_list_attestations(
     AxumState(node): AxumState<NodeState>,
     Query(params): Query<HashMap<String, String>>,
@@ -9552,15 +7751,8 @@ async fn inference_list_attestations(
 
     let height = node.state.height();
     let source_node = format!("0x{}", node.validator_address.to_hex());
-    // (mined block height, local observation time, activity row). Receipt
-    // backed rows sort first by block height; unordered legacy observations
-    // never outrank mined chain evidence merely because they lack a receipt.
     let mut activities: Vec<(Option<u64>, u64, Value)> = Vec::new();
 
-    // One linear chain-index scan builds both activity types and the O(1)
-    // dedup set for process-local observations. A body is not proof of
-    // inclusion: the map key, signed transaction hash/type, and receipt hash
-    // must all agree before any row is called mined.
     let mut receipt_backed_local_ids = HashSet::<[u8; 32]>::new();
     let mut candidates = Vec::new();
     for entry in node.state.full_transactions.iter() {
@@ -9580,7 +7772,6 @@ async fn inference_list_attestations(
             candidates.push((*hash, tx.clone()));
         }
     }
-    // No StateDB map guard survives into receipt or canonical evidence reads.
     for (hash, tx) in candidates {
         let hash = &hash;
         match &tx.body {
@@ -9644,8 +7835,6 @@ async fn inference_list_attestations(
                 ]);
                 let mut inference = local_inference_for_hash(&node, &body.job_id.0)
                     .or_else(|| {
-                        // Compatibility fallback for pre-v3 local caches that
-                        // keyed the row by the worker-certificate hash.
                         local_inference_for_hash(&node, &body.worker_certificate.attestation_hash.0)
                     })
                     .and_then(|value| value.as_object().cloned())
@@ -9733,9 +7922,6 @@ async fn inference_list_attestations(
         }
     }
 
-    // Process-local results without a matching transaction receipt are useful
-    // operational evidence, but they are not transactions, attestations, or
-    // proof of payment. Keep them visible under an explicit observation type.
     for entry in node.inference_results.iter() {
         if parse_hash256_hex(entry.key(), "record_id")
             .is_ok_and(|hash| receipt_backed_local_ids.contains(&hash.0))
@@ -9824,7 +8010,6 @@ async fn inference_list_attestations(
     })))
 }
 
-/// GET /inference/results - list stored inference results (input, output, hash, model).
 async fn inference_list_results(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let results: Vec<Value> = node
         .inference_results
@@ -9842,15 +8027,6 @@ async fn inference_list_results(AxumState(node): AxumState<NodeState>) -> Json<V
     }))
 }
 
-// ─── Sharded Inference: Pipeline-Parallel ──────────────────────────────────
-//
-// The model is split across N nodes. A request flows:
-//   client → coordinator → shard0 (layers 0..k0)
-//                       → shard1 (layers k0..k1)
-//                       → ...
-//                       → shardN-1 (layers kN-1..n_layers + LM head)
-// Each shard holds a per-request KV cache that lives across token generation.
-
 const MAX_FORWARD_SHARD_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FORWARD_SHARD_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FORWARD_SHARD_HIDDEN_ELEMENTS: usize = 131_072;
@@ -9866,52 +8042,30 @@ struct ValidatorRpcAudience {
 struct ShardKvCacheMetadata {
     signer: Hash256,
     last_seen: Instant,
-    /// Unique identity for one lifetime of this request id. A reservation from
-    /// an older lifetime must never roll back a replacement cache that happens
-    /// to use the same caller-provided id.
     generation: Arc<()>,
-    /// Number of forward handlers currently using this generation. An
-    /// unestablished cache can be rolled back only after its last handler exits.
     in_flight_reservations: usize,
-    /// Set after any forward in this generation has produced a signed response.
-    /// Once established, a malformed duplicate/out-of-order call cannot evict
-    /// the healthy cache built by earlier positions.
     established: bool,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ForwardShardRequest {
-    /// Unique request id (hex). The receiving shard uses this as the KV cache key.
     request_id: String,
-    /// Exact BLAKE3 commitment of every source-artifact byte.
     model_id: String,
-    /// Exact protocol-v3 integer dispatch profile. It is covered by both the
-    /// authenticated request envelope and the shard's response signature.
     execution_profile: String,
-    /// Either a token id (only valid on first shard) or a hidden state (i64s).
     #[serde(default)]
     token: Option<u32>,
     #[serde(default)]
     hidden: Option<Vec<i64>>,
-    /// Hash of the hidden state for integrity verification (BLAKE3 hex).
     #[serde(default)]
     hidden_hash: Option<String>,
-    /// Token position in the sequence (for RoPE + KV cache).
     position: usize,
-    /// Layer range this node should process.
     start_layer: usize,
     end_layer: usize,
-    /// Exact model width expected in every nonterminal response.
     expected_hidden_len: usize,
-    /// Whether this range includes the model's terminal LM head.
     expect_terminal: bool,
-    /// Recently generated output tokens used by the terminal shard's shared
-    /// deterministic repetition-penalty selector.  Empty during prefill and on
-    /// every nonterminal range; bounded to the protocol's 64-token window.
     #[serde(default)]
     generated_tokens: Vec<u32>,
-    /// True if this is the last token of the request - used to evict KV cache.
     #[serde(default)]
     last_token: bool,
 }
@@ -9943,38 +8097,22 @@ impl CommunityAuthenticatedPayload for ValidatorForwardShardRequest {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ForwardShardResponse {
-    /// True if this shard ran the LM head and produced a token.
     is_terminal: bool,
-    /// Hidden state to forward to the next shard (if not terminal).
     #[serde(skip_serializing_if = "Option::is_none")]
     hidden: Option<Vec<i64>>,
-    /// BLAKE3 hash of the hidden state for next-shard verification.
     #[serde(skip_serializing_if = "Option::is_none")]
     hidden_hash: Option<String>,
-    /// Token id (if terminal).
     #[serde(skip_serializing_if = "Option::is_none")]
     token_id: Option<u32>,
-    /// Hash of the logits (if terminal).
     #[serde(skip_serializing_if = "Option::is_none")]
     logits_hash: Option<String>,
-    /// Layers this shard processed.
     layers_processed: usize,
-    /// Compute time for this shard, in milliseconds.
     compute_ms: u64,
-    /// Friendly node name.
     node_name: String,
-    /// Active validator that authenticated this computation response.
     validator_address: Hash256,
-    /// Signature over the chain domain, exact request, and semantic response.
-    /// A hash majority without signer authentication is only three HTTP
-    /// aliases; this turns it into a majority of distinct validator keys.
     signature: arc_crypto::Signature,
 }
 
-/// Optional, unsigned diagnostics carried in HTTP headers so the JSON response
-/// and its v3 signed transcript remain byte-for-byte schema compatible.
-/// Older coordinators ignore these headers; newer coordinators treat absent or
-/// malformed values from older peers as unavailable telemetry.
 const SHARD_TIMING_SCHEMA_HEADER: &str = "x-arc-shard-timing-schema";
 const SHARD_TIMING_BLOCKING_QUEUE_HEADER: &str = "x-arc-shard-spawn-blocking-queue-us";
 const SHARD_TIMING_POOL_QUEUE_HEADER: &str = "x-arc-shard-compute-pool-queue-us";
@@ -10029,9 +8167,6 @@ fn parse_shard_timing_headers(headers: &HeaderMap) -> Option<ShardTimingBreakdow
     })
 }
 
-/// Domain-separated transcript signed by a shard holder for every response.
-/// Authentication covers the request as well as the result, preventing a
-/// valid response from a different prompt/position/range from being replayed.
 fn forward_shard_response_commitment(
     chain_identity: Option<&ChainIdentity>,
     req: &ForwardShardRequest,
@@ -10160,7 +8295,6 @@ fn verify_forward_shard_response_semantics(
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct CleanupShardRequest {
-    /// Unique request id whose per-shard KV cache should be evicted.
     request_id: String,
 }
 
@@ -10188,17 +8322,11 @@ impl CommunityAuthenticatedPayload for ValidatorCleanupShardRequest {
     }
 }
 
-/// GET /inference/cache_stats
-/// Report live stats about the deterministic inference cache: how many
-/// entries are warm, what the capacity is, and total cumulative hits.
-/// Dashboards call this to show a "N prompts cached" counter.
 async fn inference_cache_stats(AxumState(node): AxumState<NodeState>) -> Json<serde_json::Value> {
     Json(json!({
         "size": node.inference_cache.len(),
         "capacity": node.inference_cache.capacity(),
         "total_hits": node.inference_cache.total_hits(),
-        // Sharded requests served WITHOUT walking the pipeline. Tracked apart
-        // from sharded_runs_total so neither number lies about the other.
         "sharded_cache_hits_total": node.sharded_cache_hits.load(Ordering::Relaxed),
         "sharded_runs_total": node.sharded_runs_total.load(Ordering::Relaxed),
         "cache_type": "DistributedCache (BLAKE3-keyed, deterministic, LRU)",
@@ -10206,10 +8334,6 @@ async fn inference_cache_stats(AxumState(node): AxumState<NodeState>) -> Json<se
     }))
 }
 
-/// GET /inference/latency_stats
-/// Returns the rolling EWMA hop latency (ms) per replica socket, plus sample
-/// count and age. Coordinators use this map to sort per-range replica lists
-/// before picking primary (run_sharded) or top-k (run_consensus). Closes #29.
 async fn inference_latency_stats(AxumState(node): AxumState<NodeState>) -> Json<serde_json::Value> {
     let mut entries: Vec<serde_json::Value> = Vec::with_capacity(node.latency_stats.len());
     for kv in node.latency_stats.iter() {
@@ -10219,15 +8343,8 @@ async fn inference_latency_stats(AxumState(node): AxumState<NodeState>) -> Json<
             "ewma_ms": (stat.ms * 100.0).round() / 100.0,
             "samples": stat.count,
             "age_secs": stat.last_updated.elapsed().as_secs(),
-            // Whether the router will ACT on this figure. Samples past
-            // LATENCY_STALE_SECS are treated as unknown rather than as fact —
-            // the map used to be insert-only, so ten-hour-old numbers still
-            // steered every dispatch.
             "in_use": effective_latency_ms(&stat).is_some(),
             "stale_after_secs": LATENCY_STALE_SECS,
-            // "hop" = measured forward_shard round trip. "probe" = provisional
-            // value from a GET /health RTT, used only where no hop sample
-            // exists or where the recorded one was contradicted by the probe.
             "source": if stat.probe_only { "probe" } else { "hop" },
         }));
     }
@@ -10249,11 +8366,6 @@ async fn inference_latency_stats(AxumState(node): AxumState<NodeState>) -> Json<
     }))
 }
 
-/// POST /inference/cache_check
-/// Given a list of prompts, report for each whether it is currently warm
-/// in the cache. The dashboard uses this to show a "✓ instant" badge on
-/// preset prompt buttons, so visitors can see ahead of time which clicks
-/// will return in milliseconds and which will run the full pipeline.
 #[derive(Deserialize)]
 struct CacheCheckRequest {
     prompts: Vec<CacheCheckPrompt>,
@@ -10286,9 +8398,6 @@ async fn inference_cache_check(
         "no model loaded".to_string(),
     ))?;
 
-    // Replicate the cache-key derivation used by inference_run_sharded so
-    // a check here matches what a real call would look up. Cache entries are
-    // isolated by exact artifact bytes, not merely compatible dimensions.
     let model_id_hash = node.model_artifact_id.ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "exact source-artifact model commitment unavailable".to_string(),
@@ -10323,8 +8432,6 @@ async fn inference_cache_check(
     Ok(Json(results))
 }
 
-/// POST /inference/forward_shard
-/// Run the local shard's slice of layers on the incoming hidden state (or token).
 async fn inference_forward_shard(
     AxumState(node): AxumState<NodeState>,
     Json(signed): Json<CommunitySignedRequest<ValidatorForwardShardRequest>>,
@@ -10398,20 +8505,11 @@ impl Drop for ShardKvCacheReservation {
     }
 }
 
-/// Ownership that must live for the full CPU forward, even if the HTTP waiter
-/// is cancelled. `spawn_blocking` work is not cancelled when its JoinHandle is
-/// dropped, so keeping either guard on the async handler stack would let an
-/// abandoned request bypass compute admission or roll back a cache still in use.
 struct ShardComputeLease {
     cache_reservation: ShardKvCacheReservation,
     inference_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
-/// Keep public whole-model admission tied to the synchronous compute itself.
-/// Dropping an HTTP handler only drops its `JoinHandle`; Tokio cannot cancel an
-/// already-running `spawn_blocking` closure. Moving the permit into that
-/// closure prevents a cancelled waiter from admitting overlapping model/KV
-/// work before the abandoned computation has actually stopped.
 fn spawn_blocking_with_public_compute_permit<T, F>(
     inference_permit: tokio::sync::OwnedSemaphorePermit,
     compute: F,
@@ -10487,15 +8585,10 @@ fn reserve_shard_kv_cache(
             ));
         }
 
-        // Heal an impossible half-entry defensively. All production mutation
-        // paths take `shard_kv_cache_gate`, but old state/tests may not.
         drop(metadata);
         node.shard_kv_cache_metadata.remove(request_id);
     }
 
-    // Likewise, do not attach a new generation to a cache with no ownership
-    // metadata. A stale reservation still holds its Arc and cannot delete the
-    // replacement because both the generation and cache identity must match.
     node.shard_kv_caches.remove(request_id);
 
     if node.shard_kv_cache_metadata.len() >= VALIDATOR_SHARD_KV_CACHE_CAP {
@@ -10626,8 +8719,6 @@ async fn inference_forward_shard_authenticated(
         "No model loaded".to_string(),
     ))?;
     let local_execution_profile = model.effective_precision_label();
-    // A holder that verifies the interleaved-RoPE profile also serves it, from
-    // its Q/K copy and its legacy model's other weights.
     let interleaved_rope_qk = node.interleaved_rope_qk.clone().filter(|_| {
         req.execution_profile
             == arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
@@ -10698,9 +8789,6 @@ async fn inference_forward_shard_authenticated(
             "Node is not a shard holder".to_string(),
         ));
     }
-    // Verify this node holds the requested layer range. A node holding
-    // multiple disjoint ranges accepts requests for any of them - each range
-    // was independently announced and is an independent replica slot.
     let shard = node
         .shard_infos
         .iter()
@@ -10726,11 +8814,9 @@ async fn inference_forward_shard_authenticated(
             )
         })?;
 
-    // Decode input
     use arc_inference::cached_integer_model::{ShardInput, ShardOutput};
 
     let input = if let Some(token) = req.token {
-        // Verify this is the first shard (only first shard accepts a raw token)
         if shard.start_layer != 0 {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -10777,13 +8863,11 @@ async fn inference_forward_shard_authenticated(
         ));
     };
 
-    // Get-or-create per-request KV cache
     let n_layers = model.config.n_layers;
     let kv_cache_key = shard_kv_cache_key(&req.request_id, &req.execution_profile);
     let (cache_arc, cache_reservation) =
         reserve_shard_kv_cache(&node, &kv_cache_key, signer, n_layers)?;
 
-    // Run the shard's forward pass (blocking - uses spawn_blocking to free runtime)
     let model_clone = model.clone();
     let req_id = req.request_id.clone();
     let start_layer = shard.start_layer;
@@ -10796,16 +8880,10 @@ async fn inference_forward_shard_authenticated(
     let t0 = std::time::Instant::now();
     let pool_node = node.clone();
     let worker_execution_for_compute = worker_execution_permit.clone();
-    // `install_on_compute_pool` puts the whole forward pass — including the
-    // par_iter over attention heads and every matmul's par_chunks_mut — on
-    // this node's configured rayon pool, so POST /node/threads changes real
-    // CPU utilisation on the very next request.
     let compute_lease = ShardComputeLease {
         cache_reservation,
         inference_permit,
     };
-    // Move both ownership guards into the actual blocking job. Dropping an HTTP
-    // waiter does not cancel an already-running `spawn_blocking` closure.
     let spawn_blocking_queued_at = Instant::now();
     let ((result, timing), compute_lease) =
         spawn_blocking_with_shard_compute_lease(compute_lease, move || {
@@ -10814,11 +8892,6 @@ async fn inference_forward_shard_authenticated(
             let compute_pool_queued_at = Instant::now();
             let (result, mut timing) = install_on_compute_pool(&pool_node, move || {
                 let compute_pool_queue_us = elapsed_micros(compute_pool_queued_at);
-                // The KV lock is taken INSIDE the pool job (a MutexGuard is
-                // not Send, so it cannot cross into the pool). Concurrent
-                // jobs for the same request_id serialize here; they cannot
-                // deadlock, because a queued job holds no lock and the
-                // holder is always a running job that will finish.
                 let kv_mutex_wait_started = Instant::now();
                 let mut cache = match cache_arc.lock() {
                     Ok(g) => g,
@@ -10867,10 +8940,6 @@ async fn inference_forward_shard_authenticated(
     } = compute_lease;
     drop(inference_permit);
 
-    // A refused forward is a 409, not a 500: the request is well-formed, this
-    // REPLICA is just not in a state to serve it. The coordinator matches on
-    // the `kind` string to decide whether to drop this replica for the rest
-    // of the request (cold KV cache) or merely retry elsewhere.
     let result = result.map_err(|e| {
         let status = match e {
             arc_inference::cached_integer_model::ShardForwardError::KvCacheOutOfSync { .. } => {
@@ -10892,13 +8961,8 @@ async fn inference_forward_shard_authenticated(
         (status, format!("{} ({})", e, e.kind()))
     })?;
     let compute_ms = t0.elapsed().as_millis() as u64;
-    // Keep this node's own measurement. This is the only place the node
-    // observes its OWN compute cost for a shard hop (everything in
-    // `latency_stats` is a round trip to somebody else), so it is what
-    // /node/contribution reports as mean/p50.
     record_own_compute_ms(&node, compute_ms);
 
-    // Optionally evict cache after the last token
     if req.last_token {
         let _gate = node.shard_kv_cache_gate.lock();
         node.shard_kv_caches.remove(&kv_cache_key);
@@ -10951,18 +9015,9 @@ async fn inference_forward_shard_authenticated(
         )
     })?;
     cache_reservation.commit();
-    // Diagnostics stay outside the response body and signature transcript.
-    // Old coordinators ignore the extra headers; new coordinators accept their
-    // absence so rolling upgrades remain compatible.
     Ok((shard_timing_headers(timing), Json(response)))
 }
 
-/// POST /inference/cleanup_shard
-///
-/// Evict the per-request KV cache after a coordinator finishes or abandons a
-/// sharded run. Cleanup used to POST an incomplete `ForwardShardRequest`, so
-/// Axum rejected the JSON before `inference_forward_shard` could remove
-/// anything and every remote shard leaked one cache entry per request.
 async fn inference_cleanup_shard(
     AxumState(node): AxumState<NodeState>,
     Json(signed): Json<CommunitySignedRequest<ValidatorCleanupShardRequest>>,
@@ -10987,7 +9042,6 @@ async fn inference_cleanup_shard_authenticated(
 
     let removed = {
         let _gate = node.shard_kv_cache_gate.lock();
-        // A request's interleaved-RoPE cache, if any, sits under its own key.
         let interleaved_rope_key = shard_kv_cache_key(
             &req.request_id,
             arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
@@ -11016,52 +9070,20 @@ async fn inference_cleanup_shard_authenticated(
     })))
 }
 
-// ─── Sharded pipeline execution engine ─────────────────────────────────────
-//
-// One implementation, two endpoints. /inference/run_sharded and
-// /inference/run_consensus differ ONLY in the per-hop replica strategy they
-// pass in; both get the pipelined prefill, the accumulated trace, the shared
-// HTTP client and the parallel cleanup.
-//
-// Before this, run_consensus — the endpoint the desktop actually calls — had
-// its own fully sequential prefill: every prompt position walked all six hops
-// end-to-end before the next position started, and each hop waited for ALL k
-// replicas. That is the ~54-112 s/token the desktop's own comment records.
-
-/// Depth of each inter-shard prefill channel.
-///
-/// Was `(prompt_len + 4).max(16)`. Each queued item carries a d_model = 4096
-/// `Vec<i64>` — 32 KB — so with prompt_len in the thousands a fast shard
-/// feeding a slow one could queue 100+ MB per channel on the coordinator.
-/// Depth beyond `num_shards` buys nothing for pipeline fill anyway; a small
-/// constant keeps backpressure reaching the feed loop.
 const PREFILL_CHANNEL_DEPTH: usize = 16;
 
-/// Timeout for the fire-and-forget end-of-request KV cleanup fan-out.
 const CLEANUP_TIMEOUT_SECS: u64 = 3;
 
-/// How a single hop chooses among the replicas holding its layer range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HopStrategy {
-    /// One request in flight: try replicas in order, rotate on failure.
     Failover,
-    /// Contact `fanout` replicas at once and select as soon as `needed` of
-    /// them agree on the output hash. Remaining calls are cancelled and fully
-    /// joined before the hop returns, making each position a lifetime boundary.
-    ///   `needed == 1`          → hedged: first valid answer wins.
-    ///   `needed == fanout/2+1` → k-of-n hash majority (run_consensus).
     Fanout {
         fanout: usize,
         needed: usize,
-        /// Free inference may intentionally degrade to a majority of the live
-        /// replicas and labels that behavior in its response.  Reward-bearing
-        /// community verification must set this to false: all configured
-        /// replica slots must remain reachable and `needed` is never reduced.
         allow_degraded_quorum: bool,
     },
 }
 
-/// Per-range consensus record for one position.
 #[derive(serde::Serialize, Clone)]
 pub struct RangeVote {
     pub position: usize,
@@ -11069,21 +9091,12 @@ pub struct RangeVote {
     pub replicas_contacted: Vec<String>,
     pub replicas_returned: Vec<String>,
     pub majority_hash: Option<String>,
-    /// Terminal votes bind the selected token to its logits commitment. A
-    /// logits hash alone is insufficient: a Byzantine replica could reuse an
-    /// honest hash while returning a different token and win selection by
-    /// responding first. Non-terminal hidden-state votes leave this `None`.
     pub majority_token_id: Option<u32>,
-    /// Distinct active validator identities whose authenticated responses
-    /// formed `majority_hash`.  Community verification validates these keys
-    /// directly; a count of vote records is not quorum evidence.
     pub majority_signers: Vec<Hash256>,
     pub divergent: Vec<(String, String)>,
-    /// "unanimous" | "majority" | "split" | "no_response"
     pub agreement: String,
 }
 
-/// The exact semantic identity counted by one fan-out bucket.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum FanoutVoteKey {
     Hidden(String),
@@ -11137,8 +9150,6 @@ fn record_fanout_vote(
     response_index: usize,
     needed: usize,
 ) -> Option<(FanoutVoteKey, Vec<usize>)> {
-    // One authenticated validator identity contributes at most one vote to an
-    // exact bucket, even when it is reachable through multiple HTTP aliases.
     if !signer_votes.insert((key.clone(), signer)) {
         return None;
     }
@@ -11154,24 +9165,10 @@ fn fanout_divergence_evidence(
     (observed != majority).then(|| observed.map(FanoutVoteKey::evidence).unwrap_or_default())
 }
 
-/// Whether a fan-out hop may stop collecting once `needed` replicas agree.
-///
-/// A degraded-capable (free/demo) hop returns at the threshold and aborts its
-/// stragglers. A fixed quorum (community reward verification) must keep every
-/// selected replica's request running to completion: an aborted request never
-/// reaches that replica's stateful KV cache, the next position then finds it
-/// cold (`kv_cache_out_of_sync`) and evicts it, and an all-replica quorum
-/// becomes unsatisfiable after the first position on any WAN where one
-/// replica is reliably slower than the other two.
 fn fanout_stops_at_threshold(allow_degraded_quorum: bool) -> bool {
     allow_degraded_quorum
 }
 
-/// Resolve one fan-out plan without silently weakening a fixed quorum.
-///
-/// The free/demo endpoints deliberately preserve their old degraded behavior,
-/// but any path that can credit community work must require all configured
-/// replica slots and the original threshold for every range and position.
 fn fanout_quorum_plan(
     fanout: usize,
     needed: usize,
@@ -11203,8 +9200,6 @@ fn fanout_quorum_plan(
     Ok((use_n, effective_needed))
 }
 
-/// In-flight fan-out calls for one hop: `(replica, wall_ms, response)`, where
-/// the error side carries `(message, is_cold_cache)`.
 type FanoutJoinSet = tokio::task::JoinSet<(
     ShardInfo,
     u64,
@@ -11219,16 +9214,10 @@ type FanoutJoinSet = tokio::task::JoinSet<(
     >,
 )>;
 
-/// Cancel every unfinished fan-out task and synchronously observe its exit.
-/// `JoinSet::shutdown` is `abort_all` followed by `join_next` until empty, so a
-/// completed quorum cannot leave coordinator-side requests accumulating behind
-/// later positions. The shard's position guard safely classifies a replica as
-/// cold on its next call if cancellation happened before the request arrived.
 async fn cancel_and_drain_join_set<T: 'static>(set: &mut tokio::task::JoinSet<T>) {
     set.shutdown().await;
 }
 
-/// What one hop produced.
 struct HopOutcome {
     hidden: Option<Vec<i64>>,
     hidden_hash: Option<String>,
@@ -11244,7 +9233,6 @@ struct HopOutcome {
     vote: Option<RangeVote>,
 }
 
-/// Running totals for one pipeline hop across every position of a request.
 #[derive(Default, Clone)]
 struct HopStats {
     positions: u64,
@@ -11284,9 +9272,6 @@ impl ShardTimingTotals {
     }
 }
 
-/// Aggregate instrumented shard samples across pipeline positions. These
-/// durations may overlap across hops, so this is explicitly a sum of samples,
-/// never an estimate of end-to-end request wall time.
 fn aggregate_shard_timing(stats: &[HopStats]) -> ShardTimingTotals {
     let mut total = ShardTimingTotals::default();
     for hop in stats {
@@ -11343,15 +9328,6 @@ impl HopStats {
     }
 }
 
-/// One forward_shard call. Returns the parsed response plus the exact number
-/// of bytes on the wire in each direction, or a typed failure.
-///
-/// `Err(true)` in the tuple position means "this replica is COLD for this
-/// request_id" — it reported `kv_cache_out_of_sync`, so its KV cache does not
-/// line up with the position we asked for and it can never serve this request
-/// again. That happens after a failover or an aborted hedge, and before the
-/// engine-side guard existed it was an out-of-bounds read in
-/// `flash_attention_i64` rather than an error.
 async fn read_forward_shard_body_limited(
     mut response: reqwest::Response,
 ) -> Result<Vec<u8>, String> {
@@ -11427,8 +9403,6 @@ fn shard_rpc_origin(socket: &str) -> Result<String, String> {
     Ok(url.origin().ascii_serialization())
 }
 
-/// Canonicalize and validate a shard holder's advertised HTTP(S) origin.
-/// Main uses this before a UDS-only validator emits any external topology.
 pub fn canonical_shard_rpc_origin(socket: &str) -> Result<String, String> {
     shard_rpc_origin(socket)
 }
@@ -11575,16 +9549,10 @@ async fn forward_shard_once(
         .map_err(|error| (error, false))?;
     if !status.is_success() {
         let text = String::from_utf8_lossy(&raw);
-        // The shard holder tags a cold cache with this stable string; see
-        // ShardForwardError::kind().
         let is_cold = text.contains("kv_cache_out_of_sync");
         return Err((format!("http {}: {}", status, text.trim()), is_cold));
     }
 
-    // Read the bounded body as bytes so the response payload can be measured exactly.
-    // `total_bytes_transferred` previously counted only REQUEST bodies, which
-    // undercounted the true wire cost by roughly half — the hidden state comes
-    // back the same size it went out.
     let parsed: ForwardShardResponse =
         serde_json::from_slice(&raw).map_err(|e| (format!("parse: {}", e), false))?;
 
@@ -11604,13 +9572,6 @@ async fn forward_shard_once(
     Ok((parsed, raw.len(), request_bytes, timing))
 }
 
-/// Execute one pipeline hop under `strategy`.
-///
-/// `replicas` is this hop's live candidate list; the function rotates it so a
-/// working replica stays at the front, and the caller keeps the same Vec
-/// across positions so the choice is sticky (which matters: forward_shard is
-/// stateful per request_id, so bouncing between replicas is what makes a KV
-/// cache go cold in the first place).
 async fn pipeline_hop(
     node: &NodeState,
     replicas: &mut Vec<ShardInfo>,
@@ -11653,7 +9614,6 @@ async fn pipeline_hop(
                         if is_cold {
                             cold.push(shard.socket_addr.clone());
                             replicas.retain(|r| r.socket_addr != shard.socket_addr);
-                            // Removing shrinks the list; don't advance attempts.
                             continue;
                         }
                         attempts += 1;
@@ -11662,12 +9622,6 @@ async fn pipeline_hop(
                 }
             }
             if !cold.is_empty() && req.position > 0 {
-                // Be explicit about WHY this is unrecoverable, because it
-                // looks like a transient failure and isn't. forward_shard is
-                // stateful per request_id: a replica that missed positions
-                // 0..p cannot serve p, and this coordinator does not replay
-                // history to it. The supported answer is to commit to more
-                // than one replica from the start.
                 return Err(format!(
                     "range [{}, {}) at position {}: the serving replica failed mid-stream and \
                      {} standby replica(s) rejected the handover with kv_cache_out_of_sync \
@@ -11710,13 +9664,6 @@ async fn pipeline_hop(
                 });
             }
 
-            // Tally hashes AS THEY LAND and choose the moment `needed` agree.
-            // The old code collected with `for f in futs { f.await }`, so a hop
-            // could not return until the SLOWEST of k answered — with k=3 and
-            // exactly 3 replicas per range (the live topology, and the k the
-            // desktop sends) that made the latency-aware sort a complete no-op
-            // and every hop paid the worst replica. Cost per hop goes from
-            // max(k) to the k/2+1-th order statistic.
             let mut returned: Vec<(
                 ShardInfo,
                 u64,
@@ -11775,13 +9722,6 @@ async fn pipeline_hop(
                 }
             }
 
-            // A quorum is a strict lifetime boundary. Abort unfinished HTTP
-            // futures and wait until every task has exited before allowing the
-            // next position to launch. Detaching here multiplied one slow call
-            // per replica by every pipelined position and bypassed both the
-            // channel bound and shard queue admission. A replica whose aborted
-            // call never reached the server will report a cold cache next time
-            // and be evicted by the existing position guard.
             if !set.is_empty() {
                 cancel_and_drain_join_set(&mut set).await;
             }
@@ -11792,14 +9732,10 @@ async fn pipeline_hop(
 
             let (majority_key, members) = match winner {
                 Some((key, members)) => (Some(key), members),
-                None => {
-                    // Nobody reached `needed`. Report the largest agreeing
-                    // group so the vote record is still informative.
-                    match tally.into_iter().max_by_key(|(_, v)| v.len()) {
-                        Some((key, members)) => (Some(key), members),
-                        None => (None, Vec::new()),
-                    }
-                }
+                None => match tally.into_iter().max_by_key(|(_, v)| v.len()) {
+                    Some((key, members)) => (Some(key), members),
+                    None => (None, Vec::new()),
+                },
             };
             let majority_hash = majority_key.as_ref().map(|key| key.hash().to_string());
             let majority_token_id = majority_key.as_ref().and_then(FanoutVoteKey::token_id);
@@ -11890,7 +9826,6 @@ async fn pipeline_hop(
     }
 }
 
-/// Everything one pipeline run produced.
 struct PipelineRun {
     generated: Vec<u32>,
     hop_stats: Vec<HopStats>,
@@ -11898,7 +9833,6 @@ struct PipelineRun {
     votes: Vec<RangeVote>,
 }
 
-/// Item travelling between prefill worker tasks.
 #[derive(Debug)]
 struct PrefillFlow {
     position: usize,
@@ -11908,13 +9842,6 @@ struct PrefillFlow {
     terminal_token: Option<u32>,
 }
 
-/// Validate the exact number of stateful shard positions before any remote
-/// request is launched. The terminal range produces the first generated token
-/// on the final prefill position, so a sharded run consumes
-/// `prefill_positions + max_tokens - 1` positions (not the local model's
-/// internal-BOS formula). Keeping this check fallible at both the HTTP and
-/// execution boundaries prevents cache hits or internal callers from
-/// bypassing context admission.
 fn preflight_sharded_generation(
     model: &arc_inference::cached_integer_model::CachedIntegerModel,
     prefill_positions: usize,
@@ -11940,11 +9867,6 @@ fn preflight_sharded_generation(
     Ok(required_positions)
 }
 
-/// Record one generated token and report whether it terminates generation.
-/// EOS controls the state machine independently of whether the caller wants
-/// EOS included in the returned token vector; otherwise omitting a prefill EOS
-/// makes the decoder mistake an empty output for "no token yet" and reuse the
-/// final prompt token as a fresh decode input.
 fn record_generated_token(
     generated: &mut Vec<u32>,
     token: u32,
@@ -11986,19 +9908,6 @@ fn pipeline_execution_profile(pipeline: &[PipelineHop]) -> Result<String, String
     Ok(profile)
 }
 
-/// Walk the pipeline: pipelined prefill over the prompt, then sequential
-/// autoregressive decode.
-///
-/// PREFILL streams every prompt position through per-hop mpsc worker tasks, so
-/// at steady state each shard is working on a different position. Wall time is
-/// ~(prompt_len + num_hops - 1) x per_hop instead of prompt_len x num_hops x
-/// per_hop.
-///
-/// DECODE stays sequential: each token depends on the previous token's logits,
-/// so there is nothing to overlap.
-///
-/// `strategies` holds one replica strategy per hop, in pipeline order, so a
-/// caller can size each range's quorum to that range's replicas.
 #[allow(clippy::too_many_arguments)]
 async fn run_pipeline(
     node: &NodeState,
@@ -12019,9 +9928,6 @@ async fn run_pipeline(
             strategies.len()
         ));
     }
-    // Profile validation is a strict pre-work boundary. No feeder, worker, or
-    // outbound shard request is launched until every replica is proven to be
-    // in the same exact arithmetic group.
     let execution_profile = pipeline_execution_profile(pipeline)?;
     let model_id = node
         .model_artifact_id
@@ -12033,12 +9939,9 @@ async fn run_pipeline(
     let mut votes: Vec<RangeVote> = Vec::new();
     let mut generated: Vec<u32> = Vec::new();
 
-    // Replica lists carried across the whole request so a working replica
-    // stays primary and cold replicas stay evicted.
     let mut live_replicas: Vec<Vec<ShardInfo>> = pipeline.iter().map(|(_, r)| r.clone()).collect();
     let mut hop_stats: Vec<HopStats> = vec![HopStats::default(); num_hops];
 
-    // ─── Pipelined prefill ──────────────────────────────────────────────
     let generation_finished = {
         use tokio::sync::mpsc;
 
@@ -12052,10 +9955,6 @@ async fn run_pipeline(
 
         type WorkerState = (usize, HopStats, Vec<ShardInfo>, Vec<RangeVote>);
         type WorkerOut = Result<WorkerState, String>;
-        // JoinSet aborts every still-owned task on Drop. This is deliberate
-        // structured concurrency: cancelling the parent request must not detach
-        // prefill workers that keep issuing shard requests after admission has
-        // been released.
         let mut workers: tokio::task::JoinSet<(usize, WorkerOut)> = tokio::task::JoinSet::new();
 
         for i in 0..num_hops {
@@ -12117,10 +10016,8 @@ async fn run_pipeline(
             });
         }
 
-        // Feed the prompt in. Backpressure from PREFILL_CHANNEL_DEPTH stops a
-        // fast head shard from queueing the whole prompt ahead of a slow one.
         let input_tx = txs.remove(0);
-        drop(txs); // let workers observe EOF when their upstream finishes
+        drop(txs);
 
         let mut feeder = tokio::task::JoinSet::new();
         {
@@ -12164,10 +10061,6 @@ async fn run_pipeline(
             None => Some("prefill feeder task was missing".to_string()),
         };
 
-        // Drain EVERY worker before surfacing an error, so a failure in one
-        // hop doesn't leave the others dangling. Results arrive in completion
-        // order, but errors are retained by hop index and surfaced
-        // deterministically from the lowest failing range.
         let mut worker_errors: Vec<Option<String>> = (0..num_hops).map(|_| None).collect();
         let mut join_errors = Vec::new();
         while let Some(joined) = workers.join_next().await {
@@ -12211,7 +10104,6 @@ async fn run_pipeline(
         }
     };
 
-    // ─── Sequential decode ──────────────────────────────────────────────
     if !generation_finished {
         for gen_idx in 1..(max_tokens as usize) {
             let position = prompt_len + gen_idx - 1;
@@ -12281,12 +10173,6 @@ async fn run_pipeline(
     })
 }
 
-/// Render the accumulated per-hop statistics as the response's `shard_trace`.
-///
-/// `compute_ms` / `wall_ms` are now TOTALS across every position of the
-/// request, not a snapshot of the first position, and `payload_bytes` is the
-/// real measured wire cost in BOTH directions (it was hardcoded to 0, so the
-/// dashboard's activation-flow view showed nothing per hop).
 fn render_shard_trace(pipeline: &[PipelineHop], stats: &[HopStats]) -> Vec<Value> {
     pipeline
         .iter()
@@ -12324,16 +10210,6 @@ fn render_shard_trace(pipeline: &[PipelineHop], stats: &[HopStats]) -> Vec<Value
         .collect()
 }
 
-/// Evict the end-of-request KV cache at every replica of every range behind a
-/// strict, bounded structured-concurrency barrier.
-///
-/// This used to be `for range { for replica { ...send().await } }` on the
-/// 120-second inference client: 18 sequential round-trips on the live topology
-/// (6 ranges x 3 replicas), 4-10 s of dead tail latency appended to every
-/// request, three of them aimed at the replica with the worst EWMA. It was then
-/// made fire-and-forget, which let handler cancellation or repeated requests
-/// detach an unbounded number of cleanup tasks. Cleanup now runs concurrently,
-/// is capped as a whole per replica, and a dropped parent aborts its `JoinSet`.
 async fn send_authenticated_shard_cleanup(
     node: &NodeState,
     socket: &str,
@@ -12400,29 +10276,6 @@ async fn cleanup_shards(node: &NodeState, pipeline: &[PipelineHop], request_id: 
     while set.join_next().await.is_some() {}
 }
 
-/// Build, sign and submit an `InferenceAttestation` for a completed run.
-///
-/// Two defects used to live in the sharded copy of this code, and between
-/// them they meant 294 sharded runs produced zero on-chain attestations:
-///
-///  1. The tx was built with `hash: Hash256::ZERO` and `signature: null()`,
-///     `sig_verified` forced true, and `compute_hash()` called into a local
-///     variable that was never assigned back to `tx.hash`. arc-state rejects
-///     it as an unsigned transaction, the hash-integrity check fails, and
-///     because arc-mempool dedupes on `tx.hash.0`, every attestation after
-///     the first came back `Duplicate(0x00..0)`. `sig_verified = true` is not
-///     enough on its own: `pipeline.rs`'s verify stage inspects the signature
-///     BYTES and ignores the flag, so a null-signed tx fails on every peer.
-///
-///  2. The nonce was `state_nonce + attestation_nonce.fetch_add(1)`. The
-///     in-memory counter accumulates forever, including for txs that never
-///     land, so once the first attestation applied the account nonce advanced
-///     AND the counter advanced and every later tx carried state+2 → a
-///     permanent InvalidNonce gap. This is the exact failure already
-///     seen in the retired escrow-release path; the fix is to read the
-///     account's current nonce for every transaction.
-///
-/// Returns `(tx_hash, status)` where status is what the response reports.
 fn submit_inference_attestation(
     node: &NodeState,
     model_id: Hash256,
@@ -12449,8 +10302,6 @@ fn submit_inference_attestation(
                 output_hash,
                 challenge_period,
                 bond,
-                // Left None deliberately: the field is #[serde(skip)] and the
-                // 112-byte v0.7.2 wire layout depends on it staying that way.
                 beneficiary: None,
             },
         ),
@@ -12464,19 +10315,10 @@ fn submit_inference_attestation(
     match node.validator_keypair.as_ref() {
         Some(kp) => match node.state.sign_transaction(&mut tx, kp) {
             Ok(()) => {
-                // sign() assigns tx.hash as part of signing.
                 tx.sig_verified = true;
                 let h = tx.hash;
                 match node.state.active_protocol_version().major {
-                    // Protocol v3 rejects standalone 0x16 transactions. The
-                    // same signed certificate shape is used only as embedded
-                    // evidence inside the consensus-authorized 0x25 reward;
-                    // inserting it separately would create unpaid state-bloat
-                    // and can never produce the earnings receipt users expect.
                     3 => return (h, "certificate_only_v3_not_submitted"),
-                    // A protocol-4 block carries one native inference
-                    // transaction and nothing else; this one could only sit
-                    // in the mempool until dropped.
                     major if major >= 4 => return (h, "not_submitted_native_inference_chain"),
                     _ => {}
                 }
@@ -12489,10 +10331,6 @@ fn submit_inference_attestation(
             }
         },
         None => {
-            // Test-fixture path: no keypair wired. Keep the legacy shape so
-            // unit tests still execute, but at least assign the hash so the
-            // mempool doesn't dedupe every one of them to 0x00..0. Protocol 3
-            // and later never pool a standalone attestation, as above.
             tx.sig_verified = true;
             let h = tx.compute_hash();
             tx.hash = h;
@@ -12507,17 +10345,6 @@ fn submit_inference_attestation(
     }
 }
 
-/// Submit the attestation to the chain that can actually mine it.
-///
-/// When `ARC_ATTEST_RELAY` is set (e.g. `http://149.28.32.76:9090`), the
-/// signed attestation is submitted to that host instead of the local
-/// mempool. Two facts make this necessary for observer/coordinator nodes:
-/// the testnet seeds are independent chains (a tx in a local mempool never
-/// reaches them), and an observer never seals blocks, so a locally pooled
-/// attestation would sit pending forever. The nonce is read from the relay
-/// target's account state — the attester address may not exist there, or may
-/// have a different nonce than any local view. Falls back to the local
-/// mempool on any relay failure so the attestation is never silently lost.
 async fn submit_or_relay_attestation(
     node: &NodeState,
     model_id: Hash256,
@@ -12526,8 +10353,6 @@ async fn submit_or_relay_attestation(
     bond: u64,
     challenge_period: u64,
 ) -> (Hash256, String) {
-    // Protocol 3 and later neither pool nor relay a standalone attestation:
-    // `submit_inference_attestation` answers why without submitting it.
     if node.state.active_protocol_version().major >= 3 {
         let (hash, status) = submit_inference_attestation(
             node,
@@ -12579,7 +10404,6 @@ async fn submit_or_relay_attestation(
             .ok()
             .and_then(|v| v.get("nonce").and_then(|n| n.as_u64()))
             .unwrap_or(0),
-        // 404 = the address has no account on that chain yet: nonce 0.
         _ => 0,
     };
 
@@ -12594,8 +10418,6 @@ async fn submit_or_relay_attestation(
                 output_hash,
                 challenge_period,
                 bond,
-                // Stays None: #[serde(skip)] and the 112-byte v0.7.2 wire
-                // layout depend on it.
                 beneficiary: None,
             },
         ),
@@ -12655,8 +10477,6 @@ async fn submit_or_relay_attestation(
     }
 }
 
-/// Human-readable shape metadata. This is display-only and must never be
-/// hashed or used for routing, cache, verification, or attestation identity.
 fn model_display_name(model: &arc_inference::cached_integer_model::CachedIntegerModel) -> String {
     format!(
         "arc-{}L-{}d-{}h-{}v",
@@ -12664,8 +10484,6 @@ fn model_display_name(model: &arc_inference::cached_integer_model::CachedInteger
     )
 }
 
-/// Return the display name plus the exact source-artifact commitment.
-/// Tokenizer/config metadata cannot supply an inference identity.
 fn exact_model_identity(node: &NodeState) -> Result<(String, Hash256), String> {
     let model = node
         .inference_model
@@ -12707,9 +10525,6 @@ fn derive_free_inference_request_id(
     format!("0x{}", hasher.finalize().to_hex())
 }
 
-/// Allocate a collision-resistant request namespace without depending on wall
-/// clock resolution. The random process epoch prevents restart reuse, while
-/// the checked atomic counter makes concurrent calls injective within a boot.
 fn next_free_inference_request_id(
     node: &NodeState,
     route: FreeInferenceRequestRoute,
@@ -12753,21 +10568,6 @@ fn free_inference_assurance(profile_bound: bool, quorum_verified: bool) -> FreeI
     }
 }
 
-/// POST /inference/run_sharded
-/// Coordinator endpoint: walks the pipeline of shard-holding nodes and
-/// generates `max_tokens` tokens by forwarding hidden states between shards.
-///
-/// Returns the full output, all per-shard timings, and the network bandwidth
-/// used so the dashboard can show the activation flow.
-///
-/// Request fields (all optional except `input`):
-///   input           string   the prompt
-///   max_tokens      u64      capped at 1024
-///   chat_template   bool     default false (wrapping inflates prompt_len ~5x)
-///   redundancy      u64      1 (default) = one replica per hop with failover;
-///                            2+ = contact that many replicas for EVERY
-///                            position and take the first valid answer
-///   force_recompute bool     bypass the deterministic cache
 async fn inference_run_sharded(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<Value>,
@@ -12804,9 +10604,6 @@ async fn inference_run_sharded(
         ));
     }
 
-    // Sharded-pipeline output cap. Was 256, which combined with the model's
-    // RoPE table covering 4096 positions meant the user could never approach
-    // the actual context limit on this endpoint.
     let max_tokens = req
         .get("max_tokens")
         .and_then(|v| v.as_u64())
@@ -12819,41 +10616,22 @@ async fn inference_run_sharded(
         ));
     }
 
-    // Opt-in chat template wrapping. Default OFF because the dashboard is
-    // doing autocomplete ("The capital of France is" → " Paris"), not
-    // instruction-following. Wrapping in [INST]...[/INST] inflates prompt_len
-    // by ~5x and, since the pipeline walks every position, that 5x multiplies
-    // wall time directly.
     let chat_template_enabled = req
         .get("chat_template")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Replica redundancy. forward_shard is STATEFUL per request_id (each
-    // holder keeps a KV cache keyed by it), so you cannot hedge a single
-    // position onto a fresh replica — it would be handed a mid-stream
-    // position against a cold cache. `redundancy: 2` therefore commits to two
-    // replicas per range for the WHOLE request and sends every position to
-    // both: the first valid answer is used and the other stays warm, so
-    // failover is instant instead of fatal. Default stays 1.
     let redundancy = req
         .get("redundancy")
         .and_then(|v| v.as_u64())
         .unwrap_or(1)
         .clamp(1, 5) as usize;
 
-    // Bypass the deterministic cache. The public determinism demo runs the
-    // same prompt twice and compares output_hash; without this the second run
-    // is an LRU lookup that returns what was put in it, which proves nothing
-    // about the pipeline. With force_recompute the second run is a real,
-    // independent walk of the same 6 hops.
     let force_recompute = req
         .get("force_recompute")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // Coordinator needs a model for tokenization (text→tokens and tokens→text).
-    // This is the tokenizer vocabulary, not the full model weights.
     let model = node
         .inference_model
         .as_ref()
@@ -12898,10 +10676,6 @@ async fn inference_run_sharded(
     )
     .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error))?;
 
-    // ─────────────────────────────────────────────────────────────────────
-    // DETERMINISTIC CACHE LOOKUP
-    // Same model_id + same input tokens = same output tokens, GUARANTEED.
-    // ─────────────────────────────────────────────────────────────────────
     let cache_input_with_max: Vec<u32> = {
         let mut v = all_tokens.clone();
         v.push(max_tokens);
@@ -12920,18 +10694,8 @@ async fn inference_run_sharded(
         let output_hash = arc_crypto::hash_bytes(&output_bytes);
         let elapsed_us = overall_start.elapsed().as_micros() as u64;
 
-        // A cache hit is NOT a sharded run: no pipeline was walked, no
-        // activations moved, no shard did any work. Counting it in
-        // sharded_runs_total inflated every "distributed inference
-        // served" figure on the dashboard.
         node.sharded_cache_hits.fetch_add(1, Ordering::Relaxed);
 
-        // Return the ORIGINAL run's provenance rather than zeros: the
-        // attestation tx that recorded it, the trace of the hops that
-        // actually produced it, and how long that real run took. A hit
-        // that reports `shard_trace: []`, `total_ms: 0` and no
-        // attestation looks like the pipeline did the work in 800 µs,
-        // which is what made the "determinism check" demo hollow.
         let meta = node.sharded_run_meta.get(&cache_key_hex).map(|m| m.clone());
         let mut resp = json!({
             "success": true,
@@ -12971,10 +10735,6 @@ async fn inference_run_sharded(
                 "committee",
                 "fee_split",
                 "explorer_url",
-                // Carry the reason with the link. Copying `explorer_url`
-                // alone would let a cache hit serve a null link with no
-                // explanation — or, once the tx does get mined, a stale
-                // reason alongside a now-valid link.
                 "explorer_url_unavailable_reason",
                 "pipeline_length",
                 "profile_bound",
@@ -13005,7 +10765,6 @@ async fn inference_run_sharded(
         return Ok(Json(resp));
     }
 
-    // ─── Real pipeline walk ─────────────────────────────────────────────
     let strategy = if redundancy > 1 {
         HopStrategy::Fanout {
             fanout: redundancy,
@@ -13029,9 +10788,6 @@ async fn inference_run_sharded(
     )
     .await;
 
-    // A failed mid-pipeline run still populated remote KV caches and must not
-    // leak them until TTL. Await the bounded parallel cleanup so no handler
-    // can detach coordinator-owned tasks.
     cleanup_shards(&node, &pipeline, &request_id).await;
     let run = run_result.map_err(|error| public_pipeline_run_error(&request_id, error))?;
 
@@ -13095,11 +10851,6 @@ async fn inference_run_sharded(
         }),
     );
 
-    // ─── VRF Committee Verification ────────────────────────────────────
-    // Deterministic, reproducible committee selection seeded by output_hash.
-    // NOTE: votes are not collected — the integer engine guarantees honest
-    // members agree, so this records WHO would have verified, not that they
-    // did. The response says so.
     let committee_info = {
         let validators = node.dag_validators.read();
         let eligible: Vec<arc_inference::committee::InferenceValidator> = validators
@@ -13214,11 +10965,6 @@ async fn inference_run_sharded(
         "explorer_url_unavailable_reason": explorer_url_unavailable_reason,
     });
 
-    // Remember this run's provenance so a later cache hit can report the real
-    // attestation, trace and timings instead of zeros. Store only the
-    // provenance fields — not the output text or token vector, which the
-    // inference cache already holds — and keep the map bounded to the same
-    // capacity as that cache so it cannot grow without limit.
     remember_sharded_run(
         &node,
         cache_key_hex,
@@ -13245,12 +10991,8 @@ async fn inference_run_sharded(
     Ok(Json(response))
 }
 
-/// Capacity of `sharded_run_meta`, matched to the inference cache so the two
-/// stay roughly in step. An entry is provenance only (~2 KB), never output.
 const SHARDED_RUN_META_CAP: usize = 10_000;
 
-/// Record a completed run's provenance under its cache key, evicting an
-/// arbitrary existing entry when the map is at capacity.
 fn remember_sharded_run(node: &NodeState, cache_key_hex: String, meta: Value) {
     if node.sharded_run_meta.len() >= SHARDED_RUN_META_CAP
         && !node.sharded_run_meta.contains_key(&cache_key_hex)
@@ -13263,10 +11005,6 @@ fn remember_sharded_run(node: &NodeState, cache_key_hex: String, meta: Value) {
     node.sharded_run_meta.insert(cache_key_hex, meta);
 }
 
-/// A free consensus run may describe itself as deterministic only when every
-/// executed range/position has an authenticated majority of at least two
-/// distinct validators. A successful degraded 1-of-N response remains useful,
-/// but is explicitly not quorum proof.
 fn free_consensus_quorum_verified(
     pipeline: &[PipelineHop],
     hop_stats: &[HopStats],
@@ -13302,39 +11040,6 @@ fn free_consensus_quorum_verified(
     })
 }
 
-/// POST /inference/run_consensus
-/// Parallel k-of-n forward_shard per range with hash-majority verification at
-/// every shard boundary.
-///
-/// Semantics vs /inference/run_sharded:
-/// - run_sharded picks the best replica for each range and rotates on failure.
-///   Fast. Silent hash divergence is INVISIBLE.
-/// - run_consensus fires to k replicas per hop, tallies their output hashes,
-///   and forwards the state only once a strict majority agrees. Divergent
-///   replicas are recorded in the response. Economic auto-challenges remain
-///   disabled until each response carries an authenticated provider identity.
-///
-/// Two things changed here, and together they are the difference between
-/// ~54-112 s/token and something a person will sit through:
-///
-///  1. It now uses the SAME pipelined prefill as run_sharded. Its own prefill
-///     was fully sequential — every prompt position walked all six hops
-///     end-to-end before the next position started — so prefill cost
-///     prompt_len x num_hops serial hops instead of ~(prompt_len + num_hops).
-///
-///  2. Each hop now races to majority instead of waiting for all k. With the
-///     live topology (exactly 3 replicas per range) and the desktop's k=3,
-///     `take(k)` selected EVERY replica, which made the latency-aware sort a
-///     no-op, and the collect loop then blocked on the slowest of the three.
-///     Three of the six ranges included a replica whose recorded EWMA was
-///     37 s. Hop cost is now the (k/2+1)-th response, not the k-th.
-///
-/// Both endpoints also share one pipeline planner now, which is what fixes
-/// this endpoint's stub-preserving bucket logic and its missing overlap skip —
-/// the "Pipeline gap: expected layer 32 next, got [28, 30)" failure.
-///
-/// Request body mirrors run_sharded with an optional `k` field (default 3).
-/// Response adds a `consensus` block with per-range vote records.
 async fn inference_run_consensus(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<Value>,
@@ -13359,12 +11064,6 @@ async fn inference_run_consensus(
                 "Public inference capacity is saturated. Retry after 2 seconds.",
             )
         })?;
-    // Paid settlement used to share this free inference endpoint. Reject on
-    // field *presence* (including null or malformed values) before input
-    // validation, model access, escrow lookup, or inference work. Replica
-    // labels in this HTTP topology are not authenticated payout identities,
-    // so opening/releasing funds here would be unsafe. Free k-of-n inference
-    // remains available when none of the legacy settlement fields is present.
     const LEGACY_PAID_FIELDS: [&str; 5] = [
         "payer",
         "request_id",
@@ -13415,7 +11114,6 @@ async fn inference_run_consensus(
         ))?
         .clone();
 
-    // Tokenize
     let tokenized_text = if chat_template_enabled {
         coordinator_chat_input(input_text, chat_template_enabled, node.model_artifact_id)
             .unwrap_or_else(|| model.apply_chat_template(input_text))
@@ -13453,10 +11151,6 @@ async fn inference_run_consensus(
 
     let overall_start = std::time::Instant::now();
 
-    // Strict majority of whatever k this hop can actually reach.
-    // `pipeline_hop` clamps both numbers to the live replica count, so a range
-    // that has lost a replica degrades to a majority of the survivors rather
-    // than failing outright.
     let strategy = HopStrategy::Fanout {
         fanout: k_req,
         needed: (k_req / 2) + 1,
@@ -13492,7 +11186,6 @@ async fn inference_run_consensus(
     node.sharded_bytes_total
         .fetch_add(run.total_bytes as u64, Ordering::Relaxed);
 
-    // Summarize consensus.
     let mut unanimous = 0;
     let mut majority = 0;
     let mut split = 0;
@@ -13513,10 +11206,6 @@ async fn inference_run_consensus(
         }
     }
 
-    // Divergence remains visible, but do not fabricate a provider identity
-    // from an unauthenticated shard label or claim that the validator posted a
-    // bond. Automatic challenges can return only after the authenticated
-    // transport peer identity is propagated into every inference vote.
     let auto_challenges: Vec<Value> = Vec::new();
     let auto_challenge_status = if divergent_all.is_empty() {
         "not_needed"
@@ -13536,8 +11225,6 @@ async fn inference_run_consensus(
         "ms_per_token": if generated.is_empty() { 0 } else { total_ms / generated.len() as u64 },
         "pipeline_length": pipeline.len(),
         "k": k_req,
-        // Additive: same per-hop trace run_sharded emits, so the dashboard's
-        // activation-flow view works against this endpoint too.
         "shard_trace": shard_trace,
         "shard_timing": render_shard_timing_totals(&aggregate_shard_timing(&run.hop_stats)),
         "total_bytes_transferred": run.total_bytes,
@@ -13560,11 +11247,6 @@ async fn inference_run_consensus(
     Ok(Json(response))
 }
 
-/// Milestone C (#37): GET /models/registry
-/// Scans committed transactions for every ModelRegistration body and
-/// returns the resulting per-model metadata. For MVP this is O(N) over
-/// the full-tx DashMap; a later patch can maintain a sidecar index if
-/// the registry grows past a few thousand models.
 async fn list_model_registry(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let mut rows: Vec<Value> = Vec::new();
     for entry in node.state.full_transactions.iter() {
@@ -13587,9 +11269,6 @@ async fn list_model_registry(AxumState(node): AxumState<NodeState>) -> Json<Valu
     Json(json!({ "models": rows, "count": rows.len() }))
 }
 
-/// Milestone C (#37): GET /models/open_requests
-/// Returns every ModelRequest tx body. Workers poll this to find open
-/// demand and decide which ranges to claim.
 async fn list_open_model_requests(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let mut rows: Vec<Value> = Vec::new();
     for entry in node.state.full_transactions.iter() {
@@ -13609,9 +11288,6 @@ async fn list_open_model_requests(AxumState(node): AxumState<NodeState>) -> Json
     Json(json!({ "requests": rows, "count": rows.len() }))
 }
 
-/// Milestone D (#38): GET /capacity/advertisements
-/// Returns every CapacityAdvertisement. The planner reads this set
-/// plus open requests + current shard_registry to compute assignments.
 async fn list_capacity_advertisements(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let mut rows: Vec<Value> = Vec::new();
     for entry in node.state.full_transactions.iter() {
@@ -13633,11 +11309,6 @@ async fn list_capacity_advertisements(AxumState(node): AxumState<NodeState>) -> 
     Json(json!({ "advertisements": rows, "count": rows.len() }))
 }
 
-/// Milestone D (#38): GET /assignments/for_me?pubkey=0x...
-/// Returns every AssignmentEntry across every ShardAssignmentProposal
-/// whose `node_pubkey` matches the query parameter. Community workers
-/// long-poll this and auto-apply - they restart arc-node with the
-/// listed `--shard-range` flags and announce the assignment.
 async fn get_assignment_for_me(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -13676,8 +11347,6 @@ async fn get_assignment_for_me(
     })))
 }
 
-/// Accept both `0x`-prefixed and bare hex for a 32-byte value. `[u8; 32]`
-/// so callers can directly feed into Hash256 or request_id slots.
 fn decode_hash_hex(s: &str) -> Result<[u8; 32], String> {
     let trimmed = s.strip_prefix("0x").unwrap_or(s);
     let raw = hex::decode(trimmed).map_err(|e| format!("hex: {}", e))?;
@@ -13689,9 +11358,6 @@ fn decode_hash_hex(s: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-/// GET /shards
-/// Returns the local shard registry - every node this coordinator knows about
-/// and which layer range it holds.
 async fn get_shards(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let mut shards: Vec<ShardInfo> = fresh_shards(&node.shard_registry);
     if let Some(model_id) = node.model_artifact_id {
@@ -13713,10 +11379,6 @@ async fn get_shards(AxumState(node): AxumState<NodeState>) -> Json<Value> {
         .map(|s| s.model_name.clone())
         .unwrap_or_default();
 
-    // Dedup ranges across replicas. With 3× replication each range appears
-    // three times in `shards`; walking the raw list sees the second replica's
-    // start_layer == 0 as a backward step and flips contiguous=false. BTreeSet
-    // collapses duplicates and iterates in sorted (start, end) order.
     let unique_ranges: std::collections::BTreeSet<(usize, usize)> = shards
         .iter()
         .map(|s| (s.start_layer, s.end_layer))
@@ -13747,9 +11409,6 @@ async fn get_shards(AxumState(node): AxumState<NodeState>) -> Json<Value> {
         .map(|selection| selection.execution_profile.clone());
     let fully_covered = fully_covered && profile_bound;
 
-    // Emit both singular (legacy, first range only) and plural (current) so
-    // peers still pulling `self_shard` keep working through the rolling
-    // upgrade while new peers consume `self_shards` and see every range.
     let self_shard_legacy = node.shard_infos.first().cloned();
     Json(json!({
         "shards": shards,
@@ -13770,9 +11429,6 @@ async fn get_shards(AxumState(node): AxumState<NodeState>) -> Json<Value> {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidatorShardAnnouncement {
-    /// Canonical address of the validator whose key authenticated this
-    /// topology claim.  A registry destination is never accepted from an
-    /// anonymous HTTP caller.
     pub validator_id: String,
     pub shard: ShardInfo,
 }
@@ -13783,8 +11439,6 @@ impl CommunityAuthenticatedPayload for ValidatorShardAnnouncement {
     }
 }
 
-/// Returns true iff `addr` is a stub (unroutable placeholder) that the
-/// coordinator cannot dial to forward a shard request.
 fn is_stub_socket_addr(addr: &str) -> bool {
     let Ok(url) = shard_rpc_url(addr, "/health") else {
         return true;
@@ -13801,15 +11455,6 @@ fn is_stub_socket_addr(addr: &str) -> bool {
         .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
 }
 
-/// Bind a remote shard announcement to the TCP peer's observed source host,
-/// retaining only its declared service port. Otherwise an unauthenticated
-/// caller can advertise `169.254.169.254:80` (or any private control-plane
-/// service) and turn later inference routing into blind SSRF.
-///
-/// Loopback is deliberately retained for this process's own signed refresh:
-/// a holder often advertises its public service origin to its localhost RPC.
-/// Remote topology is never relayed and re-signed locally; every holder must
-/// authenticate its own direct announcement.
 fn bind_announced_shard_addr(announced_addr: &str, peer_addr: SocketAddr) -> String {
     if peer_addr.ip().is_loopback() {
         return announced_addr.to_string();
@@ -13820,16 +11465,9 @@ fn bind_announced_shard_addr(announced_addr: &str, peer_addr: SocketAddr) -> Str
         .and_then(|s| s.parse::<u16>().ok())
         .filter(|port| *port != 0)
         .unwrap_or_else(|| peer_addr.port());
-    // SocketAddr::Display brackets IPv6 correctly.
     SocketAddr::new(peer_addr.ip(), declared_port).to_string()
 }
 
-/// POST /shards/announce
-/// Other nodes call this to register their shard with our local registry.
-///
-/// Remote announcements never get to choose a destination host: the observed
-/// TCP source IP replaces it, while the declared shard RPC port is retained.
-/// Trusted localhost re-announcements are left intact for registry gossip.
 async fn announce_shard(
     AxumState(node): AxumState<NodeState>,
     ConnectInfo(RpcPeerAddr(peer_addr)): ConnectInfo<RpcPeerAddr>,
@@ -13860,20 +11498,6 @@ async fn announce_shard(
     req.shard.model_id = format!("0x{}", model_id.to_hex());
     let declared_origin = shard_rpc_origin(&req.shard.socket_addr)
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    // A loopback peer is NOT evidence that this node announced to itself.
-    // Behind an HTTPS gateway every remote announcement arrives from
-    // 127.0.0.1, so the peer address cannot distinguish "my own refresh" from
-    // "somebody else's announcement my proxy forwarded". The authenticated
-    // signer can, and it is the only trustworthy signal here.
-    //
-    // This is what took shard discovery down on the recovered fleet: each
-    // node advertises the stub `http://0.0.0.0:9944` (its bind address, since
-    // ARC_PUBLIC_SOCKET is unset), the gateway made the peer look local, the
-    // stub was rewritten to the RECEIVER's own `127.0.0.1:9944`, the audience
-    // probe then fetched the receiver's own /network/info, and the
-    // announcement was refused for "not matching the destination's validator
-    // identity" - a peer rejected for being the wrong node, because it had
-    // been rewritten into this one.
     let own_announcement = announcing_validator == node.validator_address;
     let from_own_process = peer_addr.ip().is_loopback() && own_announcement;
     req.shard.socket_addr = if from_own_process && is_stub_socket_addr(&req.shard.socket_addr) {
@@ -13906,16 +11530,8 @@ async fn announce_shard(
                 .to_string(),
         ));
     }
-    // The signed payload's display name is untrusted metadata. Bind the
-    // authenticated validator identity after audience verification so aliases
-    // cannot inflate a replica set or conflate two validators sharing a name.
     req.shard = bind_shard_registry_identity(req.shard, announcing_validator);
 
-    // Dedupe: if an existing entry already covers the same (layer_range,
-    // authenticated validator identity) with a routable socket_addr, drop this announcement when
-    // the incoming addr is STILL a stub (self-announce from localhost). This
-    // preserves existing behavior and prevents self-announces from clobbering
-    // gossiped entries with real public IPs.
     let still_stub = is_stub_socket_addr(&req.shard.socket_addr);
     if still_stub {
         let has_better = node.shard_registry.iter().any(|e| {
@@ -13933,14 +11549,7 @@ async fn announce_shard(
             ));
         }
     }
-    // Key by (socket_addr, range) so one node announcing multiple held ranges
-    // produces one entry per range - otherwise the DashMap insert clobbers
-    // prior announces and only the most recent range survives. The
-    // coordinator's BTreeMap grouping already keys on (start, end) so a
-    // per-range entry is exactly what we need. An interleaved-RoPE
-    // announcement keeps its own entry beside the holder's legacy one.
     let key = shard_registry_key(&req.shard);
-    // Also register in multi-model ShardRegistry for multi-model routing
     let assignment = arc_inference::distributed::ShardAssignment {
         node_address: announcing_validator,
         start_layer: req.shard.start_layer as u32,
@@ -13959,20 +11568,11 @@ async fn announce_shard(
     ))
 }
 
-// ─── Community worker registry ──────────────────────────────────────────────
-
-/// Versioned proof-of-possession envelope for every community mutation.
-/// The signature commits to the exact route, typed payload hash, timestamp,
-/// and random nonce. Read-only community endpoints remain unenveloped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommunitySignedRequest<T> {
     pub version: u8,
-    /// Exact coordinator/validator this envelope authorizes. A signature for
-    /// one seed is never a bearer token another seed may replay.
     pub target_coordinator: Hash256,
-    /// Active recovery transaction domain (None only on legacy/dev chains).
-    /// This prevents cross-network and pre/post-recovery replay.
     pub transaction_domain: Option<Hash256>,
     pub timestamp_unix_ms: u64,
     pub nonce: Hash256,
@@ -14030,8 +11630,6 @@ fn community_request_commitment(
     arc_crypto::hash_bytes(&transcript)
 }
 
-/// Construct a fresh signed request. Two UUIDv4 values supply 244 random bits
-/// after their fixed version/variant bits, sourced from the OS CSPRNG.
 pub fn sign_community_request<T: Serialize>(
     path: &str,
     payload: T,
@@ -14074,12 +11672,6 @@ pub fn sign_community_request<T: Serialize>(
     })
 }
 
-/// Build the only wire form accepted by `POST /shards/announce`.
-///
-/// Main's broadcaster first reads the destination's `/network/info`, then
-/// supplies that validator address and transaction domain here.  Binding the
-/// signer, exact destination, recovery domain, route, and complete shard
-/// record prevents registry poisoning and cross-seed replay.
 pub fn sign_validator_shard_announcement(
     shard: ShardInfo,
     keypair: &arc_crypto::KeyPair,
@@ -14333,14 +11925,6 @@ fn prune_stale_community_workers(
     workers.retain(|_, (_, last_seen)| now.duration_since(*last_seen) <= ttl);
 }
 
-/// POST /community/register
-/// A community-mode node calls this on every seed it can reach. The seed
-/// stores the worker info in its community_workers registry. The worker
-/// is then visible to the dashboard and counted in TPS/compute stats.
-/// Workers are pure outbound HTTP: no inbound port, no NAT traversal,
-/// no QUIC. Works behind any residential firewall. Signed requests provide
-/// authentication and integrity, not confidentiality; production deployments
-/// must terminate TLS at a reverse proxy or equivalent deployment layer.
 async fn community_register_signed(
     AxumState(node): AxumState<NodeState>,
     Json(signed): Json<CommunitySignedRequest<CommunityRegisterRequest>>,
@@ -14416,9 +12000,6 @@ async fn community_register(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Preserve all stat fields across re-registrations so a re-register
-    // every 60s doesn't reset the scoreboard. Default to zeros for a
-    // brand-new worker.
     let prior = node
         .community_workers
         .get(&req.worker_id)
@@ -14427,8 +12008,6 @@ async fn community_register(
 
     let worker = CommunityWorker {
         worker_id: req.worker_id.clone(),
-        // Older workers append the machine hostname, which usually carries the
-        // owner's first name. Store only the privacy-safe public label.
         name: community_public_name(&req.worker_id, &req.name),
         capabilities,
         model,
@@ -14457,8 +12036,6 @@ async fn community_register(
 #[serde(deny_unknown_fields)]
 pub struct CommunityHeartbeatRequest {
     pub worker_id: String,
-    /// Deprecated client-reported value, accepted for wire compatibility but
-    /// never trusted. Completion counters are server-authoritative.
     #[serde(default)]
     #[allow(dead_code)]
     pub work_completed: Option<u64>,
@@ -14470,10 +12047,6 @@ impl CommunityAuthenticatedPayload for CommunityHeartbeatRequest {
     }
 }
 
-/// POST /community/heartbeat
-/// Community workers call this every 15 seconds to stay alive in the
-/// registry. Without a heartbeat for COMMUNITY_WORKER_TTL_SECS (90s)
-/// the worker is pruned at read time.
 async fn community_heartbeat_signed(
     AxumState(node): AxumState<NodeState>,
     Json(signed): Json<CommunitySignedRequest<CommunityHeartbeatRequest>>,
@@ -14498,11 +12071,6 @@ async fn community_heartbeat(
     }
 }
 
-/// GET /community/worker/status
-/// This node's own community worker: whether it is polling or computing, how
-/// many coordinators accepted its last registration, and the jobs it claimed,
-/// completed, and had quorum-verified since the process started. Local
-/// observations for the desktop app, not chain or reward evidence.
 async fn community_worker_status()
 -> Result<Json<crate::community_worker::CommunityWorkerSnapshot>, (StatusCode, String)> {
     crate::community_worker::installed()
@@ -14513,10 +12081,6 @@ async fn community_worker_status()
         ))
 }
 
-/// GET /community/list
-/// Returns all fresh community workers. Entries older than
-/// COMMUNITY_WORKER_TTL_SECS are pruned at read time. The dashboard
-/// polls this to show the community node count + geographic spread.
 async fn community_list(AxumState(node): AxumState<NodeState>) -> Json<serde_json::Value> {
     let now = std::time::Instant::now();
     let ttl = std::time::Duration::from_secs(COMMUNITY_WORKER_TTL_SECS);
@@ -14560,36 +12124,8 @@ async fn community_list(AxumState(node): AxumState<NodeState>) -> Json<serde_jso
     }))
 }
 
-// ─── Community work dispatch (long-poll claim + submit) ─────────────────────
-//
-// Community nodes run with `--stake 0 --community-mode` behind NAT. They can
-// reach seed nodes via outbound HTTP but cannot accept inbound connections.
-// Production deployments must provide TLS through a reverse proxy or equivalent
-// deployment layer; request signatures do not encrypt prompts or results.
-// The two endpoints below let the coordinator push forward_shard work to these
-// workers without requiring inbound connectivity:
-//
-//   1. Worker calls POST /community/claim_work (long-poll, up to 30s).
-//      If work arrives within the window, the coordinator writes the job
-//      payload and closes the response. If not, returns {"status":"no_work"}.
-//      The worker immediately re-polls.
-//
-//   2. Worker calls POST /community/submit_work with the computed result.
-//      The coordinator matches it to the pending oneshot and resumes the
-//      pipeline walk.
-//
-// The coordinator side pushes WorkItems into `work_queue` (mpsc) and awaits
-// WorkResults via `work_results` (DashMap<request_id, oneshot::Sender>).
-// Those fields must be added to NodeState by the caller - these handlers
-// reference them directly.
-
-/// Maximum time a claim_work long-poll will hold the connection open.
 const COMMUNITY_CLAIM_TIMEOUT_SECS: u64 = 30;
 
-/// Poll the shared bounded queue without holding its receiver mutex across an
-/// await. `mpsc::Receiver` has one consumer, but a 30-second `recv().await`
-/// under the mutex serialized every worker behind the first idle long-poll.
-/// Short critical sections let all waiting workers compete for new jobs.
 async fn poll_community_work_queue(
     queue: &Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<WorkItem>>>,
     timeout: tokio::time::Duration,
@@ -14621,54 +12157,22 @@ async fn poll_community_work_queue(
     }
 }
 
-/// A whole-prompt inference job dispatched to a community worker.
-///
-/// v0.7.0: layer-shard work is no longer dispatched to community workers — it
-/// remains a seed-to-seed primitive only (see `inference_run_sharded`). The
-/// community-worker channel now carries entire prompts, which any device with
-/// a loaded model can serve end-to-end. This is the unit that makes "every
-/// device is a node" honest: a phone running a 1B model handles a whole job;
-/// a workstation running 13B handles a whole job; both earn per attestation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItem {
-    /// Unique job id (hex of blake3(input || nonce)). Used to match
-    /// submit_work back to the awaiting oneshot.
     pub job_id: String,
-    /// Prompt text (already chat-templated by the dispatcher if needed).
     pub input: String,
-    /// Maximum tokens the worker should generate.
     pub max_tokens: u32,
-    /// Optional model identifier (hex of model_id hash). When set, only
-    /// workers serving the same model will accept the job.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
-    /// Exact whole-model arithmetic profile required by this reward-bearing
-    /// assignment. Protocol-v3 workers reject anything but canonical INT8.
     pub execution_profile: String,
-    /// Protocol-v3 transaction signing domain advertised by the coordinator.
-    /// Absent on legacy/dev networks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transaction_domain: Option<String>,
-    /// Recovery-only target identity. Other workers must leave this item in
-    /// the queue so the accepted pre-tag canary alone can claim it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_worker_id: Option<String>,
-    /// Unix timestamp (ms) when the dispatcher queued the job. Workers
-    /// echo this back so the dispatcher can compute end-to-end latency.
     pub submitted_at_unix_ms: i64,
-    /// Absolute coordinator-owned deadline for any submit/retry, including
-    /// the bounded late-submit grace. Workers must stop computation and
-    /// retries at this instant; coordinators retain pending state until the
-    /// same deadline so both sides agree on assignment lifetime.
     pub expires_at_unix_ms: u64,
 }
 
-/// Coordinator-owned state for a dispatched community job.
-///
-/// This must stay in the pending map until the assigned worker submits a
-/// result. A bare response channel is not enough: without the original job
-/// and assignment, an arbitrary registered worker can invent a job id and a
-/// signed attestation that is unrelated to work the coordinator issued.
 pub struct PendingCommunityWork {
     item: WorkItem,
     assignment_epoch: Hash256,
@@ -14677,9 +12181,6 @@ pub struct PendingCommunityWork {
     assigned_at: Option<tokio::time::Instant>,
     first_submit_at: Option<tokio::time::Instant>,
     routing: community_routing::PendingRouting,
-    /// Set while one authenticated submit is independently recomputed.  The
-    /// record stays in the map until verification succeeds, so cancellation or
-    /// transient shard failure cannot irreversibly consume the assignment.
     submitting: bool,
     sender: tokio::sync::oneshot::Sender<CommunityDispatchOutcome>,
 }
@@ -14694,7 +12195,6 @@ struct CommunityRewardSubmission {
 
 #[derive(Debug, Clone)]
 struct VerifiedCommunitySettlement {
-    // Never serialized: the retained payload and journal keep the old shape.
     output_tokens: Option<Vec<u32>>,
     payload: CommunityRewardApprovalPayload,
     verified_at_unix_ms: u64,
@@ -14703,9 +12203,6 @@ struct VerifiedCommunitySettlement {
     last_error: Option<String>,
 }
 
-/// Authenticated coordinator-to-validator approval request. The prompt and
-/// output are required because each validator recomputes independently; the
-/// reward body contains only their commitments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CommunityRewardApprovalPayload {
@@ -14725,35 +12222,18 @@ impl CommunityAuthenticatedPayload for CommunityRewardApprovalPayload {
     }
 }
 
-/// Evidence created only after the coordinator independently recomputes a
-/// worker result. It is not part of `WorkResult` and therefore cannot be
-/// supplied or overridden by a worker.
 #[derive(Debug, Clone, Serialize)]
 struct CommunityVerificationSummary {
-    /// `COMMUNITY_VERIFICATION_METHOD_2_OF_3` when every range contacted
-    /// three replicas, `_2_OF_2` when every range contacted its two live
-    /// replicas, and `_MIXED` otherwise.
     method: &'static str,
-    /// The verifier admitted the assignment and every replica under the one
-    /// protocol-canonical reward profile; this is coordinator-created proof,
-    /// not a worker assertion.
     profile_bound: bool,
-    /// Every generated position completed its authenticated quorum: 2-of-3,
-    /// or 2-of-2 on a range with two live replicas.
     quorum_verified: bool,
     execution_profile: &'static str,
     output_hash: String,
     tokens_generated: usize,
     ranges: usize,
-    /// One authenticated quorum record for each verified model-range and
-    /// token-position pair. This is not a raw signature count.
     range_position_quorums: usize,
     signatures_required_per_quorum: usize,
-    /// The fewest replicas any one quorum contacted: 3, or 2 when at least
-    /// one range was verified 2-of-2.
     replicas_contacted_per_quorum: usize,
-    /// The `[start_layer, end_layer)` ranges verified 2-of-2. Omitted when
-    /// every range was verified 2-of-3, so that response is unchanged.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     ranges_verified_2_of_2: Vec<(usize, usize)>,
 }
@@ -14763,17 +12243,9 @@ struct CommunityDispatchOutcome {
     result: WorkResult,
     verification: Option<CommunityVerificationSummary>,
     settlement: Option<Value>,
-    /// `answer_release_value`, set only when `--community-release-on-verification`
-    /// sent this verified answer before the reward approvals. `settlement` is
-    /// then the journaled `verified_pending_approval` state.
     answer_release: Option<Value>,
 }
 
-/// RAII reservation for a worker's concurrent long-polls. If a request is
-/// canceled while it is waiting, dropping this guard releases the empty
-/// reservation. Once a job is assigned, the reservation stays until submit or
-/// coordinator timeout so another seed poll cannot dequeue a second job for
-/// the same single-capacity worker.
 struct CommunityClaimReservation {
     active_jobs: Arc<dashmap::DashMap<String, String>>,
     worker_id: String,
@@ -14811,10 +12283,6 @@ fn release_active_community_job_from_map(
     }
 }
 
-/// Cancellation guard for the public dispatcher.  An unclaimed queue entry is
-/// removed immediately.  Once a worker owns the job, preserve it for a bounded
-/// late-submit grace period so a proxy/client disconnect cannot erase valid
-/// work or its reward settlement while the worker is still computing.
 struct PendingDispatchReservation {
     results: Arc<dashmap::DashMap<String, PendingCommunityWork>>,
     active_jobs: Arc<dashmap::DashMap<String, String>>,
@@ -14856,8 +12324,6 @@ impl Drop for PendingDispatchReservation {
     }
 }
 
-/// Marks a pending assignment as being verified without removing it.  Dropping
-/// the future resets the marker, so an interrupted submit remains retryable.
 struct PendingSubmissionReservation {
     results: Arc<dashmap::DashMap<String, PendingCommunityWork>>,
     job_id: String,
@@ -14883,8 +12349,6 @@ impl Drop for PendingSubmissionReservation {
     }
 }
 
-/// Once the pending record is consumed, this guard guarantees that every
-/// return path and task cancellation releases the worker's single-job slot.
 struct ActiveCommunityJobReservation {
     active_jobs: Arc<dashmap::DashMap<String, String>>,
     worker_id: Option<String>,
@@ -14899,54 +12363,31 @@ impl Drop for ActiveCommunityJobReservation {
     }
 }
 
-/// Result submitted by a community worker after completing a WorkItem.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkResult {
-    /// Optional exact token claim, negotiated by the claim response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<Vec<u32>>,
-    /// Must match the WorkItem.job_id.
     pub job_id: String,
-    /// Worker's self-chosen identifier (hex of validator pubkey).
     pub worker_id: String,
-    /// True if the worker produced output; false on inference error.
     #[serde(default = "default_true")]
     pub success: bool,
-    /// True when the worker is deliberately returning an extra concurrent
-    /// assignment without attempting inference. This unblocks the coordinator
-    /// without counting a capacity race as a model failure.
     #[serde(default)]
     pub declined: bool,
-    /// Generated text (decoded from the worker's tokens).
     #[serde(default)]
     pub output: String,
-    /// BLAKE3 of the output token sequence (hex, 0x-prefixed). The chain
-    /// uses this for cross-worker hash-majority verification.
     #[serde(default)]
     pub output_hash: String,
-    /// Number of tokens generated.
     #[serde(default)]
     pub tokens_generated: u64,
-    /// Total wall time on the worker, in milliseconds (encode + generate + decode).
     #[serde(default)]
     pub total_ms: u64,
-    /// Average ms per generated token.
     #[serde(default)]
     pub ms_per_token: u64,
-    /// Engine identifier ("INT8 integer (community worker)", etc.) for analytics.
     #[serde(default)]
     pub engine: String,
-    /// Optional error message when success=false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Hex-encoded `bincode(arc_types::Transaction)` of the worker-signed
-    /// InferenceAttestation (tx 0x16) for this completion. Lets the seed
-    /// post the attestation on-chain with `from = worker_address`, so
-    /// rewards accrue to the worker who actually did the work — not the
-    /// seed that routed the request. Optional during the v0.7.0
-    /// transition; pre-v0.7 workers don't send it, and the seed accepts
-    /// the submit anyway (just no on-chain record).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_attestation_hex: Option<String>,
 }
@@ -14965,19 +12406,12 @@ struct CommunityResultVerification {
     range_count: usize,
     range_position_quorum_count: usize,
     execution_profile: &'static str,
-    /// Each verified range with the number of replicas its quorums contacted.
     range_replicas: Vec<((usize, usize), usize)>,
 }
 
 #[derive(Debug)]
 enum CommunityResultVerificationError {
-    /// A completed authenticated quorum proved that the worker's semantic
-    /// claim is wrong. This is worker-attributable and permanently rejects
-    /// the assignment.
     Invalid(String),
-    /// The coordinator could not obtain proof (missing topology/model,
-    /// timeout, capacity, or shard disagreement). Absence of proof is not
-    /// proof of worker fault; the same assignment remains retryable.
     Unavailable(String),
 }
 
@@ -15017,8 +12451,6 @@ impl From<&CommunityResultVerification> for CommunityVerificationSummary {
     }
 }
 
-/// The method label for one verification, from the number of replicas each
-/// range's quorums contacted.
 fn community_verification_method(range_replicas: &[((usize, usize), usize)]) -> &'static str {
     let two_of_two = range_replicas
         .iter()
@@ -15033,18 +12465,6 @@ fn community_verification_method(range_replicas: &[((usize, usize), usize)]) -> 
     }
 }
 
-/// Admit and recreate the exact generation context consumed by the
-/// community-worker loop. `CachedIntegerModel::try_generate` performs one
-/// internal BOS forward, then forwards the caller's raw tokenizer output and
-/// performs up to `max_tokens` decode forwards. The sharded verifier therefore
-/// receives exactly one BOS followed by the prompt and its final token once
-/// more, because the terminal range chooses the first generated token during
-/// that forwarded position.
-///
-/// Returning the model's typed preflight decision lets dispatch deadline math
-/// use the exact total position count. Every caller invokes this before queue
-/// admission or quorum recomputation, so a tokenizer-expanded prompt cannot
-/// become a worker-side panic or a doomed assignment.
 fn community_worker_generation_context(
     model: &arc_inference::cached_integer_model::CachedIntegerModel,
     input: &str,
@@ -15077,7 +12497,7 @@ fn community_worker_generation_context(
     let mut verification_tokens = Vec::with_capacity(worker_prompt.len() + 2);
     verification_tokens.push(model.config.bos_token);
     verification_tokens.extend(worker_prompt);
-    verification_tokens.push(last_prompt_token); // first decode step
+    verification_tokens.push(last_prompt_token);
     Ok((verification_tokens, preflight))
 }
 
@@ -15114,9 +12534,6 @@ fn compare_community_result_with_tokens(
     Ok(actual_hash)
 }
 
-/// The worker profile a job's verification requires: the job's own profile
-/// when this validator verifies it (`--community-verify-profiles`), and the
-/// legacy profile otherwise, exactly as before.
 fn validate_community_reward_profile_for_job(
     node: &NodeState,
     work_item: &WorkItem,
@@ -15153,16 +12570,6 @@ fn validate_community_reward_profile(result: &WorkResult) -> Result<(), String> 
     Ok(())
 }
 
-/// Validate that a successful community recomputation contains one fixed,
-/// authenticated quorum record for every executed range and token position.
-///
-/// This deliberately does not equate `votes.len()` with quorum proof.  Each
-/// record must identify two distinct currently approved, positive-stake signer
-/// keys, and every replica slot planned for its range must have been
-/// contacted: `replicas_per_range`, aligned with `pipeline`, is 3, or 2 for a
-/// range with exactly two live replicas.  The complete range/position grid is
-/// checked so a missing hop cannot disappear behind an otherwise plausible
-/// aggregate count.
 fn validate_community_range_position_quorums(
     pipeline: &[PipelineHop],
     replicas_per_range: &[usize],
@@ -15299,13 +12706,6 @@ fn validate_community_range_position_quorums(
     Ok(expected_count)
 }
 
-/// Independently recompute a community worker's claimed completion through
-/// authenticated, distinct active-validator replicas of every layer range:
-/// three replicas, or both replicas of a range with exactly two live
-/// holders, and in either case two distinct signatures that agree.
-/// `pipeline_hop` only counts one vote per validator key, and every response
-/// is signed over the exact request and chain domain. No quorum means no
-/// accepted output and no reward.
 async fn verify_community_result_with_quorum(
     node: &NodeState,
     work_item: &WorkItem,
@@ -15335,26 +12735,16 @@ async fn verify_community_result_with_quorum(
     })
 }
 
-/// The validators' authenticated quorum recomputation of an assignment,
-/// independent of any worker's claim. Twin execution recomputes once and
-/// classifies both legs against this output.
 struct CommunityCanonicalRecompute {
     generated: Vec<u32>,
     output_text: String,
     output_hash: Hash256,
     range_count: usize,
     range_position_quorum_count: usize,
-    /// The profile the validator shards executed: the assignment's own.
     execution_profile: &'static str,
-    /// Each verified range with the number of replicas its quorums contacted.
     range_replicas: Vec<((usize, usize), usize)>,
 }
 
-/// How many replicas community verification contacts for each range of
-/// `pipeline`, in pipeline order: every distinct replica, up to
-/// `COMMUNITY_VERIFICATION_REPLICAS`. A range with fewer distinct replicas
-/// than `COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED` fails the plan, because
-/// no quorum there could carry two independent signatures.
 fn community_verification_replica_plan(pipeline: &[PipelineHop]) -> Result<Vec<usize>, String> {
     pipeline
         .iter()
@@ -15374,17 +12764,11 @@ fn community_verification_replica_plan(pipeline: &[PipelineHop]) -> Result<Vec<u
         .collect()
 }
 
-/// The pipeline one community verification runs on, with the number of
-/// replicas it contacts for each layer range, aligned with `pipeline`.
 struct CommunityVerificationPlan {
     pipeline: Vec<PipelineHop>,
     replicas_per_range: Vec<usize>,
 }
 
-/// The layer-range pipeline community verification runs on: this node's
-/// fresh shards for its exact model and `required_profile`, under the strict
-/// validator-identity policy. `prune_expired_shards` removes expired registry
-/// entries while reading; read-only callers pass false.
 fn community_verification_pipeline(
     node: &NodeState,
     required_profile: &str,
@@ -15418,8 +12802,6 @@ fn pause_before_state_publication_read(node: &NodeState) {
     }
 }
 
-/// Test-only explicit verification pipeline; see
-/// `NodeState::community_verification_pipeline_override`.
 #[cfg(test)]
 fn community_verification_pipeline_override(node: &NodeState) -> Option<Vec<PipelineHop>> {
     node.community_verification_pipeline_override.clone()
@@ -15430,11 +12812,6 @@ fn community_verification_pipeline_override(_node: &NodeState) -> Option<Vec<Pip
     None
 }
 
-/// Plan a community verification of `required_profile` exactly as the
-/// verifier runs it: the pipeline, its execution profile, and the replica
-/// count of every range. `/inference/readiness` and `/inference/run` call it
-/// with `prune_expired_shards: false`, so a read never edits the registry.
-/// The error carries the readiness reason and the detail for this node's log.
 fn plan_community_verification(
     node: &NodeState,
     required_profile: &str,
@@ -15464,17 +12841,11 @@ fn plan_community_verification(
     })
 }
 
-/// Recompute an assignment through authenticated, distinct active-validator
-/// replicas of every layer range, as `verify_community_result_with_quorum`
-/// describes. Every failure is `Unavailable`: without a worker claim there is
-/// nothing for it to prove invalid.
 async fn recompute_community_output_with_quorum(
     node: &NodeState,
     work_item: &WorkItem,
 ) -> Result<CommunityCanonicalRecompute, CommunityResultVerificationError> {
     let canonical = arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE;
-    // The legacy profile, or the interleaved-RoPE one when this validator
-    // verifies it; the shards then run the assignment's own profile.
     let Some(required) = node
         .community_verify_profiles
         .verified(&work_item.execution_profile)
@@ -15508,18 +12879,12 @@ async fn recompute_community_output_with_quorum(
         )));
     }
 
-    // Every range contacts all of its distinct replicas up to three, and one
-    // with fewer than two makes verification unavailable.
     let plan = plan_community_verification(node, required, true)
         .map_err(|(_, detail)| CommunityResultVerificationError::Unavailable(detail))?;
 
     let (all_tokens, _) =
         community_worker_generation_context(&model, &work_item.input, work_item.max_tokens)
             .map_err(CommunityResultVerificationError::Unavailable)?;
-    // Every approver recomputes independently but contacts the same shard
-    // holders.  Namespace the stateful KV-cache key by approver identity;
-    // using only job_id made parallel approvers corrupt one another's cache
-    // position and rendered production five-of-six fanout impossible.
     let request_id = format!(
         "0x{}",
         arc_crypto::hash_bytes(
@@ -15532,8 +12897,6 @@ async fn recompute_community_output_with_quorum(
         )
         .to_hex()
     );
-    // A fixed quorum per range, never degraded mid-run: 2-of-3 where three
-    // replicas are contacted, 2-of-2 where a range has exactly two.
     let strategies: Vec<HopStrategy> = plan
         .replicas_per_range
         .iter()
@@ -15808,12 +13171,6 @@ fn validate_reward_approval_payload(
         tokens_generated: payload.tokens_generated,
         total_ms: 0,
         ms_per_token: 0,
-        // This is the worker execution profile committed by the candidate,
-        // not a label for the validator-side verification procedure.  Remote
-        // approvers must reconstruct the same profile that the coordinator
-        // already checked, which this validator verifies (checked above); the
-        // verifier independently proves the output through authenticated
-        // validator shards below.
         engine: payload.execution_profile.clone(),
         error: None,
         signed_attestation_hex: None,
@@ -15835,13 +13192,6 @@ async fn approve_community_reward_payload(
     payload: &CommunityRewardApprovalPayload,
 ) -> Result<arc_types::transaction::CommunityRewardValidatorApproval, String> {
     let (work_item, result) = validate_reward_approval_payload(node, payload)?;
-    // A coordinator retries until five approvals arrive in one collection.
-    // Recomputing an already-approved commitment on every retry put five
-    // full-model verifications on the same shard holders at once; each holds
-    // up to three in-flight ranges, which overflows the 12-request shard queue
-    // and left the fifth approval unreachable on the live fleet. This
-    // validator's earlier recomputation of the exact commitment is recorded,
-    // and re-signing it is deterministic, so it grants nothing new.
     if reward_commitment_already_verified(node, &payload.reward) {
         return sign_validated_reward_approval(node, &payload.reward);
     }
@@ -15857,9 +13207,6 @@ async fn approve_community_reward_payload(
     sign_validated_reward_approval(node, &payload.reward)
 }
 
-/// True only when this process already signed the identical commitment for
-/// both the job and its worker certificate, which happens solely after its own
-/// independent recomputation (or, for the coordinator, its journaled one).
 fn reward_commitment_already_verified(
     node: &NodeState,
     reward: &arc_types::transaction::CommunityInferenceRewardBody,
@@ -15937,10 +13284,6 @@ async fn community_reward_approve_signed(
             "worker is quiescing for update".to_string(),
         ))?;
     let payload = authenticate_community_request(&node, COMMUNITY_REWARD_APPROVE_PATH, signed)?;
-    // Reject malformed/model-context-invalid candidates before they occupy a
-    // bounded queue slot or start shard recomputation. The payload is
-    // revalidated after FIFO admission because chain height/budgets can change
-    // while it waits.
     validate_reward_approval_payload(&node, &payload)
         .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error))?;
     let _queue_permit = node
@@ -15955,11 +13298,6 @@ async fn community_reward_approve_signed(
                 ),
             )
         })?;
-    // Tokio's semaphore is FIFO. Once a request owns one of the reviewed
-    // outer queue slots, do not evict it after an arbitrary 120 seconds while
-    // an earlier maximum-context recomputation is still making progress. The
-    // authenticated caller's 1,500-second request deadline remains the outer
-    // transport bound and cancellation drops this fair queue ticket.
     let _approval_permit = node
         .community_approval_permits
         .clone()
@@ -16025,10 +13363,6 @@ fn validate_collected_reward_approvals(
             &body.assignment_epoch,
         );
     let mut collected: Vec<_> = if recovery_probe {
-        // A recovery retry must reconstruct byte-identical transaction data,
-        // regardless of which HTTP response happened to finish first. Bind it
-        // to the address-sorted first five members of the exact six-validator
-        // authority set and fail closed if any canonical signer is missing.
         let mut canonical: Vec<_> = active.iter().map(|(address, _)| address.0).collect();
         canonical.sort_unstable();
         canonical.truncate(COMMUNITY_REWARD_APPROVALS_REQUIRED);
@@ -16113,8 +13447,6 @@ async fn post_remote_reward_approval(
     } else {
         None
     };
-    // Both attempts share one approval timeout. A compatibility retry signs
-    // the changed payload again, including a fresh authentication nonce.
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs(COMMUNITY_APPROVAL_REQUEST_TIMEOUT_SECS);
     for attempt in 0..2 {
@@ -16156,7 +13488,6 @@ async fn post_remote_reward_approval(
     Err("approval compatibility retry exhausted".into())
 }
 
-// Kept for recovery probes, which retain their original probe/POST scheduling.
 async fn request_remote_reward_approval(
     client: reqwest::Client,
     seed: String,
@@ -16225,8 +13556,6 @@ async fn collect_community_reward_approvals(
                     }
                     Ok(Err(error)) => tracing::debug!(%error, "approval audience unavailable"),
                     Err(error) => {
-                        // A local task failure is not proof that the remote is
-                        // unreachable. Preserve the old behavior on doubt.
                         tracing::warn!(%error, "approval probe task failed; attempting approval round");
                         started = true;
                     }
@@ -16286,10 +13615,6 @@ fn move_file_write_through(
     source: &std::path::Path,
     destination: &std::path::Path,
 ) -> std::io::Result<()> {
-    // No REPLACE_EXISTING flag: settlement publication remains create-only.
-    // WRITE_THROUGH is the documented Windows durability primitive for the
-    // same-directory rename because directory handles cannot provide the Unix
-    // parent-fsync contract.
     arc_crypto::secret_file::windows_move_path_write_through(source, destination, false)
 }
 
@@ -16311,9 +13636,6 @@ fn publish_settlement_journal_file(
     }
     #[cfg(unix)]
     {
-        // Hard-link publication is atomic and create-only on Unix; rename
-        // would silently replace an existing verified settlement under a
-        // concurrent/idempotent publisher.
         std::fs::hard_link(temporary, final_path)?;
         std::fs::remove_file(temporary)
     }
@@ -16338,9 +13660,6 @@ fn sync_directory(directory: &std::path::Path) -> Result<(), String> {
     }
     #[cfg(not(unix))]
     {
-        // Windows makes each live-name publication/removal durable with a
-        // write-through rename. Other non-Unix targets have no parent-fsync
-        // primitive exposed by std.
         let _ = directory;
         Ok(())
     }
@@ -16391,10 +13710,6 @@ fn remove_settlement_journal_file(path: &std::path::Path) -> Result<(), String> 
         .ok_or_else(|| "settlement journal entry has no parent".to_string())?;
     #[cfg(windows)]
     {
-        // First remove the live name with a durable same-directory rename. A
-        // crash can resurrect only the ignored .tmp-* tombstone, never a
-        // settlement eligible for replay. Deleting the tombstone afterward is
-        // cleanup and is safely retried by journal replay after a crash.
         let tombstone = directory.join(format!(
             ".tmp-removed-{}-{}",
             path.file_name()
@@ -16411,9 +13726,6 @@ fn remove_settlement_journal_file(path: &std::path::Path) -> Result<(), String> 
         if let Err(error) = std::fs::remove_file(&tombstone)
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            // The live settlement name is already durably gone. Keep this
-            // cleanup failure observable, but do not report the semantic
-            // removal as failed: replay ignores and retries every .tmp-* file.
             tracing::warn!(path = %tombstone.display(), %error, "settlement tombstone cleanup deferred");
         }
     }
@@ -16434,11 +13746,6 @@ fn ensure_settlement_journal_directory(directory: &std::path::Path) -> Result<()
         .map_err(|error| format!("restore settlement journal directory namespace: {error}"))?;
     arc_crypto::secret_file::create_private_directory_tree(namespace_lock.target())
         .map_err(|error| format!("secure settlement journal directory: {error}"))?;
-    // The process-lifetime node data lock serializes other ARC processes. The
-    // parent-sibling guard makes this directory rebarrier atomic; runtime
-    // callers additionally retain `community_verified_settlements_gate`
-    // through the following journal publication so no same-process publisher
-    // can observe the directory's brief Windows absent-name window.
     namespace_lock
         .rebarrier_existing()
         .map_err(|error| format!("rebarrier settlement journal directory namespace: {error}"))
@@ -16621,10 +13928,6 @@ fn cleanup_settlement_temporary_file(path: &std::path::Path, name: &str) -> Resu
     if let Err(error) = std::fs::remove_file(path)
         && error.kind() != std::io::ErrorKind::NotFound
     {
-        // These exact names are never replayed as earned work. In particular,
-        // `.tmp-removed-*` has already crossed a write-through live-name
-        // retirement barrier on Windows, so an AV/indexer lock may defer only
-        // physical cleanup, never settlement semantics.
         tracing::warn!(path = %path.display(), %error, "settlement journal temporary cleanup deferred");
     }
     Ok(())
@@ -16692,11 +13995,6 @@ fn replay_verified_settlement_journal(node: &NodeState) -> Result<Vec<Hash256>, 
     Ok(replayed)
 }
 
-/// What callers see when `retain_verified_settlement` cannot prune or write
-/// its journal. Its errors become the public `reason` of a
-/// `reward_approval_quorum_unavailable` settlement in the `/inference/run`
-/// and `/community/submit_work` responses, and a journal error can name this
-/// server's filesystem paths, so the detail goes to the log only.
 const SETTLEMENT_JOURNAL_UNAVAILABLE: &str =
     "this coordinator could not journal the verified settlement; the detail is in its log";
 
@@ -16732,8 +14030,6 @@ fn retain_verified_settlement(
             "verified settlement journal is at reviewed capacity {VERIFIED_SETTLEMENT_CAP}; retry after older entries expire"
         ));
     }
-    // Durability precedes visibility: after this returns, a crash at any later
-    // await can replay the exact independently verified payload.
     persist_verified_settlement_journal(node, &payload, now)
         .map_err(|error| public_settlement_journal_error(payload.reward.job_id, error))?;
     node.community_verified_settlements.insert(
@@ -16842,10 +14138,6 @@ fn pending_mined_receipt_value(
     })
 }
 
-/// A coordinator bookkeeping row is not evidence that its transaction is
-/// still submitted. Proposers remove transactions from the mempool before
-/// inclusion, and rejected/drained transactions may never reach a block. Drop
-/// only the exact stale row observed so a concurrent replacement is retained.
 fn live_community_reward_submission(
     node: &NodeState,
     job_id: Hash256,
@@ -16869,9 +14161,6 @@ async fn attempt_verified_community_reward(
     node: &NodeState,
     job_id: Hash256,
 ) -> Result<Value, String> {
-    // Inclusion can race the retry scheduler's sleep. Always resolve the
-    // chain index before consulting or rebuilding the coordinator's mempool
-    // bookkeeping, otherwise a mined job can be submitted a second time.
     if let Some((tx_hash, _)) = indexed_reward_for_job(node, job_id)? {
         return community_reward_receipt_value(node, tx_hash);
     }
@@ -16928,11 +14217,6 @@ async fn attempt_verified_community_reward(
     Ok(pending_mined_receipt_value(node, job_id, &submission))
 }
 
-/// Deterministically de-synchronize independently verified jobs competing for
-/// the bounded validator approval queues. A fixed power-of-two retry schedule
-/// made the same earliest jobs reacquire every slot after each outage while
-/// later jobs repeatedly received 429. Full jitter over the upper half of the
-/// reviewed backoff preserves a hard cap without requiring mutable RNG state.
 fn verified_settlement_retry_delay_secs(
     job_id: Hash256,
     attempts: u32,
@@ -17022,12 +14306,7 @@ fn schedule_verified_settlement_retry(node: &NodeState, job_id: Hash256) {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {}
             }
             match attempt_verified_community_reward(&task_node, job_id).await {
-                Ok(_) => {
-                    // A mempool insertion is not a mined receipt. Keep one
-                    // bounded monitor alive so a drained/rejected transaction
-                    // is retried and the durable journal is removed only once
-                    // the chain confirms or expires the exact job.
-                }
+                Ok(_) => {}
                 Err(error) => {
                     if let Some(mut record) =
                         task_node.community_verified_settlements.get_mut(&job_id)
@@ -17040,10 +14319,6 @@ fn schedule_verified_settlement_retry(node: &NodeState, job_id: Hash256) {
     });
 }
 
-/// Build the exact job-bound reward candidate for an independently verified
-/// result and make it crash-durable in the verified-settlement journal.
-/// Both settlement timings below share this step, so they journal identical
-/// payloads and fail closed on identical preconditions.
 fn retain_verified_community_reward(
     node: &NodeState,
     work_item: &WorkItem,
@@ -17169,10 +14444,6 @@ async fn submit_verified_community_reward(
     }
 }
 
-/// Whether `--community-release-on-verification` answers this assignment
-/// before its reward approvals. Recovery probes keep the inline settlement:
-/// their caller is rollout tooling that reads the settlement evidence from
-/// the same response.
 fn release_answer_before_settlement(node: &NodeState, assignment_epoch: &Hash256) -> bool {
     node.community_release_on_verification
         && !arc_types::transaction::CommunityInferenceRewardBody::is_recovery_probe_assignment(
@@ -17180,27 +14451,17 @@ fn release_answer_before_settlement(node: &NodeState, assignment_epoch: &Hash256
         )
 }
 
-/// What `--community-release-on-verification` did with one verified job.
 enum EarlyRelease {
-    /// Journaled and handed to the retry loop: answer now, settlement pending.
     Released {
         settlement: Value,
         answer_release: Value,
     },
-    /// Settle inline before answering, exactly as with the switch off. The
-    /// journal is at its high-water mark, the reward is beyond this
-    /// coordinator's budget once its unpaid journaled rewards count, or the
-    /// journal could not take this job (`journal_error`, logged by the caller
-    /// once the inline settlement has finished).
-    Inline { journal_error: Option<String> },
-    /// The journal entry vanished between the write and the release; reported
-    /// exactly as `submit_verified_community_reward` reports it.
+    Inline {
+        journal_error: Option<String>,
+    },
     Failed(String),
 }
 
-/// This coordinator's journaled settlements that have neither expired nor
-/// been paid. A paid reward leaves its job marker account in state, so this
-/// costs one account lookup per entry rather than a transaction-index scan.
 #[derive(Clone, Copy, Debug, Default)]
 struct UnpaidSettlements {
     total: u64,
@@ -17234,13 +14495,6 @@ fn unpaid_verified_settlements(node: &NodeState, worker: Hash256) -> UnpaidSettl
     unpaid
 }
 
-/// `require_community_reward_issuance_capacity`, counting this coordinator's
-/// unpaid journaled rewards as already issued, since they draw on the same
-/// treasury and epoch budgets. `--community-release-on-verification` answers
-/// before the approvals only when this passes. Otherwise the job settles
-/// inline, as with the switch off: it is still journaled, and may still be
-/// paid if a pending reward fails or from a later epoch. Rewards journaled
-/// on other coordinators are not visible here.
 fn require_issuance_capacity_counting_unpaid(
     node: &NodeState,
     worker: Hash256,
@@ -17272,11 +14526,6 @@ fn require_issuance_capacity_counting_unpaid(
     Ok(())
 }
 
-/// Whether an inline settlement's error is the reward budget refusing the job:
-/// the issuance check the inline path runs first still refuses it with the
-/// same words. Once this coordinator's epoch budget is spent that is the
-/// normal outcome for the rest of the epoch, as with the switch off, so it is
-/// logged at info rather than as a failure.
 fn inline_refusal_is_budget_policy(node: &NodeState, worker_id: &str, reason: &str) -> bool {
     parse_hash256_hex(worker_id, "worker_id").is_ok_and(|worker| {
         require_community_reward_issuance_capacity(node, worker, node.validator_address)
@@ -17284,21 +14533,6 @@ fn inline_refusal_is_budget_policy(node: &NodeState, worker_id: &str, reason: &s
     })
 }
 
-/// `--community-release-on-verification`: decide how to settle one verified
-/// job without ever doing worse than the switch-off ordering. Every outcome
-/// other than an early release is the switch-off path itself.
-/// - At the journal's high-water mark, settle inline (backpressure).
-/// - If the reward is beyond the budgets once this coordinator's unpaid
-///   journaled rewards count, settle inline.
-/// - Otherwise journal the job exactly as `submit_verified_community_reward`
-///   does and leave the five-of-six approvals to the existing settlement
-///   retry loop. If the journal write fails, settle inline.
-///
-/// Nothing here awaits, so the journal entry, the single retry task and the
-/// reported pending state are established together. The mark and the budget
-/// are read without a lock across handlers, so verifications finishing at the
-/// same moment can all pass before any of them journals; the overshoot is
-/// bounded by the coordinator's concurrent verifications.
 fn release_verified_community_reward(
     node: &NodeState,
     work_item: &WorkItem,
@@ -17307,7 +14541,6 @@ fn release_verified_community_reward(
     result: &WorkResult,
     worker_attestation: &arc_types::Transaction,
 ) -> EarlyRelease {
-    // The inline path reports a malformed identity with its own error.
     let Ok(worker) = parse_hash256_hex(&result.worker_id, "worker_id") else {
         return EarlyRelease::Inline {
             journal_error: None,
@@ -17390,14 +14623,6 @@ fn release_verified_community_reward(
     }
 }
 
-/// Response marker for an answer released by `--community-release-on-verification`.
-/// The authenticated shard-quorum recomputation has passed. The five-of-six reward
-/// approvals and the 0x25 transaction are still outstanding. Only the
-/// journaling `coordinator` knows the job before it is mined, so the status
-/// URL is relative to the origin that answered `/inference/run`; it reports
-/// `verified_pending_approval`, then `pending_mined_receipt`, then the mined
-/// receipt. Pending ends at `expires_at_height`, after which an unpaid job is
-/// pruned and the URL returns 404.
 fn answer_release_value(node: &NodeState, job_id: Hash256, expires_at_height: u64) -> Value {
     json!({
         "schema": "arc.community.answer-release.v1",
@@ -17414,18 +14639,13 @@ fn default_true() -> bool {
     true
 }
 
-/// POST body for /community/claim_work.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimWorkRequest {
-    /// Worker's self-chosen identifier.
     pub worker_id: String,
-    /// What the worker can do. Must include "inference" to receive work.
     #[serde(default)]
     pub capabilities: Vec<String>,
-    /// Exact model identity the worker registered and has loaded.
     pub model_id: String,
-    /// Exact whole-model dispatch profile currently loaded by the worker.
     #[serde(default)]
     pub execution_profile: String,
 }
@@ -17436,16 +14656,6 @@ impl CommunityAuthenticatedPayload for ClaimWorkRequest {
     }
 }
 
-/// POST /community/claim_work
-///
-/// Long-poll endpoint. A community worker POSTs with its worker_id and
-/// capabilities. The server holds the request open for up to 30 seconds.
-/// If a forward_shard job arrives during that window, the server writes the
-/// job payload as the response and closes the connection. If no work arrives,
-/// returns `{"status":"no_work"}`. The community node immediately re-polls.
-///
-/// The worker must be registered via /community/register before claiming work
-/// (this doubles as a heartbeat - we refresh the TTL on every poll).
 async fn community_claim_work_signed(
     AxumState(node): AxumState<NodeState>,
     Json(signed): Json<CommunitySignedRequest<ClaimWorkRequest>>,
@@ -17458,7 +14668,6 @@ pub async fn community_claim_work(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<ClaimWorkRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // ── Validate worker_id ──────────────────────────────────────────────
     if req.worker_id.is_empty() || req.worker_id.len() > 128 {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -17466,7 +14675,6 @@ pub async fn community_claim_work(
         ));
     }
 
-    // ── Registration, capability, and exact model binding ───────────────
     let Some(registered) = node.community_workers.get(&req.worker_id) else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -17514,7 +14722,6 @@ pub async fn community_claim_work(
     }
     drop(registered);
 
-    // A valid claim doubles as a heartbeat.
     if let Some(mut entry) = node.community_workers.get_mut(&req.worker_id) {
         entry.value_mut().1 = std::time::Instant::now();
     }
@@ -17541,7 +14748,6 @@ pub async fn community_claim_work(
 
     community_routing::open_claim(&node, &req.worker_id, registered_model_id);
 
-    // ── Long-poll: try to receive a WorkItem from the queue ─────────────
     let work_rx = node.community_work_queue.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "work queue not initialized - coordinator not running".to_string(),
@@ -17580,16 +14786,11 @@ pub async fn community_claim_work(
                         "reason": "worker_mismatch",
                     })));
                 }
-                // Exact model commitments, not display names, decide whether this
-                // worker can execute the coordinator-issued job.
                 let item_model_id = item
                     .model_id
                     .as_deref()
                     .and_then(|value| parse_hash256_hex(value, "model_id").ok());
                 if item_model_id != Some(registered_model_id) {
-                    // Model mismatch - put the item back on the queue so
-                    // another worker can pick it up, then tell this worker
-                    // there's no matching work.
                     twin_dispatch::requeue_item(&node, item);
                     return Ok(Json(json!({
                         "status": "no_work",
@@ -17607,20 +14808,11 @@ pub async fn community_claim_work(
                     ));
                 }
 
-                // A twin leg must go to a worker independent of its sibling
-                // (crate::twin::decide_claim); a refused or briefly deferred leg
-                // goes back on the queue for another worker.
-                // Serialize fan-out reserve decisions through the actual bind.
-                // Caller bindings use the same gate, so an idle snapshot cannot
-                // spend a worker that a concurrent handler has just assigned.
                 let claim_gate = (node.community_twin.config.effective_reserve() > 0)
                     .then(|| node.community_routing.lock());
                 let twin_claim = twin_dispatch::claim_decision(&node, &item.job_id, &req.worker_id);
                 if let Some(reason) = twin_claim.and_then(twin_dispatch::refusal_reason) {
                     if node.community_twin.config.effective_reserve() > 0 {
-                        // Peek/claim races are possible. Requeue once, exclude
-                        // this leg for the rest of this poll, then examine other
-                        // work. Empty polls use the normal 25 ms cadence.
                         claim_poll.refuse(&node, item);
                         drop(claim_gate);
                         if tokio::time::Instant::now() >= deadline {
@@ -17636,10 +14828,6 @@ pub async fn community_claim_work(
                     })));
                 }
 
-                // Bind this coordinator-issued job to the worker that actually
-                // claimed it before returning the prompt. The pending record can
-                // disappear here when the dispatcher timed out while the item was
-                // still queued; never hand an expired job to a worker.
                 let Some(mut pending) = node
                     .community_work_results
                     .as_ref()
@@ -17665,22 +14853,11 @@ pub async fn community_claim_work(
                 }
                 pending.assigned_worker = Some(req.worker_id.clone());
                 pending.assigned_at = Some(tokio::time::Instant::now());
-                // Commit the worker's slot while the pending entry is still
-                // locked, so the assignment and the slot change together. A
-                // withdrawal that removes this record under the same lock then
-                // always finds the slot it has to release; one that ran before the
-                // lock was taken left no record, and the uncommitted reservation
-                // above is released instead. Committing after the unlock left a
-                // gap in which the slot could be set with no record behind it,
-                // keeping the worker busy on this coordinator until restart.
                 claim_reservation.commit(&item.job_id);
                 drop(pending);
                 drop(claim_gate);
                 community_routing::assigned(&node, &req.worker_id);
 
-                // Flat response shape — the worker (arc-node main.rs) reads
-                // `job_id`, `input`, `max_tokens` directly off the top-level
-                // JSON. Don't nest under "work".
                 let mut body = json!({
                     "status": "work",
                     "accepts_output_tokens": true,
@@ -17690,11 +14867,6 @@ pub async fn community_claim_work(
                     "execution_profile": item.execution_profile,
                     "submitted_at_unix_ms": item.submitted_at_unix_ms,
                     "expires_at_unix_ms": item.expires_at_unix_ms,
-                    // A recovery-v3 worker certificate is signed over this
-                    // transaction domain and is embedded in the eventual 0x25
-                    // reward.  Never make the worker infer the domain from a
-                    // different endpoint (or silently fall back to legacy
-                    // signing when the coordinator requires v3).
                     "transaction_domain_required": item.transaction_domain.is_some(),
                 });
                 if let Some(mid) = item.model_id {
@@ -17705,35 +14877,18 @@ pub async fn community_claim_work(
                 }
                 Ok(Json(body))
             }
-            Err(()) => {
-                // Channel closed - coordinator shut down
-                Err((
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "work queue closed - coordinator shutting down".to_string(),
-                ))
-            }
-            Ok(None) => {
-                // Timeout - no work within the window
-                Ok(Json(json!({
-                    "status": "no_work",
-                })))
-            }
+            Err(()) => Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "work queue closed - coordinator shutting down".to_string(),
+            )),
+            Ok(None) => Ok(Json(json!({
+                "status": "no_work",
+            }))),
         };
         return response;
     }
 }
 
-/// POST /community/submit_work
-///
-/// Community worker submits a completed whole-prompt inference result. The
-/// payload must include `job_id`, `worker_id`, and the generated output. The
-/// coordinator matches `job_id` to a pending oneshot::Sender and unblocks the
-/// dispatcher in `/inference/run`.
-///
-/// On success the worker's `work_completed` counter increments. A verified
-/// worker certificate is wrapped in a validator-authorized, replay-protected
-/// `CommunityInferenceReward` transaction so any eventual reward is real ARC
-/// and can only settle after block inclusion.
 async fn community_submit_work_signed(
     AxumState(node): AxumState<NodeState>,
     Json(signed): Json<CommunitySignedRequest<WorkResult>>,
@@ -17773,12 +14928,6 @@ pub async fn community_submit_work(
     AxumState(node): AxumState<NodeState>,
     Json(mut result): Json<WorkResult>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // A worker may submit during the coordinator's late-result grace period,
-    // after its `/inference/run` dispatch permit has been released. Verification
-    // below performs a fresh quorum inference, so it must own its own admission
-    // lease through verification and settlement. Reject before reserving the
-    // submission while an updater has closed compute admission; the worker can
-    // retry once the node resumes.
     let _worker_execution_permit = node
         .native_request_admission
         .worker_execution_gate()
@@ -17788,7 +14937,6 @@ pub async fn community_submit_work(
             "worker is quiescing for update".to_string(),
         ))?;
 
-    // ── Validate required fields ────────────────────────────────────────
     if result.job_id.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "job_id is required".to_string()));
     }
@@ -17820,9 +14968,6 @@ pub async fn community_submit_work(
                 .to_string(),
         ));
     }
-    // A successful submit must have an output and an output_hash. Failure
-    // submits are accepted (the dispatcher needs to know the worker tried)
-    // but they don't earn rewards.
     if result.success {
         if result.output_hash.is_empty() {
             return Err((
@@ -17847,7 +14992,6 @@ pub async fn community_submit_work(
         }
     }
 
-    // ── Worker must be registered ───────────────────────────────────────
     if !node.community_workers.contains_key(&result.worker_id) {
         return Err((
             StatusCode::NOT_FOUND,
@@ -17855,7 +14999,6 @@ pub async fn community_submit_work(
         ));
     }
 
-    // ── Match and validate the coordinator-issued job ───────────────────
     let results_map = node
         .community_work_results
         .as_ref()
@@ -17865,9 +15008,6 @@ pub async fn community_submit_work(
         ))?
         .clone();
 
-    // Freshly signed retries are idempotent. Resolve the chain index before
-    // the coordinator's submission map because block inclusion and cleanup
-    // are not atomic; a stale submission entry must never hide a mined result.
     if let Ok(job_hash) = parse_hash256_hex(&result.job_id, "job_id") {
         let indexed = indexed_reward_for_job(&node, job_hash)
             .map_err(|error| (StatusCode::CONFLICT, error))?;
@@ -18018,8 +15158,6 @@ pub async fn community_submit_work(
     };
 
     let job_id = result.job_id.clone();
-    // A twin leg is compared with its sibling first; validators recompute
-    // only when the group needs them (see `twin_dispatch`).
     if twin_dispatch::is_twin_leg(&node, &job_id) {
         return twin_dispatch::submit_twin_leg(
             &node,
@@ -18080,8 +15218,6 @@ pub async fn community_submit_work(
                     reason = %error,
                     "community result verification unavailable; preserving assignment without penalty"
                 );
-                // The reason can name validator shard holders, their socket
-                // addresses and request URLs; it is logged above, not returned.
                 return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
                     COMMUNITY_VERIFICATION_UNAVAILABLE.to_string(),
@@ -18096,10 +15232,6 @@ pub async fn community_submit_work(
         .as_ref()
         .map(|verified| verified.accepted_tokens.clone());
 
-    // Verification succeeded (or this is an explicit worker failure). Only
-    // now atomically consume the pending assignment. Until this point the drop
-    // guard resets `submitting`, preserving retryability on every error and
-    // task cancellation.
     let Some(pending) = submission_reservation.take() else {
         return Err((
             StatusCode::CONFLICT,
@@ -18116,8 +15248,6 @@ pub async fn community_submit_work(
         job_id: job_id.clone(),
     };
 
-    // Set only when `--community-release-on-verification` answers the caller
-    // before the reward approvals (`release_answer_before_settlement`).
     let mut answer_release = None;
     let settlement_outcome = if let Some(worker_attestation) = verified_attestation {
         let worker_attestation_hash = format!("0x{}", worker_attestation.hash.to_hex());
@@ -18131,12 +15261,6 @@ pub async fn community_submit_work(
             settlement["worker_attestation_hash"] = Value::String(worker_attestation_hash);
             Some(settlement)
         } else {
-            // Default: collect the five-of-six approvals here, before the
-            // caller is answered. With the switch on, the result above has
-            // already passed its shard-quorum recomputation, and
-            // `release_verified_community_reward` decides: journal it and
-            // answer now (the retry loop collects the approvals), or settle
-            // inline exactly as by default.
             let submitted = if release_answer_before_settlement(&node, &pending.assignment_epoch) {
                 match release_verified_community_reward(
                     &node,
@@ -18155,7 +15279,6 @@ pub async fn community_submit_work(
                     }
                     EarlyRelease::Failed(reason) => Err(reason),
                     EarlyRelease::Inline { journal_error } => {
-                        // The default path for this job, byte for byte.
                         let inline = submit_verified_community_reward(
                             &node,
                             &work_item,
@@ -18165,9 +15288,6 @@ pub async fn community_submit_work(
                             &worker_attestation,
                         )
                         .await;
-                        // One line per job that missed release on verification
-                        // through an error or a budget refusal, worded by how
-                        // it ended.
                         match (&inline, &journal_error) {
                             (Err(reason), _)
                                 if inline_refusal_is_budget_policy(
@@ -18255,9 +15375,6 @@ pub async fn community_submit_work(
     };
     let dispatcher_connected = pending.sender.send(dispatch_outcome).is_ok();
 
-    // Independently verified work affects worker health even when the original
-    // public client disconnected. Settlement and accounting are properties of
-    // the authenticated job, not of an hour-long frontend socket.
     if let Some(mut entry) = node.community_workers.get_mut(&result.worker_id) {
         let (worker, ts) = entry.value_mut();
         *ts = std::time::Instant::now();
@@ -18299,14 +15416,6 @@ struct CanonicalTransactionEvidence {
     receipt: Option<TxReceipt>,
 }
 
-/// Prove that a durable transaction-map entry still commits to its complete
-/// envelope and body. The map key and embedded hash are insufficient on their
-/// own: a partially restored or corrupted row could retain both while its
-/// worker, job, amount, or discriminator bytes changed underneath them.
-///
-/// Community rewards carry their own historical recovery domain, so an
-/// archive node can verify rows from every v3 recovery epoch rather than
-/// incorrectly hashing old rows in only the currently active domain.
 fn validate_canonical_transaction_identity(
     tx: &Transaction,
     index_hash: Hash256,
@@ -18363,14 +15472,6 @@ fn validate_canonical_transaction_inclusion(
     })
 }
 
-/// Bind a transaction and any execution receipt to the canonical block index.
-///
-/// A receipt whose transaction hash matches is still not proof of inclusion:
-/// its height, block hash, and index must identify the exact transaction in a
-/// structurally valid block. Every public payment view uses this helper so a
-/// corrupted or partially recovered index cannot be reported as earned ARC.
-///
-/// Takes the publication read lock; callers must hold no StateDB map guard.
 fn canonical_transaction_evidence(
     node: &NodeState,
     tx_hash: Hash256,
@@ -18386,8 +15487,6 @@ fn canonical_transaction_evidence(
     canonical_transaction_evidence_for_body(node, tx_hash, transaction)
 }
 
-/// Bind an owned transaction body to the canonical block index and receipt.
-/// Takes the publication read lock; callers must hold no StateDB map guard.
 fn canonical_transaction_evidence_for_body(
     node: &NodeState,
     tx_hash: Hash256,
@@ -18476,7 +15575,6 @@ fn indexed_reward_for_job(
         }
         candidates.push((index_hash, tx.clone()));
     }
-    // Evaluate the collected body even if its map entry has since been evicted.
     for (index_hash, tx) in candidates {
         #[cfg(test)]
         pause_before_state_publication_read(node);
@@ -18775,9 +15873,6 @@ fn parse_hash256_hex(value: &str, field: &str) -> Result<Hash256, String> {
     Hash256::from_hex(bare).map_err(|_| format!("{} must be a 32-byte hex hash", field))
 }
 
-/// Bind a signed attestation to the coordinator-owned job and submitted
-/// result. Signature verification alone only proves who signed an arbitrary
-/// transaction; these checks prove what that signature is attesting to.
 fn validate_worker_attestation_for_job(
     tx: &arc_types::Transaction,
     work_item: &WorkItem,
@@ -18787,10 +15882,6 @@ fn validate_worker_attestation_for_job(
         return Err("transaction body is not an InferenceAttestation".to_string());
     };
 
-    // Community reward certificates are reconstructed by consensus with one
-    // fixed, non-recursive transaction shape. Reject any worker transaction
-    // that would change when reconstructed; otherwise the outer reward could
-    // enter the mempool and predictably fail only during block execution.
     if tx.fee != 0 {
         return Err("community worker attestation fee must be exactly 0".to_string());
     }
@@ -18823,13 +15914,6 @@ fn validate_worker_attestation_for_job(
     Ok(())
 }
 
-/// Decode the worker-signed `InferenceAttestation` Transaction submitted
-/// alongside a WorkResult, verify its signature, and check that
-/// `tx.from` matches the claimed `worker_id`. Returns the verified tx
-/// ready for `mempool.insert`.
-///
-/// Errors as a string so submit_work can surface the diagnostic to the
-/// worker without picking a single error type.
 #[cfg(test)]
 fn decode_and_verify_worker_attestation(
     hex_bytes: &str,
@@ -18843,14 +15927,8 @@ fn decode_and_verify_worker_attestation_in_domain(
     expected_worker_id: &str,
     recovery_domain: Option<Hash256>,
 ) -> Result<arc_types::Transaction, String> {
-    // Strip optional "0x" prefix so workers can encode either way.
     let trimmed = hex_bytes.trim_start_matches("0x");
     let raw = hex::decode(trimmed).map_err(|e| format!("hex decode failed: {}", e))?;
-    // Match ARC's historical fixed-width wire encoding, but constrain every
-    // allocation to the authenticated community-body ceiling and reject any
-    // suffix. The compatibility `deserialize` entry point intentionally keeps
-    // legacy trailing-byte behavior for trusted persisted data; untrusted HTTP
-    // input must always use this bounded exact form.
     let tx: arc_types::Transaction = bincode::deserialize_limited_exact::<
         arc_types::Transaction,
         COMMUNITY_MUTATION_BODY_LIMIT_BYTES,
@@ -18864,9 +15942,6 @@ fn decode_and_verify_worker_attestation_in_domain(
         ));
     }
 
-    // The worker signs as `from = their validator_address`. The claim
-    // submission's worker_id is the hex of that address. Reject mismatches
-    // outright so a worker can't submit on someone else's behalf.
     let claim_address = expected_worker_id.trim_start_matches("0x").to_string();
     let tx_from_hex = hex::encode(tx.from.0);
     if claim_address != tx_from_hex {
@@ -18885,14 +15960,7 @@ fn decode_and_verify_worker_attestation_in_domain(
     Ok(tx)
 }
 
-// ─── Multi-Model Registry ──────────────────────────────────────────────────
-
-/// GET /models
-/// List all models known to the multi-model registry with pipeline coverage info.
 async fn get_models(AxumState(node): AxumState<NodeState>) -> Json<Value> {
-    // The flat registry is the authenticated, profile-bearing topology view.
-    // The older multi-model assignment cache has no execution-profile field,
-    // so it cannot justify coverage or determinism claims under protocol v3.
     let flat_shards = fresh_shards(&node.shard_registry);
     let total_nodes = flat_shards
         .iter()
@@ -18909,12 +15977,6 @@ async fn get_models(AxumState(node): AxumState<NodeState>) -> Json<Value> {
                 .filter(|ss| ss.model_id == s.model_id)
                 .cloned()
                 .collect();
-            // Coverage is the UNION of the announced layer intervals, not the
-            // sum of their widths. Summing double-counts replicas: on the live
-            // 3x-replicated network 6 ranges x 3 replicas over a 32-layer model
-            // summed to 96 "covered layers" out of 32 — so `fully_covered`
-            // (covered == total) was false on a network with complete,
-            // triple-redundant coverage.
             let mut intervals: Vec<(usize, usize)> = shards_for_model
                 .iter()
                 .map(|ss| (ss.start_layer, ss.end_layer))
@@ -18975,8 +16037,6 @@ async fn get_models(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     }))
 }
 
-/// GET /models/shards?model_id=0x...
-/// Get the pipeline for a specific model.
 async fn get_model_shards(
     AxumState(node): AxumState<NodeState>,
     Query(params): Query<HashMap<String, String>>,
@@ -19045,8 +16105,6 @@ async fn get_model_shards(
             })))
         }
         Err(error) => {
-            // A read-only view: the full error, with holder names and socket
-            // addresses, goes to the debug log rather than the caller.
             tracing::debug!(%error, "model shard pipeline could not be planned");
             Ok(Json(json!({
                 "model_id": model_id_hex,
@@ -19063,8 +16121,6 @@ async fn get_model_shards(
     }
 }
 
-// ─── Inference Verification Endpoints ──────────────────────────────────────
-
 #[derive(serde::Deserialize)]
 struct InferenceCommitRequest {
     request_id: String,
@@ -19072,8 +16128,6 @@ struct InferenceCommitRequest {
     bond_amount: u64,
 }
 
-/// POST /inference/commit
-/// Submit an inference commitment (result_hash + bond).
 async fn inference_commit(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<InferenceCommitRequest>,
@@ -19120,8 +16174,6 @@ struct InferenceChallengeRequest {
     bond_amount: u64,
 }
 
-/// POST /inference/challenge
-/// Challenge an inference commitment.
 async fn inference_challenge(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<InferenceChallengeRequest>,
@@ -19167,8 +16219,6 @@ async fn inference_challenge(
     })))
 }
 
-/// GET /inference/verification_status
-/// Show overall verification system stats.
 async fn inference_verification_status(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let reputation = node
         .verification_manager
@@ -19185,10 +16235,6 @@ async fn inference_verification_status(AxumState(node): AxumState<NodeState>) ->
     }))
 }
 
-// ─── Economics Endpoints ───────────────────────────────────────────────────
-
-/// GET /economics/revenue_split
-/// Show the fee distribution configuration.
 async fn get_revenue_split(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let config = &node.revenue_config;
     let num_validators = node.dag_validators.read().len();
@@ -19215,8 +16261,6 @@ async fn get_revenue_split(AxumState(node): AxumState<NodeState>) -> Json<Value>
     }))
 }
 
-// ─── Auto-Sharding ─────────────────────────────────────────────────────────
-
 #[derive(serde::Deserialize)]
 struct AutoShardPlanRequest {
     model_id: String,
@@ -19226,11 +16270,6 @@ struct AutoShardPlanRequest {
     total_params_b: f64,
 }
 
-/// POST /shards/auto_plan
-/// Compute an advisory shard plan for one exact model/profile across
-/// authenticated registered nodes. This endpoint never mutates topology.
-/// Uses compute_shard_plan() from distributed.rs which distributes layers
-/// proportional to RAM with GPU bonus.
 async fn compute_auto_shard_plan(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<AutoShardPlanRequest>,
@@ -19245,7 +16284,6 @@ async fn compute_auto_shard_plan(
         ));
     }
 
-    // Build node capabilities from the live shard registry
     let shards = fresh_shards(&node.shard_registry);
     let mut seen_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut capabilities: Vec<arc_inference::distributed::NodeCapability> = Vec::new();
@@ -19258,17 +16296,11 @@ async fn compute_auto_shard_plan(
             capabilities.push(arc_inference::distributed::NodeCapability {
                 address: Hash256(parse_hash(&s.model_id).unwrap_or([0u8; 32])),
                 socket_addr: s.socket_addr.clone(),
-                gpu_tier: 0, // TODO: detect from node capabilities
+                gpu_tier: 0,
                 available_memory: (s.memory_mb as u64) * 1024 * 1024,
             });
         }
     }
-
-    // Community full-model workers claim jobs over their outbound poll loop;
-    // they do not expose the inbound `/inference/forward_shard` socket needed
-    // by a pipeline hop. Treating a worker name as a socket both made an
-    // unreachable plan and let an unrelated model influence this model's
-    // capacity. Only exact-ID shard announcements are eligible here.
 
     if capabilities.is_empty() {
         return Err(api_error(
@@ -19306,44 +16338,27 @@ async fn compute_auto_shard_plan(
         "plan": plan_json,
         "shard_count": plan.len(),
         "node_count": capabilities.len(),
-        // This unauthenticated endpoint is advisory only. Actual topology can
-        // enter the registry only through a signed validator announcement.
         "registered_in_multi_model_registry": false,
     })))
 }
 
-// ─── Auto-Join: Node Asks Coordinator for Shard Assignment ─────────────────
-
 #[derive(serde::Deserialize)]
 #[allow(dead_code)]
 struct ShardJoinRequest {
-    /// Node's public RPC socket (e.g. "1.2.3.4:9090").
     socket_addr: String,
-    /// Friendly name (e.g. "my-mac-studio").
     #[serde(default)]
     node_name: String,
-    /// Model ID hash (hex). From the GGUF model loaded on the node.
     model_id: String,
-    /// Exact protocol-v3 integer dispatch profile this node will execute.
     #[serde(default)]
     execution_profile: String,
-    /// Model name (human-readable, e.g. "Llama-2-7B").
     #[serde(default)]
     model_name: String,
-    /// Total transformer layers in the model.
     total_layers: u32,
-    /// Available RAM on this node (MB).
     available_memory_mb: u64,
-    /// GPU tier (0 = CPU only, 1 = iGPU, 2 = discrete GPU).
     #[serde(default)]
     gpu_tier: u8,
 }
 
-/// Choose an uncovered interval, or an exact existing range to replicate.
-/// Input is already filtered to fresh announcements for one model/profile.
-/// A gap ends at the next occupied boundary, so it cannot partly overlap a
-/// holder. Full coverage replicates only exact production-tiling ranges.
-/// Return no assignment if coverage exists but no fresh on-grid range does.
 fn plan_shard_join(total_layers: usize, existing: &[ShardInfo]) -> Option<(usize, usize)> {
     let mut ranges = std::collections::BTreeMap::<(usize, usize), usize>::new();
     for shard in existing {
@@ -19367,10 +16382,6 @@ fn plan_shard_join(total_layers: usize, existing: &[ShardInfo]) -> Option<(usize
     if best.0 < best.1 {
         return Some(best);
     }
-    // Match scripts/shard-plan-3x.sh's production layout: six balanced
-    // ranges, with the remainder assigned to the first ranges. For 32 layers
-    // this is [0,6), [6,12), [12,17), [17,22), [22,27), [27,32).
-    // A fresh stray (including one with fewer replicas) is not a new grid.
     let production_ranges: Vec<_> = (0..6)
         .scan(0, |start, index| {
             let end = *start + total_layers / 6 + usize::from(index < total_layers % 6);
@@ -19387,18 +16398,6 @@ fn plan_shard_join(total_layers: usize, existing: &[ShardInfo]) -> Option<(usize
         .map(|(range, _)| range)
 }
 
-/// POST /shards/join
-/// A node with a model calls this to ask the coordinator: "what layers should I hold?"
-/// The coordinator looks at the existing shard registry, finds gaps in the pipeline,
-/// and assigns the new node the biggest uncovered interval, or an exact fresh
-/// production-tiling range with the fewest replicas (lowest start breaks ties).
-/// Returns a conflict if full coverage has no fresh on-grid replication candidate.
-/// Returns the assignment so the node can load it, then
-/// authenticate a separate signed announcement before serving.
-///
-/// This is the KEY endpoint for automatic sharding - nodes don't need manual
-/// --shard-start/--shard-end flags. This unauthenticated planning call never
-/// inserts, replaces, or refreshes a live registry entry.
 async fn shard_join(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<ShardJoinRequest>,
@@ -19421,7 +16420,6 @@ async fn shard_join(
         ));
     }
 
-    // 1. Gather existing shards for this model from the registry
     let existing: Vec<ShardInfo> = fresh_shards(&node.shard_registry)
         .into_iter()
         .filter(|s| parse_hash256_hex(&s.model_id, "shard model_id").ok() == Some(model_hash))
@@ -19436,12 +16434,6 @@ async fn shard_join(
             )
         })?;
 
-    // This route is an unauthenticated planner, never a topology mutation.
-    // The joining process must load the assigned range and then prove its
-    // validator identity, exact artifact, execution profile and destination
-    // through signed `/shards/announce` before any coordinator may route work
-    // to it. Include the proposed range only in this hypothetical coverage
-    // calculation.
     let mut new_covered: Vec<bool> = vec![false; req.total_layers as usize];
     for s in fresh_shards(&node.shard_registry)
         .iter()
@@ -19481,17 +16473,6 @@ async fn shard_join(
     })))
 }
 
-// ─── Auto-Routing Inference ────────────────────────────────────────────────
-
-/// POST /inference/auto
-/// Smart inference endpoint that automatically picks the best path:
-/// 1. Check deterministic cache first (instant, O(1))
-/// 2. If sharded pipeline is available and complete → run_sharded
-/// 3. If local model is loaded → run locally
-/// 4. If community workers are available → route to community
-/// 5. Else → 503 with helpful error
-///
-/// Users don't need to know the network topology. Just POST a prompt.
 async fn inference_auto(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<Value>,
@@ -19515,24 +16496,9 @@ async fn inference_auto(
         .unwrap_or(20)
         .min(u64::from(INFERENCE_RUN_MAX_TOKENS)) as u32;
 
-    // Strategy 1: is there a sharded pipeline we can actually walk?
-    //
-    // This used to re-implement coverage detection over the RAW replica list,
-    // sorted by start_layer only and with no dedupe. On the live 3x-replicated
-    // network that is 18 entries for 6 ranges: after the first [0, 6) set
-    // covered_to = 6, the SECOND [0, 6) replica had start_layer 0 != 6 and
-    // flipped `contiguous` false immediately. `has_full_pipeline` was
-    // therefore false for any replication factor > 1 and this endpoint never
-    // once took its own documented best path — it always fell through to
-    // `inference_run` and only reached the sharded pipeline by accident, via
-    // the partial-model guard there.
-    //
-    // Asking the real planner also means this routing decision now agrees
-    // with what run_sharded will actually do.
     let pipeline_check = assemble_pipeline_for(&node);
     let has_full_pipeline = pipeline_check.is_ok();
 
-    // Strategy 2: Check if local model is available
     let has_local_model = node.model_artifact_id.is_some()
         && (node
             .candle_model_id
@@ -19542,12 +16508,9 @@ async fn inference_auto(
                 .as_ref()
                 .is_some_and(|model| model.has_all_transformer_layers()));
 
-    // Strategy 3: Check if community workers are available
     let community_worker_count = live_inference_worker_count(&node);
 
-    // Route to the best available path
     if has_full_pipeline && node.inference_model.is_some() {
-        // Best path: sharded pipeline (distributed, deterministic)
         let sharded_req = json!({
             "input": input,
             "max_tokens": max_tokens,
@@ -19564,15 +16527,10 @@ async fn inference_auto(
             Err(e) => Err(e),
         }
     } else if has_local_model {
-        // Fallback: local single-node inference
         let local_req = json!({
             "input": input,
             "max_tokens": max_tokens,
             "chat_template": req.get("chat_template").and_then(|v| v.as_bool()).unwrap_or(false),
-            // `/inference/run` normally prefers community workers. This
-            // branch has already selected the documented local strategy, so
-            // make that choice explicit instead of dispatching elsewhere and
-            // then falsely labeling the response `local_model`.
             "force_local": true,
         });
         let result = inference_run(AxumState(node.clone()), Some(Json(local_req))).await;
@@ -19586,11 +16544,6 @@ async fn inference_auto(
             Err(e) => Err(e),
         }
     } else if community_worker_count > 0 {
-        // Use the same signed, assignment-bound dispatcher as
-        // `/inference/run`. The old branch returned a permanent 503 pointing
-        // at a retired port even while healthy workers were online, so the
-        // endpoint contradicted both its own routing contract and the path
-        // used by the dashboard.
         let community_req = json!({
             "input": input,
             "max_tokens": max_tokens,
@@ -19616,7 +16569,6 @@ async fn inference_auto(
         Err(api_error(StatusCode::SERVICE_UNAVAILABLE, json!({
             "error": "No inference path available",
             "sharded_pipeline": false,
-            // Say WHY the pipeline was rejected instead of just "false".
             "sharded_pipeline_error": pipeline_check.err().map(public_pipeline_assembly_reason),
             "local_model": false,
             "community_workers": 0,
@@ -19625,53 +16577,11 @@ async fn inference_auto(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Honest projection endpoints (v0.7.11+)
-//
-// Three additive read-only endpoints so a client never has to hardcode a
-// reward, guess a network, or invent a rate:
-//   GET /economics/rewards    — reward rate + the finite treasury behind it
-//   GET /network/info         — which chain, and whether it is actually alive
-//   GET /node/contribution    — what this node contributes, measured
-//
-// ⚠ CLIENTS MUST DEGRADE ON 404. No host on the live testnet serves these:
-// NYC runs v0.7.2 and the other five run v0.7.9, both predating this code, so
-// all three routes answer `404 Not Found` there. A 404 means "this node is too
-// old to tell you", which is NOT the same as a zero, an empty set, or a
-// stalled chain — a client that renders 0 ARC or "not producing" on a 404 is
-// reporting a fact it does not have.
-// ---------------------------------------------------------------------------
-
-/// Everything needed to project attestation earnings without inventing a
-/// number.
-///
-/// GET /economics/rewards
-///
-/// The reward rate comes from `arc_types::economics::INFERENCE_ATTESTATION_REWARD`,
-/// the same base-unit constant `arc-state` credits when an attestation
-/// applies, so the projected rate and the paid rate cannot drift.
-///
-/// `rewards_remaining` is the field that makes a projection honest. The reward
-/// is a pure TRANSFER from the dedicated inference reward treasury, never
-/// minted, so the pool is finite and exhaustible: at 2.5 ARC a job, a treasury
-/// holding 1000 ARC funds exactly 400 full rewards; later claims reject rather
-/// than paying a nondeterministic partial tail. Any "ARC per day" figure that
-/// omits this term is describing an emission the chain does not have.
-///
-/// ⚠ Live v0.7.2 (NYC) and v0.7.9 (LAX/AMS/LHR/NRT/SGP) seeds do not have
-/// this route and return 404. Treat that as "reward rate unknown from this
-/// host", not as zero — clients that need a rate from an old seed can read
-/// `reward_per_attestation_arc` from `/worker/earnings/{address}`, which those
-/// versions do serve.
 async fn economics_rewards(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let reward_base = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
     let base_units = arc_types::economics::ARC_BASE_UNITS;
     let treasury_addr = arc_types::transaction::inference_reward_treasury_address();
 
-    // The treasury account may be absent from this node's state entirely (a
-    // fresh data dir, or a snapshot that never included it). Absent is not
-    // zero: zero means "the pool is empty and rewards will stop", absent means
-    // "this node cannot see the pool". They must not render the same.
     let treasury = node.state.get_account(&treasury_addr);
     let treasury_balance = treasury.as_ref().map(|a| a.balance);
     let remaining = treasury_balance.and_then(|bal| rewards_remaining(bal, reward_base));
@@ -19683,7 +16593,6 @@ async fn economics_rewards(AxumState(node): AxumState<NodeState>) -> Json<Value>
         && budget_ready;
 
     Json(json!({
-        // ── Reward rate (from the shared on-chain constant, never a literal) ──
         "reward_per_attestation_base": reward_base,
         "reward_per_attestation_arc": REWARD_PER_ATTESTATION_ARC,
         "community_rewards_v1_enabled": issuance_ready,
@@ -19706,7 +16615,6 @@ async fn economics_rewards(AxumState(node): AxumState<NodeState>) -> Json<Value>
                           arc-state credits only when a validator-authorized, job-bound \
                           CommunityInferenceReward applies successfully",
 
-        // ── The finite pool behind that rate ──────────────────────────────
         "treasury_address": format!("0x{}", hex::encode(treasury_addr.0)),
         "treasury_balance_base": treasury_balance,
         "treasury_balance_arc": treasury_balance.map(|b| b as f64 / base_units as f64),
@@ -19748,8 +16656,6 @@ async fn economics_rewards(AxumState(node): AxumState<NodeState>) -> Json<Value>
             "worker_remaining_this_epoch": Value::Null,
             "worker_counter_unavailable_reason": "no worker identity is supplied to /economics/rewards; query /worker/earnings/{address}",
         },
-        // A sub-reward remainder cannot fund a partial payout. Keep it visible
-        // for treasury operations, but never count it as another reward.
         "unusable_treasury_remainder_base": match treasury_balance {
             Some(bal) if reward_base > 0 => Value::from(bal % reward_base),
             _ => Value::Null,
@@ -19760,9 +16666,6 @@ async fn economics_rewards(AxumState(node): AxumState<NodeState>) -> Json<Value>
              created.",
         "treasury_is_finite": true,
 
-        // Community workers sign a compact, fixed certificate. Request-level
-        // bond/challenge overrides on /inference/run apply only if routing
-        // falls back to the coordinator's local attestation path.
         "community_worker_bond_required": false,
         "community_worker_certificate_bond_base": 0,
         "community_worker_certificate_fee_base": 0,
@@ -19771,7 +16674,6 @@ async fn economics_rewards(AxumState(node): AxumState<NodeState>) -> Json<Value>
              bond=0, fee=0, gas_limit=0 and no beneficiary. They do not lock or refund worker \
              collateral.",
 
-        // ── Where the money comes from (so no UI can imply revenue) ───────
         "funding": "protocol-capped testnet promotional treasury subsidy, not customer revenue",
         "funding_detail": "each reward is a pure transfer out of a prefunded testnet treasury \
                            account, bounded by its balance and never minted. No customer pays \
@@ -19787,44 +16689,11 @@ async fn economics_rewards(AxumState(node): AxumState<NodeState>) -> Json<Value>
     }))
 }
 
-/// Which chain this is, and whether it is actually alive.
-///
-/// GET /network/info
-///
-/// Three things the desktop could not previously know, each of which has
-/// burned someone on the live network:
-///
-/// 1. **Which network.** `network` and `chain_id` are the genesis file's
-///    declared values, verbatim. A node started without `--genesis` reports
-///    both as null with a reason — its genesis HASH still identifies the chain
-///    it is on, and that is reported unconditionally. Nothing here says
-///    "mainnet" unless a genesis file literally declared it; `declares_mainnet`
-///    is a string fact about that name, not a judgement.
-///
-/// 2. **Whether blocks are being sealed.** `/health` answers `"ok"` on all six
-///    seeds, but four of them have not sealed a block in ~6 days: DAG rounds
-///    keep advancing, so the liveness signal `/health` reports is not block
-///    production. `is_block_producing` and `last_block_age_secs` let a client
-///    say "this node last sealed a block 6 days ago" instead of "healthy".
-///
-/// 3. **How many validators actually count.** `validators_registered` is the
-///    raw set length that `/validators` and `/health` report;
-///    `validators_active` excludes zero-stake peers. Four of fourteen live
-///    validators carry stake 0 and inflate every count derived from the length.
-///
-/// ⚠ Live v0.7.2 / v0.7.9 seeds return 404 here. On a 404 a client knows
-/// nothing about liveness — it must NOT render "not producing", which is a
-/// different and much stronger claim. Fall back to reading
-/// `/block/latest`.`header.timestamp` for age, which every seed serves.
 async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let height = node.state.height();
-    // The newest block that actually EXISTS here — see
-    // `latest_available_block`: looking up `height()` directly reports a
-    // producing node as blockless.
     let latest = latest_available_block(&node);
     let genesis = node.state.get_block(0);
 
-    // Declared identity (genesis file), or null + reason.
     let (network, chain_id) = match node.chain_identity.as_ref() {
         Some(id) => (
             Value::String(id.name.clone()),
@@ -19835,22 +16704,15 @@ async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let identity_missing_reason = "this node was started without --genesis, so it has no \
                                    declared chain name or chain_id; genesis_hash still \
                                    identifies the chain it is running";
-    // A pure string fact about the declared name — not an inference about what
-    // kind of network this is.
     let declares_mainnet = node
         .chain_identity
         .as_ref()
         .map(|id| id.name.to_ascii_lowercase().contains("mainnet"));
 
-    // Block liveness. `last_block_age_secs` uses the latest block's own header
-    // timestamp (unix millis, display-only), so a stalled chain reads as
-    // stalled instead of as healthy.
     let last_block_ts = latest.as_ref().map(|b| b.header.timestamp).unwrap_or(0);
     let last_block_age = age_secs_from_ms(last_block_ts);
     let chain_advancing = last_block_age.map(|age| age <= BLOCK_PRODUCTION_FRESH_SECS);
 
-    // Has THIS node sealed one of the recent blocks? Bounded backward scan for
-    // a block whose producer is this validator address.
     let mut self_produced: Option<(u64, u64)> = None;
     let floor = height.saturating_sub(SELF_PRODUCED_SCAN_BLOCKS);
     let mut h = height;
@@ -19864,9 +16726,6 @@ async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
         h -= 1;
     }
     let self_produced_age = self_produced.and_then(|(_, ts)| age_secs_from_ms(ts));
-    // "Producing" = this node sealed a block, recently. Both halves matter: a
-    // node that sealed block 5 a week ago is not producing, and a node watching
-    // someone else's fresh blocks is not producing either.
     let is_block_producing = self_produced_age
         .map(|age| age <= BLOCK_PRODUCTION_FRESH_SECS)
         .unwrap_or(false);
@@ -19882,7 +16741,6 @@ async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let recovery_manifest_hash = node.state.recovery_manifest_hash();
 
     Json(json!({
-        // ── Identity ──────────────────────────────────────────────────────
         "community_approval_output_tokens": true,
         "network": network,
         "chain_id": chain_id,
@@ -19928,17 +16786,9 @@ async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
         "recovery_active": recovery_context.is_some(),
         "recovery_epoch": recovery_context.as_ref().map(|context| context.recovery_epoch),
         "validator_set_id": recovery_context.as_ref().map(|context| context.validator_set_id),
-        // `genesis_hash` above is the retained height-zero block hash.  The
-        // recovery trust root instead binds the canonical genesis config's
-        // network hash; publish both under distinct names so a cutover gate
-        // can compare like with like rather than accepting six replicas that
-        // merely agree on the wrong identity domain.
         "network_genesis_hash": recovery_context
             .as_ref()
             .map(|context| format!("0x{}", context.genesis_hash.to_hex())),
-        // Canonical audience field consumed by every signed validator HTTP
-        // client. `recovery_domain` remains as a descriptive alias for older
-        // dashboards, but callers must not have to guess that relationship.
         "transaction_domain": node.state.transaction_domain_hash()
             .map(|domain| format!("0x{}", domain.to_hex())),
         "recovery_domain": recovery_context
@@ -19947,16 +16797,11 @@ async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
         "checkpoint_manifest_hash": recovery_manifest_hash
             .map(|hash| format!("0x{}", hash.to_hex())),
 
-        // ── Liveness ──────────────────────────────────────────────────────
         "height": height,
         "last_block_height": latest.as_ref().map(|b| b.header.height),
         "last_block_hash": latest.as_ref().map(|b| format!("0x{}", hex::encode(b.hash.0))),
         "last_block_timestamp_ms": latest.as_ref().map(|b| b.header.timestamp),
         "last_block_age_secs": last_block_age,
-        // How far the newest RETAINED block trails the height counter. Nonzero
-        // is normal on a fast chain (the counter moves before the body lands)
-        // and large means pruning; either way the fields above describe a real
-        // block, not the counter.
         "blocks_behind_height": latest
             .as_ref()
             .map(|b| height.saturating_sub(b.header.height)),
@@ -19996,7 +16841,6 @@ async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
                           /health reports ok on seeds that have produced nothing for days. \
                           Use is_block_producing / last_block_age_secs, not /health.",
 
-        // ── Validator set: active vs merely registered ─────────────────────
         "validators_registered": split.registered,
         "validators_active": split.active,
         "validators_zero_stake": split.zero_stake,
@@ -20011,25 +16855,6 @@ async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     }))
 }
 
-/// What this node is contributing right now, measured.
-///
-/// GET /node/contribution
-///
-/// The honest basis for a Settings slider that claims "more cores → more
-/// throughput": thread width against `available_parallelism`, the shard ranges
-/// actually held, whether a model is loaded at all, real work counters, and
-/// this node's own measured per-hop compute time.
-///
-/// Deliberately absent: any ARC-per-core or earnings-per-thread figure. The
-/// node has no measurement that would support one — attestation rewards are a
-/// flat per-attestation transfer that does not scale with core count, and
-/// nothing here observes a causal link between threads and attestations
-/// earned. A UI wanting to explain the benefit should say what widening the
-/// pool measurably does (more parallel work inside each hop, visible as
-/// `own_compute_ms`) rather than quote income.
-///
-/// ⚠ Live v0.7.2 / v0.7.9 seeds return 404 here. `/node/threads` exists on
-/// newer seeds and covers the thread fields alone.
 async fn node_contribution(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let dedicated = node.compute_threads.load(Ordering::Relaxed);
     let threads_in_use = if dedicated > 0 {
@@ -20041,7 +16866,6 @@ async fn node_contribution(AxumState(node): AxumState<NodeState>) -> Json<Value>
         .map(|n| n.get())
         .unwrap_or(0);
 
-    // Shard ranges held by this node, and their total layer count.
     let ranges: Vec<Value> = node
         .shard_infos
         .iter()
@@ -20060,9 +16884,6 @@ async fn node_contribution(AxumState(node): AxumState<NodeState>) -> Json<Value>
             })
         })
         .collect();
-    // Layers held, counted as a UNION of the held ranges rather than a sum of
-    // their spans. Summing overlapping replica spans is exactly the bug that
-    // makes /models report 96 layers of a 32-layer model.
     let mut covered: Vec<(usize, usize)> = node
         .shard_infos
         .iter()
@@ -20080,14 +16901,10 @@ async fn node_contribution(AxumState(node): AxumState<NodeState>) -> Json<Value>
     }
     let total_layers = node.shard_infos.first().map(|s| s.total_layers);
 
-    // Own measured hop compute. Real samples from this node's own
-    // forward_shard handler; null with a reason when it has served none.
     let samples: Vec<u64> = node.own_compute_ms.lock().iter().copied().collect();
     let own_mean = mean_u64(&samples);
     let own_p50 = p50_u64(&samples);
 
-    // This node's own entry in the latency table, if one exists. Usually
-    // absent: the table records round trips to OTHER replicas.
     let own_sockets: std::collections::HashSet<&str> = node
         .shard_infos
         .iter()
@@ -20109,7 +16926,6 @@ async fn node_contribution(AxumState(node): AxumState<NodeState>) -> Json<Value>
         });
 
     Json(json!({
-        // ── Compute offered ───────────────────────────────────────────────
         "threads": {
             "in_use": threads_in_use,
             "dedicated_pool": dedicated > 0,
@@ -20131,7 +16947,6 @@ async fn node_contribution(AxumState(node): AxumState<NodeState>) -> Json<Value>
             },
         },
 
-        // ── Model slice held ──────────────────────────────────────────────
         "shards": {
             "holds_shards": !node.shard_infos.is_empty(),
             "range_count": node.shard_infos.len(),
@@ -20156,14 +16971,12 @@ async fn node_contribution(AxumState(node): AxumState<NodeState>) -> Json<Value>
                 .map(|h| format!("0x{}", hex::encode(h.0))),
         },
 
-        // ── Work actually done since boot ─────────────────────────────────
         "sharded_runs_total": node.sharded_runs_total.load(Ordering::Relaxed),
         "sharded_cache_hits": node.sharded_cache_hits.load(Ordering::Relaxed),
         "sharded_bytes_total": node.sharded_bytes_total.load(Ordering::Relaxed),
         "counters_note": "in-memory and reset by a restart; cache hits are counted separately \
                           from runs because a hit performs no pipeline walk",
 
-        // ── This node's own measured hop compute ──────────────────────────
         "own_compute_ms": {
             "samples": samples.len(),
             "mean_ms": own_mean.map(|m| (m * 100.0).round() / 100.0),
@@ -20203,12 +17016,6 @@ async fn node_contribution(AxumState(node): AxumState<NodeState>) -> Json<Value>
     }))
 }
 
-// ─── Runtime inference width ───────────────────────────────────────────────
-
-/// GET /node/threads
-///
-/// Report the width of the pool that runs local inference compute, and the
-/// canonical INT8 projection kernel that compute uses.
 async fn get_node_threads(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let dedicated = node.compute_threads.load(Ordering::Relaxed);
     let mut body = json!({
@@ -20231,16 +17038,6 @@ struct SetThreadsRequest {
     threads: usize,
 }
 
-/// POST /node/threads  {"threads": 8}
-///
-/// Rebuild the inference compute pool at a new width, live, without a
-/// restart. Requests already running keep the old pool (they hold an Arc to
-/// it); everything dispatched after this call uses the new one.
-///
-/// This is the knob behind "add two cores" during a demo: because
-/// `forward_shard` and local `generate` both run inside
-/// `install_on_compute_pool`, widening the pool immediately widens the
-/// par_iter over attention heads and the par_chunks_mut inside every matmul.
 async fn set_node_threads(
     AxumState(node): AxumState<NodeState>,
     ConnectInfo(RpcPeerAddr(peer_addr)): ConnectInfo<RpcPeerAddr>,
@@ -20266,18 +17063,6 @@ async fn set_node_threads(
     })))
 }
 
-/// The canonical INT8 projection kernels this process runs, for node status.
-///
-/// `one_token` is the kernel that computes a one-token decode step's
-/// projections, and `batched` the kernel that computes multi-row projections
-/// (prefill chunks, verified rows, batched sequences). `pin_status` says what
-/// became of an `ARC_CANONICAL_BATCHED_KERNEL` pin: `unpinned`, `honoured`,
-/// `fell-back` (this CPU lacks `pin_missing_cpu_features`), `inactive` (the
-/// vector kernels are off) or `unrecognised`. The run counts are each
-/// kernel's projections since start, the record of what actually ran.
-/// `serves_loaded_model` is false when the loaded model is not on the
-/// canonical per-row INT8 profile, so none of its projections run these
-/// kernels.
 fn kernel_report_json(node: &NodeState) -> Value {
     use arc_inference::canonical_simd::{self, BatchedKernel};
     let report = canonical_simd::kernel_report();
@@ -20319,10 +17104,6 @@ fn kernel_report_json(node: &NodeState) -> Value {
     })
 }
 
-/// Add the kernel report to a node status object: `canonical_kernel`, the
-/// kernel that computes a one-token step, and `kernels`, the whole of
-/// [`kernel_report_json`]. Written last, so the kernel that runs replaces any
-/// value either key already holds.
 fn insert_kernel_report(body: &mut Value, node: &NodeState) {
     let kernels = kernel_report_json(node);
     if let Some(object) = body.as_object_mut() {
@@ -20347,8 +17128,6 @@ mod tests {
             .unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
         let path = std::ffi::CString::new(directory.path().as_os_str().as_bytes()).unwrap();
-        // SAFETY: chown receives a live NUL-terminated path, preserves uid,
-        // and selects the process's effective primary group.
         assert_eq!(
             unsafe { libc::chown(path.as_ptr(), u32::MAX, libc::getegid()) },
             0
@@ -20360,9 +17139,6 @@ mod tests {
         arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE.to_string()
     }
 
-    /// Most unit fixtures are legacy-domain coordinators at the zero test
-    /// address. Keep individual auth tests concise while production call
-    /// sites must always pass an explicit fetched audience.
     fn sign_community_request<T: Serialize>(
         path: &str,
         payload: T,
@@ -20433,7 +17209,7 @@ mod tests {
         assert!(!is_stub_socket_addr("149.28.32.76:9090"));
         assert!(!is_stub_socket_addr("140.82.16.112:9944"));
         assert!(!is_stub_socket_addr("https://149.28.32.76"));
-        assert!(!is_stub_socket_addr("10.0.0.1:9090")); // RFC1918 is routable on a LAN
+        assert!(!is_stub_socket_addr("10.0.0.1:9090"));
     }
 
     #[test]
@@ -20512,9 +17288,6 @@ mod tests {
         let (live_cache, mut position_zero) =
             reserve_shard_kv_cache(&node, request_id, signer, 1).unwrap();
 
-        // Position one can reach the same replica before position zero has
-        // committed when fanout stragglers overlap. Its refusal must not evict
-        // position zero's in-flight cache generation.
         let (reused_cache, position_one) =
             reserve_shard_kv_cache(&node, request_id, signer, 1).unwrap();
         assert!(Arc::ptr_eq(&live_cache, &reused_cache));
@@ -20838,8 +17611,6 @@ mod tests {
 
     #[test]
     fn shard_announce_binds_stub_to_peer_ip_keeping_declared_port() {
-        // Peer behind "0.0.0.0:9090" announcement is at 149.28.32.76:51234
-        // → should record shard at 149.28.32.76:9090 (trust the declared port)
         let got = bind_announced_shard_addr("0.0.0.0:9090", sa("149.28.32.76:51234"));
         assert_eq!(got, "149.28.32.76:9090");
     }
@@ -20860,9 +17631,6 @@ mod tests {
 
     #[test]
     fn shard_announce_trusts_loopback_self_announcement() {
-        // Self-announce from the local broadcaster hits 127.0.0.1/shards/announce.
-        // Rewriting would make self-entry look like 127.0.0.1:9090 (still unroutable)
-        // and defeat the dedupe logic - so we leave it alone.
         let got = bind_announced_shard_addr("0.0.0.0:9090", sa("127.0.0.1:51234"));
         assert_eq!(got, "0.0.0.0:9090");
     }
@@ -20877,7 +17645,6 @@ mod tests {
 
     #[test]
     fn shard_announce_uses_ipv6_peer_ip_when_peer_is_remote() {
-        // IPv6 must be bracketed when combined with a port.
         let got = bind_announced_shard_addr("0.0.0.0:9090", sa("[2001:db8::1]:51234"));
         assert_eq!(got, "[2001:db8::1]:9090");
     }
@@ -20990,8 +17757,6 @@ mod tests {
         let mut incomplete = HeaderMap::new();
         incomplete.insert(SHARD_TIMING_SCHEMA_HEADER, HeaderValue::from_static("1"));
         assert_eq!(parse_shard_timing_headers(&incomplete), None);
-        // The diagnostics travel outside the body, preserving the old JSON
-        // shape consumed by strict (`deny_unknown_fields`) peers.
         assert_eq!(serde_json::to_vec(&parsed).unwrap(), legacy_body);
     }
 
@@ -21004,7 +17769,7 @@ mod tests {
             kv_mutex_wait_us: 30,
             forward_us: 40,
         }));
-        first.fold(None); // old peer: no sample, not a fabricated zero sample
+        first.fold(None);
         let stats = HopStats {
             timing: first,
             ..HopStats::default()
@@ -21107,10 +17872,6 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            // Consume the complete request head before closing the socket. On
-            // Windows, dropping a TCP socket with unread peer data sends an
-            // abortive reset, which can race the client while it is parsing
-            // these response headers and obscure the behavior under test.
             let mut request_head = Vec::with_capacity(1024);
             loop {
                 let mut chunk = [0u8; 512];
@@ -21138,14 +17899,8 @@ mod tests {
         server.await.unwrap();
     }
 
-    // ── v0.7.0 community work queue / schema tests ─────────────────────
-
     #[test]
     fn workitem_serializes_in_shape_worker_reads() {
-        // The desktop community-worker loop in main.rs reads job_id, input,
-        // max_tokens, and (optionally) model_id directly off the top-level
-        // claim_work response. Pin the serialization shape so a future
-        // refactor can't silently drift the wire format.
         let item = WorkItem {
             job_id: "a1b2c3".to_string(),
             input: "What is 2+2?".to_string(),
@@ -21165,8 +17920,6 @@ mod tests {
         assert_eq!(v["execution_profile"], canonical_profile());
         assert_eq!(v["submitted_at_unix_ms"], 1_700_000_000_000i64);
         assert_eq!(v["expires_at_unix_ms"], 1_700_000_001_000u64);
-        // Old layer-shard fields must NOT appear — they belong to the
-        // seed-to-seed forward_shard path now.
         assert!(
             v.get("request_id").is_none(),
             "request_id is the v0.6 layer-shard field, must not leak into community jobs"
@@ -21178,8 +17931,6 @@ mod tests {
 
     #[test]
     fn workitem_omits_model_id_when_none() {
-        // model_id is optional; when None, it must be absent from JSON
-        // (workers skip the model-match check when the field isn't present).
         let item = WorkItem {
             job_id: "x".into(),
             input: "hi".into(),
@@ -21197,8 +17948,6 @@ mod tests {
 
     #[test]
     fn workresult_deserializes_from_worker_payload() {
-        // Pin compatibility with the exact JSON the worker loop in
-        // crates/arc-node/src/main.rs sends to /community/submit_work.
         let body = serde_json::json!({
             "job_id": "abc",
             "worker_id": "0x12ab",
@@ -21223,8 +17972,6 @@ mod tests {
 
     #[test]
     fn workresult_defaults_for_failure_submit() {
-        // When a worker fails it can submit just job_id + worker_id +
-        // success=false + error. All other fields default to empty/0.
         let body = serde_json::json!({
             "job_id": "abc",
             "worker_id": "0x12ab",
@@ -21268,7 +18015,6 @@ mod tests {
 
     #[test]
     fn inference_timeout_budget_is_nested_for_maximum_generation() {
-        // one internal BOS + one prompt token + max output
         let required_positions = INFERENCE_RUN_MAX_TOKENS as usize + 2;
         let protocol = community_dispatch_timeout_secs(required_positions).unwrap();
         let one_pass = (required_positions as u64 * 3_300).div_ceil(1_000);
@@ -21385,11 +18131,7 @@ mod tests {
                 },
                 validator_approvals: Vec::new(),
             },
-            // NUL is the maximum six-byte JSON escape for one input byte:
-            // 32 KiB therefore occupies 192 KiB on the wire.
             input: "\0".repeat(32_768),
-            // Exact canonical tokenizer bound measured from the reviewed
-            // GGUF: 48 bytes/token * 256 tokens = 12,288 decoded bytes.
             output: "x".repeat(12_288),
             tokens_generated: INFERENCE_RUN_MAX_TOKENS.into(),
             execution_profile: canonical_profile(),
@@ -21499,10 +18241,6 @@ mod tests {
         )));
     }
 
-    /// The ingress predicate that decides whether this chain refuses
-    /// everything but native inference. Getting it wrong on a migrated chain
-    /// rejects the traffic the migration exists to preserve, at the first
-    /// step a user reaches.
     #[test]
     fn only_a_private_protocol_4_chain_admits_native_transactions_alone() {
         let temporary =
@@ -21526,7 +18264,6 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
 
-        // No binding at all: an ordinary chain, everything admitted.
         assert!(!admits_only_native_transactions(&state));
 
         let context = arc_state::InferenceAdmissionContext {
@@ -21549,14 +18286,9 @@ mod tests {
         };
         state.activate_native_inference(context).unwrap();
 
-        // Activated at a fresh private genesis, with no migration record:
-        // this chain really does carry native work and nothing else.
         assert!(state.native_migration().is_none());
         assert!(admits_only_native_transactions(&state));
 
-        // The migrated case is the negation of that record being present,
-        // and a migrated chain always has one - qualified in arc-state,
-        // where a recovery-bound chain can be built.
         std::fs::remove_dir_all(&temporary).ok();
     }
 
@@ -21596,12 +18328,6 @@ mod tests {
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    // Mirror the production contract in
-                    // `retain_verified_settlement`: the same gate spans
-                    // directory restore/rebarrier and file publication. On
-                    // Windows, bypassing it would let a second helper move the
-                    // directory through an absent-name window while the first
-                    // publisher creates its private staging file.
                     let _gate = node.community_verified_settlements_gate.lock();
                     persist_verified_settlement_journal(&node, &payload, 1_000 + offset)
                 })
@@ -21714,7 +18440,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(temporary);
     }
 
-    /// The `tracing` output of one test, captured on the test's own thread.
     #[derive(Clone, Default)]
     struct ServerLogs(Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -21755,8 +18480,6 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&temporary).unwrap();
-        // A regular file where the journal's parent directory should be: the
-        // journal error names this path.
         let not_a_directory = temporary.join("not-a-directory");
         std::fs::write(&not_a_directory, b"not a directory").unwrap();
         let mut node = fake_node_with_workers(Vec::new());
@@ -21770,7 +18493,6 @@ mod tests {
         assert_eq!(error, SETTLEMENT_JOURNAL_UNAVAILABLE);
         assert!(!node.community_verified_settlements.contains_key(&job_id));
         let logged = logs.text();
-        // The log line names the job, so operators can tie it to the job.
         assert!(logged.contains(&job_id.to_hex()), "{logged}");
         assert!(
             logged.contains("could not journal a verified settlement"),
@@ -21778,7 +18500,6 @@ mod tests {
         );
         assert!(logged.contains("not a real directory"), "{logged}");
 
-        // Without a journal directory the caller gets the same text.
         node.community_settlement_journal_dir = None;
         let error =
             retain_verified_settlement(&node, test_verified_settlement_payload(job_id, 100))
@@ -21955,10 +18676,6 @@ mod tests {
         let input = "ARC probe";
         let input_hash = arc_crypto::hash_bytes(input.as_bytes());
 
-        // A full-loader worker is explicitly reduced to the same canonical
-        // profile as the validator fleet's merged ranges. Prove the exact
-        // generated token bytes/hash survive independent recomputation before
-        // constructing any reward certificate.
         let mut worker_model = test_reward_inference_model();
         worker_model.enable_i16();
         worker_model.enforce_canonical_i8_profile();
@@ -21989,10 +18706,6 @@ mod tests {
         let output_hash =
             compare_community_result_with_tokens(&result, &validator_tokens, &decoded).unwrap();
 
-        // The verifier also requires the complete range/position grid to
-        // carry two distinct active-validator signatures out of all three
-        // contacted replicas. This synthetic one-range proof isolates that
-        // authorization invariant from HTTP timing.
         let pipeline = vec![(
             (0, 1),
             vec![
@@ -22064,11 +18777,6 @@ mod tests {
         let job_id_hex = format!("0x{}", job_id.to_hex());
         result.job_id = job_id_hex.clone();
 
-        // Exercise the actual community assignment boundary for this same
-        // eventual reward job. Validator shard compute has a dedicated
-        // semaphore; even when every seed-owned shard permit is occupied, a
-        // registered stake-zero worker must still receive its bounded queue
-        // assignment with the exact canonical profile and artifact identity.
         let registered_worker = CommunityWorker {
             worker_id: result.worker_id.clone(),
             name: "stake-zero-canonical-worker".to_string(),
@@ -22237,8 +18945,6 @@ mod tests {
         .expect_err("approvals for an older result commitment must be rejected");
         assert!(stale_error.contains("0 valid independent approvals"));
 
-        // Recovery retries must not let responder timing choose different
-        // five-of-six evidence and therefore a different outer tx hash.
         let mut recovery_body = approval_body.clone();
         let mut probe_id = [0u8; 32];
         probe_id[..arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX.len()]
@@ -22477,10 +19183,6 @@ mod tests {
             .execute_block(&joins, legacy_keys[0].address())
             .unwrap();
         assert!(join_receipts.iter().all(|receipt| receipt.success));
-        // Production legacy validator weight lives in the validator map while
-        // the explicit system reserve carries its fungible backing. Recreate
-        // that unambiguous decomposition instead of exporting overloaded
-        // per-account staked_balance fields.
         for key in &legacy_keys {
             let mut account = source.get_account(&key.address()).unwrap();
             account.staked_balance = 0;
@@ -22674,10 +19376,6 @@ mod tests {
             execution_profile: canonical_profile(),
         };
 
-        // Approval ingress must reject a tokenizer-expanded context before it
-        // acquires either bounded queue or recomputation capacity. With two
-        // prompt-side positions and max_seq=32, max_tokens=31 requires 34
-        // positions and is deliberately one-or-more beyond the model window.
         let mut oversized_payload = payload.clone();
         oversized_payload.reward.max_tokens = 31;
         oversized_payload.reward.job_id = CommunityInferenceRewardBody::derive_job_id(
@@ -22742,10 +19440,6 @@ mod tests {
             shard_node.shard_kv_caches.clear();
             shard_node.shard_kv_cache_metadata.clear();
         }
-        // Production approval collection starts all five remote validators
-        // while the same three shard holders are busy. This is the regression
-        // that used to fail immediately at the third try_acquire and made
-        // five-of-six mathematically unreachable under real fan-out.
         let mut approval_tasks = tokio::task::JoinSet::new();
         let mut retry_approver = None;
         for key in validator_keys.iter().skip(1) {
@@ -22789,10 +19483,6 @@ mod tests {
         }
         assert_eq!(approvals.len(), 5);
 
-        // A coordinator retry must not repeat a recomputation this validator
-        // already performed. With no reachable replicas left, the recorded
-        // commitment is re-signed identically, while a validator process that
-        // never recomputed it still must, and fails.
         let mut retry_approver = retry_approver.expect("first approver retained");
         let retry_address = retry_approver.validator_address;
         let unreachable_pipeline = vec![((0, 1), Vec::new())];
@@ -22859,22 +19549,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(temporary);
     }
 
-    // ── Release on verification (`--community-release-on-verification`) ────
-    //
-    // These tests send one free prompt through the real `/inference/run`
-    // dispatcher and the real claim and submit handlers. The coordinator's
-    // check is a genuine authenticated 2-of-3 recomputation on three loopback
-    // shard holders, and the reward approvals go over HTTP to five loopback
-    // approvers whose approval endpoint can be held or failed. The chain and
-    // shard setup mirrors
-    // `remote_approval_endpoint_recomputes_canonical_worker_and_collects_five_payloads`.
-
     type InferenceRunOutput = Result<Json<Value>, (StatusCode, Json<ApiError>)>;
     type SubmitWorkOutput = Result<Json<Value>, (StatusCode, String)>;
 
-    /// One remote approver behind test switches. Each approval request is
-    /// counted on arrival, held until the gate has permits, and refused with
-    /// 503 while `fail` is set; otherwise it reaches the real endpoint.
     #[derive(Clone)]
     struct GatedApprover {
         node: NodeState,
@@ -22895,7 +19572,6 @@ mod tests {
     ) -> Result<Json<arc_types::transaction::CommunityRewardValidatorApproval>, (StatusCode, String)>
     {
         approver.requests.fetch_add(1, Ordering::SeqCst);
-        // An open gate hands each permit straight back when this returns.
         let admitted = approver.gate.acquire().await.is_ok();
         if !admitted || approver.fail.load(Ordering::SeqCst) {
             return Err((
@@ -22916,9 +19592,6 @@ mod tests {
         assert!(waited.is_ok(), "timed out waiting for {what}");
     }
 
-    /// The `tracing` output of one test. `#[tokio::test]` runs the test and
-    /// every task it spawns on one thread, so a thread-local subscriber sees
-    /// the handlers' and the retry loop's log lines.
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -22962,12 +19635,9 @@ mod tests {
         approval_requests: Arc<std::sync::atomic::AtomicUsize>,
         servers: Vec<tokio::task::JoinHandle<()>>,
         temporary: std::path::PathBuf,
-        /// Keeps the coordinator's lifecycle channel open, so its retry tasks
-        /// live in `runtime_tasks`, where a test can abort them like a crash.
         _shutdown: tokio::sync::watch::Sender<bool>,
     }
 
-    /// One `/inference/run` call in flight and the worker's submit for it.
     struct ReleaseOnVerificationJob {
         run: tokio::task::JoinHandle<InferenceRunOutput>,
         submit: tokio::task::JoinHandle<SubmitWorkOutput>,
@@ -22993,8 +19663,6 @@ mod tests {
             let worker = arc_crypto::KeyPair::generate_ed25519();
             let treasury = arc_types::transaction::inference_reward_treasury_address();
             let reward_amount = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
-            // Enough for more rewards than one epoch's coordinator budget, so
-            // the epoch budgets, not the treasury, bind in these tests.
             let mut prefunded = vec![
                 (treasury, reward_amount * 64),
                 (worker.address(), 0),
@@ -23068,8 +19736,6 @@ mod tests {
                 checkpoint.add_signature(key).unwrap();
             }
             let approved_manifest_hash = checkpoint.manifest_hash();
-            // Short names keep the settlement journal's temporary files well
-            // inside the Windows path limit.
             let temporary = std::env::temp_dir().join(format!("arc-rov-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&temporary).unwrap();
             let checkpoint_path = temporary.join("approved.arcchkpt");
@@ -23102,7 +19768,6 @@ mod tests {
             assert_eq!(active.len(), 6);
             let transaction_domain = recovered.recovery_context().unwrap().domain_hash();
 
-            // Three validator shard holders for the authenticated 2-of-3 check.
             let model_id = arc_crypto::hash_bytes(b"release-on-verification-exact-model");
             let model = Arc::new(test_reward_inference_model());
             let model_name = model_display_name(&model);
@@ -23146,7 +19811,6 @@ mod tests {
             }
             let pipeline = vec![((0, 1), replicas)];
 
-            // Five remote approvers, each recomputing before it signs.
             let approval_gate = Arc::new(tokio::sync::Semaphore::new(0));
             let approvals_fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let approval_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -23182,7 +19846,6 @@ mod tests {
                 }));
             }
 
-            // The coordinator is the sixth validator, with rewards active.
             let worker_id = format!("0x{}", worker.address().to_hex());
             let registered = CommunityWorker {
                 worker_id: worker_id.clone(),
@@ -23237,9 +19900,6 @@ mod tests {
             }
         }
 
-        /// A new coordinator process on the same chain, keys, validator set
-        /// and journal directory, with empty in-memory maps: what a restart
-        /// leaves behind.
         fn restarted_coordinator(&self) -> NodeState {
             let registered = self
                 .coordinator
@@ -23268,8 +19928,6 @@ mod tests {
             node
         }
 
-        /// Journal `count` unpaid, unexpired settlements for `worker` on this
-        /// coordinator, as earlier verified jobs would have left them.
         fn journal_unpaid_settlements(&self, count: u64, worker: Hash256) {
             let expires_at_height =
                 self.coordinator.state.height() + COMMUNITY_REWARD_EXPIRY_BLOCKS;
@@ -23309,9 +19967,6 @@ mod tests {
                 .contains_key(&job_hash)
         }
 
-        /// Send one free prompt to `/inference/run`, claim the queued job as
-        /// the registered worker, compute it with the same deterministic
-        /// model, and submit the signed result.
         async fn start_job(&self) -> ReleaseOnVerificationJob {
             let input = "ARC";
             let run = tokio::spawn(inference_run(
@@ -23424,7 +20079,6 @@ mod tests {
         let fixture = ReleaseOnVerificationFixture::build(true).await;
         let job = fixture.start_job().await;
 
-        // Every approver is held closed, yet the caller gets the verified answer.
         let response = released_answer(job.run).await;
         assert_eq!(response["success"], true);
         assert_eq!(
@@ -23441,7 +20095,6 @@ mod tests {
         assert_eq!(response["settlement"]["submitted"], false);
         assert_eq!(response["settlement"]["retry_running"], true);
         assert!(response["settlement"]["tx_hash"].is_null());
-        // The response contract documented in docs/twin-execution.md section 13.
         assert_exact_reward_receipt_fields(
             &response["answer_release"],
             &[
@@ -23465,7 +20118,6 @@ mod tests {
             response["answer_release"]["settlement_status_url"],
             format!("/community/reward_job/0x{}", job.job_hash.to_hex())
         );
-        // Where to ask, and when "pending" ends.
         assert_eq!(
             response["answer_release"]["coordinator"],
             format!("0x{}", fixture.coordinator.validator_address.to_hex())
@@ -23486,8 +20138,6 @@ mod tests {
         assert_eq!(submitted["settlement"], response["settlement"]);
         assert_eq!(submitted["answer_release"], response["answer_release"]);
 
-        // The approvals start afterwards on the retry path. Nothing reaches the
-        // mempool until five of six validators have signed.
         wait_until("all five approvers to be asked", || {
             fixture.approval_request_count() >= 5
         })
@@ -23536,7 +20186,6 @@ mod tests {
         let Json(submitted) = job.submit.await.unwrap().unwrap();
         assert_eq!(submitted["answer_release"], response["answer_release"]);
 
-        // The first approval round fails after the answer was released ...
         wait_until("the first settlement attempt to fail", || {
             fixture
                 .coordinator
@@ -23557,7 +20206,6 @@ mod tests {
         assert!(error.contains("5 of 6 required"), "{error}");
         assert!(!fixture.reward_submitted(job.job_hash));
         assert_eq!(fixture.coordinator.mempool.len(), 0);
-        // ... and leaves the released answer exactly as it was.
         let retained = fixture
             .coordinator
             .inference_results
@@ -23567,7 +20215,6 @@ mod tests {
         assert_eq!(retained["output_hash"], job.result.output_hash);
         assert_eq!(retained["verification"]["quorum_verified"], true);
 
-        // The existing retry loop settles the job once approvals recover.
         fixture.approvals_fail.store(false, Ordering::SeqCst);
         wait_until("the retried reward to reach the mempool", || {
             fixture.reward_submitted(job.job_hash)
@@ -23614,7 +20261,6 @@ mod tests {
             .clone();
         let tx_hash = format!("0x{}", submission.tx_hash.to_hex());
 
-        // A worker retry of the same submit replays the one pending reward ...
         let Json(replay) = community_submit_work(
             AxumState(fixture.coordinator.clone()),
             Json(job.result.clone()),
@@ -23624,14 +20270,12 @@ mod tests {
         assert_eq!(replay["idempotent_replay"], true);
         assert_eq!(replay["settlement"]["status"], "pending_mined_receipt");
         assert_eq!(replay["settlement"]["tx_hash"], tx_hash);
-        // ... and so does the retry loop's next pass.
         let next_pass = attempt_verified_community_reward(&fixture.coordinator, job.job_hash)
             .await
             .unwrap();
         assert_eq!(next_pass["status"], "pending_mined_receipt");
         assert_eq!(next_pass["tx_hash"], tx_hash);
 
-        // One journaled settlement, one reward transaction, one completion.
         assert_eq!(fixture.coordinator.community_verified_settlements.len(), 1);
         assert_eq!(fixture.coordinator.community_reward_submissions.len(), 1);
         assert_eq!(fixture.coordinator.mempool.len(), 1);
@@ -23654,8 +20298,6 @@ mod tests {
         let fixture = ReleaseOnVerificationFixture::build(false).await;
         let job = fixture.start_job().await;
 
-        // Verification has passed and every approver has been asked, but by
-        // default the caller is still waiting for the approvals.
         wait_until("all five approvers to be asked", || {
             fixture.approval_request_count() >= 5
         })
@@ -23704,7 +20346,6 @@ mod tests {
         let Json(submitted) = job.submit.await.unwrap().unwrap();
         assert_eq!(submitted["answer_release"], response["answer_release"]);
 
-        // The process stops right after answering; its retry task dies with it.
         fixture.coordinator.runtime_tasks.lock().abort_all();
         let restarted = fixture.restarted_coordinator();
         assert!(restarted.community_verified_settlements.is_empty());
@@ -23730,8 +20371,6 @@ mod tests {
             record.payload.reward.expires_at_height
         );
 
-        // `serve` schedules every replayed entry; the restarted process alone
-        // then collects the approvals and submits the reward.
         schedule_verified_settlement_retry(&restarted, job.job_hash);
         fixture.open_approvals();
         wait_until("the replayed reward to reach the restarted mempool", || {
@@ -23762,8 +20401,6 @@ mod tests {
         );
         let job = fixture.start_job().await;
 
-        // Verification has passed and every approver has been asked, yet the
-        // caller still waits for the approvals, as with the switch off.
         wait_until("all five approvers to be asked", || {
             fixture.approval_request_count() >= 5
         })
@@ -23783,11 +20420,6 @@ mod tests {
         assert_eq!(fixture.coordinator.mempool.len(), 1);
     }
 
-    /// With the switch on and the journal unable to take the job, the job
-    /// settles inline, exactly as with the switch off. Here the inline journal
-    /// write fails as well, so the answer carries the default path's
-    /// `reward_approval_quorum_unavailable` settlement, no approver is asked,
-    /// and the failure is logged with its cause.
     async fn assert_journal_failure_settles_inline(
         fixture: &ReleaseOnVerificationFixture,
         logs: &CapturedLogs,
@@ -23803,8 +20435,6 @@ mod tests {
             "reward_approval_quorum_unavailable"
         );
         assert_eq!(response["settlement"]["submitted"], false);
-        // The cause is checked in the log below, not in this public reason:
-        // #189 replaces a journal error's detail there with a fixed text.
         assert!(
             response["settlement"]["reason"]
                 .as_str()
@@ -23821,7 +20451,6 @@ mod tests {
         );
         assert_eq!(fixture.approval_request_count(), 0);
         assert_eq!(fixture.coordinator.mempool.len(), 0);
-        // One error line for the job, naming the cause.
         let logged = logs.text();
         assert_eq!(
             logged
@@ -23845,7 +20474,6 @@ mod tests {
         assert_journal_failure_settles_inline(&fixture, &logs, "reviewed capacity 256").await;
         let logged = logs.text();
         assert!(logged.contains("reached its high-water mark"), "{logged}");
-        // The mark sent it inline before any release attempt touched the journal.
         assert!(logged.contains("journal_error=None"), "{logged}");
     }
 
@@ -23854,13 +20482,11 @@ mod tests {
         let logs = CapturedLogs::default();
         let _logging = logs.install();
         let mut fixture = ReleaseOnVerificationFixture::build(true).await;
-        // A regular file where the journal's parent directory should be.
         let not_a_directory = fixture.temporary.join("not-a-directory");
         std::fs::write(&not_a_directory, b"not a directory").unwrap();
         fixture.coordinator.community_settlement_journal_dir =
             Some(Arc::new(not_a_directory.join("community-settlements")));
         assert_journal_failure_settles_inline(&fixture, &logs, "not a real directory").await;
-        // The release attempt's journal error is carried into that one line.
         let logged = logs.text();
         assert!(logged.contains("journal_error=Some("), "{logged}");
     }
@@ -23872,7 +20498,6 @@ mod tests {
         let mut fixture = ReleaseOnVerificationFixture::build(true).await;
         fixture.coordinator.community_settlement_journal_dir = None;
         assert_journal_failure_settles_inline(&fixture, &logs, "persistent state directory").await;
-        // The release attempt's journal error is carried into that one line.
         let logged = logs.text();
         assert!(logged.contains("journal_error=Some("), "{logged}");
     }
@@ -23889,12 +20514,10 @@ mod tests {
             "verified_pending_approval"
         );
 
-        // The retry loop's first attempt is waiting on all five approvers.
         wait_until("all five approvers to be asked", || {
             fixture.approval_request_count() >= 5
         })
         .await;
-        // A worker retry and a status read during that window ...
         let Json(replay) = community_submit_work(
             AxumState(fixture.coordinator.clone()),
             Json(job.result.clone()),
@@ -23911,7 +20534,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(status["status"], "verified_pending_approval");
-        // ... start no second attempt, even after a retry backoff of 1-2 s.
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         assert_eq!(fixture.approval_request_count(), 5);
         let record = fixture
@@ -23932,10 +20554,6 @@ mod tests {
         assert_eq!(fixture.approval_request_count(), 5);
     }
 
-    /// What main (`b26f9739`) returns for one community job that settled
-    /// inline and reached the mempool: the `/inference/run` body and the
-    /// worker's submit body, field for field. Only the elapsed `dispatch_ms`
-    /// and the verifier's range-position count are taken from `answer`.
     fn main_inline_bodies(
         fixture: &ReleaseOnVerificationFixture,
         job_hash: Hash256,
@@ -24013,7 +20631,6 @@ mod tests {
         (expected_answer, expected_submit)
     }
 
-    /// Equal as values and byte for byte as serialized JSON.
     fn assert_same_body(actual: &Value, expected: &Value) {
         assert_eq!(actual, expected);
         assert_eq!(
@@ -24035,21 +20652,14 @@ mod tests {
             fixture.coordinator.validator_address,
         );
         assert!(budget.worker_remaining_this_epoch >= 2);
-        // All but one of this worker's epoch budget is promised to rewards
-        // that are journaled but not yet paid.
         fixture.journal_unpaid_settlements(budget.worker_remaining_this_epoch - 1, worker);
 
-        // The last slot is still released early.
         let first = fixture.start_job().await;
         let response = released_answer(first.run).await;
         assert_eq!(response["answer_release"]["settlement"], "pending");
         let Json(submitted) = first.submit.await.unwrap().unwrap();
         assert_eq!(submitted["answer_release"], response["answer_release"]);
 
-        // The next reward is beyond the budget once unpaid rewards count. It
-        // is neither refused nor released early: it settles inline, so the
-        // caller and the worker get exactly what the switch-off path returns,
-        // and the reward is journaled and submitted as it would be there.
         let second = fixture.start_job().await;
         let answer = released_answer(second.run).await;
         let Json(submitted) = second.submit.await.unwrap().unwrap();
@@ -24081,8 +20691,6 @@ mod tests {
 
     #[test]
     fn release_on_verification_logs_a_budget_refusal_as_policy() {
-        // The empty test chain has no funded treasury, so the issuance check
-        // the inline path runs first refuses every reward.
         let node = fake_node_with_workers(Vec::new());
         let worker = Hash256([7; 32]);
         let refusal =
@@ -24093,7 +20701,6 @@ mod tests {
             &worker.to_hex(),
             &refusal
         ));
-        // Any other inline error is still a failure.
         assert!(!inline_refusal_is_budget_policy(
             &node,
             &worker.to_hex(),
@@ -24124,9 +20731,6 @@ mod tests {
         assert_same_body(&submitted, &expected_submit);
     }
 
-    /// Six recovered validators with community rewards active, built exactly
-    /// as the remote-approval test builds them. Returns the validator keys,
-    /// the recovered state and the temporary directory to remove.
     fn recovered_six_validator_state() -> (
         Vec<arc_crypto::KeyPair>,
         Arc<arc_state::StateDB>,
@@ -24179,10 +20783,6 @@ mod tests {
             .execute_block(&joins, legacy_keys[0].address())
             .unwrap();
         assert!(join_receipts.iter().all(|receipt| receipt.success));
-        // Production legacy validator weight lives in the validator map while
-        // the explicit system reserve carries its fungible backing. Recreate
-        // that unambiguous decomposition instead of exporting overloaded
-        // per-account staked_balance fields.
         for key in &legacy_keys {
             let mut account = source.get_account(&key.address()).unwrap();
             account.staked_balance = 0;
@@ -24259,10 +20859,6 @@ mod tests {
         (validator_keys, recovered, temporary)
     }
 
-    /// The reward fixture with real RoPE angles and pseudo-random attention
-    /// weights. The base fixture rotates nothing and its Q and K rows are
-    /// near copies of each other; even with real angles, the two profiles
-    /// generated the same tokens on it for every small job tried.
     fn dual_profile_test_model(
         seed: u64,
     ) -> arc_inference::cached_integer_model::CachedIntegerModel {
@@ -24297,8 +20893,6 @@ mod tests {
         model
     }
 
-    /// The end-to-end test's model pair for one seed: the legacy model and its
-    /// interleaved-RoPE twin.
     fn dual_profile_models(
         seed: u64,
     ) -> (
@@ -24313,8 +20907,6 @@ mod tests {
         (legacy, interleaved)
     }
 
-    /// The first seed, input and token count, in a fixed order, on which the
-    /// two profiles generate different tokens.
     fn first_profile_divergent_job() -> Option<(u64, &'static str, u32)> {
         for seed in 1..=64u64 {
             let (legacy, interleaved) = dual_profile_models(seed);
@@ -24341,11 +20933,6 @@ mod tests {
         None
     }
 
-    /// The job the end-to-end test verifies: a `dual_profile_test_model` seed,
-    /// an input and a token count on which the two profiles diverge. It is
-    /// the search's first job, as CI logged it identically on Linux, macOS and
-    /// Windows (`13ed973e`): legacy generates [1, 4] ("<s>probe") and the
-    /// interleaved-RoPE profile [1, 3] ("<s> ARC").
     const PINNED_PROFILE_DIVERGENT_JOB: Option<(u64, &str, u32)> = Some((1, "ARC", 2));
 
     #[test]
@@ -24380,7 +20967,6 @@ mod tests {
             None
         );
 
-        // Legacy cannot be dropped in this stage, and unknown names are refused.
         assert!(CommunityVerifyProfiles::parse("rope-interleaved-v1").is_err());
         assert!(CommunityVerifyProfiles::parse("").is_err());
         assert!(CommunityVerifyProfiles::parse("legacy-split-half,rope-v2").is_err());
@@ -24401,7 +20987,6 @@ mod tests {
             socket_addr: "https://198.51.100.7:9090".to_string(),
             node_name: "holder".to_string(),
         };
-        // The historical key, byte for byte.
         assert_eq!(
             shard_registry_key(&legacy),
             "https://198.51.100.7:9090#0-16"
@@ -24445,7 +21030,6 @@ mod tests {
             "holder",
             None,
         );
-        // Without the copy: the legacy entries main announces, and nothing else.
         assert!(interleaved.is_empty());
         assert_eq!(legacy.len(), 1);
         let entry = &legacy[0];
@@ -24461,8 +21045,6 @@ mod tests {
             ("https://holder:9090", "holder")
         );
 
-        // With the copy: the same ranges under both profiles, and the resident
-        // weights include the second Q/K copy.
         let copy = InterleavedRopeQk::from_resident_layers(&model).unwrap();
         assert!(copy.memory_bytes() > 0);
         assert_eq!(
@@ -24513,8 +21095,6 @@ mod tests {
             "the pinned job no longer tells the profiles apart; the first one that does is {:?}",
             first_profile_divergent_job()
         );
-        // Written straight to stderr, past the test harness's output capture,
-        // so the CI log shows which job this test verified.
         let divergence = format!(
             "dual-profile divergence: seed {seed}, input {input:?}, max_tokens {max_tokens}; \
              legacy tokens {legacy_tokens:?} text {:?}; \
@@ -24531,8 +21111,6 @@ mod tests {
         let verify_both =
             CommunityVerifyProfiles::parse("legacy-split-half,rope-interleaved-v1").unwrap();
 
-        // Three validator shard holders, each serving the one-layer range
-        // under both profiles from one legacy model plus the Q/K copy.
         let mut shard_nodes = Vec::new();
         let mut shard_handles = Vec::new();
         let mut legacy_replicas = Vec::new();
@@ -24597,7 +21175,6 @@ mod tests {
         *coordinator.dag_validators.write() = active.clone();
         coordinator.community_verify_profiles = verify_both;
 
-        // What a legacy worker and an interleaved-RoPE worker return.
         let prompt = model.encode(input);
         let job = |profile: &str| WorkItem {
             job_id: arc_crypto::hash_bytes(profile.as_bytes()).to_hex(),
@@ -24646,8 +21223,6 @@ mod tests {
         );
         assert_ne!(legacy_result.output_hash, interleaved_result.output_hash);
 
-        // A legacy job verifies through the legacy shards; the other
-        // profile's output for the same job is refused as invalid.
         coordinator.community_verification_pipeline_override = Some(legacy_pipeline.clone());
         let verified =
             verify_community_result_with_quorum(&coordinator, &legacy_job, &legacy_result)
@@ -24672,7 +21247,6 @@ mod tests {
             Err(CommunityResultVerificationError::Invalid(_))
         ));
 
-        // An interleaved-RoPE job verifies through the same holders' copy.
         coordinator.community_verification_pipeline_override = Some(interleaved_pipeline.clone());
         let verified = verify_community_result_with_quorum(
             &coordinator,
@@ -24704,7 +21278,6 @@ mod tests {
             Err(CommunityResultVerificationError::Invalid(_))
         ));
 
-        // With the setting off, everything answers exactly as on main.
         let mut legacy_only = coordinator.clone();
         legacy_only.community_verify_profiles = CommunityVerifyProfiles::default();
         let Err(CommunityResultVerificationError::Invalid(reason)) =
@@ -24764,7 +21337,6 @@ mod tests {
             "{later_error}"
         );
 
-        // A holder without the copy refuses the profile with main's answer.
         let mut plain_holder = shard_nodes[0].clone();
         plain_holder.interleaved_rope_qk = None;
         plain_holder.interleaved_rope_shard_infos.clear();
@@ -24809,8 +21381,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(temporary);
     }
 
-    /// Verify `result` for `work_item` on a copy of `coordinator` whose
-    /// verification pipeline is the one range `[0, 1)` held by `replicas`.
     async fn verify_through_replicas(
         coordinator: &NodeState,
         replicas: Vec<ShardInfo>,
@@ -24831,9 +21401,6 @@ mod tests {
         let model_id = arc_crypto::hash_bytes(b"two-replica-verification-model");
         let other_id = arc_crypto::hash_bytes(b"another-model-artifact");
         let model = Arc::new(test_reward_inference_model());
-        // Holder 3 signs with its own validator key but computes with other
-        // output weights, so its terminal logits disagree with the others.
-        // Holder 4 loaded another artifact and refuses every request.
         let mut wrong_model = test_reward_inference_model();
         let wrong_values: Vec<f32> = (0..32).map(|index| (index % 5) as f32 / 10.0).collect();
         wrong_model.output_weight = I8Weights::quantize_f32(&wrong_values, 8, 4);
@@ -24920,7 +21487,6 @@ mod tests {
             signed_attestation_hex: None,
         };
 
-        // Both replicas of a two-holder range agree: verified 2-of-2.
         let work_item = job("both replicas agree");
         let verified = verify_through_replicas(
             &coordinator,
@@ -24936,8 +21502,6 @@ mod tests {
         assert_eq!(summary.replicas_contacted_per_quorum, 2);
         assert_eq!(summary.ranges_verified_2_of_2, vec![(0, 1)]);
 
-        // One of the two disagrees, or never answers: no quorum, so the
-        // result stays unverified and nothing is charged to the worker.
         for (name, other) in [("one replica disagrees", 3), ("one replica refuses", 4)] {
             let work_item = job(name);
             let outcome = verify_through_replicas(
@@ -24953,7 +21517,6 @@ mod tests {
             assert!(reason.contains("No majority"), "{name}: {reason}");
         }
 
-        // A range with one live replica cannot be verified at all.
         let work_item = job("one live replica");
         let outcome = verify_through_replicas(
             &coordinator,
@@ -24967,8 +21530,6 @@ mod tests {
         };
         assert!(reason.contains("requires at least 2"), "{reason}");
 
-        // Three replicas behave as before: two of three agreeing verify the
-        // range, and one of three does not.
         let work_item = job("two of three agree");
         let verified = verify_through_replicas(
             &coordinator,
@@ -25005,14 +21566,10 @@ mod tests {
 
     #[tokio::test]
     async fn work_queue_round_trip_after_serve_wiring() {
-        // Smoke test: build_node_state alone leaves the queue None
-        // (callers must use serve() to wire it). After we manually wire
-        // the channel (mirroring serve()), tx.send → rx.recv works.
         let (tx, rx) = tokio::sync::mpsc::channel::<WorkItem>(8);
         let tx = Arc::new(tx);
         let rx = Arc::new(tokio::sync::Mutex::new(rx));
 
-        // Push one job
         tx.send(WorkItem {
             job_id: "j1".into(),
             input: "ping".into(),
@@ -25027,7 +21584,6 @@ mod tests {
         .await
         .unwrap();
 
-        // Drain
         let got = rx.lock().await.recv().await.expect("a job");
         assert_eq!(got.job_id, "j1");
         assert_eq!(got.input, "ping");
@@ -25078,14 +21634,6 @@ mod tests {
         assert_eq!(collected, vec!["job-a", "job-b", "job-c"]);
     }
 
-    // ── Smart router (task 2) tests ─────────────────────────────────────
-    //
-    // These exercise live_inference_worker_count and
-    // dispatch_to_community_worker against a node state we wire up by
-    // hand — a full serve() boot would pull in axum + listen sockets,
-    // which is out of scope for a unit test. We construct just enough of
-    // NodeState to drive the router paths.
-
     use std::sync::atomic::AtomicU32;
     use std::time::Instant;
 
@@ -25135,9 +21683,6 @@ mod tests {
 
     #[test]
     fn chat_format_worker_tokenizes_assignment_directly() {
-        // The production worker loop lives in the binary, outside this lib
-        // test target. Guard its actual claim-to-generate code as well as the
-        // executable verifier-context check below, without changing workers.
         let source = include_str!("main.rs");
         let worker = source
             .split_once("let input = job")
@@ -25154,8 +21699,6 @@ mod tests {
 
     #[tokio::test]
     async fn chat_format_dispatched_input_and_verification_are_wrapped_once() {
-        // Drive the real handler and queue; no model download or validator I/O.
-        // Missing/false flags and other artifacts retain the exact input bytes.
         for (flag, artifact, expected) in [
             (Some(true), LLAMA2_CHAT_ARTIFACT_ID, "[INST] x [/INST]"),
             (Some(false), LLAMA2_CHAT_ARTIFACT_ID, " x\n"),
@@ -25236,9 +21779,6 @@ mod tests {
         complete: bool,
     ) -> Arc<arc_inference::cached_integer_model::CachedIntegerModel> {
         use arc_inference::cached_integer_model::{CachedLayer, I8Weights};
-        // Use the existing synthetic tokenizer and tiny integer model, with
-        // the production encode path. These pieces reproduce the reviewed
-        // nine-token short question without loading/downloading a GGUF.
         let mut model = test_reward_inference_model();
         model.vocab = test_inference_model().vocab.clone();
         model
@@ -25296,15 +21836,12 @@ mod tests {
     }
 
     fn chat_format_desktop_timeout(input: &str, max_tokens: u32) -> u64 {
-        // Frozen desktop timeout, independent of the server's timeout helper.
         let positions = 1 + legacy_desktop_prompt_bound(input) + u64::from(max_tokens);
         ((positions * 14_850).div_ceil(1000) + 30).clamp(45, 3900) + 60
     }
 
     #[tokio::test]
     async fn chat_format_deadline_rejects_before_any_work_or_fallback() {
-        // Twin, single-worker, local, partial-model fallback, and recovery:
-        // none may enqueue, allocate an ID, or compute after this rejection.
         for (complete, workers, twin, force_local, recovery) in [
             (false, 2, true, false, false),
             (false, 1, false, false, false),
@@ -25317,7 +21854,6 @@ mod tests {
             let mut request = chat_format_request("1", 1, Some(true));
             request["force_local"] = json!(force_local);
             if recovery {
-                // Even recovery validation/ID lookup must follow the guard.
                 request["recovery_probe_id"] = json!("invalid");
             }
             let error = inference_run(AxumState(node.clone()), Some(Json(request)))
@@ -25470,8 +22006,6 @@ mod tests {
 
     #[tokio::test]
     async fn chat_format_sharded_consensus_and_auto_sharded_tokenize_once() {
-        // An intentionally tiny context rejects at the exact token boundary,
-        // before pipeline I/O. Check the typed preflight error, not source text.
         for route in ["sharded", "consensus", "auto"] {
             for flag in [Some(true), Some(false), None] {
                 let mut node = chat_format_node(false, 0, false);
@@ -25544,8 +22078,6 @@ mod tests {
                 created_at_secs: 0,
             },
         );
-        // A wrong wrap or token limit misses this exact key. No validator is
-        // involved: the handler must answer entirely from the seeded cache.
         let Json(response) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             inference_run(
@@ -25714,9 +22246,6 @@ mod tests {
         max_seq: usize,
     ) -> Arc<arc_inference::cached_integer_model::CachedIntegerModel> {
         let mut model = test_reward_inference_model();
-        // `encode` prepends SentencePiece's word-boundary marker. Keep the
-        // existing eight-row weight shape while making "ARC" exactly one
-        // tokenizer token for boundary arithmetic and real tiny inference.
         model.vocab[3] = "▁ARC".to_string();
         model.config.max_seq = max_seq;
         Arc::new(model)
@@ -25725,9 +22254,6 @@ mod tests {
     pub(super) fn fake_node_with_workers(
         workers: Vec<(CommunityWorker, std::time::Instant)>,
     ) -> NodeState {
-        // Build a minimal NodeState by hand. We can't call build_node_state
-        // because it requires real Arc<StateDB> and Arc<Mempool>; we only
-        // touch fields the router reads.
         let workers_map: dashmap::DashMap<String, (CommunityWorker, std::time::Instant)> =
             dashmap::DashMap::new();
         for (w, ts) in workers {
@@ -25735,7 +22261,6 @@ mod tests {
         }
         let (tx, rx) = tokio::sync::mpsc::channel::<WorkItem>(16);
         NodeState {
-            // Fields the router actually reads ↓
             community_workers: Arc::new(workers_map),
             community_registration_gate: Arc::new(parking_lot::Mutex::new(())),
             community_request_replays: Arc::new(parking_lot::Mutex::new(
@@ -25761,7 +22286,6 @@ mod tests {
             attestation_nonce: Arc::new(AtomicU64::new(0)),
             latency_stats: Arc::new(dashmap::DashMap::new()),
 
-            // Filler ↓ — never read by the router but required by the struct
             state: Arc::new(arc_state::StateDB::new()),
             mempool: Arc::new(arc_mempool::Mempool::new(1_000)),
             validator_address: Hash256::ZERO,
@@ -25843,7 +22367,6 @@ mod tests {
         }
     }
 
-    /// The one layer range `[0, 1)`, held by one replica at each address.
     fn range_held_at(addresses: &[&str]) -> PipelineHop {
         let replicas = addresses
             .iter()
@@ -25852,10 +22375,6 @@ mod tests {
         ((0, 1), replicas)
     }
 
-    /// A verification pipeline that passes the community dispatch precheck:
-    /// one layer range held by two distinct validator replicas. A test that
-    /// dispatches through `/inference/run` needs it, because the coordinator
-    /// sends a job to a worker only while it could verify the result.
     fn verifiable_dispatch_pipeline() -> Vec<PipelineHop> {
         vec![range_held_at(&["10.0.0.1:9090", "10.0.0.2:9090"])]
     }
@@ -26080,10 +22599,6 @@ mod tests {
             expected_receipt_url
         );
 
-        // A process-local submission row survives longer than a mempool row.
-        // Every public replay/read path must stop calling the old hash
-        // submitted once it has neither mempool presence nor chain inclusion,
-        // while retaining the durable independently verified job for retry.
         node.mempool.clear();
         let stale_recovery = recovery_probe_status_response(&node, recovery_probe_id, job_id, None)
             .unwrap()
@@ -26232,8 +22747,6 @@ mod tests {
             format!("0x{}", unavailable_block.hash.to_hex())
         );
 
-        // Inclusion can race both retry and idempotent-submit cleanup. A
-        // stale submission entry must never mask or resubmit the mined row.
         let race_worker_key = arc_crypto::KeyPair::generate_ed25519();
         let race_worker_id = format!("0x{}", race_worker_key.address().to_hex());
         let race_node = fake_node_with_workers(vec![(
@@ -26823,8 +23336,6 @@ mod tests {
             (wrong_profile, now),
         ]);
 
-        // Only "alive-inference" is fresh, inference-capable, and committed
-        // to the coordinator's exact loaded model identity.
         assert_eq!(live_inference_worker_count(&node), 1);
         node.community_active_jobs
             .insert("alive-inference".to_string(), "already-running".to_string());
@@ -26837,9 +23348,6 @@ mod tests {
 
     #[test]
     fn idle_long_polling_worker_stays_dispatch_capacity_until_assigned() {
-        // Workers long-poll claim_work on every coordinator at once, and each
-        // pending poll holds an EMPTY reservation until work arrives. That
-        // waiting worker is idle capacity; only an assigned job id is busy.
         let now = std::time::Instant::now();
         let node = fake_node_with_workers(vec![(worker("polling", &["inference"]), now)]);
         node.community_active_jobs
@@ -26866,9 +23374,6 @@ mod tests {
         let now = std::time::Instant::now();
         let stale = now - std::time::Duration::from_secs(SHARD_REGISTRY_TTL_SECS + 5);
         let mut node = fake_node_with_workers(vec![(worker("ready", &["inference"]), now)]);
-        // Make the local model deliberately partial so readiness must inspect
-        // the shard registry. The sole shard is expired and therefore cannot
-        // make a pipeline ready, but a read-only GET must not prune it.
         let mut partial_model = test_reward_inference_model();
         partial_model.layers.clear();
         node.inference_model = Some(Arc::new(partial_model));
@@ -26916,9 +23421,6 @@ mod tests {
         );
         assert_eq!(value["schema"], "arc.inference.readiness.v1");
         assert_eq!(value["mutation_free_observation"], true);
-        // A live worker alone is not a community route: with no fresh shard
-        // nothing could verify its result, so neither the route nor its
-        // worker is offered, and nothing else can serve this request.
         assert_eq!(value["community_dispatch_ready"], false);
         assert_eq!(value["live_community_workers"], 0);
         assert_eq!(value["safe_to_dispatch"], false);
@@ -26970,13 +23472,9 @@ mod tests {
             node_name: format!("0x{}", Hash256([index; 32]).to_hex()),
         };
 
-        // A third holder whose announcement lapsed is not a live replica, and
-        // a read-only GET must leave it in the registry.
         let stale = now - std::time::Duration::from_secs(SHARD_REGISTRY_TTL_SECS + 5);
         node.shard_registry.insert("h3".into(), (holder(3), stale));
 
-        // One live replica: the validators' own sharded pipeline can still
-        // answer, but no community result could carry two signatures.
         node.shard_registry.insert("h1".into(), (holder(1), now));
         let (headers, Json(one)) = inference_readiness(AxumState(node.clone())).await;
         assert!(!one.community_dispatch_ready);
@@ -26988,7 +23486,6 @@ mod tests {
             "verification_replicas_below_quorum"
         );
 
-        // A second distinct replica makes the range verifiable 2-of-2.
         node.shard_registry.insert("h2".into(), (holder(2), now));
         let (headers, Json(two)) = inference_readiness(AxumState(node.clone())).await;
         assert!(two.community_dispatch_ready);
@@ -27007,8 +23504,6 @@ mod tests {
         let mut node =
             fake_node_with_workers(vec![(worker(&worker_id, &["inference"]), Instant::now())]);
         node.inference_model = Some(context_test_inference_model(16));
-        // The only layer range has one live replica, so no community result
-        // could be verified and the idle worker must not receive the job.
         let one_replica = vec![range_held_at(&["10.0.0.1:9090"])];
         node.community_verification_pipeline_override = Some(one_replica);
         let readiness = inference_readiness_snapshot(&node);
@@ -27029,8 +23524,6 @@ mod tests {
         assert!(queue.lock().await.try_recv().is_err());
         assert!(node.community_work_results.as_ref().unwrap().is_empty());
 
-        // A sealed recovery probe proves the community path, so it is refused
-        // at once instead of falling through to this node's own model.
         let mut probe_bytes = [0u8; 32];
         probe_bytes[..arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX.len()]
             .copy_from_slice(&arc_types::transaction::RECOVERY_REWARD_PROBE_PREFIX);
@@ -27048,8 +23541,6 @@ mod tests {
         assert!(error.1.error.contains("verification_replicas_below_quorum"));
         assert!(queue.lock().await.try_recv().is_err());
 
-        // With no verification pipeline to assemble at all, the probe is
-        // refused with that reason instead.
         node.community_verification_pipeline_override = None;
         let error = inference_run(AxumState(node.clone()), Some(Json(probe)))
             .await
@@ -27073,8 +23564,6 @@ mod tests {
         ));
         let demo = json!({"input": "ARC", "max_tokens": 1, "public_demo": true});
 
-        // The only layer range has one live replica: a worker could take the
-        // job, but nothing could verify its result, so the 503 says that.
         let one_replica = vec![range_held_at(&["10.0.0.1:9090"])];
         node.community_verification_pipeline_override = Some(one_replica);
         let error = inference_run(AxumState(node.clone()), Some(Json(demo.clone())))
@@ -27083,8 +23572,6 @@ mod tests {
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(error.1.error, COMMUNITY_RESULTS_UNVERIFIABLE);
 
-        // Verifiable now, but one worker cannot make a twin pair: the 503
-        // keeps its existing reason instead of blaming verification.
         node.community_verification_pipeline_override = Some(verifiable_dispatch_pipeline());
         let error = inference_run(AxumState(node.clone()), Some(Json(demo)))
             .await
@@ -27141,12 +23628,10 @@ mod tests {
             community_default_public_name(&worker_id),
             format!("node-{}", &address_hex[..8])
         );
-        // Stable for the key, whatever the case or prefix of the ID.
         assert_eq!(
             community_default_public_name(&address_hex.to_ascii_uppercase()),
             community_default_public_name(&worker_id)
         );
-        // Non-address legacy IDs still get an opaque, well-formed label.
         let legacy = community_default_public_name("fast_reliable");
         assert_eq!(legacy.len(), "node-".len() + 8, "{legacy}");
         assert!(legacy.starts_with("node-"));
@@ -27156,7 +23641,6 @@ mod tests {
     #[test]
     fn community_public_name_redacts_legacy_hostname_registrations() {
         let worker_id = format!("0x{}", "c4".repeat(32));
-        // v0.8.10 and earlier registered `<label> (<hostname>)`.
         for legacy in [
             "arc-1a2b3c4d (Adas-MacBook-Pro.local)",
             "arc-1a2b3c4d (DESKTOP-1A2B3C4)",
@@ -27182,7 +23666,6 @@ mod tests {
             "A",
             "rig_01",
             "github-linux-x86_64-community-verification",
-            // Its own default label is not an impersonation.
             "node-5e5e5e5e",
             longest.as_str(),
         ] {
@@ -27216,7 +23699,6 @@ mod tests {
             "LAPTOP-ABCD1234",
             "ADA-PC",
             "localhost",
-            // Another worker's default label, and look-alikes of it.
             "node-deadbeef",
             "Node-DeadBeef",
             "NODE-DEADBEEF",
@@ -27311,7 +23793,6 @@ mod tests {
 
     #[tokio::test]
     async fn worker_status_route_serves_this_process_worker() {
-        // The only test in this binary that installs the process-wide status.
         let status = crate::community_worker::install(Arc::new(
             crate::community_worker::CommunityWorkerStatus::new(
                 "0xworker",
@@ -27362,10 +23843,6 @@ mod tests {
 
     #[test]
     fn community_generation_context_uses_one_bos_and_enforces_exact_boundary() {
-        // "ARC" is one encoded token. try_generate owns one internal BOS plus
-        // three generated positions: exactly 1 + 1 + 3 = 5 positions. The
-        // sharded verifier replays [BOS, ARC, ARC] and therefore reaches the
-        // same final position without introducing a second BOS.
         let exact = context_test_inference_model(5);
         let (verification_tokens, preflight) =
             community_worker_generation_context(&exact, "ARC", 3).unwrap();
@@ -27457,9 +23934,6 @@ mod tests {
         let mut node = fake_node_with_workers(Vec::new());
         node.inference_model = Some(context_test_inference_model(6));
         let model_id = node.model_artifact_id.unwrap();
-        // No model is loaded into this engine. Reaching `generate` would
-        // therefore return ModelNotFound/500; the oversized request must be
-        // rejected as a 4xx before spawn_blocking or engine lookup instead.
         node.candle_engine = Some(Arc::new(arc_inference::candle_backend::GgufEngine::new(
             1_000,
         )));
@@ -27481,19 +23955,14 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_to_community_worker_returns_result_when_worker_submits() {
-        // Wire a worker: we manually drain the queue and post a result
-        // through the same channels submit_work uses, then assert the
-        // dispatcher returns the right WorkResult.
         let now = std::time::Instant::now();
         let node = fake_node_with_workers(vec![(worker("w1", &["inference"]), now)]);
 
         let queue = node.community_work_queue.as_ref().unwrap().clone();
         let results = node.community_work_results.as_ref().unwrap().clone();
 
-        // Spawn a fake worker that drains the queue and posts a result.
         tokio::spawn(async move {
             let item = queue.lock().await.recv().await.expect("a job");
-            // submit a successful result
             if let Some((_, pending)) = results.remove(&item.job_id) {
                 let _ = pending.sender.send(CommunityDispatchOutcome {
                     result: WorkResult {
@@ -27547,7 +24016,6 @@ mod tests {
             result.settlement.as_ref().unwrap()["status"],
             "test_settlement"
         );
-        // EWMA was recorded for this worker
         assert!(node.latency_stats.contains_key("worker:w1"));
     }
 
@@ -27615,7 +24083,6 @@ mod tests {
         assert_eq!(node.community_work_results.as_ref().unwrap().len(), 0);
         drop(permits);
 
-        // The validator-only reserve remains untouched by a public flood.
         assert_eq!(
             node.validator_shard_permits.available_permits(),
             VALIDATOR_SHARD_CONCURRENCY
@@ -27630,10 +24097,6 @@ mod tests {
         )]);
         node.inference_model = Some(context_test_inference_model(512));
 
-        // Four one-token words + internal BOS + 256 outputs fit the model's
-        // context (261) but exceed the reviewed three-pass 3,900s
-        // community budget. This must remain eligible for local/sharded
-        // fallback and must never consume a queue slot.
         let error = dispatch_to_community_worker(
             &node,
             "ARC ARC ARC ARC".to_string(),
@@ -27852,8 +24315,6 @@ mod tests {
         let Json(response) = match inference_run(
             AxumState(node),
             Some(Json(json!({
-                // One exact tokenizer token keeps max-output dispatch inside
-                // the reviewed 3-pass public deadline.
                 "input": "x",
                 "max_tokens": 4096,
                 "bond": 999999,
@@ -28185,7 +24646,6 @@ mod tests {
         assert_eq!(stats.0.work_completed, 0);
     }
 
-    /// Protocol bounds shrunk so a test observes a withdrawal in milliseconds.
     fn fast_dispatch_windows(unclaimed_withdraw: Option<Duration>) -> CommunityDispatchWindows {
         CommunityDispatchWindows {
             unclaimed_withdraw,
@@ -28239,9 +24699,6 @@ mod tests {
 
     #[tokio::test]
     async fn unclaimed_assignment_is_withdrawn_after_the_claim_window() {
-        // One registered worker never long-polls this coordinator: it is
-        // computing or settling for another seed. The caller must not wait
-        // out the 45 s+ compute budget for a claim that cannot come.
         let worker_id = "busy-elsewhere";
         let node =
             fake_node_with_workers(vec![(worker(worker_id, &["inference"]), Instant::now())]);
@@ -28266,9 +24723,6 @@ mod tests {
         assert!(error.contains("no community worker claimed"));
         assert!(node.community_work_results.as_ref().unwrap().is_empty());
 
-        // The item is still queued. The next worker to dequeue it finds no
-        // pending assignment and is told there is no work, so it never starts
-        // computing a job whose caller has already been answered.
         let Json(claim) = community_claim_work(
             AxumState(node.clone()),
             Json(ClaimWorkRequest {
@@ -28287,9 +24741,6 @@ mod tests {
 
     #[tokio::test]
     async fn claimed_assignment_is_withdrawn_when_its_worker_stops_heartbeating() {
-        // The worker claims the job and its process dies: no heartbeat for
-        // longer than the registry TTL. Its own submit would now be rejected
-        // as unregistered, so the caller must not wait out the compute budget.
         let worker_id = "went-away";
         let node =
             fake_node_with_workers(vec![(worker(worker_id, &["inference"]), Instant::now())]);
@@ -28336,9 +24787,6 @@ mod tests {
 
     #[tokio::test]
     async fn claimed_assignment_with_a_live_worker_outlasts_the_claim_window() {
-        // A live worker's compute runs well past the unclaimed window. Its
-        // result must still be delivered, and a worker that keeps heartbeating
-        // is never mistaken for a dead one.
         let worker_id = "slow-but-alive";
         let node =
             fake_node_with_workers(vec![(worker(worker_id, &["inference"]), Instant::now())]);
@@ -28380,10 +24828,6 @@ mod tests {
 
     #[tokio::test]
     async fn verifying_submission_is_not_withdrawn_for_a_stale_registration() {
-        // The worker already delivered its result and the coordinator is
-        // recomputing it. The registry timestamp is refreshed only after
-        // settlement, so a long verification must never look like a dead
-        // worker and must not lose the result.
         let worker_id = "verifying";
         let node =
             fake_node_with_workers(vec![(worker(worker_id, &["inference"]), Instant::now())]);
@@ -28431,10 +24875,6 @@ mod tests {
 
     #[tokio::test]
     async fn inference_run_falls_back_to_its_own_model_when_the_assigned_worker_dies() {
-        // End to end with the protocol windows: the worker claims and dies, the
-        // handler withdraws the job and answers from this seed's own model
-        // within seconds instead of holding the caller for the compute budget
-        // and then answering 504.
         let worker_id = "dies-mid-job";
         let mut node =
             fake_node_with_workers(vec![(worker(worker_id, &["inference"]), Instant::now())]);
@@ -28479,11 +24919,6 @@ mod tests {
     #[tokio::test]
     async fn job_claimed_through_claim_work_is_withdrawn_with_its_slot_and_its_late_submit_rejected()
      {
-        // Through the real handlers: the worker claims, its heartbeats to this
-        // coordinator stop for longer than the TTL, the dispatcher withdraws
-        // the job and releases the worker's slot, and the worker's late
-        // submit is rejected as unknown work, so it can neither race the
-        // caller's fallback nor be paid.
         let worker_id = "claims-then-goes-quiet";
         let node =
             fake_node_with_workers(vec![(worker(worker_id, &["inference"]), Instant::now())]);
@@ -28533,9 +24968,6 @@ mod tests {
         assert!(node.community_work_results.as_ref().unwrap().is_empty());
         assert!(!node.community_active_jobs.contains_key(worker_id));
 
-        // The worker is still registered (stale entries are pruned lazily), so
-        // only the missing pending record stands between its late result and
-        // a second answer or a reward.
         assert!(node.community_workers.contains_key(worker_id));
         let (status, message) = community_submit_work(
             AxumState(node.clone()),
@@ -28549,8 +24981,6 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_errors_when_queue_unwired() {
-        // Build a minimal NodeState with no community_work_tx, simulating
-        // an old binary or a misconfigured server.
         let mut node = fake_node_with_workers(vec![(worker("w1", &["inference"]), Instant::now())]);
         node.community_work_tx = None;
         node.community_work_queue = None;
@@ -28564,8 +24994,6 @@ mod tests {
             "expected 'not wired' error, got: {err}"
         );
     }
-
-    // ── Task 3: worker-signed attestation tests ─────────────────────────
 
     #[tokio::test]
     async fn dispatch_rejects_a_job_without_exact_model_identity() {
@@ -28641,7 +25069,6 @@ mod tests {
             json!({
                 "input": "receipt-backed local detail",
                 "output": "world",
-                // A local cache cannot replace canonical on-chain commitments.
                 "output_hash": format!("0x{}", arc_crypto::hash_bytes(b"forged-local").to_hex()),
                 "observed_at_unix_ms": 20,
             }),
@@ -28666,8 +25093,6 @@ mod tests {
             },
         );
 
-        // A transaction-shaped key and an indexed body still do not make a
-        // receipt. This is the exact old false-positive path.
         let (unreceipted, _) = sign_attestation_for(&keypair, 2, 0);
         node.state
             .full_transactions
@@ -28682,8 +25107,6 @@ mod tests {
             }),
         );
 
-        // A receipt beside a type/body-mismatched envelope is still not an
-        // inference attestation, even if a local cache key points at it.
         let (mut mismatched, _) = sign_attestation_for(&keypair, 3, 0);
         mismatched.tx_type = TxType::Transfer;
         node.state
@@ -29402,7 +25825,6 @@ mod tests {
         let worker_id = worker_key.address().to_hex();
         let node =
             fake_node_with_workers(vec![(worker(&worker_id, &["inference"]), Instant::now())]);
-        // The verifier's reason names this holder and its address.
         announce_unsigned_test_shard(&node);
         let item = WorkItem {
             job_id: arc_crypto::hash_bytes(b"retryable-verifier-outage").to_hex(),
@@ -29427,7 +25849,6 @@ mod tests {
             .expect_err("missing authenticated shard topology is retryable unavailability");
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.1.contains("remains retryable"));
-        // The worker gets a fixed text; the coordinator's log keeps the reason.
         assert_eq!(error.1, COMMUNITY_VERIFICATION_UNAVAILABLE);
         let logged = logs.text();
         assert!(logged.contains("198.51.100.7:9090"), "{logged}");
@@ -29648,7 +26069,6 @@ mod tests {
         assert_eq!(node.mempool.len(), 1);
     }
 
-    // The native RPC fixture's activation and signed next-block request.
     fn state_lock_order_native_fixture() -> (tempfile::TempDir, NodeState, Transaction) {
         let temporary = tempfile::tempdir().unwrap();
         let state_dir = temporary.path().join("state");
@@ -29757,8 +26177,6 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        // Separate state and channels per case: no process-wide test lock.
-        // Both attestation variants must reach their earliest publication read.
         for case in [
             "earnings",
             "attestation",
@@ -29798,8 +26216,6 @@ mod tests {
             }
             let row = candidate.expect("same-shard probe exhausted 10,000 candidates");
             let row_hash = row.hash;
-            // Build a structurally valid historical block/index, as in the reward
-            // endpoint fixtures; the successful receipt is seeded explicitly.
             let history = StateDB::new();
             let (block, mut receipts) = history
                 .execute_block(std::slice::from_ref(&row), Hash256::ZERO)
@@ -29857,7 +26273,6 @@ mod tests {
             let writer_state = state.clone();
             let (writer_tx, writer_rx) = mpsc::channel();
             let writer = std::thread::spawn(move || {
-                // Keep the persistent fixture alive even on a timeout failure.
                 let _temporary = temporary;
                 let result = writer_state.execute_block_adaptive_at_with_proof(
                     &[native],
@@ -29868,8 +26283,6 @@ mod tests {
                 writer_tx.send(result).unwrap();
             });
             let deadline = Instant::now() + Duration::from_secs(30);
-            // persist_restart_artifacts appends WAL entries only. This receipt
-            // becomes visible only inside the publication write scope.
             while !state.receipts.contains_key(&native_hash.0) {
                 assert!(
                     Instant::now() < deadline,
@@ -29907,8 +26320,6 @@ mod tests {
 
     #[tokio::test]
     async fn native_rpc_requires_private_activation_and_returns_observed_receipt_links() {
-        // A cryptographically signed native envelope remains unavailable until
-        // the rooted private activation exists.
         let inactive = fake_node_with_workers(vec![]);
         let inactive_key = KeyPair::generate_ed25519();
         let mut inactive_tx = Transaction {
@@ -29992,9 +26403,6 @@ mod tests {
             None,
             None,
         );
-        // Every ingress refuses what a protocol-4 block can never carry, not
-        // only /tx/submit_signed: the Ethereum-shaped raw transfer and the
-        // internal attestation used to reach this mempool (P3 audit).
         let Json(eth) = eth_send_raw_transaction(&node, &json!(["0x00"]), &json!(1));
         assert_eq!(eth["error"]["code"], -32003, "{eth}");
         let (_, attestation) = submit_inference_attestation(
@@ -30007,7 +26415,6 @@ mod tests {
         );
         assert_eq!(attestation, "not_submitted_native_inference_chain");
         assert_eq!(mempool.len(), 0, "nothing reached the mempool");
-        // The test-fixture path without a validator keypair refuses as well.
         let keyless = build_node_state(
             state.clone(),
             mempool.clone(),
@@ -30097,7 +26504,6 @@ mod tests {
             .unwrap();
         assert_eq!(context_json["candidate_protocol"], 4);
         assert_eq!(context_json["allowed_execution_count"], 1);
-        // A client builds its job from these: the pinned tuple and the bounds.
         assert_eq!(
             context_json["allowed_executions"][0]["model_hash"],
             tuple.to_hex()
@@ -30115,8 +26521,6 @@ mod tests {
             gas_costs::NATIVE_INFERENCE_REQUEST
         );
         assert!(context_json["height"].is_u64());
-        // This node runs no native worker, so it claims no executor and
-        // tokenizes nothing.
         assert!(context_json["serving"].is_null());
         let refused = native_inference_tokenize(
             AxumState(node.clone()),
@@ -30164,9 +26568,6 @@ mod tests {
         );
     }
 
-    /// Synthetic signed end-to-end routing on an imported recovery checkpoint.
-    /// No model or invented qualification: this covers real admission, value,
-    /// native certificates, headers, and durable restart only.
     #[tokio::test]
     async fn recovered_v3_native_outer_routes_gate_commit_settlement_and_restart() {
         use crate::native_inference::NativeRequestAdmission;
@@ -30183,9 +26584,6 @@ mod tests {
             gas_costs,
         };
 
-        // This fixture isolates native routing/admission status from the
-        // production 100 ms sender throttle; dedicated RPC tests cover that
-        // limiter independently.
         async fn submit_without_test_sender_throttle(
             node: &NodeState,
             tx: Transaction,
@@ -30237,7 +26635,6 @@ mod tests {
             .collect();
         let (_, receipts) = source.execute_block(&joins, keys[0].address()).unwrap();
         assert!(receipts.iter().all(|r| r.success));
-        // The export requires the explicit legacy staking reserve decomposition.
         for key in &keys {
             let mut account = source.get_account(&key.address()).unwrap();
             account.staked_balance = 0;
@@ -30480,7 +26877,6 @@ mod tests {
         assert!(state.validate_v3_transaction_admission(&transfer).is_err());
         assert_eq!(state.get_state_root(), before);
 
-        // Default and operator-enabled-but-not-running are both closed.
         for gate in [
             NativeRequestAdmission::default(),
             NativeRequestAdmission::new(true),
@@ -30527,8 +26923,6 @@ mod tests {
             &bincode::serialize(&tx).unwrap()
         ));
         let committed = node.mempool.drain(1);
-        // Losing local readiness after a peer commits MUST NOT lose the body
-        // or change canonical validity. The reservation still executes once.
         node.native_request_admission = Arc::new(NativeRequestAdmission::default());
         commit(&state, &committed);
         assert_eq!(
@@ -30601,7 +26995,6 @@ mod tests {
             state.get_account(&requester.address()).unwrap().nonce,
             expires,
         );
-        // Canonical catch-up continues while all local admission is closed.
         commit(&state, &[second]);
         let refund = signed(
             &state,
@@ -31165,9 +27558,6 @@ mod tests {
         node.inference_model = None;
         node.model_artifact_id = None;
 
-        // A null legacy field is still an attempted paid request. The missing
-        // input and model would produce different errors if either were read
-        // before the paid-protocol boundary.
         let err = inference_run_consensus(AxumState(node.clone()), Json(json!({ "payer": null })))
             .await
             .expect_err("legacy paid consensus must stay dark");
@@ -31360,7 +27750,7 @@ mod tests {
         let kp = KeyPair::generate_ed25519();
         let (_, hex_with_0x) = sign_attestation_for(&kp, 0, 0);
         let bare = hex_with_0x.trim_start_matches("0x").to_string();
-        let worker_id = hex::encode(kp.address().0); // no 0x
+        let worker_id = hex::encode(kp.address().0);
         decode_and_verify_worker_attestation(&bare, &worker_id)
             .expect("bare hex + bare worker_id should work");
     }
@@ -31370,7 +27760,6 @@ mod tests {
         let kp_a = KeyPair::generate_ed25519();
         let kp_b = KeyPair::generate_ed25519();
         let (_, hex_s) = sign_attestation_for(&kp_a, 0, 0);
-        // Submit kp_a's signed tx but claim to be kp_b
         let worker_id_b = format!("0x{}", hex::encode(kp_b.address().0));
         let err = decode_and_verify_worker_attestation(&hex_s, &worker_id_b)
             .expect_err("must reject worker_id mismatch");
@@ -31379,8 +27768,6 @@ mod tests {
 
     #[test]
     fn decode_rejects_wrong_tx_type() {
-        // Build a Transfer tx (not an InferenceAttestation) and try to
-        // submit it as an attestation.
         let kp = KeyPair::generate_ed25519();
         let mut tx = Transaction::new_transfer(kp.address(), kp.address(), 1, 0);
         tx.sign(&kp).unwrap();
@@ -31397,7 +27784,6 @@ mod tests {
         let kp = KeyPair::generate_ed25519();
         let (mut tx, _) = sign_attestation_for(&kp, 0, 0);
 
-        // Mutate the body without re-signing — the hash + sig now mismatch.
         if let TxBody::InferenceAttestation(ref mut body) = tx.body {
             body.bond = 999;
         }
@@ -31415,8 +27801,6 @@ mod tests {
             .expect_err("hex decode must fail");
         assert!(err.contains("hex decode"), "got: {err}");
     }
-
-    // ── Task 4: worker scoring + scoreboard tests ───────────────────────
 
     fn worker_with_stats(
         id: &str,
@@ -31436,11 +27820,6 @@ mod tests {
 
     #[tokio::test]
     async fn scoreboard_sorts_by_composite_score() {
-        // Compose three workers with known stats:
-        //   fast_reliable: 100% success, 100ms avg → score = 1000 - 100 = 900
-        //   slow_reliable: 100% success, 500ms avg → score = 1000 - 500 = 500
-        //   fresh:         0 successes              → score = 0
-        // Expected ordering: fast_reliable, slow_reliable, fresh.
         let now = std::time::Instant::now();
         let node = fake_node_with_workers(vec![
             (worker_with_stats("fast_reliable", 10, 0, 1000, 100), now),
@@ -31460,7 +27839,6 @@ mod tests {
             vec!["fast_reliable", "slow_reliable", "fresh"],
             "scoreboard order must be score-descending"
         );
-        // Sanity: count_visible matches the number of fresh-TTL workers.
         assert_eq!(v.get("count_visible").and_then(|x| x.as_u64()), Some(3));
         assert_eq!(
             v.get("eligible_inference_workers").and_then(|x| x.as_u64()),
@@ -31527,18 +27905,11 @@ mod tests {
     }
 
     #[test]
-    // `score` is assigned the literal 0.0 by the branch under test, so exact
-    // equality is the assertion: an epsilon would also pass for a wrong-but-tiny
-    // score, which is the bug this is here to catch.
     #[allow(clippy::float_cmp)]
     fn scoreboard_score_handles_pure_failure() {
-        // A worker with all failures and no successes scores 0 (no
-        // success_count means no avg_ms; we don't punish to -∞ because
-        // the worker may still be online and trying).
         let w = worker_with_stats("flunker", 0, 10, 0, 0);
         assert_eq!(w.success_count, 0);
         assert_eq!(w.failure_count, 10);
-        // Equivalent of the score computation in workers_scoreboard
         let attempts = w.success_count + w.failure_count;
         let success_rate = if attempts > 0 {
             w.success_count as f64 / attempts as f64
@@ -31553,15 +27924,6 @@ mod tests {
         assert_eq!(score, 0.0);
     }
 
-    // ── assemble_pipeline ───────────────────────────────────────────────
-    //
-    // This is the planner all three inference endpoints now share, so these
-    // pin the behaviour that used to differ between them. Each case below
-    // corresponds to a failure observed on the live network.
-
-    /// A fresh announcement of the test model, by a holder without a
-    /// validator identity, so pipeline assembly names the holder and its
-    /// documentation-range address in its error.
     fn announce_unsigned_test_shard(node: &NodeState) {
         node.shard_registry.insert(
             "unsigned-holder".to_string(),
@@ -31598,7 +27960,6 @@ mod tests {
         }
     }
 
-    /// The live topology: 32 layers in 6 ranges, each on 3 of 6 nodes.
     fn live_topology() -> Vec<ShardInfo> {
         let ranges = [(0, 6), (6, 12), (12, 17), (17, 22), (22, 27), (27, 32)];
         let nodes = [
@@ -31815,10 +28176,6 @@ mod tests {
             "route domains must remain disjoint even at the same epoch/counter/input"
         );
 
-        // Exercise both public allocators against the same process counter at
-        // once. Scheduling decides which route receives which counter value,
-        // but every result must belong to the finite domain-separated
-        // counter universe and the combined set must remain injective.
         let mut mixed_node = fake_node_with_workers(Vec::new());
         mixed_node.inference_request_epoch = epoch;
         mixed_node.inference_request_counter = Arc::new(AtomicU64::new(0));
@@ -32062,8 +28419,6 @@ mod tests {
             .insert(existing_key.clone(), (existing.clone(), original_seen));
         assert_eq!(node.multi_model_registry.total_shard_nodes(), 0);
 
-        // This request chooses the same key/range and would previously have
-        // replaced the authenticated record and refreshed its TTL.
         let Json(replace_plan) = shard_join(
             AxumState(node.clone()),
             Json(ShardJoinRequest {
@@ -32103,8 +28458,6 @@ mod tests {
         assert_eq!(missing_join_profile.0, StatusCode::BAD_REQUEST);
         assert_eq!(node.shard_registry.len(), 1);
 
-        // Repeated spoofed join plans may propose the missing layer, but can
-        // neither add it nor make the canonical reward pipeline runnable.
         let spoof_request = || ShardJoinRequest {
             socket_addr: "169.254.169.254:80".to_string(),
             node_name: "unauthenticated-spoof".to_string(),
@@ -32283,9 +28636,6 @@ mod tests {
         }
         assert!(ready, "coordinator RPC did not start");
 
-        // The retired bootstrap loop fetched immediately at startup, so a
-        // reachable response would have incremented this counter and inserted
-        // its self_shards before the coordinator became healthy.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_eq!(poison_hits.load(Ordering::Relaxed), 0);
         let topology: Value = client
@@ -32466,17 +28816,6 @@ mod tests {
         );
     }
 
-    /// The fleet's exact failure, reproduced. Every node advertises the stub
-    /// `http://0.0.0.0:9944` (its bind address, because ARC_PUBLIC_SOCKET is
-    /// unset) and every announcement reaches its peers through an HTTPS
-    /// gateway, so the peer address is loopback. Before the signer check, the
-    /// stub was rewritten to the RECEIVER's own `127.0.0.1:9944`, the audience
-    /// probe fetched the receiver's own identity, and the peer was refused for
-    /// "not matching the destination's validator identity" - rejected for
-    /// being the wrong node after being rewritten into this one.
-    ///
-    /// It is still refused, because a stub is genuinely unroutable, but now
-    /// for the true reason, which tells an operator what to configure.
     #[tokio::test]
     async fn a_stub_announced_through_a_gateway_is_refused_as_unconfigured_not_as_a_wrong_validator()
      {
@@ -32500,7 +28839,6 @@ mod tests {
             execution_profile: canonical_profile(),
             memory_mb: 1,
             full_model_mb: 1,
-            // Exactly what every recovered validator advertises today.
             socket_addr: "http://0.0.0.0:9944".to_string(),
             node_name: "peer-behind-gateway".to_string(),
         };
@@ -32513,7 +28851,6 @@ mod tests {
         .unwrap();
         let error = announce_shard(
             AxumState(coordinator.clone()),
-            // Caddy forwards from localhost: this is what the node observes.
             ConnectInfo(RpcPeerAddr("127.0.0.1:49152".parse().unwrap())),
             Json(signed),
         )
@@ -32534,10 +28871,6 @@ mod tests {
         assert_eq!(coordinator.shard_registry.len(), 0);
     }
 
-    /// The same gateway path, but the peer advertises the real origin the
-    /// operator configured. This is the case that restores discovery: a
-    /// loopback peer address no longer suppresses a legitimate remote
-    /// announcement.
     #[tokio::test]
     async fn a_peer_announcing_its_real_origin_through_a_gateway_is_registered() {
         let holder_key = arc_crypto::KeyPair::generate_ed25519();
@@ -32590,13 +28923,10 @@ mod tests {
         assert_eq!(coordinator.shard_registry.len(), 1);
         let registered = coordinator.shard_registry.iter().next().unwrap();
         let (shard, _) = registered.value();
-        // The peer's own origin survived: it was not rewritten to this node.
         assert_eq!(shard.socket_addr, origin);
         assert!(!shard.socket_addr.contains("127.0.0.1"));
     }
 
-    /// This node's own stub refresh from its own process still binds to
-    /// loopback, which is the behaviour the shortcut existed for.
     #[tokio::test]
     async fn this_nodes_own_stub_refresh_from_localhost_still_binds_to_loopback() {
         let own_key = arc_crypto::KeyPair::generate_ed25519();
@@ -32609,7 +28939,6 @@ mod tests {
         let mut coordinator = fake_node_with_workers(Vec::new());
         coordinator.state = state;
         coordinator.model_artifact_id = Some(model_id);
-        // The announcement is signed by this node's own validator identity.
         coordinator.validator_address = own_key.address();
         coordinator.shard_rpc_audiences.insert(
             shard_rpc_origin("http://127.0.0.1:9944").unwrap(),
@@ -32768,9 +29097,6 @@ mod tests {
 
     #[test]
     fn shard_join_ignores_least_held_off_grid_ranges() {
-        // Every production tile has three fresh replicas; each stray has one.
-        // Include a shorter slice and a union of tiles as well as the original
-        // [0,8) bug: merely starting/ending at a boundary is insufficient.
         let mut shards = live_topology();
         for (start, end) in [(0, 8), (0, 4), (0, 12), (12, 18), (27, 31)] {
             shards.push(shard("STRAY", "203.0.113.20:9090", start, end));
@@ -32791,8 +29117,6 @@ mod tests {
             shard("D", "203.0.113.4:9090", 24, 32),
         ];
         assert_eq!(plan_shard_join(32, &shards), None);
-        // Even an incomplete production tiling supplies a safe replica if
-        // off-grid announcements cover the rest of the model.
         shards.push(shard("GRID", "203.0.113.5:9090", 12, 17));
         assert_eq!(plan_shard_join(32, &shards), Some((12, 17)));
     }
@@ -32863,7 +29187,6 @@ mod tests {
         let hops = assemble_pipeline(shards.clone(), &no_stats()).unwrap();
         assert_eq!(hops.len(), 6);
         assert_eq!(hops[0].1.len(), 2);
-        // Either replica alone can serve the first hop, with the same grid.
         for replica in &hops[0].1 {
             let available = shards
                 .iter()
@@ -32878,11 +29201,6 @@ mod tests {
 
     #[test]
     fn assemble_accepts_the_live_3x_replicated_topology() {
-        // 18 announcements, 6 hops, 3 replicas each. /inference/auto's old
-        // hand-rolled walk called this "not contiguous" because the SECOND
-        // [0, 6) replica has start_layer 0 != covered_to 6 — so it declared
-        // has_full_pipeline false on a network with complete coverage and
-        // never took the sharded path once.
         let hops =
             assemble_pipeline(live_topology(), &no_stats()).expect("live topology covers 0..32");
         assert_eq!(
@@ -32906,10 +29224,6 @@ mod tests {
 
     #[test]
     fn assemble_drops_stub_addresses_even_when_they_are_the_only_candidate() {
-        // A community worker announcing 127.0.0.1:9090 for an off-grid [0, 8)
-        // became the ONLY candidate for layer 0 under run_consensus's old
-        // "keep the stub as a fallback" rule, and the pipeline walked off the
-        // rails. A bucket that is stub-only must be dropped entirely.
         let mut shards = vec![
             shard("SQUATTER", "127.0.0.1:9090", 0, 8),
             shard("GHOST", "0.0.0.0:9090", 0, 6),
@@ -32920,7 +29234,6 @@ mod tests {
 
         let err = assemble_pipeline(shards, &no_stats())
             .expect_err("layer 0 has only unroutable candidates");
-        // Honest failure: it must NOT claim to have covered 0..6 via a stub.
         assert!(
             matches!(err, PipelineError::Gap { expected: 0, .. }),
             "expected a gap at layer 0, got {err:?}"
@@ -32929,9 +29242,6 @@ mod tests {
 
     #[test]
     fn assemble_prefers_routable_addr_over_same_nodes_stub_announcement() {
-        // After a coordinator reboot its own self-announce (0.0.0.0:9090) and
-        // the gossiped copy (public IP) land under different registry keys,
-        // producing two entries for the same node and range.
         let mut shards = live_topology();
         shards.push(shard("NYC", "0.0.0.0:9090", 0, 6));
         let hops = assemble_pipeline(shards, &no_stats()).expect("still fully covered");
@@ -32950,10 +29260,6 @@ mod tests {
 
     #[test]
     fn assemble_skips_offgrid_range_instead_of_reporting_a_false_gap() {
-        // An off-grid [0, 8) alongside the standard [0, 6)/[6, 12) tiling must
-        // be skipped, not collided with. Without the overlap skip this is the
-        // "Pipeline gap: expected layer 6 next, got shard [0, 8)" that took
-        // out sharded inference on the healthiest seed.
         let mut shards = live_topology();
         shards.push(shard("JOINER", "203.0.113.7:9090", 0, 8));
         let hops = assemble_pipeline(shards, &no_stats()).expect("standard tiling still covers");
@@ -33004,7 +29310,6 @@ mod tests {
             .collect();
         let gap = assemble_pipeline(shards, &no_stats()).expect_err("layers 12..17 are missing");
         assert!(matches!(gap, PipelineError::Gap { .. }), "{gap:?}");
-        // The log line keeps the holder and its address; callers do not.
         assert!(gap.to_string().contains(":9090"), "{gap}");
         assert_eq!(
             gap.public_message(),
@@ -33023,7 +29328,6 @@ mod tests {
             "Shard identity unavailable or malformed for a pipeline replica"
         );
 
-        // Variants that name no holder keep their text.
         for error in [
             PipelineError::ModelIdentityUnavailable,
             PipelineError::NoShards,
@@ -33035,8 +29339,6 @@ mod tests {
             assert_eq!(error.public_message(), error.to_string());
         }
 
-        // A pipeline that fails while it runs reaches the caller as one fixed
-        // text, and this node's log keeps the request URL.
         let logs = ServerLogs::default();
         let _logging = logs.install();
         let (status, Json(body)) = public_pipeline_run_error(
@@ -33076,7 +29378,6 @@ mod tests {
     fn assemble_orders_replicas_by_fresh_latency() {
         let stats = no_stats();
         let now = std::time::Instant::now();
-        // AMS fastest, NYC middle, LAX slowest.
         for (addr, ms) in [
             ("136.244.109.1:9090", 20.0),
             ("149.28.32.76:9090", 200.0),
@@ -33106,11 +29407,6 @@ mod tests {
 
     #[test]
     fn stale_latency_samples_stop_steering_the_router() {
-        // The LHR case: an EWMA of 37,276 ms recorded over ten hours ago kept
-        // it permanently last, and because only replicas[0] was ever dialled
-        // it could never earn a new sample. Past LATENCY_STALE_SECS a sample
-        // is UNKNOWN, and unknown replicas keep their announcement order
-        // rather than being sorted to the bottom by a fossil.
         let stats = no_stats();
         let stale =
             std::time::Instant::now() - std::time::Duration::from_secs(LATENCY_STALE_SECS + 60);
@@ -33131,7 +29427,6 @@ mod tests {
         );
         drop(fresh_stat);
 
-        // And a fresh one still counts.
         stats.insert(
             "140.82.16.112:9090".into(),
             LatencyEWMA {
@@ -33145,17 +29440,12 @@ mod tests {
         assert_eq!(effective_latency_ms(&s), Some(300.0));
     }
 
-    /// A node with no blocks must not claim the chain is advancing, and must
-    /// not answer `"ok"`. This is the regression that let four seeds report
-    /// `{"status":"ok"}` for eight days while sealing nothing.
     #[test]
     fn health_status_is_not_ok_when_block_liveness_is_unknown() {
         let node = fake_node_with_workers(Vec::new());
         let age = latest_available_block(&node).and_then(|b| age_secs_from_ms(b.header.timestamp));
         let chain_advancing = age.map(|a| a <= BLOCK_PRODUCTION_FRESH_SECS);
 
-        // An empty StateDB knows nothing about liveness. "Unknown" must not
-        // collapse into "fresh".
         assert_ne!(
             chain_advancing,
             Some(true),
@@ -33178,7 +29468,6 @@ mod tests {
         let mut node = fake_node_with_workers(Vec::new());
         node.state = Arc::new(arc_state::StateDB::with_genesis(&[]));
 
-        // Genesis is intentionally not exposed as a produced latest block.
         assert!(matches!(
             get_latest_block(AxumState(node.clone())).await,
             Err(StatusCode::NOT_FOUND)
@@ -33187,9 +29476,6 @@ mod tests {
         let (block, _) = node.state.execute_block(&[], Hash256([33; 32])).unwrap();
         let reserved_height = node.state.height() + 1;
 
-        // This reproduces the API's observable race without timing: the state
-        // counter has reserved the next height, while the preceding block is
-        // present and can be served by the explicit-height endpoint.
         let Json(reserved_latest) = latest_block_at(&node, reserved_height).unwrap();
         assert_eq!(reserved_latest.hash, block.hash);
 
@@ -33218,17 +29504,12 @@ mod tests {
         assert_eq!(response["extended_consensus_wire_enabled"], true);
     }
 
-    /// Both directions of the status mapping, including the one a stake-0
-    /// community node can never reach locally (it takes no consensus role, so
-    /// it never seals and never goes fresh).
     #[test]
     fn health_status_tracks_block_liveness_in_both_directions() {
-        // Sealing normally → ok, and no reason field to render.
         let (status, reason) = health_status_from(Some(true), Some(29));
         assert_eq!(status, "ok");
         assert!(reason.is_none(), "a healthy node must not carry a reason");
 
-        // The observed AMS/NRT/SGP stall: 8 days.
         let (status, reason) = health_status_from(Some(false), Some(670_501));
         assert_eq!(status, "degraded");
         let reason = reason.expect("a degraded node must explain itself");
@@ -33241,14 +29522,11 @@ mod tests {
             "reason must name the DAG/commit distinction that hid this: {reason}"
         );
 
-        // Unknown liveness must not collapse into healthy.
         let (status, reason) = health_status_from(None, None);
         assert_eq!(status, "degraded");
         assert!(reason.expect("reason required").contains("unknown"));
     }
 
-    /// The freshness boundary is inclusive, so a node sealing exactly at the
-    /// window edge is not flapped to degraded.
     #[test]
     fn block_age_at_the_freshness_boundary_is_still_ok() {
         assert_eq!(
@@ -33260,45 +29538,26 @@ mod tests {
         assert!(!advancing(HEALTH_STALL_SECS + 1));
     }
 
-    /// The threshold must not flag a slow-but-sealing node.
-    ///
-    /// Measured on the live network over 10.3 h on 2026-08-18/19: NYC sealed
-    /// 50 blocks (~744 s/block) and LAX 108 (~344 s/block), while AMS/NRT/SGP
-    /// sat at ~670,000 s. A window that calls NYC and LAX degraded would be a
-    /// worse lie than the hardcoded "ok" this replaced, because it would mark
-    /// the only two healthy seeds as broken.
     #[test]
-    // The last two assertions compare named constants, so clippy sees a value
-    // fixed at compile time. That is the point: they fail the build's test run
-    // if anyone edits HEALTH_STALL_SECS or BLOCK_PRODUCTION_FRESH_SECS back into
-    // an ordering that would mark the two healthy seeds degraded.
     #[allow(clippy::assertions_on_constants)]
     fn health_threshold_separates_slow_sealing_from_an_eight_day_stall() {
         let advancing = |age: u64| age <= HEALTH_STALL_SECS;
 
-        // Real observed inter-block times on the two sealing seeds.
         assert!(advancing(744), "NYC cadence ~12 min must read as advancing");
         assert!(
             advancing(344),
             "LAX cadence ~5.7 min must read as advancing"
         );
-        // And the ages actually observed while probing them.
         assert!(advancing(677));
         assert!(advancing(460));
 
-        // The failure this exists to catch: ~7.8 days.
         assert!(!advancing(670_501));
         assert_eq!(health_status_from(Some(false), Some(670_501)).0, "degraded");
 
-        // The old 120 s window would have called both healthy seeds degraded —
-        // guard against anyone re-pointing the status field at it.
         assert!(744 > BLOCK_PRODUCTION_FRESH_SECS);
         assert!(HEALTH_STALL_SECS > BLOCK_PRODUCTION_FRESH_SECS);
     }
 
-    /// The demo hands back a receipt. If the tx is not in a block, that receipt
-    /// must not carry a link — `/tx/{hash}` answers "not found" and the caller
-    /// cannot distinguish an unmined tx from a real one.
     #[test]
     fn explorer_url_is_null_until_the_tx_is_actually_in_a_block() {
         let node = fake_node_with_workers(Vec::new());
@@ -33315,7 +29574,6 @@ mod tests {
             "the reason must say why there is no link: {reason}"
         );
 
-        // A tx that was never submitted gets its own distinct explanation.
         let (url, reason) = explorer_url_for(&node, &tx_hash, "sign_failed");
         assert!(url.is_null());
         assert!(
@@ -33326,19 +29584,13 @@ mod tests {
 
     #[test]
     fn health_probe_only_supersedes_an_implausible_recorded_latency() {
-        // LHR: 37 s recorded, 200 ms health RTT → fossil, reset it.
         assert!(probe_supersedes_recorded(37_276.0, 200));
-        // A genuinely slow node stays slow: 8 s recorded, 6 s health RTT.
         assert!(!probe_supersedes_recorded(8_000.0, 6_000));
-        // A merely-mediocre node is never reset, however fast /health is.
         assert!(!probe_supersedes_recorded(900.0, 5));
-        // Right at the floor.
         assert!(!probe_supersedes_recorded(LATENCY_POISON_FLOOR_MS, 1));
     }
 
     #[test]
-    // `record_latency` stores 4_000 exactly; the test asserts the probe did not
-    // blend into it, so any tolerance would hide exactly the regression tested.
     #[allow(clippy::float_cmp)]
     fn probe_latency_never_overwrites_a_real_hop_sample() {
         let stats = no_stats();
@@ -33353,8 +29605,6 @@ mod tests {
     }
 
     #[test]
-    // Same reason: the assertion is "replaced, not blended", which is only
-    // expressible as exact equality with the recorded sample.
     #[allow(clippy::float_cmp)]
     fn first_real_hop_replaces_a_provisional_probe_value_rather_than_blending() {
         let stats = no_stats();
@@ -33373,13 +29623,6 @@ mod tests {
         assert!(!s.probe_only);
         assert_eq!(s.count, 1);
     }
-
-    // ── race-to-majority tally ──────────────────────────────────────────
-    //
-    // `pipeline_hop`'s Fanout arm returns the instant `needed` responses carry
-    // the same output hash. These exercise that decision rule directly: given
-    // hashes arriving in a known order, at which arrival does the hop return,
-    // and which response does it pick?
 
     #[tokio::test]
     async fn fanout_boundary_cancels_timeout_stragglers_before_next_position() {
@@ -33444,9 +29687,6 @@ mod tests {
         );
     }
 
-    /// Mirror of the tally in `pipeline_hop`'s Fanout arm: fold hashes in
-    /// arrival order and report the index of the arrival that reached
-    /// `needed` agreement, plus the winning group.
     fn tally_until_majority(
         arrivals: &[Option<&str>],
         needed: usize,
@@ -33568,9 +29808,6 @@ mod tests {
 
     #[test]
     fn majority_returns_on_the_second_agreeing_response_not_the_third() {
-        // k=3, needed=2. The whole point: with 3 replicas per range and the
-        // desktop's k=3, the old collect loop waited for the SLOWEST of three.
-        // Hop cost is now the 2nd response.
         let got = tally_until_majority(&[Some("0xaa"), Some("0xaa"), Some("0xaa")], 2)
             .expect("two agreed");
         assert_eq!(
@@ -33583,9 +29820,6 @@ mod tests {
 
     #[test]
     fn majority_waits_past_a_divergent_first_responder() {
-        // Fastest replica disagrees. We must NOT return its answer just
-        // because it arrived first — that is the difference between consensus
-        // and a race.
         let got = tally_until_majority(&[Some("0xbad"), Some("0xok"), Some("0xok")], 2)
             .expect("the honest pair agreed");
         assert_eq!(got.0, 2, "had to wait for the second honest answer");
@@ -33604,7 +29838,6 @@ mod tests {
 
     #[test]
     fn failed_replicas_do_not_count_toward_agreement() {
-        // None = the replica errored or timed out.
         assert!(tally_until_majority(&[None, Some("0xa"), None], 2).is_none());
         let got = tally_until_majority(&[None, Some("0xa"), Some("0xa")], 2).expect("two agreed");
         assert_eq!(got.0, 2);
@@ -33612,7 +29845,6 @@ mod tests {
 
     #[test]
     fn hedged_mode_takes_the_first_valid_answer() {
-        // redundancy: 2 is Fanout { fanout: 2, needed: 1 } — first valid wins.
         let got = tally_until_majority(&[Some("0xaa"), Some("0xbb")], 1).expect("first valid");
         assert_eq!(got.0, 0);
         assert_eq!(got.1, "0xaa");
@@ -33620,10 +29852,6 @@ mod tests {
 
     #[test]
     fn fixed_quorum_fanout_waits_for_every_replica_to_keep_kv_caches_warm() {
-        // Free fan-out may stop at the agreement threshold; reward
-        // verification (no degraded quorum) must never abort a replica,
-        // because an aborted position leaves that replica cold and the next
-        // position would evict it below the fixed three-replica quorum.
         assert!(fanout_stops_at_threshold(true));
         assert!(!fanout_stops_at_threshold(false));
     }
@@ -33640,8 +29868,6 @@ mod tests {
                 .expect_err("mid-run replica eviction must fail the reward verifier closed");
             assert!(error.contains("fixed quorum unavailable"), "{error}");
         }
-        // A range planned with its two live replicas needs both of them, and
-        // losing one mid-run fails closed in the same way.
         assert_eq!(
             fanout_quorum_plan(2, 2, 2, false).unwrap(),
             (2, 2),
@@ -33737,14 +29963,11 @@ mod tests {
         };
         assert_eq!(validate(&[2], &agreed).unwrap(), 1);
 
-        // The other replica disagreed or never answered: one signature is
-        // not a quorum, whatever the number of replicas.
         let mut one_signer = agreed.clone();
         one_signer.majority_signers = vec![signer_a];
         let error = validate(&[2], &one_signer).expect_err("2-of-2 needs both signatures");
         assert!(error.contains("1 distinct authenticated signer"), "{error}");
 
-        // Each range's quorum contacts exactly the replicas planned for it.
         let error = validate(&[3], &agreed).expect_err("a 2-of-3 range contacts three");
         assert!(error.contains("slot(s), expected 3"), "{error}");
         let mut three_contacted = agreed.clone();
@@ -33752,7 +29975,6 @@ mod tests {
         let error = validate(&[2], &three_contacted).expect_err("a 2-of-2 range contacts two");
         assert!(error.contains("slot(s), expected 2"), "{error}");
 
-        // One replica is never a quorum, and the plan must cover every range.
         let error = validate(&[1], &agreed).expect_err("one replica cannot verify a range");
         assert!(error.contains("planned 1 replica slot(s)"), "{error}");
         let error = validate(&[], &agreed).expect_err("every range needs a replica plan");
@@ -33769,8 +29991,6 @@ mod tests {
             vec![3, 3, 2]
         );
 
-        // One replica, two holders announcing one socket, or none at all:
-        // no quorum could carry two independent signatures.
         let one = range_held_at(&["10.0.0.1:1"]);
         let one_socket = range_held_at(&["10.0.0.1:1", "10.0.0.1:1"]);
         let none = range_held_at(&[]);
@@ -33796,7 +30016,6 @@ mod tests {
             })
         };
 
-        // Every range 2-of-3: exactly the summary and JSON shape main returns.
         let all_three = summary(vec![((0, 6), 3), ((6, 12), 3)]);
         assert_eq!(
             all_three.method,
@@ -33825,15 +30044,11 @@ mod tests {
         assert_eq!(wire["ranges_verified_2_of_2"], json!([[0, 6]]));
     }
 
-    // ── canonical INT8 kernels ──────────────────────────────────────────
-
     #[tokio::test]
     async fn node_status_names_the_kernels_projections_run() {
         let node = fake_node_with_workers(vec![]);
         let report = arc_inference::canonical_simd::kernel_report();
         let Json(threads) = get_node_threads(AxumState(node.clone())).await;
-        // `canonical_kernel` is the kernel a one-token step runs: a VNNI or
-        // SMMLA kernel whenever one is selected, not the base kernel.
         assert_eq!(threads["canonical_kernel"], report.one_token_label());
         let kernels = &threads["kernels"];
         assert_eq!(kernels["one_token"], report.one_token_label());
@@ -33857,7 +30072,6 @@ mod tests {
                 get(get_node_threads).post(set_node_threads),
             )
             .with_state(node.clone());
-        // The desktop Rust client posts JSON to 127.0.0.1, without browser headers.
         for host in ["127.0.0.1:4317", "localhost:4317", "[::1]:4317"] {
             let peer = if host.starts_with('[') {
                 "[::1]:12345"
@@ -33958,7 +30172,6 @@ mod tests {
                 node.compute_pool.read().as_ref().unwrap()
             ));
         }
-        // The read-only route remains available without operator headers.
         let response = app
             .oneshot(
                 axum::http::Request::builder()
@@ -33979,19 +30192,15 @@ mod tests {
         );
     }
 
-    // ── compute pool ────────────────────────────────────────────────────
-
     #[test]
     fn compute_pool_rebuilds_and_releases() {
         let node = fake_node_with_workers(vec![]);
         assert_eq!(node.compute_threads.load(Ordering::Relaxed), 0);
-        // Work runs fine with no dedicated pool (rayon global).
         assert_eq!(install_on_compute_pool(&node, || 6 * 7), 42);
 
         set_compute_threads(&node, 3).expect("3-thread pool");
         assert_eq!(node.compute_threads.load(Ordering::Relaxed), 3);
         assert!(node.compute_pool.read().is_some());
-        // Nested rayon work sees the installed pool.
         let width = install_on_compute_pool(&node, rayon::current_num_threads);
         assert_eq!(
             width, 3,
@@ -34017,22 +30226,16 @@ mod tests {
 
     #[test]
     fn community_jobs_run_on_the_pool_the_thread_setting_sizes() {
-        // main.rs gives the community worker loop this handle before `serve`
-        // exists; `serve` attaches the same handle to the node.
         let worker_pool = ComputePool::default();
         let mut node = fake_node_with_workers(vec![]);
         worker_pool.attach(&mut node);
 
-        // Unset: no behaviour change. The job runs on the calling thread and
-        // its rayon work on the global pool, as before.
         let global = rayon::current_num_threads();
         assert_eq!(worker_pool.install(rayon::current_num_threads), global);
 
-        // --threads 3 / [inference] threads = 3 (serve calls this at start-up).
         set_compute_threads(&node, 3).expect("3-thread pool");
         assert_eq!(worker_pool.install(rayon::current_num_threads), 3);
 
-        // The desktop's live core setting: POST /node/threads.
         set_compute_threads(&node, 2).expect("resize live");
         assert_eq!(worker_pool.install(rayon::current_num_threads), 2);
         assert_eq!(
@@ -34041,19 +30244,11 @@ mod tests {
             "local RPC compute and community jobs share one pool"
         );
 
-        // threads = 0 returns community jobs to rayon's global pool.
         set_compute_threads(&node, 0).expect("back to global");
         assert_eq!(worker_pool.install(rayon::current_num_threads), global);
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests for the honest-projection math (v0.7.11+)
-//
-// Every assertion here targets a way a projection can lie: a finite pool
-// treated as infinite, a validator count inflated by peers with nothing at
-// stake, or a rate manufactured from a window too small to measure one.
-// ---------------------------------------------------------------------------
 #[cfg(test)]
 mod projection_tests {
     use super::*;
@@ -34065,13 +30260,8 @@ mod projection_tests {
         Hash256(b)
     }
 
-    // ── Reward / treasury math ────────────────────────────────────────────
-
     #[test]
     fn reward_constant_is_the_shared_one_not_a_literal() {
-        // /economics/rewards and /worker/earnings must both quote the constant
-        // arc-state actually credits. If someone re-hardcodes 2.5 anywhere,
-        // this catches the drift.
         assert_eq!(INFERENCE_ATTESTATION_REWARD, 2_500_000_000);
         assert!(
             (REWARD_PER_ATTESTATION_ARC
@@ -34083,7 +30273,6 @@ mod projection_tests {
 
     #[test]
     fn rewards_remaining_divides_the_finite_treasury() {
-        // The dedicated genesis reward treasury holds 1000 ARC → exactly 400 rewards.
         let treasury = 1_000 * ARC_BASE_UNITS;
         assert_eq!(
             rewards_remaining(treasury, INFERENCE_ATTESTATION_REWARD),
@@ -34093,27 +30282,20 @@ mod projection_tests {
 
     #[test]
     fn rewards_remaining_is_zero_when_treasury_is_empty() {
-        // An empty pool funds nothing. This is the case a naive "count × 2.5
-        // ARC forever" projection gets wrong.
         assert_eq!(rewards_remaining(0, INFERENCE_ATTESTATION_REWARD), Some(0));
     }
 
     #[test]
     fn rewards_remaining_is_zero_when_treasury_holds_less_than_one_reward() {
-        // 2.4999... ARC cannot pay a 2.5 ARC reward. Floor division must not
-        // round up to 1, and the attestation still applies — the attester just
-        // receives min(reward, treasury_balance), i.e. less than the rate.
         let almost = INFERENCE_ATTESTATION_REWARD - 1;
         assert_eq!(
             rewards_remaining(almost, INFERENCE_ATTESTATION_REWARD),
             Some(0)
         );
-        // Exactly one reward funds exactly one.
         assert_eq!(
             rewards_remaining(INFERENCE_ATTESTATION_REWARD, INFERENCE_ATTESTATION_REWARD),
             Some(1)
         );
-        // One base unit short of two rewards funds one, not two.
         assert_eq!(
             rewards_remaining(
                 INFERENCE_ATTESTATION_REWARD * 2 - 1,
@@ -34125,14 +30307,11 @@ mod projection_tests {
 
     #[test]
     fn rewards_remaining_is_null_when_reward_is_zero() {
-        // Undefined, not infinite — the endpoint reports null plus a reason.
         assert_eq!(rewards_remaining(1_000_000, 0), None);
         assert_eq!(rewards_remaining(0, 0), None);
     }
 
     #[test]
-    // This guard applies only to the coordinator's local attestation path.
-    // Community reward certificates have a separate fixed zero-bond contract.
     #[allow(clippy::assertions_on_constants)]
     fn local_attestation_bond_contract_is_self_consistent() {
         assert!(DEFAULT_ATTESTATION_BOND < INFERENCE_ATTESTATION_REWARD);
@@ -34143,11 +30322,8 @@ mod projection_tests {
         assert!(DEFAULT_ATTESTATION_CHALLENGE_PERIOD_BLOCKS > 0);
     }
 
-    // ── Active vs registered validators ───────────────────────────────────
-
     #[test]
     fn validator_split_excludes_zero_stake_peers() {
-        // The live shape: 14 registered, 4 of them carrying stake 0.
         let mut vals: Vec<(Hash256, u64)> = (0..10)
             .map(|i| (addr(i), arc_consensus::STAKE_SPARK))
             .collect();
@@ -34165,9 +30341,9 @@ mod projection_tests {
     #[test]
     fn validator_split_respects_the_min_stake_boundary() {
         let vals = vec![
-            (addr(1), arc_consensus::STAKE_SPARK), // exactly at min → active
-            (addr(2), arc_consensus::STAKE_SPARK - 1), // one under → not active
-            (addr(3), arc_consensus::STAKE_CORE),  // well over → active
+            (addr(1), arc_consensus::STAKE_SPARK),
+            (addr(2), arc_consensus::STAKE_SPARK - 1),
+            (addr(3), arc_consensus::STAKE_CORE),
         ];
         let split = split_validators(&vals, arc_consensus::STAKE_SPARK);
         assert_eq!(split.registered, 3);
@@ -34177,7 +30353,6 @@ mod projection_tests {
             split.active_stake,
             arc_consensus::STAKE_SPARK + arc_consensus::STAKE_CORE
         );
-        // Stake below the threshold still counts toward total_stake.
         assert_eq!(
             split.total_stake,
             split.active_stake + arc_consensus::STAKE_SPARK - 1
@@ -34196,8 +30371,6 @@ mod projection_tests {
 
     #[test]
     fn validator_split_zero_min_still_excludes_zero_stake() {
-        // A validator with nothing at risk secures nothing, even if the
-        // threshold is configured to zero.
         let vals = vec![(addr(1), 0), (addr(2), 1)];
         let split = split_validators(&vals, 0);
         assert_eq!(split.active, 1);
@@ -34212,8 +30385,6 @@ mod projection_tests {
         assert_eq!(split.total_stake, 0);
     }
 
-    // ── Observed rate: the null paths ─────────────────────────────────────
-
     const DAY_MS: u64 = 86_400_000;
 
     #[test]
@@ -34224,8 +30395,6 @@ mod projection_tests {
 
     #[test]
     fn rate_is_null_with_a_single_attestation() {
-        // One event defines no interval. This is the case the old "12% of
-        // lifetime" fabrication papered over.
         let err = attestations_per_day_observed(1, Some(1_000), Some(1_000)).unwrap_err();
         assert!(err.contains("collecting data"), "got: {}", err);
         assert!(err.contains("at least 3"), "got: {}", err);
@@ -34241,8 +30410,6 @@ mod projection_tests {
 
     #[test]
     fn rate_is_null_when_block_timestamps_are_pruned() {
-        // Non-archive nodes drop old blocks, so the window's endpoints have no
-        // timestamps. Null plus a reason — never a nominal-block-time guess.
         let err = attestations_per_day_observed(10, None, Some(DAY_MS)).unwrap_err();
         assert!(err.contains("not retained"), "got: {}", err);
         let err = attestations_per_day_observed(10, Some(1), None).unwrap_err();
@@ -34255,38 +30422,27 @@ mod projection_tests {
     fn rate_is_null_on_zero_or_non_advancing_timestamps() {
         assert!(attestations_per_day_observed(5, Some(0), Some(DAY_MS)).is_err());
         assert!(attestations_per_day_observed(5, Some(DAY_MS), Some(0)).is_err());
-        // Same instant → no elapsed time to divide by.
         let err = attestations_per_day_observed(5, Some(DAY_MS), Some(DAY_MS)).unwrap_err();
         assert!(err.contains("same instant"), "got: {}", err);
-        // Clock going backwards across the window is not a negative rate.
         assert!(attestations_per_day_observed(5, Some(2 * DAY_MS), Some(DAY_MS)).is_err());
     }
 
     #[test]
     fn rate_uses_intervals_not_events() {
-        // A real epoch-millis base: 0 is reserved for "absent timestamp".
         const T0: u64 = 1_700_000_000_000;
 
-        // 3 attestations spanning exactly 2 days = 2 intervals = 1.0/day.
-        // Dividing by the event count instead would report 1.5/day.
         let rate = attestations_per_day_observed(3, Some(T0), Some(T0 + 2 * DAY_MS)).unwrap();
         assert!((rate - 1.0).abs() < 1e-9, "got {}", rate);
 
-        // 25 attestations over one day = 24 intervals/day.
         let rate = attestations_per_day_observed(25, Some(T0), Some(T0 + DAY_MS)).unwrap();
         assert!((rate - 24.0).abs() < 1e-9, "got {}", rate);
 
-        // Even a larger receipt count over one hour is still too short to
-        // annualize honestly; the endpoint remains in collecting-data state.
         let err = attestations_per_day_observed(25, Some(T0), Some(T0 + DAY_MS / 24)).unwrap_err();
         assert!(err.contains("at least 24 hours"), "got: {}", err);
     }
 
-    // ── Own-compute statistics ────────────────────────────────────────────
-
     #[test]
     fn mean_and_p50_are_null_without_samples() {
-        // An average of no measurements is unknown, not 0 ms.
         assert_eq!(mean_u64(&[]), None);
         assert_eq!(p50_u64(&[]), None);
     }
@@ -34295,8 +30451,6 @@ mod projection_tests {
     fn p50_returns_a_value_that_was_actually_measured() {
         assert_eq!(p50_u64(&[5]), Some(5));
         assert_eq!(p50_u64(&[9, 1, 5]), Some(5));
-        // Even count → lower middle, so the figure is a real sample rather
-        // than an interpolated number nothing measured.
         assert_eq!(p50_u64(&[10, 20, 30, 40]), Some(20));
         assert_eq!(mean_u64(&[10, 20, 30, 40]), Some(25.0));
     }
@@ -34315,7 +30469,6 @@ mod projection_tests {
             "newest sample retained"
         );
         assert_eq!(*ring.front().unwrap(), extra, "oldest evicted first");
-        // p50 over a full ring is still a real sample from it.
         let samples: Vec<u64> = ring.iter().copied().collect();
         assert!(
             p50_u64(&samples)

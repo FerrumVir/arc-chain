@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""Focused tests for create-only legacy updater recovery anchors.
-
-The production helper runs the embedded program as root against
-``/etc/systemd/system``.  These tests execute those exact bytes in an isolated
-temporary unit directory and never contact systemd or a production host.
-"""
 
 from __future__ import annotations
 

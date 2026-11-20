@@ -94,7 +94,7 @@ UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 
 
 class CutoverAssetError(RuntimeError):
-    """A protected handoff or derived release policy failed closed."""
+    pass
 
 
 def fail(message: str) -> NoReturn:
@@ -361,9 +361,6 @@ def validate_boundary(
     ):
         fail("recovery manifest source tuple differs from its selected captured head")
 
-    # The final sealed manifest itself is an input to the owner-signed policy;
-    # keep the argument used so static analyzers cannot mistake it for an
-    # unbound parse.
     exact_hash(manifest_sha256, "recovery manifest SHA-256")
     return freeze_sha256, capture_id
 

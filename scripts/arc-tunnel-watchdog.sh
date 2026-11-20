@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# ARC_RETIRED_LIVE_TOOL_V3_REQUIRED
 set -euo pipefail
 printf '%s\n' \
     'RETIRED: arc-tunnel-watchdog.sh cannot safely create a tunnel to the legacy fleet.' \

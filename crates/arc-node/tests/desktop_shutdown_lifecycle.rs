@@ -7,13 +7,6 @@ const TOKEN_FILE: &str = "token";
 const REQUEST_FILE: &str = "request";
 const REQUEST_SCHEMA: &str = "arc.desktop.shutdown.v1";
 const STARTUP_GGUF_SIZE: u64 = 256 * 1024 * 1024;
-// The lifecycle receipt deliberately re-hashes the exact arc-node executable
-// when it is loaded, authenticated, and acknowledged.  An unstripped debug
-// binary is hundreds of MiB on hosted runners, where those security checks can
-// legitimately take longer than the old 60-second fixture deadline even
-// though the node is making forward progress.  Keep this bounded far below
-// the production graceful-drain budget while allowing the integrity checks to
-// complete under slow CI I/O instead of weakening or bypassing them.
 const STARTUP_SHUTDOWN_TEST_TIMEOUT: Duration = Duration::from_secs(180);
 
 fn write_sparse_startup_gguf(path: &std::path::Path) {
@@ -22,19 +15,16 @@ fn write_sparse_startup_gguf(path: &std::path::Path) {
         header.extend_from_slice(value.as_bytes());
     }
 
-    // Startup reads these GGUF shape fields before opening persistent state.
-    // Keep the large sparse body to exercise model hashing, but use a valid
-    // header so the lifecycle test reaches its durable shutdown barrier.
     let mut header = Vec::new();
     header.extend_from_slice(b"GGUF");
     header.extend_from_slice(&3u32.to_le_bytes());
-    header.extend_from_slice(&0u64.to_le_bytes()); // tensor count
-    header.extend_from_slice(&2u64.to_le_bytes()); // metadata count
+    header.extend_from_slice(&0u64.to_le_bytes());
+    header.extend_from_slice(&2u64.to_le_bytes());
     write_string(&mut header, "general.architecture");
-    header.extend_from_slice(&8u32.to_le_bytes()); // string
+    header.extend_from_slice(&8u32.to_le_bytes());
     write_string(&mut header, "llama");
     write_string(&mut header, "llama.block_count");
-    header.extend_from_slice(&4u32.to_le_bytes()); // u32
+    header.extend_from_slice(&4u32.to_le_bytes());
     header.extend_from_slice(&1u32.to_le_bytes());
 
     let mut model = std::fs::File::create(path).unwrap();
@@ -72,9 +62,6 @@ fn acquire_managed_lifecycle_fixture(
         arc_crypto::secret_file::acquire_private_directory_namespace_lock(&control_dir).unwrap();
     control_namespace.restore_interrupted().unwrap();
 
-    // Match the desktop's production handoff: prove the child name first,
-    // then the parent name while no descendant handles are open, and retain
-    // the stable sibling guard until the in-directory owner lease is locked.
     control_namespace.rebarrier_existing().unwrap();
     drop(control_namespace);
     data_namespace.rebarrier_existing().unwrap();
@@ -131,15 +118,6 @@ fn publish_private_request(
     std::fs::remove_file(staging).unwrap();
 }
 
-/// Exercises the packaged Windows lifecycle channel as an actual process, not
-/// only through cfg/type checks. There is no test-only startup pause: a sparse
-/// model artifact supplies a production-shaped synchronous hash phase while a
-/// private request arrives at the data-dir lock boundary. On Windows the
-/// fixture supplies the exact desktop namespace proof and live owner lease so
-/// the node exercises the same no-rename handoff as the packaged application.
-/// The lifecycle worker must consume the request, replay/open persistent state,
-/// complete the WAL durability barrier required by the prearmed receipt, and
-/// exit before network admission.
 #[test]
 fn private_desktop_request_stops_node_during_initialization() {
     let temp = tempfile::tempdir().unwrap();

@@ -1,25 +1,9 @@
-//! Real GGUF inference backend powered by Hugging Face candle.
-//!
-//! When the `candle` feature is enabled:
-//! - Loads GGUF quantized models (Llama, Mistral, Mixtral, etc.)
-//! - Runs INT4/INT8 quantized forward pass in-process
-//! - Uses BLAS (CPU), Metal (macOS), or CUDA (NVIDIA) acceleration
-//! - Deterministic: INT4 accumulation is exact across all hardware
-//!
-//! This is the Tier 1 on-chain inference path. Every validator loads the
-//! same GGUF model and produces bitwise identical output.
-
 use crate::model_artifact::ModelArtifactCommitment;
 use crate::{InferenceError, InferenceResult};
 use arc_crypto::Hash256;
-// Only the `candle` feature has code paths that log here; without it this
-// import would be unused.
 #[cfg(feature = "candle")]
 use tracing::info;
 
-/// The quantized-Llama backend precomputes RoPE tables for exactly this many
-/// positions. Keep the public admission contract visibly tied to the backend
-/// constant so a dependency upgrade cannot silently widen or shrink it.
 pub const GGUF_CONTEXT_WINDOW: usize = 4096;
 
 #[cfg(feature = "candle")]
@@ -50,10 +34,6 @@ fn enforce_generation_timeout(elapsed_ms: u64, limit_ms: u64) -> Result<(), Infe
     Ok(())
 }
 
-/// GGUF model inference engine.
-///
-/// Loads quantized models from GGUF files and executes transformer
-/// forward passes in-process. No external API calls.
 pub struct GgufEngine {
     pub timeout_ms: u64,
     #[cfg(feature = "candle")]
@@ -62,20 +42,9 @@ pub struct GgufEngine {
 
 #[cfg(feature = "candle")]
 struct LoadedGgufModel {
-    /// Path to the GGUF file (for reference).
     path: String,
-    /// Model ID = streaming BLAKE3 of every source-artifact byte.
     model_id: Hash256,
-    /// Quantized model weights loaded via candle.
     model: candle_transformers::models::quantized_llama::ModelWeights,
-    /// Tokenizer (simple byte-level for determinism).
-    ///
-    /// Recorded but never read. Kept because it is part of this struct's
-    /// record of what was loaded — and because the value is currently
-    /// hardcoded to 32000 ("standard for Llama family", see `load`) rather
-    /// than read from the GGUF metadata. Deleting the field would remove the
-    /// only trace of that assumption; it should instead be sourced from the
-    /// file and actually used when a non-32000-vocab model is supported.
     #[allow(dead_code)]
     vocab_size: u32,
 }
@@ -89,10 +58,6 @@ impl GgufEngine {
         }
     }
 
-    /// Reject an untrusted prompt before model lookup, KV-cache mutation or
-    /// tensor allocation. The first forward consumes the whole prompt and
-    /// produces token one; each later token consumes one additional RoPE
-    /// position, so the exact requirement is `prompt + max_tokens - 1`.
     pub fn preflight_generation(
         input_tokens: usize,
         max_tokens: u32,
@@ -100,9 +65,6 @@ impl GgufEngine {
         Self::preflight_generation_for_context(input_tokens, max_tokens, GGUF_CONTEXT_WINDOW)
     }
 
-    /// Apply a paired tokenizer/model context limit in addition to Candle's
-    /// fixed backend ceiling. Callers that loaded tokenizer metadata from the
-    /// same artifact use this before dispatching blocking work.
     pub fn preflight_generation_for_context(
         input_tokens: usize,
         max_tokens: u32,
@@ -133,20 +95,12 @@ impl GgufEngine {
         Ok(required_positions)
     }
 
-    /// Load a GGUF quantized model from a file path.
-    ///
-    /// The model_id is the streaming BLAKE3 commitment of the complete source
-    /// artifact. Shape metadata and byte sampling are not identities: two GGUF
-    /// files can share them while containing different weights.
     #[cfg(feature = "candle")]
     pub fn load_gguf_file(&self, path: &str) -> Result<Hash256, InferenceError> {
         let artifact = ModelArtifactCommitment::from_path(path)?;
         self.load_gguf_artifact(&artifact)
     }
 
-    /// Load a model using an identity already computed during node startup.
-    /// The artifact is rechecked before Candle parses it so a file changed
-    /// between commitment and loading cannot be advertised under the old ID.
     #[cfg(feature = "candle")]
     pub fn load_gguf_artifact(
         &self,
@@ -163,7 +117,6 @@ impl GgufEngine {
 
         info!(path = %path.display(), "Loading GGUF model...");
 
-        // Open GGUF via candle's quantized loader
         let mut gguf_file = std::fs::File::open(path).map_err(|e| {
             InferenceError::Runtime(format!("Failed to reopen {path_display}: {e}"))
         })?;
@@ -171,13 +124,12 @@ impl GgufEngine {
         let gguf_content = candle_core::quantized::gguf_file::Content::read(&mut gguf_file)
             .map_err(|e| InferenceError::Runtime(format!("GGUF parse error: {e}")))?;
 
-        let device = Device::Cpu; // Metal: Device::new_metal(0)?
+        let device = Device::Cpu;
 
-        // Build quantized model from GGUF
         let model = ModelWeights::from_gguf(gguf_content, &mut gguf_file, &device)
             .map_err(|e| InferenceError::Runtime(format!("Model load error: {e}")))?;
 
-        let vocab_size = 32000; // Standard for Llama family
+        let vocab_size = 32000;
 
         info!(
             model_id = hex::encode(&model_id.0[..8]),
@@ -215,13 +167,6 @@ impl GgufEngine {
         ))
     }
 
-    /// Run inference on a loaded GGUF model.
-    ///
-    /// Deterministic forward pass:
-    /// - Input tokens are converted to tensor
-    /// - Transformer forward pass runs quantized matmul (INT4/INT8 → INT32 accumulation)
-    /// - Output logits → argmax for next token (deterministic tie-breaking: lowest index)
-    /// - Repeat for max_tokens
     #[cfg(feature = "candle")]
     pub fn generate(
         &self,
@@ -241,21 +186,17 @@ impl GgufEngine {
 
         let device = Device::Cpu;
 
-        // Convert input tokens to tensor
         let input_ids: Vec<u32> = input_tokens.to_vec();
         let mut all_tokens = input_ids.clone();
         let mut generated_tokens: Vec<u32> = Vec::new();
 
-        // Autoregressive generation
         for i in 0..max_tokens {
             let context = if i == 0 {
-                // First pass: use full input
                 Tensor::new(all_tokens.as_slice(), &device)
                     .map_err(|e| InferenceError::Runtime(format!("Tensor: {e}")))?
                     .unsqueeze(0)
                     .map_err(|e| InferenceError::Runtime(format!("Unsqueeze: {e}")))?
             } else {
-                // Subsequent: use only the last token (KV cache handles context)
                 let last = *all_tokens.last().unwrap();
                 Tensor::new(&[last], &device)
                     .map_err(|e| InferenceError::Runtime(format!("Tensor: {e}")))?
@@ -267,13 +208,11 @@ impl GgufEngine {
                 .dim(1)
                 .map_err(|e| InferenceError::Runtime(format!("Dim: {e}")))?;
 
-            // Forward pass through quantized transformer
             let logits = model_ref
                 .model
                 .forward(&context, generation_index_pos(input_tokens.len(), i)?)
                 .map_err(|e| InferenceError::Runtime(format!("Forward: {e}")))?;
 
-            // Get logits for last position
             let logits = logits
                 .squeeze(0)
                 .map_err(|e| InferenceError::Runtime(format!("Squeeze: {e}")))?;
@@ -285,7 +224,6 @@ impl GgufEngine {
                 logits
             };
 
-            // Argmax (deterministic: lowest index wins on tie)
             let next_token = last_logits
                 .argmax(0)
                 .map_err(|e| InferenceError::Runtime(format!("Argmax: {e}")))?
@@ -298,8 +236,6 @@ impl GgufEngine {
             let elapsed_ms = start.elapsed().as_millis() as u64;
             enforce_generation_timeout(elapsed_ms, self.timeout_ms)?;
 
-            // Stop on EOS - token 2 (LLaMA-2), 128001/128009 (LLaMA-3)
-            // Token 0 is PAD, not EOS - do not stop on it
             if matches!(next_token, 2 | 128001 | 128009) {
                 break;
             }
@@ -307,7 +243,6 @@ impl GgufEngine {
 
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
-        // Serialize output as bytes for hashing
         let output_bytes: Vec<u8> = generated_tokens
             .iter()
             .flat_map(|t| t.to_le_bytes())
@@ -335,7 +270,6 @@ impl GgufEngine {
         ))
     }
 
-    /// Check if a model is loaded.
     #[cfg(feature = "candle")]
     pub fn has_model(&self, model_id: &Hash256) -> bool {
         self.models.contains_key(&model_id.0)
@@ -346,7 +280,6 @@ impl GgufEngine {
         false
     }
 
-    /// List loaded models.
     #[cfg(feature = "candle")]
     pub fn loaded_models(&self) -> Vec<(Hash256, String)> {
         self.models

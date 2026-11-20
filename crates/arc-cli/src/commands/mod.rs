@@ -6,7 +6,6 @@ pub mod info;
 pub mod transfer;
 pub mod tx;
 
-/// Validate that an address is 64 hex characters (no 0x prefix).
 pub fn validate_address(addr: &str) -> Result<(), String> {
     let addr = addr.strip_prefix("0x").unwrap_or(addr);
     if addr.len() != 64 {

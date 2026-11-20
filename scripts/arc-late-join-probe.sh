@@ -1,13 +1,4 @@
 #!/usr/bin/env bash
-# Can a node join a chain that is already running? (checklist C7/C8, defect D5)
-#
-# Start N-1 validators, let the chain advance well past the point where a peer
-# block would be refused as "too far ahead", THEN start the last one and watch
-# whether it reaches the others' height. Before authenticated history transfer
-# the answer was no, permanently: the late node rejected every live block and
-# never produced another.
-#
-# usage: arc-late-join-probe.sh [--nodes N] [--lead SECONDS] [--observe SECONDS]
 set -uo pipefail
 
 BINARY=${BINARY:-target/debug/arc-node}
@@ -39,7 +30,7 @@ trap cleanup EXIT INT TERM
 health() { curl -s --max-time 4 "http://127.0.0.1:$1/health" 2>/dev/null; }
 field()  { printf '%s' "$1" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get(sys.argv[1],""))' "$2" 2>/dev/null; }
 
-derive() { # seed rpc p2p -> address
+derive() {
   local d="$WORK/derive-$1"; mkdir -p "$d"
   "$BINARY" --rpc "127.0.0.1:$2" --p2p-port "$3" --data-dir "$d" \
             --insecure-dev-validator-seed --validator-seed "$1" --stake "$STAKE" \
@@ -53,18 +44,11 @@ derive() { # seed rpc p2p -> address
   printf '%s' "$a"
 }
 
-start() { # index
-  # Separate declarations on purpose: `local i=$1 d="$WORK/node-$i"` expands
-  # $i from the CALLER's scope, which silently pointed one node at another
-  # node's data directory and made it fail on the lock.
+start() {
   local i="$1"
   local d="$WORK/node-$i"
   local peers=""
   mkdir -p "$d"
-  # Dial only LOWER-numbered peers. Simultaneous mutual dialling between two
-  # arc-node processes deadlocks until timeout (defect D1), so every fixture
-  # here uses a one-directional peer list; the late node therefore dials the
-  # running ones, which is exactly the case under test.
   for j in $(seq 0 $((i-1))); do
     peers="${peers}127.0.0.1:$((BASE_P2P+j)),"
   done

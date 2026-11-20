@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Process regression for streaming small binary replies through the real relay."""
 from __future__ import annotations
 import argparse
 import os
@@ -56,7 +55,7 @@ def exercise(binary: Path) -> None:
         try:
             peer, _ = listener.accept()
             request1 = b"request-one\x00binary"
-            response1 = (b"\x89\xab\xcd\xef" * 32)  # 128 bytes, no newline
+            response1 = (b"\x89\xab\xcd\xef" * 32)
             process.stdin.write(request1)
             if read_socket_exact(peer, len(request1), 5) != request1:
                 raise AssertionError("first request bytes changed in relay")
@@ -65,7 +64,7 @@ def exercise(binary: Path) -> None:
                 raise AssertionError("first response bytes changed or were buffered until EOF")
 
             request2 = b"request-two\x00binary"
-            response2 = b"\xff\xfe\xfd\xfc" * 32  # second frame, still no newline
+            response2 = b"\xff\xfe\xfd\xfc" * 32
             process.stdin.write(request2)
             if read_socket_exact(peer, len(request2), 5) != request2:
                 raise AssertionError("second request bytes changed in relay")
@@ -73,7 +72,7 @@ def exercise(binary: Path) -> None:
             if read_exact(process.stdout.fileno(), len(response2), 3) != response2:
                 raise AssertionError("second response bytes changed or were buffered until EOF")
 
-            process.stdin.close()  # relay must half-close the socket write side.
+            process.stdin.close()
             peer.settimeout(5)
             if peer.recv(1) != b"":
                 raise AssertionError("relay did not forward stdin EOF to the socket")

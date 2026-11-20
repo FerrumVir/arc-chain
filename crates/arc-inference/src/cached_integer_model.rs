@@ -1,38 +1,16 @@
-//! Cached Integer Model - Production-speed deterministic inference.
-//!
-//! Default mode: **INT16** weights (2 bytes per parameter) with per-row Q16 scale factors.
-//! INT16 gives 32,767 quantization levels per row - 258x finer than INT8's 127 levels,
-//! and 32x finer than FP16's 1,024 mantissa levels - while remaining fully deterministic.
-//!
-//! Also supports INT8 (1 byte, lower precision) and Q4 (0.5 byte, lowest bandwidth).
-//! Forward pass: integer weight × i64 activation → accumulate in i64 → per-row scale → Q16.
-//! Pure integer arithmetic during inference. Deterministic on all platforms.
-//! Float used ONLY at model load time (GGUF dequant → per-row quantization).
-
 use crate::integer_lut::*;
 use arc_crypto::Hash256;
 use rayon::prelude::*;
 use tracing::info;
 
-// ─── INT8 Weight Storage (Per-Row Quantization) ───────────────────────────────
-
-/// Per-row symmetric INT8 quantized weight matrix.
-///
-/// Each row has its own scale factor, so every row uses the full [-127, 127] range.
-/// This eliminates the precision loss from outlier weights in other rows.
-///
-/// Layout: data is row-major [n_rows × n_cols] as i8.
-/// scales[i] = Q16 representation of (abs_max_of_row_i / 127).
-/// Reconstruction: real_value[i][j] ≈ data[i*cols+j] * scales[i] / ONE
 pub struct I8Weights {
     pub data: Vec<i8>,
-    pub scales: Vec<i64>, // Per-row scale in Q16 (one per output row)
+    pub scales: Vec<i64>,
     pub n_rows: usize,
     pub n_cols: usize,
 }
 
 impl I8Weights {
-    /// Quantize f32 matrix [n_rows × n_cols] to per-row symmetric INT8.
     pub fn quantize_f32(values: &[f32], n_rows: usize, n_cols: usize) -> Self {
         assert_eq!(values.len(), n_rows * n_cols);
 
@@ -42,7 +20,6 @@ impl I8Weights {
         for i in 0..n_rows {
             let row = &values[i * n_cols..(i + 1) * n_cols];
 
-            // Per-row abs_max
             let abs_max = row.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
             let abs_max = abs_max.max(1e-10);
 
@@ -51,16 +28,6 @@ impl I8Weights {
                 data.push((x * inv_abs_max).round().clamp(-127.0, 127.0) as i8);
             }
 
-            // Per-row scale = abs_max / 127 in Q16. Compute in f64 to keep
-            // sub-1.0 abs_max values (every output.weight and ffn_down row
-            // in real Llama-2-7B per probe_i16_real_weights.rs) from
-            // collapsing to scale=1. Pre-fix this used `abs_max as i64`,
-            // which truncated abs_max < 1 to 0 — leaving every row of those
-            // tensors quantized at ~36-258× the wrong magnitude. Block-wise
-            // INT8 (the default forward path on v0.5.3+) was unaffected
-            // because it does its own per-block scale; this fix matters for
-            // any path still routing through I8Weights (sharded loaders
-            // and the I16 dual-quantize bring-up).
             let scale = ((abs_max as f64 * ONE as f64) / 127.0).round().max(1.0) as i64;
             scales.push(scale);
         }
@@ -73,13 +40,10 @@ impl I8Weights {
         }
     }
 
-    /// Memory usage in bytes.
     pub fn memory_bytes(&self) -> usize {
         self.data.len() + self.scales.len() * 8 + 16
     }
 
-    /// Zero-memory placeholder used by sharded loading for layers this node
-    /// does NOT hold. The forward path will skip these slots.
     pub fn empty() -> Self {
         Self {
             data: Vec::new(),
@@ -89,9 +53,6 @@ impl I8Weights {
         }
     }
 
-    /// Copy an exact, half-open output-row range.  The per-row Q16 scales are
-    /// inseparable from the rows: exporting data without its matching scales
-    /// would silently change canonical-I8 arithmetic.
     pub fn copy_rows(&self, start: usize, end: usize) -> Result<Self, String> {
         if start >= end
             || end > self.n_rows
@@ -113,8 +74,6 @@ impl I8Weights {
     }
 }
 
-/// Borrowed view of a contiguous I8 row range. Keeping scales paired with
-/// their rows preserves the canonical per-row quantization contract.
 #[derive(Clone, Copy)]
 pub(crate) struct I8WeightsView<'a> {
     pub(crate) data: &'a [i8],
@@ -134,29 +93,14 @@ impl<'a> From<&'a I8Weights> for I8WeightsView<'a> {
     }
 }
 
-// ─── INT16 Weight Storage (Per-Row Quantization, Feature-Gated) ──────────────
-
-/// Per-row symmetric INT16 quantized weight matrix.
-///
-/// Same approach as I8Weights but with 258x finer granularity: full [-32767, 32767] range.
-/// This reduces quantization error by ~258x compared to INT8 [-127, 127].
-///
-/// Layout: data is row-major [n_rows x n_cols] as i16.
-/// scales[i] = Q16 representation of (abs_max_of_row_i / 32767).
-/// Reconstruction: real_value[i][j] ≈ data[i*cols+j] * scales[i] / ONE
 pub struct I16Weights {
     pub data: Vec<i16>,
-    pub scales: Vec<i64>, // Per-row scale in Q16 (one per output row)
+    pub scales: Vec<i64>,
     pub n_rows: usize,
     pub n_cols: usize,
 }
 
 impl I16Weights {
-    /// Quantize f32 matrix [n_rows x n_cols] to per-row symmetric INT16.
-    ///
-    /// Uses the full [-32767, 32767] range per row, giving ~258x finer
-    /// granularity than INT8's [-127, 127]. This is where the real
-    /// perplexity improvement comes from.
     pub fn quantize_f32(values: &[f32], n_rows: usize, n_cols: usize) -> Self {
         assert_eq!(values.len(), n_rows * n_cols);
 
@@ -166,7 +110,6 @@ impl I16Weights {
         for i in 0..n_rows {
             let row = &values[i * n_cols..(i + 1) * n_cols];
 
-            // Per-row abs_max
             let abs_max = row.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
             let abs_max = abs_max.max(1e-10);
 
@@ -175,9 +118,6 @@ impl I16Weights {
                 data.push((x * inv_abs_max).round().clamp(-32767.0, 32767.0) as i16);
             }
 
-            // Per-row scale = abs_max in Q16. The matmul divides by 32767 to
-            // complete the dequantization: output = (acc * scale) / 32767 >> FRAC_BITS.
-            // This keeps the scale large enough for sub-1.0 abs_max values.
             let scale = (abs_max as f64 * ONE as f64).round() as i64;
             scales.push(scale.max(1));
         }
@@ -190,7 +130,6 @@ impl I16Weights {
         }
     }
 
-    /// Zero-memory placeholder used by sharded loading.
     pub fn empty() -> Self {
         Self {
             data: Vec::new(),
@@ -200,23 +139,8 @@ impl I16Weights {
         }
     }
 
-    /// Convert from existing I8Weights (cast i8 -> i16, adjust scales).
-    ///
-    /// This does NOT improve precision - the i8 quantization loss is already baked in.
-    /// Use this to validate the I16 code path. For real quality improvement,
-    /// use `quantize_f32` with the original float weights.
-    ///
-    /// Scale adjustment: I8 matmul uses `(acc * scale) >> FRAC_BITS` where
-    /// scale = abs_max/127 in Q16. I16 matmul uses `(acc / 32767 * scale) >> FRAC_BITS`
-    /// where scale = abs_max in Q16. To preserve correctness for i8-range values
-    /// ([-127,127] not [-32767,32767]), we set scale = i8_scale * 32767 so that
-    /// the /32767 in the matmul cancels out, giving the same result as I8.
     pub fn from_i8(w: &I8Weights) -> Self {
         let data: Vec<i16> = w.data.iter().map(|&v| v as i16).collect();
-        // Adjust scales: i8 scale represents abs_max/127 * ONE,
-        // i16 matmul expects abs_max * ONE and divides by 32767 internally.
-        // For i8-range data: scale = i8_scale * 32767 so (val / 32767 * scale) = (val * i8_scale).
-        // But we also need >> FRAC_BITS to match, so scale = i8_scale * 32767.
         let scales: Vec<i64> = w.scales.iter().map(|&s| s * 32767).collect();
         Self {
             data,
@@ -226,31 +150,24 @@ impl I16Weights {
         }
     }
 
-    /// Memory usage in bytes.
     pub fn memory_bytes(&self) -> usize {
         self.data.len() * 2 + self.scales.len() * 8 + 16
     }
 }
 
-// ─── Layer and Model Structs ──────────────────────────────────────────────────
-
-/// Pre-loaded transformer layer weights in per-row INT8 with Q16 norms.
 pub struct CachedLayer {
-    pub wq: I8Weights,       // [d_model × d_model]
-    pub wk: I8Weights,       // [d_model × d_kv]
-    pub wv: I8Weights,       // [d_model × d_kv]
-    pub wo: I8Weights,       // [d_model × d_model]
-    pub w_gate: I8Weights,   // [d_ff × d_model]
-    pub w_up: I8Weights,     // [d_ff × d_model]
-    pub w_down: I8Weights,   // [d_model × d_ff]
-    pub attn_norm: Vec<i64>, // norms stay i64 (small: d_model each)
+    pub wq: I8Weights,
+    pub wk: I8Weights,
+    pub wv: I8Weights,
+    pub wo: I8Weights,
+    pub w_gate: I8Weights,
+    pub w_up: I8Weights,
+    pub w_down: I8Weights,
+    pub attn_norm: Vec<i64>,
     pub ffn_norm: Vec<i64>,
 }
 
 impl CachedLayer {
-    /// Zero-memory placeholder for layer slots NOT held by this shard.
-    /// The pipeline forward pass only iterates [shard_start, shard_end), so
-    /// these slots are never read. Total cost: ~144 bytes per skipped layer.
     pub fn placeholder() -> Self {
         Self {
             wq: I8Weights::empty(),
@@ -265,7 +182,6 @@ impl CachedLayer {
         }
     }
 
-    /// True if this slot was populated by the loader (vs a placeholder).
     pub fn is_loaded(&self) -> bool {
         let matrix_is_complete = |weights: &I8Weights| {
             weights.n_rows > 0
@@ -289,14 +205,8 @@ impl CachedLayer {
     }
 }
 
-/// KV cache - full i64 precision for deterministic attention.
-/// i8 quantization loses too much precision for attention dot products,
-/// causing the model to attend to wrong positions after a few tokens.
-/// Memory: 7B at 2048 context: ~4 GB. Fits on Mac Studio, tight on 8GB Vultr.
 pub struct KVCache {
-    /// k_data[layer]: flat i64 array, [pos * d_kv .. (pos+1) * d_kv]
     pub k_data: Vec<Vec<i64>>,
-    /// v_data[layer]: flat i64 array
     pub v_data: Vec<Vec<i64>>,
     pub seq_len: usize,
 }
@@ -327,9 +237,6 @@ impl KVCache {
     }
 }
 
-/// Quantize an i64 Q16 vector to i8 with per-vector scale.
-// Reference helper: no live caller today, kept alongside `quantize_for_dot`
-// so the two quantisation conventions stay side by side for comparison.
 #[allow(dead_code)]
 #[inline]
 fn quantize_vec_i8(v: &[i64]) -> (Vec<i8>, i64) {
@@ -342,7 +249,6 @@ fn quantize_vec_i8(v: &[i64]) -> (Vec<i8>, i64) {
     (data, scale_factor)
 }
 
-/// Model config extracted from GGUF metadata.
 #[derive(Clone)]
 pub struct ModelConfig {
     pub n_layers: usize,
@@ -357,35 +263,18 @@ pub struct ModelConfig {
     pub rope_cos: Vec<i64>,
     pub rope_sin: Vec<i64>,
     pub max_seq: usize,
-    /// EOS token IDs read from GGUF metadata. Defaults to LLaMA family tokens.
     pub eos_tokens: Vec<u32>,
-    /// BOS token ID read from GGUF metadata.
     pub bos_token: u32,
-    /// Chat template (Jinja2) from GGUF metadata. Used to wrap user prompts
-    /// in the correct format for the model (e.g., [INST]...[/INST] for LLaMA-2,
-    /// <|start_header_id|>user<|end_header_id|> for LLaMA-3, etc.).
-    /// Empty string means no template - use raw input.
     pub chat_template: String,
-    /// Arithmetic identity of the Q/K layout consumed by the fixed-point
-    /// forward path. This is deliberately part of loaded model state: the
-    /// legacy split-half cache layout and the GGUF-interleaved compatibility
-    /// layout produce different outputs from identical source bytes.
     pub arithmetic_profile: ArithmeticProfile,
 }
 
-/// Versioned Q/K/RoPE arithmetic layouts supported by this binary.
-///
-/// `LegacySplitHalfV0` is retained for existing ARC-INT8 cache files and
-/// protocol identities. `GgufInterleavedRowsV1` permutes the Q and K output
-/// rows at load time, so the existing split-half hot path is mathematically
-/// equivalent to GGUF/Candle's adjacent-pair RoPE convention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArithmeticProfile {
     LegacySplitHalfV0,
     GgufInterleavedRowsV1,
 }
 
-/// Pre-converted Q4 layer weights (optional, converted at runtime).
 pub struct Q4Layer {
     pub wq: Q4WeightsX86,
     pub wk: Q4WeightsX86,
@@ -396,7 +285,6 @@ pub struct Q4Layer {
     pub w_down: Q4WeightsX86,
 }
 
-/// Pre-loaded transformer layer weights in per-row INT16.
 pub struct I16Layer {
     pub wq: I16Weights,
     pub wk: I16Weights,
@@ -407,11 +295,6 @@ pub struct I16Layer {
     pub w_down: I16Weights,
 }
 
-/// Pre-loaded transformer layer in ternary (2 bits/weight).
-///
-/// Matmuls route through `matmul_ternary` - zero multiplications, pure
-/// ADD + XOR on the accumulator. See `ternary_engine.rs` for the math and
-/// `sha256_isa.rs` for the SHA-256 datapath proof.
 pub struct TernaryLayer {
     pub wq: crate::ternary_engine::TernaryWeights,
     pub wk: crate::ternary_engine::TernaryWeights,
@@ -422,10 +305,6 @@ pub struct TernaryLayer {
     pub w_down: crate::ternary_engine::TernaryWeights,
 }
 
-/// Hybrid ternary + INT8 outliers. Ternary bulk runs on ASIC primitives;
-/// the small outlier fraction (1–5%) runs on the controller via regular
-/// INT8 multiply-accumulate. Preserves PTQ quality on models not trained
-/// ternary-aware. See `ternary_hybrid.rs`.
 pub struct TernaryHybridLayer {
     pub wq: crate::ternary_hybrid::TernaryHybridWeights,
     pub wk: crate::ternary_hybrid::TernaryHybridWeights,
@@ -436,10 +315,6 @@ pub struct TernaryHybridLayer {
     pub w_down: crate::ternary_hybrid::TernaryHybridWeights,
 }
 
-/// Pre-loaded transformer layer in block-wise INT8 (Q8_0-style) format.
-/// 32-weight blocks with i32 Q16 scales. Preferred storage going forward -
-/// bridges the old per-row I8 quality gap without sacrificing integer
-/// determinism.
 pub struct BlockI8Layer {
     pub wq: crate::block_i8::BlockI8Weights,
     pub wk: crate::block_i8::BlockI8Weights,
@@ -450,53 +325,30 @@ pub struct BlockI8Layer {
     pub w_down: crate::block_i8::BlockI8Weights,
 }
 
-/// Fully cached integer model with per-row INT8 weights.
 pub struct CachedIntegerModel {
     pub config: ModelConfig,
-    /// Embeddings stored at full Q16 precision (not INT8).
-    /// Embedding values can be extremely small (1e-6) and INT8 destroys them.
-    /// This is just a lookup table, not a matmul - no performance impact.
-    pub embedding_q16: Vec<i64>, // [vocab × d_model] in Q16
-    pub embedding_i8: I8Weights, // kept for weight_hash and save_weights
+    pub embedding_q16: Vec<i64>,
+    pub embedding_i8: I8Weights,
     pub layers: Vec<CachedLayer>,
     pub final_norm: Vec<i64>,
-    pub output_weight: I8Weights, // [vocab × d_model]
+    pub output_weight: I8Weights,
     pub vocab: Vec<String>,
-    /// Q4 weights - converted from I8 on enable_q4(). Halves bandwidth.
     pub q4_layers: Option<Vec<Q4Layer>>,
     pub q4_output: Option<Q4WeightsX86>,
-    /// I16 weights - converted from I8 on enable_i16(). Finer quantization.
     pub i16_layers: Option<Vec<I16Layer>>,
     pub i16_output: Option<I16Weights>,
-    /// Block-wise INT8 (32-weight blocks with i32 Q16 scales). When present,
-    /// this path takes priority in forward dispatch: higher quality than
-    /// per-row I8, full integer determinism, ~12% memory overhead vs I8.
     pub block_i8_layers: Option<Vec<BlockI8Layer>>,
     pub block_i8_output: Option<crate::block_i8::BlockI8Weights>,
-    /// Ternary weights - converted from I8 on enable_ternary().
-    /// 2 bits/weight, ASIC-compatible matmul (ADD + XOR only, zero multiplications).
-    /// See `ternary_engine.rs`.
     pub ternary_layers: Option<Vec<TernaryLayer>>,
     pub ternary_output: Option<crate::ternary_engine::TernaryWeights>,
-    /// Hybrid ternary + sparse INT8 outliers - enabled via enable_ternary_hybrid().
-    /// Takes dispatch priority over pure ternary when both are populated.
     pub ternary_hybrid_layers: Option<Vec<TernaryHybridLayer>>,
     pub ternary_hybrid_output: Option<crate::ternary_hybrid::TernaryHybridWeights>,
 }
 
-/// Exact execution profile required for reward-bearing whole-model community
-/// work. The validator shard fleet and the worker must execute the same
-/// quantization path, not merely start from the same GGUF bytes.
 pub const CANONICAL_REWARD_INFERENCE_PROFILE: &str =
     arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE;
-/// A new, incompatible execution identity for GGUF Q/K row canonicalization.
-/// It must never be substituted for the legacy canonical profile or stored in
-/// an unversioned `ARC-INT8` cache file.
 pub const GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE: &str =
     arc_types::transaction::GGUF_LLAMA_I8_INTERLEAVED_ROPE_PROFILE_V1;
-/// Diagnostic-only sampling identity used for same-GGUF source comparisons.
-/// Unlike protocol v2, this selects raw greedy argmax at every step and never
-/// applies ARC's generated-token repetition penalty.
 pub const GGUF_LLAMA_GREEDY_GENERATION_SEMANTICS_V1: &str =
     arc_types::transaction::GGUF_LLAMA_GREEDY_GENERATION_SEMANTICS_V1;
 pub const I16_INFERENCE_PROFILE: &str = "INT16 integer (per-row, cross-platform deterministic)";
@@ -506,10 +358,6 @@ pub const Q4_INFERENCE_PROFILE: &str = "Q4 integer (cross-platform deterministic
 pub const TERNARY_INFERENCE_PROFILE: &str = "ternary (1.58-bit, ASIC-compatible)";
 pub const TERNARY_HYBRID_INFERENCE_PROFILE: &str = "ternary-hybrid (per-row sparse-INT8 outliers)";
 
-/// True only for a protocol-v3 execution profile whose dispatch semantics are
-/// defined by this binary. Shard announcements use these exact identifiers as
-/// signed protocol identity, rather than treating a display-only model name as
-/// sufficient evidence that two replicas will execute the same arithmetic.
 pub fn is_supported_inference_profile(profile: &str) -> bool {
     matches!(
         profile,
@@ -523,19 +371,8 @@ pub fn is_supported_inference_profile(profile: &str) -> bool {
     )
 }
 
-/// Every whole-model generation performs one internal BOS forward before it
-/// consumes the caller's prompt and generation budget.
 pub const GENERATION_INTERNAL_BOS_POSITIONS: usize = 1;
 
-/// A successful, immutable context-window admission decision.
-///
-/// `required_positions` is the exact maximum number of calls to
-/// [`CachedIntegerModel::forward_one_token`] the request can make:
-///
-/// `1 internal BOS + prompt_tokens + max_tokens`.
-///
-/// Generation may stop earlier on EOS, but callers must reserve the full
-/// advertised `max_tokens` budget before any model compute begins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "a successful preflight must gate untrusted generation"]
 pub struct GenerationPreflight {
@@ -545,16 +382,12 @@ pub struct GenerationPreflight {
     pub max_seq: usize,
 }
 
-/// Why a whole-model generation request was rejected before compute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerationError {
-    /// The position-count formula overflowed the platform's `usize`.
     PositionCountOverflow {
         prompt_tokens: usize,
         max_tokens: u32,
     },
-    /// The complete advertised generation budget does not fit in the model's
-    /// precomputed RoPE/context window.
     ContextWindowExceeded {
         prompt_tokens: usize,
         max_tokens: u32,
@@ -564,7 +397,6 @@ pub enum GenerationError {
 }
 
 impl GenerationError {
-    /// Stable machine-readable tag for RPC error mapping.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::PositionCountOverflow { .. } => "position_count_overflow",
@@ -601,13 +433,9 @@ impl std::fmt::Display for GenerationError {
 
 impl std::error::Error for GenerationError {}
 
-/// Why a generation whose projections come from a backend stopped.
 #[derive(Debug, PartialEq, Eq)]
 pub enum BackendGenerationError {
-    /// Refused before any compute, exactly as
-    /// [`CachedIntegerModel::try_generate_v2`] refuses.
     Generation(GenerationError),
-    /// The backend could not supply exact rows for a projection.
     Projection(crate::tensor_parallel::TensorParallelError),
 }
 
@@ -634,9 +462,6 @@ impl From<crate::tensor_parallel::TensorParallelError> for BackendGenerationErro
     }
 }
 
-/// The call id of the forward at `position` of one backend generation: it
-/// binds the request and the position, so a worker's answer for one position
-/// is never accepted for another.
 fn backend_call_id(request: &Hash256, position: usize) -> Hash256 {
     let mut hasher = blake3::Hasher::new_derive_key("ARC-backend-generation-call-v1");
     hasher.update(&request.0);
@@ -645,8 +470,6 @@ fn backend_call_id(request: &Hash256, position: usize) -> Hash256 {
 }
 
 impl CachedIntegerModel {
-    /// Exact Q/K/RoPE arithmetic identity for this resident model. This does
-    /// not by itself identify the dispatched weight precision.
     pub fn arithmetic_profile(&self) -> &'static str {
         match self.config.arithmetic_profile {
             ArithmeticProfile::LegacySplitHalfV0 => CANONICAL_REWARD_INFERENCE_PROFILE,
@@ -654,25 +477,11 @@ impl CachedIntegerModel {
         }
     }
 
-    /// The complete identity eligible for canonical I8 execution claims.
-    /// Optional I16, block-I8, Q4, or experimental copies deliberately yield
-    /// `None`: they must never be represented by either canonical I8 profile.
     pub fn canonical_execution_profile(&self) -> Option<&'static str> {
         self.has_canonical_i8_profile()
             .then(|| self.arithmetic_profile())
     }
 
-    /// Convert the resident I8 Q/K projections from GGUF's adjacent-pair
-    /// feature order to the legacy split-half feature order. Applying the
-    /// existing split-half RoPE afterwards is then exactly the permuted
-    /// representation of interleaved RoPE, and Q·K attention scores are
-    /// unchanged by the shared permutation.
-    ///
-    /// This only supports the canonical per-row I8 path. Optional precision
-    /// copies would need the same row permutation, so callers must load via
-    /// `load_cached_model_canonical_i8_interleaved_rope` rather than mutate a
-    /// general-purpose model after optional profiles are materialized; this
-    /// method refuses any model that still carries one.
     pub fn canonicalize_gguf_interleaved_rope_rows(&mut self) -> Result<(), crate::InferenceError> {
         if self.config.arithmetic_profile != ArithmeticProfile::LegacySplitHalfV0 {
             return Err(crate::InferenceError::Runtime(
@@ -707,9 +516,6 @@ impl CachedIntegerModel {
         Ok(())
     }
 
-    /// Historical Llama-2 system-message adapter retained for callers that
-    /// explicitly commit this text. It is not used by the reference-qualified
-    /// minimal diagnostic prompt path and must not be inferred from a GGUF.
     pub const LLAMA2_CHAT_SYSTEM_PROMPT: &'static str = "You are a helpful, respectful and honest assistant. Always answer as helpfully as possible, while being safe. Your answers should not contain harmful, unethical, racist, sexist, toxic, dangerous, or illegal content. Please ensure your responses are socially unbiased and positive in nature. If a question does not make any sense, or is not factually coherent, explain why instead of answering something not correct. If you don't know the answer to a question, please don't share false information.";
 
     pub fn apply_llama2_chat_template(user_input: &str) -> String {
@@ -720,11 +526,6 @@ impl CachedIntegerModel {
         )
     }
 
-    /// Validate a whole-model generation request before any model compute.
-    ///
-    /// This is the central admission check for untrusted prompts. The exact
-    /// boundary is accepted; a request requiring even one additional forward
-    /// is rejected before it can index past the precomputed RoPE tables.
     pub fn preflight_generation(
         &self,
         prompt_tokens: usize,
@@ -733,19 +534,12 @@ impl CachedIntegerModel {
         preflight_generation_config(&self.config, prompt_tokens, max_tokens)
     }
 
-    /// True only when every configured transformer layer has real weights.
-    ///
-    /// Tokenizer-only and range-sharded loaders intentionally leave
-    /// placeholder layers in this vector. They are valid relay/coordinator
-    /// models, but must never advertise or execute the full-worker loop.
     pub fn has_all_transformer_layers(&self) -> bool {
         self.config.n_layers > 0
             && self.layers.len() == self.config.n_layers
             && self.layers.iter().all(CachedLayer::is_loaded)
     }
 
-    /// Convert all weights to Q4 (4-bit). Halves memory bandwidth.
-    /// Call once after loading model. Original I8 weights kept for fallback.
     pub fn enable_q4(&mut self) {
         let q4_layers: Vec<Q4Layer> = self
             .layers
@@ -764,16 +558,6 @@ impl CachedIntegerModel {
         self.q4_layers = Some(q4_layers);
     }
 
-    /// Convert all weights to hybrid ternary + INT8 outliers.
-    /// `outlier_pct` = fraction of weights (by magnitude) kept as INT8 per row.
-    /// Typical values: 1.0-5.0 (lower = more ASIC-native, higher = more quality).
-    ///
-    /// The ternary bulk runs on ASIC primitives; outliers run on the controller.
-    /// This is the PTQ quality path - works on any model without retraining.
-    ///
-    /// Gated behind the `experimental-ip` feature - the actual ternary
-    /// implementation lives in a private branch until patents are filed
-    /// (see lib.rs ternary_engine/ternary_hybrid stub modules for context).
     #[cfg(feature = "experimental-ip")]
     pub fn enable_ternary_hybrid(&mut self, outlier_pct: f32) {
         use crate::ternary_hybrid::TernaryHybridWeights;
@@ -800,14 +584,6 @@ impl CachedIntegerModel {
         self.ternary_hybrid_layers = Some(hybrid_layers);
     }
 
-    /// Convert all weights from I8 to ternary (2 bits/weight).
-    /// Call once after loading model. Original I8 weights kept for fallback.
-    ///
-    /// Ternary matmul runs on SHA-256 ASIC primitives (ADD + XOR, no multiplication),
-    /// enabling inference on Bitcoin mining hardware via the ARC distributed network.
-    ///
-    /// Gated behind `experimental-ip` for the same reason as
-    /// `enable_ternary_hybrid` - real implementation isn't in the public repo.
     #[cfg(feature = "experimental-ip")]
     pub fn enable_ternary(&mut self) {
         use crate::ternary_engine::TernaryWeights;
@@ -831,11 +607,6 @@ impl CachedIntegerModel {
         self.ternary_layers = Some(ternary_layers);
     }
 
-    /// Report the precision label the forward dispatch will actually use.
-    /// Matches the priority chain in `dispatch_matmul` (layers) and the LM
-    /// head dispatch in `forward_one_token`. Returns the highest-quality
-    /// path that is populated. Used by RPC so the engine name in the
-    /// response shows what's running, not a hardcoded string.
     pub fn effective_precision_label(&self) -> &'static str {
         if self.ternary_hybrid_layers.is_some() {
             TERNARY_HYBRID_INFERENCE_PROFILE
@@ -848,9 +619,6 @@ impl CachedIntegerModel {
         } else if self.q4_layers.is_some() {
             Q4_INFERENCE_PROFILE
         } else {
-            // Per-row INT8 runs whichever Q/K layout is resident. A model
-            // converted to the GGUF interleaved-RoPE rows must not be
-            // announced or labelled as the legacy split-half profile.
             self.arithmetic_profile()
         }
     }
@@ -868,18 +636,6 @@ impl CachedIntegerModel {
             && self.ternary_hybrid_output.is_none()
     }
 
-    /// Pin this model to the protocol's canonical per-row INT8 execution
-    /// profile.
-    ///
-    /// A GGUF artifact hash commits the source weights, but it does not by
-    /// itself commit which of the optional in-memory quantizations executes.
-    /// The full loader normally retains I16 and block-I8 variants while the
-    /// multi-range validator loader deliberately drops them after merging.
-    /// A community worker using the former and validator shards using the
-    /// latter can therefore hold identical model bytes yet produce different
-    /// token hashes. Reward-bearing whole-model workers call this immediately
-    /// after loading so their output is exactly what the distributed validator
-    /// verifier recomputes.
     pub fn enforce_canonical_i8_profile(&mut self) {
         self.q4_layers = None;
         self.q4_output = None;
@@ -894,15 +650,7 @@ impl CachedIntegerModel {
         debug_assert!(self.has_canonical_i8_profile());
     }
 
-    /// Convert all weights from I8 to I16 format.
-    /// Call once after loading model. Original I8 weights kept for fallback.
-    ///
-    /// Note: `from_i8` preserves I8-level precision (validates code path).
-    /// For real quality improvement, the model loader should call
-    /// `I16Weights::quantize_f32` from original floats instead.
     pub fn enable_i16(&mut self) {
-        // Preserve f32-quantized I16 weights installed by load_cached_model.
-        // from_i8 promotion would silently replace them with coarser I8-level precision.
         if self.i16_layers.is_some() {
             return;
         }
@@ -924,16 +672,12 @@ impl CachedIntegerModel {
     }
 }
 
-// ─── Cached Input Quantization ────────────────────────────────────────────────
-
-/// Pre-quantized i8 input - computed once, reused for multiple matmuls.
 pub struct QuantizedInput {
     pub data: Vec<i8>,
     pub scale_factor: i64,
 }
 
 impl QuantizedInput {
-    /// Quantize i64 Q16 input to i8. Call once, pass to multiple matmuls.
     #[inline]
     pub fn from_i64(input: &[i64]) -> Self {
         let abs_max = input.iter().map(|x| x.abs()).max().unwrap_or(1).max(1);
@@ -946,14 +690,8 @@ impl QuantizedInput {
     }
 }
 
-// ─── INT8 Matmul (Per-Row Scale, Optimized) ───────────────────────────────────
-
-/// Core i8×i64 dot product. Unsafe, 8-element unroll, 4 independent accumulators.
 #[inline(always)]
 unsafe fn dot_i8_i64(row: *const i8, input: *const i64, len: usize) -> i64 {
-    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
-    // The contract is unchanged: the caller guarantees the pointers are valid
-    // for `len` reads. Wrapping is purely lexical - no semantics change.
     unsafe {
         let mut acc0: i64 = 0;
         let mut acc1: i64 = 0;
@@ -981,8 +719,6 @@ unsafe fn dot_i8_i64(row: *const i8, input: *const i64, len: usize) -> i64 {
     }
 }
 
-/// Write matmul result into pre-allocated output buffer (zero-alloc).
-/// Parallel with 512-row chunks to minimize rayon scheduling overhead.
 pub(crate) fn matmul_i8_into(
     weights: &I8Weights,
     input: &[i64],
@@ -998,11 +734,6 @@ fn matmul_i8_view_into(
     in_size: usize,
     output: &mut [i64],
 ) {
-    // Empty-weight guard. Shard-mode models pre-allocate every layer as an
-    // empty placeholder and only populate the range this node holds. Any
-    // code path that iterates over a non-held layer hits an empty weight
-    // struct; without this guard the SIMD dot product dereferences a
-    // dangling non-null pointer and segfaults in the consensus thread.
     if weights.n_rows == 0 || weights.data.is_empty() {
         for o in output.iter_mut() {
             *o = 0;
@@ -1014,11 +745,6 @@ fn matmul_i8_view_into(
         weights.scales.len(),
         "matmul output/scales mismatch"
     );
-    // Bit-exact vectorised path: on by default where the CPU has it (AVX2 on
-    // x86-64, NEON dotprod on arm64), and forced either way by the
-    // `ARC_CANONICAL_KERNEL` override. The fast path refuses any input it
-    // cannot prove exact and returns false, leaving the scalar kernel below to
-    // run. See `crate::canonical_simd`.
     if crate::canonical_simd::fast_canonical_kernel_enabled()
         && crate::canonical_simd::matmul_i8_canonical_rows_fast_view(
             weights, input, in_size, output,
@@ -1028,10 +754,6 @@ fn matmul_i8_view_into(
     }
     let data = weights.data;
     let scales = weights.scales;
-    // Chunk width 256, matching matmul_i16_into. At 512 a 4096-row output
-    // yields only 8 rayon tasks, so the I8 path saturated at 8 cores no
-    // matter how wide the pool was — which made "add two cores" a no-op on
-    // any node that hadn't been promoted to I16. 256 gives 16 tasks.
     output
         .par_chunks_mut(256)
         .enumerate()
@@ -1046,18 +768,8 @@ fn matmul_i8_view_into(
         });
 }
 
-/// Four tokens against one weight row, sharing every weight load.
-///
-/// Scalar counterpart of the vectorised batched kernel. `row[j]` is loaded once
-/// and multiplied into four independent accumulators, so a batch of tokens
-/// reads the weights once instead of once per token. Each result is identical
-/// to `dot_i8_i64` for that token.
-///
-/// # Safety
-/// `row` valid for `len` reads; each `inputs[q]` valid for `len` reads.
 #[inline]
 unsafe fn dot_i8_i64_x4(row: *const i8, inputs: &[*const i64; 4], len: usize) -> [i64; 4] {
-    // SAFETY: wrapped for `unsafe_op_in_unsafe_fn`; caller guarantees the reads.
     unsafe {
         let mut acc = [0i64; 4];
         for j in 0..len {
@@ -1070,32 +782,6 @@ unsafe fn dot_i8_i64_x4(row: *const i8, inputs: &[*const i64; 4], len: usize) ->
     }
 }
 
-/// Batched per-row I8 projection: `n_tokens` activations against one matrix.
-///
-/// Token-major in (`n_tokens * in_size`) and out (`n_tokens * n_rows`). Every
-/// output is `(dot(row_i, x_t) * scale_i) >> FRAC_BITS`, exactly what
-/// [`matmul_i8_into`] computes one token at a time. Batching changes only how
-/// often the weights are read, never a value; there is no cross-token
-/// reduction and no batch-dependent quantisation in this profile.
-///
-/// When the opt-in vectorised kernel is enabled it is tried first and this
-/// falls back to the scalar path on refusal, exactly as the unbatched entry
-/// point does.
-/// Overflow-checked geometry validation for a batched projection.
-///
-/// Every bound the raw-pointer arithmetic below relies on is established HERE,
-/// before either implementation runs and before any output is written.
-///
-/// This exists because `debug_assert_eq!` was not enough and was actively
-/// misleading: it compiles out in release, which is exactly where the
-/// raw-pointer writes live. A public caller passing 1x1 weights, a one-element
-/// input and an EMPTY output slice would, in a release build, have written
-/// through the empty slice's pointer. Enabling the vectorised kernel did not
-/// help either — it refuses on shape and falls through to the same unsafe
-/// scalar path, so a SIMD refusal must never hand an unvalidated shape onward.
-///
-/// Multiplications are `checked_mul`, so a `n_tokens * in_size` that overflows
-/// `usize` is rejected rather than wrapping to a small, apparently valid length.
 fn batched_shape_is_valid(
     weights: &I8Weights,
     inputs: &[i64],
@@ -1120,12 +806,6 @@ fn batched_shape_is_valid(
         && output.len() == out_len
 }
 
-/// Batched per-row I8 projection.
-///
-/// `pub(crate)`: the only callers are the prefill in this module. It was
-/// briefly `pub`, which exposed the unsafe geometry contract below to arbitrary
-/// safe callers. Visibility alone would not be a fix — the invariant has to hold
-/// for internal callers too — so the validation above runs regardless.
 pub(crate) fn matmul_i8_into_batched(
     weights: &I8Weights,
     inputs: &[i64],
@@ -1139,9 +819,6 @@ pub(crate) fn matmul_i8_into_batched(
         }
         return;
     }
-    // Panics in release as well as debug. An invalid geometry here is a caller
-    // bug that would otherwise become memory unsafety, so failing loudly is the
-    // conservative outcome, not a regression.
     assert!(
         batched_shape_is_valid(weights, inputs, n_tokens, in_size, output),
         "matmul_i8_into_batched: invalid geometry - n_tokens={n_tokens} in_size={in_size} \
@@ -1161,11 +838,6 @@ pub(crate) fn matmul_i8_into_batched(
     let data = &weights.data;
     let scales = &weights.scales;
     let n_rows = weights.n_rows;
-    // The scalar kernel is compute-bound per row, so a four-token tile costs
-    // four rows of work whatever it holds: bench run 38056837714 measured it
-    // at 3.6x to 3.9x the one-row pass. One to three tokens therefore run the
-    // one-row path itself, token by token, exactly as `forward_one_token`
-    // runs it; the values are the same either way.
     if n_tokens < 4 {
         for (input, out) in inputs
             .chunks_exact(in_size)
@@ -1175,11 +847,6 @@ pub(crate) fn matmul_i8_into_batched(
         }
         return;
     }
-    // Same L1-resident row block and 4-token tile as the vectorised path, so
-    // the scalar batched baseline is a fair comparison rather than a straw man.
-    // One to three tokens left after the whole tiles run the one-row dot
-    // (`dot_i8_i64`, as `matmul_i8_into` does) per token, which computes no
-    // discarded lanes.
     let row_block = (131_072 / in_size.max(1)).clamp(1, n_rows);
     let n_blocks = n_rows.div_ceil(row_block);
     let out = BatchOutPtr(output.as_mut_ptr());
@@ -1193,10 +860,6 @@ pub(crate) fn matmul_i8_into_batched(
                 for (offset, &sc) in scales[r0..r1].iter().enumerate() {
                     let i = r0 + offset;
                     for q in 0..quad {
-                        // SAFETY: `i < n_rows` and `data` holds n_rows*in_size;
-                        // `t + q < n_tokens` and `inputs` holds
-                        // n_tokens*in_size. Each task owns a disjoint row
-                        // range, so writes never alias.
                         let acc = unsafe {
                             dot_i8_i64(
                                 data.as_ptr().add(i * in_size),
@@ -1212,15 +875,11 @@ pub(crate) fn matmul_i8_into_batched(
             }
             let src = |q: usize| {
                 let tok = t + q.min(quad - 1);
-                // SAFETY: `tok < n_tokens` and `inputs` holds n_tokens*in_size.
                 unsafe { inputs.as_ptr().add(tok * in_size) }
             };
             let ins = [src(0), src(1), src(2), src(3)];
             for (offset, &sc) in scales[r0..r1].iter().enumerate() {
                 let i = r0 + offset;
-                // SAFETY: `i < n_rows`, `data` holds n_rows*in_size. Each task
-                // owns a disjoint row range and writes only
-                // `out[(t+q) * n_rows + i]`, so writes never alias.
                 let acc = unsafe { dot_i8_i64_x4(data.as_ptr().add(i * in_size), &ins, in_size) };
                 for (q, a) in acc.iter().enumerate().take(quad) {
                     unsafe { *out.get().add((t + q) * n_rows + i) = (*a * sc) >> FRAC_BITS };
@@ -1231,12 +890,8 @@ pub(crate) fn matmul_i8_into_batched(
     });
 }
 
-/// Elements per task of the batched layer's SiLU products: large enough to
-/// amortize a task, small enough that one 11,008-wide row spans every thread.
 const SILU_CHUNK: usize = 2048;
 
-/// Disjoint-range output pointer for the batched matmul. See the identical
-/// wrapper in `canonical_simd` for why a field accessor is used.
 #[derive(Clone, Copy)]
 struct BatchOutPtr(*mut i64);
 unsafe impl Send for BatchOutPtr {}
@@ -1248,11 +903,6 @@ impl BatchOutPtr {
     }
 }
 
-/// Canonical per-row I8 projection for a worker-owned row shard.
-///
-/// This intentionally reaches the same raw I8×i64 dot product and Q16
-/// per-row scale operation as `matmul_fast_preq`; no synthetic matrix or
-/// altered accumulation order is introduced for tensor-parallel workers.
 pub fn matmul_i8_canonical_rows(
     weights: &I8Weights,
     input: &[i64],
@@ -1261,8 +911,6 @@ pub fn matmul_i8_canonical_rows(
     matmul_i8_canonical_row_range(weights, 0, weights.n_rows, input, output)
 }
 
-/// Canonical I8 projection over borrowed rows `[start, end)` of a resident
-/// matrix. This has the same checked dispatch as the copied-shard entry point.
 pub fn matmul_i8_canonical_row_range(
     weights: &I8Weights,
     start: usize,
@@ -1293,11 +941,6 @@ pub fn matmul_i8_canonical_row_range(
             weights.n_cols
         ));
     }
-    // `matmul_i8_into` is the established hot kernel and deliberately uses
-    // native integer arithmetic.  Before exposing it to a framed sidecar
-    // request, prove the untrusted activation cannot overflow either its dot
-    // accumulation or the exact post-dot Q16 scale multiply.  Valid model
-    // activations take the unchanged production kernel below.
     let input_abs_sum = input
         .iter()
         .try_fold(0i64, |sum, value| {
@@ -1331,7 +974,6 @@ pub fn matmul_i8_canonical_row_range(
     Ok(())
 }
 
-/// Allocating matmul (for compatibility and small outputs).
 fn matmul_i8(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
     let mut output = vec![0i64; out_size];
     if weights.n_rows == 0 || weights.data.is_empty() {
@@ -1351,18 +993,9 @@ fn matmul_i8(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize
     output
 }
 
-// ─── INT16 Matmul (Feature-Gated) ────────────────────────────────────────────
-
-/// Core i16×i64 dot product with 8-element unroll. Scalar fallback.
-// Live on x86_64 (via dot_i16_i64_avx2) and on targets with no SIMD path, and
-// used directly by the unit tests as the bit-exact reference. On aarch64 the
-// NEON path takes over, so the lib-only build sees it as unused.
 #[allow(dead_code)]
 #[inline(always)]
 unsafe fn dot_i16_i64_scalar(row: *const i16, input: *const i64, len: usize) -> i64 {
-    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
-    // The contract is unchanged: the caller guarantees the pointers are valid
-    // for `len` reads. Wrapping is purely lexical - no semantics change.
     unsafe {
         let mut acc0: i64 = 0;
         let mut acc1: i64 = 0;
@@ -1390,66 +1023,41 @@ unsafe fn dot_i16_i64_scalar(row: *const i16, input: *const i64, len: usize) -> 
     }
 }
 
-/// NEON SIMD i16×i32 dot product. Mac M2 / aarch64.
-///
-/// Truncates input from i64 → i32. The hidden state values produced by
-/// layernorm are bounded by the Q16 fixed-point range and easily fit in
-/// i32 (max ~2^30 absolute). Multiplies i16 weight × i32 input → i64
-/// accumulator. Vectorizes 8 lanes per iteration via vmull_high_s32.
-///
-/// Empirical speedup vs scalar dot_i16_i64 on M2 Ultra: ~3.5x for
-/// 4096-wide rows. Bit-identical to scalar provided inputs fit in i32.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn dot_i16_i64_neon(row: *const i16, input: *const i64, len: usize) -> i64 {
-    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
-    // The contract is unchanged: the caller guarantees the pointers are valid
-    // for `len` reads. Wrapping is purely lexical - no semantics change.
     unsafe {
         use std::arch::aarch64::*;
-        // acc0/acc1 are bound below from the horizontal sum of the vector
-        // accumulators; acc2/acc3 exist to keep the horizontal-sum expression
-        // symmetric with the scalar path and stay zero here.
         let acc2: i64 = 0;
         let acc3: i64 = 0;
         let simd_len = len / 8 * 8;
         let mut j = 0usize;
-        // Vector accumulators for 8 i64 partial sums
         let mut va0 = vdupq_n_s64(0);
         let mut va1 = vdupq_n_s64(0);
         let mut va2 = vdupq_n_s64(0);
         let mut va3 = vdupq_n_s64(0);
         while j < simd_len {
-            // Load 8 weights as i16
             let w16 = vld1q_s16(row.add(j));
-            // Widen the bottom 4 i16 to i32
             let w32_lo = vmovl_s16(vget_low_s16(w16));
-            // Widen the top 4 i16 to i32
             let w32_hi = vmovl_s16(vget_high_s16(w16));
-            // Load 8 i64 inputs and narrow to i32 (truncate)
-            let i64_0 = vld1q_s64(input.add(j)); // input[j..j+2]
-            let i64_1 = vld1q_s64(input.add(j + 2)); // input[j+2..j+4]
-            let i64_2 = vld1q_s64(input.add(j + 4)); // input[j+4..j+6]
-            let i64_3 = vld1q_s64(input.add(j + 6)); // input[j+6..j+8]
-            // Pack 4×i64 into 4×i32 (truncating)
+            let i64_0 = vld1q_s64(input.add(j));
+            let i64_1 = vld1q_s64(input.add(j + 2));
+            let i64_2 = vld1q_s64(input.add(j + 4));
+            let i64_3 = vld1q_s64(input.add(j + 6));
             let i32_lo = vcombine_s32(vmovn_s64(i64_0), vmovn_s64(i64_1));
             let i32_hi = vcombine_s32(vmovn_s64(i64_2), vmovn_s64(i64_3));
-            // Multiply low half: i32 × i32 → i64 widening
             va0 = vmlal_s32(va0, vget_low_s32(w32_lo), vget_low_s32(i32_lo));
             va1 = vmlal_high_s32(va1, w32_lo, i32_lo);
-            // Multiply high half
             va2 = vmlal_s32(va2, vget_low_s32(w32_hi), vget_low_s32(i32_hi));
             va3 = vmlal_high_s32(va3, w32_hi, i32_hi);
             j += 8;
         }
-        // Horizontal sum the four i64x2 accumulators
         let s01 = vaddq_s64(va0, va1);
         let s23 = vaddq_s64(va2, va3);
         let s = vaddq_s64(s01, s23);
         let acc0 = vgetq_lane_s64(s, 0);
         let acc1 = vgetq_lane_s64(s, 1);
         let mut acc = acc0 + acc1 + acc2 + acc3;
-        // Tail
         while j < len {
             acc += (*row.add(j) as i64) * (*input.add(j));
             j += 1;
@@ -1458,26 +1066,14 @@ unsafe fn dot_i16_i64_neon(row: *const i16, input: *const i64, len: usize) -> i6
     }
 }
 
-/// x86_64 i16×i64 dot product. Falls through to the scalar 8-element
-/// unrolled path which LLVM autovectorizes adequately for the 2-3 layer
-/// shards on NYC/LAX. An explicit AVX-512 widening path was attempted
-/// (commit 8274796) but caused segfaults during consensus on Vultr
-/// Skylake Xeon VPS - reverted to scalar pending investigation.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn dot_i16_i64_avx2(row: *const i16, input: *const i64, len: usize) -> i64 {
-    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
-    // The contract is unchanged: the caller guarantees the pointers are valid
-    // for `len` reads. Wrapping is purely lexical - no semantics change.
     unsafe { dot_i16_i64_scalar(row, input, len) }
 }
 
-/// Dispatch wrapper - picks NEON on aarch64, AVX2 on x86_64, scalar elsewhere.
 #[inline(always)]
 unsafe fn dot_i16_i64(row: *const i16, input: *const i64, len: usize) -> i64 {
-    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
-    // The contract is unchanged: the caller guarantees the pointers are valid
-    // for `len` reads. Wrapping is purely lexical - no semantics change.
     unsafe {
         #[cfg(target_arch = "aarch64")]
         {
@@ -1494,31 +1090,13 @@ unsafe fn dot_i16_i64(row: *const i16, input: *const i64, len: usize) -> i64 {
     }
 }
 
-// ─── NEON attention Q·K / attention·V SIMD ────────────────────────────────────
-
-/// NEON dot product of two i64 arrays. Used by the attention inner loop
-/// for Q · K_cache scoring. The lanes multiply the low 32 bits of each
-/// element pairwise into i64 accumulators via vmlal_s32, 4 lanes per
-/// iteration. That equals the exact product only while every element fits
-/// in i32, so a wider element takes [`dot_i64xi64_exact`], the loop every
-/// other target runs. Without that check ARM and x86 disagree once a Q or K
-/// value passes ±32768.0 (integer profile contract v1, deviation D1).
-///
-/// Speedup vs scalar i64×i64 dot: ~2.5× on M2 Ultra for d_head=128.
-/// Called 32 heads × seq_len times per layer, so even marginal
-/// attention improvements compound as generated sequences grow.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn dot_i64xi64_attn_neon(a: *const i64, b: *const i64, len: usize) -> i64 {
-    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
-    // The contract is unchanged: the caller guarantees the pointers are valid
-    // for `len` reads. Wrapping is purely lexical - no semantics change.
     unsafe {
         use std::arch::aarch64::*;
         let a_values = std::slice::from_raw_parts(a, len);
         let b_values = std::slice::from_raw_parts(b, len);
-        // Branch-free, so it vectorises: x fits in i32 exactly when
-        // (x + 2^31) as u64 is below 2^32, i.e. its top 32 bits are zero.
         let outside_i32 = a_values.iter().chain(b_values).fold(0u64, |acc, &x| {
             acc | ((x.wrapping_add(1 << 31) as u64) >> 32)
         });
@@ -1529,15 +1107,12 @@ unsafe fn dot_i64xi64_attn_neon(a: *const i64, b: *const i64, len: usize) -> i64
         let simd_len = len / 4 * 4;
         let mut j = 0usize;
         while j < simd_len {
-            // Load 4 i64 from each operand
-            let a0 = vld1q_s64(a.add(j)); // a[j..j+2]
-            let a1 = vld1q_s64(a.add(j + 2)); // a[j+2..j+4]
+            let a0 = vld1q_s64(a.add(j));
+            let a1 = vld1q_s64(a.add(j + 2));
             let b0 = vld1q_s64(b.add(j));
             let b1 = vld1q_s64(b.add(j + 2));
-            // Narrow to i32: lossless, every element was checked above.
             let a32 = vcombine_s32(vmovn_s64(a0), vmovn_s64(a1));
             let b32 = vcombine_s32(vmovn_s64(b0), vmovn_s64(b1));
-            // Multiply i32×i32 → i64 via vmull
             acc = vmlal_s32(acc, vget_low_s32(a32), vget_low_s32(b32));
             acc = vmlal_high_s32(acc, a32, b32);
             j += 4;
@@ -1551,8 +1126,6 @@ unsafe fn dot_i64xi64_attn_neon(a: *const i64, b: *const i64, len: usize) -> i64
     }
 }
 
-/// The attention dot product the integer profile defines: exact i64
-/// products, summed in order.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn dot_i64xi64_exact(a: &[i64], b: &[i64]) -> i64 {
@@ -1566,9 +1139,6 @@ fn dot_i64xi64_exact(a: &[i64], b: &[i64]) -> i64 {
 #[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 unsafe fn dot_i64xi64_attn_neon(a: *const i64, b: *const i64, len: usize) -> i64 {
-    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
-    // The contract is unchanged: the caller guarantees the pointers are valid
-    // for `len` reads. Wrapping is purely lexical - no semantics change.
     unsafe {
         let mut sum: i64 = 0;
         for i in 0..len {
@@ -1578,13 +1148,6 @@ unsafe fn dot_i64xi64_attn_neon(a: *const i64, b: *const i64, len: usize) -> i64
     }
 }
 
-/// Write i16 matmul result into pre-allocated output buffer (zero-alloc).
-///
-/// Scaling: scales[i] = abs_max_row_i * ONE (abs_max in Q16).
-/// acc = sum(i16_weight * i64_input) ≈ 32767 * ONE * dot(W, X) / abs_max.
-/// output = acc / 32767 * scale >> FRAC_BITS
-///        = acc / 32767 * abs_max * ONE >> FRAC_BITS
-///        ≈ ONE * dot(W, X)  (Q16 of the real result).
 fn matmul_i16_into(weights: &I16Weights, input: &[i64], in_size: usize, output: &mut [i64]) {
     if weights.n_rows == 0 || weights.data.is_empty() {
         for o in output.iter_mut() {
@@ -1598,10 +1161,6 @@ fn matmul_i16_into(weights: &I16Weights, input: &[i64], in_size: usize, output: 
     );
     let data = &weights.data;
     let scales = &weights.scales;
-    // Chunk size 256: empirical sweet spot on M2 Ultra. Going smaller
-    // (e.g. 64) increases rayon task overhead more than the extra core
-    // utilization helps. 256 keeps task count high enough for 4096+
-    // matmuls without per-task scheduling cost.
     output
         .par_chunks_mut(256)
         .enumerate()
@@ -1611,17 +1170,12 @@ fn matmul_i16_into(weights: &I16Weights, input: &[i64], in_size: usize, output: 
                 let i = start + local_i;
                 let acc =
                     unsafe { dot_i16_i64(data.as_ptr().add(i * in_size), input.as_ptr(), in_size) };
-                // Use i128 intermediate for full precision: avoids truncation from
-                // dividing first AND avoids i64 overflow from multiplying first.
                 let wide = (acc as i128) * (scales[i] as i128);
                 *out = ((wide / 32767) >> FRAC_BITS as i128) as i64;
             }
         });
 }
 
-/// Allocating i16 matmul (for compatibility and small outputs).
-// Only the unit tests call this today; the forward pass uses the `_into`
-// variant. Kept because the tests use it as the reference i16 result.
 #[allow(dead_code)]
 fn matmul_i16(weights: &I16Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
     let mut output = vec![0i64; out_size];
@@ -1632,12 +1186,6 @@ fn matmul_i16(weights: &I16Weights, input: &[i64], in_size: usize, out_size: usi
     output
 }
 
-// ─── SIMD INT8 Matmul (Cross-Platform Deterministic) ──────────────────────────
-
-/// NEON i8×i8→i32 SIMD matmul with per-row scales.
-/// Processes 32 elements per iteration (2 × 16-byte NEON loads).
-// Only the unit tests call this today; the forward pass uses the scalar
-// i8xi64 path (see matmul_simd_preq). Kept as the SIMD cross-check.
 #[allow(dead_code)]
 #[cfg(target_arch = "aarch64")]
 fn matmul_i8xi8_simd(
@@ -1710,11 +1258,6 @@ fn matmul_i8xi8_simd(
     output
 }
 
-/// x86 SIMD matmul - llama.cpp sign trick for AVX2, AVX-512.
-/// sign trick: abs(w) × sign_corrected(input) → safe maddubs (no i16 saturation)
-/// Processes 32 bytes at once (AVX2) or 64 (AVX-512), no sign extension needed.
-// The production dispatcher deliberately uses the full-precision scalar path;
-// this double-quantized implementation remains as a tested SIMD reference.
 #[cfg_attr(not(test), allow(dead_code))]
 #[cfg(target_arch = "x86_64")]
 fn matmul_i8xi8_simd(
@@ -1735,10 +1278,8 @@ fn matmul_i8xi8_simd(
 
     let use_avx512 = is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f");
 
-    // Quantize input once - reused across all output rows
     let input_abs_max = input.iter().map(|x| x.abs()).max().unwrap_or(1).max(1);
     let input_scale_factor = (input_abs_max / 127).max(1);
-    // Align to 64 bytes for AVX-512 loads (pad with zeros)
     let aligned_len = (in_size + 63) & !63;
     let mut input_i8 = vec![0i8; aligned_len];
     for (i, &x) in input.iter().enumerate() {
@@ -1762,9 +1303,7 @@ fn matmul_i8xi8_simd(
                 let mut acc: i64;
 
                 if use_avx512 {
-                    // AVX-512: 4 independent 512-bit accumulators for ILP
-                    // + software prefetch 256 bytes ahead
-                    let simd_len = in_size / 128 * 128; // process 128 per iteration
+                    let simd_len = in_size / 128 * 128;
                     unsafe {
                         let mut vacc0 = _mm512_setzero_si512();
                         let mut vacc1 = _mm512_setzero_si512();
@@ -1773,11 +1312,9 @@ fn matmul_i8xi8_simd(
 
                         let mut j = 0usize;
                         while j < simd_len {
-                            // Prefetch next iteration's data into L1
                             _mm_prefetch(row.add(j + 256), _MM_HINT_T0);
                             _mm_prefetch(inp_ptr.add(j + 256), _MM_HINT_T0);
 
-                            // First 64 elements
                             let vw0 = _mm512_loadu_si512(row.add(j) as *const __m512i);
                             let vi0 = _mm512_loadu_si512(inp_ptr.add(j) as *const __m512i);
                             let vw0_lo = _mm512_castsi512_si256(vw0);
@@ -1799,7 +1336,6 @@ fn matmul_i8xi8_simd(
                                 ),
                             );
 
-                            // Second 64 elements (independent accumulators for ILP)
                             let vw1 = _mm512_loadu_si512(row.add(j + 64) as *const __m512i);
                             let vi1 = _mm512_loadu_si512(inp_ptr.add(j + 64) as *const __m512i);
                             let vw1_lo = _mm512_castsi512_si256(vw1);
@@ -1829,7 +1365,6 @@ fn matmul_i8xi8_simd(
                         );
                         acc = _mm512_reduce_add_epi32(vacc0) as i64;
 
-                        // 64-element remainder
                         if j + 64 <= in_size {
                             let vw = _mm512_loadu_si512(row.add(j) as *const __m512i);
                             let vi = _mm512_loadu_si512(inp_ptr.add(j) as *const __m512i);
@@ -1852,15 +1387,13 @@ fn matmul_i8xi8_simd(
                             j += 64;
                         }
 
-                        // Scalar remainder
                         while j < in_size {
                             acc += (*row.add(j) as i64) * (*inp_ptr.add(j) as i64);
                             j += 1;
                         }
                     }
                 } else {
-                    // AVX2: 4 independent accumulators + sign trick + prefetch
-                    let simd_len = in_size / 128 * 128; // 4×32 per iteration for ILP
+                    let simd_len = in_size / 128 * 128;
                     unsafe {
                         let mut vacc0 = _mm256_setzero_si256();
                         let mut vacc1 = _mm256_setzero_si256();
@@ -1873,7 +1406,6 @@ fn matmul_i8xi8_simd(
                             _mm_prefetch(row.add(j + 256), _MM_HINT_T0);
                             _mm_prefetch(inp_ptr.add(j + 256), _MM_HINT_T0);
 
-                            // 4 independent 32-element blocks per iteration
                             let vw0 = _mm256_loadu_si256(row.add(j) as *const __m256i);
                             let vi0 = _mm256_loadu_si256(inp_ptr.add(j) as *const __m256i);
                             let ax0 = _mm256_sign_epi8(vw0, vw0);
@@ -1913,13 +1445,11 @@ fn matmul_i8xi8_simd(
                             j += 128;
                         }
 
-                        // Merge 4 accumulators
                         vacc0 = _mm256_add_epi32(
                             _mm256_add_epi32(vacc0, vacc1),
                             _mm256_add_epi32(vacc2, vacc3),
                         );
 
-                        // 32-element remainder blocks
                         while j + 32 <= in_size {
                             let vw = _mm256_loadu_si256(row.add(j) as *const __m256i);
                             let vi = _mm256_loadu_si256(inp_ptr.add(j) as *const __m256i);
@@ -1932,7 +1462,6 @@ fn matmul_i8xi8_simd(
                             j += 32;
                         }
 
-                        // Horizontal sum
                         let lo = _mm256_extracti128_si256(vacc0, 0);
                         let hi = _mm256_extracti128_si256(vacc0, 1);
                         let sum128 = _mm_add_epi32(lo, hi);
@@ -1940,7 +1469,6 @@ fn matmul_i8xi8_simd(
                         let sum128 = _mm_hadd_epi32(sum128, sum128);
                         acc = _mm_extract_epi32(sum128, 0) as i64;
 
-                        // Scalar remainder
                         while j < in_size {
                             acc += (*row.add(j) as i64) * (*inp_ptr.add(j) as i64);
                             j += 1;
@@ -1955,21 +1483,15 @@ fn matmul_i8xi8_simd(
     output
 }
 
-/// Dispatch: SIMD i8×i8 for large matmuls, scalar for small.
-/// NOTE: SIMD path quantizes input to i8 which causes double-quantization precision loss.
-/// For models with small weight distributions, use scalar path (i8×i64, full input precision).
 pub fn matmul_fast(
     weights: &I8Weights,
     input: &[i64],
     in_size: usize,
     out_size: usize,
 ) -> Vec<i64> {
-    // Use scalar i8×i64 path for full precision - SIMD i8×i8 loses too much
-    // precision for small models like TinyLlama where weights are near-zero.
     matmul_i8(weights, input, in_size, out_size)
 }
 
-/// Zero-alloc matmul - uses scalar i8×i64 for full precision.
 pub fn matmul_fast_preq(
     weights: &I8Weights,
     _input_q: &QuantizedInput,
@@ -1977,14 +1499,9 @@ pub fn matmul_fast_preq(
     in_size: usize,
     output: &mut [i64],
 ) {
-    // Use scalar i8×i64 path for full input precision.
-    // The SIMD i8×i8 path loses too much via double quantization.
     matmul_i8_into(weights, input_raw, in_size, output);
 }
 
-// Superseded by the full-precision scalar path in matmul_simd_preq (the
-// double-quantised SIMD version loses too much accuracy). Retained as the
-// reference for the NEON datapath rather than deleted.
 #[allow(dead_code)]
 #[cfg(target_arch = "aarch64")]
 fn matmul_simd_preq_neon(
@@ -2043,8 +1560,6 @@ fn matmul_simd_preq_neon(
         });
 }
 
-// See matmul_simd_preq_neon: retained as the x86 reference datapath while
-// production favors the full-precision scalar implementation.
 #[allow(dead_code)]
 #[cfg(target_arch = "x86_64")]
 fn matmul_simd_preq_x86(
@@ -2146,28 +1661,18 @@ fn matmul_simd_preq_x86(
         });
 }
 
-// ─── Q4 Weights (4-bit, half bandwidth) ──────────────────────────────────────
-
-/// Q4 weight matrix: 4-bit signed values packed 2 per byte.
-/// Byte layout: [hi_nibble(4b) | lo_nibble(4b)], both signed [-8, 7].
-/// Buffer is half the size of I8Weights → 2x bandwidth reduction.
 pub struct Q4WeightsX86 {
-    pub data: Vec<u8>,    // packed Q4 bytes (n_rows × n_cols / 2)
-    pub scales: Vec<i64>, // per-row scale factors (same as I8Weights)
+    pub data: Vec<u8>,
+    pub scales: Vec<i64>,
     pub n_rows: usize,
     pub n_cols: usize,
 }
 
 impl Q4WeightsX86 {
-    /// Total memory in bytes.
     pub fn memory_bytes(&self) -> usize {
         self.data.len() + self.scales.len() * 8
     }
 
-    /// Convert I8Weights to Q4WeightsX86 with per-row scaling.
-    /// Each i8 row is rescaled to use the full Q4 range [-8, 7].
-    /// Per-row q4_per_unit = ceil(abs_max / 7) ensures minimal clamping loss.
-    /// Encoding: bias +8 (stored [0, 15], decode by subtracting 8).
     pub fn from_i8(w: &I8Weights) -> Self {
         let n_rows = w.n_rows;
         let n_cols = w.n_cols;
@@ -2177,31 +1682,26 @@ impl Q4WeightsX86 {
         for i in 0..n_rows {
             let row = &w.data[i * n_cols..(i + 1) * n_cols];
 
-            // Per-row abs_max of i8 values
             let abs_max = row
                 .iter()
                 .map(|&x| (x as i16).unsigned_abs() as u8)
                 .max()
                 .unwrap_or(1)
                 .max(1);
-            // How many i8 units per Q4 step: ceil(abs_max / 7)
             let q4_per_unit = ((abs_max as i64 + 6) / 7).max(1);
 
             for pair in row.chunks(2) {
-                // Divide by q4_per_unit to use full Q4 range, then clamp
                 let v0 = ((pair[0] as i16) / q4_per_unit as i16).clamp(-8, 7);
                 let v1 = if pair.len() > 1 {
                     ((pair[1] as i16) / q4_per_unit as i16).clamp(-8, 7)
                 } else {
                     0
                 };
-                // Bias encoding: store value + 8 in nibble [0, 15]
                 let lo = ((v0 + 8) as u8) & 0x0F;
                 let hi = ((v1 + 8) as u8) & 0x0F;
                 data.push(lo | (hi << 4));
             }
 
-            // Combined scale: original i8 scale × q4_per_unit
             scales.push(w.scales[i] * q4_per_unit);
         }
 
@@ -2214,8 +1714,6 @@ impl Q4WeightsX86 {
     }
 }
 
-/// Q4×Q8 matmul with pre-quantized input. AVX2/AVX-512 + sign trick.
-/// Reads HALF the weight data of matmul_i8xi8 → 2x bandwidth improvement.
 #[cfg(target_arch = "x86_64")]
 pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i64]) {
     if q4.n_rows == 0 || q4.data.is_empty() {
@@ -2232,7 +1730,6 @@ pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &
     use std::arch::x86_64::*;
 
     if !is_x86_feature_detected!("avx2") {
-        // Scalar fallback
         matmul_q4_scalar(q4, input_q, output);
         return;
     }
@@ -2256,9 +1753,7 @@ pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &
                 let mut acc: i64;
 
                 unsafe {
-                    // AVX2: process 16 Q4 bytes (32 values) per iteration
-                    // Unpack nibbles → sign-extend → multiply with Q8 input via sign trick
-                    let simd_len = byte_cols / 64 * 64; // 4×16 per iteration for ILP
+                    let simd_len = byte_cols / 64 * 64;
                     let mask_lo = _mm_set1_epi8(0x0F);
                     let bias = _mm256_set1_epi8(8);
                     let ones = _mm256_set1_epi16(1);
@@ -2272,7 +1767,6 @@ pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &
                         _mm_prefetch(row.add(j + 128) as *const i8, _MM_HINT_T0);
                         _mm_prefetch(ip.add(j * 2 + 256), _MM_HINT_T0);
 
-                        // Block 0: 16 Q4 bytes → 32 i8 weights × 32 i8 input
                         let packed0 = _mm_loadu_si128(row.add(j) as *const __m128i);
                         let lo0 = _mm_and_si128(packed0, mask_lo);
                         let hi0 = _mm_and_si128(_mm_srli_epi16(packed0, 4), mask_lo);
@@ -2291,7 +1785,6 @@ pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &
                             _mm256_madd_epi16(_mm256_maddubs_epi16(ax0, sy0), ones),
                         );
 
-                        // Block 1
                         let packed1 = _mm_loadu_si128(row.add(j + 16) as *const __m128i);
                         let lo1 = _mm_and_si128(packed1, mask_lo);
                         let hi1 = _mm_and_si128(_mm_srli_epi16(packed1, 4), mask_lo);
@@ -2310,7 +1803,6 @@ pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &
                             _mm256_madd_epi16(_mm256_maddubs_epi16(ax1, sy1), ones),
                         );
 
-                        // Block 2
                         let packed2 = _mm_loadu_si128(row.add(j + 32) as *const __m128i);
                         let lo2 = _mm_and_si128(packed2, mask_lo);
                         let hi2 = _mm_and_si128(_mm_srli_epi16(packed2, 4), mask_lo);
@@ -2329,7 +1821,6 @@ pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &
                             _mm256_madd_epi16(_mm256_maddubs_epi16(ax2, sy2), ones),
                         );
 
-                        // Block 3
                         let packed3 = _mm_loadu_si128(row.add(j + 48) as *const __m128i);
                         let lo3 = _mm_and_si128(packed3, mask_lo);
                         let hi3 = _mm_and_si128(_mm_srli_epi16(packed3, 4), mask_lo);
@@ -2356,7 +1847,6 @@ pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &
                         _mm256_add_epi32(vacc2, vacc3),
                     );
 
-                    // 16-byte remainder
                     while j + 16 <= byte_cols {
                         let packed = _mm_loadu_si128(row.add(j) as *const __m128i);
                         let lo = _mm_and_si128(packed, mask_lo);
@@ -2382,7 +1872,6 @@ pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &
                     let sum128 = _mm_hadd_epi32(sum128, sum128);
                     acc = _mm_extract_epi32(sum128, 0) as i64;
 
-                    // Scalar remainder
                     while j < byte_cols {
                         let byte = *row.add(j);
                         let w_lo = (byte & 0x0F) as i8 - 8;
@@ -2397,9 +1886,6 @@ pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &
         });
 }
 
-/// Q4×Q8 matmul with NEON SIMD. Same algorithm as x86 AVX2 but uses
-/// NEON nibble extraction: vand + vshr for low/high, vsub for bias-8.
-/// Processes 16 packed bytes (32 Q4 values) per iteration.
 #[cfg(target_arch = "aarch64")]
 pub fn matmul_q4_preq_neon(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i64]) {
     if q4.n_rows == 0 || q4.data.is_empty() {
@@ -2433,7 +1919,7 @@ pub fn matmul_q4_preq_neon(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: 
                 let mut acc: i64;
 
                 unsafe {
-                    let simd_len = byte_cols / 16 * 16; // 16 bytes = 32 Q4 values
+                    let simd_len = byte_cols / 16 * 16;
                     let bias = vdupq_n_s8(8);
                     let mask_lo = vdupq_n_u8(0x0F);
                     let mut vacc0 = vdupq_n_s32(0);
@@ -2443,27 +1929,16 @@ pub fn matmul_q4_preq_neon(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: 
 
                     let mut j = 0usize;
                     while j < simd_len {
-                        // Load 16 packed Q4 bytes = 32 weight values
                         let packed = vld1q_u8(data.as_ptr().add(row_off + j));
 
-                        // Extract low nibbles [0,15] and high nibbles [0,15]
                         let lo = vreinterpretq_s8_u8(vandq_u8(packed, mask_lo));
                         let hi = vreinterpretq_s8_u8(vshrq_n_u8(packed, 4));
 
-                        // Subtract bias 8 → signed [-8, 7]
                         let q_lo = vsubq_s8(lo, bias);
                         let q_hi = vsubq_s8(hi, bias);
 
-                        // Load 32 input i8 values (lo input for lo nibbles, hi for hi)
-                        // Layout: lo nibble = even cols, hi nibble = odd cols
-                        // Need to interleave: input[j*2], input[j*2+1], input[j*2+2], ...
-                        // lo[k] pairs with input[j*2 + k*2], hi[k] with input[j*2 + k*2 + 1]
-                        // But NEON zip can interleave: q_lo[0],q_hi[0],q_lo[1],q_hi[1],...
-                        // to match sequential input layout
-
-                        // Interleave weights to match sequential input
-                        let wlo_lo = vget_low_s8(q_lo); // 8 low nibbles (even cols)
-                        let whi_lo = vget_low_s8(q_hi); // 8 high nibbles (odd cols)
+                        let wlo_lo = vget_low_s8(q_lo);
+                        let whi_lo = vget_low_s8(q_hi);
                         let wlo_hi = vget_high_s8(q_lo);
                         let whi_hi = vget_high_s8(q_hi);
 
@@ -2475,7 +1950,6 @@ pub fn matmul_q4_preq_neon(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: 
                         let i0 = vld1q_s8(inp.as_ptr().add(j * 2));
                         let i1 = vld1q_s8(inp.as_ptr().add(j * 2 + 16));
 
-                        // i8×i8 → i16 → pairwise add to i32
                         vacc0 = vpadalq_s16(
                             vacc0,
                             vmull_s8(vget_low_s8(w_interleaved_0), vget_low_s8(i0)),
@@ -2499,7 +1973,6 @@ pub fn matmul_q4_preq_neon(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: 
                     vacc0 = vaddq_s32(vaddq_s32(vacc0, vacc1), vaddq_s32(vacc2, vacc3));
                     acc = vaddvq_s32(vacc0) as i64;
 
-                    // Scalar remainder
                     while j < byte_cols {
                         let byte = data[row_off + j];
                         let w_lo = (byte & 0x0F) as i8 - 8;
@@ -2514,9 +1987,6 @@ pub fn matmul_q4_preq_neon(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: 
         });
 }
 
-// Scalar fallback for the AVX2 Q4 path; its only caller, matmul_q4_preq_x86,
-// is x86_64-only, so gate it the same way instead of leaving it unused
-// elsewhere.
 #[cfg(target_arch = "x86_64")]
 fn matmul_q4_scalar(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i64]) {
     if q4.n_rows == 0 || q4.data.is_empty() {
@@ -2549,8 +2019,6 @@ fn matmul_q4_scalar(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i
     }
 }
 
-/// Q4 × i64 matmul with FULL input precision (no pre-quantization).
-/// This avoids the double-quantization precision loss of the SIMD path.
 pub fn matmul_q4_full(q4: &Q4WeightsX86, input: &[i64], output: &mut [i64]) {
     if q4.n_rows == 0 || q4.data.is_empty() {
         for o in output.iter_mut() {
@@ -2583,36 +2051,20 @@ pub fn matmul_q4_full(q4: &Q4WeightsX86, input: &[i64], output: &mut [i64]) {
                     let w_hi = ((byte >> 4) as i64) - 8;
                     acc += w_lo * input[j * 2] + w_hi * input[j * 2 + 1];
                 }
-                // scales already include q4_per_unit factor from from_i8()
                 *out = (acc * scales[i]) >> FRAC_BITS;
             }
         });
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/// RMSNorm (what Llama uses - no mean subtraction, just root-mean-square).
-/// output[i] = (input[i] / rms) * gamma[i]
-/// where rms = sqrt(mean(x²))
 pub fn layernorm(input: &[i64], gamma: &[i64]) -> Vec<i64> {
     let n = input.len() as i64;
     if n == 0 {
         return vec![];
     }
-    // RMSNorm: compute mean of squares (NOT variance around mean).
-    //
-    // Use i128 accumulator so small x² terms don't truncate. With the old
-    // `sq_sum += (x*x) >> FRAC_BITS` pattern any x with |x| < 256 Q16
-    // (≈0.0039 real) contributed 0 to the sum because x·x was below 2^16
-    // before the shift. Long-tailed distributions (most of Llama's hidden
-    // states) got systematically understated RMS → oversized normalization
-    // factor → amplified residual stream layer-to-layer - a measurable
-    // contributor to the PPL gap vs candle's Q8_0 reference.
     let mut sq_sum: i128 = 0;
     for &x in input {
         sq_sum += (x as i128) * (x as i128);
     }
-    // sq_sum accumulated in full Q32. Bring back to Q16 once for isqrt.
     let mean_sq_q32 = sq_sum / (n as i128);
     let mean_sq = (mean_sq_q32 >> FRAC_BITS as i128) as i64;
     let inv_rms = integer_isqrt(mean_sq + 1);
@@ -2639,10 +2091,6 @@ pub fn apply_rope(vec: &mut [i64], pos: usize, d_head: usize, cos: &[i64], sin: 
     }
 }
 
-/// Apply the interleaved RoPE layout used by Candle's `rope_i` and the Llama
-/// GGUF reference path. The legacy [`apply_rope`] split-half layout remains
-/// unchanged for compatibility; callers must bind this helper to a new
-/// arithmetic profile before using it in production inference.
 pub fn apply_rope_interleaved(
     vec: &mut [i64],
     pos: usize,
@@ -2663,14 +2111,6 @@ pub fn apply_rope_interleaved(
     }
 }
 
-/// Reorder an output-projection matrix from GGUF's adjacent RoPE pairs to the
-/// split-half representation consumed by [`apply_rope`]. Rows and their
-/// per-row scales are moved together, preserving the exact I8 dequantization.
-///
-/// For one four-wide head this maps source rows `[e0, o0, e1, o1]` to
-/// `[e0, e1, o0, o1]`. The same permutation is applied independently to every
-/// Q or K head. It is intentionally loader-only: changing these rows under an
-/// existing legacy cache would silently change that cache's arithmetic.
 fn permute_interleaved_rows_to_split_half(
     weights: &mut I8Weights,
     n_heads: usize,
@@ -2719,26 +2159,11 @@ fn permute_interleaved_rows_to_split_half(
     Ok(())
 }
 
-/// A second, read-only copy of the Q and K projections of every resident
-/// layer, in the GGUF interleaved-RoPE row order
-/// (`GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE`).
-///
-/// The two community reward profiles differ only in these rows. V, O, the
-/// feed-forward matrices, norms, embeddings and the LM head are identical.
-/// A validator shard holder that verifies both profiles therefore keeps its
-/// legacy model plus this copy, not a second model. The rows come from the
-/// same permutation as
-/// [`CachedIntegerModel::canonicalize_gguf_interleaved_rope_rows`], so
-/// running a layer range with them is exactly that range of the corrected
-/// whole model.
 pub struct InterleavedRopeQk {
     layers: Vec<Option<(I8Weights, I8Weights)>>,
 }
 
 impl InterleavedRopeQk {
-    /// Copy and permute the Q/K rows of every resident layer of a legacy,
-    /// canonical per-row INT8 model. Layer slots the model does not hold get
-    /// no copy, so a range-loaded shard holder pays only for its own layers.
     pub fn from_resident_layers(model: &CachedIntegerModel) -> Result<Self, crate::InferenceError> {
         if model.config.arithmetic_profile != ArithmeticProfile::LegacySplitHalfV0 {
             return Err(crate::InferenceError::Runtime(
@@ -2786,20 +2211,16 @@ impl InterleavedRopeQk {
         Ok(Self { layers })
     }
 
-    /// Whether the copy holds every layer of `[start, end)`.
     pub fn covers(&self, start: usize, end: usize) -> bool {
         start < end
             && end <= self.layers.len()
             && self.layers[start..end].iter().all(Option::is_some)
     }
 
-    /// Resident layers that carry a copy.
     pub fn layer_count(&self) -> usize {
         self.layers.iter().filter(|layer| layer.is_some()).count()
     }
 
-    /// Size in the [`I8Weights::memory_bytes`] accounting, which the node
-    /// uses for its own logged and announced shard memory.
     pub fn memory_bytes(&self) -> usize {
         self.layers
             .iter()
@@ -2808,8 +2229,6 @@ impl InterleavedRopeQk {
             .sum()
     }
 
-    /// Exact bytes of the copied INT8 rows plus their per-row Q16 scales:
-    /// 33,619,968 per Llama-2-7B layer (two 4096 x 4096 matrices).
     pub fn weight_bytes(&self) -> usize {
         self.layers
             .iter()
@@ -2830,10 +2249,7 @@ impl InterleavedRopeQk {
     }
 }
 
-/// SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
-/// Uses the integer exp LUT for sigmoid computation.
 pub fn silu_i64(x: i64) -> i64 {
-    // sigmoid(x) = 1 / (1 + exp(-x))
     let sig = if x >= 0 {
         let exp_neg = integer_exp(-x);
         (ONE * ONE) / (ONE + exp_neg).max(1)
@@ -2841,14 +2257,9 @@ pub fn silu_i64(x: i64) -> i64 {
         let exp_pos = integer_exp(x);
         (exp_pos * ONE) / (ONE + exp_pos).max(1)
     };
-    // SiLU = x * sigmoid(x)
     (x * sig) >> FRAC_BITS
 }
 
-// ─── Fused LayerNorm + Projection ─────────────────────────────────────────────
-
-/// Compute layernorm stats (mean, inv_std) without materializing the normed vector.
-// Only caller is fused_layernorm_matmul, which is itself off the live path.
 #[allow(dead_code)]
 #[inline]
 fn layernorm_stats(input: &[i64]) -> (i64, i64) {
@@ -2863,12 +2274,6 @@ fn layernorm_stats(input: &[i64]) -> (i64, i64) {
     (mean, inv_std)
 }
 
-/// Fused layernorm + i8 matmul projection.
-/// Computes: output = matmul(weights, layernorm(input, gamma))
-/// Without allocating the intermediate normed vector.
-/// One pass over input to compute stats, then stream through weight rows.
-// The live forward pass still calls layernorm and matmul separately; this
-// fused variant is kept as the reference for the fused kernel work.
 #[allow(dead_code)]
 fn fused_layernorm_matmul(
     input: &[i64],
@@ -2891,7 +2296,6 @@ fn fused_layernorm_matmul(
                 let i = start + local_i;
                 let row = &data[i * in_size..(i + 1) * in_size];
                 let mut acc: i64 = 0;
-                // Fused: for each j, compute normed[j] on-the-fly and multiply
                 for j in 0..in_size {
                     let norm = ((input[j] - mean) * inv_std) >> FRAC_BITS;
                     let g = if j < gamma.len() { gamma[j] } else { ONE };
@@ -2904,12 +2308,6 @@ fn fused_layernorm_matmul(
     output
 }
 
-// ─── SIMD Attention KV Dot Products ──────────────────────────────────────────
-
-/// Quantize a Q16 i64 vector to i8 for SIMD dot products.
-/// Returns (i8 data, scale factor).
-// Only caller is flash_attention_i8, which is off the live path (the i64 KV
-// cache variant is what runs today).
 #[allow(dead_code)]
 #[inline]
 fn quantize_for_dot(v: &[i64]) -> (Vec<i8>, i64) {
@@ -2919,18 +2317,10 @@ fn quantize_for_dot(v: &[i64]) -> (Vec<i8>, i64) {
     (data, sf)
 }
 
-/// SIMD i8×i8 dot product for attention K scores.
-/// q_i8: query head quantized to i8, k_ptr: pointer into KV cache i8 data.
-/// Returns i32 dot product (caller applies scales).
-// Reached only through dot_i8_kv, which only flash_attention_i8 calls; that
-// i8-KV attention path is not the live one today.
 #[allow(dead_code)]
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn dot_i8_kv_neon(q_i8: *const i8, k_ptr: *const i8, d_head: usize) -> i32 {
-    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
-    // The contract is unchanged: the caller guarantees the pointers are valid
-    // for `len` reads. Wrapping is purely lexical - no semantics change.
     unsafe {
         use std::arch::aarch64::*;
         let simd_len = d_head / 32 * 32;
@@ -2960,13 +2350,9 @@ unsafe fn dot_i8_kv_neon(q_i8: *const i8, k_ptr: *const i8, d_head: usize) -> i3
     }
 }
 
-/// AVX2 i8×i8 dot for attention K scores with sign trick.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn dot_i8_kv_avx2(q_i8: *const i8, k_ptr: *const i8, d_head: usize) -> i32 {
-    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
-    // The contract is unchanged: the caller guarantees the pointers are valid
-    // for `len` reads. Wrapping is purely lexical - no semantics change.
     unsafe {
         use std::arch::x86_64::*;
         if !is_x86_feature_detected!("avx2") {
@@ -3001,8 +2387,6 @@ unsafe fn dot_i8_kv_avx2(q_i8: *const i8, k_ptr: *const i8, d_head: usize) -> i3
     }
 }
 
-/// Cross-platform SIMD dot product dispatch for attention.
-// Only caller is flash_attention_i8, which is off the live path.
 #[allow(dead_code)]
 #[inline]
 fn dot_i8_kv(q_i8: &[i8], k_ptr: &[i8], k_offset: usize, d_head: usize) -> i32 {
@@ -3024,33 +2408,7 @@ fn dot_i8_kv(q_i8: &[i8], k_ptr: &[i8], k_offset: usize, d_head: usize) -> i32 {
     }
 }
 
-// ─── Flash Attention (Online Softmax, O(1) Memory) ───────────────────────────
-
-/// Flash attention for a single query head against i8-quantized KV cache.
-/// Uses online softmax: processes KV in streaming fashion, never allocates O(n²).
-/// Not bit-equal to a two-pass softmax: rescaling truncates.
-///
-/// NOTE: This i8-quantized variant is available for future use with i8 KV caches.
-/// The production path uses flash_attention_i64() which operates directly on the
-/// i64 KV cache with online softmax. Both use the same integer_exp() arithmetic.
-///
-/// q_head: [d_head] i64 Q16 - the query for this head at current position
-/// k_data: flat i8 array of all cached K for this layer
-/// k_scales: per-position scales for K
-/// v_data: flat i8 array of all cached V
-/// v_scales: per-position scales for V
-/// d_kv: total d_kv dimension (d_head * n_kv_heads)
-/// kv_h: which KV head to use
-/// d_head: dimension per head
-/// full_seq: number of positions in cache
-/// attn_scale: 1/sqrt(d_head) in Q16
-// The live attention path is flash_attention_i64 (i64 KV cache). This i8-KV
-// variant is kept as the reference implementation for the quantised KV cache
-// and is exercised by hand when that path is revisited.
 #[allow(dead_code)]
-// Every argument is a separate KV-cache slice or a shape constant. Packing
-// them into a struct would only move the same 10 values behind an extra
-// indirection in a hot integer kernel, so the count stays as is.
 #[allow(clippy::too_many_arguments)]
 fn flash_attention_i8(
     q_head: &[i64],
@@ -3064,103 +2422,22 @@ fn flash_attention_i8(
     full_seq: usize,
     attn_scale: i64,
 ) -> Vec<i64> {
-    // Online softmax: maintain running max, sum of exp, and weighted V sum.
-    // Process one position at a time - O(1) extra memory (no scores array).
-    let mut running_max: i64 = -8 * ONE; // start very negative
-    let mut running_sum: i64 = 0; // sum of exp(score - max)
-    let mut out = vec![0i64; d_head]; // weighted V accumulator
+    let mut running_max: i64 = -8 * ONE;
+    let mut running_sum: i64 = 0;
+    let mut out = vec![0i64; d_head];
 
-    // Quantize Q to i8 ONCE for SIMD dot products across all positions
     let (q_i8, q_sf) = quantize_for_dot(q_head);
 
     for j in 0..full_seq {
         let k_off = j * d_kv + kv_h * d_head;
         let k_scale = k_scales[j];
 
-        // SIMD dot product: Q_i8 · K_i8 (both already quantized)
         let dot_i32 = dot_i8_kv(&q_i8, k_data, k_off, d_head);
         let dot = (dot_i32 as i64) * q_sf * k_scale;
         let score = ((dot >> (FRAC_BITS * 2)) * attn_scale) >> FRAC_BITS;
 
-        // Online softmax update
         if score > running_max {
-            // New max - rescale existing accumulator
-            let diff = running_max - score; // negative
-            let correction = integer_exp(diff); // exp(old_max - new_max) < 1
-            // Scale down existing sum and output
-            running_sum = (running_sum * correction) >> FRAC_BITS;
-            for o in out.iter_mut() {
-                *o = (*o * correction) >> FRAC_BITS;
-            }
-            running_max = score;
-        }
-
-        // exp(score - running_max)
-        let w = integer_exp(score - running_max);
-        running_sum += w;
-
-        // Accumulate weighted V (dequantized on-the-fly)
-        let v_off = j * d_kv + kv_h * d_head;
-        let v_scale = v_scales[j];
-        for dd in 0..d_head {
-            let v_val = (v_data[v_off + dd] as i64) * v_scale;
-            out[dd] += (w * v_val) >> FRAC_BITS;
-        }
-    }
-
-    // Normalize by sum
-    if running_sum > 0 {
-        for o in out.iter_mut() {
-            *o = (*o * ONE) / running_sum;
-        }
-    }
-
-    out
-}
-
-/// Flash attention for a single query head against the i64 KV cache.
-/// Uses online softmax: processes KV in streaming fashion, O(d_head) memory
-/// instead of O(full_seq) for the scores array. The rescaling on each new
-/// maximum truncates, so the result is NOT bit-equal to a two-pass softmax.
-/// This sequential form, in position order, is what the integer profile
-/// contract (docs/protocol/integer-profile-contract-v1.md §3.7) defines.
-///
-/// This is the production attention path as of v0.5.3. It replaces the standard
-/// path that allocated a scores Vec<i64> of size full_seq per head.
-///
-/// Returns the attention output for this head: [d_head] i64 Q16.
-// Every argument is a separate KV-cache slice or a shape constant. Packing
-// them into a struct would only move the same 8 values behind an extra
-// indirection in the hottest integer kernel in the crate, so the count stays.
-#[allow(clippy::too_many_arguments)]
-#[inline]
-pub(crate) fn flash_attention_i64(
-    q_head: &[i64],  // [d_head] i64 Q16
-    k_cache: &[i64], // flat i64 [full_seq * d_kv]
-    v_cache: &[i64], // flat i64 [full_seq * d_kv]
-    d_kv: usize,     // total KV dimension
-    kv_h: usize,     // which KV head to use
-    d_head: usize,   // dimension per head
-    full_seq: usize, // positions in cache
-    attn_scale: i64, // 1/sqrt(d_head) in Q16
-) -> Vec<i64> {
-    // Online softmax: maintain running max, sum of exp, and weighted V sum.
-    let mut running_max: i64 = i64::MIN / 2; // avoid overflow on subtraction
-    let mut running_sum: i64 = 0;
-    let mut out = vec![0i64; d_head];
-
-    for j in 0..full_seq {
-        let k_off = j * d_kv + kv_h * d_head;
-
-        // Q·K dot product (same as standard path)
-        let dot =
-            unsafe { dot_i64xi64_attn_neon(q_head.as_ptr(), k_cache.as_ptr().add(k_off), d_head) };
-        let score = ((dot >> FRAC_BITS) * attn_scale) >> FRAC_BITS;
-
-        // Online softmax update
-        if score > running_max {
-            // New max - rescale existing accumulator
-            let diff = running_max - score; // negative
+            let diff = running_max - score;
             let correction = integer_exp(diff);
             running_sum = (running_sum * correction) >> FRAC_BITS;
             for o in out.iter_mut() {
@@ -3172,14 +2449,14 @@ pub(crate) fn flash_attention_i64(
         let w = integer_exp(score - running_max);
         running_sum += w;
 
-        // Accumulate weighted V
         let v_off = j * d_kv + kv_h * d_head;
+        let v_scale = v_scales[j];
         for dd in 0..d_head {
-            out[dd] += (w * v_cache[v_off + dd]) >> FRAC_BITS;
+            let v_val = (v_data[v_off + dd] as i64) * v_scale;
+            out[dd] += (w * v_val) >> FRAC_BITS;
         }
     }
 
-    // Normalize by sum
     if running_sum > 0 {
         for o in out.iter_mut() {
             *o = (*o * ONE) / running_sum;
@@ -3189,17 +2466,64 @@ pub(crate) fn flash_attention_i64(
     out
 }
 
-// ─── Binary Weight Cache ──────────────────────────────────────────────────────
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn flash_attention_i64(
+    q_head: &[i64],
+    k_cache: &[i64],
+    v_cache: &[i64],
+    d_kv: usize,
+    kv_h: usize,
+    d_head: usize,
+    full_seq: usize,
+    attn_scale: i64,
+) -> Vec<i64> {
+    let mut running_max: i64 = i64::MIN / 2;
+    let mut running_sum: i64 = 0;
+    let mut out = vec![0i64; d_head];
+
+    for j in 0..full_seq {
+        let k_off = j * d_kv + kv_h * d_head;
+
+        let dot =
+            unsafe { dot_i64xi64_attn_neon(q_head.as_ptr(), k_cache.as_ptr().add(k_off), d_head) };
+        let score = ((dot >> FRAC_BITS) * attn_scale) >> FRAC_BITS;
+
+        if score > running_max {
+            let diff = running_max - score;
+            let correction = integer_exp(diff);
+            running_sum = (running_sum * correction) >> FRAC_BITS;
+            for o in out.iter_mut() {
+                *o = (*o * correction) >> FRAC_BITS;
+            }
+            running_max = score;
+        }
+
+        let w = integer_exp(score - running_max);
+        running_sum += w;
+
+        let v_off = j * d_kv + kv_h * d_head;
+        for dd in 0..d_head {
+            out[dd] += (w * v_cache[v_off + dd]) >> FRAC_BITS;
+        }
+    }
+
+    if running_sum > 0 {
+        for o in out.iter_mut() {
+            *o = (*o * ONE) / running_sum;
+        }
+    }
+
+    out
+}
 
 impl I8Weights {
     pub fn write_to(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         w.write_all(&(self.n_rows as u64).to_le_bytes())?;
         w.write_all(&(self.n_cols as u64).to_le_bytes())?;
-        // Per-row scales
         for &s in &self.scales {
             w.write_all(&s.to_le_bytes())?;
         }
-        // Data
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(self.data.as_ptr() as *const u8, self.data.len()) };
         w.write_all(bytes)
@@ -3251,8 +2575,6 @@ fn read_i64_vec(r: &mut impl std::io::Read) -> std::io::Result<Vec<i64>> {
     Ok(v)
 }
 
-// ─── Forward Pass ─────────────────────────────────────────────────────────────
-
 impl CachedIntegerModel {
     pub fn memory_bytes(&self) -> usize {
         let mut total = self.embedding_i8.memory_bytes()
@@ -3286,8 +2608,6 @@ impl CachedIntegerModel {
             .collect::<String>()
     }
 
-    /// Decode v2 output, reconstructing GGUF byte-fallback tokens such as
-    /// `<0x0A>` into their UTF-8 text. The legacy decoder remains unchanged.
     pub fn decode_v2(&self, tokens: &[u32]) -> String {
         let mut text = String::new();
         let mut fallback = Vec::new();
@@ -3319,11 +2639,6 @@ impl CachedIntegerModel {
         text
     }
 
-    /// Decode generated content for v2-style APIs without rendering protocol
-    /// controls. The token trace still retains terminal EOS for deterministic
-    /// comparisons; this method stops before it and suppresses BOS/control
-    /// pieces from the user-visible completion. `decode_v2` remains the
-    /// legacy-compatible literal token decoder.
     pub fn decode_v2_content(&self, tokens: &[u32]) -> String {
         let mut text = String::new();
         let mut fallback = Vec::new();
@@ -3345,9 +2660,6 @@ impl CachedIntegerModel {
                 text.push_str(&format!("[{id}]"));
                 continue;
             };
-            // GGUF control pieces are not a part of a content completion.
-            // This covers common LLaMA controls even when an older artifact
-            // omitted token-type metadata from its in-memory cache.
             if matches!(piece.as_str(), "<s>" | "</s>") {
                 continue;
             }
@@ -3392,14 +2704,12 @@ impl CachedIntegerModel {
                 tokens.push(best_id);
                 pos += best_len;
             } else {
-                // Determine the length of the current UTF-8 character to emit
-                // all its bytes as individual byte tokens without splitting mid-char.
                 let char_len = match bytes[pos] {
                     0x00..=0x7F => 1,
                     0xC0..=0xDF => 2,
                     0xE0..=0xEF => 3,
                     0xF0..=0xF7 => 4,
-                    _ => 1, // continuation byte (shouldn't happen at valid char boundary)
+                    _ => 1,
                 };
                 let char_end = (pos + char_len).min(bytes.len());
                 for b in &bytes[pos..char_end] {
@@ -3414,65 +2724,40 @@ impl CachedIntegerModel {
         tokens
     }
 
-    /// Apply the model's chat template to wrap user input in the correct format.
-    /// Parses common Jinja2 chat template patterns from GGUF metadata.
-    /// Falls back to raw input if no template or unrecognized format.
     pub fn apply_chat_template(&self, user_input: &str) -> String {
         let tmpl = &self.config.chat_template;
         if tmpl.is_empty() {
             return user_input.to_string();
         }
 
-        // Detect common template patterns by content rather than parsing Jinja2.
-        // This handles the vast majority of HuggingFace models.
         if tmpl.contains("[INST]") {
-            // LLaMA-2 / Mistral style
             format!("[INST] {} [/INST]", user_input)
         } else if tmpl.contains("<|start_header_id|>") {
-            // LLaMA-3 style
             format!(
                 "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
                 user_input
             )
         } else if tmpl.contains("<|im_start|>") {
-            // ChatML (Qwen, Yi, many finetunes)
             format!(
                 "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
                 user_input
             )
         } else if tmpl.contains("<|user|>") {
-            // Phi style
             format!("<|user|>\n{}<|end|>\n<|assistant|>\n", user_input)
         } else if tmpl.contains("[turn_start]") {
-            // Gemma style
             format!(
                 "<start_of_turn>user\n{}<end_of_turn>\n<start_of_turn>model\n",
                 user_input
             )
         } else {
-            // Unknown template - use raw input
             user_input.to_string()
         }
     }
 
-    /// Forward pass - zero-alloc matmuls with cached input quantization.
-    /// Quantize input ONCE, reuse for Q/K/V (3 matmuls) and gate/up (2 matmuls).
-    /// Saves 4 input quantizations per layer × 32 layers = 128 saved quantizations.
-    /// Uses pre-allocated buffers (q/k/v/attn_out/gate/up/gated/ff_out).
-    /// When Q4 weights are enabled (via enable_q4), uses 4-bit matmul on x86_64.
     pub fn forward_one_token(&self, token: u32, cache: &mut KVCache) -> Vec<i64> {
         self.forward_one_token_observed(token, cache, |_, _, _| {})
     }
 
-    /// [`Self::forward_one_token`], also reporting every layer boundary.
-    ///
-    /// After layer `l` has added its attention and FFN residuals,
-    /// `on_layer(position, l, hidden)` receives the residual stream that the
-    /// next layer (after the last layer, the final norm) reads. These are the
-    /// per-layer boundaries a commitment or a teacher-forced re-check compares.
-    /// The observer only reads: the logits, the KV cache and every intermediate
-    /// value are exactly those of `forward_one_token`, which calls this with an
-    /// empty observer.
     pub fn forward_one_token_observed<F>(
         &self,
         token: u32,
@@ -3486,22 +2771,10 @@ impl CachedIntegerModel {
         let d = cfg.d_model;
         let pos = cache.seq_len;
 
-        // Shard holders that don't cover layer 0 don't load embeddings.
-        // Calling forward_one_token (single-node path) on such a node would
-        // panic reading self.embedding_q16 which is empty. Return an empty
-        // vec so the RPC handler can error gracefully instead of the whole
-        // tokio worker thread panicking and killing launchd's keepalive loop.
         if self.embedding_q16.len() < (token as usize + 1) * d {
             return Vec::new();
         }
 
-        // Dispatch priority (highest quality first):
-        //   Block-I8  - 32-weight blocks with i32 Q16 scales (Q8_0-shaped)
-        //   I16       - per-row, 258× finer than I8 on paper (but known PPL
-        //               issue before the attn/LUT rescale lands, see
-        //               project_i16_ppl_bug.md). Kept as a manual override.
-        //   Q4        - x86 low-bandwidth path
-        //   I8        - original per-row fallback
         macro_rules! dispatch_matmul {
             ($hyb:expr, $tern:expr, $blk:expr, $i16w:expr, $q4w:expr, $i8w:expr, $inq:expr, $raw:expr, $in_sz:expr, $out:expr) => {{
                 if let Some(hw) = $hyb {
@@ -3509,15 +2782,6 @@ impl CachedIntegerModel {
                 } else if let Some(tw) = $tern {
                     crate::ternary_engine::matmul_ternary_into(tw, $raw, $in_sz, $out);
                 } else if let Some(i16w) = $i16w {
-                    // Reordered 2026-06-04: per-row I16 (~258× I8
-                    // resolution) wins over block-wise I8 when both
-                    // are populated. Prior order silently demoted I16
-                    // to a fallback that block_i8 (set by default in
-                    // the loader) always preempted, so enabling
-                    // i16_layers in the model struct had no observable
-                    // effect at runtime. block_i8 stays as the
-                    // fallback for the few code paths that don't
-                    // populate I16 yet.
                     matmul_i16_into(i16w, $raw, $in_sz, $out);
                 } else if let Some(blk) = $blk {
                     crate::block_i8::matmul_block_i8_into(blk, $raw, $out);
@@ -3529,12 +2793,10 @@ impl CachedIntegerModel {
             }};
         }
 
-        // Embed - use full Q16 precision (INT8 destroys tiny embedding values)
         let idx = (token as usize).min(cfg.vocab_size - 1);
         let emb_start = idx * d;
         let mut hidden: Vec<i64> = self.embedding_q16[emb_start..emb_start + d].to_vec();
 
-        // Pre-allocate buffers (reused across layers)
         let mut q = vec![0i64; d];
         let mut k_buf = vec![0i64; cfg.d_kv];
         let mut v_buf = vec![0i64; cfg.d_kv];
@@ -3551,13 +2813,10 @@ impl CachedIntegerModel {
             let i16_layer = self.i16_layers.as_ref().map(|il| &il[layer_idx]);
             let q4_layer = self.q4_layers.as_ref().map(|ql| &ql[layer_idx]);
 
-            // LayerNorm once - result fits in L1 (32KB)
             let normed = layernorm(&hidden, &layer.attn_norm);
 
-            // Quantize normed input ONCE, reuse for Q, K, V projections
             let normed_q = QuantizedInput::from_i64(&normed);
 
-            // Q/K/V with zero-alloc + cached quantized input
             dispatch_matmul!(
                 hyb_layer.map(|l| &l.wq),
                 tern_layer.map(|l| &l.wq),
@@ -3595,7 +2854,6 @@ impl CachedIntegerModel {
                 &mut v_buf
             );
 
-            // RoPE
             for h in 0..cfg.n_heads {
                 apply_rope(
                     &mut q[h * cfg.d_head..(h + 1) * cfg.d_head],
@@ -3615,15 +2873,9 @@ impl CachedIntegerModel {
                 );
             }
 
-            // Store K/V in i8 cache
             cache.push_k(layer_idx, &k_buf);
             cache.push_v(layer_idx, &v_buf);
 
-            // Flash attention with online softmax - NEON-vectorized Q·K dot product.
-            // Processes KV cache in streaming fashion: O(d_head) memory instead of
-            // O(full_seq) for the scores array. Its rescaling truncates, so it is
-            // NOT bit-equal to a two-pass softmax; this sequential form is the
-            // one the integer profile defines.
             let full_seq = pos + 1;
             let k_layer_data = &cache.k_data[layer_idx];
             let v_layer_data = &cache.v_data[layer_idx];
@@ -3653,7 +2905,6 @@ impl CachedIntegerModel {
                 attn_out[h * cfg.d_head..(h + 1) * cfg.d_head].copy_from_slice(head_out);
             }
 
-            // Wo projection + residual (zero-alloc)
             let attn_out_q = QuantizedInput::from_i64(&attn_out);
             dispatch_matmul!(
                 hyb_layer.map(|l| &l.wo),
@@ -3671,7 +2922,6 @@ impl CachedIntegerModel {
                 hidden[i] += projected[i];
             }
 
-            // FFN: quantize normed_ff ONCE for gate+up
             let normed_ff = layernorm(&hidden, &layer.ffn_norm);
             let normed_ff_q = QuantizedInput::from_i64(&normed_ff);
 
@@ -3700,12 +2950,10 @@ impl CachedIntegerModel {
                 &mut up
             );
 
-            // SiLU gate * up (in-place)
             for j in 0..cfg.d_ff {
                 gate[j] = (silu_i64(gate[j]) * up[j]) >> FRAC_BITS;
             }
 
-            // W_down + residual
             let gate_q = QuantizedInput::from_i64(&gate);
             dispatch_matmul!(
                 hyb_layer.map(|l| &l.w_down),
@@ -3728,10 +2976,6 @@ impl CachedIntegerModel {
         cache.seq_len = pos + 1;
         let normed = layernorm(&hidden, &self.final_norm);
 
-        // LM head dispatch: I16 > Block-I8 > Q4 > I8. Reordered 2026-06-04
-        // to match the layer-matmul dispatch above so the output projection
-        // doesn't silently fall through to block-I8 while every other
-        // matmul uses I16.
         if let Some(i16_out) = &self.i16_output {
             let mut logits = vec![0i64; cfg.vocab_size];
             matmul_i16_into(i16_out, &normed, d, &mut logits);
@@ -3752,35 +2996,6 @@ impl CachedIntegerModel {
         matmul_fast(&self.output_weight, &normed, d, cfg.vocab_size)
     }
 
-    /// Batched multi-token prefill for the canonical per-row I8 profile.
-    ///
-    /// Semantics are identical to calling [`Self::forward_one_token`] for each
-    /// token in order: the same layer norms, the same RoPE positions, the same
-    /// causal attention over the same KV-cache ordering, the same activation,
-    /// the same residuals and the same output projection. Only the seven
-    /// per-layer projections and the output projection are batched, and
-    /// batching cannot change a value in this profile — see
-    /// [`crate::canonical_prefill`]. Attention is ~1% of prefill arithmetic and
-    /// stays strictly per position, so causality is structurally preserved.
-    ///
-    /// Returns `None` **without touching `cache`** if it refuses; the caller
-    /// must then use the token-at-a-time path. Refusal is a capability
-    /// decision: no admission bound is relaxed.
-    ///
-    /// With `all_positions` the logits of every token are returned, which is
-    /// the verification shape. Otherwise only the final token's logits are
-    /// computed, which is all prefill actually needs.
-    ///
-    /// # Resource note
-    ///
-    /// `all_positions` accumulates `tokens.len() * vocab_size` i64 values in the
-    /// returned vector — 1.05 GB at the canonical 4096-token context window, and
-    /// the one allocation here that scales with the caller's prompt rather than
-    /// with `chunk_size`. It exists to let a verifier compare every position and
-    /// **must not be used on a request-serving path**; serving passes `false`
-    /// and gets one logit vector. A verifier that needs every position on a long
-    /// prompt should drive this in slices, as `examples/batched_prefill_experiment.rs`
-    /// does, so the logits never accumulate.
     pub fn prefill_canonical_i8_batched(
         &self,
         tokens: &[u32],
@@ -3797,12 +3012,6 @@ impl CachedIntegerModel {
         )
     }
 
-    /// [`Self::prefill_canonical_i8_batched`], also reporting every layer
-    /// boundary of every prefilled position, with the same arguments as
-    /// [`Self::forward_one_token_observed`]. Within a chunk the reports arrive
-    /// layer by layer, so index them by (position, layer) rather than by call
-    /// order. Nothing is reported when the prefill refuses. The observer only
-    /// reads, so the returned logits and the cache are unchanged by it.
     pub fn prefill_canonical_i8_batched_observed<F>(
         &self,
         tokens: &[u32],
@@ -3835,10 +3044,6 @@ impl CachedIntegerModel {
             record_prefill_refusal(PrefillRefusal::Shape);
             return None;
         }
-        // `forward_one_token` returns an empty vector when the embedding table
-        // is too small for the raw token id. Rather than reproduce that
-        // degenerate result here, refuse and let the token-at-a-time path
-        // produce exactly what it produces today.
         if tokens
             .iter()
             .any(|t| self.embedding_q16.len() < (*t as usize + 1).saturating_mul(d))
@@ -3854,13 +3059,6 @@ impl CachedIntegerModel {
             record_prefill_refusal(PrefillRefusal::ContextWindowExceeded);
             return None;
         }
-        // Two ceilings, both capability decisions rather than admission ones.
-        // The first bounds the digit scratch the vectorised kernel splits into;
-        // the second bounds the ten per-chunk activation buffers below. Chunk
-        // size cannot change any output — the conformance tests run every
-        // prompt across nine chunk sizes and require bit-identical logits and
-        // an identical KV cache — so clamping is free of semantic effect and no
-        // request that the token-at-a-time path would serve is refused here.
         let chunk_size = chunk_size
             .min(crate::canonical_simd::MAX_BATCH_TOKENS)
             .min(crate::canonical_prefill::max_chunk_within_scratch_budget(
@@ -3919,15 +3117,6 @@ impl CachedIntegerModel {
         Some(out)
     }
 
-    /// The canonical batched layer pass over `layers` for one sequence, shared
-    /// by [`Self::prefill_canonical_i8_batched_observed`] (every layer). It is
-    /// [`Self::forward_layers_multi`] with one sequence.
-    ///
-    /// `hidden` holds `t_n` token-major rows entering the first layer of the
-    /// range at positions `first_position..first_position + t_n`; on return it
-    /// holds the rows leaving the last layer. `on_layer` observes the rows
-    /// leaving every layer, by position. The caller checks the shapes and sets
-    /// `cache.seq_len`.
     fn forward_layers_batched<F>(
         &self,
         hidden: &mut [i64],
@@ -3956,27 +3145,6 @@ impl CachedIntegerModel {
         );
     }
 
-    /// The canonical batched layer pass over `layers` for rows of several
-    /// sequences, shared by the batched prefill (one sequence) and
-    /// [`Self::forward_rows_multi`].
-    ///
-    /// `hidden` holds the token-major rows entering the first layer of the
-    /// range, sequence by sequence as `spans` lays them out, and on return the
-    /// rows leaving the last layer. Each projection reads its weights once for
-    /// all rows. Each layer appends every sequence's K and V rows to that
-    /// sequence's own cache (`caches[s]` for `spans[s]`) in position order
-    /// before its attention runs, and every row attends over its own
-    /// sequence's cache, `position + 1` entries, so no row sees another
-    /// sequence or a later row. `on_layer` observes the rows leaving every
-    /// layer as `(sequence, position, layer, row)`. The caller checks the
-    /// shapes and sets each `seq_len`.
-    ///
-    /// The work between the projections runs on every thread of the pool.
-    /// Rows are independent: each row's norms, RoPE and residual adds, and
-    /// each element's SiLU product, run the same code in the same order as
-    /// one row at a time, on whichever thread holds them, so spreading them
-    /// across threads cannot change a value. The K/V appends and `on_layer`
-    /// stay sequential.
     fn forward_layers_multi<F>(
         &self,
         hidden: &mut [i64],
@@ -3989,7 +3157,6 @@ impl CachedIntegerModel {
     {
         let cfg = &self.config;
         let (d, dkv, dff, dh) = (cfg.d_model, cfg.d_kv, cfg.d_ff, cfg.d_head);
-        // Each row's sequence and absolute position.
         let row_sequence: Vec<usize> = spans
             .iter()
             .enumerate()
@@ -4020,10 +3187,6 @@ impl CachedIntegerModel {
             matmul_i8_into_batched(&layer.wk, &normed, t_n, d, &mut k);
             matmul_i8_into_batched(&layer.wv, &normed, t_n, d, &mut v);
 
-            // RoPE at each row's own absolute position, then each sequence's
-            // K/V appended to its own cache in position order. Pushing every
-            // row before attention is safe because each row attends over its
-            // own sequence's `pos + 1` entries only.
             q.par_chunks_mut(d)
                 .zip(k.par_chunks_mut(dkv))
                 .zip(row_position.par_iter())
@@ -4102,8 +3265,6 @@ impl CachedIntegerModel {
                 .for_each(|(out, row)| out.copy_from_slice(&layernorm(row, &layer.ffn_norm)));
             matmul_i8_into_batched(&layer.w_gate, &normed, t_n, d, &mut gate);
             matmul_i8_into_batched(&layer.w_up, &normed, t_n, d, &mut up);
-            // Element-wise, so any chunking is exact; fixed-size chunks
-            // spread even a single row across threads.
             gate.par_chunks_mut(SILU_CHUNK)
                 .zip(up.par_chunks(SILU_CHUNK))
                 .for_each(|(gate, up)| {
@@ -4122,11 +3283,6 @@ impl CachedIntegerModel {
         }
     }
 
-    /// Canonical-I8 whole-token forward whose projections are supplied by a
-    /// fallible row-partition backend.  Norms, RoPE, KV cache, attention,
-    /// residuals, activation, and ordered output assembly remain local.  This
-    /// is deliberately separate from `forward_one_token`, preserving every
-    /// existing production dispatch profile and public validator route.
     pub fn forward_one_token_canonical_i8_with_backend(
         &self,
         token: u32,
@@ -4140,12 +3296,6 @@ impl CachedIntegerModel {
         forward_canonical_with_backend(self, token, cache, call_id, backend)
     }
 
-    /// Generate with fallible context-window admission for untrusted callers.
-    ///
-    /// The complete request is preflighted before allocating a KV cache or
-    /// performing the internal BOS forward. Consequently an oversized
-    /// request returns [`GenerationError`] instead of reaching `apply_rope`
-    /// with an out-of-range position (an abort in release builds).
     pub fn try_generate(
         &self,
         prompt: &[u32],
@@ -4156,11 +3306,6 @@ impl CachedIntegerModel {
         Ok(self.generate_preflighted(prompt, max_tokens, eos_tokens))
     }
 
-    /// Trusted compatibility wrapper around [`Self::try_generate`].
-    ///
-    /// RPC, P2P, and other untrusted entry points must call `try_generate`
-    /// and map its typed error. This infallible signature remains for existing
-    /// offline tools and callers whose request bounds are already proven.
     pub fn generate(
         &self,
         prompt: &[u32],
@@ -4171,10 +3316,6 @@ impl CachedIntegerModel {
             .expect("trusted generation request must fit the model context window")
     }
 
-    /// Corrected whole-model generation semantics. The legacy `generate` API
-    /// is intentionally preserved for existing protocol identities; v2 owns
-    /// the single BOS forward and reuses the final prompt logits instead of
-    /// forwarding the last prompt token twice.
     pub fn try_generate_v2(
         &self,
         prompt: &[u32],
@@ -4195,11 +3336,6 @@ impl CachedIntegerModel {
             .expect("trusted v2 generation request must fit the model context window")
     }
 
-    /// Same context/BOS/final-prompt-logit semantics as [`Self::try_generate_v2`],
-    /// with raw greedy argmax instead of the protocol-v2 repetition penalty.
-    /// This exists only to compare an ARC arithmetic profile with a reference
-    /// implementation configured for greedy sampling. Production requests
-    /// must retain their separately committed generation semantics.
     pub fn try_generate_v2_greedy(
         &self,
         prompt: &[u32],
@@ -4210,12 +3346,6 @@ impl CachedIntegerModel {
         Ok(self.generate_preflighted_v2_with_sampling(prompt, max_tokens, eos_tokens, false))
     }
 
-    /// [`Self::try_generate_v2`] with every projection supplied by `backend`
-    /// (row-partitioned work, S5): the same BOS, prompt, repetition-penalty
-    /// and EOS semantics as `generate_preflighted_v2_with_sampling`, one token
-    /// at a time (the reference path batched prefill must equal), so the tokens
-    /// and hash equal the local path's whenever the backend returns exact rows.
-    /// Norms, RoPE, the KV cache, attention and token selection stay local.
     pub fn try_generate_v2_with_backend(
         &self,
         request: Hash256,
@@ -4230,25 +3360,6 @@ impl CachedIntegerModel {
         generate_canonical_with_backend(self, request, prompt, max_tokens, eos_tokens, backend)
     }
 
-    /// Prefill `prompt` into `cache` and return the final position's logits.
-    ///
-    /// **This is the serving integration point for batched prefill.** Three
-    /// conditions must all hold for the batched path to run:
-    ///
-    ///   1. the operator enabled it (`canonical_prefill::batched_prefill_enabled`,
-    ///      default OFF, settable by `ARC_BATCHED_PREFILL=1` or an explicit call);
-    ///   2. the prompt clears the measured profitability floor
-    ///      ([`crate::canonical_prefill::MIN_PROFITABLE_BATCH_TOKENS`]) — below a
-    ///      full quad, batching is slower, so serving must not take it;
-    ///   3. the batched path accepts this model and shape, having first clamped
-    ///      the chunk to the scratch budget.
-    ///
-    /// Anything else falls back to the token-at-a-time loop, which is the
-    /// reference path. The fallback is safe in the strong sense: batched prefill
-    /// is bit-identical to token-at-a-time (conformance covers ten prompt
-    /// lengths across nine chunk sizes, plus KV bytes and continuation decode),
-    /// and it returns `None` **without touching `cache`** when it refuses. So
-    /// which branch runs changes latency and scratch, never an output.
     fn prefill_prompt_into_cache(&self, prompt: &[u32], cache: &mut KVCache) -> Option<Vec<i64>> {
         if prompt.is_empty() {
             return None;
@@ -4286,9 +3397,6 @@ impl CachedIntegerModel {
         let mut cache = KVCache::new(self.config.n_layers);
         let mut generated = Vec::new();
 
-        // The whole-model API owns the one required BOS forward. Callers pass
-        // raw prompt tokens; using the artifact's configured token avoids both
-        // a duplicate BOS and the hardcoded LLaMA-2 ID on other tokenizers.
         let _ = self.forward_one_token(self.config.bos_token, &mut cache);
 
         let _ = self.prefill_prompt_into_cache(prompt, &mut cache);
@@ -4328,8 +3436,6 @@ impl CachedIntegerModel {
         repetition_penalty: bool,
     ) -> (Vec<u32>, Hash256) {
         let mut cache = KVCache::new(self.config.n_layers);
-        // The BOS forward stays token-at-a-time: it is a single token, which is
-        // below the batching profitability floor by definition.
         let mut logits = self.forward_one_token(self.config.bos_token, &mut cache);
         if let Some(last) = self.prefill_prompt_into_cache(prompt, &mut cache) {
             logits = last;
@@ -4354,7 +3460,6 @@ impl CachedIntegerModel {
         (generated, hash)
     }
 
-    /// Save weights to binary .arc-int8 file for cross-platform distribution.
     pub fn save_weights(&self, path: &str) -> std::io::Result<()> {
         use std::io::Write;
         if self.config.arithmetic_profile != ArithmeticProfile::LegacySplitHalfV0 {
@@ -4364,7 +3469,7 @@ impl CachedIntegerModel {
             ));
         }
         let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
-        f.write_all(b"ARC-INT8\x02\x00")?; // v2: per-row scales
+        f.write_all(b"ARC-INT8\x02\x00")?;
 
         let cfg = &self.config;
         for &v in &[
@@ -4407,7 +3512,6 @@ impl CachedIntegerModel {
         f.flush()
     }
 
-    /// BLAKE3 hash of all weights for cross-platform identity verification.
     pub fn weight_hash(&self) -> Hash256 {
         let mut hasher = blake3::Hasher::new();
         let hash_i8w = |h: &mut blake3::Hasher, w: &I8Weights| {
@@ -4437,20 +3541,6 @@ impl CachedIntegerModel {
         Hash256(*hash.as_bytes())
     }
 
-    /// Run a single token through layers [start_layer, end_layer) of this shard.
-    ///
-    /// `input`:
-    ///   - First shard (start_layer == 0): pass `ShardInput::Token(token_id)`.
-    ///     The function looks up the embedding internally.
-    ///   - Middle/last shards: pass `ShardInput::Hidden(state)` from the previous shard.
-    ///
-    /// `position`: token position in the sequence (for RoPE + KV cache push).
-    /// `cache`: per-request KV cache (lives across tokens; size = n_layers).
-    ///
-    /// Returns:
-    ///   - Last shard (end_layer == n_layers): `ShardOutput::Token { id, logits_hash }`.
-    ///     Runs final_norm + LM head + argmax to produce the next token id.
-    ///   - First/middle shards: `ShardOutput::Hidden(state)` to forward to the next shard.
     pub fn forward_shard_token(
         &self,
         input: ShardInput,
@@ -4462,10 +3552,6 @@ impl CachedIntegerModel {
         self.forward_shard_token_with_history(input, cache, start_layer, end_layer, position, &[])
     }
 
-    /// Sharded forward pass with the same generated-token selection semantics
-    /// as [`Self::generate`].  Only the terminal shard consumes
-    /// `generated_tokens`; earlier shards carry the field in the authenticated
-    /// request transcript but do not use it for tensor execution.
     pub fn forward_shard_token_with_history(
         &self,
         input: ShardInput,
@@ -4486,11 +3572,6 @@ impl CachedIntegerModel {
         )
     }
 
-    /// [`Self::forward_shard_token_with_history`] under the GGUF
-    /// interleaved-RoPE profile. Every layer takes its Q and K projections
-    /// from `interleaved_qk`; every other weight is this legacy model's own.
-    /// A request must use one profile for all of its positions, because the
-    /// two profiles cache different K rows.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_shard_token_with_history_interleaved_rope(
         &self,
@@ -4530,12 +3611,6 @@ impl CachedIntegerModel {
         let is_last = end_layer == cfg.n_layers;
         let end = end_layer.min(self.layers.len());
 
-        // ── Preflight guards ────────────────────────────────────────────
-        // Everything below used to be a `debug_assert!` — i.e. absent in
-        // release — in front of an unchecked read. See ShardForwardError.
-
-        // RoPE table bound. `apply_rope` indexes cos[pos * half + i] with no
-        // bounds check on `pos`.
         if position >= cfg.max_seq {
             return Err(ShardForwardError::PositionOutOfRange {
                 position,
@@ -4543,17 +3618,6 @@ impl CachedIntegerModel {
             });
         }
 
-        // KV-cache continuity. `flash_attention_i64` walks j in 0..(position+1)
-        // and dereferences `k_cache.as_ptr().add(j * d_kv + ...)` UNCHECKED, so
-        // a cache holding fewer than `position` prior entries is an
-        // out-of-bounds read (UB), not a wrong answer. This is the state a
-        // replica is in when the coordinator failed over to it mid-stream, or
-        // when a hedged/raced request to it was dropped before it landed.
-        //
-        // We require exact equality, not >=: a cache that is somehow LONGER
-        // than the position implies the coordinator is replaying a position
-        // this replica already consumed, which would double-push K/V and
-        // silently corrupt every later token.
         for layer_idx in start_layer..end {
             let cached = cache.k_data[layer_idx].len() / cfg.d_kv.max(1);
             if cached != position {
@@ -4565,17 +3629,12 @@ impl CachedIntegerModel {
             }
         }
 
-        // Layer residency. A non-resident layer carries empty weight buffers;
-        // matmul against them produces garbage at best and indexes off the end
-        // at worst.
         for layer_idx in start_layer..end {
             if !self.layers[layer_idx].is_loaded() {
                 return Err(ShardForwardError::LayerNotLoaded { layer: layer_idx });
             }
         }
 
-        // The interleaved-RoPE copy replaces only canonical per-row INT8 Q/K
-        // rows of a legacy model, and must hold every layer in the range.
         if let Some(copy) = interleaved_qk {
             if !self.has_canonical_i8_profile()
                 || self.config.arithmetic_profile != ArithmeticProfile::LegacySplitHalfV0
@@ -4589,8 +3648,6 @@ impl CachedIntegerModel {
             }
         }
 
-        // ── Input: token id (first shard) → embedding lookup ──
-        // ── Input: hidden state (middle/last) → use directly ──
         let mut hidden: Vec<i64> = match input {
             ShardInput::Token(token_id) => {
                 debug_assert!(is_first, "Token input is only valid on the first shard");
@@ -4599,9 +3656,6 @@ impl CachedIntegerModel {
                 self.embedding_q16[emb_start..emb_start + d].to_vec()
             }
             ShardInput::Hidden(state) => {
-                // A short hidden state from a peer used to panic on
-                // `hidden[i] += projected[i]`, which aborts the process under
-                // the release profile's `panic = "abort"`.
                 if state.len() != d {
                     return Err(ShardForwardError::BadHiddenDim {
                         got: state.len(),
@@ -4612,7 +3666,6 @@ impl CachedIntegerModel {
             }
         };
 
-        // Pre-allocate buffers reused across layers
         let mut q = vec![0i64; d];
         let mut k_buf = vec![0i64; cfg.d_kv];
         let mut v_buf = vec![0i64; cfg.d_kv];
@@ -4625,19 +3678,10 @@ impl CachedIntegerModel {
         for layer_idx in start_layer..end {
             let layer = &self.layers[layer_idx];
 
-            // I16 layer ref (preferred - quantized from f32 with 258x finer
-            // granularity than I8, which is what makes output coherent on
-            // smaller models like Llama-7B). Q4 layer ref used on aarch64
-            // where matmul_q4_preq_neon delivers ~2× extra bandwidth.
             let i16l = self.i16_layers.as_ref().map(|il| &il[layer_idx]);
             #[cfg(target_arch = "aarch64")]
             let q4l = self.q4_layers.as_ref().map(|ql| &ql[layer_idx]);
 
-            // Dispatch order (highest quality first, then highest speed):
-            //   NEON + Q4 weights present → matmul_q4_preq_neon (2× bw, SIMD)
-            //   I16 weights present       → matmul_i16_into (NEON SIMD in
-            //                                dot_i16_i64_neon per row)
-            //   I8 fallback               → matmul_fast_preq scalar
             macro_rules! dispatch {
                 ($i16_field:ident, $i8_field:ident, $inq:expr, $raw:expr, $in_sz:expr, $out:expr) => {{
                     #[cfg(target_arch = "aarch64")]
@@ -4661,13 +3705,9 @@ impl CachedIntegerModel {
                 }};
             }
 
-            // LayerNorm
             let normed = layernorm(&hidden, &layer.attn_norm);
             let normed_q = QuantizedInput::from_i64(&normed);
 
-            // Q/K/V projections - I16 if loaded, else I8. Under the
-            // interleaved-RoPE profile the Q and K rows come from the copy,
-            // which the preflight above restricts to canonical per-row I8.
             match interleaved_qk.and_then(|copy| copy.layer(layer_idx)) {
                 Some((wq, wk)) => {
                     matmul_fast_preq(wq, &normed_q, &normed, d, &mut q);
@@ -4680,7 +3720,6 @@ impl CachedIntegerModel {
             }
             dispatch!(wv, wv, &normed_q, &normed, d, &mut v_buf);
 
-            // RoPE on Q and K
             for h in 0..cfg.n_heads {
                 apply_rope(
                     &mut q[h * cfg.d_head..(h + 1) * cfg.d_head],
@@ -4700,12 +3739,9 @@ impl CachedIntegerModel {
                 );
             }
 
-            // Push K/V into per-request cache
             cache.push_k(layer_idx, &k_buf);
             cache.push_v(layer_idx, &v_buf);
 
-            // Flash attention with online softmax - same as forward_one_token.
-            // O(d_head) memory per head instead of O(full_seq) for scores array.
             let full_seq = position + 1;
             let k_layer_data = &cache.k_data[layer_idx];
             let v_layer_data = &cache.v_data[layer_idx];
@@ -4735,14 +3771,12 @@ impl CachedIntegerModel {
                 attn_out[h * cfg.d_head..(h + 1) * cfg.d_head].copy_from_slice(head_out);
             }
 
-            // Wo projection + residual
             let attn_out_q = QuantizedInput::from_i64(&attn_out);
             dispatch!(wo, wo, &attn_out_q, &attn_out, d, &mut projected);
             for i in 0..d {
                 hidden[i] += projected[i];
             }
 
-            // FFN: gate, up, down
             let normed_ff = layernorm(&hidden, &layer.ffn_norm);
             let normed_ff_q = QuantizedInput::from_i64(&normed_ff);
             dispatch!(w_gate, w_gate, &normed_ff_q, &normed_ff, d, &mut gate);
@@ -4757,7 +3791,6 @@ impl CachedIntegerModel {
             }
         }
 
-        // Last shard: run final norm + LM head + argmax
         if is_last {
             cache.seq_len = position + 1;
             let normed = layernorm(&hidden, &self.final_norm);
@@ -4782,13 +3815,6 @@ impl CachedIntegerModel {
     }
 }
 
-/// Apply ARC's deterministic repetition penalty and choose the next token.
-///
-/// This is the single token-selection semantic shared by whole-model workers
-/// and terminal pipeline shards.  Keeping it here prevents community
-/// verification from comparing a penalized worker result with an unpenalized
-/// distributed argmax.  Repeated appearances are intentionally applied more
-/// than once, matching the historical generation behavior exactly.
 pub fn select_next_token_with_repetition_penalty(
     logits: &mut [i64],
     generated_tokens: &[u32],
@@ -4806,66 +3832,42 @@ pub fn select_next_token_with_repetition_penalty(
     argmax_i64(logits) as u32
 }
 
-/// Input to a shard's forward pass.
 #[derive(Debug)]
 pub enum ShardInput {
-    /// Raw token id - used by the FIRST shard, which embeds it locally.
     Token(u32),
-    /// Hidden state from the previous shard - used by middle/last shards.
     Hidden(Vec<i64>),
 }
 
-/// Output from a shard's forward pass.
 #[derive(Debug)]
 pub enum ShardOutput {
-    /// Hidden state to forward to the next shard.
     Hidden(Vec<i64>),
-    /// Final token id from the LAST shard, plus the BLAKE3 hash of the logits
-    /// for cryptographic determinism verification.
     Token { id: u32, logits_hash: Hash256 },
 }
 
-/// Why a shard forward pass refused to run.
-///
-/// Every variant here replaces something that used to be a `debug_assert!`
-/// (compiled out in release) followed by an out-of-bounds read or an index
-/// panic. Because the workspace builds release with `panic = "abort"`, an
-/// index panic inside `spawn_blocking` takes the whole node down — so a
-/// coordinator that dispatched one bad request could kill a shard holder.
-/// These are now honest, typed refusals the coordinator can act on.
-///
-/// The KV-cache variant is the load-bearing one: `forward_shard_token`
-/// reads `k_cache` through an UNCHECKED raw pointer in `flash_attention_i64`,
-/// so running position `p` against a cache holding fewer than `p` positions
-/// is undefined behaviour, not merely a wrong answer. That happens whenever
-/// a coordinator fails over to a replica that missed earlier positions —
-/// which is exactly what replica failover and hedged dispatch do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShardForwardError {
-    /// This node's per-request KV cache does not line up with the requested
-    /// position: running position `p` requires exactly `p` cached positions
-    /// for every layer in the range. Means "this replica is cold for this
-    /// request" — the coordinator should treat it as a replica failure and
-    /// either replay from position 0 or use a warm replica.
     KvCacheOutOfSync {
         layer: usize,
         expected_positions: usize,
         cached_positions: usize,
     },
-    /// A layer in the requested range is not resident on this node.
-    LayerNotLoaded { layer: usize },
-    /// The hidden state from the previous shard has the wrong dimension.
-    BadHiddenDim { got: usize, expected: usize },
-    /// Position is past the model's precomputed RoPE tables.
-    PositionOutOfRange { position: usize, max_seq: usize },
-    /// The interleaved-RoPE profile was requested, but this node holds no
-    /// interleaved-RoPE Q/K rows for this layer, or its model cannot use them.
-    InterleavedRopeUnavailable { layer: usize },
+    LayerNotLoaded {
+        layer: usize,
+    },
+    BadHiddenDim {
+        got: usize,
+        expected: usize,
+    },
+    PositionOutOfRange {
+        position: usize,
+        max_seq: usize,
+    },
+    InterleavedRopeUnavailable {
+        layer: usize,
+    },
 }
 
 impl ShardForwardError {
-    /// Stable machine-readable tag. The coordinator matches on this string
-    /// over the wire, so treat it as part of the RPC contract.
     pub fn kind(&self) -> &'static str {
         match self {
             ShardForwardError::KvCacheOutOfSync { .. } => "kv_cache_out_of_sync",
@@ -4918,79 +3920,57 @@ impl std::fmt::Display for ShardForwardError {
 
 impl std::error::Error for ShardForwardError {}
 
-// ─── Multi-row stage calls ────────────────────────────────────────────────────
-
-/// The rows a stage holder runs in one call: consecutive positions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShardRowsInput {
-    /// Token ids, for the stage that holds the embedding (`start_layer == 0`).
     Tokens(Vec<u32>),
-    /// Hidden states from the previous stage, `d_model` values per row.
     Hidden(Vec<Vec<i64>>),
 }
 
-/// What a stage holder returns for the rows of one call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShardRowsOutput {
-    /// The residual stream leaving the stage, one row per input row.
     Hidden(Vec<Vec<i64>>),
-    /// Raw logits of every row, before any repetition penalty, from the stage
-    /// that holds the output head. The caller selects each row's token with
-    /// that row's own generated history, as a teacher-forced re-check does.
     Logits(Vec<Vec<i64>>),
 }
 
-/// Why a multi-row stage call or a rollback refused. A refusal leaves the
-/// cache exactly as it was.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShardRowsError {
-    /// A check that [`CachedIntegerModel::forward_shard_token`] also makes:
-    /// KV continuity and residency on every layer, the hidden width, and the
-    /// RoPE table, which the last row must fit.
     Shard(ShardForwardError),
-    /// The call carried no rows.
     NoRows,
-    /// `[start_layer, end_layer)` is empty, or runs past the model or the cache.
     BadLayerRange {
         start_layer: usize,
         end_layer: usize,
         n_layers: usize,
     },
-    /// Token ids sent to a stage without the embedding, or hidden rows sent
-    /// to the stage that holds it.
-    WrongInput { start_layer: usize },
-    /// A token id this node holds no embedding row for.
-    TokenNotEmbedded { token: u32 },
-    /// The model is not the canonical per-row I8 profile, which is what the
-    /// batched layer pass computes; the caller uses one-row calls instead.
+    WrongInput {
+        start_layer: usize,
+    },
+    TokenNotEmbedded {
+        token: u32,
+    },
     NotCanonicalProfile,
-    /// A model dimension is zero, so no row can run.
     BadShape,
-    /// The stage ends at the last layer but does not hold the final norm and
-    /// output head.
     HeadNotLoaded,
-    /// The call carries more rows than [`CachedIntegerModel::max_shard_rows`]
-    /// allows: its own allocations would exceed the prefill's scratch budget.
-    TooManyRows { rows: usize, max_rows: usize },
-    /// A rollback asked to keep more positions than the cache holds.
+    TooManyRows {
+        rows: usize,
+        max_rows: usize,
+    },
     RollbackGrows {
         keep: usize,
         cached_positions: usize,
     },
-    /// A layer's K and V lengths are not both whole rows for the position
-    /// count: a partial row, or K and V of different lengths.
     RaggedCache {
         layer: usize,
         keys: usize,
         values: usize,
         expected: usize,
     },
-    /// The cache has a different number of K layers and V layers.
-    CacheLayersDisagree { k_layers: usize, v_layers: usize },
+    CacheLayersDisagree {
+        k_layers: usize,
+        v_layers: usize,
+    },
 }
 
 impl ShardRowsError {
-    /// Stable machine-readable tag, in the style of [`ShardForwardError::kind`].
     pub fn kind(&self) -> &'static str {
         match self {
             ShardRowsError::Shard(error) => error.kind(),
@@ -5081,22 +4061,13 @@ impl std::fmt::Display for ShardRowsError {
 
 impl std::error::Error for ShardRowsError {}
 
-/// One sequence's rows in a [`CachedIntegerModel::forward_rows_multi`] call:
-/// its own K/V cache on the stage, the absolute position of its first row,
-/// and the rows themselves, exactly as one
-/// [`CachedIntegerModel::forward_shard_rows`] call takes them.
 pub struct SeqRows<'a> {
-    /// This sequence's K/V cache. Every layer of the stage must hold exactly
-    /// `position` whole rows.
     pub cache: &'a mut KVCache,
-    /// The absolute position of the first row.
     pub position: usize,
-    /// Token ids on the stage that holds the embedding, hidden rows after it.
     pub input: ShardRowsInput,
 }
 
 impl SeqRows<'_> {
-    /// How many rows this sequence brings.
     pub fn rows(&self) -> usize {
         match &self.input {
             ShardRowsInput::Tokens(tokens) => tokens.len(),
@@ -5105,26 +4076,19 @@ impl SeqRows<'_> {
     }
 }
 
-/// Why [`CachedIntegerModel::forward_rows_multi`] refused. A refusal leaves
-/// every cache in the batch unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MultiRowsError {
-    /// The call as a whole: an empty batch, the model or the stage, or more
-    /// rows in total than [`CachedIntegerModel::max_shard_rows`] allows.
     Batch(ShardRowsError),
-    /// One sequence's rows or cache, by its index in the batch.
     Sequence { index: usize, error: ShardRowsError },
 }
 
 impl MultiRowsError {
-    /// The underlying refusal, without the sequence that caused it.
     pub fn into_rows_error(self) -> ShardRowsError {
         match self {
             MultiRowsError::Batch(error) | MultiRowsError::Sequence { error, .. } => error,
         }
     }
 
-    /// Stable machine-readable tag: the underlying [`ShardRowsError::kind`].
     pub fn kind(&self) -> &'static str {
         match self {
             MultiRowsError::Batch(error) | MultiRowsError::Sequence { error, .. } => error.kind(),
@@ -5143,29 +4107,14 @@ impl std::fmt::Display for MultiRowsError {
 
 impl std::error::Error for MultiRowsError {}
 
-/// One sequence's contiguous rows inside a multi-sequence layer pass.
 #[derive(Clone, Copy, Debug)]
 struct SeqSpan {
-    /// Index of the sequence's first row among the pass's rows.
     first_row: usize,
     rows: usize,
-    /// Absolute position of the sequence's first row.
     first_position: usize,
 }
 
 impl CachedIntegerModel {
-    /// The most rows one [`Self::forward_shard_rows`] call takes on a stage
-    /// ending at `end_layer`, so that the call's own allocations stay within
-    /// the prefill's scratch budget
-    /// ([`crate::canonical_prefill::MAX_PREFILL_SCRATCH_BYTES`]). Per row
-    /// that is the prefill's activation and digit scratch
-    /// ([`crate::canonical_prefill::prefill_chunk_scratch_bytes`], which
-    /// includes the SMMLA kernel's paired copy of the digits) plus the rows
-    /// the call returns. On the stage that holds the head, those are the
-    /// final norm and the logits, which it holds twice (computed and
-    /// returned). The prefill's [`crate::canonical_simd::MAX_BATCH_TOKENS`]
-    /// ceiling applies too. At Llama-2-7B width this is 480 rows on an inner
-    /// stage and 250 on the last.
     pub fn max_shard_rows(&self, end_layer: usize) -> usize {
         let cfg = &self.config;
         let scratch = crate::canonical_prefill::prefill_chunk_scratch_bytes(
@@ -5186,51 +4135,6 @@ impl CachedIntegerModel {
             .clamp(1, crate::canonical_simd::MAX_BATCH_TOKENS)
     }
 
-    /// Runs `k` consecutive positions through this stage's layers
-    /// `[start_layer, end_layer)` in one pass over its weights.
-    ///
-    /// The multi-row twin of [`Self::forward_shard_token`]. Rows at positions
-    /// `position..position + k` produce exactly the hidden states, logits and
-    /// K/V rows that `k` one-row calls would, because every layer runs
-    /// [`Self::forward_layers_batched`], the routine the batched prefill runs,
-    /// over the stage's range, and each projection reads the stage's weights
-    /// once for all `k` rows. The stage that holds the head returns raw logits;
-    /// the caller selects each row's token with that row's generated history,
-    /// and [`Self::rollback_rows`] drops the rows of rejected drafts. It is
-    /// [`Self::forward_rows_multi`] with one sequence.
-    ///
-    /// When it pays. The base batched kernels (SDOT, AVX2) work on quads of
-    /// four rows, so a call costs about one quad's work per started quad, and
-    /// its per-row saving over one-row calls is a sawtooth in k. Measured on
-    /// Llama-2-7B (bench run 37998031423, `examples/stage_rows_bench.rs`,
-    /// 4-vCPU runners):
-    ///
-    /// - with the vectorised kernel a call pays from three rows: 0.89 of the
-    ///   one-row cost per row on AVX2 and 0.73 on NEON at k = 3, falling to
-    ///   0.67 and 0.48 at k = 8. Five rows on AVX2 (1.05) are the exception;
-    /// - with the scalar kernel only whole quads pay, about 0.92 at k = 4
-    ///   and k = 8, and every other k costs more;
-    /// - one or two rows never pay, so send those through
-    ///   [`Self::forward_shard_token`].
-    ///
-    /// CPUs with matrix extensions run cheaper kernels
-    /// ([`crate::canonical_simd::BatchedKernel`]), for one-row calls too.
-    /// Measured the same way for k = 1 to 64 (bench run 38030963937), with
-    /// each kernel's own one-row calls as the baseline:
-    ///
-    /// - SMMLA (i8mm, Neoverse-N2): a one-row call takes about 150 ms against
-    ///   345 ms on SDOT. Per row, a k-row call costs 0.72 of it at k = 2, 0.31
-    ///   at k = 8 and 0.28 from k = 16 to 64 (42 to 46 ms from k = 8);
-    /// - AVX-512 VNNI (Intel Xeon Platinum 8573C): a one-row call takes about
-    ///   295 ms against 680 ms on AVX2; 0.59 at k = 2, 0.28 at k = 8 and 0.22
-    ///   to 0.27 from k = 16 to 64 (66 to 84 ms from k = 8);
-    /// - AVX-VNNI on the same CPU: about 320 ms per one-row call; 0.56 at
-    ///   k = 2, 0.30 at k = 8 and 0.23 to 0.27 from k = 16 to 64.
-    ///
-    /// With these kernels a call pays from two rows.
-    ///
-    /// Canonical per-row I8 only: any other profile is refused, so the caller
-    /// falls back to one-row calls. A refusal leaves `cache` unchanged.
     pub fn forward_shard_rows(
         &self,
         input: ShardRowsInput,
@@ -5250,29 +4154,6 @@ impl CachedIntegerModel {
         outputs.pop().ok_or(ShardRowsError::NoRows)
     }
 
-    /// Runs the rows of several sequences through this stage's layers
-    /// `[start_layer, end_layer)` in one pass over its weights.
-    ///
-    /// Each [`SeqRows`] brings one sequence's own K/V cache and its next rows,
-    /// at positions `position..position + k`. Every projection reads the
-    /// stage's weights once for all rows of all sequences. Each row attends
-    /// only over its own sequence's cache, at its own position, and each
-    /// sequence's K/V rows go to its own cache in position order. No step
-    /// combines values across rows: norms, RoPE, attention and activations are
-    /// per row, and the batched projection computes each row's dot products on
-    /// their own (a kernel that refuses one row's operands sends the whole
-    /// call to the scalar kernel, which computes the same values). So each
-    /// sequence gets exactly the hidden rows, logits and K/V rows it would get
-    /// alone, whatever its neighbours and their order. The E4 batch-invariance
-    /// tests hold this to the token-by-token run on every kernel and thread
-    /// count.
-    ///
-    /// Returns one output per sequence, in batch order: hidden rows, or raw
-    /// logits on the stage that holds the head. The checks are those of
-    /// [`Self::forward_shard_rows`], per sequence, and the rows of all
-    /// sequences together are held to [`Self::max_shard_rows`]. A refusal
-    /// names the sequence when one sequence caused it, and leaves every cache
-    /// unchanged.
     pub fn forward_rows_multi(
         &self,
         batch: &mut [SeqRows<'_>],
@@ -5354,7 +4235,6 @@ impl CachedIntegerModel {
             return Err(MultiRowsError::Batch(ShardRowsError::HeadNotLoaded));
         }
 
-        // Every sequence's rows, one after another in batch order.
         let mut hidden = Vec::with_capacity(rows * d);
         let mut spans = Vec::with_capacity(batch.len());
         for (index, seq) in batch.iter().enumerate() {
@@ -5367,7 +4247,6 @@ impl CachedIntegerModel {
                 .map_err(|error| MultiRowsError::Sequence { index, error })?;
         }
 
-        // Nothing has been refused, so the caches change from here on.
         let mut caches: Vec<&mut KVCache> = batch.iter_mut().map(|seq| &mut *seq.cache).collect();
         let mut ignore = |_: usize, _: usize, _: usize, _: &[i64]| {};
         self.forward_layers_multi(
@@ -5415,11 +4294,6 @@ impl CachedIntegerModel {
             .collect())
     }
 
-    /// The per-sequence checks of a multi-row call: every row must fit the
-    /// RoPE table, as each one-row call requires, and every layer of the
-    /// stage must hold exactly `position` whole K rows and as many V rows.
-    /// Whole rows for another position are the one-row call's out-of-sync
-    /// refusal; a partial row or a K/V mismatch is a torn cache.
     fn check_rows_fit(
         &self,
         cache: &KVCache,
@@ -5461,8 +4335,6 @@ impl CachedIntegerModel {
         Ok(())
     }
 
-    /// Appends one sequence's input rows to `hidden`: embedding rows for
-    /// token ids on the stage that holds the embedding, hidden rows after it.
     fn append_input_rows(
         &self,
         input: &ShardRowsInput,
@@ -5477,7 +4349,6 @@ impl CachedIntegerModel {
                     return Err(ShardRowsError::WrongInput { start_layer });
                 }
                 for &token in tokens {
-                    // The same clamp as `forward_shard_token`.
                     let idx = (token as usize).min(cfg.vocab_size - 1);
                     let row = self
                         .embedding_q16
@@ -5505,12 +4376,6 @@ impl CachedIntegerModel {
         Ok(())
     }
 
-    /// Keeps the first `keep` positions of a stage holder's `cache` and drops
-    /// the rest in place, as #181's `Frame::Rollback { keep }` does on every
-    /// stage: the K/V rows of rejected drafts go and every earlier row stays
-    /// byte for byte. Keeping as many positions as the cache holds is a no-op.
-    /// Keeping more is refused, and so is a cache whose layers disagree with
-    /// its position count. Layers the stage does not hold stay empty.
     pub fn rollback_rows(&self, cache: &mut KVCache, keep: usize) -> Result<(), ShardRowsError> {
         let held = cache.seq_len;
         if keep > held {
@@ -5528,8 +4393,6 @@ impl CachedIntegerModel {
             });
         }
         for (layer, (keys, values)) in cache.k_data.iter().zip(&cache.v_data).enumerate() {
-            // A layer the stage does not hold is empty; any other layer holds
-            // exactly `held` whole rows of K and of V.
             let (keys, values) = (keys.len(), values.len());
             if (keys, values) != (0, 0) && (keys, values) != (expected, expected) {
                 return Err(ShardRowsError::RaggedCache {
@@ -5548,8 +4411,6 @@ impl CachedIntegerModel {
     }
 }
 
-// ─── RoPE Tables ──────────────────────────────────────────────────────────────
-
 pub fn compute_rope_tables(d_head: usize, max_seq: usize, base: f64) -> (Vec<i64>, Vec<i64>) {
     let half = d_head / 2;
     let mut cos_table = vec![0i64; max_seq * half];
@@ -5564,8 +4425,6 @@ pub fn compute_rope_tables(d_head: usize, max_seq: usize, base: f64) -> (Vec<i64
     }
     (cos_table, sin_table)
 }
-
-// ─── GGUF Loader ──────────────────────────────────────────────────────────────
 
 #[cfg(feature = "candle")]
 pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::InferenceError> {
@@ -5594,10 +4453,9 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         let content = gguf_file::Content::read(&mut reader)
             .map_err(|e| InferenceError::Runtime(format!("GGUF: {e}")))?;
 
-        // Detect architecture from GGUF metadata (supports llama, mistral, phi, gemma, qwen, etc.)
         let arch = match content.metadata.get("general.architecture") {
             Some(gguf_file::Value::String(s)) => s.clone(),
-            _ => "llama".to_string(), // default for LLaMA-family models
+            _ => "llama".to_string(),
         };
 
         let get_u32 = |key: &str| -> u32 {
@@ -5609,7 +4467,6 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
             }
         };
 
-        // Architecture-agnostic metadata keys: try {arch}.key first
         let nl = get_u32(&format!("{arch}.block_count")) as usize;
         let dm = get_u32(&format!("{arch}.embedding_length")) as usize;
         let nh = get_u32(&format!("{arch}.attention.head_count")) as usize;
@@ -5624,15 +4481,12 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
             .map(|t| t.shape.dims()[0])
             .unwrap_or(32000);
 
-        // Read RoPE base frequency from metadata (LLaMA-3 uses 500000, most others use 10000)
-        // Handle both F32 and F64 storage - some quantizers write F64
         let rope_base: f64 = match content.metadata.get(&format!("{arch}.rope.freq_base")) {
             Some(gguf_file::Value::F32(v)) => *v as f64,
             Some(gguf_file::Value::F64(v)) => *v,
             _ => 10000.0,
         };
 
-        // Read EOS tokens from tokenizer metadata (scalar or array)
         let eos_tokens = match content.metadata.get("tokenizer.ggml.eos_token_id") {
             Some(gguf_file::Value::U32(v)) => vec![*v],
             Some(gguf_file::Value::U64(v)) => vec![*v as u32],
@@ -5644,17 +4498,15 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
                     _ => None,
                 })
                 .collect(),
-            _ => vec![2, 128001, 128009], // LLaMA-2/3 defaults
+            _ => vec![2, 128001, 128009],
         };
 
-        // Read BOS token ID
         let bos_token = match content.metadata.get("tokenizer.ggml.bos_token_id") {
             Some(gguf_file::Value::U32(v)) => *v,
             Some(gguf_file::Value::U64(v)) => *v as u32,
-            _ => 1, // LLaMA default
+            _ => 1,
         };
 
-        // Read chat template (Jinja2 format) for correct prompt wrapping
         let chat_template = match content.metadata.get("tokenizer.chat_template") {
             Some(gguf_file::Value::String(s)) => s.clone(),
             _ => String::new(),
@@ -5698,7 +4550,6 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         d_model, n_heads, n_kv_heads, d_ff, vocab_size, "Loading GGUF into per-row INT8 cache..."
     );
 
-    // Single file handle + content parse
     let mut reader = std::fs::File::open(&gguf_path)
         .map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
     let content = gguf_file::Content::read(&mut reader)
@@ -5730,10 +4581,6 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         Ok(I8Weights::quantize_f32(&f, rows, cols))
     };
 
-    // Extract f32 ONCE, then quantize to I8, I16, AND block-wise I8 from the
-    // originals. Block-i8 is the new preferred format (see project_i16_ppl_bug.md
-    // for why per-row I8 tops out at PPL 107 and I16::from_i8 doesn't help).
-    // I16 kept for back-compat but not installed in the model by default.
     let extract_i8_and_i16 = |reader: &mut std::fs::File,
                               content: &gguf_file::Content,
                               name: &str,
@@ -5746,10 +4593,6 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         let f = extract_f32(reader, content, name)?;
         let i8 = I8Weights::quantize_f32(&f, rows, cols);
         let i16 = I16Weights::quantize_f32(&f, rows, cols);
-        // Block-i8 is safe only when n_cols is a multiple of the block size;
-        // every Llama-family dimension (4096, 11008, 32000) satisfies this,
-        // but fall back to an empty placeholder otherwise so shards with
-        // irregular shapes don't panic at load.
         let block = if cols.is_multiple_of(crate::block_i8::BLOCK_SIZE) {
             crate::block_i8::BlockI8Weights::quantize_f32(&f, rows, cols)
         } else {
@@ -5758,9 +4601,6 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         Ok((i8, i16, block))
     };
 
-    // As in the shard loader: a norm weight that is missing or the wrong
-    // length makes the artifact malformed, and substituting ONE would serve
-    // a different model under the same file (deviation D3).
     let extract_norm = |reader: &mut std::fs::File,
                         content: &gguf_file::Content,
                         name: &str,
@@ -5779,7 +4619,6 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
             .collect())
     };
 
-    // Embedding: single f32 extraction → I8 + full-precision Q16 vector.
     let embedding_f32 = extract_f32(&mut reader, &content, "token_embd.weight")?;
     let embedding_i8 = I8Weights::quantize_f32(&embedding_f32, vocab_size, d_model);
     let embedding_q16: Vec<i64> = embedding_f32
@@ -5793,8 +4632,6 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         embedding_i8.memory_bytes() / (1024 * 1024)
     );
 
-    // Output projection: f32 → I8 + I16 + Block-I8 in one pass.
-    // Falls back to tied embeddings if absent.
     let (output_weight, i16_output, block_i8_output) =
         match extract_i8_and_i16(&mut reader, &content, "output.weight", vocab_size, d_model) {
             Ok((i8, i16, block)) => (i8, Some(i16), Some(block)),
@@ -5926,12 +4763,8 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         });
     }
 
-    // Match the trained Llama-2 4096-position context window. See the
-    // matching note in `load_cached_model_ranges` for the truncation
-    // failure mode at the old 2048 cap.
     let max_seq = 4096;
     let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, rope_base);
-    // 1/sqrt(d_head) in Q16 - integer_isqrt already returns ONE/sqrt(x/ONE)
     let attn_scale = integer_isqrt((d_head as i64) * ONE);
 
     info!(
@@ -5976,27 +4809,8 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         vocab,
         q4_layers: None,
         q4_output: None,
-        // INT16 enabled 2026-06-04. The 2026-04-20 disable rationale
-        // ("logits ~38× larger magnitude than I8 baseline") cited a
-        // symptom traceable to the I8 scale bug at line 64 (`abs_max as
-        // i64` truncating sub-1.0 magnitudes to 0). That bug was fixed
-        // independently and the unit-level matmul correctness suite
-        // (test_i16_matmul_correctness, test_i16_matmul_matches_i8_on_from_i8,
-        // test_i16_quantize_f32_reconstruction, test_i16_deterministic,
-        // test_i16_from_i8_preserves_values, test_i16_matmul_nonzero_output,
-        // test_i16_memory_bytes — all 7 green) now verifies the math
-        // matches f64 reference within 15%. The dispatch macro at line
-        // 2068 prefers I16 over I8 when present, so enabling here flips
-        // every layer + the output projection to the finer-grained
-        // [-32767, 32767] quantization (~258× I8 resolution per row).
         i16_layers: Some(i16_layers_vec),
-        // i16_output is already `Option<I16Weights>` from the loader
-        // match arms above (Ok → Some(i16), Err → tied_i16 which is
-        // .map'd Option). Pass through, don't re-wrap.
         i16_output,
-        // Block-wise INT8 installed by default - 32-weight blocks with i32
-        // Q16 scales, pure integer math, quality on par with llama.cpp Q8_0.
-        // Forward dispatch prefers this over per-row I8 when present.
         block_i8_layers: Some(block_i8_layers_vec),
         block_i8_output,
         ternary_layers: None,
@@ -6013,12 +4827,6 @@ pub fn load_cached_model(_path: &str) -> Result<CachedIntegerModel, crate::Infer
     ))
 }
 
-/// Load ONLY the tokenizer from a GGUF file - no transformer weights.
-/// Returns a CachedIntegerModel with vocab, config, encode/decode capability,
-/// but zero layers and zero embedding weights. ~30MB instead of 4GB.
-///
-/// Use case: coordinator nodes that need to tokenize prompts for sharded
-/// inference but don't hold any model weights themselves.
 #[cfg(feature = "candle")]
 pub fn load_tokenizer_only(path: &str) -> Result<CachedIntegerModel, crate::InferenceError> {
     use crate::InferenceError;
@@ -6056,9 +4864,6 @@ pub fn load_tokenizer_only(path: &str) -> Result<CachedIntegerModel, crate::Infe
         .get("token_embd.weight")
         .map(|t| t.shape.dims()[0])
         .unwrap_or(32000);
-    // checked_div carries the `n_heads > 0` guard: it returns None only when
-    // the divisor is zero, so this is the same integer division and the same
-    // 128 fallback, bit for bit.
     let d_head = d_model.checked_div(n_heads).unwrap_or(128);
     let d_kv = d_head * n_kv_heads;
 
@@ -6106,7 +4911,6 @@ pub fn load_tokenizer_only(path: &str) -> Result<CachedIntegerModel, crate::Infe
         d_model, vocab_size, "Loaded tokenizer-only (no weights)"
     );
 
-    // Build config with RoPE tables
     let max_seq = 4096;
     let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, rope_base);
     let attn_scale = (ONE as f64 / (d_head as f64).sqrt()).round() as i64;
@@ -6158,21 +4962,6 @@ pub fn load_tokenizer_only(_path: &str) -> Result<CachedIntegerModel, crate::Inf
     ))
 }
 
-// ─── Sharded Loading: Load Only Layers [start, end) ──────────────────────────
-//
-// A node holding shard k of N loads only its slice of the model. This is the
-// foundation for pipeline-parallel distributed inference: each node holds a
-// fraction of the layers, and a request flows through the pipeline of shards
-// via HTTP forwarding of activations.
-//
-// Memory invariant: the layers Vec is the same size as n_layers (so absolute
-// layer indexing in forward_shard_layers stays correct), but slots outside
-// [start, end) are zero-byte placeholders. A 70B model split 8 ways uses
-// ~5GB per node instead of 40GB.
-//
-// Embeddings load only on the FIRST shard (start_layer == 0).
-// Output head + final_norm load only on the LAST shard (end_layer == n_layers).
-
 #[cfg(feature = "candle")]
 pub fn load_cached_model_shard(
     path: &str,
@@ -6182,10 +4971,6 @@ pub fn load_cached_model_shard(
     load_cached_model_shard_profile(path, start_layer, end_layer, true)
 }
 
-/// Load a whole GGUF directly into the protocol's canonical per-row INT8
-/// profile. Unlike `load_cached_model`, this never materializes I16 or
-/// block-I8 copies, keeping peak memory suitable for a community worker while
-/// producing exactly what the merged validator ranges recompute.
 #[cfg(feature = "candle")]
 pub fn load_cached_model_canonical_i8(
     path: &str,
@@ -6196,15 +4981,6 @@ pub fn load_cached_model_canonical_i8(
     Ok(model)
 }
 
-/// Load the pinned Llama-family GGUF with the versioned interleaved-RoPE
-/// compatibility profile. The source artifact stores Q/K features as adjacent
-/// pairs; this loader rewrites only the resident per-row-I8 Q/K rows into the
-/// legacy split-half representation before any request is served.
-///
-/// This is intentionally not a generic GGUF switch. It admits only
-/// `general.architecture = llama`, requires complete canonical I8 weights, and
-/// carries a distinct execution identity so it cannot join legacy caches or
-/// validator claims by accident.
 #[cfg(feature = "candle")]
 pub fn load_cached_model_canonical_i8_interleaved_rope(
     path: &str,
@@ -6437,11 +5213,6 @@ fn load_cached_model_shard_profile(
             .map_err(|e| InferenceError::Runtime(format!("tovec: {e}")))
     };
 
-    // Extract f32 once and produce BOTH I8 (kept for compat / placeholder math)
-    // AND I16 (used by forward_shard_token for ~258x finer quantization).
-    // I16 directly from f32 is the only way to get real quality improvement -
-    // I16Weights::from_i8() preserves I8-level precision, I16Weights::quantize_f32
-    // doesn't.
     let extract_i8_i16 = |reader: &mut std::fs::File,
                           content: &gguf_file::Content,
                           name: &str,
@@ -6458,10 +5229,6 @@ fn load_cached_model_shard_profile(
         Ok((i8w, i16w))
     };
 
-    // A norm weight that is missing or the wrong length makes the artifact
-    // malformed. Substituting ONE, as this loader once did, served a
-    // different model under the same identity (integer profile contract v1,
-    // deviation D3).
     let extract_norm = |reader: &mut std::fs::File,
                         content: &gguf_file::Content,
                         name: &str,
@@ -6480,7 +5247,6 @@ fn load_cached_model_shard_profile(
             .collect())
     };
 
-    // ── Embeddings: ONLY on first shard ──────────────────────────────────────
     let (embedding_q16, embedding_i8) = if is_first {
         let f = extract_f32(&mut reader, &content, "token_embd.weight")?;
         let i8w = I8Weights::quantize_f32(&f, vocab_size, d_model);
@@ -6498,9 +5264,7 @@ fn load_cached_model_shard_profile(
         (Vec::new(), I8Weights::empty())
     };
 
-    // ── Output head + final norm: ONLY on last shard ─────────────────────────
     let (output_weight, output_weight_i16, final_norm) = if is_last {
-        // Try output.weight first, fall back to token_embd.weight (tied embeddings).
         let f = extract_f32(&mut reader, &content, "output.weight")
             .or_else(|_| extract_f32(&mut reader, &content, "token_embd.weight"))?;
         let i8w = I8Weights::quantize_f32(&f, vocab_size, d_model);
@@ -6513,11 +5277,6 @@ fn load_cached_model_shard_profile(
         (I8Weights::empty(), None, Vec::new())
     };
 
-    // ── Layers: only [start_layer, end_layer) loaded; rest are placeholders ──
-    // We populate I8, I16, AND Q4 for each held layer. The Q4 weights are
-    // the fastest path on aarch64 (matmul_q4_preq_neon gives ~2× bandwidth
-    // reduction vs I16), the I16 weights are the high-quality fallback,
-    // and the I8 weights are kept so other code paths can fall back.
     let mut layers: Vec<CachedLayer> = (0..n_layers).map(|_| CachedLayer::placeholder()).collect();
     let mut i16_layers_vec: Vec<I16Layer> = (0..n_layers)
         .map(|_| I16Layer {
@@ -6576,9 +5335,6 @@ fn load_cached_model_shard_profile(
             },
         })
         .collect();
-    // Q4 is OPT-IN: enable by setting ARC_Q4_SHARD=1. Without it, the
-    // shard uses the I16 SIMD path (higher quality). Q4 gives ~2× more
-    // speed at the cost of additional quantization noise (4-bit vs 16-bit).
     let enable_q4 = include_optional_quantizations && std::env::var("ARC_Q4_SHARD").is_ok();
     let mut any_i16 = false;
     let mut any_q4 = false;
@@ -6664,7 +5420,6 @@ fn load_cached_model_shard_profile(
             w_down: wd16,
         };
         any_i16 = include_optional_quantizations;
-        // Convert the just-loaded I8 layer to Q4 if requested.
         if enable_q4 {
             let l8 = &layers[l];
             q4_layers_vec[l] = Q4Layer {
@@ -6722,8 +5477,6 @@ fn load_cached_model_shard_profile(
         q4_output: None,
         i16_layers: if any_i16 { Some(i16_layers_vec) } else { None },
         i16_output: output_weight_i16,
-        // Shard loader does not yet emit block-i8 weights; a future pass
-        // should replicate the main loader's triple-quant pattern here.
         block_i8_layers: None,
         block_i8_output: None,
         ternary_hybrid_layers: None,
@@ -6762,14 +5515,6 @@ pub fn load_cached_model_canonical_i8_interleaved_rope(
     ))
 }
 
-/// Load the union of multiple disjoint layer ranges into a single
-/// `CachedIntegerModel`. The per-range layers vec is always full `n_layers`
-/// long; slots outside any provided range are placeholders and are never
-/// touched by `forward_shard_token`.
-///
-/// Embedding loads when 0 is in any range; output head + final_norm load
-/// when `n_layers` is at any range end. Ranges must be disjoint (overlapping
-/// ranges would double-load the same weights and waste memory).
 #[cfg(feature = "candle")]
 pub fn load_cached_model_ranges(
     path: &str,
@@ -6795,27 +5540,17 @@ pub fn load_cached_model_ranges(
         }
     }
 
-    // Single-range path: call load_cached_model_shard directly and return
-    // its output untouched. Any mutation here (e.g. zeroing optional
-    // quantization slices) breaks the invariants the shard loader
-    // established and has caused segfaults in production when the forward
-    // path assumed the full set was still present. For a one-range caller,
-    // this function MUST be a thin alias for load_cached_model_shard.
     if sorted.len() == 1 {
         return load_cached_model_shard(path, sorted[0].0, sorted[0].1);
     }
 
     let mut aggregate = load_cached_model_shard(path, sorted[0].0, sorted[0].1)?;
     let n_layers = aggregate.config.n_layers;
-    // Multi-range execution is the canonical per-row I8 validator profile.
-    // Drop the first sub-load's optional copies before loading the next range
-    // so an 8 GiB validator never holds I8+I16 for multiple ranges at once.
     aggregate.enforce_canonical_i8_profile();
 
     for &(start, end) in &sorted[1..] {
         let mut other = load_cached_model_shard(path, start, end)?;
         other.enforce_canonical_i8_profile();
-        // Sanity: every shard load must produce the same n_layers-sized layers vec
         if other.layers.len() != aggregate.layers.len() {
             return Err(InferenceError::Runtime(format!(
                 "Shard loader returned inconsistent layer count: {} vs {}",
@@ -6829,12 +5564,10 @@ pub fn load_cached_model_ranges(
                     std::mem::replace(&mut other.layers[idx], CachedLayer::placeholder());
             }
         }
-        // Merge embedding if the other shard loaded it (start==0 path).
         if start == 0 && aggregate.embedding_q16.is_empty() && !other.embedding_q16.is_empty() {
             aggregate.embedding_q16 = std::mem::take(&mut other.embedding_q16);
             aggregate.embedding_i8 = std::mem::replace(&mut other.embedding_i8, I8Weights::empty());
         }
-        // Merge output head + final_norm if the other shard loaded them (end==n_layers path).
         if end == n_layers {
             if aggregate.output_weight.n_rows == 0 && other.output_weight.n_rows != 0 {
                 aggregate.output_weight =
@@ -6845,11 +5578,6 @@ pub fn load_cached_model_ranges(
             }
         }
     }
-    // Multi-range only: rebuild optional quantization paths coherently
-    // across the merged layer set. Each sub-load's i16/q4/block_i8 slices
-    // were keyed on its own subrange; regenerating from the merged I8
-    // layers is simpler than stitching partial slices. Callers that want
-    // I16 after this should call `.enable_i16()`.
     aggregate.i16_layers = None;
     aggregate.i16_output = None;
     aggregate.q4_layers = None;
@@ -6861,12 +5589,6 @@ pub fn load_cached_model_ranges(
     aggregate.ternary_hybrid_layers = None;
     aggregate.ternary_hybrid_output = None;
 
-    // Post-load sanity: every layer that was merged in must have consistent
-    // I8Weights dimensions. data.len() MUST equal n_rows * n_cols for each
-    // of the 7 matrices per layer - a mismatch is what causes the dangling-
-    // but-non-null pointer deref in matmul_i8_into / matmul_i16_into. Panic
-    // with the exact layer + matrix + dims so the crash has a backtrace
-    // instead of SIGSEGVing the consensus thread.
     for &(s, e) in &sorted {
         for idx in s..e.min(n_layers) {
             let l = &aggregate.layers[idx];
@@ -6916,7 +5638,6 @@ pub fn load_cached_model_ranges(
     ))
 }
 
-/// Load from binary .arc-int8 file.
 pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate::InferenceError> {
     use crate::InferenceError;
     use std::io::Read;
@@ -6960,7 +5681,6 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
 
     let embedding_i8 =
         I8Weights::read_from(&mut f).map_err(|e| InferenceError::Runtime(format!("Emb: {e}")))?;
-    // Reconstruct Q16 embeddings from i8 + per-row scale
     let embedding_q16: Vec<i64> = {
         let mut q16 = Vec::with_capacity(embedding_i8.n_rows * embedding_i8.n_cols);
         for i in 0..embedding_i8.n_rows {
@@ -6973,9 +5693,6 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
     };
     let output_weight =
         I8Weights::read_from(&mut f).map_err(|e| InferenceError::Runtime(format!("Out: {e}")))?;
-    // Every norm vector must hold exactly d_model weights: `layernorm` pads a
-    // short one with ONE, which would serve a different model under the same
-    // file (deviation D3).
     let checked_norm = |name: String, values: Vec<i64>| -> Result<Vec<i64>, InferenceError> {
         if values.len() == d_model {
             Ok(values)
@@ -7030,7 +5747,6 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
         n_layers, d_model, vocab_size
     );
 
-    // Binary format doesn't store these; use LLaMA family defaults
     let eos_tokens = vec![2u32, 128001, 128009];
 
     Ok(CachedIntegerModel {
@@ -7071,8 +5787,6 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
     })
 }
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7086,8 +5800,6 @@ mod tests {
     fn interleaved_rope_matches_candle_rope_i_pairing() {
         let half = ONE / 2;
         let mut actual = vec![ONE, 2 * ONE, 3 * ONE, 4 * ONE];
-        // One position with the same cos/sin for both pairs. Candle's rope_i
-        // pairs (0,1) and (2,3), unlike the legacy split-half (0,2)/(1,3).
         apply_rope_interleaved(&mut actual, 0, 4, &[half, half], &[half, half]);
         assert_eq!(
             actual,
@@ -7097,10 +5809,6 @@ mod tests {
 
     #[test]
     fn shared_repetition_penalty_changes_a_repeated_raw_argmax() {
-        // Token 1 is the raw winner. Once it appears in generated history, the
-        // shared ARC penalty lowers it from 120 to 100 and token 2 must win.
-        // Whole-model generation and terminal pipeline shards both call this
-        // exact helper, so this vector guards their common selection semantic.
         let raw_logits = vec![0, 120, 110];
         assert_eq!(argmax_i64(&raw_logits), 1);
 
@@ -7114,12 +5822,6 @@ mod tests {
         assert_eq!(distributed_verifier, worker);
         assert_eq!(worker_logits, distributed_verifier_logits);
     }
-
-    // ── Batched prefill conformance ─────────────────────────────────────────
-    //
-    // Batched prefill must be indistinguishable from calling forward_one_token
-    // once per token: same logits at every position, same KV cache bytes, same
-    // seq_len, and the same continuation decode afterwards.
 
     fn token_at_a_time(
         model: &CachedIntegerModel,
@@ -7160,8 +5862,6 @@ mod tests {
     }
 
     fn run_batched_conformance(simd: bool) {
-        // The kernel switch is process-global and the harness is parallel, so
-        // opting in here is visible to every other test until it is restored.
         let _switch = crate::canonical_simd::kernel_switch_guard();
         let prev = crate::canonical_simd::fast_canonical_kernel_enabled();
         crate::canonical_simd::set_fast_canonical_kernel(simd);
@@ -7194,9 +5894,6 @@ mod tests {
                 }
                 assert_same_cache(&ref_cache, &cache, &case);
 
-                // Continuation decode must also match, which is what proves the
-                // persisted KV state is byte-correct and not merely consistent
-                // within the prefill itself.
                 let mut ref_cont = clone_cache(&ref_cache);
                 let mut got_cont = clone_cache(&cache);
                 for step in 0..3u32 {
@@ -7269,15 +5966,11 @@ mod tests {
     #[test]
     fn batched_prefill_refuses_without_touching_the_cache() {
         use crate::canonical_prefill::{prefill_census, reset_prefill_census};
-        // The prefill counters are process-global too: without this, a
-        // concurrent `reset_prefill_census` zeroes the counts between the
-        // refusals below and the assertions on them.
         let _switch = crate::canonical_simd::kernel_switch_guard();
         let model = build_test_model(64, 32, 4, 64, 3);
         let max_seq = model.config.max_seq;
         reset_prefill_census();
 
-        // empty prompt
         let mut cache = KVCache::new(model.config.n_layers);
         assert!(
             model
@@ -7287,7 +5980,6 @@ mod tests {
         assert_eq!(cache.seq_len, 0);
         assert!(cache.k_data.iter().all(|k| k.is_empty()));
 
-        // zero chunk size
         assert!(
             model
                 .prefill_canonical_i8_batched(&[1, 2], &mut cache, 0, true)
@@ -7296,7 +5988,6 @@ mod tests {
         assert_eq!(cache.seq_len, 0);
         assert!(cache.k_data.iter().all(|k| k.is_empty()));
 
-        // beyond the context window: admission is NOT relaxed
         let too_long: Vec<u32> = vec![1; max_seq + 1];
         assert!(
             model
@@ -7306,7 +5997,6 @@ mod tests {
         assert_eq!(cache.seq_len, 0);
         assert!(cache.k_data.iter().all(|k| k.is_empty()));
 
-        // exactly at the window is still admitted
         let exact: Vec<u32> = vec![1; 4];
         assert!(
             model
@@ -7319,13 +6009,6 @@ mod tests {
         assert!(c.refused_context_window >= 1, "{c:?}");
         reset_prefill_census();
     }
-
-    // ── Batched projection geometry: the unsafe contract ────────────────────
-    //
-    // `matmul_i8_into_batched` indexes weights, inputs and output with raw
-    // pointers. Before this, its only shape checks were `debug_assert_eq!`,
-    // which compile out in release - precisely where those writes happen.
-    // These tests pin the validation that replaced them.
 
     fn w1x1() -> I8Weights {
         I8Weights::quantize_f32(&[0.5f32], 1, 1)
@@ -7345,14 +6028,9 @@ mod tests {
         let good_in = vec![0i64; 3 * 4];
         let good_out = vec![0i64; 3 * 8];
 
-        // Output one short, and the empty-output case Codex identified.
         assert!(!batched_shape_is_valid(&w, &good_in, 3, 4, &good_out[..23]));
         assert!(!batched_shape_is_valid(&w1x1(), &[1i64], 1, 1, &[]));
-        // Input one short.
         assert!(!batched_shape_is_valid(&w, &good_in[..11], 3, 4, &good_out));
-        // Weight data inconsistent with n_rows * in_size. Rebuilt rather than
-        // cloned: I8Weights deliberately does not derive Clone, and adding a
-        // derive to accepted code just to write a test is the wrong trade.
         let short = I8Weights {
             data: w.data[..w.data.len() - 1].to_vec(),
             scales: w.scales.clone(),
@@ -7360,7 +6038,6 @@ mod tests {
             n_cols: w.n_cols,
         };
         assert!(!batched_shape_is_valid(&short, &good_in, 3, 4, &good_out));
-        // Scales inconsistent with n_rows.
         let scales = I8Weights {
             data: w.data.clone(),
             scales: w.scales[..w.scales.len() - 1].to_vec(),
@@ -7368,16 +6045,13 @@ mod tests {
             n_cols: w.n_cols,
         };
         assert!(!batched_shape_is_valid(&scales, &good_in, 3, 4, &good_out));
-        // Declared inner dimension disagreeing with the matrix.
         assert!(!batched_shape_is_valid(&w, &[0i64; 3 * 5], 3, 5, &good_out));
-        // Degenerate counts.
         assert!(!batched_shape_is_valid(&w, &good_in, 0, 4, &good_out));
         assert!(!batched_shape_is_valid(&w, &good_in, 3, 0, &good_out));
     }
 
     #[test]
     fn batched_shape_predicate_rejects_overflowing_dimensions() {
-        // n_tokens * in_size must not wrap to a small, apparently valid length.
         let w = w1x1();
         let huge = usize::MAX / 2 + 1;
         assert!(!batched_shape_is_valid(&w, &[1i64], huge, 4, &[0i64]));
@@ -7394,9 +6068,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "invalid geometry")]
     fn batched_matmul_panics_on_the_empty_output_slice() {
-        // The exact trigger from the review: valid public 1x1 weights, a
-        // one-element input, and an EMPTY output slice. Must panic, not write
-        // through the empty slice's pointer.
         let _switch = crate::canonical_simd::kernel_switch_guard();
         let prev = crate::canonical_simd::fast_canonical_kernel_enabled();
         crate::canonical_simd::set_fast_canonical_kernel(false);
@@ -7423,9 +6094,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "invalid geometry")]
     fn simd_refusal_does_not_hand_an_invalid_shape_to_unsafe_scalar_code() {
-        // With the vectorised kernel ENABLED, a bad shape makes it refuse - and
-        // the refusal used to fall straight through to the unsafe scalar path
-        // with the same bad shape. It must panic instead.
         let _switch = crate::canonical_simd::kernel_switch_guard();
         let prev = crate::canonical_simd::fast_canonical_kernel_enabled();
         crate::canonical_simd::set_fast_canonical_kernel(true);
@@ -7443,7 +6111,6 @@ mod tests {
 
     #[test]
     fn batched_matmul_still_computes_the_documented_result() {
-        // Validation must not have changed any accepted result.
         let _switch = crate::canonical_simd::kernel_switch_guard();
         let prev = crate::canonical_simd::fast_canonical_kernel_enabled();
         crate::canonical_simd::set_fast_canonical_kernel(false);
@@ -7458,14 +6125,6 @@ mod tests {
         }
         crate::canonical_simd::set_fast_canonical_kernel(prev);
     }
-
-    // ── Serving integration for batched prefill ─────────────────────────────
-    //
-    // The review's point was blunt and correct: an environment variable that no
-    // serving path reads is not production integration. These tests pin that
-    // `generate_v2` - the entry the native executor actually calls, via
-    // try_generate_v2 - routes through the batched path when enabled, and that
-    // doing so cannot change a served result.
 
     #[test]
     fn serving_output_is_identical_with_batched_prefill_on_and_off() {
@@ -7518,8 +6177,6 @@ mod tests {
 
     #[test]
     fn serving_path_refuses_to_batch_below_the_profitability_floor() {
-        // Batching a sub-quad prompt is a measured LOSS, so admission must keep
-        // serving on the token-at-a-time path even with the switch on.
         let _switch = crate::canonical_simd::kernel_switch_guard();
         let model = build_test_model(64, 32, 4, 64, 3);
         let prev = crate::canonical_prefill::batched_prefill_enabled();
@@ -7536,7 +6193,6 @@ mod tests {
             );
         }
 
-        // At the floor it engages, which is what makes the bound a bound.
         let prompt: Vec<u32> =
             (1..=crate::canonical_prefill::MIN_PROFITABLE_BATCH_TOKENS as u32).collect();
         crate::canonical_prefill::reset_prefill_census();
@@ -7550,9 +6206,6 @@ mod tests {
         crate::canonical_prefill::reset_prefill_census();
     }
 
-    // Keep the old v1 forward sequence as an independent oracle, including
-    // its repeated last prompt token. The optional helper exposes KV state
-    // for comparison without changing the production generation API.
     fn legacy_prefill_trace(
         model: &CachedIntegerModel,
         prompt: &[u32],
@@ -7675,8 +6328,6 @@ mod tests {
                     for max_tokens in [1, 8] {
                         check_legacy_prefill_case(model, &prompt, max_tokens, &[]);
                     }
-                    // Pick a token whose first occurrence is strictly inside
-                    // generation, so EOS cannot accidentally test only step 1.
                     let ((tokens, _), _) = legacy_prefill_trace(model, &prompt, 8, &[], false);
                     if let Some((index, token)) = tokens
                         .iter()
@@ -7703,8 +6354,6 @@ mod tests {
         use crate::canonical_prefill as prefill;
         let _switch = crate::canonical_simd::kernel_switch_guard();
         let _restore = RestorePrefillSwitches::capture();
-        // A narrow attention width and wide FFN exercise the real scratch
-        // clamp with modest weights, rather than merely testing its formula.
         let model = build_test_model(8, 4, 1, 180_000, 1);
         let cfg = &model.config;
         let chunk = prefill::max_chunk_within_scratch_budget(cfg.d_model, cfg.d_kv, cfg.d_ff);
@@ -7748,7 +6397,6 @@ mod tests {
         };
 
         let embedding_i8 = gen_i8(vs, d);
-        // For tests, Q16 embedding = i8 * scale (same as real loading)
         let embedding_q16: Vec<i64> = {
             let mut q16 = Vec::with_capacity(vs * d);
             for i in 0..vs {
@@ -7867,8 +6515,6 @@ mod tests {
         model.config.max_seq = 6;
         let prompt = [3, 4];
 
-        // Make every forward unusable. Returning the typed admission error
-        // still proves the +1 request was refused before BOS/model compute.
         model.embedding_q16.clear();
         let err = model
             .try_generate(&prompt, 4, &[])
@@ -7888,9 +6534,6 @@ mod tests {
 
     #[test]
     fn q_and_k_row_permutation_matches_interleaved_rope_oracle_for_multihead_gqa() {
-        // Two Q heads and one KV head exercise both dimensions independently.
-        // Each row contains its source row id so data and scale movement are
-        // observable together.
         let mut q = I8Weights {
             data: (0i8..8).flat_map(|row| [row, -row]).collect(),
             scales: (0i64..8).collect(),
@@ -7917,15 +6560,11 @@ mod tests {
         let mut reference = original.clone();
         apply_rope_interleaved(&mut reference, 1, 4, &cos, &sin);
 
-        // The loader has already applied P to Q/K rows. Existing split-half
-        // RoPE computes P·R_interleaved; undo P only for this direct oracle.
         let mut split = vec![original[0], original[2], original[1], original[3]];
         apply_rope(&mut split, 1, 4, &cos, &sin);
         let restored = vec![split[0], split[2], split[1], split[3]];
         assert_eq!(restored, reference);
 
-        // Orthogonal P preserves the attention score once both Q and K use
-        // the same per-head permutation.
         let original_k = vec![23 * ONE, 29 * ONE, 31 * ONE, 37 * ONE];
         let mut reference_k = original_k.clone();
         apply_rope_interleaved(&mut reference_k, 1, 4, &cos, &sin);
@@ -7963,7 +6602,6 @@ mod tests {
         let mut legacy_cache = KVCache::new(n_layers);
         let mut profiles_differ = false;
         for (position, token) in [1u32, 5, 7, 3, 9].into_iter().enumerate() {
-            // The corrected whole model over one range...
             let whole = corrected
                 .forward_shard_token(
                     ShardInput::Token(token),
@@ -7973,7 +6611,6 @@ mod tests {
                     position,
                 )
                 .unwrap();
-            // ...equals the legacy model with the copy, split in two ranges.
             let first = legacy
                 .forward_shard_token_with_history_interleaved_rope(
                     ShardInput::Token(token),
@@ -8005,7 +6642,6 @@ mod tests {
                 shard_output_fingerprint(ranged),
                 "position {position}"
             );
-            // The legacy path itself is unchanged and computes a different profile.
             let legacy_output = legacy
                 .forward_shard_token(
                     ShardInput::Token(token),
@@ -8026,7 +6662,6 @@ mod tests {
     #[test]
     fn interleaved_rope_qk_copy_covers_and_accounts_for_resident_layers_only() {
         let mut model = build_test_model(20, 32, 2, 64, 4);
-        // A range-loaded shard holder: layer 0 belongs to another replica.
         model.layers[0] = CachedLayer::placeholder();
         let copy = InterleavedRopeQk::from_resident_layers(&model).unwrap();
         assert_eq!(copy.layer_count(), 3);
@@ -8053,7 +6688,6 @@ mod tests {
                 .sum::<usize>()
         );
 
-        // The copy refuses a range it does not hold, without touching the cache.
         let mut cache = KVCache::new(model.config.n_layers);
         let error = model
             .forward_shard_token_with_history_interleaved_rope(
@@ -8089,8 +6723,6 @@ mod tests {
             model.effective_precision_label(),
             GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE
         );
-        // A corrected model, or one with optional precision copies, cannot
-        // seed the copy.
         assert!(InterleavedRopeQk::from_resident_layers(&model).is_err());
         let mut promoted = build_test_model(16, 8, 2, 16, 1);
         promoted.enable_i16();
@@ -8119,9 +6751,6 @@ mod tests {
 
     #[test]
     fn a_binary_cache_with_a_short_or_empty_norm_is_refused() {
-        // Deviation D3 in the ARC-INT8 loader: `layernorm` pads a short gamma
-        // with ONE, so a cache whose norm vector lost entries used to load and
-        // serve a different model under the same file.
         let path = std::env::temp_dir().join(format!(
             "arc-d3-binary-norm-{}.arc-int8",
             std::process::id()
@@ -8249,9 +6878,6 @@ mod tests {
 
     #[test]
     fn canonical_community_profile_matches_validator_i8_and_detects_i16_drift() {
-        // The full GGUF loader normally leaves optional higher-precision
-        // paths populated. Model that state with enable_i16(), then apply the
-        // role-specific profile exactly as --full-integer-worker does.
         let mut worker = build_test_model(32, 16, 2, 32, 2);
         worker.enable_i16();
         assert!(!worker.has_canonical_i8_profile());
@@ -8262,9 +6888,6 @@ mod tests {
             CANONICAL_REWARD_INFERENCE_PROFILE
         );
 
-        // Multi-range validator merging retains the same base per-row I8
-        // weights but drops optional profiles. A worker completion and the
-        // validator recomputation must therefore agree byte-for-byte.
         let validator = build_test_model(32, 16, 2, 32, 2);
         assert!(validator.has_canonical_i8_profile());
         let prompt = [worker.config.bos_token, 3, 4];
@@ -8285,21 +6908,15 @@ mod tests {
 
     #[test]
     fn test_per_row_quantize_precision() {
-        // Row with large outlier vs row with small values
-        let mut values = vec![0.01f32; 8]; // row 0: small
-        values.extend(vec![10.0, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01]); // row 1: outlier
+        let mut values = vec![0.01f32; 8];
+        values.extend(vec![10.0, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01]);
         let q = I8Weights::quantize_f32(&values, 2, 8);
 
-        // Row 0: abs_max=0.01, scale=0.01/127. Values should be 127 (full range)
         assert_eq!(q.data[0], 127, "Row 0 should use full range");
-        // Row 1: abs_max=10.0, scale=10/127. 0.01 → round(0.01/10*127) = 0
-        // This is expected - but only affects row 1, not row 0
         assert_eq!(q.data[8], 127, "Row 1 outlier should be 127");
-        // Per-row means row 0 is NOT affected by row 1's outlier
         assert!(q.scales[0] < q.scales[1], "Row 0 should have smaller scale");
     }
 
-    /// Every projection of `model`, in forward order.
     fn projection_keys(model: &CachedIntegerModel) -> Vec<(Option<usize>, TensorKey)> {
         let mut keys = Vec::new();
         for layer in 0..model.layers.len() {
@@ -8319,7 +6936,6 @@ mod tests {
         keys
     }
 
-    /// Every projection split in two halves, each a `LocalRowWorker`.
     fn halved_row_backend(
         model: &CachedIntegerModel,
         artifact: Hash256,
@@ -8367,9 +6983,6 @@ mod tests {
             .try_generate_v2_with_backend(request, &prompt, 4, &[99], &backend)
             .unwrap();
         assert_eq!(rows, local);
-        // EOS stops both paths at the same token (99 is outside this
-        // vocabulary, so the case above never stops early). The second token
-        // the model generates with no stop token serves as the EOS.
         let (open_ended, _) = model.try_generate_v2(&prompt, 6, &[]).unwrap();
         let eos = [open_ended[1]];
         let local = model.try_generate_v2(&prompt, 6, &eos).unwrap();
@@ -8378,7 +6991,6 @@ mod tests {
             .try_generate_v2_with_backend(request, &prompt, 6, &eos, &backend)
             .unwrap();
         assert_eq!(rows, local);
-        // An empty prompt (BOS alone) and a request for no tokens.
         for (prompt, max_tokens) in [(&[][..], 3), (&prompt[..], 0)] {
             let local = model.try_generate_v2(prompt, max_tokens, &[99]).unwrap();
             let rows = model
@@ -8386,13 +6998,11 @@ mod tests {
                 .unwrap();
             assert_eq!(rows, local);
         }
-        // The same context refusal as the local path, before any projection.
         let too_long = vec![1u32; model.config.max_seq];
         assert!(matches!(
             model.try_generate_v2_with_backend(request, &too_long, 4, &[99], &backend),
             Err(BackendGenerationError::Generation(_))
         ));
-        // A backend that cannot supply exact rows stops the generation.
         let empty = PartitionedProjectionBackend::new(
             Hash256([77; 32]),
             model.effective_precision_label().to_string(),
@@ -8405,16 +7015,11 @@ mod tests {
         ));
     }
 
-    /// A worker holding the whole model that serves any assignment, like the
-    /// `tensor_row_model_worker` example; it can be told to fail or to lie.
     struct WholeModelWorker {
         model: Arc<CachedIntegerModel>,
         fail: bool,
         lie: bool,
-        /// A connection that has closed itself, as the SSH worker does.
         closed: bool,
-        /// Answer this many calls, then fail every later one: a machine that
-        /// drops out part-way through a query.
         fail_after: Option<usize>,
         calls: std::sync::atomic::AtomicUsize,
     }
@@ -8486,8 +7091,6 @@ mod tests {
         }
     }
 
-    /// Plans that give the first half of every projection to the coordinator
-    /// and the second half to worker "w", checked as asked.
     fn half_remote_plans(
         model: &CachedIntegerModel,
         duplicate_on: Option<crate::tensor_parallel::SliceOwner>,
@@ -8528,8 +7131,6 @@ mod tests {
         plans
     }
 
-    /// One generation on a verified backend with worker "w": the output,
-    /// every event and how many calls reached the worker.
     fn run_verified(
         model: &Arc<CachedIntegerModel>,
         worker: WholeModelWorker,
@@ -8737,7 +7338,6 @@ mod tests {
         let is_fault = |event: &RowEvent| matches!(event, RowEvent::Fault { .. });
         let is_fallback = |event: &RowEvent| matches!(event, RowEvent::Fallback { .. });
 
-        // An honest worker: the same tokens, and only timing samples.
         let (output, events, calls) = run_verified(
             &model,
             WholeModelWorker::new(&model, false, false),
@@ -8752,8 +7352,6 @@ mod tests {
                 .all(|e| matches!(e, RowEvent::Answered { .. }))
         );
 
-        // A worker that is gone: every call falls back to the coordinator's
-        // rows, each fallback is reported, and the tokens do not change.
         let (output, events, calls) = run_verified(
             &model,
             WholeModelWorker::new(&model, true, false),
@@ -8764,9 +7362,6 @@ mod tests {
         assert_eq!(events.iter().filter(|e| is_fallback(e)).count(), calls);
         assert!(!events.iter().any(is_fault));
 
-        // A worker that drops out part-way through the query: the five calls
-        // it answered count, every later call falls back, and the tokens
-        // still do not change.
         let dropout = WholeModelWorker {
             fail_after: Some(5),
             ..WholeModelWorker::new(&model, false, false)
@@ -8783,8 +7378,6 @@ mod tests {
         assert_eq!(events.iter().filter(|e| is_fallback(e)).count(), calls - 5);
         assert!(!events.iter().any(is_fault));
 
-        // A lying worker caught by a duplicate, then by a spot row: faults
-        // are reported, and the coordinator's own rows keep the tokens exact.
         for (duplicate, spot) in [(Some(SliceOwner::Local), false), (None, true)] {
             let (output, events, _) = run_verified(
                 &model,
@@ -8796,9 +7389,6 @@ mod tests {
             assert!(events.iter().any(is_fault));
         }
 
-        // Unchecked, the same lie reaches the logits: rows no check covers are
-        // trusted, which is why only an operator's own machines may feed a
-        // vote. (Logits, not tokens: a small lie need not change an argmax.)
         let events = Events::default();
         let mut workers: BTreeMap<String, Arc<dyn RowWorker>> = BTreeMap::new();
         workers.insert(
@@ -8827,7 +7417,6 @@ mod tests {
         assert_ne!(lied_logits, local_logits);
         drop(backend);
 
-        // An excluded worker is never called.
         let (output, events, calls) = run_verified(
             &model,
             WholeModelWorker::new(&model, false, true),
@@ -8836,12 +7425,9 @@ mod tests {
         );
         assert_eq!(output, local);
         assert_eq!(calls, 0);
-        // Every one of its slices is reported as skipped: none moves silently.
         assert!(!events.is_empty());
         assert!(events.iter().all(|e| matches!(e, RowEvent::Skipped { .. })));
 
-        // A closed connection is skipped the same way, without a call and
-        // without counting as a failure.
         let mut closed = WholeModelWorker::new(&model, false, false);
         closed.closed = true;
         let (output, events, calls) =
@@ -8893,7 +7479,6 @@ mod tests {
         matmul_i8_canonical_rows(&shard, &input, &mut expected).unwrap();
         assert_eq!(response.values, expected);
 
-        // Another artifact ends the session; an empty stream is a clean end.
         let mut other = request.clone();
         other.assignment.artifact_id = Hash256([1; 32]);
         let frame = encode_row_request(&other).unwrap();
@@ -8936,8 +7521,6 @@ mod tests {
             }
         }
 
-        // Invalid geometry and selected-scale overflow are refused before
-        // the caller's output buffer is touched.
         let mut untouched = vec![123; 5];
         assert!(
             matmul_i8_canonical_row_range(&weights, 1, 1, &input, &mut untouched[..0]).is_err()
@@ -8962,7 +7545,7 @@ mod tests {
         assert_eq!(untouched, vec![123; 5]);
 
         let mut overflow = I8Weights::quantize_f32(&[1.0, 2.0], 2, 1);
-        overflow.scales[1] = i64::MAX; // outside the selected range
+        overflow.scales[1] = i64::MAX;
         let mut one_row = [0];
         matmul_i8_canonical_row_range(&overflow, 0, 1, &[1], &mut one_row).unwrap();
         overflow.scales[0] = i64::MAX;
@@ -9138,28 +7721,17 @@ mod tests {
         assert_eq!(h1, h2);
     }
 
-    /// End-to-end test: run forward_one_token with ternary weights enabled.
-    /// Proves the dispatch wiring works and the full transformer pipeline
-    /// (embedding → attention → FFN → output) executes correctly with
-    /// ternary weight storage.
     #[cfg(feature = "experimental-ip")]
     #[test]
     fn test_forward_one_token_with_ternary() {
-        // Small model: 2 layers, d_model=64, vocab=100. Uses the same
-        // dimensions as test_model_deterministic so we know it's in
-        // the test-friendly size range.
         let mut model = build_test_model(100, 64, 2, 128, 2);
 
-        // Enable ternary - converts I8 layers to 2-bit ternary weights
         model.enable_ternary();
         assert!(
             model.ternary_layers.is_some(),
             "ternary layers must be populated after enable_ternary"
         );
 
-        // Run forward_one_token - this exercises the full pipeline:
-        // embedding lookup, Q/K/V matmul, attention, output projection,
-        // FFN (gate/up/down), residuals, final norm.
         let token: u32 = 5;
         let mut cache = super::KVCache::new(model.config.n_layers);
         let logits1 = model.forward_one_token(token, &mut cache);
@@ -9173,7 +7745,6 @@ mod tests {
             "ternary forward must produce non-zero logits"
         );
 
-        // Determinism: same token → same logits.
         let mut cache2 = super::KVCache::new(model.config.n_layers);
         let logits2 = model.forward_one_token(token, &mut cache2);
         assert_eq!(
@@ -9217,8 +7788,6 @@ mod tests {
             })
             .sum();
 
-        // Ternary should be approximately 4x smaller than I8 on the weight data.
-        // The scale arrays are the same size, so total ratio is ~3.5-4x.
         assert!(
             after_bytes * 3 < before_bytes,
             "ternary ({} B) should be at least 3x smaller than I8 ({} B)",
@@ -9229,23 +7798,10 @@ mod tests {
 
     #[test]
     fn test_forward_shard_token_full_equals_split() {
-        // Note: panic!() calls in this and related test functions are intentional
-        // test assertions - they are NOT in any production code path.
-        // Production functions (forward_shard_token, forward_one_token) return Results.
-        //
-        // The end-to-end claim: running all layers as a single shard
-        // [0, n_layers) on one node must produce the SAME hidden state
-        // (and the same final token id) as splitting the layers across
-        // two shard calls [0, k) → [k, n_layers) on the same model.
-        //
-        // If this test passes, the shard pipeline is correct: any layer
-        // boundary K produces a chain of forward_shard_token calls that
-        // compose into the same answer as a single full forward.
-        let model = build_test_model(20, 32, 2, 64, 4); // 4 layers, small d
+        let model = build_test_model(20, 32, 2, 64, 4);
         let n_layers = model.config.n_layers;
         let token: u32 = 5;
 
-        // Path A: one shard covering the whole model [0, n_layers)
         let mut cache_a = KVCache::new(n_layers);
         let result_a = model
             .forward_shard_token(ShardInput::Token(token), &mut cache_a, 0, n_layers, 0)
@@ -9255,8 +7811,6 @@ mod tests {
             _ => panic!("Whole-model shard should produce a token, not a hidden state"),
         };
 
-        // Path B: split at layer K, run two shards in sequence with the
-        // SAME per-request KV cache (the cache holds K/V for ALL layers)
         let k = 2;
         let mut cache_b = KVCache::new(n_layers);
         let mid = model
@@ -9283,13 +7837,10 @@ mod tests {
 
     #[test]
     fn test_forward_shard_token_three_way_split() {
-        // Same as the two-way split test but with THREE shards.
-        // Stress-tests the chained hidden-state forwarding through more hops.
-        let model = build_test_model(20, 32, 2, 64, 6); // 6 layers
+        let model = build_test_model(20, 32, 2, 64, 6);
         let n_layers = model.config.n_layers;
         let token: u32 = 7;
 
-        // Path A: one shard covering everything
         let mut cache_a = KVCache::new(n_layers);
         let result_a = model
             .forward_shard_token(ShardInput::Token(token), &mut cache_a, 0, n_layers, 0)
@@ -9299,7 +7850,6 @@ mod tests {
             _ => panic!("expected Token"),
         };
 
-        // Path B: 3 shards [0, 2), [2, 4), [4, 6)
         let mut cache_b = KVCache::new(n_layers);
         let h1 = match model
             .forward_shard_token(ShardInput::Token(token), &mut cache_b, 0, 2, 0)
@@ -9332,21 +7882,11 @@ mod tests {
 
     #[test]
     fn test_forward_shard_token_multi_position() {
-        // Run 4 positions through the shard pipeline. Each position uses
-        // the same per-request KV cache, which grows as positions advance.
-        // This catches KV cache management bugs across position boundaries
-        // (e.g. wrong push offset, wrong attention-against-history shape,
-        // wrong RoPE position propagation across shards).
-        //
-        // The test compares the FULL pipeline (single shard, all layers)
-        // against a 2-shard split, position-by-position. The output token
-        // at every position must match.
-        let model = build_test_model(15, 32, 2, 64, 4); // 4 layers
+        let model = build_test_model(15, 32, 2, 64, 4);
         let n_layers = model.config.n_layers;
-        let prompt: Vec<u32> = vec![1, 5, 9, 13]; // 4 positions
-        let k = 2; // shard split
+        let prompt: Vec<u32> = vec![1, 5, 9, 13];
+        let k = 2;
 
-        // Path A: full forward through one shard, position-by-position
         let mut cache_a = KVCache::new(n_layers);
         let mut tokens_a = Vec::new();
         for (pos, &tok) in prompt.iter().enumerate() {
@@ -9359,9 +7899,6 @@ mod tests {
             }
         }
 
-        // Path B: 2-shard split, position-by-position, sharing the same
-        // per-request KV cache (it spans all layers regardless of which
-        // shard pushed each entry)
         let mut cache_b = KVCache::new(n_layers);
         let mut tokens_b = Vec::new();
         for (pos, &tok) in prompt.iter().enumerate() {
@@ -9388,20 +7925,8 @@ mod tests {
         );
     }
 
-    // ── KV-cache continuity guard ───────────────────────────────────────
-    //
-    // These pin the behaviour that makes replica failover and hedged
-    // dispatch safe. Before the guard, running a position against a cold
-    // cache read past the end of `k_data` through an unchecked raw pointer
-    // in `flash_attention_i64` — undefined behaviour, and under the release
-    // profile's `panic = "abort"` any resulting index panic takes the whole
-    // node down.
-
     #[test]
     fn cold_replica_mid_stream_is_rejected_not_undefined() {
-        // Exactly the failover scenario: the coordinator ran positions 0..3
-        // against replica A, replica A stopped answering, and the request is
-        // handed to replica B whose cache for this request_id is empty.
         let model = build_test_model(15, 32, 2, 64, 4);
         let n_layers = model.config.n_layers;
 
@@ -9426,9 +7951,6 @@ mod tests {
 
     #[test]
     fn replayed_position_is_rejected_so_kv_cannot_double_push() {
-        // A coordinator that retries a position this replica already
-        // consumed would double-push K/V and corrupt every later token.
-        // Require exact equality, not >=.
         let model = build_test_model(15, 32, 2, 64, 4);
         let n_layers = model.config.n_layers;
         let mut cache = KVCache::new(n_layers);
@@ -9440,7 +7962,6 @@ mod tests {
             .forward_shard_token(ShardInput::Token(2), &mut cache, 0, n_layers, 1)
             .expect("position 1 follows position 0");
 
-        // Replay position 1 — cache now holds 2 positions, not 1.
         let err = model
             .forward_shard_token(ShardInput::Token(2), &mut cache, 0, n_layers, 1)
             .expect_err("replayed position must be refused");
@@ -9449,8 +7970,6 @@ mod tests {
 
     #[test]
     fn warm_replica_in_sequence_is_accepted() {
-        // The guard must not reject the normal path: every position in
-        // ascending order on the same cache.
         let model = build_test_model(15, 32, 2, 64, 4);
         let n_layers = model.config.n_layers;
         let mut cache = KVCache::new(n_layers);
@@ -9486,7 +8005,6 @@ mod tests {
 
     #[test]
     fn position_past_rope_table_is_rejected_not_panic() {
-        // apply_rope indexes cos[pos * half + i] with no bounds check.
         let model = build_test_model(15, 32, 2, 64, 4);
         let n_layers = model.config.n_layers;
         let max_seq = model.config.max_seq;
@@ -9526,12 +8044,8 @@ mod tests {
         }
     }
 
-    /// SIMD i16 dot product must match scalar bit-exactly for inputs that
-    /// fit in i32. The 4096-element row size matches Llama-7B d_model.
     #[test]
     fn test_dot_i16_simd_matches_scalar() {
-        // Pseudo-realistic Llama hidden state: i64 values with magnitudes
-        // up to ~2^28 (well within i32 range).
         let len = 4096usize;
         let row: Vec<i16> = (0..len)
             .map(|i| ((i as i32 * 31) % 65535 - 32768) as i16)
@@ -9550,10 +8064,9 @@ mod tests {
         );
     }
 
-    /// Same test but with a row size that has a tail (not divisible by 8).
     #[test]
     fn test_dot_i16_simd_tail() {
-        let len = 4099usize; // Forces a 3-element scalar tail after the SIMD loop
+        let len = 4099usize;
         let row: Vec<i16> = (0..len)
             .map(|i| ((i as i32 * 17) % 65535 - 32768) as i16)
             .collect();
@@ -9571,10 +8084,8 @@ mod tests {
         );
     }
 
-    /// Benchmark: SIMD vs scalar for a Llama-7B-shaped row.
-    /// Uses --nocapture to print the speedup.
     #[test]
-    #[ignore] // run via: cargo test --release -p arc-inference -- --nocapture --ignored bench_dot_i16
+    #[ignore]
     fn bench_dot_i16_simd_vs_scalar() {
         let len = 4096usize;
         let row: Vec<i16> = (0..len)
@@ -9585,7 +8096,6 @@ mod tests {
             .collect();
         let iters = 100_000usize;
 
-        // Scalar baseline
         let t0 = std::time::Instant::now();
         let mut sum_s: i64 = 0;
         for _ in 0..iters {
@@ -9594,7 +8104,6 @@ mod tests {
         }
         let scalar_ns = t0.elapsed().as_nanos() / iters as u128;
 
-        // Dispatched (SIMD on aarch64, scalar on x86)
         let t0 = std::time::Instant::now();
         let mut sum_d: i64 = 0;
         for _ in 0..iters {
@@ -9611,17 +8120,11 @@ mod tests {
         assert_eq!(sum_s, sum_d, "SIMD and scalar must produce identical sums");
     }
 
-    /// Regression for project_i16_ppl_bug.md. I8Weights::quantize_f32 once
-    /// truncated abs_max to i64 before computing the scale, destroying
-    /// precision when abs_max < ~5. The scale must be computed in f64:
-    ///   ((abs_max as f64 * ONE as f64) / 127.0).round().max(1.0) as i64
     #[test]
     fn test_i8_scale_roundtrip_small_abs_max() {
         for &abs_max in &[0.1_f32, 0.5, 0.9, 1.2, 2.3] {
-            // Single-row matrix with exactly abs_max as the peak value.
             let row = vec![abs_max, -abs_max, 0.0, abs_max / 2.0];
             let w = I8Weights::quantize_f32(&row, 1, 4);
-            // Round-trip: dequantize and check peak ~= abs_max within 5%.
             let scale = w.scales[0] as f64;
             let peak = (w.data[0] as f64) * scale / ONE as f64;
             let rel_err = (peak - abs_max as f64).abs() / abs_max as f64;
@@ -9649,7 +8152,6 @@ mod tests {
         assert_eq!(q4.n_rows, 512);
         assert_eq!(q4.n_cols, 256);
         assert_eq!(q4.scales.len(), 512);
-        // Verify scale magnitudes are reasonable
         for (i, (&q4s, &i8s)) in q4.scales.iter().zip(weights.scales.iter()).enumerate() {
             let ratio = q4s as f64 / i8s.max(1) as f64;
             assert!(
@@ -9668,7 +8170,6 @@ mod int16_tests {
 
     #[test]
     fn test_i16_quantize_f32_reconstruction() {
-        // Create deterministic weights, quantize to I8 and I16, compare reconstruction error
         let n = 128;
         let weights: Vec<f32> = (0..n * n)
             .map(|i| ((i * 7 + 3) % 256) as f32 / 128.0 - 1.0)
@@ -9682,9 +8183,7 @@ mod int16_tests {
         for i in 0..n {
             for j in 0..n {
                 let orig = weights[i * n + j] as f64;
-                // I8 reconstruction: data * scale / ONE (scale = abs_max/127 in Q16)
                 let i8_recon = (i8w.data[i * n + j] as f64) * (i8w.scales[i] as f64) / (ONE as f64);
-                // I16 reconstruction: data * scale / 32767 / ONE (scale = abs_max in Q16)
                 let i16_recon = (i16w.data[i * n + j] as f64) * (i16w.scales[i] as f64)
                     / 32767.0
                     / (ONE as f64);
@@ -9692,7 +8191,6 @@ mod int16_tests {
                 i16_err += (orig - i16_recon).abs();
             }
         }
-        // I16 must have significantly lower reconstruction error than I8
         assert!(
             i16_err < i8_err,
             "I16 error {i16_err} should be less than I8 error {i8_err}"
@@ -9701,7 +8199,6 @@ mod int16_tests {
 
     #[test]
     fn test_i16_matmul_correctness() {
-        // Compare I16 matmul output against f64 reference
         let rows = 4;
         let cols = 8;
         let weights_f32: Vec<f32> = (0..rows * cols)
@@ -9712,7 +8209,6 @@ mod int16_tests {
             .collect();
         let input_q16: Vec<i64> = input_f64.iter().map(|&x| (x * ONE as f64) as i64).collect();
 
-        // Reference: f64 matmul
         let mut ref_out = vec![0.0f64; rows];
         for i in 0..rows {
             for j in 0..cols {
@@ -9727,8 +8223,6 @@ mod int16_tests {
         for i in 0..rows {
             let i16_real = i16_out[i] as f64 / ONE as f64;
             let err = (ref_out[i] - i16_real).abs();
-            // Q16 fixed-point accumulation on small matrices can introduce
-            // up to ~10% error from scale quantization and truncation.
             assert!(
                 err < 0.15,
                 "Row {i}: ref={}, i16={}, err={}",
@@ -9745,14 +8239,11 @@ mod int16_tests {
         let i8w = I8Weights::quantize_f32(&weights_f32, 2, 4);
         let i16w = I16Weights::from_i8(&i8w);
 
-        // from_i8 should preserve data as wider type and adjust scales
         assert_eq!(i16w.n_rows, i8w.n_rows);
         assert_eq!(i16w.n_cols, i8w.n_cols);
         for i in 0..i8w.data.len() {
             assert_eq!(i16w.data[i], i8w.data[i] as i16);
         }
-        // Scales are adjusted: i16_scale = i8_scale * 32767 to account for
-        // the /32767 in the I16 matmul path
         for i in 0..i8w.scales.len() {
             assert_eq!(i16w.scales[i], i8w.scales[i] * 32767);
         }
@@ -9773,9 +8264,6 @@ mod int16_tests {
 
     #[test]
     fn test_i16_matmul_matches_i8_on_from_i8() {
-        // When using from_i8, i16 matmul should produce very close results to i8 matmul.
-        // Not bit-identical because I16 matmul uses /32767 integer division (different
-        // rounding path than I8's direct scale multiply).
         let weights_f32: Vec<f32> = (0..32)
             .map(|i| ((i * 17 + 3) % 100) as f32 / 50.0 - 1.0)
             .collect();
@@ -9788,7 +8276,6 @@ mod int16_tests {
 
         for i in 0..4 {
             let diff = (i8_out[i] - i16_out[i]).abs();
-            // Allow up to 1% of the value or 2 Q16 units, whichever is larger
             let tolerance = (i8_out[i].abs() / 100).max(2);
             assert!(
                 diff <= tolerance,
@@ -9805,13 +8292,11 @@ mod int16_tests {
     fn test_i16_memory_bytes() {
         let weights_f32: Vec<f32> = vec![0.0; 16];
         let w = I16Weights::quantize_f32(&weights_f32, 4, 4);
-        // 16 i16 values (32 bytes) + 4 scales (32 bytes) + 16 overhead
         assert_eq!(w.memory_bytes(), 16 * 2 + 4 * 8 + 16);
     }
 
     #[test]
     fn test_enable_i16_on_model() {
-        // Build a tiny model and verify enable_i16 converts all layers
         let model_fn = || {
             let vs = 50;
             let d = 32;
@@ -9918,7 +8403,6 @@ mod int16_tests {
         assert!(model.i16_output.is_some());
         let i16_layers = model.i16_layers.as_ref().unwrap();
         assert_eq!(i16_layers.len(), 1);
-        // Verify dimensions match the original I8 layers
         assert_eq!(i16_layers[0].wq.n_rows, model.layers[0].wq.n_rows);
         assert_eq!(i16_layers[0].wq.n_cols, model.layers[0].wq.n_cols);
     }
@@ -9944,7 +8428,6 @@ mod int16_tests {
     }
 }
 
-// Shared arithmetic: resident and low-residency coordinators use these exact routines.
 pub(crate) fn preflight_generation_config(
     config: &ModelConfig,
     prompt_tokens: usize,

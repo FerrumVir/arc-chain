@@ -24,8 +24,6 @@ from pathlib import Path
 
 
 def read_jsonl(path: Path) -> list[dict]:
-    # Split on "\n" only: str.splitlines() also breaks at U+2028, U+0085 and
-    # other characters that legitimately occur inside the corpus strings.
     return [json.loads(line) for line in path.read_text(encoding="utf-8").split("\n") if line.strip()]
 
 
@@ -81,7 +79,6 @@ def cmd_compare_tokens(args: argparse.Namespace) -> int:
             continue
         entry = {"id": row_id}
         if "chat" in row:
-            # The date is part of the template; re-render if midnight passed.
             reference_text = hf_render(templated, row["chat"])
             if row["chat"]["today"] not in reference_text:
                 entry["note"] = "date rolled over during the check; compared with today's rendering"

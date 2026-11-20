@@ -1,18 +1,8 @@
-//! GGUF → Integer Engine bridge.
-//!
-//! Loads GGUF models via candle, runs forward pass with i64 integer arithmetic.
-//! Weights stay quantized in memory. Dequantization to i64 happens per-layer
-//! during the forward pass, so memory usage equals GGUF size + activations.
-//!
-//! Works for ANY model size - 1B, 8B, 70B - as long as the GGUF fits in RAM.
-
 #[cfg(feature = "candle")]
 use candle_core::quantized::gguf_file;
 #[cfg(feature = "candle")]
 use candle_core::{Device, Tensor};
 
-// Everything these bring in is used only by the `candle`-gated GGUF loader
-// and forward pass below, so the imports are gated the same way.
 use crate::InferenceError;
 #[cfg(feature = "candle")]
 use crate::cached_integer_model::{apply_rope, compute_rope_tables, silu_i64};
@@ -21,8 +11,6 @@ use crate::integer_engine::*;
 #[cfg(feature = "candle")]
 use crate::integer_lut::*;
 
-/// Convert an f32 tensor to i64 Q16 fixed-point.
-/// Deterministic: IEEE-754 round-to-nearest for values in typical weight range.
 #[cfg(feature = "candle")]
 fn tensor_to_i64(tensor: &Tensor) -> Result<Vec<i64>, InferenceError> {
     let flat = tensor
@@ -36,7 +24,6 @@ fn tensor_to_i64(tensor: &Tensor) -> Result<Vec<i64>, InferenceError> {
         .collect())
 }
 
-/// Extract a quantized tensor from GGUF, dequantize to f32, convert to i64 Q16.
 #[cfg(feature = "candle")]
 fn extract_tensor(
     content: &gguf_file::Content,
@@ -53,7 +40,6 @@ fn extract_tensor(
     tensor_to_i64(&dequant)
 }
 
-/// Try to extract a tensor, return zeros if not found (some models don't have all tensors).
 #[cfg(feature = "candle")]
 fn extract_tensor_or_ones(
     content: &gguf_file::Content,
@@ -65,7 +51,6 @@ fn extract_tensor_or_ones(
     extract_tensor(content, reader, device, name).unwrap_or_else(|_| vec![ONE; size])
 }
 
-/// Get a u32 metadata value from GGUF.
 #[cfg(feature = "candle")]
 fn get_meta_u32(content: &gguf_file::Content, key: &str) -> Result<u32, InferenceError> {
     match content.metadata.get(key) {
@@ -78,13 +63,6 @@ fn get_meta_u32(content: &gguf_file::Content, key: &str) -> Result<u32, Inferenc
     }
 }
 
-/// Load a GGUF model and run integer-only inference.
-///
-/// The model stays quantized in memory. Each layer is dequantized to i64
-/// on-the-fly during the forward pass, then dropped. This means:
-/// - Memory = GGUF size + one layer of i64 activations
-/// - Works for any model size (1B, 8B, 70B)
-/// - Forward pass is pure i64 - deterministic on all platforms
 #[cfg(feature = "candle")]
 pub fn generate_integer_from_gguf(
     path: &str,
@@ -97,19 +75,16 @@ pub fn generate_integer_from_gguf(
     let start = Instant::now();
     let device = Device::Cpu;
 
-    // Parse GGUF
     let mut reader =
         std::fs::File::open(path).map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
     let content = gguf_file::Content::read(&mut reader)
         .map_err(|e| InferenceError::Runtime(format!("GGUF: {e}")))?;
 
-    // Detect architecture from GGUF metadata (supports llama, mistral, phi, gemma, qwen, etc.)
     let arch = match content.metadata.get("general.architecture") {
         Some(gguf_file::Value::String(s)) => s.clone(),
         _ => "llama".to_string(),
     };
 
-    // Read model config from metadata using architecture-specific keys
     let n_layers = get_meta_u32(&content, &format!("{arch}.block_count"))? as usize;
     let d_model = get_meta_u32(&content, &format!("{arch}.embedding_length"))? as usize;
     let n_heads = get_meta_u32(&content, &format!("{arch}.attention.head_count"))? as usize;
@@ -122,8 +97,6 @@ pub fn generate_integer_from_gguf(
         .map(|t| t.shape.dims()[0])
         .unwrap_or(32000);
 
-    // Read RoPE base frequency from metadata (LLaMA-3 uses 500000, most others use 10000)
-    // Handle both F32 and F64 storage - some quantizers write F64
     let _rope_base: f64 = match content.metadata.get(&format!("{arch}.rope.freq_base")) {
         Some(gguf_file::Value::F32(v)) => *v as f64,
         Some(gguf_file::Value::F64(v)) => *v,
@@ -132,8 +105,7 @@ pub fn generate_integer_from_gguf(
     let d_head = d_model / n_heads;
     let d_kv = d_head * n_kv_heads;
 
-    // Precompute RoPE tables (matches CachedIntegerModel path)
-    let max_seq = 4096; // reasonable default, covers most contexts
+    let max_seq = 4096;
     let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, _rope_base);
 
     tracing::info!(
@@ -147,16 +119,11 @@ pub fn generate_integer_from_gguf(
         "GGUF integer engine: model config loaded"
     );
 
-    // Load token embeddings (kept in memory for all tokens)
     let embedding = extract_tensor(&content, &mut reader, &device, "token_embd.weight")?;
     tracing::info!("Embeddings loaded: {} values", embedding.len());
 
-    // Load output head + final norm
-    let output_weight =
-        extract_tensor(&content, &mut reader, &device, "output.weight").or_else(|_| {
-            // Some models tie embeddings to output
-            Ok(embedding.clone())
-        })?;
+    let output_weight = extract_tensor(&content, &mut reader, &device, "output.weight")
+        .or_else(|_| Ok(embedding.clone()))?;
     let final_norm = extract_tensor_or_ones(
         &content,
         &mut reader,
@@ -166,31 +133,26 @@ pub fn generate_integer_from_gguf(
     );
     let final_norm_beta = vec![0i64; d_model];
 
-    // Attention scale: round(ONE / sqrt(d_head))
     let attn_scale = {
         let isqrt = integer_isqrt((d_head as i64) * ONE);
         (ONE * ONE) / isqrt.max(1)
     };
 
-    // Autoregressive generation
     let mut all_tokens = input_tokens.to_vec();
     let mut generated = Vec::new();
 
     for token_step in 0..max_tokens {
         let seq_len = all_tokens.len();
 
-        // Embed all tokens
         let mut hidden: Vec<i64> = Vec::with_capacity(seq_len * d_model);
         for &tok in &all_tokens {
             let idx = (tok as usize).min(vocab_size - 1);
             hidden.extend_from_slice(&embedding[idx * d_model..(idx + 1) * d_model]);
         }
 
-        // Process each transformer layer (streaming - load, run, drop)
         for layer in 0..n_layers {
             let prefix = format!("blk.{layer}");
 
-            // Load layer weights as i64 (dequantized from Q4)
             let wq = extract_tensor(
                 &content,
                 &mut reader,
@@ -249,8 +211,6 @@ pub fn generate_integer_from_gguf(
             );
             let zero_beta = vec![0i64; d_model];
 
-            // === Attention block ===
-            // Pre-norm
             let mut normed = Vec::with_capacity(seq_len * d_model);
             for pos in 0..seq_len {
                 normed.extend(layernorm_i64(
@@ -260,7 +220,6 @@ pub fn generate_integer_from_gguf(
                 ));
             }
 
-            // Q, K, V projections
             let mut all_q = Vec::with_capacity(seq_len * d_model);
             let mut all_k = Vec::with_capacity(seq_len * d_kv);
             let mut all_v = Vec::with_capacity(seq_len * d_kv);
@@ -271,7 +230,6 @@ pub fn generate_integer_from_gguf(
                 all_v.extend(matmul_i64(&wv, &[], x, d_model, d_kv));
             }
 
-            // Apply RoPE to Q and K per position
             for pos in 0..seq_len {
                 for h in 0..n_heads {
                     let q_start = pos * d_model + h * d_head;
@@ -295,10 +253,9 @@ pub fn generate_integer_from_gguf(
                 }
             }
 
-            // Multi-head attention (with GQA support)
             let mut attn_out = vec![0i64; seq_len * d_model];
             for h in 0..n_heads {
-                let kv_h = h * n_kv_heads / n_heads; // GQA: map head to kv head
+                let kv_h = h * n_kv_heads / n_heads;
                 let mut hq = vec![0i64; seq_len * d_head];
                 let mut hk = vec![0i64; seq_len * d_head];
                 let mut hv = vec![0i64; seq_len * d_head];
@@ -320,7 +277,6 @@ pub fn generate_integer_from_gguf(
                 }
             }
 
-            // Output projection + residual
             let mut after_attn = Vec::with_capacity(seq_len * d_model);
             for pos in 0..seq_len {
                 let projected = matmul_i64(
@@ -335,17 +291,14 @@ pub fn generate_integer_from_gguf(
                 }
             }
 
-            // === FFN block ===
             let mut output = Vec::with_capacity(seq_len * d_model);
             for pos in 0..seq_len {
                 let x = &after_attn[pos * d_model..(pos + 1) * d_model];
                 let normed_ff = layernorm_i64(x, &ffn_norm, &zero_beta);
 
-                // SwiGLU: gate = silu(x @ w_gate), up = x @ w_up, out = (gate * up) @ w_down
                 let gate = matmul_i64(&w_gate, &[], &normed_ff, d_model, d_ff);
                 let up = matmul_i64(&w_up, &[], &normed_ff, d_model, d_ff);
 
-                // SiLU(x) = x * sigmoid(x) - proper integer implementation via LUT
                 let mut gated = Vec::with_capacity(d_ff);
                 for i in 0..d_ff {
                     gated.push((silu_i64(gate[i]) * up[i]) >> FRAC_BITS);
@@ -359,7 +312,6 @@ pub fn generate_integer_from_gguf(
             }
 
             hidden = output;
-            // Layer weights dropped here - memory freed
 
             if layer % 4 == 0 {
                 tracing::debug!(
@@ -371,14 +323,11 @@ pub fn generate_integer_from_gguf(
             }
         }
 
-        // Final norm (last position only)
         let last_pos = &hidden[(seq_len - 1) * d_model..seq_len * d_model];
         let normed = layernorm_i64(last_pos, &final_norm, &final_norm_beta);
 
-        // LM head → logits
         let logits = matmul_i64(&output_weight, &[], &normed, d_model, vocab_size);
 
-        // Argmax (deterministic: lowest index wins on tie)
         let next_token = argmax_i64(&logits) as u32;
         generated.push(next_token);
         all_tokens.push(next_token);
@@ -398,7 +347,6 @@ pub fn generate_integer_from_gguf(
         }
     }
 
-    // Compute output hash
     let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
     let hash = arc_crypto::hash_bytes(&output_bytes);
 

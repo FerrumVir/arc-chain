@@ -7,18 +7,16 @@ fn main() {
     let tokens = model.encode(prompt);
 
     let mut cache = KVCache::new(cfg.n_layers);
-    let _ = model.forward_one_token(1, &mut cache); // BOS
+    let _ = model.forward_one_token(1, &mut cache);
     for &tok in &tokens {
         let _ = model.forward_one_token(tok, &mut cache);
     }
 
-    // Generate step by step, show top 5 at each step
     let mut generated = Vec::new();
     for step in 0..10 {
         let last = generated.last().copied().unwrap_or(*tokens.last().unwrap());
         let mut logits = model.forward_one_token(last, &mut cache);
 
-        // Apply repetition penalty (same as generate())
         for &prev_tok in generated.iter().rev().take(64) {
             let idx = prev_tok as usize;
             if idx < logits.len() {
@@ -47,14 +45,12 @@ fn main() {
         }
         println!(" ]");
 
-        // Check where "4" ranks
         let four_logit = logits[29946];
         let four_rank = indexed
             .iter()
             .position(|(id, _)| *id == 29946)
             .unwrap_or(99999);
         if step >= 5 {
-            // after "2 + 2 ="
             println!("  '4' (29946) rank={} logit={}", four_rank, four_logit);
         }
 

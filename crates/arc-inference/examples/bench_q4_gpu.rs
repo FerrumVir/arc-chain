@@ -1,6 +1,3 @@
-//! Benchmark Q4 direct + GPU matmul.
-//! Usage: cargo run --example bench_q4_gpu --features candle --release -- /path/to/model.arc-int8
-
 use arc_inference::cached_integer_model::*;
 use arc_inference::q4_engine::*;
 use std::time::Instant;
@@ -20,7 +17,6 @@ fn main() {
     let cfg = &model.config;
     println!("Model: {}L d={} ff={}", cfg.n_layers, cfg.d_model, cfg.d_ff);
 
-    // Benchmark Q4 conversion
     println!("\n=== Q4 Conversion ===");
     let q4_start = Instant::now();
     let q4_wq = Q4Weights::from_i8(&model.layers[0].wq);
@@ -38,7 +34,6 @@ fn main() {
         model.layers[0].w_gate.memory_bytes() / 1024
     );
 
-    // Create test input
     let d = cfg.d_model;
     let dff = cfg.d_ff;
     let input_d: Vec<i64> = (0..d)
@@ -50,30 +45,25 @@ fn main() {
     let input_d_q = QuantizedInput::from_i64(&input_d);
     let input_ff_q = QuantizedInput::from_i64(&input_ff);
 
-    // Benchmark INT8 vs Q4 matmul
     println!("\n=== INT8 vs Q4 Matmul Speed ===");
 
-    // Warmup
     let _ = matmul_fast(&model.layers[0].wq, &input_d, d, d);
     let _ = matmul_q4(&q4_wq, &input_d, d, d);
 
     let iters = 20;
 
-    // INT8 Wq
     let start = Instant::now();
     for _ in 0..iters {
         let _ = matmul_fast(&model.layers[0].wq, &input_d, d, d);
     }
     let i8_wq = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-    // Q4 Wq
     let start = Instant::now();
     for _ in 0..iters {
         let _ = matmul_q4(&q4_wq, &input_d, d, d);
     }
     let q4_wq_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-    // Q4 Wq with preq
     let mut out_d = vec![0i64; d];
     let start = Instant::now();
     for _ in 0..iters {
@@ -91,14 +81,12 @@ fn main() {
         i8_wq / q4_wq_preq.max(0.001)
     );
 
-    // INT8 W_gate
     let start = Instant::now();
     for _ in 0..iters {
         let _ = matmul_fast(&model.layers[0].w_gate, &input_d, d, dff);
     }
     let i8_gate = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-    // Q4 W_gate with preq
     let mut out_ff = vec![0i64; dff];
     let start = Instant::now();
     for _ in 0..iters {
@@ -115,7 +103,6 @@ fn main() {
         i8_gate / q4_gate_preq.max(0.001)
     );
 
-    // INT8 W_down
     let start = Instant::now();
     for _ in 0..iters {
         let _ = matmul_fast(&model.layers[0].w_down, &input_ff, dff, d);
@@ -138,7 +125,6 @@ fn main() {
         i8_down / q4_down_preq.max(0.001)
     );
 
-    // Estimate total with Q4
     let total_i8_est = (i8_wq * 4.0 + i8_gate * 2.0 + i8_down) * cfg.n_layers as f64;
     let total_q4_est = (q4_wq_preq * 4.0 + q4_gate_preq * 2.0 + q4_down_preq) * cfg.n_layers as f64;
     println!(
@@ -148,14 +134,12 @@ fn main() {
         total_i8_est / total_q4_est.max(0.001)
     );
 
-    // GPU test
     println!("\n=== GPU Matmul ===");
     match arc_gpu::gpu_matmul::GpuMatmul::new(dff, cfg.vocab_size) {
         Ok(gpu) => {
             let gw = gpu.upload_weights(&model.layers[0].wq.data, d, d, None);
             let input_i8: Vec<i8> = input_d_q.data.clone();
 
-            // Warmup
             let _ = gpu.matmul(&gw, &input_i8);
 
             let start = Instant::now();

@@ -1,7 +1,3 @@
-//! Messages go to stderr (which v0.7 supervisors already capture: the
-//! desktop's Logs screen, launchd/systemd `node.log`) and are appended to
-//! `legacy-bridge/bridge.log`. No message ever contains a seed or key.
-
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -16,7 +12,6 @@ impl Log {
         Log { file: None }
     }
 
-    /// Append to `path` as well; logging never fails the bridge.
     pub fn with_file(path: &Path) -> Log {
         let file = OpenOptions::new().create(true).append(true).open(path).ok();
         Log { file }
@@ -46,7 +41,6 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// `YYYY-MM-DDTHH:MM:SSZ` for a Unix timestamp (proleptic Gregorian, UTC).
 pub fn utc_rfc3339(unix: u64) -> String {
     let days = i64::try_from(unix / 86_400).unwrap_or(0);
     let seconds = unix % 86_400;
@@ -59,7 +53,6 @@ pub fn utc_rfc3339(unix: u64) -> String {
     )
 }
 
-/// Howard Hinnant's `civil_from_days`.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;

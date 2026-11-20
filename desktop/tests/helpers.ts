@@ -1,19 +1,11 @@
 import { expect, type Locator, type Page } from "@playwright/test";
 
-/**
- * Open the app on a given screen. ARC opens on Home ("Ask ARC"); the seeded
- * suites below test the other screens from the dashboard, as they always
- * have, so the seed helpers open there. A Home test calls this with
- * "inference" after seeding. Read once by store.ts at startup.
- */
 export async function openOn(page: Page, route: string) {
   await page.addInitScript((startRoute) => {
     (window as unknown as { __ARC_START_ROUTE__?: string }).__ARC_START_ROUTE__ = startRoute;
   }, route);
 }
 
-// Seed the app into a "post-onboarding" state so dashboard tests don't need to
-// walk the wizard. Writes the same shape the zustand store persists.
 export async function seedOnboarded(page: Page, address = "99".repeat(32)) {
   await openOn(page, "dashboard");
   await page.addInitScript((workerAddress) => {
@@ -22,9 +14,6 @@ export async function seedOnboarded(page: Page, address = "99".repeat(32)) {
       JSON.stringify({
         onboarded: true,
         identity: {
-          // No seedPhrase: the store no longer accepts one, and
-          // scrubIdentity() would strip it on load anyway. See
-          // seedOnboardedLegacy() for a fixture that still has it.
           address: workerAddress,
           publicKey:
             "0x7c31fe12aab4c7d2e44a88b1f91023abfe23bb8a4446f23a62033001cb22e1e9",
@@ -33,7 +22,6 @@ export async function seedOnboarded(page: Page, address = "99".repeat(32)) {
         config: {
           role: "worker",
           modelPath: null,
-          // Match the real defaults (9090/9091), not the old 9944/9945.
           rpcPort: 9090,
           p2pPort: 9091,
           autoStart: true,
@@ -49,10 +37,6 @@ export async function seedOnboarded(page: Page, address = "99".repeat(32)) {
   }, address);
 }
 
-/**
- * A state blob written by an older build — recovery phrase and all — for
- * testing that the scrub-on-load path actually evicts it.
- */
 export async function seedOnboardedLegacy(page: Page) {
   await openOn(page, "dashboard");
   await page.addInitScript(() => {
@@ -79,24 +63,12 @@ export async function seedOnboardedLegacy(page: Page) {
           dataDir: "~/.arc/data-v3",
           workerThreads: null,
         },
-        // The removed on-chain mode, to exercise the coercion on load.
         inferenceMode: "onchain",
       }),
     );
   });
 }
 
-/**
- * Force specific mock command results, so the degraded paths are reachable.
- *
- * The endpoints behind the projection and Network screens are newer than the
- * deployed seed binaries, so their real behaviour today is a 404 that has to
- * degrade to a stated reason. A test cannot make a Rust process 404 on demand,
- * and the honest-degradation copy is the part most worth locking down — so the
- * mock layer takes per-command overrides (see `mockOverride` in lib/tauri.ts).
- *
- * Keys are Tauri command names, e.g. `fetch_earnings_projection`.
- */
 export async function seedMockOverrides(
   page: Page,
   overrides: Record<string, unknown>,
@@ -106,7 +78,6 @@ export async function seedMockOverrides(
   }, overrides);
 }
 
-/** A `/worker/earnings` 404, phrased the way the fetch layer phrases it. */
 export const PROJECTION_404 = {
   sourceHost: "http://140.82.16.112:9090",
   unavailable:
@@ -132,11 +103,6 @@ export const PROJECTION_404 = {
   rateCaveat: null,
 };
 
-/**
- * The endpoint answered, but has no attestation history to measure a rate
- * from. This is the state a brand-new node is in, and the one where inventing
- * a projection would be easiest and worst.
- */
 export const PROJECTION_NO_HISTORY = {
   sourceHost: "http://140.82.16.112:9090",
   unavailable: null,
@@ -163,13 +129,6 @@ export const PROJECTION_NO_HISTORY = {
   rateCaveat: null,
 };
 
-/**
- * A `/economics/rewards` 404 — no treasury figures and, importantly, no
- * community-certificate bond terms.
- *
- * Losing this endpoint costs the projection its ceiling and certificate
- * terms, so the assumptions line must say no deduction was assumed.
- */
 export const ECONOMICS_404 = {
   sourceHost: "http://140.82.16.112:9090",
   unavailable:
@@ -186,12 +145,6 @@ export const ECONOMICS_404 = {
   fundingDetail: null,
 };
 
-/**
- * The treasury endpoint answered, but could not read the treasury account.
- *
- * A distinct state from a 404: the endpoint exists and gave a reason, which
- * must be shown instead of a figure.
- */
 export const ECONOMICS_NO_BALANCE = {
   ...ECONOMICS_404,
   unavailable: null,
@@ -206,7 +159,6 @@ export const ECONOMICS_NO_BALANCE = {
   bondRefundedAfterChallengePeriod: null,
 };
 
-/** Model an eligible, unanswered install migrated to the sharing default. */
 export async function seedComputePrompt(page: Page) {
   await page.addInitScript(() => {
     (window as unknown as { __ARC_MOCK_COMPUTE_PROMPT__?: boolean }).__ARC_MOCK_COMPUTE_PROMPT__ = true;
@@ -224,14 +176,6 @@ export async function clearState(page: Page) {
   });
 }
 
-/**
- * Onboarded, but with NO stored node config.
- *
- * This is a real state — an install whose store.json predates the config
- * block, or one whose config failed to persist. It is the case where the
- * Settings screen has to fall back to defaults, and where `save()` used to
- * `return` early and silently do nothing.
- */
 export async function seedOnboardedWithoutConfig(page: Page) {
   await openOn(page, "dashboard");
   await page.addInitScript(() => {
@@ -252,19 +196,6 @@ export async function seedOnboardedWithoutConfig(page: Page) {
   });
 }
 
-/**
- * Walk the onboarding wizard from a clean state to the launch step.
- *
- * The wizard has FOUR steps — welcome → identity → **model** → launch. It
- * gained the model picker in v0.6.0, when "did the user download a model?"
- * became the thing that decides worker vs observer. Several specs still
- * walked three steps and asserted `step-launch` straight after identity, so
- * they stalled on "Pick your model" and failed.
- *
- * Picks "skip" (verifier-only), which keeps the walk fast and implies no
- * GGUF download. The compute step starts on where the model is recommended,
- * as in the mock, so Skip is what turns it off here.
- */
 export async function walkToLaunch(page: Page) {
   await page.getByTestId("btn-continue-welcome").click();
   await page.getByTestId("btn-reveal-seed").click();
@@ -273,17 +204,9 @@ export async function walkToLaunch(page: Page) {
   await page.getByTestId("btn-continue-model").click();
 }
 
-/**
- * Bring an onboarding step's action on screen the way a person does, with the
- * mouse wheel, and assert all of it is visible. Playwright's own click scrolls
- * even a container that a person cannot scroll (`overflow: hidden`), so a
- * passing click alone does not prove the action can be reached.
- */
 export async function wheelIntoView(page: Page, target: Locator) {
   const viewport = page.viewportSize();
   if (viewport) await page.mouse.move(viewport.width / 2, viewport.height / 2);
-  // Wait for the step to mount before dispatching wheel events. Sending all
-  // eight events during the startup transition can scroll the splash instead.
   await expect(target).toBeVisible();
   await expect(async () => {
     await page.mouse.wheel(0, 400);

@@ -50,9 +50,6 @@ test.describe("exact, receipt-backed wallet", () => {
   });
 });
 
-// A failed claim or transfer: "didn't go through" only when nothing of ours
-// can have been included; a lost answer after the POST says to check the
-// balance first, because the host may have mined it (lib/wallet-outcome.ts).
 test.describe("wallet failures", () => {
   test("a transfer whose answer was lost after the POST says to check the balance, not that it failed", async ({
     page,
@@ -74,7 +71,6 @@ test.describe("wallet failures", () => {
     await expect(failure.getByTestId("send-error-sentence")).toHaveText(PLAIN_COPY.wallet.sendUnconfirmed);
     await expect(failure.getByTestId("send-error-sentence")).not.toContainText("didn't go through");
     await expect(failure).toHaveAttribute("data-failure-kind", "unconfirmed");
-    // The native text waits behind Show details, never as the headline.
     const details = failure.getByTestId("send-error-details");
     await expect(details.locator("pre")).toBeHidden();
     await details.locator("summary").click();
@@ -99,7 +95,6 @@ test.describe("wallet failures", () => {
     const faucet = page.getByTestId("faucet-error");
     await expect(faucet.getByTestId("faucet-error-sentence")).toHaveText(PLAIN_COPY.wallet.faucetFailed);
     await expect(faucet).toHaveAttribute("data-failure-kind", "refused");
-    // The host's text is behind Show details, not in the sentence.
     await expect(faucet.getByTestId("faucet-error-sentence")).not.toContainText("faucet exhausted");
 
     await page.getByTestId("send-recipient").fill(`0x${"11".repeat(32)}`);

@@ -1,31 +1,3 @@
-//! ARC Chain - Mixed Workload Benchmark (ETH-weighted TPS)
-//!
-//! Simulates real Ethereum mainnet transaction distribution through the
-//! production pipeline.  Every transaction is a real signed transfer that
-//! goes through Receive → Verify → Execute → Commit.  Heavier tx types
-//! (DEX swaps, lending, contract deploys, …) are modelled by performing
-//! additional state reads and writes proportional to their gas-equivalent
-//! cost, so the benchmark measures how state pressure from a realistic
-//! workload mix affects throughput.
-//!
-//! The ETH-weighted TPS conversion uses a composite weight factor of 3.93×
-//! derived from mainnet tx-type distribution:
-//!
-//! | Tx Type            |   %  | Weight | Gas Equiv. |
-//! |--------------------|------|--------|------------|
-//! | Simple transfer    |  38% |  1.0×  |    21,000  |
-//! | ERC-20 transfer    |  21% |  2.7×  |    57,500  |
-//! | DEX swap           |  15% |  6.0×  |   125,000  |
-//! | NFT operation      |   8% |  7.1×  |   150,000  |
-//! | Lending/borrowing  |   5% | 13.1×  |   275,000  |
-//! | MEV bot            |   4% |  4.8×  |   100,000  |
-//! | Bridge             |   3% |  3.8×  |    80,000  |
-//! | Contract deploy    | 0.5% | 61.9×  | 1,300,000  |
-//! | Other              | 5.5% |  3.8×  |    80,000  |
-//!
-//! Usage:
-//!   arc-bench-mixed [--txs 100000] [--batch-size 10000] [--threads 0]
-
 mod ephemeral_keys;
 
 use arc_crypto::Hash256;
@@ -35,10 +7,6 @@ use arc_types::Transaction;
 use clap::Parser;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-// ---------------------------------------------------------------------------
-// CLI
-// ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
 #[command(
@@ -59,11 +27,6 @@ struct Args {
     threads: usize,
 }
 
-// ---------------------------------------------------------------------------
-// Transaction-type model
-// ---------------------------------------------------------------------------
-
-/// Simulated transaction category modelling real Ethereum mainnet workloads.
 #[derive(Clone, Copy, Debug)]
 enum SimTxType {
     SimpleTransfer,
@@ -78,7 +41,6 @@ enum SimTxType {
 }
 
 impl SimTxType {
-    /// ETH-equivalent gas cost weight relative to a simple transfer (1.0×).
     fn weight(self) -> f64 {
         match self {
             Self::SimpleTransfer => 1.0,
@@ -93,7 +55,6 @@ impl SimTxType {
         }
     }
 
-    /// Gas equivalent.
     fn gas(self) -> u64 {
         match self {
             Self::SimpleTransfer => 21_000,
@@ -108,61 +69,37 @@ impl SimTxType {
         }
     }
 
-    /// Extra state reads to simulate this tx type's computational cost.
-    /// Simple transfers already perform 2 reads + 2 writes in the pipeline,
-    /// so these are the ADDITIONAL ops on top of that baseline.
     fn extra_reads(self) -> usize {
         match self {
-            Self::SimpleTransfer => 0,    // baseline: 2 reads already
-            Self::Erc20Transfer => 2,     // 4 total - 2 baseline = 2 extra
-            Self::DexSwap => 6,           // 8 total - 2 baseline
-            Self::NftOperation => 4,      // 6 total - 2 baseline
-            Self::LendingBorrowing => 10, // 12 total - 2 baseline
-            Self::MevBot => 4,            // ~6 reads total
-            Self::Bridge => 3,            // ~5 reads total
-            Self::ContractDeploy => 48,   // 50 total - 2 baseline
-            Self::Other => 3,             // ~5 reads total
+            Self::SimpleTransfer => 0,
+            Self::Erc20Transfer => 2,
+            Self::DexSwap => 6,
+            Self::NftOperation => 4,
+            Self::LendingBorrowing => 10,
+            Self::MevBot => 4,
+            Self::Bridge => 3,
+            Self::ContractDeploy => 48,
+            Self::Other => 3,
         }
     }
 
-    /// Extra state writes to simulate this tx type's computational cost.
     fn extra_writes(self) -> usize {
         match self {
-            Self::SimpleTransfer => 0,   // baseline: 2 writes already
-            Self::Erc20Transfer => 1,    // 3 total - 2 baseline = 1 extra
-            Self::DexSwap => 4,          // 6 total - 2 baseline
-            Self::NftOperation => 3,     // 5 total - 2 baseline
-            Self::LendingBorrowing => 6, // 8 total - 2 baseline
-            Self::MevBot => 2,           // ~4 writes total
-            Self::Bridge => 1,           // ~3 writes total
-            Self::ContractDeploy => 28,  // 30 total - 2 baseline
-            Self::Other => 1,            // ~3 writes total
+            Self::SimpleTransfer => 0,
+            Self::Erc20Transfer => 1,
+            Self::DexSwap => 4,
+            Self::NftOperation => 3,
+            Self::LendingBorrowing => 6,
+            Self::MevBot => 2,
+            Self::Bridge => 1,
+            Self::ContractDeploy => 28,
+            Self::Other => 1,
         }
     }
 }
 
-/// Composite ETH-weighted factor: sum(pct × weight) across all tx types.
-/// Pre-computed: 0.38×1.0 + 0.21×2.7 + 0.15×6.0 + 0.08×7.1 + 0.05×13.1
-///             + 0.04×4.8 + 0.03×3.8 + 0.005×61.9 + 0.055×3.8  ≈ 3.93
 const ETH_WEIGHT_FACTOR: f64 = 3.93;
 
-// ---------------------------------------------------------------------------
-// Distribution assignment
-// ---------------------------------------------------------------------------
-
-/// Assign a simulated tx type based on the transaction's index within the
-/// batch.  Uses deterministic bucketing (not random) for reproducibility.
-///
-/// Cumulative thresholds (per-mille for integer precision):
-///   SimpleTransfer:    0..380    (38.0%)
-///   Erc20Transfer:   380..590   (21.0%)
-///   DexSwap:         590..740   (15.0%)
-///   NftOperation:    740..820    (8.0%)
-///   LendingBorrowing:820..870    (5.0%)
-///   MevBot:          870..910    (4.0%)
-///   Bridge:          910..940    (3.0%)
-///   ContractDeploy:  940..945    (0.5%)
-///   Other:           945..1000   (5.5%)
 fn assign_tx_type(index: usize) -> SimTxType {
     let bucket = (index % 1000) as u16;
     match bucket {
@@ -177,10 +114,6 @@ fn assign_tx_type(index: usize) -> SimTxType {
         _ => SimTxType::Other,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn format_tps(tps: f64) -> String {
     if tps >= 1_000_000_000.0 {
@@ -206,21 +139,13 @@ fn format_gas(gas: f64) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pre-sign transactions
-// ---------------------------------------------------------------------------
-
-/// Pre-sign a batch of transfer transactions.
-/// Returns the signed transactions and genesis accounts to prefund.
 fn presign_transactions(total_txs: usize) -> (Vec<Transaction>, Vec<(Hash256, u64)>, Vec<Hash256>) {
     let sender_count = 10usize;
     let keypairs = ephemeral_keys::signing_keypairs(sender_count);
 
-    // Receiver addresses (don't overlap with senders)
     let receivers = ephemeral_keys::addresses(56);
     let aux_addrs = ephemeral_keys::addresses(100);
 
-    // Genesis: fund all senders generously, receivers start at 0
     let mut genesis: Vec<(Hash256, u64)> = keypairs
         .iter()
         .map(|(_, addr)| (*addr, u64::MAX / 4))
@@ -228,8 +153,6 @@ fn presign_transactions(total_txs: usize) -> (Vec<Transaction>, Vec<(Hash256, u6
     for r in &receivers {
         genesis.push((*r, 0));
     }
-    // Also prefund "extra" accounts used for simulated state ops.
-    // We use addresses 100..199 as auxiliary accounts for extra reads/writes.
     for addr in &aux_addrs {
         genesis.push((*addr, u64::MAX / 8));
     }
@@ -255,16 +178,6 @@ fn presign_transactions(total_txs: usize) -> (Vec<Transaction>, Vec<(Hash256, u6
     (transactions, genesis, aux_addrs)
 }
 
-// ---------------------------------------------------------------------------
-// Simulate extra state ops for heavy tx types
-// ---------------------------------------------------------------------------
-
-/// Perform additional state reads and writes on the StateDB to simulate
-/// the computational cost of heavier transaction types beyond the baseline
-/// transfer that the pipeline already executed.
-///
-/// Uses auxiliary accounts (addresses 100..199) so we do not interfere
-/// with the pipeline's own balance accounting.
 fn simulate_extra_state_ops(state: &StateDB, tx_types: &[SimTxType], aux_addrs: &[Hash256]) {
     let storage_contract = aux_addrs[0];
 
@@ -272,25 +185,19 @@ fn simulate_extra_state_ops(state: &StateDB, tx_types: &[SimTxType], aux_addrs: 
         let reads = sim_type.extra_reads();
         let writes = sim_type.extra_writes();
 
-        // Perform extra reads (account lookups)
         for r in 0..reads {
             let addr = aux_addrs[(i + r) % aux_addrs.len()];
             let _ = state.get_account(&addr);
         }
 
-        // Perform extra writes (storage writes to simulate contract state)
         for w in 0..writes {
             let key_bytes = ((i as u64) * 1000 + (w as u64)).to_le_bytes();
             let key = arc_crypto::hash_bytes(&key_bytes);
-            let value = vec![0u8; 32]; // 32-byte storage slot
+            let value = vec![0u8; 32];
             state.set_storage(&storage_contract, key, value);
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Distribution stats
-// ---------------------------------------------------------------------------
 
 struct MixStats {
     counts: [(SimTxType, usize); 9],
@@ -357,10 +264,6 @@ fn type_name(t: SimTxType) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Run transfer-only baseline
-// ---------------------------------------------------------------------------
-
 fn run_transfer_only(total_txs: usize, batch_size: usize) -> (usize, usize, Duration) {
     let (transactions, genesis, _) = presign_transactions(total_txs);
     let state = Arc::new(StateDB::with_genesis(&genesis));
@@ -411,18 +314,12 @@ fn run_transfer_only(total_txs: usize, batch_size: usize) -> (usize, usize, Dura
     (total_processed, total_success, elapsed)
 }
 
-// ---------------------------------------------------------------------------
-// Run mixed workload
-// ---------------------------------------------------------------------------
-
 fn run_mixed_workload(
     total_txs: usize,
     batch_size: usize,
 ) -> (usize, usize, Duration, Vec<SimTxType>) {
-    // Assign simulated tx types for the entire batch
     let tx_types: Vec<SimTxType> = (0..total_txs).map(assign_tx_type).collect();
 
-    // Pre-sign all transactions (they go through the pipeline as transfers)
     let (transactions, genesis, aux_addrs) = presign_transactions(total_txs);
     let state = Arc::new(StateDB::with_genesis(&genesis));
     let pipeline = Pipeline::new(Arc::clone(&state));
@@ -449,10 +346,6 @@ fn run_mixed_workload(
             .expect("pipeline submit");
         batches_submitted += 1;
 
-        // While the pipeline processes this batch, simulate the extra
-        // state operations that heavier tx types would require.
-        // This adds real state pressure (DashMap reads + storage writes)
-        // concurrent with the pipeline's own execution.
         simulate_extra_state_ops(&state, batch_types, &aux_addrs);
     }
 
@@ -480,10 +373,6 @@ fn run_mixed_workload(
     let elapsed = start.elapsed();
     (total_processed, total_success, elapsed, tx_types)
 }
-
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
 
 fn main() {
     let args = Args::parse();
@@ -524,7 +413,6 @@ fn main() {
     println!("    Batch size:         {}", args.batch_size);
     println!();
 
-    // ── Phase 1: Transfer-only baseline ──────────────────────────────────
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  PHASE 1: Transfer-only baseline (simple transfers only)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -548,7 +436,6 @@ fn main() {
     );
     println!();
 
-    // ── Phase 2: Mixed workload ──────────────────────────────────────────
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  PHASE 2: Mixed workload (Ethereum mainnet distribution)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -559,7 +446,6 @@ fn main() {
     let mx_raw_tps = mx_processed as f64 / mx_elapsed.as_secs_f64();
     let mx_weighted_tps = mx_raw_tps / ETH_WEIGHT_FACTOR;
 
-    // Compute distribution stats
     let stats = compute_mix_stats(&tx_types);
 
     println!("  Transaction Mix:");
@@ -576,10 +462,10 @@ fn main() {
             count,
             pct,
             sim_type.weight(),
-            2 + sim_type.extra_reads(),  // total reads
-            2 + sim_type.extra_writes(), // total writes
-            sim_type.extra_reads(),      // extra reads
-            sim_type.extra_writes(),     // extra writes
+            2 + sim_type.extra_reads(),
+            2 + sim_type.extra_writes(),
+            sim_type.extra_reads(),
+            sim_type.extra_writes(),
         );
     }
     println!();
@@ -614,7 +500,6 @@ fn main() {
     );
     println!();
 
-    // ── Phase 3: Comparison ──────────────────────────────────────────────
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  RESULTS COMPARISON");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -631,7 +516,7 @@ fn main() {
     );
     println!(
         "    ETH-weighted TPS:   {:>12}  {:>12}",
-        format_tps(tf_tps), // transfers are 1.0x weight, so same
+        format_tps(tf_tps),
         format_tps(mx_weighted_tps)
     );
     println!(
@@ -656,9 +541,8 @@ fn main() {
     );
     println!();
 
-    // ── Ethereum comparison ──────────────────────────────────────────────
-    let eth_tps = 15.0; // ~15 TPS on Ethereum mainnet
-    let eth_gas_per_sec = 2_500_000.0; // ~2.5M gas/sec average
+    let eth_tps = 15.0;
+    let eth_gas_per_sec = 2_500_000.0;
     let arc_gas_per_sec = stats.total_gas as f64 / mx_elapsed.as_secs_f64();
 
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -691,7 +575,6 @@ fn main() {
     );
     println!();
 
-    // ── Honesty report ───────────────────────────────────────────────────
     println!("================================================================");
     println!(" HONESTY REPORT");
     println!("================================================================");

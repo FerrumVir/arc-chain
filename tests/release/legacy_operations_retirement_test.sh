@@ -38,14 +38,12 @@ RETIRED_SCRIPTS=(
 retirement_guards_are_early_and_unconditional() {
     local script header
     for script in "${RETIRED_SCRIPTS[@]}"; do
-        header="$(sed -n '1,7p' "$script")"
+        header="$(sed -n '1,6p' "$script")"
         assert_equals '#!/usr/bin/env bash' "$(sed -n '1p' "$script")" \
             "$script lost its bash entrypoint" || return 1
-        assert_equals '# ARC_RETIRED_LIVE_TOOL_V3_REQUIRED' "$(sed -n '2p' "$script")" \
-            "$script does not declare the v3 retirement boundary first" || return 1
-        assert_equals 'set -euo pipefail' "$(sed -n '3p' "$script")" \
+        assert_equals 'set -euo pipefail' "$(sed -n '2p' "$script")" \
             "$script does not enable strict mode before its retirement message" || return 1
-        assert_equals 'exit 78' "$(sed -n '7p' "$script")" \
+        assert_equals 'exit 78' "$(sed -n '6p' "$script")" \
             "$script does not exit with EX_CONFIG before legacy logic" || return 1
         if printf '%s\n' "$header" | grep -Eq \
             '^[[:space:]]*(if|case|while|until|for)[[:space:]]|\$\{|\$[@*]|ARC_(ALLOW|FORCE|UNSAFE|OVERRIDE)'; then
@@ -84,9 +82,7 @@ retired_scripts_exit_before_any_operation() {
     install_operation_shims "$fake_bin" "$marker"
 
     for script in "${RETIRED_SCRIPTS[@]}"; do
-        # Refuse to execute a regression that has already lost the static
-        # boundary; this keeps the contract test itself offline and harmless.
-        if [ "$(sed -n '7p' "$script")" != 'exit 78' ]; then
+        if [ "$(sed -n '6p' "$script")" != 'exit 78' ]; then
             printf '%s has no verified early exit; refusing to execute it\n' "$script"
             /bin/rm -rf -- "$temp_dir"
             return 1
@@ -150,8 +146,6 @@ cloud_templates_are_inert_and_non_validator() {
 
     assert_file_contains "$cloud_init" '^#cloud-config$' \
         'retired cloud-init file is not valid cloud-config input' || return 1
-    assert_file_contains "$cloud_init" 'intentionally inert' \
-        'retired cloud-init file does not explain its no-op contract' || return 1
     assert_file_not_contains "$cloud_init" \
         '(^|[[:space:]])(runcmd|bootcmd|packages|users):|curl|wget|systemctl|ufw|releases/latest|arc-node-linux' \
         'retired cloud-init still installs, downloads, or enables software' || return 1

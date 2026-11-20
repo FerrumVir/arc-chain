@@ -1,7 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-# ARC Chain Quick Test - build, start, submit tx, verify block, check receipt
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 RPC="http://127.0.0.1:9944"
@@ -18,7 +17,6 @@ trap cleanup EXIT
 echo "=== ARC Chain Quick Test ==="
 echo ""
 
-# 1. Build in debug mode
 echo "[1/7] Building arc-node (debug)..."
 cd "$PROJECT_DIR"
 cargo build -p arc-node 2>&1 | tail -5
@@ -30,17 +28,14 @@ if [ ! -f "$BIN" ]; then
 fi
 echo "  OK: Binary built"
 
-# 2. Start the node in background
 echo "[2/7] Starting node..."
 RUST_LOG=arc=info "$BIN" &
 NODE_PID=$!
 echo "  PID: $NODE_PID"
 
-# 3. Wait for node to start
 echo "[3/7] Waiting for node to come up..."
 sleep 3
 
-# 4. Check health endpoint
 echo "[4/7] Checking /health..."
 HEALTH=$(curl -sf "$RPC/health" 2>/dev/null || echo "FAIL")
 if echo "$HEALTH" | grep -q '"status":"ok"'; then
@@ -50,13 +45,10 @@ else
     exit 1
 fi
 
-# Get initial block height
 INITIAL_HEIGHT=$(curl -sf "$RPC/info" | python3 -c "import sys,json; print(json.load(sys.stdin)['block_height'])" 2>/dev/null || echo "0")
 echo "  Initial height: $INITIAL_HEIGHT"
 
-# 5. Submit a test transfer
 echo "[5/7] Submitting test transfer..."
-# Genesis account 0 = hash of [0x00] - prefunded with 1T
 FROM="af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
 TO="2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"
 
@@ -72,7 +64,6 @@ else
     exit 1
 fi
 
-# 6. Wait for block production
 echo "[6/7] Waiting for block production..."
 sleep 2
 
@@ -86,7 +77,6 @@ else
     exit 1
 fi
 
-# 7. Check receipt
 echo "[7/7] Checking transaction receipt..."
 RECEIPT=$(curl -sf "$RPC/tx/$TX_HASH" 2>/dev/null || echo "FAIL")
 if echo "$RECEIPT" | grep -q '"success":true'; then

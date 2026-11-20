@@ -20,7 +20,7 @@ ADVISORY_URL = re.compile(r"https://github\.com/advisories/(" + GHSA + r")")
 
 
 class GateError(ValueError):
-    """An input or audit execution cannot be trusted."""
+    pass
 
 
 class Parser(argparse.ArgumentParser):
@@ -150,8 +150,6 @@ def validate_report(report):
     require(type(totals["total"]) is int and totals["total"] == len(findings),
             "inconsistent total vulnerability count")
 
-    # npm's dependent graph may contain cycles. Traverse each reachable graph
-    # once, retaining every root; a cycle with no advisory is never evidence.
     roots = {}
     for package in findings:
         pending, seen, causes = [package], set(), set()

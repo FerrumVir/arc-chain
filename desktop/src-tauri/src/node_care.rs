@@ -1,19 +1,3 @@
-//! Node Care: opt-out anonymous error reports and a daily heartbeat.
-//!
-//! The WebView decides what to report, builds and scrubs every payload, and
-//! keeps the queue and rate limits (`src/lib/node-care.ts`, unit-tested
-//! there). This module does three small things the WebView cannot:
-//!
-//! 1. Keep that state in `node-care.json` in the app-data dir.
-//! 2. Report the platform (`os`, `arch`) and app version.
-//! 3. POST one payload to the endpoint baked in at build time through
-//!    `ARC_NODE_CARE_ENDPOINT`. Unset or empty means reporting is disabled:
-//!    nothing is ever sent, whatever the WebView asks.
-//!
-//! It refuses anything but the two published schemas with their exact field
-//! lists, refuses when the saved switch is not explicitly on, and never
-//! surfaces a delivery error: the caller only learns delivered or not.
-
 use crate::AppState;
 use serde::Serialize;
 use std::path::Path;
@@ -52,10 +36,8 @@ const HEARTBEAT_FIELDS: &[&str] = &[
     "os",
 ];
 
-/// Serializes state-file writes; two IPC saves must not share a temp file.
 static STATE_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The build-time endpoint, HTTPS only, without a trailing slash.
 fn endpoint() -> Option<&'static str> {
     normalize_endpoint(ENDPOINT?)
 }
@@ -72,13 +54,10 @@ fn normalize_endpoint(raw: &str) -> Option<&str> {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeCareInfo {
-    /// False when this build has no report endpoint: nothing can be sent.
     pub endpoint_configured: bool,
     pub app_version: &'static str,
     pub os: &'static str,
     pub arch: &'static str,
-    /// Used only on this machine, to replace the home folder with `~` in a
-    /// message before it is sent. Never part of a payload.
     pub home_dir: String,
 }
 
@@ -112,8 +91,6 @@ pub async fn node_care_save_state(state: State<'_, AppState>, json: String) -> R
     write_state(&dir, &json).map_err(|error| error.to_string())
 }
 
-/// POST one payload. `kind` is `report` or `heartbeat`. Resolves `true` only
-/// on a 2xx answer; every refusal and failure is `false`, never an error.
 #[tauri::command]
 pub async fn node_care_send(
     state: State<'_, AppState>,
@@ -159,8 +136,6 @@ fn route_for(kind: &str) -> Option<(&'static str, &'static str, &'static [&'stat
     }
 }
 
-/// A flat JSON object with the expected schema and no field outside the
-/// published list, so this command cannot carry anything else.
 fn payload_shape_ok(body: &str, schema: &str, fields: &[&str]) -> bool {
     let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(body) else {
         return false;
@@ -172,7 +147,6 @@ fn payload_shape_ok(body: &str, schema: &str, fields: &[&str]) -> bool {
             .all(|value| !value.is_object() && !value.is_array())
 }
 
-/// Sending needs the saved switch to be explicitly on.
 fn reporting_enabled(dir: &Path) -> bool {
     read_state(dir)
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())

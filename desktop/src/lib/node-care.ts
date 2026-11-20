@@ -2,35 +2,16 @@ import { classifyStartFailure } from "./start-failure";
 import type { NodeStatus } from "./types";
 import type { UpdateSnapshot } from "./update-controller";
 
-/**
- * Node Care: opt-out anonymous error reports and a daily heartbeat.
- *
- * When the node will not start, crashes, gets stuck or an update fails, ARC
- * sends one small scrubbed report so the problem can be fixed without a
- * screenshot. Once a day a running app sends a heartbeat so working nodes can
- * be counted. desktop/PRIVACY.md lists every field.
- *
- * Everything here is pure logic with injected I/O, so the unit specs drive it
- * without a native host. Native code (src-tauri/src/node_care.rs) only keeps
- * the state file and POSTs a payload to the endpoint baked in at build time;
- * a build without one never sends anything.
- */
-
 export const REPORT_SCHEMA = "arc.node-care.report.v1";
 export const HEARTBEAT_SCHEMA = "arc.node-care.heartbeat.v1";
 
 export const MESSAGE_MAX_BYTES = 2048;
 export const QUEUE_MAX = 50;
-/** The same problem is reported at most once an hour. */
 export const SAME_REPORT_INTERVAL_MS = 60 * 60_000;
-/** And no install sends more than this many reports a day. */
 export const DAILY_REPORT_CAP = 20;
 export const HEARTBEAT_INTERVAL_MS = 24 * 60 * 60_000;
-/** Queued items older than this are dropped rather than retried. */
 export const QUEUE_MAX_AGE_MS = 7 * 24 * 60 * 60_000;
-/** How many recent payloads "See what's sent" keeps. */
 export const RECENT_MAX = 5;
-/** A node starting, or a last session closing, for this long is stuck. */
 export const STUCK_AFTER_MS = 10 * 60_000;
 
 export type NodeCareEvent =
@@ -68,7 +49,6 @@ export interface NodeCareHeartbeat {
 
 export type PayloadKind = "report" | "heartbeat";
 
-/** What native `node_care_info` returns. `homeDir` never leaves the machine. */
 export interface NodeCarePlatform {
   endpointConfigured: boolean;
   appVersion: string;
@@ -80,7 +60,6 @@ export interface NodeCarePlatform {
 export interface NodeCareDeps {
   loadState: () => Promise<string | null>;
   saveState: (json: string) => Promise<void>;
-  /** Resolves true only when the endpoint accepted the payload. */
   send: (kind: PayloadKind, body: string) => Promise<boolean>;
   platform: () => Promise<NodeCarePlatform>;
   now?: () => number;
@@ -97,7 +76,6 @@ export type Delivery = "sent" | "queued" | "not-configured";
 
 export interface RecentItem {
   kind: PayloadKind;
-  /** The exact JSON that was (or will be) sent. */
   body: string;
   at: number;
   delivery: Delivery;
@@ -109,7 +87,6 @@ export interface NodeCareState {
   enabled: boolean;
   noticeShownAt: number | null;
   queue: QueuedItem[];
-  /** Report fingerprint -> when it was last reported. */
   reportedAt: Record<string, number>;
   lastHeartbeatAt: number | null;
   recent: RecentItem[];
@@ -141,17 +118,12 @@ export type ReportOutcome =
   | "not-configured"
   | "rate-limited";
 
-// ── Scrubbing ────────────────────────────────────────────────────────────
-
 const REDACTED = "[redacted]";
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/**
- * Truncate to at most `maxBytes` of UTF-8 without splitting a character.
- */
 export function truncateUtf8(text: string, maxBytes: number): string {
   const encoder = new TextEncoder();
   if (encoder.encode(text).length <= maxBytes) return text;
@@ -168,42 +140,25 @@ export function truncateUtf8(text: string, maxBytes: number): string {
   return out + ellipsis;
 }
 
-/**
- * Remove anything that could identify a person or a wallet from an error
- * message, then cap it at 2 KB. The home folder and any user folder become
- * `~`; emails, IPv4/IPv6 addresses, 0x-hex of 40+ digits, bare hex of 32+
- * digits and long base64-looking keys become `[redacted]`.
- *
- * No lookbehind: the WebView on older macOS cannot parse it.
- */
 export function scrubMessage(raw: string, homeDir?: string | null): string {
   let text = String(raw ?? "");
 
-  // The home folder as the native side reports it, both slash styles.
   const home = (homeDir ?? "").replace(/[\\/]+$/, "");
   if (home.length > 1) {
     for (const variant of new Set([home, home.replace(/\\/g, "/"), home.replace(/\//g, "\\")])) {
       text = text.replace(new RegExp(escapeRegExp(variant), "gi"), "~");
     }
   }
-  // Any other user folder: macOS, Linux, Windows (either slash), root.
   text = text
     .replace(/\b[A-Za-z]:[\\/]+(?:Users|Documents and Settings)[\\/]+[^\\/\s:'"]+/gi, "~")
     .replace(/\/(?:Users|home)\/[^/\\\s:'"]+/g, "~")
     .replace(/(^|[\s'"(=:])\/root(?=[/\s'")]|$)/g, "$1~");
 
-  // Emails before anything that could split them.
   text = text.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g, REDACTED);
-  // URLs keep their scheme, lose credentials and host.
   text = text.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/'"]+/gi, `$1${REDACTED}`);
-  // 0x-hex of 40+ digits (addresses, keys, hashes).
   text = text.replace(/\b0x[0-9a-fA-F]{40,}\b/g, REDACTED);
-  // Bare hex of 32+ digits (addresses and keys without a prefix).
   text = text.replace(/\b[0-9a-fA-F]{32,}\b/g, REDACTED);
-  // IPv4, with an optional port.
   text = text.replace(/\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b/g, REDACTED);
-  // IPv6: a run of hex groups and colons, standing alone, with "::" or at
-  // least 5 colons (so 12:34:56 and std::io stay as they are).
   text = text.replace(
     /(^|[^\w:.])(\[?[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4}){2,7}(?:%[\w.]+)?\]?(?::\d{1,5})?)(?![\w:])/g,
     (match, prefix: string, candidate: string) => {
@@ -213,7 +168,6 @@ export function scrubMessage(raw: string, homeDir?: string | null): string {
       return isIpv6 ? `${prefix}${REDACTED}` : match;
     },
   );
-  // Long base64 / key material: 32+ characters mixing digits and both cases.
   text = text.replace(/[A-Za-z0-9+/_-]{32,}={0,2}/g, (token) =>
     /\d/.test(token) && /[a-z]/.test(token) && /[A-Z]/.test(token) ? REDACTED : token,
   );
@@ -221,13 +175,10 @@ export function scrubMessage(raw: string, homeDir?: string | null): string {
   return truncateUtf8(text, MESSAGE_MAX_BYTES);
 }
 
-// ── Payloads ─────────────────────────────────────────────────────────────
-
 function isoSeconds(ms: number): string {
   return new Date(Math.floor(ms / 1000) * 1000).toISOString().replace(".000Z", "Z");
 }
 
-/** Short tokens only: anything else in a code field becomes "unknown". */
 function code(value: string | null | undefined): string {
   const text = String(value ?? "").trim();
   return /^[A-Za-z0-9._-]{1,64}$/.test(text) ? text : "unknown";
@@ -272,13 +223,8 @@ export function buildHeartbeat(
   };
 }
 
-/**
- * The same problem twice: same event, stage and code, and the same message
- * once numbers (exit codes, ports, counts, times) are ignored.
- */
 export function reportFingerprint(report: Pick<NodeCareReport, "event" | "stage" | "error_code" | "message">): string {
   const key = [report.event, report.stage, report.error_code, report.message.replace(/\d+/g, "#")].join("|");
-  // FNV-1a, 32-bit: a local dedupe key, never sent.
   let hash = 0x811c9dc5;
   for (let i = 0; i < key.length; i++) {
     hash ^= key.charCodeAt(i);
@@ -287,7 +233,6 @@ export function reportFingerprint(report: Pick<NodeCareReport, "event" | "stage"
   return hash.toString(16).padStart(8, "0");
 }
 
-/** The heartbeat status for a node status, or null when the node is off by choice. */
 export function heartbeatStatus(
   status: Pick<NodeStatus, "running" | "pid" | "health" | "lastError"> | undefined,
   startBlock: string | null,
@@ -301,8 +246,6 @@ export function heartbeatStatus(
   return null;
 }
 
-// ── State ────────────────────────────────────────────────────────────────
-
 function randomHex(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
@@ -315,7 +258,6 @@ function defaultRandomBytes(length: number): Uint8Array {
 
 const INSTALL_ID = /^[0-9a-f]{32}$/;
 
-/** Read a stored state, keeping only well-formed parts. */
 export function parseState(raw: string | null, fresh: () => NodeCareState): NodeCareState {
   const base = fresh();
   if (!raw) return base;
@@ -361,7 +303,6 @@ export function parseState(raw: string | null, fresh: () => NodeCareState): Node
   return {
     v: 1,
     installId: typeof p.installId === "string" && INSTALL_ID.test(p.installId) ? p.installId : base.installId,
-    // Only an explicit false is off: the switch defaults on.
     enabled: p.enabled !== false,
     noticeShownAt: typeof p.noticeShownAt === "number" ? p.noticeShownAt : null,
     queue,
@@ -371,13 +312,6 @@ export function parseState(raw: string | null, fresh: () => NodeCareState): Node
   };
 }
 
-// ── Controller ───────────────────────────────────────────────────────────
-
-/**
- * Owns the switch, the install ID, the queue and the limits. Every method is
- * safe to call at any time and never throws: a failure to save or send is
- * silent, and nothing here is awaited on the start path.
- */
 export class NodeCare {
   private state: NodeCareState | null = null;
   private platform: NodeCarePlatform | null = null;
@@ -410,7 +344,6 @@ export class NodeCare {
 
   getSnapshot = (): NodeCareSnapshot => this.snapshot;
 
-  /** Load (or create) the state. Later calls reuse the first. */
   init(): Promise<void> {
     if (!this.initPromise) {
       this.initPromise = (async () => {
@@ -434,7 +367,6 @@ export class NodeCare {
     return this.initPromise;
   }
 
-  /** Respected at once: the queue is dropped and nothing more is sent. */
   async setEnabled(enabled: boolean): Promise<void> {
     await this.init();
     const state = this.state!;
@@ -445,19 +377,16 @@ export class NodeCare {
     if (enabled) void this.flush();
   }
 
-  /** A new random install ID; the old one is never sent again. */
   async resetInstallId(): Promise<void> {
     await this.init();
     const state = this.state!;
     state.installId = randomHex(this.randomBytes(16));
-    // Queued payloads carry the old ID.
     state.queue = [];
     state.lastHeartbeatAt = null;
     await this.persist();
     this.emit();
   }
 
-  /** The first-run notice has been on screen. Queued reports may now go. */
   async markNoticeShown(): Promise<void> {
     await this.init();
     const state = this.state!;
@@ -488,7 +417,6 @@ export class NodeCare {
       });
       const body = JSON.stringify(report);
 
-      // Limits, counted per attempt so a failing network cannot build a pile.
       for (const [key, at] of Object.entries(state.reportedAt)) {
         if (now - at > HEARTBEAT_INTERVAL_MS) delete state.reportedAt[key];
       }
@@ -510,10 +438,8 @@ export class NodeCare {
     }
   }
 
-  /** At most once every 24 hours. */
   async heartbeat(status: HeartbeatStatus, nodeVersion: string | null | undefined): Promise<ReportOutcome> {
     try {
-      // Cheap in-memory check first: this runs on every status poll.
       const current = this.state;
       const now = this.now();
       if (current && current.lastHeartbeatAt !== null && now - current.lastHeartbeatAt < HEARTBEAT_INTERVAL_MS) {
@@ -537,7 +463,6 @@ export class NodeCare {
     }
   }
 
-  /** Retry the queue, oldest first, stopping at the first failure. */
   flush(): Promise<void> {
     if (this.flushing) return this.flushing;
     const run = (async () => {
@@ -557,7 +482,6 @@ export class NodeCare {
           ok = false;
         }
         if (!ok) break;
-        // Switched off while sending: the queue was already dropped.
         if (state.queue[0] === item) state.queue.shift();
         this.markSent(item.body);
         changed = true;
@@ -567,8 +491,6 @@ export class NodeCare {
         this.emit();
       }
     })();
-    // Cleared after the assignment: a run that returns before its first
-    // await must not leave a settled promise blocking every later flush.
     const flushing = run.catch(() => {}).finally(() => {
       if (this.flushing === flushing) this.flushing = null;
     });
@@ -576,7 +498,6 @@ export class NodeCare {
     return flushing;
   }
 
-  /** Test seam: the stored state as JSON. */
   peekState(): NodeCareState | null {
     return this.state ? (JSON.parse(JSON.stringify(this.state)) as NodeCareState) : null;
   }
@@ -597,7 +518,6 @@ export class NodeCare {
   private async deliver(kind: PayloadKind, body: string): Promise<ReportOutcome> {
     const state = this.state!;
     let ok = false;
-    // Before the first-run notice has been seen, everything waits.
     if (state.noticeShownAt !== null) {
       try {
         ok = await this.deps.send(kind, body);
@@ -634,7 +554,6 @@ export class NodeCare {
     try {
       await this.deps.saveState(JSON.stringify(this.state));
     } catch {
-      /* silent: reporting must never surface an error */
     }
   }
 
@@ -653,8 +572,6 @@ export class NodeCare {
   }
 }
 
-// ── Watching the app ─────────────────────────────────────────────────────
-
 export type WatchedStatus = Pick<
   NodeStatus,
   "running" | "pid" | "health" | "version" | "uptimeSeconds" | "lastError"
@@ -667,12 +584,6 @@ interface Sink {
 
 const CRASH_TEXT = "exited unexpectedly";
 
-/**
- * Turns what the app already observes (the node status poll, the start
- * fence, Start errors, the updater) into reports. Each distinct problem is
- * reported once while it lasts; the first healthy status after one is a
- * `recovered` report.
- */
 export class NodeCareWatcher {
   private problem: { stage: string; errorCode: string } | null = null;
   private crashKey: string | null = null;
@@ -709,7 +620,6 @@ export class NodeCareWatcher {
         });
       }
     } else if (!status.running && lastError && status.pid == null) {
-      // A start the app made by itself (launch auto-start, crash restart).
       if (lastError !== this.statusErrorKey) {
         this.statusErrorKey = lastError;
         this.raise({
@@ -785,10 +695,8 @@ export class NodeCareWatcher {
     if (beat) void this.sink.heartbeat(beat, this.nodeVersion).catch(() => {});
   }
 
-  /** A Start or Restart the user pressed was refused. */
   observeStartError(error: unknown, stage: string = "start") {
     const message = error instanceof Error ? error.message : String(error);
-    // The status poll may show the same text next; one report is enough.
     this.statusErrorKey = message;
     this.raise({ event: "start_failed", stage, errorCode: classifyStartFailure(message), message });
   }

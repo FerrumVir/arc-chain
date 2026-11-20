@@ -10,9 +10,9 @@ repository: layout, checks, invariants and which docs are current.
 
 The previous version of this file, a pre-recovery snapshot, is in git history
 at [8949910b](https://github.com/FerrumVir/arc-chain/blob/8949910bdfd079bdef18d6a41b62f6838acf60b7/CLAUDE.md),
-for history only. Code comments that cite "CLAUDE.md rule N" (for example
-`desktop/src-tauri/src/commands.rs:1698`) mean that snapshot's numbered rules,
-not this file.
+for history only. Code comments at 8949910b that cite "CLAUDE.md rule N"
+(for example `desktop/src-tauri/src/commands.rs:1698`) mean that snapshot's
+numbered rules, not this file. Code comments were removed after that commit.
 
 ## Safety rules that still hold
 
@@ -53,10 +53,12 @@ does not describe what any network runs.
 
 - Run the checks in [AGENTS.md](AGENTS.md#build-test-and-lint) that cover
   your change. The heavy ones are marked there.
+- Write no code comments; `python3 scripts/ci/no_comments.py` must pass. Put
+  the reason for a change in the commit message or PR.
 - Run the secret scan with `--worktree` before you commit:
   `bash tests/release/current_tree_secret_scan.sh --worktree`.
 - After any doc edit, run `bash tests/release/documentation_contract_test.sh`.
-  It requires the bold sentence at the top of this file
-  (`tests/release/documentation_contract_test.sh:400`).
+  It requires the bold sentence at the top of this file (`CLAUDE_GUIDE` in
+  that test).
 - If you change behaviour that AGENTS.md or this file describes, update them
   in the same PR.

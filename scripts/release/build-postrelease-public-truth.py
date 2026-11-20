@@ -49,11 +49,6 @@ PROTOCOL_VERSION_RE = re.compile(r"^3\.[0-9]+\.[0-9]+$")
 RECOVERY_EPOCH = 1
 VALIDATOR_SET_ID = 1
 LEGACY_CONTINUITY_SAFETY_MARGIN = 128
-# The exact projection deliberately nests the complete archive verifier (up to
-# 24h), bounded per-object/per-fork provenance reads, and fresh all-six live,
-# convergence, and reward checks. Keep the outer watchdog beyond the sum of
-# every valid inner watchdog so it never kills a slow operation that remains
-# inside the reviewed contract.
 RECOVERY_FRONTEND_PROJECTION_TIMEOUT_SECONDS = 72 * 60 * 60
 REWARD_PER_RECEIPT_BASE = 2_500_000_000
 PUBLIC_CONSOLE = "https://ferrumvir.github.io/arc-chain/"
@@ -292,7 +287,7 @@ EXPECTED_RELEASE_ASSETS = {
 
 
 class TruthError(ValueError):
-    """Evidence cannot support a live public status claim."""
+    pass
 
 
 def fail(message: str) -> NoReturn:
@@ -355,8 +350,6 @@ def _blake3_compress_short(
 
 
 def blake3_short(raw: bytes) -> str:
-    """Independently hash the bounded packaged-native challenge prompt."""
-
     if len(raw) > 1024:
         fail("packaged native challenge prompt exceeds one reviewed BLAKE3 chunk")
     chaining: Sequence[int] = _BLAKE3_IV
@@ -521,8 +514,6 @@ def timestamp(value: object, label: str) -> str:
 
 
 def repository_tool(relative: Path, label: str) -> tuple[Path, str]:
-    """Return one exact non-symlink helper from this builder's checkout."""
-
     script_path = Path(__file__)
     try:
         script_stat = script_path.lstat()
@@ -546,8 +537,6 @@ def canonical_chain_hash(value: object, label: str) -> str:
 
 
 def desktop_app_source_tree_sha256() -> str:
-    """Hash the reviewed desktop/src tree exactly as the Node receipt helper does."""
-
     script_path = Path(__file__)
     root = script_path.resolve().parents[2]
     source_root = root / "desktop" / "src"
@@ -593,8 +582,6 @@ def run_packaged_appimage_verify(
     receipt_path: Path,
     release_binding_path: Path,
 ) -> dict[str, Any]:
-    """Re-run the exact checked-in deep verifier over host and guest evidence."""
-
     verifier, verifier_sha = repository_tool(
         PACKAGED_APPIMAGE_VERIFIER_RELATIVE, "packaged AppImage live verifier"
     )
@@ -654,8 +641,6 @@ def run_packaged_appimage_verify(
 
 
 def load_macos_package_evidence(directory: Path) -> dict[str, dict[str, Any]]:
-    """Load the exact private, canonical receipt-only macOS evidence bundle."""
-
     if not directory.is_absolute():
         fail("macOS package evidence directory must be absolute")
     try:
@@ -968,8 +953,6 @@ def validate_macos_package_evidence(
     config_sha256: str,
     rollout_sha256: str,
 ) -> None:
-    """Independently cross-bind the original macOS controller receipts."""
-
     package = wrapper.get("packageEvidence")
     if not isinstance(package, dict):
         fail("packaged native wrapper omits macOS package provenance")
@@ -1485,8 +1468,6 @@ def validate_desktop_live_receipt(
     appimage_verification: dict[str, Any],
     macos_evidence: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    """Validate and embed the exact successful desktop live-product receipt."""
-
     receipt, receipt_raw = load_json(
         path, "desktop live-product receipt", canonical=True
     )
@@ -2150,9 +2131,6 @@ def validate_network(
     ):
         fail("frontend checkpoint differs from the reviewed recovery identity")
     sources = config["sources"]
-    # The former `len(sources) != 12` invariant incorrectly presented every
-    # stopped capture as a noncanonical fork. The producer emits six v3 rows
-    # plus only the captures actually classified valid_noncanonical_fork.
     if not isinstance(sources, list) or not 6 <= len(sources) <= 12:
         fail("frontend sources must contain six validators and only captured legacy forks")
     if any(not isinstance(row, dict) for row in sources):
@@ -2194,9 +2172,6 @@ def validate_network(
     capture_ids: set[str] = set()
     fork_nodes: list[str] = []
     previous_fleet_index = -1
-    # Selection is only through H. The selected source node may itself retain
-    # a divergent post-H legacy tail, so archive classification—not node name—
-    # decides whether that capture receives a noncanonical history view.
     for index, row in enumerate(forks):
         exact_keys(
             row,
@@ -2309,12 +2284,6 @@ def validate_network(
     ):
         fail("frontend live gate differs from the sealed all-six interlock")
 
-    # Per-fork checkpoint, binding, inventory, and source roots are
-    # intentionally candidate-specific: a valid noncanonical capture is
-    # expected to differ from the selected checkpoint. They are authenticated
-    # by the exact recovery verifier's deterministic frontend-config
-    # projection below, which derives them from the capture-bound immutable
-    # archive rather than trusting the supplied frontend JSON.
     validated_checkpoint = dict(checkpoint)
     validated_checkpoint.update(
         {
@@ -2883,16 +2852,6 @@ def run_recovery_verify(
     config_raw: bytes,
     temporary_root: Path,
 ) -> dict[str, Any]:
-    """Rebuild the public config with the exact verifier and require byte identity.
-
-    ``frontend-config`` includes the same final all-six live/reward gate as
-    ``verify`` and additionally authenticates the finalized archive before
-    deriving every frontend field.  Using that command here avoids a duplicate
-    live pass while making the archive checkpoint payload hash come from the
-    exact capture-bound provenance path instead of an unauthenticated value in
-    the supplied frontend JSON.
-    """
-
     verifier, verifier_sha = repository_tool(
         RECOVERY_VERIFIER_RELATIVE, "recovery rollout verifier"
     )
@@ -2921,9 +2880,6 @@ def run_recovery_verify(
             stdout=stdout,
             stderr=stderr,
             check=False,
-            # The nested immutable-archive verifier alone has a reviewed
-            # 24-hour bound. Leave room for the subsequent all-six live and
-            # reward checks while retaining a finite outer watchdog.
             timeout=RECOVERY_FRONTEND_PROJECTION_TIMEOUT_SECONDS,
         )
     stderr_raw = load_bytes(
@@ -2987,8 +2943,6 @@ def run_recovery_verify(
 def require_exact_frontend_projection(
     supplied_raw: bytes, projected_raw: bytes
 ) -> None:
-    """Fail unless public bytes are the verifier's exact deterministic projection."""
-
     if supplied_raw != projected_raw:
         fail(
             "frontend config differs from the exact capture-bound sealed-manifest "
@@ -3005,8 +2959,6 @@ def run_product_surface_verify(
     node_path: Path,
     expected_node_sha256: str,
 ) -> dict[str, str]:
-    """Prove exact rollout receipts through the shipped dashboard/explorer readers."""
-
     verifier, verifier_sha = repository_tool(
         PRODUCT_SURFACE_VERIFIER_RELATIVE, "post-cutover product-surface verifier"
     )
@@ -3282,10 +3234,6 @@ def build(args: argparse.Namespace) -> tuple[Path, Path]:
             reward, manifest, source_sha
         )
 
-        # This is deliberately the final evidence gate.  The exact checked-in
-        # rollout verifier re-reads the sealed files and performs live all-six
-        # convergence and mined-reward verification immediately before any
-        # public claim or acceptance receipt is rendered.
         recovery = run_recovery_verify(
             args.rollout_manifest,
             args.reward_evidence,
@@ -3357,11 +3305,6 @@ def build(args: argparse.Namespace) -> tuple[Path, Path]:
     output_readme = (readme[:begin] + block + readme[end:]).encode("utf-8")
     status = {
         "acceptance": {
-            # Embed the complete canonical v2 receipt so a public reader can
-            # independently canonicalize/re-hash it and follow its exact
-            # workflow, run, job, artifact, Pages, and recovery evidence
-            # identities.  The receipt deliberately does not depend on this
-            # status document, so this introduces no circular hash.
             "receipt": acceptance,
             "publishedArtifactReceiptSha256": published[
                 "canonicalReceiptSha256"
@@ -3523,9 +3466,6 @@ def build(args: argparse.Namespace) -> tuple[Path, Path]:
             opened_parent.st_mode,
         ):
             fail("public-truth output parent changed while it was written")
-        # Persist the one-shot directory entry as well as its contents. Without
-        # this parent fsync, a crash can make the create-only path disappear and
-        # incorrectly permit the same evidence attempt to be reused.
         os.fsync(parent_fd)
     except OSError as error:
         fail(f"cannot create public-truth output: {error}")

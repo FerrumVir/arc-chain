@@ -1,5 +1,3 @@
-"""Fast tests for the operational checks. Synthetic facts; no nodes."""
-
 import copy
 import os
 import sys
@@ -104,7 +102,7 @@ class Evaluate(unittest.TestCase):
         c = healthy()
         c["native"]["receipts"]["r1"] = {"observed_status": "Pending",
                                          "admission_transaction": {"block_height": 1}}
-        c["native"]["to"] = 3_000  # pending for 2,999 blocks
+        c["native"]["to"] = 3_000
         self.assertEqual(judge(c)["status"], "WARN")
         c = healthy()
         c["native"]["txs"].append({"type": "NativeInferenceRefund", "success": True,

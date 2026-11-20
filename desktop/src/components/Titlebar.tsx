@@ -12,8 +12,6 @@ export function Titlebar() {
     refetchInterval: 2000,
   });
 
-  // Until the first status arrives nothing is known: "Checking", not "Offline".
-  // After that, the connection in plain words (lib/connection.ts).
   const connection = describeConnection(status);
 
   return (

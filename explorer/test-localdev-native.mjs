@@ -1,5 +1,3 @@
-// node explorer/test-localdev-native.mjs - the rules behind the local-dev
-// native-inference view, without a browser.
 import { createRequire } from "node:module";
 import assert from "node:assert/strict";
 
@@ -14,7 +12,6 @@ const check = (name, fn) => {
   console.log(`ok ${passed} - ${name}`);
 };
 
-// A real-shaped native receipt on the recovered chain.
 const finalized = {
   request_id: "20".repeat(32),
   observed_status: "Finalized",
@@ -41,17 +38,10 @@ check("a settled receipt reconciles when credits equal the reservation", () => {
   assert.equal(s.terminalHeight, 21);
 });
 
-// A migrated chain settles paid work too, and its receipts are the same shape
-// whatever binding settled them. On the node side, reading a receipt used to
-// require the binding its metadata named to still be one the chain held, so a
-// configuration change made every past settlement unreadable. The view must
-// not reintroduce that from the other end: what a receipt says is decided by
-// the receipt, not by which binding is in force now.
 check("a settlement made under a superseded binding still reads and reconciles", () => {
   const underOldBinding = {
     ...finalized,
     request_id: "21".repeat(32),
-    // The binding that settled it, which the chain has since replaced.
     context_commitment: "11".repeat(32),
   };
   const s = native.summarize(underOldBinding);
@@ -62,10 +52,6 @@ check("a settlement made under a superseded binding still reads and reconciles",
   assert.equal(s.terminal, true);
 });
 
-// A migrated chain reports protocol 3 and carries native receipts at the same
-// time - a combination neither a recovered chain nor a private protocol-4
-// chain has ever produced. These rules read receipts, not protocol versions,
-// and that is what makes them work across the migration.
 check("a receipt is read the same way whatever protocol version the chain reports", () => {
   const three = { ...finalized, request_id: "22".repeat(32), protocol_version: "3.0.0" };
   const four = { ...finalized, request_id: "22".repeat(32), protocol_version: "4.0.0" };
@@ -181,10 +167,6 @@ check("native transaction stage labels require a successful canonical mined rece
   assert.equal(native.nativeEvidenceLabels(unmined, true).outcome, "Receipt does not prove mined inclusion");
 });
 
-// The node source for expires_at/requester/output_hex/output_text was added
-// but is not yet compiled anywhere; every receipt above is the shape a
-// running node actually serves today. These fields must read as
-// "unavailable", never as fabricated zeros/empties, until a node upgrades.
 check("expiry, requester, and certified output are absent-safe on an un-upgraded receipt", () => {
   const s = native.summarize(finalized);
   assert.equal(s.expiresAt, null);
@@ -220,7 +202,7 @@ check("output_text absent from an otherwise-upgraded receipt reads as unavailabl
 check("a Pending request past its expiry height is expired without a certificate", () => {
   const pending = { ...finalized, observed_status: "Pending", settlement_credits: [], terminal_transaction: null, expires_at: 40 };
   const s = native.summarize(pending);
-  const atBoundary = native.classifyExpiry(s, 39); // 39 + 1 >= 40
+  const atBoundary = native.classifyExpiry(s, 39);
   assert.equal(atBoundary.applicable, true);
   assert.equal(atBoundary.expired, true);
   assert.match(atBoundary.message, /refundable by a refund transaction/);
@@ -230,7 +212,7 @@ check("a Pending request past its expiry height is expired without a certificate
 check("a Pending request before its expiry height is not expired", () => {
   const pending = { ...finalized, observed_status: "Pending", settlement_credits: [], terminal_transaction: null, expires_at: 40 };
   const s = native.summarize(pending);
-  const early = native.classifyExpiry(s, 10); // 10 + 1 < 40
+  const early = native.classifyExpiry(s, 10);
   assert.equal(early.applicable, true);
   assert.equal(early.expired, false);
   assert.equal(early.message, null);
@@ -262,15 +244,12 @@ check("replicas that differ only in requester, expiry, or certified output are s
 });
 
 check("a replica that does not report the newer fields yet is not a disagreement", () => {
-  // During a rolling upgrade one node reports expiry, requester and output
-  // bytes and another does not: missing detail, not a different settlement.
   const upgraded = { ...finalized, expires_at: 40, requester: "cc".repeat(32), output_hex: "deadbeef" };
   const mixed = native.compareReplicas([
     { source: "new", receipt: upgraded },
     { source: "old", receipt: finalized },
   ]);
   assert.equal(mixed.agree, true);
-  // Settlement itself is still compared strictly across both.
   const differentCredits = {
     ...finalized,
     settlement_credits: [{ payee: "ff".repeat(32), amount: 1 }],
@@ -282,7 +261,6 @@ check("a replica that does not report the newer fields yet is not a disagreement
     ]).agree,
     false,
   );
-  // Two upgraded replicas with different certified output bytes disagree.
   assert.equal(
     native.compareReplicas([
       { source: "a", receipt: upgraded },

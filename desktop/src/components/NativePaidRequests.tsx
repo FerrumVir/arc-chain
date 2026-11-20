@@ -1,13 +1,3 @@
-// Native paid requests: prepare a prompt, sign and submit a
-// paid request from this wallet, follow it on chain, and see what it cost.
-//
-// Everything past "submitted" comes from the request's receipt on the pinned
-// chain host (see lib/native-request.ts). Signing happens in Rust
-// (src-tauri/src/native_paid.rs); this screen passes only the prompt, the
-// price choices and public identifiers. Cancellation follows finality: an
-// unsigned request can be withdrawn; a signed one runs to finalized,
-// dropped, or refunded, and a refund after expiry is a real transaction.
-
 import { useQuery } from "@tanstack/react-query";
 import { Coins, Loader2, RotateCcw, Send, Undo2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -32,12 +22,9 @@ import {
 } from "../lib/native-request";
 
 const POLL_MS = 1_500;
-/** While a request is not admitted, resend its identical signed bytes this often. */
 const RESUBMIT_EVERY_POLLS = 8;
 const BASE_UNITS = 1_000_000_000;
-/** The wallet core's answer when a journaled transaction's nonce is used or it expired. */
 const NO_LONGER_ADMISSIBLE = /can no longer be admitted/;
-/** The node's own validation refusals: the only final ones (as the wallet core decides). */
 const FINAL_REFUSAL_STATUSES = new Set([400, 413, 422]);
 
 interface Draft {
@@ -111,7 +98,6 @@ export function NativePaidRequests() {
     });
   }, []);
 
-  // A restart resumes following every journaled request from its receipt.
   const trackingAvailable = context.data?.trackingAvailable === true;
   useEffect(() => {
     if (!account) return;
@@ -129,8 +115,6 @@ export function NativePaidRequests() {
         });
       })
       .catch((error) => {
-        // The wallet core refuses to sign while its journal cannot be read
-        // (it may list signed requests still in flight), so say why.
         if (!cancelled) setJournalError(errorText(error));
       });
     return () => {
@@ -179,8 +163,6 @@ export function NativePaidRequests() {
       if (!state.requestId) return;
       const count = (polls.current.get(state.localId) ?? 0) + 1;
       polls.current.set(state.localId, count);
-      // Delivery unknown or refused for now: send the identical bytes again,
-      // at every poll for the first few attempts and then with backoff.
       const due = state.attempts < RETRY_ATTEMPT_LIMIT || count % RESUBMIT_EVERY_POLLS === 0;
       if (state.phase === "submitting" && state.txHash && due) {
         dispatch(state.localId, { type: "submit_started" });
@@ -190,7 +172,6 @@ export function NativePaidRequests() {
         } catch (error) {
           const message = errorText(error);
           if (NO_LONGER_ADMISSIBLE.test(message)) {
-            // Its nonce is used or it expired: only the receipt can say more.
             dispatch(state.localId, { type: "submit_refused", status: 409, body: "" });
           } else {
             dispatch(state.localId, { type: "network_error", message });
@@ -211,13 +192,9 @@ export function NativePaidRequests() {
         return;
       }
       if (!found && state.phase === "submitted" && state.txHash && count % RESUBMIT_EVERY_POLLS === 0) {
-        // A node that restarted may have lost it from its mempool.
         await api.nativeResubmit(state.txHash).catch(() => undefined);
       }
       if (state.phase === "refund_submitted" && state.refundTxHash && count % RESUBMIT_EVERY_POLLS === 0) {
-        // A refund can be dropped from a mempool too. Resend its identical
-        // bytes; once they can no longer be admitted while the request is
-        // still pending, it can be claimed again.
         try {
           await api.nativeResubmit(state.refundTxHash);
         } catch (error) {
@@ -296,7 +273,6 @@ export function NativePaidRequests() {
     setPrompt("");
   };
 
-  /** Queue a request again that was refused before anything was signed. */
   const requeue = (state: NativeRequestState) => {
     const draft = drafts.current.get(state.localId);
     if (!context.data?.compatible || !draft || !account) return;
@@ -322,11 +298,6 @@ export function NativePaidRequests() {
       const result = await api.nativeRefund(state.requestId);
       const final = result.httpStatus !== null && FINAL_REFUSAL_STATUSES.has(result.httpStatus);
       if (result.accepted || !final) {
-        // Accepted, or signed and journaled with delivery unknown or refused
-        // for now (busy, rate-limited, "already have it"): keep its handle,
-        // so it is resent and "Resend refund" works. The wallet keeps these
-        // bytes and signs nothing else for this account until they are
-        // admitted or can no longer be.
         dispatch(state.localId, { type: "refund_ok", txHash: result.txHash });
         if (result.networkError !== null) {
           dispatch(state.localId, { type: "network_error", message: result.networkError });
@@ -353,13 +324,11 @@ export function NativePaidRequests() {
         });
       }
     } catch (error) {
-      // Its nonce was used or its hold lapsed: claim again if still pending.
       dispatch(state.localId, { type: "refund_refused", reason: errorText(error) });
     }
   };
 
   if (context.isLoading || context.data === null || context.data === undefined) {
-    // No native-inference context yet, or still asking the host.
     return null;
   }
   const view = context.data;

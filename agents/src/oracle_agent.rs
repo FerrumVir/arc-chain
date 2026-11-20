@@ -1,23 +1,3 @@
-//! Price Oracle Agent - On-chain AI agent that attests to price data.
-//!
-//! Demonstrates:
-//! - Fetching external price data (simulated)
-//! - Attesting to prices on-chain via InferenceAttestation TX (Tier 2)
-//! - Serving price feeds through the oracle precompile (0x04)
-//! - Agent lifecycle management (registration, activation, execution)
-//!
-//! # Architecture
-//!
-//! ```text
-//! ┌───────────────┐    RegisterAgent TX     ┌──────────────┐
-//! │  Price Oracle  │ ──────────────────────> │  ARC Chain   │
-//! │     Agent      │    Price Update         │              │
-//! │                │ ──────────────────────> │  Oracle      │
-//! │  (simulated    │    InferenceAttestation │  Precompile  │
-//! │   feeds)       │ ──────────────────────> │  0x04        │
-//! └───────────────┘                         └──────────────┘
-//! ```
-
 use arc_crypto::signature::Signature;
 use arc_crypto::{Hash256, hash_bytes};
 use arc_types::transaction::{InferenceAttestationBody, RegisterBody, Transaction, TxBody, TxType};
@@ -26,32 +6,22 @@ use arc_vm::agent::{
 };
 use arc_vm::precompiles::{OracleRegistry, PriceFeed};
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 const AGENT_NAME: &str = "price-oracle-v1";
 
-/// Simulated token addresses for price feeds.
 fn token_addresses() -> Vec<([u8; 32], &'static str, u128)> {
     vec![
-        (hash_bytes(b"ARC").0, "ARC", 2_500_000_000_000_000_000), // $2.50
-        (hash_bytes(b"ETH").0, "ETH", 3_200_000_000_000_000_000_000), // $3,200
-        (hash_bytes(b"BTC").0, "BTC", 67_500_000_000_000_000_000_000), // $67,500
-        (hash_bytes(b"USDC").0, "USDC", 1_000_000_000_000_000_000), // $1.00
-        (hash_bytes(b"SOL").0, "SOL", 145_000_000_000_000_000_000), // $145
+        (hash_bytes(b"ARC").0, "ARC", 2_500_000_000_000_000_000),
+        (hash_bytes(b"ETH").0, "ETH", 3_200_000_000_000_000_000_000),
+        (hash_bytes(b"BTC").0, "BTC", 67_500_000_000_000_000_000_000),
+        (hash_bytes(b"USDC").0, "USDC", 1_000_000_000_000_000_000),
+        (hash_bytes(b"SOL").0, "SOL", 145_000_000_000_000_000_000),
     ]
 }
 
-// ---------------------------------------------------------------------------
-// Transaction helpers
-// ---------------------------------------------------------------------------
-
-/// Construct a RegisterAgent transaction for the oracle agent.
 fn build_register_tx(owner: Hash256, nonce: u64) -> Transaction {
     let body = TxBody::RegisterAgent(RegisterBody {
         agent_name: AGENT_NAME.to_string(),
-        capabilities: vec![0x04], // oracle/price-feed capability
+        capabilities: vec![0x04],
         endpoint: "arc://agents/price-oracle-v1".to_string(),
         protocol: hash_bytes(b"price-oracle-v1"),
         metadata: serde_json::to_vec(&serde_json::json!({
@@ -79,7 +49,6 @@ fn build_register_tx(owner: Hash256, nonce: u64) -> Transaction {
     }
 }
 
-/// Construct an InferenceAttestation TX for a price update.
 fn build_attestation_tx(
     from: Hash256,
     model_id: Hash256,
@@ -91,8 +60,8 @@ fn build_attestation_tx(
         model_id,
         input_hash: hash_bytes(input_data),
         output_hash: hash_bytes(output_data),
-        challenge_period: 100, // 100 blocks
-        bond: 1000,            // 1000 ARC bond
+        challenge_period: 100,
+        bond: 1000,
         beneficiary: None,
     });
 
@@ -111,24 +80,18 @@ fn build_attestation_tx(
     }
 }
 
-/// Simulate fetching a price with deterministic jitter.
 fn simulate_price_fetch(base_price: u128, round: u64) -> u128 {
     let jitter_basis = ((round * 7 + 13) % 100) as u128;
-    let jitter_pct = jitter_basis as i128 - 50; // range: -50 to +49
-    let delta = (base_price as i128 * jitter_pct) / 10_000; // max 0.5% change
+    let jitter_pct = jitter_basis as i128 - 50;
+    let delta = (base_price as i128 * jitter_pct) / 10_000;
     (base_price as i128 + delta) as u128
 }
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 
 fn main() {
     println!("=== ARC Chain Price Oracle Agent ===\n");
 
     let owner = hash_bytes(b"oracle-agent-owner");
 
-    // 1. Register agent on-chain.
     println!("[1/4] Registering oracle agent on-chain");
     let register_tx = build_register_tx(owner, 0);
     println!("      RegisterAgent TX: hash={}", register_tx.hash);
@@ -162,7 +125,6 @@ fn main() {
         .expect("activation failed");
     println!("      Agent registered and activated: {:?}", agent_id);
 
-    // 2. Initialize oracle registry with price feeds.
     println!("[2/4] Setting up oracle registry with initial price feeds");
     let mut oracle = OracleRegistry::new();
     let tokens = token_addresses();
@@ -187,7 +149,6 @@ fn main() {
         oracle.price_count()
     );
 
-    // 3. Simulate price update rounds.
     println!("[3/4] Simulating price update rounds\n");
     let num_rounds = 5u64;
     let model_id = hash_bytes(b"oracle-model");
@@ -196,10 +157,8 @@ fn main() {
         println!("  --- Round {} ---", round);
 
         for (token_addr, symbol, base_price) in &tokens {
-            // Simulate fetching new price.
             let new_price = simulate_price_fetch(*base_price, round);
 
-            // Update oracle registry.
             let feed = PriceFeed {
                 token: *token_addr,
                 price_usd: new_price,
@@ -209,7 +168,6 @@ fn main() {
             };
             oracle.update_price(feed);
 
-            // Build attestation TX.
             let input_data = format!("{}-round-{}", symbol, round);
             let output_data = format!("{}", new_price);
             let attestation_tx = build_attestation_tx(
@@ -227,7 +185,6 @@ fn main() {
                 &hex::encode(attestation_tx.hash.0)[..16],
             );
 
-            // Record action in agent registry.
             let action = AgentAction {
                 agent_id,
                 action_type: ActionType::Inference,
@@ -242,7 +199,6 @@ fn main() {
                 .expect("action execution failed");
         }
 
-        // Verify prices are readable from oracle.
         for (token_addr, _symbol, _) in &tokens {
             let feed = oracle.get_price(token_addr).expect("feed not found");
             assert_eq!(feed.round_id, round);
@@ -251,7 +207,6 @@ fn main() {
         println!();
     }
 
-    // 4. Print agent summary.
     println!("[4/4] Agent summary\n");
     let final_agent = registry.get(&agent_id).expect("agent not found");
     println!("  Name:          {}", final_agent.name);
@@ -261,7 +216,6 @@ fn main() {
     println!("  Reputation:    {:.2}", final_agent.reputation);
     println!("  Oracle feeds:  {}", oracle.price_count());
 
-    // Final prices.
     println!("\n  Latest prices:");
     for (token_addr, symbol, _) in &tokens {
         let feed = oracle.get_price(token_addr).unwrap();

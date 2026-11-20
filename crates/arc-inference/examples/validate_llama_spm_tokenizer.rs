@@ -1,5 +1,3 @@
-//! Header-only reference validation for the versioned LLaMA GGUF SPM profile.
-
 use arc_inference::llama_spm_tokenizer::{
     GGUF_LLAMA_SPM_TOKENIZER_PROFILE_V1, LlamaGgufSpmTokenizer,
 };
@@ -69,8 +67,6 @@ fn main() {
             "--model" => model = args.next(),
             "--reference-bin" => reference_bin = args.next(),
             "--output-jsonl" => output_jsonl = args.next(),
-            // One JSON object per line with a "text" field, e.g.
-            // scripts/arc_conformance/data/tokenizer_corpus.jsonl (M3).
             "--corpus" => corpus = args.next(),
             "--help" | "-h" => {
                 println!(

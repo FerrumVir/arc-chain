@@ -1,8 +1,3 @@
-//! GPU-Resident State Benchmark
-//!
-//! Compares state execution throughput with and without GPU-resident state cache.
-//! Tests: DashMap-only (baseline) vs GPU-backed state (Metal unified / CPU fallback).
-
 use arc_crypto::Hash256;
 use arc_state::StateDB;
 use arc_state::gpu_state::GpuStateCacheConfig;
@@ -28,19 +23,16 @@ pub fn run_gpu_state_benchmark() {
     let num_lookups: usize = 1_000_000;
     let num_transfers: usize = 500_000;
 
-    // ── Phase 1: Setup ──────────────────────────────────────────────────────
     println!("Setting up {} accounts...", num_accounts);
 
     let genesis: Vec<(Address, u64)> = (0..num_accounts as u16)
         .map(|i| (benchmark_address_u16(i), 1_000_000))
         .collect();
 
-    // ── Phase 2: Baseline - DashMap only ────────────────────────────────────
     println!("\n━━━ Phase 2: Baseline (DashMap only) ━━━");
 
     let state_baseline = Arc::new(StateDB::with_genesis(&genesis));
 
-    // Random account lookups
     let t0 = Instant::now();
     let mut hits = 0u64;
     for i in 0..num_lookups {
@@ -58,7 +50,6 @@ pub fn run_gpu_state_benchmark() {
         hits
     );
 
-    // Transfer execution
     let t1 = Instant::now();
     let mut success_count = 0u64;
     for i in 0..num_transfers {
@@ -89,7 +80,6 @@ pub fn run_gpu_state_benchmark() {
         baseline_tps
     );
 
-    // ── Phase 3: GPU-Resident State ─────────────────────────────────────────
     println!("\n━━━ Phase 3: GPU-Resident State ━━━");
 
     let gpu_config = GpuStateCacheConfig {
@@ -99,7 +89,6 @@ pub fn run_gpu_state_benchmark() {
     let state_gpu = StateDB::with_genesis_gpu(&genesis, gpu_config);
     let state_gpu = Arc::new(state_gpu);
 
-    // Report memory model
     if let Some(cache) = state_gpu.gpu_cache() {
         println!("  Memory model: {:?}", cache.memory_model());
         let stats = cache.stats();
@@ -109,7 +98,6 @@ pub fn run_gpu_state_benchmark() {
         );
     }
 
-    // Random account lookups (GPU-backed)
     let t2 = Instant::now();
     let mut gpu_hits = 0u64;
     for i in 0..num_lookups {
@@ -127,7 +115,6 @@ pub fn run_gpu_state_benchmark() {
         gpu_hits
     );
 
-    // Transfer execution (GPU-backed)
     let t3 = Instant::now();
     let mut gpu_success = 0u64;
     for i in 0..num_transfers {
@@ -158,7 +145,6 @@ pub fn run_gpu_state_benchmark() {
         gpu_tps
     );
 
-    // GPU cache stats
     if let Some(cache) = state_gpu.gpu_cache() {
         let stats = cache.stats();
         println!(
@@ -170,7 +156,6 @@ pub fn run_gpu_state_benchmark() {
         );
     }
 
-    // ── Summary ─────────────────────────────────────────────────────────────
     println!();
     println!("╔══════════════════════════════════════════════════════════════════╗");
     println!("║  RESULTS                                                        ║");
@@ -189,7 +174,6 @@ pub fn run_gpu_state_benchmark() {
     println!("╚══════════════════════════════════════════════════════════════════╝");
     println!();
 
-    // Verify correctness
     assert_eq!(hits, num_lookups as u64, "baseline lookups should all hit");
     assert_eq!(gpu_hits, num_lookups as u64, "GPU lookups should all hit");
 }

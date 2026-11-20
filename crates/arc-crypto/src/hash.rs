@@ -1,9 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
-/// 256-bit hash used throughout the chain.
-/// Serializes as hex string in human-readable formats (JSON),
-/// raw bytes in binary formats (bincode).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Hash256(pub [u8; 32]);
 
@@ -21,7 +18,6 @@ impl<'de> Deserialize<'de> for Hash256 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if deserializer.is_human_readable() {
             let s = String::deserialize(deserializer)?;
-            // Strip optional 0x prefix
             let hex_str = s.strip_prefix("0x").unwrap_or(&s);
             Self::from_hex(hex_str).map_err(serde::de::Error::custom)
         } else {
@@ -45,7 +41,6 @@ impl Hash256 {
     pub fn from_hex(s: &str) -> Result<Self, hex::FromHexError> {
         let bytes = hex::decode(s)?;
         if bytes.len() != 32 {
-            // Return InvalidStringLength error for wrong-length input
             return Err(hex::FromHexError::InvalidStringLength);
         }
         let mut arr = [0u8; 32];
@@ -72,14 +67,11 @@ impl AsRef<[u8]> for Hash256 {
     }
 }
 
-/// BLAKE3 hash of arbitrary bytes. Used as the primary hash function
-/// throughout ARC chain for its speed and parallelism.
 #[inline]
 pub fn hash_bytes(data: &[u8]) -> Hash256 {
     Hash256(*blake3::hash(data).as_bytes())
 }
 
-/// Hash two 32-byte values together (for Merkle tree internal nodes).
 #[inline]
 pub fn hash_pair(left: &Hash256, right: &Hash256) -> Hash256 {
     let mut hasher = blake3::Hasher::new();

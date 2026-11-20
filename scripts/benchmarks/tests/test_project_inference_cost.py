@@ -1,4 +1,3 @@
-"""Runs the cost calculator's own self-test (M9) under unittest, so CI runs it."""
 import importlib.util
 import os
 import unittest

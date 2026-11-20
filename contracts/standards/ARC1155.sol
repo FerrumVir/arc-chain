@@ -1,24 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-/**
- * @title ARC1155
- * @notice Multi-token standard for ARC Chain (ERC-1155 compatible)
- * @dev Implements the ERC-1155 interface with mint/burn controlled by the contract owner.
- *      Supports both fungible and non-fungible tokens in a single contract.
- */
 contract ARC1155 {
-    // ── State ──────────────────────────────────────────────────────────────
-
     address public owner;
     string private _uri;
 
-    // token ID => account => balance
     mapping(uint256 => mapping(address => uint256)) private _balances;
-    // account => operator => approved
     mapping(address => mapping(address => bool)) private _operatorApprovals;
-
-    // ── Events ─────────────────────────────────────────────────────────────
 
     event TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value);
 
@@ -32,8 +20,6 @@ contract ARC1155 {
 
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
-    // ── Errors ─────────────────────────────────────────────────────────────
-
     error NotOwner();
     error ZeroAddress();
     error InsufficientBalance(uint256 id, uint256 available, uint256 required);
@@ -42,47 +28,25 @@ contract ARC1155 {
     error UnsafeRecipient(address to);
     error SettingApprovalForSelf();
 
-    // ── Modifiers ──────────────────────────────────────────────────────────
-
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
         _;
     }
 
-    // ── Constructor ────────────────────────────────────────────────────────
-
-    /**
-     * @param uri_  Base URI for token metadata (use `{id}` placeholder per ERC-1155 spec)
-     */
     constructor(string memory uri_) {
         owner = msg.sender;
         _uri = uri_;
     }
 
-    // ── ERC-165 ────────────────────────────────────────────────────────────
-
-    /**
-     * @notice Query interface support (ERC-165).
-     */
     function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
-        return interfaceId == 0xd9b67a26 // ERC-1155
-            || interfaceId == 0x0e89341c // ERC-1155 Metadata URI
-            || interfaceId == 0x01ffc9a7; // ERC-165
+        return interfaceId == 0xd9b67a26 || interfaceId == 0x0e89341c || interfaceId == 0x01ffc9a7;
     }
 
-    // ── ERC-1155 Interface ─────────────────────────────────────────────────
-
-    /**
-     * @notice Get the balance of a specific token for an account.
-     */
     function balanceOf(address account, uint256 id) public view returns (uint256) {
         if (account == address(0)) revert ZeroAddress();
         return _balances[id][account];
     }
 
-    /**
-     * @notice Get balances for multiple account/token pairs.
-     */
     function balanceOfBatch(address[] calldata accounts, uint256[] calldata ids)
         external
         view
@@ -97,25 +61,16 @@ contract ARC1155 {
         return batchBalances;
     }
 
-    /**
-     * @notice Set or revoke approval for an operator to manage all your tokens.
-     */
     function setApprovalForAll(address operator, bool approved) external {
         if (operator == msg.sender) revert SettingApprovalForSelf();
         _operatorApprovals[msg.sender][operator] = approved;
         emit ApprovalForAll(msg.sender, operator, approved);
     }
 
-    /**
-     * @notice Check if an operator is approved for all tokens of an account.
-     */
     function isApprovedForAll(address account, address operator) public view returns (bool) {
         return _operatorApprovals[account][operator];
     }
 
-    /**
-     * @notice Transfer a single token type.
-     */
     function safeTransferFrom(address from, address to, uint256 id, uint256 amount, bytes calldata data) external {
         if (from != msg.sender && !isApprovedForAll(from, msg.sender)) {
             revert NotAuthorized(msg.sender);
@@ -123,9 +78,6 @@ contract ARC1155 {
         _safeTransferFrom(from, to, id, amount, data);
     }
 
-    /**
-     * @notice Transfer multiple token types in a single call.
-     */
     function safeBatchTransferFrom(
         address from,
         address to,
@@ -139,52 +91,22 @@ contract ARC1155 {
         _safeBatchTransferFrom(from, to, ids, amounts, data);
     }
 
-    // ── Metadata ───────────────────────────────────────────────────────────
-
-    /**
-     * @notice Get the URI for a token type.
-     * @dev Returns the base URI. Clients replace `{id}` with the hex token ID per ERC-1155 spec.
-     */
-    function uri(
-        uint256 /* id */
-    )
-        external
-        view
-        returns (string memory)
-    {
+    function uri(uint256) external view returns (string memory) {
         return _uri;
     }
 
-    /**
-     * @notice Set the base URI. Owner only.
-     */
     function setURI(string memory newuri) external onlyOwner {
         _uri = newuri;
     }
 
-    /**
-     * @notice Emit a URI change event for a specific token. Owner only.
-     */
     function emitURI(string memory value, uint256 id) external onlyOwner {
         emit URI(value, id);
     }
 
-    // ── Owner Functions ────────────────────────────────────────────────────
-
-    /**
-     * @notice Mint a single token type. Owner only.
-     * @param to      Recipient
-     * @param id      Token ID
-     * @param amount  Number of tokens to mint
-     * @param data    Data payload for receiver hook
-     */
     function mint(address to, uint256 id, uint256 amount, bytes calldata data) external onlyOwner {
         _mint(to, id, amount, data);
     }
 
-    /**
-     * @notice Mint multiple token types in a single call. Owner only.
-     */
     function mintBatch(address to, uint256[] calldata ids, uint256[] calldata amounts, bytes calldata data)
         external
         onlyOwner
@@ -192,9 +114,6 @@ contract ARC1155 {
         _mintBatch(to, ids, amounts, data);
     }
 
-    /**
-     * @notice Burn tokens from the caller's balance.
-     */
     function burn(address from, uint256 id, uint256 amount) external {
         if (from != msg.sender && !isApprovedForAll(from, msg.sender)) {
             revert NotAuthorized(msg.sender);
@@ -202,9 +121,6 @@ contract ARC1155 {
         _burn(from, id, amount);
     }
 
-    /**
-     * @notice Burn multiple token types from the caller's balance.
-     */
     function burnBatch(address from, uint256[] calldata ids, uint256[] calldata amounts) external {
         if (from != msg.sender && !isApprovedForAll(from, msg.sender)) {
             revert NotAuthorized(msg.sender);
@@ -212,16 +128,11 @@ contract ARC1155 {
         _burnBatch(from, ids, amounts);
     }
 
-    /**
-     * @notice Transfer contract ownership.
-     */
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert ZeroAddress();
         emit OwnershipTransferred(owner, newOwner);
         owner = newOwner;
     }
-
-    // ── Internal ───────────────────────────────────────────────────────────
 
     function _safeTransferFrom(address from, address to, uint256 id, uint256 amount, bytes calldata data) internal {
         if (to == address(0)) revert ZeroAddress();
@@ -368,9 +279,6 @@ contract ARC1155 {
     }
 }
 
-/**
- * @dev Interface for contracts that want to support transfers from ERC-1155 contracts.
- */
 interface IERC1155Receiver {
     function onERC1155Received(address operator, address from, uint256 id, uint256 value, bytes calldata data)
         external

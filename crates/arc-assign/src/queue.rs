@@ -1,22 +1,3 @@
-//! A bounded, fair call queue per worker (S6): round-robin across requesters,
-//! per-call deadlines, cancellation, and a hard capacity - so one busy
-//! requester cannot starve the others of SERVICE, and a stuck worker cannot
-//! grow memory.
-//!
-//! The fairness here is in service, not in admission, and the difference
-//! matters. `next` rotates between requesters, so whoever is already in the
-//! queue gets an even share of turns. `push` is first-come-first-served
-//! against one global capacity, so a single requester that pushes `capacity`
-//! calls before anyone else WILL make the next requester's push fail with
-//! `Full`. Nothing in this type prevents that.
-//!
-//! What prevents it is the caller. `arc-node`'s native worker offers pending
-//! requests round-robin by requester (`poll_once`), so admissions interleave
-//! before they ever reach this queue, and a `Full` there is treated as
-//! backpressure - the rest are offered again on the next poll. Any other
-//! caller that pushes in bulk from one requester inherits the admission
-//! problem and has to solve it the same way.
-
 use crate::Hash256;
 use std::collections::{BTreeMap, VecDeque};
 
@@ -24,7 +5,6 @@ use std::collections::{BTreeMap, VecDeque};
 pub struct Call {
     pub request: Hash256,
     pub call_id: Hash256,
-    /// Monotonic deadline (the caller's clock units).
     pub deadline: u64,
 }
 
@@ -34,11 +14,9 @@ pub enum QueueError {
     Full(usize),
 }
 
-/// What `next` found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Next {
     Run(Call),
-    /// Calls whose deadline passed; the caller fails them fast.
     Expired(Vec<Call>),
     Idle,
 }
@@ -46,7 +24,6 @@ pub enum Next {
 pub struct FairQueue {
     capacity: usize,
     len: usize,
-    /// Per request, in arrival order; `order` rotates between requests.
     calls: BTreeMap<[u8; 32], VecDeque<Call>>,
     order: VecDeque<[u8; 32]>,
 }
@@ -83,7 +60,6 @@ impl FairQueue {
         Ok(())
     }
 
-    /// Drop every queued call of a cancelled request.
     pub fn cancel(&mut self, request: &Hash256) -> usize {
         let removed = self.calls.remove(&request.0).map(|q| q.len()).unwrap_or(0);
         self.order.retain(|k| *k != request.0);
@@ -91,7 +67,6 @@ impl FairQueue {
         removed
     }
 
-    /// The next call, taking one request's turn, or the expired calls first.
     pub fn next(&mut self, now: u64) -> Next {
         let mut expired = Vec::new();
         for queue in self.calls.values_mut() {
@@ -148,12 +123,9 @@ mod tests {
         }
     }
 
-    /// The property this type exists for: one requester with a backlog does
-    /// not get the worker to itself.
     #[test]
     fn service_rotates_between_requesters_so_a_backlog_cannot_monopolise_a_worker() {
         let mut q = FairQueue::new(8);
-        // A arrives first with three calls; B queues one behind them.
         for id in 1..=3 {
             q.push(call(0xAA, id, 100)).unwrap();
         }
@@ -161,8 +133,6 @@ mod tests {
         assert_eq!(q.len(), 4);
 
         let served: Vec<Hash256> = (0..4).map(|_| run(&mut q, 0).request).collect();
-        // A, B, A, A: B is served second despite arriving last, and A keeps
-        // its own arrival order within its turns.
         assert_eq!(served, vec![h(0xAA), h(0xBB), h(0xAA), h(0xAA)]);
         assert!(q.is_empty());
         assert_eq!(q.next(0), Next::Idle);
@@ -188,20 +158,15 @@ mod tests {
         }
         assert_eq!(q.len(), 3);
         assert_eq!(q.push(call(0xBB, 4, 100)), Err(QueueError::Full(3)));
-        // A refused call leaves nothing behind.
         assert_eq!(q.len(), 3);
     }
 
-    /// Admission is first-come, not fair. This is the honest shape of the
-    /// type, and the reason the node's worker interleaves before pushing.
     #[test]
     fn admission_is_first_come_so_one_requester_can_fill_the_queue() {
         let mut q = FairQueue::new(2);
         q.push(call(0xAA, 1, 100)).unwrap();
         q.push(call(0xAA, 2, 100)).unwrap();
-        // B never gets in, though it would be served fairly if it had.
         assert_eq!(q.push(call(0xBB, 3, 100)), Err(QueueError::Full(2)));
-        // Once A is served the slot frees: backpressure, not loss.
         assert_eq!(run(&mut q, 0).request, h(0xAA));
         q.push(call(0xBB, 3, 100)).unwrap();
         assert_eq!(q.len(), 2);
@@ -225,10 +190,6 @@ mod tests {
         assert_eq!(run(&mut q, 10).call_id, h(2));
     }
 
-    /// `deadline == now` is already expired. The node passes
-    /// `now = height + 1`, and the contract refunds when
-    /// `height + 1 >= expires_at`, so a call must not run in the same block
-    /// its escrow becomes refundable.
     #[test]
     fn a_deadline_equal_to_now_is_already_expired() {
         let mut q = FairQueue::new(4);
@@ -249,7 +210,6 @@ mod tests {
 
         assert_eq!(q.cancel(&h(0xAA)), 2);
         assert_eq!(q.len(), 1, "only B's call remains");
-        // Cancelling something absent is a no-op, not an underflow.
         assert_eq!(q.cancel(&h(0xAA)), 0);
         assert_eq!(q.cancel(&h(0xCC)), 0);
         assert_eq!(q.len(), 1);
@@ -263,8 +223,8 @@ mod tests {
     fn length_stays_consistent_through_expiry_cancellation_and_service() {
         let mut q = FairQueue::new(16);
         for id in 0..4u8 {
-            q.push(call(0xAA, id, 5)).unwrap(); // expire at 10
-            q.push(call(0xBB, 100 + id, 100)).unwrap(); // live
+            q.push(call(0xAA, id, 5)).unwrap();
+            q.push(call(0xBB, 100 + id, 100)).unwrap();
         }
         assert_eq!(q.len(), 8);
 
@@ -282,8 +242,6 @@ mod tests {
         assert_eq!(q.next(10), Next::Idle);
     }
 
-    /// A requester that empties and comes back rejoins the rotation instead of
-    /// being dropped from it.
     #[test]
     fn a_requester_that_drains_and_returns_is_queued_again() {
         let mut q = FairQueue::new(4);
@@ -293,7 +251,6 @@ mod tests {
 
         q.push(call(0xBB, 2, 100)).unwrap();
         q.push(call(0xAA, 3, 100)).unwrap();
-        // B was queued first this time, so B goes first.
         assert_eq!(run(&mut q, 0).request, h(0xBB));
         assert_eq!(run(&mut q, 0).request, h(0xAA));
     }

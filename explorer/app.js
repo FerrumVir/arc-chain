@@ -158,11 +158,6 @@
     }
   }
 
-  // Why a permitted source added nothing to a lookup. A 404 on every request
-  // it was sent means it answered and holds no record. Any other status, no
-  // response or a timeout leaves its record unknown. The inspector names each
-  // such source: an outage is never read as agreement, and a missing record
-  // never as an outage.
   function describeSilentSource(label, errors, noun) {
     const item = noun || "record";
     const seen = (Array.isArray(errors) ? errors : [errors]).filter(Boolean);
@@ -176,9 +171,6 @@
     return { label, state: "unknown", text: `${label}: could not be asked (${failure?.message || "no usable answer"}), so its ${item} is unknown.` };
   }
 
-  // Some deployed v0.8 gateways return 404 for the /block/latest alias even
-  // though the source RPC implements it. Resolve the current height through
-  // read-only status endpoints, then fetch the same canonical block shape.
   async function requestLatestBlock(fetchImpl, source, options) {
     const direct = await optionalRequest(fetchImpl, source, "/block/latest", options);
     if (direct.ok) return direct.value;
@@ -268,13 +260,6 @@
 
   const BLOCKS_PAGE_SIZE = 20;
 
-  // A bounded, paged window of recent blocks, newest end first. Canonical mode
-  // routes each side of the page the same way a single block does
-  // (`resolver.routeBlock`); a page that straddles the signed checkpoint is
-  // split into its legacy and v3 segments and each is fetched from its own
-  // configured source, never blended into one request. An explicit source
-  // bypasses that split entirely and serves the whole page, like
-  // `queryTransaction`/`queryAddress` do.
   async function queryBlocksPage(options) {
     const { resolver, fetchImpl, startHeight, sourceId, signal } = options;
     if (!Number.isSafeInteger(startHeight) || startHeight < 0) {
@@ -305,10 +290,6 @@
       }
     }
     const fetched = await Promise.all(segments.map(async (segment) => {
-      // Same rule as every other query: an explicitly selected preserved fork
-      // is trusted only after its own provenance verifies, never on request
-      // shape alone. A no-op for the legacy-canonical/v3 sources the
-      // canonical split always uses.
       await requireLegacyArchiveProvenance(segment.source, fetchImpl, signal);
       const limit = segment.to - segment.from + 1;
       const result = await optionalRequest(fetchImpl, segment.source, `/blocks?from=${segment.from}&to=${segment.to}&limit=${limit}`, { signal });
@@ -321,9 +302,6 @@
 
   async function queryTransaction(options) {
     const { resolver, fetchImpl, hash, sourceId, signal, checkpointAudit } = options;
-    // The hash reaches this function straight from the URL fragment, so it is
-    // normalized before it is ever interpolated into an RPC path. Without this
-    // an unvalidated fragment escapes /tx/ and queries arbitrary node paths.
     const txHash = network.normalizeHex(hash, 32);
     if (!txHash) throw new RpcError("Transactions must be 32-byte hexadecimal values", 0, null);
     const planned = resolver.lookupSources({ sourceId });
@@ -398,8 +376,6 @@
 
   async function queryAddress(options) {
     const { resolver, fetchImpl, address, sourceId, signal, checkpointAudit } = options;
-    // Same fragment-supplied input as queryTransaction: normalize before it can
-    // reach an RPC path.
     const accountAddress = network.normalizeHex(address, 32);
     if (!accountAddress) throw new RpcError("Addresses must be 32-byte hexadecimal values", 0, null);
     const planned = resolver.lookupSources({ sourceId });
@@ -412,11 +388,6 @@
       const historyValue = history.ok ? history.value : null;
       const txHashes = Array.isArray(historyValue?.tx_hashes) ? historyValue.tx_hashes : [];
       const found = account.ok || txHashes.length > 0;
-      // `/account/{address}/txs` never 404s for a well-formed address on a node
-      // that implements it (an unused address just gets an empty list back),
-      // so a 404 here means the route itself is absent - an older node, not
-      // "no history". Any other failure is a genuine reachability problem.
-      // Each gets its own message; none is silently treated as "no history".
       const historyState = history.ok ? "served" : history.error?.status === 404 ? "not-served" : history.error?.status ? "error" : "unreachable";
       const configuredCanonical = sourceId === "canonical"
         && (source.id === resolver.config.checkpoint?.v3SourceId || source.id === resolver.config.checkpoint?.legacySourceId);
@@ -439,25 +410,14 @@
     return { records: attempts.filter((attempt) => attempt.found), failures: attempts.filter((attempt) => !attempt.found) };
   }
 
-  // A native paid-inference request is identified by its request
-  // id; its canonical record is the receipt each validator serves. Every
-  // permitted source is asked, and the page shows whether the ones that
-  // answer record the same settlement - a disagreement is shown, never
-  // averaged away - and whether each settlement's credits reconcile.
   async function queryNativeRequest(options) {
     const { resolver, fetchImpl, requestId, sourceId, signal } = options;
     const id = network.normalizeHex(requestId, 32);
     if (!id) throw new RpcError("Native request ids must be 32-byte hexadecimal values", 0, null);
-    // Canonical view: every enabled replica of the current network, since the
-    // point is whether they agree. An explicitly selected source: that one.
     const planned = sourceId && sourceId !== "canonical"
       ? resolver.lookupSources({ sourceId })
       : resolver.v3Replicas().map((source) => ({ source, sourceId: source.id }));
     const answers = await Promise.all(planned.map(async ({ source }) => {
-      // `/health` is fetched from the same source as the receipt, never a
-      // different one: whether a Pending request has passed its expiry is a
-      // claim about that source's own view of the chain, not a claim merged
-      // across sources.
       const [result, health] = await Promise.all([
         optionalRequest(fetchImpl, source, `/native-inference/receipt/${id}`, { signal }),
         optionalRequest(fetchImpl, source, "/health", { signal }),
@@ -496,12 +456,8 @@
       blocksStatus: $("blocks-status"), blocksBody: $("blocks-body"), blocksPageLink: $("blocks-page-link"), sourceFacts: $("source-facts"), inferenceStatus: $("inference-status"), inferenceList: $("inference-list"), rewardsStatus: $("rewards-status"), rewardsList: $("rewards-list"),
       searchForm: $("search-form"), searchInput: $("search-input"), searchKind: $("search-kind"), searchError: $("search-error"), inspector: $("inspector"), inspectorKicker: $("inspector-kicker"), inspectorTitle: $("inspector-title"), inspectorClose: $("inspector-close"), inspectorContent: $("inspector-content"),
     };
-    // renderedView: the source view whose result is on screen, so a refresh of that same view runs in the background.
-    // refreshedLabel: what "Last refreshed" settles to once a refresh ends.
     const state = { config: null, resolver: null, sourceId: "canonical", checkpointAudit: { state: "unknown", reason: "not-audited" }, refreshController: null, lookupController: null, timer: null, lastKnownHeight: null, renderedView: null, refreshedLabel: elements.lastRefreshed.textContent };
 
-    // A write that would not change a node is skipped: a background refresh that finds the same evidence rewrites
-    // nothing, so nothing flickers and the live banner does not announce it again.
     const text = (node, value) => {
       if (!node) return;
       const next = value == null ? "" : String(value);
@@ -523,23 +479,18 @@
     };
     const sourceDisplay = (source) => `${source.name}${source.region ? ` · ${source.region}` : ""}`;
 
-    // The aqueduct in the page header (aqueduct/band.js) draws only blocks this page read: the blocks of each refresh
-    // and a light poll of the same source's latest block. Its water runs with the confirmed inference receipts each
-    // refresh reads. It is optional; without it every aqueduct call below does nothing.
     const aqueduct = (() => {
       const band = window.ArcAqueductBand;
       if (!band || typeof band.mount !== "function") return null;
       let mounted = null;
       try { mounted = band.mount(document.getElementById("aqueduct"), { bot: 340 }); } catch (_error) { return null; }
       if (!mounted) return null;
-      // The band only illustrates evidence the page already shows: a failure inside it must never change that evidence.
-      const safely = (method) => (options) => { try { mounted[method](options); } catch (_error) { /* the picture stays as it was */ } };
+      const safely = (method) => (options) => { try { mounted[method](options); } catch (_error) { } };
       return { follow: safely("follow"), clear: safely("clear") };
     })();
     const aqueductBlock = (block) => ({ height: network.blockHeight(block), txCount: txCount(block), timestamp: blockTimestamp(block) });
     function followAqueduct(source, snapshot, liveness, alternate, checkpointAudit, receipts) {
       if (!aqueduct) return;
-      // The band withdraws its picture whenever the page withdraws its claim, and never draws two sources as one chain.
       if (checkpointAudit.state === "mismatch") {
         aqueduct.clear({ tone: "bad", title: "Recovery checkpoint mismatch", detail: "Canonical labels are paused, so no blocks are drawn." });
         return;
@@ -566,8 +517,6 @@
         stalled,
         blocks,
         poll: (signal) => requestLatestBlock(window.fetch.bind(window), source, { signal }).then((block) => [aqueductBlock(block)]),
-        // Only a verified canonical view feeds the water: the receipts Inference activity lists as confirmed. Any
-        // other view, or a refresh whose receipt request failed, feeds nothing and withdraws the line.
         inference: view === "verified" && Array.isArray(receipts)
           ? receipts.map(({ receipt }) => ({ id: receipt.txHash, height: receipt.height }))
           : null,
@@ -582,8 +531,6 @@
       elements.sourceDot.className = `status-dot ${kind === "online" ? "online" : kind === "degraded" ? "stalled" : kind === "error" ? "offline" : "unknown"}`;
     }
 
-    // A refresh of the view already on screen runs in the background: the banner keeps the last result and its signal
-    // pulses, and "Last refreshed" reads "Refreshing…" until the new result is in.
     function setRefreshing(on) {
       if (on) elements.banner.classList.add("refreshing");
       else elements.banner.classList.remove("refreshing");
@@ -593,7 +540,6 @@
     function fact(label, value, title) {
       const row = create("div");
       row.append(create("dt", "", label));
-      // a hash is set in the monospace face; words and numbers are set as text
       const dd = create("dd", /^0x[0-9a-f]/i.test(String(value ?? "")) ? "hash" : "", value ?? "Unavailable");
       if (title) dd.title = title;
       row.append(dd);
@@ -618,7 +564,6 @@
       if (!checkpoint) {
         text(elements.recoveryTitle, "Recovery checkpoint unavailable");
         text(elements.recoverySummary, "Canonical claims are paused. Legacy peers are not automatically treated as one chain.");
-        // The loading placeholders settle to what is known without a checkpoint: nothing.
         text(elements.checkpointHash, "Signed checkpoint unavailable");
         text(elements.boundaryState, "Parent link not checked");
         text(elements.manifestHash, "Manifest unavailable");
@@ -635,7 +580,6 @@
         mismatch: "PARENT HASH MISMATCH",
         unknown: "Parent link unavailable",
         "not-boundary": "Boundary response unavailable",
-        // configuration loaded, first audit not yet answered: neutral, neither a pass nor a warning
         auditing: "Checking parent link…",
       };
       text(elements.boundaryState, messages[boundary?.state] || "Parent link not checked");
@@ -694,8 +638,6 @@
       return null;
     }
 
-    // The rows a `/block/{height}/txs` response actually carries, reduced to
-    // just what is needed to link each one to its own transaction lookup.
     function transactionEntries(payload) {
       const rows = Array.isArray(payload?.transactions) ? payload.transactions : [];
       return rows
@@ -783,16 +725,11 @@
         fact("Issuance", readiness),
         fact("Attestation reward", reward === null ? "Unavailable" : `${reward} ARC configured rate`),
         fact("Observed worker rate", observed === null ? "Unavailable" : `${observed}/day · backward-looking`),
-        // `/economics/rewards` has no worker identity or exact receipt rows.
-        // A numeric field on this fleet-wide endpoint can never establish a
-        // worker projection, so the explorer always withholds it.
         fact("Projected earnings", `Unavailable · ${projectionReason}`),
       );
       text(elements.rewardsStatus, payload ? "Current source report" : "Unavailable");
     }
 
-    // The evidence panels start on neutral loading placeholders (index.html). A path that ends with no source to read
-    // (no canonical route, or a rejected configuration) settles them to the explicit wording instead of loading forever.
     function renderWithoutSource(status) {
       clear(elements.blocksBody);
       const tr = create("tr");
@@ -849,9 +786,6 @@
         return;
       }
       const alternate = state.sourceId !== "canonical" && source.id !== state.config.checkpoint?.v3SourceId && source.id !== state.config.checkpoint?.legacySourceId;
-      // The view on screen stays up while it refreshes (the 30-second timer, a return to the tab, the refresh button);
-      // only a first load, or a switch to another source, replaces it with a loading banner, after which no finished
-      // result is on screen until this one lands.
       if (state.renderedView === state.sourceId) setRefreshing(true);
       else {
         state.renderedView = null;
@@ -918,10 +852,6 @@
                                      parseRoute(), !elements.inspectorClose.hidden)) handleRoute();
       } catch (error) {
         if (!signal.aborted) {
-          // Evidence panels are cleared with the metrics. Leaving the previous
-          // block, inference, and reward renders on screen would present stale
-          // rows - possibly from a different source - as current evidence while
-          // the banner reports the selected source as unreachable.
           state.checkpointAudit = { state: "unknown", reason: "selected-source-unreachable" };
           resetMetrics();
           renderFacts(source, null, null);
@@ -940,7 +870,6 @@
                                        parseRoute(), !elements.inspectorClose.hidden)) handleRoute();
         }
       } finally {
-        // Only the newest refresh settles the controls: one it cancelled must not end the indicator of its replacement.
         if (state.refreshController === controller) {
           elements.refreshButton.classList.remove("spinning");
           setRefreshing(false);
@@ -971,11 +900,6 @@
       elements.inspectorContent.append(wrap);
     }
 
-    // One note per permitted source that contributed nothing. A source with
-    // no record is listed only where every source should hold one (the
-    // replicas of a native request); across the recovery boundary a record
-    // on one segment only is expected. A source whose record is unknown is
-    // always listed.
     function appendSilentSources(silent, includeNoRecord) {
       for (const entry of silent) {
         if (entry.state === "no-record" && !includeNoRecord) continue;
@@ -1169,10 +1093,6 @@
       }
     }
 
-    // A bounded, paged, client-side view over the tx hashes a source already
-    // returned in full: `/account/{address}/txs` has no offset/limit of its
-    // own, so pagination here is display-only - it never issues another
-    // request. Newest first, since the node appends hashes as it applies them.
     function buildHashPager(hashes) {
       const pageSize = 20;
       const wrap = create("div", "detail-section");
@@ -1396,7 +1316,6 @@
       } catch (error) {
         resetMetrics();
         renderFacts(null, null, null);
-        // Nothing loaded, so nothing is left loading.
         renderRecovery(null);
         renderWithoutSource("Unavailable");
         setBanner("error", "Explorer configuration rejected", error.message);

@@ -1,10 +1,3 @@
-// The compute slider's real effect, and whether the node persists.
-//
-// Both exist to answer questions the owner asked directly: "can users set how
-// much compute they dedicate" and "will mining auto-persist even when they turn
-// it off and back on". The copy is the deliverable here, so the copy is what is
-// asserted — including the absence of a cores-to-ARC multiplier claim.
-
 import { expect, test } from "@playwright/test";
 import { seedMockOverrides, seedOnboarded, seedOnboardedWithoutConfig } from "./helpers";
 
@@ -34,13 +27,9 @@ test.describe("Compute contribution", () => {
     await gotoSettings(page);
     const hint = page.getByTestId("compute-contribution");
     await expect(hint).toContainText("serve each hop faster");
-    // The honest causal chain: a successful mined 0x25 receipt pays; cores and
-    // raw attestations do not.
     await expect(hint).toContainText("Cores do not multiply ARC");
     await expect(hint).toContainText("successful mined");
     await expect(hint).toContainText("0x25");
-    // The previous copy promised "more cores means more work served - and more
-    // earnings". That claim must not come back.
     await expect(hint).not.toContainText("more cores means more work served");
   });
 
@@ -51,11 +40,9 @@ test.describe("Compute contribution", () => {
     const actual = page.getByTestId("actual-contribution");
     await expect(actual).toBeVisible();
     await expect(actual).toContainText("Currently contributing");
-    // Threads in use vs available, as a ratio - format not magnitude.
     await expect(page.getByTestId("contrib-cores-in-use")).toHaveText(
       /^\d+ of \d+$/,
     );
-    // Attributed to the user's own node, not a seed.
     await expect(actual).toContainText("127.0.0.1");
     await expect(actual).toContainText("your own node");
   });
@@ -64,7 +51,6 @@ test.describe("Compute contribution", () => {
     await gotoSettings(page);
     const actual = page.getByTestId("actual-contribution");
     await expect(actual).toContainText("Pipeline runs served");
-    // Summing these two would overstate the work this node performed.
     await expect(actual).toContainText("Served from cache");
   });
 
@@ -93,7 +79,6 @@ test.describe("Compute contribution", () => {
     const reason = page.getByTestId("contribution-unavailable");
     await expect(reason).toBeVisible();
     await expect(reason).toContainText("cannot be read right now");
-    // No fabricated substitute figures.
     await expect(page.getByTestId("contrib-cores-in-use")).toHaveCount(0);
   });
 
@@ -122,7 +107,6 @@ test.describe("Compute contribution", () => {
     const actual = page.getByTestId("actual-contribution");
     await expect(actual).toContainText("does not serve");
     await expect(actual).toContainText("/node/contribution");
-    // Anything unmeasured is omitted, not zeroed.
     await expect(
       page.getByTestId("contrib-measured-time-per-hop"),
     ).toHaveCount(0);
@@ -148,7 +132,6 @@ test.describe("Persistence - auto-start on", () => {
   }) => {
     await gotoSettings(page);
     await expect(page.getByTestId("persistence-autostart")).toHaveText("on");
-    // Registered independently of the flag, so a disagreement stays visible.
     await expect(page.getByTestId("persistence-login-item")).toContainText(
       /login item/,
     );
@@ -157,7 +140,6 @@ test.describe("Persistence - auto-start on", () => {
   test("is truthful that a model-less node resumes without local inference", async ({
     page,
   }) => {
-    // seedOnboarded writes modelPath: null.
     await gotoSettings(page);
     const role = page.getByTestId("persistence-role");
     await expect(role).toHaveText("Your node needs a model before it can answer questions.");
@@ -212,11 +194,9 @@ test.describe("Persistence - no stored config", () => {
   test("falls back to the real default rather than rendering blank", async ({
     page,
   }) => {
-    // An install whose store.json predates the config block.
     await seedOnboardedWithoutConfig(page);
     await gotoSettings(page);
     await expect(page.getByTestId("persistence-card")).toBeVisible();
-    // DEFAULT_NODE_CONFIG.autoStart is true.
     await expect(page.getByTestId("persistence-autostart")).toHaveText("on");
   });
 });

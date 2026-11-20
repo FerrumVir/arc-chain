@@ -1,24 +1,3 @@
-//! 4-stage pipelined block execution.
-//!
-//! Overlaps work on consecutive blocks across four stages:
-//!
-//! ```text
-//!   Block N  : [Receive] [Verify] [Execute] [Commit]
-//!   Block N+1:           [Receive] [Verify] [Execute] [Commit]
-//!   Block N+2:                     [Receive] [Verify] [Execute] [Commit]
-//! ```
-//!
-//! Each stage runs on its own thread, communicating via bounded crossbeam
-//! channels (capacity 2).  The pipeline is driven by the consensus loop:
-//! instead of doing all four phases serially per block, it pushes a batch
-//! of transactions into the pipeline's receive end and the commit stage
-//! emits the finished block asynchronously.
-//!
-//! **Throughput gain**: On a 4+ core machine, the pipeline effectively hides
-//! verification latency behind execution of the previous block, and execution
-//! latency behind commit of the block before that.  Real-world improvement
-//! is 2-3× on CPU-bound workloads (signature verification dominates).
-
 use crate::block_stm::BlockSTM;
 use arc_consensus::encode_block_data;
 use arc_state::StateDB;
@@ -30,52 +9,25 @@ use std::sync::Arc;
 use std::thread;
 use tracing::{debug, info, warn};
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
-/// How the execute stage processes transactions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ExecutionMode {
-    /// Execute transactions one-by-one (original behaviour).
     #[default]
     Sequential,
-    /// Optimistic parallel execution via Block-STM with automatic fallback to
-    /// sequential if too many conflict rounds occur.
     BlockSTM,
-    /// Speculative Block-STM - executes ALL transactions in parallel optimistically,
-    /// validates read/write sets, and re-executes only conflicting transactions.
-    /// Falls back to sequential for unresolved conflicts after max rounds.
     SpeculativeSTM,
-    /// GPU-resident state: hot accounts live in GPU unified/managed memory.
-    /// Combines Block-STM parallel execution with GPU-accelerated state lookups
-    /// for ~40x bandwidth improvement on hot accounts.
     GpuResident,
 }
 
-/// How the verify stage verifies Ed25519 signatures.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum VerifyMode {
-    /// CPU-only verification via rayon parallel iterator.
     #[default]
     Cpu,
-    /// GPU-accelerated verification via Metal (Apple Silicon) with automatic
-    /// fallback to CPU for small batches or non-Apple platforms.
     GpuMetal,
-    /// GPU-accelerated verification via CUDA (NVIDIA GPUs).
-    /// Falls back to CPU until the CUDA kernel is implemented (week 3-5).
     GpuCuda,
-    /// CPU SIMD verification using AVX-512 intrinsics (x86_64).
-    /// Falls back to scalar CPU until the AVX-512 kernel is implemented (week 6-7).
     CpuAvx512,
-    /// CPU SIMD verification using ARM NEON intrinsics (aarch64).
-    /// Falls back to scalar CPU until the NEON kernel is implemented (week 8).
     CpuNeon,
 }
 
-/// Auto-detect the best verification mode based on runtime hardware probing.
-///
-/// Priority: CUDA → Metal → AVX-512 → NEON → CPU (scalar).
 fn auto_detect_verify_mode() -> VerifyMode {
     let hw = arc_gpu::hardware_detect::detect();
     if hw.cuda_available {
@@ -91,22 +43,13 @@ fn auto_detect_verify_mode() -> VerifyMode {
     }
 }
 
-/// Tuning knobs for the pipeline.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
-    /// Which execution strategy to use in stage 3.
     pub execution_mode: ExecutionMode,
-    /// Which verification strategy to use in stage 2.
     pub verify_mode: VerifyMode,
-    /// Whether to run state-coalescing as a pre-processing step before
-    /// execution. Coalescing groups same-sender transactions and collapses
-    /// redundant reads/writes for hot accounts.
     pub coalesce_enabled: bool,
-    /// (Reserved) Maximum number of transactions per execution batch.
     pub batch_size: usize,
-    /// When `true` and `execution_mode == GpuResident`, enables GPU state cache.
     pub gpu_state_enabled: bool,
-    /// GPU state cache capacity (number of hot accounts in GPU memory).
     pub gpu_state_capacity: usize,
 }
 
@@ -123,93 +66,59 @@ impl Default for PipelineConfig {
     }
 }
 
-/// A batch of transactions entering the pipeline.
 pub struct PipelineBatch {
     pub transactions: Vec<Transaction>,
     pub producer: Address,
 }
 
-/// Result from the commit stage.
 pub struct PipelineResult {
     pub height: u64,
     pub tx_count: usize,
     pub success_count: usize,
     pub elapsed_ms: u128,
-    /// Which execution strategy was used for this block.
     pub execution_mode: ExecutionMode,
-    /// If coalescing ran, the number of state reads saved. `None` when disabled.
     pub coalesce_reads_saved: Option<usize>,
 }
 
-/// After signature verification, the batch gains validity flags.
 struct VerifiedBatch {
     transactions: Vec<Transaction>,
     sig_valid: Vec<bool>,
     producer: Address,
 }
 
-/// After execution, we have receipts.
 struct ExecutedBatch {
     transactions: Vec<Transaction>,
     receipt_success: Vec<bool>,
     producer: Address,
-    /// Which execution mode was actually used (may differ from config if
-    /// Block-STM fell back to sequential).
     execution_mode: ExecutionMode,
-    /// State reads saved by coalescing (None if coalescing was disabled).
     coalesce_reads_saved: Option<usize>,
-    /// Pre-execution (sender_balance, sender_nonce, receiver_balance) for each
-    /// transaction, or `None` when the transaction is not an eligible transfer.
-    /// Feeds the block STARK's balance-conservation constraints.
     transfer_pre: Vec<Option<(u64, u64, u64)>>,
 }
 
-/// The 4-stage pipeline.
 pub struct Pipeline {
-    /// Send batches into the pipeline.
     tx_in: Sender<PipelineBatch>,
-    /// Receive finished results.
     rx_out: Receiver<PipelineResult>,
-    /// The config this pipeline was created with.
     config: PipelineConfig,
-    /// Pre-verification cache for GPU signature verification.
-    /// Populated by background verification; checked at block-time verify stage.
     sig_cache: Arc<arc_gpu::metal_verify::SigVerifyCache>,
 }
 
 impl Pipeline {
-    /// Create and start the pipeline with default config (sequential execution,
-    /// coalescing disabled).
-    ///
-    /// Spawns 3 background threads (verify, execute, commit).
-    /// The receive stage is implicit - the caller pushes `PipelineBatch` via `submit()`.
     pub fn new(state: Arc<StateDB>) -> Self {
         Self::with_config(state, PipelineConfig::default())
     }
 
-    /// Create and start the pipeline with the given config.
-    ///
-    /// Spawns 3 background threads (verify, execute, commit).
     pub fn with_config(mut state: Arc<StateDB>, mut config: PipelineConfig) -> Self {
         if config.coalesce_enabled {
-            // The historical coalescer wrote account snapshots outside the
-            // canonical StateDB executor/WAL and exposed only aggregate
-            // failures, so the commit stage could publish successful receipts
-            // for failed transactions. Keep the tuning flag for config-file
-            // compatibility, but force the unsafe engine dark in protocol v3.
             warn!(
                 "Pipeline coalescing is disabled until its writes and per-transaction results are canonical and restart-durable"
             );
             config.coalesce_enabled = false;
         }
-        // Enable GPU state cache if requested.
         if config.gpu_state_enabled || config.execution_mode == ExecutionMode::GpuResident {
             let gpu_config = arc_state::gpu_state::GpuStateCacheConfig {
                 max_gpu_accounts: config.gpu_state_capacity,
                 ..Default::default()
             };
-            // Safe: Arc::get_mut succeeds because no other Arcs or Weaks
-            // exist yet - this runs at startup before thread spawning below.
             if let Some(state_mut) = Arc::get_mut(&mut state) {
                 state_mut.enable_gpu_cache(gpu_config);
             } else {
@@ -221,8 +130,6 @@ impl Pipeline {
             );
         }
 
-        // Bounded channels between stages (capacity 2 to allow slight buffering
-        // without unbounded memory growth).
         let (tx_in, rx_receive) = channel::bounded::<PipelineBatch>(2);
         let (tx_verified, rx_verified) = channel::bounded::<VerifiedBatch>(2);
         let (tx_executed, rx_executed) = channel::bounded::<ExecutedBatch>(2);
@@ -230,16 +137,12 @@ impl Pipeline {
 
         let sig_cache = Arc::new(arc_gpu::metal_verify::SigVerifyCache::new());
 
-        // ── Stage 2: Verify (batch Ed25519 + individual fallback) ────────
         let verify_mode = config.verify_mode;
         let verify_cache = Arc::clone(&sig_cache);
-        // Recovery context is installed before the pipeline starts and is
-        // immutable for the lifetime of this process.
         let recovery_domain = state.transaction_domain_hash();
         thread::Builder::new()
             .name("pipeline-verify".into())
             .spawn(move || {
-                // Initialize the backend-specific verifier for this thread.
                 let mut metal_verifier = match verify_mode {
                     VerifyMode::GpuMetal => Some(arc_gpu::metal_verify::MetalVerifier::new()),
                     _ => None,
@@ -263,7 +166,6 @@ impl Pipeline {
                     let n = batch.transactions.len();
                     let mut sig_valid = vec![false; n];
 
-                    // ── Phase 1: hash integrity check (parallel) ─────────
                     let hash_ok: Vec<bool> = batch
                         .transactions
                         .par_iter()
@@ -276,7 +178,6 @@ impl Pipeline {
                         })
                         .collect();
 
-                    // ── Phase 2: separate Ed25519 from others ────────────
                     let mut ed_indices: Vec<usize> = Vec::new();
                     let mut ed_msgs: Vec<Vec<u8>> = Vec::new();
                     let mut ed_sigs: Vec<ed25519_dalek::Signature> = Vec::new();
@@ -285,19 +186,17 @@ impl Pipeline {
 
                     for (i, tx) in batch.transactions.iter().enumerate() {
                         if !hash_ok[i] {
-                            continue; // hash mismatch → invalid
+                            continue;
                         }
                         match &tx.signature {
                             arc_crypto::Signature::Ed25519 {
                                 public_key,
                                 signature,
                             } => {
-                                // Check address derivation.
                                 let derived = arc_crypto::address_from_ed25519_pubkey(public_key);
                                 if derived != tx.from {
-                                    continue; // address mismatch → invalid
+                                    continue;
                                 }
-                                // Extract components for batch verification.
                                 if let (Ok(vk), true) = (
                                     ed25519_dalek::VerifyingKey::from_bytes(public_key),
                                     signature.len() == 64,
@@ -310,7 +209,7 @@ impl Pipeline {
                                     ed_sigs.push(sig);
                                     ed_vks.push(vk);
                                 } else {
-                                    continue; // malformed key/sig → invalid
+                                    continue;
                                 }
                             }
                             _ => {
@@ -319,8 +218,6 @@ impl Pipeline {
                         }
                     }
 
-                    // ── Phase 3: batch verify Ed25519 ────────────────────
-                    // Check pre-verification cache first, only verify uncached sigs.
                     if !ed_indices.is_empty() {
                         let mut uncached_task_indices: Vec<usize> = Vec::new();
                         let mut cached_count = 0usize;
@@ -344,10 +241,7 @@ impl Pipeline {
                             );
                         }
 
-                        // Verify remaining uncached signatures via the selected backend.
                         if !uncached_task_indices.is_empty() {
-                            // Helper: CPU rayon fallback path (used by CPU mode and
-                            // as fallback for not-yet-implemented kernel modes).
                             let cpu_verify =
                                 |indices: &[usize],
                                  msgs: &[Vec<u8>],
@@ -370,7 +264,6 @@ impl Pipeline {
 
                             match verify_mode {
                                 VerifyMode::GpuMetal if metal_verifier.is_some() => {
-                                    // GPU Metal path
                                     let verifier = metal_verifier.as_mut().unwrap();
                                     let tasks: Vec<arc_gpu::metal_verify::VerifyTask> =
                                         uncached_task_indices
@@ -389,7 +282,6 @@ impl Pipeline {
                                     }
                                 }
                                 VerifyMode::GpuCuda if cuda_verifier.is_some() => {
-                                    // CUDA kernel dispatch
                                     let verifier = cuda_verifier.as_mut().unwrap();
                                     let tasks: Vec<arc_gpu::metal_verify::VerifyTask> =
                                         uncached_task_indices
@@ -408,7 +300,6 @@ impl Pipeline {
                                     }
                                 }
                                 VerifyMode::CpuAvx512 if avx512_verifier.is_some() => {
-                                    // AVX-512 kernel dispatch
                                     let verifier = avx512_verifier.as_mut().unwrap();
                                     let tasks: Vec<arc_gpu::metal_verify::VerifyTask> =
                                         uncached_task_indices
@@ -427,7 +318,6 @@ impl Pipeline {
                                     }
                                 }
                                 VerifyMode::CpuNeon if neon_verifier.is_some() => {
-                                    // NEON kernel dispatch
                                     let verifier = neon_verifier.as_mut().unwrap();
                                     let tasks: Vec<arc_gpu::metal_verify::VerifyTask> =
                                         uncached_task_indices
@@ -446,7 +336,6 @@ impl Pipeline {
                                     }
                                 }
                                 _ => {
-                                    // CPU scalar path (default)
                                     cpu_verify(
                                         &uncached_task_indices,
                                         &ed_msgs,
@@ -460,7 +349,6 @@ impl Pipeline {
                         }
                     }
 
-                    // ── Phase 4: verify non-Ed25519 individually ─────────
                     for &i in &other_indices {
                         let tx = &batch.transactions[i];
                         sig_valid[i] = tx.signature.verify(&tx.hash, &tx.from).is_ok();
@@ -488,8 +376,6 @@ impl Pipeline {
             })
             .expect("spawn verify thread");
 
-        // ── Stage 3: Execute ─────────────────────────────────────────────
-        // Capture config values for the execute thread.
         let exec_mode = config.execution_mode;
         let exec_state = Arc::clone(&state);
         thread::Builder::new()
@@ -498,7 +384,6 @@ impl Pipeline {
                 while let Ok(vbatch) = rx_verified.recv() {
                     let n = vbatch.transactions.len();
 
-                    // Filter to only signature-valid transactions for execution.
                     let valid_txs: Vec<Transaction> = vbatch
                         .transactions
                         .iter()
@@ -507,7 +392,6 @@ impl Pipeline {
                         .map(|(_, tx)| tx.clone())
                         .collect();
 
-                    // Build an index mapping: valid_txs[j] == vbatch.transactions[orig_indices[j]]
                     let orig_indices: Vec<usize> = vbatch
                         .transactions
                         .iter()
@@ -520,16 +404,6 @@ impl Pipeline {
                     let mut actual_mode = exec_mode;
                     let coalesce_reads_saved: Option<usize> = None;
 
-                    // ── Block-STARK witness: capture pre-state ───────────
-                    // The block AIR constrains balance conservation and nonce
-                    // increment, so it needs before/after values. "Before" has
-                    // to be read here, ahead of every execution branch.
-                    //
-                    // Only transfers whose sender and receiver each appear
-                    // once in the batch are eligible: with a repeated address
-                    // the post-state read at commit returns the batch's final
-                    // balance rather than this transaction's, which would not
-                    // satisfy the constraints anyway.
                     let transfer_pre: Vec<Option<(u64, u64, u64)>> = {
                         let mut touches: std::collections::HashMap<Address, usize> =
                             std::collections::HashMap::new();
@@ -566,22 +440,18 @@ impl Pipeline {
                             .collect()
                     };
 
-                    // ── Block-STM path ───────────────────────────────────
                     if exec_mode == ExecutionMode::BlockSTM && !valid_txs.is_empty() {
                         let stm = BlockSTM::new(Arc::clone(&exec_state));
                         let stm_result = stm.execute(&valid_txs);
 
                         if stm_result.rounds > 3 {
-                            // Too many conflict rounds - fall back to sequential.
                             warn!(
                                 rounds = stm_result.rounds,
                                 reexecutions = stm_result.reexecutions,
                                 "Block-STM: too many rounds, falling back to sequential"
                             );
                             actual_mode = ExecutionMode::Sequential;
-                            // Fall through to sequential below.
                         } else {
-                            // Block-STM succeeded within acceptable rounds.
                             for (j, &ok) in stm_result.success.iter().enumerate() {
                                 receipt_success[orig_indices[j]] = ok;
                             }
@@ -607,16 +477,13 @@ impl Pipeline {
                             {
                                 break;
                             }
-                            continue; // Done, skip sequential.
+                            continue;
                         }
                     }
 
-                    // ── Speculative STM path ─────────────────────────────
                     if exec_mode == ExecutionMode::SpeculativeSTM && !valid_txs.is_empty() {
-                        // Build a DashMap snapshot of accounts for speculative execution.
                         let account_snapshot = dashmap::DashMap::new();
                         for tx in &valid_txs {
-                            // Pre-load all accounts that transactions might touch.
                             let sender_addr = tx.from;
                             if let Some(acct) = exec_state.get_account(&sender_addr) {
                                 account_snapshot.insert(sender_addr.0, acct);
@@ -633,7 +500,6 @@ impl Pipeline {
                                     }
                                 }
                                 TxBody::WasmCall(body) => {
-                                    // Pre-load contract account for value transfers + execution
                                     if let Some(acct) = exec_state.get_account(&body.contract) {
                                         account_snapshot.insert(body.contract.0, acct);
                                     }
@@ -649,7 +515,6 @@ impl Pipeline {
                                     }
                                 }
                                 TxBody::Stake(body) => {
-                                    // Pre-load the validator address account if different from sender
                                     if body.validator != sender_addr
                                         && let Some(acct) = exec_state.get_account(&body.validator)
                                     {
@@ -704,11 +569,9 @@ impl Pipeline {
                         let (spec_results, unresolved) =
                             execute_speculative(&valid_txs, &account_snapshot);
 
-                        // Apply speculative results to the state and mark receipt success.
                         for res in &spec_results {
                             let j = res.tx_index;
                             if res.success {
-                                // Apply writes from validated speculative execution.
                                 for (&key, &(balance, nonce)) in &res.access_set.writes {
                                     let addr = arc_crypto::Hash256(key);
                                     let mut acct = exec_state
@@ -724,7 +587,6 @@ impl Pipeline {
                             }
                         }
 
-                        // Execute unresolved transactions sequentially as fallback.
                         for &idx in &unresolved {
                             exec_state.mark_tx_accounts_dirty_pub(&valid_txs[idx]);
                             let tx_ok = exec_state.execute_tx_pub(&valid_txs[idx]).is_ok();
@@ -752,14 +614,10 @@ impl Pipeline {
                         {
                             break;
                         }
-                        continue; // Done, skip sequential.
+                        continue;
                     }
 
-                    // ── GPU-Resident path ─────────────────────────────────
-                    // Combines Block-STM parallel execution with GPU state cache.
-                    // Hot accounts are read from GPU unified/managed memory.
                     if exec_mode == ExecutionMode::GpuResident && !valid_txs.is_empty() {
-                        // Prefetch accounts that transactions will touch into GPU cache.
                         if let Some(cache) = exec_state.gpu_cache() {
                             let mut addrs: Vec<[u8; 32]> = Vec::with_capacity(valid_txs.len() * 2);
                             for tx in &valid_txs {
@@ -776,7 +634,6 @@ impl Pipeline {
                             cache.prefetch(&addrs);
                         }
 
-                        // Use Block-STM for parallel execution (with GPU-cached state).
                         let stm = BlockSTM::new(Arc::clone(&exec_state));
                         let stm_result = stm.execute(&valid_txs);
 
@@ -785,7 +642,6 @@ impl Pipeline {
                                 receipt_success[orig_indices[j]] = ok;
                             }
 
-                            // Sync GPU cache after execution.
                             if let Some(cache) = exec_state.gpu_cache() {
                                 cache.sync();
                             }
@@ -814,7 +670,6 @@ impl Pipeline {
                             }
                             continue;
                         }
-                        // Too many rounds - fall through to sequential.
                         warn!(
                             rounds = stm_result.rounds,
                             "GPU-Resident Block-STM: too many rounds, falling back to sequential"
@@ -822,7 +677,6 @@ impl Pipeline {
                         actual_mode = ExecutionMode::Sequential;
                     }
 
-                    // ── Sequential path (default / fallback) ─────────────
                     for (i, tx) in vbatch.transactions.iter().enumerate() {
                         if vbatch.sig_valid[i] {
                             exec_state.mark_tx_accounts_dirty_pub(tx);
@@ -855,7 +709,6 @@ impl Pipeline {
             })
             .expect("spawn execute thread");
 
-        // ── Stage 4: Commit ──────────────────────────────────────────────
         let commit_state = Arc::clone(&state);
         thread::Builder::new()
             .name("pipeline-commit".into())
@@ -876,13 +729,6 @@ impl Pipeline {
                             let success_count =
                                 ebatch.receipt_success.iter().filter(|&&v| v).count();
 
-                            // ── Block witness ───────────────────────────
-                            // Pair each eligible transfer's pre-state with the
-                            // committed post-state so the AIR's balance and
-                            // nonce constraints have real rows to check.
-                            // `satisfies_air` is the gate: an inconsistent
-                            // witness is a proving failure, and block
-                            // production must never depend on that.
                             let mut state_diffs: Vec<([u8; 32], [u8; 32], [u8; 32])> = Vec::new();
                             let mut transfers: Vec<arc_crypto::stark::TransferWitness> = Vec::new();
                             let acct_digest = |addr: &Address, bal: u64, nonce: u64| -> [u8; 32] {
@@ -938,7 +784,6 @@ impl Pipeline {
                             }
                             let witness_rows = transfers.len();
 
-                            // ── STARK proof generation ──────────────────
                             let proof_input = arc_crypto::stark::BlockProofInput {
                                 height: block.header.height,
                                 block_hash: block.hash.0,
@@ -951,7 +796,6 @@ impl Pipeline {
                             let proof = arc_crypto::stark::BlockProof::prove(&proof_input);
                             let vr = proof.verify();
 
-                            // Compress the proof for storage / transmission
                             let compressed =
                                 arc_crypto::proof_compress::compress_proof(&proof.proof_data);
                             let ratio = if compressed.original_size > 0 {
@@ -976,7 +820,6 @@ impl Pipeline {
                                 "Pipeline: STARK proof generated"
                             );
 
-                            // ── DA erasure encoding ──────────────────
                             let da_input: Vec<u8> =
                                 block.tx_hashes.iter().flat_map(|h| h.0.to_vec()).collect();
                             let da_encoding = encode_block_data(&da_input, 4, 2);
@@ -1022,31 +865,18 @@ impl Pipeline {
         }
     }
 
-    /// Returns the config this pipeline was created with.
     pub fn config(&self) -> &PipelineConfig {
         &self.config
     }
 
-    /// Get a reference to the signature pre-verification cache.
-    ///
-    /// Use this to pre-verify signatures as transactions arrive in the mempool:
-    /// ```rust,ignore
-    /// let cache = pipeline.sig_cache();
-    /// cache.pre_verify(&tasks, &hashes);
-    /// // Later, verify stage checks cache automatically
-    /// ```
     pub fn sig_cache(&self) -> &Arc<arc_gpu::metal_verify::SigVerifyCache> {
         &self.sig_cache
     }
 
-    /// Submit a batch of transactions into the pipeline.
-    ///
-    /// Non-blocking if the pipeline has capacity, blocks briefly otherwise.
     pub fn submit(&self, batch: PipelineBatch) -> Result<(), channel::SendError<PipelineBatch>> {
         self.tx_in.send(batch)
     }
 
-    /// Try to receive a completed result (non-blocking).
     pub fn try_recv(&self) -> Option<PipelineResult> {
         self.rx_out.try_recv().ok()
     }
@@ -1061,11 +891,8 @@ mod tests {
         hash_bytes(&[n])
     }
 
-    // ── Existing tests (unchanged) ──────────────────────────────────────
-
     #[test]
     fn test_pipeline_basic() {
-        // Generate a keypair so we can produce a valid signature.
         let kp = KeyPair::generate_ed25519();
         let sender = kp.address();
 
@@ -1073,7 +900,6 @@ mod tests {
 
         let pipeline = Pipeline::new(Arc::clone(&state));
 
-        // Create and sign the transaction.
         let mut tx = Transaction::new_transfer(sender, addr(2), 100, 0);
         tx.sign(&kp).expect("signing must succeed");
 
@@ -1085,7 +911,6 @@ mod tests {
             })
             .unwrap();
 
-        // Wait for result (with timeout)
         let result = pipeline
             .rx_out
             .recv_timeout(std::time::Duration::from_secs(5));
@@ -1093,7 +918,6 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result.tx_count, 1);
         assert_eq!(result.success_count, 1);
-        // Default mode is now BlockSTM.
         assert_eq!(result.execution_mode, ExecutionMode::BlockSTM);
         assert!(result.coalesce_reads_saved.is_none());
     }
@@ -1104,7 +928,6 @@ mod tests {
 
         let pipeline = Pipeline::new(Arc::clone(&state));
 
-        // Submit an unsigned transaction - must be rejected.
         let txs = vec![Transaction::new_transfer(addr(1), addr(2), 100, 0)];
         pipeline
             .submit(PipelineBatch {
@@ -1121,8 +944,6 @@ mod tests {
         assert_eq!(result.tx_count, 1);
         assert_eq!(result.success_count, 0, "unsigned tx must not succeed");
     }
-
-    // ── New tests for Block-STM + coalescing integration ────────────────
 
     #[test]
     fn test_pipeline_config_defaults() {
@@ -1148,10 +969,8 @@ mod tests {
         };
         let pipeline = Pipeline::with_config(Arc::clone(&state), config);
 
-        // Verify config is accessible.
         assert_eq!(pipeline.config().execution_mode, ExecutionMode::BlockSTM);
 
-        // Create and sign the transaction.
         let mut tx = Transaction::new_transfer(sender, addr(2), 100, 0);
         tx.sign(&kp).expect("signing must succeed");
 
@@ -1257,8 +1076,6 @@ mod tests {
             "unsafe coalescing must remain disabled in protocol v3"
         );
 
-        // Create three txs from the same sender to the same receiver to ensure
-        // coalescing is "worthwhile" (3 txs, 2 unique accounts).
         let mut tx1 = Transaction::new_transfer(sender, addr(2), 100, 0);
         tx1.sign(&kp).expect("signing must succeed");
         let mut tx2 = Transaction::new_transfer(sender, addr(2), 200, 1);

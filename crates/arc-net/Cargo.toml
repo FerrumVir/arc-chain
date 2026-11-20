@@ -7,8 +7,6 @@ license.workspace = true
 
 [features]
 default = []
-# Compatibility feature retained for downstream build scripts. Validator-key
-# certificate pinning and mutual TLS are unconditional in every build.
 strict-tls = []
 
 [dependencies]

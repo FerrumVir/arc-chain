@@ -1,19 +1,9 @@
-// Traces hidden-state magnitudes through every layer of the integer forward,
-// dumping max/mean/p99 per stage. The first layer where magnitudes diverge
-// meaningfully from the expected Q16 range (real values ~[-5, +5]) is the
-// bug site.
-//
-// Reconstructs the forward manually using public primitives so we don't have
-// to fork forward_one_token. Uses the same dispatch order as production
-// (block-i8 > i8 fallback).
-
 use arc_inference::block_i8;
 use arc_inference::cached_integer_model::{
     KVCache, apply_rope, layernorm, load_cached_model, matmul_fast, silu_i64,
 };
 use arc_inference::integer_lut::{FRAC_BITS, ONE, integer_exp};
 
-/// `$HOME/.arc-models/llama-2-7b.gguf`, resolved at run time.
 fn model_path() -> String {
     let home = std::env::var("HOME").expect("HOME is set");
     format!("{home}/.arc-models/llama-2-7b.gguf")
@@ -67,7 +57,6 @@ fn main() {
         .expect("need block_i8_layers");
     println!("Using block-i8 for Q/K/V/O/gate/up/down.\n");
 
-    // Token: BOS (1), then a known content token.
     let mut cache = KVCache::new(cfg.n_layers);
     for (ti, token) in [1u32, 5000u32].iter().enumerate() {
         let pos = cache.seq_len;
@@ -83,13 +72,11 @@ fn main() {
         for (li, layer) in model.layers.iter().enumerate() {
             let blk = &block_layers[li];
 
-            // Attention norm
             let normed = layernorm(&hidden, &layer.attn_norm);
             if li == 0 || li == cfg.n_layers - 1 || li % 8 == 0 {
                 stats(&format!("L{:02} attn_norm out", li), &normed);
             }
 
-            // Q/K/V
             let mut q = vec![0i64; d];
             let mut k_buf = vec![0i64; cfg.d_kv];
             let mut v_buf = vec![0i64; cfg.d_kv];
@@ -103,7 +90,6 @@ fn main() {
                 stats(&format!("L{:02} V (post-matmul)", li), &v_buf);
             }
 
-            // RoPE
             for h in 0..cfg.n_heads {
                 apply_rope(
                     &mut q[h * cfg.d_head..(h + 1) * cfg.d_head],
@@ -127,11 +113,9 @@ fn main() {
                 stats(&format!("L{:02} K (post-RoPE)", li), &k_buf);
             }
 
-            // Push K/V into cache
             cache.push_k(li, &k_buf);
             cache.push_v(li, &v_buf);
 
-            // Attention: simple serial scan over full_seq
             let full_seq = pos + 1;
             let mut attn_out = vec![0i64; d];
             for h in 0..cfg.n_heads {
@@ -188,7 +172,6 @@ fn main() {
                 attn_out[h * dh..(h + 1) * dh].copy_from_slice(&out_head);
             }
 
-            // Wo projection + residual
             let mut projected = vec![0i64; d];
             block_i8::matmul_block_i8_into(&blk.wo, &attn_out, &mut projected);
             if li <= 2 || li == cfg.n_layers - 1 {
@@ -201,7 +184,6 @@ fn main() {
                 stats(&format!("L{:02} hidden after Wo residual", li), &hidden);
             }
 
-            // FFN norm + gate/up/down
             let normed_ff = layernorm(&hidden, &layer.ffn_norm);
             let mut gate = vec![0i64; cfg.d_ff];
             let mut up = vec![0i64; cfg.d_ff];
@@ -230,13 +212,10 @@ fn main() {
                 hidden[i] += ff_out[i];
             }
 
-            // Print every layer's end-of-layer hidden max so we can see exactly
-            // where the residual stream diverges from the expected bounded range.
             stats(&format!("L{:02} hidden (end of layer)", li), &hidden);
         }
         cache.seq_len = pos + 1;
 
-        // Final norm + LM head
         let normed = layernorm(&hidden, &model.final_norm);
         stats("FINAL layernorm out", &normed);
 

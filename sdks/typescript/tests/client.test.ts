@@ -1,9 +1,3 @@
-/**
- * Unit tests for the ARC Chain TypeScript SDK.
- *
- * Uses Jest with mocked fetch so no running node is needed.
- */
-
 import {
   ArcClient,
   ArcError,
@@ -14,10 +8,6 @@ import { KeyPair } from "../src/crypto";
 import { TransactionBuilder } from "../src/transaction";
 import { Channel } from "../src/channel";
 import { parseJsonWithBigInts } from "../src/u64";
-
-// ---------------------------------------------------------------------------
-// Mock fetch helper
-// ---------------------------------------------------------------------------
 
 function mockFetchResponse(data: unknown, status: number = 200): jest.Mock {
   return jest.fn().mockResolvedValue({
@@ -34,10 +24,6 @@ function mockFetchReject(error: Error): jest.Mock {
 beforeEach(() => {
   jest.restoreAllMocks();
 });
-
-// ---------------------------------------------------------------------------
-// Client - getBlock
-// ---------------------------------------------------------------------------
 
 describe("ArcClient.getBlock", () => {
   it("returns block data on success", async () => {
@@ -94,10 +80,6 @@ describe("ArcClient.getBlock", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Client - getAccount
-// ---------------------------------------------------------------------------
-
 describe("ArcClient.getAccount", () => {
   it("returns account data on success", async () => {
     const addr = "ab".repeat(32);
@@ -149,10 +131,6 @@ describe("ArcClient.getAccount", () => {
     ).toBe(9_007_199_254_740_993n);
   });
 });
-
-// ---------------------------------------------------------------------------
-// Client - submitTransaction
-// ---------------------------------------------------------------------------
 
 describe("ArcClient.submitTransaction", () => {
   it("submits a raw transaction and returns hash", async () => {
@@ -324,10 +302,6 @@ describe("ArcClient.submitTransaction", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Client - submitBatch
-// ---------------------------------------------------------------------------
-
 describe("ArcClient.submitBatch", () => {
   it("submits a batch and returns results", async () => {
     global.fetch = mockFetchResponse({
@@ -384,10 +358,6 @@ describe("ArcClient.submitBatch", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Client - getChainInfo / getStats
-// ---------------------------------------------------------------------------
-
 describe("ArcClient.getChainInfo", () => {
   it("returns chain info", async () => {
     global.fetch = mockFetchResponse({
@@ -428,10 +398,6 @@ describe("ArcClient.getStats", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Client - ethCall
-// ---------------------------------------------------------------------------
-
 describe("ArcClient.ethCall", () => {
   it("sends eth_chainId and returns result", async () => {
     global.fetch = mockFetchResponse({
@@ -459,10 +425,6 @@ describe("ArcClient.ethCall", () => {
     expect(result.result).toBe("0x64");
   });
 });
-
-// ---------------------------------------------------------------------------
-// KeyPair
-// ---------------------------------------------------------------------------
 
 describe("KeyPair", () => {
   it("generates a random key pair", async () => {
@@ -556,10 +518,6 @@ describe("KeyPair", () => {
     ).toBe(true);
   });
 });
-
-// ---------------------------------------------------------------------------
-// TransactionBuilder
-// ---------------------------------------------------------------------------
 
 describe("TransactionBuilder", () => {
   it("builds a valid transfer transaction", () => {
@@ -741,10 +699,6 @@ describe("TransactionBuilder", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Transaction signing
-// ---------------------------------------------------------------------------
-
 describe("TransactionBuilder.sign", () => {
   it("signs a transfer and attaches Ed25519 signature", async () => {
     const kp = await KeyPair.generate();
@@ -758,7 +712,6 @@ describe("TransactionBuilder.sign", () => {
     expect(signed.signature).not.toBeNull();
     expect(signed.signature!.Ed25519.public_key).toBe(kp.publicKeyHex());
 
-    // Verify the signature
     const { hexToBytes } = await import("@noble/hashes/utils");
     const sigBytes = hexToBytes(signed.signature!.Ed25519.signature);
     const hashBytes = hexToBytes(signed.hash);

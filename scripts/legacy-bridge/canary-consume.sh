@@ -1,20 +1,4 @@
 #!/usr/bin/env bash
-# Consume a legacy-bridge canary release on ONE v0.7 headless machine.
-#
-# Before the bridge release is marked "Latest", no v0.7 updater can see it.
-# This script performs exactly the steps the v0.7.11 arc-auto-update.sh
-# performs once a release is "Latest", but against an explicit tag, and adds
-# the digest check the old updater never had:
-#
-#   download releases/download/<tag>/arc-node-<platform>, require the SHA-256
-#   from the handoff SHA256SUMS, keep bin/arc-node.prev, move the launcher into
-#   bin/arc-node, write version.txt, restart the v0.7 service, wait 30 s, and
-#   roll back exactly as the v0.7 updater would if /health does not answer.
-#
-# It prints the plan and changes nothing unless --apply is given.
-#
-# Usage:
-#   bash canary-consume.sh --tag v0.7.14 --expect-sha256 <hex> [--apply] [--arc-dir ~/.arc]
 set -Eeuo pipefail
 
 repo="FerrumVir/arc-chain"

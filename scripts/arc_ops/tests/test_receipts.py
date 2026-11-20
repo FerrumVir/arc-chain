@@ -1,5 +1,3 @@
-"""The receipt reconciler, over synthetic replicas."""
-
 import json
 import os
 import sys

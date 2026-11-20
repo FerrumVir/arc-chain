@@ -22,13 +22,8 @@ import {
   NATIVE_UPDATE_UNFINISHED,
 } from "../src/lib/start-failure";
 
-// Pure logic: no page. What a desktop that would not start says, and what it
-// keeps behind "Show details".
-
 const __dirnameHere = path.dirname(fileURLToPath(import.meta.url));
 
-// The text v0.8.12 desktops showed on "Ready to set up" (field reports,
-// October 2026): a refusal recorded inside another, framing and advice twice.
 const V0812_FIELD_ERROR =
   "ARC refused to start the node because chain-data migration is not safely resolved: managed-node durability recovery failed: ARC refused to start the node because chain-data migration is not safely resolved: managed-node startup reconciliation is still in progress; binary replacement and node start are temporarily blocked. Restart ARC after repairing the reported path or permissions; do not point v0.8 at the preserved legacy directory.. Restart ARC after repairing the reported path or permissions; do not point v0.8 at the preserved legacy directory.";
 
@@ -61,8 +56,6 @@ test.describe("start failure wording", () => {
   });
 
   test("a repair says so, keeps the native text open, and offers the next step", () => {
-    // A launch refusal holds until ARC restarts, so the step after the
-    // repair is a restart.
     const migration = `${NATIVE_REFUSAL_PREFIX}legacy-data migration preflight failed: refusing protocol-v3 migration through symbolic-link data directory /Users/me/.arc. ${NATIVE_REFUSAL_ADVICE}`;
     const refused = describeStartFailure(migration, { updateAvailable: true });
     expect(refused.kind).toBe("needs-repair");
@@ -71,8 +64,6 @@ test.describe("start failure wording", () => {
     expect(refused.body).toBe(PLAIN_COPY.startFailure.needsRepair.bodyThenRestart);
     expect(`${refused.title} ${refused.body}`).not.toMatch(/cleanly|last session/);
 
-    // Outside a launch refusal a restart can't help; another try can, once
-    // the repair is made.
     for (const raw of [
       "managed data-directory parent /Volumes/arc must already exist; the installer or operator must create it before node start",
       "cannot durably secure desktop node data directory /Users/me/.arc/data-v3: Permission denied (os error 13)",
@@ -86,17 +77,13 @@ test.describe("start failure wording", () => {
   });
 
   test("the advice every refusal carries does not make it a repair", () => {
-    // The advice names paths and permissions; only the reason decides.
     expect(classifyStartFailure(V0812_FIELD_ERROR)).toBe("blocked");
     expect(
       classifyStartFailure(
         `${NATIVE_REFUSAL_PREFIX}managed-node durability recovery failed: recovery node exited before its WAL barrier. ${NATIVE_REFUSAL_ADVICE}`,
       ),
     ).toBe("blocked");
-    // "WAL" is a word, not the start of "wallet".
     expect(classifyStartFailure("wallet operation failed")).toBe("unknown");
-    // An arc-node too old for this desktop names the WAL barrier it cannot
-    // prove. That is not an unclean last session.
     const outdated = describeStartFailure(
       "arc-node at /Users/me/.arc/bin/arc-node lacks the authenticated durable desktop shutdown protocol; update the managed node before starting so Stop, Update, and rollback can prove its final WAL barrier",
       { updateAvailable: false },
@@ -134,7 +121,6 @@ test.describe("start failure wording", () => {
 
   test("launch reconciliation is a wait, not a failure", () => {
     expect(isStartupReconciliationInProgress(RECONCILING)).toBe(true);
-    // In v0.8.12 the same phrase sat inside a refusal. That one is a refusal.
     expect(isStartupReconciliationInProgress(V0812_FIELD_ERROR)).toBe(false);
     const view = describeStartFailure(RECONCILING, { updateAvailable: true });
     expect(view.kind).toBe("reconciling");
@@ -155,7 +141,6 @@ test.describe("start failure wording", () => {
     expect(
       describeStartFailure("model download timed out", { updateAvailable: true }).action,
     ).toBe("try-again");
-    // A missing release file is not the user's connection.
     expect(
       classifyStartFailure("release checksum manifest returned HTTP 404"),
     ).toBe("unknown");
@@ -170,7 +155,6 @@ test.describe("start failure wording", () => {
     expect(view.action).toBe("try-again");
     expect(view.detailsOpen).toBe(true);
     expect(view.details).toBe("something nobody anticipated");
-    // A newer release may carry the fix for a failure nobody anticipated.
     expect(
       describeStartFailure("something nobody anticipated", { updateAvailable: true })
         .action,
@@ -195,10 +179,6 @@ test.describe("start failure wording", () => {
     expect(nodeManager).toContain(`"${NATIVE_UPDATE_UNFINISHED}"`);
   });
 
-  // An install that failed after its handoff keeps the update's fence until
-  // ARC exits. Start used to fail against that fence as "another ARC
-  // desktop currently owns the managed node lifecycle" and offered another
-  // try; Start and Restart are refused before it now.
   test("a Start refused while an unfinished update holds the node says to quit ARC", () => {
     for (const updateAvailable of [false, true]) {
       const view = describeStartFailure(NATIVE_UPDATE_UNFINISHED, { updateAvailable });
@@ -210,7 +190,6 @@ test.describe("start failure wording", () => {
         detailsOpen: false,
       });
     }
-    // The same sentence Home shows from the updater's own state.
     expect(PLAIN_COPY.startFailure.updateUnfinished.title).toBe(PLAIN_COPY.nodeStrip.updateFailed);
     expect(classifyStartFailure("another ARC desktop currently owns the managed node lifecycle for ~/.arc/data-v3: Resource temporarily unavailable (os error 35)")).toBe("other-desktop");
   });
@@ -271,27 +250,21 @@ test.describe("node strip on Home", () => {
       totalBytes: 3_800_000_000,
       done: false,
     };
-    // Compute starts on at setup, so the node is up and the model follows.
     const view = strip({ status: running, modelProgress: downloading });
     expect(view.sentence).toMatch(
       /^Your node is getting ready: downloading the AI model \(.+ of .+\)\.$/,
     );
     expect(view).toMatchObject({ action: null, tone: "busy" });
-    // The last report of a finished download is not "downloading".
     expect(
       strip({
         status: running,
         modelProgress: { ...downloading, downloadedBytes: 3_800_000_000, done: true },
       }),
     ).toMatchObject({ sentence: PLAIN_COPY.nodeStrip.running, tone: "ok" });
-    // An update on offer outranks it, as it does for a node that is off.
     expect(strip({ status: running, modelProgress: downloading, update: ready })).toMatchObject({
       sentence: PLAIN_COPY.nodeStrip.updateAvailable,
       action: "update-arc",
     });
-    // A download that goes quiet without a final report is forgotten, but
-    // only well after the longest quiet spell inside a live one (a dropped
-    // connection waits 60 s, then a retry up to 60 s).
     expect(MODEL_PROGRESS_STALE_MS).toBeGreaterThanOrEqual(120_000);
   });
 
@@ -341,7 +314,6 @@ test.describe("node strip on Home", () => {
     ] as const;
     for (const failure of failures) {
       const update = { ...settled, ...failure, restartRequired: true };
-      // It outranks the node's own state and a refused Start: only a reopen clears it.
       for (const input of [{ status: running }, {}, { startBlock: V0812_FIELD_ERROR }]) {
         const view = strip({ ...input, update });
         expect(view).toMatchObject({
@@ -352,7 +324,6 @@ test.describe("node strip on Home", () => {
         expect(view.details).toBe(`${failure.message}\n${failure.error}`);
       }
     }
-    // An update that failed without needing a reopen leaves the node's state.
     const retryable = {
       ...settled,
       phase: "error",
@@ -374,9 +345,7 @@ test.describe("node strip on Home", () => {
       action: "quit-arc",
       tone: "attention",
     });
-    // An update on offer does not outrank it: nothing installs until ARC reopens.
     expect(strip({ startError: NATIVE_UPDATE_UNFINISHED, update: ready }).action).toBe("quit-arc");
-    // The Dashboard reads the updater's state through the same rule.
     expect(isUnfinishedUpdate({ phase: "ready", error: "installer IPC disconnected", restartRequired: true })).toBe(true);
     expect(isUnfinishedUpdate({ phase: "error", error: "resume failed", restartRequired: true })).toBe(true);
     expect(isUnfinishedUpdate({ phase: "ready", error: null, restartRequired: true })).toBe(false);
@@ -392,22 +361,18 @@ test.describe("node strip on Home", () => {
       tone: "attention",
     });
     expect(blocked.details?.split(NATIVE_REFUSAL_PREFIX)).toHaveLength(2);
-    // The update installs while the node is blocked, so it is the fix.
     expect(strip({ startBlock: V0812_FIELD_ERROR, update: ready }).action).toBe("update-arc");
-    // Launch reconciliation clears by itself; the strip polls.
     expect(strip({ startBlock: RECONCILING })).toMatchObject({
       sentence: PLAIN_COPY.startFailure.reconciling.title,
       action: null,
       tone: "busy",
     });
-    // A Start pressed on the strip that fails reads the same way.
     expect(
       strip({ startError: "another ARC desktop currently owns the managed node lifecycle for /x" }),
     ).toMatchObject({ sentence: PLAIN_COPY.startFailure.otherDesktop.title, action: "close-copy" });
   });
 
   test("a running node reads as connected once a peer or a coordinator answered, and ordinary states are never red", () => {
-    // A community node: no peers by design, a coordinator answering.
     const connected = strip({
       status: { ...running, health: "lite", coordinatorUrl: "https://140.82.16.112" },
     });
@@ -420,13 +385,11 @@ test.describe("node strip on Home", () => {
       sentence: PLAIN_COPY.nodeStrip.runningConnected,
       tone: "ok",
     });
-    // Nothing has answered yet: a wait, not a warning.
     expect(strip({ status: { ...running, health: "syncing" } })).toMatchObject({
       sentence: PLAIN_COPY.nodeStrip.runningConnecting,
       action: null,
       tone: "busy",
     });
-    // After the same wait the Dashboard uses, Home says to check the connection: calm, nothing to press.
     expect(
       strip({ status: { ...running, health: "syncing" }, connectingSeconds: CONNECTING_LONG_SECS - 1 }),
     ).toMatchObject({ sentence: PLAIN_COPY.nodeStrip.runningConnecting, tone: "busy" });
@@ -438,15 +401,12 @@ test.describe("node strip on Home", () => {
       tone: "idle",
       details: null,
     });
-    // The sentences never claim the node itself reached the network through a coordinator.
     for (const sentence of [PLAIN_COPY.nodeStrip.runningConnected, PLAIN_COPY.connection.connectedCoordinator("LAX")]) {
       expect(sentence).toMatch(/ARC is connected/);
       expect(sentence).not.toMatch(/node is (?:running and )?connected/);
     }
-    // Off by choice is idle, and an update on offer is information.
     expect(strip({})).toMatchObject({ tone: "idle" });
     expect(strip({ update: ready }).tone).toBe("info");
-    // The status's "nothing answered" text is this computer's connection, not a failed start.
     const offline = strip({
       status: {
         running: false,

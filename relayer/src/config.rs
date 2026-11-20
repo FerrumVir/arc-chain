@@ -1,24 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Configuration for the ARC Chain bridge relayer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayerConfig {
-    /// Ethereum JSON-RPC endpoint (e.g. "https://mainnet.infura.io/v3/...")
     pub eth_rpc_url: String,
-    /// ARC Chain RPC endpoint (e.g. "http://localhost:9944")
     pub arc_rpc_url: String,
-    /// ArcBridge.sol contract address on Ethereum
     pub bridge_contract: String,
-    /// Ed25519 private key (hex) for signing ARC Chain transactions
     pub relayer_private_key: String,
-    /// Ethereum private key (hex) for signing ETH transactions
     pub eth_private_key: String,
-    /// Number of block confirmations required before processing a lock event
     pub confirmations: u64,
-    /// Polling interval in seconds
     pub poll_interval_secs: u64,
-    /// Path to the SQLite database for tracking processed events
     pub db_path: String,
 }
 
@@ -38,14 +29,12 @@ impl Default for RelayerConfig {
 }
 
 impl RelayerConfig {
-    /// Load configuration from a TOML file at the given path.
     pub fn from_file(path: &PathBuf) -> anyhow::Result<Self> {
         let contents = std::fs::read_to_string(path)?;
         let config: RelayerConfig = toml::from_str(&contents)?;
         Ok(config)
     }
 
-    /// Validate that all required fields are populated.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.eth_rpc_url.is_empty() {
             anyhow::bail!("eth_rpc_url must be set");
@@ -65,12 +54,6 @@ impl RelayerConfig {
         Ok(())
     }
 
-    /// Parse the bridge contract address into a 20-byte array.
-    // Nothing calls this yet. `validate()` only checks that `bridge_contract`
-    // is non-empty; it never checks the string is a real 20-byte address, and
-    // this function is the missing check. Calling it from `validate()` would
-    // change startup behaviour (a malformed address would start being rejected),
-    // so that is left as a deliberate follow-up rather than slipped in here.
     #[allow(dead_code)]
     pub fn bridge_contract_bytes(&self) -> anyhow::Result<[u8; 20]> {
         let stripped = self

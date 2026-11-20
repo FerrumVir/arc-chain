@@ -1,46 +1,3 @@
-"""Judge a recorded ARC soak run. Pure function of the run directory.
-
-    python3 -m arc_soak.analyze RUN_DIR        # writes verdict.json + report.txt
-
-Exit status is the verdict, and nothing else decides it:
-
-    0  PASS        every required criterion was met with sufficient evidence
-    1  FAIL        a criterion was violated
-    2  INCOMPLETE  the evidence needed to decide is missing, malformed or too thin
-
-Missing evidence is never a pass. Every criterion below either proves its
-property from the records or refuses to certify it.
-
-Criteria, and why each exists
------------------------------
-completion   The run must have ended normally and lasted as planned. An aborted
-             or truncated run tested less than it claims.
-provenance   The binary that ran must be the binary the build record describes.
-             A result about an unidentified artifact is not evidence.
-safety       Any SAFETY VIOLATION or panic line in any node log fails the run,
-             whatever every other counter says. A zero disagreement count
-             cannot override a detected conflicting certificate.
-liveness     No node may be down outside a scheduled fault, and the network as a
-             whole may not stop advancing for longer than `max_stall_s`.
-agreement    Every check must name exactly the intended replicas. A check only
-             counts as agreement when every replica that is not scheduled down
-             returned a coherent block at the requested height and all of them
-             are identical. Missing or malformed responses are unavailability,
-             never agreement. At least one full agreement check is required.
-recovery     Each fault is tracked through distinct phases - process ready with
-             the right identity, peers, caught up, new work committed and seen,
-             agreement including the restarted node - within a time budget.
-             Process readiness alone is not recovery.
-throughput   A stable pre-fault baseline (after warm-up, enough samples, a
-             meaningful window, low dispersion) is compared with the steady rate
-             after each recovery under the same offered workload. Rates must be
-             finite and the baseline positive; NaN, zero or too few samples make
-             the verdict INCOMPLETE, never PASS.
-workload     When required, work must actually have been offered and every item
-             accounted for: finalized, refunded, rejected with a reason, or lost
-             only because the node holding it was deliberately killed.
-"""
-
 import glob
 import json
 import math
@@ -53,28 +10,14 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 PASS, FAIL, INCOMPLETE = "PASS", "FAIL", "INCOMPLETE"
 EXIT_CODES = {PASS: 0, FAIL: 1, INCOMPLETE: 2}
 
-# Defaults. The run may override any of them in run.json "thresholds"; the
-# values actually applied are written into verdict.json, so a verdict always
-# says what it was judged against.
 DEFAULT_THRESHOLDS = {
-    # completion
     "min_duration_fraction": 0.98,
-    # liveness
     "max_stall_s": 60.0,
-    # coverage: the longest gap between sample ticks that still counts as
-    # observed time - this many sample intervals, and never less than the floor
     "max_sample_gap_intervals": 10.0,
     "min_sample_gap_s": 120.0,
-    # agreement
     "min_full_agreement_checks": 1,
     "max_unscheduled_unavailable_fraction": 0.05,
-    # recovery: restart -> every phase complete
     "recovery_budget_s": 180.0,
-    # throughput. The baseline must be long and stable enough that a recovered
-    # rate can be compared with it at all; 0.8 of baseline is the stable-rate
-    # criterion because after recovery the network is in the SAME configuration
-    # under the SAME offered load as during the baseline, so the steady rate
-    # should return to it. 0.5 was an alarm, not an acceptance level.
     "baseline_warmup_s": 30.0,
     "min_baseline_samples": 5,
     "min_baseline_window_s": 60.0,
@@ -83,14 +26,9 @@ DEFAULT_THRESHOLDS = {
     "min_recovery_samples": 5,
     "min_recovery_window_s": 60.0,
     "min_recovered_ratio": 0.8,
-    # workload
     "max_unresolved_items": 0,
     "max_invalid_fraction": 0.0,
     "max_failed_items": 0,
-    # An accepted item is excused as lost to a fault only if its node was
-    # killed within this long after accepting it - i.e. before it could
-    # reasonably have been gossiped and included. A kill hours later excuses
-    # nothing.
     "lost_to_fault_window_s": 30.0,
 }
 
@@ -98,18 +36,14 @@ HEX64 = re.compile(r"^(0x)?[0-9a-fA-F]{64}$")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
-# ── reading ─────────────────────────────────────────────────────────────────
-
 class Evidence:
-    """Everything read from a run directory, plus what could not be read."""
-
     def __init__(self) -> None:
         self.run: Optional[Dict[str, Any]] = None
         self.samples: List[Dict[str, Any]] = []
         self.agreement: List[Dict[str, Any]] = []
         self.faults: List[Dict[str, Any]] = []
         self.workload: List[Dict[str, Any]] = []
-        self.problems: List[str] = []   # unreadable / malformed evidence
+        self.problems: List[str] = []
 
 
 def _read_jsonl(path: str, ev: Evidence, name: str) -> List[Dict[str, Any]]:
@@ -155,7 +89,6 @@ def load(run_dir: str) -> Evidence:
 
 
 def _finite(value: Any) -> Optional[float]:
-    """A finite float, or None. NaN and infinities are not numbers here."""
     if isinstance(value, bool) or value is None:
         return None
     try:
@@ -172,8 +105,6 @@ def _int(value: Any) -> Optional[int]:
     return int(f)
 
 
-# ── the judgement ───────────────────────────────────────────────────────────
-
 class Verdict:
     def __init__(self) -> None:
         self.fail: List[str] = []
@@ -182,8 +113,6 @@ class Verdict:
 
     @property
     def status(self) -> str:
-        # FAIL outranks INCOMPLETE: a violation observed in partial evidence is
-        # still a violation.
         if self.fail:
             return FAIL
         if self.incomplete:
@@ -257,8 +186,6 @@ def check_provenance(ev: Evidence, v: Verdict) -> None:
 
 
 def scan_logs(run_dir: str) -> Tuple[Dict[str, int], Dict[str, int], List[str]]:
-    """Stream every node log once. Returns safety and panic counts per log and
-    up to 50 evidence lines. Streaming, because a day of logs does not fit."""
     safety: Dict[str, int] = {}
     panics: Dict[str, int] = {}
     evidence: List[str] = []
@@ -296,16 +223,6 @@ def check_safety(run_dir: str, v: Verdict) -> None:
 
 
 def _samples_by_time(ev: Evidence) -> Dict[float, List[Dict[str, Any]]]:
-    """Group samples by the TICK they belong to, keyed by the tick's time.
-
-    Each node is probed at a slightly different instant, so grouping by the
-    per-probe timestamp put every node's sample in its own group - and the
-    "chain" series then alternated between individual nodes, laggards
-    included, which made the baseline's dispersion meaningless. The first live
-    run of this analyzer exposed it; the synthetic tests, which gave all nodes
-    one timestamp, could not. Records carry `tick_t`; older ones fall back to
-    `t`.
-    """
     by: Dict[float, List[Dict[str, Any]]] = {}
     for s in ev.samples:
         t = _finite(s.get("tick_t"))
@@ -330,9 +247,6 @@ def check_liveness(ev: Evidence, v: Verdict, th: Dict[str, float]) -> None:
         v.fail.append(
             f"liveness: {len(unscheduled_down)} sample(s) found node(s) {', '.join(nodes)} "
             "down outside a scheduled fault")
-    # Network-wide stall: the longest interval over which no up node's height
-    # increased. Measured in seconds, not sample counts, so the criterion does
-    # not change meaning when the sample interval does.
     by = _samples_by_time(ev)
     times = sorted(by)
     best = None
@@ -356,10 +270,6 @@ def check_liveness(ev: Evidence, v: Verdict, th: Dict[str, float]) -> None:
             f"(limit {th['max_stall_s']:.0f}s)")
     v.facts["longest_network_stall_s"] = longest
 
-    # A live node's committed height never goes backwards. Committed blocks are
-    # durable before the height advances, so a lower reading from the SAME
-    # uninterrupted process is a correctness fault, not noise. Across a
-    # scheduled restart the node is a new process and the comparison restarts.
     regressions = []
     last: Dict[Any, int] = {}
     for t in times:
@@ -383,14 +293,6 @@ def check_liveness(ev: Evidence, v: Verdict, th: Dict[str, float]) -> None:
 
 
 def check_coverage(ev: Evidence, v: Verdict, th: Dict[str, float]) -> None:
-    """A run observes only while it samples. A long gap between sample ticks
-    - the host asleep or hibernating, the orchestrator stalled - is time with
-    no liveness, agreement or fault evidence, so the verdict cannot speak for
-    it. Wall-clock completion still counts that time, and heights still rise
-    across it (the chain advanced before and after), which is why neither the
-    completion nor the stall check can see it. On 2026-09-22 a host that went
-    to sleep on low battery froze a 24-hour soak for 71 minutes that way.
-    """
     times = sorted(_samples_by_time(ev))
     if len(times) < 2:
         return
@@ -411,7 +313,6 @@ def check_coverage(ev: Evidence, v: Verdict, th: Dict[str, float]) -> None:
 
 
 def _coherent(replica: Dict[str, Any], target: int, identity: str) -> Optional[str]:
-    """Why this replica's response is NOT usable agreement evidence, or None."""
     if replica.get("ok") is not True:
         return replica.get("error") or "no response"
     got_identity = str(replica.get("identity") or "").lower().replace("0x", "")
@@ -444,8 +345,6 @@ def check_agreement(ev: Evidence, v: Verdict, th: Dict[str, float]) -> None:
             if isinstance(r, dict) and _int(r.get("node")) is not None:
                 by_node[int(r["node"])] = r
         if sorted(by_node) != intended:
-            # A check that does not name exactly the intended replicas cannot
-            # say anything about agreement among them.
             malformed += 1
             continue
         scheduled = [n for n in intended if by_node[n].get("scheduled_down") is True]
@@ -460,8 +359,6 @@ def check_agreement(ev: Evidence, v: Verdict, th: Dict[str, float]) -> None:
                 valid[n] = (r["hash"].lower(), r["parent"].lower(), r["state_root"].lower())
             else:
                 unscheduled_missing = True
-        # Disagreement among the replicas that DID answer coherently is a
-        # failure regardless of who else was missing.
         if len(set(valid.values())) > 1:
             disagree += 1
             v.fail.append(
@@ -555,7 +452,6 @@ def _rate(points: List[Tuple[float, float]]) -> Optional[float]:
 
 
 def _chain_series(ev: Evidence) -> List[Tuple[float, float]]:
-    """(t, highest height among nodes not scheduled down) per sample time."""
     by = _samples_by_time(ev)
     out = []
     for t in sorted(by):
@@ -577,9 +473,6 @@ def check_throughput(ev: Evidence, v: Verdict, th: Dict[str, float],
     kills = sorted(_finite(f.get("kill_t")) for f in ev.faults
                    if _finite(f.get("kill_t")) is not None)
     first_kill = kills[0] if kills else None
-    # Warm-up: the baseline starts only once every node has produced a height
-    # AND a further warm-up interval has passed, so start-up ramp is not
-    # mistaken for the steady rate.
     all_up = None
     by = _samples_by_time(ev)
     for t in sorted(by):
@@ -607,8 +500,6 @@ def check_throughput(ev: Evidence, v: Verdict, th: Dict[str, float],
     if base_rate is None or base_rate <= 0:
         v.incomplete.append("throughput: baseline rate is not a positive finite number")
         return
-    # Dispersion of the per-interval rates inside the baseline. A baseline that
-    # itself swings widely cannot anchor a comparison.
     per = []
     for (t0, h0), (t1, h1) in zip(base, base[1:]):
         if t1 > t0:
@@ -683,14 +574,10 @@ def check_workload(ev: Evidence, v: Verdict, th: Dict[str, float]) -> None:
             else:
                 counts["invalid"] += 1
         elif status == "failed":
-            # Included and executed, but the execution failed. The workload
-            # offers only work that should succeed, so this is a defect.
             counts["failed"] += 1
         elif status == "submit_error":
             counts["submit_error"] += 1
         else:
-            # Accepted but never settled. Allowed ONLY when the node that held
-            # it was deliberately killed shortly after accepting it.
             node = it.get("accepted_by")
             at = _finite(it.get("submitted_t"))
             window = th["lost_to_fault_window_s"]
@@ -765,7 +652,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_dir = argv[0]
     try:
         v = judge(run_dir)
-    except Exception as exc:  # the analyzer failing is never a pass
+    except Exception as exc:
         v = Verdict()
         v.incomplete.append(f"analyzer crashed: {type(exc).__name__}: {exc}")
     text = render(v)

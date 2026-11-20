@@ -1,8 +1,5 @@
-//! Link measurements (S2): what a coordinator-worker path costs.
-
 use serde::{Deserialize, Serialize};
 
-/// One probe exchange: round trip, bytes moved, whether it failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Probe {
     pub rtt_us: u64,
@@ -11,23 +8,15 @@ pub struct Probe {
     pub failed: bool,
 }
 
-/// Summary of a link, from probes. Placement uses the pessimistic figures
-/// (p95 RTT, worst observed bandwidth), because a stage waits for its
-/// slowest participant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkMeasurement {
     pub samples: u32,
     pub rtt_median_us: u64,
     pub rtt_p95_us: u64,
     pub jitter_us: u64,
-    /// Bytes per second, from the slowest bulk probe.
     pub bandwidth_bps: u64,
-    /// Failures per thousand probes.
     pub failure_per_mille: u32,
-    /// Height (or a monotonic epoch) the measurement was taken at.
     pub measured_at: u64,
-    /// True when conditions were injected (tests, emulated networks); such a
-    /// measurement is evidence about the emulator, never about a real path.
     pub simulated: bool,
 }
 
@@ -62,9 +51,6 @@ pub fn summarize(probes: &[Probe], measured_at: u64, simulated: bool) -> Option<
     })
 }
 
-/// Cumulative path counters from one transport connection (quinn's
-/// `Connection::stats().path`), tagged with that connection's generation so
-/// that a reconnect is never read as a window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathCounters {
     pub generation: u64,
@@ -72,13 +58,6 @@ pub struct PathCounters {
     pub lost_packets: u64,
 }
 
-/// Loss per mille over the window between two snapshots of the SAME
-/// connection. quinn's counters are cumulative for the life of a connection,
-/// so only a delta says anything about the recent path. `None` when the
-/// snapshots come from different connections (a reconnect starts a new
-/// window), when a counter went backwards, or when nothing was sent in
-/// between. Packets sent before the window can be declared lost inside it,
-/// so the figure is capped at 1000.
 pub fn windowed_loss_per_mille(earlier: &PathCounters, later: &PathCounters) -> Option<u32> {
     if earlier.generation != later.generation {
         return None;

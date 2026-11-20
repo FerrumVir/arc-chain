@@ -1,13 +1,3 @@
-"""Rebuild the committed integer-inference KAT model and recompute its answers.
-
-The fixture recipe (tests/fixtures/integer_inference_kat.json) defines a small
-synthetic model from a 64-bit LCG. This module rebuilds it and runs it through
-the independent reference executor, so every committed digest can be checked
-without the Rust engine.
-
-    python3 -m arc_conformance.kat [path/to/integer_inference_kat.json]
-"""
-
 from __future__ import annotations
 
 import json
@@ -22,7 +12,6 @@ REPO = Path(__file__).resolve().parents[2]
 DEFAULT_FIXTURE = REPO / "crates/arc-inference/tests/fixtures/integer_inference_kat.json"
 MASK64 = (1 << 64) - 1
 
-# Q16 samples of the unit circle at multiples of pi/8 (fixture constants).
 FIXTURE_COS = [65536, 60547, 46341, 25080, 0, -25080, -46341, -60547,
                -65536, -60547, -46341, -25080, 0, 25080, 46341, 60547]
 FIXTURE_SIN = [0, 25080, 46341, 60547, 65536, 60547, 46341, 25080,
@@ -104,7 +93,7 @@ def build(fixture: dict, profile: str = ref.LEGACY_SPLIT_HALF):
     model = ref.Model(
         profile=profile, d_model=d_model, n_heads=n_heads, n_kv_heads=n_kv,
         d_ff=d_ff, vocab_size=vocab, max_seq=fixture["max_seq"],
-        attn_scale=23170,  # round(2**16 / sqrt(8)); the fixture fixes d_head = 8
+        attn_scale=23170,
         rope_cos=rope_cos, rope_sin=rope_sin, embedding_q16=embedding_q16,
         layers=layers, final_norm=final_norm,
         output=ref.Matrix(out_data, out_scales, vocab, d_model), bos_token=1)

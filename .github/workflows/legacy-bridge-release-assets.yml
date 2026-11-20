@@ -1,16 +1,5 @@
 name: Legacy bridge release handoff
 
-# Assembles everything the owner needs to publish the legacy bridge release
-# (docs/LEGACY-BRIDGE.md): the launcher for every platform a released v0.7
-# updater can request, under the exact v0.7 asset names, plus a byte-for-byte
-# copy of a qualified v0.8 desktop release's latest.json whose four updater
-# signatures were verified with the key every v0.5.4..v0.7.11 desktop embeds.
-#
-# This workflow never creates, edits, or publishes a GitHub release or tag.
-# Publication, and the separate decision to mark the release "Latest", are
-# owner actions. The handoff records whether the inputs are eligible for
-# "Latest": the pinned node must not publish hostnames and the desktop release
-# must contain the first-launch compute question.
 on:
   workflow_dispatch:
     inputs:
@@ -33,12 +22,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # A branch push exercises the pipeline against the current release as a
-  # stand-in; only a workflow_dispatch run on main with an explicit
-  # desktop_tag yields a handoff that is ever published. v0.8.13 is the
-  # stand-in. It contains the first-launch question
-  # (legacy_upgrade::hold_at_startup), which v0.8.12 introduced; v0.8.11
-  # does not.
   DESKTOP_TAG: ${{ inputs.desktop_tag || 'v0.8.13' }}
 
 jobs:
@@ -47,7 +30,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Recompute every pin from the release and its owner signature
@@ -74,10 +57,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-03-16
           targets: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, aarch64-apple-darwin, x86_64-apple-darwin, x86_64-pc-windows-msvc
@@ -120,7 +103,7 @@ jobs:
           done
           rm -f dist/*.version
           ls -l dist
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: launcher-${{ matrix.label }}
           path: dist/
@@ -132,10 +115,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-03-16
       - name: Verify the desktop release and every updater signature
@@ -174,15 +157,13 @@ jobs:
             "$verifier" "$pubkey" payload signature
             rm -f payload signature
           done
-          # The dialog alone is not enough: the release must also hold every
-          # v0.7 origin fail-closed (never-ran nodes, earlier fences).
           if git cat-file -e "$DESKTOP_TAG:desktop/src/components/LegacyUpgradeDialog.tsx" 2>/dev/null \
             && git show "$DESKTOP_TAG:desktop/src-tauri/src/legacy_upgrade.rs" 2>/dev/null | grep -q '^pub fn hold_at_startup('; then
             echo true > handoff-desktop/has-consent-question
           else
             echo false > handoff-desktop/has-consent-question
           fi
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: desktop-latest-json
           path: handoff-desktop/
@@ -195,10 +176,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           path: collected
       - name: Assemble assets, checksums, provenance, and release notes
@@ -277,7 +258,7 @@ jobs:
           PY
           cat handoff/RELEASE-NOTES.md
           ls -l "$release_dir"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: legacy-bridge-release-handoff
           path: handoff/

@@ -1,5 +1,3 @@
-//! Trace activation magnitudes through each layer to find where signal dies.
-
 use arc_inference::cached_integer_model::{KVCache, load_cached_model};
 use arc_inference::integer_lut::ONE;
 
@@ -17,8 +15,7 @@ fn main() {
     let model = load_cached_model(&path).unwrap();
     let cfg = &model.config;
 
-    // Process BOS + "What is 2+2?" and trace hidden states
-    let prompt = [1u32, 1724, 338, 29871, 29906, 29974, 29906, 29973]; // BOS + "What is 2+2?"
+    let prompt = [1u32, 1724, 338, 29871, 29906, 29974, 29906, 29973];
 
     let mut cache = KVCache::new(cfg.n_layers);
     println!(
@@ -45,7 +42,6 @@ fn main() {
         );
     }
 
-    // Generate 4 more tokens
     println!("\nGeneration:");
     let mut last = *prompt.last().unwrap();
     for i in 0..4 {

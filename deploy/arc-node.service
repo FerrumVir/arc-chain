@@ -13,16 +13,13 @@ Restart=always
 RestartSec=5
 LimitNOFILE=65536
 
-# Logging
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=arc-node
 
-# Environment
 Environment=RUST_LOG=info
 Environment=RUST_BACKTRACE=1
 
-# Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

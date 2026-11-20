@@ -46,8 +46,6 @@ from urllib.parse import quote
 SCHEMA = "arc.packaged-appimage-live-product.v1"
 HOST_SCHEMA = "arc.packaged-appimage-live-host.v1"
 RELEASE_SCHEMA = "arc.published-release-binding.v1"
-# Existing-chain update releases carry an explicit profile in the otherwise
-# identical binding produced by published-artifact-acceptance.py.
 UPDATE_RELEASE_SCHEMA = "arc.published-release-binding.v2"
 UPDATE_RELEASE_PROFILE = "existing-recovered-chain-update-v1"
 DESKTOP_RELEASE_PROFILE = "desktop-update-existing-validators-v1"
@@ -73,15 +71,7 @@ EXPECTED_APP_BINARY = "arc-desktop"
 RETAINED_EARNINGS_SOURCE = "scan of this node's in-memory full_transactions map"
 INFERENCE_WAIT_SECONDS = 3960
 RECEIPT_UI_WAIT_SECONDS = 210
-# The outer limit includes AppImage extraction/onboarding, the protocol-sized
-# inference window, receipt inclusion, bounded independent reads, and cleanup.
-# It is deliberately larger than the sum of the two live network waits rather
-# than accidentally treating the inference deadline as the whole-gate budget.
 GUEST_GATE_TIMEOUT_SECONDS = 6000
-# `guest-run` enforces the sealed 6,000-second product budget itself. The
-# enclosing Lima command needs a small, explicit grace period so it cannot
-# kill the guest at the exact instant the guest is persisting its terminal
-# evidence and performing secret/profile cleanup.
 HOST_GUEST_COMMAND_TIMEOUT_SECONDS = GUEST_GATE_TIMEOUT_SECONDS + 120
 MAX_JSON_BYTES = 16 * 1024 * 1024
 MAX_HTTP_HEADER_BYTES = 16 * 1024
@@ -96,10 +86,6 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")
 CANONICAL_HASH_RE = re.compile(r"0x[0-9a-f]{64}")
 VM_NAME_RE = re.compile(r"arc-packaged-live-v080-[0-9a-f]{8}-[a-z0-9]{6}")
 
-# Independent host-side BLAKE3 verifier for the sealed prompt.  Python's
-# standard library has no BLAKE3, and trusting the guest's b3sum output would
-# make the evidence self-attesting.  The gate prompt is bounded below one
-# 1,024-byte BLAKE3 chunk, so this deliberately omits tree reduction.
 _U32_MASK = (1 << 32) - 1
 _BLAKE3_IV = (
     0x6A09E667,
@@ -204,7 +190,7 @@ TERMINAL_RECEIPT_FIELDS = frozenset(
 
 
 class GateError(RuntimeError):
-    """A condition that makes the packaged-product claim unavailable."""
+    pass
 
 
 def utc_now() -> str:
@@ -272,8 +258,6 @@ def _blake3_compress(
 
 
 def independent_blake3_short(raw: bytes) -> str:
-    """Return lower-hex BLAKE3 for one bounded chunk, without guest tooling."""
-
     if len(raw) > 1024:
         raise GateError("independent BLAKE3 input exceeds one reviewed chunk")
     chaining_value: Sequence[int] = _BLAKE3_IV
@@ -385,8 +369,6 @@ def create_dir(path: Path, mode: int = 0o700) -> None:
 
 
 def create_durable_host_output_dir(path: Path, mode: int = 0o700) -> None:
-    """Create the one-shot host evidence root and persist its parent entry."""
-
     parent = path.parent
     try:
         parent_info = parent.lstat()
@@ -478,8 +460,6 @@ def create_file(path: Path, raw: bytes, mode: int = 0o400) -> None:
             opened_parent.st_mode,
         ):
             raise GateError(f"create-only parent changed while writing: {parent}")
-        # Persist the new directory entry as well as the file content. This is
-        # what makes the armed-no-retry marker survive a host crash.
         os.fsync(parent_fd)
     finally:
         os.close(parent_fd)
@@ -721,7 +701,6 @@ def run_command(
 
 
 def arc_blake3_hash(raw: bytes) -> str:
-    """Hash exact ARC inference bytes with the pinned guest b3sum binary."""
     result = run_command(
         ["/usr/bin/b3sum", "--no-names"], input_data=raw, timeout=15
     )
@@ -821,8 +800,6 @@ def free_loopback_port() -> int:
 
 
 class RestrictedConnectRelay:
-    """Authenticated HTTP CONNECT relay for exactly production LAX TLS."""
-
     def __init__(self, upstream_port: int, token: str) -> None:
         if not (1 <= upstream_port <= 65535):
             raise GateError("relay upstream port is invalid")
@@ -927,8 +904,6 @@ class RestrictedConnectRelay:
                         selector = selectors.DefaultSelector()
                         selector.register(self.request, selectors.EVENT_READ, (upstream, "bytes_client_to_lax"))
                         selector.register(upstream, selectors.EVENT_READ, (self.request, "bytes_lax_to_client"))
-                        # The production coordinator permits up to 3900s for
-                        # the multi-pass community inference/approval path.
                         deadline = time.monotonic() + 4200
                         while time.monotonic() < deadline:
                             ready = selector.select(timeout=1)
@@ -1114,9 +1089,6 @@ class W3CClient:
     def wait(self, condition: Callable[[], Any], label: str, timeout: float = 30) -> Any:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            # A false-y value means "not ready yet". GateError is deliberately
-            # not swallowed: launch/inference errors and W3C transport failures
-            # are terminal facts, not transient element absence.
             value = condition()
             if value:
                 return value
@@ -1244,8 +1216,6 @@ def package_tree_manifest(root: Path) -> tuple[list[dict[str, Any]], str]:
     if not entries:
         raise GateError("extracted AppImage tree is empty")
     entries.sort(key=lambda item: item["path"])
-    # Resolution is checked separately for the executable.  Merely hashing the
-    # paths is not sufficient because an AppRun symlink could escape the tree.
     if not canonical_root.is_dir():
         raise GateError("extracted AppImage root is not a directory")
     raw = canonical_json(entries)
@@ -1522,7 +1492,6 @@ def validate_terminal_receipt(value: Mapping[str, Any], tx_hash: str) -> dict[st
 def validate_receipt_product_binding(
     receipt: Mapping[str, Any], expected: Mapping[str, str]
 ) -> None:
-    """Bind independent public receipt truth to this exact packaged UI run."""
     fields = {
         "input_hash",
         "job_id",
@@ -1544,7 +1513,6 @@ def validate_receipt_product_binding(
 def fetch_coherent_terminal_receipt(
     proxy_host: str, proxy_port: int, token: str, tx_hash: str
 ) -> tuple[dict[str, Any], bytes, int]:
-    """Retry only safe GETs and require two identical terminal snapshots."""
     previous: bytes | None = None
     last_error: Exception | None = None
     reads = 0
@@ -1586,9 +1554,6 @@ def copy_regular_exclusive(source: Path, destination: Path, mode: int) -> None:
 def sanitized_app_environment(
     profile: Path, proxy_host: str, proxy_port: int, token: str
 ) -> dict[str, str]:
-    # Start empty.  In particular, never carry LD_PRELOAD, LD_LIBRARY_PATH,
-    # GTK_MODULES, GIO_EXTRA_MODULES, a compiler wrapper, or an ambient ARC
-    # override into the process whose packaged identity this gate attests.
     inherited_allowlist = (
         "DBUS_SESSION_BUS_ADDRESS",
         "DISPLAY",
@@ -1715,9 +1680,6 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901
     for path in (profile / "home", profile / "cache", profile / "config", profile / "data"):
         create_dir(path)
 
-    # Authenticate the raw updater payload before changing its mode or asking
-    # its AppImage header to extract anything. `--appimage-extract` executes
-    # payload-controlled code and therefore belongs strictly after this gate.
     appimage = args.asset_directory / APPIMAGE_NAME
     runtime = runtime_inventory()
     updater_signature = verify_updater_signature_in_guest(
@@ -1804,9 +1766,6 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901
             start_new_session=True,
         )
         wait_tcp_listener(driver, driver_port)
-        # The W3C capability points at the exact public AppImage, not an
-        # unpackaged cargo binary. APPIMAGE_EXTRACT_AND_RUN avoids depending on
-        # FUSE while retaining the AppImage's own production entrypoint.
         client.new_session(appimage)
         app_matches = wait_exact_process(EXPECTED_APP_BINARY, app_binary_sha, timeout=45)
         app_process = app_matches[0]
@@ -1824,9 +1783,6 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901
         address = address_raw if address_raw.startswith("0x") else f"0x{address_raw}"
         if not CANONICAL_HASH_RE.fullmatch(address):
             raise GateError("native onboarding identity address is not canonical")
-        # This is the final artifact capture before the explicit reveal.  No
-        # screenshot, page-source request, execute-script call, or element-text
-        # call is made while the recovery phrase is present in the WebView.
         screenshots.append(client.screenshot(evidence / "02-identity-blurred.png"))
         client.click(client.element(testid("btn-reveal-seed")))
 
@@ -1850,8 +1806,6 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901
             errors = client.elements(testid("launch-error"))
             if errors:
                 raise GateError(f"native onboarding launch failed: {client.text(errors[0])[:500]}")
-            # Setup lands on Home ("Ask ARC") from v0.8.14; the dashboard
-            # tiles are read after navigating there below.
             homes = client.elements(testid("inference-screen"))
             return homes[0] if homes else None
 
@@ -2150,9 +2104,6 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901
                 raise GateError(f"{label} is not finite and non-negative: {raw!r}")
             return value
 
-        # The same selected-host endpoint feeds both the earnings list and the
-        # projection.  Wait through initial React Query loading, then bind the
-        # nonsecret DOM attributes rather than trusting formatted card text.
         def coherent_earnings_root() -> dict[str, str] | None:
             from_chain = client.attribute(earnings_screen, "data-from-chain") or ""
             count = client.attribute(
@@ -2232,11 +2183,6 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901
         if row_total != total_arc:
             raise GateError("rendered confirmed receipt rewards do not reconcile to total ARC")
 
-        # The new local observer normally requested work that a remote
-        # community worker performed.  In that case its exact confirmed gross
-        # earnings are zero.  If assignment selected the local identity, the
-        # independently verified fresh receipt must instead appear exactly
-        # once and match every exposed receipt field.
         local_worker_receipts = [
             row for row in row_bindings if row["tx_hash"] == receipt["tx_hash"]
         ]
@@ -2368,9 +2314,6 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901
     if [row.get("name") for row in tests] != list(EXPECTED_TESTS[:-1]):
         raise GateError("packaged live gate tests are incomplete or out of order")
 
-    # The only secret-bearing files live below this fresh profile.  They are
-    # never copied to evidence.  Remove the whole profile only after the node
-    # and GUI are both gone; the disposable VM is then deleted by the host.
     shutil.rmtree(profile)
     if profile.exists():
         raise GateError("secret-bearing packaged-app profile was not destroyed")
@@ -3351,8 +3294,6 @@ def copy_guest_evidence(limactl: Path, vm_name: str, guest_runtime: str, output:
     )
     if (destination / "receipt.json").is_file():
         return destination
-    # scp implementations sometimes preserve the source basename beneath the
-    # requested directory. Accept only that one unambiguous shape.
     nested = destination / "evidence"
     if nested.is_dir() and (nested / "receipt.json").is_file():
         return nested
@@ -3368,8 +3309,6 @@ def validate_test_observations(
     execution: Mapping[str, Any],
     expected_assets: Mapping[str, Mapping[str, Any]],
 ) -> None:
-    """Reject passed labels that are not backed by exact product observations."""
-
     for index, row in enumerate(tests):
         expected_keys = {"name", "status"} if index == 0 else {
             "name",
@@ -3715,9 +3654,6 @@ def run_host(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901
     if vm_name in initial_instances:
         raise GateError("disposable packaged-live VM name already exists")
 
-    # Durably persist the one-shot output root before arming the inference.
-    # A host crash must never erase the directory entry and make reusing the
-    # same output/challenge path appear safe.
     create_durable_host_output_dir(args.output)
     config_raw = lima_config()
     config_path = args.output / "lima.yaml"
@@ -3737,10 +3673,6 @@ def run_host(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901
     )
     attempt_raw = canonical_json(attempt)
     attempt_path = args.output / "inference-attempt.json"
-    # This is intentionally armed on durable host storage before the guest can
-    # click Run inference. Any later error is terminal for this challenge and
-    # output directory; host-run refuses to reuse either by requiring a new,
-    # absent output path.
     create_file(attempt_path, attempt_raw, 0o400)
     if sha256_bytes(attempt_prompt.encode("utf-8")) != attempt["prompt_sha256"]:
         raise GateError("internal armed inference prompt binding failed")
@@ -3920,7 +3852,7 @@ def run_host(args: argparse.Namespace) -> dict[str, Any]:  # noqa: C901
             attempt_raw,
             assets,
         )
-    except BaseException as error:  # cleanup must run for interrupts too
+    except BaseException as error:
         primary_error = error
     finally:
         if relay is not None:
@@ -4194,8 +4126,6 @@ def validate_host_receipt_envelope(
     binding_raw: bytes,
     evidence_root: Path,
 ) -> tuple[dict[str, Mapping[str, Any]], Mapping[str, Any]]:
-    """Validate host-side claims that are outside the guest evidence tree."""
-
     expected_assets: dict[str, Mapping[str, Any]] = {
         name: {"name": name, **binding["assets"][name]}
         for name in (APPIMAGE_NAME, APPIMAGE_SIGNATURE_NAME, NODE_NAME)

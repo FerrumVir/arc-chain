@@ -20,10 +20,8 @@ test.describe("Accessibility basics", () => {
     page,
   }) => {
     await page.goto("/");
-    // Focus the first nav item
     await page.getByTestId("nav-dashboard").focus();
     await expect(page.getByTestId("nav-dashboard")).toBeFocused();
-    // Tab forward and confirm another button gets focus
     await page.keyboard.press("Tab");
     const focused = await page.evaluate(
       () => document.activeElement?.getAttribute("data-testid") ?? "",
@@ -83,7 +81,7 @@ test.describe("Accessibility basics", () => {
   test("production bundles block before either browser-live or fixture dispatch", () => {
     const invokeBody = tauriSource.slice(
       tauriSource.indexOf("export async function invoke"),
-      tauriSource.indexOf("// Typed wrappers"),
+      tauriSource.indexOf("export const api = {"),
     );
     expect(invokeBody.indexOf("if (IS_PROD_TAURI_BUNDLE)")).toBeGreaterThan(-1);
     expect(invokeBody.indexOf("if (IS_PROD_TAURI_BUNDLE)")).toBeLessThan(

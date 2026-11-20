@@ -31,11 +31,8 @@ def run_block() -> str:
 
 def container_script(platform: str) -> str:
     block = run_block().replace("${{ matrix.platform }}", platform)
-    marker = "# Boot the real headless node"
     lines = block.splitlines()
-    start = next(i for i, line in enumerate(lines)
-                 if i > next(j for j, item in enumerate(lines) if marker in item)
-                 and "docker run --rm" in line)
+    start = max(i for i, line in enumerate(lines) if "docker run --rm" in line)
     end = next(i for i in range(start + 1, len(lines)) if lines[i].strip() == "'")
     docker_call = "\n".join(lines[start : end + 1])
     return textwrap.dedent(docker_call)
@@ -61,8 +58,6 @@ class UbuntuServerSmokeScriptTests(unittest.TestCase):
                         "docker() { printf '%s' \"${@: -1}\" > \"$CAPTURE_INNER\"; }\n"
                         + container_script(platform)
                     )
-                    # The mock docker function captures the real shell argument; no
-                    # container, binary, network, or service is executed.
                     env = {**os.environ, "CAPTURE_INNER": str(capture)}
                     result = subprocess.run(["bash", "-euo", "pipefail", "-c", wrapper],
                                             env=env, text=True, capture_output=True, check=False)

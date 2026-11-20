@@ -1,5 +1,3 @@
-//! ARC-AGI task loading and evaluation.
-
 use crate::Grid;
 use crate::search::beam::{BeamConfig, SearchResult, beam_search};
 use crate::search::solver::{self, SolveResult, SolverConfig};
@@ -26,7 +24,6 @@ pub struct EvalResult {
     pub time_ms: u64,
 }
 
-/// Load and solve a single ARC-AGI task.
 pub fn solve_task(path: &Path, config: &BeamConfig) -> EvalResult {
     let task_id = path
         .file_stem()
@@ -74,7 +71,6 @@ pub fn solve_task(path: &Path, config: &BeamConfig) -> EvalResult {
 
     match result {
         Some(sr) => {
-            // Verify against test output
             let test_correct = if !data.test.is_empty() {
                 sr.output == data.test[0].output
             } else {
@@ -99,7 +95,6 @@ pub fn solve_task(path: &Path, config: &BeamConfig) -> EvalResult {
     }
 }
 
-/// Evaluate on a directory of ARC-AGI tasks.
 pub fn evaluate_directory(
     dir: &Path,
     config: &BeamConfig,

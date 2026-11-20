@@ -52,8 +52,6 @@ jobs:
           printf 'Exact protected-main SHA: %s\n' "$remote_main_sha" \
             >> "$GITHUB_STEP_SUMMARY"
 
-      # This fresh protected job never checks out or executes repository code.
-      # Only fixed system tools touch the three recovery-equivalent secrets.
       - name: Create restore-tested ciphertext
         id: backup
         shell: bash
@@ -111,8 +109,6 @@ jobs:
           trap cleanup_keys EXIT HUP INT TERM
 
           /usr/bin/printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" > "$tauri_key"
-          # GitHub secrets do not preserve a terminal newline reliably. OpenSSH
-          # private keys require one; without it ssh-keygen fails in libcrypto.
           /usr/bin/printf '%s\n' "$ARC_RELEASE_MANIFEST_PRIVATE_KEY" > "$manifest_key"
           /usr/bin/chmod 600 "$tauri_key" "$manifest_key"
 
@@ -176,7 +172,7 @@ jobs:
 
       - name: Upload ciphertext only
         id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ${{ steps.backup.outputs.artifact_name }}
           path: ${{ steps.backup.outputs.cipher_path }}

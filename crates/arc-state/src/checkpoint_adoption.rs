@@ -1,34 +1,3 @@
-//! What a node may adopt from a certified checkpoint (C11, design v2:
-//! docs/design/checkpoint-rejoin.md).
-//!
-//! The certificate authenticates the tip block and the state root. This
-//! module decides which parts of a payload those two commitments actually
-//! cover, and returns only those parts; everything else must already be
-//! identical to this node's own state, or adoption is refused.
-//!
-//! * History: the tip is certified. Every earlier window block is authenticated
-//!   by hash linkage from the tip, with each hash **recomputed**, its map key
-//!   equal to its header height, and its `tx_root` equal to the Merkle root of
-//!   its `tx_hashes`. Transaction bodies, receipts and event logs are not bound
-//!   to anything the certificate covers closely enough to adopt (a body's hash
-//!   excludes its signature), so none of them is adopted.
-//! * State, and only on a protocol-4 chain (native inference activated, no
-//!   recovery context): accounts are covered by the account-only root. A
-//!   storage row a certified account commits (a native escrow's metadata, the
-//!   context pin) is adopted only if that account commits it - equality with
-//!   this node's copy is not enough, since that copy may be the stale one.
-//!   Every other storage row, and contracts, identities, validators, the
-//!   staking pool and the reward activation height, must be byte-identical to
-//!   this node's own: on protocol 4 nothing but native inference runs after
-//!   activation, so none of them can change. Collections must be strictly
-//!   ordered by key, so a payload cannot carry two versions of one row.
-//! * Any other chain is refused. On a legacy account-only chain the uncovered
-//!   domains do change (contract storage, stake), so "equal to this node's"
-//!   would adopt stale state; a recovery-context chain's engine is
-//!   repositioned only by its signed recovery path.
-//! * Derived indexes (native pending, Tier 1, bond releases) are never taken
-//!   from a payload; they are rebuilt from the adopted state.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use arc_crypto::{Hash256, MerkleTree};
@@ -41,8 +10,6 @@ fn refuse(reason: impl Into<String>) -> StateError {
     StateError::PersistenceError(format!("checkpoint refused: {}", reason.into()))
 }
 
-/// Verify the history window from the certified tip down. Returns the set of
-/// transaction hashes the verified blocks list.
 pub fn verify_history_window(
     blocks: &[(u64, Block)],
     tip: &Block,
@@ -96,10 +63,6 @@ fn strictly_increasing(keys: impl IntoIterator<Item = [u8; 32]>) -> bool {
     true
 }
 
-/// Accounts, storage holders and each holder's rows strictly increasing by
-/// key: one version of anything. Installation keeps the last copy of a
-/// duplicated key, and a stale copy placed after a checked one would
-/// otherwise be what the node ends up with.
 fn strictly_ordered(payload: &SnapshotPayload) -> Result<(), StateError> {
     if !strictly_increasing(payload.accounts.iter().map(|(address, _)| address.0))
         || !strictly_increasing(payload.storage.iter().map(|(address, _)| address.0))
@@ -115,10 +78,6 @@ fn strictly_ordered(payload: &SnapshotPayload) -> Result<(), StateError> {
     Ok(())
 }
 
-/// Every account filed under its own address. The account-only root hashes
-/// each account's contents in key order but not the key itself, so an
-/// account moved to another key between the same neighbours keeps the root
-/// while its owner vanishes. Honest state never files an account elsewhere.
 pub(crate) fn accounts_bound_to_keys(payload: &SnapshotPayload) -> Result<(), StateError> {
     match payload
         .accounts
@@ -133,9 +92,6 @@ pub(crate) fn accounts_bound_to_keys(payload: &SnapshotPayload) -> Result<(), St
     }
 }
 
-/// The adoption preconditions that depend only on this node and the payload,
-/// not on the certified tip. Checked when planning and again immediately
-/// before the durable write.
 pub(crate) fn adoption_preconditions(
     state: &StateDB,
     payload: &SnapshotPayload,
@@ -156,9 +112,6 @@ pub(crate) fn adoption_preconditions(
              chain they can change, so a checkpoint cannot be adopted",
         ));
     };
-    // Without D20 a node that adopted a checkpoint, and so lacks the
-    // receipts of already-applied transactions, could count candidates its
-    // peers skip and select a different transaction.
     if context.selection_rule
         != crate::inference_contract_state::NativeSelectionRule::SkipUsedNoncesV2
     {
@@ -171,9 +124,6 @@ pub(crate) fn adoption_preconditions(
     accounts_bound_to_keys(payload)
 }
 
-/// Validators at or above the minimum stake, sorted. Activation records only
-/// those, while every start re-seeds the full genesis list, so entries below
-/// the minimum depend on when a node last restarted and carry no meaning.
 fn active_validator_list(
     validators: &[(arc_types::Address, u64)],
 ) -> Vec<(arc_types::Address, u64)> {
@@ -191,9 +141,6 @@ fn canonical<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StateError> {
 }
 
 impl StateDB {
-    /// The part of `payload` this node may adopt, given the certified `tip`.
-    /// The caller has verified the envelope (committee, domain, digest) and
-    /// the tip against the certificate and the anchor commitment.
     pub fn plan_checkpoint_adoption(
         &self,
         payload: &SnapshotPayload,
@@ -207,13 +154,6 @@ impl StateDB {
         }
         verify_history_window(&payload.blocks, tip)?;
 
-        // A window that is internally consistent still has to be THIS chain's.
-        // A payload from another run of a chain with the same genesis and
-        // committee verifies every certificate check and chains to its own
-        // tip perfectly well, so the only local evidence is what this node
-        // already committed: every height it holds inside the window must
-        // match block for block, and the window's lowest block must name this
-        // node's own block as its parent.
         if let Some((lowest_height, lowest)) = payload.blocks.first() {
             for (height, block) in &payload.blocks {
                 if let Some(ours) = self.get_block(*height)
@@ -238,7 +178,6 @@ impl StateDB {
 
         adoption_preconditions(self, payload)?;
 
-        // Domains nothing certified: they must already be this node's own.
         let local = self.export_durable_snapshot();
         for (name, theirs, ours) in [
             (
@@ -275,7 +214,6 @@ impl StateDB {
             }
         }
 
-        // Storage: equal to ours, or committed by a certified account.
         let accounts: BTreeMap<[u8; 32], &arc_types::Account> = payload
             .accounts
             .iter()
@@ -314,10 +252,6 @@ impl StateDB {
                 }
             }
         }
-        // Omission: a certified account whose storage root is new or changed
-        // commits a row the payload must carry. Without it this node would
-        // later refuse a transition its peers apply, which stops its
-        // consensus loop.
         let local_roots: BTreeMap<[u8; 32], Hash256> = local
             .accounts
             .iter()

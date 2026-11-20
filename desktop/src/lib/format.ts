@@ -11,7 +11,6 @@ export function formatInt(n: number): string {
   return n.toLocaleString("en-US");
 }
 
-/** Group an exact ARC decimal string without converting it to a Number. */
 export function formatArcExact(value: string): string {
   if (!/^\d+(?:\.\d{1,9})?$/.test(value)) return value;
   const [whole, fraction] = value.split(".");
@@ -64,12 +63,6 @@ export function formatTps(n: number): string {
   return n.toString();
 }
 
-/**
- * One line describing a model download, for every stage the backend reports:
- * connecting (or resuming), downloading, retrying after a dropped connection,
- * verifying the pinned SHA-256, and done. Saved bytes are never discarded on a
- * retry, so the copy says so instead of implying the download restarted.
- */
 export function modelDownloadStatus(progress: ModelDownloadProgress): string {
   const total = progress.totalBytes;
   const saved = progress.downloadedBytes;

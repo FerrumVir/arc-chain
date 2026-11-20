@@ -1,22 +1,9 @@
-//! Bounded conformance and timing for the opt-in vectorised canonical kernel.
-//!
-//! Loads ONE real canonical-I8 model, drives a FIXED token sequence through it
-//! twice - once on the existing scalar kernel, once on the vectorised one -
-//! and compares EVERY logit at EVERY position exactly. The token sequence is
-//! fixed in advance, so it cannot drift between the two runs.
-//!
-//! This is a conformance experiment. It changes no admission, execution or
-//! consensus semantics: the vectorised kernel is opt-in and defaults to off.
-//!
-//! usage: canonical_kernel_conformance GGUF [n_positions] [repeats]
-
 use arc_inference::cached_integer_model::{CachedIntegerModel, KVCache};
 use arc_inference::canonical_simd;
 use std::time::Instant;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn max_rss_bytes() -> Option<u64> {
-    // SAFETY: getrusage receives a zeroed, correctly sized out-parameter.
     unsafe {
         let mut u: libc::rusage = std::mem::zeroed();
         if libc::getrusage(libc::RUSAGE_SELF, &mut u) != 0 {
@@ -63,7 +50,6 @@ fn main() -> Result<(), String> {
     let n_pos: usize = args.get(2).map(|s| s.parse().unwrap_or(8)).unwrap_or(8);
     let repeats: usize = args.get(3).map(|s| s.parse().unwrap_or(3)).unwrap_or(3);
 
-    // Fixed real Llama-2 token ids, independent of either kernel's output.
     let base: [u32; 12] = [
         1, 6324, 29892, 306, 29915, 29885, 263, 1243, 310, 278, 1904, 29889,
     ];
@@ -97,7 +83,6 @@ fn main() -> Result<(), String> {
         return Err("this CPU/build has no ARM dotprod; nothing to compare".into());
     }
 
-    // Warmup on each path (discarded) so neither run pays first-touch costs.
     canonical_simd::set_projection_census_enabled(false);
     canonical_simd::set_fast_canonical_kernel(false);
     let _ = run(&model, &tokens[..1.min(tokens.len())]);
@@ -111,8 +96,6 @@ fn main() -> Result<(), String> {
     let mut reference: Option<Vec<Vec<i64>>> = None;
     let mut order_log: Vec<&'static str> = Vec::new();
 
-    // One pass = `repeats` rounds; the kernel ORDER ALTERNATES between rounds,
-    // so a fixed scalar-first ordering cannot be what produces the difference.
     let one_pass = |census: bool,
                     scalar_ms: &mut Vec<f64>,
                     fast_ms: &mut Vec<f64>,
@@ -181,8 +164,6 @@ fn main() -> Result<(), String> {
         Ok(())
     };
 
-    // Pass A: diagnostic counting ON, so the census describes a REAL
-    // conformance run rather than a separate synthetic one.
     canonical_simd::reset_projection_census();
     let (mut sa_ms, mut fa_ms) = (Vec::new(), Vec::new());
     one_pass(
@@ -198,8 +179,6 @@ fn main() -> Result<(), String> {
     )?;
     let census = canonical_simd::projection_census();
 
-    // Pass B: counting OFF. These are the headline timings; the difference
-    // between the two passes IS the measured cost of the diagnostics.
     let (mut scalar_ms, mut fast_ms) = (Vec::new(), Vec::new());
     one_pass(
         false,

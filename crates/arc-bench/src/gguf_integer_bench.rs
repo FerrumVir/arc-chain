@@ -1,13 +1,3 @@
-//! GGUF Integer Engine Benchmark
-//!
-//! Loads a REAL GGUF model and runs it through the integer-only engine.
-//! Cross-platform deterministic - proves the same model produces the
-//! same output on ARM, x86, GPU, or any hardware.
-//!
-//! Usage:
-//!   cargo run --release --bin arc-bench-gguf-integer --features candle -- \
-//!     --model /path/to/model.gguf --tokens 8
-
 use arc_inference::gguf_integer::generate_integer_from_gguf;
 use std::time::Instant;
 
@@ -86,7 +76,7 @@ fn main() {
             &input_tokens,
             max_tokens,
             &eos_tokens,
-            300_000, // 5 minute timeout
+            300_000,
         ) {
             Ok((tokens, hash)) => {
                 let elapsed = start.elapsed();

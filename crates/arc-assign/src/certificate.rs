@@ -1,6 +1,3 @@
-//! Assignment certificates (S4): the placement for one job, bound to the
-//! exact inputs it was computed from, so any validator can recompute it.
-
 use crate::placement::{Candidate, Placement, PlacementError, Policy, Stage, place};
 use crate::verify::VerificationRule;
 use crate::{Hash256, digest};
@@ -11,7 +8,6 @@ pub const POLICY_DOMAIN: &str = "ARC-assign-policy-v1";
 pub const CERTIFICATE_DOMAIN_V2: &str = "ARC-assign-certificate-v2";
 pub const POLICY_DOMAIN_V2: &str = "ARC-assign-policy-v2";
 
-/// Everything the placement was computed from, and the placement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssignmentCertificate {
     pub version: u32,
@@ -21,8 +17,6 @@ pub struct AssignmentCertificate {
     pub epoch: u64,
     pub stages: Vec<Stage>,
     pub coordinator_macs_per_s: u64,
-    /// The validated candidates (measured rates, links), in canonical
-    /// order, with the digests of the signed leases they came from.
     pub candidates: Vec<Candidate>,
     pub lease_digests: Vec<Hash256>,
     pub policy: Policy,
@@ -42,18 +36,10 @@ pub enum CertificateError {
     WrongPolicy,
 }
 
-/// The policy hash a job's `assignment_hash` names: the placement algorithm
-/// version, its policy parameters and the verification rule. The activation
-/// allowlists this, not a particular worker set.
 pub fn policy_hash(policy: &Policy, verification: &VerificationRule) -> Hash256 {
     digest(POLICY_DOMAIN, &(1u32, policy, verification))
 }
 
-/// Stable authorization for native private-row execution. Unlike v1, the
-/// observation height is not an authorization setting. Certificates still
-/// record it and use it to reject stale links when placement is recomputed.
-/// The coordinator mode explicitly commits whether local fallback is allowed.
-/// This is a new contract, never a reinterpretation of a published v1 hash.
 pub fn policy_hash_v2(policy: &Policy, verification: &VerificationRule) -> Hash256 {
     let Policy {
         max_workers,
@@ -90,7 +76,6 @@ pub fn policy_hash_v2(policy: &Policy, verification: &VerificationRule) -> Hash2
 }
 
 impl AssignmentCertificate {
-    /// Compute a placement and bind it with its inputs.
     #[allow(clippy::too_many_arguments)]
     pub fn issue(
         request_id: Hash256,
@@ -123,8 +108,6 @@ impl AssignmentCertificate {
         })
     }
 
-    /// Same placement algorithm and observation record as v1, under the
-    /// explicitly stable v2 authorization and certificate domains.
     #[allow(clippy::too_many_arguments)]
     pub fn issue_v2(
         request_id: Hash256,
@@ -163,8 +146,6 @@ impl AssignmentCertificate {
         digest(domain, self)
     }
 
-    /// Recompute the placement from the bound inputs and require that it is
-    /// the one recorded, under the policy the job authorised.
     pub fn verify(&self, authorised_policy: &Hash256) -> Result<(), CertificateError> {
         let policy = match self.version {
             1 => policy_hash(&self.policy, &self.verification),

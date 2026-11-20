@@ -37,7 +37,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 SCHEMA = "arc.m8.native-request-latency.v1"
 OUTCOMES = ("finalized", "refunded", "rejected", "submit_error", "pending")
-# soak_native_load's main loop: poll every in-flight request, then sleep 250 ms.
 OBSERVATION_RESOLUTION_S = 0.25
 
 
@@ -48,8 +47,6 @@ def _number(value: Any) -> Optional[float]:
 
 
 def distribution(samples: List[float]) -> Optional[Dict[str, Any]]:
-    """Nearest-rank summary: pXX is the smallest sample with at least XX% of
-    the samples at or below it. None for no samples, never zeros."""
     if not samples:
         return None
     ordered = sorted(samples)

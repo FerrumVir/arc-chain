@@ -1,11 +1,3 @@
-//! Quorum-certified, content-addressed production recovery checkpoints.
-//!
-//! `ARCCHKPT` is deliberately separate from the legacy peer snapshot API.
-//! A peer response is not a trust root: activation requires an operator-
-//! approved manifest hash, an exact configured validator set, and a strict
-//! validator identity + stake supermajority. The complete package is verified
-//! in memory before any active-data marker is written.
-
 use crate::wal::{
     ContractStorage, RepairableWalSummary, RepairableWalTail, Snapshot,
     hash_wal_identity_and_prefix, quarantine_and_truncate_wal_tail, verify_wal_file_identity,
@@ -27,29 +19,12 @@ use std::sync::atomic::Ordering;
 
 pub const ARCCHKPT_MAGIC: [u8; 8] = *b"ARCCHKPT";
 pub const ARCCHKPT_FORMAT_VERSION: u16 = 1;
-/// Format-v1 checkpoints are decoded as one in-memory object. Bound the input
-/// before deserialization so an operator cannot accidentally hand an offline
-/// signer or validator a sparse/hostile file that exhausts the machine.
-/// A future format can raise this safely by chunking and authenticating each
-/// section independently.
 pub const ARCCHKPT_MAX_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
-/// Snapshot-assisted legacy recovery is intentionally bounded to the same
-/// in-memory envelope as an ARCCHKPT payload. The legacy LZ4 framing carries
-/// its decompressed length in the first four bytes, so reject allocation bombs
-/// before asking the decoder to reserve attacker-controlled memory.
 pub const LEGACY_SNAPSHOT_MAX_BYTES: usize = ARCCHKPT_MAX_PAYLOAD_BYTES;
-/// Protocol-v3 recovery has one fixed six-validator trust committee.
 pub const RECOVERY_VALIDATOR_SET_SIZE: usize = 6;
-/// Five identities are required in addition to strict >2/3 signed stake.
 pub const RECOVERY_SIGNATURES_REQUIRED: usize = 5;
-/// The selected canonical legacy fork retained one exact eight-validator set.
-/// Other fork-local peer registries contain zero-stake community identities
-/// and divergent dynamically admitted validators; none of those registries is
-/// a recovery trust source.
 pub const LEGACY_RECOVERY_VALIDATOR_SET_SIZE: usize = 8;
-/// Every validator in the selected source set carried exactly 5M stake.
 pub const LEGACY_RECOVERY_VALIDATOR_STAKE: u64 = 5_000_000;
-/// The canonical legacy validator-set total committed by the recovery input.
 pub const LEGACY_RECOVERY_TOTAL_STAKE: u64 = 40_000_000;
 
 fn checkpoint_destination_digest(path: &Path) -> Result<String, RecoveryError> {
@@ -220,9 +195,6 @@ const ACTIVE_RECOVERY_MARKER: &str = "recovery.active";
 const ACTIVE_RECOVERY_PREFIX: &str = "recovery-";
 const ACTIVE_RECOVERY_SUFFIX: &str = ".arcchkpt";
 
-/// The third prefunded legacy system account funds the one-time conversion
-/// of synthetic legacy validator weights into real bonded account balances.
-/// The transition debits it exactly; it never mints stake.
 pub fn recovery_stake_reserve_address() -> Address {
     hash_bytes(&[2u8])
 }
@@ -281,8 +253,6 @@ impl RecoverySignature {
     }
 }
 
-/// Consensus domain installed after a recovery transition. Legacy state has
-/// no domain, preserving every pre-recovery hash and state-root behavior.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryContext {
     pub chain_id_hash: Hash256,
@@ -308,7 +278,6 @@ impl RecoveryContext {
         }
     }
 
-    /// Domain used by consensus messages and state commitments after H+1.
     pub fn domain_hash(&self) -> Hash256 {
         let mut hasher = blake3::Hasher::new_derive_key("ARC-recovery-consensus-domain-v1");
         hasher.update(self.chain_id_hash.as_ref());
@@ -322,10 +291,6 @@ impl RecoveryContext {
     }
 }
 
-/// Complete retained canonical state and history at source height H.
-///
-/// Maps are represented by sorted vectors. Import rejects non-canonical order
-/// and duplicates rather than sorting attacker-controlled input before hashing.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecoveryPayload {
     pub blocks: Vec<(u64, Block)>,
@@ -371,8 +336,6 @@ impl RecoveryManifest {
         )
     }
 
-    /// Stable address of this manifest. Signatures are stored outside the
-    /// manifest so adding the fifth approval cannot change what was approved.
     pub fn content_hash(&self) -> Hash256 {
         let bytes = bincode::serialize(self).expect("ARCCHKPT manifest is serializable");
         let mut hasher = blake3::Hasher::new_derive_key("ARCCHKPT-manifest-content-v1");
@@ -396,9 +359,6 @@ impl RecoveryManifest {
         Hash256(*hasher.finalize().as_bytes())
     }
 
-    /// The only valid H+1 block for this checkpoint. It contains no ordinary
-    /// transactions; the manifest hash occupies `tx_root` and the transition
-    /// transcript occupies `proof_hash` without changing the legacy wire type.
     pub fn transition_block(&self) -> Result<Block, RecoveryError> {
         let height = self
             .source_height
@@ -490,11 +450,6 @@ impl ArcCheckpoint {
         mut spec: RecoveryExportSpec,
     ) -> Result<Self, RecoveryError> {
         canonicalize_recovery_validators(&mut spec.validators)?;
-        // Payload is the exact legacy source state. Validator replacement and
-        // missing zero-balance validator accounts are deterministic H+1
-        // transition effects, not edits to the source snapshot. Keeping both
-        // states distinct lets offline signers recompute the legacy state root
-        // as well as the post-transition v3 root.
         let payload = state.export_recovery_payload();
         payload.validate_canonical()?;
 
@@ -511,8 +466,6 @@ impl ArcCheckpoint {
                 replayed_source_state_root, state_source_root
             )));
         }
-        // Legacy genesis used a zero state_root in block 0. Every later block
-        // must bind the actual replayed state root in its header.
         if (*source_height != 0 || source_block.header.state_root != Hash256::ZERO)
             && source_block.header.state_root != replayed_source_state_root
         {
@@ -563,10 +516,6 @@ impl ArcCheckpoint {
     }
 
     pub fn add_signature(&mut self, keypair: &KeyPair) -> Result<(), RecoveryError> {
-        // Never let the low-level signing API bless content the signer has not
-        // independently validated. CLI callers also verify against their
-        // operator trust root, but this protects direct/library use from
-        // signing a structurally forged history.
         self.verify_content()?;
         let address = keypair.address();
         let validator = self
@@ -603,9 +552,6 @@ impl ArcCheckpoint {
         Ok(())
     }
 
-    /// Verify every byte and internal invariant without consulting an external
-    /// trust root or requiring a completed signature quorum. This is the safe
-    /// pre-signing check used by offline validators.
     pub fn verify_content(&self) -> Result<(), RecoveryError> {
         if self.magic != ARCCHKPT_MAGIC {
             return Err(RecoveryError::Invalid("bad ARCCHKPT magic".into()));
@@ -688,8 +634,6 @@ impl ArcCheckpoint {
         Ok(())
     }
 
-    /// Verify content, the exact operator pin, and the complete local network
-    /// policy before an offline validator signs the candidate.
     pub fn verify_candidate(&self, trust: &RecoveryTrustRoot) -> Result<(), RecoveryError> {
         let actual_hash = self.manifest_hash();
         if actual_hash != trust.approved_manifest_hash {
@@ -702,8 +646,6 @@ impl ArcCheckpoint {
         self.verify_content()
     }
 
-    /// Verify the candidate plus both strict identity and stake
-    /// supermajorities before activation.
     pub fn verify(&self, trust: &RecoveryTrustRoot) -> Result<(), RecoveryError> {
         self.verify_candidate(trust)?;
         self.verify_signature_quorum()
@@ -831,24 +773,14 @@ impl ArcCheckpoint {
                         ),
                     )));
                 }
-                // Only a byte-identical retry may migrate legacy permissions;
-                // a conflicting create-only destination is left untouched.
                 arc_crypto::secret_file::tighten_open_owned_private(&existing, path)?;
                 drop(existing);
-                // Re-prove the byte-identical name with a parent fsync on Unix
-                // or two constant-space write-through moves on Windows.
-                // Rewriting a 256 MiB checkpoint on every retry can fail
-                // exactly when recovery disk is tight.
                 destination_lock.rebarrier_existing()?;
                 return Ok(());
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(RecoveryError::Io(error)),
         }
-        // One deterministic destination-bound staging file makes repeated
-        // crashes disk-bounded. A partial prior attempt is truncated and
-        // reused under the persistent destination lock instead of allocating
-        // another checkpoint-sized UUID file.
         let mut file =
             match arc_crypto::secret_file::open_private_read_write(&destination_lock.staging) {
                 Ok(file) => file,
@@ -887,12 +819,6 @@ impl ArcCheckpoint {
         Self::read_from_bytes(&bytes)
     }
 
-    /// Decode one complete ARCCHKPT byte string without reopening a path.
-    ///
-    /// Archive-query callers first open and hash an exact regular inode, then
-    /// pass those same bytes here. Keeping decoding on the already-hashed byte
-    /// string closes the path-replacement race that would exist if validation
-    /// hashed one file and `read_from` reopened another.
     pub fn read_from_bytes(bytes: &[u8]) -> Result<Self, RecoveryError> {
         if bytes.len() > ARCCHKPT_MAX_PAYLOAD_BYTES.saturating_add(16) {
             return Err(RecoveryError::Invalid(format!(
@@ -949,8 +875,6 @@ impl RecoveryPayload {
         Hash256(*hasher.finalize().as_bytes())
     }
 
-    /// Domain-separated commitment to the source validator metadata that is
-    /// transitively signed through `manifest.payload_hash`.
     pub fn source_validator_set_hash(&self) -> Hash256 {
         let bytes = bincode::serialize(&(self.validators.as_slice(), self.staking_pool))
             .expect("canonical source validator state is serializable");
@@ -959,9 +883,6 @@ impl RecoveryPayload {
         Hash256(*hasher.finalize().as_bytes())
     }
 
-    /// Recompute the legacy account-only Merkle root from the exact retained
-    /// source accounts. This is intentionally independent of StateDB caches,
-    /// dirty-key tracking, and the replacement validator set.
     pub fn legacy_state_root(&self) -> Hash256 {
         legacy_account_state_root(&self.accounts)
     }
@@ -988,14 +909,6 @@ impl RecoveryPayload {
         }
 
         let mut accounts = self.accounts.clone();
-        // The selected legacy fleet recorded validator weight in the validator
-        // map, while its validator account `staked_balance` fields are expected
-        // to be zero. That account field is overloaded by legacy channel
-        // disputes and inference-provider bonds, so a non-zero value cannot be
-        // safely interpreted as validator stake without a separately signed
-        // per-address decomposition artifact. V3 deliberately has no guessing
-        // fallback: require the archived account bytes to prove zero and fund
-        // the exact source stake entirely from the explicit system reserve.
         for (source_validator, _) in &self.validators {
             let Ok(index) = accounts.binary_search_by_key(&source_validator.0, |entry| entry.0.0)
             else {
@@ -1052,9 +965,6 @@ impl RecoveryPayload {
         Ok(accounts)
     }
 
-    /// Recompute the deterministic H+1 state root for an independently
-    /// supplied recovery validator set. Offline archive/audit tooling uses
-    /// this to validate fixtures without constructing a live [`StateDB`].
     pub fn transition_consensus_state_root(
         &self,
         context: &RecoveryContext,
@@ -1116,10 +1026,6 @@ impl RecoveryPayload {
         require_sorted_unique(&self.event_logs, |entry| entry.0, "event logs")?;
         require_sorted_unique(&self.validators, |entry| entry.0.0, "validator state")?;
 
-        // Legacy benchmark blocks may repeat a zero transaction placeholder,
-        // so a hash is not itself a globally unique position. Preserve every
-        // exact canonical occurrence and require retained indexes/receipts to
-        // name one of them (and agree with each other when both exist).
         let mut canonical_transaction_positions =
             HashMap::<Hash256, Vec<(u64, u32, Hash256)>>::new();
         for (index, (height, block)) in self.blocks.iter().enumerate() {
@@ -1258,9 +1164,6 @@ impl RecoveryPayload {
 }
 
 fn legacy_account_state_root(accounts: &[(Address, Account)]) -> Hash256 {
-    // Match `IncrementalMerkle::update`'s historical last-write-wins behavior
-    // for duplicate keys, while bulk-building the sorted index only once.
-    // Checkpoint verification separately rejects duplicates as non-canonical.
     let mut leaves = BTreeMap::new();
     for (address, account) in accounts {
         let bytes = bincode::serialize(account).expect("canonical account is serializable");
@@ -1335,10 +1238,6 @@ fn validate_recovery_validators(validators: &[RecoveryValidator]) -> Result<(), 
     Ok(())
 }
 
-/// Validate and canonicalize the independently archived validator metadata
-/// for the selected legacy fork. This deliberately accepts only the separately
-/// sealed eight-validator, 40M-stake source shape. Runtime peer registries and
-/// divergent validator maps on other legacy forks are not authoritative.
 pub fn canonicalize_legacy_recovery_validator_set(
     mut validators: Vec<(Address, u64)>,
 ) -> Result<Vec<(Address, u64)>, RecoveryError> {
@@ -1492,12 +1391,6 @@ struct LegacyWalPrefixRead {
     rejected_tail: Option<LegacyWalRejectedTail>,
 }
 
-/// Exact physical source-WAL boundary selected for snapshot-assisted recovery.
-///
-/// Operators can copy the first `source_wal_accepted_prefix_bytes` bytes as the
-/// canonical block-boundary evidence and quarantine the remaining bytes. The
-/// lengths always add back to `source_wal_original_bytes`; the loader never
-/// rewrites the source file.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LegacyWalBoundaryReport {
     pub source_wal_original_bytes: u64,
@@ -1507,10 +1400,6 @@ pub struct LegacyWalBoundaryReport {
     pub source_wal_selected_checkpoint_sequence: u64,
 }
 
-/// Exact operator-approved snapshot tuple for the exceptional case where a
-/// content-addressed live snapshot does not describe any durable WAL
-/// boundary. Normal snapshot-assisted recovery never consults this structure
-/// and continues to require an exact snapshot height/root match.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LegacyDurableWalSnapshotExpectation {
     pub source_snapshot_height: u64,
@@ -1581,11 +1470,6 @@ fn legacy_wal_boundary_report(
     })
 }
 
-/// Read the longest checksum- and sequence-valid WAL prefix while retaining a
-/// precise reason for any rejected tail. Exact-snapshot recovery binds the
-/// selected block boundary to the independently captured snapshot; the
-/// exceptional durable-WAL path instead requires a separately content-pinned
-/// plan and rejects every tail byte.
 fn read_legacy_wal_prefix(path: &Path) -> Result<LegacyWalPrefixRead, StateError> {
     let file = File::open(path).map_err(|error| {
         StateError::PersistenceError(format!("failed to open legacy WAL {path:?}: {error}"))
@@ -1747,9 +1631,6 @@ fn legacy_post_root_state_mutation(op: &WalOp) -> bool {
     )
 }
 
-/// Locate the latest structurally complete block boundary without trusting a
-/// final WAL record merely because it calls itself a checkpoint. A later torn
-/// suffix has no matching SetBlock+root and is deliberately not selected.
 fn latest_complete_legacy_boundary(entries: &[WalEntry]) -> Result<LegacyBoundary, StateError> {
     let mut blocks = HashMap::<u64, usize>::new();
     let mut latest = None;
@@ -1793,12 +1674,6 @@ fn latest_complete_legacy_boundary(entries: &[WalEntry]) -> Result<LegacyBoundar
     })
 }
 
-/// Locate the complete WAL boundary committed by an independently captured
-/// snapshot.  A live writer may append one or more later complete blocks after
-/// `/sync/snapshot` has serialized its state and before the WAL is read.  Those
-/// later frames are a suffix of the capture, not evidence that the snapshot is
-/// stale or unsafe.  Selection is therefore by the snapshot's exact
-/// height/root tuple rather than by the newest complete WAL checkpoint.
 fn exact_complete_legacy_boundary(
     entries: &[WalEntry],
     snapshot_height: u64,
@@ -2134,7 +2009,6 @@ fn validate_snapshot_sections_against_wal(
     Ok(())
 }
 
-/// Exact physical repair performed on a post-recovery state WAL before replay.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryWalRepairReport {
     pub recovery_wal_original_bytes: u64,
@@ -2172,8 +2046,6 @@ fn plan_post_recovery_wal(
     let mut semantic_error: Option<String> = None;
 
     let summary = visit_repairable_wal_prefix(path, |entry, frame_end| {
-        // Keep scanning after a semantic rejection so the reader still
-        // verifies every later complete frame's encoding, sequence, and CRC.
         if semantic_error.is_some() {
             return Ok(());
         }
@@ -2418,10 +2290,6 @@ struct VerifiedRecoveryWalReplay {
 
 impl VerifiedRecoveryWalReplay {
     fn apply(&mut self, state: &StateDB, entry: &WalEntry) -> Result<(), StateError> {
-        // Keep this exhaustive alongside apply_wal_op and
-        // consensus_state_root_from_sections. Historical records do not
-        // change that root. Metadata records preserve it only when their
-        // entire effect is a no-op.
         let changes_root = match &entry.op {
             WalOp::SetValidatorState(validators, staking_pool) => {
                 *staking_pool != state.staking_pool.load(Ordering::Acquire)
@@ -2590,13 +2458,6 @@ impl StateDB {
     }
 
     pub fn active_protocol_version(&self) -> ProtocolVersion {
-        // A MIGRATED chain is still the chain it was. Paid inference is an
-        // added capability there, not a replacement protocol: it keeps its
-        // recovery protocol version, and with it the whole v3 admission path
-        // that validates transfers, faucet claims and community rewards.
-        // Reporting 4 would skip that validation for every ordinary family
-        // the migration exists to preserve. Only a chain activated at a
-        // fresh private genesis, with no migration record, is protocol 4.
         if self.native_inference_context.read().is_some() && self.native_migration.read().is_none()
         {
             return ProtocolVersion::new(4, 0, 0);
@@ -2635,21 +2496,12 @@ impl StateDB {
         self.compute_recovery_state_root_with(context, &[], &[])
     }
 
-    /// The recovery consensus root this state WOULD have with `replacements`
-    /// applied to its accounts. Native settlement needs the root of the block
-    /// it is about to write before writing it, and on a recovery-bound chain
-    /// that root commits domains an account-only projection never sees. Same
-    /// cost as the block's own root, which any state-changing block pays.
     pub(crate) fn compute_recovery_state_root_with(
         &self,
         context: &RecoveryContext,
         replacements: &[(Address, Account)],
         storage_replacements: &[(Address, Hash256, Vec<u8>)],
     ) -> Hash256 {
-        // Do not materialize retained blocks, receipts, transaction bodies, or
-        // logs here. They are content-addressed in ARCCHKPT, but are historical
-        // data rather than live consensus state. Re-hashing history on every
-        // block would make production O(chain length).
         let mut accounts: Vec<_> = self
             .accounts
             .iter()
@@ -2718,9 +2570,6 @@ impl StateDB {
         )
     }
 
-    /// Strict, read-only loader for the legacy WAL used to build an unsigned
-    /// recovery candidate. It never creates a binding, marker, WAL, or
-    /// checkpoint file and requires a complete block-boundary checkpoint.
     pub fn load_legacy_recovery_source(
         wal_dir: impl AsRef<Path>,
         expected_genesis_hash: Hash256,
@@ -2735,14 +2584,6 @@ impl StateDB {
         .map(|(state, _)| state)
     }
 
-    /// Load a legacy recovery source and bind its canonical block boundary to
-    /// a same-height live state snapshot.
-    ///
-    /// Old ARC nodes did not persist every in-memory state section in every
-    /// execution path. A WAL remains authoritative for block/history ordering,
-    /// while the snapshot supplies exactly accounts/storage/contracts. The
-    /// snapshot is never trusted by metadata: its account root is recomputed
-    /// and must equal both the final complete WAL checkpoint and block header.
     pub fn load_legacy_recovery_source_with_snapshot(
         wal_dir: impl AsRef<Path>,
         expected_genesis_hash: Hash256,
@@ -2758,10 +2599,6 @@ impl StateDB {
         .map(|(state, _)| state)
     }
 
-    /// Snapshot-assisted loader variant that also reports the exact physical
-    /// WAL prefix accepted through the selected checkpoint frame. The source
-    /// WAL remains read-only; operators may use the returned byte boundary to
-    /// archive the accepted prefix and quarantine the suffix byte-for-byte.
     pub fn load_legacy_recovery_source_with_snapshot_report(
         wal_dir: impl AsRef<Path>,
         expected_genesis_hash: Hash256,
@@ -2782,14 +2619,6 @@ impl StateDB {
         Ok((state, report))
     }
 
-    /// Load the canonical legacy block/account boundary and bind the explicit
-    /// operator-archived source validator metadata used by ARCCHKPT export.
-    ///
-    /// Legacy snapshots do not carry validator state, and the selected WAL did
-    /// not persist the genesis validator map. The account root is therefore
-    /// verified first. Only then may this inject the independently supplied
-    /// eight-validator/40M consensus metadata; no account, block, receipt,
-    /// storage, or contract data is changed.
     pub fn load_legacy_recovery_export_source(
         wal_dir: impl AsRef<Path>,
         expected_genesis_hash: Hash256,
@@ -2807,8 +2636,6 @@ impl StateDB {
         .map(|(state, _)| state)
     }
 
-    /// Export loader variant that returns the exact physical source-WAL
-    /// boundary selected by the signed snapshot height/root.
     pub fn load_legacy_recovery_export_source_with_report(
         wal_dir: impl AsRef<Path>,
         expected_genesis_hash: Hash256,
@@ -2816,7 +2643,6 @@ impl StateDB {
         snapshot_path: impl AsRef<Path>,
         legacy_validators: &[(Address, u64)],
     ) -> Result<(Self, LegacyWalBoundaryReport), StateError> {
-        // Validate before the potentially expensive production WAL replay.
         let legacy_validators =
             canonicalize_legacy_recovery_validator_set(legacy_validators.to_vec())?;
         let (state, report) = Self::load_legacy_recovery_source_inner(
@@ -2834,17 +2660,6 @@ impl StateDB {
         Ok((state, report))
     }
 
-    /// Exceptional, explicitly pinned export path for a legacy live snapshot
-    /// whose claimed height/root has no exact durable WAL boundary.
-    ///
-    /// The snapshot is parsed and its claimed tuple must match `expected`, but
-    /// none of its state sections are imported. Instead, the complete source
-    /// WAL must parse through EOF with no torn/corrupt/sequence-invalid tail,
-    /// its final frame must be the latest complete SetBlock + Checkpoint
-    /// boundary named by `expected`, and WAL-only replay must recompute that
-    /// checkpoint root. The latest boundary is derived rather than accepted as
-    /// caller input; callers are responsible for pinning the complete WAL by
-    /// content hash and preserving the rejected snapshot as evidence.
     pub fn load_legacy_recovery_export_source_from_durable_wal_with_report(
         wal_dir: impl AsRef<Path>,
         expected_genesis_hash: Hash256,
@@ -2853,7 +2668,6 @@ impl StateDB {
         legacy_validators: &[(Address, u64)],
         expected: &LegacyDurableWalSnapshotExpectation,
     ) -> Result<(Self, LegacyWalBoundaryReport), StateError> {
-        // Validate before the potentially expensive production WAL replay.
         let legacy_validators =
             canonicalize_legacy_recovery_validator_set(legacy_validators.to_vec())?;
         let (state, report) = Self::load_legacy_recovery_source_inner(
@@ -3112,9 +2926,6 @@ impl StateDB {
                 })?;
                 validate_snapshot_sections_against_wal(snapshot, &state)?;
                 state.import_snapshot(snapshot, boundary.state_root)?;
-                // import_snapshot changes only the three snapshot-covered
-                // state sections and height. WAL-derived blocks/history/
-                // receipts remain.
                 state.rebuild_transaction_indexes();
             }
             LegacyRecoveryBoundarySelection::LatestWal
@@ -3250,8 +3061,6 @@ impl StateDB {
         Ok(())
     }
 
-    /// Open normal state or activate/reopen an approved ARCCHKPT base.
-    /// Existing legacy WAL data is never overwritten by an import.
     pub fn with_genesis_persistent_recovery(
         prefunded: &[(Address, u64)],
         wal_dir: impl AsRef<Path>,
@@ -3267,10 +3076,6 @@ impl StateDB {
         )
     }
 
-    /// Open normal state or activate/reopen an approved ARCCHKPT base beneath
-    /// an already-proven directory namespace. The opaque capability can only
-    /// be minted by a successful direct rebarrier or by the desktop's exact
-    /// private lifecycle proof while the stable sibling lock remains held.
     pub fn with_genesis_persistent_recovery_in_prepared_directory(
         prefunded: &[(Address, u64)],
         namespace_lock: &arc_crypto::secret_file::PreparedPrivateDirectoryNamespaceLock,
@@ -3323,8 +3128,6 @@ impl StateDB {
         };
         checkpoint.verify(&trust)?;
 
-        // Verify the complete logical import in an isolated, non-persistent
-        // StateDB before creating a marker or WAL in the active directory.
         let staged = StateDB::new();
         staged.install_verified_checkpoint(&checkpoint)?;
         if staged.height() != checkpoint.manifest.source_height + 1 {
@@ -3357,21 +3160,12 @@ impl StateDB {
         let stored_checkpoint = ArcCheckpoint::read_from(&stored_path)?;
         stored_checkpoint.verify(&trust)?;
         if existing_marker.is_none() && stored_was_present {
-            // A previous write-through publication may have made the final
-            // name visible while reporting a late flush failure. Before a
-            // marker can make that name a permanent trust dependency, give
-            // the exact verified package a fresh namespace barrier. This is
-            // activation/retry-only, never a 256 MiB healthy-restart rewrite.
             stored_checkpoint.write_to(&stored_path).map_err(|error| {
                 StateError::PersistenceError(format!(
                     "failed to rebarrier stored recovery checkpoint {stored_path:?}: {error}"
                 ))
             })?;
         } else {
-            // Healthy restarts avoid rewriting the bounded-but-large package.
-            // The marker could only have been published after the package's
-            // namespace barrier; repeat the file-data barrier and Unix parent
-            // fsync to detect media/permission failures before replay.
             let stored_file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -3406,7 +3200,6 @@ impl StateDB {
                 ))
             })?;
         }
-        // Release the decoded verification copy before reading the full WAL.
         drop(stored_checkpoint);
         if existing_marker.is_none() {
             write_marker_atomically(&marker_path, approved_hash)?;
@@ -3455,15 +3248,11 @@ impl StateDB {
             })?;
         }
 
-        // Prove the selected physical prefix against the signed checkpoint and
-        // its canonical state root before preserving or truncating any byte.
         if wal_existed {
             staged.apply_verified_recovery_wal_stream(&wal_path, &wal_plan, true)?;
         }
         staged.rebuild_recovery_transaction_indexes(&checkpoint.payload)?;
         staged.verify_recovery_restart(&wal_plan, &checkpoint)?;
-        // The staged full state has served its pre-mutation verification role;
-        // free it before constructing the persistent replay state.
         drop(staged);
 
         if wal_plan.report.recovery_wal_quarantined_tail_bytes != 0 {
@@ -3549,12 +3338,6 @@ impl StateDB {
         }
     }
 
-    /// Rebuild every index derivable from replayed receipts/transaction bodies,
-    /// then merge the signed retained indexes from ARCCHKPT. Legacy sources may
-    /// have pruned a body and/or receipt while still retaining its block hash
-    /// occurrence and account-history index; those signed entries are evidence,
-    /// not disposable caches. A replayed receipt for the same hash must name the
-    /// same canonical position or startup fails closed.
     fn rebuild_recovery_transaction_indexes(
         &self,
         payload: &RecoveryPayload,
@@ -3590,10 +3373,6 @@ impl StateDB {
         Ok(())
     }
 
-    /// Replay privately during startup, checking every block/checkpoint root.
-    /// Return the number of full root computations so tests can bound the
-    /// work without relying on wall-clock timing. This cache never escapes
-    /// replay and cannot affect projected roots used by native settlement.
     #[cfg(test)]
     fn apply_verified_recovery_wal(
         &self,
@@ -3748,8 +3527,6 @@ fn restore_interrupted_stored_checkpoint_names(wal_dir: &Path) -> Result<(), Sta
                 ))
             })?;
             if digest != expected {
-                // A standalone operator export may share this directory. Its
-                // destination-bound staging is unrelated to the active store.
                 continue;
             }
             restore_checkpoint_destination_if_interrupted(&destination).map_err(|error| {
@@ -3831,12 +3608,6 @@ fn reject_interrupted_checkpoint_staging_without_import(wal_dir: &Path) -> Resul
                 ))
             })?,
         );
-        // This can be either a fully fsynced package awaiting create-only
-        // publication or a partial package that `ArcCheckpoint::write_to`
-        // will safely truncate and reuse. Without an approved import there is
-        // no trust root with which to activate it, but silently initializing a
-        // normal genesis WAL would make the interrupted recovery impossible
-        // to resume in this directory.
         return Err(StateError::PersistenceError(format!(
             "interrupted ARCCHKPT package staging exists without recovery.active or an approved import: {path:?}; refusing normal genesis startup"
         )));
@@ -3848,9 +3619,6 @@ fn write_checkpoint_atomically(
     checkpoint: &ArcCheckpoint,
     destination: &Path,
 ) -> Result<(), RecoveryError> {
-    // `ArcCheckpoint::write_to` already stages, fsyncs, publishes create-only,
-    // and rebarriers an identical retry. A second 256 MiB staging layer only
-    // doubles peak disk use and creates another orphan class.
     checkpoint.write_to(destination)
 }
 
@@ -3928,16 +3696,11 @@ fn cleanup_recovery_staging_files(wal_dir: &Path) -> Result<(), StateError> {
 fn rename_for_durable_publish(source: &Path, destination: &Path) -> Result<(), RecoveryError> {
     #[cfg(windows)]
     {
-        // Windows has no documented parent-directory fsync. Publish the
-        // already-synced file through the supported write-through move so its
-        // live name is durable before activation can continue.
         arc_crypto::secret_file::windows_move_path_write_through(source, destination, false)?;
         Ok(())
     }
     #[cfg(unix)]
     {
-        // A hard-link publication preserves create-new semantics under races;
-        // the caller fsyncs the shared parent after the staging name is gone.
         fs::hard_link(source, destination)?;
         fs::remove_file(source)?;
         Ok(())
@@ -3960,7 +3723,6 @@ fn sync_parent(path: &Path) -> Result<(), RecoveryError> {
     }
     #[cfg(not(unix))]
     {
-        // Windows publication is flushed by rename_for_durable_publish.
         let _ = path;
     }
     Ok(())
@@ -3994,8 +3756,6 @@ mod tests {
             original_hash: pinned_hash,
         };
 
-        // Same frame count and byte length cannot substitute for the pinned
-        // source or repaired prefix hash.
         let changed = RepairableWalSummary {
             entry_count: 1,
             original_bytes: 10,
@@ -4005,8 +3765,6 @@ mod tests {
         assert!(verify_post_recovery_wal_reread(changed, &plan).is_err());
         assert!(verify_post_recovery_prefix_reread(changed, &plan).is_err());
 
-        // An entry appearing after an empty plan must not be replayed just
-        // because its byte source is otherwise structurally valid.
         let empty_plan = PostRecoveryWalPlan {
             accepted_entry_count: 0,
             source_entry_count: 0,
@@ -4052,9 +3810,6 @@ mod tests {
         incremental.rebuild();
         assert_eq!(legacy_account_state_root(&accounts), incremental.root());
 
-        // The checkpoint format still rejects duplicate account keys before
-        // accepting a payload, even though the public legacy-root helper keeps
-        // its historical last-write-wins behavior for direct callers.
         let (mut checkpoint, _, _) = checkpoint();
         let address = checkpoint.payload.accounts[0].0;
         checkpoint
@@ -4677,9 +4432,6 @@ mod tests {
             },
         )];
         checkpoint.payload.full_transactions = vec![(retained.hash, retained.clone())];
-        // The stopped source retained this block occurrence/account index but
-        // pruned both the transaction body and receipt. The signed checkpoint
-        // must remain sufficient to query and prove its block inclusion.
         checkpoint.payload.tx_index = vec![(pruned_hash, (0, 0))];
         checkpoint.payload.account_txs = vec![(indexed_account, vec![pruned_hash])];
         checkpoint.payload.validate_canonical().unwrap();
@@ -4899,8 +4651,6 @@ mod tests {
             .staking_pool
             .store(LEGACY_RECOVERY_TOTAL_STAKE, Ordering::Release);
 
-        // Exact legacy ChannelDispute encoding: nonce is the accepted state
-        // nonce and staked_balance is the still-active expiry height.
         let mut dispute = Account::new(dispute_address, 75_000);
         dispute.nonce = 9;
         dispute.staked_balance = 237_145;
@@ -4909,8 +4659,6 @@ mod tests {
         state.accounts.insert(dispute_address.0, dispute.clone());
         state.dirty_accounts.insert(dispute_address.0);
 
-        // Exact legacy InferenceRegister shape: balance was debited and the
-        // provider bond remains locked in staked_balance.
         let mut provider = Account::new(provider_address, 75_000);
         provider.nonce = 1;
         provider.staked_balance = 25_000;
@@ -5380,10 +5128,6 @@ mod tests {
         fs::remove_dir_all(active_dir).unwrap();
     }
 
-    /// A checkpoint import puts its history window and transition block in
-    /// the block table, and committed blocks follow. Each reads back byte for
-    /// byte, by height and through the recovery export in height order, both
-    /// before and after a restart replays them.
     #[test]
     fn block_table_returns_the_same_blocks_after_import_commit_and_restart() {
         fn encoded(blocks: &[(u64, Block)]) -> Vec<Vec<u8>> {
@@ -5585,8 +5329,6 @@ mod tests {
 
         let wal_path = active_dir.join("state.wal");
         let accepted_prefix = fs::read(&wal_path).unwrap();
-        // The tail deliberately skips a height. It is valid but uncommitted,
-        // so the prior checkpoint remains the accepted boundary.
         let next_height = expected_height + 2;
         let next_block = Block::new(
             BlockHeader {
@@ -5811,9 +5553,6 @@ mod tests {
         assert_eq!(replayed.height(), state.height());
         assert_eq!(replayed.get_state_root(), state.get_state_root());
 
-        // Exercise the decoded-entry checker with a bad intermediate root
-        // after its cache is warm. Physical WAL checksum validation is a
-        // separate layer; the existing restart regression covers that path.
         let bad_height = checkpoint.manifest.source_height + 9;
         let bad_root = hash_bytes(b"cached-replay-bad-intermediate-root");
         for entry in &mut entries {
@@ -5860,9 +5599,6 @@ mod tests {
         validators.sort_by_key(|entry| entry.0.0);
         let pool = state.staking_pool.load(Ordering::Acquire);
         let mut duplicates = validators.clone();
-        // Same row count and individually matching stakes, but applying this
-        // removes one current validator. A length-and-values check alone
-        // would incorrectly retain the old root.
         duplicates[1] = duplicates[0];
         let mut context = state.recovery_context().unwrap();
         context.validator_set_id += 1;
@@ -5942,9 +5678,6 @@ mod tests {
                 timestamp: 1_787_777_001_000,
                 parent_hash: transition.hash,
                 tx_root: MerkleTree::from_leaves(Vec::new()).root(),
-                // Deliberately commit the pre-mutation root. The second block
-                // restores the account, so final-only replay validation would
-                // accept this invalid intermediate history.
                 state_root: final_root,
                 proof_hash: hash_bytes(b"bad-intermediate-root-first"),
                 tx_count: 0,
@@ -6177,10 +5910,6 @@ mod tests {
         assert_eq!(snapshot.state_root, block.header.state_root);
         snapshot.write_to(&snapshot_path).unwrap();
 
-        // Recreate the complete block/history boundary but deliberately omit
-        // the recipient account from the WAL. This models the real legacy
-        // failure mode: the block root is canonical, while WAL-only replay is
-        // missing live state that the exact-height snapshot still commits.
         let writer = crate::WalWriter::new(data_dir.join("state.wal")).unwrap();
         writer.append(WalOp::SetAccount(sender, Account::new(sender, 1_000)), 0);
         writer.append(WalOp::SetBlock(0, Block::genesis()), 0);
@@ -6228,9 +5957,6 @@ mod tests {
         assert_eq!(durable_snapshot.block_height, 1);
         assert_eq!(durable_snapshot.state_root, block.header.state_root);
 
-        // Build a complete WAL whose state sections independently reproduce
-        // the checkpoint root. Unlike `legacy_snapshot_fixture`, this fixture
-        // deliberately does not need any snapshot state to replay safely.
         let writer = crate::WalWriter::new(data_dir.join("state.wal")).unwrap();
         let mut accounts = durable_snapshot.accounts.clone();
         accounts.sort_by_key(|entry| entry.0.0);

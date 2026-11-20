@@ -1,8 +1,3 @@
-//! Consensus manager - wires arc-consensus into the node.
-//!
-//! Wraps the DAG `ConsensusEngine` and drives the propose → commit loop,
-//! draining the mempool and feeding committed blocks into `StateDB`.
-
 use crate::SharedValidators;
 use crate::recovery_dag_wal::{ActiveDurability, ActiveLogWriter, RetainedDagRecord};
 use crate::vrf::ProposerSelector;
@@ -16,9 +11,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-/// Transaction bodies retained between DAG availability and canonical commit.
-/// Backpressure is safer than deleting an arbitrary body that a later leader
-/// block still commits to.
 const MAX_PENDING_DAG_PREIMAGES: usize = 100_000;
 const RECOVERY_DAG_REBROADCAST_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -27,10 +19,6 @@ enum DurableAbsenceVoteCollection {
     Added(Option<arc_consensus::view_change::SkipCertificate>),
 }
 
-/// Connectivity is a transport readiness check, not an authority decision.
-/// Keep the historical full-committee barrier only at explicitly configured
-/// genesis; recovery-round participation is enforced separately by the
-/// engine's verified-parent quorum gate.
 fn connected_validator_quorum(
     validator_set: &ValidatorSet,
     connected: &std::collections::HashSet<Hash256>,
@@ -49,17 +37,12 @@ fn connected_validator_quorum(
     validator_set.stake_for_addresses(&connected) >= validator_set.quorum
 }
 
-/// The node checks this before draining its mempool. Delegate parent
-/// authority to the same engine rule used by advance/receive/propose.
 fn proposal_parent_quorum(engine: &ConsensusEngine, current_round: u64) -> bool {
     current_round == 0
         || engine.is_recovery_bootstrap_round(current_round)
         || engine.has_quorum_parents_for_round(current_round.saturating_sub(1))
 }
 
-/// Supply the exact verified authority needed by this bounded history window.
-/// A peer that was offline during the original gossip cannot reconstruct a
-/// quorum certificate from blocks or from its own absence observation.
 fn history_absence_certificates(
     engine: &ConsensusEngine,
     blocks: &[arc_consensus::DagBlock],
@@ -86,9 +69,6 @@ fn history_absence_certificates(
     certificates
 }
 
-/// Add a locally signed absence vote only after its no-equivocation decision
-/// is already durable. Peer votes use the same collector through the inbound
-/// path; counting the local vote here makes the threshold identical for both.
 fn persist_then_collect_absence_vote(
     vote: arc_consensus::view_change::SkipVote,
     decision_already_durable: bool,
@@ -114,11 +94,6 @@ fn persist_then_collect_absence_vote(
         .map(DurableAbsenceVoteCollection::Added)
 }
 
-/// Runtime policy that may replace a bounded recovery-DAG writer with a
-/// compacted successor. The caller hands over exclusive ownership of the
-/// writer so its advisory store lock is released before generation publish.
-/// An error deliberately leaves the writer slot empty and is fatal to the
-/// consensus loop; restart then follows the generation crash-recovery rules.
 pub trait RecoveryDagRollover: Send + Sync {
     fn prepare_append(
         &self,
@@ -187,8 +162,6 @@ fn exact_dag_preimages(
     exact_dag_preimages_from(pending, None, hashes)
 }
 
-/// The bodies a history response carries for `wanted` transaction hashes: from
-/// the pending cache, or - once executed - from the canonical state.
 fn history_bodies(
     pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
     state: &StateDB,
@@ -205,14 +178,6 @@ fn history_bodies(
         .collect()
 }
 
-/// Resolve exact DAG transaction bodies, also accepting a body this node's
-/// canonical state already holds.
-///
-/// The pending cache drops a body once its transaction executes. A committed
-/// DAG block can still name it - a transaction re-proposed before its receipt
-/// was seen - and a restarted node's cache is empty. The canonical state keeps
-/// every executed body, and the hash binds the body exactly, so it is an
-/// equally authentic source.
 fn exact_dag_preimages_from(
     pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
     state: Option<&StateDB>,
@@ -238,11 +203,6 @@ fn exact_dag_preimages_from(
         .collect()
 }
 
-/// Recover the exact local proposal for `round`, including every body needed
-/// for a byte-identical re-broadcast. A protocol-v3 restart can occur after its
-/// proposal crossed the DAG fsync barrier but before every peer received it.
-/// Re-proposing would be a double vote, while failing to re-broadcast would
-/// strand unanimous recovery-mode progress forever.
 fn local_proposal_with_preimages(
     engine: &ConsensusEngine,
     local_address: Hash256,
@@ -302,18 +262,8 @@ fn try_rebroadcast_local_proposal(
     }
 }
 
-/// Bound ordinary legacy DAG replay independently of arbitrary peer claims.
 const MAX_RECOVERY_REPLAY_ROUNDS: u64 = 16;
 
-/// Re-send exact held local proposals around the undecided commit boundary.
-/// A delayed validator can miss a parent while we move two rounds ahead, and
-/// re-sending only our current/current-1 proposal cannot repair that gap. The
-/// commit cursor is the NEXT undecided round: include its predecessor too,
-/// bounded to 16 rounds. Executed transaction bodies come from canonical state.
-///
-/// Used periodically as well as on reconnect. Only already-signed, locally
-/// held blocks are queued, oldest first; no certificate, cursor, or signature
-/// is manufactured. More distant history still requires authenticated sync.
 fn queue_recovery_reconnect_replay(
     engine: &ConsensusEngine,
     local_address: Hash256,
@@ -338,9 +288,6 @@ fn queue_recovery_reconnect_replay(
     }
 }
 
-/// Complete one entire replay window, including one drained across several
-/// ticks. Clearing the retry flag here prevents a capacity-limited transport
-/// from immediately refilling the same window and starving consensus input.
 fn complete_recovery_rebroadcast(pending: &mut bool, next: &mut Instant) {
     *pending = false;
     *next = Instant::now() + RECOVERY_DAG_REBROADCAST_INTERVAL;
@@ -367,10 +314,6 @@ enum RecoveryReplayDrain {
     Backpressured { round: u64 },
 }
 
-/// Enqueue queued reconnect proposals in ascending round order and retain the
-/// first unsent round on backpressure. Transport ordering therefore puts the
-/// missing parent before a dependent current-round block whenever both use the
-/// same connection, while the retained queue makes a full channel lossless.
 fn try_drain_recovery_reconnect_replay(
     engine: &ConsensusEngine,
     local_address: Hash256,
@@ -398,9 +341,6 @@ fn try_drain_recovery_reconnect_replay(
                         "recovery reconnect parent proposal for round {round} is missing"
                     ));
                 }
-                // The current proposal can legitimately be absent when a peer
-                // connects before this node has collected all parents. An
-                // observer also has no local proposal to replay.
                 pending_rounds.remove(&round);
             }
             LocalProposalBroadcast::Backpressured => {
@@ -411,38 +351,18 @@ fn try_drain_recovery_reconnect_replay(
     Ok(RecoveryReplayDrain::Complete)
 }
 
-/// The outbound transport queue may refuse every send for this long before
-/// the loop warns (and again every `OUTBOUND_BACKPRESSURE_WARN_EVERY`).
 const OUTBOUND_BACKPRESSURE_WARN_AFTER: Duration = Duration::from_secs(30);
 const OUTBOUND_BACKPRESSURE_WARN_EVERY: Duration = Duration::from_secs(60);
-/// After this long with the queue full and nothing taken from it, the
-/// transport is treated as wedged: the loop logs an error and returns, and the
-/// consensus thread then exits the process with a non-zero code so the
-/// service manager restarts it. Before, the loop retried the same send every
-/// tick, logging only at debug level, and the node hung without exiting.
 const OUTBOUND_BACKPRESSURE_EXIT_AFTER: Duration = Duration::from_secs(120);
-/// Inbound messages parked while the loop waits on outbound backpressure. One
-/// inbound channel's worth, so parking at most doubles what is already held.
 const MAX_PARKED_INBOUND: usize = 1_000;
 
-/// What the loop should do about the outbound queue this tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutboundBackpressureVerdict {
-    /// The queue had room, or has been full for less than the warning time.
     Continue,
-    /// The queue has been full for `stalled`; log a warning.
     Warn { stalled: Duration },
-    /// The queue has been full for `stalled`, past the exit bound.
     GiveUp { stalled: Duration },
 }
 
-/// Tracks how long the outbound queue has stayed full.
-///
-/// It is sampled once per tick, before the loop enqueues anything, so a
-/// transport that takes even one message during the tick sleep shows spare
-/// capacity at the next sample and resets the clock. Only a queue that stays
-/// full at every sample, which is a transport that has stopped taking
-/// messages, reaches the exit bound.
 #[derive(Debug, Default)]
 struct OutboundBackpressure {
     full_since: Option<Instant>,
@@ -473,17 +393,6 @@ impl OutboundBackpressure {
     }
 }
 
-/// Move inbound messages out of the transport channel into `parked`, in
-/// order, without handling any of them, until the channel is empty or
-/// `parked` holds `cap`. Returns how many were moved.
-///
-/// The loop calls this when it must not process input yet (an exact
-/// parent-first replay window is still waiting for outbound room). Leaving the
-/// messages in the channel would make the transport's peer readers wait on a
-/// full channel, stop reading their streams, and push the stall back onto the
-/// peers. Parked messages are handled first at the next drain, after any
-/// released blocks and before anything newer, which is the order they would
-/// have had in the channel.
 fn park_inbound<T>(
     rx: Option<&mut mpsc::Receiver<T>>,
     parked: &mut std::collections::VecDeque<T>,
@@ -505,8 +414,6 @@ fn park_inbound<T>(
     moved
 }
 
-/// The next inbound message to handle: blocks released this drain first, then
-/// messages parked during backpressure, then the transport channel.
 fn next_inbound<T>(
     released: &mut std::collections::VecDeque<T>,
     parked: &mut std::collections::VecDeque<T>,
@@ -528,7 +435,6 @@ mod outbound_backpressure_tests {
         let start = Instant::now();
         for second in 0..600 {
             let now = start + Duration::from_secs(second);
-            // Full at every sample except one every 20 s.
             let verdict = pressure.observe(second % 20 != 0, now);
             assert_eq!(
                 verdict,
@@ -544,7 +450,6 @@ mod outbound_backpressure_tests {
         let start = Instant::now();
         let mut warnings = Vec::new();
         let mut gave_up = None;
-        // One sample per 50 ms tick.
         for tick in 0..=(130 * 20) {
             let now = start + Duration::from_millis(tick * 50);
             match pressure.observe(true, now) {
@@ -625,14 +530,11 @@ mod outbound_backpressure_tests {
         );
         tx.try_send(10).unwrap();
 
-        // Released blocks first, then parked messages, then the channel.
         let mut released = std::collections::VecDeque::from([100, 101]);
         let mut order = Vec::new();
         while let Some(message) = next_inbound(&mut released, &mut parked, &mut rx) {
             order.push(message);
             if message == 1 {
-                // A block released while handling a parked message is handled
-                // before the next parked one, as it would be for the channel.
                 released.push_back(102);
             }
         }
@@ -640,26 +542,8 @@ mod outbound_backpressure_tests {
     }
 }
 
-/// Drop preimages no committed or retained DAG block can still need.
-///
-/// A body whose transaction EXECUTED goes once every round naming it is behind
-/// the commit cursor: the canonical state keeps it and serves it from there.
-/// A body that never executed has no such home. Under protocol 4 that is the
-/// common case for an omitted transaction - several validators each submit a
-/// finalize, one wins the block's single slot, the rest are dropped - and a
-/// restarted node re-running the commit-time selection needs EVERY body the
-/// committed block names. Pruned at the commit cursor, those bodies existed
-/// nowhere: a restarted validator sat on one committed block for minutes,
-/// asking every peer for a body none of them held. So a never-executed body
-/// is kept until `unexecuted_floor` - the DAG retention horizon, the same
-/// window the blocks naming it are served from.
-/// How long a native transaction may keep being put back for a later block.
-/// A future-nonce transaction becomes admissible within blocks of its
-/// predecessor executing; one still waiting after this long never will.
 const NATIVE_REQUEUE_LIFETIME: Duration = Duration::from_secs(120);
 
-/// Whether `transaction` may be put back for a later block once more: true
-/// until it has been waiting `NATIVE_REQUEUE_LIFETIME`, then false for good.
 fn requeue_native(
     requeued_since: &mut std::collections::HashMap<[u8; 32], Instant>,
     transaction: &arc_types::Transaction,
@@ -670,9 +554,6 @@ fn requeue_native(
     first.elapsed() < NATIVE_REQUEUE_LIFETIME
 }
 
-/// Select the chain's single native transition without losing ordinary v3
-/// work displaced by it. Selection is canonical; this requeue policy affects
-/// only later local proposals and still honors the NEW-request readiness gate.
 fn select_native_transactions_and_requeue(
     state: &StateDB,
     candidates: &[arc_types::Transaction],
@@ -691,10 +572,6 @@ fn select_native_transactions_and_requeue(
             state.native_transaction_still_admissible(transaction)
                 && requeue_native(requeued_since, transaction)
         } else {
-            // A migrated v3 chain retains its ordinary transaction families.
-            // Their exclusion from a native block says nothing about whether
-            // they can execute in the following ordinary block. Preserve the
-            // usual v3 admission rules, with no native retry lifetime applied.
             state.active_protocol_version().major == 3
                 && state.native_migration().is_some()
                 && state.validate_v3_transaction_admission(transaction).is_ok()
@@ -728,9 +605,6 @@ fn prune_irreversible_preimages(
     obsolete.len()
 }
 
-/// Retain every body in the replay predecessor, including receipt-bearing
-/// bodies whose canonical copy may have been evicted. Older unexecuted bodies
-/// remain available until the same retention floor as their DAG blocks.
 fn prune_dag_preimages(
     pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
     latest_round: &dashmap::DashMap<[u8; 32], u64>,
@@ -754,17 +628,12 @@ enum PeerStateDiffError {
     StateRootMismatch,
 }
 
-/// Latest transport generation observed for one authenticated peer. A closed
-/// generation is retained as a tombstone so a delayed `PeerConnected` event
-/// cannot resurrect a connection whose disconnect was delivered first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PeerConnectionGeneration {
     connection_id: u64,
     connected: bool,
 }
 
-/// Record a live connection only when it is newer than the peer's last event.
-/// An equal-generation disconnect wins over a reordered connect event.
 fn record_peer_connected(
     peers: &mut std::collections::HashMap<Hash256, PeerConnectionGeneration>,
     address: Hash256,
@@ -785,9 +654,6 @@ fn record_peer_connected(
     }
 }
 
-/// Record a disconnect for exactly this generation (or a newer event that
-/// overtook an older live generation). Returns true only when the event
-/// transitions the peer from live to disconnected.
 fn record_peer_disconnected(
     peers: &mut std::collections::HashMap<Hash256, PeerConnectionGeneration>,
     address: Hash256,
@@ -834,8 +700,6 @@ mod peer_connection_generation_tests {
         assert!(record_peer_disconnected(&mut connected, peer, 41));
         assert!(record_peer_connected(&mut connected, peer, 42));
 
-        // The old connection's reader exits after the replacement is live.
-        // Its delayed cleanup must not remove the newer quorum member.
         assert!(!record_peer_disconnected(&mut connected, peer, 41));
         assert_eq!(
             connected.get(&peer),
@@ -854,8 +718,6 @@ mod peer_connection_generation_tests {
         let peer = hash_bytes(b"reordered-validator");
         let mut connected = std::collections::HashMap::new();
 
-        // Transport removal can overtake the connect notification on the
-        // shared channel. Retaining a tombstone prevents false live quorum.
         assert!(!record_peer_disconnected(&mut connected, peer, 7));
         assert!(!record_peer_connected(&mut connected, peer, 7));
         assert!(!connected.get(&peer).unwrap().connected);
@@ -867,10 +729,6 @@ mod peer_connection_generation_tests {
     }
 }
 
-/// A state diff is only a performance hint, never proof of execution. Bind it
-/// to the authenticated author of the committed DAG block and compare it with
-/// the result of local canonical execution before accepting it as corroborating
-/// data. Callers must not apply `diff` to derive `executed_root`.
 fn verify_peer_state_diff(
     source: Hash256,
     expected_author: Hash256,
@@ -891,9 +749,6 @@ fn verify_peer_state_diff(
     Ok(())
 }
 
-/// Verify that peer-supplied transaction bodies are the exact preimages for a
-/// DAG block's canonical hash list. The returned copies carry a process-local
-/// verification cache bit; that bit is never accepted from the wire.
 #[cfg(test)]
 fn verify_peer_dag_transactions(
     committed_hashes: &[Hash256],
@@ -902,16 +757,6 @@ fn verify_peer_dag_transactions(
     verify_peer_dag_transactions_in_domain(committed_hashes, transactions, None)
 }
 
-/// This node's own block hash at `height` when a verified quorum finality
-/// certificate names a different block there. `None` when the hashes agree
-/// or this node has not executed that height (or no longer holds it).
-///
-/// A difference means one of two things. Either this node's chain diverged
-/// from the committee's (nondeterminism, a corrupt store, a bad adoption),
-/// or the certificate comes from another run of a chain with the same
-/// genesis and committee: a certificate's domain binds the genesis identity
-/// and validator epoch, not one run of the chain, so a certificate from an
-/// aborted or repeated run verifies here too. See [`report_divergence`].
 fn divergence(state: &StateDB, height: u64, certified: Hash256) -> Option<Hash256> {
     state
         .get_block(height)
@@ -919,30 +764,15 @@ fn divergence(state: &StateDB, height: u64, certified: Hash256) -> Option<Hash25
         .filter(|local| *local != certified)
 }
 
-/// The diverged height to record, as height + 1 (0: none yet): the lowest
-/// height reported so far, or `None` to keep the recorded one.
 fn lower_divergence(recorded_plus_one: u64, height: u64) -> Option<u64> {
     let candidate = height.saturating_add(1);
     (recorded_plus_one == 0 || candidate < recorded_plus_one).then_some(candidate)
 }
 
-/// Heights whose divergence was already logged, so a conflicting certificate
-/// delivered again and again is logged once. The lowest are forgotten first.
 static REPORTED_DIVERGENCES: std::sync::Mutex<std::collections::BTreeSet<u64>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 const MAX_REPORTED_DIVERGENCES: usize = 256;
 
-/// Record and announce a divergence found by [`divergence`]: the lowest such
-/// height goes to `/consensus/diagnostics` (`diverged_at_height_plus_one`)
-/// and each height is logged once, naming both hashes.
-///
-/// It is an alarm, not a stop. Stopping on a certificate that is not bound
-/// to this chain run would let any peer holding one certificate from another
-/// run of the same genesis and committee halt every node that executed that
-/// height, and a stopped node under a restart policy only restarts into the
-/// same state. The node therefore keeps running, as it did before this
-/// check existed, and an operator compares its block with its peers'. A stop
-/// becomes safe once certificates are bound to the chain run.
 fn report_divergence(height: u64, local: Hash256, certified: Hash256) {
     let _ = crate::consensus_diagnostics::DIAG
         .diverged_at_height_plus_one
@@ -975,8 +805,6 @@ fn report_divergence(height: u64, local: Hash256, certified: Hash256) {
     );
 }
 
-/// The actual untrusted Transactions ingress, shared with route regression tests.
-/// DAG block/history preimages intentionally do not use this local policy.
 pub(crate) fn admit_gossiped_transaction(
     state: &StateDB,
     mempool: &Mempool,
@@ -986,10 +814,6 @@ pub(crate) fn admit_gossiped_transaction(
     let Ok(mut tx) = bincode::deserialize::<arc_types::Transaction>(bytes) else {
         return false;
     };
-    // Gossip is an untrusted ingress boundary.
-    // Verify before consuming bounded mempool
-    // capacity and cache the result only in
-    // this process.
     tx.sig_verified = false;
     if state.verify_transaction_signature(&tx).is_err() {
         return false;
@@ -1000,22 +824,6 @@ pub(crate) fn admit_gossiped_transaction(
     {
         return false;
     }
-    // A body retained for one non-leader DAG
-    // block must remain proposal-eligible until
-    // it has a canonical receipt. Inbound
-    // transaction gossip is not immediately
-    // re-broadcast, and Mempool deduplicates its
-    // resident set, so accepting this retry does
-    // not create a wire echo loop.
-    // On a PRIVATE protocol-4 chain nothing but
-    // native work can ever execute, so anything
-    // else is dropped here rather than
-    // circulated. A MIGRATED chain keeps every
-    // family it had, so only its native
-    // transactions are judged this way and the
-    // rest take the ordinary path - dropping
-    // them here would mean a transfer submitted
-    // to one validator never reached the others.
     let native_only =
         state.native_inference_context().is_some() && state.native_migration().is_none();
     let is_native = arc_state::StateDB::is_native_inference_transaction(&tx);
@@ -1024,14 +832,8 @@ pub(crate) fn admit_gossiped_transaction(
             && state.native_inference_context().is_some()
             && !state.native_transaction_still_admissible(&tx))
     {
-        // Not native on a chain that carries
-        // only native work, or native but
-        // neither admissible now nor a bounded
-        // future transaction of a funded sender.
         return false;
     }
-    // Already executed: re-admitting it is how
-    // a transaction circulated forever.
     if state.receipts.contains_key(&tx.hash.0) {
         crate::consensus_diagnostics::bump(
             &crate::consensus_diagnostics::DIAG.stale_transactions_dropped,
@@ -1041,18 +843,6 @@ pub(crate) fn admit_gossiped_transaction(
     admission.insert(mempool, tx)
 }
 
-/// Keep only transactions that have NOT yet produced a canonical receipt.
-///
-/// Only the round leader's DAG block becomes canonical here, so a transaction
-/// carried by a non-leader block is re-proposed until it lands in a leader's -
-/// "until it has a canonical receipt", as the proposal path says. Nothing
-/// actually checked the receipt, so every transaction ever submitted kept
-/// being re-proposed, re-gossiped and re-persisted after it had executed: the
-/// soak self-test found 242 transactions written to the DAG WAL ~75 times each
-/// in nine minutes, ~165 per block, growing with every transaction ever
-/// offered. Execution was never duplicated (the commit path filters receipted
-/// bodies), but disk, bandwidth and per-block signature verification all grew
-/// without bound.
 fn retain_unreceipted(state: &StateDB, transactions: &mut Vec<arc_types::Transaction>) -> usize {
     let before = transactions.len();
     transactions.retain(|transaction| !state.receipts.contains_key(&transaction.hash.0));
@@ -1085,17 +875,10 @@ fn verify_peer_dag_transactions_in_domain(
             Ok(verified)
         })
         .collect::<Result<_, _>>()?;
-    // The DAG commits only the canonical hash sequence, not the sender's
-    // attachment order. Canonicalize the bodies to that same order before any
-    // state-admission decision so two honest peers cannot accept/reject the
-    // same block differently after receiving permuted JSON/bincode vectors.
     verified.sort_by_key(|transaction| transaction.hash.0);
     Ok(verified)
 }
 
-/// The live DAG boundary authenticates exact bodies and immutable envelope
-/// rules. Current-state eligibility is checked separately at proposal/commit;
-/// it must not make an already-signed consensus parent disappear in flight.
 fn verify_peer_dag_availability(
     state: &StateDB,
     committed_hashes: &[Hash256],
@@ -1115,11 +898,6 @@ fn verify_peer_dag_availability(
     Ok(verified)
 }
 
-/// The direct benchmark executor mutates canonical `StateDB` without a DAG
-/// commit. That is valid only for a one-validator development chain. A
-/// multi-validator benchmark must feed its signed transactions through the
-/// mempool and normal DAG proposal/commit path so every validator executes the
-/// same ordered block with the same consensus timestamp.
 fn should_execute_local_benchmark(
     benchmark: bool,
     can_produce: bool,
@@ -1128,179 +906,60 @@ fn should_execute_local_benchmark(
     benchmark && can_produce && validator_count == 1
 }
 
-/// Orchestrates DAG consensus for a single validator node.
-/// How far back the duplicate-decision check looks in canonical history.
-/// Extra canonical blocks indexed beyond the DAG retention window.
-///
-/// The window has to cover every anchor a peer could still serve, because that
-/// is exactly the set that can be re-offered to the commit path. Peers serve
-/// history only within their retention window, so retention bounds the
-/// exposure; this margin covers retention changing between runs.
 const DECISION_INDEX_MARGIN_BLOCKS: u64 = 512;
 
-/// How often a node publishes a state snapshot, in canonical blocks.
-///
-/// Chosen so a restart applies at most this many blocks' worth of WAL
-/// records, while the copy itself stays infrequent enough not to sit on the
-/// commit path in practice.
 pub const DEFAULT_SNAPSHOT_EVERY_BLOCKS: u64 = 1024;
 
-/// How many consecutive history requests may buy nothing before the node asks
-/// for a checkpoint instead.
-///
-/// Deliberately not one. A single unproductive request is ordinary - a peer
-/// may simply not have answered yet - and adopting a peer's state is a
-/// strictly stronger trust decision than importing self-authenticating
-/// history, so it is the last resort rather than the first.
 const UNPRODUCTIVE_REQUESTS_BEFORE_CHECKPOINT: u32 = 8;
 
-/// How often an already-made absence attestation is re-gossiped.
-///
-/// Often enough that a peer which missed it still gets it within a few rounds;
-/// rarely enough that re-sending is no longer the dominant cost of the loop.
 const ABSENCE_REGOSSIP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Bounded retention runs once every this many canonical heights.
 const RECORD_PRUNE_EVERY: u64 = 128;
 
-/// Finality votes kept below the current canonical height. A validator votes
-/// only on heights it has just produced, so anything this far below the tip is
-/// settled by the durable chain itself.
 const FINALITY_RECORD_MARGIN: u64 = 256;
 
-/// Absence attestations kept below the commit cursor. Twice the window the
-/// node can attest in at all.
 const ABSENCE_RECORD_MARGIN: u64 = 2 * ABSENCE_SCAN_ROUNDS;
 
-/// Bounds on one history transfer. A request cannot make a peer serve more than
-/// this, and an importer will not step over more than this in one go.
 const HISTORY_MAX_ROUNDS: u64 = 256;
-/// Hard cap on blocks in one history response, whatever the round span.
 const HISTORY_MAX_BLOCKS: usize = 4_096;
-/// Rounds of parent context served before the requested round, so the first
-/// round's blocks can have their parents validated from the same payload.
 const HISTORY_PARENT_CONTEXT: u64 = 2;
-/// Minimum gap between history requests from this node, so a persistent gap
-/// cannot turn into a request storm against its peers.
 const HISTORY_REQUEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How often this node may ask one author for the history behind a block it
-/// is holding. Much shorter than the heartbeat-driven interval above: a held
-/// block is direct evidence of exactly what is missing and who has it, so the
-/// request is small and targeted rather than a blind re-sync.
 const TARGETED_FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
-/// A peer is served at most one checkpoint per this interval.
 const CHECKPOINT_SERVE_INTERVAL: Duration = Duration::from_secs(30);
-/// How long a node sits at one round, with peers connected, before it concludes
-/// it is behind and asks for history rather than waiting for gossip it can
-/// never accept.
 const HISTORY_STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// How many rounds back the absence scan looks each tick. The cursor only
-/// falls behind when it is stuck, which is exactly when the scan is needed, but
-/// the work still has to be bounded.
 const ABSENCE_SCAN_ROUNDS: u64 = 64;
 
 pub struct ConsensusManager {
-    /// The underlying DAG consensus engine.
     pub engine: Arc<ConsensusEngine>,
-    /// This validator's address.
     pub validator_address: Hash256,
-    /// This validator's staked ARC.
     pub stake: u64,
-    /// Stake tier (Spark / Arc / Core).
     pub tier: StakeTier,
-    /// Number of sender-shards.
     pub num_shards: u16,
-    /// Whether benchmark mode is active (bypass mempool, generate txs directly).
     pub benchmark: bool,
-    /// Whether this node runs in proposer mode (full execution + state diff export).
-    /// When false, acts as a verifier (applies diffs, confirms roots).
     pub proposer_mode: bool,
-    /// Pending state-diff hints keyed by block hash. The source is the peer
-    /// identity authenticated by transport; diffs never replace local execution.
     pending_diffs: dashmap::DashMap<[u8; 32], (Hash256, arc_types::StateDiff, u64)>,
-    /// VRF-based proposer selector (None = VRF disabled, backward compat).
     vrf_selector: Option<ProposerSelector>,
-    /// Shared operator-approved validator authority list for RPC. Transport
-    /// connection events must never add, remove, or reweight entries.
     pub dag_validators: Option<SharedValidators>,
-    /// Shared DAG round counter for health endpoint.
     pub dag_round: Option<Arc<std::sync::atomic::AtomicU64>>,
-    /// Shared DAG committed block counter for health endpoint.
     pub dag_committed: Option<Arc<std::sync::atomic::AtomicU64>>,
-    /// WAL writer for DAG persistence - enables consensus recovery after restart.
     pub dag_wal: Option<Arc<arc_state::WalWriter>>,
-    /// Content-addressed, bounded recovery-domain DAG delta. Protocol v3 uses
-    /// this instead of the legacy unbounded segmented WAL.
     pub recovery_dag_writer: Option<Arc<parking_lot::Mutex<Option<ActiveLogWriter>>>>,
-    /// Synchronous rollover policy invoked at safe append boundaries. Protocol
-    /// v3 requires this alongside its bounded writer so capacity cannot turn
-    /// into periodic coordinated validator exits.
     pub recovery_dag_rollover: Option<Arc<dyn RecoveryDagRollover>>,
-    /// Registry for externally certified long-range checkpoints. It remains
-    /// empty until canonical state-root signatures are actually collected.
-    /// Behind Mutex for interior mutability in the consensus loop (takes &self).
     pub checkpoint_registry: std::sync::Mutex<arc_consensus::security::CheckpointRegistry>,
-    /// Nothing-at-stake mitigation: double-vote tracker with graduated slashing.
-    /// Behind Mutex for interior mutability in the consensus loop (takes &self).
     pub stake_tracker: std::sync::Mutex<arc_consensus::security::StakeTracker>,
-    /// Strictly verified transaction bodies restored from the bound recovery
-    /// DAG WAL before the live loop starts.
     recovered_preimages: Vec<arc_types::Transaction>,
-    /// Where this validator's anti-equivocation record lives. Absence and
-    /// finality decisions are fsynced here BEFORE the signature leaves the
-    /// process; forgetting one is exactly the equivocation the protocol is
-    /// built to prevent, so a record that exists but cannot be read is a hard
-    /// startup failure rather than a fresh start.
     pub signing_record_path: Option<std::path::PathBuf>,
-    /// Publish a state snapshot every this many canonical blocks. Zero
-    /// disables snapshots, which is correct but leaves recovery replaying the
-    /// whole WAL.
     pub snapshot_every_blocks: u64,
-    /// The native-inference vote relay, when this node runs the native worker:
-    /// its own votes go out through the loop, and peers' votes come back in.
     pub native_vote_relay: Option<Arc<crate::native_inference::NativeFinalizeSink>>,
-    /// Local NEW-request gate only; canonical DAG preimages bypass this policy.
     pub native_request_admission: Arc<crate::native_inference::NativeRequestAdmission>,
-    /// DAG decision commitment -> the canonical height it produced, over the
-    /// window of anchors a peer could still serve. This is what makes applying
-    /// an anchor idempotent across a lost commit record.
     applied_decisions: dashmap::DashMap<Hash256, u64>,
-    /// The canonical height the index currently covers.
     decisions_indexed_through: std::sync::atomic::AtomicU64,
-    /// DEVELOPMENT/TEST START BARRIER, default off.
-    ///
-    /// While this node is still at round 0, wait for EVERY genesis validator
-    /// with stake to be connected before proposing, instead of the usual
-    /// quorum of connected stake.
-    ///
-    /// This exists because of a measured startup race. With equal stake and
-    /// four or more validators, quorum is smaller than the committee, so the
-    /// nodes that start first reach quorum without the last one and advance
-    /// immediately. The last node is then permanently behind - it rejects
-    /// every peer block as "round N is too far ahead (current=0)" because
-    /// there is no authenticated history transfer - never proposes again, and
-    /// the commit rule, which commits only the round leader's block and has no
-    /// certified skip, halts at the first round that node was due to lead.
-    ///
-    /// The barrier is STRICTLY STRONGER than the quorum rule, so it weakens
-    /// nothing; it only delays the first proposal. It is not a substitute for
-    /// history transfer, and it does nothing for a node that falls behind
-    /// after round 0.
     pub require_full_committee_at_genesis: bool,
 }
 
 impl ConsensusManager {
-    /// Create a new consensus manager.
-    ///
-    /// # Arguments
-    /// * `validator_address` - 256-bit address derived from the validator key.
-    /// * `stake` - amount of ARC staked (must be >= STAKE_SPARK).
-    /// * `num_shards` - number of sender-shards for the DAG.
-    ///
-    /// # Panics
-    /// Panics if `stake` is below the minimum Spark threshold (500 000 ARC).
     pub fn new(
         validator_address: Hash256,
         stake: u64,
@@ -1355,9 +1014,6 @@ impl ConsensusManager {
         }
     }
 
-    /// Create a consensus manager with a signing keypair (production mode).
-    /// Blocks proposed by this node will be signed with the keypair,
-    /// and unsigned blocks from peers will be rejected.
     pub fn new_with_keypair(
         validator_address: Hash256,
         stake: u64,
@@ -1417,9 +1073,6 @@ impl ConsensusManager {
         }
     }
 
-    /// Install preimages that were signature/domain checked during strict DAG
-    /// WAL replay. They are retained directly; routing them through the live
-    /// mempool could delay a previously certified commit behind a drain cap.
     pub fn install_recovered_preimages(&mut self, transactions: Vec<arc_types::Transaction>) {
         self.recovered_preimages = transactions;
     }
@@ -1431,10 +1084,6 @@ impl ConsensusManager {
             || self.dag_wal.is_some()
     }
 
-    /// History changes the same DAG as live gossip. Validate exact transaction
-    /// bodies without applying local NEW-request policy, and persist every
-    /// accepted block before the importer can advance or accept its children.
-    /// Only accepted blocks publish preimages into the bounded pending cache.
     fn import_history_durably(
         &self,
         state: &StateDB,
@@ -1460,9 +1109,6 @@ impl ConsensusManager {
             blocks,
             HISTORY_MAX_ROUNDS,
             |block| {
-                // Only blocks the importer actually accepts need bodies. A
-                // missing body in a thin/ignored suffix cannot poison the
-                // authenticated prefix. Duplicate blocks never get here.
                 if block.transactions.windows(2).any(|pair| pair[0] == pair[1]) {
                     return Err(ConsensusError::InvalidBlock(
                         "history block repeats a transaction hash".into(),
@@ -1542,9 +1188,6 @@ impl ConsensusManager {
                 .as_ref()
                 .is_some_and(|writer| block.round < writer.retention_floor_round())
             {
-                // A late, ordinarily validated ancestor can precede the
-                // durable compaction floor. That exact baseline already
-                // covers it; never append it outside the retained window.
                 return Ok(());
             }
             let mut writer = slot
@@ -1594,10 +1237,6 @@ impl ConsensusManager {
                     ActiveDurability::Fsync,
                 )
                 .map_err(|error| error.to_string())?;
-            // This call is deliberately after both canonical state fsync and
-            // commit-record fsync. It may drop the old writer, compact through
-            // this exact boundary, publish/pin a successor, and return its new
-            // active writer before the loop performs any further work.
             if let Some(rollover) = &self.recovery_dag_rollover {
                 writer = rollover.prepare_append(state, &self.engine, writer, &[])?;
             }
@@ -1611,9 +1250,6 @@ impl ConsensusManager {
         Ok(())
     }
 
-    /// Enable proposer mode: this node fully executes blocks and exports
-    /// state diffs for verifier nodes.  Without proposer mode, the node
-    /// acts as a verifier and applies diffs from proposers.
     pub fn set_proposer_mode(&mut self, enabled: bool) {
         self.proposer_mode = enabled;
         info!(proposer_mode = enabled, "Propose-Verify mode updated");
@@ -1624,14 +1260,8 @@ impl ConsensusManager {
         stake: u64,
         peer_validators: &[(Hash256, u64)],
     ) -> (ValidatorSet, StakeTier) {
-        // Observer mode: stake=0 means this node serves inference but
-        // doesn't participate in consensus voting. We still need a tier
-        // for display, so we default to Spark (lowest) for observers.
         let tier = StakeTier::from_stake(stake).unwrap_or(StakeTier::Spark);
 
-        // Build validator set from peers only - observer isn't added.
-        // This keeps observers out of the quorum calculation so they
-        // don't break consensus when they go offline.
         let mut validators = Vec::new();
         if stake > 0
             && let Some(v) = Validator::new(validator_address, stake, 0)
@@ -1643,13 +1273,10 @@ impl ConsensusManager {
                 validators.push(v);
             }
         }
-        // This fixed, operator-approved set is active from epoch 1. Transport
-        // peer metadata never changes its identities or voting power.
         let validator_set = ValidatorSet::new(validators, 1);
         (validator_set, tier)
     }
 
-    /// Build a VRF ProposerSelector from the local validator + peers.
     fn build_vrf_selector(
         validator_address: Hash256,
         stake: u64,
@@ -1658,7 +1285,7 @@ impl ConsensusManager {
         use crate::vrf::ValidatorInfo;
 
         let mut vrf_validators = vec![ValidatorInfo {
-            public_key: validator_address.0, // Use address bytes as pubkey placeholder
+            public_key: validator_address.0,
             stake,
             address: validator_address,
         }];
@@ -1672,10 +1299,6 @@ impl ConsensusManager {
         Some(ProposerSelector::new(vrf_validators))
     }
 
-    /// Verify a certificate, register it, inherit its refusal, and re-gossip.
-    ///
-    /// Returns false when the certificate does not verify; nothing is adopted
-    /// in that case.
     fn adopt_absence_certificate(
         &self,
         state: &StateDB,
@@ -1727,9 +1350,6 @@ impl ConsensusManager {
             let Some(mut writer) = slot.take() else {
                 return false;
             };
-            // Compaction must account for the upcoming certificate before it
-            // is appended. A rollover may move the retention floor, so check
-            // the exact resulting writer again before authorizing anything.
             if let Some(rollover) = &self.recovery_dag_rollover {
                 writer = match rollover.prepare_append(
                     state,
@@ -1760,8 +1380,6 @@ impl ConsensusManager {
 
         if let Some(tracker) = tracker.as_mut() {
             tracker.adopt_certificate(certificate);
-            // Preserve the observed choice before using the certificate. The
-            // typed recovery-DAG record remains the participation authority.
             if !self.persist_signing_record(tracker.record()) && self.signing_record_path.is_some()
             {
                 return false;
@@ -1782,20 +1400,6 @@ impl ConsensusManager {
         true
     }
 
-    /// The canonical height whose block was produced by this exact DAG
-    /// decision, if this node already applied it.
-    ///
-    /// Backed by an index rather than a backward scan. The first version
-    /// scanned the last 256 blocks on the reasoning that a re-offered anchor
-    /// is only a few rounds stale - true when the durable record survives, and
-    /// false when it does not. A node whose record was lost or migrated to
-    /// "nothing applied" resumes its scan at round 0 and is re-offered every
-    /// anchor its peers can still serve, which is `--dag-retained-rounds`
-    /// (4096 by default) - sixteen times the old window. Anything outside it
-    /// would have been applied a second time.
-    ///
-    /// So the window is the retention window plus a margin, and it is an index
-    /// because scanning thousands of blocks per offered anchor is not viable.
     pub fn canonical_height_for_decision(&self, state: &StateDB, decision: Hash256) -> Option<u64> {
         self.ensure_decision_index(state);
         self.applied_decisions
@@ -1803,19 +1407,12 @@ impl ConsensusManager {
             .map(|entry| *entry.value())
     }
 
-    /// How many canonical blocks the index must cover: everything a peer could
-    /// still serve history for, since that is exactly what can be re-offered.
     fn decision_index_span(&self) -> u64 {
         self.engine
             .retained_rounds()
             .saturating_add(DECISION_INDEX_MARGIN_BLOCKS)
     }
 
-    /// Build the index once from durable state, then keep it current.
-    ///
-    /// Reading it from the blocks themselves rather than persisting it means
-    /// there is no second durable thing to keep in step - the block IS the
-    /// record, and it became durable at the same instant the effects did.
     fn ensure_decision_index(&self, state: &StateDB) {
         let top = state.height();
         let span = self.decision_index_span();
@@ -1826,8 +1423,6 @@ impl ConsensusManager {
         if indexed_through >= top && indexed_through > 0 {
             return;
         }
-        // On the first pass this walks the whole window; afterwards only the
-        // blocks added since.
         let start = if indexed_through == 0 {
             floor.saturating_add(1)
         } else {
@@ -1841,8 +1436,6 @@ impl ConsensusManager {
                 added += 1;
             }
         }
-        // Drop entries that have fallen out of the window, so the index cannot
-        // grow without bound on a long-running node.
         if floor > 0 {
             self.applied_decisions.retain(|_, height| *height > floor);
         }
@@ -1859,11 +1452,6 @@ impl ConsensusManager {
         }
     }
 
-    /// Load this validator's durable anti-equivocation record.
-    ///
-    /// A missing file is a first run. A file that exists but will not parse is
-    /// fatal: continuing would mean signing without knowing what this key has
-    /// already promised.
     pub fn load_signing_record(&self) -> arc_consensus::view_change::ConsensusSigningRecord {
         let Some(path) = self.signing_record_path.as_ref() else {
             return Default::default();
@@ -1893,15 +1481,11 @@ impl ConsensusManager {
         }
     }
 
-    /// Persist the record and fsync it. Returns false when the write failed, in
-    /// which case the caller must NOT emit the signature it was about to make.
     pub fn persist_signing_record(
         &self,
         record: &arc_consensus::view_change::ConsensusSigningRecord,
     ) -> bool {
         let Some(path) = self.signing_record_path.as_ref() else {
-            // No durable home configured (legacy/dev): refuse to sign rather
-            // than sign something this node could forget.
             return false;
         };
         let persist_started = std::time::Instant::now();
@@ -1917,11 +1501,6 @@ impl ConsensusManager {
             file.sync_all()?;
             std::fs::rename(&temporary, path)?;
             if let Some(parent) = path.parent() {
-                // The rename is only durable once the DIRECTORY entry is, so a
-                // failure here is a failure of the whole write. Swallowing it
-                // would report a decision as persisted that a crash could
-                // still lose, which is the one thing this record exists to
-                // prevent.
                 let dir = std::fs::File::open(parent)?;
                 dir.sync_all()?;
             }
@@ -1944,19 +1523,10 @@ impl ConsensusManager {
         }
     }
 
-    /// Returns whether the validator set has more than one validator,
-    /// meaning multi-validator DAG commit should be used instead of
-    /// the single-validator fast path.
     pub fn is_multi_validator(&self) -> bool {
         self.engine.validator_set().len() > 1
     }
 
-    /// Run the consensus loop: propose blocks, advance rounds, commit, and
-    /// execute against state.
-    ///
-    /// When `inbound_rx` and `outbound_tx` are provided, the loop integrates
-    /// with the P2P transport layer for multi-node consensus. When `None`,
-    /// it behaves as a single-node (backward compatible).
     pub async fn run_consensus_loop(
         &self,
         state: Arc<StateDB>,
@@ -1976,13 +1546,6 @@ impl ConsensusManager {
         .await;
     }
 
-    /// Run consensus until the node lifecycle requests shutdown.
-    ///
-    /// The receiver is checked before every new consensus tick. Returning from
-    /// this method therefore proves that no later proposal, commit, StateDB
-    /// mutation, or DAG-WAL append can start on this manager. The process-level
-    /// shutdown path joins the owning OS thread before its final StateDB WAL
-    /// barrier.
     pub async fn run_consensus_loop_with_shutdown(
         &self,
         state: Arc<StateDB>,
@@ -2023,87 +1586,43 @@ impl ConsensusManager {
             "Consensus loop started"
         );
 
-        // Authenticated absence / finality state. The tracker is created lazily
-        // because the recovery domain is installed after this manager is built.
         let mut skip_tracker: Option<arc_consensus::view_change::SkipTracker> = None;
         let mut skip_vote_collector = arc_consensus::view_change::SkipVoteCollector::new();
-        // A tracker record also contains a decision made during this process
-        // before its first persist attempt. Track durability separately so a
-        // failed fsync can never be mistaken for a durable prior decision.
         let mut durable_skip_decisions = std::collections::HashSet::<(u64, Hash256)>::new();
         let mut finality_vote_collector = arc_consensus::view_change::FinalityVoteCollector::new();
         let mut finality_signed_heights: std::collections::HashSet<u64> =
             std::collections::HashSet::new();
 
-        // Monotonic clock for the absence grace period. Wall-clock time never
-        // enters a transcript; this only paces how long a late block is waited
-        // for, and a wrong pace cannot make an unsafe skip safe.
         let absence_clock = std::time::Instant::now();
-        // Set while this node is filling an empty DAG in from genesis; None
-        // once it has caught up with its own round cursor.
         let mut bootstrap_watermark: Option<u64> = None;
         let mut bootstrap_checked_at: Option<Instant> = None;
-        // Consecutive history requests that moved the bootstrap watermark
-        // nowhere. Past a bound, DAG history cannot rescue this node and it
-        // needs an authenticated checkpoint instead.
-        // Authenticated blocks that arrived early - parents not here yet, or
-        // more than one round ahead. See arc_consensus::pending for why they
-        // are held rather than dropped.
         let mut pending_blocks = arc_consensus::pending::PendingBlocks::new();
-        // Blocks released from `pending_blocks`, re-offered through the SAME
-        // inbound path in the same drain, so there is one implementation of
-        // what receiving a block means.
         let mut replay: std::collections::VecDeque<InboundMessage> =
             std::collections::VecDeque::new();
-        // Inbound messages taken off the transport channel, unhandled, while
-        // the loop waits on outbound backpressure. See `park_inbound`.
         let mut parked_inbound: std::collections::VecDeque<InboundMessage> =
             std::collections::VecDeque::new();
         let mut outbound_backpressure = OutboundBackpressure::default();
-        // When this node last asked each author for the history behind a held
-        // block, so a burst of early blocks becomes one request per author.
         let mut targeted_fetch_at: std::collections::HashMap<Hash256, Instant> =
             std::collections::HashMap::new();
         let mut unproductive_bootstrap_requests: u32 = 0;
-        // The bootstrap round last actually requested, to tell a request that
-        // bought nothing (same round asked again) from progress.
         let mut last_bootstrap_request: Option<u64> = None;
         let mut iteration_started: Option<Instant> = None;
         let mut gauges_published_at: Option<Instant> = None;
-        // When each native transaction was first put back for a later block.
-        // Admissible-later is not forever: past NATIVE_REQUEUE_LIFETIME it is
-        // dropped (see `requeue_native`).
         let mut requeued_since: std::collections::HashMap<[u8; 32], Instant> =
             std::collections::HashMap::new();
-        // Committed DAG blocks waiting for transaction bodies, in round order.
         let mut commit_backlog: Vec<arc_consensus::DagBlock> = Vec::new();
         let mut commit_stall_fetch_at: Option<Instant> = None;
         let mut vote_refusal_logged_at: Option<Instant> = None;
-        // (committed DAG round, legacy DAG WAL sequence) pairs, so segments
-        // wholly below the retention horizon can be deleted. See the pruning
-        // step in the commit path.
         let mut dag_wal_checkpoints: std::collections::VecDeque<(u64, u64)> =
             std::collections::VecDeque::new();
-        // When this node last asked peers for a checkpoint. Asked again at most
-        // once a minute while history stays unproductive: a first request can
-        // find no peer able to serve (its snapshot's anchor already pruned).
         let mut checkpoint_requested_at: Option<Instant> = None;
-        // The peers the outstanding checkpoint request went to. A response is
-        // considered only while a request is outstanding and only from one of
-        // them: an unsolicited checkpoint must not reset anything.
         let mut checkpoint_requested_from: std::collections::HashSet<Hash256> =
             std::collections::HashSet::new();
-        // When each peer was last served a checkpoint. Serving reads and
-        // decodes a whole snapshot, so a peer gets one per interval.
         let mut checkpoint_served_at: std::collections::HashMap<Hash256, Instant> =
             std::collections::HashMap::new();
-        // When this node last gossiped each absence attestation it has made.
         let mut absence_gossiped_at: std::collections::HashMap<(u64, Hash256), std::time::Instant> =
             std::collections::HashMap::new();
         let mut last_round_seen = self.engine.current_round();
-        // A node that restored a commit cursor but holds no DAG cannot make
-        // progress until its bootstrap runs, so it starts at once rather than
-        // after the stall timer.
         let mut last_round_change =
             if self.engine.dag_is_empty() && self.engine.last_committed_round() > 0 {
                 std::time::Instant::now()
@@ -2135,12 +1654,7 @@ impl ConsensusManager {
             }
         }
 
-        // Pending transaction index: tx_hash → Transaction
-        // Transactions live here between drain from mempool and execution.
         let pending_txs: DashMap<[u8; 32], Transaction> = DashMap::new();
-        // Highest DAG round that still references each retained preimage.
-        // A body is removable only once this round is behind the contiguous
-        // canonical commit cursor.
         let pending_tx_latest_round: DashMap<[u8; 32], u64> = DashMap::new();
         let recovered_round = self.engine.current_round();
         if let Err(error) = retain_dag_preimages(
@@ -2158,9 +1672,6 @@ impl ConsensusManager {
             return;
         }
 
-        // Track last proposed round to avoid double-proposing. Strict replay
-        // may already have restored our durable proposal for the current
-        // round; in that case it must be re-broadcast, never re-signed.
         let recovered_local_round = match local_proposal_with_preimages(
             &self.engine,
             self.validator_address,
@@ -2184,33 +1695,12 @@ impl ConsensusManager {
         let mut next_recovery_rebroadcast = Instant::now();
         let mut recovery_reconnect_replay = std::collections::BTreeSet::<u64>::new();
 
-        // Genesis membership and live transport connectivity are different
-        // facts. The validator set must be known/frozen before networking,
-        // but proposing before enough of that set is connected strands this
-        // node's round-0 block before peers can receive it. Track authenticated
-        // connections and wait for live quorum before proposing.
         let mut connected_validators =
             std::collections::HashMap::<Hash256, PeerConnectionGeneration>::new();
 
         'consensus_loop: loop {
-            // Single-validator: 1ms tight loop for max TPS.
-            // Multi-validator: 50ms to give peer blocks time to arrive
-            // before re-checking quorum parents. This amortizes the
-            // cross-continent latency (~100-300ms) without sacrificing
-            // throughput - rounds advance when peers are ready, not on
-            // a fixed timer.
-            // Multi-validator: 200ms normal, 50ms benchmark (fast but peers can keep up).
-            // Single-validator: 1ms for max local TPS.
-            // 50ms tick for all multi-validator modes.
-            // advance_round() returns immediately if quorum exists.
-            // At 50ms, rounds advance as fast as blocks propagate
-            // (~100-200ms cross-continent = 5-10 rounds/sec actual).
             let tick = if self.is_multi_validator() { 50 } else { 1 };
             let tick_delay = tokio::time::Duration::from_millis(tick);
-            // Busy time of the PREVIOUS iteration: everything since it began,
-            // minus the tick it slept. This is the ground truth for "the loop
-            // was blocked" - a phase that `continue`s can hide from the phase
-            // markers below, but not from this.
             if let Some(started) = iteration_started.take() {
                 let busy = started.elapsed().saturating_sub(tick_delay);
                 let busy_us = busy.as_micros() as u64;
@@ -2226,9 +1716,6 @@ impl ConsensusManager {
                     );
                 }
             }
-            // Sizes of this loop's own collections, about once a second. The
-            // engine's and state's maps are read by the diagnostics endpoint
-            // itself; these live only here.
             if gauges_published_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
                 gauges_published_at = Some(Instant::now());
                 use crate::consensus_diagnostics::{DIAG, set};
@@ -2289,10 +1776,6 @@ impl ConsensusManager {
                 break 'consensus_loop;
             }
 
-            // Bound how long the outbound queue may stay full. Every
-            // backpressure path below `continue`s and retries next tick, so
-            // without this a transport that stops taking messages would leave
-            // this loop spinning silently forever.
             if let Some(tx) = outbound_tx.as_ref() {
                 match outbound_backpressure.observe(tx.capacity() == 0, Instant::now()) {
                     OutboundBackpressureVerdict::Continue => {}
@@ -2316,9 +1799,6 @@ impl ConsensusManager {
                 }
             }
 
-            // A previous reconnect attempt may have found the outbound queue
-            // full. Retry its exact parent-first window before accepting a
-            // dependent peer block or advancing local consensus state.
             if self.engine.requires_full_round_participation()
                 && !recovery_reconnect_replay.is_empty()
             {
@@ -2337,8 +1817,6 @@ impl ConsensusManager {
                         );
                     }
                     Ok(RecoveryReplayDrain::Backpressured { round }) => {
-                        // Handle nothing yet, but keep the transport's inbound
-                        // channel moving so peer readers do not stall on it.
                         let parked = park_inbound(
                             inbound_rx.as_mut(),
                             &mut parked_inbound,
@@ -2361,9 +1839,6 @@ impl ConsensusManager {
             }
 
             let mut phase_mark = Instant::now();
-            // ── 0. Process inbound network messages ─────────────────────
-            // Certificate traffic is buffered rather than handled inline so the
-            // borrow of `inbound_rx` ends before it is verified and registered.
             let mut inbound_absence_votes: Vec<(Hash256, arc_consensus::view_change::SkipVote)> =
                 Vec::new();
             let mut inbound_absence_certificates: Vec<(
@@ -2440,10 +1915,6 @@ impl ConsensusManager {
                                 continue;
                             }
                             if self.engine.requires_full_round_participation() {
-                                // A validator may reconnect one round behind
-                                // after its proposal reached us but our same-
-                                // round proposal did not reach its WAL. Replay
-                                // that missing parent before the current block.
                                 queue_recovery_reconnect_replay(
                                     &self.engine,
                                     self.validator_address,
@@ -2464,10 +1935,6 @@ impl ConsensusManager {
                                         );
                                     }
                                     Ok(RecoveryReplayDrain::Backpressured { round }) => {
-                                        // Do not drain a newly connected peer's
-                                        // dependent block or advance locally
-                                        // before the exact parent-first window
-                                        // has entered the transport queue.
                                         debug!(
                                             round,
                                             "Recovery DAG reconnect replay is backpressured"
@@ -2483,10 +1950,6 @@ impl ConsensusManager {
                                     }
                                 }
                             }
-                            // Transport authentication proves the peer identity,
-                            // but its advertised stake is still self-asserted.
-                            // Only the operator-approved genesis/checkpoint set
-                            // grants voting membership and voting power.
                             let configured_stake = self
                                 .engine
                                 .validator_set()
@@ -2530,9 +1993,6 @@ impl ConsensusManager {
                                 );
                                 continue;
                             }
-                            // Connectivity is liveness metadata, never a
-                            // membership transaction. Keep the fixed voting set
-                            // unchanged for both configured and unknown peers.
                             if self.engine.validator_set().is_validator(&address) {
                                 info!(
                                     peer = %address,
@@ -2546,17 +2006,6 @@ impl ConsensusManager {
                             block,
                             transactions,
                         } => {
-                            // Verify peer-supplied envelopes locally before
-                            // they can reach committed execution. The
-                            // `sig_verified` bit is a process-local cache and
-                            // is deliberately forced false across serde; a peer
-                            // cannot confer trust by setting it.
-                            // The attachment must be an exact preimage set of
-                            // the transaction hashes committed by the DAG
-                            // block. Accepting a partial or unrelated
-                            // vector can finalize a block whose transactions
-                            // are unavailable (or populate pending state with
-                            // transactions the author never committed to).
                             let verified = match verify_peer_dag_availability(
                                 &state,
                                 &block.transactions,
@@ -2584,7 +2033,6 @@ impl ConsensusManager {
                                 );
                                 continue;
                             }
-                            // Feed block into consensus engine
                             crate::consensus_diagnostics::bump(
                                 &crate::consensus_diagnostics::DIAG.live_blocks_received,
                             );
@@ -2594,10 +2042,6 @@ impl ConsensusManager {
                                 &crate::consensus_diagnostics::DIAG.live_block_validate_us,
                                 validate_started,
                             );
-                            // An early block - parents not here yet, or more
-                            // than one round ahead - is authenticated already
-                            // and is held, not dropped. `hold_if_early` is the
-                            // same decision the regression test exercises.
                             let received = match received {
                                 Err(
                                     error @ (arc_consensus::ConsensusError::MissingParents {
@@ -2623,10 +2067,6 @@ impl ConsensusManager {
                                                 &crate::consensus_diagnostics::DIAG
                                                     .pending_blocks_held,
                                             );
-                                            // Ask the author - it certainly holds
-                                            // its own parents - for the history
-                                            // behind it, once per author per
-                                            // interval.
                                             let due =
                                                 targeted_fetch_at.get(&block.author).is_none_or(
                                                     |at| at.elapsed() >= TARGETED_FETCH_INTERVAL,
@@ -2663,9 +2103,6 @@ impl ConsensusManager {
                                     crate::consensus_diagnostics::bump(
                                         &crate::consensus_diagnostics::DIAG.live_blocks_accepted,
                                     );
-                                    // Availability precedes visibility to the
-                                    // commit loop: persist exact bodies + block
-                                    // and fsync before retaining them in memory.
                                     let persist_started = std::time::Instant::now();
                                     let persisted =
                                         self.persist_dag_block(&state, &block, &verified);
@@ -2741,10 +2178,6 @@ impl ConsensusManager {
                                             &crate::consensus_diagnostics::DIAG.rounds_advanced,
                                         );
                                     }
-                                    // Blocks that were waiting on this one, and
-                                    // blocks that were only too far ahead and
-                                    // are now within one round, go back through
-                                    // this same path.
                                     let mut released = pending_blocks.release_on(&block.hash);
                                     released.extend(
                                         pending_blocks
@@ -2760,20 +2193,11 @@ impl ConsensusManager {
                                             transactions,
                                         });
                                     }
-                                    // Only reset the view-change timer if the
-                                    // round actually advanced or the block is
-                                    // for our current round. Resetting on every
-                                    // received block prevented view-change from
-                                    // ever firing when stuck (blocks arrive but
-                                    // don't form quorum in our round).
                                     if advanced || block.round == round_before {
                                         self.engine.reset_round_timer();
                                     }
                                     let peer_round = self.engine.current_round();
-                                    if last_proposed_round != Some(peer_round) {
-                                        // Will propose on the very next tick
-                                        // (no need to duplicate propose logic here)
-                                    }
+                                    if last_proposed_round != Some(peer_round) {}
                                 }
                                 Err(e) => {
                                     let message = e.to_string();
@@ -2784,13 +2208,6 @@ impl ConsensusManager {
                                             &message,
                                         );
                                     }
-                                    // Missing parents is the ordinary state of a
-                                    // node that is behind, and a duplicate is a
-                                    // redundant gossip delivery of a block already
-                                    // in the DAG. Both are counted above; as WARN
-                                    // the duplicates alone wrote ~2 GB/day of
-                                    // syslog per validator (2026-09-29). Everything
-                                    // else still warns.
                                     if message.contains("missing or wrong-round parents")
                                         || message
                                             .contains("duplicate block: already exists in DAG")
@@ -2818,10 +2235,6 @@ impl ConsensusManager {
                             diff,
                             block_height,
                         } => {
-                            // State diffs are optional hints, not execution
-                            // proofs. Reject unsolicited hashes and bind the
-                            // authenticated transport identity to the DAG block
-                            // author before retaining bounded pending state.
                             let Some(block) = self.engine.get_block(&block_hash) else {
                                 warn!(
                                     source = %source,
@@ -2864,8 +2277,6 @@ impl ConsensusManager {
                                 debug!(count = inserted, "Inserted gossiped txs into mempool");
                             }
                         }
-                        // State sync messages are handled by the RPC layer,
-                        // not the consensus loop. Log and ignore at this layer.
                         InboundMessage::SnapshotManifestRequest { .. }
                         | InboundMessage::SnapshotChunkRequest { .. }
                         | InboundMessage::SnapshotManifestResponse { .. }
@@ -2878,10 +2289,6 @@ impl ConsensusManager {
                             max_tokens,
                             requester: _,
                         } => {
-                            // This pre-v0.8 P2P message never had a complete
-                            // execution/settlement protocol. Keep it dark: the
-                            // supported community path is the authenticated,
-                            // job-bound RPC queue and verified result endpoint.
                             warn!(
                                 request_id = %request_id,
                                 tokens = max_tokens,
@@ -2896,9 +2303,6 @@ impl ConsensusManager {
                             ms_per_token,
                             responder,
                         } => {
-                            // A response on the old P2P surface is not bound to
-                            // an authenticated assignment and must never affect
-                            // work counters or reward settlement.
                             warn!(
                                 request_id = %request_id,
                                 responder = %responder,
@@ -2906,17 +2310,12 @@ impl ConsensusManager {
                                 "Ignored dormant legacy P2P inference response"
                             );
                         }
-                        // ── Partition detection via heartbeat round info ───
                         InboundMessage::HeartbeatWithRound {
                             peer,
                             dag_round,
                             committed_round,
                         } => {
                             let my_round = self.engine.current_round();
-                            // A peer more than one round ahead is a peer this
-                            // node cannot follow by gossip alone, because a
-                            // block more than one round ahead is refused. Ask
-                            // for the contiguous history instead of guessing.
                             if dag_round > my_round.saturating_add(1) {
                                 if history_clock.elapsed() < HISTORY_REQUEST_INTERVAL {
                                     crate::consensus_diagnostics::bump(
@@ -2946,7 +2345,6 @@ impl ConsensusManager {
                                 );
                             }
                         }
-                        // ── Round sync request - respond with our state ───
                         InboundMessage::RoundSyncRequest {
                             peer,
                             their_round,
@@ -2956,8 +2354,6 @@ impl ConsensusManager {
                             let my_committed = self.engine.last_committed_round();
                             let vs = self.engine.validator_set();
                             if let Some(ref tx) = outbound_tx {
-                                // Use try_send to avoid blocking the consensus loop when
-                                // the outbound channel is full (root cause of P2P deadlock).
                                 let _ = tx.try_send(
                                     arc_net::transport::OutboundMessage::SendRoundSyncResponse {
                                         target: peer,
@@ -2979,17 +2375,12 @@ impl ConsensusManager {
                                     .observe_untrusted_round_hint(their_round, their_committed);
                             }
                         }
-                        // ── Round sync response - update our round if behind ───
                         InboundMessage::RoundSyncResponse {
                             current_round,
                             last_committed_round,
                         } => {
                             let my_round = self.engine.current_round();
                             if current_round > my_round.saturating_add(1) {
-                                // The round-sync peer is not identified in this
-                                // message, so ask every connected peer; the
-                                // first usable answer wins and the rest are
-                                // rejected as duplicates.
                                 history_requests_broadcast = Some(my_round);
                             }
                             if current_round.saturating_sub(my_round) > 1000 {
@@ -3003,7 +2394,6 @@ impl ConsensusManager {
                                 );
                             }
                         }
-                        // ── Shard messages (forwarded to inference engine) ───
                         InboundMessage::ShardForward {
                             request_id,
                             model_id: _,
@@ -3018,7 +2408,6 @@ impl ConsensusManager {
                                 layer = next_layer,
                                 "Received shard forward - processing layers"
                             );
-                            // Shard processing handled by inference coordinator (Phase 2)
                         }
                         InboundMessage::ShardResult {
                             request_id,
@@ -3033,11 +2422,6 @@ impl ConsensusManager {
                                 "Received shard result"
                             );
                         }
-                        // ── Authenticated absence / finality certificates ──
-                        // These payloads carry their own signatures, consensus
-                        // domain and committee commitment, so the transport
-                        // identity that delivered them is never the
-                        // authorisation boundary. `source` is diagnostics only.
                         InboundMessage::ConsensusAbsenceVote { source, vote } => {
                             inbound_absence_votes.push((source, vote));
                         }
@@ -3093,11 +2477,6 @@ impl ConsensusManager {
                                             &crate::consensus_diagnostics::DIAG
                                                 .native_votes_refused,
                                         );
-                                        // Refusals are normal after a request
-                                        // finalizes, so they are rate-limited -
-                                        // but the reason must be visible, or a
-                                        // certificate that never forms cannot
-                                        // be explained.
                                         if vote_refusal_logged_at.is_none_or(|at: Instant| {
                                             at.elapsed() >= std::time::Duration::from_secs(2)
                                         }) {
@@ -3162,10 +2541,6 @@ impl ConsensusManager {
                 &crate::consensus_diagnostics::DIAG.phase_inbound_us,
                 phase_mark,
             );
-            // ── 0b. Absence and finality certificates ───────────────────
-            // Every one of these is verified against the frozen committee and
-            // the bound consensus domain before it can affect anything; an
-            // invalid one is dropped with a log and never retried.
             for (source, vote) in inbound_absence_votes {
                 let Some(domain) = self.engine.certificate_domain() else {
                     continue;
@@ -3253,17 +2628,9 @@ impl ConsensusManager {
                 }
             }
             for (source, certificate) in inbound_finality_certificates {
-                // A certificate for a height already held is NOT skipped. It is
-                // the only way to observe a committee that certified two
-                // different blocks at one height, and skipping it was a blind
-                // spot: the conflicting evidence arrived and was discarded
-                // unread. Registration is idempotent for a matching block and
-                // returns `ConflictingFinality` for a differing one.
                 let (height, certified) = (certificate.height, certificate.block_hash);
                 match self.engine.register_finality_certificate(certificate) {
                     Ok(_) => {
-                        // Verified: it should also name the block this node
-                        // executed at that height, if it has.
                         if let Some(local) = divergence(&state, height, certified) {
                             report_divergence(height, local, certified);
                         }
@@ -3282,19 +2649,11 @@ impl ConsensusManager {
                 }
             }
 
-            // A bootstrap also finishes when live gossip, not history, closes
-            // the last gap - which is the usual way. The check below only runs
-            // while the round is stalled, so on its own it never noticed, and
-            // ingress stayed closed on a node that had long caught up.
             if let Some(mark) = bootstrap_watermark
                 && bootstrap_checked_at.is_none_or(|at| at.elapsed() >= Duration::from_millis(250))
             {
                 bootstrap_checked_at = Some(Instant::now());
                 let now_round = self.engine.current_round();
-                // Scan from the commit cursor at the lowest: rounds below it
-                // may already be pruned (a big catch-up batch commits and
-                // prunes in one iteration), and a pruned round reads as a gap
-                // that would keep the bootstrap - and ingress - open forever.
                 let from = mark.max(self.engine.last_committed_round());
                 let next = self
                     .engine
@@ -3305,8 +2664,6 @@ impl ConsensusManager {
                     self.engine.close_restart_base_round();
                     self.engine.set_dag_bootstrapping(false);
                     info!(round = next, "DAG bootstrap complete");
-                    // History recovered this node: any checkpoint request is
-                    // over, and a late answer to it must not be adopted.
                     checkpoint_requested_at = None;
                     checkpoint_requested_from.clear();
                 } else if next > mark {
@@ -3316,10 +2673,6 @@ impl ConsensusManager {
                 }
             }
 
-            // Being stuck at one round while peers are connected is itself a
-            // reason to ask for history: a node that fell behind never receives
-            // another block it can accept, so no gossip event will ever tell it
-            // that it is behind. Heartbeat cadence is far too slow to rely on.
             {
                 let now_round = self.engine.current_round();
                 if now_round != last_round_seen {
@@ -3329,42 +2682,6 @@ impl ConsensusManager {
                     && last_round_change.elapsed() >= HISTORY_STUCK_AFTER
                     && connected_validators.iter().any(|(_, g)| g.connected)
                 {
-                    // Ask from the oldest round this node can actually USE.
-                    //
-                    // Block validation is recursive: inserting a block at round
-                    // R needs its parents at R-1. A node whose DAG is empty -
-                    // which is every node just after a restart - can therefore
-                    // only be bootstrapped from round 0, where parents are
-                    // empty by definition. Asking from the commit cursor
-                    // produces a run whose very first round can never be
-                    // validated, which is why a restarted node sent 252
-                    // history requests and imported nothing.
-                    // Where to ask from depends on whether this node is
-                    // BOOTSTRAPPING or merely lagging, and the two need
-                    // opposite answers.
-                    //
-                    // Bootstrapping - the DAG was empty, which is every node
-                    // just after a restart - used to mean validation had to
-                    // start at round 0, because inserting a block at round R
-                    // needs its parents at R-1 and the recursion only bottoms
-                    // out at genesis. That stops working the moment the chain
-                    // runs past the DAG retention window: peers have pruned
-                    // round 0, serve their oldest retained rounds instead - all
-                    // below this node's commit cursor - and every batch is
-                    // refused as adding nothing. A node restarted after that
-                    // point never rejoined. So a node that restored a durable
-                    // commit cursor bootstraps from THAT round, admitted as its
-                    // one parentless round (`set_restart_base_round` states why
-                    // that is safe); a node with no cursor still starts at 0.
-                    // A watermark walks up from there as rounds fill in, so the
-                    // node never re-requests what it already has.
-                    //
-                    // Merely lagging is different: a healthy node legitimately
-                    // holds gaps, because it only ever needed a quorum of each
-                    // round. Hunting its earliest gap would make it re-request
-                    // ancient history forever - which is what an earlier
-                    // version of this did, and it left a node stuck below its
-                    // peers even before it was killed.
                     let from_round = match bootstrap_watermark {
                         Some(mark) => {
                             let from = mark.max(self.engine.last_committed_round());
@@ -3372,23 +2689,12 @@ impl ConsensusManager {
                                 .engine
                                 .first_missing_round(from, HISTORY_MAX_ROUNDS)
                                 .min(now_round);
-                            // Whether this bought anything is judged where a
-                            // request is actually sent (below): this branch runs
-                            // every loop iteration while stalled, and counting
-                            // here escalated to a checkpoint about two seconds
-                            // after any restart.
                             bootstrap_watermark = Some(next);
                             if next > mark {
-                                // History made progress: any checkpoint
-                                // request is over, and a late answer to it
-                                // must not be adopted mid-recovery.
                                 checkpoint_requested_at = None;
                                 checkpoint_requested_from.clear();
                             }
                             if next >= now_round {
-                                // Caught up with the round cursor; from here on
-                                // this node is an ordinary lagging peer, and
-                                // every block needs its parents again.
                                 bootstrap_watermark = None;
                                 self.engine.close_restart_base_round();
                                 self.engine.set_dag_bootstrapping(false);
@@ -3426,8 +2732,6 @@ impl ConsensusManager {
                 }
             }
 
-            // Ask the peers that are ahead for history, at most once per
-            // interval so a persistent gap cannot turn into a request storm.
             if (!history_requests.is_empty() || history_requests_broadcast.is_some())
                 && history_clock.elapsed() >= HISTORY_REQUEST_INTERVAL
             {
@@ -3452,11 +2756,6 @@ impl ConsensusManager {
                     }
                 }
                 if let Some(from_round) = history_requests_broadcast {
-                    // A watermark that has not moved since the last request
-                    // means that request bought nothing. Peers legitimately
-                    // refuse when the round is below their prune horizon, and
-                    // no number of further requests will change that - so the
-                    // unproductive ones are counted instead of asking forever.
                     if bootstrap_watermark.is_some() {
                         if last_bootstrap_request == Some(from_round) {
                             unproductive_bootstrap_requests =
@@ -3485,10 +2784,6 @@ impl ConsensusManager {
                     }
                 }
 
-                // Escalate to a checkpoint only once, and only after history
-                // has demonstrably failed. Asking earlier would adopt a peer's
-                // state while self-authenticating history was still available,
-                // and adopting state is the strictly stronger trust decision.
                 if unproductive_bootstrap_requests >= UNPRODUCTIVE_REQUESTS_BEFORE_CHECKPOINT
                     && checkpoint_requested_at
                         .is_none_or(|at| at.elapsed() >= Duration::from_secs(60))
@@ -3524,17 +2819,8 @@ impl ConsensusManager {
                 &crate::consensus_diagnostics::DIAG.phase_certificates_us,
                 phase_mark,
             );
-            // ── 0b2. Bounded authenticated history transfer ─────────────
-            // Answer a peer's request from what this node actually holds. The
-            // requester re-validates everything, so serving history is not a
-            // trust decision; the bound is a resource decision.
             for (source, from_round, max_rounds) in inbound_history_requests {
                 let span = max_rounds.min(HISTORY_MAX_ROUNDS);
-                // Serve a little BEFORE the requested round. A block at the
-                // first served round references parents in the round before it,
-                // and a requester that holds only a quorum subset of that round
-                // cannot validate them - which pinned a node at one round while
-                // it asked 162 times and imported once.
                 let first = from_round.saturating_sub(HISTORY_PARENT_CONTEXT);
                 let mut blocks = Vec::new();
                 for round in first..first.saturating_add(span) {
@@ -3548,12 +2834,6 @@ impl ConsensusManager {
                     }
                 }
                 if blocks.is_empty() {
-                    // An empty result has two different causes, and the old
-                    // message named only one of them. It said "below this
-                    // node's prune horizon" at round ~460 with 4096-round
-                    // retention, where nothing can have been pruned - the node
-                    // simply did not hold those rounds. That sent the soak
-                    // investigation the wrong way. Say which one it is.
                     let oldest_retained = self
                         .engine
                         .last_committed_round()
@@ -3588,12 +2868,6 @@ impl ConsensusManager {
                     .iter()
                     .flat_map(|block| block.transactions.iter().map(|hash| hash.0))
                     .collect();
-                // Bodies come from the pending cache OR the canonical state. The
-                // cache drops a body once its transaction executes, so a peer
-                // that needs to apply an older committed block - a restarted
-                // node above all - used to receive the block without the body
-                // it names, and its consensus loop exited on the missing
-                // preimage. The state keeps every executed body.
                 let transactions = history_bodies(&pending_txs, &state, &wanted);
                 crate::consensus_diagnostics::bump(
                     &crate::consensus_diagnostics::DIAG.history_requests_served,
@@ -3651,8 +2925,6 @@ impl ConsensusManager {
                         crate::consensus_diagnostics::bump(
                             &crate::consensus_diagnostics::DIAG.history_imports_ok,
                         );
-                        // An import can fill many parents at once; offer every
-                        // held block again. Anything still early is held again.
                         for (early, transactions) in pending_blocks.drain_all() {
                             crate::consensus_diagnostics::bump(
                                 &crate::consensus_diagnostics::DIAG.pending_blocks_released,
@@ -3682,14 +2954,6 @@ impl ConsensusManager {
                         info!(%source, reached, "Joined a running chain from authenticated history");
                     }
                     Err(error) => {
-                        // Several peers answer one request, so by the time the
-                        // later answers arrive this node has usually moved past
-                        // their start round - common and harmless, hence debug.
-                        //
-                        // While BOOTSTRAPPING it is neither. A node filling an
-                        // empty DAG that rejects everything is stuck, and the
-                        // reason is the only thing that can say why, so it is
-                        // logged once per cycle at warn.
                         if bootstrap_watermark.is_some() && !bootstrap_reject_logged {
                             bootstrap_reject_logged = true;
                             warn!(
@@ -3709,15 +2973,6 @@ impl ConsensusManager {
                 &crate::consensus_diagnostics::DIAG.phase_history_us,
                 phase_mark,
             );
-            // ── 0b3. Authenticated checkpoint transfer ──────────────────
-            // A SEPARATE trust boundary from history import. History is
-            // self-authenticating block by block and the importer re-validates
-            // everything, so serving it is not a trust decision. A checkpoint
-            // is a committee's signed claim about a state this node will adopt
-            // WITHOUT replaying how it got there - so it is accepted only on a
-            // quorum finality certificate bound to this node's own frozen
-            // committee and chain domain, and only for bytes that hash to the
-            // digest that certificate authorises.
             for (source, needed_below_height) in inbound_checkpoint_requests {
                 if checkpoint_served_at
                     .get(&source)
@@ -3740,10 +2995,6 @@ impl ConsensusManager {
                     }
                 };
                 let height = snapshot.manifest.identity.height;
-                // The certificate must cover THIS snapshot's height, and must
-                // agree with it about the state root. A certificate for a
-                // different height, or one naming a different root, authorises
-                // nothing about these bytes.
                 let Some(certificate) = self.engine.finality_certificate(height) else {
                     warn!(
                         %source, height,
@@ -3766,11 +3017,6 @@ impl ConsensusManager {
                         continue;
                     }
                 };
-                // Where a node adopting this resumes: the anchor that produced
-                // the block at this height, found from that block's header in
-                // the retained DAG. The receiver checks it against the certified
-                // header, so an old snapshot whose anchor was pruned is simply
-                // not served.
                 let anchor = self
                     .engine
                     .consensus_domain()
@@ -3812,16 +3058,10 @@ impl ConsensusManager {
             }
 
             for (source, envelope, payload) in inbound_checkpoints {
-                // Only an answer to this node's own outstanding request, from
-                // a peer it asked. The request itself is sent only after
-                // history bootstrap proved unproductive.
-                // One answer per asked peer per request, whatever its outcome.
                 if checkpoint_requested_at.is_none() || !checkpoint_requested_from.remove(&source) {
                     warn!(%source, "Ignoring an unsolicited checkpoint; nothing was installed");
                     continue;
                 }
-                // Nothing below touches the payload until the envelope has
-                // been verified against THIS node's committee and domain.
                 let Some(domain) = self.engine.certificate_domain() else {
                     warn!(%source, "Refusing a checkpoint: this node has no certificate domain");
                     continue;
@@ -3855,11 +3095,6 @@ impl ConsensusManager {
                     );
                     continue;
                 };
-                // Where does consensus resume? The certified block at the
-                // checkpoint height is the payload's tip; its header carries the
-                // decision commitment of the anchor that produced it, which the
-                // envelope's declared anchor must reproduce. A wrong resume
-                // round is a fork, so it is never taken on the server's word.
                 let Some((tip_height, tip)) = decoded.blocks.last().cloned() else {
                     warn!(%source, "REFUSED a checkpoint that carries no tip block");
                     continue;
@@ -3883,10 +3118,6 @@ impl ConsensusManager {
                         continue;
                     }
                 };
-                // Only what the certificate covers is adopted: the window is
-                // re-hashed block by block from the tip, unbound receipts and
-                // logs are dropped, and every domain the root does not cover
-                // must already be this node's own.
                 let adopted = match state.plan_checkpoint_adoption(&decoded, &tip) {
                     Ok(adopted) => adopted,
                     Err(error) => {
@@ -3894,19 +3125,11 @@ impl ConsensusManager {
                         continue;
                     }
                 };
-                // Ask the engine BEFORE writing anything: a checkpoint it would
-                // refuse must never reach the WAL.
                 if let Err(error) = self.engine.check_rebase(envelope.anchor_round) {
                     warn!(%source, %error, "REFUSED a checkpoint the engine cannot resume from");
                     continue;
                 }
 
-                // Adopt: durably first (the state record carries the resume
-                // round, so a crash anywhere after it restarts at the right
-                // cursor), then the commit record, then the engine. Once the
-                // record is written, any failure is fatal: a restart recovers
-                // from the record, whereas carrying on would leave the state
-                // and the consensus cursor apart.
                 if let Err(error) = state.rebase_onto_checkpoint(
                     &adopted,
                     &tip,
@@ -3977,11 +3200,6 @@ impl ConsensusManager {
                 &crate::consensus_diagnostics::DIAG.phase_checkpoint_us,
                 phase_mark,
             );
-            // ── 0c. Decide and sign absence votes ───────────────────────
-            // A round that already carries a quorum of stake, but no block from
-            // some fixed member, is a round this node can attest about. The
-            // tracker enforces S1-S5; this only supplies observations and
-            // persists the decision before the signature leaves the process.
             if self.is_multi_validator()
                 && let Some(domain) = self.engine.certificate_domain()
                 && let Some(keypair) = self.engine.local_keypair()
@@ -3991,9 +3209,6 @@ impl ConsensusManager {
                     durable_skip_decisions.extend(record.skipped_rounds.iter().flat_map(
                         |(round, members)| members.keys().map(|member| (*round, *member)),
                     ));
-                    // Restore durable signing observations, not participation
-                    // exceptions. Only register_skip_certificate can excuse a
-                    // member after verifying the complete quorum certificate.
                     skip_tracker = Some(
                         arc_consensus::view_change::SkipTracker::new(
                             domain,
@@ -4012,8 +3227,6 @@ impl ConsensusManager {
                 let now_ms = absence_clock.elapsed().as_millis() as u64;
                 let scan_round = self.engine.current_round();
                 let mut locally_assembled_absence_certificates = Vec::new();
-                // Bounded: only the rounds the cursor is actually waiting on,
-                // and never more than a fixed window of them.
                 let window_start = cursor.max(scan_round.saturating_sub(ABSENCE_SCAN_ROUNDS));
                 for round in window_start..=scan_round {
                     let hashes = self.engine.blocks_in_round(round);
@@ -4036,7 +3249,6 @@ impl ConsensusManager {
                             continue;
                         }
                         let present = seen.contains(&member);
-                        // (a) the member produced no block in this round
                         tracker.observe(
                             round,
                             &member,
@@ -4046,17 +3258,6 @@ impl ConsensusManager {
                             vs.quorum,
                             now_ms,
                         );
-                        // Already decided AND recently gossiped: nothing to do.
-                        //
-                        // Re-signing an identical decision is correct for
-                        // safety, and the record permits it. But nothing
-                        // remembered that the decision had already been SENT,
-                        // so every loop iteration signed it again, rewrote and
-                        // fsynced the record, and gossiped it - 1,171 times in
-                        // ninety seconds for one (round, member) in the soak
-                        // self-test. The re-gossip is still needed, because a
-                        // peer may have missed it, so it is rate-limited rather
-                        // than removed.
                         let decision_durable = durable_skip_decisions.contains(&(round, member));
                         let gossip_key = (round, member);
                         if decision_durable
@@ -4075,11 +3276,6 @@ impl ConsensusManager {
                             now_ms,
                             keypair,
                         ) {
-                            // S5: persist before the local collector can use
-                            // this vote or it can leave the process. Previously
-                            // only the outbound path counted it, so four
-                            // quorum-stake validators each saw only three
-                            // sub-quorum peer votes.
                             let mut persisted_now = false;
                             let collection = persist_then_collect_absence_vote(
                                 vote.clone(),
@@ -4136,8 +3332,6 @@ impl ConsensusManager {
                         }
                     }
                 }
-                // The tracker is no longer used here, so the mutable borrow
-                // ends before the shared adoption helper updates its record.
                 for certificate in locally_assembled_absence_certificates {
                     if self.adopt_absence_certificate(
                         &state,
@@ -4160,19 +3354,12 @@ impl ConsensusManager {
                 skip_vote_collector.prune_below(absence_floor);
             }
 
-            // A PeerConnected event can discover backpressure while enqueueing
-            // the parent-first window. Do not process a dependent block or
-            // advance this tick; the retry at the top of the next tick drains
-            // the retained oldest round first.
             if self.engine.requires_full_round_participation()
                 && !recovery_reconnect_replay.is_empty()
             {
                 continue;
             }
 
-            // Re-send the bounded parent-first window even while connected.
-            // Network delivery is not implied by enqueueing, and a newer
-            // current proposal cannot repair a peer's missing ancestor.
             if self.engine.requires_full_round_participation()
                 && queue_due_recovery_replay(
                     &self.engine,
@@ -4207,7 +3394,6 @@ impl ConsensusManager {
                 }
             }
 
-            // Check multi-validator EACH iteration (validator set is dynamic).
             let multi_validator = self.is_multi_validator();
             let current_round = self.engine.current_round();
             let already_proposed = last_proposed_round == Some(current_round);
@@ -4230,10 +3416,6 @@ impl ConsensusManager {
                 &crate::consensus_diagnostics::DIAG.phase_absence_us,
                 phase_mark,
             );
-            // ── Pre-feed benchmark transactions into mempool ──────────────
-            // Do this BEFORE the propose check so transactions are always
-            // available regardless of round/parent state.
-            // Cap mempool at 50K to prevent unbounded memory growth.
             if self.benchmark
                 && multi_validator
                 && mempool.len() < 5_000
@@ -4253,24 +3435,10 @@ impl ConsensusManager {
                 }
             }
 
-            // ── 1. Propose a block ─────────────────────────────────────────
-            // In multi-validator mode, propose every round (even empty) so the
-            // DAG advances and the 2-round commit rule can fire.
-            // In single-validator mode, only propose when there are transactions.
-            //
-            // IMPORTANT: Check parent readiness BEFORE draining the mempool.
-            // If the peer's block from the previous round hasn't arrived yet,
-            // we would fail to propose and lose the drained transactions.
             let has_quorum_parents = proposal_parent_quorum(&self.engine, current_round);
 
-            // ── VRF proposer eligibility check ──────────────────────────
-            // In DAG consensus, ALL validators propose every round - that's
-            // what builds the DAG. The leader is selected at commit time, not
-            // at proposal time. VRF selection (EXPECTED_PROPOSERS_PER_SLOT=1)
-            // would filter out 7/8 validators per round, preventing quorum.
-            // Skip VRF in multi-validator DAG mode.
             let vrf_approved = if multi_validator {
-                true // DAG: all validators propose every round
+                true
             } else if let Some(ref selector) = self.vrf_selector {
                 let mut vrf_input = [0u8; 40];
                 vrf_input[..8].copy_from_slice(&current_round.to_le_bytes());
@@ -4281,21 +3449,14 @@ impl ConsensusManager {
                 };
                 selector.is_proposer(self.stake, &vrf_output)
             } else {
-                true // No VRF = always allowed (backward compat)
+                true
             };
 
-            // Multi-validator proposals require both connected stake and a
-            // unique-author parent quorum. A timeout is not a parent
-            // certificate. Single-validator mode uses VRF scheduling.
             let allow_propose = if multi_validator {
-                has_connected_quorum // DAG: wait until peers can receive round 0
+                has_connected_quorum
             } else {
-                vrf_approved // Single-validator: VRF gates block production
+                vrf_approved
             };
-            // ── Single-validator benchmark fast path ─────────────────────
-            // Direct StateDB execution is intentionally forbidden once the
-            // configured set has multiple validators. Multi-validator benchmark
-            // traffic was pre-fed into the mempool above and must be DAG-committed.
             if should_execute_local_benchmark(
                 self.benchmark,
                 can_produce,
@@ -4337,7 +3498,6 @@ impl ConsensusManager {
                 && has_quorum_parents
             {
                 if !multi_validator && self.benchmark {
-                    // Single-validator: just advance DAG round for tracking
                     let timestamp = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
@@ -4345,13 +3505,6 @@ impl ConsensusManager {
                     let _ = self.engine.propose_block(vec![], timestamp);
                     let _ = self.engine.advance_round();
                 } else {
-                    // ── Normal path: drain mempool ──────────────────────────────
-                    // In benchmark mode, drain aggressively for max TPS.
-                    // In normal mode, 100 per block keeps QUIC payload small.
-                    // Multi-validator benchmark: 1000 per block (RPC-friendly).
-                    // Single-validator benchmark: 50K (max local TPS).
-                    // 500 txs per block in normal mode (was 100).
-                    // At 10 rounds/sec = 5,000 tx/sec consensus throughput.
                     let drain_limit = if self.benchmark && multi_validator {
                         1_000
                     } else if self.benchmark {
@@ -4364,11 +3517,6 @@ impl ConsensusManager {
                     self.native_request_admission
                         .retain_for_proposal(&mut transactions);
                     let stale = retain_unreceipted(&state, &mut transactions);
-                    // Keyed on the binding rather than the reported protocol
-                    // version, for the same reason as the commit path: a
-                    // migrated chain reports 3 and still carries native work,
-                    // and a proposal holding two native transactions is
-                    // refused at execution on every node at once.
                     if state.native_inference_context().is_some() && !transactions.is_empty() {
                         transactions = select_native_transactions_and_requeue(
                             &state,
@@ -4383,20 +3531,11 @@ impl ConsensusManager {
                             .stale_transactions_dropped
                             .fetch_add(stale as u64, std::sync::atomic::Ordering::Relaxed);
                     }
-                    // Recovery protocol v3 never proposes a transaction that
-                    // would become a failed canonical history entry. Validate
-                    // the complete candidate first; on a conflicting batch,
-                    // deterministically retain the first FIFO-valid disjoint
-                    // subset, defer candidate-local conflicts, and discard
-                    // envelopes already stale against canonical state.
                     if state.active_protocol_version().major == 3 {
                         transactions.retain(|transaction| {
                             !state.receipts.contains_key(&transaction.hash.0)
                                 && state.validate_v3_transaction_admission(transaction).is_ok()
                         });
-                        // DagBlock commits lexicographically sorted hashes.
-                        // Validate exactly that order, never the local FIFO
-                        // attachment order which peers are free to permute.
                         transactions.sort_by_key(|transaction| transaction.hash.0);
                         if state.validate_v3_block_admission(&transactions).is_err() {
                             let mut admitted = Vec::with_capacity(transactions.len());
@@ -4411,11 +3550,6 @@ impl ConsensusManager {
                                 }
                             }
                             transactions = admitted;
-                            // Individually valid envelopes can conflict only
-                            // within this candidate (for example two spends of
-                            // one nonce). Keep the loser available until the
-                            // winning canonical state transition decides which
-                            // envelope became stale.
                             for transaction in deferred {
                                 self.native_request_admission.insert(&mempool, transaction);
                             }
@@ -4451,21 +3585,12 @@ impl ConsensusManager {
                             );
                         }
                     } else if mempool_len_pre > 0 {
-                        // Routine, not a fault: everything drained was either
-                        // already receipted, not admissible yet, or not the
-                        // one transaction a protocol-4 block may carry.
                         debug!(
                             mempool_len = mempool_len_pre,
                             stale, "Nothing proposable after filtering the drained mempool"
                         );
                     }
 
-                    // The former encrypted-mempool branch was never a network
-                    // protocol: ciphertext was proposer-local, absent from the
-                    // signed DAG block/WAL, and every process held every test
-                    // committee secret. Keep it completely dark until ARC has
-                    // a replicated ciphertext commitment and validator-specific
-                    // threshold reveal protocol.
                     self.native_request_admission
                         .retain_for_proposal(&mut transactions);
                     let has_txs = !transactions.is_empty();
@@ -4474,19 +3599,7 @@ impl ConsensusManager {
                         let tx_hashes: Vec<Hash256> =
                             transactions.iter().map(|tx| tx.hash).collect();
 
-                        // Gossip admissible envelopes so every leader has an
-                        // opportunity to include them. They become commit
-                        // eligible locally only after the exact proposed block
-                        // and bodies cross the DAG WAL fsync barrier below.
                         if has_txs {
-                            // Re-enabled: gossip txs so peers can include them
-                            // in THEIR proposals too. The leader-only commit
-                            // rule (lib.rs:1452) means a tx in only OUR block
-                            // is orphaned 5/6 of the time. Letting peers
-                            // re-include it gives every leader a chance to
-                            // commit it. Duplicate-execution is dedup'd by
-                            // state.receipts at execute time, so cost is just
-                            // DAG bandwidth.
                             if let Some(ref tx_chan) = outbound_tx {
                                 let serialized: Vec<Vec<u8>> = transactions
                                     .iter()
@@ -4507,8 +3620,6 @@ impl ConsensusManager {
 
                         match self.engine.propose_block(tx_hashes, timestamp) {
                             Ok(block) => {
-                                // Persist our own exact proposal and fsync it
-                                // before advancing/broadcasting/committing.
                                 if let Err(error) =
                                     self.persist_dag_block(&state, &block, &transactions)
                                 {
@@ -4540,7 +3651,6 @@ impl ConsensusManager {
                                 );
                                 last_proposed_round = Some(block.round);
 
-                                // Broadcast to peers
                                 if let Some(ref tx_chan) = outbound_tx {
                                     match tx_chan.try_send(OutboundMessage::BroadcastDagBlock {
                                         block: block.clone(),
@@ -4584,12 +3694,6 @@ impl ConsensusManager {
                                     }
                                     warn!("No outbound channel - cannot broadcast DAG block");
                                 }
-                                // Only the deterministic leader block for a
-                                // round becomes canonical. Keep every
-                                // unreceipted envelope proposal-eligible across
-                                // rounds; otherwise the first non-leader to
-                                // include it would strand it forever in the DAG
-                                // preimage cache.
                                 for transaction in transactions.iter().cloned() {
                                     if !state.receipts.contains_key(&transaction.hash.0) {
                                         self.native_request_admission.insert(&mempool, transaction);
@@ -4604,23 +3708,11 @@ impl ConsensusManager {
                             }
                         }
 
-                        // After proposing, advance the round ONLY if we have enough
-                        // peer blocks in the current round. Without this gate, the node
-                        // races ahead of its peers (advancing every 1ms) while peer
-                        // blocks take 100-300ms to arrive across continents. The 2-round
-                        // commit rule then can't fire because parent references are stale.
-                        //
-                        // A single-validator chain can advance immediately. A
-                        // multi-validator benchmark uses the same quorum-paced
-                        // round transition as every other production DAG.
                         if !multi_validator {
                             let _ = self.engine.advance_round();
                         }
-                        // Multi-validator: round advancement happens below when
-                        // has_quorum_parents becomes true on the NEXT iteration.
 
                         if multi_validator {
-                            // ── Multi-validator: DAG commit path ─────────────
                             if has_txs {
                                 debug!(
                                     pending = pending_txs.len(),
@@ -4628,11 +3720,6 @@ impl ConsensusManager {
                                 );
                             }
                         } else if has_txs {
-                            // ── Canonical synchronous path: single-validator mode ──
-                            // Filter out transactions already applied via RPC
-                            // (faucet/submit direct-apply). Without this filter,
-                            // consensus re-executes them → double nonce
-                            // increment and double balance deduction.
                             let fresh_txs: Vec<Transaction> = transactions
                                 .iter()
                                 .filter(|tx| !state.receipts.contains_key(&tx.hash.0))
@@ -4666,38 +3753,11 @@ impl ConsensusManager {
                                     }
                                 }
                             }
-
-                            // The preimage index is NOT cleaned up here.
-                            //
-                            // Single-validator mode runs both paths over the
-                            // same drained transactions: these were proposed
-                            // into this round's DAG block a few lines above,
-                            // and `retain_dag_preimages` registered them
-                            // against that round. Deleting them once the
-                            // synchronous executor finished removed bodies that
-                            // the two-round commit rule still needed: two
-                            // rounds later `exact_dag_preimages` reported
-                            // Missing for the very transaction that had just
-                            // executed, which is a fatal consensus-loop exit,
-                            // so the first transaction on a single-validator
-                            // chain shut the node down.
-                            //
-                            // `prune_irreversible_preimages` owns this
-                            // lifecycle and already drops a body only once
-                            // every DAG round referencing it is behind the
-                            // commit cursor. Duplicate execution is prevented
-                            // by the receipt filter on the commit path, not by
-                            // discarding evidence early.
                         }
                     }
                 }
             }
 
-            // Advance round ONLY when quorum parents exist. If peer blocks
-            // haven't arrived yet (100-300ms cross-continent), wait. The 200ms
-            // tick gives them time. force_advance_round() was causing nodes to
-            // race ahead of their peers, breaking parent references needed for
-            // the 2-round commit rule.
             if already_proposed {
                 let _ = self.engine.advance_round();
             }
@@ -4706,21 +3766,9 @@ impl ConsensusManager {
                 &crate::consensus_diagnostics::DIAG.phase_propose_us,
                 phase_mark,
             );
-            // ── 2. Try to commit finalized DAG blocks (multi-validator) ──────
             let mut committed: Vec<arc_consensus::DagBlock> = std::mem::take(&mut commit_backlog);
             committed.extend(self.engine.try_commit());
-            // Sort by round to ensure all nodes process in the same order.
-            // Without this, nodes discover committed blocks at different times
-            // and produce chain blocks in different sequences.
             committed.sort_by_key(|b| b.round);
-            // A committed block whose bodies are not all here yet is not a
-            // reason to stop the process. It used to be: the loop exited on the
-            // missing preimage, and a restarted node - which re-imports the
-            // same block with the same missing body - would crash-loop. Apply
-            // the fully available prefix, keep the rest IN ORDER for the next
-            // iteration, and ask for the history behind the first stalled one.
-            // The durable record only ever advances past applied rounds, so a
-            // backlog never skips anything.
             if let Some(first_missing) = committed.iter().position(|block| {
                 exact_dag_preimages_from(&pending_txs, Some(&state), &block.transactions).is_err()
             }) {
@@ -4771,10 +3819,6 @@ impl ConsensusManager {
                         "DAG block committed"
                     );
 
-                    // A committed hash list without every exact transaction
-                    // body is not executable consensus. Never silently skip a
-                    // missing preimage: stop this loop before state or the
-                    // durable commit cursor can move.
                     let all_preimages = match exact_dag_preimages_from(
                         &pending_txs,
                         Some(&state),
@@ -4806,11 +3850,6 @@ impl ConsensusManager {
                         .filter(|transaction| !state.receipts.contains_key(&transaction.hash.0))
                         .collect();
 
-                    // State can advance between DAG availability and commit.
-                    // Conflicting envelopes that were valid when admitted are
-                    // deterministically omitted instead of becoming free failed
-                    // receipts. The resulting subset is revalidated as one
-                    // exact v3 state block before any mutation.
                     if state.active_protocol_version().major == 3
                         && state.validate_v3_block_admission(&committed_txs).is_err()
                     {
@@ -4831,17 +3870,6 @@ impl ConsensusManager {
                         );
                     }
 
-                    // At most one native-inference transaction per canonical
-                    // block, chosen deterministically. Without this, execution
-                    // refused the block and the refusal is fatal below - so two
-                    // requests in one committed DAG block would have stopped
-                    // every node at the same place.
-                    //
-                    // Keyed on the BINDING, not on the reported protocol
-                    // version: a migrated chain reports 3 and still carries
-                    // native work, so keying on the version would have left it
-                    // with exactly the fatal case this exists to prevent. The
-                    // selection returns an ordinary block unchanged.
                     if state.native_inference_context().is_some() {
                         let selected = select_native_transactions_and_requeue(
                             &state,
@@ -4898,14 +3926,6 @@ impl ConsensusManager {
 
                     let started = std::time::Instant::now();
                     let received_diff = self.pending_diffs.remove(&dag_block.hash.0);
-                    // Bind the anchor into the canonical block on EVERY chain,
-                    // not only one with a recovery domain. This commitment
-                    // covers the chain domain, the anchor's hash and its round,
-                    // so the resulting block carries a durable, domain-
-                    // separated statement of which decision produced it - and
-                    // it is durable at exactly the moment the block is, with no
-                    // window between applying a block and recording what it
-                    // came from.
                     let decision_proof = match self
                         .engine
                         .consensus_domain()
@@ -4923,14 +3943,6 @@ impl ConsensusManager {
                         None => Hash256::ZERO,
                     };
 
-                    // Idempotency, derived from state rather than from a
-                    // separate record. Re-applying an anchor appends a second
-                    // canonical block for one decision: the transaction filter
-                    // makes it empty, but it still takes a height, and every
-                    // later height on this replica is then offset from its
-                    // peers. Because the commitment above is in the header, an
-                    // anchor this node already applied is recognisable in its
-                    // own recent history.
                     if decision_proof != Hash256::ZERO
                         && let Some(existing) =
                             self.canonical_height_for_decision(&state, decision_proof)
@@ -4947,9 +3959,6 @@ impl ConsensusManager {
                         }
                         continue;
                     }
-                    // Every committed DAG leader maps to exactly one canonical
-                    // state block, including an empty block when all envelopes
-                    // were previously receipted or became state-stale.
                     let execute_started = Instant::now();
                     let executed = state.execute_block_adaptive_at_with_proof(
                         &committed_txs,
@@ -5013,10 +4022,6 @@ impl ConsensusManager {
                         }
                     }
 
-                    // StateDB's block boundary has already fsynced here. Only
-                    // now may the separate DAG WAL record and fsync the commit
-                    // cursor. A crash before this point replays the certified
-                    // block without ever claiming a durable DAG commit.
                     if let Err(error) = self.persist_dag_commit(&state, dag_block) {
                         tracing::error!(
                             block = %dag_block.hash,
@@ -5033,10 +4038,6 @@ impl ConsensusManager {
 
                     let elapsed = started.elapsed();
                     let success = receipts.iter().filter(|receipt| receipt.success).count();
-                    // Per block at debug: at info this and its neighbours were
-                    // about seven lines per height, ~1 GB per node per day. A
-                    // block that carries transactions is still worth a line,
-                    // and so is a progress mark every 1,000 heights.
                     let height_now = block.header.height;
                     if committed_txs.is_empty() {
                         debug!(
@@ -5070,14 +4071,6 @@ impl ConsensusManager {
                         &crate::consensus_diagnostics::DIAG.canonical_blocks_produced,
                     );
 
-                    // ── the exact local commit record ────────────────────
-                    // Written only now, after this committed block crossed the
-                    // durability barrier. On restart it is what lets the commit
-                    // cursor come back instead of being fail-closed at 0, and
-                    // it trusts nobody: it is this node's own statement about
-                    // work it already performed and fsynced. A crash can leave
-                    // it behind the true cursor, which is safe; it can never be
-                    // ahead.
                     if let Some(tracker) = skip_tracker.as_mut() {
                         tracker.note_durable_commit_round(dag_block.round);
                         if !self.persist_signing_record(tracker.record()) {
@@ -5089,16 +4082,6 @@ impl ConsensusManager {
                         }
                     }
 
-                    // ── periodic state snapshot ──────────────────────────
-                    // Bounds how much of the WAL a restart has to apply. Taken
-                    // only AFTER the block is durable, so the snapshot can
-                    // never describe state the log has not recorded.
-                    //
-                    // Cost is real: it copies live state, so the interval is
-                    // an operator choice and zero disables it. A failure here
-                    // is logged and nothing else - the WAL alone still
-                    // recovers the node, which is exactly why a snapshot is
-                    // allowed to fail.
                     if self.snapshot_every_blocks > 0 {
                         let height = state.height();
                         if height > 0 && height.is_multiple_of(self.snapshot_every_blocks) {
@@ -5124,13 +4107,6 @@ impl ConsensusManager {
                         }
                     }
 
-                    // ── bounded retention ────────────────────────────────
-                    // Everything below keyed by height or round used to grow
-                    // for the life of the process - the durable signing record
-                    // most expensively, since it is rewritten and fsynced in
-                    // full before every signature. The floors are chosen so
-                    // nothing this validator could still be asked to decide is
-                    // forgotten; `ConsensusSigningRecord::prune` states why.
                     {
                         let height = state.height();
                         if height > 0 && height.is_multiple_of(RECORD_PRUNE_EVERY) {
@@ -5146,13 +4122,6 @@ impl ConsensusManager {
                             finality_signed_heights.retain(|h| *h >= finality_floor);
                             absence_gossiped_at.retain(|(round, _), _| *round >= absence_floor);
 
-                            // The legacy DAG WAL's segments were never deleted:
-                            // 64 MB segments accumulated for the life of the
-                            // node. Its only use at restart is the highest
-                            // round it holds (bootstrap comes from peers), and
-                            // that is always in the newest entries - so
-                            // segments wholly below the DAG retention horizon
-                            // are deleted. The writer keeps at least two.
                             if let Some(wal) = &self.dag_wal {
                                 let committed_round = self.engine.last_committed_round();
                                 dag_wal_checkpoints.push_back((committed_round, wal.sequence()));
@@ -5195,22 +4164,12 @@ impl ConsensusManager {
                         }
                     }
 
-                    // A certificate that arrived before this node executed the
-                    // height (a lagging or replaying node) is checked now. A
-                    // difference is reported, and this node still signs its
-                    // own block: see `report_divergence`.
                     if let Some(certificate) = self.engine.finality_certificate(block.header.height)
                         && certificate.block_hash != block.hash
                     {
                         report_divergence(block.header.height, block.hash, certificate.block_hash);
                     }
 
-                    // ── finality attestation ─────────────────────────────
-                    // Signed only now: after the two-round commit rule
-                    // certified the DAG block AND its transactions executed
-                    // durably. A DAG signature authorises its own block hash;
-                    // this transcript is a different, domain-separated
-                    // statement about a committed linear block.
                     if self.is_multi_validator()
                         && let Some(domain) = self.engine.certificate_domain()
                         && let Some(keypair) = self.engine.local_keypair()
@@ -5219,8 +4178,6 @@ impl ConsensusManager {
                     {
                         let height = block.header.height;
                         let identity = (block.hash, block.header.state_root, block.header.tx_root);
-                        // One transcript per height, ever. A restart reloads
-                        // this record, so the promise survives the process.
                         let previous = tracker.record().finality_votes.get(&height).copied();
                         match previous {
                             Some(existing) if existing != identity => {
@@ -5250,7 +4207,6 @@ impl ConsensusManager {
                                                     ),
                                                 );
                                             }
-                                            // Count this node's own vote too.
                                             let set = self.engine.validator_set();
                                             if let Ok(Some(certificate)) =
                                                 finality_vote_collector.add(vote, &domain, &set)
@@ -5267,9 +4223,6 @@ impl ConsensusManager {
                                         ),
                                     }
                                 } else {
-                                    // Allow the next tick to try again rather
-                                    // than dropping this height's vote for the
-                                    // life of the process.
                                     finality_signed_heights.remove(&height);
                                     tracing::error!(
                                         height,
@@ -5287,7 +4240,6 @@ impl ConsensusManager {
                 &crate::consensus_diagnostics::DIAG.phase_commit_us,
                 phase_mark,
             );
-            // ── Update shared health counters for /health endpoint ─────────
             if let Some(ref r) = self.dag_round {
                 r.store(current_round, std::sync::atomic::Ordering::Relaxed);
             }
@@ -5296,13 +4248,10 @@ impl ConsensusManager {
                     c.fetch_add(committed.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
 
-                // ── Security: track votes + create checkpoints ──────────────
                 if let Ok(mut tracker) = self.stake_tracker.lock() {
                     for dag_block in &committed {
-                        // Track the proposer's vote for double-vote detection
                         tracker.report_vote(dag_block.author, dag_block.round, dag_block.hash.0);
 
-                        // Check for double voting in this round
                         let evidence = tracker.detect_double_voting(dag_block.round);
                         for ev in &evidence {
                             let slash = arc_consensus::security::calculate_slash_amount(
@@ -5328,18 +4277,11 @@ impl ConsensusManager {
                         }
                     }
 
-                    // Prune old security data every 10000 rounds to bound memory
                     if current_round.is_multiple_of(10_000) && current_round > 10_000 {
                         tracker.prune_votes(current_round - 10_000);
                     }
                 }
 
-                // Do not turn a local wall-clock timestamp and a hash of the
-                // height into a fake long-range trust anchor. The trusted
-                // checkpoint registry accepts only a canonical state-root
-                // transcript carrying strict validator identity + stake
-                // supermajorities. This loop does not yet collect that
-                // evidence, so checkpoint intervals remain explicitly dark.
                 for dag_block in &committed {
                     if dag_block.round > 0
                         && dag_block.round % arc_consensus::security::CHECKPOINT_INTERVAL == 0
@@ -5353,11 +4295,6 @@ impl ConsensusManager {
                 }
             }
 
-            // ── 3. Liveness: certified view-change check ──────────────────────
-            // A local wall-clock timeout is not a quorum view-change
-            // certificate. Until the network collects and verifies such a
-            // certificate, preserve the current view and fail closed instead
-            // of letting each node advance on a different timer.
             if multi_validator && self.engine.needs_view_change() {
                 warn!(
                     round = current_round,
@@ -5366,17 +4303,13 @@ impl ConsensusManager {
                 self.engine.reset_round_timer();
             }
 
-            // ── 3b. Broadcast round-info heartbeat every ~30 seconds ─────
-            // Peers compare rounds to detect partitions early.
             static HEARTBEAT_COUNTER: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let hb_count = HEARTBEAT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let hb_interval = if self.is_multi_validator() { 600 } else { 6000 }; // ~30s at 50ms/600 or 1ms/6000
+            let hb_interval = if self.is_multi_validator() { 600 } else { 6000 };
             if hb_count.is_multiple_of(hb_interval)
                 && let Some(ref tx) = outbound_tx
             {
-                // Use try_send to avoid blocking the consensus loop when
-                // the outbound channel is full (root cause of P2P deadlock).
                 let _ = tx.try_send(
                     arc_net::transport::OutboundMessage::BroadcastHeartbeatWithRound {
                         dag_round: current_round,
@@ -5385,22 +4318,12 @@ impl ConsensusManager {
                 );
             }
 
-            // Membership remains the fixed, operator-approved epoch-1 set.
-            // A future epoch transition must be driven by an authenticated
-            // on-chain governance certificate, never transport discovery.
-
-            // ── 4. Periodic memory eviction ──────────────────────────────────
-            // Cap in-memory data to prevent OOM in long-running nodes.
-            // Run every ~100 iterations to amortize overhead.
             static EVICTION_COUNTER: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let count = EVICTION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if count.is_multiple_of(100) {
-                state.evict_transactions(1_000_000); // Keep last ~1M tx bodies
+                state.evict_transactions(1_000_000);
 
-                // Transaction preimages are pruned only after every DAG round
-                // known to reference them is irreversibly behind the contiguous
-                // commit cursor. Never use arbitrary DashMap iteration here.
                 let committed_round = self.engine.last_committed_round();
                 let pruned = prune_dag_preimages(
                     &pending_txs,
@@ -5457,19 +4380,14 @@ mod tests {
             )
             .unwrap();
         let local = state.get_block(1).unwrap().hash;
-        // The committee certified this node's own block: no divergence.
         assert_eq!(divergence(&state, 1, local), None);
-        // It certified another block at a height this node executed.
         let other = arc_crypto::hash_bytes(b"another block");
         assert_eq!(divergence(&state, 1, other), Some(local));
-        // A height this node has not executed yet says nothing.
         assert_eq!(divergence(&state, 2, other), None);
     }
 
     #[test]
     fn the_lowest_diverged_height_is_the_one_recorded() {
-        // Recorded as height + 1, 0 meaning none: the first report is kept
-        // until a lower height is reported.
         assert_eq!(lower_divergence(0, 7), Some(8));
         assert_eq!(lower_divergence(8, 9), None);
         assert_eq!(lower_divergence(8, 7), None);
@@ -5479,9 +4397,6 @@ mod tests {
 
     #[test]
     fn a_committed_block_s_executed_body_is_found_in_state_when_the_cache_dropped_it() {
-        // The restart crash: a committed DAG block named a transaction the
-        // pending cache no longer held (it had executed), a restarted node had
-        // no cache at all, and the consensus loop exited on the missing body.
         let sender = arc_crypto::signature::KeyPair::from_ed25519_secret_bytes(
             &arc_crypto::hash_bytes(b"preimage sender").0,
         );
@@ -5498,12 +4413,10 @@ mod tests {
             .expect("executes");
         let pending: dashmap::DashMap<[u8; 32], arc_types::Transaction> = dashmap::DashMap::new();
 
-        // Cache-only lookup: missing - the old, fatal behaviour.
         assert!(matches!(
             exact_dag_preimages(&pending, &[executed.hash]),
             Err(DagPreimageError::Missing(_))
         ));
-        // State-aware lookup: found, and it is the exact body.
         let found = exact_dag_preimages_from(&pending, Some(&state), &[executed.hash])
             .expect("the canonical state holds the executed body");
         assert_eq!(found[0].hash, executed.hash);
@@ -5526,7 +4439,6 @@ mod tests {
             local_proposal_with_preimages(&engine, sender.address(), 0, &pending, None).is_err()
         );
 
-        // And a responder now serves it.
         let wanted: std::collections::HashSet<[u8; 32]> = [executed.hash.0].into_iter().collect();
         let served = history_bodies(&pending, &state, &wanted);
         assert_eq!(
@@ -5539,9 +4451,6 @@ mod tests {
 
     #[test]
     fn a_body_nobody_holds_is_still_reported_missing() {
-        // The state fallback must not invent anything: a hash that is in
-        // neither place stays Missing, which now stalls the commit rather than
-        // exiting.
         let state = StateDB::with_genesis(&[]);
         let pending: dashmap::DashMap<[u8; 32], arc_types::Transaction> = dashmap::DashMap::new();
         let unknown = arc_crypto::hash_bytes(b"nobody has this");
@@ -5553,8 +4462,6 @@ mod tests {
 
     #[test]
     fn a_receipted_transaction_is_never_offered_again() {
-        // Regression for the circulation defect: a transaction that already has
-        // a canonical receipt must be dropped at every re-proposal point.
         let sender = arc_crypto::signature::KeyPair::from_ed25519_secret_bytes(
             &arc_crypto::hash_bytes(b"circulating sender").0,
         );
@@ -5686,8 +4593,6 @@ mod tests {
             4
         );
 
-        // Certificates never contribute stake. Three parent authors remain
-        // below quorum even when every other member has a valid certificate.
         let under_quorum = &engines[2];
         for block in bootstrap.iter().take(2) {
             under_quorum.receive_block(block).unwrap();
@@ -5724,8 +4629,6 @@ mod tests {
             "certificates replace missing membership only; they do not count stake"
         );
 
-        // A certificate for the wrong round must not excuse either absent
-        // author from the parent round being checked.
         let wrong_round = &engines[1];
         for block in bootstrap.iter().take(4) {
             if block.author != keys[1].address() {
@@ -5839,9 +4742,6 @@ mod tests {
             .or_default()
             .insert(absentee, AbsenceReason::NoBlock);
 
-        // Each enabled validator receives the other three enabled votes. That
-        // is below quorum; adding its own vote reaches quorum, matching the
-        // four enabled validators in the six-member live fleet.
         for local in 0..4 {
             let mut collector = arc_consensus::view_change::SkipVoteCollector::new();
             for (peer, key) in keys.iter().take(4).enumerate() {
@@ -5861,7 +4761,6 @@ mod tests {
                 assert!(collector.add(vote, &domain, &set).unwrap().is_none());
             }
 
-            // Repeated peer traffic cannot inflate the distinct-voter stake.
             let repeated = SkipVote::sign(
                 domain,
                 set_hash,
@@ -5908,8 +4807,6 @@ mod tests {
             assert_eq!(certificate.verify(&domain, &set).unwrap(), 26_666_668);
         }
 
-        // A failed signing-record write must leave the local vote out of the
-        // collector. Retrying after the decision is durable then completes it.
         let mut collector = arc_consensus::view_change::SkipVoteCollector::new();
         for key in keys.iter().take(4).skip(1) {
             let vote = SkipVote::sign(
@@ -6137,8 +5034,6 @@ mod tests {
         )
         .unwrap();
 
-        // Executed (as far as this test's `executed` says): pruned at the
-        // commit cursor.
         assert_eq!(
             prune_irreversible_preimages(&pending, &latest, 5, 0, |_| true),
             1
@@ -6187,8 +5082,6 @@ mod tests {
             JoinValidatorBody, NativeInferenceFinalizeBody, NativeInferenceRequestBody, gas_costs,
         };
 
-        // Use an actual signed recovery checkpoint and authorized migration:
-        // an ordinary fresh-genesis fixture cannot exercise this mixed lane.
         let directory = tempfile::tempdir().unwrap();
         let requester = KeyPair::from_ed25519_secret_bytes(&hash_bytes(b"requeue-requester").0);
         let keys: Vec<_> = (0..6)
@@ -6276,8 +5169,6 @@ mod tests {
             }),
         )
         .unwrap();
-        // Synthetic execution identity tests transaction/certificate routing,
-        // not model qualification or numerical inference.
         let tuple = hash_bytes(b"synthetic-requeue-execution");
         let context = arc_state::InferenceAdmissionContext {
             domain: InferenceDomain {
@@ -6415,8 +5306,6 @@ mod tests {
         };
         let winner = finalize(0, &keys[..5]);
         let alternative = finalize(1, &keys[1..]);
-        // Same output, different valid >2/3 certificate signer sets. The
-        // latter becomes stale only after the first certificate is stored.
         state.validate_v3_transaction_admission(&winner).unwrap();
         state
             .validate_v3_transaction_admission(&alternative)
@@ -6436,10 +5325,6 @@ mod tests {
                 .is_err(),
             "the native transition must still execute alone"
         );
-        // Reproduce the observed timing: one validator has a signed finalizer
-        // DAG block before canonical finalization; another receives those
-        // IDENTICAL bytes afterward. Both must retain the same consensus
-        // parents even though only the first terminal transaction may execute.
         let domain =
             arc_consensus::ConsensusDomain::new(state.transaction_domain_hash().unwrap(), 1, 1);
         let make_engine = || {
@@ -6500,8 +5385,6 @@ mod tests {
             "history cannot repair a tip below quorum by relaxing its cursor"
         );
 
-        // Admission still authenticates the outer recovery domain, all exact
-        // bodies (including ones already receipted), and immutable wire rules.
         assert!(verify_peer_dag_availability(&state, &[alternative.hash], &[]).is_err());
         assert!(
             verify_peer_dag_availability(
@@ -6605,7 +5488,6 @@ mod tests {
         let mempool = Mempool::new(16);
         let admission = NativeRequestAdmission::default();
         let mut since = std::collections::HashMap::new();
-        // An ordinary envelope must not inherit the native retry expiry.
         since.insert(
             ordinary.hash.0,
             Instant::now()
@@ -6661,11 +5543,6 @@ mod tests {
         history.engine.install_consensus_domain(domain).unwrap();
         history.engine.install_recovery_cursor(0).unwrap();
         let pending = dashmap::DashMap::new();
-        // Preserve history compatibility: the old live boundary removed
-        // receipted bodies before structural checks. It could have accepted
-        // this block while the alternate finalizer was still fresh. History
-        // must still retain its exact signed bodies, never reinterpret that
-        // past acceptance using the new live boundary or current state.
         assert!(state.receipts.contains_key(&request_tx.hash.0));
         assert!(
             state
@@ -6719,8 +5596,6 @@ mod tests {
         assert!(early.advance_round());
         assert!(late.advance_round());
         assert_eq!(late.current_round(), 3);
-        // Exact already-receipted bodies remain valid availability; corrupting
-        // such an attachment cannot hide behind the canonical receipt filter.
         assert!(availability(&winner).is_ok());
         let mut forged_receipted = winner.clone();
         forged_receipted.gas_limit = u64::MAX;
@@ -6753,8 +5628,6 @@ mod tests {
         assert!(!mempool.contains(&alternative.hash));
         assert!(!mempool.contains(&invalid_ordinary.hash));
 
-        // The next real selector invocation proposes the displaced transfer,
-        // and the unchanged v3 executor produces its successful receipt.
         let selected = select_native_transactions_and_requeue(
             &state,
             &mempool.drain(16),
@@ -6774,8 +5647,6 @@ mod tests {
             988
         );
         assert!(mempool.is_empty());
-        // Even when a stale native body triggers selection again, the
-        // already-receipted transfer must not be put back.
         assert!(
             select_native_transactions_and_requeue(
                 &state,
@@ -6791,9 +5662,6 @@ mod tests {
 
     #[test]
     fn a_body_that_never_executed_is_kept_for_the_retention_window() {
-        // The omitted finalize: named by a committed block, never executed.
-        // A restarted peer re-running the selection needs it, and nothing but
-        // this cache holds it.
         let key = KeyPair::generate_ed25519();
         let omitted = signed_transfer(&key, 31, 0);
         let executed = signed_transfer(&key, 32, 1);
@@ -6802,7 +5670,6 @@ mod tests {
         retain_dag_preimages(&pending, &latest, 100, &[omitted.clone(), executed.clone()]).unwrap();
         let ran = |hash: &[u8; 32]| *hash == executed.hash.0;
 
-        // The commit cursor passed round 100, the retention horizon has not.
         assert_eq!(
             prune_irreversible_preimages(&pending, &latest, 150, 50, ran),
             1
@@ -6821,7 +5688,6 @@ mod tests {
             vec![omitted.hash],
             "a peer can still be served the omitted body"
         );
-        // Once the retention horizon passes the round, it goes too.
         assert_eq!(
             prune_irreversible_preimages(&pending, &latest, 5_000, 101, ran),
             1
@@ -6872,9 +5738,6 @@ mod tests {
             let domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"history-test"), 1, 1);
             manager.engine.install_consensus_domain(domain).unwrap();
             manager.engine.install_recovery_cursor(64).unwrap();
-            // with_genesis stores the height-0 sentinel, whose hash and root
-            // stay zero even when accounts are funded. Execute a canonical
-            // pre-recovery block so the generation pins a real state anchor.
             let state = StateDB::with_genesis(&[(keys[0].address(), 1)]);
             let (baseline, _) = state
                 .execute_block_verified_at(&[], keys[0].address(), 64)
@@ -6970,7 +5833,6 @@ mod tests {
         }
 
         fn records(&self) -> Vec<RetainedDagRecord> {
-            // Reopen from bytes after releasing the exclusive live writer.
             drop(
                 self.manager
                     .recovery_dag_writer
@@ -7091,8 +5953,6 @@ mod tests {
         ));
         assert!(f.manager.engine.has_skip_certificate(66, &absentee));
 
-        // A peer offline during the original certificate gossip must receive
-        // the needed parent-round authority with its requested history.
         let child = f.block(0, 66, vec![], vec![]);
         let certificates = history_absence_certificates(&f.manager.engine, &[child.clone(), child]);
         assert_eq!(
@@ -7220,7 +6080,6 @@ mod tests {
         use crate::recovery_dag_wal::RetainedRecordKind;
         let f = HistoryDurabilityFixture::new();
         let parents: Vec<_> = (0..6).map(|i| f.block(i, 65, vec![], vec![])).collect();
-        // The observed restart held four parents and fetched the other two.
         for block in parents.iter().take(4) {
             f.manager.engine.receive_block(block).unwrap();
             f.manager.persist_dag_block(&f.state, block, &[]).unwrap();
@@ -7230,7 +6089,6 @@ mod tests {
         let child = f.block(0, 66, parents.iter().map(|b| b.hash).collect(), vec![]);
         f.manager.engine.receive_block(&child).unwrap();
         f.manager.persist_dag_block(&f.state, &child, &[]).unwrap();
-        // Already-held history must not append another record or change bytes.
         assert!(f.import(&parents, &[]).is_err());
         let records = f.records();
         assert_eq!(records.len(), 7);
@@ -7249,8 +6107,6 @@ mod tests {
         }
         assert!(restarted.get_block(&child.hash).is_some());
         assert_eq!(restarted.current_round(), 66);
-        // The old path's durable prefix is exactly the reproducible failure:
-        // remove the two history-only parents, keep the later live child.
         let old = ConsensusEngine::new_with_keypair(
             f.manager.engine.validator_set(),
             f.keys[0].address(),
@@ -7434,8 +6290,6 @@ mod tests {
         f.import(&blocks, std::slice::from_ref(&attached)).unwrap();
         for body in bodies {
             assert_eq!(*f.latest.get(&body.hash.0).unwrap(), 65);
-            // Existing pending entries need not have their cache bit changed;
-            // signed payload identity and authentication are the invariant.
             let retained = f.pending.get(&body.hash.0).unwrap();
             assert_eq!(retained.hash, body.hash);
             retained.verify_signature().unwrap();
@@ -7483,7 +6337,7 @@ mod tests {
                     public_key: [0; 32],
                     signature: vec![0; 64],
                 };
-                body.sig_verified = true; // A remote cache flag never establishes trust.
+                body.sig_verified = true;
                 vec![body]
             } else if invalid_case == 2 {
                 vec![body]
@@ -7632,9 +6486,6 @@ mod tests {
                 }
             }
         }
-        // Model a node two rounds ahead with a genuine certificate. The live
-        // incident reached this shape via the separately-regressed local-vote
-        // defect; replay must also handle a legitimate certified advance.
         let votes = keys
             .iter()
             .take(5)
@@ -7715,7 +6566,6 @@ mod tests {
                 sent.push(block.round);
             }
             if drain == RecoveryReplayDrain::Complete {
-                // This is also the top-of-loop continuation after backpressure.
                 complete_recovery_rebroadcast(&mut retry, &mut next);
                 break;
             }
@@ -7774,8 +6624,6 @@ mod tests {
         let latest = dashmap::DashMap::new();
         retain_dag_preimages(&pending, &latest, 100, &[executed.clone(), omitted.clone()]).unwrap();
         let ran = |hash: &[u8; 32]| *hash == executed.hash.0;
-        // cursor101 replays its predecessor100: even a receipt with no longer
-        // retained canonical body must remain fully replayable from this cache.
         assert_eq!(prune_dag_preimages(&pending, &latest, 101, 0, ran), 0);
         assert_eq!(
             exact_dag_preimages(&pending, &[executed.hash, omitted.hash])
@@ -7783,8 +6631,6 @@ mod tests {
                 .len(),
             2
         );
-        // Once100 is outside the replay boundary, executed bodies may leave;
-        // omitted bodies remain until the same retention floor as their DAG.
         assert_eq!(prune_dag_preimages(&pending, &latest, 102, 0, ran), 1);
         assert!(pending.contains_key(&omitted.hash.0));
     }
@@ -7828,8 +6674,6 @@ mod tests {
             })
             .collect();
 
-        // All live peers received the soon-to-stop validator's bootstrap
-        // proposal, so all six original engines can advance one round.
         for (target, engine) in engines.iter().enumerate() {
             for (source, proposal) in bootstrap_proposals.iter().enumerate() {
                 if source != target {
@@ -7840,9 +6684,6 @@ mod tests {
             assert_eq!(engine.current_round(), 102);
         }
 
-        // Five continuously-running validators produce round 102. They cannot
-        // advance without validator 5, but their round-102 blocks all depend on
-        // the complete six-author bootstrap parent set.
         let current_proposals: Vec<_> = engines
             .iter()
             .take(5)
@@ -7862,10 +6703,6 @@ mod tests {
             assert!(!engine.advance_round(), "5/6 must remain below unanimity");
         }
 
-        // The restarted validator restores only its own durable round-101
-        // proposal. This is the exact live failure: valid peer round-102 blocks
-        // remain inadmissible because their other five parent bodies are not in
-        // the restarted process.
         let restarted = ConsensusEngine::new(validator_set, validators[5]);
         restarted.install_consensus_domain(domain).unwrap();
         restarted.install_recovery_cursor(100).unwrap();
@@ -7884,9 +6721,6 @@ mod tests {
             queue_recovery_reconnect_replay(&engines[source], validators[source], &mut queued);
             assert_eq!(queued.iter().copied().collect::<Vec<_>>(), vec![101, 102]);
 
-            // A one-slot transport proves ordering and lossless retry for the
-            // first peer. The others use two slots to prove the complete
-            // parent-first window is emitted in one drain.
             let (sender, mut receiver) = mpsc::channel(if source == 0 { 1 } else { 2 });
             if source == 0 {
                 assert_eq!(
@@ -7958,9 +6792,6 @@ mod tests {
         assert!(restarted.advance_round());
         assert_eq!(restarted.current_round(), 102);
 
-        // Once the missing parent window is present, the exact same peer
-        // current blocks become admissible. The restarted validator then makes
-        // its one legal round-102 proposal and restores six-of-six progress.
         for proposal in &current_proposals {
             restarted.receive_block(proposal).unwrap();
         }
@@ -8001,9 +6832,6 @@ mod tests {
         let funded = hash_bytes(b"funded");
         let attacker = hash_bytes(b"attacker");
 
-        // Build a root that is internally consistent for an attacker-chosen
-        // balance mutation. This is exactly what the old apply-and-compare path
-        // accepted as proof.
         let forged_state = StateDB::with_genesis(&[(funded, 1_000)]);
         let forged_account = Account::new(attacker, u64::MAX);
         forged_state.update_account(&attacker, forged_account.clone());
@@ -8016,8 +6844,6 @@ mod tests {
             new_root: forged_root,
         };
 
-        // Canonical local execution did not create the attacker account, so
-        // its independently computed root wins and the hint is rejected.
         let canonical_state = StateDB::with_genesis(&[(funded, 1_000)]);
         let canonical_root = canonical_state.get_state_root();
         assert_ne!(forged_root, canonical_root);
@@ -8049,16 +6875,11 @@ mod tests {
         let addr = hash_bytes(b"spark-validator");
         let mgr = ConsensusManager::new(addr, 500_000, 4, false, &[]);
         assert_eq!(mgr.tier, StakeTier::Spark);
-        // Spark validators cannot produce blocks
         assert!(!mgr.tier.can_produce_blocks());
     }
 
     #[test]
     fn test_consensus_manager_below_minimum_is_spark_observer() {
-        // After observer mode was added (so community nodes can join with
-        // stake=0), small-stake validators are no longer rejected. They get
-        // the lowest tier (Spark) and cannot produce blocks, but they can
-        // still observe consensus and serve inference. Verify that contract.
         let addr = hash_bytes(b"observer");
         let mgr = ConsensusManager::new(addr, 100_000, 4, false, &[]);
         assert_eq!(
@@ -8070,7 +6891,6 @@ mod tests {
             !mgr.tier.can_produce_blocks(),
             "Spark tier should not produce blocks"
         );
-        // Even stake=0 should work (community observer mode)
         let observer_addr = hash_bytes(b"zero-stake-observer");
         let observer = ConsensusManager::new(observer_addr, 0, 4, false, &[]);
         assert_eq!(observer.tier, StakeTier::Spark);

@@ -1,10 +1,3 @@
-// A small, safe Markdown renderer for model answers. It builds React elements
-// only (never HTML strings), so nothing in an answer can inject markup or
-// script. It covers what answers actually use: paragraphs, line breaks,
-// headings, lists, quotes, fenced code, inline code, bold and italic. Links are
-// shown as their text followed by the address, never as clickable links: an
-// answer must not be able to send someone to an arbitrary site from the app.
-
 import { Check, Copy } from "lucide-react";
 import { Fragment, useState, type ReactNode } from "react";
 
@@ -32,13 +25,12 @@ export function parseBlocks(source: string): Block[] {
       const body: string[] = [];
       i++;
       while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) { body.push(lines[i]); i++; }
-      i++; // the closing fence, if there is one
+      i++;
       blocks.push({ kind: "code", lang: fence[1] || "", text: body.join("\n") });
       continue;
     }
     const h = line.match(H);
     if (h) { blocks.push({ kind: "h", level: h[1].length, text: h[2] }); i++; continue; }
-    // gather the run of non-blank lines up to the next blank line or fence
     const run: string[] = [];
     while (i < lines.length && lines[i].trim() && !/^\s*```/.test(lines[i]) && !H.test(lines[i])) { run.push(lines[i]); i++; }
     if (run.every((l) => UL.test(l))) blocks.push({ kind: "ul", items: run.map((l) => l.match(UL)![1]) });
@@ -49,15 +41,12 @@ export function parseBlocks(source: string): Block[] {
   return blocks;
 }
 
-// Inline marks: `code`, **bold**, __bold__, *italic* and [text](address). Underscore italics are left alone:
-// identifiers like snake_case are far commoner in answers (and lookbehind would break older WebKit).
 const INLINE = /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(__[^_\n]+__)|(\*[^*\s][^*\n]*\*)|(\[[^\]\n]+\]\([^)\s]+\))/g;
 
 export function renderInline(text: string, key = ""): ReactNode[] {
   const out: ReactNode[] = [];
   let last = 0;
   let m: RegExpExecArray | null;
-  // A fresh expression per call: bold and italic recurse, and must not move the outer scan.
   const re = new RegExp(INLINE.source, "g");
   while ((m = re.exec(text))) {
     if (m.index > last) out.push(text.slice(last, m.index));

@@ -1,17 +1,3 @@
-//! ARC Chain - Multi-Node Live Benchmark
-//!
-//! Modes:
-//!   live     - Live dashboard + WebSocket coordinator
-//!   worker   - Benchmark worker (standalone HTTP or reporting to coordinator)
-//!   coord    - One-shot aggregation of worker nodes
-//!   local    - Run benchmark locally, output JSON
-//!
-//! Usage:
-//!   arc-bench-node live [--port 8080] [--listen 127.0.0.1]
-//!   arc-bench-node worker [--port 9944] [--listen 127.0.0.1] [--coord http://coordinator:8080]
-//!   arc-bench-node coord --nodes http://node1:9944,http://node2:9944 [--n 1000000]
-//!   arc-bench-node local [--n 1000000]
-
 use arc_crypto::*;
 use arc_gpu::{cpu_batch_commit, gpu_batch_commit, probe_gpu};
 use arc_state::StateDB;
@@ -36,10 +22,6 @@ use std::{
 use tokio::sync::RwLock;
 
 const PUBLIC_BIND_OPT_IN: &str = "--allow-public-benchmark-bind";
-
-// ─────────────────────────────────────────────────────────────────
-//  Types
-// ─────────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct NodeResult {
@@ -86,10 +68,6 @@ fn default_n() -> usize {
     1_000_000
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  Live coordinator state
-// ─────────────────────────────────────────────────────────────────
-
 struct TrackedNode {
     result: NodeResult,
     last_seen: Instant,
@@ -135,10 +113,6 @@ impl LiveState {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  Benchmark logic
-// ─────────────────────────────────────────────────────────────────
-
 fn run_benchmark(n: usize, node_id: Option<String>) -> NodeResult {
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().to_string())
@@ -149,7 +123,6 @@ fn run_benchmark(n: usize, node_id: Option<String>) -> NodeResult {
 
     println!("  Running benchmark (n={}) on {}...", n, hostname);
 
-    // 1. CPU parallel BLAKE3
     let data: Vec<Vec<u8>> = (0..n)
         .map(|i| {
             let mut buf = vec![0u8; 256];
@@ -171,7 +144,6 @@ fn run_benchmark(n: usize, node_id: Option<String>) -> NodeResult {
     let cpu_hash_tps = n as f64 / start.elapsed().as_secs_f64();
     println!("    CPU BLAKE3:     {:>12.0} TPS", cpu_hash_tps);
 
-    // 2. GPU BLAKE3
     let gpu_hash_tps = if gpu.available && n >= 5000 {
         let _ = gpu_batch_commit(&refs[..5000]);
         let start = Instant::now();
@@ -190,7 +162,6 @@ fn run_benchmark(n: usize, node_id: Option<String>) -> NodeResult {
         0.0
     };
 
-    // 3. State execution
     let num_agents = 10_000u32;
     let agent_accounts: Vec<(Hash256, u64)> = (0..num_agents)
         .map(|i| (hash_bytes(&i.to_le_bytes()), u64::MAX / 2))
@@ -217,7 +188,6 @@ fn run_benchmark(n: usize, node_id: Option<String>) -> NodeResult {
         state_exec_tps, success, total
     );
 
-    // 4. Compact pipeline
     let start = Instant::now();
 
     let compact_txs: Vec<[u8; COMPACT_TX_SIZE]> = transactions
@@ -258,10 +228,6 @@ fn run_benchmark(n: usize, node_id: Option<String>) -> NodeResult {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  Standalone worker handlers (no shared state)
-// ─────────────────────────────────────────────────────────────────
-
 async fn handle_health() -> &'static str {
     "ok"
 }
@@ -283,10 +249,6 @@ async fn handle_benchmark(Query(params): Query<BenchParams>) -> Json<NodeResult>
         .unwrap();
     Json(result)
 }
-
-// ─────────────────────────────────────────────────────────────────
-//  Live coordinator handlers (with shared state)
-// ─────────────────────────────────────────────────────────────────
 
 async fn live_dashboard(State(_): State<Arc<LiveState>>) -> Html<&'static str> {
     Html(include_str!("dashboard.html"))
@@ -326,14 +288,9 @@ async fn live_api_nodes(State(state): State<Arc<LiveState>>) -> Json<LiveSnapsho
     Json(state.snapshot().await)
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  Live mode - coordinator + dashboard + self-benchmark
-// ─────────────────────────────────────────────────────────────────
-
 async fn run_live(addr: SocketAddr) -> std::io::Result<()> {
     let state = Arc::new(LiveState::new());
 
-    // Background: self-benchmark
     let self_state = state.clone();
     tokio::spawn(async move {
         let node_id = uuid::Uuid::new_v4().to_string();
@@ -353,7 +310,6 @@ async fn run_live(addr: SocketAddr) -> std::io::Result<()> {
         }
     });
 
-    // Background: prune stale nodes
     let prune_state = state.clone();
     tokio::spawn(async move {
         loop {
@@ -394,17 +350,12 @@ async fn run_live(addr: SocketAddr) -> std::io::Result<()> {
     axum::serve(listener, app).await
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  Worker mode - standalone HTTP or reporting to coordinator
-// ─────────────────────────────────────────────────────────────────
-
 async fn run_worker(addr: SocketAddr, coord_url: Option<String>) -> std::io::Result<()> {
     if let Some(coord) = coord_url {
         run_worker_reporting(&coord).await;
         return Ok(());
     }
 
-    // Standalone HTTP server
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/info", get(handle_info))
@@ -468,10 +419,6 @@ async fn run_worker_reporting(coord_url: &str) {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
-
-// ─────────────────────────────────────────────────────────────────
-//  Coordinator mode - one-shot aggregation (existing)
-// ─────────────────────────────────────────────────────────────────
 
 async fn run_coordinator(node_urls: Vec<String>, n: usize) {
     println!("╔══════════════════════════════════════════════════════════════╗");
@@ -603,10 +550,6 @@ async fn run_coordinator(node_urls: Vec<String>, n: usize) {
     println!("\n  Results: benchmark-results.json");
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  Main
-// ─────────────────────────────────────────────────────────────────
-
 fn get_arg(args: &[String], flag: &str) -> Option<String> {
     args.iter()
         .position(|a| a == flag)
@@ -633,10 +576,6 @@ fn unique_arg<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, Str
     Ok(Some(value))
 }
 
-/// Parse a benchmark server bind address without DNS or shell interpretation.
-///
-/// Listening is loopback-only by default. Exposing a benchmark endpoint on any
-/// other interface is allowed only after an explicit command-line opt-in.
 fn parse_bind_addr(args: &[String], default_port: u16) -> Result<SocketAddr, String> {
     let ip = unique_arg(args, "--listen")?
         .unwrap_or("127.0.0.1")

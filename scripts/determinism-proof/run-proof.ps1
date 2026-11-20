@@ -1,22 +1,3 @@
-<#
-.SYNOPSIS
-Run ARC's cross-platform determinism proof on Windows and print the combined
-SHA-256 of its transcript.
-
-.DESCRIPTION
-The pinned Llama-2-7B-Chat Q4_K_M weights, the fixed prompts in prompts.json
-and greedy decoding produce a byte-identical transcript on every CPU platform
-the CI proof covers. Compare the printed hash with the published value in
-docs/determinism-proof.md (also in expected-sha256.txt). CPU only.
-
-Needs rustup with the MSVC build tools (the repository pins its toolchain),
-curl.exe (built into Windows 10 1803 and later), about 5 GB of disk for the
-model and about 8 GB of free memory; less memory works, slowly, through the
-page file. docs/determinism-proof.md lists measured CI run times.
-
-.EXAMPLE
-powershell -ExecutionPolicy Bypass -File scripts\determinism-proof\run-proof.ps1 -Kernel scalar
-#>
 [CmdletBinding()]
 param(
     [ValidateSet('scalar', 'simd')]

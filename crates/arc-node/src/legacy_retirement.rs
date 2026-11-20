@@ -1,12 +1,3 @@
-//! Offline, fail-closed retirement evidence for ARC v0.7 community nodes.
-//!
-//! This module is deliberately outside normal node startup: it opens no ARC
-//! network connection, starts no listener, never signals a process, and never
-//! opens legacy data writable. The only mutations are create-only intent and
-//! receipt files plus the persistent create-only sibling namespace-lock file
-//! that excludes v0.8 startup while the receipt crosses its durability barrier;
-//! all are outside the legacy tree.
-
 use crate::recovery_descriptor;
 use anyhow::{Context, Result, bail, ensure};
 use clap::{ArgGroup, Subcommand};
@@ -71,9 +62,6 @@ const FLEET: [(&str, &str); 6] = [
 ];
 
 #[derive(Clone, Debug, Subcommand)]
-// This command is parsed once at process startup. Keeping each signed artifact as a
-// named clap field makes accidental cross-binding harder to review than boxing an
-// arbitrary subset solely to reduce the enum's stack size.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum LegacyRetirementCommand {
     /// Seal an exact running or already-offline v0.7 stake-zero installation.
@@ -576,13 +564,6 @@ fn stable_read(path: &Path, label: &str, maximum: u64) -> Result<(Vec<u8>, FileR
     ))
 }
 
-/// Emit the byte-for-byte form used by the frozen Python oracle:
-/// `json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"`.
-///
-/// In particular, Python's default `ensure_ascii=True` is consensus-relevant
-/// here. `serde_json::to_vec` emits UTF-8 for non-ASCII strings, which would
-/// otherwise give the Rust verifier a different digest for an entirely valid
-/// Unicode home/data path.
 fn canonical_bytes(input: &Value) -> Result<Vec<u8>> {
     fn string(output: &mut Vec<u8>, value: &str) {
         output.push(b'"');
@@ -2835,9 +2816,6 @@ fn system_matching_processes(
             basic.pbi_uid == legacy_owner_uid,
             "macOS UID-scoped process enumeration returned another owner"
         );
-        // Zombie and in-exit processes can no longer execute legacy work, and
-        // KERN_PROCARGS2 may block indefinitely while their kernel teardown is
-        // stuck. Tree/listener stability still catches any pending effects.
         if basic.pbi_status == 5 || basic.pbi_flags & 4 != 0 {
             continue;
         }
@@ -2864,9 +2842,6 @@ fn system_matching_processes(
         let candidate_metadata = match std::fs::symlink_metadata(selected_path) {
             Ok(metadata) => metadata,
             Err(error) => {
-                // A process that vanished between the UID-scoped enumeration
-                // and its executable open is harmless churn. Any persistent
-                // same-owner inspection failure is fail-closed.
                 let mut info = std::mem::MaybeUninit::<MacProcBsdInfo>::zeroed();
                 let received = unsafe {
                     proc_pidinfo(
@@ -2890,12 +2865,7 @@ fn system_matching_processes(
         };
         let semantic_match = match mac_process_argv(pid) {
             Ok(argv) => parse_stake_zero_argv(&argv, Path::new(data_dir)).is_ok(),
-            Err(error) if error.downcast_ref::<std::str::Utf8Error>().is_some() => {
-                // Unix argv is byte-valued. Invalid UTF-8 is a semantic
-                // nonmatch; a same-size executable is still hashed below so
-                // this cannot hide a renamed byte-identical legacy binary.
-                false
-            }
+            Err(error) if error.downcast_ref::<std::str::Utf8Error>().is_some() => false,
             Err(error) => return Err(error).context("cannot inspect same-owner macOS argv"),
         };
         let hash_match = if candidate_metadata.len() == executable_size {
@@ -2983,8 +2953,6 @@ where
     let mut matches = Vec::new();
     for pid in pids {
         let root = PathBuf::from(format!("/proc/{pid}"));
-        // Ownership is checked before exe/cmdline so an unprivileged verifier
-        // never attempts protected reads from unrelated users' /proc entries.
         let owner = match std::fs::metadata(&root) {
             Ok(metadata) => metadata.uid(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -3035,8 +3003,6 @@ where
                 let argv = argv.into_iter().map(str::to_owned).collect::<Vec<_>>();
                 parse_stake_zero_argv(&argv, Path::new(data_dir)).is_ok()
             }
-            // Byte-valued argv on a differently-hashed process is not an
-            // error. Same-sized executables remain subject to SHA comparison.
             Err(_) => false,
         };
         let hash_match = if candidate_metadata.len() == executable_size {
@@ -4064,10 +4030,6 @@ fn create_intent_with_host<H: RetirementHost>(
         .map(|value| value.as_str().expect("validated argv string").to_owned())
         .collect::<Vec<_>>();
 
-    // The preserved data-tree owner is the retirement namespace owner. This
-    // remains correct when a Linux installer itself runs as root on behalf of
-    // SUDO_USER/a managed system user, and prevents either missing that user's
-    // replacement process or scanning unrelated users' protected /proc rows.
     let root_anchor = directory_record(&request.data_dir, "legacy data directory")?;
     let legacy_owner_uid = u32::try_from(
         root_anchor["uid"]
@@ -4939,8 +4901,6 @@ fn revalidate_intent_assets<H: RetirementHost>(intent: &Value, host: &H) -> Resu
     Ok(cutoff.to_owned())
 }
 
-// The arguments deliberately mirror the signed CLI boundary one-for-one. Grouping
-// independent paths and digests would make a security-sensitive binding less clear.
 #[allow(clippy::too_many_arguments)]
 fn finalize_with_host<H: RetirementHost>(
     intent_path: &Path,
@@ -5355,7 +5315,6 @@ mod tests {
 
     const TEST_SOURCE_HEIGHT: u64 = 141_062;
     const TEST_TRANSITION_HEIGHT: u64 = TEST_SOURCE_HEIGHT + 1;
-    // A taller noncanonical fork raises C/F without becoming canonical H.
     const TEST_OBSERVED_CUTOFF_HEIGHT: u64 = 141_100;
     const TEST_REOPENING_FLOOR_HEIGHT: u64 = TEST_OBSERVED_CUTOFF_HEIGHT + CONTINUITY_SAFETY_MARGIN;
     use clap::Parser as _;
@@ -6333,8 +6292,6 @@ mod tests {
         set_mode(&selected, 0o500);
         let expected =
             stable_hash_file(&selected, "selected test executable", MAX_EXECUTABLE_BYTES).unwrap();
-        // The live path is /bin/sleep while the bound path is a distinct copy:
-        // path-prefiltering cannot find it, but exact bytes/SHA must.
         let mut child = std::process::Command::new("/bin/sleep")
             .arg("30")
             .spawn()

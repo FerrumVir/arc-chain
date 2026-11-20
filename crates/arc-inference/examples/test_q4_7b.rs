@@ -24,7 +24,6 @@ fn main() {
     model.enable_q4();
     println!("Q4 conversion in {:.1}s", q4_start.elapsed().as_secs_f64());
 
-    // Q4 memory estimate
     let q4_mem: usize = model
         .q4_layers
         .as_ref()
@@ -57,7 +56,7 @@ fn main() {
         let eos = vec![2u32, 0];
         let (generated, hash) = model.generate(&tokens, max_tok, &eos);
         let decoded = model.decode(&generated);
-        println!("\nPrompt: {}", &prompt[7..prompt.len() - 8]); // strip [INST]
+        println!("\nPrompt: {}", &prompt[7..prompt.len() - 8]);
         println!("Output: {}", decoded.trim());
         println!(
             "Hash: 0x{} ({} tokens)",
@@ -66,7 +65,6 @@ fn main() {
         );
     }
 
-    // Determinism check
     println!("\n=== Determinism ===");
     let tokens = model.encode("[INST] What is 2+2? [/INST]");
     let eos = vec![2u32, 0];

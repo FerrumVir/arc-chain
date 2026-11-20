@@ -1,32 +1,5 @@
 name: Multi-sequence bench
 
-# CI-runner measurement of aggregate decode throughput when several users'
-# sequences share every weight read (examples/multi_seq_bench.rs), on the live
-# network model: Llama-2-7B-Chat Q4_K_M, pinned by SHA-256 exactly as #182's
-# speculative bench pins it, loaded as the canonical legacy INT8 profile. For
-# each count of concurrent sequences in SEQUENCES, each sequence with its own
-# prompt and K/V cache, every decode step is one forward_rows_multi call
-# carrying the next row of every sequence (one forward_one_token call for a
-# single sequence), with the scalar kernel and every multi-row kernel the
-# runner's CPU has. Every sequence generates as the worker's try_generate
-# does, selecting each token with the repetition penalty over its own history.
-#
-# Every run is also an exactness check on the real model: every sequence must
-# return the same tokens and output hash, with every kernel and neighbour
-# count, as its own try_generate, or the driver exits non-zero. Timings are CI-runner
-# measurements on shared 4-vCPU hosted runners, not production figures.
-# Hosted x86-64 hosts vary from run to run (AMD EPYC 7763 with AVX2 only, EPYC
-# 9V74 with AVX-512 VNNI, EPYC 9V45 and Intel Xeon Platinum 8573C with both
-# VNNI kinds), so x86-64 runs on a Linux and a Windows leg, and every leg
-# records its CPU.
-#
-# Cost control: a leg downloads about 4 GB and an x86-64 leg takes up to an
-# hour, so it never runs on a push. It runs when started by hand
-# (workflow_dispatch, once this file is on the default branch), or once at the
-# moment the `multi-seq-bench` label is added to a pull request that changes
-# the multi-sequence path or this bench. One label event is one run;
-# measuring again means removing and re-adding the label. The model is never
-# uploaded or cached.
 on:
   pull_request:
     types: [labeled]
@@ -42,14 +15,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # The same bytes as arc-node's TESTNET_MODEL_SHA256 and #182's bench.
   MODEL_URL: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf
   MODEL_SHA256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa
   MODEL_BYTES: "4081004224"
   MODEL_FILE: .multi-seq-bench/llama-2-7b-chat.Q4_K_M.gguf
-  # Concurrent sequences to measure. Bench run 38056837714 measured 1 to 32
-  # before small batches ran on the one-row kernels; run 38059431216
-  # re-measured 1 to 4 after it.
   SEQUENCES: "1,2,3,4,8,16,32"
 
 jobs:
@@ -58,8 +27,6 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.label.name == 'multi-seq-bench'
-    # Per leg, so a skipped run (another label added) never takes the slot of
-    # a run that is measuring.
     concurrency:
       group: multi-seq-bench-${{ github.event.pull_request.number || github.ref }}-${{ matrix.leg }}
       cancel-in-progress: true
@@ -78,7 +45,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
@@ -121,8 +88,7 @@ jobs:
           fi
           echo "verified $MODEL_FILE: sha256 $actual, $size bytes"
 
-      # Keep this dated toolchain aligned with rust-toolchain.toml.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-03-16
 
@@ -175,7 +141,7 @@ jobs:
 
       - name: Upload this leg's results (never the model)
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: multi-seq-bench-${{ matrix.leg }}
           path: ${{ runner.temp }}/multi-seq-bench/

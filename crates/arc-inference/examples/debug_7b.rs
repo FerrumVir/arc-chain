@@ -5,7 +5,6 @@ fn main() {
     let model = load_cached_model("/tmp/llama-2-7b-chat.Q4_K_M.gguf").unwrap();
     let cfg = &model.config;
 
-    // Process "[INST] What is 2+2? [/INST]" token by token
     let prompt_text = "[INST] What is 2+2? [/INST]";
     let tokens = model.encode(prompt_text);
     println!(
@@ -17,16 +16,13 @@ fn main() {
 
     let mut cache = KVCache::new(cfg.n_layers);
 
-    // BOS
     let _ = model.forward_one_token(1, &mut cache);
 
-    // Process all prompt tokens
     let mut last_logits = vec![0i64; cfg.vocab_size];
     for &tok in &tokens {
         last_logits = model.forward_one_token(tok, &mut cache);
     }
 
-    // Show top 10 predictions after the full prompt
     let mut indexed: Vec<(usize, i64)> = last_logits
         .iter()
         .enumerate()
@@ -48,10 +44,7 @@ fn main() {
         );
     }
 
-    // Check where "4" is
-    // Token for "4" in Llama vocab
     for candidate in [29946u32, 29871, 29945, 29900, 29896] {
-        // likely token IDs for "4", " ", "5", "0", "1"
         let word = model
             .vocab
             .get(candidate as usize)

@@ -1,11 +1,3 @@
-"""Tests for arc_conformance.modern_reference.
-
-Run from scripts/:  python3 -m unittest arc_conformance.tests.test_modern_reference
-Spec: docs/protocol/integer-profile-hf-llama-dyadic-v1.md. Everything here is
-synthetic (a 64-wide, 4-layer BF16 model written by
-scripts/arc_modern/make_tiny_model.py) and runs in seconds.
-"""
-
 from __future__ import annotations
 
 import contextlib
@@ -25,9 +17,6 @@ from arc_conformance import modern_reference as mr
 
 SCRIPTS = Path(__file__).resolve().parents[2]
 
-# Regression pin: make_tiny_model.py + this preparer must give these exact bytes on every OS.
-# (Re-pin deliberately if the tiny-model generator changes; CI separately requires the Rust
-# converter to produce the same package.)
 TINY_PACKAGE_SHA256 = "642f58445725b7cd19c6619655d86aa4553feeefcffa95c9e3ed832080f5e851"
 
 
@@ -90,7 +79,7 @@ class Tables(unittest.TestCase):
         self.assertEqual(mr.exp_q16(-16 * 65536), 0)
         self.assertEqual(mr.exp_q16(-(1 << 40)), 0)
         self.assertEqual(mr.exp_q16(-65536), 24109)
-        x = -65536 + 128  # o = 15*2^16 + 128: i = 3840, f = 128
+        x = -65536 + 128
         self.assertEqual(mr.exp_q16(x), t[3840] + (((t[3841] - t[3840]) * 128) >> 8))
         self.assertEqual(mr.exp_q16(-1), t[4095] + (((t[4096] - t[4095]) * 255) >> 8))
         with self.assertRaises(mr.DomainError):
@@ -104,12 +93,12 @@ class Bf16(unittest.TestCase):
         self.assertEqual(mr.bf16_parts(0x3F80), (0, 128, -7))
         self.assertEqual(mr.bf16_value(0x3F80), 1)
         self.assertEqual(mr.bf16_value(0xBF80), -1)
-        self.assertEqual(mr.bf16_value(0x0001), Fraction(1, 2 ** 133))  # smallest subnormal
-        self.assertEqual(mr.bf16_parts(0x007F), (0, 127, -133))  # largest subnormal
-        self.assertEqual(mr.bf16_value(0x0080), Fraction(1, 2 ** 126))  # smallest normal
-        self.assertEqual(mr.bf16_parts(0x8000), (1, 0, -133))  # negative zero
+        self.assertEqual(mr.bf16_value(0x0001), Fraction(1, 2 ** 133))
+        self.assertEqual(mr.bf16_parts(0x007F), (0, 127, -133))
+        self.assertEqual(mr.bf16_value(0x0080), Fraction(1, 2 ** 126))
+        self.assertEqual(mr.bf16_parts(0x8000), (1, 0, -133))
         self.assertEqual(mr.bf16_value(0x8000), 0)
-        self.assertEqual(mr.bf16_value(0x7F7F), 255 * 2 ** 120)  # largest finite
+        self.assertEqual(mr.bf16_value(0x7F7F), 255 * 2 ** 120)
 
     def test_infinity_and_nan_are_refused(self):
         for bits in (0x7F80, 0xFF80, 0x7FC0, 0x7F81, 0xFFFF):
@@ -132,25 +121,19 @@ class Quantization(unittest.TestCase):
         self.assertEqual((vq[0].tolist(), int(vmu[0]), int(vk[0])), (q, mu, k))
 
     def test_hand_checked_rows(self):
-        # [1, -1/2, 1/4, 0]: 127*(-1/2) = -63.5 rounds away from zero to -64; 31.75 -> 32.
-        # t = 30 (128*2^30 >= 127*2^30), mu = rha(2^37/127) = 1082196484, k = 30 + 7.
         self.check([0x3F80, 0xBF00, 0x3E80, 0x0000], [127, -64, 32, 0], 1082196484, 37)
-        # Maximum tied between 3 and -3; 127/3 = 42.33 -> 42; mu = rha(192*2^30/127), k = 30 + 6.
         self.check([0x4040, 0xC040, 0x3F80], [127, -127, 42], 1623294726, 36)
-        # Positive half-way tie: 127 * 1/2 = 63.5 -> 64.
         self.check([0x3F80, 0x3F00], [127, 64], 1082196484, 37)
 
     def test_zero_rows_and_tiny_elements(self):
         self.check([0x8000, 0x0000, 0x8000], [0, 0, 0], 0, 16)
-        # 2^-70 is 70 binades below the maximum (d > 60): q = 0. Subnormal below 1.0: q = 0.
         self.check([0x3F80, 0x1C80, 0x0001], [127, 0, 0], 1082196484, 37)
 
     def test_out_of_range_scales_are_refused(self):
-        with self.assertRaises(mr.PreparationError):  # only subnormals: k = 37 + 133 > 62
+        with self.assertRaises(mr.PreparationError):
             mr.quantize_row_exact([0x0001, 0x0000])
         with self.assertRaises(mr.PreparationError):
             mr.quantize_rows(np.array([[0x0001, 0x0000]], dtype=np.uint16))
-        # 2^22: e_A = 15, t = 30, k = 15 < 16 refused; 2^21 gives k = 16, accepted.
         with self.assertRaises(mr.PreparationError):
             mr.quantize_rows(np.array([[0x4A80, 0x3F80]], dtype=np.uint16))
         self.assertEqual(int(mr.quantize_rows(np.array([[0x4A00, 0x3F80]], dtype=np.uint16))[2][0]), 16)
@@ -160,7 +143,7 @@ class Quantization(unittest.TestCase):
         rows = []
         for _ in range(300):
             width = rng.randrange(1, 24)
-            top = rng.randrange(95, 155)  # around the accepted k range, so some rows are refused
+            top = rng.randrange(95, 155)
             spread = rng.choice([2, 8, 30, 90])
             row = []
             for _ in range(width):
@@ -168,7 +151,7 @@ class Quantization(unittest.TestCase):
                 if r < 0.08:
                     row.append(rng.choice([0x0000, 0x8000]))
                 elif r < 0.14:
-                    row.append(rng.randrange(1, 0x80) | (rng.randrange(2) << 15))  # subnormal
+                    row.append(rng.randrange(1, 0x80) | (rng.randrange(2) << 15))
                 else:
                     e = max(1, top - rng.randrange(spread))
                     row.append((rng.randrange(2) << 15) | (e << 7) | rng.randrange(128))
@@ -196,7 +179,7 @@ class Quantization(unittest.TestCase):
                 exact = 127 * mr.bf16_value(b) / amax
                 self.assertLessEqual(abs(exact - qv), Fraction(1, 2))
                 if abs(exact - qv) == Fraction(1, 2):
-                    self.assertGreater(abs(qv), abs(exact))  # ties away from zero
+                    self.assertGreater(abs(qv), abs(exact))
         self.assertGreater(accepted, 200)
         self.assertGreater(refused, 0)
 
@@ -210,7 +193,7 @@ class NormsAndConfig(unittest.TestCase):
             v = mr.bf16_value(bits) * 65536
             self.assertEqual(gain, mr.rha_ratio(v.numerator, v.denominator))
         with self.assertRaises(mr.PreparationError):
-            mr.norm_gain(0x7F7F)  # 255 * 2^136 does not fit i64
+            mr.norm_gain(0x7F7F)
 
     def test_rms_eps(self):
         self.assertEqual(mr.rms_eps_q32(1e-06), 4295)
@@ -327,12 +310,12 @@ class ExactFastArithmetic(unittest.TestCase):
         mu[0] = (1 << 31) - 1
         ks = np.arange(16, 63)
         small = a.copy()
-        small[:64] >>= 30  # keep the k < 32 columns in range for the int64 path
+        small[:64] >>= 30
         y = mr._mul_u31_shr(small, mu, ks)
         for i in range(small.shape[0]):
             for j in range(47):
                 self.assertEqual(int(y[i, j]), (int(small[i, j]) * int(mu[j])) >> int(ks[j]))
-        big = mr._mul_u31_shr(a[:, 16:], mu[16:], ks[16:])  # k >= 32: never needs Python
+        big = mr._mul_u31_shr(a[:, 16:], mu[16:], ks[16:])
         for i in range(a.shape[0]):
             for j in range(big.shape[1]):
                 self.assertEqual(int(big[i, j]), (int(a[i, 16 + j]) * int(mu[16 + j])) >> int(ks[16 + j]))
@@ -356,7 +339,6 @@ class ExactFastArithmetic(unittest.TestCase):
 
     def test_matmul_exact_with_and_without_limbs(self):
         rng = np.random.default_rng(9)
-        # Plain float path; limbs on the left operand (weights); limbs on both operands.
         for amag, bmag, k in ((1 << 20, 127, 64), (1 << 44, 127, 64), (1 << 46, 127, 300), (1 << 30, 1 << 25, 16)):
             a = rng.integers(-amag, amag, size=(5, k))
             b = rng.integers(-bmag, bmag + 1, size=(k, 7))
@@ -373,14 +355,13 @@ class ExactFastArithmetic(unittest.TestCase):
 class Selection(unittest.TestCase):
     def test_argmax_and_rp64(self):
         logits = [10, 12, -6, 12]
-        self.assertEqual(mr.select_next(logits, [], "argmax"), 1)  # lowest id on ties
-        self.assertEqual(mr.select_next(logits, [1], "rp64-argmax"), 3)  # 12 -> 10
-        self.assertEqual(mr.select_next(logits, [1, 3], "rp64-argmax"), 0)  # both 10: lowest id
-        self.assertEqual(mr.select_next([10, 11, -6, 0], [1, 1], "rp64-argmax"), 0)  # 11 -> 9 -> 7
-        self.assertEqual(mr.select_next([-6, -7], [0], "rp64-argmax"), 0)  # -6 -> -7 (tdiv(-36, 5))
-        self.assertEqual(mr.select_next([-6, -7], [0, 0], "rp64-argmax"), 1)  # -7 -> -8
-        self.assertEqual(mr.select_next([0, -1], [0], "rp64-argmax"), 0)  # 0 stays 0
-        # Only the 64 most recent generated tokens count: token 0 is 65th newest, then 64th.
+        self.assertEqual(mr.select_next(logits, [], "argmax"), 1)
+        self.assertEqual(mr.select_next(logits, [1], "rp64-argmax"), 3)
+        self.assertEqual(mr.select_next(logits, [1, 3], "rp64-argmax"), 0)
+        self.assertEqual(mr.select_next([10, 11, -6, 0], [1, 1], "rp64-argmax"), 0)
+        self.assertEqual(mr.select_next([-6, -7], [0], "rp64-argmax"), 0)
+        self.assertEqual(mr.select_next([-6, -7], [0, 0], "rp64-argmax"), 1)
+        self.assertEqual(mr.select_next([0, -1], [0], "rp64-argmax"), 0)
         self.assertEqual(mr.select_next([12, 11, 11], [0] + [2] * 64, "rp64-argmax"), 0)
         self.assertEqual(mr.select_next([12, 11, 11], [0] + [2] * 63, "rp64-argmax"), 1)
         with self.assertRaises(mr.DomainError):
@@ -432,11 +413,11 @@ class Engines(unittest.TestCase):
     def test_operators_on_large_values_match_python(self):
         engine = mr.FastEngine(self.pkg)
         rng = np.random.default_rng(17)
-        x = rng.integers(-(1 << 44), 1 << 44, size=(3, 64))  # mean square stays below 2^92
+        x = rng.integers(-(1 << 44), 1 << 44, size=(3, 64))
         g = rng.integers(-(1 << 30), 1 << 30, size=64)
         want = [mr.rmsnorm_int(r, g.tolist(), 4295) for r in x.tolist()]
         self.assertEqual(engine._rmsnorm_fast(x, g, "t").tolist(), want)
-        gate = rng.integers(-(1 << 40), 1 << 40, size=(2, 50))  # |g*sigma*u| >> 32 stays below 2^62
+        gate = rng.integers(-(1 << 40), 1 << 40, size=(2, 50))
         gate[0, :6] = [0, -1, 1, -(16 << 16), 16 << 16, 5]
         up = rng.integers(-(1 << 35), 1 << 35, size=(2, 50))
         self.assertEqual(engine._silu(gate, up, "t").tolist(),

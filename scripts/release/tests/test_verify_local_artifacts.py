@@ -1,5 +1,3 @@
-"""Tests for the build-local-artifacts verifier. Synthetic OUTPUT_DIRs, nothing built."""
-
 import hashlib
 import importlib.util
 import io
@@ -37,7 +35,6 @@ def write(path, data):
 
 
 def app_tarball(path, stapled=False, extra=None):
-    """A .app archived as the script does (tar -czf of the bundle directory)."""
     work = tempfile.mkdtemp()
     try:
         app = os.path.join(work, "ARC.app", "Contents")
@@ -146,7 +143,7 @@ class Verify(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(report["status"], "FAIL")
         self.assertFalse(report["checks"][check]["pass"])
-        self.assertEqual(snapshot(self.out), before)  # a failing verification writes nothing either
+        self.assertEqual(snapshot(self.out), before)
         return report["checks"][check]
 
     def test_a_complete_build_passes_and_is_left_untouched(self):
@@ -186,8 +183,6 @@ class Verify(unittest.TestCase):
         self.assertEqual(self.failing("checksums")["problem"], "SHA256SUMS missing")
 
     def test_a_desktop_artifact_that_was_never_collected_fails(self):
-        # The script copies desktop artifacts with `cp ... || true`: a failed copy
-        # would leave them out of collected/ and out of SHA256SUMS silently.
         os.remove(os.path.join(self.out, "collected", "UNSIGNED-ARC_0.8.0_aarch64.dmg"))
         write_sums(self.out)
         self.assertEqual(self.failing("checksums")["desktop_not_collected"], ["UNSIGNED-ARC_0.8.0_aarch64.dmg"])
@@ -257,7 +252,7 @@ class Verify(unittest.TestCase):
         self.assertIn("desktop-unsigned/UNSIGNED-ARC.app.tar.gz:ARC.app/Contents/CodeResources", tickets)
 
     def test_the_ad_hoc_code_signature_is_not_a_signing_claim(self):
-        rc, report = run(self.out)  # the fixture's app carries Contents/_CodeSignature/CodeResources
+        rc, report = run(self.out)
         self.assertEqual(rc, 0)
         self.assertEqual(report["checks"]["unsigned"]["stapled_tickets"], [])
 

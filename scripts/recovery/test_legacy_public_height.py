@@ -94,8 +94,6 @@ class ResponseHandler(BaseHTTPRequestHandler):
 class LegacyPublicHeightTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        # macOS spells this location through the /var -> /private/var symlink;
-        # production inputs intentionally reject symlinked path ancestry.
         self.root = Path(self.temporary.name).resolve()
         self.freeze_validator = mock.patch.object(
             height, "validate_pinned_freeze_plan", return_value=object()

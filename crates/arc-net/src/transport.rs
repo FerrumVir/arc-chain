@@ -1,9 +1,3 @@
-//! QUIC transport - real peer-to-peer networking for ARC Chain.
-//!
-//! Provides a QUIC server (listener) and client (dialer) unified behind
-//! `run_transport()`. Communicates with the consensus layer via tokio mpsc
-//! channels.
-
 use crate::protocol::*;
 use arc_consensus::DagBlock;
 use arc_crypto::{Hash256, KeyPair, Signature as CryptoSignature, hash_bytes};
@@ -19,36 +13,15 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-/// Maximum number of simultaneous peer connections.
-/// At scale (millions of nodes), each node only needs O(sqrt(N)) peers
-/// for full reachability - gossip propagation handles the rest.
-/// 256 peers gives 2-hop reachability for networks up to ~65K nodes,
-/// and 3-hop for networks up to ~16M nodes.
 const MAX_PEERS: u32 = 256;
 
-/// Target number of outbound peers. We maintain this many active outbound
-/// connections and accept inbound connections up to MAX_PEERS.
-//
-// Kept rather than deleted: this is the documented outbound-peer target for the
-// transport, but nothing reads it yet — the dial paths (bootstrap, persisted,
-// PEX, reconnect) are only bounded by MAX_PEERS. Deleting the constant would
-// erase the record of that gap, so it is allowed to stay unused until the
-// outbound-target logic is actually wired up.
 #[allow(dead_code)]
 const TARGET_OUTBOUND: u32 = 16;
 
-/// Per-peer message rate limit (messages per second).
 const PEER_MSG_RATE_LIMIT: u32 = 500;
-/// Per-peer payload-byte budget per second. Four maximum-size block/snapshot
-/// frames fit in one window; a fifth is rejected from its header before body
-/// allocation.
 const PEER_BYTE_RATE_LIMIT: u64 = 64 * 1024 * 1024;
-/// Rate limit window in seconds.
 const RATE_LIMIT_WINDOW_SECS: u64 = 1;
 
-/// Explicit, temporary outbound compatibility for the original protocol-3
-/// fleet, whose authenticated handshake has no message-capability field.
-/// This changes no authentication, membership, or consensus decision.
 #[derive(Default)]
 pub struct TransportWirePolicy {
     legacy_v3: bool,
@@ -67,14 +40,11 @@ impl TransportWirePolicy {
         self.legacy_v3
     }
 
-    /// Suppressed send requests, not delivered messages or peer failures.
     pub fn suppressed_messages(&self) -> u64 {
         self.suppressed_messages.load(Ordering::Relaxed)
     }
 
     fn permits(&self, message: MessageType) -> bool {
-        // The deployed legacy parser accepts exactly 0x01..=0x12. Keep
-        // future extensions closed too; do not infer support from v3 alone.
         if self.legacy_v3 && message as u8 > 0x12 {
             self.suppressed_messages.fetch_add(1, Ordering::Relaxed);
             debug!(
@@ -88,23 +58,15 @@ impl TransportWirePolicy {
     }
 }
 
-// ─── Channel Types ──────────────────────────────────────────────────────────
-
-/// Messages the transport sends TO consensus.
 #[derive(Debug)]
 pub enum InboundMessage {
     PeerConnected {
         address: Hash256,
-        /// Signed handshake advertisement for diagnostics only. Consensus must
-        /// resolve voting stake and membership from the fixed validator set.
         stake: u64,
-        /// Monotonic process-local generation for this peer connection.
         connection_id: u64,
     },
     PeerDisconnected {
         address: Hash256,
-        /// Generation that closed. Consensus ignores this event if a newer
-        /// connection for `address` is already live.
         connection_id: u64,
     },
     DagBlockWithTxs {
@@ -112,46 +74,34 @@ pub enum InboundMessage {
         transactions: Vec<Transaction>,
     },
     Transactions(Vec<Vec<u8>>),
-    /// State diff from a proposer node (Propose-Verify protocol).
-    /// `source` is the identity authenticated by the QUIC handshake. Consensus
-    /// must bind it to the author of `block_hash`; payload fields alone are not
-    /// an authorization boundary.
     StateDiff {
         source: Hash256,
         block_hash: Hash256,
         diff: arc_types::StateDiff,
         block_height: u64,
     },
-    /// State Sync - a peer is requesting our snapshot manifest.
     SnapshotManifestRequest {
         source: Hash256,
     },
-    /// State Sync - a peer is requesting a specific snapshot chunk.
     SnapshotChunkRequest {
         source: Hash256,
         manifest_hash: Hash256,
         chunk_index: u32,
     },
-    /// State Sync - received a snapshot manifest from a peer.
     SnapshotManifestResponse {
         source: Hash256,
         manifest: arc_state::SnapshotManifest,
     },
-    /// State Sync - received a snapshot chunk from a peer.
     SnapshotChunkResponse {
         source: Hash256,
         chunk: arc_state::StateSnapshot,
     },
-    /// Dormant legacy inference request. The current consensus consumer logs
-    /// this event but does not execute work from it.
     InferenceRequest {
         request_id: Hash256,
         input: String,
         max_tokens: u32,
         requester: Hash256,
     },
-    /// Dormant legacy inference response. The current consensus consumer logs
-    /// this event but does not settle or route work from it.
     InferenceResponse {
         request_id: Hash256,
         output: String,
@@ -160,13 +110,11 @@ pub enum InboundMessage {
         ms_per_token: u64,
         responder: Hash256,
     },
-    /// Heartbeat with round info (partition detection).
     HeartbeatWithRound {
         peer: Hash256,
         dag_round: u64,
         committed_round: u64,
     },
-    /// Dormant legacy shard activation forward.
     ShardForward {
         request_id: Hash256,
         model_id: Hash256,
@@ -176,14 +124,12 @@ pub enum InboundMessage {
         activations: Vec<u8>,
         activation_hash: Hash256,
     },
-    /// Dormant legacy shard result.
     ShardResult {
         request_id: Hash256,
         token_id: u32,
         logits_hash: Hash256,
         responder: Hash256,
     },
-    /// Dormant legacy shard announcement.
     ShardAnnounce {
         model_id: Hash256,
         start_layer: u32,
@@ -193,66 +139,50 @@ pub enum InboundMessage {
         available_memory: u64,
         gpu_tier: u8,
     },
-    /// Round sync request from a peer (partition detection).
     RoundSyncRequest {
         peer: Hash256,
         their_round: u64,
         their_committed: u64,
     },
-    /// Round sync response - peer's current consensus state.
     RoundSyncResponse {
         current_round: u64,
         last_committed_round: u64,
     },
-    /// A peer's absence attestation. Self-authenticating; `source` is recorded
-    /// for diagnostics only and is never the authorisation boundary.
     ConsensusAbsenceVote {
         source: Hash256,
         vote: arc_consensus::view_change::SkipVote,
     },
-    /// A peer's complete absence certificate.
     ConsensusAbsenceCertificate {
         source: Hash256,
         certificate: arc_consensus::view_change::SkipCertificate,
     },
-    /// A peer's finality attestation over a committed block.
     ConsensusFinalityVote {
         source: Hash256,
         vote: arc_consensus::view_change::FinalityVote,
     },
-    /// A peer's complete finality certificate.
     ConsensusFinalityCertificate {
         source: Hash256,
         certificate: arc_consensus::view_change::FinalityCertificate,
     },
-    /// A peer is asking this node for a bounded run of DAG history.
     DagHistoryRequest {
         source: Hash256,
         from_round: u64,
         max_rounds: u64,
     },
-    /// A peer supplied a bounded run of DAG history.
     DagHistoryResponse {
         source: Hash256,
         blocks: Vec<DagBlock>,
         transactions: Vec<Transaction>,
     },
-    /// A peer has fallen below every peer's retention window and is asking
-    /// for an authenticated state checkpoint.
     CheckpointRequest {
         source: Hash256,
         needed_below_height: u64,
     },
-    /// A checkpoint envelope and the payload bytes it authorises. Nothing here
-    /// is trusted: the receiver verifies the envelope against its own frozen
-    /// committee and chain domain before decoding the payload.
     CheckpointResponse {
         source: Hash256,
         envelope: Box<arc_consensus::view_change::CheckpointEnvelope>,
         payload: Vec<u8>,
     },
-    /// A validator's signed native-inference vote. Self-authenticating; the
-    /// receiver verifies it before it counts.
     NativeInferenceVote {
         source: Hash256,
         request_id: Hash256,
@@ -261,7 +191,6 @@ pub enum InboundMessage {
     },
 }
 
-/// Messages consensus sends TO the transport for outbound delivery.
 #[derive(Debug)]
 pub enum OutboundMessage {
     BroadcastDagBlock {
@@ -269,28 +198,19 @@ pub enum OutboundMessage {
         transactions: Vec<Transaction>,
     },
     BroadcastTransactions(Vec<Vec<u8>>),
-    /// Gossip this node's absence attestation to every peer.
     BroadcastAbsenceVote(arc_consensus::view_change::SkipVote),
-    /// Gossip a complete absence certificate to every peer.
     BroadcastAbsenceCertificate(arc_consensus::view_change::SkipCertificate),
-    /// Gossip this node's finality attestation to every peer.
     BroadcastFinalityVote(arc_consensus::view_change::FinalityVote),
-    /// Gossip a complete finality certificate to every peer.
     BroadcastFinalityCertificate(arc_consensus::view_change::FinalityCertificate),
-    /// Ask one peer for a bounded run of DAG history.
     SendDagHistoryRequest {
         target: Hash256,
         from_round: u64,
         max_rounds: u64,
     },
-    /// Answer one peer's history request.
     SendDagHistoryResponse {
         target: Hash256,
         blocks: Vec<DagBlock>,
         transactions: Vec<Transaction>,
-        /// Existing certificate messages sent to this requester before the
-        /// unchanged history message. They restore missing-parent authority
-        /// even when the original certificate gossip happened while offline.
         absence_certificates: Vec<arc_consensus::view_change::SkipCertificate>,
     },
     SendCheckpointRequest {
@@ -307,20 +227,17 @@ pub enum OutboundMessage {
         tokens: Vec<u32>,
         vote: arc_types::inference_contract::InferenceVote,
     },
-    /// Broadcast a state diff (Propose-Verify protocol).
     BroadcastStateDiff {
         block_hash: Hash256,
         diff: arc_types::StateDiff,
         block_height: u64,
     },
-    /// Dormant legacy P2P inference request surface.
     BroadcastInferenceRequest {
         request_id: Hash256,
         input: String,
         max_tokens: u32,
         requester: Hash256,
     },
-    /// Dormant legacy P2P inference response surface.
     SendInferenceResponse {
         request_id: Hash256,
         output: String,
@@ -329,32 +246,26 @@ pub enum OutboundMessage {
         ms_per_token: u64,
         responder: Hash256,
     },
-    /// Dormant legacy P2P shard-forward surface.
     SendShardForward {
         target: Hash256,
         message: crate::protocol::ShardForwardMessage,
     },
-    /// Dormant legacy P2P shard-result surface.
     SendShardResult {
         target: Hash256,
         message: crate::protocol::ShardResultMessage,
     },
-    /// Dormant legacy P2P shard-announcement surface.
     BroadcastShardAnnounce {
         message: crate::protocol::ShardAnnounceMessage,
     },
-    /// Send heartbeat with round info to all peers.
     BroadcastHeartbeatWithRound {
         dag_round: u64,
         committed_round: u64,
     },
-    /// Request round sync from a specific peer.
     SendRoundSyncRequest {
         target: Hash256,
         my_round: u64,
         my_committed: u64,
     },
-    /// Respond to round sync request.
     SendRoundSyncResponse {
         target: Hash256,
         current_round: u64,
@@ -364,8 +275,6 @@ pub enum OutboundMessage {
     },
 }
 
-// ─── TLS Configuration ─────────────────────────────────────────────────────
-
 fn validator_tls_identity(
     keypair: &KeyPair,
 ) -> anyhow::Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
@@ -373,10 +282,6 @@ fn validator_tls_identity(
         anyhow::bail!("validator QUIC identity requires an Ed25519 validator key")
     };
 
-    // RFC 8410 Ed25519 PrivateKeyInfo: the validator seed is wrapped in the
-    // inner CurvePrivateKey OCTET STRING. The resulting certificate's SPKI is
-    // therefore the exact public key from which the ARC validator address is
-    // derived; no second TLS identity is introduced.
     let mut pkcs8 = Vec::with_capacity(48);
     pkcs8.extend_from_slice(&[
         0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
@@ -594,14 +499,13 @@ fn make_server_config(
         QuicServerConfig::try_from(server_crypto).expect("failed to create QUIC server config"),
     ));
 
-    // Keep connections alive and allow large payloads (testnet)
     let transport = Arc::get_mut(&mut server_config.transport).unwrap();
     transport.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(std::time::Duration::from_secs(300)).unwrap(),
     ));
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-    transport.stream_receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024)); // 64 MB
-    transport.receive_window(quinn::VarInt::from_u32(256 * 1024 * 1024)); // 256 MB
+    transport.stream_receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
+    transport.receive_window(quinn::VarInt::from_u32(256 * 1024 * 1024));
 
     Ok(server_config)
 }
@@ -624,7 +528,6 @@ fn make_client_config(
         QuicClientConfig::try_from(crypto).expect("failed to create QUIC client config"),
     ));
 
-    // Keep connections alive and allow large payloads (testnet)
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(std::time::Duration::from_secs(300)).unwrap(),
@@ -637,15 +540,9 @@ fn make_client_config(
     Ok(client_config)
 }
 
-// ─── TLS-session-bound peer authentication ─────────────────────────────────
-
 const PEER_AUTH_EXPORTER_LABEL: &[u8] = b"EXPORTER-ARC-peer-auth-v3";
 const PEER_AUTH_EXPORTER_CONTEXT: &[u8] = b"arc-chain-validator-identity";
 
-/// Derive a value unique to this QUIC/TLS session. Both endpoints obtain the
-/// same bytes; a recorded application handshake from another connection does
-/// not. This is the peer-issued freshness that the old sender-chosen nonce did
-/// not provide.
 fn connection_binding(connection: &quinn::Connection) -> anyhow::Result<[u8; 32]> {
     let mut binding = [0u8; 32];
     connection
@@ -658,8 +555,6 @@ fn connection_binding(connection: &quinn::Connection) -> anyhow::Result<[u8; 32]
     Ok(binding)
 }
 
-/// Canonical transcript for one peer identity proof. Every field that affects
-/// routing, membership compatibility, or diagnostics is authenticated.
 fn compute_handshake_challenge(message: &HandshakeMessage) -> Hash256 {
     let mut hasher = blake3::Hasher::new_derive_key("ARC-peer-auth-v3");
     hasher.update(&message.nonce);
@@ -675,7 +570,6 @@ fn compute_handshake_challenge(message: &HandshakeMessage) -> Hash256 {
     Hash256(*hasher.finalize().as_bytes())
 }
 
-/// Create a handshake whose identity proof is bound to this QUIC session.
 fn make_signed_handshake(
     local_address: Hash256,
     local_stake: u64,
@@ -694,7 +588,7 @@ fn make_signed_handshake(
         challenge_sig: Vec::new(),
         protocol_version: crate::protocol::PROTOCOL_VERSION,
         min_compatible_version: crate::protocol::MIN_COMPATIBLE_VERSION,
-        dag_round: 0, // filled in by caller if available
+        dag_round: 0,
     };
     let challenge = compute_handshake_challenge(&message);
     let signature = keypair
@@ -705,8 +599,6 @@ fn make_signed_handshake(
     message
 }
 
-/// Verify a peer's handshake: pubkey derives to claimed address, signature is valid,
-/// the proof belongs to this TLS session, and protocol version is compatible.
 fn verify_handshake(msg: &HandshakeMessage, expected_binding: &[u8; 32]) -> anyhow::Result<()> {
     if &msg.nonce != expected_binding {
         anyhow::bail!("peer identity proof belongs to a different QUIC session");
@@ -718,7 +610,6 @@ fn verify_handshake(msg: &HandshakeMessage, expected_binding: &[u8; 32]) -> anyh
         anyhow::bail!("peer identity signature exceeds the protocol bound");
     }
 
-    // 1. Verify public key derives to the claimed validator address
     let derived_address = hash_bytes(&msg.public_key);
     if derived_address != msg.validator_address {
         anyhow::bail!(
@@ -728,7 +619,6 @@ fn verify_handshake(msg: &HandshakeMessage, expected_binding: &[u8; 32]) -> anyh
         );
     }
 
-    // 2. Verify the session-bound, full-transcript signature.
     let challenge = compute_handshake_challenge(msg);
     let sig: CryptoSignature = deserialize_message(&msg.challenge_sig)
         .map_err(|e| anyhow::anyhow!("failed to deserialize challenge signature: {e}"))?;
@@ -741,8 +631,6 @@ fn verify_handshake(msg: &HandshakeMessage, expected_binding: &[u8; 32]) -> anyh
     sig.verify(&challenge, &msg.validator_address)
         .map_err(|e| anyhow::anyhow!("challenge signature verification failed: {e}"))?;
 
-    // 3. Protocol version compatibility check.
-    // Treat version 0 as v1 (old nodes that don't send protocol_version).
     let peer_version = if msg.protocol_version == 0 {
         1
     } else {
@@ -784,17 +672,12 @@ fn verify_handshake(msg: &HandshakeMessage, expected_binding: &[u8; 32]) -> anyh
     Ok(())
 }
 
-/// Payloads may repeat a sender identity for routing, but that declaration is
-/// never an authentication boundary. Only the identity proven by the QUIC
-/// handshake is authoritative.
 fn payload_identity_is_authenticated(
     authenticated_peer: &Hash256,
     declared_identity: &Hash256,
 ) -> bool {
     authenticated_peer == declared_identity
 }
-
-// ─── Per-Peer Rate Limiter ───────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
 struct PeerRateWindow {
@@ -803,9 +686,6 @@ struct PeerRateWindow {
     window_start_epoch_secs: u64,
 }
 
-/// Per-peer rate limiting, keyed by the identity authenticated during the QUIC
-/// handshake. Both message and byte budgets are checked from the five-byte
-/// frame header before allocating the payload.
 struct PeerRateLimiter {
     counters: DashMap<Hash256, PeerRateWindow>,
 }
@@ -817,7 +697,6 @@ impl PeerRateLimiter {
         }
     }
 
-    /// Returns true if the frame should be allowed, false if rate-limited.
     fn allow(&self, peer: &Hash256, payload_len: u32) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -859,35 +738,18 @@ impl PeerRateLimiter {
     }
 }
 
-// ─── Peer Connection Map ────────────────────────────────────────────────────
-
-/// One live peer generation. Keeping stream and metadata in the same DashMap
-/// entry makes replacement/removal atomic for a validator address.
 struct PeerConnection<S> {
     connection_id: u64,
-    /// Shared so a writer can clone the handle out of the map and release the
-    /// shard guard before it awaits the network. See `write_to_peer`.
     send: SharedPeerStream<S>,
-    /// The address to dial this peer at (IP from connection + listen_port from handshake).
     dial_addr: SocketAddr,
-    /// The peer's self-reported stake.
     stake: u64,
-    /// Whether THIS node dialed the connection (false: the peer did).
     initiated_locally: bool,
     installed_at: std::time::Instant,
 }
 
-/// Two connections to one peer installed within this window are treated as a
-/// simultaneous dial, and resolved by the tie-break in `install_directed`.
 const SIMULTANEOUS_DIAL_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Every framed write to a peer gets this long plus `PEER_WRITE_MIN_BYTES_PER_SEC`
-/// worth of time for its payload. A peer that cannot take one frame in that
-/// time is treated as a dead connection. The wait for the stream's writer lock
-/// has its own budget of the same length; running out of it is not a failure.
 const PEER_WRITE_BASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-/// Slowest sustained rate a live peer is assumed to accept. A 16 MiB frame
-/// therefore gets 5 s + 16 s instead of being cut off at a flat 5 s.
 const PEER_WRITE_MIN_BYTES_PER_SEC: u64 = 1024 * 1024;
 
 fn peer_write_timeout(base: std::time::Duration, payload_len: usize) -> std::time::Duration {
@@ -895,15 +757,8 @@ fn peer_write_timeout(base: std::time::Duration, payload_len: usize) -> std::tim
     base.saturating_add(std::time::Duration::from_millis(allowance_ms))
 }
 
-/// One peer's send stream behind an async mutex. The mutex keeps exactly one
-/// framed write in flight per stream, so frames from different tasks never
-/// interleave and each task's frames keep their order.
 struct PeerStream<S> {
     stream: S,
-    /// Set while a frame is being written and cleared once it is flushed. A
-    /// write that is cancelled by its timeout, or that fails, leaves it set:
-    /// the stream may then hold a partial frame, so no later frame may follow
-    /// it and the connection must be dropped.
     torn: bool,
 }
 
@@ -916,12 +771,10 @@ fn shared_peer_stream<S>(stream: S) -> SharedPeerStream<S> {
     }))
 }
 
-/// Why a write to a peer did not complete.
 #[derive(Debug)]
 enum PeerWriteFailure {
     Io(std::io::Error),
     TimedOut,
-    /// An earlier write on this stream was cut off mid-frame.
     Torn,
 }
 
@@ -935,35 +788,23 @@ impl std::fmt::Display for PeerWriteFailure {
     }
 }
 
-/// Outcome of one framed write to one peer.
 #[derive(Debug)]
 enum PeerWrite {
     Sent,
-    /// The peer is not connected, or a different generation than the caller
-    /// expected now holds its slot. Nothing was written.
     NotConnected,
-    /// Another task's write to this stream held its writer lock for the whole
-    /// wait budget. Nothing was written and the connection is left alone: the
-    /// holder is bounded by its own write timeout and removes the connection
-    /// itself if that write fails, so a frame queued behind a long but healthy
-    /// write never disconnects a live peer.
     Busy,
-    /// The write failed; `connection_id` is the generation it was written to,
-    /// which the caller removes.
     Failed {
         connection_id: u64,
         failure: PeerWriteFailure,
     },
 }
 
-/// Tracks active peer send streams and metadata for outbound broadcast.
 struct PeerConnections<S = quinn::SendStream> {
     peers: DashMap<[u8; 32], PeerConnection<S>>,
     next_connection_id: AtomicU64,
     inbound_tx: mpsc::Sender<InboundMessage>,
     peer_count: Arc<AtomicU32>,
     wire_policy: Arc<TransportWirePolicy>,
-    /// `PEER_WRITE_BASE_TIMEOUT` in production; tests shorten it.
     write_base_timeout: std::time::Duration,
 }
 
@@ -975,7 +816,6 @@ impl<S> PeerConnections<S> {
     ) -> Self {
         Self {
             peers: DashMap::new(),
-            // Zero is reserved as "no generation" in diagnostics/tests.
             next_connection_id: AtomicU64::new(1),
             inbound_tx,
             peer_count,
@@ -984,26 +824,6 @@ impl<S> PeerConnections<S> {
         }
     }
 
-    /// Atomically install the newest authenticated connection generation for
-    /// one fixed validator identity, resolving a simultaneous dial
-    /// deterministically. Returns `None` when the new connection loses the
-    /// tie-break and must be closed.
-    ///
-    /// A clean process restart can leave the remote QUIC generation writable
-    /// in the kernel for substantially longer than the validator process is
-    /// alive. Refusing the replacement until that stale stream times out makes
-    /// a rolling restart look like a partition. The validator TLS certificate
-    /// and exporter-bound handshake are verified before this method is called,
-    /// so replacing this one identity's slot cannot admit a new member or grow
-    /// the fixed connection set. Generation-checked cleanup below prevents the
-    /// superseded reader from removing its replacement.
-    ///
-    /// Last-writer-wins was the rule, and under a simultaneous dial it let
-    /// each side keep a DIFFERENT connection and then drop the one the other
-    /// side kept - so both died. Both sides now compute the same answer:
-    /// within `SIMULTANEOUS_DIAL_WINDOW`, the connection initiated by the
-    /// lower validator address is the one kept. Outside the window the newer
-    /// connection still wins, which is the reconnect case.
     fn install_directed(
         &self,
         key: [u8; 32],
@@ -1015,7 +835,6 @@ impl<S> PeerConnections<S> {
     ) -> Option<(u64, Option<u64>)> {
         use dashmap::mapref::entry::Entry;
         let now = std::time::Instant::now();
-        // The initiator of the preferred connection is the lower address.
         let preferred_initiator_is_local = local_key < key;
         match self.peers.entry(key) {
             Entry::Occupied(mut entry) => {
@@ -1026,8 +845,6 @@ impl<S> PeerConnections<S> {
                     && existing.initiated_locally == preferred_initiator_is_local
                     && initiated_locally != preferred_initiator_is_local
                 {
-                    // The existing connection is the preferred one; so is the
-                    // peer's view of it. Keep it and drop the newcomer.
                     return None;
                 }
                 let previous_id = existing.connection_id;
@@ -1058,13 +875,10 @@ impl<S> PeerConnections<S> {
         }
     }
 
-    /// Check if a peer is currently connected by validator address bytes.
     fn is_connected(&self, key: &[u8; 32]) -> bool {
         self.peers.contains_key(key)
     }
 
-    /// Remove only the exact connection generation that failed. If a reconnect
-    /// has already installed a newer generation, the stale cleanup is a no-op.
     fn remove_if_current(&self, key: &[u8; 32], connection_id: u64) -> bool {
         use dashmap::mapref::entry::Entry;
 
@@ -1106,9 +920,6 @@ impl<S: tokio::io::AsyncWrite + Unpin> PeerConnections<S> {
             );
             return;
         }
-        // Snapshot peer keys first - do NOT hold DashMap shard locks during
-        // network I/O. The old code held iter_mut() locks for the entire
-        // broadcast, which blocked peer insert/remove operations for seconds.
         let peer_keys: Vec<([u8; 32], u64)> = self
             .peers
             .iter()
@@ -1118,8 +929,6 @@ impl<S: tokio::io::AsyncWrite + Unpin> PeerConnections<S> {
         let mut sent = 0usize;
         let mut dead_peers = Vec::new();
         for (key, connection_id) in &peer_keys {
-            // One slow or dead peer costs at most one write timeout before it
-            // is removed; it can never hold a peer-map guard while it waits.
             match self
                 .write_to_peer(key, Some(*connection_id), msg_type, payload)
                 .await
@@ -1155,7 +964,6 @@ impl<S: tokio::io::AsyncWrite + Unpin> PeerConnections<S> {
         }
     }
 
-    /// Send a message to a specific peer by validator address.
     async fn send_to(&self, target: &Hash256, msg_type: MessageType, payload: &[u8]) {
         if !self.wire_policy.permits(msg_type) {
             return;
@@ -1193,20 +1001,6 @@ impl<S: tokio::io::AsyncWrite + Unpin> PeerConnections<S> {
         }
     }
 
-    /// Write one frame to one peer without holding any peer-map guard across
-    /// the network write.
-    ///
-    /// The stream handle and generation are cloned out under a short shard
-    /// read guard that is released before the first await. The wait for the
-    /// stream's own writer lock and the write itself then each run under the
-    /// write timeout, so one call takes at most twice that. Holding
-    /// a DashMap guard across the write let a stalled peer park every other
-    /// task that touched the same shard (`is_connected`, `len`, `iter`,
-    /// `install_directed`) on a synchronous lock, which on a small runtime
-    /// leaves no worker to finish the write and release the guard.
-    ///
-    /// With `expected_generation`, a slot now held by a different generation
-    /// is reported as `NotConnected` and left alone.
     async fn write_to_peer(
         &self,
         key: &[u8; 32],
@@ -1251,10 +1045,6 @@ impl<S: tokio::io::AsyncWrite + Unpin> PeerConnections<S> {
         }
     }
 
-    /// Write an empty heartbeat to every connected peer, one at a time, and
-    /// remove each generation whose write fails or times out. Dead QUIC
-    /// streams fail at once; a stalled one is cut off by the write timeout
-    /// rather than holding the peer map. Returns how many were removed.
     async fn probe_peers(&self) -> usize {
         let peer_keys: Vec<([u8; 32], u64)> = self
             .peers
@@ -1285,16 +1075,6 @@ impl<S: tokio::io::AsyncWrite + Unpin> PeerConnections<S> {
     }
 }
 
-// ─── Transport Main Loop ───────────────────────────────────────────────────
-
-/// Run the P2P transport layer.
-///
-/// Binds a QUIC endpoint, dials bootstrap peers, accepts incoming connections,
-/// and bridges network I/O to/from the consensus layer via channels.
-//
-// Collapsing these into a config struct would be a breaking change to a public
-// entry point that arc-node and arc-bench both call, and those crates are out of
-// scope for this change, so the argument list stays as-is.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_transport(
     listen_addr: SocketAddr,
@@ -1328,10 +1108,6 @@ pub async fn run_transport(
     .await;
 }
 
-/// Start validator transport and report only after the authenticated QUIC
-/// endpoint is fully bound and its client configuration is installed. A
-/// production node must await this signal before starting consensus; otherwise
-/// a TLS/key/bind failure could leave a validator executing in isolation.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_transport_with_readiness(
     listen_addr: SocketAddr,
@@ -1366,11 +1142,6 @@ pub async fn run_transport_with_readiness(
     .await;
 }
 
-/// Start validator transport with the same readiness contract as
-/// [`run_transport_with_readiness`], then stop accepting/dialing peers when the
-/// node lifecycle requests shutdown. The future returns only after the QUIC
-/// endpoint is closed and the transport-owned fanout and peer-maintenance tasks
-/// have stopped.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_transport_with_readiness_and_shutdown(
     listen_addr: SocketAddr,
@@ -1426,8 +1197,6 @@ async fn wait_for_transport_shutdown(receiver: &mut Option<tokio::sync::watch::R
             return;
         }
         if receiver.changed().await.is_err() {
-            // Dropping the lifecycle owner means the transport can no longer
-            // prove it is supervised. Fail closed by stopping network input.
             return;
         }
     }
@@ -1444,8 +1213,6 @@ async fn join_transport_task(
         Err(_) => {
             warn!("P2P task exceeded shutdown grace; aborting and joining");
             task.abort();
-            // Aborting alone does not join: wait for cancellation to release
-            // task state before the node can cross its persistence barrier.
             task.await
         }
     }
@@ -1493,32 +1260,8 @@ async fn run_transport_inner(
         report_transport_startup_failure(&mut startup, message);
         return;
     }
-    // ── Install rustls crypto provider (required for rustls 0.23+) ─────
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // ── Bind QUIC endpoint ──────────────────────────────────────────────
-    // Try the configured port first (5× with 2 s spacing) so seeds and
-    // anyone with the port actually free keeps the stable inbound port.
-    // If that fails, fall back to an OS-assigned ephemeral UDP port so
-    // consumer/outbound nodes still join the network — they don't need
-    // a stable inbound port, and some local environments make the
-    // configured port un-bindable in ways no firewall/port-forward rule
-    // touches:
-    //
-    //   • Windows Hyper-V dynamic UDP exclusions
-    //     (`netsh int ipv4 show excludedportrange protocol=udp`) often
-    //     swallow ranges around 9000-9100 when WSL2 / Docker Desktop
-    //     is installed — 9091 becomes un-bindable for any user-mode
-    //     process even with Administrator + firewall exception +
-    //     forwarded UDP.
-    //   • Another P2P app holding the port (Transmission/qBittorrent
-    //     historically defaulted to 9091).
-    //   • Antivirus / EDR port reservations on locked-down Windows.
-    //
-    // Trade-off: a fallback-bound node cannot serve as a public seed
-    // (peers can't dial it on a known port). That is fine for the
-    // residential consumers this fallback exists for — they're behind
-    // NAT and never accept unsolicited inbound anyway.
     let server_config = match make_server_config(&local_keypair, allowed_validators.clone()) {
         Ok(config) => config,
         Err(error) => {
@@ -1584,7 +1327,6 @@ async fn run_transport_inner(
         }
         bound.unwrap()
     };
-    // Set client config for outgoing connections on the same endpoint
     let client_config = match make_client_config(&local_keypair, allowed_validators.clone()) {
         Ok(config) => config,
         Err(error) => {
@@ -1597,10 +1339,6 @@ async fn run_transport_inner(
     };
     endpoint.set_default_client_config(client_config);
 
-    // Shadow the parameter with the actual bound address. If we fell
-    // back to ephemeral, every downstream handshake/self-skip uses the
-    // real port - peers see the truth in our handshake, and PEX gossip
-    // to other nodes carries the real address.
     let listen_addr = endpoint.local_addr().unwrap_or(configured_addr);
     if listen_addr.port() != configured_addr.port() {
         info!(
@@ -1636,20 +1374,12 @@ async fn run_transport_inner(
         allowed_validators.len().saturating_mul(2).max(8),
     ));
 
-    // ── PEX auto-dial channel ───────────────────────────────────────────
     let (pex_dial_tx, mut pex_dial_rx) = mpsc::channel::<SocketAddr>(64);
 
-    // ── Dial bootstrap peers (concurrent with 5s timeout each) ──────────
     {
         let mut dial_handles = Vec::new();
         let allow_loopback_peers = std::env::var("ARC_ALLOW_LOOPBACK_PEERS").is_ok();
         for peer_addr in &bootstrap_peers {
-            // Skip self - check loopback, listen_addr, AND local interfaces
-            // (our public IP is in the seeds file but listen_addr is 0.0.0.0).
-            // Distinct loopback ports are valid peers (local clusters and the
-            // integration harness rely on this). ARC_ALLOW_LOOPBACK_PEERS=1
-            // additionally relaxes the non-loopback local-interface check so
-            // multiple nodes can use the host's LAN/public addresses.
             if peer_addr == &listen_addr {
                 continue;
             }
@@ -1658,8 +1388,6 @@ async fn run_transport_inner(
                     if peer_addr.port() == listen_addr.port() {
                         continue;
                     }
-                    // A different 127.0.0.1 port is another local node, not
-                    // this listener. Let the authenticated handshake decide.
                 } else if std::net::UdpSocket::bind(SocketAddr::new(peer_addr.ip(), 0)).is_ok() {
                     info!("Skipping self-dial to {} (local interface)", peer_addr);
                     continue;
@@ -1680,10 +1408,8 @@ async fn run_transport_inner(
                 &allowed_validators,
             );
             dial_handles.push(tokio::spawn(async move {
-                // Try up to 3 times with increasing timeouts. Intercontinental
-                // QUIC handshakes (e.g., US→Singapore) can need >5s on first attempt.
                 for attempt in 1..=3u32 {
-                    let timeout_secs = 5 * attempt as u64; // 5s, 10s, 15s
+                    let timeout_secs = 5 * attempt as u64;
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(timeout_secs),
                         dial_peer(&ep, addr, &ctx),
@@ -1722,15 +1448,6 @@ async fn run_transport_inner(
                 }
             }));
         }
-        // Do NOT wait for the dials here. This used to await every dial
-        // before the function reached its accept loop, so a node could not
-        // answer anyone's handshake while its own dials were in flight. Four
-        // nodes started together each waited on acceptors that did not exist
-        // yet: every dial timed out (3 x 15 s), the queued inbound handshakes
-        // were then abandoned "during the handshake", and the 30 s reconnect
-        // timer finally connected them - D1's "simultaneous mutual dialling
-        // deadlocks until timeout", which staggered startup had only avoided.
-        // The dials now finish in the background while inbound is served.
         let dial_phase_peer_count = peer_count.clone();
         tokio::spawn(async move {
             for h in dial_handles {
@@ -1743,7 +1460,6 @@ async fn run_transport_inner(
         });
     }
 
-    // ── Dial persisted peers (from previous sessions) ───────────────────
     let persisted_peers = load_peers_from_disk(&data_dir);
     if !persisted_peers.is_empty() {
         info!(
@@ -1764,10 +1480,6 @@ async fn run_transport_inner(
             &rate_limiter,
             &allowed_validators,
         );
-        // In the background, like the bootstrap dials. Awaited here, one
-        // dead persisted address held back the outbound fanout and the accept
-        // loop - neither exists until this section finishes - for a full dial
-        // timeout, so a restarted validator could neither gossip nor accept.
         let ep = endpoint.clone();
         let addr = *peer_addr;
         tokio::spawn(async move {
@@ -1778,7 +1490,6 @@ async fn run_transport_inner(
         });
     }
 
-    // ── Spawn outbound fanout task ──────────────────────────────────────
     let conn_out = connections.clone();
     let mut outbound_shutdown = shutdown.clone();
     let outbound_task = tokio::spawn(async move {
@@ -2058,20 +1769,14 @@ async fn run_transport_inner(
         }
     });
 
-    // ── PEX + reconnect as independent background task ─────────────────
-    // Spawned separately so the accept loop can't starve timers.
-    // Without this, heavy inbound traffic or benchmark mode prevents
-    // reconnect/PEX timers from ever firing (tokio::select! starvation).
     let mut pex_interval = tokio::time::interval(std::time::Duration::from_secs(60));
-    pex_interval.tick().await; // skip immediate fire
+    pex_interval.tick().await;
 
     let mut reconnect_interval = tokio::time::interval(std::time::Duration::from_secs(30));
-    reconnect_interval.tick().await; // skip immediate fire
+    reconnect_interval.tick().await;
 
     let conn_pex = connections.clone();
 
-    // ── Spawn PEX + reconnect as independent task ──────────────────
-    // This prevents the accept loop from starving timer-driven work.
     let pex_task = {
         let conn_bg = connections.clone();
         let bp = bootstrap_peers.clone();
@@ -2086,10 +1791,6 @@ async fn run_transport_inner(
         tokio::spawn(async move {
             let mut pex_tick = tokio::time::interval(std::time::Duration::from_secs(60));
             pex_tick.tick().await;
-            // Reconnect every 30s. Tried 10s but that caused excessive dial
-            // churn - every restart triggered a flood of duplicate-accept
-            // events from the restarting node's peers, which then deadlocked
-            // accept_peer with consensus on shared DashMap shards.
             let mut recon_tick = tokio::time::interval(std::time::Duration::from_secs(30));
             recon_tick.tick().await;
             loop {
@@ -2124,10 +1825,6 @@ async fn run_transport_inner(
                         candidates.sort();
                         candidates.dedup();
 
-                        // Probe live connections with a tiny heartbeat to each peer
-                        // stream, pruning stale entries that would otherwise block
-                        // reconnect. Every probe write is bounded by the write
-                        // timeout and holds no peer-map guard while it waits.
                         conn_bg.probe_peers().await;
 
                         let connected_addrs: std::collections::HashSet<SocketAddr> = conn_bg.peers.iter()
@@ -2189,7 +1886,6 @@ async fn run_transport_inner(
                 lifecycle_stop = true;
                 break;
             }
-            // ── Accept inbound connections ──────────────────────────────
             incoming_opt = endpoint.accept() => {
                 let incoming = match incoming_opt {
                     Some(inc) => inc,
@@ -2210,12 +1906,6 @@ async fn run_transport_inner(
                 let remote_addr = conn.remote_address();
                 info!("Incoming connection from {}", remote_addr);
 
-                // Do not reject solely because every fixed validator-address
-                // slot is occupied. This connection may be the authenticated
-                // replacement for a stale pre-restart generation. Mutual TLS,
-                // the exporter-bound application handshake, and the fixed
-                // allowlist run before the address slot is installed; the map
-                // therefore remains bounded by the configured validator set.
                 let Ok(handshake_permit) = handshake_slots.clone().try_acquire_owned() else {
                     warn!("Validator handshake concurrency limit reached, rejecting {}", remote_addr);
                     continue;
@@ -2233,8 +1923,6 @@ async fn run_transport_inner(
 
                 tokio::spawn(async move {
                     let _handshake_permit = handshake_permit;
-                    // 10-second handshake timeout - prevents attackers from
-                    // holding connection slots with incomplete handshakes.
                     let result = tokio::time::timeout(
                         std::time::Duration::from_secs(10),
                         accept_peer(conn, &ctx)
@@ -2248,14 +1936,6 @@ async fn run_transport_inner(
                 });
             }
 
-            // PEX broadcast + reconnect are handled by the background task above.
-
-            // ── PEX auto-dial (from handle_peer_recv) ──────────────────
-            // Spawn the entire processing into a separate task. The select body
-            // must NEVER iterate the peer DashMap because
-            // it can deadlock with another task holding a write lock on the
-            // same shard. The "already connected" check belongs inside the
-            // spawned task, not the select body.
             addr = pex_dial_rx.recv() => {
                 if let Some(peer_addr) = addr {
                     let conn_pex_clone = conn_pex.clone();
@@ -2270,7 +1950,6 @@ async fn run_transport_inner(
                         &allowed_validators,
                     );
                     tokio::spawn(async move {
-                        // Skip if already connected (moved out of select body)
                         let already = conn_pex_clone
                             .peers
                             .iter()
@@ -2288,16 +1967,9 @@ async fn run_transport_inner(
                     });
                 }
             }
-
-            // Reconnect is handled by the background task above.
         }
     }
 
-    // Closing the endpoint wakes every peer receive loop and prevents any
-    // reconnect child that raced the lifecycle signal from establishing a new
-    // session. The two transport-owned long-lived tasks are joined before this
-    // future returns, so peer-file writes and outbound fanout cannot cross the
-    // node's final persistence barrier.
     endpoint.close(0_u32.into(), b"node lifecycle shutdown");
     if !lifecycle_stop {
         outbound_task.abort();
@@ -2313,8 +1985,6 @@ async fn run_transport_inner(
     if let Err(error) = pex_result {
         warn!(%error, "P2P peer-maintenance task failed during shutdown");
     }
-    // close() already sent CONNECTION_CLOSE; idle cleanup must not hold the
-    // lifecycle barrier until a peer's full QUIC idle timeout expires.
     if tokio::time::timeout(TRANSPORT_SHUTDOWN_GRACE, endpoint.wait_idle())
         .await
         .is_err()
@@ -2326,20 +1996,9 @@ async fn run_transport_inner(
     info!("P2P transport stopped at the lifecycle barrier");
 }
 
-// ─── Shared Connection-Setup Context ───────────────────────────────────────
-
-/// The node-wide handles that every connection-setup path needs.
-///
-/// `dial_peer` and `accept_peer` both require the same identity and runtime
-/// handles, and every
-/// call site was cloning them into individually named locals. Bundling them
-/// keeps the setup functions to a readable arity and keeps the two paths from
-/// drifting apart. All fields are cheap clones (`Arc` / mpsc `Sender`).
 #[derive(Clone, Copy)]
 struct LocalPeerIdentity {
     address: Hash256,
-    /// Diagnostic advertisement only. Consensus resolves voting stake from
-    /// the fixed genesis validator set and never trusts this transport field.
     advertised_stake: u64,
     listen_port: u16,
     genesis_hash: Hash256,
@@ -2356,7 +2015,6 @@ struct PeerContext {
 }
 
 impl PeerContext {
-    /// Build a context from the transport's own long-lived handles.
     fn new(
         identity: LocalPeerIdentity,
         keypair: &Arc<KeyPair>,
@@ -2377,8 +2035,6 @@ impl PeerContext {
         }
     }
 }
-
-// ─── Dial (Outbound Connection) ─────────────────────────────────────────────
 
 async fn dial_peer(
     endpoint: &quinn::Endpoint,
@@ -2401,18 +2057,15 @@ async fn dial_peer(
         session_binding,
     );
 
-    // Send our handshake
     let payload = bincode::serialize(&local_handshake)?;
     write_message(&mut send, MessageType::Handshake, &payload).await?;
 
-    // Read their handshake ack
     let (msg_type, data) = read_message(&mut recv).await?;
     if msg_type != MessageType::HandshakeAck {
         anyhow::bail!("expected HandshakeAck, got {:?}", msg_type);
     }
     let remote: HandshakeMessage = deserialize_message(&data)?;
 
-    // Validate genesis
     if remote.genesis_hash != local_handshake.genesis_hash {
         anyhow::bail!(
             "genesis mismatch: local={} remote={}",
@@ -2421,7 +2074,6 @@ async fn dial_peer(
         );
     }
 
-    // Verify peer's identity: pubkey → address + valid signature
     verify_handshake(&remote, &session_binding)?;
     let tls_address = peer_tls_validator_address(&conn)?;
     if tls_address != remote.validator_address {
@@ -2438,11 +2090,8 @@ async fn dial_peer(
         );
     }
 
-    // Compute dialable address: remote IP + their listen port
     let dial_addr = SocketAddr::new(conn.remote_address().ip(), remote.listen_port);
 
-    // Reject self-connections. The seeds file includes our own IP,
-    // and 0.0.0.0 != our public IP, so the bootstrap skip-self check misses it.
     if remote.validator_address == local_address {
         debug!(
             "Rejected self-connection (dial) to {}",
@@ -2456,9 +2105,6 @@ async fn dial_peer(
         remote.validator_address, remote.stake, dial_addr
     );
 
-    // Atomically install the newest authenticated generation. A delayed reader
-    // cleanup from the old generation is generation-checked below and cannot
-    // remove this replacement.
     let Some((connection_id, replaced_generation)) = connections.install_directed(
         remote.validator_address.0,
         local_address.0,
@@ -2490,17 +2136,12 @@ async fn dial_peer(
         })
         .await;
 
-    // Spawn reader. CRITICAL: move `conn` into the spawn so the Quinn
-    // Connection stays alive for the duration of the recv loop. Previously,
-    // `conn` was dropped at the end of connect_peer, which closed the QUIC
-    // connection and made recv fail within microseconds, triggering a
-    // connect→disconnect cascade that prevented any block gossip.
     let peer_addr_hash = remote.validator_address;
     let recv_context = PeerRecvContext::from_peer_context(ctx);
     let connections_ref = recv_context.connections.clone();
     let rate_limiter_clone = recv_context.rate_limiter.clone();
     tokio::spawn(async move {
-        let _conn = conn; // keep Quinn Connection alive until recv loop exits
+        let _conn = conn;
         handle_peer_recv(recv, peer_addr_hash, recv_context).await;
         if connections_ref
             .remove_and_notify(peer_addr_hash, connection_id)
@@ -2519,8 +2160,6 @@ async fn dial_peer(
     Ok(())
 }
 
-// ─── Accept (Inbound Connection) ────────────────────────────────────────────
-
 async fn accept_peer(conn: quinn::Connection, ctx: &PeerContext) -> anyhow::Result<()> {
     let local_address = ctx.identity.address;
     let connections = &ctx.connections;
@@ -2537,19 +2176,16 @@ async fn accept_peer(conn: quinn::Connection, ctx: &PeerContext) -> anyhow::Resu
         session_binding,
     );
 
-    // Read their handshake
     let (msg_type, data) = read_message(&mut recv).await?;
     if msg_type != MessageType::Handshake {
         anyhow::bail!("expected Handshake, got {:?}", msg_type);
     }
     let remote: HandshakeMessage = deserialize_message(&data)?;
 
-    // Validate genesis
     if remote.genesis_hash != local_handshake.genesis_hash {
         anyhow::bail!("genesis mismatch");
     }
 
-    // Verify peer's identity: pubkey → address + valid signature
     verify_handshake(&remote, &session_binding)?;
     let tls_address = peer_tls_validator_address(&conn)?;
     if tls_address != remote.validator_address {
@@ -2566,14 +2202,11 @@ async fn accept_peer(conn: quinn::Connection, ctx: &PeerContext) -> anyhow::Resu
         );
     }
 
-    // Send our handshake ack (with our own signed challenge)
     let payload = bincode::serialize(&local_handshake)?;
     write_message(&mut send, MessageType::HandshakeAck, &payload).await?;
 
-    // Compute dialable address: remote IP + their listen port
     let dial_addr = SocketAddr::new(conn.remote_address().ip(), remote.listen_port);
 
-    // Reject self-connections
     if remote.validator_address == local_address {
         debug!(
             "Rejected self-connection (accept) from {}",
@@ -2587,9 +2220,6 @@ async fn accept_peer(conn: quinn::Connection, ctx: &PeerContext) -> anyhow::Resu
         remote.validator_address, remote.stake, dial_addr
     );
 
-    // Replace only this already-authenticated validator identity's generation.
-    // The fixed allowlist above bounds the address map; replacement keeps the
-    // peer count constant and makes a clean rolling restart immediately usable.
     let Some((connection_id, replaced_generation)) = connections.install_directed(
         remote.validator_address.0,
         local_address.0,
@@ -2621,15 +2251,12 @@ async fn accept_peer(conn: quinn::Connection, ctx: &PeerContext) -> anyhow::Resu
         })
         .await;
 
-    // Spawn reader. CRITICAL: move `conn` into the spawn so the Quinn
-    // Connection stays alive for the duration of the recv loop. See
-    // matching comment in connect_peer for the full explanation.
     let peer_addr_hash = remote.validator_address;
     let recv_context = PeerRecvContext::from_peer_context(ctx);
     let connections_ref = recv_context.connections.clone();
     let rate_limiter_clone = recv_context.rate_limiter.clone();
     tokio::spawn(async move {
-        let _conn = conn; // keep Quinn Connection alive until recv loop exits
+        let _conn = conn;
         handle_peer_recv(recv, peer_addr_hash, recv_context).await;
         if connections_ref
             .remove_and_notify(peer_addr_hash, connection_id)
@@ -2647,8 +2274,6 @@ async fn accept_peer(conn: quinn::Connection, ctx: &PeerContext) -> anyhow::Resu
 
     Ok(())
 }
-
-// ─── Per-Peer Recv Loop ─────────────────────────────────────────────────────
 
 struct PeerRecvContext {
     local_address: Hash256,
@@ -2816,28 +2441,19 @@ async fn handle_peer_recv(
                             if !allowed_validators.contains(&pex_peer.address.0) {
                                 continue;
                             }
-                            // Skip self
                             if pex_peer.address == local_address {
                                 continue;
                             }
-                            // Skip already-connected peers
                             if connections.is_connected(&pex_peer.address.0) {
                                 continue;
                             }
-                            // Skip empty addresses
                             if pex_peer.socket_addr.is_empty() {
                                 continue;
                             }
-                            // Rate-limit PEX dials: only try if we're below
-                            // MAX_PEERS connections. This prevents sybil attacks
-                            // from filling our connection slots via PEX.
-                            // The QUIC handshake verifies genesis_hash + ed25519
-                            // signature, so invalid peers are rejected at connect.
                             if connections.peers.len() as u32 >= MAX_PEERS {
                                 debug!("PEX: at connection limit, skipping {}", pex_peer.address);
                                 break;
                             }
-                            // Queue for dialing
                             if let Ok(addr) = pex_peer.socket_addr.parse::<SocketAddr>() {
                                 debug!(
                                     "PEX: queueing discovered peer {} at {}",
@@ -2999,8 +2615,6 @@ async fn handle_peer_recv(
                 }
             }
             MessageType::Heartbeat => {
-                // Heartbeat now carries round info for partition detection.
-                // Old heartbeats (empty payload) are still valid - just skip parse.
                 if !data.is_empty()
                     && let Ok(hb) = deserialize_message::<crate::protocol::HeartbeatMessage>(&data)
                 {
@@ -3244,7 +2858,6 @@ async fn handle_peer_recv(
                     Err(e) => warn!("Bad RoundSyncResponse from {}: {}", peer_address, e),
                 }
             }
-            // Handshake messages are handled during connection setup, not here.
             MessageType::Handshake | MessageType::HandshakeAck => {
                 debug!(
                     "Unexpected handshake message from {} in data loop",
@@ -3255,9 +2868,6 @@ async fn handle_peer_recv(
     }
 }
 
-// ─── Peer Persistence ──────────────────────────────────────────────────────
-
-/// Save known peer dial addresses to `known_peers.json` in the data directory.
 fn save_peers_to_disk(data_dir: &str, connections: &PeerConnections) {
     let peers: Vec<String> = connections
         .peers
@@ -3268,7 +2878,6 @@ fn save_peers_to_disk(data_dir: &str, connections: &PeerConnections) {
         return;
     }
     let path = std::path::Path::new(data_dir).join("known_peers.json");
-    // Ensure directory exists
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -3284,7 +2893,6 @@ fn save_peers_to_disk(data_dir: &str, connections: &PeerConnections) {
     }
 }
 
-/// Load known peer dial addresses from disk.
 fn load_peers_from_disk(data_dir: &str) -> Vec<SocketAddr> {
     let path = std::path::Path::new(data_dir).join("known_peers.json");
     match std::fs::read_to_string(&path) {
@@ -3393,9 +3001,6 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_v3_wire_filters_extensions_without_closing_streams() {
-        // Exercise the real broadcast and directed-send paths over a framed
-        // stream. A surviving legacy marker proves no extension leaked or
-        // broke the connection; default mode must still deliver extensions.
         for legacy in [true, false] {
             let policy = Arc::new(TransportWirePolicy::new(legacy));
             let (inbound_tx, _inbound_rx) = mpsc::channel(1);
@@ -3767,8 +3372,6 @@ mod tests {
         assert_eq!(replaced, None);
         assert!(replacement_id > old_id);
 
-        // The old reader exits after the replacement has claimed the same
-        // validator address. Its delayed cleanup must be a no-op.
         assert!(!connections.remove_if_current(&peer, old_id));
         assert_eq!(
             connections.peers.get(&peer).unwrap().connection_id,
@@ -3780,20 +3383,13 @@ mod tests {
         assert_eq!(peer_count.load(Ordering::Relaxed), 0);
     }
 
-    /// The stream currently installed for `key`, for tests whose streams are
-    /// plain labels.
     fn installed_stream<S: Copy>(connections: &PeerConnections<S>, key: &[u8; 32]) -> S {
         let stream = connections.peers.get(key).unwrap().send.clone();
         stream.try_lock().expect("no write in flight").stream
     }
 
-    /// A local identity for the single-map tests (the lower of the pair).
     const LOCAL: [u8; 32] = [1_u8; 32];
 
-    /// Replays one simultaneous dial between a lower address A and a higher
-    /// address B, with each side's two handshakes finishing in the given
-    /// order, and returns which connection each side kept. "A->B" is the one
-    /// A initiated.
     fn simultaneous_dial(
         a_accepts_first: bool,
         b_accepts_first: bool,
@@ -3803,7 +3399,6 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:7333".parse().unwrap();
         let (a_view, _) = test_connections::<&'static str>();
         let (b_view, _) = test_connections::<&'static str>();
-        // On A: "A->B" is a dial, "B->A" an accept. On B, the reverse.
         let a_steps = [("A->B", true), ("B->A", false)];
         let b_steps = [("B->A", true), ("A->B", false)];
         for (view, local, remote, steps, accepts_first) in [
@@ -3827,9 +3422,6 @@ mod tests {
 
     #[test]
     fn a_simultaneous_dial_converges_on_one_connection_in_every_completion_order() {
-        // Under last-writer-wins, A could keep "B->A" while B kept "A->B",
-        // each then closing the connection the other side kept. Every order
-        // must now land both sides on the SAME connection.
         for a_accepts_first in [false, true] {
             for b_accepts_first in [false, true] {
                 let (a_kept, b_kept) = simultaneous_dial(a_accepts_first, b_accepts_first);
@@ -3866,9 +3458,6 @@ mod tests {
 
     #[test]
     fn outside_the_window_a_reconnect_replaces_the_old_connection_in_either_direction() {
-        // A restarted peer's new connection must win over a stale one even
-        // when the stale one had the preferred direction - otherwise a
-        // rolling restart would look like a partition until QUIC timed out.
         let (connections, peer_count) = test_connections::<&'static str>();
         let local = [1_u8; 32];
         let remote = [2_u8; 32];
@@ -3894,10 +3483,7 @@ mod tests {
         assert_eq!(peer_count.load(Ordering::Relaxed), 1);
     }
 
-    /// A test send stream: either one that never accepts a byte, like a peer
-    /// whose flow-control window never reopens, or an in-memory pipe.
     enum TestStream {
-        /// Notified on every write attempt, so a test knows a write is stuck.
         Stalled(Arc<tokio::sync::Notify>),
         Open(tokio::io::DuplexStream),
     }
@@ -3979,13 +3565,8 @@ mod tests {
         );
     }
 
-    /// Two workers, as on a validator's main runtime. A task stuck writing to
-    /// one peer must leave that peer's own shard free for every other task:
-    /// before, the writer held the shard's write guard across the network
-    /// write, and two more accesses parked both workers for good.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stalled_peer_write_never_blocks_the_peer_map() {
-        // Long enough that the probes below run while the write is stuck.
         let (connections, peer_count, mut inbound_rx) =
             fast_timeout_connections(std::time::Duration::from_secs(2));
         let connections = Arc::new(connections);
@@ -4009,15 +3590,12 @@ mod tests {
             .await
             .expect("the write reached the stalled stream");
 
-        // One task per worker, each touching the stalled peer's own shard.
-        // The test thread waits on a std channel, so it never needs a worker.
         let (done_tx, done_rx) = std::sync::mpsc::channel::<&'static str>();
         let (replacement_send, mut replacement_receive) = tokio::io::duplex(4096);
         {
             let connections = connections.clone();
             let done = done_tx.clone();
             tokio::spawn(async move {
-                // Either the stalled stream or its replacement holds the slot.
                 assert!(connections.is_connected(&stalled));
                 assert!(matches!(connections.peers.len(), 1 | 2));
                 done.send("is_connected and len").unwrap();
@@ -4051,8 +3629,6 @@ mod tests {
                 .expect("peer-map access completed while a peer write was stuck");
         }
 
-        // The stuck write gives up on its own timeout. Its generation was
-        // already replaced, so its cleanup must leave the replacement alone.
         tokio::time::timeout(std::time::Duration::from_secs(5), writer)
             .await
             .expect("the stuck write gave up")
@@ -4124,8 +3700,6 @@ mod tests {
             } => assert_eq!(connection_id, generation),
             other => panic!("expected a timeout, got {other:?}"),
         }
-        // A writer that cloned the stream before the connection was removed
-        // must refuse it at once rather than write after a partial frame.
         let started = std::time::Instant::now();
         match connections
             .write_to_peer(&peer, Some(generation), MessageType::Heartbeat, &[])
@@ -4138,7 +3712,6 @@ mod tests {
             other => panic!("expected a torn stream, got {other:?}"),
         }
         assert!(started.elapsed() < connections.write_base_timeout);
-        // A generation the caller did not expect is left alone.
         assert!(matches!(
             connections
                 .write_to_peer(&peer, Some(generation + 1), MessageType::Heartbeat, &[])
@@ -4147,9 +3720,6 @@ mod tests {
         ));
     }
 
-    /// A short frame queued behind a longer write to the same peer must not
-    /// count the wait against itself and drop a peer that is still taking
-    /// that longer write. Only the write that holds the stream is judged.
     #[tokio::test]
     async fn a_write_queued_behind_a_longer_one_skips_the_peer_without_removing_it() {
         let (connections, peer_count, mut inbound_rx) =
@@ -4162,7 +3732,6 @@ mod tests {
             .install_directed(peer, LOCAL, stream, addr, 1, true)
             .unwrap();
 
-        // A 2 MiB frame is allowed 2 s more than an empty heartbeat.
         let large = vec![0_u8; 2 * 1024 * 1024];
         let holder_limit = peer_write_timeout(SHORT_WRITE_TIMEOUT, large.len());
         let holder = {
@@ -4202,7 +3771,6 @@ mod tests {
             "no disconnect for a busy peer"
         );
 
-        // The write that held the stream is still bounded by its own timeout.
         match holder.await.unwrap() {
             PeerWrite::Failed {
                 connection_id,

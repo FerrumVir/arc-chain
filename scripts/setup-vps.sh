@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# ARC_RETIRED_LIVE_TOOL_V3_REQUIRED
 set -euo pipefail
 printf '%s\n' \
     'RETIRED: setup-vps.sh cannot safely install toolchains or run deployment benchmarks on a host.' \

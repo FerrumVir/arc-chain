@@ -1,7 +1,3 @@
-/* Round 6: an engraving engine. A plate is an ordered list of strokes (polylines with a width at every point) and
-   masks (polygons filled with the ground colour, for occlusion). Forms are modelled under one light; hatching
-   follows each form, swells in shadow and tapers into light, and crosses in up to four layers where it is darkest.
-   White on Arc blue reads as a negative print: the more shadow, the more white. */
 (function () {
   'use strict';
   var PI = Math.PI;
@@ -16,7 +12,6 @@
   function norm(v) { var l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; }
   var LIGHT = norm([-0.58, 0.6, 0.55]);
   function lit(n) { return Math.max(0, n[0] * LIGHT[0] + n[1] * LIGHT[1] + n[2] * LIGHT[2]); }
-  // darkness of a surface with normal n (x right, y up, z toward the viewer), with a floor of ambient light
   function shade(n, amb) { return clamp(1 - (amb == null ? 0.12 : amb) - lit(n) * 1.05, 0, 1); }
 
   function Plate(w, h) { this.w = w; this.h = h; this.items = []; this.nPts = 0; }
@@ -33,13 +28,11 @@
   };
   Plate.prototype.line = function (pts, w, layer) { this.add(pts, w, layer); };
   Plate.prototype.seg = function (x0, y0, x1, y1, w, layer) { this.add([[x0, y0], [x1, y1]], w, layer); };
-  // colour: a fill other than the ground, for a surface that has its own tone (a screen's glass)
   Plate.prototype.mask = function (pts, colour) {
     var P = new Float32Array(pts.length * 2); for (var i = 0; i < pts.length; i++) { P[i * 2] = pts[i][0]; P[i * 2 + 1] = pts[i][1]; }
     this.items.push(colour ? { t: 1, p: P, c: colour } : { t: 1, p: P });
   };
   function rings(list) { return list.map(function (pts) { var P = new Float32Array(pts.length * 2); for (var i = 0; i < pts.length; i++) { P[i * 2] = pts[i][0]; P[i * 2 + 1] = pts[i][1]; } return P; }); }
-  // a mask or a clip with holes: the first ring is the outline, the rest are cut out of it
   Plate.prototype.maskHoles = function (list, colour) { this.items.push(colour ? { t: 5, r: rings(list), c: colour } : { t: 5, r: rings(list) }); };
   Plate.prototype.clipHoles = function (list) { this.items.push({ t: 6, r: rings(list) }); };
   Plate.prototype.clip = function (pts) { var P = new Float32Array(pts.length * 2); for (var i = 0; i < pts.length; i++) { P[i * 2] = pts[i][0]; P[i * 2 + 1] = pts[i][1]; } this.items.push({ t: 3, p: P }); };
@@ -50,13 +43,9 @@
     for (var i = 0; i <= k; i++) { var a = a0 + (a1 - a0) * i / k; pts.push([cx + Math.cos(a) * r, cy - Math.sin(a) * r]); }
     this.add(pts, w, layer);
   };
-  // a contour whose weight follows the shadow: thicker where the form turns away from the light
   Plate.prototype.contour = function (pts, darkAt, w0, w1, layer) {
     var ws = pts.map(function (p, i) { return mix(w0, w1, clamp(darkAt(p, i), 0, 1)); }); this.add(pts, ws, layer);
   };
-  /* hatch a patch. pt(u, v) -> [x, y] maps the unit square onto the drawing; dark(u, v) -> 0 (light) .. 1 (black).
-     o.lenU, o.lenV: its size in drawing units. Family one runs along v and is spaced along u; three crossing families
-     enter at rising darkness. Strokes swell with darkness and taper where they end. */
   Plate.prototype.hatch = function (pt, dark, o) {
     var self = this, sp = o.sp || 1.5, nu = Math.max(2, Math.round(o.lenU / sp)), nv = Math.max(2, Math.round(o.lenV / (o.step || 1.4)));
     var T = o.t || [0.14, 0.42, 0.64, 0.84], w0 = o.w0 == null ? 0.16 : o.w0, w1 = o.w1 == null ? 0.72 : o.w1, layer = o.layer == null ? 3 : o.layer;
@@ -95,15 +84,12 @@
       }
     });
   };
-  // stipple: short strokes and dots scattered where dark, for grain, earth and foliage
   Plate.prototype.stipple = function (x0, y0, x1, y1, dark, count, seed, w, layer) {
     var r = rng(seed || 1);
     for (var i = 0; i < count; i++) { var x = x0 + r() * (x1 - x0), y = y0 + r() * (y1 - y0), d = dark(x, y); if (r() > d) continue;
       var a = r() * PI, l = 0.4 + r() * 0.9; this.add([[x, y], [x + Math.cos(a) * l, y + Math.sin(a) * l]], (w || 0.35) * (0.7 + d * 0.6), layer == null ? 4 : layer); }
   };
 
-  /* draw a plate. T: { x, y, s } maps plate units to CSS px; the canvas is in device px (dpr).
-     opt.reveal 0..1 draws each stroke up to that share of its length (outlines first); opt.wz scales widths with zoom. */
   var BINS = [0.26, 0.38, 0.52, 0.7, 0.95, 1.3, 1.8, 2.6];
   function draw(g, plate, T, dpr, opt) {
     opt = opt || {};
@@ -120,7 +106,6 @@
     g.lineCap = 'round'; g.lineJoin = 'round';
     var items = plate.items, cl = -20, cr = CW + 20, ct = -20, cb = CH + 20, dl = opt.deadline || 0;
     for (var i = opt.from || 0; i < items.length; i++) {
-      // resumable: when drawing into a cached picture a slice at a time, stop at the deadline and say where to go on
       if (dl && (i & 127) === 0 && i > (opt.from || 0) && performance.now() > dl) { flush(); return i; }
       var it = items[i], P = it.p;
       if (it.t === 3) { flush(); g.save(); g.beginPath(); for (var m3 = 0; m3 < P.length; m3 += 2) { var X3 = ox + P[m3] * s, Y3 = oy + P[m3 + 1] * s; if (m3) g.lineTo(X3, Y3); else g.moveTo(X3, Y3); } g.closePath(); g.clip(); continue; }

@@ -1,23 +1,3 @@
-//! Tier 1 on-chain inference validator task.
-//!
-//! Polls [`StateDB::tier1_pending_requests`] on a tick, derives the committee
-//! for each open request, and:
-//!   1. Submits an `InferenceVote` tx when this validator is selected and
-//!      hasn't yet voted.
-//!   2. Submits an `InferenceFinalize` tx when the vote count reaches the
-//!      committee size OR the deadline has elapsed.
-//!
-//! Inference itself runs the candle Q4 backend on the validator's own
-//! machine (`GgufEngine::generate`), producing bitwise-identical output
-//! across hardware. The output_hash committed on-chain is BLAKE3 of the
-//! concatenated little-endian token IDs.
-//!
-//! Spawn this task at boot from `main.rs` after the candle engine + cached
-//! integer model are loaded. It owns no chain state — it reads via the
-//! shared `Arc<StateDB>` and writes by inserting txs into `Arc<Mempool>`.
-//!
-//! See `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md` for the full design.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,15 +17,8 @@ use dashmap::DashMap;
 use tokio::time;
 use tracing::{info, warn};
 
-/// How often the task scans for new work. 500 ms balances reactivity against
-/// state-lock contention. The chain's block tempo (~1-3 s) is the natural
-/// upper bound — finer polling than that wastes cycles.
 const TICK: Duration = Duration::from_millis(500);
 
-/// Candle's model object owns one mutable KV cache and therefore serializes
-/// work per loaded artifact. Admit only one Tier-1 compute at a time instead
-/// of spawning an unbounded set of blocking jobs that merely wait on the
-/// model lock. Public inference has its own independently bounded permits.
 const TIER1_INFERENCE_COMPUTE_CONCURRENCY: usize = 1;
 
 fn spawn_blocking_with_tier1_compute_permit<T, F>(
@@ -62,42 +35,20 @@ where
     })
 }
 
-/// The validator background task.
 pub struct InferenceValidatorTask {
     pub state: Arc<StateDB>,
     pub mempool: Arc<Mempool>,
     pub validator_address: Address,
     pub validator_keypair: KeyPair,
-    /// Candle GGUF engine (forward pass). Optional — if a node hasn't loaded
-    /// a model it simply never votes. Other committee members can still
-    /// reach `min_agreement` without it.
     pub engine: Option<Arc<GgufEngine>>,
-    /// Cached integer model used for tokenizer encode/decode + chat template.
     pub tokenizer: Option<Arc<CachedIntegerModel>>,
-    /// Streaming BLAKE3 of every byte in the source artifact loaded into the
-    /// candle engine. None means this validator must abstain from inference.
     pub model_id: Option<Hash256>,
-    /// In-memory dedup so the task never submits two votes for the same
-    /// request from the same validator. State-side `apply_inference_vote`
-    /// also rejects duplicates; this avoids burning gas on doomed txs.
     voted: Arc<DashMap<[u8; 32], ()>>,
-    /// Last finalize-submit time per request. Used to throttle retries:
-    /// the apply-time eligibility check (`now >= anchor_height +
-    /// deadline_blocks`) can race a finalize tx through mempool→block in a
-    /// window where the height is still 1 below deadline; the tx then
-    /// applies-with-error (consuming the validator's nonce) and the request
-    /// stays Open forever unless we re-submit. Track the timestamp so we
-    /// retry every `FINALIZE_RETRY_AFTER` seconds while the request stays
-    /// non-terminal.
     finalize_submitted: Arc<DashMap<[u8; 32], std::time::Instant>>,
     compute_permits: Arc<tokio::sync::Semaphore>,
     worker_execution: Arc<crate::native_inference::WorkerExecutionGate>,
 }
 
-/// How long to wait after a finalize submit before allowing a retry on the
-/// same request, if it hasn't reached a terminal state. Long enough to give
-/// the original tx time to commit and apply, short enough that a wedged
-/// request unsticks within minutes rather than hours.
 const FINALIZE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl InferenceValidatorTask {
@@ -135,25 +86,14 @@ impl InferenceValidatorTask {
         self
     }
 
-    /// Run forever. Cancellation is via the parent runtime dropping the
-    /// task handle. Never returns under normal operation.
-    ///
-    /// Convenience: takes `self` and wraps in `Arc` internally. If you
-    /// already have an `Arc<InferenceValidatorTask>`, call `run_arc` instead
-    /// to avoid the move.
     pub async fn run(self) {
         Self::run_arc_inner(Arc::new(self), None).await
     }
 
-    /// Run until the node lifecycle closes admission, then wait for every
-    /// already-started inference/vote job to finish before returning.
     pub async fn run_with_shutdown(self, shutdown: tokio::sync::watch::Receiver<bool>) {
         Self::run_arc_inner(Arc::new(self), Some(shutdown)).await
     }
 
-    /// Same as `run` but operates on a pre-built `Arc<Self>`. Used by
-    /// integration tests that need to keep a reference for assertions
-    /// while the loop runs.
     pub async fn run_arc(me: Arc<Self>) {
         Self::run_arc_inner(me, None).await
     }
@@ -211,7 +151,6 @@ impl InferenceValidatorTask {
         info!("Tier 1 inference validator stopped at the lifecycle barrier");
     }
 
-    /// One pass over the pending request set. Idempotent.
     async fn tick(self: &Arc<Self>, jobs: &mut tokio::task::JoinSet<()>) {
         let pending = self.state.tier1_pending_requests();
         if pending.is_empty() {
@@ -223,13 +162,10 @@ impl InferenceValidatorTask {
                 Some(s) => s,
                 None => continue,
             };
-            // Skip terminal states. The pending index should already be
-            // pruned but double-check (we may race with apply).
             if snap.status == TIER1_STATUS_FINALIZED || snap.status == TIER1_STATUS_REFUNDED {
                 continue;
             }
 
-            // Vote path. Skip if we already voted on this request.
             let already_voted = snap
                 .votes
                 .iter()
@@ -242,14 +178,9 @@ impl InferenceValidatorTask {
                 );
                 let in_committee = committee.iter().any(|a| a.0 == self.validator_address.0);
                 if in_committee {
-                    // A busy model is retried on the next tick. Do not create
-                    // one waiter/task per pending request: the engine itself
-                    // is serialized, so queued blocking jobs add no throughput
-                    // and can exhaust runtime memory under adversarial demand.
                     if let Some(worker_permit) = self.worker_execution.try_enter()
                         && let Ok(compute_permit) = self.compute_permits.clone().try_acquire_owned()
                     {
-                        // Mark optimistically; clear on submission failure.
                         self.voted.insert(request_id, ());
                         let task = self.clone();
                         let task_for_cleanup = self.clone();
@@ -275,9 +206,6 @@ impl InferenceValidatorTask {
                 }
             }
 
-            // Finalize path. Two trigger conditions:
-            //   (a) Vote count reached committee_size  → ready
-            //   (b) Height has passed deadline         → timeout
             let votes_done = snap.votes.len() >= snap.committee_size as usize;
             let deadline_reached = now >= snap.anchor_height.saturating_add(snap.deadline_blocks);
             let retry_ok = self
@@ -304,8 +232,6 @@ impl InferenceValidatorTask {
         }
     }
 
-    /// Run candle inference on a request's input blob, then submit an
-    /// `InferenceVote` tx.
     async fn run_inference_and_vote(
         self: Arc<Self>,
         snap: Tier1RequestSnapshot,
@@ -319,11 +245,6 @@ impl InferenceValidatorTask {
             "Tier 1 inference: running for committee membership"
         );
 
-        // candle.generate() is CPU-bound (5-15 sec on TinyLlama CPU). Running
-        // it directly inside an async tokio task blocks the worker thread,
-        // and a handful of concurrent inferences starves the whole runtime —
-        // /health timeouts, RPC frozen. Move it onto the blocking pool so
-        // tokio workers stay free for I/O.
         let engine = self.engine.clone();
         let tokenizer = self.tokenizer.clone();
         let model_id = self
@@ -359,7 +280,6 @@ impl InferenceValidatorTask {
             .await
             .map_err(|e| anyhow::anyhow!("inference task join: {}", e))??;
 
-        // Submit InferenceVote tx
         let nonce = self
             .state
             .get_account(&self.validator_address)
@@ -369,15 +289,12 @@ impl InferenceValidatorTask {
             request_id,
             output_hash,
             output_blob: if snap.votes.is_empty() {
-                // First voter attaches the plaintext; subsequent voters omit
-                // to save block space (the apply-time hash check rejects
-                // malformed blobs anyway).
                 Some(output_blob)
             } else {
                 None
             },
-            vrf_proof: Vec::new(),         // VRF proof not enforced in Phase A.
-            committee_seed: Hash256::ZERO, // advisory only; apply re-derives.
+            vrf_proof: Vec::new(),
+            committee_seed: Hash256::ZERO,
         });
         let mut tx = Transaction {
             tx_type: TxType::InferenceVote,
@@ -402,11 +319,6 @@ impl InferenceValidatorTask {
             "Tier 1 vote submitted"
         );
 
-        // Also post a raw InferenceAttestation as challengeable evidence for
-        // the same work. Raw 0x16 attestations never transfer treasury funds
-        // and `/worker/earnings` counts only successfully mined threshold-
-        // authorized CommunityInferenceReward (0x25) receipts. Best-effort: a
-        // failure here logs but does not block the Tier 1 vote.
         let input_hash = arc_crypto::hash_bytes(&snap.input_blob);
         let mut att_tx = Transaction {
             tx_type: TxType::InferenceAttestation,
@@ -444,12 +356,6 @@ impl InferenceValidatorTask {
         Ok(())
     }
 
-    /// Compute the model output for a request. Synchronous — call this
-    /// from `tokio::task::spawn_blocking` only. The candle path is CPU-bound.
-    ///
-    /// Missing or mismatched model state is an abstention, never a synthetic
-    /// vote. A stub output would falsely claim execution of an unavailable
-    /// artifact and could influence consensus.
     fn compute_output_blocking(
         engine: &Option<Arc<GgufEngine>>,
         loaded_model_id: Hash256,
@@ -466,8 +372,6 @@ impl InferenceValidatorTask {
         let result = engine
             .generate(&loaded_model_id, tokens, max_tokens)
             .map_err(|e| anyhow::anyhow!("candle generate: {:?}", e))?;
-        // Engine already provides bitwise-deterministic output bytes and the
-        // BLAKE3 hash over them.
         Ok((result.output_hash, result.output))
     }
 
@@ -517,9 +421,6 @@ impl InferenceValidatorTask {
         .map_err(|error| anyhow::anyhow!("invalid Tier-1 generation context: {error}"))
     }
 
-    /// Recover the model commitment from the canonical request transaction.
-    /// If pruning or incomplete state makes it unavailable, voting fails
-    /// closed instead of guessing from model dimensions or a display name.
     fn request_parameters(&self, request_id: &[u8; 32]) -> Option<(Hash256, u32, Hash256)> {
         self.state.full_transactions.iter().find_map(|entry| {
             let TxBody::InferenceRequest(body) = &entry.value().body else {
@@ -533,8 +434,6 @@ impl InferenceValidatorTask {
         })
     }
 
-    /// Submit an `InferenceFinalize` tx. Any validator can submit; the
-    /// first to commit wins, the rest reject with a no-op error.
     fn submit_finalize(&self, request_id: &[u8; 32]) -> anyhow::Result<()> {
         let nonce = self
             .state

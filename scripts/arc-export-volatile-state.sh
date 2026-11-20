@@ -1,66 +1,15 @@
 #!/usr/bin/env bash
-# ARC_RETIRED_LIVE_TOOL_V3_REQUIRED
 set -euo pipefail
 printf '%s\n' \
     'RETIRED: arc-export-volatile-state.sh cannot safely operate the current validator fleet.' \
     'No action was taken. Use the approved manifest-bound recovery capture workflow.' >&2
 exit 78
-# ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — export the volatile, unreplicated node state before any restart
-#
-# WHY THIS EXISTS
-#
-# Three things on a seed live in process memory with no WAL entry and no
-# snapshot, and are destroyed by a restart:
-#
-#   1. `inference_results`   — the recorded sharded runs. On 2026-08-17 LHR
-#                              held 15, and that was the network's ENTIRE
-#                              stock of genuine sharded output.
-#   2. `community_workers`   — the worker scoreboard. Registrations are
-#                              node-local and NOT replicated between seeds,
-#                              so each seed holds a different set.
-#   3. `sharded_runs_total`  — the per-node run/byte counters.
-#
-# Chain state is NOT in that category: blocks, height and accounts replay from
-# `state.wal` on startup, and the DAG WAL recovers on boot. This script exists
-# for the three things that do not come back.
-#
-# It is the read-only step that must happen BEFORE a rolling restart. Running
-# it costs nothing and forecloses nothing.
-#
-# SAFETY
-#
-#   - GET only. This script never POSTs and never mutates a seed.
-#   - It NEVER calls `/community/list`. That handler PRUNES the worker
-#     registry as a side effect; calling it is what empties the scoreboard
-#     you were about to export. `/workers/scoreboard` does not prune.
-#   - Dry-run is the DEFAULT. Pass --run to actually write files.
-#   - A non-200 is recorded as a non-200. The script never writes an empty or
-#     error body to a file that looks like captured data.
-#
-# USAGE
-#
-#   bash scripts/arc-export-volatile-state.sh              # dry run: show the plan
-#   bash scripts/arc-export-volatile-state.sh --run        # perform the export
-#   bash scripts/arc-export-volatile-state.sh --run --out DIR
-#
-# EXIT CODES
-#
-#   0  every CRITICAL endpoint captured on every reachable seed
-#   1  at least one CRITICAL endpoint failed — do NOT restart that seed yet
-#   2  bad usage / missing dependency
-# ─────────────────────────────────────────────────────────────────────────────
 
-# No `set -e`: one transient curl failure must not abort a salvage run that
-# still has five other seeds to capture.
 set -u
 
 RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
 BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
 
-# ── Seeds ────────────────────────────────────────────────────────────────────
-# name:host. Kept literal rather than parsed from testnet-seeds.txt because
-# that file lists P2P ports (9091/443); these are the RPC ports (9090).
 SEEDS=(
     "NYC:149.28.32.76"
     "LAX:140.82.16.112"
@@ -72,27 +21,22 @@ SEEDS=(
 RPC_PORT="${ARC_RPC_PORT:-9090}"
 TIMEOUT="${ARC_EXPORT_TIMEOUT:-30}"
 
-# ── Endpoints ────────────────────────────────────────────────────────────────
-# CRITICAL = irreplaceable on restart. A failure here blocks the restart.
-# CONTEXT  = reconstructible or forensically useful, but not irreplaceable.
-#
-# `/community/list` is deliberately absent and must stay absent — see SAFETY.
 CRITICAL_ENDPOINTS=(
-    "/inference/results"      # the recorded sharded runs — the whole point
-    "/workers/scoreboard"     # node-local worker registry, not replicated
-    "/inference/attestations" # attestation history held by this node
+    "/inference/results"
+    "/workers/scoreboard"
+    "/inference/attestations"
 )
 CONTEXT_ENDPOINTS=(
     "/health"
     "/block/latest"
-    "/validators"             # the divergent sets — evidence for the stall
+    "/validators"
     "/stats"
     "/shards"
     "/models"
-    "/inference/latency_stats" # the poisoned EWMA, before a restart clears it
+    "/inference/latency_stats"
     "/inference/cache_stats"
     "/economics/rewards"
-    "/network/info"           # 404s on v0.7.2/v0.7.9 — recorded as such
+    "/network/info"
 )
 
 DRY_RUN=1
@@ -113,7 +57,6 @@ done
 
 command -v curl >/dev/null || { printf "%s[FAIL]%s curl not found\n" "$RED" "$RESET" >&2; exit 2; }
 
-# Portable sha256 — macOS ships shasum, Linux ships sha256sum.
 sha256_of() {
     if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'
     elif command -v shasum >/dev/null; then shasum -a 256 "$1" | awk '{print $1}'
@@ -164,7 +107,6 @@ TOTAL_OK=0
 TOTAL_FAIL=0
 SUMMARY_ROWS=""
 
-# fetch <name> <host> <endpoint> <tier>
 fetch() {
     local name="$1" host="$2" ep="$3" tier="$4"
     local slug; slug="$(printf '%s' "$ep" | sed 's#^/##; s#[/?=]#_#g')"
@@ -188,7 +130,6 @@ fetch() {
         return 0
     fi
 
-    # Not 200. Record the failure as a failure — never as data.
     rm -f "$body_file"
     TOTAL_FAIL=$((TOTAL_FAIL + 1))
     [ "$MANIFEST_FIRST" -eq 0 ] && printf ',\n' >> "$MANIFEST"
@@ -212,8 +153,6 @@ for entry in "${SEEDS[@]}"; do
     for ep in "${CRITICAL_ENDPOINTS[@]}"; do fetch "$name" "$host" "$ep" "CRITICAL"; done
     for ep in "${CONTEXT_ENDPOINTS[@]}"; do fetch "$name" "$host" "$ep" "context"; done
 
-    # Per-seed headline figures, read back from what we just captured — never
-    # from memory, and never restated from a doc.
     res_file="${OUT_DIR}/${name}_inference_results.json"
     sb_file="${OUT_DIR}/${name}_workers_scoreboard.json"
     n_runs="n/a"; n_workers="n/a"
@@ -241,7 +180,6 @@ done
 printf '\n  ],\n  "critical_failures": %s,\n  "files_captured": %s,\n  "requests_failed": %s\n}\n' \
     "$CRITICAL_FAILURES" "$TOTAL_OK" "$TOTAL_FAIL" >> "$MANIFEST"
 
-# ── Human-readable summary ───────────────────────────────────────────────────
 {
     printf '# ARC volatile-state export — %s\n\n' "$STAMP"
     printf 'Read-only capture of the three things a restart destroys:\n'

@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""Materialize bytes that can become the next ARC release.
-
-Index mode reads blobs directly from Git's index, so a staged secret cannot be
-hidden by replacing the working-copy file before running the local gate.
-Worktree mode includes tracked files plus untracked, non-ignored files and
-therefore catches edits that have not been staged yet. Symlinks are always
-written as their target text; this scanner never follows them outside the repo.
-"""
 
 from __future__ import annotations
 
@@ -51,8 +43,6 @@ def materialize_index(repository: Path, destination: Path) -> None:
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         if mode == "160000":
-            # A gitlink contains no file bytes in this repository. Preserve the
-            # exact object identity as inert text without entering the submodule.
             target.write_text(object_id + "\n", encoding="ascii")
         else:
             blob = git(repository, "cat-file", "blob", object_id)
@@ -95,7 +85,6 @@ def main() -> None:
     repository = args.repository.resolve()
     destination = args.destination.resolve()
     if not (repository / ".git").exists():
-        # Linked worktrees have a .git control file, so `exists()` is enough.
         raise SystemExit(f"not a Git worktree: {repository}")
     prepare_destination(destination)
     if args.index:

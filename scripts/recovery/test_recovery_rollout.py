@@ -851,8 +851,6 @@ class RecoveryRolloutTests(unittest.TestCase):
         }
 
     def maintenance_stage_fixture(self):
-        """Build a compact canonical bundle/boundary/offline cross-binding set."""
-
         value = self.fixture(production=True)
         canonical = rollout.canonical_bytes
         sha_value = lambda item: hashlib.sha256(canonical(item)).hexdigest()
@@ -2286,8 +2284,6 @@ class RecoveryRolloutTests(unittest.TestCase):
 
     @staticmethod
     def repack_maintenance_stage(value, rows, payloads, bundle, boundary):
-        """Recompute every outer seal after a semantic union-fixture rewrite."""
-
         canonical = rollout.canonical_bytes
         sha_value = lambda item: hashlib.sha256(canonical(item)).hexdigest()
 
@@ -3287,8 +3283,6 @@ class RecoveryRolloutTests(unittest.TestCase):
             if row["node"] == "sgp" and row["label"] == "authenticated_info_after"
         )
         target["height"] -= 50
-        # Recompute the attacker's claimed cutoff/ceiling and all outer hashes;
-        # the retained authenticated proof must still make this fail closed.
         boundary["observed_cutoff_height"] = max(
             row["height"] for row in boundary["evidence_heights"]
         )
@@ -3524,8 +3518,6 @@ class RecoveryRolloutTests(unittest.TestCase):
         ):
             self.assertIn(exact, source)
 
-        # The same public-gate transaction also requires a fresh, exact v2
-        # retirement tripwire; any resurrected retired source latches maintenance.
         value, _rows, payloads = self.maintenance_stage_fixture()
         source_artifact = value["artifacts"]["legacy_late_fork_source_set"]
         source_path = Path(source_artifact["path"])
@@ -6042,8 +6034,6 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         def fail_install(_node):
             raise rollout.RolloutError("sentinel late failure")
 
-        # The original-baseline rollback remains valid only before the
-        # journaled one-way quarantine-retirement boundary.
         harness._install_late_fork_interlock = mock.Mock(side_effect=fail_install)
         harness._install_gateway_and_unit = mock.Mock()
         def restored_proof(node, expected):
@@ -8332,8 +8322,6 @@ assert_udp_listener_owner 10001 "$ARC_TEST_EXPECTED_PID" validator-quic-p2p
         self.seal_reward_cutoff(first)
         first.persist_reward_evidence(evidence)
         sidecar = output.with_name(output.name + ".sha256")
-        # Model a crash after exact final bytes reached both files but before
-        # their read-only chmods completed.
         os.chmod(output, 0o600)
         os.chmod(sidecar, 0o600)
 

@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""Create, select, and verify the unsigned desktop build handoff.
-
-The unsigned build runs on a runner that never receives updater signing keys.
-It uploads one create-only, commit/run/attempt/hash-bound artifact.  A fresh
-release-environment runner downloads that artifact by immutable Actions ID and
-uses this helper to verify both the server ZIP digest and the inner build
-manifest before the minimal Tauri file signer sees the signing key. Native
-bundling never runs in the key-bearing job.
-"""
 
 from __future__ import annotations
 
@@ -133,15 +124,6 @@ def require_regular(path: Path, *, label: str, maximum: int) -> os.stat_result:
 def signer_input_permissions_are_read_only(
     metadata: os.stat_result, *, windows: bool
 ) -> bool:
-    """Return whether a signer input has the host's strict read-only state.
-
-    POSIX preserves the materializer's exact ``0400`` mode. Native Windows
-    deliberately maps ``chmod(..., 0400)`` to the read-only file attribute and
-    reports the resulting permission bits as ``0444``. Prove both Windows
-    representations and reject reparse points instead of weakening the POSIX
-    contract to a cross-platform numeric mode comparison.
-    """
-
     mode = stat.S_IMODE(metadata.st_mode)
     if not windows:
         return mode == 0o400
@@ -163,8 +145,6 @@ def signer_input_permissions_are_read_only(
 
 
 def same_regular_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
-    """Compare an open descriptor and pathname without trusting mode text."""
-
     return (
         stat.S_ISREG(left.st_mode)
         and stat.S_ISREG(right.st_mode)
@@ -176,8 +156,6 @@ def same_regular_file_identity(left: os.stat_result, right: os.stat_result) -> b
 
 
 def windows_permissions_match_mode(metadata: os.stat_result, mode: int) -> bool:
-    """Prove the Windows read-only attribute implied by a portable mode."""
-
     readonly_flag = getattr(stat, "FILE_ATTRIBUTE_READONLY", None)
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", None)
     file_attributes = getattr(metadata, "st_file_attributes", None)
@@ -200,16 +178,6 @@ def windows_permissions_match_mode(metadata: os.stat_result, mode: int) -> bool:
 
 
 def set_open_file_mode(path: Path, descriptor: int, mode: int) -> None:
-    """Set a mode while proving that path still names the open regular file.
-
-    Python gained ``os.fchmod`` on Windows only in 3.13, while the hosted
-    Windows runner currently exposes Python 3.12. On that runtime, use the
-    pathname API only while retaining the descriptor, and bind the pathname to
-    the descriptor both before and after the mutation. A replacement, link, or
-    reparse-point race therefore fails closed rather than being accepted as
-    the staged handoff object.
-    """
-
     before_descriptor = os.fstat(descriptor)
     before_path = path.lstat()
     if path.is_symlink() or not same_regular_file_identity(
@@ -270,10 +238,6 @@ def payload_files(platform: str, root: Path) -> list[tuple[str, Path, int]]:
         total += metadata.st_size
         if total > MAX_PAYLOAD_BYTES:
             fail("unsigned payload exceeds the aggregate size bound")
-        # AppImage must be executable after release assembly. Every other
-        # normalized release asset is data. These canonical modes are carried
-        # in the signed handoff metadata, while materialization deliberately
-        # strips execution permission in the key-bearing workspace.
         mode = 0o755 if name.endswith(".AppImage") else 0o644
         result.append((name, path, mode))
     return result
@@ -758,10 +722,6 @@ def materialize(args: argparse.Namespace) -> None:
                     handle = archive.extractfile(members[name])
                     if handle is None:
                         fail("cannot materialize handoff payload member")
-                    # Nothing produced by source compilation is executable in
-                    # the signing workspace. Release modes are restored only
-                    # after the signing-key step has exited and the exact input
-                    # hashes and signature have been verified.
                     copy_stream(handle, args.output_dir / name, 0o400)
         except (OSError, tarfile.TarError) as error:
             fail(f"cannot read selected handoff archive: {error}")
@@ -788,8 +748,6 @@ def materialize(args: argparse.Namespace) -> None:
 
 
 def verify_signed(args: argparse.Namespace) -> None:
-    """Verify the signer changed only the expected signature and restore modes."""
-
     validate_scalars(args)
     root = args.workspace
     if not root.is_dir() or root.is_symlink():
@@ -859,8 +817,6 @@ def verify_signed(args: argparse.Namespace) -> None:
     signature_path = root / signature_name
     require_regular(signature_path, label="updater signature", maximum=MAX_METADATA_BYTES)
 
-    # Restore normalized release modes only after the key-bearing command has
-    # ended and all source-generated inputs are proven byte-identical.
     for name, mode in expected_modes.items():
         os.chmod(root / name, mode)
     os.chmod(signature_path, 0o644)

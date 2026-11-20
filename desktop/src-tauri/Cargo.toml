@@ -33,16 +33,10 @@ directories = "5"
 rand = "0.8"
 hex = "0.4"
 fs2 = "0.4"
-# Identity / signing - must match the arc-node derivation scheme
-# (crates/arc-node/src/main.rs:310–311). Any change here desyncs the address
-# from what the chain actually sees.
 bip39 = "2.0"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 blake3 = "1.5"
 sha2 = "0.10"
-# Pure-Rust OpenSSH `sshsig` verification. The desktop must authenticate the
-# owner-signed SHA256SUMS before it trusts and executes a downloaded arc-node;
-# invoking an optional system ssh-keygen would break clean Windows installs.
 ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519", "getrandom"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
@@ -50,10 +44,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize = "1"
 libc = "0.2"
 
-# Milestone B (#36): build InferenceEscrowOpen transactions locally so the
-# desktop app can submit them to a coordinator before calling
-# /inference/run_consensus. Using path deps (not workspace deps) since
-# desktop/src-tauri is intentionally excluded from the top-level workspace.
 arc-types = { path = "../../crates/arc-types" }
 arc-crypto = { path = "../../crates/arc-crypto" }
 
@@ -73,8 +63,5 @@ custom-protocol = ["tauri/custom-protocol"]
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 
-# Tauri 2.11's Linux GTK3 stack is constrained to glib 0.18. Keep the
-# dependency version honest while applying the exact upstream fix for
-# RUSTSEC-2024-0429 until Tauri ships a supported newer GTK stack.
 [patch.crates-io]
 glib = { path = "../../vendor/third_party/glib-0.18.5" }

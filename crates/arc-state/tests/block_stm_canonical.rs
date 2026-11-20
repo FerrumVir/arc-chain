@@ -113,9 +113,6 @@ fn assert_accounts_match(sequential: &StateDB, adaptive: &StateDB, addresses: &[
 
 #[test]
 fn partition_preserves_transitive_conflict_order() {
-    // tx 1 depends on tx 0 through A; tx 2 depends on tx 1 through C but is
-    // disjoint from tx 0. Ordinary first-fit coloring put tx 2 back in batch
-    // 0, executing it before its conflicting predecessor in batch 1.
     let transactions = vec![
         verified_transfer(address(1, 1), address(1, 2), 1, 0),
         verified_transfer(address(1, 3), address(1, 1), 1, 0),
@@ -142,7 +139,6 @@ fn adaptive_matches_sequential_for_parallel_threshold_dependency_chain() {
     ];
     let mut transactions = vec![
         verified_transfer(account_a, account_b, 1, 0),
-        // Canonically fails: C is funded only by the later third transaction.
         verified_transfer(account_c, account_a, 1, 0),
         verified_transfer(account_d, account_c, 1, 0),
     ];
@@ -192,8 +188,6 @@ fn adaptive_matches_sequential_for_parallel_threshold_dependency_chain() {
 fn adaptive_matches_sequential_for_cross_sender_treasury_rewards() {
     let validator_a = KeyPair::generate_ed25519();
     let validator_b = KeyPair::generate_ed25519();
-    // Put the lexicographically larger sender first so the old sender sort
-    // deterministically reversed the two shared-treasury transactions.
     let (first_validator, second_validator) = if validator_a.address().0 > validator_b.address().0 {
         (&validator_a, &validator_b)
     } else {
@@ -299,8 +293,6 @@ fn adaptive_matches_sequential_for_cross_sender_challenges() {
     ];
     let filler_count = PARALLEL_THRESHOLD - transactions.len();
     append_disjoint_fillers(&mut transactions, &mut genesis, filler_count);
-    // Fillers were added to genesis after the databases were created; install
-    // those accounts explicitly so both executions start from the same state.
     for (account, balance) in genesis.iter().skip(4) {
         sequential.update_account(account, arc_types::Account::new(*account, *balance));
         adaptive.update_account(account, arc_types::Account::new(*account, *balance));

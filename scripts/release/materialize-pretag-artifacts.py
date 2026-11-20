@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Verify selected pre-tag archives and materialize the exact release bytes."""
 
 from __future__ import annotations
 

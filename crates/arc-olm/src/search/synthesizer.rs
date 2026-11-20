@@ -1,39 +1,20 @@
-//! 5-level program synthesizer for ARC-AGI tasks.
-//!
-//! Progressively tries more complex programs (Level 0..4), returning the first
-//! one that produces correct output for ALL training pairs.
-//!
-//! Level 0 (<1ms):   Unary Grid->Grid primitives
-//! Level 1 (<50ms):  Parameterized single primitives
-//! Level 2 (<500ms): Two-step compositions of Level 0 + Level 1
-//! Level 3 (<5s):    Object-centric patterns (covers ~54% of ARC tasks)
-//! Level 4 (<10s):   Common composite ARC patterns
-
 use crate::primitives::{grid, object};
 use crate::{Color, Grid, Object};
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-/// A grid->grid transform paired with the name used for it in a program string.
 type NamedGridFn = (&'static str, fn(&Grid) -> Grid);
 
-/// An object->cell-set function paired with the name used for it in a program string.
 type NamedRegionFn = (&'static str, fn(&Object) -> BTreeSet<(usize, usize)>);
 
-/// Cells grouped by color: color -> set of (color, (row, col)).
 type ColorGroups = std::collections::HashMap<u8, BTreeSet<(u8, (usize, usize))>>;
 
-/// Result of synthesis.
 pub struct SynthResult {
     pub program_desc: String,
     pub test_outputs: Vec<Grid>,
     pub level: u8,
 }
 
-/// Run the 5-level synthesizer with a timeout.
-///
-/// Tries progressively more expensive search levels, returning the first
-/// program that produces correct output on ALL training pairs.
 pub fn synthesize(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -46,7 +27,6 @@ pub fn synthesize(
     let start = Instant::now();
     let colors = collect_colors(train_pairs);
 
-    // --- Level 0: unary Grid->Grid primitives (<1ms) ---
     if let Some(r) = level_0(train_pairs, test_inputs) {
         return Some(r);
     }
@@ -54,7 +34,6 @@ pub fn synthesize(
         return None;
     }
 
-    // --- Level 1: parameterized single primitives (<50ms) ---
     if let Some(r) = level_1(train_pairs, test_inputs, &colors, &start, timeout_ms) {
         return Some(r);
     }
@@ -62,7 +41,6 @@ pub fn synthesize(
         return None;
     }
 
-    // --- Level 2: two-step compositions (<500ms) ---
     if let Some(r) = level_2(train_pairs, test_inputs, &colors, &start, timeout_ms) {
         return Some(r);
     }
@@ -70,7 +48,6 @@ pub fn synthesize(
         return None;
     }
 
-    // --- Level 3: object-centric patterns (<5s) ---
     if let Some(r) = level_3(train_pairs, test_inputs, &colors, &start, timeout_ms) {
         return Some(r);
     }
@@ -78,20 +55,13 @@ pub fn synthesize(
         return None;
     }
 
-    // --- Level 4: common ARC patterns (<10s) ---
     level_4(train_pairs, test_inputs, &colors, &start, timeout_ms)
 }
-
-// ============================================================
-// Helper functions
-// ============================================================
 
 fn elapsed_ms(start: &Instant) -> u64 {
     start.elapsed().as_millis() as u64
 }
 
-/// Check if a candidate function produces correct output for ALL training
-/// pairs. If so, apply to test inputs and return the test outputs.
 fn verify_and_apply(
     f: &dyn Fn(&Grid) -> Grid,
     train_pairs: &[(Grid, Grid)],
@@ -104,7 +74,6 @@ fn verify_and_apply(
             _ => return None,
         }
     }
-    // All training pairs matched -- apply to test inputs.
     let mut test_outputs = Vec::with_capacity(test_inputs.len());
     for test_in in test_inputs {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(test_in)));
@@ -116,7 +85,6 @@ fn verify_and_apply(
     Some(test_outputs)
 }
 
-/// Collect all distinct colors present in training data (inputs and outputs).
 fn collect_colors(pairs: &[(Grid, Grid)]) -> Vec<Color> {
     let mut seen = [false; 10];
     for (inp, out) in pairs {
@@ -133,10 +101,6 @@ fn collect_colors(pairs: &[(Grid, Grid)]) -> Vec<Color> {
     }
     (0u8..10).filter(|&c| seen[c as usize]).collect()
 }
-
-// ============================================================
-// Level 0: unary Grid->Grid primitives
-// ============================================================
 
 fn level_0(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<SynthResult> {
     let unary_prims: Vec<NamedGridFn> = vec![
@@ -168,7 +132,6 @@ fn level_0(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<SynthRe
         }
     }
 
-    // Identity: output == input
     if let Some(test_outputs) = verify_and_apply(&|g: &Grid| g.clone(), train_pairs, test_inputs) {
         return Some(SynthResult {
             program_desc: "identity".into(),
@@ -180,10 +143,6 @@ fn level_0(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<SynthRe
     None
 }
 
-// ============================================================
-// Level 1: parameterized single primitives
-// ============================================================
-
 fn level_1(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -191,7 +150,6 @@ fn level_1(
     start: &Instant,
     timeout_ms: u64,
 ) -> Option<SynthResult> {
-    // 1a. replace_color(grid, c1, c2) for all color pairs
     for &c1 in colors {
         for &c2 in colors {
             if c1 == c2 {
@@ -214,7 +172,6 @@ fn level_1(
         }
     }
 
-    // 1b. switch_colors(grid, a, b)
     for (i, &a) in colors.iter().enumerate() {
         for &b in &colors[i + 1..] {
             if elapsed_ms(start) > timeout_ms {
@@ -234,7 +191,6 @@ fn level_1(
         }
     }
 
-    // 1c. upscale(grid, factor) for factors 2-5
     for factor in 2..=5usize {
         if elapsed_ms(start) > timeout_ms {
             return None;
@@ -252,7 +208,6 @@ fn level_1(
         }
     }
 
-    // 1d. downscale(grid, factor) for factors 2-5
     for factor in 2..=5usize {
         if elapsed_ms(start) > timeout_ms {
             return None;
@@ -270,7 +225,6 @@ fn level_1(
         }
     }
 
-    // 1e. crop(grid, sr, sc, h, w) for varying positions and sizes
     if let Some((_, first_out)) = train_pairs.first() {
         let out_h = first_out.len();
         let out_w = if out_h > 0 { first_out[0].len() } else { 0 };
@@ -306,7 +260,6 @@ fn level_1(
         }
     }
 
-    // 1g. Multi-color replace: detect consistent color mapping across ALL training pairs
     {
         let mut color_map: Option<Vec<(u8, u8)>> = None;
         let mut valid = true;
@@ -340,7 +293,6 @@ fn level_1(
             match &color_map {
                 None => color_map = Some(this_map),
                 Some(existing) => {
-                    // Verify same mapping across pairs
                     for &(from, to) in &this_map {
                         if let Some(&(_, eto)) = existing.iter().find(|&&(f, _)| f == from)
                             && eto != to
@@ -385,7 +337,6 @@ fn level_1(
         }
     }
 
-    // 1f. Self-concat patterns
     let concat_patterns: Vec<NamedGridFn> = vec![
         ("hconcat(I,I)", |g| grid::hconcat(g, g)),
         ("vconcat(I,I)", |g| grid::vconcat(g, g)),
@@ -433,10 +384,6 @@ fn level_1(
     None
 }
 
-// ============================================================
-// Level 2: two-step compositions
-// ============================================================
-
 fn level_2(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -460,7 +407,6 @@ fn level_2(
         ("compress", grid::compress),
     ];
 
-    // 2a. All pairs of unary Grid->Grid: f(g(input))
     for (name_f, f) in &unary_prims {
         for (name_g, g) in &unary_prims {
             if elapsed_ms(start) > timeout_ms {
@@ -482,7 +428,6 @@ fn level_2(
         }
     }
 
-    // 2b. Unary + replace_color (both orderings)
     for (name_f, f) in &unary_prims {
         for &c1 in colors {
             for &c2 in colors {
@@ -493,7 +438,6 @@ fn level_2(
                     return None;
                 }
 
-                // f(replace_color(input, c1, c2))
                 let f_ref = *f;
                 if let Some(test_outputs) = verify_and_apply(
                     &move |inp: &Grid| f_ref(&grid::replace_color(inp, c1, c2)),
@@ -507,7 +451,6 @@ fn level_2(
                     });
                 }
 
-                // replace_color(f(input), c1, c2)
                 if let Some(test_outputs) = verify_and_apply(
                     &move |inp: &Grid| grid::replace_color(&f_ref(inp), c1, c2),
                     train_pairs,
@@ -523,7 +466,6 @@ fn level_2(
         }
     }
 
-    // 2c. Two replace_color operations in sequence
     for &c1 in colors {
         for &c2 in colors {
             if c1 == c2 {
@@ -564,11 +506,6 @@ fn level_2(
     None
 }
 
-// ============================================================
-// Level 3: object-centric patterns
-// ============================================================
-
-/// The 4 canonical object extraction modes used throughout the crate.
 const OBJ_MODES: [(bool, bool, bool, &str); 8] = [
     (true, true, true, "TTT"),
     (true, false, true, "TFT"),
@@ -598,13 +535,11 @@ fn level_3(
     start: &Instant,
     timeout_ms: u64,
 ) -> Option<SynthResult> {
-    // 3a. subgrid(selector(objects(input, ...)), input) for each mode x selector
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         if elapsed_ms(start) > timeout_ms {
             return None;
         }
 
-        // argmax_size
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let objs = object::objects(inp, uni, diag, nobg);
@@ -623,7 +558,6 @@ fn level_3(
             });
         }
 
-        // argmin_size
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let objs = object::objects(inp, uni, diag, nobg);
@@ -643,14 +577,12 @@ fn level_3(
         }
     }
 
-    // 3b. subgrid(colorfilter(objects(input, ...), color)[0], input)
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         for &color in colors {
             if elapsed_ms(start) > timeout_ms {
                 return None;
             }
 
-            // First object of that color
             if let Some(test_outputs) = verify_and_apply(
                 &|inp: &Grid| {
                     let objs = object::objects(inp, uni, diag, nobg);
@@ -674,7 +606,6 @@ fn level_3(
                 });
             }
 
-            // Largest object of that color
             if let Some(test_outputs) = verify_and_apply(
                 &|inp: &Grid| {
                     let objs = object::objects(inp, uni, diag, nobg);
@@ -697,7 +628,6 @@ fn level_3(
                 });
             }
 
-            // Smallest object of that color
             if let Some(test_outputs) = verify_and_apply(
                 &|inp: &Grid| {
                     let objs = object::objects(inp, uni, diag, nobg);
@@ -722,7 +652,6 @@ fn level_3(
         }
     }
 
-    // 3c. fill(input, fill_color, ofcolor(input, source_color))
     for &source_color in colors {
         for &fill_color in colors {
             if source_color == fill_color {
@@ -749,9 +678,6 @@ fn level_3(
         }
     }
 
-    // 3d. fill(input, fill_color, region(selector(objects(input, ...))))
-    //     region in {delta, backdrop, obj_box}
-    //     selector in {argmax_size, argmin_size}
     let region_fns: Vec<NamedRegionFn> = vec![
         ("delta", object::delta),
         ("backdrop", object::backdrop),
@@ -765,7 +691,6 @@ fn level_3(
                     return None;
                 }
 
-                // argmax_size
                 if let Some(test_outputs) = verify_and_apply(
                     &|inp: &Grid| {
                         let objs = object::objects(inp, uni, diag, nobg);
@@ -790,7 +715,6 @@ fn level_3(
                     });
                 }
 
-                // argmin_size
                 if let Some(test_outputs) = verify_and_apply(
                     &|inp: &Grid| {
                         let objs = object::objects(inp, uni, diag, nobg);
@@ -818,13 +742,11 @@ fn level_3(
         }
     }
 
-    // 3e. cover(input, selector(objects(input, ...))) -- erase an object
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         if elapsed_ms(start) > timeout_ms {
             return None;
         }
 
-        // cover argmax
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let objs = object::objects(inp, uni, diag, nobg);
@@ -843,7 +765,6 @@ fn level_3(
             });
         }
 
-        // cover argmin
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let objs = object::objects(inp, uni, diag, nobg);
@@ -862,7 +783,6 @@ fn level_3(
             });
         }
 
-        // cover by color
         for &color in colors {
             if elapsed_ms(start) > timeout_ms {
                 return None;
@@ -892,7 +812,6 @@ fn level_3(
         }
     }
 
-    // 3f. paint all objects of one mode onto a blank canvas
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         for &bg_color in colors {
             if elapsed_ms(start) > timeout_ms {
@@ -924,7 +843,6 @@ fn level_3(
         }
     }
 
-    // 3g. fill(input, fill_color, delta(each_object)) -- fill holes in every object
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         for &fill_color in colors {
             if elapsed_ms(start) > timeout_ms {
@@ -955,7 +873,6 @@ fn level_3(
         }
     }
 
-    // 3h. fill(input, obj.primary_color(), delta(obj)) -- fill holes with object's own color
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         if elapsed_ms(start) > timeout_ms {
             return None;
@@ -982,7 +899,6 @@ fn level_3(
         }
     }
 
-    // 3i. Merge all objects and extract subgrid
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         if elapsed_ms(start) > timeout_ms {
             return None;
@@ -1007,7 +923,6 @@ fn level_3(
         }
     }
 
-    // 3j. Replace color of objects: for each object, replace its color with another
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         for &new_color in colors {
             if elapsed_ms(start) > timeout_ms {
@@ -1038,7 +953,6 @@ fn level_3(
         }
     }
 
-    // 3k. Outline objects: draw bounding box of each object
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         for &box_color in colors {
             if elapsed_ms(start) > timeout_ms {
@@ -1069,7 +983,6 @@ fn level_3(
         }
     }
 
-    // 3l. Partition by color (group cells by color as objects)
     {
         fn partition(grid: &Grid) -> Vec<Object> {
             let mut color_groups: ColorGroups = std::collections::HashMap::new();
@@ -1084,7 +997,6 @@ fn level_3(
                 .collect()
         }
 
-        // Subgrid of largest partition (non-background)
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let bg = grid::mostcolor(inp);
@@ -1105,7 +1017,6 @@ fn level_3(
             });
         }
 
-        // Subgrid of smallest partition (non-background)
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let bg = grid::mostcolor(inp);
@@ -1127,7 +1038,6 @@ fn level_3(
         }
     }
 
-    // 3m. Fill backdrop of each object with object's own color
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         if elapsed_ms(start) > timeout_ms {
             return None;
@@ -1154,7 +1064,6 @@ fn level_3(
         }
     }
 
-    // 3n. Connect same-color objects with lines
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         for &line_color in colors {
             if elapsed_ms(start) > timeout_ms {
@@ -1167,7 +1076,6 @@ fn level_3(
                     for i in 0..objs.len() {
                         for j in (i + 1)..objs.len() {
                             if objs[i].primary_color() == objs[j].primary_color() {
-                                // Connect centers
                                 let (ri, ci) = center_of(&objs[i]);
                                 let (rj, cj) = center_of(&objs[j]);
                                 let line = object::connect((ri, ci), (rj, cj));
@@ -1192,13 +1100,11 @@ fn level_3(
         }
     }
 
-    // 3o. Gravity: sort non-background cells to bottom/top/left/right
     for &(_uni, _diag, _nobg, _mode_name) in &OBJ_MODES {
         if elapsed_ms(start) > timeout_ms {
             return None;
         }
 
-        // Gravity down (per column)
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let h = inp.len();
@@ -1235,7 +1141,6 @@ fn level_3(
             });
         }
 
-        // Gravity up
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let h = inp.len();
@@ -1271,7 +1176,6 @@ fn level_3(
             });
         }
 
-        // Gravity left (per row)
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let h = inp.len();
@@ -1307,7 +1211,6 @@ fn level_3(
             });
         }
 
-        // Gravity right
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let h = inp.len();
@@ -1344,11 +1247,9 @@ fn level_3(
             });
         }
 
-        break; // gravity doesn't depend on object mode, run once
+        break;
     }
 
-    // 3p. Flood fill from border: fill all cells reachable from border with a color
-    // (this catches "fill enclosed regions" patterns)
     for &fill_c in colors {
         if elapsed_ms(start) > timeout_ms {
             return None;
@@ -1361,7 +1262,6 @@ fn level_3(
                 }
                 let w = inp[0].len();
                 let bg = grid::mostcolor(inp);
-                // BFS from all border bg cells
                 let mut reachable = vec![vec![false; w]; h];
                 let mut queue = std::collections::VecDeque::new();
                 for r in 0..h {
@@ -1388,7 +1288,6 @@ fn level_3(
                         }
                     }
                 }
-                // Fill unreachable bg cells with fill_c
                 let mut result = inp.clone();
                 for r in 0..h {
                     for c in 0..w {
@@ -1410,13 +1309,11 @@ fn level_3(
         }
     }
 
-    // 3q. Unique object: find the object that differs from all others (different size/color)
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         if elapsed_ms(start) > timeout_ms {
             return None;
         }
 
-        // Unique by size (only one object with that size)
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let objs = object::objects(inp, uni, diag, nobg);
@@ -1442,7 +1339,6 @@ fn level_3(
             });
         }
 
-        // Unique by color
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let objs = object::objects(inp, uni, diag, nobg);
@@ -1469,7 +1365,6 @@ fn level_3(
         }
     }
 
-    // 3r. Tiling: output = input tiled NxM times
     if let Some((first_in, first_out)) = train_pairs.first() {
         let ih = first_in.len();
         let iw = if ih > 0 { first_in[0].len() } else { 0 };
@@ -1510,14 +1405,12 @@ fn level_3(
         }
     }
 
-    // 3s. Tile with transforms (e.g., 2x2 tile with rot/mirror variants)
     if let Some((first_in, first_out)) = train_pairs.first() {
         let ih = first_in.len();
         let iw = if ih > 0 { first_in[0].len() } else { 0 };
         let oh = first_out.len();
         let ow = if oh > 0 { first_out[0].len() } else { 0 };
         if ih > 0 && iw > 0 && oh == ih * 2 && ow == iw * 2 {
-            // Try 2x2 arrangements with transforms
             let transforms: Vec<NamedGridFn> = vec![
                 ("id", |g: &Grid| g.clone()),
                 ("rot90", grid::rot90 as fn(&Grid) -> Grid),
@@ -1559,7 +1452,6 @@ fn level_3(
         }
     }
 
-    // 3t. Add/remove border: output = input with 1-cell border of a color
     for &border_c in colors {
         if elapsed_ms(start) > timeout_ms {
             return None;
@@ -1590,7 +1482,6 @@ fn level_3(
         }
     }
 
-    // 3u. Underfill: fill background cells within each object's bbox with a color
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         for &fill_c in colors {
             if elapsed_ms(start) > timeout_ms {
@@ -1626,7 +1517,6 @@ fn level_3(
         }
     }
 
-    // 3v. Crop to non-background bounding box (trim bg from all sides)
     if let Some(test_outputs) = verify_and_apply(
         &|inp: &Grid| {
             let h = inp.len();
@@ -1664,12 +1554,10 @@ fn level_3(
         });
     }
 
-    // 3w. Extract the second-largest or second-smallest object
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         if elapsed_ms(start) > timeout_ms {
             return None;
         }
-        // Second largest
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let mut objs = object::objects(inp, uni, diag, nobg);
@@ -1691,8 +1579,6 @@ fn level_3(
         }
     }
 
-    // 3x. Flood fill from each non-background cell outward (spreading pattern)
-    // For each color, find cells of that color and expand them to fill adjacent background cells
     for &spread_c in colors {
         if elapsed_ms(start) > timeout_ms {
             return None;
@@ -1706,7 +1592,6 @@ fn level_3(
                 let w = inp[0].len();
                 let bg = grid::mostcolor(inp);
                 let mut result = inp.clone();
-                // Find all cells of spread_c and expand them by 1 in 4 directions
                 let mut to_fill = Vec::new();
                 for r in 0..h {
                     for c in 0..w {
@@ -1740,12 +1625,10 @@ fn level_3(
         }
     }
 
-    // 3y. For each non-bg color, fill the row and column through each cell of that color
     for &line_c in colors {
         if elapsed_ms(start) > timeout_ms {
             return None;
         }
-        // Cross pattern: fill row AND column
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let h = inp.len();
@@ -1790,7 +1673,6 @@ fn level_3(
             });
         }
 
-        // Row fill only
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let h = inp.len();
@@ -1821,7 +1703,6 @@ fn level_3(
             });
         }
 
-        // Column fill only
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let h = inp.len();
@@ -1853,8 +1734,6 @@ fn level_3(
         }
     }
 
-    // 3z. Mirror/complete symmetry: fill cells to make grid symmetric
-    // Horizontal symmetry completion
     if let Some(test_outputs) = verify_and_apply(
         &|inp: &Grid| {
             let h = inp.len();
@@ -1865,11 +1744,6 @@ fn level_3(
             let bg = grid::mostcolor(inp);
             let mut result = inp.clone();
             for r in 0..h {
-                // allow: each cell is filled in place from the mirrored row of the
-                // SAME grid we are writing, and later rows can legitimately read
-                // cells that earlier rows already changed. An iterator over one row
-                // cannot read another row of the same grid, so any rewrite would
-                // need a defensive copy and would change what this reads.
                 #[allow(clippy::needless_range_loop)]
                 for c in 0..w {
                     let mirror_r = h - 1 - r;
@@ -1890,7 +1764,6 @@ fn level_3(
         });
     }
 
-    // Vertical symmetry completion
     if let Some(test_outputs) = verify_and_apply(
         &|inp: &Grid| {
             let h = inp.len();
@@ -1920,7 +1793,6 @@ fn level_3(
         });
     }
 
-    // Both H+V symmetry completion
     if let Some(test_outputs) = verify_and_apply(
         &|inp: &Grid| {
             let h = inp.len();
@@ -1930,7 +1802,6 @@ fn level_3(
             let w = inp[0].len();
             let bg = grid::mostcolor(inp);
             let mut result = inp.clone();
-            // Multiple passes to propagate
             for _ in 0..3 {
                 let prev = result.clone();
                 for r in 0..h {
@@ -1961,7 +1832,6 @@ fn level_3(
         });
     }
 
-    // Diagonal symmetry completion
     if let Some(test_outputs) = verify_and_apply(
         &|inp: &Grid| {
             let h = inp.len();
@@ -1974,9 +1844,6 @@ fn level_3(
             }
             let bg = grid::mostcolor(inp);
             let mut result = inp.clone();
-            // allow: this reads the transposed cell result[c][r] of the same grid it
-            // writes, in place, so an earlier cell can change what a later one sees.
-            // Iterating rows would make the transposed read impossible to express.
             #[allow(clippy::needless_range_loop)]
             for r in 0..h {
                 for c in 0..w {
@@ -2000,10 +1867,6 @@ fn level_3(
     None
 }
 
-// ============================================================
-// Level 4: common composite ARC patterns
-// ============================================================
-
 fn level_4(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -2011,13 +1874,11 @@ fn level_4(
     start: &Instant,
     timeout_ms: u64,
 ) -> Option<SynthResult> {
-    // 4a. Fill enclosed regions with grid-derived color
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         if elapsed_ms(start) > timeout_ms {
             return None;
         }
 
-        // Fill each object's delta with leastcolor
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let objs = object::objects(inp, uni, diag, nobg);
@@ -2039,7 +1900,6 @@ fn level_4(
             });
         }
 
-        // Fill with mostcolor
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let objs = object::objects(inp, uni, diag, nobg);
@@ -2062,13 +1922,11 @@ fn level_4(
         }
     }
 
-    // 4b. Majority voting: split grid, overlay, pick most common color per cell
     for n_splits in [2usize, 3] {
         if elapsed_ms(start) > timeout_ms {
             return None;
         }
 
-        // Horizontal split + majority
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let parts = grid::hsplit(inp, n_splits);
@@ -2087,7 +1945,6 @@ fn level_4(
             });
         }
 
-        // Vertical split + majority
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let parts = grid::vsplit(inp, n_splits);
@@ -2107,7 +1964,6 @@ fn level_4(
         }
     }
 
-    // 4c. hconcat/vconcat of transformed halves
     let half_transforms: Vec<NamedGridFn> = vec![
         ("rot90", grid::rot90),
         ("rot180", grid::rot180),
@@ -2123,7 +1979,6 @@ fn level_4(
         }
         let t = *t_fn;
 
-        // hconcat(transform(lefthalf), righthalf)
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let lh = grid::lefthalf(inp);
@@ -2140,7 +1995,6 @@ fn level_4(
             });
         }
 
-        // hconcat(lefthalf, transform(righthalf))
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let lh = grid::lefthalf(inp);
@@ -2157,7 +2011,6 @@ fn level_4(
             });
         }
 
-        // vconcat(transform(tophalf), bottomhalf)
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let th = grid::tophalf(inp);
@@ -2174,7 +2027,6 @@ fn level_4(
             });
         }
 
-        // vconcat(tophalf, transform(bottomhalf))
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let th = grid::tophalf(inp);
@@ -2192,13 +2044,11 @@ fn level_4(
         }
     }
 
-    // 4d. cellwise overlay of halves with each possible fallback color
     for &fallback in colors {
         if elapsed_ms(start) > timeout_ms {
             return None;
         }
 
-        // cellwise(lefthalf, righthalf, fallback)
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let lh = grid::lefthalf(inp);
@@ -2215,7 +2065,6 @@ fn level_4(
             });
         }
 
-        // cellwise(tophalf, bottomhalf, fallback)
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let th = grid::tophalf(inp);
@@ -2233,14 +2082,12 @@ fn level_4(
         }
     }
 
-    // 4e. underfill patterns: fill background cells at certain positions
     for &(uni, diag, nobg, mode_name) in &OBJ_MODES {
         for &fill_color in colors {
             if elapsed_ms(start) > timeout_ms {
                 return None;
             }
 
-            // underfill delta of each object
             if let Some(test_outputs) = verify_and_apply(
                 &|inp: &Grid| {
                     let objs = object::objects(inp, uni, diag, nobg);
@@ -2264,7 +2111,6 @@ fn level_4(
                 });
             }
 
-            // underfill backdrop of each object
             if let Some(test_outputs) = verify_and_apply(
                 &|inp: &Grid| {
                     let objs = object::objects(inp, uni, diag, nobg);
@@ -2290,13 +2136,11 @@ fn level_4(
         }
     }
 
-    // 4f. XOR overlay of halves (keep cells that differ between halves)
     for &fallback in colors {
         if elapsed_ms(start) > timeout_ms {
             return None;
         }
 
-        // XOR of left/right halves
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let lh = grid::lefthalf(inp);
@@ -2335,7 +2179,6 @@ fn level_4(
             });
         }
 
-        // XOR of top/bottom halves
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let th = grid::tophalf(inp);
@@ -2375,7 +2218,6 @@ fn level_4(
         }
     }
 
-    // 4g. AND overlay of halves (keep only cells that are non-bg in BOTH halves)
     if let Some(test_outputs) = verify_and_apply(
         &|inp: &Grid| {
             let lh = grid::lefthalf(inp);
@@ -2444,8 +2286,6 @@ fn level_4(
         });
     }
 
-    // 4h. Repeat smallest repeating unit to fill grid
-    // Detect the smallest subgrid that tiles to produce the output
     if let Some(test_outputs) = verify_and_apply(
         &|inp: &Grid| {
             let h = inp.len();
@@ -2453,7 +2293,6 @@ fn level_4(
                 return inp.clone();
             }
             let w = inp[0].len();
-            // Try all possible tile sizes
             for th in 1..=h / 2 {
                 if !h.is_multiple_of(th) {
                     continue;
@@ -2496,8 +2335,6 @@ fn level_4(
     None
 }
 
-/// Majority vote across multiple same-size grids.
-/// For each cell position, pick the most frequently occurring color.
 fn majority_vote(grids: &[Grid]) -> Grid {
     if grids.is_empty() {
         return vec![];
@@ -2528,15 +2365,10 @@ fn majority_vote(grids: &[Grid]) -> Grid {
     out
 }
 
-// ============================================================
-// Tests
-// ============================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Helper: build a simple training pair + test input.
     fn make_task(
         train_pairs: Vec<(Grid, Grid)>,
         test_inputs: Vec<Grid>,
@@ -2546,7 +2378,6 @@ mod tests {
 
     #[test]
     fn test_level0_rot90() {
-        // rot90 of [[1,2],[3,4]] = [[3,1],[4,2]]
         let inp1 = vec![vec![1, 2], vec![3, 4]];
         let out1 = vec![vec![3, 1], vec![4, 2]];
 
@@ -2568,7 +2399,6 @@ mod tests {
 
     #[test]
     fn test_level1_replace_color() {
-        // Replace color 1 with color 3
         let inp1 = vec![vec![1, 0, 2], vec![2, 1, 0]];
         let out1 = vec![vec![3, 0, 2], vec![2, 3, 0]];
 
@@ -2589,9 +2419,6 @@ mod tests {
 
     #[test]
     fn test_level2_composition() {
-        // vmirror(rot90(input))
-        //   rot90([[1,2],[3,4]]) = [[3,1],[4,2]]
-        //   vmirror([[3,1],[4,2]]) = [[1,3],[2,4]]
         let inp1 = vec![vec![1, 2], vec![3, 4]];
         let rot = grid::rot90(&inp1);
         let out1 = grid::vmirror(&rot);
@@ -2617,7 +2444,6 @@ mod tests {
         let train = vec![(vec![vec![1, 2], vec![3, 4]], vec![vec![9, 9], vec![9, 9]])];
         let test = vec![vec![vec![0, 0]]];
 
-        // rot90 does not produce [[9,9],[9,9]] from [[1,2],[3,4]]
         let result = verify_and_apply(&|g: &Grid| grid::rot90(g), &train, &test);
         assert!(result.is_none());
     }
@@ -2639,19 +2465,14 @@ mod tests {
 
     #[test]
     fn test_timeout_respected() {
-        // Give a 0ms timeout -- should return None quickly
         let train = vec![(vec![vec![1, 2], vec![3, 4]], vec![vec![9, 9], vec![9, 9]])];
         let test = vec![vec![vec![0, 0]]];
         let result = synthesize(&train, &test, 0);
-        // Level 0 checks happen instantly before timeout is checked,
-        // so we just verify it doesn't panic with 0ms timeout.
-        // Result may or may not be None depending on Level 0 speed.
         let _ = result;
     }
 
     #[test]
     fn test_multiple_test_inputs() {
-        // rot90 with two test inputs
         let inp = vec![vec![1, 2], vec![3, 4]];
         let out = vec![vec![3, 1], vec![4, 2]];
 

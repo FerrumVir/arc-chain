@@ -1,9 +1,3 @@
-"""
-Unit tests for the ARC Chain Python SDK.
-
-Uses unittest.mock to mock httpx responses so no running node is needed.
-"""
-
 import unittest
 from importlib.metadata import version
 from unittest.mock import patch
@@ -19,8 +13,6 @@ from arc_sdk.types import Account, Block, ChainInfo, ChainStats, Receipt
 
 
 class MockResponse:
-    """Minimal mock for httpx.Response."""
-
     def __init__(self, json_data: dict, status_code: int = 200):
         self._json_data = json_data
         self.status_code = status_code
@@ -35,14 +27,7 @@ class TestPackageMetadata(unittest.TestCase):
         self.assertEqual(__version__, version("arc-sdk"))
 
 
-# ---------------------------------------------------------------------------
-# Client tests
-# ---------------------------------------------------------------------------
-
-
 class TestGetBlock(unittest.TestCase):
-    """Tests for ArcClient.get_block()."""
-
     @patch("arc_sdk.client.httpx.Client")
     def test_get_block_success(self, MockHttpClient):
         mock_instance = MockHttpClient.return_value
@@ -81,8 +66,6 @@ class TestGetBlock(unittest.TestCase):
 
 
 class TestGetAccount(unittest.TestCase):
-    """Tests for ArcClient.get_account()."""
-
     @patch("arc_sdk.client.httpx.Client")
     def test_get_account_success(self, MockHttpClient):
         mock_instance = MockHttpClient.return_value
@@ -120,8 +103,6 @@ class TestGetAccount(unittest.TestCase):
 
 
 class TestSubmitTransaction(unittest.TestCase):
-    """Tests for ArcClient.submit_transaction()."""
-
     @patch("arc_sdk.client.httpx.Client")
     def test_submit_raw_tx(self, MockHttpClient):
         mock_instance = MockHttpClient.return_value
@@ -257,8 +238,6 @@ class TestSubmitTransaction(unittest.TestCase):
 
 
 class TestSubmitBatch(unittest.TestCase):
-    """Tests for ArcClient.submit_batch()."""
-
     @patch("arc_sdk.client.httpx.Client")
     def test_submit_batch_success(self, MockHttpClient):
         mock_instance = MockHttpClient.return_value
@@ -302,8 +281,6 @@ class TestSubmitBatch(unittest.TestCase):
 
 
 class TestChainInfo(unittest.TestCase):
-    """Tests for ArcClient.get_chain_info() and get_stats()."""
-
     @patch("arc_sdk.client.httpx.Client")
     def test_get_chain_info(self, MockHttpClient):
         mock_instance = MockHttpClient.return_value
@@ -370,8 +347,6 @@ class TestChainInfo(unittest.TestCase):
 
 
 class TestEthCall(unittest.TestCase):
-    """Tests for ArcClient.eth_call()."""
-
     @patch("arc_sdk.client.httpx.Client")
     def test_eth_chain_id(self, MockHttpClient):
         mock_instance = MockHttpClient.return_value
@@ -405,14 +380,7 @@ class TestEthCall(unittest.TestCase):
         self.assertEqual(result["result"], "0x64")
 
 
-# ---------------------------------------------------------------------------
-# Crypto tests
-# ---------------------------------------------------------------------------
-
-
 class TestKeyPairGeneration(unittest.TestCase):
-    """Tests for KeyPair generation and address derivation."""
-
     def test_generate_random(self):
         kp = KeyPair.generate()
         self.assertEqual(len(kp.address()), 64)
@@ -451,8 +419,6 @@ class TestKeyPairGeneration(unittest.TestCase):
 
 
 class TestKeyPairSigning(unittest.TestCase):
-    """Tests for Ed25519 signing and verification."""
-
     def test_sign_and_verify(self):
         kp = KeyPair.generate()
         msg = b"hello ARC chain"
@@ -478,14 +444,7 @@ class TestKeyPairSigning(unittest.TestCase):
         self.assertTrue(KeyPair.verify_with_public_key(kp.public_key_bytes(), msg, sig))
 
 
-# ---------------------------------------------------------------------------
-# Transaction builder tests
-# ---------------------------------------------------------------------------
-
-
 class TestTransactionBuilder(unittest.TestCase):
-    """Tests for TransactionBuilder."""
-
     def test_transfer_builds_valid_tx(self):
         addr_from = "aa" * 32
         addr_to = "bb" * 32
@@ -593,8 +552,6 @@ class TestTransactionBuilder(unittest.TestCase):
 
 
 class TestTransactionSigning(unittest.TestCase):
-    """Tests for transaction signing."""
-
     def test_sign_transfer(self):
         kp = KeyPair.generate()
         tx = TransactionBuilder.transfer(
@@ -610,7 +567,6 @@ class TestTransactionSigning(unittest.TestCase):
             signed["signature"]["Ed25519"]["public_key"],
             kp.public_key_hex(),
         )
-        # Verify the signature
         sig_bytes = bytes.fromhex(signed["signature"]["Ed25519"]["signature"])
         hash_bytes = bytes.fromhex(signed["hash"])
         self.assertTrue(kp.verify(hash_bytes, sig_bytes))
@@ -657,14 +613,7 @@ class TestTransactionSigning(unittest.TestCase):
         )
 
 
-# ---------------------------------------------------------------------------
-# Type deserialization tests
-# ---------------------------------------------------------------------------
-
-
 class TestTypes(unittest.TestCase):
-    """Tests for typed dataclass deserialization."""
-
     def test_account_from_dict(self):
         acct = Account.from_dict(
             {

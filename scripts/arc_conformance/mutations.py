@@ -1,11 +1,3 @@
-"""Which clauses of the integer contract does the committed KAT actually pin?
-
-Each mutation changes one clause of the reference executor. A mutation the
-KAT still passes marks a clause that only operator-level vectors can check.
-
-    python3 -m arc_conformance.mutations
-"""
-
 from __future__ import annotations
 
 import contextlib
@@ -161,7 +153,6 @@ def main() -> int:
         print(f"{model:18s}{ops:18s}{label}")
         if model == "no" and ops == "no":
             undetected.append(label)
-    # Profile swap: the same weights under interleaved RoPE must differ.
     model, _ = kat.build(fixture, ref.GGUF_INTERLEAVED)
     swapped = kat.run_sequence(model, fixture["sequence_tokens"])
     differs = swapped["logits_hashes"] != fixture["expected"]["logits_hashes"]

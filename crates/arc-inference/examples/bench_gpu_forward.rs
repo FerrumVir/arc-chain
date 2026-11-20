@@ -1,6 +1,3 @@
-//! End-to-end GPU forward pass benchmark.
-//! Usage: cargo run --example bench_gpu_forward --features candle --release -- <model.arc-int8>
-
 use arc_gpu::gpu_forward::GpuForward;
 use arc_inference::cached_integer_model::*;
 use std::time::Instant;
@@ -13,7 +10,6 @@ fn main() {
 
     println!("=== GPU-Resident Forward Pass Benchmark ===\n");
 
-    // Load model
     let model = if path.ends_with(".arc-int8") {
         load_cached_model_binary(path).unwrap()
     } else {
@@ -25,7 +21,6 @@ fn main() {
         cfg.n_layers, cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.vocab_size
     );
 
-    // Init GPU
     let gpu = match GpuForward::new() {
         Ok(g) => g,
         Err(e) => {
@@ -34,7 +29,6 @@ fn main() {
         }
     };
 
-    // Upload model to GPU
     println!("\nUploading model to GPU...");
     let upload_start = Instant::now();
 
@@ -87,10 +81,9 @@ fn main() {
         upload_start.elapsed().as_secs_f64()
     );
 
-    // Run GPU forward pass
     println!("\nRunning GPU forward pass (token 0)...");
     let start = Instant::now();
-    let token = gpu.forward_one_token(&gpu_model, 1, 0); // token 1, position 0
+    let token = gpu.forward_one_token(&gpu_model, 1, 0);
     let elapsed = start.elapsed();
     println!(
         "GPU forward: {:.2} ms → token {}",
@@ -98,7 +91,6 @@ fn main() {
         token
     );
 
-    // Run again (warmed up)
     let start = Instant::now();
     let token2 = gpu.forward_one_token(&gpu_model, token, 1);
     let elapsed2 = start.elapsed();
@@ -108,7 +100,6 @@ fn main() {
         token2
     );
 
-    // Compare with CPU
     println!("\nCPU forward for comparison...");
     let mut cache = KVCache::new(cfg.n_layers);
     let cpu_start = Instant::now();

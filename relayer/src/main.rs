@@ -1,17 +1,3 @@
-//! ARC Chain Bridge Relayer
-//!
-//! A service that watches for bridge events on both Ethereum and ARC Chain,
-//! generating Merkle proofs and submitting cross-chain transactions to
-//! complete bridge transfers.
-//!
-//! ## Directions
-//!
-//! **ETH -> ARC**: Watches ArcBridge.sol `Lock` events, waits for confirmations,
-//! then submits BridgeMint (0x10) TXs on ARC Chain.
-//!
-//! **ARC -> ETH**: Watches ARC Chain for BridgeLock (0x0f) TXs, generates state
-//! proofs, then calls `unlock()` on ArcBridge.sol.
-
 mod arc_submitter;
 mod config;
 mod eth_watcher;
@@ -37,8 +23,6 @@ struct Cli {
     config: PathBuf,
 }
 
-/// In-memory set of processed event keys for deduplication.
-/// Key format: "{direction}:{nonce}" e.g. "eth2arc:42"
 struct ProcessedEvents {
     seen: HashSet<String>,
 }
@@ -50,12 +34,10 @@ impl ProcessedEvents {
         }
     }
 
-    /// Returns true if this event has already been processed.
     fn is_processed(&self, direction: &str, nonce: u64) -> bool {
         self.seen.contains(&format!("{}:{}", direction, nonce))
     }
 
-    /// Mark an event as processed.
     fn mark_processed(&mut self, direction: &str, nonce: u64) {
         self.seen.insert(format!("{}:{}", direction, nonce));
     }
@@ -63,7 +45,6 @@ impl ProcessedEvents {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing/logging.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -88,7 +69,6 @@ async fn main() -> Result<()> {
         "relayer configured"
     );
 
-    // Initialize watchers and submitters.
     let mut eth_watcher = EthWatcher::new(&config);
     let mut arc_submitter = ArcSubmitter::new(&config)?;
     let mut processed = ProcessedEvents::new();
@@ -98,7 +78,6 @@ async fn main() -> Result<()> {
     info!("entering main relay loop");
 
     loop {
-        // --- ETH -> ARC direction ---
         match eth_watcher.poll_lock_events().await {
             Ok(events) => {
                 for event in events {
@@ -139,7 +118,6 @@ async fn main() -> Result<()> {
             }
         }
 
-        // --- ARC -> ETH direction ---
         match arc_submitter.poll_bridge_locks().await {
             Ok(events) => {
                 for event in events {
@@ -157,13 +135,8 @@ async fn main() -> Result<()> {
                         "processing ARC BridgeLock"
                     );
 
-                    // For ARC -> ETH, we need the state root from the ARC Chain
-                    // block that included this BridgeLock. In production the
-                    // relayer would first commit the state root to the Ethereum
-                    // contract, then call unlock(). Here we construct a
-                    // placeholder proof.
-                    let state_root = [0u8; 32]; // Would come from arc_getBlock
-                    let merkle_proof: Vec<[u8; 32]> = vec![]; // Would come from arc_getProof
+                    let state_root = [0u8; 32];
+                    let merkle_proof: Vec<[u8; 32]> = vec![];
 
                     match arc_submitter
                         .submit_eth_unlock(

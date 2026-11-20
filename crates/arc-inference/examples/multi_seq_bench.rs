@@ -1,43 +1,3 @@
-//! Aggregate decode throughput when several users' sequences share every
-//! weight read, on the real network model. An internal measurement, not a
-//! product figure.
-//!
-//! The model is loaded as a community worker loads it
-//! (`load_cached_model_canonical_i8`, the legacy split-half canonical INT8
-//! profile). Every sequence has its own prompt (the lengths differ, so the
-//! sequences sit at different positions) and its own K/V cache. For each
-//! kernel and each number S of concurrent sequences, the driver runs `--steps`
-//! decode steps from the prefilled prompts:
-//!
-//! * S = 1 is one user decoding as a worker does, one `forward_one_token` call
-//!   per step;
-//! * S >= 2 is one `forward_rows_multi` call per step, carrying the next row
-//!   of every sequence.
-//!
-//! The report is the median time of a decode step and the aggregate decoded
-//! tokens per second, S over that median.
-//!
-//! Every sequence follows the worker's own generation (`try_generate`): the
-//! BOS and the prompt, then the last prompt token once more, and each step
-//! picks the next token with the worker's selection,
-//! `select_next_token_with_repetition_penalty`, over the sequence's own
-//! generated history.
-//!
-//! Exactness on the real model. Every sequence first runs alone through
-//! `try_generate`, the worker's own call. Every timed run must give every
-//! sequence the same tokens and output hash, for every kernel and every S;
-//! otherwise the driver exits non-zero.
-//!
-//! Kernels: `scalar`, or a multi-row kernel by its label (`neon-sdot-limb`,
-//! `neon-i8mm-limb`, `avx2-limb`, `avx-vnni-limb`, `avx512-vnni-limb`); `simd`
-//! is the architecture's base kernel, `best` the one chosen automatically,
-//! and `all` (the default) is `scalar` plus every multi-row kernel this CPU
-//! has.
-//!
-//! usage: multi_seq_bench --model GGUF [--kernel all|scalar|simd|best|LABEL,...]
-//!        [--sequences 1,2,4,8,16,32] [--prompt N] [--steps N]
-//!        [--cpu NAME] [--out FILE.json] [--summary FILE.md]
-
 use arc_crypto::{Hash256, hash_bytes};
 use arc_inference::cached_integer_model::{
     CANONICAL_REWARD_INFERENCE_PROFILE, CachedIntegerModel, KVCache, SeqRows, ShardRowsInput,
@@ -47,7 +7,6 @@ use arc_inference::canonical_simd::{self, BatchedKernel};
 use serde_json::{Value, json};
 use std::time::Instant;
 
-/// `None` is the scalar kernel; `Some` pins a vectorised multi-row kernel.
 type KernelChoice = Option<BatchedKernel>;
 
 struct Args {
@@ -66,7 +25,6 @@ fn parse_count(text: &str) -> Result<usize, String> {
         .map_err(|_| format!("expected a whole number, got {text}"))
 }
 
-/// The architecture's base multi-row kernel (SDOT or AVX2).
 fn base_kernel() -> Result<BatchedKernel, String> {
     [BatchedKernel::NeonSdot, BatchedKernel::Avx2]
         .into_iter()
@@ -116,8 +74,6 @@ fn kernel_name(kernel: KernelChoice) -> &'static str {
     kernel.map_or("scalar", BatchedKernel::label)
 }
 
-/// The CPU model: `--cpu` if given, else `/proc/cpuinfo`'s model name, else
-/// Windows' `PROCESSOR_IDENTIFIER`.
 fn cpu_model(given: Option<&str>) -> String {
     if let Some(name) = given {
         return name.to_string();
@@ -180,15 +136,12 @@ fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
-/// One sequence's generation: its tokens and output hash, as `try_generate`
-/// returns them.
 #[derive(Clone, PartialEq, Eq)]
 struct Generated {
     tokens: Vec<u32>,
     hash: Hash256,
 }
 
-/// The output hash `try_generate` returns: BLAKE3 of the little-endian tokens.
 fn output_hash(tokens: &[u32]) -> Hash256 {
     let bytes: Vec<u8> = tokens
         .iter()
@@ -197,7 +150,6 @@ fn output_hash(tokens: &[u32]) -> Hash256 {
     hash_bytes(&bytes)
 }
 
-/// One sequence alone, through the worker's own call.
 fn generate_alone(
     model: &CachedIntegerModel,
     prompt: &[u32],
@@ -210,9 +162,6 @@ fn generate_alone(
     Ok(Generated { tokens, hash })
 }
 
-/// A sequence after its BOS and prompt: its cache, and the token its first
-/// step feeds, which is the last prompt token again, as `try_generate` feeds
-/// it.
 struct Prefilled {
     cache: KVCache,
     first_feed: u32,
@@ -226,8 +175,6 @@ fn clone_cache(cache: &KVCache) -> KVCache {
     }
 }
 
-/// Runs every sequence's BOS and prompt in multi-sequence calls of at most
-/// the stage's row cap, so the prompts share weight reads too.
 fn prefill_all(model: &CachedIntegerModel, prompts: &[Vec<u32>]) -> Result<Vec<Prefilled>, String> {
     let n_layers = model.config.n_layers;
     let cap = model.max_shard_rows(n_layers);
@@ -277,11 +224,6 @@ fn prefill_all(model: &CachedIntegerModel, prompts: &[Vec<u32>]) -> Result<Vec<P
     Ok(done)
 }
 
-/// Runs `steps` decode steps of the first `count` prefilled sequences, all in
-/// one call per step (one `forward_one_token` per step for a single
-/// sequence), each sequence selecting its next token with the worker's
-/// selection over its own history. Returns each sequence's generation and
-/// each step's forward time.
 fn decode_together(
     model: &CachedIntegerModel,
     prefilled: &[Prefilled],
@@ -377,8 +319,6 @@ fn main() -> Result<(), String> {
     let features = canonical_simd::detected_cpu_features();
     println!("cpu: {cpu}; detected features: {features:?}");
 
-    // Prompts of four lengths, so the sequences sit at different positions.
-    // Fixed token ids that avoid the special tokens 0, 1 and 2.
     let prompts: Vec<Vec<u32>> = (0..most)
         .map(|sequence| {
             (0..args.prompt + sequence % 4)
@@ -390,8 +330,6 @@ fn main() -> Result<(), String> {
         })
         .collect();
 
-    // Every sequence alone through the worker's own call, with the widest
-    // kernel, as the reference.
     canonical_simd::set_fast_canonical_kernel(true);
     canonical_simd::set_batched_kernel_preference(None);
     let alone_started = Instant::now();

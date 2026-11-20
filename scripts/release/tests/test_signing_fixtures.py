@@ -1,17 +1,3 @@
-"""R3: the release signing paths, exercised with clearly labelled FIXTURE keys.
-
-Nothing here is, or may be described as, a signed production release. Each
-test generates a throwaway key, signs fixture bytes, and runs the exact
-verification the shipped code runs, so the path itself is proven to accept
-the right signature and refuse everything else.
-
-`install.sh` hard-codes the owner's key (deliberately: no override), so the
-installer's check is replicated here with a fixture key, and a separate test
-pins that `install.sh` still contains exactly this command.
-
-    python3 -m unittest scripts/release/tests/test_signing_fixtures.py
-"""
-
 from __future__ import annotations
 
 import re
@@ -41,7 +27,6 @@ class InstallerChecksumSignature(unittest.TestCase):
         self.assertEqual(made.returncode, 0, made.stderr)
         public = (self.path / "FIXTURE-release-key.pub").read_text().split()
         self.allowed = self.path / "allowed-signers"
-        # Same shape as install.sh: identity, namespace restriction, key.
         self.allowed.write_text(
             f'{IDENTITY} namespaces="{NAMESPACE}" {public[0]} {public[1]} {NAMESPACE}\n')
         self.sums = b"0" * 64 + b"  arc-node-linux-x86_64\n"
@@ -57,7 +42,6 @@ class InstallerChecksumSignature(unittest.TestCase):
         return self.path / "SHA256SUMS.sig"
 
     def verify(self, payload: bytes, signature: Path) -> bool:
-        # The exact command install.sh runs.
         result = ssh_keygen("-Y", "verify", "-f", str(self.allowed), "-I", IDENTITY,
                             "-n", NAMESPACE, "-s", str(signature), stdin=payload)
         return result.returncode == 0

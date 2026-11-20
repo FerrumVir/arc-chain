@@ -1,10 +1,3 @@
-//! Resumable, size-capped, digest-checked HTTPS downloads.
-//!
-//! A cached file is reused only if its size and SHA-256 equal the pin; a
-//! mismatching cache entry is deleted and fetched again. Downloads land in a
-//! `.partial` sibling, resume with a byte range after an interruption, and
-//! are renamed into place only after the full pinned digest matches.
-
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -26,7 +19,6 @@ pub struct Fetcher {
 }
 
 impl Fetcher {
-    /// Assets of one exact GitHub release tag, HTTPS only.
     pub fn github_release(repository: &str, tag: &str) -> Fetcher {
         Fetcher::with_base(
             format!("https://github.com/{repository}/releases/download/{tag}"),
@@ -34,7 +26,6 @@ impl Fetcher {
         )
     }
 
-    /// Files under one fixed HTTPS URL prefix.
     pub fn https_prefix(base: &str) -> Fetcher {
         Fetcher::with_base(base.trim_end_matches('/').to_string(), true)
     }
@@ -65,7 +56,6 @@ impl Fetcher {
         format!("{}/{name}", self.base)
     }
 
-    /// Make `dest` hold exactly the pinned bytes. Returns true if it downloaded.
     pub fn ensure_file(
         &self,
         name: &str,
@@ -174,7 +164,6 @@ impl Fetcher {
             bail!("GET {name} returned HTTP {status}");
         };
 
-        // Read at most one byte past the pin so an oversized body is caught.
         let mut reader = response.into_reader().take(size - written + 1);
         let mut buffer = vec![0_u8; 256 * 1024];
         loop {
@@ -202,7 +191,6 @@ impl Fetcher {
     }
 }
 
-/// True when `path` is a regular file of exactly `size` bytes and `sha256`.
 pub fn file_matches(path: &Path, sha256: &str, size: u64) -> Result<bool> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -230,8 +218,6 @@ pub(crate) mod test_server {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
-    /// A tiny HTTP/1.1 file server for download tests. `cut_after` makes the
-    /// first full-body response stop early, simulating a dropped connection.
     pub struct TestServer {
         pub base: String,
         pub requests: Arc<Mutex<Vec<String>>>,

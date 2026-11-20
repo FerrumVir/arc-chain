@@ -1,26 +1,4 @@
 #!/usr/bin/env bash
-# Committee-size sweep with a start barrier, for the four-validator stall (D6).
-#
-# scripts/arc-block-production-probe.sh established that committee size, not the
-# genesis source, decides whether an IDLE chain produces blocks: one validator
-# proposes only when it has work (consensus.rs:1640-1643), three validators
-# propose every round and committed 530 blocks in 45 s. D6 claims four
-# validators stall at height 1 while DAG rounds keep advancing. This varies only
-# the committee size, from 2 to 5, and measures the same two numbers each time.
-#
-# START BARRIER (harness-level, protocol untouched):
-#   every node must report peers == N-1 BEFORE the observation window opens.
-# A node that joins after its peers have started proposing is a different
-# experiment (that is D5), and mixing the two is what made D6 ambiguous.
-# Nothing here lowers quorum, widens a round window, or trusts a peer snapshot;
-# the barrier only decides WHEN measurement starts.
-#
-# Reports, per committee size:
-#   quorum/total stake as the node itself reports them
-#   committed height before -> after      (chain progress)
-#   dag_round before -> after             (liveness, which is NOT progress)
-#
-# usage: arc-committee-size-sweep.sh [--sizes "2 3 4 5"] [--observe 45]
 set -uo pipefail
 
 BINARY=${BINARY:-target/debug/arc-node}
@@ -54,8 +32,7 @@ trap cleanup EXIT INT TERM
 health() { curl -s --max-time 4 "http://127.0.0.1:$1/health" 2>/dev/null; }
 field()  { printf '%s' "$1" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get(sys.argv[1],""))' "$2" 2>/dev/null; }
 
-# Read the committee the node actually froze, not the one we intended.
-committee() { # port -> "validators total_stake quorum"
+committee() {
   curl -s --max-time 4 "http://127.0.0.1:$1/validators" 2>/dev/null | python3 -c '
 import sys, json
 try:
@@ -69,7 +46,7 @@ print(len(vs), total, total * 2 // 3 + 1)
 ' 2>/dev/null || echo "? ? ?"
 }
 
-derive() { # seed rpc p2p -> address
+derive() {
   local d="$WORK/derive-$1"; mkdir -p "$d"
   "$BINARY" --rpc "127.0.0.1:$2" --p2p-port "$3" --data-dir "$d" \
             --insecure-dev-validator-seed --validator-seed "$1" --stake "$STAKE" \
@@ -83,7 +60,7 @@ derive() { # seed rpc p2p -> address
   printf '%s' "$a"
 }
 
-write_genesis() { # file addr...
+write_genesis() {
   local f=$1; shift
   { echo '[chain]'; echo 'name = "arc-committee-sweep"'; echo 'chain_id = "0x415243"'
     echo 'validator_set_complete = false'
@@ -93,9 +70,7 @@ write_genesis() { # file addr...
   } > "$f"
 }
 
-# ── Self-test: the barrier predicate, with no node and no build ───────────────
-# barrier_met FILE N  where FILE holds one peer count per line, one per node.
-barrier_met() { # peer-count-file expected-nodes
+barrier_met() {
   awk -v want="$2" '
     { n++; if ($1 + 0 != want - 1) bad = 1 }
     END {
@@ -107,7 +82,7 @@ barrier_met() { # peer-count-file expected-nodes
 
 if [[ -n "${SELF_TEST:-}" ]]; then
   t=$(mktemp -d); fail=0
-  check() { # name expected file n
+  check() {
     local got; got=$(barrier_met "$3" "$4")
     if [[ "$got" == "$2" ]]; then echo "  ok   $1"; else echo "  FAIL $1: want $2 got $got"; fail=1; fi
   }
@@ -159,7 +134,6 @@ for N in $SIZES; do
     for _ in $(seq 1 60); do health $((BASE_RPC+i)) >/dev/null 2>&1 && break; sleep 1; done
   done
 
-  # ── start barrier ──────────────────────────────────────────────────────────
   peerfile="$WORK/peers-$N.txt"; verdict="INCOMPLETE"
   for _ in $(seq 1 "$BARRIER_TIMEOUT"); do
     : > "$peerfile"
@@ -179,7 +153,6 @@ for N in $SIZES; do
   sleep "$OBSERVE"
   b=$(health $BASE_RPC); h1=$(field "$b" height); r1=$(field "$b" dag_round)
 
-  # Every node's committed height, so "the chain progressed" is not one node's word.
   allh=""
   for i in $(seq 0 $((N-1))); do
     allh="$allh $(field "$(health $((BASE_RPC+i)))" height)"

@@ -1,12 +1,3 @@
-//! The integer package file (`arc.integer-package.v1`) and its manifest.
-//!
-//! A package holds every integer the forward pass reads: INT8 weights with
-//! dyadic row scales, Q16 norm gains and the RoPE tables (spec §4.8, §4.9).
-//! Its layout is fully determined by the model configuration, so the header,
-//! the offsets and every padding byte are identical on every platform. The
-//! package's identity is the SHA-256 (and BLAKE3) of the whole file; a node
-//! refuses a package whose digest differs from the pinned manifest (§4.10).
-
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -18,18 +9,12 @@ use super::arith::DyadicMatrix;
 use super::model::{ModernConfig, ModernLayer, ModernModel};
 use super::{ModernError, PROFILE, hex_lower, identity_blake3};
 
-/// File magic.
 pub const MAGIC: &[u8; 8] = b"ARCIPKG1";
-/// Package schema identity.
 pub const PACKAGE_SCHEMA: &str = "arc.integer-package.v1";
-/// Package manifest schema identity.
 pub const MANIFEST_SCHEMA: &str = "arc.integer-package-manifest.v1";
-/// Alignment of the data region and of every tensor.
 pub const ALIGN: u64 = 64;
-/// Refuse package headers larger than this.
 const MAX_HEADER_BYTES: u64 = 16 << 20;
 
-/// Element type of a package tensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dtype {
     I8,
@@ -57,13 +42,11 @@ impl Dtype {
     }
 }
 
-/// One tensor of the layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorEntry {
     pub name: String,
     pub dtype: Dtype,
     pub shape: Vec<usize>,
-    /// Offset from the start of the data region.
     pub offset: u64,
     pub bytes: u64,
 }
@@ -78,7 +61,6 @@ fn push_matrix(specs: &mut Vec<(String, Dtype, Vec<usize>)>, name: &str, rows: u
     specs.push((format!("{name}.k"), Dtype::U8, vec![rows]));
 }
 
-/// The canonical tensor layout for `config` (spec §4.8).
 pub fn layout(config: &ModernConfig) -> Vec<TensorEntry> {
     let (d, f, v) = (config.d_model, config.d_ff, config.vocab_size);
     let (dq, dkv) = (config.d_q(), config.d_kv());
@@ -126,7 +108,6 @@ pub fn layout(config: &ModernConfig) -> Vec<TensorEntry> {
         .collect()
 }
 
-/// The `model` object of the header and manifest (spec §4.9).
 pub fn model_json(config: &ModernConfig) -> Value {
     json!({
         "architecture": config.architecture,
@@ -145,7 +126,6 @@ pub fn model_json(config: &ModernConfig) -> Value {
     })
 }
 
-/// Parse the header's `model` object back into a configuration.
 pub fn config_from_json(model: &Value) -> Result<ModernConfig, ModernError> {
     let bad = |what: &str| ModernError::Invalid(format!("package model.{what}"));
     let size = |key: &str| -> Result<usize, ModernError> {
@@ -197,7 +177,6 @@ pub fn config_from_json(model: &Value) -> Result<ModernConfig, ModernError> {
     Ok(config)
 }
 
-/// The header object (spec §4.9).
 pub fn header_json(config: &ModernConfig, source: &Value, entries: &[TensorEntry]) -> Value {
     let tensors: Vec<Value> = entries
         .iter()
@@ -225,7 +204,6 @@ fn canonical(value: &Value) -> Result<String, ModernError> {
         .map_err(|e| ModernError::Invalid(format!("canonical JSON: {e}")))
 }
 
-/// Size and digests of a package file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageDigest {
     pub bytes: u64,
@@ -239,7 +217,6 @@ impl PackageDigest {
     }
 }
 
-/// Streams a package to disk in layout order, hashing every byte written.
 pub struct PackageWriter {
     out: BufWriter<File>,
     sha256: Sha256,
@@ -251,7 +228,6 @@ pub struct PackageWriter {
 }
 
 impl PackageWriter {
-    /// Create `path` and write the magic, the header and its padding.
     pub fn create(
         path: &Path,
         header: &Value,
@@ -296,7 +272,6 @@ impl PackageWriter {
         self.emit(&zeros[..count])
     }
 
-    /// Write the next tensor of the layout; its name and size must match.
     pub fn write_tensor(&mut self, name: &str, bytes: &[u8]) -> Result<(), ModernError> {
         let entry = self
             .entries
@@ -317,7 +292,6 @@ impl PackageWriter {
         Ok(())
     }
 
-    /// Write the final padding, flush, and return the file's digests.
     pub fn finish(mut self) -> Result<PackageDigest, ModernError> {
         if self.next != self.entries.len() {
             return Err(ModernError::Invalid(format!(
@@ -339,22 +313,18 @@ impl PackageWriter {
     }
 }
 
-/// Little-endian bytes of an i8 slice.
 pub fn i8_bytes(values: &[i8]) -> Vec<u8> {
     values.iter().map(|&v| v as u8).collect()
 }
 
-/// Little-endian bytes of an i32 slice.
 pub fn i32_bytes(values: &[i32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
-/// Little-endian bytes of an i64 slice.
 pub fn i64_bytes(values: &[i64]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
-/// Write the three tensors of one dyadic matrix.
 pub fn write_matrix(
     writer: &mut PackageWriter,
     name: &str,
@@ -365,13 +335,11 @@ pub fn write_matrix(
     writer.write_tensor(&format!("{name}.k"), &matrix.k)
 }
 
-/// The parsed header of a package file.
 #[derive(Debug, Clone)]
 pub struct PackageHeader {
     pub value: Value,
     pub config: ModernConfig,
     pub entries: Vec<TensorEntry>,
-    /// Bytes before the header padding: magic, length and header text.
     pub header_end: u64,
     pub data_start: u64,
 }
@@ -400,7 +368,6 @@ fn read_header(reader: &mut impl Read, file_len: u64) -> Result<PackageHeader, M
         .map_err(|e| ModernError::io("package header", e))?;
     let value: Value = serde_json::from_slice(&text)
         .map_err(|e| ModernError::Invalid(format!("package header JSON: {e}")))?;
-    // The header must be the canonical encoding of itself.
     if canonical(&value)?.as_bytes() != text.as_slice() {
         return Err(ModernError::Invalid(
             "package header is not canonical JSON".into(),
@@ -421,7 +388,6 @@ fn read_header(reader: &mut impl Read, file_len: u64) -> Result<PackageHeader, M
         .ok_or_else(|| ModernError::Invalid("package header has no model".into()))?;
     let config = config_from_json(model)?;
     let entries = layout(&config);
-    // The header's tensor table must be exactly the canonical layout.
     let expected = header_json(
         &config,
         value.get("source").unwrap_or(&Value::Null),
@@ -452,7 +418,6 @@ fn read_header(reader: &mut impl Read, file_len: u64) -> Result<PackageHeader, M
     })
 }
 
-/// Read only the header of a package file.
 pub fn read_package_header(path: &Path) -> Result<PackageHeader, ModernError> {
     let context = path.display().to_string();
     let file = File::open(path).map_err(|e| ModernError::io(&context, e))?;
@@ -549,7 +514,6 @@ impl<R: Read> TensorReader<R> {
     }
 }
 
-/// Load a package into memory, validating every value range.
 pub fn load_package(path: &Path) -> Result<ModernModel, ModernError> {
     let context = path.display().to_string();
     let file = File::open(path).map_err(|e| ModernError::io(&context, e))?;
@@ -619,7 +583,6 @@ pub fn load_package(path: &Path) -> Result<ModernModel, ModernError> {
     Ok(model)
 }
 
-/// Stream a file through SHA-256 and BLAKE3.
 pub fn digest_file(path: &Path) -> Result<PackageDigest, ModernError> {
     let context = path.display().to_string();
     let mut file = File::open(path).map_err(|e| ModernError::io(&context, e))?;
@@ -645,7 +608,6 @@ pub fn digest_file(path: &Path) -> Result<PackageDigest, ModernError> {
     })
 }
 
-/// Build the package manifest (spec §4.10) for a finished package.
 pub fn build_manifest(
     header: &Value,
     digest: &PackageDigest,
@@ -678,14 +640,10 @@ pub fn build_manifest(
     Ok(manifest)
 }
 
-/// Canonical text of a manifest (what is written to disk).
 pub fn manifest_text(manifest: &Value) -> Result<String, ModernError> {
     canonical(manifest)
 }
 
-/// Check a package file against a pinned manifest: the manifest must hash to
-/// its own `manifest_blake3`, and the package's length, SHA-256, BLAKE3,
-/// profile, model and source must be exactly what the manifest records.
 pub fn verify_package(path: &Path, manifest_bytes: &[u8]) -> Result<PackageDigest, ModernError> {
     let manifest: Value = serde_json::from_slice(manifest_bytes)
         .map_err(|e| ModernError::Invalid(format!("manifest JSON: {e}")))?;
@@ -770,8 +728,6 @@ mod tests {
 
     #[test]
     fn the_pinned_smollm3_manifest_is_self_consistent() {
-        // Produced byte-identically by `arc-modern convert` on ubuntu x86-64,
-        // windows x86-64, macOS arm64 and macOS x86-64 CI runners.
         let text =
             include_str!("../../../../docs/protocol/packages/smollm3-3b.integer-package.json");
         let manifest: Value = serde_json::from_str(text).unwrap();
@@ -792,13 +748,11 @@ mod tests {
             "19c67496ee23fe5da0e12eb1f22cb17f6386c560071587b5b8dfa68731c0aa91"
         );
         assert_eq!(manifest["package"]["bytes"], 3_084_214_016u64);
-        // The source it was converted from is exactly the pinned source.
         let source = super::super::convert::SourceManifest::parse(include_bytes!(
             "../../../../docs/protocol/packages/smollm3-3b.source.json"
         ))
         .unwrap();
         assert_eq!(manifest["source"], source.header_json());
-        // The shape the converter derived: GQA 16:4, NoPE on every 4th layer.
         let config = config_from_json(&manifest["model"]).unwrap();
         assert_eq!(
             (

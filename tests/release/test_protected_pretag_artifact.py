@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Adversarial tests for live protected-main raw Actions artifact staging."""
 
 from __future__ import annotations
 

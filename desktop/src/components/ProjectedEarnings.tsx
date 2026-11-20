@@ -8,47 +8,11 @@ import { formatArc, formatInt } from "../lib/format";
 import { hostLabel, hostLabelVerbose } from "../lib/hosts";
 import type { EarningsProjection, RewardEconomics } from "../lib/types";
 
-/**
- * Projected rewards — the only forward-looking number in the app.
- *
- * The rules it follows, in order of how badly breaking each one would hurt:
- *
- * 1. **The forecast is backend-authoritative.** `projectedDailyArc` is either
- *    supplied after the coordinator applies readiness, treasury, and
- *    consensus-budget policy, or it is absent with a reason. This component
- *    never reconstructs it from receipt rate or reward amount.
- * 2. **The treasury is finite.** The remaining balance and the number of
- *    reward receipts it can still fund are shown whenever known. A per-day
- *    figure with no stated ceiling implies an unlimited payout, and that is the
- *    dishonest version of this feature.
- * 3. **Settlement must be active.** The selected coordinator must explicitly
- *    report that community reward v1 is enabled. Jobs can execute while reward
- *    settlement is paused, so a protocol constant alone is not permission to
- *    display projected earnings.
- * 4. **Worker bond terms are exact.** Community certificates currently carry
- *    a zero bond. The unrelated local-attestation bond is never subtracted
- *    from a worker reward.
- * 5. **This is a testnet treasury transfer, not revenue.** Stated on every
- *    variant. No fiat figure and no currency symbol appears anywhere.
- * 6. **Every number is attributable.** The host each figure came from is named
- *    inline. Cross-source aggregation requires independently verified
- *    canonical agreement.
- *
- * Two reads are joined here: `/worker/earnings/{addr}` supplies the rate and
- * the reward and rollout gate, `/economics/rewards` supplies worker certificate
- * terms and the treasury ceiling.
- * Either can 404 independently, and losing one must not take down the other.
- */
-
-/** Horizon for the secondary figure. A week is the longest span a measured
- *  daily rate can be extended over without the stalls dominating it. */
 const PROJECTION_DAYS = 7;
 
-/** Precision if a future community-certificate contract reports a small bond. */
 const BOND_DIGITS = 6;
 
 interface Derived {
-  /** Explicit reward amount for one mined receipt; never used to synthesize a forecast. */
   netPerAttestation: number | null;
   perDay: number | null;
   perWeek: number | null;
@@ -81,22 +45,11 @@ function projectionEvidenceAttributes(
   };
 }
 
-/**
- * Combine the two reads into the figures shown.
- *
- * Worker certificate terms arrive from `/economics/rewards`, not from the
- * earnings endpoint. They must never be confused with the coordinator's local
- * attestation bond.
- */
 function derive(
   p: EarningsProjection | undefined,
   _econ: RewardEconomics | undefined,
 ): Derived {
   const reward = p?.rewardPerAttestation ?? null;
-  // The coordinator already applies readiness, budget, treasury and observed
-  // receipt policy. Reconstructing `(reward - bond) * observedRate` here can
-  // display a forecast the coordinator explicitly withheld. A worker
-  // certificate bond is also not a deduction from this authoritative field.
   const perDay = p?.projectedDailyArc ?? null;
   return {
     netPerAttestation: reward,
@@ -105,7 +58,6 @@ function derive(
   };
 }
 
-/** The label that says where a rate came from. Never "assumed". */
 function rateSourceLabel(p: EarningsProjection): string {
   switch (p.rewardRateSource) {
     case "chain":
@@ -117,14 +69,6 @@ function rateSourceLabel(p: EarningsProjection): string {
   }
 }
 
-/**
- * The assumptions line, built as clauses so a missing input drops its clause
- * instead of rendering "over null blocks".
- *
- * `compact` shortens each clause for the Dashboard tile without dropping any of
- * the facts a reader needs — the successful mined reward-receipt rate and
- * where it was measured, the 0x25 reward amount, and certificate terms.
- */
 function assumptionClauses(
   p: EarningsProjection,
   econ: RewardEconomics | undefined,
@@ -160,8 +104,6 @@ function assumptionClauses(
       : "the selected coordinator reports both reward-protocol activation and validator-approval collection ready",
   );
 
-  // Community reward certificate bond only. A zero here is meaningful: the
-  // worker signs a certificate but posts no collateral.
   const bond = econ?.bondPerAttestation ?? null;
   if (bond !== null) {
     if (bond === 0) {
@@ -194,14 +136,6 @@ function assumptionClauses(
   return out;
 }
 
-/**
- * The finite-treasury line.
- *
- * Shows the remaining balance AND how many reward receipts it can still fund.
- * That count comes from the selected host, not from arithmetic here. Dividing
- * a host-scoped treasury by one worker's rate would produce a "days remaining"
- * figure describing nothing, so this deliberately does no such division.
- */
 function TreasuryLine({
   econ,
   compact = false,
@@ -229,8 +163,6 @@ function TreasuryLine({
   const balance = econ.treasuryBalanceArc;
   const remaining = econ.attestationsRemaining;
 
-  // The endpoint answered but carried neither figure — give the reason it
-  // supplied rather than dropping the ceiling silently.
   if (balance === null && remaining === null) {
     const why =
       econ.treasuryBalanceUnavailableReason ??
@@ -274,7 +206,6 @@ function TreasuryLine({
           </>
         )}
         on this selected chain host
-        {/* A COUNT the host computed — not currency, and not our arithmetic. */}
         {remaining !== null && (
           <>
             {" "}
@@ -303,7 +234,6 @@ function TreasuryLine({
   );
 }
 
-/** Shown on every variant. The single most important sentence here. */
 function FundingLabel() {
   return (
     <span
@@ -351,7 +281,6 @@ function BudgetLine({
   );
 }
 
-/** The host's own caveat about how it derived the rate, shown verbatim. */
 function RateCaveat({ p }: { p: EarningsProjection }) {
   if (!p.rateCaveat) return null;
   return (
@@ -388,7 +317,6 @@ export function ProjectedEarnings({
   const d = derive(projection, econ);
   const compact = variant === "tile";
 
-  // ── Still reading ──────────────────────────────────────────────────────
   if (!projection) {
     return (
       <Card data-testid="projection-loading" aria-busy="true">
@@ -407,7 +335,6 @@ export function ProjectedEarnings({
     );
   }
 
-  // ── The earnings read failed ───────────────────────────────────────────
   if (projection.unavailable) {
     return (
       <Card
@@ -430,9 +357,6 @@ export function ProjectedEarnings({
     );
   }
 
-  // Jobs and rewards have separate rollout gates. Never turn a configured
-  // protocol amount into projected earnings unless this coordinator confirms
-  // that it can actually settle community reward transactions.
   if (projection.communityRewardsEnabled !== true) {
     const inactive = projection.communityRewardsEnabled === false;
     const rolloutReason = inactive
@@ -459,7 +383,6 @@ export function ProjectedEarnings({
     );
   }
 
-  // ── No measured rate: show the rate card, project nothing ──────────────
   if (d.perDay === null) {
     const noRateReason =
       projection.projectedDailyUnavailableReason ??
@@ -522,7 +445,6 @@ export function ProjectedEarnings({
     );
   }
 
-  // ── Full projection: every input is real ───────────────────────────────
   return (
     <Card
       data-testid="projection-card"
@@ -587,5 +509,4 @@ export function ProjectedEarnings({
   );
 }
 
-/** Icon re-export so callers can label a section without importing lucide. */
 export const ProjectionIcon = TrendingUp;

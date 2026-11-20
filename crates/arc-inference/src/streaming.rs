@@ -1,84 +1,37 @@
-//! Streaming Weight Provider & Speculative Decoding
-//!
-//! Enables models larger than RAM by streaming layer weights from disk (mmap)
-//! and speculative decoding with a small draft model for 2-3x throughput.
-//!
-//! ## SSD Weight Streaming
-//!
-//! Instead of loading all layers into memory, the `StreamingWeightProvider`
-//! keeps only N layers in a hot cache (RAM). When a layer is needed that's
-//! not cached, it's loaded from the memory-mapped GGUF file on-demand.
-//! Cold layers are evicted LRU. This means a 400B model can run on a
-//! machine with 16GB RAM - only ~2 layers in memory at a time.
-//!
-//! ## Speculative Decoding
-//!
-//! A small draft model (e.g. TinyLlama 1.1B) predicts N candidate tokens.
-//! The large target model verifies the batch in a single forward pass.
-//! Because integer inference is deterministic, verification is just hash
-//! comparison - if draft output == target output, all N tokens are accepted.
-//! Typical acceptance rate: 60-80% → 2-3x effective throughput.
-//!
-//! ## Memory-Tier Execution
-//!
-//! `MemoryTierConfig` detects available VRAM/RAM/SSD and assigns layers:
-//! - **GPU VRAM**: Hot layers (attention, first/last layers)
-//! - **RAM**: Warm layers (middle transformer blocks)
-//! - **SSD**: Cold layers (loaded on-demand via mmap)
-//!
-//! This is what makes ARC 15x cheaper: any hardware works. A $5K community
-//! node with a 2TB NVMe SSD can serve a 400B model. No $240K H100 required.
-
 use crate::cached_integer_model::{
     CachedIntegerModel, CachedLayer, I8Weights, KVCache, ModelConfig,
 };
 use crate::integer_lut::*;
 use std::collections::HashMap;
-use tracing::info;
-// `debug!` is only called from the `candle`-gated disk-streaming loader.
 #[cfg(feature = "candle")]
 use tracing::debug;
+use tracing::info;
 
-// ─── Memory Tier Detection ─────────────────────────────────────────────────
-
-/// Detected memory tiers on this machine.
 #[derive(Debug, Clone)]
 pub struct MemoryTierConfig {
-    /// Available GPU VRAM in bytes (0 if no GPU).
     pub vram_bytes: u64,
-    /// Available system RAM in bytes.
     pub ram_bytes: u64,
-    /// Available SSD space in bytes (for mmap weight files).
     pub ssd_bytes: u64,
-    /// NVMe sequential read bandwidth estimate (bytes/sec).
-    /// Used to predict per-token latency when streaming from SSD.
     pub ssd_bandwidth: u64,
-    /// How many layers fit in VRAM.
     pub vram_layer_capacity: usize,
-    /// How many layers fit in RAM.
     pub ram_layer_capacity: usize,
 }
 
 impl MemoryTierConfig {
-    /// Auto-detect memory tiers for a model with given layer size.
     pub fn detect(bytes_per_layer: u64) -> Self {
-        // Estimate available memory conservatively
         let ram_bytes = Self::estimate_available_ram();
         let ssd_bytes = Self::estimate_available_ssd();
         let vram_bytes = Self::estimate_available_vram();
 
-        // NVMe: ~3.5 GB/s sequential read (conservative for consumer NVMe)
         let ssd_bandwidth = 3_500_000_000u64;
 
         let vram_layer_capacity = if bytes_per_layer > 0 {
-            // Reserve 20% VRAM for activations/KV cache
             ((vram_bytes as f64 * 0.8) / bytes_per_layer as f64) as usize
         } else {
             0
         };
 
         let ram_layer_capacity = if bytes_per_layer > 0 {
-            // Reserve 30% RAM for OS + activations + KV cache
             ((ram_bytes as f64 * 0.7) / bytes_per_layer as f64) as usize
         } else {
             0
@@ -107,7 +60,6 @@ impl MemoryTierConfig {
     }
 
     fn estimate_available_ram() -> u64 {
-        // Use /proc/meminfo on Linux, sysctl on macOS
         #[cfg(target_os = "macos")]
         {
             let output = std::process::Command::new("sysctl")
@@ -120,7 +72,7 @@ impl MemoryTierConfig {
             {
                 return bytes;
             }
-            16 * 1024 * 1024 * 1024 // default 16GB
+            16 * 1024 * 1024 * 1024
         }
         #[cfg(target_os = "linux")]
         {
@@ -143,36 +95,27 @@ impl MemoryTierConfig {
     }
 
     fn estimate_available_ssd() -> u64 {
-        // Conservative: assume 500GB available for model caching
         500 * 1024 * 1024 * 1024
     }
 
     fn estimate_available_vram() -> u64 {
-        // GPU detection is handled by arc-gpu crate
-        // Default: 0 (CPU-only). Real detection in hardware_detect.rs.
         0
     }
 
-    /// Compute the tier assignment for each layer.
-    /// Returns: Vec of MemoryTier, one per layer.
     pub fn assign_tiers(&self, n_layers: usize) -> Vec<MemoryTier> {
         let mut tiers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             if i < self.vram_layer_capacity {
-                // First N layers in VRAM (fast attention)
                 tiers.push(MemoryTier::Vram);
             } else if i < self.vram_layer_capacity + self.ram_layer_capacity {
-                // Middle layers in RAM
                 tiers.push(MemoryTier::Ram);
             } else {
-                // Overflow layers on SSD (streamed on-demand)
                 tiers.push(MemoryTier::Ssd);
             }
         }
         tiers
     }
 
-    /// Estimate ms/token for a given number of SSD-streamed layers.
     pub fn estimate_ssd_latency_ms(&self, ssd_layers: usize, bytes_per_layer: u64) -> f64 {
         if self.ssd_bandwidth == 0 || ssd_layers == 0 {
             return 0.0;
@@ -182,46 +125,27 @@ impl MemoryTierConfig {
     }
 }
 
-/// Which memory tier a layer's weights are stored in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryTier {
-    /// GPU VRAM - fastest access, limited capacity.
     Vram,
-    /// System RAM - fast, moderate capacity.
     Ram,
-    /// SSD via mmap - slow but unlimited capacity.
     Ssd,
 }
 
-// ─── Streaming Weight Provider ─────────────────────────────────────────────
-
-/// LRU cache for transformer layers loaded from disk on-demand.
-/// Only keeps `capacity` layers in RAM at a time. When a layer is needed
-/// that's not in cache, it's loaded from the GGUF file (or mmap) and the
-/// least-recently-used layer is evicted.
 pub struct StreamingLayerCache {
-    /// Loaded layers: layer_idx → CachedLayer.
     cache: HashMap<usize, CachedLayer>,
-    /// LRU order: most recently used at the back.
     #[allow(dead_code)]
     lru_order: Vec<usize>,
-    /// Maximum layers to keep in memory.
     capacity: usize,
-    /// Model config for weight dimensions.
     #[allow(dead_code)]
     config: ModelConfig,
-    /// Path to GGUF file for on-demand loading.
     #[allow(dead_code)]
     gguf_path: String,
-    /// Total layers evicted (for stats).
     pub evictions: u64,
-    /// Total layers loaded from disk (for stats).
     pub disk_loads: u64,
 }
 
 impl StreamingLayerCache {
-    /// Create a new streaming cache with given capacity.
-    /// `capacity` = how many layers fit in RAM. Detect with MemoryTierConfig.
     pub fn new(config: ModelConfig, gguf_path: String, capacity: usize) -> Self {
         info!(capacity, path = %gguf_path, "StreamingLayerCache initialized");
         Self {
@@ -235,30 +159,23 @@ impl StreamingLayerCache {
         }
     }
 
-    /// Get a layer, loading from disk if not cached.
-    /// Updates LRU order. Evicts oldest layer if at capacity.
     #[cfg(feature = "candle")]
     pub fn get_layer(&mut self, layer_idx: usize) -> Result<&CachedLayer, crate::InferenceError> {
-        // Check if already cached
         if self.cache.contains_key(&layer_idx) {
-            // Move to back of LRU
             self.lru_order.retain(|&x| x != layer_idx);
             self.lru_order.push(layer_idx);
             return Ok(self.cache.get(&layer_idx).unwrap());
         }
 
-        // Not cached - load from disk
         self.load_layer_from_disk(layer_idx)?;
         Ok(self.cache.get(&layer_idx).unwrap())
     }
 
-    /// Load a single layer from the GGUF file into cache.
     #[cfg(feature = "candle")]
     fn load_layer_from_disk(&mut self, layer_idx: usize) -> Result<(), crate::InferenceError> {
         use candle_core::Device;
         use candle_core::quantized::gguf_file;
 
-        // Evict LRU if at capacity
         while self.cache.len() >= self.capacity {
             if let Some(evict_idx) = self.lru_order.first().copied() {
                 self.cache.remove(&evict_idx);
@@ -363,13 +280,10 @@ impl StreamingLayerCache {
         ))
     }
 
-    /// Number of layers currently in cache.
     pub fn cached_count(&self) -> usize {
         self.cache.len()
     }
 
-    /// Insert a layer directly (for testing or pre-loading).
-    /// Evicts LRU if at capacity.
     pub fn insert_layer(&mut self, layer_idx: usize, layer: CachedLayer) {
         while self.cache.len() >= self.capacity {
             if let Some(evict_idx) = self.lru_order.first().copied() {
@@ -385,41 +299,21 @@ impl StreamingLayerCache {
         self.lru_order.push(layer_idx);
     }
 
-    /// Check if a layer is currently cached.
     pub fn is_cached(&self, layer_idx: usize) -> bool {
         self.cache.contains_key(&layer_idx)
     }
 }
 
-// ─── Speculative Decoding ──────────────────────────────────────────────────
-
-/// Result of speculative decoding: accepted tokens + stats.
 #[derive(Debug, Clone)]
 pub struct SpeculativeResult {
-    /// Tokens accepted from draft model (verified by target).
     pub accepted_tokens: Vec<u32>,
-    /// Total tokens proposed by draft.
     pub proposed: usize,
-    /// How many were accepted.
     pub accepted: usize,
-    /// Acceptance rate (accepted / proposed).
     pub acceptance_rate: f64,
-    /// Time spent on draft inference (ms).
     pub draft_ms: u64,
-    /// Time spent on target verification (ms).
     pub verify_ms: u64,
 }
 
-/// Speculative decoding: use a small draft model to predict N tokens,
-/// then verify the batch with the large target model.
-///
-/// Because ARC's integer inference is deterministic, verification is
-/// trivial: if the target model produces the same token at each position,
-/// the draft was correct. No probabilistic acceptance/rejection needed.
-///
-/// Throughput improvement: if draft acceptance rate is p and draft is Kx
-/// faster than target, effective speedup ≈ K*p / (1 + 1/N) where N is
-/// the speculation depth. For p=0.7, K=10, N=8: ~5.6x speedup.
 pub fn speculative_decode(
     draft: &CachedIntegerModel,
     target: &CachedIntegerModel,
@@ -437,21 +331,16 @@ pub fn speculative_decode(
     let mut draft_cache = KVCache::new(draft.config.n_layers);
     let mut target_cache = KVCache::new(target.config.n_layers);
 
-    // Prefill: run prompt through both models.
-    // forward_one_token increments cache.seq_len internally - do NOT set it manually.
     for &tok in prompt_tokens {
         draft.forward_one_token(tok, &mut draft_cache);
         target.forward_one_token(tok, &mut target_cache);
     }
 
     while accepted_tokens.len() < max_tokens as usize {
-        // Phase 1: Draft model generates N speculative tokens.
-        // Each forward_one_token call advances draft_cache.seq_len by 1.
         let t0 = std::time::Instant::now();
         let mut draft_tokens: Vec<u32> = Vec::with_capacity(speculation_depth);
         let mut draft_input = *all_tokens.last().unwrap_or(&1);
 
-        // Save draft cache position so we can rollback on rejection
         let _draft_seq_before = draft_cache.seq_len;
 
         for _ in 0..speculation_depth {
@@ -473,9 +362,6 @@ pub fn speculative_decode(
         }
         total_proposed += draft_tokens.len();
 
-        // Phase 2: Target model verifies each drafted token.
-        // We feed the LAST accepted token to target's forward_one_token,
-        // which produces logits predicting the NEXT token.
         let t1 = std::time::Instant::now();
         let mut accepted_this_round = 0usize;
         let mut rejected = false;
@@ -490,7 +376,6 @@ pub fn speculative_decode(
             let target_tok = crate::integer_lut::argmax_i64(&target_logits) as u32;
 
             if target_tok == draft_tok {
-                // Draft was correct - accept
                 accepted_tokens.push(target_tok);
                 all_tokens.push(target_tok);
                 accepted_this_round += 1;
@@ -502,16 +387,11 @@ pub fn speculative_decode(
                     break;
                 }
             } else {
-                // Draft diverged - accept target's token (it's correct),
-                // discard remaining draft tokens
                 accepted_tokens.push(target_tok);
                 all_tokens.push(target_tok);
                 accepted_this_round += 1;
                 rejected = true;
 
-                // Rollback draft cache: replay from scratch to current position.
-                // This is expensive but correct. Future optimization: keep
-                // snapshots at checkpoint positions.
                 draft_cache = KVCache::new(draft.config.n_layers);
                 for &t in &all_tokens {
                     draft.forward_one_token(t, &mut draft_cache);
@@ -522,11 +402,7 @@ pub fn speculative_decode(
         verify_ms += t1.elapsed().as_millis() as u64;
         total_accepted += accepted_this_round;
 
-        // If no rejection and draft produced tokens, the draft cache is ahead
-        // by (draft_tokens.len() - accepted_this_round) positions. Rollback
-        // the excess positions.
         if !rejected && accepted_this_round < draft_tokens.len() {
-            // Draft cache advanced too far - rebuild
             draft_cache = KVCache::new(draft.config.n_layers);
             for &t in &all_tokens {
                 draft.forward_one_token(t, &mut draft_cache);
@@ -558,28 +434,16 @@ pub fn speculative_decode(
     }
 }
 
-// ─── Expert-Parallel Routing for MoE ───────────────────────────────────────
-
-/// Which experts were selected by the gating network for a given token.
 #[derive(Debug, Clone)]
 pub struct ExpertSelection {
-    /// Expert indices selected (top-k from gating logits).
     pub expert_indices: Vec<u32>,
-    /// Gating weights for each selected expert (normalized).
     pub weights: Vec<i64>,
 }
 
-/// Evaluate the MoE gating network to select top-k experts for a token.
-/// Uses the integer matmul path for deterministic expert selection.
-///
-/// gate_weights: [num_experts × d_model] I8 weights for the gating network.
-/// hidden: [d_model] i64 Q16 hidden state at the MoE layer.
-/// top_k: how many experts to select (typically 2 for Mixtral, 8 for R1).
 pub fn select_experts(gate_weights: &I8Weights, hidden: &[i64], top_k: usize) -> ExpertSelection {
     let num_experts = gate_weights.n_rows;
     let d = gate_weights.n_cols;
 
-    // Compute gating logits: gate_weights × hidden
     let mut logits = vec![0i64; num_experts];
     for (row, logit) in logits.iter_mut().enumerate() {
         let mut acc: i64 = 0;
@@ -590,12 +454,10 @@ pub fn select_experts(gate_weights: &I8Weights, hidden: &[i64], top_k: usize) ->
         *logit = ((acc / 127) * scale) >> FRAC_BITS;
     }
 
-    // Top-k selection
     let mut indexed: Vec<(usize, i64)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
     indexed.sort_by_key(|e| std::cmp::Reverse(e.1));
     indexed.truncate(top_k);
 
-    // Softmax over selected experts for gating weights
     let selected_logits: Vec<i64> = indexed.iter().map(|(_, v)| *v).collect();
     let weights = crate::integer_lut::softmax_i64(&selected_logits);
 
@@ -604,8 +466,6 @@ pub fn select_experts(gate_weights: &I8Weights, hidden: &[i64], top_k: usize) ->
         weights,
     }
 }
-
-// ─── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -643,9 +503,8 @@ mod tests {
             rng = rng
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            *v = ((rng >> 56) as i8).clamp(-5, 5); // small values to avoid overflow through layers
+            *v = ((rng >> 56) as i8).clamp(-5, 5);
         }
-        // Small scales to keep activations bounded through multiple layers
         let scales = vec![ONE / 10; rows];
         I8Weights {
             data,
@@ -668,8 +527,6 @@ mod tests {
             ffn_norm: vec![ONE; d_model],
         }
     }
-
-    // ── Memory Tier Tests ──────────────────────────────────────────────
 
     #[test]
     fn test_memory_tier_detection() {
@@ -719,15 +576,12 @@ mod tests {
             vram_layer_capacity: 0,
             ram_layer_capacity: 8,
         };
-        let tiers = config.assign_tiers(80); // 80-layer model on 16GB machine
+        let tiers = config.assign_tiers(80);
         assert_eq!(tiers.iter().filter(|&&t| t == MemoryTier::Vram).count(), 0);
         assert_eq!(tiers.iter().filter(|&&t| t == MemoryTier::Ram).count(), 8);
         assert_eq!(tiers.iter().filter(|&&t| t == MemoryTier::Ssd).count(), 72);
     }
 
-    // estimate_ssd_latency_ms early-returns the literal 0.0 when ssd_layers is
-    // 0, so no arithmetic or rounding is involved - comparing to exactly 0.0 is
-    // the assertion we want here, and loosening it would stop testing anything.
     #[allow(clippy::float_cmp)]
     #[test]
     fn test_ssd_latency_estimate() {
@@ -744,8 +598,6 @@ mod tests {
         assert_eq!(config.estimate_ssd_latency_ms(0, 500_000_000), 0.0);
     }
 
-    // ── Streaming Cache Tests ──────────────────────────────────────────
-
     #[test]
     fn test_streaming_cache_insert_and_evict() {
         let config = make_test_config(32, 128);
@@ -753,7 +605,6 @@ mod tests {
         let d_ff = config.d_ff;
         let mut cache = StreamingLayerCache::new(config, "/dev/null".to_string(), 3);
 
-        // Insert 3 layers - should all fit
         cache.insert_layer(0, make_random_layer(d, d_ff, 100));
         cache.insert_layer(1, make_random_layer(d, d_ff, 200));
         cache.insert_layer(2, make_random_layer(d, d_ff, 300));
@@ -763,7 +614,6 @@ mod tests {
         assert!(cache.is_cached(2));
         assert_eq!(cache.evictions, 0);
 
-        // Insert 4th - should evict layer 0 (LRU)
         cache.insert_layer(3, make_random_layer(d, d_ff, 400));
         assert_eq!(cache.cached_count(), 3);
         assert!(!cache.is_cached(0), "layer 0 should be evicted");
@@ -784,9 +634,7 @@ mod tests {
         cache.insert_layer(1, make_random_layer(d, d_ff, 200));
         cache.insert_layer(2, make_random_layer(d, d_ff, 300));
 
-        // Access layer 0 (makes it MRU), then insert layer 3
-        // Should evict layer 1 (now LRU), not layer 0
-        cache.insert_layer(0, make_random_layer(d, d_ff, 100)); // re-touch layer 0
+        cache.insert_layer(0, make_random_layer(d, d_ff, 100));
         cache.insert_layer(3, make_random_layer(d, d_ff, 400));
         assert!(
             cache.is_cached(0),
@@ -815,8 +663,6 @@ mod tests {
         assert_eq!(cache.evictions, 1);
     }
 
-    // ── Expert Selection Tests ─────────────────────────────────────────
-
     #[test]
     fn test_expert_selection_basic() {
         let gate = I8Weights {
@@ -840,7 +686,6 @@ mod tests {
         let sel1 = select_experts(&gate, &hidden, 4);
         let sel2 = select_experts(&gate, &hidden, 4);
 
-        // Same input → same experts (determinism)
         assert_eq!(sel1.expert_indices, sel2.expert_indices);
         assert_eq!(sel1.weights, sel2.weights);
     }
@@ -864,40 +709,29 @@ mod tests {
         let h2 = vec![0, 0, 0, ONE];
         let sel1 = select_experts(&gate, &h1, 2);
         let sel2 = select_experts(&gate, &h2, 2);
-        // Different inputs should (usually) select different experts
-        // Not guaranteed for random weights, but very likely with orthogonal inputs
         assert!(
             sel1.expert_indices != sel2.expert_indices || sel1.weights != sel2.weights,
             "Different inputs should produce different expert selections"
         );
     }
 
-    // ── Speculative Decoding Tests ─────────────────────────────────────
-
-    // acceptance_rate is accepted/total computed in f64; when every draft token
-    // is accepted those are the same integer, so the quotient is an exact 1.0.
-    // The exact comparison is the point of the test - it must not be loosened.
     #[allow(clippy::float_cmp)]
     #[test]
     fn test_speculative_decode_identical_models() {
-        // When draft == target (same model), acceptance rate should be 100%
         let config = make_test_config(2, 128);
         let d = config.d_model;
         let d_ff = config.d_ff;
 
-        // Build a tiny model with random weights
         let mut layers = Vec::new();
         for i in 0..2 {
             layers.push(make_random_layer(d, d_ff, 1000 + i as u64));
         }
 
-        // Random embeddings
-        // Small embeddings to avoid i64 overflow in layernorm (x*x >> 16)
         let mut rng = 42u64;
         let embedding_q16: Vec<i64> = (0..config.vocab_size * d)
             .map(|_| {
                 rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-                ((rng >> 48) as i64) * 16 // small values, ~O(1000)
+                ((rng >> 48) as i64) * 16
             })
             .collect();
 
@@ -923,7 +757,6 @@ mod tests {
             ternary_hybrid_output: None,
         };
 
-        // Use the same model as both draft and target
         let result = speculative_decode(&model, &model, &[1, 5, 10], 8, 4);
         assert!(
             !result.accepted_tokens.is_empty(),
@@ -933,7 +766,6 @@ mod tests {
             result.accepted_tokens.len() <= 8,
             "Should respect max_tokens"
         );
-        // With identical models, every draft token should be accepted
         assert_eq!(
             result.acceptance_rate, 1.0,
             "Identical models should have 100% acceptance rate, got {}",
@@ -943,17 +775,15 @@ mod tests {
 
     #[test]
     fn test_speculative_decode_different_models() {
-        // Different models should still produce valid output (just lower acceptance)
         let config = make_test_config(2, 128);
         let d = config.d_model;
         let d_ff = config.d_ff;
 
-        // Small embeddings to avoid i64 overflow in layernorm (x*x >> 16)
         let mut rng = 42u64;
         let embedding_q16: Vec<i64> = (0..config.vocab_size * d)
             .map(|_| {
                 rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-                ((rng >> 48) as i64) * 16 // small values, ~O(1000)
+                ((rng >> 48) as i64) * 16
             })
             .collect();
 
@@ -998,8 +828,6 @@ mod tests {
             "Should respect max_tokens"
         );
         assert!(result.proposed > 0, "Draft should propose tokens");
-        // Acceptance rate with different models should be < 1.0 (probably 0.3-0.7)
-        // but at least some tokens should be accepted (target always produces 1 per round)
         assert!(result.accepted > 0, "Should accept at least some tokens");
     }
 
@@ -1009,12 +837,11 @@ mod tests {
         let d = config.d_model;
         let d_ff = config.d_ff;
 
-        // Small embeddings to avoid i64 overflow in layernorm (x*x >> 16)
         let mut rng = 42u64;
         let embedding_q16: Vec<i64> = (0..config.vocab_size * d)
             .map(|_| {
                 rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-                ((rng >> 48) as i64) * 16 // small values, ~O(1000)
+                ((rng >> 48) as i64) * 16
             })
             .collect();
 
@@ -1052,7 +879,6 @@ mod tests {
         let r1 = speculative_decode(&draft, &target, &[1, 3], 5, 3);
         let r2 = speculative_decode(&draft, &target, &[1, 3], 5, 3);
 
-        // Deterministic: same input → same output every time
         assert_eq!(
             r1.accepted_tokens, r2.accepted_tokens,
             "Speculative decode must be deterministic"

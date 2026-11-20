@@ -223,12 +223,8 @@ class AttemptTests(unittest.TestCase):
                 digest(canonical),
                 digest(GATE.canonical_updater_public_key_bytes(alternate)),
             )
-            # Python accepts non-zero pad bits unless canonical re-encoding is
-            # checked (YR== decodes to the same byte as canonical YQ==).
             with self.assertRaisesRegex(GATE.GateError, "non-canonical base64"):
                 GATE.canonical_updater_public_key_bytes("YR==")
-            # Python accepts non-zero pad bits unless canonical re-encoding is
-            # checked (YR== decodes to the same byte as canonical YQ==).
             with self.assertRaisesRegex(GATE.GateError, "non-canonical base64"):
                 GATE.canonical_updater_public_key_bytes("YR==")
 

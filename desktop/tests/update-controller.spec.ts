@@ -46,13 +46,8 @@ class FakeTimers implements UpdateTimers {
   setInterval = (callback: () => void, delayMs: number): number =>
     this.add(callback, delayMs, delayMs);
 
-  /** The fake wall clock, for `UpdateRuntime.now`. */
   now = (): number => this.nowMs;
 
-  /**
-   * Move the clock without firing anything: a hidden WebView whose timers
-   * were throttled, or a computer that slept.
-   */
   async skipWithoutFiring(ms: number): Promise<void> {
     this.nowMs += ms;
     for (const task of this.tasks.values()) task.at += ms;
@@ -100,7 +95,6 @@ class FakeTimers implements UpdateTimers {
   }
 
   private async flushPromises(): Promise<void> {
-    // The controller and async runtime mock each add a microtask boundary.
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
@@ -321,7 +315,6 @@ test.describe("UpdateController", () => {
       timers,
     );
 
-    // Nothing happens while automatic checks are off.
     controller.signal("focus");
     await timers.advanceBy(0);
     expect(checkCalls).toBe(0);
@@ -330,7 +323,6 @@ test.describe("UpdateController", () => {
     await timers.advanceBy(10);
     expect(checkCalls).toBe(1);
 
-    // Too soon after the startup check.
     controller.signal("focus");
     await timers.advanceBy(0);
     expect(checkCalls).toBe(1);
@@ -345,14 +337,11 @@ test.describe("UpdateController", () => {
     await timers.advanceBy(0);
     expect(checkCalls).toBe(3);
 
-    // A tick alone never checks early.
     await timers.advanceBy(1_000);
     controller.signal("tick");
     await timers.advanceBy(0);
     expect(checkCalls).toBe(3);
 
-    // A wake after a long sleep checks at once, even though the WebView's
-    // timers did not run while the computer slept.
     await timers.skipWithoutFiring(50_000);
     controller.signal("wake");
     await timers.advanceBy(0);
@@ -389,14 +378,12 @@ test.describe("UpdateController", () => {
     await timers.advanceBy(10);
     expect(checkCalls).toBe(1);
 
-    // The WebView's timer never fires; the clock moves past its due time.
     await timers.skipWithoutFiring(5_000);
     expect(checkCalls).toBe(1);
     controller.signal("tick");
     await timers.advanceBy(0);
     expect(checkCalls).toBe(2);
 
-    // The interval starts again from that check.
     await timers.advanceBy(999);
     expect(checkCalls).toBe(2);
     await timers.advanceBy(1);
@@ -438,7 +425,6 @@ test.describe("UpdateController", () => {
         },
         now: timers.now,
       },
-      // A long interval, so only the busy retry runs here.
       { startupDelayMs: 10, intervalMs: 100 * hour },
       timers,
     );
@@ -447,10 +433,8 @@ test.describe("UpdateController", () => {
     await timers.advanceBy(10);
     expect(prepareAttempts).toBe(1);
 
-    // Not at the old 1, 5 and 15 minute marks...
     await timers.advanceBy(15 * 60_000);
     expect(prepareAttempts).toBe(1);
-    // ...but every hour, more than the three failure retries allow.
     await timers.advanceBy(hour - 15 * 60_000 - 1);
     expect(prepareAttempts).toBe(1);
     await timers.advanceBy(1);
@@ -462,7 +446,6 @@ test.describe("UpdateController", () => {
     }
     expect(order.filter((step) => step === "download")).toEqual(["download"]);
 
-    // A throttled timer is caught up by a native tick.
     await timers.skipWithoutFiring(hour);
     controller.signal("tick");
     await timers.advanceBy(0);
@@ -539,7 +522,6 @@ test.describe("UpdateController", () => {
     expect(checkCalls).toBe(3);
     await timers.advanceBy(15 * 60_000);
     expect(checkCalls).toBe(4);
-    // The retries are spent; the next try is the 6-hour check.
     await timers.advanceBy(60 * 60_000);
     expect(checkCalls).toBe(4);
     controller.dispose();
@@ -1404,8 +1386,6 @@ test.describe("UpdateController", () => {
     controller.dispose();
   });
 
-  // The native refusal while launch-time reconciliation still owns the node
-  // (start_fence.rs STARTUP_RECONCILIATION_IN_PROGRESS).
   const RECONCILING =
     "managed-node startup reconciliation is still in progress: ARC is checking how the previous node session ended before it starts or updates arc-node. Try again in a few seconds.";
 
@@ -1446,7 +1426,6 @@ test.describe("UpdateController", () => {
 
     await controller.checkForUpdates("manual");
     await controller.installAvailableUpdate();
-    // Not an error: the verified download is kept and the install waits.
     expect(order).toEqual(["download", "prepare"]);
     expect(controller.getSnapshot()).toMatchObject({
       phase: "available",
@@ -1511,7 +1490,6 @@ test.describe("UpdateController", () => {
           order.push("relaunch");
         },
       },
-      // A daily interval: only the reconciliation retry can run in this window.
       { startupDelayMs: 10, intervalMs: 24 * 60 * 60 * 1_000, retryDelaysMs: [] },
       timers,
     );
@@ -1572,7 +1550,6 @@ test.describe("UpdateController", () => {
           order.push("manual-prepare");
         },
         beginHandoff: async () => {},
-        // The native abort waits for the recovery launch to release the node.
         abortRelaunch: () => {
           order.push("abort");
           return abort.promise;
@@ -1587,7 +1564,6 @@ test.describe("UpdateController", () => {
     controller.setAutoInstallEnabled(true);
     await timers.advanceBy(10);
     expect(order).toEqual(["download", "try-prepare", "abort"]);
-    // Already says why while the abort waits.
     expect(controller.getSnapshot().message).toContain("last session");
     abort.resolve();
     await timers.advanceBy(0);
@@ -1700,7 +1676,6 @@ test.describe("UpdateController", () => {
     await controller.installAvailableUpdate();
     expect(prepareAttempts).toBe(1);
 
-    // The waiting 0.8.14 install never runs once 0.8.15 replaces it.
     await controller.checkForUpdates("manual");
     expect(controller.getSnapshot()).toMatchObject({
       phase: "available",
@@ -1726,7 +1701,6 @@ test.describe("UpdateController", () => {
           download: async () => {},
           install: async () => {},
         }),
-        // The Settings install is refused the same way, so it can't be the advice.
         tryPrepareAutoUpdateRelaunch: async () => {
           throw new Error(
             "automatic update preparation requires a safe abort: legacy desktop node reconciliation is unresolved; refusing the update boundary: legacy-data migration preflight failed",
@@ -1780,9 +1754,6 @@ test.describe("UpdateController", () => {
     controller.dispose();
   });
 
-  // macOS: run from the mounted .dmg, a translocated download or another
-  // volume, the updater's install failed only after the node had stopped and
-  // the one-way handoff had begun. Native preparation now refuses first.
   test("a manual install from where ARC can't update itself stays available and stops nothing", async () => {
     const order: string[] = [];
     const controller = createUpdateController({
@@ -1813,7 +1784,6 @@ test.describe("UpdateController", () => {
 
     await controller.checkForUpdates("manual");
     await controller.installAvailableUpdate();
-    // No handoff, so nothing holds the node: Start and Restart stay open.
     expect(order).toEqual(["download", "prepare"]);
     expect(controller.getSnapshot()).toMatchObject({
       phase: "available",
@@ -1824,8 +1794,6 @@ test.describe("UpdateController", () => {
       restartRequired: false,
     });
 
-    // Pressing Install again asks native preparation again; the verified
-    // payload is not downloaded twice.
     await controller.installAvailableUpdate();
     expect(order).toEqual(["download", "prepare", "prepare"]);
     expect(controller.getSnapshot().message).toBe(PLAIN_COPY.updates.wrongLocation);
@@ -1870,7 +1838,6 @@ test.describe("UpdateController", () => {
     controller.setAutoInstallEnabled(true);
     await timers.advanceBy(10);
     await timers.advanceBy(0);
-    // The pre-handoff abort finds nothing prepared to release.
     expect(order).toEqual(["download", "try-prepare", "abort"]);
     expect(controller.getSnapshot()).toMatchObject({
       phase: "available",
@@ -1881,7 +1848,6 @@ test.describe("UpdateController", () => {
       restartRequired: false,
     });
 
-    // Moving ARC takes a quit, so nothing retries from this process.
     await timers.advanceBy(60_000 * 2);
     expect(order).toEqual(["download", "try-prepare", "abort"]);
     controller.dispose();
@@ -1893,7 +1859,6 @@ test.describe("UpdateController", () => {
       "utf8",
     );
     expect(source).toContain(`"${NATIVE_WRONG_LOCATION}"`);
-    // One sentence to act on: where to put ARC, and that it takes a quit.
     expect(PLAIN_COPY.updates.wrongLocation).toMatch(/^ARC can't update itself/);
     expect(PLAIN_COPY.updates.wrongLocation).toContain("Quit ARC");
     expect(PLAIN_COPY.updates.wrongLocation).toContain("Applications folder");

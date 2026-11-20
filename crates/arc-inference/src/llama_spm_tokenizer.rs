@@ -1,16 +1,7 @@
-//! Versioned, metadata-backed tokenizer for GGUF LLaMA SentencePiece models.
-//!
-//! This is deliberately narrower than [`CachedIntegerModel::encode`]: it
-//! implements llama.cpp's historical SPM score-ordered pair merge using the
-//! GGUF vocabulary, scores, token types, and byte fallback table.  Callers
-//! must bind this profile in their generation identity; it is not a silent
-//! replacement for the legacy greedy encoder.
-
 use std::collections::HashMap;
 
 use crate::InferenceError;
 
-/// Identity for the LLaMA-only GGUF tokenizer implemented in this module.
 pub const GGUF_LLAMA_SPM_TOKENIZER_PROFILE_V1: &str =
     arc_types::transaction::GGUF_LLAMA_SPM_TOKENIZER_PROFILE_V1;
 
@@ -22,7 +13,6 @@ const TOKEN_TYPE_USER_DEFINED: i32 = 4;
 #[cfg(feature = "candle")]
 const TOKEN_TYPE_BYTE: i32 = 6;
 
-/// Header-only LLaMA GGUF tokenizer.  It does not read tensor weights.
 #[derive(Debug, Clone)]
 pub struct LlamaGgufSpmTokenizer {
     bos_token: u32,
@@ -44,8 +34,6 @@ struct Symbol {
 }
 
 impl LlamaGgufSpmTokenizer {
-    /// Read only GGUF header metadata and reject every tokenizer model other
-    /// than the score-merge LLaMA SPM contract.
     #[cfg(feature = "candle")]
     pub fn from_gguf(path: &str) -> Result<Self, InferenceError> {
         use candle_core::quantized::gguf_file;
@@ -172,19 +160,14 @@ impl LlamaGgufSpmTokenizer {
         GGUF_LLAMA_SPM_TOKENIZER_PROFILE_V1
     }
 
-    /// The BOS id that [`Self::encode_prompt`] prepends.
     pub fn bos_token(&self) -> u32 {
         self.bos_token
     }
 
-    /// Number of pieces in the vocabulary.
     pub fn vocab_len(&self) -> usize {
         self.pieces.len()
     }
 
-    /// BLAKE3 over the vocabulary, as the package manifest records it
-    /// (`tokenizer.vocab_blake3`): for each id in order, the piece's UTF-8
-    /// length (u32 LE) and bytes, its score (f32 LE) and its type (i32 LE).
     pub fn vocabulary_digest(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         for ((piece, score), kind) in self.pieces.iter().zip(&self.scores).zip(&self.types) {
@@ -196,14 +179,10 @@ impl LlamaGgufSpmTokenizer {
         *hasher.finalize().as_bytes()
     }
 
-    /// End-of-generation ids, as read from the file.
     pub fn eos_tokens(&self) -> &[u32] {
         &self.eos_tokens
     }
 
-    /// Decode generated content while stopping before EOG and suppressing
-    /// BOS/control pieces. This is the content-facing companion to token
-    /// trace APIs, which retain the terminal EOG for exact comparisons.
     pub fn decode_generated_content(&self, tokens: &[u32]) -> String {
         let mut output = String::new();
         let mut fallback = Vec::new();
@@ -239,9 +218,6 @@ impl LlamaGgufSpmTokenizer {
         output
     }
 
-    /// llama_tokenize-compatible input encoding: prepend one BOS and apply
-    /// the SPM leading-space rule.  Literal control, unknown, and
-    /// user-defined pieces are partitioned as special tokens first.
     pub fn encode_prompt(&self, text: &str) -> Result<Vec<u32>, InferenceError> {
         let mut output = vec![self.bos_token];
         let mut previous_was_special = true;
@@ -302,8 +278,6 @@ impl LlamaGgufSpmTokenizer {
         fragments
     }
 
-    // Exact score equality selects the earliest adjacent pair, matching the
-    // SentencePiece merge contract and preserving deterministic token IDs.
     #[allow(clippy::float_cmp)]
     fn encode_spm_escaped(&self, text: &str, output: &mut Vec<u32>) -> Result<(), InferenceError> {
         let mut symbols = Vec::new();
@@ -321,10 +295,6 @@ impl LlamaGgufSpmTokenizer {
             symbols[index].next = (index + 1 < symbols.len()).then_some(index + 1);
         }
 
-        // llama.cpp selects the available adjacent pair with highest token
-        // score; equal scores choose the smaller left index.  Recomputing the
-        // candidates after each merge is slower than its priority queue but
-        // preserves those semantics for bounded coordinator prompts.
         loop {
             let mut best: Option<(usize, usize, f32)> = None;
             for left in 0..symbols.len() {

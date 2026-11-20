@@ -37,7 +37,6 @@ DEFAULT_FLEET = [
     ("SGP", "149.28.153.31"),
 ]
 
-# Strict verification, explicitly. Not a default that a flag can turn off.
 TLS = ssl.create_default_context()
 TLS.check_hostname = True
 TLS.verify_mode = ssl.CERT_REQUIRED
@@ -58,7 +57,6 @@ def require(condition: bool, problems: list[str], message: str) -> bool:
 
 
 def is_routable(addr: object) -> bool:
-    """A stub cannot be dialled by a peer, which is the whole failure."""
     if not isinstance(addr, str) or not addr.strip():
         return False
     host = addr.split("//")[-1].rsplit(":", 1)[0].strip("[]")
@@ -140,11 +138,6 @@ def main(argv: list[str] | None = None) -> int:
         networks.add(str(info.get("network")))
         chain_ids.add(str(info.get("chain_id")))
 
-        # `self_shards` is what this node holds; `shards` is its registry.
-        # While announcements are being refused the two are identical, which
-        # is precisely the failure, so peers are counted as registry entries
-        # that are NOT this node's own ranges. `node_name` is a display label,
-        # not an identity, and must never be used for this.
         own = shards.get("self_shards")
         registry = shards.get("shards")
         require(isinstance(own, list), problems, f"{name} /shards omitted self_shards")

@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 
 MASK64 = (1 << 64) - 1
-SEED = 0x534D_4F4C_4C4D_3321  # "SMOLLM3!"
+SEED = 0x534D_4F4C_4C4D_3321
 
 VOCAB = 300
 D_MODEL = 64
@@ -102,18 +102,15 @@ def bf16(sign: int, exponent: int, mantissa: int) -> int:
 
 
 def weight_bits(rng: Lcg, lo_exp: int, n_exp: int) -> int:
-    """Random sign, 7 random mantissa bits, biased exponent in [lo_exp, lo_exp + n_exp)."""
     r = rng.next()
     return bf16((r >> 63) & 1, lo_exp + (r >> 40) % n_exp, (r >> 56) & 0x7F)
 
 
 def matrix(rng: Lcg, rows: int, cols: int, lo_exp: int = 120, n_exp: int = 5) -> list:
-    # Exponents 120..124: magnitudes in [2^-7, 2^-2), RMS about 0.1.
     return [[weight_bits(rng, lo_exp, n_exp) for _ in range(cols)] for _ in range(rows)]
 
 
 def norm(rng: Lcg, width: int) -> list:
-    # Gains in [0.5, 2): biased exponent 126 or 127, positive.
     out = []
     for _ in range(width):
         r = rng.next()
@@ -122,7 +119,6 @@ def norm(rng: Lcg, width: int) -> list:
 
 
 def tensors() -> list:
-    """(name, shape, bit patterns) in a fixed order."""
     rng = Lcg(SEED)
     out = []
     embed = matrix(rng, VOCAB, D_MODEL, lo_exp=121)
@@ -140,19 +136,14 @@ def tensors() -> list:
         up = matrix(rng, D_FF, D_MODEL)
         down = matrix(rng, D_MODEL, D_FF)
         if layer == 0:
-            # Row maximum tied between +v and -v (exponent 125 is above every random
-            # entry); subnormals 123 binades below it (the d > 60 rule); negative zero.
             wq[3][0], wq[3][1] = bf16(0, 125, 0x55), bf16(1, 125, 0x55)
             wq[3][2], wq[3][3], wq[3][4] = 0x0001, 0x807F, 0x8000
-            # Elements 20 and 40 binades below the row maximum (q = 0 with d <= 60).
             down[5][0] = bf16(0, 125, 0x7F)
             down[5][1], down[5][2] = bf16(1, 105, 0x01), bf16(0, 85, 0x00)
-            # Norm gains that round half-way: 1.5 * 2^-16 -> 2, -1.5 * 2^-16 -> -2,
-            # 2.5 * 2^-16 -> 3 (half away from zero), tiny and subnormal -> 0, a negative gain.
             attn_norm[0:6] = [0x37C0, 0xB7C0, 0x3820, 0x0003, 0x8000, bf16(1, 126, 0x40)]
         if layer == 1:
-            wk[0] = [0x0000] * D_MODEL  # an all-zero projection row
-            ffn_norm[7] = bf16(0, 130, 0x20)  # a larger gain (~10)
+            wk[0] = [0x0000] * D_MODEL
+            ffn_norm[7] = bf16(0, 130, 0x20)
         out += [(p + "input_layernorm.weight", [D_MODEL], attn_norm),
                 (p + "self_attn.q_proj.weight", [N_HEADS * D_HEAD, D_MODEL], wq),
                 (p + "self_attn.k_proj.weight", [N_KV_HEADS * D_HEAD, D_MODEL], wk),

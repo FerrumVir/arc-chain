@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# Scan either the exact checked-out commit (the CI default) or every releasable
-# tracked/untracked file in the local working tree. Never scan the already-
-# compromised Git history. The pinned archive checksum prevents a replaced
-# release asset from silently changing this blocking gate.
 set -Eeuo pipefail
 
 TEST_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -78,9 +74,6 @@ if [ "$SOURCE_MODE" = --commit ]; then
         --config "$CONFIG_FILE" \
         "$SCAN_ROOT"
 else
-    # Scan both views. The index catches bytes already staged for commit even
-    # when the working copy was subsequently cleaned; the worktree catches
-    # tracked edits and untracked, non-ignored files not staged yet.
     for tree_mode in index worktree; do
         SCAN_ROOT="$TEMP_ROOT/$tree_mode-tree"
         mkdir -p "$SCAN_ROOT"

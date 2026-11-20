@@ -1,17 +1,6 @@
-//! Formal Verification Types and Utilities
-//!
-//! Provides a model-checking framework with invariants, safety/liveness
-//! properties, state transitions, counterexample generation, and a pre-built
-//! BFT consensus model.
-
 use std::collections::HashMap;
 use std::fmt;
 
-// ---------------------------------------------------------------------------
-// Verification status
-// ---------------------------------------------------------------------------
-
-/// Status of a property after verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationStatus {
     Unverified,
@@ -33,11 +22,6 @@ impl fmt::Display for VerificationStatus {
     }
 }
 
-// ---------------------------------------------------------------------------
-// State values & transitions
-// ---------------------------------------------------------------------------
-
-/// A value in the model state space.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StateValue {
     Bool(bool),
@@ -47,7 +31,6 @@ pub enum StateValue {
     Array(Vec<StateValue>),
 }
 
-/// A named transition between model states, guarded by pre/post-conditions.
 #[derive(Debug, Clone)]
 pub struct StateTransition {
     pub name: String,
@@ -56,10 +39,8 @@ pub struct StateTransition {
     pub action: String,
 }
 
-/// Comparison applied to a `uint` state variable and a parsed literal.
 type UintCmp = dyn Fn(u64, u64) -> bool;
 
-/// A snapshot of the model's state.
 #[derive(Debug, Clone)]
 pub struct ModelState {
     pub variables: HashMap<String, StateValue>,
@@ -74,12 +55,6 @@ impl ModelState {
         }
     }
 
-    /// Evaluate a simple expression against this state. Supports:
-    /// - `<var> == <literal>` (bool: true/false, uint: digits)
-    /// - `<var> > <literal>` (uint only)
-    /// - `<var> < <literal>` (uint only)
-    /// - `<var> >= <literal>` (uint only)
-    /// - `true` / `false` (constant)
     pub fn evaluate(&self, expr: &str) -> Option<bool> {
         let expr = expr.trim();
         if expr == "true" {
@@ -89,7 +64,6 @@ impl ModelState {
             return Some(false);
         }
 
-        // Try relational operators (longest first to avoid partial match).
         let operators: &[(&str, &UintCmp)] = &[
             (">=", &|a: u64, b: u64| a >= b),
             ("==", &|a: u64, b: u64| a == b),
@@ -102,7 +76,6 @@ impl ModelState {
                 let literal = rhs.trim();
 
                 if let Some(val) = self.variables.get(var_name) {
-                    // Bool comparison for ==.
                     if op == "==" {
                         match (val, literal) {
                             (StateValue::Bool(b), "true") => return Some(*b),
@@ -110,13 +83,11 @@ impl ModelState {
                             _ => {}
                         }
                     }
-                    // Uint comparison.
                     if let StateValue::Uint(v) = val
                         && let Ok(lit) = literal.parse::<u64>()
                     {
                         return Some(cmp_fn(*v, lit));
                     }
-                    // Int comparison.
                     if let StateValue::Int(v) = val
                         && let Ok(lit) = literal.parse::<i64>()
                     {
@@ -141,11 +112,6 @@ impl Default for ModelState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Properties
-// ---------------------------------------------------------------------------
-
-/// An invariant that must hold in every reachable state.
 #[derive(Debug, Clone)]
 pub struct Invariant {
     pub name: String,
@@ -154,7 +120,6 @@ pub struct Invariant {
     pub checked_at: Option<u64>,
 }
 
-/// A safety property: "something bad never happens."
 #[derive(Debug, Clone)]
 pub struct SafetyProperty {
     pub name: String,
@@ -163,7 +128,6 @@ pub struct SafetyProperty {
     pub status: VerificationStatus,
 }
 
-/// A liveness property: "something good eventually happens."
 #[derive(Debug, Clone)]
 pub struct LivenessProperty {
     pub name: String,
@@ -172,11 +136,6 @@ pub struct LivenessProperty {
     pub status: VerificationStatus,
 }
 
-// ---------------------------------------------------------------------------
-// Results & counterexamples
-// ---------------------------------------------------------------------------
-
-/// Result of checking a single property.
 #[derive(Debug, Clone)]
 pub struct PropertyResult {
     pub property_name: String,
@@ -184,7 +143,6 @@ pub struct PropertyResult {
     pub counterexample: Option<CounterExample>,
 }
 
-/// A counterexample trace showing how a property is violated.
 #[derive(Debug, Clone)]
 pub struct CounterExample {
     pub states: Vec<ModelState>,
@@ -192,11 +150,6 @@ pub struct CounterExample {
     pub description: String,
 }
 
-// ---------------------------------------------------------------------------
-// Model Checker
-// ---------------------------------------------------------------------------
-
-/// A model checker that holds properties and checks them against states.
 pub struct ModelChecker {
     invariants: Vec<Invariant>,
     safety_properties: Vec<SafetyProperty>,
@@ -204,7 +157,6 @@ pub struct ModelChecker {
 }
 
 impl ModelChecker {
-    /// Create a new model checker with no properties.
     pub fn new() -> Self {
         Self {
             invariants: Vec::new(),
@@ -213,26 +165,21 @@ impl ModelChecker {
         }
     }
 
-    /// Add an invariant.
     pub fn add_invariant(&mut self, inv: Invariant) {
         self.invariants.push(inv);
     }
 
-    /// Add a safety property.
     pub fn add_safety_property(&mut self, prop: SafetyProperty) {
         self.safety_properties.push(prop);
     }
 
-    /// Add a liveness property.
     pub fn add_liveness_property(&mut self, prop: LivenessProperty) {
         self.liveness_properties.push(prop);
     }
 
-    /// Check all properties against a single state snapshot.
     pub fn check_state(&mut self, state: &ModelState) -> Vec<PropertyResult> {
         let mut results = Vec::new();
 
-        // Check invariants.
         for inv in &mut self.invariants {
             let satisfied = state.evaluate(&inv.expression).unwrap_or(false);
             inv.holds = Some(satisfied);
@@ -254,7 +201,6 @@ impl ModelChecker {
             });
         }
 
-        // Check safety properties.
         for prop in &mut self.safety_properties {
             let satisfied = state.evaluate(&prop.formula).unwrap_or(false);
             prop.status = if satisfied {
@@ -280,13 +226,11 @@ impl ModelChecker {
             });
         }
 
-        // Check liveness properties.
         for prop in &mut self.liveness_properties {
             let satisfied = state.evaluate(&prop.formula).unwrap_or(false);
             prop.status = if satisfied {
                 VerificationStatus::Verified
             } else {
-                // Liveness can't be truly violated in a single state; mark unknown.
                 VerificationStatus::Unknown
             };
             results.push(PropertyResult {
@@ -299,7 +243,6 @@ impl ModelChecker {
         results
     }
 
-    /// Check properties across a state transition (from -> to).
     pub fn check_transition(
         &mut self,
         from: &ModelState,
@@ -308,7 +251,6 @@ impl ModelChecker {
     ) -> Vec<PropertyResult> {
         let mut results = Vec::new();
 
-        // Verify preconditions of the named transition hold in `from`.
         if let Some(trans) = from.transitions.iter().find(|t| t.name == transition) {
             for pre in &trans.preconditions {
                 let holds = from.evaluate(pre).unwrap_or(false);
@@ -330,7 +272,6 @@ impl ModelChecker {
                 });
             }
 
-            // Verify postconditions hold in `to`.
             for post in &trans.postconditions {
                 let holds = to.evaluate(post).unwrap_or(false);
                 results.push(PropertyResult {
@@ -352,16 +293,13 @@ impl ModelChecker {
             }
         }
 
-        // Also check all invariants hold in the new state.
         let inv_results = self.check_state(to);
         results.extend(inv_results.into_iter().filter(|r| !r.satisfied));
 
         results
     }
 
-    /// Generate a counterexample for a named property (if violated).
     pub fn generate_counterexample(&self, property: &str) -> Option<CounterExample> {
-        // Search invariants.
         for inv in &self.invariants {
             if inv.name == property
                 && let Some(false) = inv.holds
@@ -377,7 +315,6 @@ impl ModelChecker {
             }
         }
 
-        // Search safety properties.
         for prop in &self.safety_properties {
             if prop.name == property && prop.status == VerificationStatus::Violated {
                 return Some(CounterExample {
@@ -394,17 +331,14 @@ impl ModelChecker {
         None
     }
 
-    /// Access invariants.
     pub fn invariants(&self) -> &[Invariant] {
         &self.invariants
     }
 
-    /// Access safety properties.
     pub fn safety_properties(&self) -> &[SafetyProperty] {
         &self.safety_properties
     }
 
-    /// Access liveness properties.
     pub fn liveness_properties(&self) -> &[LivenessProperty] {
         &self.liveness_properties
     }
@@ -416,28 +350,14 @@ impl Default for ModelChecker {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pre-built consensus model
-// ---------------------------------------------------------------------------
-
-/// Builder for a BFT consensus verification model.
 pub struct ConsensusModel;
 
 impl ConsensusModel {
-    /// Build a model checker pre-loaded with BFT safety and liveness
-    /// properties for a given validator set size.
-    ///
-    /// Safety: No two honest validators commit conflicting blocks
-    ///   (requires > 2/3 honest, i.e. `faulty < validators / 3`).
-    ///
-    /// Liveness: The chain makes progress if > 2/3 validators are honest.
     pub fn build_bft_model(validators: usize, faulty: usize) -> ModelChecker {
         let mut checker = ModelChecker::new();
 
-        // Invariant: faulty validators must be less than 1/3.
         let threshold = validators / 3;
         let _inv_holds = faulty < threshold || (validators >= 3 && 3 * faulty < validators);
-        // More precise: BFT tolerates f < n/3.
 
         checker.add_invariant(Invariant {
             name: "bft_fault_tolerance".to_string(),
@@ -446,7 +366,6 @@ impl ConsensusModel {
             checked_at: Some(0),
         });
 
-        // Safety: no conflicting commits while f < n/3.
         checker.add_safety_property(SafetyProperty {
             name: "no_conflicting_commits".to_string(),
             description: format!(
@@ -461,7 +380,6 @@ impl ConsensusModel {
             },
         });
 
-        // Liveness: progress if > 2/3 honest.
         let honest = validators - faulty;
         checker.add_liveness_property(LivenessProperty {
             name: "chain_progress".to_string(),
@@ -477,7 +395,6 @@ impl ConsensusModel {
             },
         });
 
-        // Additional safety: total validators is consistent.
         checker.add_invariant(Invariant {
             name: "validator_count_consistent".to_string(),
             expression: format!("total_validators == {}", validators),
@@ -488,10 +405,6 @@ impl ConsensusModel {
         checker
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -606,7 +519,6 @@ mod tests {
         let to = make_state(vec![("balance", StateValue::Uint(50))]);
 
         let results = checker.check_transition(&from, &to, "transfer");
-        // Both pre and post should be satisfied.
         assert!(results.iter().all(|r| r.satisfied));
     }
 
@@ -622,7 +534,6 @@ mod tests {
             action: "transfer 50".to_string(),
         });
 
-        // Postcondition will fail: balance is 70, not 50.
         let to = make_state(vec![("balance", StateValue::Uint(70))]);
 
         let results = checker.check_transition(&from, &to, "transfer");
@@ -644,7 +555,6 @@ mod tests {
             checked_at: None,
         });
 
-        // Violate it.
         let state = make_state(vec![("x", StateValue::Uint(0))]);
         checker.check_state(&state);
 
@@ -671,10 +581,9 @@ mod tests {
 
     #[test]
     fn test_bft_model_safe() {
-        // 4 validators, 1 faulty => 3*1 = 3 < 4 => safe.
         let checker = ConsensusModel::build_bft_model(4, 1);
         assert_eq!(checker.invariants().len(), 2);
-        assert!(checker.invariants()[0].holds.unwrap()); // bft_fault_tolerance
+        assert!(checker.invariants()[0].holds.unwrap());
         assert_eq!(
             checker.safety_properties()[0].status,
             VerificationStatus::Verified
@@ -687,7 +596,6 @@ mod tests {
 
     #[test]
     fn test_bft_model_unsafe() {
-        // 4 validators, 2 faulty => 3*2 = 6 >= 4 => NOT safe.
         let checker = ConsensusModel::build_bft_model(4, 2);
         assert!(!checker.invariants()[0].holds.unwrap());
         assert_eq!(

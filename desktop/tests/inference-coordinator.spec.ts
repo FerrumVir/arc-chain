@@ -1,14 +1,3 @@
-// Observer / no-model nodes call a seed's community-first /inference/run
-// before the standalone /inference/run_consensus fallback.
-//
-// Exercises the live-mode coordinator-fallback code path end-to-end:
-//   1. `window.__ARC_LIVE__` makes tauri.ts hit `fetch` instead of its
-//      in-process mock.
-//   2. `page.route` intercepts fetch and responds:
-//   3. The UI proves request order and renders either authenticated community
-//      verification/settlement or, if every direct seed safely fails, the
-//      sharded-consensus fallback.
-
 import { expect, test, type Page } from "@playwright/test";
 import { PLAIN_COPY } from "../src/lib/plain-copy";
 import { seedOnboarded } from "./helpers";
@@ -874,7 +863,6 @@ test.describe("Inference - community-first coordinator routing", () => {
     await page.getByTestId("inference-prompt").fill("Do this once");
     await page.getByTestId("btn-run-inference").click();
 
-    // The sentence says what happened; the coordinator's text waits behind Show details.
     const failed = page.getByTestId("inference-error");
     await expect(failed.getByTestId("inference-error-title")).toHaveText(
       PLAIN_COPY.ask.unknownOutcome,
@@ -986,9 +974,6 @@ test.describe("Inference - community-first coordinator routing", () => {
     });
     await installReadiness(page, () => false);
 
-    // No `/inference/run` POST is safe merely because its HTTP response says
-    // 503: the server may have accepted an assignment before emitting it.
-    // All local/direct origins are rejected by the mutation-free GET instead.
     let remoteDirectFailures = 0;
     await page.route("**/inference/run", (route) => {
       if (new URL(route.request().url()).hostname !== "127.0.0.1") {
@@ -1003,8 +988,6 @@ test.describe("Inference - community-first coordinator routing", () => {
       });
     });
 
-    // Only after every direct origin declines before a POST may the first seed
-    // answer via one standalone sharded-consensus POST.
     let coordHitCount = 0;
     await page.route("**/inference/run_consensus", (route) => {
       coordHitCount++;
@@ -1015,7 +998,6 @@ test.describe("Inference - community-first coordinator routing", () => {
       });
     });
 
-    // Silence the /health poll so it doesn't clutter test output.
     await page.route("**/health", (route) =>
       route.fulfill({
         status: 200,
@@ -1037,12 +1019,10 @@ test.describe("Inference - community-first coordinator routing", () => {
     await page.getByTestId("inference-prompt").fill("Biggest planet?");
     await page.getByTestId("btn-run-inference").click();
 
-    // Result card renders (coordinator answered).
     await expect(page.getByTestId("inference-result")).toBeVisible({
       timeout: 15_000,
     });
 
-    // Consensus banner is present and names the NYC coordinator.
     const banner = page.getByTestId("inference-consensus");
     await page.getByText(PLAIN_COPY.answer.proof, { exact: true }).click();
     await expect(banner).toBeVisible();
@@ -1053,18 +1033,14 @@ test.describe("Inference - community-first coordinator routing", () => {
     await expect(banner).toContainText("coordinator reports");
     await expect(banner).toContainText("exact execution profile bound");
     await expect(banner).toContainText("authenticated quorum verified");
-    // This payload has no claim transaction. Coordinator agreement is
-    // recomputation evidence; the UI must not invent a claim or payment.
     await expect(page.getByTestId("inference-result")).not.toContainText(
       /reward|paid/,
     );
 
-    // Output text is the coordinator's real answer, not the mock stub.
     await expect(page.getByTestId("inference-output")).toContainText(
       "Jupiter",
     );
 
-    // Only one coordinator was hit (NYC succeeded first - no retry).
     expect(coordHitCount).toBe(1);
     expect(remoteDirectFailures).toBe(0);
   });
@@ -1150,7 +1126,6 @@ test.describe("Inference - community-first coordinator routing", () => {
       (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
     });
 
-    // Local node serves inference successfully (validator with --model).
     await page.route("**/inference/run", (route) =>
       route.fulfill({
         status: 200,
@@ -1175,7 +1150,6 @@ test.describe("Inference - community-first coordinator routing", () => {
       }),
     );
 
-    // If any fetch hits run_consensus, we fail - local should have served it.
     let hitConsensus = false;
     await page.route("**/inference/run_consensus", (route) => {
       hitConsensus = true;
@@ -1207,11 +1181,6 @@ test.describe("Inference - community-first coordinator routing", () => {
       timeout: 10_000,
     });
 
-    // The provenance banner is now always shown - it reports WHICH machine
-    // served the request, not merely that consensus happened. For a locally
-    // served run it must say so, and the consensus details (k=, votes) must
-    // be absent. This is a stronger assertion than the previous
-    // `toHaveCount(0)`, which only proved the banner was missing.
     const banner = page.getByTestId("inference-consensus");
     await page.getByText(PLAIN_COPY.answer.proof, { exact: true }).click();
     await expect(banner).toBeVisible();

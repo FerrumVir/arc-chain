@@ -1,7 +1,3 @@
-//! Offline-only checker for native migration on a disposable copy of a
-//! recovered state directory. It never starts a node, listener, model, or
-//! network connection and never opens the supplied source directory writable.
-
 use anyhow::{Context, Result, bail, ensure};
 use arc_crypto::{Hash256, hash_bytes};
 use arc_node::{config, native_inference};

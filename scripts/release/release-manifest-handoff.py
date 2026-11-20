@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Stage and verify exact ARC release assets across isolated signing jobs."""
 
 from __future__ import annotations
 

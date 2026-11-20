@@ -80,7 +80,6 @@ def main(argv: list[str]) -> int:
     if args.only == "all":
         entries.extend(manifest["files"])
     else:
-        # Small files only (config.json and the like); never the weights.
         entries.extend(f for f in manifest["files"] if not f["name"].endswith(".safetensors"))
     for key in ("tokenizer", "chat_template"):
         if key in manifest:

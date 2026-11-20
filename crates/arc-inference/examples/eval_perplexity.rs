@@ -1,36 +1,11 @@
-//! Perplexity evaluation for the deterministic integer inference engine.
-//!
-//! Measures quality (perplexity) of INT8 quantized inference against a text corpus.
-//! This provides the missing quality metric for the determinism paper.
-//!
-//! The inference forward pass is 100% deterministic integer arithmetic.
-//! Only the perplexity *measurement* (log-softmax) uses f64 - this is standard
-//! practice even for floating-point models.
-//!
-//! Usage:
-//!   cargo run --example eval_perplexity --features candle --release -- \
-//!       /path/to/model.gguf /path/to/wikitext-2-raw/wiki.test.raw [max_tokens]
-//!
-//! The text file should be raw text (e.g., WikiText-2 test split).
-//! Download WikiText-2: https://huggingface.co/datasets/wikitext (wikitext-2-raw-v1)
-
 use arc_inference::cached_integer_model::load_cached_model;
 use std::time::Instant;
 
-const ONE: f64 = 65536.0; // Q16 fixed-point scale
+const ONE: f64 = 65536.0;
 
-/// Compute log-softmax in f64 from Q16 integer logits.
-///
-/// The inference engine produces logits in Q16 (deterministic, integer-only).
-/// We convert to f64 for the perplexity *measurement*, which is standard -
-/// even FP16 models measure perplexity in f64.
 fn log_softmax_f64(logits_q16: &[i64]) -> Vec<f64> {
-    // Convert Q16 logits to f64
     let logits: Vec<f64> = logits_q16.iter().map(|&x| x as f64 / ONE).collect();
 
-    // Numerically stable log-softmax: log(exp(x_i) / sum(exp(x_j)))
-    //   = x_i - log(sum(exp(x_j)))
-    //   = x_i - max - log(sum(exp(x_j - max)))
     let max = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let log_sum_exp: f64 = logits.iter().map(|&x| (x - max).exp()).sum::<f64>().ln() + max;
 
@@ -51,7 +26,6 @@ fn main() {
     let text_path = &args[2];
     let max_tokens: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
 
-    // Load model
     println!("=== ARC Chain Perplexity Evaluation ===");
     println!("Model: {}", model_path);
     println!("Text:  {}", text_path);
@@ -70,15 +44,12 @@ fn main() {
     );
     println!();
 
-    // Read tokens: either pre-tokenized JSON ([1, 2, 3, ...]) or raw text
     let raw = std::fs::read_to_string(text_path).expect("Failed to read input file");
     let tokens: Vec<u32> = if text_path.ends_with(".json") {
-        // Pre-tokenized: JSON array of token IDs (use HuggingFace tokenizer for accuracy)
         let ids: Vec<u64> = serde_json::from_str(&raw).expect("Invalid JSON token array");
         println!("Pre-tokenized input: {} tokens", ids.len());
         ids.into_iter().map(|id| id as u32).collect()
     } else {
-        // Raw text: use model's built-in tokenizer (greedy longest-match)
         let toks = model.encode(&raw);
         println!(
             "Text: {} chars -> {} tokens (model tokenizer)",
@@ -99,38 +70,29 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Evaluate perplexity
-    // PPL = exp( -1/N * sum_{i=1}^{N} log P(token_i | token_{<i}) )
     let mut cache = arc_inference::cached_integer_model::KVCache::new(model.config.n_layers);
     let mut neg_log_likelihood_sum: f64 = 0.0;
     let mut n_evaluated: usize = 0;
 
     let eval_start = Instant::now();
 
-    // Feed BOS token
     let _ = model.forward_one_token(1, &mut cache);
 
-    // Feed each token and measure probability of the NEXT token
     for i in 0..n_tokens - 1 {
         let token = tokens[i];
         let next_token = tokens[i + 1] as usize;
 
-        // Forward pass: deterministic integer arithmetic (Q16)
         let logits_q16 = model.forward_one_token(token, &mut cache);
 
-        // Measurement: compute log-softmax in f64 from Q16 logits
         let log_probs = log_softmax_f64(&logits_q16);
 
-        // Extract log-probability of the true next token
         if next_token < log_probs.len() {
             neg_log_likelihood_sum -= log_probs[next_token];
         } else {
-            // OOV token - use worst-case
             neg_log_likelihood_sum -= (-(model.config.vocab_size as f64)).ln();
         }
         n_evaluated += 1;
 
-        // Progress reporting
         if (i + 1) % 200 == 0 || i == n_tokens - 2 {
             let elapsed = eval_start.elapsed().as_secs_f64();
             let running_ppl = (neg_log_likelihood_sum / n_evaluated as f64).exp();
@@ -172,7 +134,6 @@ fn main() {
     println!("Deterministic: all forward pass computations use pure integer arithmetic");
     println!("Measurement:   log-softmax computed in f64 from Q16 logits (standard practice)");
 
-    // Determinism check: re-run first 10 tokens and verify same logits
     println!();
     println!("--- Determinism Verification ---");
     let mut all_match = true;

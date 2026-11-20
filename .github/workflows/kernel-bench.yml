@@ -1,16 +1,5 @@
 name: Kernel benchmark
 
-# CI-runner measurement for Stage 0 of the kernel plan. The benchmark times the
-# canonical INT8 forward a community worker runs once per position, on a
-# synthetic model with Llama-2-7B shapes, with the process's default projection
-# kernel and then with the other kernel, in one process on the same runner.
-# It fails if the two kernels' logits or KV caches differ, or if the vectorised
-# kernel refused a projection. Speed is reported, not gated: shared runners
-# vary from run to run. GitHub's x86-64 runners below have 4 vCPUs.
-#
-# Paths: the inference crate, the lockfile and toolchain, and this file.
-# The benchmark exercises nothing outside arc-inference.
-
 on:
   pull_request:
     branches: [main]
@@ -49,7 +38,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-15-intel]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Record runner facts
@@ -69,26 +58,18 @@ jobs:
               powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors; Get-CimInstance Win32_ComputerSystem | Format-List TotalPhysicalMemory"
               ;;
           esac
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-03-16
-      # Pull requests restore but never save, so iterating on a branch cannot
-      # evict the shared caches the required CI jobs depend on.
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
         with:
           shared-key: kernel-bench-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # The shipped release profile (fat LTO, one codegen unit), which is also
-      # what the determinism proof's timings were measured with.
       - name: Build the benchmark
         run: cargo build --locked --release -p arc-inference --example canonical_worker_bench
-      # Every runner here is x86-64 with AVX2, where the limb kernel is the
-      # default; the run also times the scalar kernel for comparison.
       - name: Run the benchmark
         shell: bash
         run: cargo run --locked --release -p arc-inference --example canonical_worker_bench -- --summary "$GITHUB_STEP_SUMMARY" --expect-default avx2-limb
-      # One layer is enough to prove the operator override reaches a real
-      # process: the default leg must run scalar and still match the AVX2 leg.
       - name: Check that ARC_CANONICAL_KERNEL=scalar forces the scalar kernel
         shell: bash
         env:

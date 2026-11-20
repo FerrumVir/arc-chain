@@ -10,7 +10,6 @@ import {
   type WatchedStatus,
 } from "./node-care";
 
-/** How often the queue is retried while ARC is open. */
 const FLUSH_INTERVAL_MS = 10 * 60_000;
 
 export const nodeCare = new NodeCare({
@@ -22,11 +21,6 @@ export const nodeCare = new NodeCare({
 
 const watcher = new NodeCareWatcher(nodeCare);
 
-/**
- * Watch what the app already polls (the `status` and `start-block` queries
- * and the updater) and report from it. Adds no polling of its own and
- * nothing on the start path waits for it. Returns a cleanup.
- */
 export function startNodeCare(queryClient: QueryClient): () => void {
   if (isBlockedProductionBrowser) return () => {};
   void nodeCare.init();
@@ -42,7 +36,6 @@ export function startNodeCare(queryClient: QueryClient): () => void {
     try {
       watcher.observeStatus(status, block);
     } catch {
-      /* never let reporting break the query cache */
     }
   };
   const unsubscribeCache = queryClient.getQueryCache().subscribe((event) => {
@@ -55,7 +48,6 @@ export function startNodeCare(queryClient: QueryClient): () => void {
     try {
       watcher.observeUpdate(appUpdater.getSnapshot());
     } catch {
-      /* ignore */
     }
   });
 

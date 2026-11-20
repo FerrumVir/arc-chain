@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""Canonical validators for crash-safe, mixed-state legacy quarantine rounds.
-
-The recovery transaction cannot atomically fence six remote hosts.  This
-module models that fact explicitly: every immutable round starts from an exact
-partition of already-fenced and still-live nodes, freshly authorizes only the
-live targets, and records the subset that actually crossed the nft boundary.
-At most six rounds are possible because a node may transition live->fenced
-exactly once.
-"""
 
 from __future__ import annotations
 
@@ -108,7 +99,7 @@ MAX_WINDOW_SECONDS = 300
 
 
 class QuarantineRoundError(ValueError):
-    """An immutable quarantine-round artifact is malformed or inconsistent."""
+    pass
 
 
 def fail(message: str) -> None:
@@ -142,13 +133,6 @@ def require_uint(value: Any, label: str, *, positive: bool = False) -> int:
 
 
 def validate_legacy_dag_round(value: Any, label: str) -> Mapping[str, Any]:
-    """Validate the self-contained, read-only durable DAG cursor proof.
-
-    The outer scalar projection is intentionally redundant.  Consumers must
-    recompute both roots from the embedded inspector output so a release can be
-    selected without trusting a live node or reopening archived WAL bytes.
-    """
-
     fields = {
         "source_consensus_round", "namespace_sha256", "inspection",
         "inspection_sha256",
@@ -713,8 +697,6 @@ def validate_durable_wal_boundary_plan(value: Any, label: str) -> dict[str, Any]
 def validate_durable_wal_boundary_capture(
     value: Any, plan_sha256: Any, label: str
 ) -> dict[str, Any]:
-    """Validate the content-addressed Rust SGP durable-boundary proof."""
-
     plan_sha = require_hash(plan_sha256, f"{label} plan sha256")
     if not isinstance(value, dict) or set(value) != {
         "source_plan", "fixed_plan", "plan", "selected_boundary",
@@ -778,8 +760,6 @@ def validate_durable_wal_boundary_capture(
 def validate_sgp_persisted_head_v5(
     value: Any, expected_plan_sha256: Any, label: str
 ) -> dict[str, Any]:
-    """Validate the exact persisted SGP durable-WAL exception and its archive relation."""
-
     expected_plan = require_hash(expected_plan_sha256, f"{label} expected plan")
     fields = set(PERSISTED_LEGACY_HEAD_COMMON_FIELDS) | {"durable_wal_boundary"}
     if not isinstance(value, dict) or set(value) != fields:
@@ -1923,15 +1903,6 @@ def validate_node_stopped_precommit(
     authorization_sha256: str | None = None,
     node: str | None = None,
 ) -> tuple[dt.datetime, dt.datetime, int]:
-    """Validate the fail-closed stopped-writer path without a live RPC claim.
-
-    This terminal is deliberately distinct from an nft-applied receipt.  It
-    proves the authorized writer is stably gone after authorization expiry, every automatic
-    restart source is pinned behind the exact fail-closed unit, and an offline
-    inspector derives the final head plus both authorization ancestry checks
-    from stable source inputs.  No late nft application is permitted.
-    """
-
     fields = {
         "schema", "capture_id", "freeze_plan_sha256", "source_main_commit",
         "round_number", "round_authorization_sha256", "round_readiness_sha256",
@@ -2752,8 +2723,6 @@ def validate_node_transition(
     authorization_sha256: str | None = None,
     node: str | None = None,
 ) -> dict[str, Any]:
-    """Validate one positive live-to-secured transition and normalize its proof."""
-
     if not isinstance(value, dict):
         fail("quarantine node transition is not an object")
     schema = value.get("schema")
@@ -2983,7 +2952,6 @@ def validate_round_authorization(
     if not target_names or set(prior_names) & set(target_names):
         fail("quarantine-round partition overlaps or has no targets")
     if prior_names + target_names != [name for name, _host in FLEET]:
-        # Each side is already fleet ordered; compare the union independently.
         if set(prior_names) | set(target_names) != set(FLEET_MAP):
             fail("quarantine-round partition does not cover the fixed fleet")
     prior_fields = {
@@ -3117,9 +3085,6 @@ def validate_round_authorization(
         }
     authorized = parse_utc(value.get("authorized_at"), "round authorization time")
     deadline = parse_utc(value.get("authorization_deadline"), "round deadline")
-    # UTC across the operator and remote nodes is audit-only.  Exact wrapper
-    # roots establish public -> cross -> source-capture causality; each source
-    # only has to be internally non-regressing.
     if (public_started > public_completed or cross_started > cross_completed
             or min(capture_completed) > max(capture_completed) or authorized > deadline):
         fail("quarantine-round authorization audit timeline differs")
@@ -3128,8 +3093,6 @@ def validate_round_authorization(
         or deadline > observation_selected_at + dt.timedelta(seconds=MAX_WINDOW_SECONDS)
     ):
         fail("first quarantine mutation exceeds the live-observation selection window")
-    # Prior remote UTC observations are not compared to operator UTC; their
-    # exact transition/status roots bind the causal predecessor.
     return {
         "capture_id": capture, "freeze_plan_sha256": freeze, "round_number": number,
         "source_main_commit": source,
@@ -3448,13 +3411,6 @@ def validate_zero_progress_attempt(
     expected_freeze_sha256: str | None = None,
     containing_round_name: str | None = None,
 ) -> dict[str, Any]:
-    """Validate an inert dispatched attempt and its complete positive prefix.
-
-    A current authorization hash transitively binds the immutable result roots,
-    but that is useful only after every prefix result has been validated in
-    order.  This shared contract is used before issuing remote challenges and
-    by every consumer of a zero-progress release receipt.
-    """
     if len(prior_authorizations) != len(prior_results):
         fail("zero-progress prior quarantine-round pair count differs")
     validated_results: list[Mapping[str, Any]] = []
@@ -3572,7 +3528,6 @@ def validate_zero_progress_release(
     expected_freeze_sha256: str | None = None,
     containing_round_name: str | None = None,
 ) -> dict[str, Any]:
-    """Validate a challenged release for an expired zero-progress dispatch."""
     state = validate_zero_progress_attempt(
         authorization=authorization,
         readiness=readiness,

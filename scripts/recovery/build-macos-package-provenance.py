@@ -1,22 +1,4 @@
 #!/usr/bin/env python3
-"""Fail-closed provenance and execution controller for the shipped macOS app.
-
-The controller has three deliberately separate phases:
-
-* ``lima-verify`` verifies the Tauri updater signature in a new, digest-pinned
-  Lima VM with ``minisign`` installed from one Ubuntu snapshot.
-* ``inspect`` safely extracts the updater archive, mounts the exact DMG read
-  only, proves both packages contain the same app, records the truthful ad-hoc
-  code-signing state, detaches the image, and seals the bundle identity used to
-  construct the native acceptance input.
-* ``run`` independently rechecks every input and the extracted updater app,
-  remounts the exact DMG read only, and invokes the mounted shipped executable
-  in its bounded ``--arc-production-acceptance`` mode.  It hashes the mounted
-  tree before and after execution and detaches before sealing final evidence.
-
-No phase downloads release assets, changes package bytes, clears quarantine,
-re-signs an app, or exposes a WebDriver/devtools/test-only service.
-"""
 
 from __future__ import annotations
 
@@ -48,8 +30,6 @@ REPOSITORY = "FerrumVir/arc-chain"
 TAG = "v0.8.23"
 VERSION = "0.8.23"
 RELEASE_SCHEMA = "arc.published-release-binding.v1"
-# Existing-chain update releases are bound by the same acceptance tool with an
-# explicit profile; the asset/workflow contract is otherwise identical.
 UPDATE_RELEASE_SCHEMA = "arc.published-release-binding.v2"
 UPDATE_RELEASE_PROFILE = "existing-recovered-chain-update-v1"
 DESKTOP_RELEASE_PROFILE = "desktop-update-existing-validators-v1"
@@ -100,7 +80,7 @@ MAX_ARCHIVE_ENTRIES = 20_000
 MAX_ARCHIVE_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 MAX_ARCHIVE_MEMBER_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_PATH_BYTES = 4_096
-MAX_ARCHIVE_DEPTH = 33  # one app root plus the native verifier's depth 32
+MAX_ARCHIVE_DEPTH = 33
 MAX_COMMAND_OUTPUT_BYTES = 16 * 1024 * 1024
 NATIVE_INNER_MAX_SECONDS = 4_300
 NATIVE_OUTER_TIMEOUT_SECONDS = 4_360
@@ -113,7 +93,7 @@ FIXED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 
 
 class ProvenanceError(RuntimeError):
-    """Evidence is incomplete, ambiguous, mutable, or outside the gate."""
+    pass
 
 
 def fail(message: str) -> NoReturn:
@@ -204,8 +184,6 @@ def require_absolute(path: Path, label: str) -> Path:
 
 
 def secure_ancestry(path: Path, label: str, *, include_leaf: bool = False) -> None:
-    """Reject symlinked or group/world-writable operator input ancestry."""
-
     require_absolute(path, label)
     stop = len(path.parts) if include_leaf else len(path.parts) - 1
     current = Path(path.anchor)
@@ -391,8 +369,6 @@ def create_file(path: Path, raw: bytes, label: str, mode: int = 0o400) -> None:
 
 
 def create_root_system_file(path: Path, raw: bytes, label: str, mode: int) -> None:
-    """Create one root-owned system file without trusting a path recheck."""
-
     if os.geteuid() != 0 or not path.is_absolute():
         fail(f"{label} requires root and an absolute path")
     parent_fd = os.open(
@@ -1146,7 +1122,7 @@ def lima_verify(args: argparse.Namespace) -> dict[str, Any]:
             public_key_sha256=sha256_bytes(updater_key),
             helper_sha256=helper_sha256,
         )
-    except BaseException as error:  # cleanup also runs for interruption
+    except BaseException as error:
         primary_error = error
     finally:
         if vm_created:
@@ -1496,8 +1472,6 @@ def safe_extract_archive(archive: Path, extraction_root: Path) -> dict[str, Any]
                 os.close(directory_fd)
         os.fsync(root_fd)
     except BaseException:
-        # Preserve a partial extraction for diagnosis; every later phase
-        # refuses an existing destination, so it can never be resumed.
         raise
     finally:
         os.close(root_fd)
@@ -1634,7 +1608,7 @@ def plist_object(raw: bytes, label: str) -> dict[str, Any]:
         fail(f"{label} is empty or oversized")
     try:
         value = plistlib.loads(raw)
-    except Exception as error:  # plistlib raises several parser-specific types
+    except Exception as error:
         raise ProvenanceError(f"{label} is not a valid property list") from error
     if not isinstance(value, dict):
         fail(f"{label} must be a property-list dictionary")
@@ -2660,9 +2634,6 @@ def build_native_input(args: argparse.Namespace) -> dict[str, Any]:
         "validatorSetCommitment": validator_commitment,
         "validatorSetId": validator_set_id,
     }
-    # Exercise the same validator used immediately before execution.  The
-    # output does not exist yet, so materialize bytes only after all scalar,
-    # release, asset, and package checks pass.
     raw = canonical_json(value)
     create_file(output, raw, "packaged native input", 0o400)
     validate_native_input(output, binding, assets, inspection["bundle"])
@@ -2932,9 +2903,6 @@ def run_package(args: argparse.Namespace) -> dict[str, Any]:
         if semantic_code_signature(signature_before) != semantic_code_signature(inspection["codeSignature"]):
             fail("freshly mounted app code-signature truth differs from inspection")
         executable = mounted_app / EXECUTABLE_RELATIVE_PATH
-        # All package, mount, and code-seal checks remain safely pre-dispatch.
-        # Create the isolated state and durable no-retry marker only once the
-        # exact mounted executable is ready to be spawned.
         create_directory(native_home, "native isolated HOME")
         create_directory(native_home / "tmp", "native isolated TMPDIR")
         controller_attempt = {

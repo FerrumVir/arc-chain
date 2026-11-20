@@ -1,21 +1,8 @@
-// ARC brand marks, drawn only from the real arc.ai wordmark: the same file the
-// website uses, copied to src/assets/brand/arc-logo-white.svg (white on
-// transparent, viewBox 0 0 241.87 94.04). Per the brand:
-//   - "arc" is the wordmark, always lowercase, and is never typed in a font
-//   - the logo icon is that white wordmark housed in a solid or gradient container
-//   - "Own your AI" is the tagline
-//
-// The asset is imported directly rather than looked up, so a build without it
-// fails instead of quietly falling back to a placeholder. See
-// src/assets/brand/README.md.
-
 import type { CSSProperties } from "react";
 import wordmarkUrl from "../assets/brand/arc-logo-white.svg";
 
-/** Width over height of the wordmark's viewBox (241.87 x 94.04). */
 const WORDMARK_ASPECT = 241.87 / 94.04;
 
-/** The arc wordmark, white, at a given height in CSS pixels. */
 export function Wordmark({
   height = 24,
   decorative = false,
@@ -23,7 +10,6 @@ export function Wordmark({
   style,
 }: {
   height?: number;
-  /** True when a surrounding element already names the brand. */
   decorative?: boolean;
   className?: string;
   style?: CSSProperties;
@@ -43,10 +29,6 @@ export function Wordmark({
   );
 }
 
-/**
- * The logo icon: the white wordmark in a solid Arc-blue or brand-gradient
- * container, as on the app icon and the website's favicon.
- */
 export function LogoMark({
   size = 28,
   radius,
@@ -57,7 +39,6 @@ export function LogoMark({
   size?: number;
   radius?: number;
   glow?: boolean;
-  /** solid (default) or gradient (the onboarding hero). */
   variant?: "solid" | "gradient";
   className?: string;
 }) {
@@ -71,7 +52,6 @@ export function LogoMark({
     flexShrink: 0,
     boxShadow: glow ? "var(--shadow-glow)" : undefined,
   };
-  // The wordmark fills about 70% of the container's width, as in the favicon.
   return (
     <span
       role="img"

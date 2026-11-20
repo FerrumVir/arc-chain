@@ -1,12 +1,3 @@
-//! Cached Integer Model Benchmark - Production-speed deterministic inference.
-//!
-//! Loads GGUF model ONCE at startup, then generates tokens using cached weights
-//! with KV cache and rayon parallelism. Pure i64, cross-platform deterministic.
-//!
-//! Usage:
-//!   cargo run --release --bin arc-bench-cached-integer --features candle -- \
-//!     --model /path/to/model.gguf --tokens 16
-
 use arc_inference::cached_integer_model::load_cached_model;
 use std::time::Instant;
 
@@ -71,7 +62,6 @@ fn main() {
     eprintln!("  Engine:   Cached i64 + KV cache + rayon parallel");
     eprintln!();
 
-    // ONE-TIME model load
     let load_start = Instant::now();
     let model = load_cached_model(&model_path).expect("Failed to load model");
     let load_time = load_start.elapsed();

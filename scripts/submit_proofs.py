@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Submit STARK proofs as ShardProof TXs through multi-node consensus."""
 
 import json, os, sys, time, urllib.request, hashlib
 from datetime import datetime
@@ -32,7 +31,6 @@ def main():
     proof_dir = sys.argv[1] if len(sys.argv) > 1 else "/tmp/stark-proofs"
     manifest = json.load(open(f"{proof_dir}/manifest.json"))
 
-    # Find live nodes
     live = []
     for name, ip in NODES:
         h = get_json(f"http://{ip}:9090/health")
@@ -52,12 +50,8 @@ def main():
         proof_data = open(proof_file, "rb").read()
         proof_hex = proof_data.hex()
 
-        # Submit proof as inference run + include proof hash in the request
-        # Use a different node each time (round-robin)
         node_name, node_ip = live[idx % len(live)]
 
-        # Run inference on this node (this creates an InferenceAttestation TX)
-        # The proof data is submitted alongside as evidence
         prompt = f"ZK-proof-{label}-{entry['out_size']}x{entry['in_size']}"
         inf_result = post_json(f"http://{node_ip}:9090/inference/run", {
             "input": prompt,
@@ -86,17 +80,14 @@ def main():
             print(f"[{idx:2}/60] {label:20} ERROR on {node_name}: {inf_result.get('error', 'unknown')}")
             results.append({"idx": idx, "label": label, "status": "error", "error": str(inf_result)})
 
-        # Brief pause to let consensus process
         time.sleep(0.5)
 
-    # Check final consensus alignment
     print(f"\n=== Consensus Check ===")
     for name, ip in live:
         h = get_json(f"http://{ip}:9090/health")
         if h:
             print(f"  {name}: height={h['height']} peers={h['peers']}")
 
-    # Save results
     with open("/tmp/zk-proof-submission.json", "w") as f:
         json.dump({"timestamp": timestamp, "proofs": results, "tx_hashes": all_txs}, f, indent=2)
     with open("/tmp/zk-proof-txs.txt", "w") as f:

@@ -1,5 +1,3 @@
-//! `arc info` - display chain metadata.
-
 use crate::rpc::RpcClient;
 use anyhow::Result;
 

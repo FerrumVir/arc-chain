@@ -1,4 +1,3 @@
-"""False-pass regressions for the production cohort report gate; no model/SSH."""
 import copy
 import importlib.util
 from pathlib import Path

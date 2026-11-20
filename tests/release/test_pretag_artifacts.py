@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Adversarial tests for the exact-byte pre-tag artifact handoff."""
 
 from __future__ import annotations
 

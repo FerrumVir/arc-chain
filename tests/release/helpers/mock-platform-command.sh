@@ -11,7 +11,6 @@ case "$command_name" in
         esac
         ;;
     sleep)
-        # Installer startup waits are deliberately elided in offline tests.
         if [ "${MOCK_REAL_SLEEP:-false}" = true ]; then
             /bin/sleep 0.05
         fi
@@ -83,9 +82,6 @@ case "$command_name" in
         exit 0
         ;;
     stat)
-        # Contract tests simulate uid 1000 even when the host test account has
-        # another uid. Preserve real stat behavior except for the managed
-        # install-root marker ownership probe.
         last_argument="${!#}"
         if [ -n "${MOCK_ROOT_OWNED_PREFIX:-}" ]; then
             case " $* :$last_argument" in
@@ -103,9 +99,6 @@ case "$command_name" in
         esac
         ;;
     runuser)
-        # The installer uses runuser only to prove the selected community user
-        # can access its directories. The contract test cannot create an OS
-        # account, so consume `-u USER --` and execute the probe unchanged.
         [ "${1:-}" = -u ] && [ "$#" -ge 4 ] || exit 2
         shift 2
         [ "${1:-}" = -- ] || exit 2

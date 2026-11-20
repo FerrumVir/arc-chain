@@ -1,12 +1,3 @@
-//! `arc-modern`: the CLI path for modern models (SmolLM3-3B) on ARC's
-//! deterministic integer engine, profile `arc.hf-llama.i8-dyadic-row.q16.v1`.
-//!
-//! This is an additional engine path. It does not touch consensus, rewards or
-//! native inference, and it does not change the network's canonical model.
-//!
-//! Subcommands (run with no arguments for usage):
-//! convert, verify, inspect, generate, golden, ppl, tokenize, render.
-
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -104,8 +95,6 @@ fn configure_kernel(args: &Args) -> Result<String, ModernError> {
     let kernel = args
         .value("--kernel")
         .unwrap_or_else(|| "scalar".to_string());
-    // Read the ARC_FAST_CANONICAL_KERNEL default first, so the explicit
-    // choice below is the one that stays in force.
     let _ = canonical_simd::fast_canonical_kernel_enabled();
     match kernel.as_str() {
         "scalar" => canonical_simd::set_fast_canonical_kernel(false),
@@ -376,8 +365,6 @@ fn cmd_golden(args: &Args) -> Result<(), ModernError> {
     let rate = |count: f64, seconds: f64| if seconds > 0.0 { count / seconds } else { 0.0 };
     let prefill_tok_s = rate(prompt_total as f64, prefill_total);
     let decode_tok_s = rate(forwards_total as f64, decode_total);
-    // The run names one semantics family; each case's `selection` is
-    // authoritative (the Python reference uses the same convention).
     let generation = if selections.iter().all(|s| *s == "argmax") {
         Selection::Argmax.semantics()
     } else {
@@ -452,7 +439,6 @@ fn cmd_generate(args: &Args) -> Result<(), ModernError> {
     Ok(())
 }
 
-/// Negative log-likelihood of `target` under Q16 logits (measurement only).
 fn nll(logits: &[i64], target: usize) -> f64 {
     const Q16: f64 = 65_536.0;
     let max = logits.iter().copied().max().unwrap_or(0) as f64 / Q16;

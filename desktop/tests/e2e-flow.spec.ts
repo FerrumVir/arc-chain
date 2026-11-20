@@ -1,8 +1,3 @@
-// End-to-end flow tests exercising the six fixes that unblocked testnet
-// release (arc-node CLI spawn args, bundled seeds/genesis, BIP-39 validator
-// seed, auto-download binary, mined-reward versus raw-claim semantics, Gatekeeper
-// docs). These tests run against the mock IPC layer - exhaustive live
-// behaviour is covered by tests/live.spec.ts.
 import { expect, test } from "@playwright/test";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -27,9 +22,6 @@ test.describe("Onboarding → launch end-to-end", () => {
   test("four-step setup: welcome → identity → model → launch", async ({
     page,
   }) => {
-    // A computer below the memory floor for the ARC model: the native side
-    // recommends no tier, so the compute step starts off there, as it did
-    // before compute was on by default.
     await seedMockOverrides(page, { recommended_tier: "none" });
     await page.goto("/");
 
@@ -37,7 +29,6 @@ test.describe("Onboarding → launch end-to-end", () => {
     await expect(page.getByTestId("step-identity")).toBeVisible();
     await page.getByTestId("btn-reveal-seed").click();
     await page.getByTestId("btn-continue-identity").click();
-    // Model picker (v0.6.0). This spec used to assert step-launch here.
     await expect(page.getByTestId("step-model")).toBeVisible();
     await expect(page.getByTestId("tier-standard")).toBeVisible();
     await expect(page.getByTestId("tier-standard")).toContainText(
@@ -60,8 +51,6 @@ test.describe("Onboarding → launch end-to-end", () => {
 
     await page.getByTestId("btn-launch").click();
 
-    // Mock flow: ensureBinary + startNode + waitForPeer resolve, then Home
-    // (Ask ARC) renders without submitting any balance-changing request.
     await expect(page.getByTestId("inference-screen")).toBeVisible({ timeout: 15_000 });
   });
 
@@ -77,23 +66,12 @@ test.describe("Onboarding → launch end-to-end", () => {
   });
 
   test("node role is derived from whether a model was downloaded", () => {
-    // This previously asserted a literal `role: "observer"` + `modelPath:
-    // null`, from the v0.5.x design where onboarding always shipped an
-    // observer and the user picked nothing. v0.6.0 deliberately replaced
-    // that: the user chooses a model tier, and the role is a CONSEQUENCE of
-    // whether a model landed on disk. That is the behaviour to guard now -
-    // the old assertion would force a regression back to a node that can
-    // never earn.
     const src = fs.readFileSync(
       path.resolve(REPO_DESKTOP, "src", "screens", "Onboarding.tsx"),
       "utf8",
     );
-    // Role is computed from modelPath, and observer is still the no-model
-    // outcome.
     expect(src).toMatch(/role:\s*modelPath\s*\?\s*"worker"\s*:\s*"observer"/);
-    // Skipping the model picker must still yield a null modelPath.
     expect(src).toMatch(/let modelPath: string \| null = null/);
-    // And still no role picker - that part of the old contract stands.
     expect(src).not.toMatch(/ROLE_META/);
     expect(src).not.toMatch(/setRole/);
   });
@@ -103,11 +81,8 @@ test.describe("Onboarding → launch end-to-end", () => {
       path.resolve(REPO_DESKTOP, "src", "screens", "Onboarding.tsx"),
       "utf8",
     );
-    // Onboarding is a setup transaction, not authorization for a wallet
-    // write. The explicit Wallet button remains the only faucet trigger.
     expect(src).toMatch(/waitForPeer/);
     expect(src).not.toMatch(/faucetClaim/);
-    // The launch step carries the testnet line instead of a credit promise.
     expect(src).toMatch(/PLAIN_COPY\.setup\.testnet/);
   });
 });
@@ -137,8 +112,6 @@ test.describe("Raw inference claims never become earnings", () => {
       "scan of this node's in-memory full_transactions map",
     );
 
-    // The mock carries dated raw inference claims. Those timestamps are not
-    // mined 0x25 reward receipts, so no seven-day income chart may be built.
     await expect(page.getByTestId("weekly-chart")).toHaveCount(0);
     const feed = page.getByTestId("all-attestations");
     await expect(
@@ -146,8 +119,6 @@ test.describe("Raw inference claims never become earnings", () => {
     ).toHaveCount(2);
     await expect(feed.getByText(/\+2\.50 ARC · COMPUTED \+ PAID/)).toHaveCount(2);
 
-    // A display prefix is not a receipt identity. The DOM contract used by
-    // the live product gate must retain every exact canonical binding.
     const canaryTx = `0x${"aa".repeat(32)}`;
     const paid = feed.locator(`[data-tx-hash="${canaryTx}"]`);
     await expect(paid).toHaveCount(1);
@@ -176,8 +147,6 @@ test.describe("Raw inference claims never become earnings", () => {
     await page.getByTestId("nav-earnings").click();
     const feed = page.getByTestId("all-attestations");
     await expect(feed).toBeVisible();
-    // Four of five real activity rows are the user's. Old-seed padding is not
-    // activity and the other worker's 0x16 row must not become this income.
     await expect(page.getByText(/4 yours · 5 shown/)).toBeVisible();
     await expect(
       feed.getByText("COMPUTED · NOT PAYMENT · network", { exact: true }),
@@ -211,7 +180,6 @@ test.describe("Paid settlement recovery gate", () => {
 
     for (const command of ["run_paid_inference", "tier1_submit"]) {
       const bodies = caseBodies(command);
-      // One browser-live adapter and one browser-preview adapter.
       expect(bodies).toHaveLength(2);
       for (const body of bodies) {
         expect(body).toContain("throw settlementWriteUnavailable");
@@ -227,9 +195,6 @@ test.describe("Recovery phrase never reaches localStorage", () => {
   test("a phrase persisted by an older build is scrubbed on load", async ({
     page,
   }) => {
-    // Older builds wrote the full identity - seedPhrase included - into
-    // localStorage in plaintext. Those blobs are still on disk, so the
-    // store scrubs them on load rather than only avoiding new writes.
     await seedOnboardedLegacy(page);
     await page.goto("/");
     await expect(page.getByTestId("dashboard")).toBeVisible();
@@ -241,7 +206,6 @@ test.describe("Recovery phrase never reaches localStorage", () => {
     expect(stored).not.toContain("seedPhrase");
     expect(stored).not.toContain("galaxy stellar quantum");
 
-    // The address survives - only the signing material is dropped.
     expect(stored).toContain("99".repeat(32));
   });
 
@@ -251,8 +215,6 @@ test.describe("Recovery phrase never reaches localStorage", () => {
     await seedOnboardedLegacy(page);
     await page.goto("/");
     await page.getByTestId("nav-settings").click();
-    // The on-chain radio was deleted but every default still said
-    // "onchain", so this radio rendered unchecked on a fresh install.
     await expect(page.getByTestId("inference-mode-coordinator")).toBeChecked();
   });
 });
@@ -279,7 +241,6 @@ test.describe("Gatekeeper + first-run docs are shipped", () => {
       expect(text, guide).toMatch(/macOS 15 Sequoia/);
       expect(text, guide).toMatch(/System Settings\*\* → \*\*Privacy &\s+Security/);
       expect(text, guide).toMatch(/\*\*Open Anyway\*\*/);
-      // Right-click → Open is described only as the macOS 14-and-earlier path.
       expect(text, guide).toMatch(/macOS 14 Sonoma and earlier/);
     }
   });
@@ -293,15 +254,12 @@ test.describe("Bundled testnet resources", () => {
     expect(fs.existsSync(seeds)).toBe(true);
     expect(fs.existsSync(genesis)).toBe(true);
 
-    // Sanity: seeds file lists the 6 live testnet seeds (NYC/LAX/AMS/
-    // LHR/NRT/SGP). SAO and JNB were retired GH #32 so they must NOT
-    // appear in the shipped seeds file.
     const seedsText = fs.readFileSync(seeds, "utf8");
-    expect(seedsText).toContain("149.28.32.76"); // NYC
-    expect(seedsText).toContain("140.82.16.112"); // LAX
-    expect(seedsText).toContain("149.28.153.31"); // SGP
-    expect(seedsText).not.toMatch(/216\.238\.120\.27/); // SAO retired
-    expect(seedsText).not.toMatch(/139\.84\.237\.49/); // JNB retired
+    expect(seedsText).toContain("149.28.32.76");
+    expect(seedsText).toContain("140.82.16.112");
+    expect(seedsText).toContain("149.28.153.31");
+    expect(seedsText).not.toMatch(/216\.238\.120\.27/);
+    expect(seedsText).not.toMatch(/139\.84\.237\.49/);
   });
 
   test("tauri.conf.json declares the resources so they land in the bundle", () => {
@@ -317,18 +275,13 @@ test.describe("Bundled testnet resources", () => {
 });
 
 test.describe("Spawn CLI contract (Rust source)", () => {
-  // Guard against regressions in the node_manager.rs flag wiring: the
-  // only way arc-node joins testnet is if --rpc, --p2p-port, --data-dir,
-  // --validator-key-file, --seeds-file, --genesis, --eth-rpc-port, and
-  // --community-mode and the non-shard full-integer worker role all end up on
-  // the cmd line.
   const src = fs.readFileSync(
     path.resolve(REPO_DESKTOP, "src-tauri", "src", "node_manager.rs"),
     "utf8",
   );
   const activeStartBegin = src.indexOf("    pub async fn start(\n");
   const activeStartEnd = src.indexOf(
-    "    /// Called on every node_status poll.",
+    "    pub async fn try_reap_if_crashed(",
     activeStartBegin,
   );
   const activeStart = src.slice(activeStartBegin, activeStartEnd);
@@ -350,9 +303,7 @@ test.describe("Spawn CLI contract (Rust source)", () => {
     production.slice(legacyMatcherEnd);
 
   test("--rpc is passed as a single addr:port (not --rpc-port)", () => {
-    // Positive: the string "--rpc" appears followed by the addr:port pattern.
     expect(src).toMatch(/\.arg\("--rpc"\)\s*\.\s*arg\(format!\("127\.0\.0\.1/);
-    // Negative: no stray --rpc-port anywhere (that flag doesn't exist in arc-node).
     expect(src).not.toMatch(/--rpc-port/);
   });
 
@@ -369,8 +320,6 @@ test.describe("Spawn CLI contract (Rust source)", () => {
     ]) {
       expect(activeStart).toContain(flag);
     }
-    // Compute flags are appended by the shared launch-projection helper.
-    // Require the live spawn path to call it, then inspect that helper's argv.
     expect(activeStart).toContain("append_compute_launch_args(&mut cmd, config);");
     const computeBegin = production.indexOf("fn append_compute_launch_args(");
     expect(computeBegin).toBeGreaterThanOrEqual(0);
@@ -382,9 +331,6 @@ test.describe("Spawn CLI contract (Rust source)", () => {
     expect(activeStart).not.toContain("ARC_VALIDATOR_SEED");
     expect(activeStart).toContain("<app-owned-private-keyfile>");
 
-    // The only production allowance for the old secret-in-argv flag is the
-    // exact, tokenless v0.7 ownership matcher. It classifies an already-running
-    // public legacy process and never builds current spawn argv.
     expect(legacyMatcherBegin).toBeGreaterThanOrEqual(0);
     expect(legacyMatcherEnd).toBeGreaterThan(legacyMatcherBegin);
     expect(legacyV07Matcher).toContain('"--validator-seed"');
@@ -408,22 +354,12 @@ test.describe("Spawn CLI contract (Rust source)", () => {
   });
 
   test("community-mode only toggled for worker role WITH a model", () => {
-    // The old regex was `if config.role == "worker" {` followed by
-    // `--community-mode`, and it passed against the *log-line* formatting
-    // rather than the spawn gate. The real gate has always additionally
-    // required a model (a worker with no model would have the gateway
-    // forward requests it cannot answer), so the test was green for the
-    // wrong reason and would have stayed green if the gate were deleted.
-    // Assert the actual argv condition.
     expect(src).toMatch(
       /if\s+config\.role\s*==\s*"worker"\s*&&\s*config\.model_path\.is_some\(\)\s*\{[\s\S]{0,600}?--community-mode[\s\S]{0,100}?--full-integer-worker/,
     );
   });
 
   test("never joins the public network as a staked validator", () => {
-    // LIVE-NETWORK SAFETY (CLAUDE.md rules 2 and 3): arc-node's --stake
-    // defaults to 5,000,000, and stake > 0 with a model set is what triggers
-    // auto-shard-join. A desktop node must always announce stake 0.
     expect(src).toMatch(/\.arg\("--stake"\)\s*\n?\s*\.arg\("0"\)/);
   });
 });
@@ -435,18 +371,12 @@ test.describe("ensure_binary auto-download", () => {
   );
 
   test("selects correct release asset per platform", () => {
-    // Asset names must match what the CI release workflow actually ships.
     expect(commands).toContain('"arc-node-macos-arm64"');
     expect(commands).toContain('"arc-node-macos-x86_64"');
     expect(commands).toContain('"arc-node-linux-x86_64"');
   });
 
   test("downloaded binary is written to ~/.arc/bin/arc-node", () => {
-    // The path is composed across two files now: paths.rs owns
-    // `home_dir()/.arc` (so Windows resolves USERPROFILE instead of silently
-    // falling back to `./.arc`), and node_manager.rs appends `bin/arc-node`.
-    // The old single-file regex matched the literal `.arc"` that used to sit
-    // inside managed_binary_path.
     const nm = fs.readFileSync(
       path.resolve(REPO_DESKTOP, "src-tauri", "src", "node_manager.rs"),
       "utf8",
@@ -462,9 +392,6 @@ test.describe("ensure_binary auto-download", () => {
   });
 
   test("home dir resolution honours USERPROFILE, not just HOME", () => {
-    // Windows normally has no HOME. Reading only HOME turned the default
-    // `~/.arc` data dir into `./.arc` relative to the GUI's CWD - typically
-    // an unwritable directory under Program Files.
     const paths = fs.readFileSync(
       path.resolve(REPO_DESKTOP, "src-tauri", "src", "paths.rs"),
       "utf8",
@@ -559,7 +486,6 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     expect(lib).toMatch(/tauri_plugin_updater::Builder::new\(\)\.build\(\)/);
     expect(lib).toContain("updater_channel::check_arc_update");
     expect(conf.plugins?.updater?.active).toBe(true);
-    // Reject any TODO / placeholder values.
     const pubkey = conf.plugins?.updater?.pubkey ?? "";
     expect(pubkey.length).toBeGreaterThan(50);
     expect(pubkey).not.toMatch(/TODO/i);
@@ -624,7 +550,7 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     );
     const resetPeerState = commands.slice(
       commands.indexOf("pub async fn reset_peer_state"),
-      commands.indexOf("/// Health and progress of the node running on THIS machine."),
+      commands.indexOf("#[tauri::command]\npub async fn node_status("),
     );
     expect(lib).toContain("data_migration_error");
     expect(transactionBegin).toBeGreaterThanOrEqual(0);
@@ -653,9 +579,6 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     expect(startTransaction).toContain(
       "store.config.clone().unwrap_or_default()",
     );
-    // WebView Start/Retry and auto-start run the ordinary transaction, which
-    // waits behind the launch-time fence. Only launch reconciliation's own
-    // recovery launch may pass that fence (StartupRecoveryOnly).
     expect(
       startWrapper.match(
         /start_node_transaction\(app, state, StartTransaction::Start\)/g,
@@ -688,7 +611,6 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     expect(commands).toContain("start_node_inner(&app, &state).await");
     expect(commands).not.toContain("start_node_inner(&app, &state, &config)");
     expect(startFence).toContain("ARC refused to start the node");
-    // A real refusal blocks every caller, startup's recovery launch included.
     expect(startFence).toContain("(Some(StartFence::MigrationRefused(reason)), _) => Err(refusal_message(reason))");
     expect(startFence).toMatch(/\(Some\(StartFence::Refused\(reason\)\), _\) => \{\s*Err\(/);
   });
@@ -697,8 +619,6 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     expect(cargo).toMatch(/tauri-plugin-autostart\s*=\s*"2"/);
     expect(lib).toMatch(/tauri_plugin_autostart::init\(/);
     expect(lib).toContain('"--minimized"');
-    // Capabilities must grant autostart permissions or the plugin 500s
-    // from the frontend.
     expect(caps.permissions).toEqual(expect.arrayContaining(["autostart:default"]));
   });
 
@@ -708,7 +628,6 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     expect(lib).toMatch(/tray::install/);
     expect(tray).toMatch(/MenuItem::with_id\(app,\s*"open"/);
     expect(tray).toMatch(/MenuItem::with_id\(app,\s*"quit"/);
-    // Ticker that refreshes status + round labels.
     expect(tray).toMatch(/dag_round/);
     expect(tray).toMatch(/interval\.tick\(\)\.await/);
   });

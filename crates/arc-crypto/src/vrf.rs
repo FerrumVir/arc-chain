@@ -1,74 +1,17 @@
-//! Verifiable Random Function (VRF) for ARC Chain.
-//!
-//! Simplified ECVRF construction using Ed25519 + BLAKE3, inspired by RFC 9381
-//! (ECVRF-ED25519-SHA512-TAI). Rather than raw curve arithmetic, we use
-//! Ed25519 signatures as the secret-key-dependent operation and BLAKE3 for
-//! domain-separated hashing.
-//!
-//! # Construction
-//!
-//! ```text
-//! gamma = BLAKE3_derive("ARC-vrf-gamma-derive-v1",
-//!             sign(sk, BLAKE3_derive("ARC-vrf-gamma-v1", pk || alpha)))
-//! proof = sign(sk, BLAKE3_derive("ARC-vrf-proof-v1", gamma || H(alpha)))
-//! output = BLAKE3_derive("ARC-vrf-output-v1", gamma)
-//! ```
-//!
-//! **Verification** recomputes the proof message from the supplied gamma and
-//! alpha, then checks the Ed25519 signature against the prover's address.
-//! A valid signature proves the prover knew the secret key, and the output
-//! is deterministically derived from gamma.
-//!
-//! # Security properties
-//!
-//! - **Uniqueness**: For a given keypair and input, there is exactly one valid
-//!   output (the Ed25519 signature is deterministic per RFC 8032).
-//! - **Pseudorandomness**: The output is indistinguishable from random to
-//!   anyone who does not know the secret key.
-//! - **Verifiability**: Anyone with the public key can verify that the output
-//!   was correctly derived.
-
 use crate::hash::{Hash256, hash_bytes};
 use crate::signature::{KeyPair, Signature, SignatureError};
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-/// VRF proof binding a pseudorandom output to a secret key and input.
-///
-/// Contains the intermediate `gamma` point (as a Hash256) and an Ed25519
-/// signature over `gamma || H(alpha)` that proves knowledge of the secret key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VrfProof {
-    /// Deterministic intermediate value derived from secret key + input.
     pub gamma: Hash256,
-    /// Ed25519 signature over `BLAKE3("ARC-vrf-proof-v1", gamma || H(alpha))`.
     pub signature: Signature,
 }
 
-/// The 32-byte pseudorandom output of a VRF evaluation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VrfOutput(pub Hash256);
 
-// ---------------------------------------------------------------------------
-// Core API
-// ---------------------------------------------------------------------------
-
-/// Produce a VRF proof and pseudorandom output for the given input.
-///
-/// # Arguments
-///
-/// * `keypair` - An Ed25519 `KeyPair` (other key types will work but VRF
-///   is designed around Ed25519 deterministic signatures).
-/// * `alpha` - The VRF input (arbitrary bytes).
-///
-/// # Returns
-///
-/// `(VrfProof, VrfOutput)` on success, or `SignatureError` if signing fails.
 pub fn vrf_prove(keypair: &KeyPair, alpha: &[u8]) -> Result<(VrfProof, VrfOutput), SignatureError> {
-    // Step 1: Derive a gamma input deterministically from (pk, alpha).
     let gamma_input = {
         let mut h = blake3::Hasher::new_derive_key("ARC-vrf-gamma-v1");
         h.update(&keypair.public_key_bytes());
@@ -76,35 +19,28 @@ pub fn vrf_prove(keypair: &KeyPair, alpha: &[u8]) -> Result<(VrfProof, VrfOutput
         Hash256(*h.finalize().as_bytes())
     };
 
-    // Step 2: Sign the gamma input - this binds gamma to the secret key.
-    // Ed25519 signatures are deterministic (RFC 8032), so the same
-    // (keypair, alpha) always produces the same gamma.
     let gamma_sig = keypair.sign(&gamma_input)?;
 
-    // Step 3: Derive gamma from the signature bytes.
-    // We feed the raw signature material into a domain-separated BLAKE3 hash
-    // so gamma is a clean 32-byte value.
     let gamma = {
         let mut h = blake3::Hasher::new_derive_key("ARC-vrf-gamma-derive-v1");
-        // Include scheme discriminant to prevent cross-scheme collisions
         match &gamma_sig {
             Signature::Ed25519 {
                 public_key,
                 signature,
             } => {
-                h.update(&[0u8]); // scheme tag
+                h.update(&[0u8]);
                 h.update(public_key);
                 h.update(signature);
             }
             Signature::Secp256k1 { signature } => {
-                h.update(&[1u8]); // scheme tag
+                h.update(&[1u8]);
                 h.update(signature);
             }
             Signature::MlDsa65 {
                 public_key,
                 signature,
             } => {
-                h.update(&[2u8]); // scheme tag
+                h.update(&[2u8]);
                 h.update(public_key);
                 h.update(signature);
             }
@@ -112,7 +48,7 @@ pub fn vrf_prove(keypair: &KeyPair, alpha: &[u8]) -> Result<(VrfProof, VrfOutput
                 public_key,
                 signature,
             } => {
-                h.update(&[3u8]); // scheme tag
+                h.update(&[3u8]);
                 h.update(public_key);
                 h.update(signature);
             }
@@ -120,7 +56,6 @@ pub fn vrf_prove(keypair: &KeyPair, alpha: &[u8]) -> Result<(VrfProof, VrfOutput
         Hash256(*h.finalize().as_bytes())
     };
 
-    // Step 4: Create the proof - sign(gamma || H(alpha)).
     let alpha_hash = hash_bytes(alpha);
     let proof_msg = {
         let mut h = blake3::Hasher::new_derive_key("ARC-vrf-proof-v1");
@@ -130,7 +65,6 @@ pub fn vrf_prove(keypair: &KeyPair, alpha: &[u8]) -> Result<(VrfProof, VrfOutput
     };
     let signature = keypair.sign(&proof_msg)?;
 
-    // Step 5: Derive the output from gamma.
     let output = {
         let mut h = blake3::Hasher::new_derive_key("ARC-vrf-output-v1");
         h.update(gamma.as_ref());
@@ -140,24 +74,11 @@ pub fn vrf_prove(keypair: &KeyPair, alpha: &[u8]) -> Result<(VrfProof, VrfOutput
     Ok((VrfProof { gamma, signature }, VrfOutput(output)))
 }
 
-/// Verify a VRF proof and return the pseudorandom output if valid.
-///
-/// # Arguments
-///
-/// * `public_key_address` - The ARC address of the prover (BLAKE3 hash of
-///   their public key).
-/// * `alpha` - The same VRF input that was passed to `vrf_prove`.
-/// * `proof` - The `VrfProof` to verify.
-///
-/// # Returns
-///
-/// `VrfOutput` on success, or `SignatureError` if the proof is invalid.
 pub fn vrf_verify(
     public_key_address: &Hash256,
     alpha: &[u8],
     proof: &VrfProof,
 ) -> Result<VrfOutput, SignatureError> {
-    // Recompute the proof message from the supplied gamma and alpha.
     let alpha_hash = hash_bytes(alpha);
     let proof_msg = {
         let mut h = blake3::Hasher::new_derive_key("ARC-vrf-proof-v1");
@@ -166,11 +87,8 @@ pub fn vrf_verify(
         Hash256(*h.finalize().as_bytes())
     };
 
-    // Verify the Ed25519 signature - this proves the prover knew the
-    // secret key corresponding to `public_key_address`.
     proof.signature.verify(&proof_msg, public_key_address)?;
 
-    // Recompute the output from gamma (must match what the prover computed).
     let output = {
         let mut h = blake3::Hasher::new_derive_key("ARC-vrf-output-v1");
         h.update(proof.gamma.as_ref());
@@ -179,10 +97,6 @@ pub fn vrf_verify(
 
     Ok(VrfOutput(output))
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -256,7 +170,6 @@ mod tests {
 
         let (mut proof, _) = vrf_prove(&kp, alpha).expect("prove ok");
 
-        // Tamper with gamma - flip a byte.
         proof.gamma.0[0] ^= 0xff;
 
         let result = vrf_verify(&address, alpha, &proof);
@@ -274,7 +187,6 @@ mod tests {
 
         let (proof, _) = vrf_prove(&kp, alpha).expect("prove ok");
 
-        // Verify with a different alpha.
         let result = vrf_verify(&address, b"different-input", &proof);
         assert!(
             result.is_err(),
@@ -289,11 +201,9 @@ mod tests {
 
         let (proof, output) = vrf_prove(&kp, alpha).expect("prove ok");
 
-        // Serialize to JSON and back.
         let json = serde_json::to_string(&proof).expect("serialize");
         let recovered: VrfProof = serde_json::from_str(&json).expect("deserialize");
 
-        // Verify the deserialized proof still works.
         let address = kp.address();
         let verified = vrf_verify(&address, alpha, &recovered).expect("verify ok");
         assert_eq!(output, verified);

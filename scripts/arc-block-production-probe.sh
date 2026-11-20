@@ -1,34 +1,4 @@
 #!/usr/bin/env bash
-# Controlled comparison: what does this build need in order to COMMIT a block?
-#
-# Two observations were being explained by one guess. The four-validator stall
-# and the single-validator non-commit were both attributed to "explicit
-# --genesis", but the comparison behind that claim changed several variables at
-# once (explicit genesis AND activation AND no --benchmark, against self-genesis
-# AND --benchmark AND no activation).
-#
-# RESULT (2026-09-20, recorded in outputs/.../round3/d7-block-production-probe.txt):
-# A=NO_COMMIT, B=NO_COMMIT, C=COMMITS. The genesis source makes no difference.
-# Arms A and B carry no workload, and consensus.rs:1640-1643 states the rule
-# directly - multi-validator mode proposes every round so the DAG advances,
-# single-validator mode proposes only when it has transactions - so an idle
-# single-validator chain not committing is designed behaviour, not a defect.
-#
-# The staged lifecycle diagnostic that originally claimed a single validator
-# "never leaves height 0 even with work pending" was wrong, and its own node log
-# disproved it: the node produced height 1, executed the paid request, and then
-# shut itself down on a preimage it had deleted. See the commit "Stop the first
-# transaction from killing a single-validator node".
-#
-# This holds everything else constant and varies ONE thing at a time:
-#
-#   A  1 validator, explicit --genesis
-#   B  1 validator, self-seeded genesis        (varies: genesis source)
-#   C  3 validators, explicit --genesis        (varies: committee size)
-#
-# No activation, no runtime, no --benchmark in any arm, so those cannot explain
-# a difference. Each arm is bounded and reports only whether committed height
-# left 0, separately from whether DAG rounds advanced.
 set -uo pipefail
 
 BINARY=${BINARY:-target/debug/arc-node}
@@ -48,7 +18,7 @@ mkdir -p "$WORK"
 echo "=== block-production probe ==="
 echo "work dir: $WORK   observe: ${OBSERVE}s per arm"
 
-derive() { # seed rpc p2p -> address on stdout
+derive() {
   local d="$WORK/probe-$1"; mkdir -p "$d"
   "$BINARY" --rpc "127.0.0.1:$2" --p2p-port "$3" --data-dir "$d" \
             --insecure-dev-validator-seed --validator-seed "$1" --stake "$STAKE" \
@@ -65,8 +35,7 @@ derive() { # seed rpc p2p -> address on stdout
 health() { curl -s --max-time 4 "http://127.0.0.1:$1/health" 2>/dev/null; }
 field() { printf '%s' "$1" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get(sys.argv[1],""))' "$2" 2>/dev/null; }
 
-# Report committed height AND dag round separately: live rounds are not commits.
-observe() { # label port
+observe() {
   local h0 r0 h1 r1 body
   body=$(health "$2"); h0=$(field "$body" height); r0=$(field "$body" dag_round)
   sleep "$OBSERVE"
@@ -77,7 +46,7 @@ observe() { # label port
   [[ "${h1:-0}" -gt 0 ]] && return 0 || return 1
 }
 
-start_node() { # seed rpc p2p datadir [genesis] [peers]
+start_node() {
   local seed=$1 rpc=$2 p2p=$3 dd=$4 gen=${5:-} peers=${6:-}
   mkdir -p "$dd"
   local args=(--rpc "127.0.0.1:$rpc" --p2p-port "$p2p" --data-dir "$dd"
@@ -89,7 +58,7 @@ start_node() { # seed rpc p2p datadir [genesis] [peers]
   for _ in $(seq 1 60); do health "$rpc" >/dev/null 2>&1 && break; sleep 1; done
 }
 
-write_genesis() { # file addr...
+write_genesis() {
   local f=$1; shift
   { echo '[chain]'; echo 'name = "arc-blockprobe"'; echo 'chain_id = "0x415243"'
     echo 'validator_set_complete = false'

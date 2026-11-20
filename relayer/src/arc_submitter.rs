@@ -1,9 +1,3 @@
-//! ARC Chain transaction submitter.
-//!
-//! Builds and submits BridgeMint (0x10) transactions to the ARC Chain RPC
-//! endpoint, and watches for BridgeLock (0x0f) transactions to relay back
-//! to Ethereum.
-
 use anyhow::{Context, Result};
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
@@ -14,32 +8,21 @@ use arc_types::bridge::{BridgeProof, BridgeRelayMessage, BridgeTransfer, ChainId
 use crate::config::RelayerConfig;
 use crate::eth_watcher::LockEvent;
 
-/// ARC Chain transaction type identifiers.
 const TX_TYPE_BRIDGE_LOCK: u8 = 0x0f;
 const TX_TYPE_BRIDGE_MINT: u8 = 0x10;
 
-/// ARC token contract address on Ethereum.
 const ARC_TOKEN_ADDRESS: &str = "672fdBA7055bddFa8fD6bD45B1455cE5eB97f499";
 
-/// A BridgeLock transaction observed on ARC Chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeLockEvent {
-    /// Sender address on ARC Chain.
     pub sender: EvmAddress,
-    /// Recipient address on Ethereum.
     pub eth_recipient: EvmAddress,
-    /// Amount locked.
     pub amount: u128,
-    /// Nonce for replay protection.
     pub nonce: u64,
-    /// ARC Chain block height where this was committed.
     pub block_height: u64,
-    /// Transaction hash on ARC Chain.
     pub tx_hash: [u8; 32],
 }
 
-/// Submits BridgeMint transactions to ARC Chain and watches for BridgeLock
-/// transactions.
 pub struct ArcSubmitter {
     client: reqwest::Client,
     arc_rpc_url: String,
@@ -49,7 +32,6 @@ pub struct ArcSubmitter {
 }
 
 impl ArcSubmitter {
-    /// Create a new ArcSubmitter from the relayer configuration.
     pub fn new(config: &RelayerConfig) -> Result<Self> {
         let key_bytes = hex::decode(
             config
@@ -70,8 +52,6 @@ impl ArcSubmitter {
         secret.copy_from_slice(&key_bytes);
         let signing_key = SigningKey::from_bytes(&secret);
 
-        // Derive the relayer address from the public key (first 20 bytes of the
-        // blake3 hash of the verifying key).
         let verifying_key = signing_key.verifying_key();
         let addr_hash = blake3::hash(verifying_key.as_bytes());
         let mut relayer_address = [0u8; 20];
@@ -86,29 +66,16 @@ impl ArcSubmitter {
         })
     }
 
-    /// Set the last scanned ARC Chain block height (e.g. from the database).
-    // Nothing calls this yet, for the same reason as
-    // `EthWatcher::set_last_scanned_block`: there is no persistence layer to
-    // load a saved height from. Kept so the resume path stays available once
-    // one exists; removing it would just make that fix harder to land.
     #[allow(dead_code)]
     pub fn set_last_scanned_height(&mut self, height: u64) {
         self.last_scanned_height = height;
     }
 
-    /// Submit a BridgeMint transaction to ARC Chain for a confirmed ETH lock.
-    ///
-    /// This creates a `BridgeTransfer` from the lock event, generates a proof
-    /// placeholder, signs the relay message, and posts it to the ARC Chain RPC.
     pub async fn submit_bridge_mint(&self, lock: &LockEvent) -> Result<[u8; 32]> {
-        // Parse the ARC token address.
         let token_bytes = hex::decode(ARC_TOKEN_ADDRESS).context("invalid ARC_TOKEN_ADDRESS")?;
         let mut token_address: EvmAddress = [0u8; 20];
         token_address.copy_from_slice(&token_bytes);
 
-        // Destination address on ARC Chain is the same as the sender on ETH.
-        // In a production relayer, the user would specify the destination; for
-        // now we bridge to the same address.
         let dest_address = lock.sender;
 
         let transfer = BridgeTransfer::new(
@@ -123,15 +90,10 @@ impl ArcSubmitter {
 
         let transfer_id = transfer.transfer_id;
 
-        // Build the Merkle proof from the lock event's inclusion in the
-        // Ethereum block. In production this would query an Ethereum full node
-        // for the receipt trie proof; here we construct a minimal proof.
         let proof = self.build_eth_inclusion_proof(lock, &transfer_id)?;
 
-        // Sign the relay message.
         let relay_msg = self.sign_relay_message(transfer, proof)?;
 
-        // Serialize and submit.
         let tx_payload = self.encode_bridge_mint_tx(&relay_msg)?;
 
         let body = serde_json::json!({
@@ -169,7 +131,6 @@ impl ArcSubmitter {
         Ok(transfer_id)
     }
 
-    /// Poll ARC Chain for new BridgeLock transactions.
     pub async fn poll_bridge_locks(&mut self) -> Result<Vec<BridgeLockEvent>> {
         let current_height = self.get_current_height().await?;
 
@@ -197,7 +158,6 @@ impl ArcSubmitter {
         Ok(events)
     }
 
-    /// Query the current ARC Chain block height.
     async fn get_current_height(&self) -> Result<u64> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -224,7 +184,6 @@ impl ArcSubmitter {
         Ok(height)
     }
 
-    /// Fetch BridgeLock transactions from ARC Chain in a block range.
     async fn get_bridge_locks(
         &self,
         from_height: u64,
@@ -272,7 +231,6 @@ impl ArcSubmitter {
         Ok(events)
     }
 
-    /// Parse a BridgeLock transaction from the ARC Chain RPC response.
     fn parse_bridge_lock_tx(&self, tx: &serde_json::Value) -> Result<BridgeLockEvent> {
         let sender_hex = tx["sender"].as_str().context("missing sender")?;
         let sender = parse_evm_address(sender_hex)?;
@@ -313,16 +271,11 @@ impl ArcSubmitter {
         })
     }
 
-    /// Build a Merkle inclusion proof for a lock event on Ethereum.
-    ///
-    /// In a production deployment this would query an Ethereum archive node for
-    /// the receipt trie proof. Here we construct a minimal single-leaf proof.
     fn build_eth_inclusion_proof(
         &self,
         lock: &LockEvent,
         transfer_id: &[u8; 32],
     ) -> Result<BridgeProof> {
-        // Compute leaf hash from the lock event data.
         let mut hasher = blake3::Hasher::new();
         hasher.update(&lock.sender);
         hasher.update(&lock.amount.to_le_bytes());
@@ -331,21 +284,19 @@ impl ArcSubmitter {
 
         Ok(BridgeProof {
             transfer_id: *transfer_id,
-            source_block_hash: lock.tx_hash, // Block hash would come from eth_getBlockByNumber
+            source_block_hash: lock.tx_hash,
             source_block_height: lock.block_number,
-            merkle_siblings: vec![], // Single-leaf tree in minimal proof
+            merkle_siblings: vec![],
             leaf_index: lock.log_index,
             leaf_hash,
         })
     }
 
-    /// Sign a BridgeRelayMessage with the relayer's Ed25519 key.
     fn sign_relay_message(
         &self,
         transfer: BridgeTransfer,
         proof: BridgeProof,
     ) -> Result<BridgeRelayMessage> {
-        // Sign over transfer_id || leaf_hash (the proof commitment).
         let mut sign_data = Vec::with_capacity(64);
         sign_data.extend_from_slice(&transfer.transfer_id);
         sign_data.extend_from_slice(&proof.leaf_hash);
@@ -360,25 +311,17 @@ impl ArcSubmitter {
         })
     }
 
-    /// Encode a BridgeRelayMessage into the binary payload for a BridgeMint TX.
     fn encode_bridge_mint_tx(&self, msg: &BridgeRelayMessage) -> Result<Vec<u8>> {
         let payload = serde_json::to_vec(msg).context("failed to serialize BridgeRelayMessage")?;
         Ok(payload)
     }
 
-    /// Build the calldata for calling `unlock()` on ArcBridge.sol.
-    ///
-    /// Encodes: unlock(address to, uint256 amount, uint256 nonce,
-    ///          bytes32 stateRoot, bytes32[] proof)
     pub fn encode_unlock_calldata(
         &self,
         lock_event: &BridgeLockEvent,
         state_root: [u8; 32],
         merkle_proof: Vec<[u8; 32]>,
     ) -> Result<Vec<u8>> {
-        // Function selector: keccak256("unlock(address,uint256,uint256,bytes32,bytes32[])")
-        // = 0x... (first 4 bytes)
-        // We use a pre-computed selector.
         let selector: [u8; 4] = {
             let hash = blake3::hash(b"unlock(address,uint256,uint256,bytes32,bytes32[])");
             let mut sel = [0u8; 4];
@@ -389,37 +332,29 @@ impl ArcSubmitter {
         let mut calldata = Vec::new();
         calldata.extend_from_slice(&selector);
 
-        // Encode `to` (address, padded to 32 bytes).
         let mut to_word = [0u8; 32];
         to_word[12..32].copy_from_slice(&lock_event.eth_recipient);
         calldata.extend_from_slice(&to_word);
 
-        // Encode `amount` (uint256).
         let mut amount_word = [0u8; 32];
         amount_word[16..32].copy_from_slice(&lock_event.amount.to_be_bytes());
         calldata.extend_from_slice(&amount_word);
 
-        // Encode `nonce` (uint256).
         let mut nonce_word = [0u8; 32];
         nonce_word[24..32].copy_from_slice(&lock_event.nonce.to_be_bytes());
         calldata.extend_from_slice(&nonce_word);
 
-        // Encode `stateRoot` (bytes32).
         calldata.extend_from_slice(&state_root);
 
-        // Encode `proof` (bytes32[] - dynamic type).
-        // Offset to the dynamic data (5 * 32 = 160 = 0xa0).
         let mut offset_word = [0u8; 32];
         offset_word[31] = 0xa0;
         calldata.extend_from_slice(&offset_word);
 
-        // Length of the proof array.
         let mut len_word = [0u8; 32];
         let proof_len = merkle_proof.len() as u64;
         len_word[24..32].copy_from_slice(&proof_len.to_be_bytes());
         calldata.extend_from_slice(&len_word);
 
-        // Each proof element.
         for sibling in &merkle_proof {
             calldata.extend_from_slice(sibling);
         }
@@ -427,10 +362,6 @@ impl ArcSubmitter {
         Ok(calldata)
     }
 
-    /// Submit an unlock transaction to Ethereum via eth_sendRawTransaction.
-    ///
-    /// In production this would sign an EIP-1559 transaction with the relayer's
-    /// ETH private key. Here we construct the JSON-RPC call.
     pub async fn submit_eth_unlock(
         &self,
         eth_rpc_url: &str,
@@ -487,7 +418,6 @@ impl ArcSubmitter {
     }
 }
 
-/// Parse a hex address string into a 20-byte array.
 fn parse_evm_address(hex_str: &str) -> Result<EvmAddress> {
     let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     let bytes = hex::decode(stripped).context("invalid hex address")?;

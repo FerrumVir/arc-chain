@@ -1,21 +1,3 @@
-//! Recognize the exact command lines released v0.7 supervisors start
-//! `arc-node` with, and nothing else.
-//!
-//! * Desktop, every v0.6.0..=v0.7.11 app (`node_manager.rs` `start`):
-//!   `--rpc 127.0.0.1:<p> --p2p-port <q> --data-dir <~/.arc> --validator-seed <phrase>
-//!   --eth-rpc-port 0 [--seeds-file <f>] [--genesis <g>] [--community-mode] [--model <m>]`.
-//!   It never passes `--stake`; v0.7's default stake was 5,000,000, so these
-//!   nodes ran as accidental validators. The bridge always runs them at 0.
-//! * Headless, `scripts/install-community-node.sh` (launchd, systemd, and the
-//!   no-root and `--no-service` fallbacks):
-//!   `--rpc 0.0.0.0:<p> --p2p-port <q> --seeds-file <f> --genesis <g>
-//!   --validator-seed <seed> --stake 0 --min-stake 0 --eth-rpc-port 0
-//!   --data-dir <ARC_DIR>/data [--model <m>] [--community-mode]`.
-//!
-//! An explicit non-zero `--stake` is an operator-configured validator and is
-//! always refused. The `--validator-seed` value is consumed and dropped; it is
-//! never stored, compared, or printed.
-
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
@@ -45,7 +27,6 @@ impl LegacyKind {
     }
 }
 
-/// A recognized v0.7 invocation. It deliberately has no seed field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LegacyInvocation {
     pub kind: LegacyKind,
@@ -109,7 +90,6 @@ const VALUE_FLAGS: &[&str] = &[
 
 const COMMUNITY_FLAG: &str = "--community-mode";
 
-/// Parse the arguments after the program name.
 pub fn parse(args: &[OsString]) -> Result<LegacyInvocation, ArgvError> {
     let mut values: BTreeMap<&'static str, String> = BTreeMap::new();
     let mut community_mode = false;
@@ -142,7 +122,6 @@ pub fn parse(args: &[OsString]) -> Result<LegacyInvocation, ArgvError> {
                 next.to_str().ok_or(ArgvError::NotUtf8)?.to_string()
             }
         };
-        // The legacy seed is consumed and dropped right here.
         let stored = if known == SEED_FLAG {
             String::new()
         } else {
@@ -216,7 +195,6 @@ fn classify(
         data_dir: PathBuf::from(data_dir),
         seeds_file: get("--seeds-file").map(PathBuf::from),
         genesis: get("--genesis").map(PathBuf::from),
-        // The v0.7 `--no-service` path passed `--model ""` without a model.
         model: get("--model")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from),
@@ -224,7 +202,6 @@ fn classify(
     })
 }
 
-/// Name an unknown argument without echoing anything that might be a secret.
 fn describe_unknown(flag: &str) -> String {
     let plain_flag = flag.starts_with("--")
         && flag.len() <= 40
@@ -249,7 +226,6 @@ mod tests {
         args.iter().map(OsString::from).collect()
     }
 
-    /// Exact argv from v0.7.11 desktop `node_manager.rs` for a worker.
     fn desktop_worker() -> Vec<OsString> {
         os(&[
             "--rpc",
@@ -272,7 +248,6 @@ mod tests {
         ])
     }
 
-    /// Exact argv from the v0.7.11 community installer's launchd plist.
     fn headless_launchd() -> Vec<OsString> {
         os(&[
             "--rpc",
@@ -337,12 +312,10 @@ mod tests {
         assert!(invocation.community_mode);
         assert_eq!(invocation.data_dir, PathBuf::from("/home/ops/.arc/data"));
 
-        // The v0.7.11 no-root Linux fallback omitted --community-mode.
         let mut no_root = headless_launchd();
         no_root.pop();
         assert!(!parse(&no_root).unwrap().community_mode);
 
-        // The --no-service fallback passed `--model ""` without a model.
         let mut no_service = headless_launchd();
         no_service.pop();
         no_service.extend(os(&["--model", ""]));

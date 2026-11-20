@@ -1,4 +1,3 @@
-//! Quiet, bounded scoreboard reads. No worker identities cross IPC.
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -34,7 +33,6 @@ impl Cache {
             response.json::<WorkerNetwork>().await.ok()
         }
         .await;
-        // Cache absence too: a missing endpoint must not cause a request storm.
         self.0 = Some((host.to_owned(), Instant::now(), value.clone()));
         value
     }

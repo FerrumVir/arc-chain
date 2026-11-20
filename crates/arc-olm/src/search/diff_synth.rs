@@ -1,9 +1,3 @@
-//! Diff-guided synthesis: analyze HOW the output differs from the input
-//! across all training pairs, detect a consistent rule, and apply it.
-//!
-//! This catches the massive "identity + localized changes" category
-//! (146/400 near-misses from identity alone).
-
 use crate::primitives::{grid, object};
 use crate::{Color, Grid, Object};
 use std::collections::{BTreeSet, HashMap};
@@ -14,7 +8,6 @@ pub struct DiffResult {
     pub test_outputs: Vec<Grid>,
 }
 
-/// Analyze diffs and try to construct a transformation.
 pub fn diff_synthesize(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -26,12 +19,10 @@ pub fn diff_synthesize(
     let start = Instant::now();
     let elapsed = || start.elapsed().as_millis() as u64;
 
-    // Only operate on same-size pairs for most strategies
     let same_size = train_pairs.iter().all(|(inp, out)| {
         inp.len() == out.len() && !inp.is_empty() && !out.is_empty() && inp[0].len() == out[0].len()
     });
 
-    // Strategy 1: Consistent color mapping
     if same_size && let Some(r) = strategy_color_mapping(train_pairs, test_inputs) {
         return Some(r);
     }
@@ -39,7 +30,6 @@ pub fn diff_synthesize(
         return None;
     }
 
-    // Strategy 2: Positional diff - cells that change share a spatial pattern
     if same_size && let Some(r) = strategy_positional_diff(train_pairs, test_inputs) {
         return Some(r);
     }
@@ -47,7 +37,6 @@ pub fn diff_synthesize(
         return None;
     }
 
-    // Strategy 3: Object diff - detect what happened to objects
     if let Some(r) = strategy_object_diff(train_pairs, test_inputs) {
         return Some(r);
     }
@@ -55,7 +44,6 @@ pub fn diff_synthesize(
         return None;
     }
 
-    // Strategy 4: Conditional color replace
     if same_size && let Some(r) = strategy_conditional_replace(train_pairs, test_inputs) {
         return Some(r);
     }
@@ -63,7 +51,6 @@ pub fn diff_synthesize(
         return None;
     }
 
-    // Strategy 5: Pattern stamp / copy
     if let Some(r) = strategy_pattern_stamp(train_pairs, test_inputs) {
         return Some(r);
     }
@@ -71,7 +58,6 @@ pub fn diff_synthesize(
         return None;
     }
 
-    // Strategy 6: Remove or keep specific objects
     if same_size && let Some(r) = strategy_remove_objects(train_pairs, test_inputs) {
         return Some(r);
     }
@@ -79,17 +65,12 @@ pub fn diff_synthesize(
         return None;
     }
 
-    // Strategy 7: Fill between objects
     if same_size && let Some(r) = strategy_fill_between(train_pairs, test_inputs) {
         return Some(r);
     }
 
     None
 }
-
-// ============================================================
-// Helpers
-// ============================================================
 
 fn grid_dims(g: &Grid) -> (usize, usize) {
     let h = g.len();
@@ -107,7 +88,6 @@ fn colors_in_grid(g: &Grid) -> BTreeSet<u8> {
     s
 }
 
-/// Positions adjacent (4-connected) to any cell of a given color.
 fn adjacent_to_color(g: &Grid, color: Color) -> BTreeSet<(usize, usize)> {
     let (h, w) = grid_dims(g);
     let mut result = BTreeSet::new();
@@ -132,7 +112,6 @@ fn adjacent_to_color(g: &Grid, color: Color) -> BTreeSet<(usize, usize)> {
     result
 }
 
-/// Check if a cell has zero same-color 4-neighbors (isolated).
 fn is_isolated(g: &Grid, r: usize, c: usize) -> bool {
     let (h, w) = grid_dims(g);
     let color = g[r][c];
@@ -152,7 +131,6 @@ fn is_isolated(g: &Grid, r: usize, c: usize) -> bool {
     true
 }
 
-/// Cells in the same row or column as any cell of a given color (excluding that color).
 fn line_from_color(g: &Grid, color: Color) -> BTreeSet<(usize, usize)> {
     let mut rows_with = BTreeSet::new();
     let mut cols_with = BTreeSet::new();
@@ -175,13 +153,11 @@ fn line_from_color(g: &Grid, color: Color) -> BTreeSet<(usize, usize)> {
     result
 }
 
-/// Flood-fill to find enclosed regions of background inside a color boundary.
 fn enclosed_by_color(g: &Grid, boundary_color: Color) -> BTreeSet<(usize, usize)> {
     let (h, w) = grid_dims(g);
     if h == 0 || w == 0 {
         return BTreeSet::new();
     }
-    // BFS from all border cells that are not boundary_color to find exterior
     let mut exterior = vec![vec![false; w]; h];
     let mut queue = std::collections::VecDeque::new();
     for (r, row) in g.iter().enumerate() {
@@ -206,7 +182,6 @@ fn enclosed_by_color(g: &Grid, boundary_color: Color) -> BTreeSet<(usize, usize)
             }
         }
     }
-    // Interior = non-boundary cells that are not exterior
     let mut result = BTreeSet::new();
     for (r, row) in g.iter().enumerate() {
         for (c, &cell) in row.iter().enumerate() {
@@ -218,20 +193,17 @@ fn enclosed_by_color(g: &Grid, boundary_color: Color) -> BTreeSet<(usize, usize)
     result
 }
 
-/// Find cells between two same-color cells on the same row or column (gap fill).
 fn gap_cells(g: &Grid, color: Color) -> BTreeSet<(usize, usize)> {
     let (h, w) = grid_dims(g);
     let bg = grid::mostcolor(g);
     let mut result = BTreeSet::new();
 
-    // Horizontal gaps
     for (r, row) in g.iter().enumerate() {
         let cols: Vec<usize> = (0..w).filter(|&c| row[c] == color).collect();
         for i in 0..cols.len() {
             for j in (i + 1)..cols.len() {
                 let c1 = cols[i];
                 let c2 = cols[j];
-                // Only fill if all cells between are background
                 let all_bg = (c1 + 1..c2).all(|c| row[c] == bg);
                 if all_bg && c2 > c1 + 1 {
                     for c in (c1 + 1)..c2 {
@@ -242,10 +214,6 @@ fn gap_cells(g: &Grid, color: Color) -> BTreeSet<(usize, usize)> {
         }
     }
 
-    // Vertical gaps
-    // allow: this walks the grid column by column, so `c` is the *second* index
-    // (g[r][c]) rather than something we can iterate over. There is no column
-    // iterator to enumerate here, and clippy's suggested rewrite would be wrong.
     #[allow(clippy::needless_range_loop)]
     for c in 0..w {
         let rows: Vec<usize> = (0..h).filter(|&r| g[r][c] == color).collect();
@@ -266,7 +234,6 @@ fn gap_cells(g: &Grid, color: Color) -> BTreeSet<(usize, usize)> {
     result
 }
 
-/// Compute the diff between two same-size grids: positions that changed.
 fn compute_diff(inp: &Grid, out: &Grid) -> Vec<(usize, usize, u8, u8)> {
     let (h, w) = grid_dims(inp);
     let mut diffs = Vec::new();
@@ -280,15 +247,10 @@ fn compute_diff(inp: &Grid, out: &Grid) -> Vec<(usize, usize, u8, u8)> {
     diffs
 }
 
-// ============================================================
-// Strategy 1: Consistent color mapping (global remap)
-// ============================================================
-
 fn strategy_color_mapping(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
 ) -> Option<DiffResult> {
-    // Build mapping from each training pair
     let mut global_map: HashMap<u8, u8> = HashMap::new();
 
     for (inp, out) in train_pairs {
@@ -299,7 +261,7 @@ fn strategy_color_mapping(
                 let to = out[r][c];
                 if let Some(&existing) = global_map.get(&from) {
                     if existing != to {
-                        return None; // Inconsistent mapping
+                        return None;
                     }
                 } else {
                     global_map.insert(from, to);
@@ -308,13 +270,11 @@ fn strategy_color_mapping(
         }
     }
 
-    // Must actually change something
     let changes = global_map.iter().any(|(k, v)| k != v);
     if !changes {
         return None;
     }
 
-    // Verify on all training pairs
     for (inp, out) in train_pairs {
         let applied = apply_color_map(inp, &global_map);
         if applied != *out {
@@ -322,7 +282,6 @@ fn strategy_color_mapping(
         }
     }
 
-    // Apply to test inputs
     let test_outputs: Vec<Grid> = test_inputs
         .iter()
         .map(|inp| apply_color_map(inp, &global_map))
@@ -350,15 +309,10 @@ fn apply_color_map(g: &Grid, map: &HashMap<u8, u8>) -> Grid {
         .collect()
 }
 
-// ============================================================
-// Strategy 2: Positional diff
-// ============================================================
-
 fn strategy_positional_diff(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
 ) -> Option<DiffResult> {
-    // Try each sub-strategy
     if let Some(r) = positional_adjacent_fill(train_pairs, test_inputs) {
         return Some(r);
     }
@@ -395,7 +349,6 @@ fn strategy_positional_diff(
     None
 }
 
-/// 2f: Relaxed adjacency fill - changed cells of ANY source color adjacent to trigger
 fn positional_adjacent_fill_any(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -422,9 +375,6 @@ fn positional_adjacent_fill_any(
                         return false;
                     }
 
-                    // Check: every cell where inp==from_color AND adjacent to trigger_color
-                    //   must become to_color in output
-                    // And no other cells change
                     let mut ok = true;
                     for r in 0..h {
                         for c in 0..w {
@@ -504,13 +454,10 @@ fn positional_adjacent_fill_any(
     None
 }
 
-/// 2g: Replace all cells of one specific color with another, but only if they
-/// satisfy a spatial criterion (e.g., NOT on the border, or isolated)
 fn positional_replace_from_color(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
 ) -> Option<DiffResult> {
-    // Check for "replace color X with Y, but only NON-border cells"
     let all_colors = collect_all_colors(train_pairs);
 
     for &from_c in &all_colors {
@@ -519,7 +466,6 @@ fn positional_replace_from_color(
                 continue;
             }
 
-            // Non-border variant: cells of from_c that are NOT on the grid border
             let consistent = train_pairs.iter().all(|(inp, out)| {
                 let h = inp.len();
                 if h == 0 {
@@ -580,7 +526,6 @@ fn positional_replace_from_color(
                 });
             }
 
-            // Isolated variant: cells of from_c with NO same-color 4-neighbors
             let consistent = train_pairs.iter().all(|(inp, out)| {
                 let h = inp.len();
                 if h == 0 {
@@ -604,7 +549,6 @@ fn positional_replace_from_color(
                         .any(|&(nr, nc)| nr < h && nc < w && inp[nr][nc] == from_c);
 
                         if inp[r][c] == from_c && !has_same_neighbor {
-                            // Isolated cell of from_c → should become to_c
                             if out[r][c] != to_c {
                                 ok = false;
                                 break;
@@ -661,9 +605,6 @@ fn positional_replace_from_color(
     None
 }
 
-/// 2h: Row/column intersection fill.
-/// Find rows containing color A, columns containing color B;
-/// at each intersection cell that is background, fill with F.
 fn positional_intersection_fill(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -773,8 +714,6 @@ fn positional_intersection_fill(
     None
 }
 
-/// 2i: Enclosed region fill with flexible barrier.
-/// BFS from border through background only; bg cells unreachable from border are enclosed.
 fn positional_enclosed_flexible(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -842,7 +781,6 @@ fn positional_enclosed_flexible(
     None
 }
 
-/// BFS from all border background cells; return bg cells NOT reachable from border.
 fn find_enclosed_bg(grid: &Grid, bg: Color) -> BTreeSet<(usize, usize)> {
     let (h, w) = grid_dims(grid);
     if h == 0 || w == 0 {
@@ -851,7 +789,6 @@ fn find_enclosed_bg(grid: &Grid, bg: Color) -> BTreeSet<(usize, usize)> {
     let mut reachable = vec![vec![false; w]; h];
     let mut queue = std::collections::VecDeque::new();
 
-    // Seed BFS from all border cells that ARE background
     for r in 0..h {
         for c in 0..w {
             if (r == 0 || r == h - 1 || c == 0 || c == w - 1) && grid[r][c] == bg {
@@ -886,7 +823,6 @@ fn find_enclosed_bg(grid: &Grid, bg: Color) -> BTreeSet<(usize, usize)> {
     enclosed
 }
 
-/// 2j: Enclosed recolor - replace cells of color X with Y only when inside enclosed regions.
 fn positional_enclosed_recolor(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -906,21 +842,11 @@ fn positional_enclosed_recolor(
                 }
                 let bg = grid::mostcolor(inp);
 
-                // Enclosed bg cells define the interior region.
-                // We also include non-bg cells that are fully surrounded by
-                // the enclosed region (i.e., all 4-neighbors are enclosed-bg or non-bg-interior).
-                // Simpler: use BFS from border through anything that is NOT a barrier.
-                // A barrier is any non-bg, non-from_c cell.
-                // Actually, simplest correct approach: a cell of from_c is "enclosed"
-                // if BFS from border through bg cannot reach it.
                 let enclosed_bg = find_enclosed_bg(inp, bg);
                 if enclosed_bg.is_empty() {
                     return false;
                 }
 
-                // A cell of from_c is enclosed if ALL its 4-neighbors are either
-                // enclosed-bg, non-bg (barrier), or another enclosed from_c cell.
-                // Simpler: do BFS from border through bg AND from_c, see which from_c cells are reachable.
                 let mut reachable = vec![vec![false; w]; h];
                 let mut queue = std::collections::VecDeque::new();
                 for r in 0..h {
@@ -1028,7 +954,6 @@ fn positional_enclosed_recolor(
     None
 }
 
-/// 2k: Diagonal neighbors fill - like adjacency fill but 8-connected.
 fn positional_diagonal_fill(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -1104,7 +1029,6 @@ fn positional_diagonal_fill(
     None
 }
 
-/// Positions 8-connected (including diagonals) to any cell of a given color.
 fn adjacent_8_to_color(g: &Grid, color: Color) -> BTreeSet<(usize, usize)> {
     let (h, w) = grid_dims(g);
     let mut result = BTreeSet::new();
@@ -1138,7 +1062,6 @@ fn adjacent_8_to_color(g: &Grid, color: Color) -> BTreeSet<(usize, usize)> {
     result
 }
 
-/// 2a: Changed cells are ALL adjacent to a specific color - fill with a target color.
 fn positional_adjacent_fill(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -1157,13 +1080,10 @@ fn positional_adjacent_fill(
                     return false;
                 }
                 let adj = adjacent_to_color(inp, trigger_color);
-                // All changed cells must be adjacent to trigger_color,
-                // changed to fill_color, and from background
                 let bg = grid::mostcolor(inp);
                 diffs.iter().all(|&(r, c, from, to)| {
                     adj.contains(&(r, c)) && to == fill_color && from == bg
                 }) && {
-                    // And ALL adjacent-to-trigger bg cells must have changed
                     let expected: BTreeSet<_> = adj
                         .iter()
                         .filter(|&&(r, c)| inp[r][c] == bg)
@@ -1203,7 +1123,6 @@ fn positional_adjacent_fill(
     None
 }
 
-/// 2b: Changed cells are ALL enclosed by a specific color.
 fn positional_enclosed_fill(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -1226,11 +1145,9 @@ fn positional_enclosed_fill(
                     return false;
                 }
                 let changed: BTreeSet<_> = diffs.iter().map(|&(r, c, _, _)| (r, c)).collect();
-                // All changed cells enclosed, all changed to fill_color
                 diffs.iter().all(|&(_, _, _, to)| to == fill_color)
                     && changed.is_subset(&enclosed)
                     && {
-                        // All enclosed cells that weren't boundary must have changed
                         let expected: BTreeSet<_> = enclosed
                             .iter()
                             .filter(|&&(r, c)| {
@@ -1270,7 +1187,6 @@ fn positional_enclosed_fill(
     None
 }
 
-/// 2c: Changed cells are in same row/col as a specific color.
 fn positional_line_fill(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<DiffResult> {
     let all_colors = collect_all_colors(train_pairs);
 
@@ -1330,12 +1246,10 @@ fn positional_line_fill(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> O
     None
 }
 
-/// 2d: Noise removal - isolated cells replaced by background.
 fn positional_noise_removal(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
 ) -> Option<DiffResult> {
-    // Check: every diff is an isolated cell being replaced by background
     let consistent = train_pairs.iter().all(|(inp, out)| {
         let diffs = compute_diff(inp, out);
         if diffs.is_empty() {
@@ -1346,7 +1260,6 @@ fn positional_noise_removal(
             .iter()
             .all(|&(r, c, _from, to)| to == bg && is_isolated(inp, r, c))
             && {
-                // Verify all isolated non-bg cells were removed
                 let (h, w) = grid_dims(inp);
                 let changed: BTreeSet<_> = diffs.iter().map(|&(r, c, _, _)| (r, c)).collect();
                 let expected: BTreeSet<_> = (0..h)
@@ -1383,7 +1296,6 @@ fn positional_noise_removal(
     })
 }
 
-/// 2e: Gap fill - fill between two same-color cells.
 fn positional_gap_fill(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<DiffResult> {
     let all_colors = collect_all_colors(train_pairs);
 
@@ -1423,25 +1335,17 @@ fn positional_gap_fill(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Op
     None
 }
 
-// ============================================================
-// Strategy 3: Object diff
-// ============================================================
-
 fn strategy_object_diff(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<DiffResult> {
-    // Try object recoloring
     if let Some(r) = object_recolor(train_pairs, test_inputs) {
         return Some(r);
     }
-    // Try object movement
     if let Some(r) = object_move(train_pairs, test_inputs) {
         return Some(r);
     }
     None
 }
 
-/// Detect consistent object recoloring across training pairs.
 fn object_recolor(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<DiffResult> {
-    // For each pair, extract objects and see if some are recolored
     let mut recolor_map: Option<HashMap<u8, u8>> = None;
 
     for (inp, out) in train_pairs {
@@ -1454,7 +1358,6 @@ fn object_recolor(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<
             let inp_pos = inp_obj.positions();
             let inp_color = inp_obj.primary_color();
 
-            // Find matching object in output by position overlap
             let mut best_match: Option<&Object> = None;
             let mut best_overlap = 0;
             for out_obj in &out_objs {
@@ -1471,7 +1374,7 @@ fn object_recolor(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<
                 if inp_color != out_color {
                     if let Some(&existing) = pair_map.get(&inp_color) {
                         if existing != out_color {
-                            return None; // Inconsistent within pair
+                            return None;
                         }
                     } else {
                         pair_map.insert(inp_color, out_color);
@@ -1487,7 +1390,6 @@ fn object_recolor(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<
         match &recolor_map {
             None => recolor_map = Some(pair_map),
             Some(existing) => {
-                // Must be consistent across pairs
                 for (k, v) in &pair_map {
                     if let Some(&ev) = existing.get(k)
                         && ev != *v
@@ -1507,7 +1409,6 @@ fn object_recolor(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<
         return None;
     }
 
-    // Verify on training pairs
     for (inp, out) in train_pairs {
         let applied = apply_color_map(inp, &recolor_map);
         if applied != *out {
@@ -1526,9 +1427,7 @@ fn object_recolor(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<
     })
 }
 
-/// Detect consistent object movement across training pairs.
 fn object_move(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<DiffResult> {
-    // Check if the same-size grids have objects that moved consistently
     let same_size = train_pairs.iter().all(|(inp, out)| {
         inp.len() == out.len() && !inp.is_empty() && !out.is_empty() && inp[0].len() == out[0].len()
     });
@@ -1536,7 +1435,6 @@ fn object_move(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<Dif
         return None;
     }
 
-    // Extract objects and detect consistent delta
     let mut consistent_dr: Option<isize> = None;
     let mut consistent_dc: Option<isize> = None;
     let mut move_color: Option<u8> = None;
@@ -1549,7 +1447,6 @@ fn object_move(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<Dif
             let inp_pos = inp_obj.positions();
             let inp_color = inp_obj.primary_color();
 
-            // Find matching object by same shape (same relative positions)
             let inp_bbox = object::bbox(inp_obj);
             let inp_rel: BTreeSet<(usize, usize)> = inp_pos
                 .iter()
@@ -1594,7 +1491,6 @@ fn object_move(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<Dif
     let dc = consistent_dc?;
     let mv_color = move_color?;
 
-    // Verify on training pairs
     for (inp, out) in train_pairs {
         let applied = apply_object_move(inp, dr, dc, mv_color);
         if applied != *out {
@@ -1624,18 +1520,12 @@ fn apply_object_move(g: &Grid, dr: isize, dc: isize, color: u8) -> Grid {
     result
 }
 
-// ============================================================
-// Strategy 4: Conditional color replace
-// ============================================================
-
 fn strategy_conditional_replace(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
 ) -> Option<DiffResult> {
-    // Group changes by (from_color, to_color) and find what condition characterizes them
     let all_colors = collect_all_colors(train_pairs);
 
-    // For each (from, to), check if the condition is "adjacent to color X"
     for &from_color in &all_colors {
         for &to_color in &all_colors {
             if from_color == to_color {
@@ -1648,7 +1538,6 @@ fn strategy_conditional_replace(
 
                 let consistent = train_pairs.iter().all(|(inp, out)| {
                     let (h, w) = grid_dims(inp);
-                    // Find all cells that are from_color AND adjacent to adj_color
                     let mut expected_changes = BTreeSet::new();
                     for r in 0..h {
                         for c in 0..w {
@@ -1660,14 +1549,12 @@ fn strategy_conditional_replace(
                     if expected_changes.is_empty() {
                         return false;
                     }
-                    // Check that exactly these cells changed from from_color to to_color
                     let diffs = compute_diff(inp, out);
                     let actual_relevant: BTreeSet<_> = diffs
                         .iter()
                         .filter(|&&(_, _, f, t)| f == from_color && t == to_color)
                         .map(|&(r, c, _, _)| (r, c))
                         .collect();
-                    // All other diffs should be (from_color, to_color) only
                     let other_diffs: Vec<_> = diffs
                         .iter()
                         .filter(|&&(_, _, f, t)| !(f == from_color && t == to_color))
@@ -1703,7 +1590,6 @@ fn strategy_conditional_replace(
         }
     }
 
-    // Check "on border of grid" condition
     for &from_color in &all_colors {
         for &to_color in &all_colors {
             if from_color == to_color {
@@ -1782,31 +1668,23 @@ fn has_neighbor(g: &Grid, r: usize, c: usize, color: Color) -> bool {
     false
 }
 
-// ============================================================
-// Strategy 5: Pattern stamp / copy
-// ============================================================
-
 fn strategy_pattern_stamp(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
 ) -> Option<DiffResult> {
-    // Sub-case A: output is a subgrid of the input (extract a pattern)
     if let Some(r) = pattern_extract(train_pairs, test_inputs) {
         return Some(r);
     }
-    // Sub-case B: output is the input tiled
     if let Some(r) = pattern_tile(train_pairs, test_inputs) {
         return Some(r);
     }
     None
 }
 
-/// Extract: the output is the bounding box of the non-background region.
 fn pattern_extract(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<DiffResult> {
     let consistent = train_pairs.iter().all(|(inp, out)| {
         let bg = grid::mostcolor(inp);
         let (h, w) = grid_dims(inp);
-        // Find bounding box of non-bg cells
         let mut min_r = h;
         let mut max_r = 0;
         let mut min_c = w;
@@ -1864,9 +1742,7 @@ fn pattern_extract(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option
     })
 }
 
-/// Tile: the output is the input repeated/tiled.
 fn pattern_tile(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<DiffResult> {
-    // Check if output dimensions are exact multiples of input dimensions
     let mut tile_r: Option<usize> = None;
     let mut tile_c: Option<usize> = None;
 
@@ -1899,7 +1775,6 @@ fn pattern_tile(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<Di
     let tr = tile_r?;
     let tc = tile_c?;
 
-    // Verify tiling produces the correct output
     for (inp, out) in train_pairs {
         let tiled = tile_grid(inp, tr, tc);
         if tiled != *out {
@@ -1933,15 +1808,10 @@ fn tile_grid(g: &Grid, rows: usize, cols: usize) -> Grid {
     out
 }
 
-// ============================================================
-// Strategy 6: Remove or keep specific objects
-// ============================================================
-
 fn strategy_remove_objects(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
 ) -> Option<DiffResult> {
-    // Check: remove smallest objects
     if let Some(r) = remove_by_criterion(train_pairs, test_inputs, "smallest", |objs| {
         if objs.is_empty() {
             return BTreeSet::new();
@@ -1956,7 +1826,6 @@ fn strategy_remove_objects(
         return Some(r);
     }
 
-    // Check: remove objects of a specific color
     let all_colors = collect_all_colors(train_pairs);
     for &remove_color in &all_colors {
         if let Some(r) = remove_by_criterion(
@@ -2028,14 +1897,9 @@ fn remove_by_criterion(
     })
 }
 
-// ============================================================
-// Strategy 7: Fill between objects
-// ============================================================
-
 fn strategy_fill_between(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<DiffResult> {
     let all_colors = collect_all_colors(train_pairs);
 
-    // For each color, try filling between same-color objects
     for &fill_color in &all_colors {
         let consistent = train_pairs.iter().all(|(inp, out)| {
             let objs = object::objects(inp, true, false, true);
@@ -2048,7 +1912,6 @@ fn strategy_fill_between(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> 
             }
 
             let mut result = inp.clone();
-            // Fill lines between bounding-box centers of same-color objects
             for i in 0..color_objs.len() {
                 for j in (i + 1)..color_objs.len() {
                     let bb_i = object::bbox(color_objs[i]);
@@ -2058,7 +1921,6 @@ fn strategy_fill_between(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> 
                     let cj_r = (bb_j.0 + bb_j.2) / 2;
                     let cj_c = (bb_j.1 + bb_j.3) / 2;
 
-                    // Horizontal line
                     if ci_r == cj_r {
                         let min_c = ci_c.min(cj_c);
                         let max_c = ci_c.max(cj_c);
@@ -2068,7 +1930,6 @@ fn strategy_fill_between(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> 
                             }
                         }
                     }
-                    // Vertical line
                     if ci_c == cj_c {
                         let min_r = ci_r.min(cj_r);
                         let max_r = ci_r.max(cj_r);
@@ -2136,10 +1997,6 @@ fn strategy_fill_between(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> 
     None
 }
 
-// ============================================================
-// Utilities
-// ============================================================
-
 fn collect_all_colors(train_pairs: &[(Grid, Grid)]) -> Vec<u8> {
     let mut colors = BTreeSet::new();
     for (inp, out) in train_pairs {
@@ -2149,17 +2006,12 @@ fn collect_all_colors(train_pairs: &[(Grid, Grid)]) -> Vec<u8> {
     colors.into_iter().collect()
 }
 
-// ============================================================
-// Tests
-// ============================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_color_mapping() {
-        // Replace color 1 -> 3
         let input = vec![vec![1, 0, 2], vec![2, 1, 0]];
         let output = vec![vec![3, 0, 2], vec![2, 3, 0]];
         let train = vec![(input.clone(), output.clone())];
@@ -2174,7 +2026,6 @@ mod tests {
 
     #[test]
     fn test_noise_removal() {
-        // Input has isolated cell at (0,2), should be removed
         let input = vec![
             vec![0, 0, 1, 0],
             vec![0, 2, 2, 0],
@@ -2198,7 +2049,6 @@ mod tests {
 
     #[test]
     fn test_gap_fill() {
-        // Two cells of color 3 with a gap between them
         let input = vec![
             vec![0, 0, 0, 0, 0],
             vec![0, 3, 0, 0, 3],

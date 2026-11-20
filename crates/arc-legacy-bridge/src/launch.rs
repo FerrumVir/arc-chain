@@ -1,19 +1,3 @@
-//! Start the pinned v0.8 node exactly as `install.sh` would, at stake 0.
-//!
-//! The argument list mirrors `install.sh` `NODE_ARGS` (RPC on loopback, the
-//! release's seeds and genesis, `--stake 0 --min-stake 0 --eth-rpc-port 0`, a
-//! dedicated data directory and keyfile, community mode with the six HTTPS
-//! origins, and `--model … --full-integer-worker` only for a consented
-//! worker). It never passes `--shard-range`, a validator seed, or any
-//! insecure development flag.
-//!
-//! A stake-zero v0.8 node with no `--model` loads any canonical GGUF it finds
-//! at `./llama2-7b.gguf`, `./llama-2-7b.Q4_K_M.gguf`, `$HOME/.arc-models/…`,
-//! `/opt/arc/llama2-7b.gguf`, or `/var/lib/arc/llama2-7b.gguf`
-//! (`arc-node` `auto_discover_model`). With compute off, the bridge therefore
-//! runs the node from a private working directory with a private `HOME`, and
-//! refuses to start if one of the absolute paths exists.
-
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -80,8 +64,6 @@ pub fn plan(
             args.push(origin.into());
         }
     } else {
-        // Read-only: no registration, heartbeat, or claims, so a pin that
-        // would publish the hostname never announces this computer.
         args.push("--no-community".into());
     }
     let compute_model = match compute {
@@ -103,7 +85,6 @@ pub fn plan(
     }
 }
 
-/// Refuse to start an observer that the node would silently turn into a worker.
 pub fn check_autodiscovery(plan: &LaunchPlan) -> Result<()> {
     if plan.compute_model.is_some() {
         return Ok(());
@@ -136,8 +117,6 @@ fn command_for(plan: &LaunchPlan) -> Command {
     command
 }
 
-/// Replace this process with the node, so the supervisor's PID, signals,
-/// and stdio now belong to the node itself. Returns only on failure.
 #[cfg(unix)]
 pub fn exec(plan: &LaunchPlan) -> Result<i32> {
     use std::os::unix::process::CommandExt;
@@ -145,9 +124,6 @@ pub fn exec(plan: &LaunchPlan) -> Result<i32> {
     Err(anyhow::Error::new(error).context(format!("could not start {}", plan.program.display())))
 }
 
-/// Windows cannot replace a process image. Run the node as a child in a job
-/// object that kills it when this process ends, so the v0.7 desktop's
-/// "stop" (which terminates its direct child) still stops the node.
 #[cfg(windows)]
 pub fn exec(plan: &LaunchPlan) -> Result<i32> {
     use anyhow::{Context, anyhow};
@@ -160,8 +136,6 @@ pub fn exec(plan: &LaunchPlan) -> Result<i32> {
     };
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // SAFETY: null security attributes and a null name create an unnamed job
-    // with default security; the call has no other preconditions.
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if job.is_null() {
         return Err(anyhow!(
@@ -169,13 +143,10 @@ pub fn exec(plan: &LaunchPlan) -> Result<i32> {
             std::io::Error::last_os_error()
         ));
     }
-    // SAFETY: an all-zero bit pattern is a valid value of this plain C struct.
     let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     let size = u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
         .map_err(|_| anyhow!("job limit structure size does not fit in u32"))?;
-    // SAFETY: `job` is a live job handle and `limits` is a live, correctly
-    // sized JOBOBJECT_EXTENDED_LIMIT_INFORMATION for this information class.
     let configured = unsafe {
         SetInformationJobObject(
             job,
@@ -195,7 +166,6 @@ pub fn exec(plan: &LaunchPlan) -> Result<i32> {
     let mut child = command
         .spawn()
         .with_context(|| format!("could not start {}", plan.program.display()))?;
-    // SAFETY: both handles are live; `child` owns its process handle.
     let assigned = unsafe { AssignProcessToJobObject(job, child.as_raw_handle()) };
     if assigned == 0 {
         let error = std::io::Error::last_os_error();
@@ -206,12 +176,9 @@ pub fn exec(plan: &LaunchPlan) -> Result<i32> {
         ));
     }
     let status = child.wait().context("could not wait for the node")?;
-    // The job handle is deliberately left open: it closes, killing anything
-    // still in the job, only when this launcher process exits.
     Ok(status.code().unwrap_or(1))
 }
 
-/// Whether `path` would be found by the node's model auto-discovery.
 pub fn is_autodiscovery_path(path: &Path) -> bool {
     let text = path.to_string_lossy();
     ABSOLUTE_MODEL_AUTODISCOVERY
@@ -273,8 +240,6 @@ mod tests {
     fn observer_plan_is_stake_zero_fresh_and_never_registers_on_an_unsafe_pin() {
         let temp = TempDir::new("launch-observer");
         let (layout, invocation, release) = fixture(&temp);
-        // The shipped pin is privacy-safe; an unsafe one is built from it so
-        // the refusal to register stays covered.
         let mut pins = Pins::embedded().unwrap();
         pins.node_release.worker_names_privacy_safe = false;
         let plan = plan(

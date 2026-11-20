@@ -1,16 +1,7 @@
-//! ARM NEON accelerated Ed25519 batch signature verification.
-//!
-//! Uses `curve25519-dalek` for curve arithmetic and adds NEON-specific
-//! optimizations:
-//! - Batch k-scalar pre-computation (SHA-512) with 2-wide NEON processing
-//! - Custom verification path: decompress → k-scalar → vartime_double_scalar_mul
-//! - Cache-optimized batch scheduling in groups of 2
-
 use crate::metal_verify::{GpuVerifyResult, VerifyTask};
 use std::time::Instant;
 use tracing::debug;
 
-/// ARM NEON batch Ed25519 verifier.
 pub struct NeonVerifier {
     pub min_batch: usize,
     total_verified: u64,
@@ -91,27 +82,16 @@ impl NeonVerifier {
     }
 }
 
-/// Core batch verification using curve25519-dalek internals.
-///
-/// Custom verification path:
-/// 1. Batch decompress all R and A points
-/// 2. Batch compute k-scalars via SHA-512 (NEON-accelerated on aarch64)
-/// 3. Verify each: [s]B == R + [k]A  via vartime_double_scalar_mul_basepoint
 #[cfg(target_arch = "aarch64")]
 fn neon_batch_verify_inner(tasks: &[VerifyTask]) -> Vec<bool> {
     use rayon::prelude::*;
 
     if tasks.len() < 64 {
-        // Small batch: sequential with custom verification path
         tasks.iter().map(verify_custom).collect()
     } else {
-        // Large batch: parallel custom verification.
-        // Pre-compute k-scalars in pairs (NEON 2-wide SHA-512 via hardware).
-        // Then verify in parallel via rayon.
         tasks
             .par_chunks(2)
             .flat_map(|pair| {
-                // Compute k-scalars for this pair
                 let results: Vec<bool> = pair.iter().map(verify_custom).collect();
                 results
             })
@@ -129,46 +109,32 @@ fn neon_batch_verify_inner(tasks: &[VerifyTask]) -> Vec<bool> {
     }
 }
 
-/// Custom Ed25519 verification using curve25519-dalek directly.
-///
-/// This avoids ed25519-dalek's overhead (key re-validation, cofactor checks)
-/// by going straight to the curve operations:
-/// 1. Decompress R (signature point) and A (public key)
-/// 2. Compute k = SHA-512(R || A || msg) reduced mod l
-/// 3. Extract s from signature
-/// 4. Check: [s]B == R + [k]A  via  [s]B - [k]A == R
 fn verify_custom(task: &VerifyTask) -> bool {
     use curve25519_dalek::EdwardsPoint;
     use curve25519_dalek::edwards::CompressedEdwardsY;
     use curve25519_dalek::scalar::Scalar;
     use sha2::{Digest, Sha512};
 
-    // Extract R (first 32 bytes of signature) and s (last 32 bytes)
     let r_bytes: [u8; 32] = task.signature[..32].try_into().unwrap_or([0u8; 32]);
     let s_bytes: [u8; 32] = task.signature[32..64].try_into().unwrap_or([0u8; 32]);
 
-    // Decompress R
     let r_compressed = CompressedEdwardsY(r_bytes);
     let r_point = match r_compressed.decompress() {
         Some(p) => p,
         None => return false,
     };
 
-    // Decompress A (public key)
     let a_compressed = CompressedEdwardsY(task.public_key);
     let a_point = match a_compressed.decompress() {
         Some(p) => p,
         None => return false,
     };
 
-    // Parse s as scalar (reject if not canonical)
     let s_scalar = match Scalar::from_canonical_bytes(s_bytes).into() {
         Some(s) => s,
         None => return false,
     };
 
-    // Compute k = SHA-512(R || A || msg) mod l
-    // On aarch64, SHA-512 uses hardware SHA2 instructions automatically
     let mut hasher = Sha512::new();
     hasher.update(r_bytes);
     hasher.update(task.public_key);
@@ -176,9 +142,6 @@ fn verify_custom(task: &VerifyTask) -> bool {
     let hash: [u8; 64] = hasher.finalize().into();
     let k_scalar = Scalar::from_bytes_mod_order_wide(&hash);
 
-    // Verify: [s]B - [k]A == R
-    // Using vartime_double_scalar_mul_basepoint: computes [a]A + [b]B
-    // We want [s]B - [k]A = [-k]A + [s]B
     let neg_k = -k_scalar;
     let check = EdwardsPoint::vartime_double_scalar_mul_basepoint(&neg_k, &a_point, &s_scalar);
 
@@ -253,7 +216,6 @@ mod tests {
     #[test]
     fn test_neon_malformed_key() {
         let mut v = NeonVerifier::new();
-        // Use a point that definitely won't decompress (all 0xFF)
         let task = VerifyTask {
             message: b"hello".to_vec(),
             public_key: [0xFFu8; 32],
@@ -265,7 +227,6 @@ mod tests {
 
     #[test]
     fn test_custom_verify_matches_dalek() {
-        // Verify that our custom path produces the same results as ed25519-dalek
         use ed25519_dalek::Signer;
         let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
         let vk = sk.verifying_key();
@@ -278,7 +239,6 @@ mod tests {
                 public_key: vk.to_bytes(),
                 signature: sig.to_bytes(),
             };
-            // Custom path should agree with dalek
             assert!(verify_custom(&task), "Custom verify failed for msg {i}");
             assert!(vk.verify_strict(task.message.as_slice(), &sig).is_ok());
         }

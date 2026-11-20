@@ -90,8 +90,6 @@ def main() -> int:
         write_json(args.out, {"root": str(args.root), "entries": snapshot(args.root, args.desktop_root)})
         return 0
     if args.command == "hook":
-        # Never fail the unit start: a broken hook would change the behavior
-        # under test. Errors are recorded in the snapshot itself instead.
         try:
             args.out_dir.mkdir(parents=True, exist_ok=True)
             number = len(list(args.out_dir.glob("start-*.json"))) + 1

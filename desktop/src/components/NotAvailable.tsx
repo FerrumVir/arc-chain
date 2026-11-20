@@ -1,18 +1,5 @@
 import { HelpCircle } from "lucide-react";
 
-/**
- * The one way this app says "we don't know".
- *
- * Every chain read in the projection and Network screens can come back
- * unavailable — most of the endpoints behind them are newer than the deployed
- * seed binaries, so a 404 is the expected path, not an exceptional one. The
- * rule that makes that safe is: state the reason, name the host, and show no
- * number at all. A zero, a dash, or a stale cached figure would each read as a
- * measurement.
- *
- * `reason` is always a sentence produced by the fetch layer, which knows what
- * it observed (404 vs. unreachable vs. unparseable) and never guesses why.
- */
 export function NotAvailable({
   reason,
   title = "Not available from this host",

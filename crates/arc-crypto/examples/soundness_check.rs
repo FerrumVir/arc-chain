@@ -1,14 +1,6 @@
-//! Adversarial check: does the Dense layer AIR actually bind the output?
-//!
-//! Proves a correct matrix-multiply, then tries to prove a forged one where a
-//! single output element is off by one. A sound AIR must reject the forgery.
-//!
-//! Usage: cargo run --release --example soundness_check --features stwo-prover
-
 use arc_crypto::inference_proof::dense_forward_i64;
 use arc_crypto::stwo_air::try_prove_dense_stark;
 
-/// Deterministic pseudo-random i64 values seeded by a string.
 fn make_data(seed: &str, len: usize) -> Vec<i64> {
     let mut rng: u64 = 0;
     for b in seed.bytes() {
@@ -39,7 +31,6 @@ fn main() {
         in_size * out_size
     );
 
-    // ── 1. Honest proof ─────────────────────────────────────────────────
     print!("1. Honest output                    ... ");
     match try_prove_dense_stark(&weights, &input, &output, &bias, in_size, out_size) {
         Ok((data, size, ms)) => {
@@ -52,7 +43,6 @@ fn main() {
         }
     }
 
-    // ── 2. Forged: one output off by one ────────────────────────────────
     let mut forged = output.clone();
     forged[0] += 1;
     print!("\n2. output[0] off by one             ... ");
@@ -64,7 +54,6 @@ fn main() {
         Err(_) => println!("REJECTED"),
     }
 
-    // ── 3. Forged: a middle neuron's output swapped ─────────────────────
     let mut swapped = output.clone();
     swapped.swap(3, 7);
     print!("3. two neuron outputs swapped       ... ");
@@ -76,7 +65,6 @@ fn main() {
         Err(_) => println!("REJECTED"),
     }
 
-    // ── 4. Forged: bias tampered ────────────────────────────────────────
     let mut bad_bias = bias.clone();
     bad_bias[1] += 1000;
     print!("4. bias[1] tampered                 ... ");
@@ -88,7 +76,6 @@ fn main() {
         Err(_) => println!("REJECTED"),
     }
 
-    // ── 5. Forged: one weight changed, output left alone ────────────────
     let mut bad_w = weights.clone();
     bad_w[0] += 1;
     print!("5. weight[0][0] changed             ... ");

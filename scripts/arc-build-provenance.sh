@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-# Build one arc-node binary through Cargo and record what it actually is.
-#
-# The `.rs` mtime guard in the fixture catches only the class of staleness it
-# was written for. It cannot see a changed manifest, lockfile, toolchain,
-# feature set or generated input, and copied or restored timestamps fool it. It
-# is kept as a cheap supplement; this script is the record of provenance.
-#
-# The binary is copied to an immutable, digest-named path and that copy is what
-# the run executes, so the artifact cannot change underneath a long fixture.
-#
-# Usage: scripts/arc-build-provenance.sh [--profile debug|release] [--out DIR]
 set -euo pipefail
 
 PROFILE=debug
@@ -34,11 +23,8 @@ cargo_args=(build -p arc-node --locked)
 [[ -n $FEATURES ]] && cargo_args+=(--features "$FEATURES")
 cmd="cargo ${cargo_args[*]}"
 
-# ── source identity ──────────────────────────────────────────────────────────
 revision=$(git rev-parse HEAD 2>/dev/null || echo "not-a-git-checkout")
 dirty=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
-# A revision alone does not identify a dirty tree, so hash the exact inputs.
-# Content, not timestamps: a restored mtime cannot forge this.
 digest_inputs() {
   { find crates scripts -type f \( -name '*.rs' -o -name '*.toml' -o -name '*.sh' -o -name '*.py' \) -print0 2>/dev/null \
       | sort -z | xargs -0 shasum -a 256; \
@@ -72,11 +58,6 @@ if [[ $build_exit -ne 0 ]]; then
   exit $build_exit
 fi
 
-# The digest above was taken BEFORE the build. If any input changed while
-# Cargo ran, the binary may have been built from a mixture, and labelling it
-# with the pre-build digest would be a false provenance record. That happened
-# once: sources were edited during a release build, which then failed to
-# compile - but a build that happened to succeed would have been mislabelled.
 after_digest=$(digest_inputs)
 if [[ $after_digest != "$input_digest" ]]; then
   echo "INPUTS CHANGED DURING THE BUILD: $input_digest -> $after_digest" | tee -a "$manifest"

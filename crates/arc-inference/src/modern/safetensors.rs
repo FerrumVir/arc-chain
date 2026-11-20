@@ -1,11 +1,3 @@
-//! Minimal reader for Hugging Face safetensors files (BF16 tensors only).
-//!
-//! Layout: an 8-byte little-endian header length `N`, `N` bytes of JSON
-//! (`name -> {dtype, shape, data_offsets: [begin, end]}` plus an optional
-//! `__metadata__` object), then the data region. Offsets are relative to the
-//! start of the data region. Every offset and length is validated before any
-//! tensor is read.
-
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -13,28 +5,22 @@ use std::path::{Path, PathBuf};
 
 use super::ModernError;
 
-/// Refuse headers larger than this; real files carry a few tens of KiB.
 const MAX_HEADER_BYTES: u64 = 64 << 20;
 
-/// One tensor's metadata, with absolute file offsets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorInfo {
     pub dtype: String,
     pub shape: Vec<usize>,
-    /// Absolute byte offset of the first element.
     pub begin: u64,
-    /// Absolute byte offset one past the last element.
     pub end: u64,
 }
 
 impl TensorInfo {
-    /// Number of elements.
     pub fn elements(&self) -> usize {
         self.shape.iter().product()
     }
 }
 
-/// An opened safetensors file: its path and its validated tensor table.
 #[derive(Debug, Clone)]
 pub struct SafetensorsFile {
     pub path: PathBuf,
@@ -52,7 +38,6 @@ fn element_bytes(dtype: &str) -> Option<u64> {
 }
 
 impl SafetensorsFile {
-    /// Read and validate the header of `path`.
     pub fn open(path: &Path) -> Result<Self, ModernError> {
         let context = path.display().to_string();
         let mut file = File::open(path).map_err(|e| ModernError::io(&context, e))?;
@@ -136,7 +121,6 @@ impl SafetensorsFile {
         })
     }
 
-    /// Read a BF16 tensor's raw 16-bit patterns.
     pub fn read_bf16(&self, name: &str) -> Result<Vec<u16>, ModernError> {
         let info = self
             .tensors
@@ -164,7 +148,6 @@ impl SafetensorsFile {
     }
 }
 
-/// Serialise BF16 tensors into a safetensors file (used to build test models).
 pub fn write_bf16_safetensors(
     path: &Path,
     tensors: &[(String, Vec<usize>, Vec<u16>)],
@@ -231,7 +214,6 @@ mod tests {
         );
         assert_eq!(file.read_bf16("b").unwrap(), vec![0x3F80]);
         assert!(file.read_bf16("missing").is_err());
-        // Truncating the data region makes the declared offsets invalid.
         let bytes = std::fs::read(&path).unwrap();
         std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
         assert!(SafetensorsFile::open(&path).is_err());

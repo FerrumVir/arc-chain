@@ -1,87 +1,36 @@
-//! Twin execution v0: pure building blocks.
-//!
-//! A twin-executed community job is dispatched to two community workers with
-//! independent identities. The coordinator compares their output commitments
-//! and asks the validators to recompute only when the twins disagree, when a
-//! job is selected for a validator spot check, when a reward needs the
-//! coordinator's own recomputation, or when one twin never answers.
-//!
-//! This module holds the parts that do not touch the network: worker
-//! independence, claim-time pairing, output comparison, the rolling
-//! checkpoint chain, region tags from measured round-trip times, public demo
-//! prompts and their screening, rate limits, statistics and the receipt
-//! commitment. Orchestration lives in `rpc::twin_dispatch`.
-//!
-//! Nothing here is consensus input. Twin execution is a per-coordinator,
-//! off-chain policy that stays disabled unless the operator enables it. See
-//! `docs/twin-execution.md`.
-
 use arc_crypto::Hash256;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-/// Schema of the receipt recorded for every twin-executed job.
 pub const TWIN_RECEIPT_SCHEMA: &str = "arc.community.twin-receipt.v1";
-/// Schema of `GET /community/twin_stats`.
 pub const TWIN_STATS_SCHEMA: &str = "arc.community.twin-stats.v1";
-/// Signed worker report of round-trip times to the validator origins.
 pub const COMMUNITY_REGION_PATH: &str = "/community/region";
-/// What a region tag is derived from. It is self-reported by the worker, so
-/// it may steer pairing and coarse display, never payment or penalties.
 pub const REGION_TAG_BASIS: &str = "worker_reported_rtt_to_validators";
-/// The only comparison basis v0 workers support: the BLAKE3 commitment to
-/// the complete generated token sequence, plus its token count and text.
 pub const COMPARISON_BASIS_FINAL_OUTPUT: &str = "final_output_hash";
-/// Tokens per rolling checkpoint once workers stream checkpoints
-/// (research-7 section 3.6 compares running hashes every 32 tokens).
 pub const CHECKPOINT_INTERVAL_TOKENS: usize = 32;
-/// Research-7 section 1.7: p80 diameter of an L2 latency region.
 pub const REGION_DIAMETER_MS: u32 = 60;
-/// Research-7 section 1.7: p80 diameter of an L1 continent.
 pub const CONTINENT_DIAMETER_MS: u32 = 150;
-/// Largest round-trip time a region report may carry.
 pub const MAX_REPORTED_RTT_MS: u32 = 60_000;
-/// Largest number of samples in one region report.
 pub const MAX_RTT_SAMPLES: usize = 16;
-/// Default share of twin-matched jobs (without a reward) that validators
-/// still recompute, in parts per thousand.
 pub const DEFAULT_SPOT_CHECK_PER_MILLE: u16 = 50;
-/// Default seconds between demand ticks on one coordinator.
 pub const DEFAULT_DEMAND_INTERVAL_SECS: u64 = 120;
-/// Lower bound for the demand tick, so no configuration floods workers.
 pub const MIN_DEMAND_INTERVAL_SECS: u64 = 30;
-/// Default share of demand ticks spent on re-executing a verified prompt.
 pub const DEFAULT_REPLAY_SHARE_PER_MILLE: u16 = 250;
-/// Maximum fan-out and pump-only open groups.
 pub const MAX_DEMAND_GROUPS: usize = 32;
-/// Default pump refill, in groups per hour.
 pub const DEFAULT_DEMAND_GROUPS_PER_HOUR: u32 = 30;
-/// Bound memory and generated load to one group per second on average.
 pub const MAX_DEMAND_GROUPS_PER_HOUR: u32 = 3_600;
-/// Output budget of coordinator-generated demo and replay jobs.
 pub const PUMP_MAX_TOKENS: u32 = 32;
-/// Output budget of caller requests marked `public_demo`.
 pub const PUBLIC_DEMO_MAX_TOKENS: u32 = 64;
-/// Longest prompt the public demo accepts.
 pub const PUBLIC_DEMO_PROMPT_MAX_BYTES: usize = 1_000;
-/// How long a queued twin leg may wait for a more diverse or less recently
-/// served idle worker before any independent worker may take it.
 pub const CLAIM_PREFERENCE_WINDOW_MS: u64 = 3_000;
-/// A worker counts as "less recently served" only when it has waited at
-/// least this much longer than the claimer.
 pub const FAIRNESS_MARGIN_MS: u64 = 60_000;
-/// Shown with every public demo answer.
 pub const PUBLIC_DEMO_NOTICE: &str = "Public ARC testnet demo. Your prompt is sent to independent community computers that can read it and is not private. Do not enter personal data. Testnet output only; nothing here has monetary value.";
-/// Shown with every twin receipt so it can never be read as more than it is.
 pub const CENTRALIZATION_DISCLOSURE: &str = "The coordinator that dispatched this job and the validators that recompute results are operated by the ARC team (six validators, one hosting provider). The two workers are community nodes with distinct node keys; operator identity and network independence are not yet verified.";
 
 const CHECKPOINT_DOMAIN: &str = "ARC community twin rolling checkpoint v1";
 const RECEIPT_COMMITMENT_DOMAIN: &str = "ARC community twin receipt v1";
 const BUCKET_UNITS_PER_TOKEN: u64 = 3_600_000;
 
-/// Display labels for the six genesis validators. The addresses are the
-/// public `/network/info` identities of the community RPC origins listed in
-/// `install.sh`. Any other validator is labelled by its address prefix.
 const KNOWN_VALIDATOR_REGIONS: [(&str, &str, &str); 6] = [
     (
         "adf4ff16f997c871c16f3897e67881311d08f975f28ebdcf79e86ea9e3b99d0f",
@@ -115,8 +64,6 @@ const KNOWN_VALIDATOR_REGIONS: [(&str, &str, &str); 6] = [
     ),
 ];
 
-/// Fixed, harmless public prompts used by coordinator-generated demand.
-/// They are published in receipts verbatim. Caller prompts never are.
 pub const PUBLIC_DEMO_PROMPTS: [&str; 32] = [
     "Name three primary colors.",
     "Write one sentence about the ocean.",
@@ -152,26 +99,15 @@ pub const PUBLIC_DEMO_PROMPTS: [&str; 32] = [
     "What is a group of wolves called?",
 ];
 
-/// Operator configuration. Every switch defaults to off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TwinConfig {
-    /// Dispatch each community job to two independent workers.
     pub twin_execution: bool,
-    /// Generate rate-limited public demo and replay jobs for idle workers.
     pub demand_pump: bool,
-    /// Plan and log every demand tick without dispatching anything, so an
-    /// operator can review what the pump would do before enabling it.
     pub demand_dry_run: bool,
-    /// Share of twin-matched jobs without a reward that validators still
-    /// recompute, in parts per thousand.
     pub spot_check_per_mille: u16,
-    /// Seconds between demand ticks on this coordinator.
     pub demand_interval_secs: u64,
-    /// Open pump groups, including resolution. Default 1; clamped to 1..=32.
     pub demand_max_groups: usize,
-    /// Idle workers reserved for callers; at least two during fan-out.
     pub demand_reserve_workers: usize,
-    /// Pump token-bucket refill; clamped to 1..=3,600 groups/hour.
     pub demand_groups_per_hour: u32,
 }
 
@@ -204,13 +140,10 @@ impl TwinConfig {
         self.demand_max_groups.max(2) as u32
     }
 
-    /// Keep the default ring path unchanged; isolate IDs when throughput changes.
     pub fn separate_pump_memory(self) -> bool {
         self.fan_out() || self.demand_groups_per_hour != DEFAULT_DEMAND_GROUPS_PER_HOUR
     }
 
-    /// Two legs per group, a full burst, plus every previously open group.
-    /// Live entries are never evicted to make room: admission backs off instead.
     pub fn pump_leg_memory_cap(self, assignment_lifetime_secs: u64) -> usize {
         2 * ((u64::from(self.demand_groups_per_hour) * assignment_lifetime_secs).div_ceil(3_600)
             as usize
@@ -218,7 +151,6 @@ impl TwinConfig {
             + MAX_DEMAND_GROUPS)
     }
 
-    /// Clamp operator input to the reviewed bounds.
     pub fn normalized(self) -> Self {
         Self {
             demand_max_groups: self.demand_max_groups.clamp(1, MAX_DEMAND_GROUPS),
@@ -232,12 +164,10 @@ impl TwinConfig {
     }
 }
 
-/// Idle capacity left for the next plan, including legs not yet claimed.
 pub fn pump_worker_budget(idle: usize, reserve: usize, unclaimed_legs: usize) -> usize {
     idle.saturating_sub(reserve).saturating_sub(unclaimed_legs)
 }
 
-/// Number of same-size jobs that fit both the worker budget and open slots.
 pub fn pump_group_budget(
     idle: usize,
     reserve: usize,
@@ -253,19 +183,14 @@ pub fn pump_group_budget(
         .min(max_groups.saturating_sub(in_flight))
 }
 
-/// How precisely a region tag places a worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RegionClass {
-    /// Nearest validator within the L2 region diameter.
     Region,
-    /// Nearest validator within the L1 continent diameter.
     Continent,
-    /// Farther than a continent from every validator.
     Distant,
 }
 
-/// Coarse, measured-latency location label of a community worker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RegionTag {
     pub region: String,
@@ -273,15 +198,11 @@ pub struct RegionTag {
     pub class: RegionClass,
     pub basis: &'static str,
     pub measured_at_unix_ms: u64,
-    /// Used for classification only and never published: a precise
-    /// round-trip time narrows a home location more than a region label.
     #[serde(skip)]
     pub nearest_rtt_ms: u32,
 }
 
 impl RegionTag {
-    /// The key twins should differ in: the region when the worker is within
-    /// a region diameter of a validator, otherwise its continent.
     pub fn locality(&self) -> String {
         match self.class {
             RegionClass::Region => format!("region:{}", self.region),
@@ -292,23 +213,19 @@ impl RegionTag {
     }
 }
 
-/// One measured round trip from a worker to a validator origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RttSample {
     pub validator: Hash256,
     pub rtt_ms: u32,
 }
 
-/// Wire form of one sample in a signed region report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommunityRttSample {
-    /// 0x-prefixed validator address from the origin's `/network/info`.
     pub validator: String,
     pub rtt_ms: u32,
 }
 
-/// Signed worker report of round-trip times to the validator origins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommunityRegionReport {
@@ -317,8 +234,6 @@ pub struct CommunityRegionReport {
 }
 
 impl CommunityRegionReport {
-    /// Check bounds and parse every sample. Duplicate validators keep the
-    /// smallest round trip.
     pub fn parsed_samples(&self) -> Result<Vec<RttSample>, String> {
         if self.samples.is_empty() || self.samples.len() > MAX_RTT_SAMPLES {
             return Err(format!(
@@ -352,7 +267,6 @@ impl CommunityRegionReport {
     }
 }
 
-/// Display region and continent of a validator address.
 pub fn validator_region(validator: &Hash256) -> (String, String) {
     let hex = validator.to_hex();
     for (address, region, continent) in KNOWN_VALIDATOR_REGIONS {
@@ -363,8 +277,6 @@ pub fn validator_region(validator: &Hash256) -> (String, String) {
     (format!("validator-{}", &hex[..8]), "unknown".to_string())
 }
 
-/// Classify a worker by its nearest validator, using research-7's region
-/// (60 ms) and continent (150 ms) diameters.
 pub fn classify_region(samples: &[RttSample], measured_at_unix_ms: u64) -> Option<RegionTag> {
     let nearest = samples
         .iter()
@@ -392,22 +304,16 @@ pub fn classify_region(samples: &[RttSample], measured_at_unix_ms: u64) -> Optio
     })
 }
 
-/// What the coordinator knows about a worker when pairing twins.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkerFacts {
     pub worker_id: String,
-    /// Declared operator or family (Tor-style). Not collected yet.
     pub operator: Option<String>,
-    /// Salted client network prefix (/24 IPv4, /48 IPv6). Unavailable until
-    /// the gateway forwards a network group to the node.
     pub network_group: Option<String>,
     pub region: Option<RegionTag>,
-    /// Operating system and architecture from registration.
     pub platform: Option<String>,
     pub last_served_unix_ms: Option<u64>,
 }
 
-/// Why two workers may or may not twin each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Independence {
@@ -417,8 +323,6 @@ pub enum Independence {
     SameNetwork,
 }
 
-/// Hard independence rule: distinct node keys, and distinct operator and
-/// network group whenever both sides are known.
 pub fn independence(left: &WorkerFacts, right: &WorkerFacts) -> Independence {
     if left.worker_id == right.worker_id {
         return Independence::SameWorker;
@@ -436,13 +340,10 @@ pub fn independence(left: &WorkerFacts, right: &WorkerFacts) -> Independence {
     Independence::Independent
 }
 
-/// Outcome of a worker asking for a twin leg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimDecision {
     Accept,
-    /// The claimer breaks a hard independence rule; the leg stays queued.
     Refuse(&'static str),
-    /// A better-placed idle worker exists; the leg stays queued briefly.
     Defer(&'static str),
 }
 
@@ -452,22 +353,15 @@ pub const REASON_SAME_NETWORK: &str = "twin_same_network";
 pub const REASON_PREFER_DIVERSE: &str = "twin_prefers_more_diverse_worker";
 pub const REASON_PREFER_LEAST_SERVED: &str = "prefer_least_recently_served";
 
-/// Inputs to one claim decision.
 pub struct ClaimContext<'a> {
     pub claimer: &'a WorkerFacts,
-    /// Workers holding another leg of the group, or that produced the replay
-    /// reference. The claimer must be independent of every one.
     pub related: &'a [WorkerFacts],
-    /// Other idle workers currently long-polling this coordinator.
     pub idle_alternatives: &'a [WorkerFacts],
     pub waited_ms: u64,
     pub preference_window_ms: u64,
-    /// Coordinator-generated demand spreads work across idle workers.
     pub prefer_least_recently_served: bool,
 }
 
-/// Points for differing from every related worker in locality and platform.
-/// Unknown values never earn a point.
 pub fn diversity_score(candidate: &WorkerFacts, related: &[WorkerFacts]) -> u8 {
     if related.is_empty() {
         return 0;
@@ -499,13 +393,6 @@ fn independent_of_all(candidate: &WorkerFacts, related: &[WorkerFacts]) -> bool 
         .all(|other| independence(candidate, other) == Independence::Independent)
 }
 
-/// Decide whether `claimer` may take a twin leg now.
-///
-/// Hard rule first: the claimer must be independent of every related
-/// worker. Inside the preference window, a leg waits for an idle worker that
-/// differs from the related workers in more of {region, platform}; for
-/// coordinator-generated demand it also waits for a worker that has gone
-/// unserved for longer. After the window any independent worker may take it.
 pub fn decide_claim(ctx: &ClaimContext<'_>) -> ClaimDecision {
     for other in ctx.related {
         match independence(ctx.claimer, other) {
@@ -549,17 +436,12 @@ pub fn decide_claim(ctx: &ClaimContext<'_>) -> ClaimDecision {
     }
 }
 
-/// Where a twin-executed job came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DemandSource {
-    /// A caller's `/inference/run` request.
     PublicRequest,
-    /// A caller's `/inference/run` request marked `public_demo`.
     PublicDemo,
-    /// A coordinator-generated job from [`PUBLIC_DEMO_PROMPTS`].
     PumpDemo,
-    /// A coordinator-generated re-execution of a verified public prompt.
     PumpReplay,
 }
 
@@ -577,25 +459,18 @@ impl DemandSource {
         matches!(self, Self::PumpDemo | Self::PumpReplay)
     }
 
-    /// Only caller demand may draw on the protocol-capped promotional
-    /// reward budget. Demand the coordinator generates itself never does.
     pub fn reward_eligible(&self) -> bool {
         matches!(self, Self::PublicRequest | Self::PublicDemo)
     }
 }
 
-/// The commitments of one successful twin leg that are compared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegOutput {
-    /// BLAKE3 of the generated token ids (little-endian u32).
     pub output_hash: Hash256,
     pub tokens_generated: u64,
-    /// BLAKE3 of the decoded output text, so a worker that reports the right
-    /// token hash with different text is caught as well.
     pub text_digest: Hash256,
 }
 
-/// Fields in which two leg outputs differ. Empty means a byte-exact match.
 pub fn mismatch_fields(left: &LegOutput, right: &LegOutput) -> Vec<&'static str> {
     let mut fields = Vec::new();
     if left.output_hash != right.output_hash {
@@ -610,7 +485,6 @@ pub fn mismatch_fields(left: &LegOutput, right: &LegOutput) -> Vec<&'static str>
     fields
 }
 
-/// Result of comparing a group's legs with each other or with a reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComparisonResult {
@@ -641,8 +515,6 @@ impl ComparisonResult {
     }
 }
 
-/// Compare a group. A replay group (one leg) compares against the verified
-/// reference; a twin group compares its two legs.
 pub fn compare_group(
     legs: &[Option<LegOutput>],
     reference: Option<&LegOutput>,
@@ -674,7 +546,6 @@ pub fn compare_group(
     }
 }
 
-/// Why validators recompute a twin group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecomputeReason {
@@ -684,11 +555,6 @@ pub enum RecomputeReason {
     Reward,
 }
 
-/// Decide whether validators recompute. Disagreement always does. Agreement
-/// does only for a reward (a validator approval asserts its own
-/// recomputation) or a spot check. An incomplete caller job falls back to
-/// today's single-worker verification; incomplete generated demand is
-/// dropped without spending validator capacity.
 pub fn recompute_reason(
     comparison: ComparisonResult,
     source: DemandSource,
@@ -715,8 +581,6 @@ pub fn recompute_reason(
     }
 }
 
-/// Deterministic, coordinator-secret spot-check selection. Workers cannot
-/// predict which matched groups validators will recompute.
 pub fn spot_check_selected(secret: &[u8; 32], group_id: &str, per_mille: u16) -> bool {
     if per_mille == 0 {
         return false;
@@ -732,7 +596,6 @@ pub fn spot_check_selected(secret: &[u8; 32], group_id: &str, per_mille: u16) ->
     u64::from_le_bytes(bytes) % 1_000 < u64::from(per_mille)
 }
 
-/// What validators reported, when they recomputed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecomputeStatus {
@@ -755,7 +618,6 @@ impl RecomputeStatus {
     }
 }
 
-/// Final verdict of a twin group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
@@ -778,7 +640,6 @@ pub const VERIFIED_BY_TWIN: &str = "twin_match";
 pub const VERIFIED_BY_VALIDATORS: &str = "validator_recompute";
 pub const VERIFIED_BY_REFERENCE: &str = "reference_hash";
 
-/// Per-leg validity, verdict and the leg whose output is served.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Classification {
     pub leg_valid: Vec<Option<bool>>,
@@ -786,12 +647,9 @@ pub struct Classification {
     pub verified_by: Vec<&'static str>,
     pub chosen_leg: Option<usize>,
     pub recompute_status: RecomputeStatus,
-    /// Whether the replay reference agrees with the validators' output.
     pub reference_valid: Option<bool>,
 }
 
-/// Classify a group from its comparison and, when validators recomputed,
-/// their canonical output (`Ok`) or why they did not (`Err`).
 pub fn classify(
     legs: &[Option<LegOutput>],
     comparison: ComparisonResult,
@@ -877,12 +735,6 @@ pub fn classify(
     }
 }
 
-/// Rolling checkpoint chain over a generated token sequence.
-///
-/// `h_0` is the job commitment; `h_{k+1} = BLAKE3-derive-key(domain,
-/// h_k || chunk_len_le64 || tokens_le32)` for each chunk of `interval`
-/// tokens (the last chunk may be shorter). Workers that stream will post
-/// `h_k` every `interval` tokens so twins can be compared while generating.
 pub fn checkpoint_chain(job_commitment: &Hash256, tokens: &[u32], interval: usize) -> Vec<Hash256> {
     let interval = interval.max(1);
     let mut previous = *job_commitment;
@@ -900,7 +752,6 @@ pub fn checkpoint_chain(job_commitment: &Hash256, tokens: &[u32], interval: usiz
     chain
 }
 
-/// Index of the first checkpoint where two chains disagree, if any.
 pub fn first_divergent_checkpoint(left: &[Hash256], right: &[Hash256]) -> Option<usize> {
     if let Some(index) = left.iter().zip(right.iter()).position(|(a, b)| a != b) {
         return Some(index);
@@ -908,7 +759,6 @@ pub fn first_divergent_checkpoint(left: &[Hash256], right: &[Hash256]) -> Option
     (left.len() != right.len()).then_some(left.len().min(right.len()))
 }
 
-/// Token bucket in exact integer units (no rounding loss between refills).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenBucket {
     capacity: u32,
@@ -918,7 +768,6 @@ pub struct TokenBucket {
 }
 
 impl TokenBucket {
-    /// A full bucket of `capacity` that refills `per_hour` tokens an hour.
     pub fn new(capacity: u32, per_hour: u32, now_unix_ms: u64) -> Self {
         Self {
             capacity,
@@ -938,7 +787,6 @@ impl TokenBucket {
             .min(cap);
     }
 
-    /// Take one token if available.
     pub fn try_take(&mut self, now_unix_ms: u64) -> bool {
         self.refill(now_unix_ms);
         if self.available_units >= BUCKET_UNITS_PER_TOKEN {
@@ -950,14 +798,12 @@ impl TokenBucket {
     }
 }
 
-/// Which kind of job a demand tick should create.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DemandKind {
     TwinDemo,
     Replay,
 }
 
-/// Plan one demand tick from the idle workers and verified references.
 pub fn plan_demand(
     idle_workers: usize,
     twin_enabled: bool,
@@ -978,14 +824,11 @@ pub fn plan_demand(
     Err("twin demo jobs need two idle workers and twin execution enabled")
 }
 
-/// The fixed public prompt for a demand counter.
 pub fn public_demo_prompt(counter: u64) -> (usize, &'static str) {
     let slot = (counter % PUBLIC_DEMO_PROMPTS.len() as u64) as usize;
     (slot, PUBLIC_DEMO_PROMPTS[slot])
 }
 
-/// Reject public demo prompts that look like they carry private data. This
-/// is a best-effort screen; the notice is what tells people not to.
 pub fn public_demo_prompt_rejection(prompt: &str) -> Option<&'static str> {
     if prompt.trim().is_empty() {
         return Some("public demo prompt is empty");
@@ -1053,11 +896,9 @@ fn contains_secret_like_token(text: &str) -> bool {
     })
 }
 
-/// A verified answer to a fixed public prompt, used to re-execute it later.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayReference {
     pub prompt_index: usize,
-    /// The exact input the workers ran (the prompt after the chat template).
     pub input: String,
     pub max_tokens: u32,
     pub model_id: Hash256,
@@ -1067,7 +908,6 @@ pub struct ReplayReference {
     pub recorded_at_unix_ms: u64,
 }
 
-/// The latest verified answer per fixed public prompt.
 #[derive(Debug, Default)]
 pub struct ReferenceBook {
     by_prompt: BTreeMap<usize, ReplayReference>,
@@ -1078,7 +918,6 @@ impl ReferenceBook {
         self.by_prompt.insert(reference.prompt_index, reference);
     }
 
-    /// Remove a reference that validators contradicted.
     pub fn evict(&mut self, prompt_index: usize, source_group_id: &str) {
         if self
             .by_prompt
@@ -1089,7 +928,6 @@ impl ReferenceBook {
         }
     }
 
-    /// Pick a reference for this model with a caller-supplied selector.
     pub fn pick(&self, selector: u64, model_id: &Hash256) -> Option<&ReplayReference> {
         let candidates: Vec<&ReplayReference> = self
             .by_prompt
@@ -1118,7 +956,6 @@ impl ReferenceBook {
     }
 }
 
-/// Verified jobs and tokens over the trailing hour.
 #[derive(Debug, Default)]
 pub struct ThroughputWindow {
     events: VecDeque<(u64, u64)>,
@@ -1143,7 +980,6 @@ impl ThroughputWindow {
         }
     }
 
-    /// `(jobs, tokens)` in the trailing hour.
     pub fn summary(&mut self, now_unix_ms: u64) -> (u64, u64) {
         self.prune(now_unix_ms);
         let tokens: u64 = self.events.iter().map(|(_, tokens)| *tokens).sum();
@@ -1151,7 +987,6 @@ impl ThroughputWindow {
     }
 }
 
-/// Monotonic counters since the coordinator started.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct TwinCounters {
     pub groups_started: u64,
@@ -1202,7 +1037,6 @@ impl TwinCounters {
         }
     }
 
-    /// Share of twin comparisons that matched, if any were made.
     pub fn twin_match_rate(&self) -> Option<f64> {
         let compared = self.groups_matched + self.groups_mismatched;
         if compared == 0 {
@@ -1212,7 +1046,6 @@ impl TwinCounters {
     }
 }
 
-/// Status of one leg in a receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LegStatus {
@@ -1236,7 +1069,6 @@ impl LegStatus {
         }
     }
 
-    /// The leg can no longer produce a result.
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Submitted | Self::Failed | Self::Declined)
     }
@@ -1276,7 +1108,6 @@ pub struct ComparisonReceipt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IndependenceReceipt {
     pub distinct_worker_keys: bool,
-    /// "yes", "no" or "unknown".
     pub distinct_operators: &'static str,
     pub distinct_network_groups: &'static str,
     pub different_regions: Option<bool>,
@@ -1300,7 +1131,6 @@ pub struct ReceiptSignature {
     pub signature: String,
 }
 
-/// The public record of one twin-executed job.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TwinReceipt {
     pub schema: &'static str,
@@ -1332,9 +1162,6 @@ fn put_str(hasher: &mut blake3::Hasher, value: &str) {
 }
 
 impl TwinReceipt {
-    /// Language-neutral commitment the coordinator signs. Every string is
-    /// length-prefixed (u64 big-endian) UTF-8; absent values are empty
-    /// strings, an absent token count is `u64::MAX`.
     pub fn compute_commitment(&self) -> Hash256 {
         let mut hasher = blake3::Hasher::new_derive_key(RECEIPT_COMMITMENT_DOMAIN);
         hasher.update(&[1u8]);
@@ -1368,7 +1195,6 @@ impl TwinReceipt {
     }
 }
 
-/// Bounded store of recent receipts, addressable by group or leg job id.
 #[derive(Debug, Default)]
 pub struct ReceiptStore {
     order: VecDeque<String>,
@@ -1379,7 +1205,6 @@ pub struct ReceiptStore {
 impl ReceiptStore {
     pub const CAPACITY: usize = 512;
 
-    /// Lower-case job id without a 0x prefix.
     pub fn normalize_id(id: &str) -> String {
         id.trim()
             .strip_prefix("0x")
@@ -1417,7 +1242,6 @@ impl ReceiptStore {
         self.receipts.get(&group_id)
     }
 
-    /// Newest first.
     pub fn recent(&self, limit: usize) -> Vec<&TwinReceipt> {
         self.order
             .iter()
@@ -1701,7 +1525,6 @@ mod tests {
             independence(&a_network, &b_network),
             Independence::SameNetwork
         );
-        // Unknown on one side never blocks a pair.
         a_network.network_group = None;
         assert_eq!(
             independence(&a_network, &b_network),
@@ -1775,7 +1598,6 @@ mod tests {
         let mut claimer = facts("0xb");
         claimer.region = Some(tag("us-east", "north-america", RegionClass::Region));
         assert_eq!(diversity_score(&claimer, &related), 0);
-        // The only better-placed idle worker is the sibling itself.
         let mut sibling_alternative = sibling.clone();
         sibling_alternative.platform = Some("linux-x86_64".to_string());
         let alternatives = [sibling_alternative];
@@ -1814,7 +1636,6 @@ mod tests {
             ..pump
         };
         assert_eq!(decide_claim(&caller), ClaimDecision::Accept);
-        // Inside the margin the claimer keeps the job.
         let mut close = facts("0xc");
         close.last_served_unix_ms = Some(10_000_000 - FAIRNESS_MARGIN_MS + 1);
         let close_alternatives = [close];
@@ -2045,14 +1866,11 @@ mod tests {
         assert!(bucket.try_take(0));
         assert!(bucket.try_take(0));
         assert!(!bucket.try_take(0));
-        // 60 per hour is one per minute, with no rounding loss across
-        // frequent small refills.
         for step in 1..60 {
             assert!(!bucket.try_take(step * 1_000), "step {step}");
         }
         assert!(bucket.try_take(60_000));
         assert!(!bucket.try_take(60_000));
-        // A long idle period refills to capacity, not beyond.
         assert!(bucket.try_take(10 * 3_600_000));
         assert!(bucket.try_take(10 * 3_600_000));
         assert!(!bucket.try_take(10 * 3_600_000));
@@ -2111,7 +1929,6 @@ mod tests {
         assert_eq!(public_demo_prompt_rejection("follow @arc on social"), None);
         assert!(public_demo_prompt_rejection("call +1 (555) 123-4567").is_some());
         assert!(public_demo_prompt_rejection("my card is 4111 1111 1111 1111").is_some());
-        // Built at runtime so no secret scanner mistakes the fixture for a key.
         let secret_like = format!("token {}", "a1b2c3d4".repeat(5));
         assert!(public_demo_prompt_rejection(&secret_like).is_some());
         assert_eq!(

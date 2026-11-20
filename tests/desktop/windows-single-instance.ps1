@@ -1,6 +1,3 @@
-# Run only against an unsigned MSI built from the candidate checkout in CI.
-# A responsive visible HWND is observable on the hosted runner; foreground
-# focus, physical shortcut clicks and installer update still need manual tests.
 param(
     [Parameter(Mandatory=$true)][string] $MsiPath,
     [Parameter(Mandatory=$true)][string] $EvidenceDirectory
@@ -105,8 +102,6 @@ try {
         $desktop.Refresh()
         if ($desktop.HasExited) { throw "owner exited during startup: $($desktop.ExitCode)" }
         $window = $desktop.MainWindowHandle
-        # A native HWND can appear before WebView2 creation and app setup.
-        # Do not touch it until the owner confirms both have completed.
         if (Test-Path $ownerLog) {
             $ready = [bool](Select-String -Path $ownerLog -Pattern '\bdesktop ready\b' -Quiet)
         }
@@ -115,17 +110,16 @@ try {
     if ($window.ToInt64() -eq 0) { throw 'no candidate desktop window' }
     Assert-Visible $window
     $phase = 'minimized-second-launch'
-    [void][ArcInstanceWindow]::ShowWindow($window, 6) # Minimize.
+    [void][ArcInstanceWindow]::ShowWindow($window, 6)
     if (-not [ArcInstanceWindow]::IsIconic($window)) { throw 'test did not minimize owner' }
     Assert-Secondary 'second'
     Assert-OneOwner
     Assert-Visible $window
     $phase = 'hidden-login-launch'
-    [void][ArcInstanceWindow]::ShowWindow($window, 0) # Hide.
+    [void][ArcInstanceWindow]::ShowWindow($window, 0)
     if ([ArcInstanceWindow]::IsWindowVisible($window)) { throw 'test did not hide owner' }
     Assert-Secondary 'login' @('--minimized')
     Assert-OneOwner
-    # Allow queued main-thread work to run before declaring it stayed hidden.
     Start-Sleep -Milliseconds 750
     if ([ArcInstanceWindow]::IsWindowVisible($window)) { throw 'login copy raised the window' }
     $phase = 'hidden-reopen'
@@ -148,15 +142,12 @@ try {
         physical_focus_verified = $false; installer_update_verified = $false
     } | ConvertTo-Json | Set-Content -Encoding utf8NoBOM (Join-Path $evidence 'result.json')
 } catch {
-    # Snapshot before cleanup so every failed assertion retains the actual
-    # HWND visibility/minimization and process responsiveness, not just a timeout.
     [ordered]@{
         failure = $_.Exception.Message
         window_state = (Get-WindowState)
     } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM (Join-Path $evidence 'result.json')
     throw
 } finally {
-    # Only children recorded by this script; never kill processes by name.
     foreach ($child in $children) {
         $child.Refresh()
         if (-not $child.HasExited) {

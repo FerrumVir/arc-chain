@@ -3,10 +3,6 @@ use arc_crypto::{Hash256, hash_bytes};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-// ─── Genesis Configuration ──────────────────────────────────────────────
-
-/// Top-level genesis configuration loaded from a TOML file.
-/// Defines the initial chain state: prefunded accounts, validators, and chain metadata.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GenesisConfig {
     pub chain: ChainInfo,
@@ -16,58 +12,30 @@ pub struct GenesisConfig {
     pub validators: Vec<GenesisValidator>,
 }
 
-/// Chain identity and metadata baked into the genesis block.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChainInfo {
     pub name: String,
     #[serde(default = "default_chain_id")]
     pub chain_id: String,
-    /// Must be explicitly true before this file can start a production node.
-    /// This makes validator-key migration fail closed instead of silently
-    /// booting a partial or legacy seed-derived validator set.
     #[serde(default)]
     pub validator_set_complete: bool,
-    /// Consensus activation height for `CommunityInferenceReward` (tx 0x25).
-    /// Absent means disabled. Because this value is committed by
-    /// `network_hash`, validators with different schedules cannot handshake
-    /// as though they were on the same chain.
     #[serde(default)]
     pub community_rewards_v1_activation_height: Option<u64>,
-    /// Distinguishes one *run* of a chain from any other run that shares this
-    /// genesis. `network_hash` commits to it, so it reaches every certificate
-    /// domain: a certificate, a recovery decision or a checkpoint produced by
-    /// an earlier chain with the same name, accounts and committee cannot be
-    /// presented to a later one as its own history. A chain sets it once, at
-    /// genesis, and never changes it; a disposable local or test network
-    /// generates a fresh one per run, which is exactly where the same genesis
-    /// is otherwise reused verbatim.
-    ///
-    /// Absent, the network hash is byte-identical to the hash of the same
-    /// file without the field, so an existing chain keeps its identity and
-    /// does not have to restart to upgrade.
     #[serde(default)]
     pub instance_id: Option<String>,
 }
 
-/// A prefunded account in the genesis state.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GenesisAccount {
-    /// 64-character hex string (32 bytes) - the account address.
     pub address: String,
-    /// Initial balance in ARC (smallest unit).
     pub balance: u64,
 }
 
-/// A validator included in the genesis validator set.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenesisValidator {
-    /// Public ARC address emitted by `arc keygen`. Never put a secret key or
-    /// deterministic validator seed in a production genesis file.
     #[serde(default)]
     pub address: Option<String>,
-    /// Local-test-only deterministic identity. Accepted only when the genesis
-    /// is marked incomplete AND the node has the explicit insecure dev flag.
     #[serde(default)]
     pub insecure_dev_seed: Option<String>,
     #[serde(default = "default_stake")]
@@ -75,9 +43,6 @@ pub struct GenesisValidator {
 }
 
 impl GenesisConfig {
-    /// Parse the exact account set that will be materialized into state.
-    /// Network authentication and state initialization must share this input;
-    /// neither may add an account derived from the local signing identity.
     pub fn validated_accounts(&self) -> Result<Vec<(Hash256, u64)>> {
         let mut seen = HashSet::new();
         let mut accounts = Vec::with_capacity(self.accounts.len());
@@ -96,9 +61,6 @@ impl GenesisConfig {
         Ok(accounts)
     }
 
-    /// Validate and materialize the validator set without ever reading a
-    /// production secret from genesis. Incomplete sets are usable only for an
-    /// explicitly insecure disposable development network.
     pub fn validated_validator_set(&self, allow_insecure_dev: bool) -> Result<Vec<(Hash256, u64)>> {
         if !self.chain.validator_set_complete && !allow_insecure_dev {
             bail!(
@@ -176,19 +138,11 @@ impl GenesisConfig {
         Ok(validators)
     }
 
-    /// Canonical semantic hash used to separate P2P networks at handshake.
-    /// TOML formatting and entry order do not affect it; every effective
-    /// chain/account/validator field does. Secret seed text is never hashed or
-    /// exposed: insecure dev entries first become their public addresses.
     pub fn network_hash(&self, allow_insecure_dev: bool) -> Result<Hash256> {
         let validators = self.validated_validator_set(allow_insecure_dev)?;
         self.canonical_network_hash(validators)
     }
 
-    /// Hash an intentionally empty validator set for a stake-zero community
-    /// node while the shipped production genesis is awaiting public keys.
-    /// Such a node must not start P2P or consensus; this hash exists so the
-    /// parsed placeholder still has an unambiguous public identity for status.
     pub fn migration_observer_network_hash(&self) -> Result<Hash256> {
         ensure!(
             !self.chain.validator_set_complete,
@@ -234,10 +188,6 @@ impl GenesisConfig {
             canonical.extend_from_slice(&address.0);
             append_u64(&mut canonical, stake);
         }
-        // The chain-run identity is a tagged suffix rather than a field in
-        // the v3 body: a genesis without it hashes to exactly the bytes it
-        // hashed to before this field existed, so adopting the field is not a
-        // network split for chains that do not set one.
         if let Some(instance) = &self.chain.instance_id {
             ensure!(
                 !instance.is_empty() && instance.len() <= MAX_INSTANCE_ID_LEN,
@@ -256,8 +206,6 @@ impl GenesisConfig {
     }
 }
 
-/// Long enough for a UUID, a run label or a timestamped name; short enough
-/// that a genesis cannot carry a payload in this field.
 const MAX_INSTANCE_ID_LEN: usize = 128;
 
 fn append_bytes(canonical: &mut Vec<u8>, value: &[u8]) {
@@ -269,7 +217,6 @@ fn append_u64(canonical: &mut Vec<u8>, value: u64) {
     canonical.extend_from_slice(&value.to_be_bytes());
 }
 
-/// A voting node must use exactly the address and stake declared by genesis.
 pub fn verify_staked_identity(
     validators: &[(Hash256, u64)],
     address: Hash256,
@@ -294,10 +241,6 @@ pub fn verify_staked_identity(
     Ok(())
 }
 
-// ─── Node Configuration ────────────────────────────────────────────────
-
-/// Top-level node runtime configuration loaded from a TOML file.
-/// All sections are optional and fall back to defaults matching the CLI defaults.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct NodeConfig {
     #[serde(default)]
@@ -316,132 +259,72 @@ pub struct NodeConfig {
     pub community: CommunityConfig,
 }
 
-/// Outbound authenticated community/reward RPC configuration. Kept separate
-/// from `[p2p] peers`: a QUIC consensus address is never an HTTP trust or TLS
-/// configuration.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct CommunityConfig {
-    /// Absolute RPC origins, e.g. `https://seed-1.arc.network`.
     #[serde(default)]
     pub rpc_urls: Vec<String>,
-    /// Disposable development only. Remote production origins require HTTPS;
-    /// loopback HTTP does not need this override.
     #[serde(default)]
     pub allow_insecure_remote_http: bool,
 }
 
-/// Inference runtime configuration.
-///
-/// ── How thread width is actually decided ─────────────────────────────────
-///
-/// All inference compute (the `into_par_iter()` over attention heads in
-/// `forward_shard_token`, and the `par_chunks_mut` inside every matmul) runs
-/// on a rayon pool. Which pool, in priority order:
-///
-///   1. A DEDICATED pool, when `--threads N` / `[inference] threads = N` is
-///      non-zero, or after a `POST /node/threads {"threads": N}` at runtime.
-///      This is the only setting that can be changed without a restart.
-///   2. Rayon's implicit GLOBAL pool otherwise. Rayon builds that pool lazily
-///      on first use and sizes it from the `RAYON_NUM_THREADS` environment
-///      variable when it is set and parses to a positive integer, and from
-///      `std::thread::available_parallelism()` when it is not.
-///
-/// `RAYON_NUM_THREADS` is read by rayon itself, not by this crate, and only
-/// at the moment the global pool is first built — exporting it after the
-/// process has started has no effect. `GET /node/threads` reports which of
-/// the two is in force, along with the env var's observed value.
-///
-/// Note that `[benchmark] rayon_threads` is a DIFFERENT knob: it calls
-/// `build_global()` and only under `--benchmark`. It sizes the pool used for
-/// batch signature verification, not inference.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct InferenceConfig {
-    /// Dedicated inference pool width. 0 (default) = use rayon's global pool.
     #[serde(default)]
     pub threads: usize,
 }
 
-/// RPC server configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RpcConfig {
-    /// Listen address for the native ARC RPC (default: "127.0.0.1:9944").
     #[serde(default = "default_rpc_listen")]
     pub listen: String,
-    /// Port for the ETH-compatible JSON-RPC server (default: 0 = disabled).
     #[serde(default = "default_eth_port")]
     pub eth_port: u16,
 }
 
-/// P2P networking configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct P2pConfig {
-    /// QUIC listen port (default: 9091).
     #[serde(default = "default_p2p_port")]
     pub port: u16,
-    /// Bootstrap peer addresses (host:port).
     #[serde(default)]
     pub peers: Vec<String>,
 }
 
-/// Validator identity and staking configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ValidatorConfig {
-    /// Mode-0600 Ed25519 JSON keyfile created by `arc keygen`.
     #[serde(default)]
     pub key_file: Option<String>,
-    /// Local development / stake-zero compatibility only. Production staked
-    /// nodes reject this unless the explicit insecure dev flag is present.
     #[serde(default)]
     pub seed: Option<String>,
-    /// Staked ARC amount (default: 0 = observer / community node).
-    ///
-    /// Deliberately NOT `default_stake` (which is the GENESIS validator
-    /// default and stays at 5,000,000). A node that omits `[validator] stake`
-    /// must not silently become a voting validator on whatever network it is
-    /// pointed at — see the `--stake` doc comment in main.rs for what that
-    /// costs and why it is unrecoverable without restarting every seed.
     #[serde(default = "default_node_stake")]
     pub stake: u64,
-    /// Minimum stake required to run as a validator (default: 500,000).
     #[serde(default = "default_min_stake")]
     pub min_stake: u64,
 }
 
-/// Persistent storage configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StorageConfig {
-    /// Directory for WAL, snapshots, and state data (default: "./arc-data").
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
 }
 
-/// Benchmark mode configuration (only relevant when --benchmark is set).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BenchmarkConfig {
-    /// Transactions per batch (default: 500).
     #[serde(default = "default_bench_batch")]
     pub batch_size: usize,
-    /// Milliseconds between benchmark batches (default: 200).
     #[serde(default = "default_bench_interval")]
     pub interval_ms: u64,
-    /// First sender index, 0-49 (default: 0).
     #[serde(default)]
     pub sender_start: u8,
-    /// Number of senders this node owns (default: 50).
     #[serde(default = "default_bench_sender_count")]
     pub sender_count: u8,
-    /// Number of signing threads (default: 4).
     #[serde(default = "default_bench_sign_threads")]
     pub sign_threads: usize,
-    /// Number of rayon threads for batch verification (default: 6).
     #[serde(default = "default_bench_rayon_threads")]
     pub rayon_threads: usize,
 }
 
-// ─── Default value functions ────────────────────────────────────────────
-
 fn default_chain_id() -> String {
-    "0x415243".to_string() // "ARC" in hex
+    "0x415243".to_string()
 }
 
 fn default_rpc_listen() -> String {
@@ -456,13 +339,10 @@ fn default_p2p_port() -> u16 {
     9945
 }
 
-/// Default stake for a GENESIS validator entry. Genesis files describe a
-/// network being created, where a validator with no stake is meaningless.
 fn default_stake() -> u64 {
     5_000_000
 }
 
-/// Default stake for THIS node. Zero: joining as a validator is an explicit act.
 fn default_node_stake() -> u64 {
     0
 }
@@ -494,11 +374,6 @@ fn default_bench_sign_threads() -> usize {
 fn default_bench_rayon_threads() -> usize {
     6
 }
-
-// ─── Default trait implementations ──────────────────────────────────────
-//
-// `NodeConfig` and `InferenceConfig` derive theirs (all-default fields); the
-// rest need non-zero field defaults and are written out below.
 
 impl Default for RpcConfig {
     fn default() -> Self {
@@ -550,9 +425,6 @@ impl Default for BenchmarkConfig {
     }
 }
 
-// ─── Loader functions ───────────────────────────────────────────────────
-
-/// Load a genesis configuration from a TOML file at the given path.
 pub fn load_genesis(path: &str) -> Result<GenesisConfig> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read genesis config from '{}'", path))?;
@@ -561,7 +433,6 @@ pub fn load_genesis(path: &str) -> Result<GenesisConfig> {
     Ok(config)
 }
 
-/// Load a node configuration from a TOML file at the given path.
 pub fn load_config(path: &str) -> Result<NodeConfig> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read node config from '{}'", path))?;
@@ -570,8 +441,6 @@ pub fn load_config(path: &str) -> Result<NodeConfig> {
     Ok(config)
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,17 +448,12 @@ mod tests {
     #[test]
     fn test_default_node_config() {
         let cfg = NodeConfig::default();
-        // Ports moved from 9090/9091 -> 9944/9945 to avoid collisions with
-        // Prometheus (9090) and Transmission/BitTorrent (9091). These tests
-        // assert the current defaults; update both together when rebinding.
         assert_eq!(cfg.rpc.listen, "127.0.0.1:9944");
         assert_eq!(cfg.rpc.eth_port, 0);
         assert_eq!(cfg.p2p.port, 9945);
         assert!(cfg.p2p.peers.is_empty());
         assert!(cfg.validator.key_file.is_none());
         assert!(cfg.validator.seed.is_none());
-        // Zero by default: a node must opt IN to being a voting validator.
-        // See ValidatorConfig::stake.
         assert_eq!(cfg.validator.stake, 0);
         assert_eq!(cfg.validator.min_stake, 500_000);
         assert_eq!(cfg.storage.data_dir, "./arc-data");
@@ -600,8 +464,6 @@ mod tests {
 
     #[test]
     fn genesis_validator_stake_default_is_unchanged() {
-        // The node's own stake default moved to 0, but a genesis file that
-        // omits `stake` for a validator still means a real validator.
         let toml_str = r#"
             [chain]
             name = "arc-testnet"
@@ -628,7 +490,6 @@ mod tests {
         "#;
         let cfg: NodeConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.rpc.listen, "127.0.0.1:9999");
-        // All other fields should use defaults
         assert_eq!(cfg.rpc.eth_port, 0);
         assert_eq!(cfg.p2p.port, 9945);
         assert!(cfg.validator.key_file.is_none());
@@ -888,8 +749,6 @@ mod tests {
             .unwrap()
         };
 
-        // A genesis that names no run keeps the identity it had before the
-        // field existed: the hash must not move for a chain already running.
         let unset = parse(None);
         let mut explicitly_none = unset.clone();
         explicitly_none.chain.instance_id = None;
@@ -898,8 +757,6 @@ mod tests {
             explicitly_none.network_hash(false).unwrap()
         );
 
-        // Two runs of the identical genesis are different chains, so their
-        // certificate domains differ and neither can adopt the other.
         let run_a = parse(Some("run-a"));
         let run_b = parse(Some("run-b"));
         assert_ne!(

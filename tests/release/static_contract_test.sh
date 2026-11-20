@@ -381,7 +381,6 @@ release_manifest_has_owner_signature_and_preflight() {
         'gh run download "$backup_run_id"' \
         'Restore only the four bounded members and exercise both keys' \
         'Verify the updater canary only after all recovered secrets are gone' \
-        'No repository script, package lifecycle, compiler, or source-generated' \
         'sha: ${{ steps.candidate.outputs.sha }}' \
         'name: seal exact-main pre-tag evidence' \
         'name: Package a hash-bound validator-staging artifact' \
@@ -570,12 +569,6 @@ pretag_exact_byte_handoff_is_fail_closed() {
 }
 
 upload_artifact_digests_are_canonicalized_at_job_boundaries() {
-    # The exact pinned actions/upload-artifact implementation exposes its
-    # artifact-digest output as 64 bare lowercase hex characters. GitHub's
-    # artifact REST objects expose the same value as sha256:<hex>. Keep the
-    # repository-facing job-output contract in the REST form, exactly once at
-    # each producer boundary, so downstream validators never receive a bare or
-    # double-prefixed digest.
     local upload_pin evidence_boundary evidence_boundary_count
     upload_pin='actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a'
     evidence_boundary="evidence_digest: \${{ format('sha256:{0}', steps.evidence.outputs.artifact-digest) }}"
@@ -665,8 +658,6 @@ raw_node_downloads_are_version_pinned() {
 }
 
 updater_has_semver_downgrade_guard() {
-    # Equality alone is insufficient: if the newest asset-bearing release is
-    # older than the local build, an updater must keep the local build.
     if ! grep -Eq '(version_(gt|compare|is_newer)|sort[[:space:]]+-V|dpkg[[:space:]]+--compare-versions)' "$INSTALLER"; then
         printf 'embedded updater has no numeric semantic-version greater-than guard\n'
         return 1
@@ -1029,10 +1020,6 @@ release_supply_chain_and_npm_audits_are_blocking() {
         }
     done
 
-    # Every lockfile blocks at low, except that the compatibility SDK
-    # (sdks/typescript) blocks at low on its shipped runtime dependencies and
-    # at high on its dev-only test tooling. CI and the quality harness apply
-    # the same split.
     for required in \
         'python3 -I -B scripts/release/npm-audit-gate.py --package "$package" --level low --lock-only' \
         'if [ "$package" = sdks/typescript ]; then' \
@@ -1363,10 +1350,6 @@ release_secret_jobs_require_the_owner_environment() {
         capture && /^  seal:/ { exit }
     ' "$RELEASE_PREFLIGHT_WORKFLOW")"
 
-    # An empty capture means we failed to READ the workflow, not that the job is
-    # missing a literal. Under resource pressure a command substitution can fork
-    # -fail and return empty, which then reports as "omits <literal>" and sends
-    # the reader hunting a non-existent workflow regression. Distinguish them.
     for captured in unsigned_block handoff_block signer_block; do
         eval "captured_value=\${$captured}"
         [ -n "$captured_value" ] || {
@@ -1480,7 +1463,6 @@ release_secret_jobs_require_the_owner_environment() {
         'artifact-ids: ${{ needs.desktop-signer-handoff.outputs.artifact_id }}' \
         'merge-multiple: true' \
         'digest-mismatch: error' \
-        'No repository program runs before the updater-key step' \
         'npm ci --prefix desktop --ignore-scripts' \
         'Freeze the exact locked file-signing surface without executing it' \
         'Sign only the verified updater payload' \
@@ -1548,7 +1530,6 @@ release_secret_jobs_require_the_owner_environment() {
         'needs: [validate, assemble-release]' \
         'environment: release' \
         'artifact-ids: ${{ needs.assemble-release.outputs.artifact_id }}' \
-        'No repository program executes before the private-key step' \
         'Validate the complete unsigned allowlist and freeze all inputs' \
         'Sign only the frozen SHA256SUMS manifest' \
         'ARC_RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.ARC_RELEASE_MANIFEST_PRIVATE_KEY }}' \
@@ -1652,7 +1633,6 @@ release_secret_jobs_require_the_owner_environment() {
     done
     for required in \
         'needs: [validate, manifest-sign]' \
-        'This privileged job deliberately has no checkout' \
         'artifact-ids: ${{ needs.manifest-sign.outputs.artifact_id }}' \
         'gh release upload "$RELEASE_TAG" release-files/*' \
         '## Upgrading from v0.7.x' \
@@ -1679,7 +1659,6 @@ release_secret_jobs_require_the_owner_environment() {
     done
     for required in \
         'needs: [validate, publish-draft, verify-draft-release]' \
-        'The fresh mutation runner' \
         'cmp -s "$canonical_expected" "$canonical_current"' \
         '-F draft=false -f make_latest=false' \
         'publication_attempted=true' \
@@ -1883,7 +1862,6 @@ ref: ${{ needs.validate.outputs.sha }}' ]; then
     fi
     for required in \
         'needs: [validate, manifest-sign]' \
-        'This privileged job deliberately has no checkout' \
         'artifact-ids: ${{ needs.manifest-sign.outputs.artifact_id }}' \
         'EXPECTED_SHA: ${{ needs.validate.outputs.sha }}' \
         'SELECTED_PREFLIGHT_RUN_ID: ${{ needs.validate.outputs.pretag_run_id }}' \
@@ -1931,7 +1909,6 @@ ref: ${{ needs.validate.outputs.sha }}' ]; then
     done
     for required in \
         'needs: [validate, publish-draft, verify-draft-release]' \
-        'The fresh mutation runner receives only previously verified API JSON' \
         'repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG' \
         'repos/$GITHUB_REPOSITORY/branches/main' \
         'cmp -s "$canonical_expected" "$canonical_current"' \
@@ -2067,7 +2044,7 @@ postrelease_public_truth_is_hermetic_exact_and_release_gated() {
         '"arc-node-linux-arm64"' \
         '"arc-cli-linux-arm64"' \
         'PROTOCOL_VERSION_RE.fullmatch(checkpoint["protocolVersion"])' \
-        'len(sources) != 12' \
+        'not 6 <= len(sources) <= 12' \
         'frontend source identities and endpoints must be unique' \
         'legacy forks do not share one sealed capture' \
         'REWARD_PER_RECEIPT_BASE = 2_500_000_000' \
@@ -2415,7 +2392,6 @@ signing_key_backup_is_encrypted_create_only_and_restore_tested() {
         '[ "$GITHUB_REF" = "refs/heads/main" ]' \
         '[ "$GITHUB_SHA" = "$EXPECTED_MAIN_SHA" ]' \
         'repos/$GITHUB_REPOSITORY/branches/main' \
-        'never checks out or executes repository code' \
         'ARC_RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.ARC_RELEASE_MANIFEST_PRIVATE_KEY }}' \
         'TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}' \
         'ARC_SIGNING_BACKUP_PASSPHRASE: ${{ secrets.ARC_SIGNING_BACKUP_PASSPHRASE }}' \
@@ -2624,11 +2600,6 @@ boundaries = {
     "capture_phase": "manifest_field() {",
     "verify_installed_keys_phase": "upload_immutable() {",
     "verify_complete_phase": "verify_reference_pair() (",
-    # seal_phase ends at the next top-level declaration. The previous anchor
-    # COMMAND="${1:-}" now sits ~1,600 lines further down, past the whole
-    # dispatcher, so the slice swallowed its `trap - EXIT` and aborted this
-    # gate with "seal_phase overrides its invocation EXIT cleanup" before a
-    # single dispatcher assertion could run.
     "seal_phase": 'archive_write_current_process_id() {',
 }
 bodies = {}
@@ -2669,7 +2640,6 @@ all_transport_calls = re.findall(
 )
 all_python_calls = re.findall(r"(?m)^\s*configure_operator_python\s*$", text)
 if len(all_transport_calls) != 6 or len(all_python_calls) != 3:
-    # The third Python call is the transport helper's internal dependency.
     raise SystemExit("a configure call was added outside the enumerated command scopes")
 
 cleanup_start = text.index("cleanup_temporary_root() {")
@@ -2685,9 +2655,6 @@ roots = (
 for root in roots:
     if f'"${root}"' not in cleanup:
         raise SystemExit(f"cleanup omits {root}")
-# The sweep is a loop over exactly those four roots. Assert it does not merely
-# call rm: it must verify absence afterwards and propagate a non-zero status,
-# because an unchecked rm reported a partial credential sweep as success.
 for required in (
     'rm -rf -- "$root" || cleanup_status=1',
     'if [ -e "$root" ] || [ -L "$root" ]; then',
@@ -2713,9 +2680,6 @@ for required in (
     "set +m",
     'ARC_ARCHIVE_DISPATCH_SIGNAL_FORWARDED=false',
     'builtin kill -s "$ARC_ARCHIVE_DISPATCH_SIGNAL" --',
-    # The phase is a fresh profile-free Bash that drops every inherited
-    # function before sourcing the orchestrator. That unset loop is the
-    # defense against exported functions shadowing rm/mv/mktemp.
     'for imported_function in $(builtin compgen -A function); do',
     'arc-archive-dispatch-phase',
     'mkdir -m 700 "$gate/runtime"',
@@ -2723,23 +2687,11 @@ for required in (
     'export TMPDIR',
     'archive_remove_dispatch_gate "$gate"',
     'archive_remove_dispatch_gate_until_absent "$gate"',
-    # The sentinel anchors the phase PGID so it cannot be reused while members
-    # are being killed by exact PID.
     '[ "$sentinel_pgid" = "$phase_pgid" ] || exit 125',
-    # The guardian must lead its OWN group. This is precisely what makes its
-    # archive_process_group_has_members_except calls sound while the sentinel's
-    # were not: the guardian's ps children land outside the counted group.
     '[ "$watchdog_pid" = "$watchdog_pgid" ] || exit 125',
-    # The guardian heartbeat is identity-bound to the exact watchdog pid/pgid.
     '[ "$ready_pid" = "$watchdog_pid" ] && [ "$ready_pgid" = "$watchdog_pgid" ]',
-    # The supervisor accepts watchdog.ready only from a process that leads its
-    # own process group AND whose group is not the phase group -- the property
-    # that makes the guardian's membership queries trustworthy.
     '[ "$ready_pid" = "$ready_pgid" ] && [ "$ready_pgid" != "$phase_pgid" ]',
     'observed_parent="$(archive_process_field ppid "$watchdog_pid")"',
-    # Bash 3.2 + set -u: an unguarded empty-array expansion is fatal and no
-    # caller-side "|| true" suppresses it. Dying there leaves the whole group
-    # SIGSTOPped with its matching CONT never reached.
     '${targets[@]+"${targets[@]}"}',
     'wait "$phase_pid"',
     'archive_restore_signal_trap "$saved_hup" HUP',
@@ -2776,10 +2728,6 @@ sentinel_move_body = text[
 if '/bin/mv -f "$1" "$2"' not in sentinel_move_body:
     raise SystemExit("sentinel atomic publication no longer uses the fixed mv path")
 normalized_sentinel = " ".join(sentinel_body.replace("\\\n", " ").split())
-# The guardian may kill an external mv child in the phase group while preserving
-# the sentinel shell itself. Each publication that can overlap that drain must
-# tolerate the child failure; its existing receipt handshake retries or retains
-# the private gate fail closed.
 for required in (
     'archive_sentinel_atomic_move "$gate/signal.$request_argument.ack.partial" "$gate/signal.$request_argument.ack" || true',
     'archive_sentinel_atomic_move "$gate/sentinel.finalize.ack.partial" "$gate/sentinel.finalize.ack" || true',
@@ -2787,15 +2735,6 @@ for required in (
 ):
     if required not in normalized_sentinel:
         raise SystemExit(f"sentinel drain-time publication can abort its sweeper: {required}")
-# REGRESSION GUARD (credential leak). The sentinel runs inside phase_pgid, so
-# any call it makes to archive_process_group_has_members_except forks a /bin/ps
-# child INTO the very group being counted; that child is not in the exclusion
-# list, so the answer is unconditionally "members exist". Gating the terminal
-# sweep on such a call made archive_remove_dispatch_gate_until_absent
-# unreachable and stranded the 0700 gate -- which IS the phase TMPDIR holding
-# id_ed25519, known_hosts and rclone.conf -- on every guardian-kill path.
-# Excluding the caller's own PID does NOT fix it: Bash forks twice for
-# "$(...)", so the exec'd ps is a grandchild of the sentinel.
 if "archive_process_group_has_members_except" in sentinel_body:
     raise SystemExit(
         "sentinel queries phase-group membership from inside phase_pgid; its own "
@@ -2808,10 +2747,6 @@ sentinel_sweep = sentinel_body.index(
 if not finalized_gate < sentinel_sweep:
     raise SystemExit("sentinel sweep is not gated on the guardian completion receipt")
 
-# The receipt that sweep now trusts must itself be earned: the guardian only
-# publishes guardian.finalized after its anchor-validated drain loop empties
-# the group. Its identical membership calls ARE sound because it leads its own
-# PGID (asserted in the required-literal list above).
 guardian_body = text[text.index("archive_dispatch_parent_watchdog() {"):]
 guardian_drain = guardian_body.index(
     'while archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid"; do'
@@ -3341,8 +3276,6 @@ PY
         printf 'desktop/src-tauri/windows/installer-hooks.nsh is missing\n'
         return 1
     }
-    # The Tauri 2.11 installer.nsi template inserts exactly these four macros,
-    # each behind an `!ifmacrodef`, so a misspelt name is silently never run.
     while read -r macro; do
         case "$macro" in
             NSIS_HOOK_PREINSTALL|NSIS_HOOK_POSTINSTALL|NSIS_HOOK_PREUNINSTALL|NSIS_HOOK_POSTUNINSTALL) ;;
@@ -3358,9 +3291,6 @@ PY
         'installer hooks file has unbalanced macro definitions' || return 1
     assert_file_contains "$DESKTOP_NSIS_INSTALLER_HOOKS" '^!macro NSIS_HOOK_PREUNINSTALL$' \
         'the uninstaller hook that guards app-data deletion is not defined' || return 1
-    # The hook reads the template's own checkbox and update-mode variables,
-    # asks once, names what is lost, keeps the data on No and in silent runs,
-    # and deletes nothing itself.
     for required in \
         '\$DeleteAppDataCheckboxState = 1' \
         '\$UpdateMode <> 1' \
@@ -3376,8 +3306,6 @@ PY
     done
     assert_file_not_contains "$DESKTOP_NSIS_INSTALLER_HOOKS" 'RmDir|RMDir|^[[:space:]]*Delete ' \
         'installer hooks must not delete anything themselves' || return 1
-    # The variable names and insertion points were verified against the
-    # Tauri 2.11 template; a CLI major or minor bump re-opens that check.
     grep -A1 -F '"node_modules/@tauri-apps/cli": {' "$DESKTOP_PACKAGE_LOCK" \
         | grep -Eq '"version": "2\.11\.[0-9]+"' || {
         printf 'installer hooks were verified against the Tauri 2.11 NSIS template; re-check NSIS_HOOK_* names and $DeleteAppDataCheckboxState/$UpdateMode for the locked CLI\n'

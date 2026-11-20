@@ -1,14 +1,7 @@
-//! Canonical coordinator state without resident projection matrices or a
-//! local generation fallback. Lazy reads are checked against chunk hashes
-//! captured in the same pass that verifies the qualified artifact commitment.
-//! The arithmetic and generation loop are shared with the resident executor.
-
 use crate::cached_integer_model::{BackendGenerationError, CachedIntegerModel, ModelConfig};
 use crate::tensor_parallel::{ProjectionBackend, TensorKey, TensorParallelError};
 use arc_crypto::Hash256;
 
-/// Local canonical rows used for challenges, spot checks and duplicate
-/// verification. This is not a generation backend or a fallback policy.
 pub trait CanonicalRowSource: Send + Sync {
     fn config(&self) -> &ModelConfig;
     fn canonical_execution_profile(&self) -> Option<&'static str>;
@@ -75,9 +68,6 @@ impl CanonicalForwardSource for CachedIntegerModel {
     }
 }
 
-/// Norms and RoPE stay resident; even embeddings are read one row at a time.
-/// Construction validates every required projection's shape and block layout.
-/// It never loads a whole layer, embedding matrix, or output head.
 pub struct LowResidencyModel {
     #[cfg(feature = "candle")]
     artifact: Hash256,
@@ -115,9 +105,6 @@ impl LowResidencyModel {
             self, token, cache, call, backend,
         )
     }
-    /// Export one projection for an existing bounded stdio worker. At most
-    /// one matrix is prepared, never a layer or the whole model. The legacy
-    /// row-file writer has one equally sized serialization scratch buffer.
     #[cfg(feature = "candle")]
     pub fn export_rows(
         &self,
@@ -164,8 +151,6 @@ impl LowResidencyModel {
         crate::tensor_parallel::export_canonical_row_file(path, assignment, &weights)
     }
 
-    /// Norms and RoPE only; excludes bounded GGUF metadata, hash index, one
-    /// 64 KiB verified read buffer, activations and the separately capped KV.
     pub fn resident_state_bytes(&self) -> usize {
         (self
             .norms
@@ -212,8 +197,6 @@ impl CanonicalRowSource for LowResidencyModel {
                 .map_err(|_| TensorParallelError::Worker("GGUF row reader poisoned".into()))?;
             let name = source.tensor_name(layer, tensor);
             let mut output = Vec::with_capacity(end - start);
-            // Bound scratch to one source row even for a wide duplicate or
-            // challenge. Quantization is per row, exactly as the full loader.
             for row in start..end {
                 let source_row = canonical_source_row(row, tensor, self.config.d_head);
                 let f = source.row(&name, source_row)?;
@@ -301,9 +284,6 @@ fn projection_shape(
     })
 }
 
-/// Blocks are hashed in the *same pass* as the whole artifact. Every later
-/// read verifies a complete block before returning any bytes from it. Holding
-/// the descriptor also prevents path replacement from redirecting lazy reads.
 #[cfg(any(feature = "candle", test))]
 struct VerifiedArtifact {
     file: std::fs::File,
@@ -519,9 +499,6 @@ pub fn load_low_residency_model(
             "low-residency canonical profile requires general.architecture=llama".into(),
         ));
     }
-    // Enforce the coordinator's resident-state bound *before* the shared
-    // parser allocates RoPE tables. A qualified but unsuitable graph must
-    // refuse without first allocating a large prepared state.
     let metadata_u64 = |name: &str| -> Option<u64> {
         match content.metadata.get(name) {
             Some(Value::U32(n)) => Some(u64::from(*n)),
@@ -760,8 +737,6 @@ mod tests {
             KVCache, load_cached_model_canonical_i8_interleaved_rope,
         };
         use candle_core::quantized::GgmlDType;
-        // Includes block quantizations used by Q4_K artifacts, GQA, Q/K row
-        // permutation, embeddings, norms, output-head rows and full generation.
         for dtype in [
             GgmlDType::F32,
             GgmlDType::Q4_0,
@@ -827,7 +802,6 @@ mod tests {
                 assert_eq!(a.k_data, b.k_data);
                 assert_eq!(a.v_data, b.v_data);
             }
-            // Exact context boundary (BOS+2 prompt+3 generated) and plus one.
             full.config.max_seq = 6;
             low.config.max_seq = 6;
             let expected = full.try_generate_v2(&[4, 7], 3, &[]).unwrap();
@@ -852,8 +826,6 @@ mod tests {
                 Err(BackendGenerationError::Generation(_))
             ));
             assert!(low.embedding(32).is_err());
-            // Exported rows are byte-identical to the qualified full loader's
-            // format, including permuted Q/K and the layerless output head.
             for (layer, tensor) in [
                 (Some(0), TensorKey::Wq),
                 (Some(0), TensorKey::Wk),

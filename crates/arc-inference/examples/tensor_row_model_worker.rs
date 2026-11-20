@@ -1,18 +1,3 @@
-//! Private-cohort row worker that holds the whole canonical artifact and
-//! serves any row assignment of it: an operator's own machine under option
-//! (a) of docs/design/assignment-node-integration.md, so the coordinator can
-//! place any rows on it. Build it on that machine:
-//! `cargo build -p arc-inference --example tensor_row_model_worker --features candle --release`.
-//!
-//!     tensor_row_model_worker --model <gguf> --artifact <blake3 hex>
-//!
-//! It refuses to start unless the file's BLAKE3 equals `--artifact`, the
-//! pinned artifact hash of the chain's activation. Like
-//! `tensor_row_stdio_worker` it has no network listener. Its only transport
-//! is length-prefixed frames over stdin/stdout, reached through a persistent
-//! SSH session with StrictHostKeyChecking=yes and a pinned known_hosts file.
-//! Nothing else may be written to stdout: it is the protocol channel.
-
 use arc_crypto::Hash256;
 use arc_inference::cached_integer_model::load_cached_model_canonical_i8_interleaved_rope;
 use arc_inference::tensor_parallel::serve_row_frames;

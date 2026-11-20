@@ -20,7 +20,6 @@ import { formatArcExact, formatInt } from "../lib/format";
 import { classifyWalletFailure } from "../lib/wallet-outcome";
 import type { TxLookup, WalletTxResult } from "../lib/types";
 
-/** The text a failed call returned, one click away from the sentence that says what happened. */
 function FailureDetails({ error, testId }: { error: unknown; testId: string }) {
   const message = error instanceof Error ? error.message : String(error);
   return (
@@ -31,12 +30,6 @@ function FailureDetails({ error, testId }: { error: unknown; testId: string }) {
   );
 }
 
-/**
- * One sentence for a failed claim or transfer. "Didn't go through" only when
- * the request was refused before or by the host; when the answer was lost
- * after the POST, the host may have accepted it, so the sentence asks the
- * person to check their balance before sending again (lib/wallet-outcome.ts).
- */
 function WalletFailure({
   error,
   flow,
@@ -75,8 +68,6 @@ function WalletFailure({
   );
 }
 
-// How long the wallet keeps checking a submitted transaction for its mined receipt before it says so and stops.
-// It used to poll every 2 s for as long as the screen stayed open.
 const RECEIPT_WAIT_MS = 3 * 60_000;
 
 function receiptView(result: WalletTxResult, lookup?: TxLookup, timedOut = false) {
@@ -123,7 +114,6 @@ function receiptView(result: WalletTxResult, lookup?: TxLookup, timedOut = false
       text: `Submitted ${formatArcExact(result.amountArc)} ARC · no mined receipt after 3 minutes. The wallet stopped checking; look the hash up on the Network screen.`,
     };
   }
-  // Waiting for a block is the ordinary path after a submit, not a warning.
   return {
     tone: "var(--text-muted)",
     text: `Submitted ${formatArcExact(result.amountArc)} ARC · waiting for a mined receipt`,
@@ -160,8 +150,6 @@ export function Wallet() {
     onSuccess: setTrackedTx,
   });
 
-  // Only a protocol-4 native-only chain refuses ordinary transfers and faucet
-  // claims. Migrated protocol-3 chains can serve native inference alongside them.
   const nativeContext = useQuery({
     queryKey: ["native-context"],
     queryFn: api.nativeContext,
@@ -525,7 +513,6 @@ export function Wallet() {
             lineHeight: 1.55,
           }}
         >
-          {/* A standing fact about testnet, not a warning: an info mark, not a triangle. */}
           <Info
             size={16}
             aria-hidden="true"

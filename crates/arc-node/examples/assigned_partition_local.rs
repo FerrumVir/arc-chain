@@ -1,40 +1,3 @@
-//! One query, different pieces, assigned automatically - on ONE host.
-//!
-//! LABEL: LOCAL, IN-PROCESS WORKERS, SIMULATED LINKS. Every worker is a
-//! distinct signing identity with its own lease, measured rate and slices,
-//! but all of them run in this process against the coordinator's loaded
-//! model, and their links are synthetic. This exercises the assignment path
-//! end to end on real canonical-I8 weights; it is NOT a multi-machine or WAN
-//! result, and it does not change S10 (the original single-query comparison
-//! across machines), which stays FAIL until a real distributed run passes.
-//!
-//! What it does, in order:
-//! 1. Each worker signs a capability lease (arc-assign S1). One worker may
-//!    claim a false rate (`--dishonest-last`).
-//! 2. The coordinator runs a row-projection challenge on each worker and
-//!    checks the result; the measured rate replaces the claim, and a claim
-//!    the measurement does not support is refused (S1).
-//! 3. Links are summarised from synthetic probes, marked `simulated` (S2).
-//! 4. Placement splits every projection of every layer by measured rate and
-//!    link cost (S3); an assignment certificate binds it, and any validator
-//!    can recompute it (S4).
-//! 5. The partitioned backend runs a real generation with those slices (S5).
-//!    Every forward is compared exactly with the unpartitioned model
-//!    (full-model equivalence), and the verification plan's spot rows and
-//!    duplicate slices are recomputed and compared (S8).
-//!
-//! Usage (heavy: loads the canonical 7B model; run only in a model window):
-//!   cargo run --release -p arc-node --example assigned_partition_local -- \
-//!     GGUF [--workers 3] [--slowdown 1,2,4] [--tokens 4] [--prompt TEXT] \
-//!     [--rtt-us 200] [--bandwidth-mbps 10000] [--dishonest-last] [--churn] [--out FILE]
-//!
-//! `--churn` (S7): one placed worker fails partway through the query. The
-//! query aborts - the backend never falls back to another participant or to
-//! local rows on its own - and the coordinator re-places the query without
-//! that worker under a new certificate (epoch 1), then runs it again from
-//! empty KV caches. Row workers hold no KV state (the coordinator does), so
-//! no cache history can mix across the reassignment.
-
 use arc_assign::certificate::{AssignmentCertificate, policy_hash};
 use arc_assign::lease::{
     CapabilityLease, ChallengeResult, LeaseBody, LeaseRequirements, OP_ROW_PROJECTION_I8,
@@ -157,7 +120,6 @@ fn tensor_name(tensor: TensorKey) -> &'static str {
     }
 }
 
-/// Every projection the canonical forward dispatches, in forward order.
 fn projections(model: &CachedIntegerModel) -> Vec<(Option<usize>, TensorKey, &I8Weights)> {
     let mut out = Vec::new();
     for (index, layer) in model.layers.iter().enumerate() {
@@ -177,8 +139,6 @@ fn projections(model: &CachedIntegerModel) -> Vec<(Option<usize>, TensorKey, &I8
     out
 }
 
-/// A participant's compute: rows done, time spent, and the latest
-/// (input, output) per assignment for the verification plan.
 #[derive(Default)]
 struct Ledger {
     rows: BTreeMap<String, u64>,
@@ -186,15 +146,11 @@ struct Ledger {
     latest: BTreeMap<String, (Vec<i64>, Vec<i64>)>,
 }
 
-/// A worker identity computing one assignment, slowed by `slowdown` to stand
-/// in for a slower device. It records what it computed.
 struct AccountedWorker {
     participant: String,
     slowdown: u32,
     inner: ModelRowWorker,
     ledger: Arc<Mutex<Ledger>>,
-    /// Calls this participant answers before it leaves (churn), shared by
-    /// all of its slices. `None`: it never leaves.
     leaves_after: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
@@ -237,7 +193,6 @@ impl RowWorker for AccountedWorker {
 }
 
 fn challenge_input(cols: usize) -> Vec<i64> {
-    // Deterministic Q16 activations in [-2, 2).
     (0..cols)
         .map(|i| {
             let h = hash_bytes(&(i as u64).to_le_bytes());
@@ -270,7 +225,6 @@ fn main() -> Result<(), String> {
         .to_string();
     let ledger = Arc::new(Mutex::new(Ledger::default()));
 
-    // 1. Identities and signed leases.
     let keys: Vec<KeyPair> = (0..args.workers)
         .map(|_| KeyPair::generate_ed25519())
         .collect();
@@ -288,7 +242,6 @@ fn main() -> Result<(), String> {
         row_end: CHALLENGE_ROWS,
         worker_id,
     };
-    // The coordinator's own rate and the expected challenge answer.
     let reference = ModelRowWorker {
         worker_id: "coordinator-challenge".into(),
         assignment: challenge_assignment("coordinator-challenge".into()),
@@ -337,8 +290,6 @@ fn main() -> Result<(), String> {
             elapsed_us: elapsed.as_micros().max(1) as u64,
             correct: values == expected,
         };
-        // An honest claim is what the worker believes it does: its measured
-        // rate. The dishonest one claims ten times that.
         let claimed = if args.dishonest_last && index + 1 == keys.len() {
             measured.measured_macs_per_s().saturating_mul(10)
         } else {
@@ -409,7 +360,6 @@ fn main() -> Result<(), String> {
         });
     }
 
-    // 3-4. Placement over every projection, bound by a certificate.
     let stages: Vec<Stage> = projections(&model)
         .iter()
         .map(|(layer, tensor, weights)| Stage {
@@ -485,7 +435,6 @@ fn main() -> Result<(), String> {
             .workers
             .first()
             .ok_or("--churn needs at least one placed worker")?;
-        // Leave after roughly a quarter of the first forward's projections.
         let leaves_after = (first.placement.stages.len() / 4).max(1);
         let aborted = context.run(&first, &factor_of, Some((leaving, leaves_after)));
         let error = match aborted {
@@ -570,7 +519,6 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-/// What one query needs, whichever certificate places it.
 struct QueryContext<'a> {
     model: &'a Arc<CachedIntegerModel>,
     artifact: Hash256,
@@ -590,10 +538,6 @@ struct Outcome {
 }
 
 impl QueryContext<'_> {
-    /// Run the query from empty KV caches on the backend `certificate`
-    /// places, requiring exact logits at every forward and executing its
-    /// verification plan. `leaves` makes one worker leave after that many
-    /// projection calls.
     fn run(
         &self,
         certificate: &AssignmentCertificate,
@@ -655,7 +599,6 @@ impl QueryContext<'_> {
             workers,
         );
         {
-            // Report only this query: an aborted one's work is in `churn`.
             let mut ledger = self.ledger.lock();
             ledger.latest.clear();
             ledger.rows.clear();

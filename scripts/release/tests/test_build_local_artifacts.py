@@ -1,20 +1,3 @@
-"""FIXTURE tests for scripts/release/build-local-artifacts.sh (R2).
-
-The script runs from a copy inside a throwaway tree whose builders are stubs:
-cargo "builds" a few bytes, npm "bundles" a fake .app and .dmg, and pgrep,
-uname and git answer as each test says. Nothing is compiled, bundled or
-signed, and the throwaway tree has no sources a real builder could build. The
-real scripts/arc-build-provenance.sh and scripts/release/sbom.py run
-unmodified inside it.
-
-What this proves: the script's own guards (running soak, OUTPUT_DIR, signing
-and notarization environment), that a refused run never reaches cargo or the
-bundler, that no signing variable reaches either of them, and that the layout
-the script writes passes verify_local_artifacts.py and the runbook's
-`shasum -a 256 -c` step. What it does not prove: that a real build of this
-checkout succeeds or verifies. That build runs after the soak.
-"""
-
 import importlib.util
 import os
 import shutil
@@ -33,9 +16,6 @@ SPEC = importlib.util.spec_from_file_location("verify_local_artifacts", RELEASE 
 v = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(v)
 
-# Every signing or notarization input the pinned Tauri CLI (2.11.4) reads,
-# taken from the names in its own binary - listed here independently of the
-# script, so a name dropped from the script's list fails this test.
 SIGNING_NAMES = (
     "TAURI_SIGNING_PRIVATE_KEY", "TAURI_SIGNING_PRIVATE_KEY_PASSWORD", "TAURI_SIGNING_PRIVATE_KEY_PATH",
     "TAURI_PRIVATE_KEY", "TAURI_PRIVATE_KEY_PASSWORD", "TAURI_PRIVATE_KEY_PATH",
@@ -48,7 +28,6 @@ APP = "ARC Node.app"
 DMG = "ARC Node_0.8.0_aarch64.dmg"
 
 STUBS = {
-    # cargo: records argv and environment; `build -p X` writes target/<profile>/<bin>.
     "cargo": r'''#!/bin/sh
 printf '%s\n' "$*" >> "$FIXTURE_LOG/cargo.argv"
 [ "$1" = "--version" ] && { echo "cargo 0.0.0-fixture"; exit 0; }
@@ -65,7 +44,6 @@ mkdir -p "target/$profile"
 printf 'fixture %s binary\n' "$pkg" > "target/$profile/$bin"
 ''',
     "rustc": '#!/bin/sh\necho "rustc 0.0.0-fixture"\n',
-    # npm: `ci` is a no-op; `run tauri:build` lays out a bundle like Tauri's.
     "npm": r'''#!/bin/sh
 printf '%s\n' "$*" >> "$FIXTURE_LOG/npm.argv"
 env > "$FIXTURE_LOG/npm-$1.env"
@@ -94,7 +72,6 @@ case $1 in
   *) exit 97 ;;
 esac
 ''',
-    # pgrep -f PATTERN "matches" only the pattern the test names.
     "pgrep": '#!/bin/sh\n[ -n "${FIXTURE_PGREP_MATCH:-}" ] && [ "$2" = "$FIXTURE_PGREP_MATCH" ] && exit 0\nexit 1\n',
     "uname": '#!/bin/sh\ncase "$*" in -m) echo arm64 ;; -srm) echo "Darwin 24.0.0 arm64" ;; *) echo Darwin ;; esac\n',
 }
@@ -131,8 +108,6 @@ class BuildLocalArtifacts(unittest.TestCase):
             path.write_text(body)
             path.chmod(0o755)
         self.env = {
-            # The stubs come first; HOME is empty so arc-build-provenance.sh's
-            # $HOME/.local/bin prefix adds nothing.
             "PATH": os.pathsep.join([str(shim), os.path.dirname(sys.executable), "/usr/bin", "/bin"]),
             "HOME": str(self.tmp / "home"),
             "LC_ALL": "C",
@@ -172,7 +147,6 @@ class BuildLocalArtifacts(unittest.TestCase):
         sums = (self.out / "SHA256SUMS").read_text().splitlines()
         self.assertEqual(sorted(line.split("  ", 1)[1] for line in sums),
                          sorted(["arc-node", "arc-cli", f"UNSIGNED-{APP}.tar.gz", f"UNSIGNED-{DMG}"]))
-        # Runbook step: the entries are relative to collected/, so check from there.
         check = subprocess.run(["shasum", "-a", "256", "-c", "../SHA256SUMS"], cwd=str(self.out / "collected"),
                                capture_output=True, text=True, timeout=60)
         self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
@@ -232,8 +206,6 @@ class BuildLocalArtifacts(unittest.TestCase):
 
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores the read-only directory")
     def test_a_desktop_artifact_that_cannot_be_collected_fails_the_build_loudly(self):
-        # Before the fix this copy failed silently and SHA256SUMS left the
-        # desktop bundle out.
         proc = self.run_script(FIXTURE_LOCK_COLLECTED=str(self.out / "collected"))
         self.assert_refused(proc, "could not copy the desktop artifacts")
         self.assertFalse((self.out / "SHA256SUMS").exists())

@@ -1,16 +1,3 @@
-//! Whether the bridged node contributes compute. Off unless the operator says
-//! otherwise.
-//!
-//! * Desktop: always off here. The v0.7 app cannot ask, so the updated ARC
-//!   desktop app asks on first launch and records the answer itself.
-//! * Headless: on only when the operator wrote `yes` to `compute-consent`
-//!   (normally through `arc-node --legacy-bridge-compute on`) and a model
-//!   record proves the exact pinned model bytes are on disk. Released v0.7
-//!   has no consent flag or file to inherit: every v0.7 community installer
-//!   hard-coded `--community-mode`, and `--model` named a file, not a choice
-//!   about the new network.
-//! * Never on a pin whose node build would publish the computer's hostname.
-
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -61,7 +48,6 @@ pub fn modified_nanos(metadata: &fs::Metadata) -> Option<u64> {
     u64::try_from(since_epoch.as_nanos()).ok()
 }
 
-/// `Some(true)` for "yes", `Some(false)` for "no", `None` if never answered.
 pub fn read_consent(layout: &Layout) -> Result<Option<bool>> {
     let path = layout.consent_file();
     match fs::read_to_string(&path) {
@@ -83,7 +69,6 @@ pub fn write_consent(layout: &Layout, yes: bool) -> Result<()> {
     write_atomic(&layout.consent_file(), answer)
 }
 
-/// The recorded model, if it still is exactly the bytes that were verified.
 pub fn verified_model(layout: &Layout, pins: &Pins) -> Result<Option<PathBuf>> {
     let path = layout.model_record();
     let text = match fs::read_to_string(&path) {
@@ -113,7 +98,6 @@ pub fn verified_model(layout: &Layout, pins: &Pins) -> Result<Option<PathBuf>> {
     Ok(Some(model))
 }
 
-/// Hash `model` and, if it is exactly the pinned model, record it.
 pub fn verify_and_record_model(
     layout: &Layout,
     pins: &Pins,
@@ -177,7 +161,6 @@ pub fn decide(layout: &Layout, invocation: &LegacyInvocation, pins: &Pins) -> Re
     }
 }
 
-/// The one next step to print after the node starts.
 pub fn next_step(
     layout: &Layout,
     invocation: &LegacyInvocation,
@@ -196,13 +179,10 @@ pub fn next_step(
             "Nothing to do now: the next bridge release enables community registration, and then you can opt in to compute.".to_string()
         }
         (LegacyKind::Headless, Compute::Off(_)) => {
-            // The v0.7 no-root fallback passed its model path with literal
-            // quote characters.
             let model = match &invocation.model {
                 Some(model) => format!(" --model {}", model.display().to_string().trim_matches('"')),
                 None => " --download-model".to_string(),
             };
-            // Operator commands are recognized only as the first argument.
             format!(
                 "To contribute compute: {} --legacy-bridge-compute on{model}, then restart the node.",
                 layout.launcher.display()
@@ -292,7 +272,6 @@ mod tests {
         write_consent(&layout, false).unwrap();
         assert!(!decide(&layout, &invocation, &pins).unwrap().is_on());
         write_consent(&layout, true).unwrap();
-        // Replacing the model file invalidates the record.
         std::thread::sleep(std::time::Duration::from_millis(20));
         fs::write(&model, b"other bytes with a different length").unwrap();
         assert!(!decide(&layout, &invocation, &pins).unwrap().is_on());
@@ -311,9 +290,6 @@ mod tests {
         assert!(!layout.model_record().exists());
     }
 
-    /// Every command line a released v0.6.0..=v0.7.11 supervisor starts
-    /// `arc-node` with (`tests/legacy-bridge/check_v07_fixtures.py` checks
-    /// them against each tag).
     const V07_ARGV: &str = include_str!("../../../tests/legacy-bridge/fixtures/v07-argv.json");
 
     fn args_of(shape: &serde_json::Value) -> Vec<std::ffi::OsString> {
@@ -360,7 +336,6 @@ mod tests {
             let expect = &shape["expect"];
             let parsed = crate::argv::parse(&args_of(shape));
             if let Some(error) = expect["error"].as_str() {
-                // Refused before anything starts: no node, so no compute.
                 assert_eq!(format!("{:?}", parsed.unwrap_err()), error, "{name}");
                 continue;
             }
@@ -389,12 +364,9 @@ mod tests {
                 continue;
             }
             if cfg!(windows) && kind == LegacyKind::Headless {
-                // Released v0.7 had no Windows headless installer; the layout
-                // refuses it before anything starts.
                 continue;
             }
 
-            // Run it through the bridge as installed under a temporary root.
             let temp = TempDir::new("consent-v07-argv");
             let root = temp.path().join(".arc");
             let launcher = fake_arc_dir(&root);
@@ -410,9 +382,6 @@ mod tests {
             let model = temp.path().join("pinned.gguf");
             fs::write(&model, &model_body).unwrap();
 
-            // The shipped pin, an unsafe one built from it, and a privacy-safe
-            // one with the test model: off without consent, even when v0.7
-            // passed --model and --community-mode.
             let mut unsafe_pins = Pins::embedded().unwrap();
             unsafe_pins.node_release.worker_names_privacy_safe = false;
             for pins in [
@@ -434,8 +403,6 @@ mod tests {
                 );
             }
 
-            // Only the owner's own opt-in turns it on, and never under the
-            // v0.7 desktop app, which cannot ask.
             let pins = privacy_safe_pins(&model_body);
             write_consent(&layout, true).unwrap();
             assert!(

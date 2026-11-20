@@ -1,21 +1,10 @@
-/* ─────────────────────────────────────────────────────────────────────
-   Engraved theme: the website's language, white line on Arc blue.
-   Switched by one attribute, <html data-theme="engraved"> (lib/theme.ts).
-   Every screen follows through the design tokens; the rules after the token
-   block only replace the few hard-coded glows and fills in app.css that
-   would look wrong on blue. Remove the attribute and the classic theme is
-   untouched.
-   ───────────────────────────────────────────────────────────────────── */
-
 :root {
-  /* The ground an engraving is printed on (its masks paint this colour). */
   --engrave-ground: var(--surface);
 }
 
 :root[data-theme="engraved"] {
   color-scheme: dark;
 
-  /* Ground and plates. Cards sit a shade deeper than the page, as inked areas do. */
   --bg: #002dde;
   --bg-soft: #0029cc;
   --surface: #0026c4;
@@ -26,13 +15,11 @@
   --border-bright: rgba(255, 255, 255, 0.42);
   --border-focus: #ffffff;
 
-  /* Ink. Muted text stays above 4.5:1 on the blue. */
   --text: #ffffff;
   --text-secondary: rgba(255, 255, 255, 0.86);
   --text-muted: rgba(255, 255, 255, 0.72);
   --text-faint: rgba(255, 255, 255, 0.48);
 
-  /* Accents. White does the work that the accent blue did on the dark theme. */
   --arc: #1d4cff;
   --arc-ink: #ffffff;
   --arc-deep: #001a99;
@@ -53,7 +40,6 @@
   --earn-from: #ffffff;
   --earn-to: #c7d5ff;
 
-  /* States keep their hue so they read at a glance, pitched to sit on the blue. */
   --success: #8af2cb;
   --success-bg: rgba(138, 242, 203, 0.13);
   --warning: #ffd98c;
@@ -63,7 +49,6 @@
   --info: #b3dcff;
   --info-bg: rgba(179, 220, 255, 0.13);
 
-  /* The site's three faces. */
   --font-sans: "Hanken Grotesk", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --font-display: "Arc Figures", "Marcellus", Georgia, "Times New Roman", serif;
   --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
@@ -72,7 +57,6 @@
   --tracking-wide: 0.06em;
   --tracking-wider: 0.12em;
 
-  /* Crisp plates, as on the site: small radii, hairlines instead of glows. */
   --radius-xs: 2px;
   --radius-sm: 3px;
   --radius-md: 4px;
@@ -88,7 +72,6 @@
   --engrave-ground: var(--surface);
 }
 
-/* The page is a plate: faint engraved strokes run across it where the dark theme had glows. */
 [data-theme="engraved"] .app-shell::before,
 [data-theme="engraved"] .onboarding::before {
   background: repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.028) 0 1px, transparent 1px 4px);
@@ -114,7 +97,6 @@
   box-shadow: 0 0 10px rgba(255, 255, 255, 0.55);
 }
 
-/* Titles in Marcellus, each underscored by a short engraved hatch. */
 [data-theme="engraved"] .page-title {
   font-weight: 400;
   letter-spacing: 0.005em;
@@ -138,7 +120,6 @@
   letter-spacing: 0.005em;
 }
 
-/* Cards carry a plate mark: an outer hairline and a fainter inner one. */
 [data-theme="engraved"] .card {
   box-shadow: inset 0 0 0 4px var(--surface), inset 0 0 0 5px rgba(255, 255, 255, 0.07);
 }
@@ -146,7 +127,6 @@
   font-weight: 600;
 }
 
-/* Buttons as on the site: a white primary with blue ink; outlined secondaries. */
 [data-theme="engraved"] .btn-primary {
   background: #ffffff;
   color: #002dde;
@@ -201,7 +181,6 @@
 [data-theme="engraved"] .hw-item.highlight {
   background: rgba(255, 255, 255, 0.08);
 }
-/* Numbers are always set in the text face, lining and tabular, never in Marcellus: Marcellus is for words (titles). */
 [data-theme="engraved"] .big-number,
 [data-theme="engraved"] .stat-value {
   font-family: var(--font-sans);
@@ -212,7 +191,6 @@
   background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.1) 50%, transparent 100%);
 }
 
-/* The preview warning keeps its amber: it must never blend into the product. */
 [data-theme="engraved"] .synthetic-preview-banner {
   background: rgba(38, 26, 0, 0.97);
   box-shadow: 0 14px 45px rgba(0, 8, 60, 0.55);
@@ -227,7 +205,6 @@
   outline-offset: 2px;
 }
 
-/* An empty state's engraving sits where its icon was. */
 .empty .vignette {
   --engrave-ground: var(--surface);
   margin-bottom: var(--space-3);

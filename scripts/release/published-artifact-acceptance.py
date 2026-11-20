@@ -81,7 +81,6 @@ PROFILE_EXISTING_UPDATE_V1 = "existing-recovered-chain-update-v1"
 
 
 def release_profile_for_assets(names: set[str] | frozenset[str]) -> str:
-    """Resolve only exact, mutually exclusive public release asset contracts."""
     if names == EXPECTED_RELEASE_ASSETS:
         return PROFILE_CUTOVER_V1
     if names == EXISTING_UPDATE_RELEASE_ASSETS:
@@ -131,10 +130,6 @@ PUBLISHED_EVIDENCE_MEMBER = "release-published.json"
 MAX_PUBLISHED_EVIDENCE_BYTES = 4 * 1024 * 1024
 MAX_PUBLISHED_EVIDENCE_ZIP_BYTES = 8 * 1024 * 1024
 
-# v0.7.7 is not a GitHub-immutable release.  Its migration input is therefore
-# pinned independently by tag commit, release ID, asset ID, size, and digest.
-# Replacing or re-uploading the historical binary cannot silently satisfy this
-# contract even if the public tag URL continues to resolve.
 LEGACY_SOURCE = {
     "tag": "v0.7.7",
     "commit": "37df67b526cd0eebf6b55fa940c7646d1f4c947f",
@@ -295,7 +290,7 @@ MAX_CANONICAL_EVIDENCE_TOTAL_BYTES = 512 * 1024 * 1024
 
 
 class AcceptanceError(ValueError):
-    """A captured release fact or downloaded byte failed closed."""
+    pass
 
 
 def load_json(path: Path, description: str) -> Any:
@@ -1134,8 +1129,6 @@ def command_component(args: argparse.Namespace) -> None:
         "schema": "arc.published-artifact-acceptance-component.v1",
         "tag": binding["tag"],
     }
-    # Run the same aggregate-side validator here so a malformed component is
-    # rejected in its native job as well as by the final fan-in job.
     validate_component(component, binding, sha256_file(args.binding))
     write_canonical(args.output, component)
 

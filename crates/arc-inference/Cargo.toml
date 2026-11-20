@@ -9,13 +9,6 @@ license.workspace = true
 default = []
 int16 = []
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
-# Patent-pending integer/ASIC inference paths (ternary, INT8/INT16-ASIC, mining
-# datapath, etc). Source files for these modules are intentionally NOT in the
-# public repo until patents are filed; they live in a private branch and on
-# the author's local working tree. The default build (and CI release builds)
-# stub out the type signatures so the rest of the crate compiles. Enabling
-# `experimental-ip` requires the actual implementation files at
-# crates/arc-inference/src/ternary_engine.rs and ternary_hybrid.rs.
 experimental-ip = []
 
 [dependencies]
@@ -31,14 +24,9 @@ dashmap.workspace = true
 hex.workspace = true
 rayon.workspace = true
 libc = "0.2"
-# SHA-256 identities of pinned Hugging Face sources and integer packages
-# (`modern`). Already in the shipped graph through arc-crypto.
 sha2.workspace = true
-# The Llama-3/SmolLM3 tokenizer split pattern needs a negative lookahead.
-# Already locked through candle-transformers; no new crate enters the graph.
 fancy-regex = "0.13"
 
-# Optional: real INT4/GGUF inference via Hugging Face candle
 candle-core = { version = "0.8", optional = true }
 candle-nn = { version = "0.8", optional = true }
 candle-transformers = { version = "0.8", optional = true }
@@ -46,21 +34,10 @@ candle-transformers = { version = "0.8", optional = true }
 [dev-dependencies]
 rand.workspace = true
 
-# Modern-model CLI (SmolLM3-3B): convert, verify, generate, golden, ppl.
 [[bin]]
 name = "arc-modern"
 path = "src/bin/arc_modern.rs"
 
-# Examples that load GGUF models or run inference benchmarks against candle-
-# backed tensors pull in candle-core/candle-nn/candle-transformers. Declare
-# required-features so `cargo test --workspace` (default features) skips
-# building them. Build any single example with:
-#     cargo run --example <name> --features candle --release
-#
-# Only examples whose source files are actually checked in are listed here -
-# adding a [[example]] line for an uncommitted file fails manifest parse on
-# CI runners and breaks the release workflow (last seen v0.5.5 / v0.5.6,
-# where arc-node-*.exe binaries never made it onto the GitHub release).
 [[example]]
 name = "bench_int8"
 required-features = ["candle"]
@@ -112,10 +89,6 @@ required-features = ["candle"]
 [[example]]
 name = "batched_prefill_experiment"
 required-features = ["candle"]
-# These five were missing from this list, so `--all-targets` (and plain
-# `cargo test -p arc-inference`) tried to build them without the candle
-# dependency and failed on unresolved `candle_core`/`candle_transformers`
-# imports. They are candle-only probes like the rest of the list.
 [[example]]
 name = "probe_block_i8"
 required-features = ["candle"]

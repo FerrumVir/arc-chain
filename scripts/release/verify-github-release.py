@@ -18,7 +18,7 @@ TAG_PATTERN = re.compile(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9
 
 
 class VerificationError(ValueError):
-    """The server release does not match the expected immutable contract."""
+    pass
 
 
 def parse_boolean(value: str) -> bool:

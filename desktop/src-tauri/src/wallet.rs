@@ -1,9 +1,3 @@
-//! Wallet primitives that must stay on the Rust side of the Tauri boundary.
-//!
-//! The WebView sends only a destination and a decimal ARC amount. Recovery
-//! material is read from the private Rust store and used here; it is never an
-//! IPC argument or result.
-
 use crate::types::Identity;
 use arc_crypto::{Hash256, KeyPair};
 use arc_types::Transaction;
@@ -12,9 +6,6 @@ use std::net::IpAddr;
 
 const KEY_DERIVATION_DOMAIN: &str = "ARC-chain-validator-keypair-v1";
 pub const ARC_BASE_UNITS: u64 = arc_types::economics::ARC_BASE_UNITS;
-/// Protocol-v3 transfer floor. Kept explicit here because the desktop depends
-/// only on the wire/type crate; v3 recovery-domain signing is the signal that
-/// the state admission rule applies.
 pub const V3_MIN_TRANSFER_FEE_BASE: u64 = 1;
 
 pub fn transfer_fee_base(transaction_domain: Option<Hash256>) -> u64 {
@@ -25,8 +16,6 @@ pub fn transfer_fee_base(transaction_domain: Option<Hash256>) -> u64 {
     }
 }
 
-/// Accept production HTTPS origins and loopback-only HTTP for local dev.
-/// Wallet writes never follow redirects (configured in `lib.rs`).
 pub fn validate_rpc_origin(value: &str) -> Result<String, String> {
     let parsed = reqwest::Url::parse(value.trim())
         .map_err(|_| "wallet RPC must be a valid origin URL".to_string())?;
@@ -69,10 +58,6 @@ pub fn validate_rpc_origin(value: &str) -> Result<String, String> {
     Ok(value.trim().trim_end_matches('/').to_string())
 }
 
-/// Parse a plain decimal ARC amount into exact base units.
-///
-/// Scientific notation, signs, separators, and more than nine fractional
-/// digits are rejected. Nothing is rounded and no floating point is used.
 pub fn parse_arc_amount(input: &str) -> Result<u64, String> {
     let value = input.trim();
     if value.is_empty() {
@@ -139,7 +124,6 @@ pub fn parse_arc_amount(input: &str) -> Result<u64, String> {
         .ok_or_else(|| "amount is larger than ARC's base-unit limit".to_string())
 }
 
-/// Format exact base units as ARC without rounding or scientific notation.
 pub fn format_arc_amount(base_units: u64) -> String {
     let whole = base_units / ARC_BASE_UNITS;
     let fraction = base_units % ARC_BASE_UNITS;
@@ -160,7 +144,6 @@ fn parse_address(value: &str, field: &str) -> Result<Hash256, String> {
         .map_err(|_| format!("{field} must be exactly 32 bytes (64 hexadecimal characters)"))
 }
 
-/// Build and sign an ARC transfer from the Rust-only identity.
 pub fn signed_transfer(
     identity: &Identity,
     recipient: &str,
@@ -186,8 +169,6 @@ pub fn signed_transfer(
     Ok(tx)
 }
 
-/// The wallet's signing key, derived from the Rust-only recovery phrase and
-/// checked against the stored address. It never crosses the IPC boundary.
 pub(crate) fn wallet_keypair(identity: &Identity) -> Result<(Hash256, KeyPair), String> {
     let address = parse_address(&identity.address, "stored wallet address")?;
     let secret = blake3::derive_key(KEY_DERIVATION_DOMAIN, identity.seed_phrase.as_bytes());
@@ -198,8 +179,6 @@ pub(crate) fn wallet_keypair(identity: &Identity) -> Result<(Hash256, KeyPair), 
     Ok((address, keypair))
 }
 
-/// Sign `tx` for the chain's transaction domain: the recovery domain when
-/// one is active, the legacy hash otherwise.
 pub(crate) fn sign_for_domain(
     tx: &mut Transaction,
     keypair: &KeyPair,

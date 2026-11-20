@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# ARC_RETIRED_LIVE_TOOL_V3_REQUIRED
 set -euo pipefail
 printf '%s\n' \
     'RETIRED: this legacy false-health monitor is disabled in the v0.8.0 recovery candidate.' \

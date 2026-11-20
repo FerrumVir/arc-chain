@@ -1,22 +1,4 @@
 "use strict";
-/**
- * ARC Chain TypeScript SDK.
- *
- * A complete TypeScript client for interacting with the ARC Chain blockchain,
- * including transaction building, Ed25519 signing, and RPC communication.
- *
- * @example
- * ```ts
- * import { ArcClient, KeyPair, TransactionBuilder } from "@arc-chain/sdk";
- *
- * const client = new ArcClient("http://localhost:9090");
- * const kp = await KeyPair.generate();
- *
- * const tx = TransactionBuilder.transfer(kp.address(), "0".repeat(64), 1000);
- * const signed = await TransactionBuilder.sign(tx, kp);
- * const hash = await client.submitTransaction(signed);
- * ```
- */
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.keccak256 = exports.functionSelector = exports.decodeFunctionInput = exports.decodeFunctionResult = exports.encodeFunctionCall = exports.decodeAbi = exports.encodeAbi = exports.TransactionBuilder = exports.KeyPair = exports.ArcTransactionError = exports.ArcConnectionError = exports.ArcError = exports.ArcClient = void 0;
 var client_1 = require("./client");

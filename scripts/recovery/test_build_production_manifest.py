@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Hermetic adversarial tests for the production manifest builder/finalizer."""
 
 from __future__ import annotations
 
@@ -72,8 +71,6 @@ class Fixture:
         captured_at: str,
         index: int,
     ) -> dict:
-        """Build the exact preauthorization source pair consumed by a round."""
-
         seed = 20_000 + index * 100
 
         def directory(offset: int) -> dict:
@@ -2176,9 +2173,6 @@ print(json.dumps(value,sort_keys=True))
             f"{sha(boundary_payload)}  {self.boundary.name}\n".encode(),
             0o400,
         )
-        # The late-fork monitor is intentionally pinned to the exact maintenance
-        # boundary. Keep that dependent fixture coherent so boundary-focused
-        # negative tests reach the validator they are meant to exercise.
         source_sidecar = self.late_fork_source_set.with_name(
             self.late_fork_source_set.name + ".sha256"
         )
@@ -2244,8 +2238,6 @@ print(json.dumps(value,sort_keys=True))
         )
 
     def write_union_maintenance(self, stopped_names: set[str]) -> None:
-        """Rewrite the canonical active fixture as an exact mixed-state union."""
-
         bundle = json.loads(self.bundle.read_text())
         boundary = json.loads(self.boundary.read_text())
         generation = bundle["quarantine_generation_ledger"]["value"]
@@ -2762,9 +2754,6 @@ print(json.dumps(value,sort_keys=True))
         artifact_id = self.artifact_ids[group]
         raw_sha = sha(raw_path.read_bytes())
         archive_sha = sha(f"{kind}/{platform}/archive".encode())
-        # All nine artifacts are proven from one four-request API root.  Keep
-        # the fixture's shared root stable even when a test spans a wall-clock
-        # second boundary.
         now = self.proof_now + (1 if final else 0)
         if group == ("headless", builder.PRETAG_PLATFORM):
             metadata = json.loads(self.build_metadata.read_text())
@@ -4046,8 +4035,6 @@ class ProductionManifestBuilderTests(unittest.TestCase):
             - dt.timedelta(hours=2)
         )
         self.fixture.write_height(completed_at=public_completed)
-        # Remote UTC is audit-only: the operator-authored dispatch and each
-        # node's same-boot CLOCK_BOOTTIME lease are the mutation safety gate.
         self.fixture.write_offline_stop(
             fleet_started_at=public_completed + dt.timedelta(seconds=1),
             fleet_completed_at=public_completed + dt.timedelta(seconds=2),
@@ -4329,9 +4316,6 @@ class ProductionManifestBuilderTests(unittest.TestCase):
         return manifest, staged_file, stage_manifest
 
     def test_final_identity_window_is_deterministic_under_ctime_only_noise(self) -> None:
-        # APFS can publish a delayed ctime after create/chmod.  Cross-window
-        # safety is the held no-follow descriptor plus stable identity fields;
-        # ctime is checked only in the post-hash descriptor/path snapshot.
         for index in range(20):
             manifest, staged_file, stage_manifest = self.identity_window_fixture(
                 f"identity-stable-{index}"
@@ -4441,10 +4425,6 @@ class ProductionManifestBuilderTests(unittest.TestCase):
 
     def test_remote_stop_verification_rejects_replay_partial_wrong_host_and_duplicate_key(self) -> None:
         def reset_fixture() -> None:
-            # Every failed prearchive attempt intentionally leaves its private,
-            # content-addressed input stage behind.  Adversarial cases must use
-            # fresh source bytes and a fresh stage so one rejection cannot mask
-            # the next case with the stage-identity guard.
             self.tearDown()
             self.setUp()
 
@@ -4648,7 +4628,6 @@ class ProductionManifestBuilderTests(unittest.TestCase):
         self.assertFalse(path.stat().st_mode & 0o022)
         self.assertGreaterEqual(path.stat().st_nlink, 1)
         if sys.platform == "darwin":
-            # Apple's signed system Python is intentionally one of many hard links.
             self.assertGreater(path.stat().st_nlink, 1)
             bsd_stat = builder.subprocess.run(
                 ["/usr/bin/stat", "-c", "%u:%h:%a", os.fspath(path)],
@@ -4659,8 +4638,6 @@ class ProductionManifestBuilderTests(unittest.TestCase):
             )
             self.assertNotEqual(bsd_stat.returncode, 0)
 
-        # Debian/Ubuntu's protected /usr/bin/python3 -> python3.N shape is the
-        # second explicitly supported production layout.
         linux_stats = {
             "/usr/bin/python3": types.SimpleNamespace(
                 st_mode=stat.S_IFLNK | 0o777, st_uid=0

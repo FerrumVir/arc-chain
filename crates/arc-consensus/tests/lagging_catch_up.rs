@@ -1,32 +1,11 @@
-//! A node that falls behind must be able to catch up from live gossip.
-//!
-//! The soak diagnostics measured what happened when it could not: a node two
-//! rounds behind found every live block either more than one round ahead or
-//! missing parents - one node accepted 2 of 83 - so it advanced only through
-//! history requests throttled to one per two seconds. At N=4 the tip needs
-//! three blocks, so two such nodes held the whole network to that pace, before
-//! any fault and again after a restart.
-//!
-//! This is the smallest deterministic reproduction. Validator 3 runs rounds
-//! 0..=K with everyone, then stops; the other three carry on to round R. A
-//! restarted validator 3, holding rounds 0..=K, then receives the later blocks
-//! in the worst order - newest first - with NO history transfer and NO
-//! re-gossip. (The consensus simulation re-sends every node's recent blocks on
-//! every tick, which the real transport never does; that redundancy is why the
-//! simulation could not see this.)
-//!
-//! Dropping early blocks strands it. Holding them - through the same
-//! `receive_block` validation, released only when their parents are present -
-//! brings it to the tip.
-
 use arc_consensus::pending::{Offered, PendingBlocks, receive_or_hold};
 use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
 use arc_crypto::{KeyPair, hash_bytes};
 use std::collections::VecDeque;
 use std::time::Instant;
 
-const K: u64 = 6; // rounds everyone runs together
-const R: u64 = 20; // the round the other three reach
+const K: u64 = 6;
+const R: u64 = 20;
 
 fn committee() -> (ValidatorSet, Vec<KeyPair>) {
     let keys: Vec<KeyPair> = (0..4)
@@ -40,16 +19,10 @@ fn committee() -> (ValidatorSet, Vec<KeyPair>) {
     (ValidatorSet::new(validators, 1), keys)
 }
 
-/// Quorum-only advancement - the rule the soak network runs. (Installing a
-/// consensus domain would switch to the recovery domain's all-validator
-/// participation rule, where a departed member must be excused by certificate
-/// before a round can close; that is covered by view_change_simulation.)
 fn engine(set: &ValidatorSet, key: &KeyPair) -> ConsensusEngine {
     ConsensusEngine::new_with_keypair(set.clone(), key.address(), key.clone())
 }
 
-/// Run `rounds` with the given participants, delivering everything to them.
-/// Returns every block produced, in production order.
 fn run_rounds(engines: &[&ConsensusEngine], rounds: u64, ts: &mut u64) -> Vec<DagBlock> {
     let mut produced = Vec::new();
     for _ in 0..rounds {
@@ -73,7 +46,6 @@ fn run_rounds(engines: &[&ConsensusEngine], rounds: u64, ts: &mut u64) -> Vec<Da
     produced
 }
 
-/// Blocks of rounds 0..=K, and of rounds K+1..=R produced without validator 3.
 fn history() -> (ValidatorSet, Vec<KeyPair>, Vec<DagBlock>, Vec<DagBlock>) {
     let (set, keys) = committee();
     let e: Vec<ConsensusEngine> = keys.iter().map(|k| engine(&set, k)).collect();
@@ -88,7 +60,6 @@ fn history() -> (ValidatorSet, Vec<KeyPair>, Vec<DagBlock>, Vec<DagBlock>) {
     (set, keys, early, late)
 }
 
-/// A restarted validator 3 that holds rounds 0..=K.
 fn restarted(set: &ValidatorSet, keys: &[KeyPair], early: &[DagBlock]) -> ConsensusEngine {
     let lag = engine(set, &keys[3]);
     let mut by_round = early.to_vec();
@@ -174,13 +145,10 @@ fn holding_early_blocks_lets_a_node_that_fell_behind_reach_the_tip() {
 
 #[test]
 fn a_block_with_a_wrong_round_parent_is_never_held() {
-    // Holding must not become a place to park malformed blocks: a parent that
-    // IS present but from the wrong round makes the block invalid, not early.
     let (set, keys, early, _late) = history();
     let lag = restarted(&set, &keys, &early);
     let mut pending = PendingBlocks::new();
 
-    // Build a block for round K+2 whose parent is a real round-0 block.
     let round0 = early
         .iter()
         .find(|b| b.round == 0)
@@ -208,22 +176,8 @@ fn a_block_with_a_wrong_round_parent_is_never_held() {
     assert!(pending.is_empty());
 }
 
-// ─── Restart past the retention window ─────────────────────────────────────
-//
-// A restarted node's DAG is empty. It used to rebuild it from round 0, the
-// only round whose blocks validate without parents. Once the chain ran past
-// the retention window, peers had pruned round 0 and served their oldest
-// retained rounds instead - all below the node's own commit cursor - and it
-// refused every batch as adding nothing. A 20-minute native-workload run hit
-// exactly that on its first fault: killed at round 4291 with 4096 retained,
-// 38 refused batches, never caught up.
-
-/// The retention floor (`PRUNE_DEPTH`): the smallest window an engine keeps.
 const RETAINED: u64 = 100;
 
-/// Run rounds as a live node does - proposing, receiving, advancing and
-/// committing, which also prunes. Each engine's committed anchors are
-/// appended to the matching entry of `committed`.
 fn run_committing(
     engines: &[&ConsensusEngine],
     rounds: u64,
@@ -250,7 +204,6 @@ fn run_committing(
     }
 }
 
-/// Everything a peer still holds from `from` to its tip, as it would serve it.
 fn served_from(peer: &ConsensusEngine, from: u64) -> Vec<DagBlock> {
     (from..=peer.current_round())
         .flat_map(|round| peer.blocks_in_round(round))
@@ -268,21 +221,18 @@ fn a_restarted_node_rejoins_from_its_own_commit_cursor_after_peers_pruned_round_
     let mut ts = 1_700_000_000_000u64;
     let mut committed = vec![Vec::new(); 4];
 
-    // All four run together well past the retention window.
     run_committing(
         &[&e[0], &e[1], &e[2], &e[3]],
         3 * RETAINED,
         &mut ts,
         &mut committed,
     );
-    // Validator 3 is killed. Its durable records keep its round and cursor.
     let crashed_round = e[3].current_round();
     let cursor = e[3].last_committed_round();
     assert!(
         cursor > RETAINED,
         "the cursor must be past the window for this to test anything"
     );
-    // The other three carry on, for less than their retention window.
     run_committing(
         &[&e[0], &e[1], &e[2]],
         RETAINED / 2,
@@ -295,20 +245,15 @@ fn a_restarted_node_rejoins_from_its_own_commit_cursor_after_peers_pruned_round_
         "peers still hold the restarted node's cursor round"
     );
 
-    // The restarted process: an empty DAG, cursors from its own records.
     let restarted = engine(&set, &keys[3]);
     restarted.restore_round_from_local_wal(crashed_round, cursor);
 
-    // What it used to ask for - "from round 0" - is served from the peers'
-    // oldest retained round, whose parents nobody has any more.
     let oldest = served_from(&e[0], 0);
     assert!(oldest.iter().all(|b| b.round > 0));
     assert!(
         restarted.import_history(&oldest, u64::MAX).is_err(),
         "history from the oldest retained round cannot validate on an empty DAG"
     );
-    // From its own cursor, but without the base round, the first round
-    // cannot validate either.
     assert!(
         restarted
             .import_history(&served_from(&e[0], cursor), u64::MAX)
@@ -319,7 +264,6 @@ fn a_restarted_node_rejoins_from_its_own_commit_cursor_after_peers_pruned_round_
         "a refused import leaves nothing behind"
     );
 
-    // Only at its own cursor, only on an empty DAG.
     assert!(restarted.set_restart_base_round(cursor + 1).is_err());
     restarted
         .set_restart_base_round(cursor)
@@ -333,8 +277,6 @@ fn a_restarted_node_rejoins_from_its_own_commit_cursor_after_peers_pruned_round_
         "a base round can be opened only on an empty DAG"
     );
 
-    // Rejoin. From here the restarted node must commit exactly what its peers
-    // commit, and never anything below its cursor again.
     let mut rejoined = vec![Vec::new(); 4];
     run_committing(
         &[&e[0], &e[1], &e[2], &restarted],
@@ -394,12 +336,8 @@ fn a_restart_base_round_admits_only_well_formed_signed_blocks() {
     let real = e[0]
         .get_block(&e[0].blocks_in_round(cursor)[0])
         .expect("a block at the base round");
-    // The excuse is for missing parents during a history import, never for
-    // live gossip - even for an authentic block.
     assert!(restarted.receive_block(&real).is_err());
 
-    // Parentless, zero-parent, duplicated-parent and unsigned variants of a
-    // real block: none is imported, whatever else the batch carries.
     let author = keys.iter().find(|k| k.address() == real.author).unwrap();
     let mut variants = Vec::new();
     for parents in [
@@ -443,10 +381,6 @@ fn a_restart_base_round_admits_only_well_formed_signed_blocks() {
 
 #[test]
 fn history_served_from_below_the_base_round_still_reaches_it() {
-    // Peers may answer "from the cursor" with a batch that starts a few rounds
-    // lower. Those rounds are below the restarting node's cursor - decided
-    // already - and their parents are gone; they must be skipped, not allowed
-    // to stop the import before it reaches the base.
     let (set, keys) = committee();
     let e: Vec<ConsensusEngine> = keys.iter().map(|k| engine(&set, k)).collect();
     for x in &e {
@@ -485,9 +419,6 @@ fn history_served_from_below_the_base_round_still_reaches_it() {
 
 #[test]
 fn a_base_round_block_nothing_in_the_next_round_supports_is_not_imported() {
-    // A byzantine peer's fabricated base block - committee-signed, garbage
-    // parents - must not become part of a restarting node's DAG, and live
-    // gossip never gets the missing-parents excuse at all.
     let (set, keys) = committee();
     let e: Vec<ConsensusEngine> = keys.iter().map(|k| engine(&set, k)).collect();
     for x in &e {
@@ -508,7 +439,6 @@ fn a_base_round_block_nothing_in_the_next_round_supports_is_not_imported() {
     restarted.restore_round_from_local_wal(crashed_round, cursor);
     restarted.set_restart_base_round(cursor).unwrap();
 
-    // Validator 1 signs a second block at the base round with invented parents.
     let real = e[0]
         .get_block(
             &e[0]
@@ -532,10 +462,7 @@ fn a_base_round_block_nothing_in_the_next_round_supports_is_not_imported() {
     fabricated.hash = fabricated.compute_hash();
     fabricated.signature = bincode::serialize(&keys[1].sign(&fabricated.hash).unwrap()).unwrap();
 
-    // Live gossip: no excuse, so its missing parents refuse it.
     assert!(restarted.receive_block(&fabricated).is_err());
-    // A batch carrying it next to the real history: only the base blocks the
-    // next round names are admitted.
     let mut batch = vec![fabricated.clone()];
     batch.extend(served_from(&e[0], cursor));
     restarted
@@ -546,7 +473,6 @@ fn a_base_round_block_nothing_in_the_next_round_supports_is_not_imported() {
         "the fabricated block was imported"
     );
     assert!(restarted.get_block(&real.hash).is_some());
-    // A batch whose base round nothing supports is refused outright.
     let fresh = engine(&set, &keys[3]);
     fresh.restore_round_from_local_wal(crashed_round, cursor);
     fresh.set_restart_base_round(cursor).unwrap();
@@ -564,7 +490,6 @@ fn rebasing_to_a_checkpoint_clears_the_dag_and_resumes_after_its_anchor() {
     let reached = e[3].current_round();
     assert!(!e[3].dag_is_empty());
 
-    // Adopt a checkpoint whose anchor is far ahead of this node.
     let cursor = e[3].rebase_to(500).expect("rebase");
     assert_eq!(cursor, 501);
     assert!(e[3].dag_is_empty(), "nothing below the checkpoint is kept");
@@ -577,9 +502,6 @@ fn rebasing_to_a_checkpoint_clears_the_dag_and_resumes_after_its_anchor() {
     );
     assert!(reached < 501);
 
-    // A backward (or no-op) move is refused before anything changes, and the
-    // node asks first (`check_rebase`) so it never writes a checkpoint the
-    // engine would then refuse.
     let behind = engine(&set, &keys[3]);
     behind.restore_round_from_local_wal(reached, reached - 2);
     assert!(behind.check_rebase(3).is_err());
@@ -587,8 +509,6 @@ fn rebasing_to_a_checkpoint_clears_the_dag_and_resumes_after_its_anchor() {
     assert_eq!(behind.last_committed_round(), reached - 2, "nothing moved");
     assert!(behind.check_rebase(reached).is_ok());
 
-    // A forward rebase whose cursor is still below the round this node had
-    // reached keeps the proposal floor: it may have signed blocks there.
     let fresh = engine(&set, &keys[3]);
     fresh.restore_round_from_local_wal(reached, 2);
     fresh
@@ -602,9 +522,6 @@ fn rebasing_to_a_checkpoint_clears_the_dag_and_resumes_after_its_anchor() {
 
 #[test]
 fn a_live_engine_never_re_signs_its_round_after_a_rebase() {
-    // Unlike the restart case above, nothing here was restored from a WAL:
-    // only `rebase_to` itself can stop this engine from signing a second
-    // block at a round it signed before the rebase cleared its DAG.
     let (set, keys) = committee();
     let e: Vec<ConsensusEngine> = keys.iter().map(|k| engine(&set, k)).collect();
     let mut ts = 1_700_000_000_000u64;

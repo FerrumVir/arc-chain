@@ -1,19 +1,3 @@
-// ARC identity = BIP-39 phrase → ed25519 keypair → BLAKE3(pk) address.
-//
-// This MUST match ARC's historical recovery-phrase derivation, otherwise the
-// phrase shown to a user in this app will not restore the same wallet/node
-// address when materialized as a persistent Ed25519 keyfile.
-//
-// Chain derivation (crates/arc-node/src/main.rs:310–311,
-// crates/arc-crypto/src/signature.rs:404,521–522):
-//
-//     seed_bytes = blake3::derive_key(DOMAIN_TAG, seed_str.as_bytes())
-//     signing_key = ed25519_dalek::SigningKey::from_bytes(&seed_bytes)
-//     public_key  = signing_key.verifying_key().as_bytes()
-//     address     = blake3::hash(public_key).as_bytes()  // 32 bytes
-//
-// The DOMAIN_TAG below matches the chain's constant verbatim. Do not change.
-
 use crate::types::Identity;
 use bip39::{Language, Mnemonic};
 use ed25519_dalek::SigningKey;
@@ -46,21 +30,15 @@ impl Drop for ValidatorKeyfile {
     }
 }
 
-/// Generate a fresh 12-word BIP-39 mnemonic and derive the ARC identity.
 pub fn generate() -> Identity {
-    let mut entropy = [0u8; 16]; // 128 bits → 12 words
+    let mut entropy = [0u8; 16];
     OsRng.fill_bytes(&mut entropy);
     let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)
         .expect("valid entropy always yields a mnemonic");
     derive(&mnemonic.to_string()).expect("freshly-generated mnemonic derives successfully")
 }
 
-/// Derive an ARC identity from any seed string (typically a BIP-39 phrase).
-/// The same input always produces the same (sk, pk, address) triple, on
-/// every machine, forever.
 pub fn derive(phrase: &str) -> Result<Identity, String> {
-    // Validate BIP-39 format + checksum if it parses as one. Accept non-BIP-39
-    // strings too for backward-compatible desktop identity recovery.
     let is_bip39 = Mnemonic::parse_in(Language::English, phrase.trim()).is_ok();
     let normalized = phrase.trim().to_string();
 
@@ -75,7 +53,6 @@ pub fn derive(phrase: &str) -> Result<Identity, String> {
         created_at: chrono::Utc::now().timestamp_millis(),
     })
     .inspect(|_| {
-        // Tag logging only - identity still returned unchanged.
         if !is_bip39 {
             tracing::warn!(
                 "imported identity is not a BIP-39 phrase - derivation still deterministic but no checksum protection"
@@ -91,13 +68,6 @@ fn signing_key_from_phrase(phrase: &str) -> SigningKey {
     signing_key
 }
 
-/// Materialize the desktop wallet's existing chain identity as the exact JSON
-/// format consumed by `arc-node --validator-key-file`.
-///
-/// The phrase never enters argv, the environment, or logs. Creation is
-/// private from the first open, durable, and no-replace; an existing file is
-/// accepted only when its secret, public key, and address reproduce the
-/// persisted wallet address exactly.
 pub(crate) fn ensure_validator_keyfile(
     app_data_dir: &Path,
     phrase: &str,
@@ -162,8 +132,6 @@ pub(crate) fn ensure_validator_keyfile(
                 .map_err(|error| format!("sync identity directory: {error}"))?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Another desktop instance won the no-replace publication race.
-            // Never overwrite it; accept only the exact same identity.
             validate_validator_keyfile(&target, phrase, persisted_address)?;
             return Ok(target);
         }
@@ -295,8 +263,6 @@ fn validate_validator_keyfile(
     Ok(())
 }
 
-/// Attempt to parse an input as a BIP-39 mnemonic, surfacing a clear error
-/// to the user if checksum or word list validation fails.
 pub fn validate_bip39(phrase: &str) -> Result<(), String> {
     Mnemonic::parse_in(Language::English, phrase.trim())
         .map(|_| ())
@@ -362,7 +328,6 @@ mod tests {
 
     #[test]
     fn bip39_with_typo_fails_validation() {
-        // Swap a valid word for an invalid one
         let bad = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon notaword";
         assert!(validate_bip39(bad).is_err());
     }

@@ -1,30 +1,13 @@
-//! Unified Testing Framework
-//!
-//! Provides a structured test runner for smart contracts and chain operations,
-//! supporting unit, integration, e2e, fuzz, property-based, benchmark, and
-//! security test categories.
-
 use std::collections::HashMap;
 use std::fmt;
 use std::time::Instant;
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
-/// Runner-wide configuration.
 #[derive(Debug, Clone)]
 pub struct TestConfig {
-    /// Per-test timeout in milliseconds.
     pub timeout_ms: u64,
-    /// Gas limit for test execution.
     pub gas_limit: u64,
-    /// Print verbose output.
     pub verbose: bool,
-    /// Stop on first failure.
     pub fail_fast: bool,
-    /// Run tests in parallel (currently advisory; real parallelism requires
-    /// async or thread pool integration).
     pub parallel: bool,
 }
 
@@ -40,11 +23,6 @@ impl Default for TestConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Test categories
-// ---------------------------------------------------------------------------
-
-/// Classification of a test case.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TestCategory {
     Unit,
@@ -70,11 +48,6 @@ impl fmt::Display for TestCategory {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Setup / teardown steps
-// ---------------------------------------------------------------------------
-
-/// Actions that can be performed during test setup or teardown.
 #[derive(Debug, Clone)]
 pub enum TestSetupStep {
     DeployContract {
@@ -99,11 +72,6 @@ pub enum TestSetupStep {
     },
 }
 
-// ---------------------------------------------------------------------------
-// Assertions
-// ---------------------------------------------------------------------------
-
-/// Declarative assertions that the runner evaluates after execution.
 #[derive(Debug, Clone)]
 pub enum TestAssertion {
     BalanceEquals {
@@ -134,11 +102,6 @@ pub enum TestAssertion {
     },
 }
 
-// ---------------------------------------------------------------------------
-// Test specification
-// ---------------------------------------------------------------------------
-
-/// Full specification of a single test case.
 #[derive(Debug, Clone)]
 pub struct TestSpec {
     pub name: String,
@@ -149,11 +112,6 @@ pub struct TestSpec {
     pub teardown: Vec<TestSetupStep>,
 }
 
-// ---------------------------------------------------------------------------
-// Results
-// ---------------------------------------------------------------------------
-
-/// Outcome of a single test run.
 #[derive(Debug, Clone)]
 pub struct TestRunResult {
     pub test_name: String,
@@ -165,7 +123,6 @@ pub struct TestRunResult {
     pub assertions_total: usize,
 }
 
-/// Aggregate summary of a test suite run.
 #[derive(Debug, Clone, Default)]
 pub struct TestSummary {
     pub total: usize,
@@ -186,11 +143,6 @@ impl fmt::Display for TestSummary {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Fuzz testing types
-// ---------------------------------------------------------------------------
-
-/// Configuration for fuzz test campaigns.
 #[derive(Debug, Clone)]
 pub struct FuzzConfig {
     pub iterations: u32,
@@ -208,7 +160,6 @@ impl Default for FuzzConfig {
     }
 }
 
-/// Result of a fuzz campaign.
 #[derive(Debug, Clone)]
 pub struct FuzzResult {
     pub iterations: u32,
@@ -222,11 +173,6 @@ impl FuzzResult {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Property-based testing
-// ---------------------------------------------------------------------------
-
-/// Specification for a property-based test.
 #[derive(Debug, Clone)]
 pub struct PropertyTest {
     pub name: String,
@@ -235,25 +181,16 @@ pub struct PropertyTest {
     pub iterations: u32,
 }
 
-// ---------------------------------------------------------------------------
-// Test Runner
-// ---------------------------------------------------------------------------
-
-/// Orchestrates test execution, collecting results and producing summaries.
 pub struct TestRunner {
     pub tests: Vec<TestSpec>,
     pub results: Vec<TestRunResult>,
     pub config: TestConfig,
-    /// Simulated account balances for assertion evaluation.
     balances: HashMap<[u8; 32], u64>,
-    /// Simulated state for assertion evaluation.
     state: HashMap<([u8; 32], [u8; 32]), [u8; 32]>,
-    /// Simulated emitted events (topics).
     events: Vec<[u8; 32]>,
 }
 
 impl TestRunner {
-    /// Create a new runner with the given configuration.
     pub fn new(config: TestConfig) -> Self {
         Self {
             tests: Vec::new(),
@@ -265,12 +202,10 @@ impl TestRunner {
         }
     }
 
-    /// Add a test specification to the suite.
     pub fn add_test(&mut self, spec: TestSpec) {
         self.tests.push(spec);
     }
 
-    /// Execute a single test by name.
     pub fn run_test(&mut self, name: &str) -> Option<TestRunResult> {
         let spec = self.tests.iter().find(|t| t.name == name)?.clone();
         let result = self.execute_spec(&spec);
@@ -278,7 +213,6 @@ impl TestRunner {
         Some(result)
     }
 
-    /// Execute all tests in the suite, respecting `fail_fast`.
     pub fn run_all(&mut self) -> TestSummary {
         let specs: Vec<TestSpec> = self.tests.clone();
         let start = Instant::now();
@@ -297,7 +231,6 @@ impl TestRunner {
         summary
     }
 
-    /// Run all tests in a given category.
     pub fn run_category(&mut self, category: TestCategory) -> Vec<TestRunResult> {
         let specs: Vec<TestSpec> = self
             .tests
@@ -314,7 +247,6 @@ impl TestRunner {
         results
     }
 
-    /// Compute a summary from all collected results.
     pub fn summary(&self) -> TestSummary {
         let mut s = TestSummary {
             total: self.results.len(),
@@ -332,10 +264,6 @@ impl TestRunner {
         s
     }
 
-    // -----------------------------------------------------------------------
-    // Internal execution
-    // -----------------------------------------------------------------------
-
     fn execute_spec(&mut self, spec: &TestSpec) -> TestRunResult {
         let start = Instant::now();
         let mut gas_used: u64 = 0;
@@ -343,13 +271,11 @@ impl TestRunner {
         let assertions_total = spec.assertions.len();
         let mut error: Option<String> = None;
 
-        // Setup phase.
         for step in &spec.setup {
             self.apply_setup(step);
-            gas_used += 100; // symbolic gas cost per setup step
+            gas_used += 100;
         }
 
-        // Assertion phase.
         for assertion in &spec.assertions {
             match self.evaluate_assertion(assertion, &mut gas_used) {
                 Ok(()) => assertions_passed += 1,
@@ -364,12 +290,10 @@ impl TestRunner {
             }
         }
 
-        // Teardown phase.
         for step in &spec.teardown {
             self.apply_setup(step);
         }
 
-        // Reset simulated state between tests.
         self.balances.clear();
         self.state.clear();
         self.events.clear();
@@ -400,15 +324,9 @@ impl TestRunner {
             } => {
                 self.state.insert((*address, *key), *value);
             }
-            TestSetupStep::DeployContract { .. } => {
-                // In a real implementation this would deploy to a test VM.
-            }
-            TestSetupStep::AdvanceBlock { .. } => {
-                // Symbolic - advance the simulated block height.
-            }
-            TestSetupStep::CallContract { .. } => {
-                // Symbolic call.
-            }
+            TestSetupStep::DeployContract { .. } => {}
+            TestSetupStep::AdvanceBlock { .. } => {}
+            TestSetupStep::CallContract { .. } => {}
         }
     }
 
@@ -417,7 +335,7 @@ impl TestRunner {
         assertion: &TestAssertion,
         gas_used: &mut u64,
     ) -> Result<(), String> {
-        *gas_used += 50; // symbolic gas per assertion
+        *gas_used += 50;
         match assertion {
             TestAssertion::BalanceEquals { address, expected } => {
                 let actual = self.balances.get(address).copied().unwrap_or(0);
@@ -446,12 +364,8 @@ impl TestRunner {
                     Err(format!("state mismatch at key {:?}", key))
                 }
             }
-            TestAssertion::TxSucceeds { .. } => {
-                // Symbolic: assume success unless setup says otherwise.
-                Ok(())
-            }
+            TestAssertion::TxSucceeds { .. } => Ok(()),
             TestAssertion::TxReverts { error, .. } => {
-                // Symbolic: we validate the error message is non-empty.
                 if error.is_empty() {
                     Err("expected revert error but message is empty".to_string())
                 } else {
@@ -473,7 +387,6 @@ impl TestRunner {
                 }
             }
             TestAssertion::Custom { name, check } => {
-                // Custom assertions are symbolic; pass if check is non-empty.
                 if check.is_empty() {
                     Err(format!("custom assertion '{}' has empty check", name))
                 } else {
@@ -483,10 +396,6 @@ impl TestRunner {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -571,7 +480,7 @@ mod tests {
         runner.add_test(simple_spec("c", TestCategory::Unit));
         let summary = runner.run_all();
         assert_eq!(summary.total, 3);
-        assert_eq!(summary.passed, 3); // no assertions = pass
+        assert_eq!(summary.passed, 3);
     }
 
     #[test]
@@ -672,7 +581,6 @@ mod tests {
         config.fail_fast = true;
         let mut runner = TestRunner::new(config);
 
-        // First test will fail.
         let failing = TestSpec {
             name: "will_fail".to_string(),
             description: "".to_string(),
@@ -688,7 +596,6 @@ mod tests {
         runner.add_test(simple_spec("should_not_run", TestCategory::Unit));
 
         let summary = runner.run_all();
-        // Only the first test should have run.
         assert_eq!(summary.total, 1);
         assert_eq!(summary.failed, 1);
     }

@@ -2,8 +2,6 @@ import type { LucideIcon } from "lucide-react";
 import { useTheme } from "../lib/theme";
 import { Vignette, type VignetteKind } from "./Vignette";
 
-// In the engraved theme an empty state shows a small engraving of what is
-// missing instead of a stock icon; call sites stay the same.
 const ENGRAVED: Record<string, VignetteKind> = {
   FileSignature: "tablet",
   ScrollText: "leaves",

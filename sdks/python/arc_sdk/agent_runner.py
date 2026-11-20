@@ -1,60 +1,3 @@
-"""
-ARC Chain Agent Runner — connect any AI model to ARC Chain.
-
-The AgentRunner is the bridge between off-chain AI models (GPT-4,
-Llama, Ollama, OpenClaw, or any HTTP API) and ARC Chain's on-chain agent
-infrastructure (registration, inference attestation, settlement).
-
-Usage with OpenAI::
-
-    from arc_sdk import ArcClient, KeyPair
-    from arc_sdk.agent_runner import AgentRunner
-    import openai
-
-    client = ArcClient("http://localhost:9944")
-    kp = KeyPair.from_seed(blake3.blake3(b"my-agent-seed").digest())
-
-    async def gpt4_inference(input_text: str, model_id: str) -> str:
-        response = await openai.ChatCompletion.acreate(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": input_text}],
-        )
-        return response.choices[0].message.content
-
-    runner = AgentRunner(
-        client=client,
-        keypair=kp,
-        name="my-gpt4-agent",
-        inference_fn=gpt4_inference,
-    )
-    await runner.start()
-
-Usage with local Ollama::
-
-    import httpx
-
-    async def ollama_inference(input_text: str, model_id: str) -> str:
-        async with httpx.AsyncClient() as http:
-            resp = await http.post("http://localhost:11434/api/generate",
-                json={"model": "llama3", "prompt": input_text, "stream": False})
-            return resp.json()["response"]
-
-    runner = AgentRunner(client=client, keypair=kp, name="llama-local",
-                         inference_fn=ollama_inference)
-
-Usage with OpenClaw gateway::
-
-    async def openclaw_inference(input_text: str, model_id: str) -> str:
-        async with httpx.AsyncClient() as http:
-            resp = await http.post("http://openclaw-gateway:8000/v1/run",
-                json={"agent_id": model_id, "input": input_text},
-                headers={"Authorization": "Bearer <token>"})
-            return resp.json()["output"]
-
-    runner = AgentRunner(client=client, keypair=kp, name="openclaw-router",
-                         inference_fn=openclaw_inference)
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -71,25 +14,19 @@ from .errors import ArcError
 
 logger = logging.getLogger(__name__)
 
-# Type alias for the user-provided inference function.
-# Signature: async fn(input_text: str, model_id: str) -> str
 InferenceFn = Callable[[str, str], Awaitable[str]]
 
 
 def _blake3_hex(data: bytes) -> str:
-    """Compute BLAKE3 hash and return as 64-char hex string."""
     return blake3.blake3(data).hexdigest()
 
 
 def _model_id(name: str) -> str:
-    """Derive a deterministic 32-byte model ID from a name."""
     return _blake3_hex(f"arc-model-{name}".encode())
 
 
 @dataclass
 class AgentStats:
-    """Running statistics for the agent."""
-
     requests_processed: int = 0
     requests_failed: int = 0
     attestations_submitted: int = 0
@@ -111,8 +48,6 @@ class AgentStats:
 
 @dataclass
 class InferenceRequest:
-    """A pending inference request from the chain."""
-
     request_id: str
     sender: str
     input_text: str
@@ -123,8 +58,6 @@ class InferenceRequest:
 
 @dataclass
 class InferenceResult:
-    """Result of an inference execution."""
-
     request_id: str
     output_text: str
     input_hash: str
@@ -135,21 +68,6 @@ class InferenceResult:
 
 
 class AgentRunner:
-    """
-    Off-chain agent daemon that connects any AI model to ARC Chain.
-
-    The runner:
-    1. Registers as an agent on ARC Chain (RegisterAgent TX)
-    2. Polls for incoming inference requests
-    3. Calls your inference function (any model, any API)
-    4. Submits InferenceAttestation TX with (model_id, input_hash, output_hash)
-    5. Settles payment via zero-fee Settle TX
-    6. Repeats
-
-    The inference function is yours — GPT-4, Llama, Ollama, OpenClaw,
-    a local model, or anything that takes text in and returns text out.
-    """
-
     def __init__(
         self,
         client: ArcClient,
@@ -182,10 +100,7 @@ class AgentRunner:
         self._running = False
         self._nonce = 0
 
-    # ── Lifecycle ────────────────────────────────────────────────────────
-
     async def register(self) -> str:
-        """Register this agent on ARC Chain. Returns the TX hash."""
         tx = {
             "from": self.address,
             "nonce": self._next_nonce(),
@@ -207,12 +122,6 @@ class AgentRunner:
         return tx_hash
 
     async def start(self, max_iterations: Optional[int] = None):
-        """
-        Start the agent runner loop.
-
-        Polls ARC Chain for inference requests, processes them, and submits
-        attestations + settlements. Runs until stopped or max_iterations reached.
-        """
         logger.info(f"Starting AgentRunner: {self.name}")
         logger.info(f"  Address:    {self.address[:16]}...")
         logger.info(f"  Model:      {self.model_name} ({self.model_id[:16]}...)")
@@ -220,7 +129,6 @@ class AgentRunner:
         logger.info(f"  Bond:       {self.bond_amount} ARC")
         logger.info(f"  Fee:        {self.fee_per_request} ARC/request")
 
-        # Register on-chain
         try:
             await self.register()
         except Exception as e:
@@ -252,31 +160,22 @@ class AgentRunner:
         logger.info(f"Agent stopped. Stats: {self.stats}")
 
     def stop(self):
-        """Signal the runner to stop after the current iteration."""
         self._running = False
 
-    # ── Core Processing ──────────────────────────────────────────────────
-
     async def _process_request(self, req: InferenceRequest) -> InferenceResult:
-        """Process a single inference request end-to-end."""
         start = time.time()
 
         try:
-            # 1. Call the user's inference function
             output_text = await self.inference_fn(req.input_text, req.model_id)
             inference_ms = (time.time() - start) * 1000
 
-            # 2. Compute hashes
             input_hash = _blake3_hex(req.input_text.encode("utf-8"))
             output_hash = _blake3_hex(output_text.encode("utf-8"))
 
-            # 3. Submit InferenceAttestation TX
             attestation_tx = await self._submit_attestation(input_hash, output_hash)
 
-            # 4. Submit Settle TX (zero-fee settlement)
             settlement_tx = await self._submit_settlement(req.sender, req.fee)
 
-            # 5. Update stats
             self.stats.requests_processed += 1
             self.stats.attestations_submitted += 1
             self.stats.settlements_submitted += 1
@@ -307,7 +206,6 @@ class AgentRunner:
             raise
 
     async def _submit_attestation(self, input_hash: str, output_hash: str) -> Optional[str]:
-        """Submit an InferenceAttestation TX to record the inference on-chain."""
         tx = {
             "from": self.address,
             "nonce": self._next_nonce(),
@@ -329,7 +227,6 @@ class AgentRunner:
             return None
 
     async def _submit_settlement(self, recipient: str, amount: int) -> Optional[str]:
-        """Submit a zero-fee Settle TX for the inference payment."""
         tx = {
             "from": self.address,
             "nonce": self._next_nonce(),
@@ -349,34 +246,9 @@ class AgentRunner:
             return None
 
     async def _poll_requests(self) -> List[InferenceRequest]:
-        """
-        Poll ARC Chain for pending inference requests.
-
-        In the current implementation, this checks the agent's account for
-        incoming transactions. A future version will use WebSocket subscriptions.
-        """
-        # For now, return empty — requests come from external callers
-        # who invoke the agent directly via the runner's HTTP endpoint
-        # or through the ARC Chain RPC.
         return []
 
-    # ── Direct Inference (callable without polling) ──────────────────────
-
     async def infer(self, input_text: str, sender: str = "", fee: int = 0) -> InferenceResult:
-        """
-        Run inference directly (without polling).
-
-        Call this from your own HTTP server, CLI, or integration layer.
-        The runner handles the model call + attestation + settlement.
-
-        Args:
-            input_text: The input to send to the model.
-            sender: Address of the requester (for settlement).
-            fee: Amount to settle (0 = free).
-
-        Returns:
-            InferenceResult with output, hashes, and TX hashes.
-        """
         req = InferenceRequest(
             request_id=_blake3_hex(f"{input_text}{time.time()}".encode())[:16],
             sender=sender or self.address,
@@ -387,16 +259,12 @@ class AgentRunner:
         )
         return await self._process_request(req)
 
-    # ── Helpers ──────────────────────────────────────────────────────────
-
     def _next_nonce(self) -> int:
-        """Get and increment the local nonce counter."""
         n = self._nonce
         self._nonce += 1
         return n
 
     def status(self) -> Dict[str, Any]:
-        """Return agent status as a dict."""
         return {
             "name": self.name,
             "address": self.address,
@@ -414,9 +282,6 @@ class AgentRunner:
         }
 
 
-# ── Convenience constructors for common providers ────────────────────────
-
-
 def openai_runner(
     client: ArcClient,
     keypair: KeyPair,
@@ -426,7 +291,6 @@ def openai_runner(
     name: str = "openai-agent",
     **kwargs,
 ) -> AgentRunner:
-    """Create an AgentRunner that calls OpenAI's API."""
     import os
 
     _api_key = api_key or os.getenv("OPENAI_API_KEY", "")
@@ -458,8 +322,6 @@ def ollama_runner(
     name: str = "ollama-agent",
     **kwargs,
 ) -> AgentRunner:
-    """Create an AgentRunner that calls a local Ollama instance."""
-
     async def _infer(input_text: str, model_id: str) -> str:
         import httpx
 
@@ -487,8 +349,6 @@ def openclaw_runner(
     name: str = "openclaw-agent",
     **kwargs,
 ) -> AgentRunner:
-    """Create an AgentRunner that routes through an OpenClaw gateway."""
-
     async def _infer(input_text: str, model_id: str) -> str:
         import httpx
 

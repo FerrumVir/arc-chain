@@ -1,15 +1,5 @@
 import { expect, test } from "@playwright/test";
 
-// LOCAL-DEVELOPMENT explorer: native paid inference (protocol 4).
-//
-// Against a disposable protocol-4 network - e.g. the soak harness's
-// `--workload native` validators. It discovers a settled request from the
-// chain itself (a NativeInferenceFinalize transaction in a recent block), so
-// every assertion is about a real receipt, cross-checked against the node's
-// own JSON rather than against anything the page computed.
-//
-// ARC_LOCALDEV_NATIVE_RPC: one node's RPC base (http://127.0.0.1:9960)
-// ARC_LOCALDEV_NATIVE_REPLICAS: optional comma-separated other nodes
 const RPC = process.env.ARC_LOCALDEV_NATIVE_RPC;
 const REPLICAS = (process.env.ARC_LOCALDEV_NATIVE_REPLICAS ?? "").split(",").filter(Boolean);
 
@@ -19,8 +9,6 @@ const get = async (path: string): Promise<Json | null> => {
   return response.ok ? response.json() : null;
 };
 
-/// The newest settled native request in the last 2,000 blocks, with the block
-/// that settled it.
 async function settledRequest(): Promise<{ requestId: string; height: number } | null> {
   const health = await get("/health");
   const tip = Number(health?.height ?? 0);

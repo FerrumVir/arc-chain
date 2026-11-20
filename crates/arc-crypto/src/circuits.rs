@@ -1,26 +1,5 @@
-//! Verification circuit definitions for ARC Chain ZK proofs.
-//!
-//! Provides an arithmetic circuit abstraction used by the STARK proving pipeline.
-//! Circuits are composed of wires (variables) and gates (constraints), and can be
-//! evaluated against a witness to verify that all constraints hold.
-//!
-//! Includes pre-built circuits for common ARC Chain operations:
-//! - **TransferCircuit**: Verifies balance transfer correctness (sufficient funds,
-//!   no overflow, correct new balances).
-//! - **StateTransitionCircuit**: Verifies that a state root transition is valid
-//!   given a set of leaf updates.
-//!
-//! ## Architecture
-//!
-//! ```text
-//! CircuitBuilder  ──build()──>  Circuit  ──evaluate()──>  witness values
-//!                                        ──verify()───>   bool (all constraints hold)
-//! ```
-
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-// ── Error type ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum CircuitError {
@@ -41,27 +20,15 @@ pub enum CircuitError {
     ArithmeticOverflow(usize),
 }
 
-// ── Gate and Wire types ───────────────────────────────────────────────────────
-
-/// A gate in an arithmetic circuit.
-///
-/// Each gate operates on wire indices. The convention is:
-/// `out = op(left, right)` where the tuple fields are (left, right, out).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Gate {
-    /// Addition gate: wire[out] = wire[a] + wire[b].
     Add(usize, usize, usize),
-    /// Multiplication gate: wire[out] = wire[a] * wire[b].
     Mul(usize, usize, usize),
-    /// Constant gate: wire[out] = value.
     Const(usize, u64),
-    /// Public input gate: marks wire[idx] as a public input.
     PublicInput(usize),
-    /// Assertion gate: asserts wire[idx] == value.
     Assert(usize, u64),
 }
 
-/// A wire (variable) in the circuit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Wire {
     pub id: usize,
@@ -69,27 +36,17 @@ pub struct Wire {
     pub is_public: bool,
 }
 
-// ── Circuit ───────────────────────────────────────────────────────────────────
-
-/// A complete arithmetic circuit with gates, wires, and public input designations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Circuit {
-    /// Unique circuit identifier (BLAKE3 of circuit structure).
     pub id: [u8; 32],
-    /// Human-readable name.
     pub name: String,
-    /// Ordered list of gates.
     pub gates: Vec<Gate>,
-    /// Wire definitions.
     pub wires: Vec<Wire>,
-    /// Indices of wires that are public inputs.
     pub public_inputs: Vec<usize>,
-    /// Total number of constraints (assertion gates + multiplication gates).
     pub constraints: usize,
 }
 
 impl Circuit {
-    /// Compute a deterministic ID for this circuit based on its structure.
     fn compute_id(name: &str, gates: &[Gate], wire_count: usize) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"arc-circuit-id");
@@ -131,9 +88,6 @@ impl Circuit {
     }
 }
 
-// ── Circuit Builder ───────────────────────────────────────────────────────────
-
-/// Fluent builder for constructing arithmetic circuits.
 pub struct CircuitBuilder {
     name: String,
     gates: Vec<Gate>,
@@ -142,7 +96,6 @@ pub struct CircuitBuilder {
 }
 
 impl CircuitBuilder {
-    /// Create a new circuit builder with the given name.
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -152,7 +105,6 @@ impl CircuitBuilder {
         }
     }
 
-    /// Allocate a new wire and return its index.
     fn alloc_wire(&mut self, is_public: bool) -> usize {
         let idx = self.wire_count;
         self.wire_count += 1;
@@ -162,45 +114,38 @@ impl CircuitBuilder {
         idx
     }
 
-    /// Add a public input wire and return its index.
     pub fn add_public_input(&mut self) -> usize {
         let idx = self.alloc_wire(true);
         self.gates.push(Gate::PublicInput(idx));
         idx
     }
 
-    /// Add a private (witness) input wire and return its index.
     pub fn add_private_input(&mut self) -> usize {
         self.alloc_wire(false)
     }
 
-    /// Add an addition gate: wire[out] = wire[a] + wire[b]. Returns the output wire index.
     pub fn add(&mut self, a: usize, b: usize) -> usize {
         let out = self.alloc_wire(false);
         self.gates.push(Gate::Add(a, b, out));
         out
     }
 
-    /// Add a multiplication gate: wire[out] = wire[a] * wire[b]. Returns the output wire index.
     pub fn mul(&mut self, a: usize, b: usize) -> usize {
         let out = self.alloc_wire(false);
         self.gates.push(Gate::Mul(a, b, out));
         out
     }
 
-    /// Add a constant gate: wire[out] = val. Returns the output wire index.
     pub fn constant(&mut self, val: u64) -> usize {
         let out = self.alloc_wire(false);
         self.gates.push(Gate::Const(out, val));
         out
     }
 
-    /// Add an assertion gate: assert wire[idx] == val.
     pub fn assert_equal(&mut self, wire: usize, val: u64) {
         self.gates.push(Gate::Assert(wire, val));
     }
 
-    /// Build the circuit.
     pub fn build(self) -> Circuit {
         let constraints = self
             .gates
@@ -229,25 +174,13 @@ impl CircuitBuilder {
     }
 }
 
-// ── Circuit Evaluator ─────────────────────────────────────────────────────────
-
-/// Evaluates circuits against input witnesses and verifies constraints.
 pub struct CircuitEvaluator;
 
 impl CircuitEvaluator {
-    /// Evaluate a circuit with the given inputs.
-    ///
-    /// `inputs` provides values for wires in order: public inputs first (in the
-    /// order they appear in `circuit.public_inputs`), then private inputs for
-    /// any remaining wires that are not computed by gates.
-    ///
-    /// Returns the final wire values.
     pub fn evaluate(circuit: &Circuit, inputs: &[u64]) -> Result<Vec<u64>, CircuitError> {
         let wire_count = circuit.wires.len();
         let mut values: Vec<Option<u64>> = vec![None; wire_count];
 
-        // Phase 1: Determine which wires are "produced" by computation gates.
-        // Wires that are outputs of Add, Mul, or Const gates don't need external input.
         let mut produced = vec![false; wire_count];
         for gate in &circuit.gates {
             match gate {
@@ -257,11 +190,8 @@ impl CircuitEvaluator {
             }
         }
 
-        // Phase 2: Assign inputs. Public input wires first (in gate order),
-        // then private input wires (any wire not produced and not public, in index order).
         let mut input_idx = 0;
 
-        // Assign public inputs in the order their PublicInput gates appear.
         for gate in &circuit.gates {
             if let Gate::PublicInput(idx) = gate {
                 if *idx >= wire_count {
@@ -275,7 +205,6 @@ impl CircuitEvaluator {
             }
         }
 
-        // Assign remaining inputs to private (non-produced, non-public) wires.
         for i in 0..wire_count {
             if values[i].is_none() && !produced[i] && input_idx < inputs.len() {
                 values[i] = Some(inputs[input_idx]);
@@ -283,10 +212,9 @@ impl CircuitEvaluator {
             }
         }
 
-        // Phase 3: Evaluate computation gates.
         for (gate_idx, gate) in circuit.gates.iter().enumerate() {
             match gate {
-                Gate::PublicInput(_) => { /* already assigned */ }
+                Gate::PublicInput(_) => {}
                 Gate::Const(idx, val) => {
                     if *idx >= wire_count {
                         return Err(CircuitError::InvalidWire(*idx, wire_count));
@@ -346,7 +274,6 @@ impl CircuitEvaluator {
         Ok(values.into_iter().map(|v| v.unwrap_or(0)).collect())
     }
 
-    /// Verify that all constraints in the circuit are satisfied by the given witness.
     pub fn verify_constraints(circuit: &Circuit, witness: &[u64]) -> bool {
         if witness.len() < circuit.wires.len() {
             return false;
@@ -382,9 +309,7 @@ impl CircuitEvaluator {
                         return false;
                     }
                 }
-                Gate::PublicInput(_) => {
-                    // No constraint to verify, just a designation.
-                }
+                Gate::PublicInput(_) => {}
             }
         }
 
@@ -392,76 +317,30 @@ impl CircuitEvaluator {
     }
 }
 
-// ── Pre-built circuits ────────────────────────────────────────────────────────
-
-/// Builds a circuit that verifies a balance transfer.
-///
-/// Public inputs (4): sender_balance, receiver_balance, amount, expected_zero
-/// Constraints verified:
-/// 1. sender_balance >= amount (sender_balance - amount >= 0, represented as non-negative)
-/// 2. receiver_balance + amount does not overflow
-/// 3. new_sender_balance = sender_balance - amount
-/// 4. new_receiver_balance = receiver_balance + amount
-///
-/// Wire layout:
-/// 0: sender_balance (public)
-/// 1: receiver_balance (public)
-/// 2: amount (public)
-/// 3: new_sender = sender_balance - amount (computed via: sender_balance = amount + new_sender)
-/// 4: new_receiver = receiver_balance + amount
 pub struct TransferCircuit;
 
 impl TransferCircuit {
     pub fn build_transfer_circuit() -> Circuit {
         let mut builder = CircuitBuilder::new("transfer-verification");
 
-        // Public inputs.
-        let _sender_bal = builder.add_public_input(); // wire 0
-        let receiver_bal = builder.add_public_input(); // wire 1
-        let amount = builder.add_public_input(); // wire 2
+        let _sender_bal = builder.add_public_input();
+        let receiver_bal = builder.add_public_input();
+        let amount = builder.add_public_input();
 
-        // new_sender = sender_balance - amount.
-        // We represent subtraction as: new_sender + amount = sender_balance.
-        // new_sender is a private witness input.
-        let new_sender = builder.add_private_input(); // wire 3
+        let new_sender = builder.add_private_input();
 
-        // Constraint: new_sender + amount == sender_balance.
-        let _sum_check = builder.add(new_sender, amount); // wire 4 = new_sender + amount
-        // We need to assert sum_check == sender_balance.
-        // Since we can't directly assert equality of two wires with the current gate set,
-        // we use a multiplication by 1: sender_balance * 1 == sum_check (via a Mul gate).
-        // Instead, we verify during evaluation. For the circuit model, we add a
-        // subtraction check: sum_check - sender_balance == 0.
-        // Represent as: sender_balance + 0 = sum_check (equivalently).
-        // Actually, let's use a simpler approach: we add the private input for
-        // new_sender and assert specific constraints.
+        let _sum_check = builder.add(new_sender, amount);
 
-        // new_receiver = receiver_balance + amount.
-        let _new_receiver = builder.add(receiver_bal, amount); // wire 5
-
-        // Overflow check: new_receiver must be >= receiver_balance.
-        // In our u64 model, if overflow occurred, new_receiver < receiver_balance.
-        // We can represent this by multiplying with a boolean flag.
-        // For simplicity in the circuit model, we use assertion gates with
-        // expected values that the evaluator will check.
-
-        // The circuit encodes the structural relationships. The actual constraint
-        // verification happens in `verify_constraints`, which checks:
-        // - All Add/Mul gates produce correct outputs.
-        // - All Assert gates match expected values.
+        let _new_receiver = builder.add(receiver_bal, amount);
 
         builder.build()
     }
 
-    /// Evaluate the transfer circuit with concrete values.
-    ///
-    /// Returns Ok(witness) if the transfer is valid, Err if any constraint fails.
     pub fn verify_transfer(
         sender_balance: u64,
         receiver_balance: u64,
         amount: u64,
     ) -> Result<TransferResult, CircuitError> {
-        // Pre-check: sender must have sufficient balance.
         if amount > sender_balance {
             return Err(CircuitError::ConstraintViolation {
                 index: 0,
@@ -470,7 +349,6 @@ impl TransferCircuit {
             });
         }
 
-        // Pre-check: receiver balance must not overflow.
         let new_receiver = receiver_balance
             .checked_add(amount)
             .ok_or(CircuitError::ArithmeticOverflow(1))?;
@@ -478,11 +356,9 @@ impl TransferCircuit {
         let new_sender = sender_balance - amount;
 
         let circuit = Self::build_transfer_circuit();
-        // Inputs: sender_balance, receiver_balance, amount, then private: new_sender.
         let inputs = vec![sender_balance, receiver_balance, amount, new_sender];
         let witness = CircuitEvaluator::evaluate(&circuit, &inputs)?;
 
-        // Verify the witness satisfies all gate constraints.
         if !CircuitEvaluator::verify_constraints(&circuit, &witness) {
             return Err(CircuitError::ConstraintViolation {
                 index: 0,
@@ -500,7 +376,6 @@ impl TransferCircuit {
     }
 }
 
-/// Result of a verified transfer circuit evaluation.
 #[derive(Debug, Clone)]
 pub struct TransferResult {
     pub new_sender_balance: u64,
@@ -509,19 +384,12 @@ pub struct TransferResult {
     pub circuit_id: [u8; 32],
 }
 
-/// Builds a circuit that verifies state root transitions.
-///
-/// Verifies that applying a list of updates (key-value pairs) to an old state root
-/// produces the expected new state root. Uses BLAKE3 hashing to simulate Merkle
-/// root computations within the circuit.
 pub struct StateTransitionCircuit;
 
 impl StateTransitionCircuit {
-    /// Build a state transition verification circuit for `num_updates` leaf changes.
     pub fn build_state_transition_circuit(num_updates: usize) -> Circuit {
         let mut builder = CircuitBuilder::new("state-transition-verification");
 
-        // Public inputs: old_state_root (as 4 x u64 limbs) and new_state_root (4 x u64 limbs).
         let mut old_root_wires = Vec::new();
         for _ in 0..4 {
             old_root_wires.push(builder.add_public_input());
@@ -531,13 +399,11 @@ impl StateTransitionCircuit {
             new_root_wires.push(builder.add_public_input());
         }
 
-        // Private inputs: each update is (leaf_index, old_value, new_value).
         let mut _update_wires = Vec::new();
         for _ in 0..num_updates {
             let leaf_idx = builder.add_private_input();
             let old_val = builder.add_private_input();
             let new_val = builder.add_private_input();
-            // Chain updates: each update's hash feeds into the next.
             let update_hash = builder.mul(leaf_idx, old_val);
             let chained = builder.add(update_hash, new_val);
             _update_wires.push(chained);
@@ -546,10 +412,6 @@ impl StateTransitionCircuit {
         builder.build()
     }
 
-    /// Verify a state transition.
-    ///
-    /// `old_root` and `new_root` are 32-byte state roots.
-    /// `updates` are (leaf_index, old_value, new_value) tuples.
     pub fn verify_transition(
         old_root: &[u8; 32],
         new_root: &[u8; 32],
@@ -557,7 +419,6 @@ impl StateTransitionCircuit {
     ) -> Result<bool, CircuitError> {
         let circuit = Self::build_state_transition_circuit(updates.len());
 
-        // Encode roots as 4 x u64 limbs.
         let mut inputs = Vec::new();
         for chunk in old_root.chunks(8) {
             let mut bytes = [0u8; 8];
@@ -570,7 +431,6 @@ impl StateTransitionCircuit {
             inputs.push(u64::from_le_bytes(bytes));
         }
 
-        // Add update values as private inputs.
         for (leaf_idx, old_val, new_val) in updates {
             inputs.push(*leaf_idx);
             inputs.push(*old_val);
@@ -581,8 +441,6 @@ impl StateTransitionCircuit {
         Ok(CircuitEvaluator::verify_constraints(&circuit, &witness))
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -621,7 +479,6 @@ mod tests {
 
         assert_eq!(c, 2);
         assert_eq!(circuit.wires.len(), 3);
-        // Add gates are not counted as constraints (only Mul and Assert).
         assert_eq!(circuit.constraints, 0);
     }
 
@@ -634,7 +491,7 @@ mod tests {
         let circuit = builder.build();
 
         assert_eq!(c, 2);
-        assert_eq!(circuit.constraints, 1); // Mul counts as a constraint.
+        assert_eq!(circuit.constraints, 1);
     }
 
     #[test]
@@ -673,8 +530,8 @@ mod tests {
 
         let witness = CircuitEvaluator::evaluate(&circuit, &[50]).unwrap();
         assert_eq!(witness[0], 50);
-        assert_eq!(witness[1], 100); // constant
-        assert_eq!(witness[2], 150); // sum
+        assert_eq!(witness[1], 100);
+        assert_eq!(witness[2], 150);
     }
 
     #[test]
@@ -718,7 +575,6 @@ mod tests {
         let _c = builder.mul(a, b);
         let circuit = builder.build();
 
-        // Correct witness: 5 * 6 = 30.
         assert!(CircuitEvaluator::verify_constraints(&circuit, &[5, 6, 30]));
     }
 
@@ -730,7 +586,6 @@ mod tests {
         let _c = builder.mul(a, b);
         let circuit = builder.build();
 
-        // Incorrect witness: 5 * 6 != 31.
         assert!(!CircuitEvaluator::verify_constraints(&circuit, &[5, 6, 31]));
     }
 
@@ -772,7 +627,6 @@ mod tests {
     fn test_state_transition_circuit_build() {
         let circuit = StateTransitionCircuit::build_state_transition_circuit(3);
         assert_eq!(circuit.name, "state-transition-verification");
-        // 8 public inputs (4 old root limbs + 4 new root limbs) + private wires.
         assert_eq!(circuit.public_inputs.len(), 8);
     }
 
@@ -828,7 +682,6 @@ mod tests {
 
     #[test]
     fn test_chained_operations() {
-        // Build: result = (a + b) * c.
         let mut builder = CircuitBuilder::new("chained");
         let a = builder.add_public_input();
         let b = builder.add_public_input();
@@ -838,11 +691,10 @@ mod tests {
         builder.assert_equal(product, 150);
         let circuit = builder.build();
 
-        // (10 + 20) * 5 = 150.
         let result = CircuitEvaluator::evaluate(&circuit, &[10, 20, 5]);
         assert!(result.is_ok());
         let witness = result.unwrap();
-        assert_eq!(witness[3], 30); // sum
-        assert_eq!(witness[4], 150); // product
+        assert_eq!(witness[3], 30);
+        assert_eq!(witness[4], 150);
     }
 }

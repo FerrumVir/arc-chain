@@ -1,11 +1,3 @@
-//! Private-cohort tensor-row parallelism for one inference query.
-//!
-//! This module is intentionally separate from the public layer-shard RPC.
-//! Every worker owns disjoint rows of one canonical-I8 matrix, returns those
-//! rows for one authenticated call, and the coordinator restores the tensor in
-//! row order.  It is useful on trusted, pinned-host-key stdio transports; it
-//! does not advertise a public listener or a validator capability.
-
 use crate::cached_integer_model::{
     I8Weights, matmul_i8_canonical_row_range, matmul_i8_canonical_rows,
 };
@@ -26,17 +18,10 @@ pub const MAX_ROW_INPUT_ELEMENTS: usize = 131_072;
 pub const MAX_ROW_OUTPUT_ELEMENTS: usize = 131_072;
 pub const MAX_ROW_WORKERS_PER_STAGE: usize = 32;
 pub const MAX_ROW_ID_BYTES: usize = 256;
-/// Deliberately below the sidecar's 1536 MiB cgroup budget, leaving space for
-/// the worker, input frame, and OS.  A deployment must split a larger slice.
 pub const MAX_CANONICAL_ROW_FILE_BYTES: usize = 1_073_741_824;
 const ROW_FILE_MAGIC: &[u8; 8] = b"ARCROW01";
-/// Request frames carry `ROW_FRAME_MAGIC`, responses `ROW_RESPONSE_MAGIC`, so a
-/// request frame (or a worker that echoes one) is never read as a response.
 const ROW_FRAME_MAGIC: &[u8; 8] = b"ARCTP001";
 const ROW_RESPONSE_MAGIC: &[u8; 8] = b"ARCTR001";
-// Additive private-service handshake, outside the unchanged row-v1 codec.
-// Distinct request/response domains reject reflected requests. SSH authenticates
-// the host; this proves service configuration, not honest remote computation.
 pub(crate) const MANIFEST_PIN_REQUEST_MAGIC: &[u8; 8] = b"ARCPIN01";
 pub(crate) const MANIFEST_PIN_RESPONSE_MAGIC: &[u8; 8] = b"ARCPACK1";
 pub(crate) fn manifest_pin_frame(magic: &[u8; 8], hash: Hash256, worker: &str) -> [u8; 72] {
@@ -66,11 +51,8 @@ pub struct RowAssignment {
     pub execution_profile: String,
     pub layer: Option<usize>,
     pub tensor: TensorKey,
-    /// Logical canonical output rows, inclusive/exclusive.  Q/K means rows
-    /// after the loader's interleaved-to-split-half permutation.
     pub row_start: usize,
     pub row_end: usize,
-    /// Pinned transport identity, never a display name or network address.
     pub worker_id: String,
 }
 
@@ -116,14 +98,10 @@ pub enum TensorParallelError {
     MissingWorker(String),
     #[error("worker rejected row projection: {0}")]
     Worker(String),
-    /// The worker's connection had already closed: nothing was sent.
     #[error("the row worker's connection is closed")]
     Closed,
 }
 
-/// Validate that a stage has exactly one owner for every output row.  This is
-/// deliberately strict: missing output rows, duplicate rows, and different
-/// artifact/profile identities all fail before a worker is contacted.
 pub fn validate_exact_coverage(
     assignments: &[RowAssignment],
     artifact_id: Hash256,
@@ -175,26 +153,17 @@ pub fn validate_exact_coverage(
     Ok(ordered)
 }
 
-/// A transport adapter.  Production wiring uses a persistent SSH stdio child
-/// with a pinned host key; this trait keeps the numeric/coverage proof
-/// testable without opening a socket or changing validator RPC.
 pub trait RowWorker: Send + Sync {
     fn project(
         &self,
         request: RowProjectionRequest,
     ) -> Result<RowProjectionResponse, TensorParallelError>;
 
-    /// Whether the worker can still take a call. A transport that closes
-    /// itself after a failure (as [`SshStdioRowWorker`] does) says so here,
-    /// so its owner can reconnect it.
     fn is_open(&self) -> bool {
         true
     }
 }
 
-/// Fallible projection interface consumed by the canonical-I8 forward adapter.
-/// A backend receives only a projection stage and its activation; it cannot
-/// replace local layernorm, RoPE, attention, residuals, or token selection.
 pub trait ProjectionBackend: Send + Sync {
     fn project_rows(
         &self,
@@ -205,9 +174,6 @@ pub trait ProjectionBackend: Send + Sync {
         output_rows: usize,
     ) -> Result<Vec<i64>, TensorParallelError>;
 
-    /// Independent projections from the same activation (Q/K/V and gate/up)
-    /// are dispatched concurrently.  The result order is the input order;
-    /// each individual projection still performs exact row coverage checks.
     fn project_group(
         &self,
         call_id: Hash256,
@@ -233,18 +199,12 @@ pub trait ProjectionBackend: Send + Sync {
     }
 }
 
-/// A row shard used by the portable stdio worker and deterministic tests.
 pub struct LocalRowWorker {
     pub worker_id: String,
     pub assignment: RowAssignment,
-    /// Contains only `assignment.rows()` canonical matrix rows and their Q16
-    /// scales; it is never a resident full model.
     pub weights: I8Weights,
 }
 
-/// Coordinator-local view of one resident canonical model.  Unlike
-/// `LocalRowWorker`, it does not retain a second copy of a tensor shard; it
-/// slices the coordinator's verified model only for the bounded projection.
 pub struct ModelRowWorker {
     pub worker_id: String,
     pub assignment: RowAssignment,
@@ -322,10 +282,6 @@ impl RowWorker for LocalRowWorker {
     }
 }
 
-/// Configuration for a single persistent, private SSH stdio sidecar.  The
-/// command is constructed as argv (never a shell string), host-key checking is
-/// mandatory, and a protocol failure kills the child instead of retrying a
-/// different endpoint or silently falling back to local projection.
 pub struct SshStdioConfig {
     pub ssh_program: std::path::PathBuf,
     pub target: String,
@@ -340,21 +296,15 @@ struct SshChild {
     stdout: ChildStdout,
 }
 
-/// The longest a single call to an SSH row worker may take, whatever it is
-/// configured with.
 pub const MAX_SSH_CALL_TIMEOUT_MS: u64 = 3_600_000;
 
 pub struct SshStdioRowWorker {
     worker_id: String,
     child: Mutex<Option<SshChild>>,
     timeout_ms: AtomicU64,
-    /// Set when the worker closes itself; read without waiting on a call.
     closed: AtomicBool,
 }
 
-/// The remote command as the one string OpenSSH hands the remote shell: each
-/// argv element single-quoted, an embedded `'` written as `'\''` (close,
-/// escaped quote, reopen), so no element can end its quoting.
 fn remote_shell_command(args: &[String]) -> String {
     args.iter()
         .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
@@ -362,8 +312,6 @@ fn remote_shell_command(args: &[String]) -> String {
         .join(" ")
 }
 
-/// An absolute path of letters, digits and `._/-` only: OpenSSH reads it
-/// verbatim in a file-name option, with nothing to split, expand or unescape.
 pub fn is_plain_absolute_path(path: &str) -> bool {
     path.starts_with('/')
         && path
@@ -387,9 +335,6 @@ impl SshStdioRowWorker {
         if config.remote_command.iter().any(|arg| arg.contains('\0')) {
             return Err(TensorParallelError::Bounds);
         }
-        // ssh splits UserKnownHostsFile on whitespace, expands `%`, `~` and
-        // `${VAR}`, and collapses backslashes: accept only a plain absolute
-        // path it reads as exactly this one file.
         let known_hosts = config
             .known_hosts
             .to_str()
@@ -398,11 +343,6 @@ impl SshStdioRowWorker {
         let remote = remote_shell_command(&config.remote_command);
         let mut command = Command::new(&config.ssh_program);
         command
-            // No configuration file: a ControlMaster, ProxyCommand,
-            // KnownHostsCommand or host-key setting there could widen or
-            // bypass the pin. The target names the user (and, as
-            // ssh://user@host:port, the port); the key comes from ssh's
-            // default identities or an agent.
             .arg("-F")
             .arg("none")
             .arg("-oBatchMode=yes")
@@ -413,9 +353,6 @@ impl SshStdioRowWorker {
             .arg("-oCheckHostIP=no")
             .arg("-oControlPath=none")
             .arg("-oPasswordAuthentication=no")
-            // Bounded without a config file: an unreachable host fails within
-            // 10 s, a dead session within about 45 s (15 s keepalives, 2 missed
-            // before the next one fails).
             .arg("-oConnectTimeout=10")
             .arg("-oServerAliveInterval=15")
             .arg("-oServerAliveCountMax=2")
@@ -452,8 +389,6 @@ impl SshStdioRowWorker {
         })
     }
 
-    /// Change the per-call timeout, e.g. after a first call that had to cover
-    /// the remote model load.
     pub fn set_timeout(&self, timeout: Duration) {
         self.timeout_ms.store(
             u64::try_from(timeout.as_millis())
@@ -463,10 +398,6 @@ impl SshStdioRowWorker {
         );
     }
 
-    /// Before any row traffic, require the private service to acknowledge the
-    /// manifest it verified while loading resident bytes. Legacy/unpinned
-    /// services fail closed. This is configuration binding over pinned SSH,
-    /// not remote attestation of an untrusted host's software or computation.
     pub fn verify_manifest_pin(&self, manifest: Hash256) -> Result<(), TensorParallelError> {
         let mut slot = self.child.lock().map_err(|_| {
             self.closed.store(true, AtomicOrdering::Release);
@@ -516,8 +447,6 @@ impl SshStdioRowWorker {
 
 impl Drop for SshStdioRowWorker {
     fn drop(&mut self) {
-        // Even after a panic poisoned the lock, the ssh child is killed and
-        // reaped rather than leaked.
         let slot = match self.child.get_mut() {
             Ok(slot) => slot,
             Err(poisoned) => poisoned.into_inner(),
@@ -545,13 +474,10 @@ impl RowWorker for SshStdioRowWorker {
         }
         let frame = encode_row_request(&request)?;
         let mut slot = self.child.lock().map_err(|_| {
-            // A panic during a call left the session unusable, and this call
-            // sends nothing: the connection is closed.
             self.closed.store(true, AtomicOrdering::Release);
             TensorParallelError::Closed
         })?;
         let child = slot.as_mut().ok_or(TensorParallelError::Closed)?;
-        // Clamped, so no configured timeout can overflow the deadline.
         let timeout = self
             .timeout_ms
             .load(AtomicOrdering::Relaxed)
@@ -650,7 +576,6 @@ fn tensor_from_byte(byte: u8) -> Result<TensorKey, TensorParallelError> {
     }
 }
 
-/// Encode a row request frame (coordinator to worker).
 pub fn encode_row_request(request: &RowProjectionRequest) -> Result<Vec<u8>, TensorParallelError> {
     if request.input.len() > MAX_ROW_INPUT_ELEMENTS {
         return Err(TensorParallelError::Bounds);
@@ -682,7 +607,6 @@ pub fn encode_row_request(request: &RowProjectionRequest) -> Result<Vec<u8>, Ten
     Ok(out)
 }
 
-/// Decode a row response frame (worker to coordinator).
 pub fn decode_row_response(raw: &[u8]) -> Result<RowProjectionResponse, TensorParallelError> {
     let mut bytes = raw;
     if pull(&mut bytes, 8)? != ROW_RESPONSE_MAGIC {
@@ -746,11 +670,8 @@ pub fn decode_row_response(raw: &[u8]) -> Result<RowProjectionResponse, TensorPa
     })
 }
 
-/// Largest frame either side sends; the SSH reader refuses anything larger.
 pub const MAX_ROW_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
-/// The header both frame directions carry: the call, the input it binds and
-/// the exact assignment. Byte layout identical to [`encode_row_request`].
 fn push_frame_header(
     out: &mut Vec<u8>,
     magic: &[u8; 8],
@@ -781,8 +702,6 @@ fn pull_hash(bytes: &mut &[u8]) -> Result<Hash256, TensorParallelError> {
     ))
 }
 
-/// Inverse of [`push_frame_header`], with the same checks as
-/// [`decode_row_response`].
 fn pull_frame_header(
     bytes: &mut &[u8],
     magic: &[u8; 8],
@@ -820,7 +739,6 @@ fn pull_frame_header(
     Ok((call_id, input_hash, assignment))
 }
 
-/// Decode a row request frame (the worker's side of [`encode_row_request`]).
 pub fn decode_row_request(raw: &[u8]) -> Result<RowProjectionRequest, TensorParallelError> {
     let mut bytes = raw;
     let (call_id, input_hash, assignment) = pull_frame_header(&mut bytes, ROW_FRAME_MAGIC)?;
@@ -843,7 +761,6 @@ pub fn decode_row_request(raw: &[u8]) -> Result<RowProjectionRequest, TensorPara
     })
 }
 
-/// Encode a row response frame (the worker's side of [`decode_row_response`]).
 pub fn encode_row_response(
     response: &RowProjectionResponse,
 ) -> Result<Vec<u8>, TensorParallelError> {
@@ -871,7 +788,6 @@ pub fn encode_row_response(
     Ok(out)
 }
 
-/// The resident matrix of one projection of `model`.
 pub fn model_projection_weights(
     model: &crate::cached_integer_model::CachedIntegerModel,
     layer: Option<usize>,
@@ -890,8 +806,6 @@ pub fn model_projection_weights(
     }
 }
 
-/// Rows `[start, end)` of `weights` applied by the coordinator. Validate the
-/// geometry before allocating so a malformed plan cannot request a huge vec.
 pub(crate) fn rows_of(
     weights: &I8Weights,
     start: usize,
@@ -913,7 +827,6 @@ pub(crate) fn rows_of(
     Ok(values)
 }
 
-/// The remote frame path retains its assignment-scoped row copy.
 fn rows_of_copy(
     weights: &I8Weights,
     start: usize,
@@ -932,42 +845,16 @@ fn rows_of_copy(
     Ok(values)
 }
 
-/// A contiguous row range of ONE canonical tensor, held by a worker that does
-/// not hold the model.
-///
-/// This is the whole resident state a row worker needs: the i8 rows, their
-/// per-row scales and the column count, plus the identity those rows belong
-/// to. No embeddings, norms, vocabulary, KV cache or `ModelConfig` - a
-/// full-model worker carries well over a gigabyte of those and never reads
-/// them while serving.
 pub struct RowShard {
     pub artifact: Hash256,
     pub profile: String,
     pub layer: Option<usize>,
     pub tensor: TensorKey,
-    /// The canonical row range these weights are, half-open.
     pub row_start: usize,
     pub row_end: usize,
-    /// Exactly the held rows, already in canonical (post-permutation) order.
     pub weights: I8Weights,
 }
 
-/// Answer one projection from held shards, serving any SUB-RANGE of a shard.
-///
-/// Placement decides row ranges when a request arrives and cannot know, when
-/// the weights were placed, how it will later divide them. A worker that
-/// insisted on bounds equal to what it holds would force a re-export for every
-/// re-placement, which is what kept memory-bounded workers out of automatic
-/// placement.
-///
-/// `worker_id` is deliberately not matched. It is placement's label for a
-/// machine, not an identity: the machine is authenticated by its transport,
-/// and these weights are identified by artifact, profile, layer, tensor and
-/// row range, every one of which is still matched exactly.
-///
-/// The arithmetic is the canonical kernel, not a second implementation of it,
-/// so a shard's answer is bit-identical to the same rows computed by a
-/// coordinator holding the whole model.
 pub fn project_from_shards(
     shards: &[RowShard],
     request: &RowProjectionRequest,
@@ -998,13 +885,6 @@ pub fn project_from_shards(
     rows_of(&shard.weights, offset, end, &request.input)
 }
 
-/// Serve row projections of a resident canonical model over length-prefixed
-/// frames: the private-cohort protocol [`SshStdioRowWorker`] speaks, for any
-/// assignment of this artifact and profile. For an operator's own machine
-/// that holds the whole artifact (the `tensor_row_model_worker` example), so
-/// a coordinator can place any rows on it. Returns at a clean end of input;
-/// the first malformed or mismatched request ends the session with an error,
-/// which the coordinator sees as a closed worker.
 pub fn serve_row_frames(
     model: &crate::cached_integer_model::CachedIntegerModel,
     artifact_id: Hash256,
@@ -1166,10 +1046,6 @@ fn read_framed_timeout(_: &mut ChildStdout, _: Instant) -> Result<Vec<u8>, Strin
     Err("SSH row worker requires Unix poll timeout support".into())
 }
 
-/// Coordinator-side backend for the fallible forward adapter.  Workers run
-/// concurrently for a stage; deterministic merge remains local and happens
-/// only after every bounded response has passed identity, call, shape, and
-/// exact-coverage checks.
 pub struct PartitionedProjectionBackend {
     artifact_id: Hash256,
     profile: String,
@@ -1289,72 +1165,51 @@ impl ProjectionBackend for PartitionedProjectionBackend {
     }
 }
 
-/// Who computes one slice of a placed projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SliceOwner {
-    /// The coordinator, from its own resident rows.
     Local,
-    /// A pinned worker, by its transport identity.
     Remote(String),
 }
 
-/// One slice of a placed projection, and how it is checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedSlice {
     pub owner: SliceOwner,
     pub row_start: usize,
     pub row_end: usize,
-    /// A second participant that recomputes this slice at every call. Any
-    /// difference is a fault (a duplicate check).
     pub duplicate_on: Option<SliceOwner>,
 }
 
-/// A placed projection: slices in row order that cover every output row
-/// once, and the rows the coordinator recomputes itself at every call (spot
-/// checks).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProjectionPlan {
     pub slices: Vec<PlannedSlice>,
     pub spot_rows: Vec<usize>,
 }
 
-/// What the coordinator saw a remote worker do. Every fallback and every
-/// fault is reported; none is silent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowEvent {
-    /// The worker answered a call: a timing sample for link measurement.
     Answered {
         worker: String,
         rows: usize,
         bytes: usize,
         elapsed: Duration,
     },
-    /// The worker is excluded for the epoch, or its connection is closed, so
-    /// the coordinator computed its slice without calling it. Reported, but
-    /// not a failure: a closed connection's calls would all fail at once.
     Skipped {
         worker: String,
         layer: Option<usize>,
         tensor: TensorKey,
     },
-    /// The call failed, timed out or was refused; the coordinator computed
-    /// the slice from its own rows.
     Fallback {
         worker: String,
         layer: Option<usize>,
         tensor: TensorKey,
         error: String,
     },
-    /// Strict coordinator refused a transport/identity/shape failure. No
-    /// local fallback was performed.
     Refused {
         worker: String,
         layer: Option<usize>,
         tensor: TensorKey,
         error: String,
     },
-    /// Exact arithmetic disagreed on a checked slice or row; the coordinator
-    /// recomputed the slice and used its own rows.
     Fault {
         worker: String,
         layer: Option<usize>,
@@ -1366,22 +1221,11 @@ pub enum RowEvent {
     },
 }
 
-/// Receives a backend's events and says which workers to skip.
 pub trait RowEventSink: Send + Sync {
     fn record(&self, event: RowEvent);
-    /// Excluded for the rest of the epoch: its slices are computed locally.
     fn is_excluded(&self, worker: &str) -> bool;
 }
 
-/// Row-partitioned projections with exact checks and per-call fallback (S5,
-/// S7 and S8 in the running node). A remote slice that fails is computed from
-/// the coordinator's own rows. A duplicate or spot check that disagrees makes
-/// the coordinator recompute the slice and use its own rows. Both are
-/// reported through the sink, so the output equals the local forward whenever
-/// every row that fed it passed its checks or was computed locally. Rows that
-/// no check covered are trusted, which is why only this operator's own
-/// machines may feed a vote (docs/design/assignment-node-integration.md,
-/// trust model).
 pub struct VerifiedPartitionBackend<'a> {
     source: &'a dyn crate::low_residency::CanonicalRowSource,
     strict: bool,
@@ -1415,9 +1259,6 @@ impl<'a> VerifiedPartitionBackend<'a> {
         })
     }
 
-    /// All primary slices must be remote. Local rows remain available only
-    /// for the certificate's numerical checks. A failed check or transport
-    /// refuses the request; no primary slice is recomputed as a fallback.
     pub fn new_strict(
         source: &'a dyn crate::low_residency::CanonicalRowSource,
         artifact_id: Hash256,
@@ -1429,7 +1270,6 @@ impl<'a> VerifiedPartitionBackend<'a> {
             .canonical_execution_profile()
             .ok_or(TensorParallelError::WrongIdentity)?
             .to_string();
-        // Validate every required stage before the first token is forwarded.
         let keys = (0..source.config().n_layers)
             .flat_map(|layer| {
                 [
@@ -1562,8 +1402,6 @@ impl<'a> VerifiedPartitionBackend<'a> {
         Ok(response.values)
     }
 
-    /// One participant's rows for a slice: `Ok(None)` when a remote call
-    /// failed (reported as a fallback), so the caller computes it locally.
     #[allow(clippy::too_many_arguments)]
     fn attempt(
         &self,
@@ -1601,8 +1439,6 @@ impl<'a> VerifiedPartitionBackend<'a> {
                     worker, call_id, input_hash, layer, tensor, start, end, input,
                 ) {
                     Ok(values) => Ok(Some(values)),
-                    // The connection closed between the check and the call:
-                    // nothing was sent, so this is a skip, not a failure.
                     Err(TensorParallelError::Closed) => {
                         self.events.record(RowEvent::Skipped {
                             worker: worker.clone(),
@@ -1638,7 +1474,6 @@ impl<'a> VerifiedPartitionBackend<'a> {
         }
     }
 
-    /// A slice's rows after its checks.
     #[allow(clippy::too_many_arguments)]
     fn slice_rows(
         &self,
@@ -1665,7 +1500,6 @@ impl<'a> VerifiedPartitionBackend<'a> {
             return self.local(layer, tensor, start, end, input);
         };
         let SliceOwner::Remote(worker) = &slice.owner else {
-            // The coordinator's own rows need no check.
             return Ok(values);
         };
         let fault = |expected: &[i64]| {
@@ -1685,8 +1519,6 @@ impl<'a> VerifiedPartitionBackend<'a> {
             )?;
             if second.as_deref() != Some(values.as_slice()) {
                 if self.strict {
-                    // A bounded local check identifies faulty participants,
-                    // but its result can never replace the failed primary.
                     let own = self.local(layer, tensor, start, end, input)?;
                     if own != values {
                         fault(&own);
@@ -1708,8 +1540,6 @@ impl<'a> VerifiedPartitionBackend<'a> {
                         "duplicate row verification disagreed; request refused".into(),
                     ));
                 }
-                // Disagreement, or no second answer: the coordinator's own
-                // rows decide, and are what the forward uses.
                 let own = self.local(layer, tensor, start, end, input)?;
                 if own != values {
                     fault(&own);
@@ -1840,11 +1670,6 @@ pub fn hash_i64(values: &[i64]) -> Hash256 {
     Hash256(*hasher.finalize().as_bytes())
 }
 
-/// Export one already-canonicalized tensor range for a private sidecar.  The
-/// source `I8Weights` must come from the corrected canonical loader, so Q/K
-/// row order and their scales are exported together after permutation.
-/// This file is data-only; it contains no model-wide embedding, norms, cache,
-/// tokenizer, or public endpoint configuration.
 pub(crate) fn export_canonical_row_file(
     path: impl AsRef<Path>,
     assignment: &RowAssignment,
@@ -1897,10 +1722,6 @@ pub(crate) fn export_canonical_row_file(
     Ok(())
 }
 
-/// Export from the actual resident canonical model, binding the file to the
-/// caller's independently verified artifact commitment and the model's own
-/// versioned arithmetic profile.  Callers cannot label an arbitrary matrix as
-/// a canonical tensor export through the public API.
 pub fn export_verified_model_rows(
     path: impl AsRef<Path>,
     model: &crate::cached_integer_model::CachedIntegerModel,
@@ -1993,12 +1814,9 @@ mod tests {
                 &response.values
             )
         );
-        // A response must carry exactly its assignment's rows.
         let mut short = response.clone();
         short.values.pop();
         assert!(encode_row_response(&short).is_err());
-        // A request frame is not a response frame, nor the other way round,
-        // even when its payload has exactly the assignment's row count.
         assert!(decode_row_response(&frame).is_err());
         assert!(decode_row_request(&encode_row_response(&response).unwrap()).is_err());
     }
@@ -2006,9 +1824,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_remote_command_reaches_the_remote_shell_exactly() {
-        // OpenSSH hands the remote shell one string; a POSIX shell parses it
-        // back. Every argument must come back byte for byte, and nothing in
-        // one may run: apostrophes, command substitution, quotes, spaces.
         let args: Vec<String> = [
             "/opt/arc/tensor_row_model_worker",
             "--model",
@@ -2036,9 +1851,6 @@ mod tests {
         assert_eq!(printed, args);
     }
 
-    /// A throwaway "ssh" program: it ignores its arguments, waits
-    /// `delay_secs`, writes `replies` (length-prefixed frames) to stdout and
-    /// then holds the session open. Returns the worker and the directory.
     #[cfg(unix)]
     fn fake_ssh_worker(
         name: &str,
@@ -2147,10 +1959,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_replayed_answer_is_refused_and_the_session_closes() {
-        // A misbehaving worker answers the first call, then sends the same
-        // answer again. The next call reads that copy: it binds another call,
-        // so it is refused, the session is closed, and nothing further is
-        // sent or read.
         let a = assignment(0, 2, "replay");
         let input = vec![3i64, -4];
         let first = RowProjectionRequest {
@@ -2189,9 +1997,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_late_answer_is_never_read_by_a_later_call() {
-        // The answer arrives after the call's deadline. The call fails and
-        // the session is killed, so the late answer can never be taken as the
-        // answer to the next call.
         let a = assignment(0, 2, "late");
         let input = vec![1i64, 2];
         let request = RowProjectionRequest {
@@ -2385,8 +2190,6 @@ mod tests {
         assert!(matmul_i8_canonical_rows(&weights, &[1], &mut output).is_err());
     }
 
-    // ---- memory-bounded row shards -------------------------------------
-
     fn tensor_weights(n_rows: usize, n_cols: usize) -> I8Weights {
         let data = (0..n_rows * n_cols)
             .map(|i| (((i * 31) % 251) as i64 - 125) as i8)
@@ -2421,15 +2224,11 @@ mod tests {
         }
     }
 
-    /// The property the whole memory-bounded design rests on: a worker holding
-    /// only some rows returns, for any sub-range, exactly what a coordinator
-    /// holding the whole tensor computes for those same rows.
     #[test]
     fn a_shard_serves_any_sub_range_bit_identically_to_the_whole_tensor() {
         let n_cols = 12;
         let whole = tensor_weights(32, n_cols);
         let input: Vec<i64> = (0..n_cols).map(|i| (i as i64) * 7 - 40).collect();
-        // One worker holds rows 8..24 and nothing else.
         let shards = vec![shard_of(&whole, 8, 24)];
 
         for (start, end) in [(8, 24), (8, 9), (23, 24), (10, 18), (12, 13)] {
@@ -2456,13 +2255,11 @@ mod tests {
                 "rows {start}..{end} are not held and must not be answered"
             );
         }
-        // An empty or inverted range is refused before anything is matched.
         assert!(
             project_from_shards(&shards, &request_for(assignment(10, 10, "w"), &input)).is_err()
         );
     }
 
-    /// Placement renames machines between runs; the weights do not change.
     #[test]
     fn a_shard_serves_whatever_placement_label_the_request_carries() {
         let whole = tensor_weights(16, 4);
@@ -2503,8 +2300,6 @@ mod tests {
         }
     }
 
-    /// Several shards of different tensors on one worker, which is what a
-    /// memory budget actually looks like once placement spreads work.
     #[test]
     fn a_worker_holding_several_shards_picks_the_right_one() {
         let n_cols = 6;

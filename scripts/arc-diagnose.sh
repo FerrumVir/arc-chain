@@ -1,9 +1,4 @@
 #!/usr/bin/env bash
-# ARC community-node and public-fleet diagnostic.
-#
-# This script never prints process arguments, environment variables, key paths,
-# seeds, or validator material. It treats HTTP reachability, DAG motion, block
-# production, and canonical-chain agreement as separate facts.
 set -Eeuo pipefail
 
 RPC_PORT="${ARC_RPC_PORT:-9944}"

@@ -5,9 +5,7 @@ exports.u64ToBigInt = u64ToBigInt;
 exports.assertU64 = assertU64;
 exports.stringifyJsonWithBigInts = stringifyJsonWithBigInts;
 exports.parseJsonWithBigInts = parseJsonWithBigInts;
-/** Largest value accepted by Rust's `u64`. */
 exports.U64_MAX = (1n << 64n) - 1n;
-/** Convert a public u64 input to its exact bigint representation. */
 function u64ToBigInt(value, fieldName) {
     if (typeof value === "number") {
         if (!Number.isSafeInteger(value) || value < 0) {
@@ -23,15 +21,9 @@ function u64ToBigInt(value, fieldName) {
     }
     return value;
 }
-/** Fail closed before an inexact or out-of-range u64 reaches the network. */
 function assertU64(value, fieldName) {
     u64ToBigInt(value, fieldName);
 }
-/**
- * JSON.stringify cannot encode bigint. This serializer emits bigint values as
- * exact, unquoted JSON integer tokens, which serde_json's Rust `u64` decoder
- * accepts. Other JSON values retain JSON.stringify-compatible behavior.
- */
 function stringifyJsonWithBigInts(value) {
     const serialized = serializeJsonValue(value, new Set());
     if (serialized === undefined) {
@@ -63,11 +55,6 @@ const U64_RESPONSE_FIELDS = new Set([
     "usage_units",
     "value",
 ]);
-/**
- * Parse JSON while reading integer tokens directly from the response text.
- * This stays lossless on Node 18 and browsers that do not provide the newer
- * `JSON.parse` reviver `context.source` argument.
- */
 function parseJsonWithBigInts(text) {
     let index = 0;
     const syntaxError = (message) => {

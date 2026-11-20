@@ -1,6 +1,3 @@
-//! Reservations, windowed loss and the bounded coordinator books (S1, S2, S6,
-//! S7): synthetic, no network, no model.
-
 use arc_assign::book::{
     self, ChallengeBook, ChallengeError, ChallengeState, Exclusion, Exclusions, LeaseBook, Offer,
     Offered, ProbeBook,
@@ -94,20 +91,16 @@ fn a_worker_is_never_double_booked_and_every_ending_releases_its_slot() {
         ledger.reserve_all(&[worker(1)], request(3), 100, 10),
         Err(ReservationError::NoFreeSlot)
     );
-    // Asking again for a slot already held takes no second one.
     ledger
         .reserve_all(&[worker(1)], request(1), 100, 10)
         .unwrap();
     assert_eq!(ledger.len(), 2);
 
-    // Finalized or abandoned: released.
     assert_eq!(ledger.release(&request(1)), 1);
     assert_eq!(ledger.free(&worker(1)), 1);
-    // Refund-eligible (height + 1 >= expires_at): swept, and not before.
     assert_eq!(ledger.sweep(98), 0);
     assert_eq!(ledger.sweep(99), 1);
     assert!(ledger.is_empty());
-    // A request that is already refund-eligible cannot reserve.
     assert_eq!(
         ledger.reserve_all(&[worker(1)], request(4), 100, 99),
         Err(ReservationError::AlreadyExpired)
@@ -122,13 +115,11 @@ fn a_placement_reserves_on_every_worker_or_on_none() {
     ledger
         .reserve_all(&[worker(2)], request(9), 100, 10)
         .unwrap();
-    // worker 2 is full, so the pair fails and worker 1 keeps its slot.
     assert_eq!(
         ledger.reserve_all(&[worker(1), worker(2)], request(1), 100, 10),
         Err(ReservationError::NoFreeSlot)
     );
     assert_eq!(ledger.free(&worker(1)), 1);
-    // A worker the ledger does not know is refused the same way.
     assert_eq!(
         ledger.reserve_all(&[worker(1), worker(3)], request(1), 100, 10),
         Err(ReservationError::UnknownWorker)
@@ -148,7 +139,6 @@ fn reassignment_moves_a_slot_in_one_step() {
     ledger
         .reserve_all(&[worker(2)], request(2), 100, 10)
         .unwrap();
-    // The target is full: nothing moves.
     assert_eq!(
         ledger.reassign(&request(1), &worker(1), worker(2)),
         Err(ReservationError::NoFreeSlot)
@@ -215,12 +205,10 @@ fn loss_is_measured_per_connection_window_and_never_goes_negative() {
         windowed_loss_per_mille(&at(1, 1_000, 10), &at(1, 2_000, 30)),
         Some(20)
     );
-    // A reconnect is a new window, not a delta.
     assert_eq!(
         windowed_loss_per_mille(&at(1, 1_000, 10), &at(2, 50, 0)),
         None
     );
-    // Counters that went backwards, or a window with nothing sent.
     assert_eq!(
         windowed_loss_per_mille(&at(1, 1_000, 10), &at(1, 900, 10)),
         None
@@ -229,7 +217,6 @@ fn loss_is_measured_per_connection_window_and_never_goes_negative() {
         windowed_loss_per_mille(&at(1, 1_000, 10), &at(1, 1_000, 12)),
         None
     );
-    // Losses of packets sent before the window are capped.
     assert_eq!(
         windowed_loss_per_mille(&at(1, 1_000, 0), &at(1, 1_010, 50)),
         Some(1000)
@@ -263,11 +250,9 @@ fn the_probe_book_keeps_recent_probes_and_the_worse_of_probe_and_transport_loss(
         Some(100)
     );
     assert_eq!(probes.link(&worker(1)).unwrap().failure_per_mille, 100);
-    // After a reconnect the old connection's loss no longer counts.
     assert_eq!(probes.record_counters(&worker(1), counters(2, 10, 0)), None);
     assert_eq!(probes.link(&worker(1)).unwrap().failure_per_mille, 0);
 
-    // A worker whose every probe failed has no link.
     probes.record_probe(
         &worker(2),
         5,
@@ -277,7 +262,6 @@ fn the_probe_book_keeps_recent_probes_and_the_worse_of_probe_and_transport_loss(
         },
     );
     assert!(probes.link(&worker(2)).is_none());
-    // Leaving the member set drops everything about the worker.
     assert_eq!(probes.retain_members(&members(&[1])), 1);
     assert_eq!(probes.len(), book::MAX_PROBES_PER_WORKER);
 }
@@ -300,12 +284,10 @@ fn the_lease_book_keeps_one_current_lease_per_member_and_ignores_replays() {
         "reordered"
     );
     assert_eq!(leases.get(&worker(1)).unwrap().body.nonce, 2);
-    // Not a member: refused, and the book does not grow.
     assert_eq!(leases.offer(signed(3, 1), &req), Err(LeaseError::NotMember));
     assert_eq!(leases.len(), 1);
 
     assert_eq!(leases.offer(signed(2, 1), &req), Ok(Offered::Accepted));
-    // Worker 2 leaves the committee; then worker 1's lease expires.
     assert_eq!(leases.retain_current(&members(&[1]), 500), [worker(2)]);
     assert_eq!(leases.retain_current(&members(&[1]), 1_000), [worker(1)]);
     assert!(leases.is_empty());
@@ -326,25 +308,21 @@ fn a_worker_is_challenged_once_per_epoch() {
         })
     );
     assert_eq!(challenges.measured(&worker(1)), Some(1_800_000_000));
-    // Answered once: a second answer has nothing in flight to answer.
     assert_eq!(
         challenges.answer(&worker(1), Ok(1), 41),
         Err(ChallengeError::NotInFlight)
     );
 
-    // A correct answer after the deadline is still a refusal.
     challenges.issue(&worker(2), 50).unwrap();
     assert_eq!(
         challenges.answer(&worker(2), Ok(1_800_000_000), 51),
         Ok(ChallengeState::Refused)
     );
-    // An unanswered challenge expires into a refusal.
     challenges.issue(&worker(3), 50).unwrap();
     assert_eq!(challenges.expire(50), 0);
     assert_eq!(challenges.expire(51), 1);
     assert_eq!(challenges.state(&worker(3)), Some(ChallengeState::Refused));
 
-    // The next epoch starts clean.
     assert_eq!(challenges.begin_epoch(4), 3);
     assert_eq!(challenges.epoch(), 4);
     challenges.issue(&worker(2), 90).unwrap();
@@ -362,7 +340,6 @@ fn a_fault_or_repeated_failures_exclude_a_worker_until_the_next_epoch() {
     );
     assert_eq!(same, Finding::Agrees);
     assert_eq!(exclusions.fault(certificate, &same), None);
-    // A finding against the coordinator excludes nobody.
     let own = compare(
         0,
         Participant::Coordinator,
@@ -397,7 +374,6 @@ fn a_fault_or_repeated_failures_exclude_a_worker_until_the_next_epoch() {
         "the first fault of the epoch is the evidence kept"
     );
 
-    // Failures count only while consecutive.
     assert!(!exclusions.call_failed(&worker(2)));
     assert!(!exclusions.call_failed(&worker(2)));
     exclusions.call_succeeded(&worker(2));
@@ -409,7 +385,6 @@ fn a_fault_or_repeated_failures_exclude_a_worker_until_the_next_epoch() {
         Some(&Exclusion::Failures(book::FAILURES_BEFORE_EXCLUSION))
     );
 
-    // A reconnect lifts an exclusion for failures, never one for a fault.
     assert!(exclusions.forgive_failures(&worker(2)));
     assert!(!exclusions.is_excluded(&worker(2)));
     assert!(!exclusions.forgive_failures(&worker(1)));
@@ -448,7 +423,6 @@ fn only_workers_with_every_input_become_candidates_and_the_certificate_recompute
         ledger.set_capacity(worker(i), 4);
         if i != 2 {
             challenges.issue(&worker(i), 50).unwrap();
-            // Measured above the 2e9 claim: the claim caps it.
             challenges
                 .answer(&worker(i), Ok(3_000_000_000), 40)
                 .unwrap();
@@ -457,8 +431,6 @@ fn only_workers_with_every_input_become_candidates_and_the_certificate_recompute
             probes.record_probe(&worker(i), 100, probe(50));
         }
     }
-    // Worker 2 has no measured rate, worker 3 no probe, worker 4 is
-    // excluded, worker 5 has no free slot.
     exclusions.fault(
         hash_bytes(b"earlier"),
         &compare(
@@ -492,7 +464,6 @@ fn only_workers_with_every_input_become_candidates_and_the_certificate_recompute
     assert_eq!(only.link.measured_at, 100);
     assert_eq!(digests, [signed(1, 1).digest()]);
 
-    // An expired lease drops out without being evicted first.
     let late = requirements(&set, 1_000);
     assert!(
         book::candidates(&late, &leases, &challenges, &probes, &ledger, &exclusions)
@@ -500,7 +471,6 @@ fn only_workers_with_every_input_become_candidates_and_the_certificate_recompute
             .is_empty()
     );
 
-    // What the books produce is exactly what a certificate binds.
     let stages = vec![Stage {
         layer: Some(0),
         tensor: "wq".into(),
@@ -529,7 +499,6 @@ fn only_workers_with_every_input_become_candidates_and_the_certificate_recompute
 
 #[test]
 fn an_operator_offer_uses_its_measured_rate_and_needs_every_other_input() {
-    // Option (a): this operator's own machine, configured rather than leased.
     let machine = hash_bytes(b"operator machine rack-1");
     let offer = || Offer {
         worker: machine,
@@ -544,7 +513,6 @@ fn an_operator_offer_uses_its_measured_rate_and_needs_every_other_input() {
     let mut probes = ProbeBook::new(false);
     let mut ledger = ReservationLedger::new();
     let exclusions = Exclusions::new(3);
-    // No measured rate yet: not a candidate.
     let none = book::candidates_from([offer()], &challenges, &probes, &ledger, &exclusions);
     assert!(none.0.is_empty());
     challenges.issue(&machine, 50).unwrap();

@@ -1,27 +1,13 @@
-//! Measured post-quantum signature throughput on this machine.
-//!
-//! Exercises the exact `KeyPair::sign` / `Signature::verify` path that the
-//! mempool and block pipeline use, so the numbers reflect real transaction
-//! verification cost - address derivation included.
-//!
-//! Usage: cargo run --release --example pq_bench
-
 use arc_crypto::{KeyPair, hash_bytes};
 use std::time::Instant;
 
 const KEYGEN_N: usize = 100;
 const SIGN_N: usize = 500;
 const VERIFY_N: usize = 500;
-/// Warm-up ops before timing, so the first-call cost of lazily initialised
-/// tables doesn't land in the measurement.
 const WARMUP: usize = 200;
-/// Timing batches. We report the fastest batch: on a 24-core desktop the
-/// scheduler adds tens of microseconds of noise to any single run, and the
-/// minimum is the measurement least contaminated by it.
 const BATCHES: usize = 7;
 
 fn bench(label: &str, make: fn() -> KeyPair) {
-    // ── keygen ──────────────────────────────────────────────────────────
     let t0 = Instant::now();
     let mut kps = Vec::with_capacity(KEYGEN_N);
     for _ in 0..KEYGEN_N {
@@ -33,14 +19,12 @@ fn bench(label: &str, make: fn() -> KeyPair) {
     let addr = kp.address();
     let msg = hash_bytes(b"arc-chain pq benchmark message");
 
-    // ── warm up both paths before timing anything ───────────────────────
     let mut sig = kp.sign(&msg).expect("sign");
     for _ in 0..WARMUP {
         sig = kp.sign(&msg).expect("sign");
         sig.verify(&msg, &addr).expect("verify");
     }
 
-    // ── sign: fastest of BATCHES batches ────────────────────────────────
     let mut sign_us = f64::MAX;
     for _ in 0..BATCHES {
         let t = Instant::now();
@@ -53,7 +37,6 @@ fn bench(label: &str, make: fn() -> KeyPair) {
         }
     }
 
-    // ── verify: full tx path (address derivation + signature check) ─────
     let mut verify_us = f64::MAX;
     for _ in 0..BATCHES {
         let t = Instant::now();
@@ -66,7 +49,6 @@ fn bench(label: &str, make: fn() -> KeyPair) {
         }
     }
 
-    // ── on-chain footprint ──────────────────────────────────────────────
     let wire_bytes = bincode_len(&sig);
 
     println!(
@@ -80,7 +62,6 @@ fn bench(label: &str, make: fn() -> KeyPair) {
     );
 }
 
-/// Raw on-wire byte count: public key + signature material.
 fn bincode_len(sig: &arc_crypto::Signature) -> usize {
     use arc_crypto::Signature as S;
     match sig {

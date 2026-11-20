@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Re-resolve a selected pre-tag run immediately before an exact-ID download.
 set -Eeuo pipefail
 
 die() {

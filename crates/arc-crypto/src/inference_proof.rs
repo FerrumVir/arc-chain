@@ -1,112 +1,40 @@
-//! STARK proof of neural network inference (Dense layer forward pass).
-//!
-//! Proves that `output[i] = sum(weight[i][j] * input[j]) + bias[i]`
-//! for a Dense layer using Circle STARKs over the Mersenne-31 field.
-//!
-//! ## Approach: Layer-by-Layer Folding
-//!
-//! For large models (50B+ parameters), proving the entire forward pass in
-//! one trace is infeasible (would require 2^36+ rows). Instead:
-//!
-//! 1. Prove each layer independently (each fits in memory)
-//! 2. Fold proofs using recursive composition (existing `prove_recursive`)
-//! 3. The recursive verifier ensures: layer_k output = layer_{k+1} input
-//!
-//! This allows proving arbitrarily large models on commodity hardware.
-//!
-//! ## Trace Layout (DenseLayerAIR)
-//!
-//! One row per multiply-accumulate operation:
-//!
-//! | Column | Meaning |
-//! |--------|---------|
-//! | active | 1 if row is active, 0 if padding |
-//! | row_idx | Output neuron index (i) |
-//! | col_idx | Input index (j) |
-//! | weight | weight[i][j] (M31 field element) |
-//! | input | input[j] (M31 field element) |
-//! | product | weight * input (M31) |
-//! | acc_prev | Accumulator before this MAC |
-//! | acc_next | Accumulator after this MAC |
-//! | is_last_col | 1 if j == in_size - 1, else 0 |
-//! | bias | bias[i] (only used when is_last_col = 1) |
-//! | output | output[i] = acc_next + bias (when is_last_col = 1) |
-//!
-//! ## Constraints (all degree ≤ 2)
-//!
-//! 1. `active * (active - 1) = 0` - boolean
-//! 2. `is_last_col * (is_last_col - 1) = 0` - boolean
-//! 3. `active * (product - weight * input) = 0` - multiplication correctness
-//! 4. `active * (acc_next - acc_prev - product) = 0` - accumulation
-//! 5. `active * is_last_col * (output - acc_next - bias) = 0` - final output
-
 use crate::{Hash256, hash_bytes};
 use serde::{Deserialize, Serialize};
 
-/// Number of columns in the Dense layer trace.
 pub const DENSE_TRACE_COLS: usize = 11;
 
-/// Input for proving a Dense layer forward pass.
 #[derive(Debug, Clone)]
 pub struct DenseLayerInput {
-    /// Weight matrix [out_size × in_size] flattened row-major.
     pub weights: Vec<i64>,
-    /// Bias vector [out_size].
     pub bias: Vec<i64>,
-    /// Input vector [in_size].
     pub input: Vec<i64>,
-    /// Output vector [out_size] (computed by prover, verified by AIR).
     pub output: Vec<i64>,
-    /// Dimensions.
     pub in_size: usize,
     pub out_size: usize,
 }
 
-/// Result of proving a Dense layer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DenseLayerProof {
-    /// Serialized proof data.
     pub proof_data: Vec<u8>,
-    /// Hash binding this proof to the layer computation.
     pub binding_hash: Hash256,
-    /// Input hash: BLAKE3(input vector).
     pub input_hash: Hash256,
-    /// Output hash: BLAKE3(output vector).
     pub output_hash: Hash256,
-    /// Proving time in milliseconds.
     pub proving_time_ms: u64,
-    /// Number of trace rows.
     pub trace_rows: usize,
-    /// What actually produced `proof_data`: `"stwo-circle-stark"` for a real
-    /// Circle STARK, `"blake3-commitment"` for the hash-only fallback that is
-    /// compiled when the `stwo-prover` feature is off. Never report a
-    /// commitment as a proof - check this field.
     pub proof_kind: String,
 }
 
-/// Result of a folded multi-layer proof.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FoldedInferenceProof {
-    /// One proof per layer.
     pub layer_proofs: Vec<DenseLayerProof>,
-    /// Recursive composition proof (proves all layers chain correctly).
     pub composition_proof: Vec<u8>,
-    /// Model input hash.
     pub model_input_hash: Hash256,
-    /// Model output hash.
     pub final_output_hash: Hash256,
-    /// Total proving time across all layers.
     pub total_proving_time_ms: u64,
-    /// Total proof size in bytes.
     pub total_proof_size: usize,
-    /// Number of layers proven.
     pub num_layers: usize,
 }
 
-/// Compute the Dense layer forward pass (reference implementation).
-///
-/// Uses exact integer arithmetic for determinism:
-/// `output[i] = sum(weight[i][j] * input[j]) + bias[i]`
 pub fn dense_forward_i64(
     weights: &[i64],
     bias: &[i64],
@@ -126,16 +54,11 @@ pub fn dense_forward_i64(
     output
 }
 
-/// Generate the execution trace for a Dense layer proof.
-///
-/// One row per multiply-accumulate: total rows = out_size * in_size.
-/// Padded to next power of 2 for NTT.
 pub fn generate_dense_trace(layer: &DenseLayerInput) -> Vec<Vec<i64>> {
     let n_ops = layer.out_size * layer.in_size;
     let log_size = (n_ops as f64).log2().ceil() as u32;
-    let trace_size = 1usize << log_size.max(4); // minimum 16 rows
+    let trace_size = 1usize << log_size.max(4);
 
-    // Initialize columns
     let mut active = vec![0i64; trace_size];
     let mut row_idx = vec![0i64; trace_size];
     let mut col_idx = vec![0i64; trace_size];
@@ -198,10 +121,6 @@ pub fn generate_dense_trace(layer: &DenseLayerInput) -> Vec<Vec<i64>> {
     ]
 }
 
-/// Verify a Dense layer trace against constraints (CPU verification, no STARK).
-///
-/// This is the reference verifier - checks all constraints row by row.
-/// Used for testing and as a fallback when the stwo-prover feature is disabled.
 pub fn verify_dense_trace(trace: &[Vec<i64>]) -> Result<(), String> {
     if trace.len() != DENSE_TRACE_COLS {
         return Err(format!(
@@ -227,19 +146,16 @@ pub fn verify_dense_trace(trace: &[Vec<i64>]) -> Result<(), String> {
     for row in 0..n_rows {
         let a = active[row];
 
-        // Constraint 1: active is boolean
         if a * (a - 1) != 0 {
             return Err(format!("Row {row}: active not boolean ({a})"));
         }
 
-        // Constraint 2: is_last_col is boolean
         let ilc = is_last_col[row];
         if ilc * (ilc - 1) != 0 {
             return Err(format!("Row {row}: is_last_col not boolean ({ilc})"));
         }
 
         if a == 1 {
-            // Constraint 3: product = weight * input
             let expected_product = weight[row] * input[row];
             if product[row] != expected_product {
                 return Err(format!(
@@ -248,7 +164,6 @@ pub fn verify_dense_trace(trace: &[Vec<i64>]) -> Result<(), String> {
                 ));
             }
 
-            // Constraint 4: acc_next = acc_prev + product
             if acc_next[row] != acc_prev[row] + product[row] {
                 return Err(format!(
                     "Row {row}: accumulation mismatch: {} != {} + {}",
@@ -256,7 +171,6 @@ pub fn verify_dense_trace(trace: &[Vec<i64>]) -> Result<(), String> {
                 ));
             }
 
-            // Constraint 5: if is_last_col, output = acc_next + bias
             if ilc == 1 && output[row] != acc_next[row] + bias[row] {
                 return Err(format!(
                     "Row {row}: output mismatch: {} != {} + {}",
@@ -269,25 +183,14 @@ pub fn verify_dense_trace(trace: &[Vec<i64>]) -> Result<(), String> {
     Ok(())
 }
 
-/// Prove and verify a Dense layer forward pass.
-///
-/// Generates the 11-column execution trace, verifies all AIR constraints
-/// (multiplication correctness, accumulation, output), and produces a
-/// BLAKE3 binding hash committing to the verified trace. The binding hash
-/// and input/output hashes are used by `prove_folded_inference()` to chain
-/// layers, which can then be composed via `stwo_air::prove_recursive()`
-/// for a full Circle STARK proof of the folded inference.
 pub fn prove_dense_layer(layer: &DenseLayerInput) -> Result<DenseLayerProof, String> {
     let start = Instant::now();
 
-    // Generate trace
     let trace = generate_dense_trace(layer);
     let trace_rows = trace[0].len();
 
-    // Verify trace (CPU reference check)
     verify_dense_trace(&trace)?;
 
-    // Compute binding hash
     let mut binding_input = Vec::new();
     for col in &trace {
         for &val in col {
@@ -296,15 +199,12 @@ pub fn prove_dense_layer(layer: &DenseLayerInput) -> Result<DenseLayerProof, Str
     }
     let binding_hash = hash_bytes(&binding_input);
 
-    // Compute input/output hashes
     let input_bytes: Vec<u8> = layer.input.iter().flat_map(|v| v.to_le_bytes()).collect();
     let input_hash = hash_bytes(&input_bytes);
 
     let output_bytes: Vec<u8> = layer.output.iter().flat_map(|v| v.to_le_bytes()).collect();
     let output_hash = hash_bytes(&output_bytes);
 
-    // Proof data: a real Circle STARK receipt when the prover is compiled in,
-    // otherwise a clearly-labelled BLAKE3 commitment.
     #[cfg(feature = "stwo-prover")]
     let (proof_data, proof_kind) = {
         let (receipt, _size, _ms) = crate::stwo_air::try_prove_dense_stark(
@@ -342,13 +242,6 @@ pub fn prove_dense_layer(layer: &DenseLayerInput) -> Result<DenseLayerProof, Str
     })
 }
 
-/// Prove a multi-layer network with folded composition.
-///
-/// Each layer is proven independently. The composition proof verifies:
-/// - Each layer proof is valid
-/// - Layer k's output_hash == layer (k+1)'s input_hash (chaining)
-/// - The first layer's input_hash matches the model input
-/// - The last layer's output_hash matches the model output
 pub fn prove_folded_inference(layers: &[DenseLayerInput]) -> Result<FoldedInferenceProof, String> {
     let total_start = Instant::now();
 
@@ -356,14 +249,12 @@ pub fn prove_folded_inference(layers: &[DenseLayerInput]) -> Result<FoldedInfere
         return Err("No layers to prove".into());
     }
 
-    // Prove each layer
     let mut layer_proofs = Vec::with_capacity(layers.len());
     for (i, layer) in layers.iter().enumerate() {
         let proof = prove_dense_layer(layer).map_err(|e| format!("Layer {i} proof failed: {e}"))?;
         layer_proofs.push(proof);
     }
 
-    // Verify chaining: layer k output == layer k+1 input
     for i in 0..layer_proofs.len() - 1 {
         if layer_proofs[i].output_hash != layer_proofs[i + 1].input_hash {
             return Err(format!(
@@ -376,7 +267,6 @@ pub fn prove_folded_inference(layers: &[DenseLayerInput]) -> Result<FoldedInfere
         }
     }
 
-    // Composition proof: hash of all layer binding hashes
     let mut comp_input = Vec::new();
     for proof in &layer_proofs {
         comp_input.extend_from_slice(&proof.binding_hash.0);
@@ -406,51 +296,26 @@ pub fn prove_folded_inference(layers: &[DenseLayerInput]) -> Result<FoldedInfere
 
 use std::time::Instant;
 
-// ─── Sharded Dense Layer Proving (for 50B+ scale) ──────────────────────────
-
-/// Result of proving a single shard of a Dense layer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardProof {
-    /// Which shard index (0-based).
     pub shard_idx: usize,
-    /// Column range this shard covers: [col_start, col_end).
     pub col_start: usize,
     pub col_end: usize,
-    /// Partial accumulator output for this shard [out_size].
-    /// The final output = sum of all shard partial outputs + bias.
     pub partial_sums_hash: Hash256,
-    /// Proof of this shard's computation.
     pub proof: DenseLayerProof,
 }
 
-/// Result of proving a large Dense layer via column sharding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardedLayerProof {
-    /// One proof per shard.
     pub shard_proofs: Vec<ShardProof>,
-    /// Combined output hash (same as non-sharded proof would produce).
     pub output_hash: Hash256,
-    /// Input hash.
     pub input_hash: Hash256,
-    /// Layer dimensions.
     pub out_size: usize,
     pub in_size: usize,
-    /// Total proving time.
     pub total_proving_time_ms: u64,
-    /// Total proof size.
     pub total_proof_size: usize,
 }
 
-/// Prove a large Dense layer by splitting columns into shards.
-///
-/// For a [16384 × 16384] layer (268M MACs), a single trace would need 2^28 rows.
-/// Instead, split into shards of `shard_cols` columns each:
-/// - Shard 0: columns [0, shard_cols), each output row accumulates partial sum
-/// - Shard 1: columns [shard_cols, 2*shard_cols), adds to accumulator
-/// - ...final shard adds bias
-///
-/// Each shard produces a `DenseLayerProof`. Shard outputs chain via accumulator.
-/// Total trace rows per shard = out_size × shard_cols (fits in memory).
 pub fn prove_sharded_dense(
     weights: &[i64],
     bias: &[i64],
@@ -468,7 +333,6 @@ pub fn prove_sharded_dense(
     let n_shards = in_size.div_ceil(shard_cols);
     let mut shard_proofs = Vec::with_capacity(n_shards);
 
-    // Running partial sums per output row (accumulated across shards)
     let mut partial_sums = vec![0i64; out_size];
 
     for shard_idx in 0..n_shards {
@@ -477,7 +341,6 @@ pub fn prove_sharded_dense(
         let shard_width = col_end - col_start;
         let is_last_shard = shard_idx == n_shards - 1;
 
-        // Extract shard weights: [out_size × shard_width]
         let mut shard_weights = Vec::with_capacity(out_size * shard_width);
         for i in 0..out_size {
             for j in col_start..col_end {
@@ -485,12 +348,10 @@ pub fn prove_sharded_dense(
             }
         }
 
-        // Extract shard input
         let shard_input: Vec<i64> = input[col_start..col_end].to_vec();
 
-        // Compute shard output (partial sums for this column range)
         let shard_bias = if is_last_shard {
-            bias.to_vec() // Only add bias in last shard
+            bias.to_vec()
         } else {
             vec![0i64; out_size]
         };
@@ -502,7 +363,6 @@ pub fn prove_sharded_dense(
             out_size,
         );
 
-        // Update running partial sums
         for i in 0..out_size {
             partial_sums[i] += shard_output[i];
         }
@@ -514,7 +374,6 @@ pub fn prove_sharded_dense(
                 .collect::<Vec<_>>(),
         );
 
-        // Create DenseLayerInput for this shard
         let layer_input = DenseLayerInput {
             weights: shard_weights,
             bias: shard_bias,
@@ -524,7 +383,6 @@ pub fn prove_sharded_dense(
             out_size,
         };
 
-        // Prove this shard
         let proof = prove_dense_layer(&layer_input)
             .map_err(|e| format!("Shard {shard_idx} proof failed: {e}"))?;
 
@@ -537,7 +395,6 @@ pub fn prove_sharded_dense(
         });
     }
 
-    // Final output = partial_sums (which includes bias from last shard)
     let output_bytes: Vec<u8> = partial_sums.iter().flat_map(|v| v.to_le_bytes()).collect();
     let output_hash = hash_bytes(&output_bytes);
 
@@ -557,13 +414,11 @@ pub fn prove_sharded_dense(
     })
 }
 
-/// Verify a sharded layer proof: check each shard and that partial sums chain correctly.
 pub fn verify_sharded_proof(proof: &ShardedLayerProof) -> Result<(), String> {
     if proof.shard_proofs.is_empty() {
         return Err("No shards".into());
     }
 
-    // Verify each shard covers the right columns and they tile the full input
     let mut expected_col = 0;
     for (i, shard) in proof.shard_proofs.iter().enumerate() {
         if shard.col_start != expected_col {
@@ -596,8 +451,6 @@ mod tests {
 
     #[test]
     fn test_dense_forward_i64() {
-        // 2×3 Dense: output[0] = 1*1 + 2*2 + 3*3 + 10 = 24
-        //            output[1] = 4*1 + 5*2 + 6*3 + 20 = 52
         let weights = vec![1, 2, 3, 4, 5, 6];
         let bias = vec![10, 20];
         let input = vec![1, 2, 3];
@@ -631,7 +484,6 @@ mod tests {
         let in_size = 64;
         let out_size = 32;
 
-        // Deterministic weights
         let mut rng: u64 = 42;
         let mut next = || -> i64 {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -655,7 +507,7 @@ mod tests {
         let proof = prove_dense_layer(&layer).unwrap();
         assert!(proof.trace_rows >= in_size * out_size);
         assert!(!proof.proof_data.is_empty());
-        assert!(proof.proving_time_ms < 5000); // should be fast for 64×32
+        assert!(proof.proving_time_ms < 5000);
     }
 
     #[test]
@@ -670,13 +522,11 @@ mod tests {
             ((rng >> 33) as i64) % 10 - 5
         };
 
-        // Layer 1: dim1 → dim2
         let w1: Vec<i64> = (0..dim2 * dim1).map(|_| next()).collect();
         let b1: Vec<i64> = (0..dim2).map(|_| next()).collect();
         let input1: Vec<i64> = (0..dim1).map(|_| next()).collect();
         let output1 = dense_forward_i64(&w1, &b1, &input1, dim1, dim2);
 
-        // Layer 2: dim2 → dim3
         let w2: Vec<i64> = (0..dim3 * dim2).map(|_| next()).collect();
         let b2: Vec<i64> = (0..dim3).map(|_| next()).collect();
         let output2 = dense_forward_i64(&w2, &b2, &output1, dim2, dim3);
@@ -705,7 +555,6 @@ mod tests {
         assert_eq!(folded.layer_proofs.len(), 2);
         assert!(folded.total_proof_size > 0);
 
-        // Chain integrity: layer 1 output hash == layer 2 input hash
         assert_eq!(
             folded.layer_proofs[0].output_hash,
             folded.layer_proofs[1].input_hash,
@@ -714,7 +563,6 @@ mod tests {
 
     #[test]
     fn test_prove_larger_layer() {
-        // 256×128 Dense = 32,768 MACs
         let in_size = 256;
         let out_size = 128;
 
@@ -761,7 +609,6 @@ mod tests {
 
         let mut trace = generate_dense_trace(&layer);
 
-        // Tamper with product column
         trace[5][0] = 999;
 
         assert!(verify_dense_trace(&trace).is_err());
@@ -769,10 +616,9 @@ mod tests {
 
     #[test]
     fn test_sharded_dense_matches_unsharded() {
-        // Prove a 64×32 layer both ways and verify same output hash
         let in_size = 32;
         let out_size = 16;
-        let shard_cols = 8; // 4 shards of 8 columns
+        let shard_cols = 8;
 
         let mut rng: u64 = 555;
         let mut next = || -> i64 {
@@ -785,7 +631,6 @@ mod tests {
         let input: Vec<i64> = (0..in_size).map(|_| next()).collect();
         let output = dense_forward_i64(&weights, &bias, &input, in_size, out_size);
 
-        // Unsharded proof
         let layer = DenseLayerInput {
             weights: weights.clone(),
             bias: bias.clone(),
@@ -796,19 +641,16 @@ mod tests {
         };
         let unsharded = prove_dense_layer(&layer).unwrap();
 
-        // Sharded proof
         let sharded =
             prove_sharded_dense(&weights, &bias, &input, in_size, out_size, shard_cols).unwrap();
 
-        // Output hashes must match
         assert_eq!(unsharded.output_hash, sharded.output_hash);
-        assert_eq!(sharded.shard_proofs.len(), 4); // 32/8 = 4 shards
+        assert_eq!(sharded.shard_proofs.len(), 4);
         assert!(verify_sharded_proof(&sharded).is_ok());
     }
 
     #[test]
     fn test_sharded_large_layer() {
-        // 512×256 layer, sharded into 64-column chunks = 4 shards
         let in_size = 256;
         let out_size = 128;
         let shard_cols = 64;
@@ -838,16 +680,14 @@ mod tests {
 
     #[test]
     fn test_sharded_50b_scale_dimension() {
-        // Simulate a 50B-scale layer: 1024×1024 (reduced from 16384×16384 for test speed)
-        // In production, this would be 16384×16384 with shard_cols=512 → 32 shards
         let in_size = 1024;
         let out_size = 256;
-        let shard_cols = 128; // 8 shards
+        let shard_cols = 128;
 
-        let mut rng: u64 = 50_000_000_000; // 50B seed :)
+        let mut rng: u64 = 50_000_000_000;
         let mut next = || -> i64 {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((rng >> 33) as i64) % 4 - 2 // small values to avoid overflow
+            ((rng >> 33) as i64) % 4 - 2
         };
 
         let weights: Vec<i64> = (0..out_size * in_size).map(|_| next()).collect();
@@ -862,14 +702,9 @@ mod tests {
         assert_eq!(sharded.shard_proofs.len(), 8);
         assert!(verify_sharded_proof(&sharded).is_ok());
 
-        // Extrapolate to 16384×16384:
-        // Per-shard: out_size × shard_cols MACs → 256 × 128 = 32K per shard here
-        // At 16384×16384 with shard_cols=512: 16384 × 512 = 8.4M per shard
-        // Scale factor: 8.4M / 32K = 262x
-        // Estimated time per shard at scale: (total_ms / 8) * 262
         let per_shard_ms = total_ms / 8;
         let scaled_per_shard = per_shard_ms * 262;
-        let scaled_total = scaled_per_shard * 32; // 32 shards for 16384/512
+        let scaled_total = scaled_per_shard * 32;
 
         println!(
             "Test: {}×{} in {}ms ({} shards, {}ms/shard)",
@@ -882,7 +717,7 @@ mod tests {
         println!(
             "For 80 layers (50B model): {}s total proving time",
             (scaled_total * 80 * 7) / 1000
-        ); // 7 weight matrices per layer
+        );
     }
 
     #[test]
@@ -901,7 +736,6 @@ mod tests {
 
         let w2: Vec<i64> = (0..dim * dim).map(|_| next()).collect();
         let b2: Vec<i64> = (0..dim).map(|_| 0).collect();
-        // WRONG input for layer 2 (doesn't match layer 1 output)
         let wrong_input: Vec<i64> = (0..dim).map(|_| next()).collect();
         let output2 = dense_forward_i64(&w2, &b2, &wrong_input, dim, dim);
 

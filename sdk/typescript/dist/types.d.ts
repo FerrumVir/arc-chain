@@ -1,12 +1,8 @@
 import type { U64 } from "./u64.js";
 export type { U64 } from "./u64.js";
-/** 64-character hex-encoded BLAKE3 hash (no 0x prefix on the native API). */
 export type Hash256 = string;
-/** 64-character hex-encoded account/validator address. */
 export type Address = string;
-/** Hex-encoded bytes without a required prefix. */
 export type HexString = string;
-/** Hex-encoded bytes with the `0x` prefix used by selected RPC projections. */
 export type PrefixedHexString = `0x${string}`;
 export interface HealthResponse {
     status: string;
@@ -157,14 +153,6 @@ export interface FullTransaction {
     success?: boolean;
     gas_used?: U64;
 }
-/**
- * A signed transfer projection that can be normalized to `POST /tx/submit`.
- *
- * `FullTransaction` is the broad read model returned by `/tx/{hash}/full` and
- * is not itself a write contract.  Keeping this transfer-only type separate
- * prevents callers from accidentally POSTing the nested read projection to
- * the node's flat transfer adapter.
- */
 export interface SignedTransferTransaction extends Omit<FullTransaction, "tx_type" | "body" | "signature"> {
     tx_type: "Transfer";
     body: TransferBody;
@@ -174,7 +162,6 @@ export interface SignedTransferTransaction extends Omit<FullTransaction, "tx_typ
             signature: string;
         };
     };
-    /** Exact domain advertised by `/network/info`; null on pre-v3 chains. */
     transaction_domain: PrefixedHexString | null;
 }
 export interface TxSubmitResponse {
@@ -382,7 +369,6 @@ export interface ModelRequestBody {
     bond_per_layer_epoch: number;
     max_wait_secs: number;
 }
-/** Inclusive start/end layer range serialized by the RPC as a JSON tuple. */
 export type LayerRange = [number, number];
 export interface ShardCoverageClaimBody {
     type: "ShardCoverageClaim";
@@ -451,9 +437,7 @@ export interface CommunityInferenceRewardBody {
     expires_at_height: number;
     worker_attestation_hash: Hash256;
 }
-/** Discriminated union of all 37 ARC Chain transaction body projections. */
 export type TransactionBody = TransferBody | SettleBody | SwapBody | EscrowBody | StakeBody | WasmCallBody | MultiSigBody | DeployContractBody | RegisterAgentBody | JoinValidatorBody | LeaveValidatorBody | ClaimRewardsBody | UpdateStakeBody | GovernanceBody | BridgeLockBody | BridgeMintBody | BatchSettleBody | ChannelOpenBody | ChannelCloseBody | ChannelDisputeBody | ShardProofBody | InferenceAttestationBody | InferenceChallengeBody | InferenceRegisterBody | InferenceEscrowOpenBody | InferenceEscrowReleaseBody | InferenceEscrowRefundBody | ModelRegistrationBody | ModelRequestBody | ShardCoverageClaimBody | CapacityAdvertisementBody | ShardAssignmentProposalBody | FaucetClaimBody | InferenceRequestBody | InferenceVoteBody | InferenceFinalizeBody | CommunityInferenceRewardBody;
-/** String literal union of all transaction type discriminators. */
 export type TransactionType = TransactionBody["type"];
 export interface Account {
     address: Address;
@@ -565,10 +549,8 @@ export interface TxSubmitPayload {
     tx_type?: "Transfer";
     signature: string;
     public_key: string;
-    /** Exact domain used by the signer; checked locally and never sent. */
     transaction_domain: PrefixedHexString | null;
 }
-/** Minimal recovery metadata required to bind transaction signatures. */
 export interface TransactionDomainInfo {
     protocol_version?: string | null;
     recovery_active?: boolean;

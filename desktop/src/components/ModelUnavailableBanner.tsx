@@ -1,13 +1,6 @@
 import { useAppStore } from "../lib/store";
 import type { ModelUnavailableReason } from "../lib/types";
 
-/**
- * Shown while the running node was started without its configured model
- * because the file is missing or cannot be read (community PR #132). The
- * node stays up as an observer, so this is a calm status rather than an
- * error. It says local compute is off and points to the model download in
- * Settings.
- */
 export function ModelUnavailableBanner({
   reason,
 }: {

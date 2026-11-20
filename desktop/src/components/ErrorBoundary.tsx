@@ -12,8 +12,6 @@ interface State {
   errorInfo: ErrorInfo | null;
 }
 
-// Catches render errors from any child tree, shows a non-fatal recovery UI
-// instead of the default white screen. Used once, at the top of App.
 export class ErrorBoundary extends Component<Props, State> {
   state: State = { error: null, errorInfo: null };
 

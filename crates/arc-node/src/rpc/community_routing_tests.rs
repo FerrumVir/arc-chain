@@ -161,8 +161,6 @@ mod routing_tests {
         let mut answer = enqueue(&n, &job);
         let clone = n.clone();
         let slow = tokio::spawn(async move { claim(&clone, "slow").await });
-        // The receiver becoming empty proves the slow handler moved the item
-        // into shared storage before entering its polling sleep.
         loop {
             if n.community_work_queue
                 .as_ref()
@@ -236,7 +234,6 @@ mod routing_tests {
             "unrelated"
         ));
         assert!(routing::sample(&n, "decliner").is_none());
-        // A stale empty reservation is still ignored.
         n.community_active_jobs
             .insert("decliner".into(), String::new());
         assert!(!routing::has_other_waiter(
@@ -385,7 +382,7 @@ mod routing_tests {
                 PUBLIC_INFERENCE_CONCURRENCY - 1
             );
             waiting(&n, "first");
-            assert!(poll(&n, "first").await.is_none()); // retry is safely held
+            assert!(poll(&n, "first").await.is_none());
             let mut fillers = Vec::new();
             for i in 0..16 {
                 fillers.push(enqueue(&n, &item(&format!("fill-{i}"))));
@@ -409,8 +406,6 @@ mod routing_tests {
                 assert_eq!(submitted["ok"], true);
                 assert!(dispatch.await.unwrap().unwrap_err().local_fallback_safe);
             } else {
-                // Verification/settlement have their own tests. Send a fully
-                // identifiable second outcome through the actual dispatcher.
                 let (_, pending) = n
                     .community_work_results
                     .as_ref()
@@ -455,9 +450,6 @@ mod routing_tests {
             let first_id = format!("0x{}", "1".repeat(64));
             let mut n = node(&[&first_id, "other"]);
             n.inference_model = Some(context_test_inference_model(512));
-            // This tokenizer maps each "ARC" to one token. Three prompt
-            // tokens plus BOS and 256 output tokens reach the 260-position
-            // boundary without exceeding the public output-token limit.
             let input = if case == "largest" {
                 "ARC ARC ARC"
             } else {

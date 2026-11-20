@@ -1,37 +1,3 @@
-"""Deterministic operational checks for a running ARC validator set (R7).
-
-    python3 -m arc_ops.check --rpc 127.0.0.1:9960,127.0.0.1:9961,... [--window 600]
-
-Collects read-only facts over HTTP from every listed node, then a PURE
-evaluator decides. The evaluator is the only thing that sets the result, so
-the collection can be replayed and the decision re-derived from the saved
-report (`--from-report`).
-
-What is checked, and why each can fail the run:
-
-* reachability and identity - a node that does not answer, or answers as
-  someone else, is not serving;
-* liveness - the newest block's age; the finality lag (committed height
-  minus the highest height a quorum finality certificate covers);
-* agreement - every reachable node's block hash AND state root at a common
-  height below all their tips (disagreement is a FAIL, never a warning);
-* drift - the spread of heights across nodes;
-* peers - a node with no peers is partitioned; fewer than all others is a
-  warning;
-* bootstrapping - a node rebuilding its DAG refuses submissions;
-* native inference - pending requests, the oldest pending request's age in
-  blocks, and, over the last `--window` blocks: requests, finalizes, refunds
-  and any failed native transaction (on a protocol-4 chain a failed one is a
-  defect); every settlement seen must credit exactly its reservation and be
-  identical on two nodes (payment reconciliation).
-
-Exit status: 0 PASS, 1 FAIL, 2 INCOMPLETE (too few nodes answered to judge),
-3 WARN (nothing failed, something needs a look).
-
-Resource use (RSS/CPU/disk) is local-process information: `--local` adds it
-for nodes on this host, found by the port they listen on.
-"""
-
 import argparse
 import json
 import subprocess
@@ -59,7 +25,6 @@ Fetch = Callable[[str, str], Optional[Any]]
 
 
 def http_fetch(node: str, path: str, timeout: float = 4.0) -> Optional[Any]:
-    """GET http://node/path as JSON; None on any failure."""
     try:
         with urllib.request.urlopen(f"http://{node}{path}", timeout=timeout) as resp:
             if resp.status != 200:
@@ -68,8 +33,6 @@ def http_fetch(node: str, path: str, timeout: float = 4.0) -> Optional[Any]:
     except (urllib.error.URLError, OSError, ValueError):
         return None
 
-
-# ── collection (impure) ─────────────────────────────────────────────────────
 
 def collect(nodes: List[str], fetch: Fetch, window: int) -> Dict[str, Any]:
     out: Dict[str, Any] = {"collected_t": time.time(), "nodes": {}}
@@ -95,7 +58,6 @@ def collect(nodes: List[str], fetch: Fetch, window: int) -> Dict[str, Any]:
                               "state_root": (block.get("header") or {}).get("state_root")}
                              if isinstance(block, dict) else None)
 
-    # Native settlement over the window, read from the first answering node.
     reader = next((node for node, n in out["nodes"].items() if n.get("health")), None)
     second = next((node for node, n in out["nodes"].items()
                    if n.get("health") and node != reader), None)
@@ -133,7 +95,6 @@ def collect(nodes: List[str], fetch: Fetch, window: int) -> Dict[str, Any]:
 
 
 def local_resources(nodes: List[str]) -> Dict[str, Any]:
-    """RSS/CPU of local processes listening on each node's RPC port."""
     res: Dict[str, Any] = {}
     for node in nodes:
         port = node.rsplit(":", 1)[-1]
@@ -149,8 +110,6 @@ def local_resources(nodes: List[str]) -> Dict[str, Any]:
             continue
     return res
 
-
-# ── evaluation (pure) ───────────────────────────────────────────────────────
 
 def evaluate(c: Dict[str, Any], th: Dict[str, float]) -> Dict[str, Any]:
     fail: List[str] = []

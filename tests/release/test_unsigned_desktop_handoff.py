@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Hermetic tests for the unsigned desktop build/signing-runner handoff."""
 
 from __future__ import annotations
 

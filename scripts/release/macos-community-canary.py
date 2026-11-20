@@ -40,10 +40,6 @@ RPC = "127.0.0.1:19944"
 STOP_BUDGET_SECONDS = 4_420
 NO_PID_STABILITY_OBSERVATIONS = 3
 NO_PID_STABILITY_INTERVAL_SECONDS = 1
-# The native runner re-hashes the 4 GB GGUF before exec, and the node then loads
-# the complete integer model before opening RPC.  Real Apple Silicon startup has
-# taken about 130 seconds end-to-end, so keep a bounded but practical proof
-# window around both exact, non-networked initialization phases.
 START_PROOF_SECONDS = 300
 CANONICAL_GENESIS_SHA256 = (
     "8394894aaf32aff64df5c6988186e4802cb77a62daf259d8f5cab11d818ed269"
@@ -132,11 +128,11 @@ class CanaryError(RuntimeError):
 
 
 class CanaryUnexpectedSockets(CanaryError):
-    """An exact node opened sockets outside its final canary contract."""
+    pass
 
 
 class CanaryProcessObservationLost(CanaryError):
-    """The admitted process exited between two proof-tool observations."""
+    pass
 
 
 def fail(message: str) -> NoReturn:
@@ -186,8 +182,6 @@ def regular_file(path: Path, description: str) -> os.stat_result:
 
 
 def secure_operator_source(path: Path, uid: int, description: str) -> os.stat_result:
-    """Reject writable/symlinked ancestry before an operator input is pinned."""
-
     path = Path(os.path.abspath(path.expanduser()))
     if not path.is_absolute():
         fail(f"{description} path must be absolute: {path}")
@@ -604,10 +598,6 @@ def managed_paths(root: Path, home: Path) -> Paths:
         acceptance_receipt=root / "evidence/ACCEPTED.json",
         log=root / "logs/node.log",
         launch_agent=home / f"Library/LaunchAgents/{LABEL}.plist",
-        # This lock is deliberately outside the managed root and is never
-        # removed by cleanup.  Every mutating/lifecycle command therefore
-        # contends on the same inode even while the LaunchAgent plist is being
-        # removed.
         lifecycle_lock=home / f".{LABEL}.lifecycle.lock",
     )
 
@@ -682,8 +672,6 @@ def validate_full_live_provenance(
     expected_files: dict[str, str],
     phase: str,
 ) -> dict[str, Any]:
-    """Validate the complete canonical single-artifact public-API proof."""
-
     if (
         not isinstance(value, dict)
         or raw != canonical_json(value)
@@ -821,8 +809,6 @@ def validate_full_live_provenance(
 
 
 def live_provenance_invariant(value: dict[str, Any]) -> tuple[object, object, object]:
-    """Return the immutable tuple shared by initial, final, and retry proofs."""
-
     return (
         {
             key: item
@@ -848,13 +834,6 @@ def require_same_live_provenance_invariant(
 def require_ordered_fresh_live_provenance_pair(
     initial: dict[str, Any], final: dict[str, Any]
 ) -> None:
-    """Prove the final API observation is a distinct, non-earlier recheck.
-
-    GitHub's authoritative Date header has one-second resolution, so equality
-    at the boundary is valid. Reusing any request identity is not: every GET in
-    the final proof must be a fresh request made after the initial sequence.
-    """
-
     require_same_live_provenance_invariant(initial, final)
     initial_responses = initial["api"]["responses"]
     final_responses = final["api"]["responses"]
@@ -1136,10 +1115,6 @@ def plist_bytes(paths: Paths) -> bytes:
     )
     value = {
         "Label": LABEL,
-        # /usr/bin/env is SIP-protected on the supported macOS host. Clearing
-        # the inherited launchd environment before /bin/sh interprets the
-        # runner prevents BASH_ENV/ENV and DYLD interposition from running
-        # before the script's own defensive unset contract.
         "ProgramArguments": [
             "/usr/bin/env",
             "-i",
@@ -2027,8 +2002,6 @@ class CanaryController:
     def _acceptance_payload(
         self, config: dict[str, Any], *, pid: int, accepted_at_unix_ns: int
     ) -> dict[str, Any]:
-        """Return the immutable handoff that binds production probes to this worker."""
-
         return {
             "schema": "arc.macos.pretag-community-canary.acceptance.v1",
             "accepted": True,
@@ -2205,8 +2178,6 @@ class CanaryController:
         return command
 
     def _pid_identity_snapshot(self, pid: int) -> tuple[str, Path, tuple[str, ...]]:
-        """Read one stable command/executable view across an expected exec edge."""
-
         for _ in range(3):
             before = self._process_command(pid)
             executable_result = self.platform.run(
@@ -2265,10 +2236,6 @@ class CanaryController:
         expected_resolved = expected.resolve(strict=True)
         if executable != expected_resolved:
             fail(f"canary PID executable differs from the exact {description}")
-        # Darwin may report additional `txt` mappings (for example its logging
-        # plist cache).  `ps comm` identifies the executable; lsof must
-        # independently corroborate that exact path, but unrelated text maps do
-        # not make the executable ambiguous.
         if str(expected) not in text_paths and str(expected_resolved) not in text_paths:
             fail(f"lsof did not corroborate the exact {description} executable")
 
@@ -2335,8 +2302,6 @@ class CanaryController:
             )
 
     def _classify_start_phase(self, config: dict[str, Any], pid: int) -> str:
-        """Return `runner`, `node-initializing`, or `ready` for one exact PID."""
-
         final_command = " ".join(config["runtime"]["argv"])
         launch_arguments = plistlib.loads(plist_bytes(self.paths))["ProgramArguments"]
         bootstrap = {
@@ -2348,8 +2313,6 @@ class CanaryController:
             listener_names = self._lsof_socket_names(pid, "-iTCP", "-sTCP:LISTEN")
             all_tcp_names, udp_names = self._pid_all_network_names(pid)
             if self._process_command(pid) != snapshot[0]:
-                # The exact env -> sh -> node chain uses exec and retains this
-                # launchd PID.  Retry a boundary crossed during observation.
                 continue
             command = snapshot[0]
             if command == final_command:
@@ -2397,15 +2360,6 @@ class CanaryController:
         *,
         rpc_listener_closed: bool,
     ) -> bool:
-        """Prove one exact, monotonic network state after SIGTERM.
-
-        A proved ready node may retain its sole RPC listener briefly while it
-        drains admitted work.  Once that listener closes, it may never reopen;
-        already-established TCP connections may finish, while UDP remains
-        forbidden.  The executable, complete argv, hash, and launchd PID are
-        re-proved by the caller on every live observation.
-        """
-
         self._prove_pid_base_identity(config, pid)
         listener_names, udp_names = self._pid_socket_names(pid)
         if udp_names:
@@ -2493,8 +2447,6 @@ class CanaryController:
         return sorted(matches)
 
     def _prove_loaded_disabled_no_process_snapshot(self, config: dict[str, Any]) -> str:
-        """Prove one exact loaded definition has no launchd-owned process."""
-
         result = self._launchctl_print()
         if result.returncode != 0:
             fail("loaded-disabled canary disappeared during no-PID recovery proof")
@@ -2555,17 +2507,11 @@ class CanaryController:
     def _prove_stable_loaded_disabled_no_pid(
         self, config: dict[str, Any]
     ) -> tuple[str, int]:
-        """Return the stable exact launchd definition hash and observation count."""
-
         snapshots: list[str] = []
         for observation in range(NO_PID_STABILITY_OBSERVATIONS):
             snapshots.append(self._prove_loaded_disabled_no_process_snapshot(config))
             if observation + 1 < NO_PID_STABILITY_OBSERVATIONS:
                 self.platform.sleep(NO_PID_STABILITY_INTERVAL_SECONDS)
-        # Re-prove every immutable on-disk input and then the complete service
-        # condition immediately before bootout.  The disabled label cannot
-        # launch a new instance, and bootout therefore only unregisters the
-        # stably inert job.
         self._validate_installation(require_launch_agent=True)
         snapshots.append(self._prove_loaded_disabled_no_process_snapshot(config))
         if len(set(snapshots)) != 1:
@@ -2573,8 +2519,6 @@ class CanaryController:
         return snapshots[-1], len(snapshots)
 
     def _recover_loaded_disabled_no_pid(self, config: dict[str, Any]) -> None:
-        """Unregister one stably inert disabled label without sending a signal."""
-
         snapshot_sha256, observation_count = (
             self._prove_stable_loaded_disabled_no_pid(config)
         )
@@ -2612,8 +2556,6 @@ class CanaryController:
                         "start", {"pid": pid, "recovered_loaded_disabled": True}
                     )
                 except Exception:
-                    # Recovery is not complete until both the post-enable proof
-                    # and its append-only evidence succeed.
                     self.platform.run(
                         ("launchctl", "disable", self._service_target()), check=False
                     )
@@ -2650,9 +2592,6 @@ class CanaryController:
                 try:
                     phase = self._classify_start_phase(config, pid)
                 except CanaryUnexpectedSockets:
-                    # The final executable and complete argv are exact. Quarantine
-                    # an unexpected listener using SIGTERM only, then preserve the
-                    # original proof failure for the operator.
                     self.platform.run(("launchctl", "disable", self._service_target()))
                     if not self._service_disabled():
                         fail("launchctl did not disable the rejected canary label")
@@ -2680,8 +2619,6 @@ class CanaryController:
                         fail("failed-start canary remained loaded after graceful quarantine")
                     raise
                 except CanaryError:
-                    # Prevent a restart, but never signal a PID whose identity
-                    # has not been established.
                     self.platform.run(
                         ("launchctl", "disable", self._service_target()),
                         check=False,
@@ -2744,8 +2681,6 @@ class CanaryController:
 
     @lifecycle_transaction
     def accept(self) -> None:
-        """Seal the exact running worker identity for production reward probes."""
-
         config = self._validate_installation(require_launch_agent=True)
         pid = self._prove_process(config)
         if self.paths.acceptance_receipt.exists() or self.paths.acceptance_receipt.is_symlink():
@@ -2841,8 +2776,6 @@ class CanaryController:
                             rpc_listener_closed=rpc_listener_closed,
                         )
                     except CanaryProcessObservationLost:
-                        # Exiting between ps/lsof reads is an allowed terminal
-                        # edge only when both launchd and ps now prove death.
                         if self._service_pid() is None and not self._process_exists(pid):
                             break
                         raise

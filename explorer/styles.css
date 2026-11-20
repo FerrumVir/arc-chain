@@ -1,9 +1,3 @@
-/* ARC composite explorer: the engraved Arc look of the desktop app (desktop/src/styles/engraved.css).
-   White line on Arc blue #002dde. Marcellus is for words only: titles, headings and the headline. Every number is set
-   in Hanken Grotesk with lining tabular figures (JetBrains Mono where it is a hash, an address or code), and a figure
-   inside a Marcellus heading is drawn from Hanken Grotesk too (the "Arc Figures" face below).
-   Fonts are self-hosted under ./fonts (SIL Open Font License 1.1, ./fonts/OFL.txt) so the page CSP needs no change. */
-
 @font-face {
   font-family: "Hanken Grotesk";
   font-style: normal;
@@ -52,7 +46,6 @@
   src: url("./fonts/marcellus-latin.woff2") format("woff2");
   unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
 }
-/* figures for the display face: digits and the signs that travel with them, from Hanken Grotesk */
 @font-face {
   font-family: "Arc Figures";
   font-style: normal;
@@ -64,12 +57,10 @@
 
 :root {
   color-scheme: dark;
-  /* the plate everything is printed on, and the deeper inked areas cut into it */
   --ground: #002dde;
   --ground-deep: #0026c4;
   --ground-well: rgba(0, 16, 120, 0.34);
   --ground-bar: rgba(0, 36, 184, 0.9);
-  /* ink: muted text stays at least 4.5:1 on the ground and on panels; faint is decoration only */
   --ink: #ffffff;
   --ink-soft: rgba(255, 255, 255, 0.88);
   --ink-muted: rgba(255, 255, 255, 0.74);
@@ -78,7 +69,6 @@
   --line: rgba(255, 255, 255, 0.2);
   --line-strong: rgba(255, 255, 255, 0.42);
   --line-soft: rgba(255, 255, 255, 0.11);
-  /* states keep their hue, pitched to read on the blue */
   --good: #8af2cb;
   --good-bg: rgba(138, 242, 203, 0.13);
   --warn: #ffd98c;
@@ -100,7 +90,6 @@
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
 
-/* the page is a plate: faint engraved strokes run across it */
 body {
   min-width: 320px;
   margin: 0;
@@ -135,7 +124,6 @@ select option { background: var(--ground-deep); color: var(--ink); }
   border: 0;
 }
 
-/* ---------- masthead ---------- */
 .topbar {
   position: sticky;
   top: 0;
@@ -152,12 +140,10 @@ select option { background: var(--ground-deep); color: var(--ink); }
   -webkit-backdrop-filter: blur(16px);
 }
 
-/* the page's one copy of the wordmark, referenced by every <use> */
 .symbols { position: absolute; width: 0; height: 0; overflow: hidden; }
 
 .brand { display: inline-flex; align-items: center; gap: 12px; min-width: 0; }
 
-/* the arc.ai wordmark itself, white; never "arc" typed in a font */
 .wordmark { display: block; flex: none; width: calc(24px * 241.87 / 94.04); height: 24px; fill: #ffffff; }
 
 .brand-label {
@@ -252,13 +238,8 @@ select option { background: var(--ground-deep); color: var(--ink); }
   stroke-width: 1.6;
 }
 
-/* a request is in flight: the refresh arrows turn until it settles */
 .icon-button.spinning svg { animation: spin 0.9s linear infinite; }
 
-/* ---------- the header: the chain as an aqueduct, behind the headline ---------- */
-/* The drawing fills the header edge to edge (aqueduct/band.js). Water runs in the channel along its top, so nothing is
-   laid over the top of it: the headline sits low, over the ground, on a scrim that rises from the bottom, and the
-   search sits under the headline. On a phone the search moves below the drawing, so the scrim stays short. */
 .hero { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: 1fr auto auto; }
 
 .hero-stage {
@@ -322,11 +303,9 @@ select option { background: var(--ground-deep); color: var(--ink); }
 
 .hero h1 em { color: var(--paper); font-style: normal; }
 
-/* the inference readout: a quiet line under the headline, present only while the page can stand behind it */
 .hero-inference { margin: 2px 0 0; color: var(--ink-soft); font: 500 0.78rem/1.45 var(--font-mono); letter-spacing: 0.08em; }
 .hero-inference:empty { display: none; }
 
-/* the search, under the headline and over the ground; its height is held in the overlay's bottom padding */
 .hero-foot { position: relative; z-index: 2; grid-row: 2; grid-column: 1; min-width: 0; padding: 0 var(--gutter) 24px; }
 
 .search {
@@ -376,7 +355,6 @@ select option { background: var(--ground-deep); color: var(--ink); }
 
 .hero-foot .field-error { min-height: 20px; margin: 8px 0 0 18px; color: var(--bad); font-size: 0.8rem; }
 
-/* a notice over an empty building site when there is nothing the page can draw */
 .aqueduct-veil {
   position: absolute;
   top: 34%;
@@ -398,7 +376,6 @@ select option { background: var(--ground-deep); color: var(--ink); }
 .hero[data-tone="bad"] .aqueduct-veil { border-color: var(--bad); }
 .hero[data-tone="warn"] .aqueduct-veil { border-color: var(--warn); }
 
-/* what the drawing is showing, and from where: under the header, never over the channel */
 .hero-caption {
   display: grid;
   grid-row: 3;
@@ -459,7 +436,6 @@ select option { background: var(--ground-deep); color: var(--ink); }
 
 .aqueduct-legend sup { font-size: 0.7em; line-height: 0; }
 
-/* ---------- the evidence ---------- */
 main {
   width: min(var(--measure), calc(100% - 48px));
   margin: 0 auto;
@@ -474,7 +450,6 @@ main {
   line-height: 1.7;
 }
 
-/* ---------- connection, continuity, and the selected view: one plate ---------- */
 .connection-banner {
   display: flex;
   align-items: center;
@@ -506,8 +481,6 @@ main {
 
 .banner-pulse { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; background: rgba(255, 255, 255, 0.6); }
 .loading .banner-pulse { animation: pulse 1.2s ease-in-out infinite; }
-/* a background refresh keeps the last result on screen; only its signal pulses until the new one is in
-   (prefers-reduced-motion stills it, with every other animation, at the end of this file) */
 .connection-banner.refreshing .banner-pulse { animation: pulse 1.2s ease-in-out infinite; }
 .online .banner-pulse { background: var(--good); box-shadow: 0 0 0 3px var(--good-bg); }
 .degraded .banner-pulse { background: var(--warn); box-shadow: 0 0 0 3px var(--warn-bg); }
@@ -537,7 +510,6 @@ main {
   list-style: none;
 }
 
-/* a surveyor's line between the stations: a hairline with its ticks */
 .continuity-track::before {
   position: absolute;
   top: 17px;
@@ -595,10 +567,8 @@ main {
 .source-ribbon code { color: var(--info); font-family: var(--font-mono); font-size: 0.78rem; }
 #source-help { align-self: center; color: var(--ink-muted); font-size: 0.76rem; line-height: 1.5; }
 
-/* ---------- metrics ---------- */
 .metric-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-bottom: 24px; }
 
-/* cards carry a plate mark: an outer hairline and a fainter inner one */
 .metric-card {
   position: relative;
   min-width: 0;
@@ -658,7 +628,6 @@ main {
   white-space: nowrap;
 }
 
-/* ---------- panels ---------- */
 .content-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(290px, 0.72fr); gap: 18px; margin-bottom: 18px; }
 .content-grid > * { min-width: 0; }
 .activity-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin-bottom: 18px; }
@@ -710,7 +679,6 @@ table { width: 100%; border-collapse: collapse; }
 th, td { padding: 13px 16px; border-bottom: 1px solid rgba(255, 255, 255, 0.1); text-align: left; white-space: nowrap; }
 th { color: var(--ink-muted); font-size: 0.64rem; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; }
 td { color: var(--ink-soft); font-size: 0.84rem; }
-/* hashes are set in the monospace face; heights, ages and counts are text with tabular figures */
 td.hash, td code { font-family: var(--font-mono); font-size: 0.78rem; }
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover td { background: rgba(255, 255, 255, 0.04); }
@@ -784,10 +752,8 @@ tbody tr:hover td { background: rgba(255, 255, 255, 0.04); }
 .occurrence-card.canonical { border-color: rgba(138, 242, 203, 0.45); }
 .occurrence-card.alternate { border-color: rgba(255, 217, 140, 0.55); }
 .occurrence-card > h3 { margin: 0 0 14px; font-family: var(--font-display); font-size: 1.1rem; font-weight: 400; }
-/* every occurrence card is titled the same way: the source that served it */
 .occurrence-card > .evidence-heading { margin-bottom: 14px; }
 .occurrence-card > .evidence-heading strong { font-family: var(--font-display); font-size: 1.1rem; font-weight: 400; }
-/* the way from a native transaction to its request's receipts */
 .occurrence-card > .table-link {
   display: inline-flex;
   align-items: center;
@@ -859,7 +825,6 @@ tbody tr:hover td { background: rgba(255, 255, 255, 0.04); }
 .detail-item dt, .detail-item dd { margin: 0; }
 .detail-item dt { margin-bottom: 7px; color: var(--ink-muted); font-size: 0.64rem; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; }
 .detail-item dd { overflow-wrap: anywhere; font-size: 0.86rem; font-weight: 500; line-height: 1.5; }
-/* the wide rows hold hashes, addresses and certified bytes: those are set in the monospace face */
 .detail-item.wide dd { font-family: var(--font-mono); font-size: 0.78rem; font-weight: 400; line-height: 1.55; }
 
 .detail-section { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
@@ -919,7 +884,6 @@ tbody tr:hover td { background: rgba(255, 255, 255, 0.04); }
 .inspector-note.good { border-color: rgba(138, 242, 203, 0.5); background: var(--good-bg); }
 .inspector-note.error { border-color: rgba(255, 176, 176, 0.55); background: var(--bad-bg); }
 
-/* ---------- footer ---------- */
 footer {
   display: flex;
   align-items: center;
@@ -955,7 +919,6 @@ footer p { max-width: 640px; margin: 0; text-align: right; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes pulse { 0%, 100% { opacity: 0.35; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1.1); } }
 
-/* ---------- narrower ---------- */
 @media (max-width: 1080px) {
   .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .source-ribbon { grid-template-columns: repeat(3, 1fr); }
@@ -977,12 +940,10 @@ footer p { max-width: 640px; margin: 0; text-align: right; }
 }
 
 @media (max-width: 620px) {
-  /* the brand keeps its label; the chain view takes a row of its own below it */
   .topbar { flex-wrap: wrap; gap: 12px; padding: 12px 16px; }
   .brand { flex: 1 1 auto; }
   .source-control { flex: 1 1 100%; }
   .select-wrap { flex: 1; width: auto; }
-  /* the drawing keeps the same framing as on a wide screen; the search moves below it, so the scrim stays short */
   .hero-stage { grid-row: 1; height: clamp(340px, 97.5vw, 460px); }
   .hero-overlay { gap: 10px; padding: 56px 16px 20px; }
   .eyebrow { gap: 10px; font-size: 0.64rem; }

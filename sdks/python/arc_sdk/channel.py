@@ -1,16 +1,3 @@
-"""
-Off-chain bilateral payment channel for ARC Chain.
-
-Provides a Channel class with pay(), receive(), close(), and dispute()
-methods for high-throughput off-chain transactions between two agents.
-
-Usage:
-    channel = Channel(channel_id, "opener", total_deposit=1_000_000)
-    channel.confirm_open()
-    commitment = channel.pay(100)
-    # Send commitment to counterparty...
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,8 +6,6 @@ from typing import List, Optional
 
 
 class ChannelState(Enum):
-    """Channel lifecycle states."""
-
     OPENING = "Opening"
     OPEN = "Open"
     CLOSING = "Closing"
@@ -29,16 +14,12 @@ class ChannelState(Enum):
 
 
 class Role(Enum):
-    """Role of a party in the channel."""
-
     OPENER = "opener"
     COUNTERPARTY = "counterparty"
 
 
 @dataclass
 class StateCommitment:
-    """A signed state commitment for the channel."""
-
     channel_id: bytes
     nonce: int
     opener_balance: int
@@ -52,19 +33,10 @@ class StateCommitment:
 
 
 class ChannelError(Exception):
-    """Base error for channel operations."""
-
     pass
 
 
 class Channel:
-    """
-    Off-chain bilateral payment channel.
-
-    Manages state transitions, signature verification, and balance conservation
-    for a two-party payment channel on ARC Chain.
-    """
-
     def __init__(
         self,
         channel_id: bytes,
@@ -87,30 +59,23 @@ class Channel:
         self._history: List[StateCommitment] = []
 
     def confirm_open(self) -> None:
-        """Mark channel as open after on-chain ChannelOpen confirms."""
         if self.state != ChannelState.OPENING:
             raise ChannelError(f"Cannot open: channel is {self.state.value}")
         self.state = ChannelState.OPEN
 
     @property
     def my_balance(self) -> int:
-        """Get this party's current balance."""
         if self.role == Role.OPENER:
             return self.opener_balance
         return self.counterparty_balance
 
     @property
     def their_balance(self) -> int:
-        """Get counterparty's current balance."""
         if self.role == Role.OPENER:
             return self.counterparty_balance
         return self.opener_balance
 
     def pay(self, amount: int) -> StateCommitment:
-        """
-        Transfer `amount` from this party to the counterparty.
-        Returns a half-signed state commitment to send to the counterparty.
-        """
         if self.state != ChannelState.OPEN:
             raise ChannelError(f"Cannot pay: channel is {self.state.value}")
 
@@ -127,7 +92,6 @@ class Channel:
         return self.propose_state(new_opener, new_counter)
 
     def propose_state(self, opener_balance: int, counterparty_balance: int) -> StateCommitment:
-        """Propose a new state with arbitrary balances."""
         if self.state != ChannelState.OPEN:
             raise ChannelError(f"Cannot propose: channel is {self.state.value}")
 
@@ -147,10 +111,6 @@ class Channel:
         )
 
     def receive_state(self, commitment: StateCommitment) -> StateCommitment:
-        """
-        Receive and validate a state commitment from the counterparty.
-        Updates local state if valid.
-        """
         if self.state != ChannelState.OPEN:
             raise ChannelError(f"Cannot receive: channel is {self.state.value}")
 
@@ -164,14 +124,13 @@ class Channel:
         if total != self.total_deposit:
             raise ChannelError("Conservation violated")
 
-        # In full implementation, verify proposer's Ed25519 signature here.
         signed = StateCommitment(
             channel_id=commitment.channel_id,
             nonce=commitment.nonce,
             opener_balance=commitment.opener_balance,
             counterparty_balance=commitment.counterparty_balance,
             proposer_sig=commitment.proposer_sig,
-            acceptor_sig=b"\x00" * 64,  # Caller signs externally
+            acceptor_sig=b"\x00" * 64,
         )
 
         self.nonce = commitment.nonce
@@ -182,7 +141,6 @@ class Channel:
         return signed
 
     def finalize_state(self, commitment: StateCommitment) -> None:
-        """Finalize a state after receiving counterparty's co-signature."""
         if not commitment.is_fully_signed:
             raise ChannelError("Commitment not fully signed")
 
@@ -192,7 +150,6 @@ class Channel:
         self._history.append(commitment)
 
     def close(self) -> StateCommitment:
-        """Initiate cooperative close."""
         if self.state != ChannelState.OPEN:
             raise ChannelError(f"Cannot close: channel is {self.state.value}")
 
@@ -206,14 +163,12 @@ class Channel:
         )
 
     def dispute(self) -> StateCommitment:
-        """Get the latest fully-signed state for on-chain dispute submission."""
         for c in reversed(self._history):
             if c.is_fully_signed:
                 return c
         raise ChannelError("No fully-signed states available for dispute")
 
     def confirm_closed(self) -> None:
-        """Mark channel as closed after on-chain resolution."""
         self.state = ChannelState.CLOSED
 
     @staticmethod
@@ -223,7 +178,6 @@ class Channel:
         deposit: int,
         timeout_blocks: int = 100,
     ) -> dict:
-        """Build a ChannelOpen transaction body."""
         return {
             "type": "ChannelOpen",
             "channel_id": channel_id,
@@ -240,7 +194,6 @@ class Channel:
         counterparty_sig: list,
         state_nonce: int,
     ) -> dict:
-        """Build a ChannelClose transaction body."""
         return {
             "type": "ChannelClose",
             "channel_id": channel_id,
@@ -259,7 +212,6 @@ class Channel:
         state_nonce: int,
         challenge_period: int = 100,
     ) -> dict:
-        """Build a ChannelDispute transaction body."""
         return {
             "type": "ChannelDispute",
             "channel_id": channel_id,

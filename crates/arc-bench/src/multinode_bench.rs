@@ -1,22 +1,3 @@
-//! ARC Chain - Real Multi-Node TPS Benchmark
-//!
-//! This benchmark starts 2+ real arc-node instances in-process, connected via
-//! QUIC transport with DAG consensus, and measures actual committed TPS through
-//! the full stack:
-//!
-//!   1. Start N nodes with shared genesis, QUIC transport, DAG consensus
-//!   2. Pre-sign M transactions (fresh process-local Ed25519 keypairs)
-//!   3. Inject transactions into each node's mempool (partitioned by sender)
-//!   4. Wait for consensus to commit all transactions to state
-//!   5. Report real TPS = committed transactions / wall-clock time
-//!
-//! Architecture (mirrors main.rs wiring per node):
-//!   Transport <── outbound_rx ── ConsensusManager ── outbound_tx ──> Transport
-//!   Transport ── inbound_tx ──> ConsensusManager <── inbound_rx ── Transport
-//!
-//! Usage:
-//!   cargo run --release --bin arc-bench-multinode -- --txs 100000 --batch 1000 --nodes 2
-
 #![allow(dead_code)]
 
 mod ephemeral_keys;
@@ -46,8 +27,6 @@ fn require_loopback_benchmark_network(
     }
     Ok(())
 }
-
-// ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -84,8 +63,6 @@ struct Args {
     output: String,
 }
 
-// ── Result types ────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BenchmarkConfig {
     num_nodes: usize,
@@ -114,10 +91,6 @@ struct BenchmarkResult {
     projected_256_nodes: f64,
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
-
-/// Standard genesis accounts funded for the benchmark.
-/// All nodes MUST use the same genesis for identical genesis hash (QUIC handshake).
 fn genesis_accounts(senders: &[Hash256], receivers: &[Hash256]) -> Vec<(Hash256, u64)> {
     let mut accounts = Vec::with_capacity(senders.len() + receivers.len());
     accounts.extend(senders.iter().map(|address| (*address, 1_000_000_000_000)));
@@ -146,8 +119,6 @@ fn format_num(n: usize) -> String {
     }
 }
 
-/// Pre-sign transactions for a given node's sender partition.
-/// Node `node_id` gets senders [node_id*senders_per_node .. (node_id+1)*senders_per_node).
 fn presign_partition(
     keypairs: Vec<(KeyPair, Hash256)>,
     receivers: Vec<Hash256>,
@@ -174,26 +145,16 @@ fn presign_partition(
     transactions
 }
 
-// ── Benchmark Node ──────────────────────────────────────────────────────────
-
 struct BenchNode {
-    /// This node's validator address (derived from keypair).
     address: Hash256,
-    /// Port the QUIC transport is listening on.
     port: u16,
-    /// State database (in-memory, no WAL).
     state: Arc<StateDB>,
-    /// Transaction mempool.
     mempool: Arc<Mempool>,
-    /// Peer count tracker (shared with transport).
     peer_count: Arc<AtomicU32>,
-    /// JoinHandles for spawned tasks (aborted on drop).
     task_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl BenchNode {
-    /// Start a full node stack: Transport + ConsensusManager.
-    /// Mirrors TestNode::start from multi_node.rs integration tests.
     async fn start(
         keypair: KeyPair,
         stake: u64,
@@ -210,7 +171,6 @@ impl BenchNode {
         let state = Arc::new(StateDB::with_genesis(genesis));
         let mempool = Arc::new(Mempool::new(500_000));
 
-        // Large channel buffers for high-throughput benchmarking
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(10_000);
         let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(10_000);
         let peer_count = Arc::new(AtomicU32::new(0));
@@ -223,7 +183,6 @@ impl BenchNode {
                 .collect::<std::collections::HashSet<_>>(),
         );
 
-        // Start QUIC transport
         let transport_keypair = keypair.clone();
         let transport_inbound_tx = inbound_tx.clone();
         let transport_peer_count = peer_count.clone();
@@ -246,16 +205,8 @@ impl BenchNode {
             .filter(|(validator, _)| *validator != address)
             .copied()
             .collect();
-        // Start DAG consensus with the same fixed validator authority set on
-        // every node. Transport connectivity never creates voting members.
-        let consensus = ConsensusManager::new_with_keypair(
-            address,
-            stake,
-            4,     // num_shards
-            false, // not benchmark mode - we inject into mempool directly
-            &peer_validators,
-            keypair,
-        );
+        let consensus =
+            ConsensusManager::new_with_keypair(address, stake, 4, false, &peer_validators, keypair);
         let state_clone = state.clone();
         let mempool_clone = mempool.clone();
         let consensus_handle = tokio::spawn(async move {
@@ -265,7 +216,7 @@ impl BenchNode {
                     mempool_clone,
                     Some(inbound_rx),
                     Some(outbound_tx),
-                    None, // no benchmark pool - direct mempool injection
+                    None,
                 )
                 .await;
         });
@@ -280,7 +231,6 @@ impl BenchNode {
         }
     }
 
-    /// Wait until this node has at least `n` connected peers, or timeout.
     async fn wait_for_peers(&self, n: u32, deadline: Duration) -> bool {
         let start = tokio::time::Instant::now();
         loop {
@@ -294,7 +244,6 @@ impl BenchNode {
         }
     }
 
-    /// Wait until state height reaches at least `target`.
     async fn wait_for_height(&self, target: u64, deadline: Duration) -> bool {
         let start = tokio::time::Instant::now();
         loop {
@@ -317,12 +266,9 @@ impl Drop for BenchNode {
     }
 }
 
-// ── Main ────────────────────────────────────────────────────────────────────
-
 fn main() {
     let args = Args::parse();
 
-    // Validate
     assert!(
         args.nodes >= 2 && args.nodes <= 4,
         "Node count must be 2-4 (got {})",
@@ -338,7 +284,6 @@ fn main() {
         .map(|n| n.get())
         .unwrap_or(1);
 
-    // Build tokio runtime with enough workers for transport + consensus tasks
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(cpu_cores.min(16))
@@ -349,7 +294,6 @@ fn main() {
 }
 
 async fn run_benchmark(args: Args, cpu_cores: usize) {
-    // Suppress noisy tracing from transport/consensus internals
     let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
 
     let config = BenchmarkConfig {
@@ -361,7 +305,7 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
     };
 
     let txs_per_node = args.txs / args.nodes;
-    let stake = 5_000_000u64; // Arc tier - can produce blocks
+    let stake = 5_000_000u64;
 
     println!();
     println!("============================================================");
@@ -375,7 +319,6 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
     println!("============================================================");
     println!();
 
-    // ── Phase 1: Genesis Setup ──────────────────────────────────────────
     print!("  Phase 1: Genesis Setup ........................ ");
     let sender_partitions: Vec<Vec<(KeyPair, Hash256)>> = (0..args.nodes)
         .map(|_| ephemeral_keys::signing_keypairs(args.senders_per_node))
@@ -388,10 +331,8 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
     let genesis = genesis_accounts(&sender_addresses, &receivers);
     println!("OK ({} accounts)", genesis.len());
 
-    // ── Phase 2: Start Nodes with QUIC Transport ────────────────────────
     print!("  Phase 2: Transport & Consensus ................ ");
 
-    // Find free ports (bind to 0, read back, release)
     let mut ports = Vec::with_capacity(args.nodes);
     for _ in 0..args.nodes {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
@@ -400,7 +341,6 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
         ports.push(socket.local_addr().unwrap().port());
     }
 
-    // Start Node 0 (seed node, no bootstrap)
     let mut nodes = Vec::with_capacity(args.nodes);
     let mut validator_keypairs: Vec<Option<KeyPair>> = (0..args.nodes)
         .map(|_| Some(KeyPair::generate_ed25519()))
@@ -425,10 +365,8 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
     .await;
     nodes.push(node_0);
 
-    // Brief delay for Node 0 to bind its QUIC listener
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Start remaining nodes, each bootstrapping to all previously started nodes
     let addr_0: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
     for i in 1..args.nodes {
         let mut bootstrap: Vec<SocketAddr> = vec![addr_0];
@@ -448,7 +386,6 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Wait for full mesh connectivity
     let expected_peers = (args.nodes - 1) as u32;
     let peer_timeout = Duration::from_secs(30);
     let mut all_connected = true;
@@ -464,8 +401,6 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
         }
     }
 
-    // Allow consensus to process PeerConnected messages and transition
-    // from single-validator to multi-validator DAG mode
     tokio::time::sleep(Duration::from_millis(1000)).await;
 
     if all_connected {
@@ -474,11 +409,9 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
         println!("PARTIAL ({} nodes, some peers missing)", args.nodes);
     }
 
-    // ── Phase 3: Pre-sign Transactions ──────────────────────────────────
     print!("  Phase 3: Pre-signing transactions ............. ");
     let sign_start = Instant::now();
 
-    // Pre-sign in parallel threads (one per node partition)
     let sign_handles: Vec<_> = sender_partitions
         .into_iter()
         .map(|keypairs| {
@@ -499,16 +432,11 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
         format_tps(args.txs as f64 / sign_elapsed.as_secs_f64())
     );
 
-    // Record the initial height before injection
     let initial_height = nodes[0].state.height();
 
-    // ── Phase 4: Transaction Injection (parallel across all nodes) ─────
     println!("  Phase 4: Transaction injection ................ ");
     let inject_start = Instant::now();
 
-    // Inject into ALL nodes simultaneously using threads to avoid the
-    // sequential injection problem where Node 0's gossip floods Node 1's
-    // mempool before Node 1 even receives its own transactions.
     let inject_handles: Vec<_> = all_partitions
         .iter()
         .enumerate()
@@ -544,30 +472,25 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
     }
     let _inject_elapsed = inject_start.elapsed();
 
-    // ── Phase 5: Consensus & Commitment ─────────────────────────────────
     println!("  Phase 5: Consensus & Commitment ............... ");
 
     let commit_start = Instant::now();
     let timeout_dur = Duration::from_secs(args.timeout_secs);
 
-    // Track block progression for reporting
     let mut last_reported_height = initial_height;
-    let mut per_second_txs: Vec<usize> = Vec::new(); // TXs committed per 1-second window
+    let mut per_second_txs: Vec<usize> = Vec::new();
     let mut last_window_committed = 0usize;
     let mut last_window_time = Instant::now();
 
-    // Poll until all transactions are committed or timeout
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Check height on node 0 (all nodes should converge)
         let current_height = nodes[0].state.height();
         let elapsed = commit_start.elapsed();
 
         if current_height > last_reported_height {
             let _blocks_advanced = current_height - last_reported_height;
 
-            // Track per-second windows using real mempool drain measurement
             let remaining: usize = nodes.iter().map(|n| n.mempool.len()).sum();
             let committed_so_far = args.txs.saturating_sub(remaining);
             if last_window_time.elapsed() >= Duration::from_secs(1) {
@@ -577,7 +500,6 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
                 last_window_time = Instant::now();
             }
 
-            // Report block progression (sampled to avoid spam)
             if current_height % 50 == 0 || current_height <= initial_height + 3 {
                 let mp: Vec<usize> = nodes.iter().map(|n| n.mempool.len()).collect();
                 let committed_now = args.txs.saturating_sub(mp.iter().sum::<usize>());
@@ -599,15 +521,12 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
             last_reported_height = current_height;
         }
 
-        // Check if all mempools are drained and heights have stabilized
         let all_drained = nodes.iter().all(|n| n.mempool.is_empty());
         if all_drained && elapsed > Duration::from_secs(3) {
-            // Wait a few more seconds for final blocks to commit
             let h_before = nodes[0].state.height();
             tokio::time::sleep(Duration::from_secs(2)).await;
             let h_after = nodes[0].state.height();
             if h_after == h_before {
-                // Heights stable, all mempools drained - done
                 break;
             }
         }
@@ -622,7 +541,6 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
         }
     }
 
-    // Push final window delta
     {
         let remaining: usize = nodes.iter().map(|n| n.mempool.len()).sum();
         let committed_so_far = args.txs.saturating_sub(remaining);
@@ -632,14 +550,12 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
         }
     }
 
-    // Calculate committed transactions = total injected - remaining in mempools
     let remaining_in_mempools: usize = nodes.iter().map(|n| n.mempool.len()).sum();
     let total_committed = args.txs - remaining_in_mempools;
 
-    let total_elapsed = inject_start.elapsed(); // From injection start to completion
+    let total_elapsed = inject_start.elapsed();
     let commit_elapsed = commit_start.elapsed();
 
-    // ── Compute final metrics ───────────────────────────────────────────
     let final_height = nodes[0].state.height();
     let blocks_produced = final_height - initial_height;
     let tps = if total_elapsed.as_secs_f64() > 0.0 {
@@ -662,12 +578,8 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
         0.0
     };
 
-    // 2-round DAG commit rule means finality is ~2x the average block time
     let finality_time_ms = avg_block_time_ms * 2.0;
 
-    // ── Multi-node projections ──────────────────────────────────────────
-    // Based on measured per-node TPS, scale with 0.88 network efficiency factor.
-    // DAG consensus scales near-linearly with proposers (sender-sharded).
     let efficiency = 0.88;
     let per_node_tps = tps / args.nodes as f64;
     let project = |n: f64| per_node_tps * n * efficiency;
@@ -690,7 +602,6 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
         projected_256_nodes: project(256.0),
     };
 
-    // ── Print Results ───────────────────────────────────────────────────
     println!();
     println!("============================================================");
     println!("  RESULTS");
@@ -742,7 +653,6 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
     );
     println!("============================================================");
 
-    // ── Honesty Report ──────────────────────────────────────────────────
     println!();
     println!("  HONESTY REPORT:");
     println!("    [x] Real QUIC transport between nodes (not simulated)");
@@ -754,7 +664,6 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
     println!("    [x] Sender partitioning to avoid nonce conflicts");
     println!();
 
-    // ── Write JSON ──────────────────────────────────────────────────────
     let json = serde_json::to_string_pretty(&result).expect("JSON serialization");
     std::fs::write(&args.output, &json).expect("failed to write results JSON");
     println!("  Results written to: {}", args.output);

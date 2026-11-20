@@ -1,6 +1,3 @@
-// ─── ARC Chain Wallet ─────────────────────────────────────────
-// Key management, transaction signing, nonce tracking
-
 import type {
   Address,
   Hash256,
@@ -10,7 +7,6 @@ import type {
 } from "./types";
 import { ArcClient } from "./client";
 
-/** Simple in-memory wallet for agents */
 export class ArcWallet {
   private _address: Address;
   private _privateKey: Uint8Array;
@@ -22,7 +18,6 @@ export class ArcWallet {
     this._privateKey = privateKey;
   }
 
-  /** Create a new random wallet */
   static create(): ArcWallet {
     const privateKey = new Uint8Array(32);
     if (typeof crypto !== "undefined" && crypto.getRandomValues) {
@@ -33,12 +28,10 @@ export class ArcWallet {
       }
     }
 
-    // Derive address from private key (simplified - BLAKE3 hash, take first 20 bytes)
     const address = deriveAddress(privateKey);
     return new ArcWallet(address, privateKey);
   }
 
-  /** Import wallet from hex private key */
   static fromPrivateKey(hexKey: string): ArcWallet {
     const clean = hexKey.startsWith("0x") ? hexKey.slice(2) : hexKey;
     const privateKey = hexToBytes(clean);
@@ -46,34 +39,27 @@ export class ArcWallet {
     return new ArcWallet(address, privateKey);
   }
 
-  /** Get wallet address */
   get address(): Address {
     return this._address;
   }
 
-  /** Export private key as hex */
   get privateKeyHex(): string {
     return "0x" + bytesToHex(this._privateKey);
   }
 
-  /** Sync nonce from chain */
   async syncNonce(client: ArcClient): Promise<void> {
     this._nonce = await client.getNonce(this._address);
     this._nonceInitialized = true;
   }
 
-  /** Get current nonce (auto-incrementing) */
   get nonce(): number {
     return this._nonce;
   }
 
-  /** Sign a transaction */
   sign(tx: UnsignedTransaction): SignedTransaction {
-    // Compute transaction hash (simplified BLAKE3 - full impl needs WASM)
     const txBytes = serializeTx(tx);
     const hash = simpleHash(txBytes);
 
-    // Sign with private key (simplified - real impl uses Ed25519 or ECDSA)
     const signature = simpleSign(hash, this._privateKey);
 
     const signed: SignedTransaction = {
@@ -82,13 +68,11 @@ export class ArcWallet {
       signature: "0x" + bytesToHex(signature),
     };
 
-    // Auto-increment nonce
     this._nonce++;
 
     return signed;
   }
 
-  /** Create and sign a transfer transaction */
   transfer(to: Address, amount: bigint): SignedTransaction {
     return this.sign({
       tx_type: "Transfer" as TxType,
@@ -99,7 +83,6 @@ export class ArcWallet {
     });
   }
 
-  /** Create and sign a settle transaction (agent settlement) */
   settle(to: Address, amount: bigint, data?: Uint8Array): SignedTransaction {
     return this.sign({
       tx_type: "Settle" as TxType,
@@ -111,7 +94,6 @@ export class ArcWallet {
     });
   }
 
-  /** Create and sign a swap transaction */
   swap(to: Address, amount: bigint): SignedTransaction {
     return this.sign({
       tx_type: "Swap" as TxType,
@@ -122,7 +104,6 @@ export class ArcWallet {
     });
   }
 
-  /** Create and sign a stake transaction */
   stake(amount: bigint): SignedTransaction {
     return this.sign({
       tx_type: "Stake" as TxType,
@@ -133,7 +114,6 @@ export class ArcWallet {
     });
   }
 
-  /** Create and sign a WASM contract call */
   callContract(
     contract: Address,
     data: Uint8Array,
@@ -151,10 +131,7 @@ export class ArcWallet {
   }
 }
 
-// ─── Helpers ────────────────────────────────────────────────
-
 function deriveAddress(privateKey: Uint8Array): Address {
-  // Simplified address derivation - hash private key, take first 20 bytes
   const hash = simpleHash(privateKey);
   return "0x" + bytesToHex(hash.slice(0, 20));
 }
@@ -180,10 +157,8 @@ function serializeTx(tx: UnsignedTransaction): Uint8Array {
   return result;
 }
 
-/** Simplified BLAKE3-like hash (for SDK without WASM dependency) */
 function simpleHash(data: Uint8Array): Uint8Array {
   const hash = new Uint8Array(32);
-  // FNV-1a style mixing (placeholder - real SDK will use WASM BLAKE3)
   let h = 0x811c9dc5;
   for (let i = 0; i < data.length; i++) {
     h ^= data[i];
@@ -197,7 +172,6 @@ function simpleHash(data: Uint8Array): Uint8Array {
   return hash;
 }
 
-/** Simplified signing (placeholder - real SDK will use Ed25519) */
 function simpleSign(hash: Uint8Array, key: Uint8Array): Uint8Array {
   const sig = new Uint8Array(64);
   for (let i = 0; i < 64; i++) {

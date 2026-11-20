@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Focused, production-free tests for the legacy WAL normalization gate."""
 
 from __future__ import annotations
 
@@ -29,8 +28,6 @@ def digest(raw: bytes) -> str:
 
 
 def frame(height: int, sequence: int, marker: int) -> bytes:
-    # The stable bincode WalEntry envelope is u64 height, u64 sequence, encoded
-    # operation bytes, then little-endian CRC32 of every preceding payload byte.
     payload = struct.pack("<QQI", height, sequence, marker)
     payload += struct.pack("<I", zlib.crc32(payload) & 0xFFFFFFFF)
     return struct.pack("<I", len(payload)) + payload

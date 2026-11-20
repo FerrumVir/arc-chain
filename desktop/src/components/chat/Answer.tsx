@@ -1,10 +1,3 @@
-// One answer in the Inference thread, with the evidence that came back with it.
-//
-// The receipt, settlement and quorum logic here is the Inference screen's
-// original logic, moved into a per-answer component unchanged, so every answer
-// in the thread polls and judges its own receipt exactly as before. Only the
-// latest answer carries the canonical test ids; earlier ones carry "-earlier".
-
 import { useQuery } from "@tanstack/react-query";
 import { Check, ClipboardCheck, Coins, Copy, Globe, RotateCcw, Search, ShieldCheck, Sparkles, Zap } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -18,14 +11,10 @@ import type { ChatTurn } from "../../lib/chat";
 import { Markdown } from "./Markdown";
 import { StageTrack, timeOf } from "./Stages";
 
-/** What the answer says about a second computer re-running the work. */
 type CheckState = "agreed" | "reported" | "none";
 
 const ARC_HASH_RE = /^0x[0-9a-f]{64}$/;
 const COMMUNITY_REWARD_ARC = 2.5;
-// Match the operator walkthrough's 180-second settlement budget. A healthy
-// inference must not look failed merely because block inclusion took longer
-// than the old one-minute UI window.
 const MAX_RECEIPT_POLLS = 61;
 const MAX_RECEIPT_POLL_MS = 180_000;
 
@@ -38,10 +27,8 @@ export function Answer({
 }: {
   turn: ChatTurn;
   latest: boolean;
-  /** An earlier answer to the same prompt and token budget, for comparing fingerprints. */
   earlier: ChatTurn | null;
   onAskAgain: () => void;
-  /** Told what this answer has shown about being checked and recorded, whenever that changes (for the chat aqueduct). */
   onFacts?: (facts: { agreed: boolean; height: number | null }) => void;
 }) {
   const result = turn.result!;
@@ -58,16 +45,10 @@ export function Answer({
   };
 
   const communityWorker = result.routedVia?.startsWith("community:") ? result.routedVia.slice("community:".length) : null;
-  // A quorum flag without an exact execution-profile binding is incomplete
-  // evidence: it cannot establish that every vote covered the same model and
-  // protocol profile. Keep the result visible, but do not promote it to
-  // authenticated consensus in the product copy.
   const authenticatedQuorum = Boolean(result.quorumVerified === true && result.profileBound === true);
   const settlement = result.settlement;
   const isCommunityRewardTx = Boolean(settlement?.submitted === true && settlement.txType === "0x25" && ARC_HASH_RE.test(settlement.txHash));
   const exactCommunityReceiptUrl = settlement?.txHash ? `/community/reward_receipt/${settlement.txHash}` : "";
-  // A 0x16 claim was sent only when the serving node reports "submitted_to_mempool" with a real hash. Any other status
-  // is at most a candidate claim, and is shown as one (main #113, carried into the per-answer view).
   const submittedAttestationTx = Boolean(result.attestationStatus === "submitted_to_mempool" && ARC_HASH_RE.test(result.txHash));
   const attestationLine = !result.attestationStatus
     ? null
@@ -172,7 +153,6 @@ export function Answer({
   } else if (settlement?.txType && settlement.txType !== "0x25") {
     communitySettlementMessage = `unrecognized settlement type ${settlement.txType}; no community reward credited`;
   } else if (settlement && !settlement.submitted && settlement.status === "verified_pending_approval") {
-    // Verified work whose reward waits for validator approval is usually paid; it is pending, not lost.
     communitySettlementMessage = "Verified. Reward pending validator approval.";
   } else if (settlement && !settlement.submitted) {
     communitySettlementMessage = `No 0x25 was submitted (${settlement.status.replaceAll("_", " ")}); no ARC reward can be confirmed`;
@@ -201,7 +181,6 @@ export function Answer({
     void rewardReceipt.refetch();
   };
 
-  // what the chat aqueduct may draw: agreement only when authenticated, a block only from a confirmed mined receipt
   const factHeight = confirmedCommunityReward && rewardReceipt.data?.blockHeight != null ? rewardReceipt.data.blockHeight : null;
   const onFactsRef = useRef(onFacts);
   onFactsRef.current = onFacts;
@@ -209,7 +188,6 @@ export function Answer({
     onFactsRef.current?.({ agreed: authenticatedQuorum, height: factHeight });
   }, [authenticatedQuorum, factHeight]);
 
-  // ---- the plain-language provenance: who served it, whether it was checked, what reached the chain
   const check: CheckState = authenticatedQuorum ? "agreed" : result.consensus ? "reported" : "none";
   const checkLine = check === "agreed" ? PLAIN_COPY.answer.checked
     : check === "reported" ? PLAIN_COPY.answer.reported : PLAIN_COPY.answer.unchecked;
@@ -217,8 +195,6 @@ export function Answer({
   const ownWorker = Boolean(communityWorker && normalizedAddress
     && /^[0-9a-f]{64}$/.test(normalizedAddress)
     && communityWorker.replace(/^0x/i, "").toLowerCase() === normalizedAddress);
-  // "local" is relative to the serving node, which may be a remote seed.
-  // Conversely, our own endpoint may delegate to remote replicas.
   const answerSource = ownWorker || (result.routedVia === "local" && result.servedLocally)
     ? "own"
     : result.routedVia === "local" || result.routedVia === "sharded_seed_pipeline" ? "arc" : "network";
@@ -359,8 +335,6 @@ export function Answer({
           </div>
         )}
 
-        {/* Per-hop pipeline trace, shown only when the serving node reports one: the evidence that the model
-            really was split across machines. */}
         {result.trace && result.trace.length > 0 && (
           <div className="trace" data-testid={tid("inference-trace")}>
             <div className="trace-title">Pipeline · {result.trace.length} hops</div>
@@ -398,8 +372,6 @@ export function Answer({
           <span>
             Engine: {result.engine} {result.deterministic && "· serving host reports deterministic"}
           </span>
-          {/* The in-app lookup resolves the hash against the pinned host, the only place it can honestly be
-              confirmed, including telling the person it is not in a block yet. */}
           <span className="evidence-links">
             {isCommunityRewardTx && settlement?.txHash && (
               <button className="btn btn-ghost btn-sm" onClick={() => lookupHash(settlement.txHash)} data-testid={tid("btn-lookup-reward")}>

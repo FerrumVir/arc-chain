@@ -1,7 +1,3 @@
-// Verify block-i8 is actually dispatching during forward_one_token.
-// We compare logits from the full-forward with block-i8 enabled vs disabled;
-// if they differ, dispatch is working. If they match, something is bypassing
-// the block-i8 path.
 use arc_inference::cached_integer_model::{KVCache, load_cached_model};
 
 fn main() {
@@ -15,7 +11,6 @@ fn main() {
     );
     eprintln!("block_i8_output: {}", model.block_i8_output.is_some());
 
-    // With block-i8 enabled
     let mut cache_a = KVCache::new(model.config.n_layers);
     let _ = model.forward_one_token(1, &mut cache_a);
     let logits_with = model.forward_one_token(5000, &mut cache_a);
@@ -31,7 +26,6 @@ fn main() {
         &logits_with[..4]
     );
 
-    // Disable block-i8
     let saved_l = model.block_i8_layers.take();
     let saved_o = model.block_i8_output.take();
 
@@ -50,11 +44,9 @@ fn main() {
         &logits_without[..4]
     );
 
-    // Restore
     model.block_i8_layers = saved_l;
     model.block_i8_output = saved_o;
 
-    // Compare
     let identical = logits_with == logits_without;
     eprintln!("Identical: {}", identical);
     if identical {

@@ -1,5 +1,3 @@
-//! Streaming SHA-256 helpers.
-
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
@@ -14,7 +12,6 @@ pub fn sha256_file(path: &Path) -> io::Result<String> {
     sha256_file_with_progress(path, |_| {})
 }
 
-/// Hash a file in 1 MiB chunks, reporting the running byte count.
 pub fn sha256_file_with_progress(path: &Path, mut progress: impl FnMut(u64)) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();

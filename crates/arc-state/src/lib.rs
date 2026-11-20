@@ -44,15 +44,9 @@ pub use wal::{
     latest_block_height_in_wal_dir, read_wal, read_wal_dir, read_wal_strict,
 };
 
-/// Protocol-v3 transfers pay at least one base unit into the fixed generic
-/// treasury. This makes every valid user-created history entry economically
-/// bounded while conserving supply.
 pub const V3_MIN_TRANSFER_FEE: u64 = 1;
-/// Hard ingress bound before any signature or body work.
 pub const V3_MAX_TRANSACTION_BYTES: u64 = 64 * 1024;
-/// Conservative launch bound for one canonical state block.
 pub const V3_MAX_TRANSACTIONS_PER_BLOCK: usize = 1_024;
-/// Launch policy: one transaction from an address per canonical state block.
 pub const V3_MAX_TRANSACTIONS_PER_SENDER_PER_BLOCK: usize = 1;
 
 pub const V3_COMMUNITY_REWARD_EPOCH_BLOCKS: u64 = 216_000;
@@ -212,9 +206,6 @@ fn state_staging_name(name: &str) -> bool {
 }
 
 fn cleanup_state_staging_files(wal_dir: &Path) -> Result<(), StateError> {
-    // Restore semantic WAL bytes before inspecting/deleting inert staging.
-    // On Windows a crash can occur while an existing live name is being moved
-    // through its deterministic write-through rebarrier sibling.
     wal::restore_interrupted_wal_namespace_rebarriers(wal_dir).map_err(|error| {
         StateError::PersistenceError(format!(
             "failed to restore interrupted state WAL namespace in {wal_dir:?}: {error}"
@@ -247,18 +238,12 @@ fn cleanup_state_staging_files(wal_dir: &Path) -> Result<(), StateError> {
             continue;
         }
         if let Err(error) = arc_crypto::secret_file::sync_parent_directory(&path) {
-            // The staging name is never interpreted as live state. If a late
-            // parent-fsync error lets it reappear, this exact cleanup retries.
             tracing::warn!(path = ?path, %error, "state WAL staging cleanup barrier will be retried");
         }
     }
     Ok(())
 }
 
-/// Restore, create, and durably prove one persistent-state directory leaf
-/// before any caller decides whether its binding/WAL history exists. The
-/// returned parent-sibling guard must stay live through those startup
-/// decisions so a second cooperating constructor cannot create a split root.
 pub(crate) fn prepare_persistent_state_directory(
     requested: &Path,
 ) -> Result<arc_crypto::secret_file::PreparedPrivateDirectoryNamespaceLock, StateError> {
@@ -313,83 +298,41 @@ pub(crate) fn prepare_persistent_state_directory(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Chunked State Snapshot Protocol - types for fast state sync
-// ---------------------------------------------------------------------------
-
-/// A single chunk of a state snapshot for streaming sync.
-///
-/// Large states are split into fixed-size chunks so peers can download
-/// them in parallel from multiple sources without loading the entire
-/// state into memory at once.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StateSnapshot {
-    /// Block height at which this snapshot was taken.
     pub version: u64,
-    /// Merkle state root at this height.
     pub state_root: Hash256,
-    /// Account entries in this chunk.
     pub accounts: Vec<(Address, Account)>,
-    /// Zero-based index of this chunk within the full snapshot.
     pub chunk_index: u32,
-    /// Total number of chunks in the full snapshot.
     pub total_chunks: u32,
-    /// BLAKE3 hash of the serialised account data in this chunk (integrity proof).
     pub chunk_proof: Hash256,
 }
 
-/// Metadata describing a complete chunked snapshot.
-///
-/// Sent ahead of the chunks so the receiver can allocate tracking structures
-/// and verify completeness.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotManifest {
-    /// Block height at snapshot time.
     pub version: u64,
-    /// Expected Merkle state root.
     pub state_root: Hash256,
-    /// Total number of accounts across all chunks.
     pub total_accounts: u64,
-    /// Number of chunks the snapshot is split into.
     pub total_chunks: u32,
-    /// Number of accounts per chunk (last chunk may be smaller).
     pub chunk_size: usize,
-    /// BLAKE3 hash of the manifest metadata itself (excluding this field).
     pub manifest_hash: Hash256,
 }
 
-/// Tracks progress while importing a chunked snapshot.
 pub struct SyncProgress {
-    /// The manifest being synced against.
     pub manifest: SnapshotManifest,
-    /// Per-chunk received flag (indexed by chunk_index).
     pub received_chunks: Vec<bool>,
-    /// Number of chunks that have been received and verified.
     pub verified_chunks: u32,
-    /// Running total of accounts imported so far.
     pub total_accounts_imported: u64,
-    /// Latest state_root reported by an imported chunk. Chunks are
-    /// generated live on the server, so when the source chain is producing
-    /// blocks, the manifest's `state_root` (taken at manifest-fetch time)
-    /// will differ from the chunk's (taken at chunk-fetch time). The chunk's
-    /// `state_root` describes the accounts we actually imported, so we use
-    /// it as the authority for `finalize_sync`'s integrity check.
     pub latest_chunk_state_root: Option<Hash256>,
 }
 
-/// Compact state summary for monitoring / health-check endpoints.
 pub struct StateSummary {
-    /// Number of accounts in the state database.
     pub account_count: u64,
-    /// Sum of all account balances.
     pub total_balance: u128,
-    /// Current Merkle state root.
     pub state_root: Hash256,
-    /// Current block height.
     pub block_height: u64,
 }
 
-/// WASM module magic bytes: `\0asm`.
 const WASM_MAGIC: &[u8; 4] = b"\0asm";
 
 #[inline]
@@ -397,12 +340,7 @@ fn below_policy_minimum(value: u64, minimum: u64) -> bool {
     value < minimum
 }
 
-/// Historical fixed reserves used by legacy faucet collision checks. Keep
-/// this exact set stable so archived v2 blocks retain their execution rules.
 pub fn is_legacy_reserved_system_account(address: &Address) -> bool {
-    // The first three content-derived accounts are finite protocol reserves:
-    // public faucet, community-reward treasury, and recovery validator-funding
-    // reserve. The legacy bridge/model treasuries are also state-machine-owned.
     [
         arc_types::transaction::faucet_pool_address(),
         arc_types::transaction::inference_reward_treasury_address(),
@@ -413,8 +351,6 @@ pub fn is_legacy_reserved_system_account(address: &Address) -> bool {
     .contains(address)
 }
 
-/// Whether protocol-v3 admission must prevent externally authorized state
-/// writes to this fixed or dynamically namespaced state-machine account.
 pub fn is_reserved_system_account(address: &Address) -> bool {
     is_legacy_reserved_system_account(address)
         || *address == hash_bytes(b"arc-treasury")
@@ -480,50 +416,17 @@ enum V3TransactionFamilyPolicy {
     Denied,
 }
 
-// ── Tier 1 on-chain inference status bytes ────────────────────────────────
-// Stored in the first byte of the request escrow's `code_hash` field. See
-// `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md` for the lifecycle.
 pub const TIER1_STATUS_OPEN: u8 = 0;
 pub const TIER1_STATUS_VOTING: u8 = 1;
 pub const TIER1_STATUS_FINALIZED: u8 = 2;
 pub const TIER1_STATUS_REFUNDED: u8 = 3;
 
-// ── Tier 2 optimistic-attestation escrow encoding ─────────────────────────
-// A Tier 2 attestation bond is locked in a deterministic escrow account keyed
-// by BLAKE3("arc-inference" || attestation_tx_hash). Its balance holds the
-// bond; the other Account fields carry INTERNAL metadata (never wire-
-// serialized tx data) that the maturation sweep needs to refund the bond:
-//
-//   balance      = locked funds (attester bond, plus challenger bond if
-//                  the attestation was challenged)
-//   code_hash    = the original attester's address (refund target)
-//   nonce        = release height (deadline = apply_height + challenge_period);
-//                  the sweep refunds once current_height >= this value
-//   storage_root = [ MAGIC (8 bytes) | STATUS (1 byte) | zero... ]
-//
-// The 8-byte MAGIC lets `rebuild_pending_bond_releases()` re-identify these
-// escrows on restart with ~2^-64 false-positive odds (no collision with the
-// Tier 1 escrows, which key their status off `code_hash[0]`). The STATUS byte
-// distinguishes an OPEN (refundable-after-deadline) escrow from a CHALLENGED
-// one, whose bond stays locked pending dispute resolution.
-//
-// NOTE: this is escrow-account *storage*, not `TxBody`/`Transaction` wire
-// layout — changing it does not touch the v0.7.2 112-byte attestation wire
-// format or the `#[serde(skip)] beneficiary` field.
 const ATTEST_ESCROW_MAGIC: [u8; 8] = *b"ARCATB2\x01";
 pub const ATTEST_STATUS_OPEN: u8 = 0;
 pub const ATTEST_STATUS_CHALLENGED: u8 = 1;
 
-/// Max Tier 2 bonds refunded per block by the maturation sweep. Bounds the
-/// per-block work so a backlog of matured escrows can never stall block
-/// production; any excess is carried to the next block (still in deterministic
-/// order). Community workers attest with `bond == 0` (no escrow is created),
-/// so on the demo path this sweep is a no-op.
 pub const MAX_BOND_RELEASES_PER_BLOCK: usize = 256;
 
-/// Read-only snapshot of a Tier 1 inference request — returned by
-/// `StateDB::tier1_request_snapshot()` so the validator inference task can
-/// pick its next action without holding state locks.
 #[derive(Clone, Debug)]
 pub struct Tier1RequestSnapshot {
     pub request_id: [u8; 32],
@@ -535,17 +438,9 @@ pub struct Tier1RequestSnapshot {
     pub input_blob: Vec<u8>,
     pub votes: Vec<(Address, Hash256)>,
     pub max_reward: u64,
-    /// Address that originally submitted the InferenceRequest. Used by the
-    /// voting validator to credit the user (not itself) on the subsequent
-    /// InferenceAttestation it posts. Defaults to escrow_addr for legacy
-    /// snapshots that pre-date Option C.
     pub requester: Address,
 }
 
-/// Derive a deterministic contract address from the deployer address and nonce.
-///
-/// Mirrors the logic in `arc_vm::compute_contract_address` - duplicated here to
-/// avoid a circular dependency (arc-vm already depends on arc-state).
 fn compute_contract_address(deployer: &Address, nonce: u64) -> Address {
     let mut preimage = Vec::with_capacity(32 + 32 + 8);
     preimage.extend_from_slice(b"ARC-chain-contract-addr-v1\x00\x00\x00\x00\x00\x00");
@@ -554,9 +449,6 @@ fn compute_contract_address(deployer: &Address, nonce: u64) -> Address {
     hash_bytes(&preimage)
 }
 
-/// A batch of benchmark transactions to be indexed asynchronously.
-/// Contains metadata for the indexer to lazily reconstruct Transaction objects,
-/// avoiding 2GB+ heap allocation in the hot execution path.
 #[cfg(feature = "benchmark-tools")]
 pub struct IndexerBatch {
     pub block_hash: Hash256,
@@ -567,149 +459,58 @@ pub struct IndexerBatch {
     pub txs_per_sender: u64,
 }
 
-/// In-memory state database with optional WAL persistence.
-/// Uses DashMap for lock-free concurrent reads across threads.
 pub struct StateDB {
-    /// Account states (address → Account).
     accounts: DashMap<[u8; 32], Account>,
-    /// Contract storage (address → key → value).
     storage: DashMap<[u8; 32], DashMap<Hash256, Vec<u8>>>,
-    /// Block chain (height → Block).
-    ///
-    /// Boxed, so a bucket of this table is a height and a pointer. The table
-    /// keeps every committed block, and its hashbrown shards size an empty
-    /// bucket like a full one and double their bucket arrays when 7/8 full.
-    /// With `Block` (about 300 bytes) inline, each doubling allocated about
-    /// 300 bytes per new bucket at once; boxed, it allocates 16, and each
-    /// block is a separate allocation of its own size.
     blocks: DashMap<u64, Box<Block>>,
-    /// Current block height.
     height: RwLock<u64>,
-    /// Transaction receipts indexed by tx hash.
     pub receipts: DashMap<[u8; 32], TxReceipt>,
-    /// Transaction hash → (block_height, tx_index) for fast lookup.
     pub tx_index: DashMap<[u8; 32], (u64, u32)>,
-    /// Account address → list of tx hashes involving this account.
     pub account_txs: DashMap<[u8; 32], Vec<Hash256>>,
-    /// Contract WASM bytecode cache (address → bytecode).
     pub contracts: DashMap<[u8; 32], Vec<u8>>,
-    /// Write-ahead log for persistence (None = no persistence / benchmark mode).
     wal: WalWriter,
-    /// On-chain identity registry (address -> Identity).
     identities: DashMap<[u8; 32], Identity>,
-    /// Full transaction bodies indexed by tx hash (for explorer queries).
     pub full_transactions: DashMap<[u8; 32], Transaction>,
-    /// Blocks since last snapshot.
     snapshot_counter: AtomicU64,
-    /// How many of the most recent heights a durable snapshot carries the
-    /// history of. See `export_durable_snapshot`.
     snapshot_history_window: AtomicU64,
-    /// The anchor round of the latest checkpoint this node adopted (0: none).
-    /// Consensus resumes scanning at the round after it.
     rebase_anchor_round: AtomicU64,
-    /// Total benchmark transactions executed (atomic counter for /stats).
     pub benchmark_tx_count: AtomicU64,
-    /// Async indexer channel - sends batches to background threads.
     #[cfg(feature = "benchmark-tools")]
     indexer_tx: Option<crossbeam::channel::Sender<IndexerBatch>>,
-    /// Benchmark block nonce bases: height → nonce_base for deterministic tx reconstruction.
     #[cfg(feature = "benchmark-tools")]
     benchmark_nonces: DashMap<u64, u64>,
-    /// Cached sender array for benchmark tx reconstruction.
     #[cfg(feature = "benchmark-tools")]
     benchmark_senders: parking_lot::RwLock<Option<Arc<Vec<Hash256>>>>,
-    /// Cached receiver array for benchmark tx reconstruction.
     #[cfg(feature = "benchmark-tools")]
     benchmark_receivers: parking_lot::RwLock<Option<Arc<Vec<Hash256>>>>,
-    /// Transactions per sender in benchmark blocks.
     #[cfg(feature = "benchmark-tools")]
     benchmark_txs_per_sender: AtomicU64,
-    /// Signed benchmark block data: height → (transactions, success_flags, block_hash).
-    /// Stored for blocks produced by execute_block_signed_benchmark()
-    /// so /block/{height}/txs and /tx/{hash}/full can serve data on-demand.
     signed_block_data: DashMap<u64, (Vec<Transaction>, Vec<bool>, Hash256)>,
-    /// Persistent incremental Merkle tree for O(k log n) state root updates.
-    /// Replaces the previous DashMap cache + full-rebuild approach.
     incremental_merkle: parking_lot::Mutex<IncrementalMerkle>,
-    /// Accounts modified since the last state root computation.
     dirty_accounts: DashSet<[u8; 32]>,
-    /// Event logs indexed by block height for eth_getLogs.
     pub event_logs: DashMap<u64, Vec<arc_types::EventLog>>,
-    /// Staking pool: total staked amount across all validators.
     staking_pool: AtomicU64,
-    /// Validator set: address -> staked amount. Only addresses above minimum
-    /// stake threshold are considered active validators.
     validators: DashMap<[u8; 32], u64>,
-    /// Jellyfish Merkle Tree for incremental state root computation.
-    /// Provides an alternative to IncrementalMerkle with domain-separated
-    /// BLAKE3 hashing and Merkle inclusion proofs.
     jmt: parking_lot::Mutex<JmtStateTree>,
-    /// Whether to use the JMT for state root computation (default: false).
-    /// When false, the existing IncrementalMerkle is used for backward compat.
     use_jmt: bool,
-    /// Optional GPU-resident state cache for hot accounts.
-    /// When enabled, `get_account()` checks GPU memory first.
     gpu_cache: Option<Arc<gpu_state::GpuStateCache>>,
-    /// Archive mode - when true, skips all pruning (keeps full history).
-    /// Used by block explorers and analytics nodes.
     pub archive_mode: bool,
-    /// Earliest block at or after the initial protocol-v3 recovery boundary
-    /// whose complete transaction/receipt history was verified. `u64::MAX`
-    /// means the claim has not been established.
     archive_history_boundary: AtomicU64,
-    /// Highest block whose full block → tx index → body → receipt bindings
-    /// were verified while archive mode was already enabled.
     archive_history_verified_through: AtomicU64,
-    /// Canonical genesis-committed activation height for community reward v1.
-    /// `u64::MAX` means disabled. This runtime copy is not mutable through RPC;
-    /// nodes derive it from the genesis configuration whose semantic hash is
-    /// authenticated during the P2P handshake.
     community_rewards_v1_activation_height: AtomicU64,
-    /// Index of open Tier 1 inference requests (request_id → anchor_height).
-    /// Populated by `apply_inference_request`, cleared by
-    /// `apply_inference_finalize`. The `inference_validator` background task
-    /// polls this to discover requests where its address is in the committee.
     pub tier1_pending: DashMap<[u8; 32], u64>,
-    /// Maturation queue for Tier 2 attestation bond escrows:
-    /// `release_height → sorted list of escrow addresses`. Populated when an
-    /// attestation with `bond > 0` is applied; drained deterministically by
-    /// `sweep_matured_bond_releases()` inside `commit_executed_block`. A
-    /// derived, in-memory index with no WAL op of its own — rebuilt on restart
-    /// from the surviving escrow accounts by `rebuild_pending_bond_releases()`.
     pending_bond_releases: parking_lot::Mutex<BTreeMap<u64, Vec<[u8; 32]>>>,
-    /// Present only after a quorum-certified ARCCHKPT H+1 transition.
-    /// `None` preserves legacy state-root and protocol behavior byte-for-byte.
     recovery_context: RwLock<Option<recovery::RecoveryContext>>,
-    /// Exact operator-approved manifest that established `recovery_context`.
     recovery_manifest_hash: RwLock<Option<Hash256>>,
     native_inference_context: RwLock<Option<InferenceAdmissionContext>>,
-    /// Operator authorisation to activate native inference on a chain that is
-    /// already running (see `NativeMigrationRecord`). Absent means the
-    /// original rule applies: fresh genesis only, never recovery-bound state.
     pub(crate) native_migration:
         RwLock<Option<crate::inference_contract_state::NativeMigrationRecord>>,
-    /// The binding a still-pending migration will freeze when its coordinated
-    /// height arrives. Held with the record so the activation is performed by
-    /// the chain itself at that height, rather than only by whichever node
-    /// happened to be starting up at that moment.
     pub(crate) pending_migration_context: RwLock<Option<InferenceAdmissionContext>>,
-    /// Bindings that have been superseded but are still named by requests
-    /// admitted under them. A configuration update governs NEW requests; work
-    /// already in flight settles or refunds under the binding it was admitted
-    /// with, so that binding stays available until nothing references it.
     pub(crate) superseded_bindings:
         RwLock<std::collections::BTreeMap<[u8; 32], InferenceAdmissionContext>>,
-    /// A binding update the operator has authorised but the chain has not
-    /// reached yet: the coordinated height, the binding being replaced, and
-    /// the one replacing it. Publishing a binding writes state, so every
-    /// validator has to do it in the same block or they derive different
-    /// roots from there on - the same reason activation names one height.
     pub(crate) pending_binding_update: RwLock<Option<(u64, Hash256, InferenceAdmissionContext)>>,
     native_inference_pending: DashMap<[u8; 32], u64>,
     native_inference_execution: parking_lot::Mutex<()>,
-    /// Lock order: native_inference_execution, native_inference_publication,
-    /// then height and StateDB map shards. Never acquire publication while
-    /// holding a map iterator, Ref, RefMulti, or RefMut (including in helpers).
     native_inference_publication: RwLock<()>,
 }
 
@@ -718,19 +519,14 @@ impl StateDB {
         StateError::PersistenceError(error.to_string())
     }
 
-    /// Persistence failures are fatal for subsequent block application. A
-    /// caller must never mutate another block after the WAL lost durability.
     fn require_healthy_wal(&self) -> Result<(), StateError> {
         self.wal.check_health().map_err(Self::wal_state_error)
     }
 
-    /// Complete the durable block boundary before returning a block to the
-    /// consensus caller. This includes every queued append, flush, and fsync.
     fn durable_wal_barrier(&self) -> Result<(), StateError> {
         self.wal.sync().map_err(Self::wal_state_error)
     }
 
-    /// Whether this database acknowledges mutations through a durable WAL.
     pub fn is_persistent(&self) -> bool {
         self.wal.directory().is_some()
     }
@@ -749,7 +545,6 @@ impl StateDB {
         Ok(())
     }
 
-    /// Create a new empty state (no persistence - benchmark mode).
     pub fn new() -> Self {
         Self {
             accounts: DashMap::new(),
@@ -805,7 +600,6 @@ impl StateDB {
         }
     }
 
-    /// Create a new state with WAL persistence.
     pub fn with_persistence(wal_path: impl AsRef<Path>) -> Result<Self, StateError> {
         let wal =
             WalWriter::new(wal_path).map_err(|e| StateError::PersistenceError(e.to_string()))?;
@@ -863,7 +657,6 @@ impl StateDB {
         })
     }
 
-    /// Initialize with genesis block and prefunded accounts.
     pub fn with_genesis(prefunded: &[(Address, u64)]) -> Self {
         let state = Self::new();
         for (addr, balance) in prefunded {
@@ -875,17 +668,12 @@ impl StateDB {
         state
     }
 
-    /// Initialize with genesis accounts and GPU-resident state cache enabled.
-    ///
-    /// Hot accounts are stored in GPU unified/managed memory for ~40x bandwidth
-    /// improvement. Falls back to CPU-only if no GPU is detected.
     pub fn with_genesis_gpu(
         prefunded: &[(Address, u64)],
         gpu_config: gpu_state::GpuStateCacheConfig,
     ) -> Self {
         let cache = Arc::new(gpu_state::GpuStateCache::new(gpu_config));
         let mut state = Self::with_genesis(prefunded);
-        // Pre-load genesis accounts into GPU cache.
         for (addr, _) in prefunded {
             if let Some(acct) = state.accounts.get(&addr.0).map(|a| a.clone()) {
                 cache.put_account(&acct);
@@ -895,16 +683,14 @@ impl StateDB {
         state
     }
 
-    /// Enable GPU state cache on an existing StateDB.
     pub fn enable_gpu_cache(&mut self, config: gpu_state::GpuStateCacheConfig) {
         let cache = Arc::new(gpu_state::GpuStateCache::new(config));
-        // Pre-load existing accounts into GPU cache.
         let mut loaded = 0usize;
         for entry in self.accounts.iter() {
             cache.put_account(entry.value());
             loaded += 1;
             if loaded >= cache.gpu_count() + 1_000_000 {
-                break; // Don't exceed GPU capacity.
+                break;
             }
         }
         self.gpu_cache = Some(cache);
@@ -914,18 +700,10 @@ impl StateDB {
         );
     }
 
-    /// Get the GPU state cache (if enabled) for direct access.
     pub fn gpu_cache(&self) -> Option<&Arc<gpu_state::GpuStateCache>> {
         self.gpu_cache.as_ref()
     }
 
-    /// Create state with WAL persistence + genesis accounts, bound to one
-    /// authenticated genesis/network hash.
-    ///
-    /// A pre-existing WAL without the binding file is deliberately rejected:
-    /// replaying legacy state under a new genesis can make peers authenticate
-    /// as one network while executing different histories. Operators must use
-    /// a fresh data directory or an explicitly approved checkpoint migration.
     pub fn with_genesis_persistent(
         prefunded: &[(Address, u64)],
         wal_dir: impl AsRef<Path>,
@@ -952,11 +730,6 @@ impl StateDB {
         Self::verify_or_create_genesis_binding(wal_dir, wal_path.exists(), expected_genesis_hash)?;
 
         if wal_path.exists() {
-            // WAL exists - replay to recover state. Validation still walks the
-            // whole log: it checks the genesis prefix, block/checkpoint
-            // pairing and chain linkage, and a snapshot does not make earlier
-            // records trustworthy. What the snapshot bounds is the far more
-            // expensive part - APPLYING every record ever written.
             let entries = Self::prepare_normal_wal_replay(&wal_path, prefunded)?;
             let state = Self::with_persistence(&wal_path)?;
             let adopted = state.adopt_snapshot_if_trustworthy(wal_dir);
@@ -965,18 +738,10 @@ impl StateDB {
             let mut history_rebuilt = 0usize;
             for entry in &entries {
                 if resume_from.is_some_and(|first| entry.sequence < first) {
-                    // Before the snapshot: its state is already installed, but
-                    // a snapshot carries only a recent window of history. The
-                    // rest is rebuilt here from the records that were just
-                    // decoded and validated anyway - insertion, never
-                    // execution, so the cost is the same order as reading.
                     if Self::is_history_op(&entry.op) {
                         state.apply_wal_op(&entry.op);
                         history_rebuilt += 1;
                     } else if let WalOp::Rebase(record) = &entry.op {
-                        // A rebase below the snapshot: its state is already
-                        // in the snapshot, its history window and its resume
-                        // round are not.
                         state.install_history_window(&record.state);
                         state.apply_wal_op(&WalOp::SetBlock(record.height, record.tip.clone()));
                         state
@@ -990,7 +755,6 @@ impl StateDB {
                 entry_count += 1;
             }
 
-            // Insert genesis block if not already present from WAL replay
             if state.blocks.get(&0).is_none() {
                 state.blocks.insert(0, Box::new(Block::genesis()));
             }
@@ -1008,9 +772,6 @@ impl StateDB {
             state.restore_native_inference_context()?;
             Ok(state)
         } else {
-            // Build the complete genesis WAL at an inert staging name. The
-            // live state.wal name is published only after every configured
-            // account and the genesis block passed one fsync barrier.
             let staging_path =
                 wal_dir.join(format!(".state.wal.genesis-{}.tmp", uuid::Uuid::new_v4()));
             let mut state = Self::with_persistence(&staging_path)?;
@@ -1019,7 +780,6 @@ impl StateDB {
                 let account = Account::new(*addr, *balance);
                 state.accounts.insert(addr.0, account.clone());
                 state.dirty_accounts.insert(addr.0);
-                // Write genesis accounts to WAL so they survive restart
                 state.wal.append(WalOp::SetAccount(*addr, account), 0);
             }
 
@@ -1261,12 +1021,6 @@ impl StateDB {
                         last_checkpoint_height = height;
                         height
                     } else {
-                        // Some public persistence APIs durably commit auxiliary
-                        // rows or an authenticated state diff without adding a
-                        // second block. Their checkpoint must remain at the
-                        // current canonical height and commit the exact same
-                        // state-root domain; it can never advance or rewrite
-                        // block history.
                         if entry.block_height != last_checkpoint_height {
                             return Err(StateError::PersistenceError(format!(
                                 "state WAL standalone checkpoint height {} differs from current canonical height {}",
@@ -1290,11 +1044,6 @@ impl StateDB {
                     accepted_entries = index + 1;
                 }
                 WalOp::Rebase(record) => {
-                    // An adopted checkpoint: it must move the chain forward to
-                    // a self-consistent tip, and its state must reproduce the
-                    // root that tip's header carries - the root a quorum
-                    // certified when it was adopted. Contiguity and linkage
-                    // then continue from the tip.
                     if pending_block.is_some()
                         || record.height <= last_checkpoint_height
                         || !record.state.receipts.is_empty()
@@ -1313,9 +1062,6 @@ impl StateDB {
                             record.height
                         )));
                     }
-                    // The window the record carries has to chain to that tip:
-                    // these blocks become this node's history at replay, so
-                    // they get the same check the adoption did.
                     checkpoint_adoption::verify_history_window(&record.state.blocks, &record.tip)?;
                     validation.apply_wal_op(&entry.op);
                     let actual_root = validation.get_state_root();
@@ -1378,7 +1124,6 @@ impl StateDB {
         Ok(read.entries)
     }
 
-    /// Recover state from a snapshot and WAL replay.
     pub fn recover(snapshot: Snapshot, wal_path: impl AsRef<Path>) -> Result<Self, StateError> {
         if snapshot.storage.iter().any(|(_, entries)| {
             entries
@@ -1391,7 +1136,6 @@ impl StateDB {
         }
         let state = Self::with_persistence(&wal_path)?;
 
-        // Load snapshot state
         for (addr, account) in &snapshot.accounts {
             state.accounts.insert(addr.0, account.clone());
         }
@@ -1407,7 +1151,6 @@ impl StateDB {
         }
         *state.height.write() = snapshot.block_height;
 
-        // Replay WAL from snapshot's sequence
         let entries = wal::read_wal_from(&wal_path, snapshot.wal_sequence);
         for entry in entries {
             state.apply_wal_op(&entry.op);
@@ -1432,10 +1175,6 @@ impl StateDB {
         Ok(state)
     }
 
-    /// Apply a WAL operation to in-memory state (used during recovery replay).
-    /// Records that describe the chain's history - blocks, receipts, bodies,
-    /// event logs - as opposed to its state. Replaying one below a snapshot
-    /// rebuilds history the snapshot deliberately does not carry.
     fn is_history_op(op: &WalOp) -> bool {
         matches!(
             op,
@@ -1446,9 +1185,6 @@ impl StateDB {
         )
     }
 
-    /// How many of the most recent heights a durable snapshot carries the
-    /// history of (at least 1: the tip block anchors the chain linkage of
-    /// whatever is applied next).
     pub fn set_snapshot_history_window(&self, heights: u64) {
         self.snapshot_history_window
             .store(heights.max(1), Ordering::Release);
@@ -1472,10 +1208,6 @@ impl StateDB {
                 }
             }
             WalOp::SetBlock(height, block) => {
-                // `tx_index` is derived from canonical block bodies and has no
-                // independent WAL record. Rebuild it while replaying each
-                // durable block so archive completeness can be recomputed
-                // after restart rather than depending on pre-crash memory.
                 if let Some(replaced) = self.blocks.insert(*height, Box::new(block.clone())) {
                     for old_hash in replaced.tx_hashes {
                         let points_to_replaced_height = self
@@ -1500,9 +1232,7 @@ impl StateDB {
             WalOp::SetReceipt(hash, receipt) => {
                 self.receipts.insert(hash.0, receipt.clone());
             }
-            WalOp::SetAgent(_addr, _name, _endpoint, _caps) => {
-                // Agent registry - stored in account metadata (future)
-            }
+            WalOp::SetAgent(_addr, _name, _endpoint, _caps) => {}
             WalOp::SetContract(addr, bytecode) => {
                 self.contracts.insert(addr.0, bytecode.clone());
             }
@@ -1549,34 +1279,19 @@ impl StateDB {
                         .insert(*key, value.clone());
                 }
             }
-            WalOp::Checkpoint(_) => {
-                // Checkpoints are informational - no state change
-            }
+            WalOp::Checkpoint(_) => {}
             WalOp::Rebase(record) => {
-                // The state is replaced wholesale. History this node already
-                // holds below the checkpoint stays, and so do the indexes
-                // over it (`tx_index`, `receipts`, `account_txs`): adoption
-                // proves the window is byte-identical wherever it overlaps
-                // this node's own blocks, so nothing kept here can describe a
-                // block the window replaced with a different one.
                 self.clear_state_for_rebase();
                 self.install_durable_snapshot(&record.state);
                 self.apply_wal_op(&WalOp::SetBlock(record.height, record.tip.clone()));
                 self.rebase_anchor_round
                     .fetch_max(record.anchor_round, Ordering::AcqRel);
             }
-            WalOp::SetDagBlock(_, _) | WalOp::SetDagRound(_) | WalOp::CommitDagBlock(_) => {
-                // DAG operations are replayed by the consensus engine, not StateDB.
-                // StateDB just needs to not crash when encountering these in the WAL.
-            }
+            WalOp::SetDagBlock(_, _) | WalOp::SetDagRound(_) | WalOp::CommitDagBlock(_) => {}
         }
     }
 
-    /// Take a snapshot of current state.
     pub fn snapshot(&self) -> Snapshot {
-        // Take a consistent snapshot by recording the height before and after
-        // collecting data. If a block was applied mid-snapshot, retry.
-        // This avoids adding a lock to the hot execution path.
         loop {
             let height_before = self.height();
             let accounts: Vec<(Address, Account)> = self
@@ -1611,13 +1326,13 @@ impl StateDB {
                     height_before,
                     height_after
                 );
-                continue; // Retry - a block was applied during iteration
+                continue;
             }
 
             return Snapshot {
                 block_height: height_after,
                 state_root: self.compute_state_root(),
-                wal_sequence: 0, // Will be set by caller
+                wal_sequence: 0,
                 accounts,
                 storage,
                 contracts,
@@ -1625,25 +1340,20 @@ impl StateDB {
         }
     }
 
-    /// Deploy a contract (store bytecode in the contracts cache).
     pub fn deploy_contract(&self, address: &Address, bytecode: Vec<u8>) {
         self.contracts.insert(address.0, bytecode.clone());
         self.wal
             .append(WalOp::SetContract(*address, bytecode), self.height());
     }
 
-    /// Get contract bytecode.
     pub fn get_contract(&self, address: &Address) -> Option<Vec<u8>> {
         self.contracts.get(&address.0).map(|c| c.clone())
     }
 
-    /// Get the full transaction by hash (for explorer/RPC).
-    /// Checks full_transactions first, then signed_block_data for benchmark blocks.
     pub fn get_transaction(&self, tx_hash: &[u8; 32]) -> Option<Transaction> {
         if let Some(tx) = self.full_transactions.get(tx_hash).map(|t| t.clone()) {
             return Some(tx);
         }
-        // Check signed benchmark block data
         if let Some(&(height, idx)) = self.tx_index.get(tx_hash).as_deref()
             && let Some(block_data) = self.signed_block_data.get(&height)
         {
@@ -1653,10 +1363,6 @@ impl StateDB {
         None
     }
 
-    // ── Tier 1 on-chain inference helpers ────────────────────────────────
-
-    /// Snapshot of open Tier 1 inference requests for the validator task.
-    /// Returns `(request_id, anchor_height)` pairs. Order is unspecified.
     pub fn tier1_pending_requests(&self) -> Vec<([u8; 32], u64)> {
         self.tier1_pending
             .iter()
@@ -1664,31 +1370,11 @@ impl StateDB {
             .collect()
     }
 
-    /// Rebuild `tier1_pending` from on-disk state. Call once at startup,
-    /// after any WAL replay/snapshot load and BEFORE spawning the validator
-    /// task. `tier1_pending` is a DashMap with no WAL op of its own; on
-    /// restart it starts empty even though the underlying escrow accounts
-    /// (with their `OPEN`/`VOTING` status byte) survive in the persistent
-    /// account map.
-    ///
-    /// Strategy: scan every account whose `code_hash[0]` is `TIER1_STATUS_OPEN`
-    /// or `TIER1_STATUS_VOTING`. Those are Tier 1 escrow addresses. Read the
-    /// `tier1.request_id` storage key that `InferenceRequest.apply` writes
-    /// (added in the same change), get the requester-supplied request_id,
-    /// and re-insert it into `tier1_pending` keyed by the escrow's anchor
-    /// height (stored in `escrow.nonce`).
-    ///
-    /// Returns the count of requests rebuilt so the operator can sanity-
-    /// check against `/inference/results` cardinality.
     pub fn rebuild_tier1_pending(&self) -> usize {
         let key = hash_bytes(b"tier1.request_id");
         let mut rebuilt = 0usize;
         for entry in self.accounts.iter() {
             let acct = entry.value();
-            // Only escrows whose status is still actionable. Finalized /
-            // refunded escrows have already been pruned from pending via
-            // the apply path; rebuilding them would burn the validator
-            // task's tick cycles for no payoff.
             let status = acct.code_hash.0[0];
             if status != TIER1_STATUS_OPEN && status != TIER1_STATUS_VOTING {
                 continue;
@@ -1700,7 +1386,6 @@ impl StateDB {
             };
             let mut request_id = [0u8; 32];
             request_id.copy_from_slice(&raw);
-            // anchor_height was stamped into escrow.nonce at apply time.
             let anchor_height = acct.nonce;
             self.tier1_pending.insert(request_id, anchor_height);
             rebuilt += 1;
@@ -1708,9 +1393,6 @@ impl StateDB {
         rebuilt
     }
 
-    /// Read a Tier 1 request's escrow state + storage. Returns `None` if no
-    /// such escrow exists. Used by the validator task to check status,
-    /// gather votes, and decide whether to vote/finalize.
     pub fn tier1_request_snapshot(&self, request_id: &[u8; 32]) -> Option<Tier1RequestSnapshot> {
         let escrow_addr = arc_crypto::hash_bytes(&[b"arc-infreq", request_id.as_ref()].concat());
         let escrow = self.get_account(&escrow_addr)?;
@@ -1737,8 +1419,6 @@ impl StateDB {
             addr.copy_from_slice(&requester_bytes);
             Hash256(addr)
         } else {
-            // Legacy snapshots without a stored requester fall back to the
-            // escrow address itself so callers always get a usable Address.
             escrow_addr
         };
         Some(Tier1RequestSnapshot {
@@ -1755,9 +1435,6 @@ impl StateDB {
         })
     }
 
-    /// Derive the committee for a given request. Mirrors the apply-time
-    /// derivation in `apply_inference_vote`. Used by the validator task
-    /// to check whether it should vote.
     pub fn tier1_committee_for(
         &self,
         request_id: &[u8; 32],
@@ -1793,7 +1470,6 @@ impl StateDB {
             .collect()
     }
 
-    /// Set a storage value for a contract.
     pub fn set_storage(&self, contract: &Address, key: Hash256, value: Vec<u8>) {
         self.storage
             .entry(contract.0)
@@ -1803,8 +1479,6 @@ impl StateDB {
             .append(WalOp::SetStorage(*contract, key, value), self.height());
     }
 
-    /// Get a storage value for a contract.
-    /// Takes the publication read lock; callers must hold no StateDB map guard.
     pub fn get_storage(&self, contract: &Address, key: &Hash256) -> Option<Vec<u8>> {
         let _publication = self.native_inference_publication.read();
         self.storage
@@ -1812,7 +1486,6 @@ impl StateDB {
             .and_then(|map| map.get(key).map(|v| v.clone()))
     }
 
-    /// Get all storage entries for a contract (snapshot for VM execution).
     pub fn get_contract_storage(&self, contract: &Address) -> HashMap<Hash256, Vec<u8>> {
         self.storage
             .get(&contract.0)
@@ -1820,7 +1493,6 @@ impl StateDB {
             .unwrap_or_default()
     }
 
-    /// Delete a storage value for a contract.
     pub fn delete_storage(&self, contract: &Address, key: &Hash256) {
         if let Some(map) = self.storage.get(&contract.0) {
             map.remove(key);
@@ -1829,14 +1501,8 @@ impl StateDB {
             .append(WalOp::DeleteStorage(*contract, *key), self.height());
     }
 
-    /// Get an account (returns None if not found).
-    ///
-    /// When a GPU state cache is enabled, checks GPU memory first for ~40x
-    /// bandwidth improvement on hot accounts.
-    /// Takes the publication read lock; callers must hold no StateDB map guard.
     pub fn get_account(&self, addr: &Address) -> Option<Account> {
         let _publication = self.native_inference_publication.read();
-        // Fast path: check GPU cache first.
         if let Some(ref cache) = self.gpu_cache
             && let Some(acct) = cache.get_account_fast(&addr.0)
         {
@@ -1845,7 +1511,6 @@ impl StateDB {
         self.accounts.get(&addr.0).map(|a| a.clone())
     }
 
-    /// Get or create an account (lazy initialization).
     pub fn get_or_create_account(&self, addr: &Address) -> Account {
         self.accounts
             .entry(addr.0)
@@ -1853,21 +1518,14 @@ impl StateDB {
             .clone()
     }
 
-    /// Update an account's state (used by EVM state persistence).
-    ///
-    /// When a GPU state cache is enabled, also writes the updated account
-    /// to GPU memory for subsequent fast lookups.
     pub fn update_account(&self, addr: &Address, account: Account) {
         self.accounts.insert(addr.0, account.clone());
         self.dirty_accounts.insert(addr.0);
-        // Write-through to GPU cache (fast path - single DashMap insert).
         if let Some(ref cache) = self.gpu_cache {
             cache.update_account_fast(&account);
         }
     }
 
-    /// Check if a contract address holds EVM bytecode (vs WASM).
-    /// Returns true if the contract exists and does NOT start with the WASM magic header.
     pub fn is_evm_contract(&self, addr: &Address) -> bool {
         match self.get_contract(addr) {
             Some(bytecode) => bytecode.len() < 4 || &bytecode[..4] != WASM_MAGIC,
@@ -1875,17 +1533,12 @@ impl StateDB {
         }
     }
 
-    /// Store event logs for a specific block height.
     pub fn store_event_logs(&self, height: u64, logs: Vec<arc_types::EventLog>) {
         if !logs.is_empty() {
             if self.is_persistent()
                 && (self.recovery_context().is_some()
                     || self.native_inference_context.read().is_some())
             {
-                // Recovery replay currently accepts only signed transition
-                // state followed by canonical SetBlock+Checkpoint boundaries.
-                // Do not emit a standalone durable record that this stricter
-                // planner would reject on the next restart.
                 tracing::error!(
                     height,
                     "standalone event-log persistence is unavailable on recovery-bound state; include logs in the canonical block commit"
@@ -1908,12 +1561,8 @@ impl StateDB {
         }
     }
 
-    // ── Staking ──────────────────────────────────────────────────────────
-
-    /// Minimum stake (in ARC) required to be registered as a validator.
     pub const MIN_VALIDATOR_STAKE: u64 = 100_000;
 
-    /// Get the total amount staked across all validators.
     pub fn total_staked(&self) -> u64 {
         self.staking_pool.load(Ordering::Relaxed)
     }
@@ -1944,12 +1593,10 @@ impl StateDB {
             })
     }
 
-    /// Get the staked amount for a specific validator address.
     pub fn get_validator_stake(&self, addr: &Address) -> Option<u64> {
         self.validators.get(&addr.0).map(|v| *v)
     }
 
-    /// Check if an address is an active validator (staked above minimum).
     pub fn is_validator(&self, addr: &Address) -> bool {
         self.validators
             .get(&addr.0)
@@ -1957,8 +1604,6 @@ impl StateDB {
             .unwrap_or(false)
     }
 
-    /// Install the consensus activation schedule parsed from canonical
-    /// genesis. Call once during boot before state sync or consensus starts.
     pub fn set_community_rewards_v1_activation_height(&self, height: Option<u64>) {
         self.community_rewards_v1_activation_height
             .store(height.unwrap_or(u64::MAX), Ordering::Release);
@@ -1974,31 +1619,11 @@ impl StateDB {
         }
     }
 
-    /// Whether tx 0x25 is a valid state transition at the current height.
     pub fn community_rewards_v1_active(&self) -> bool {
         self.community_rewards_v1_activation_height()
             .is_some_and(|activation| self.height() >= activation)
     }
 
-    /// Reset the validator set to exactly the genesis validators at startup.
-    ///
-    /// Two problems this solves:
-    ///
-    /// 1. `StateDB.validators` is otherwise only populated by on-chain
-    ///    JoinValidator/Stake/UpdateStake txs. On nodes that haven't fully
-    ///    synced the chain history, the genesis validators are missing,
-    ///    which makes `is_validator()` return false for them and breaks
-    ///    any tx body that authorizes by validator membership (notably
-    ///    TxBody::FaucetClaim).
-    /// 2. Dynamic validators added during a prior process lifetime survive
-    ///    state.wal replay but DIVERGE between peers (different commit-log
-    ///    heights → different replayed JoinValidator txs). The result is
-    ///    that each seed disagrees on the validator-set size, so they
-    ///    disagree on the 2/3 quorum threshold, and BFT consensus stalls.
-    ///
-    /// Clearing first + reseeding from genesis gives every node the same
-    /// 8-validator set at boot. Subsequent JoinValidator txs still update
-    /// this map normally, but the agreed baseline is consistent.
     pub fn seed_genesis_validators(&self, genesis_validators: &[(Address, u64)]) {
         self.validators.clear();
         for (addr, stake) in genesis_validators {
@@ -2006,7 +1631,6 @@ impl StateDB {
         }
     }
 
-    /// Get all active validators and their stakes.
     pub fn active_validators(&self) -> Vec<(Address, u64)> {
         self.validators
             .iter()
@@ -2015,15 +1639,6 @@ impl StateDB {
             .collect()
     }
 
-    /// Verify reward-v1's independent off-chain authorization quorum.
-    ///
-    /// Policy is deliberately stronger than either identity count or stake
-    /// alone: approvals must contain strictly more than two thirds of active
-    /// validator identities (`floor(2N/3) + 1`) AND strictly more than two
-    /// thirds of active stake (`floor(2S/3) + 1`). Every signer is unique, active at execution
-    /// time, and uses the fixed Ed25519-only approval representation. The
-    /// outer transaction signer is merely an aggregator and is not counted
-    /// unless it also supplied an explicit approval.
     fn verify_community_reward_validator_approvals(
         &self,
         body: &arc_types::transaction::CommunityInferenceRewardBody,
@@ -2051,11 +1666,6 @@ impl StateDB {
                 MAX_COMMUNITY_REWARD_APPROVALS
             )));
         }
-        // Protocol-v3 production recovery fixes this authorization committee
-        // at five of six. Legacy/dev states retain the generic strict-BFT
-        // verifier below solely for backward-compatible local fixtures; a
-        // production coordinator cannot advertise issuance-ready without a
-        // recovery context.
         if self.recovery_context().is_some()
             && active.len() != arc_types::transaction::COMMUNITY_REWARD_VALIDATOR_SET_SIZE
         {
@@ -2155,8 +1765,6 @@ impl StateDB {
                 tx.body.tx_type()
             )));
         }
-        // A rooted migration adds the native lane to recovery v3. It does not
-        // relax the ordinary v3 family policy or promote the chain to v4.
         let migrated_native =
             native_authorized && inference_contract_state::is_native_body(&tx.body);
         if !Self::v3_allows_transaction(&tx.body) && !migrated_native {
@@ -2187,10 +1795,6 @@ impl StateDB {
                 gas_costs::BLOCK_GAS_LIMIT
             )));
         }
-        // `sig_verified` is an in-memory performance hint, not an
-        // authorization capability. Reverify at the v3 state boundary so no
-        // alternate executor, RPC path, or forged local flag can bypass the
-        // recovery-domain signature check.
         self.verify_transaction_signature(tx).map_err(|_| {
             StateError::ExecutionError(
                 "invalid transaction signature for recovery protocol v3".to_string(),
@@ -2711,9 +2315,6 @@ impl StateDB {
                 body.assignment_epoch.to_hex()
             )));
         }
-        // Historical v2 marker keys remain valid replay evidence after the
-        // upgrade, but an arbitrary transfer to a predictable legacy hash is
-        // not. Only the exact state-machine marker shape blocks v3 issuance.
         let legacy_job_marker =
             arc_types::transaction::CommunityInferenceRewardBody::marker_address(
                 &body.chain_domain,
@@ -2796,10 +2397,6 @@ impl StateDB {
         Ok(())
     }
 
-    /// Side-effect-free protocol-v3 ingress validation. Read the prospective
-    /// height and state under the canonical execution lock, so an intervening
-    /// empty block cannot make a valid native transaction fail the exact-height
-    /// check. Canonical execution already holds this lock and uses `_at`.
     pub fn validate_v3_transaction_admission(&self, tx: &Transaction) -> Result<(), StateError> {
         let _guard = self.native_inference_execution.lock();
         let execution_height = self.height().checked_add(1).ok_or_else(|| {
@@ -2808,7 +2405,6 @@ impl StateDB {
         self.validate_v3_transaction_admission_at(tx, execution_height)
     }
 
-    /// Exact-height variant used by canonical DAG/block validation.
     pub fn validate_v3_transaction_admission_at(
         &self,
         tx: &Transaction,
@@ -2833,9 +2429,6 @@ impl StateDB {
                     std::slice::from_ref(tx),
                     execution_height,
                 ),
-            // Keep this list exhaustive rather than using a wildcard: a new
-            // transaction family must be consciously classified and wired
-            // before the crate can compile.
             TxBody::Settle(_)
             | TxBody::Swap(_)
             | TxBody::Escrow(_)
@@ -2875,11 +2468,6 @@ impl StateDB {
         }
     }
 
-    /// Check signed DAG transaction availability, independently of execution.
-    /// A body's nonce, balance, expiry or terminal status can change while its
-    /// authenticated DAG block is in flight. Those checks belong to proposal
-    /// selection and canonical execution, not reception of consensus parents.
-    /// This does not authorize executing any transaction or opening ingress.
     pub fn validate_v3_dag_availability(
         &self,
         transactions: &[Transaction],
@@ -2897,10 +2485,6 @@ impl StateDB {
                 "native v3 blocks contain one native transition and cannot mix transaction families".into(),
             ));
         }
-        // A lagging node may need the DAG carrying activation's descendants
-        // before it has executed activation itself. Only its locally approved,
-        // matching migration binding permits retaining that native family.
-        // No peer-supplied context, height hint or transaction opens the lane.
         let native_authorized = contains_native
             && self.native_migration().is_some_and(|record| {
                 if self.native_inference_context().is_some() {
@@ -2942,8 +2526,6 @@ impl StateDB {
                 ));
             }
             self.validate_v3_transaction_envelope_with_native(tx, native_authorized)?;
-            // Native access is checked by its single-transition planner at
-            // execution; ordinary blocks retain the existing static isolation.
             if !contains_native {
                 for account in crate::block_stm::tx_access_set(tx).accounts {
                     if !accessed.insert(account) {
@@ -2957,10 +2539,6 @@ impl StateDB {
         Ok(())
     }
 
-    /// Validate a complete candidate v3 state block without mutation. The
-    /// launch policy permits one transaction per sender and rejects any
-    /// overlapping static account access sets, ensuring that individually
-    /// valid preflights cannot invalidate one another before execution.
     pub fn validate_v3_block_admission(
         &self,
         transactions: &[Transaction],
@@ -2971,7 +2549,6 @@ impl StateDB {
         self.validate_v3_block_admission_at(transactions, execution_height)
     }
 
-    /// Exact-height candidate-block validation for consensus.
     pub fn validate_v3_block_admission_at(
         &self,
         transactions: &[Transaction],
@@ -2981,9 +2558,6 @@ impl StateDB {
             .iter()
             .any(|tx| inference_contract_state::is_native_body(&tx.body))
         {
-            // Native blocks have a single transition and cannot mix lanes.
-            // This validator is also called under the native execution lock;
-            // use the lock-free planner, not the public ingress lock wrapper.
             if self.active_protocol_version().major != 3 {
                 return Err(StateError::ExecutionError(
                     "native v3 block requires recovery protocol v3".into(),
@@ -3033,11 +2607,6 @@ impl StateDB {
         Ok(())
     }
 
-    /// Get current block height.
-    /// Entry counts of the in-memory collections, for resource diagnostics.
-    /// Blocks, receipts, transaction bodies and indexes are the chain's own
-    /// history and grow with it by design; everything else should plateau.
-    /// `/consensus/diagnostics` reports these so a soak can tell the two apart.
     pub fn memory_gauges(&self) -> Vec<(&'static str, u64)> {
         let account_tx_entries: usize = self.account_txs.iter().map(|e| e.value().len()).sum();
         let event_log_entries: usize = self.event_logs.iter().map(|e| e.value().len()).sum();
@@ -3068,22 +2637,12 @@ impl StateDB {
         .collect()
     }
 
-    /// Takes the publication read lock; callers must hold no StateDB map guard.
     pub fn height(&self) -> u64 {
         let _publication = self.native_inference_publication.read();
         *self.height.read()
     }
 
-    /// Evict old transaction bodies from memory to bound memory usage.
-    /// Keeps at most `max_entries` in `full_transactions`. Evicts arbitrary
-    /// entries (DashMap has no insertion order; a proper LRU would require
-    /// an ordered map, but this simple cap prevents OOM).
     pub fn evict_transactions(&self, max_entries: usize) {
-        // Archive mode is a durability contract, not merely a longer cache.
-        // Removing a body here also makes an old mined reward disappear from
-        // `/worker/earnings`, and deleting its WAL segment makes that loss
-        // survive restart.  Archive operators explicitly accept unbounded
-        // history growth and must retain both the in-memory index and WAL.
         if self.archive_mode {
             return;
         }
@@ -3107,9 +2666,6 @@ impl StateDB {
             "Evicted old transaction bodies from memory"
         );
 
-        // Prune old WAL segments. The WAL grows unbounded because
-        // delete_segments_before() was never called. Keep segments
-        // from the last 1000 entries for crash recovery.
         let wal_seq = self.wal.sequence();
         if wal_seq > 1000
             && let Err(e) = self.wal.delete_segments_before(wal_seq - 1000)
@@ -3118,14 +2674,11 @@ impl StateDB {
         }
     }
 
-    /// Get a block by height.
-    /// Takes the publication read lock; callers must hold no StateDB map guard.
     pub fn get_block(&self, height: u64) -> Option<Block> {
         let _publication = self.native_inference_publication.read();
         self.blocks.get(&height).map(|b| Block::clone(&b))
     }
 
-    /// Look up a block by its hash. Scans from latest to earliest.
     pub fn get_block_by_hash(&self, hash: &[u8; 32]) -> Option<Block> {
         let h = self.height();
         for height in (0..=h).rev() {
@@ -3138,8 +2691,6 @@ impl StateDB {
         None
     }
 
-    /// Execute a batch of transactions, produce a block, and update state.
-    /// Returns the new block and receipts for each transaction.
     pub fn execute_block(
         &self,
         transactions: &[Transaction],
@@ -3165,9 +2716,7 @@ impl StateDB {
             .map(|b| b.hash)
             .unwrap_or(Hash256::ZERO);
 
-        // Execute transactions - use Block-STM parallel batches when beneficial
         if transactions.len() >= 16 {
-            // Block-STM: partition into conflict-free batches for parallel execution
             let batches = block_stm::partition_batches(transactions);
             tracing::info!(
                 block_height = height,
@@ -3178,7 +2727,6 @@ impl StateDB {
                 batches.len(),
             );
 
-            // Pre-size receipts with placeholders so we can write by index
             receipts.resize(
                 transactions.len(),
                 TxReceipt {
@@ -3194,19 +2742,15 @@ impl StateDB {
                 },
             );
 
-            // Collect all tx hashes up front (order must match input)
             for tx in transactions.iter() {
                 tx_hashes.push(tx.hash);
             }
 
-            // Execute batches sequentially; within each batch, execute in parallel
             for batch_indices in &batches {
-                // Mark dirty accounts for all txs in this batch before execution
                 for &idx in batch_indices {
                     self.mark_tx_accounts_dirty(&transactions[idx]);
                 }
 
-                // Each batch contains txs that touch disjoint accounts - safe to parallelize
                 let results: Vec<(usize, bool, u64)> = batch_indices
                     .par_iter()
                     .map(|&idx| {
@@ -3219,7 +2763,6 @@ impl StateDB {
                     })
                     .collect();
 
-                // Write receipts back at the correct original index
                 for (idx, success, gas_used) in results {
                     receipts[idx] = TxReceipt {
                         tx_hash: transactions[idx].hash,
@@ -3235,7 +2778,6 @@ impl StateDB {
                 }
             }
         } else {
-            // Sequential fallback for small batches (< 16 txs)
             for (i, tx) in transactions.iter().enumerate() {
                 self.mark_tx_accounts_dirty(tx);
                 let result = self.execute_tx(tx);
@@ -3260,7 +2802,6 @@ impl StateDB {
             }
         }
 
-        // Track total block gas usage
         let total_gas: u64 = receipts.iter().map(|r| r.gas_used).sum();
         if total_gas > gas_costs::BLOCK_GAS_LIMIT * 80 / 100 {
             tracing::warn!(
@@ -3270,24 +2811,12 @@ impl StateDB {
             );
         }
 
-        // Build Merkle tree from transaction hashes
-        // Refund matured, unchallenged Tier 2 attestation bonds at this height
-        // BEFORE the state root is computed so refunds land in this block.
-        // Bounded, deterministic, and a no-op when nothing has matured (always
-        // so on the bond==0 community-worker demo path). Applied uniformly to
-        // every real block-application path so the bond lifecycle advances the
-        // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
-        // A coordinated binding change due at this height belongs INSIDE this
-        // block, exactly as the sweep above does: it has to be in the state
-        // before the root is taken, or it is a change only the nodes that ran
-        // this particular path ever make.
         self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
 
-        // Compute state root
         let state_root = self.compute_state_root();
 
         let header = BlockHeader {
@@ -3308,7 +2837,6 @@ impl StateDB {
 
         let block = Block::new(header, tx_hashes);
 
-        // Update receipts with block hash and Merkle inclusion proofs
         for (i, receipt) in receipts.iter_mut().enumerate() {
             receipt.block_hash = block.hash;
             if let Some(proof) = tree.proof(i) {
@@ -3316,7 +2844,6 @@ impl StateDB {
             }
         }
 
-        // Index receipts, tx locations, account transactions, and full tx bodies
         for (i, tx) in transactions.iter().enumerate() {
             self.receipts.insert(tx.hash.0, receipts[i].clone());
             self.tx_index.insert(tx.hash.0, (height, i as u32));
@@ -3324,36 +2851,22 @@ impl StateDB {
             self.full_transactions.insert(tx.hash.0, tx.clone());
         }
 
-        // Store block + WAL
         self.blocks.insert(height, Box::new(block.clone()));
         self.wal
             .append(WalOp::SetBlock(height, block.clone()), height);
         self.persist_restart_artifacts(transactions, &receipts, height);
 
-        // WAL checkpoint at block boundary
         self.wal.append(WalOp::Checkpoint(state_root), height);
         self.durable_wal_barrier()?;
 
-        // Check if we should take a snapshot
         let count = self.snapshot_counter.fetch_add(1, Ordering::Relaxed);
         if count > 0 && count.is_multiple_of(10_000) {
             tracing::info!("Snapshot trigger at block {}", height);
-            // Snapshot is taken asynchronously in production - here we just log
         }
 
         Ok((block, receipts))
     }
 
-    /// Execute a batch of transactions with signature verification.
-    /// Unsigned or invalid-signature transactions are marked as failed.
-    /// Returns the new block and receipts for each transaction.
-    /// Execute a block with adaptive mode selection.
-    ///
-    /// Automatically chooses sequential or BlockSTM based on the transaction mix:
-    /// - Simple transfer-only blocks → sequential (no overhead)
-    /// - Contract calls / high diversity → BlockSTM (parallel)
-    ///
-    /// This is the primary execution entry point for the consensus pipeline.
     pub fn execute_block_adaptive(
         &self,
         transactions: &[Transaction],
@@ -3366,11 +2879,6 @@ impl StateDB {
         self.execute_block_adaptive_at(transactions, producer, timestamp)
     }
 
-    /// Execute the canonical transaction sequence using a consensus-provided
-    /// timestamp. Validators committing the same DAG block must build the same
-    /// linear block hash; sampling each machine's wall clock during local
-    /// re-execution made otherwise-identical validators expose different block
-    /// hashes and then carry different parent hashes forever.
     pub fn execute_block_adaptive_at(
         &self,
         transactions: &[Transaction],
@@ -3380,18 +2888,6 @@ impl StateDB {
         self.execute_block_adaptive_at_with_proof(transactions, producer, timestamp, Hash256::ZERO)
     }
 
-    /// Execute one canonical consensus decision and bind its authenticated DAG
-    /// identity directly into the resulting linear block header. Protocol-v3
-    /// consensus uses a domain-separated commitment to the exact DAG hash and
-    /// round; legacy and direct execution paths retain a zero proof hash.
-    /// Which execution path a block takes.
-    ///
-    /// A chain with an active inference binding executes sequentially. The
-    /// native path requires it outright, and on a MIGRATED chain an ordinary
-    /// block of a hundred or more transfers would otherwise be routed to
-    /// BlockSTM, which refuses while a binding is active - failing a block of
-    /// perfectly ordinary traffic. Sequential execution of those blocks is a
-    /// throughput choice; routing them somewhere that refuses them is a bug.
     pub(crate) fn execution_mode(
         &self,
         transactions: &[Transaction],
@@ -3399,9 +2895,6 @@ impl StateDB {
         if self.native_inference_context.read().is_some() {
             return crate::block_stm::AdaptiveMode::Sequential;
         }
-        // A binding change waiting for its coordinated height is applied in
-        // the block that reaches it. Keep those blocks on the sequential
-        // path, which is the one this behaviour is qualified on.
         if self.native_migration.read().is_some() || self.pending_binding_update.read().is_some() {
             return crate::block_stm::AdaptiveMode::Sequential;
         }
@@ -3424,23 +2917,14 @@ impl StateDB {
                     proof_hash,
                 ),
             crate::block_stm::AdaptiveMode::BlockSTM => {
-                // Use BlockSTM partitioned execution
                 self.execute_block_blockstm_at(transactions, producer, timestamp, proof_hash)
             }
         }?;
-        // An authorised migration whose coordinated height this block just
-        // reached is applied HERE, before any later block can be built on
-        // top of it. Doing it only at startup would activate whichever node
-        // happened to be starting at that moment and strand every node that
-        // was already running, or was down and caught up later: a validator
-        // passes through the coordinated height whether it produces or
-        // applies, and this is the one place both paths share.
         self.apply_due_native_migration()?;
         self.apply_due_binding_update()?;
         Ok(produced)
     }
 
-    /// Execute a block using BlockSTM partitioned parallel execution.
     fn execute_block_blockstm_at(
         &self,
         transactions: &[Transaction],
@@ -3457,11 +2941,6 @@ impl StateDB {
         self.validate_next_protocol_block_admission(transactions)?;
         use rayon::prelude::*;
 
-        // The transaction slice is already in canonical block/DAG order.
-        // Re-sorting by sender used to reverse cross-sender conflicts (shared
-        // treasury, reward marker, challenge escrow, etc.) while merely moving
-        // receipts back to their original slots. Partition that canonical
-        // sequence directly; partition_batches preserves every conflict edge.
         let batches = crate::block_stm::partition_batches(transactions);
         let mut receipts = vec![None; transactions.len()];
         let mut tx_hashes = vec![Hash256::ZERO; transactions.len()];
@@ -3478,9 +2957,6 @@ impl StateDB {
             .map(|b| b.hash)
             .unwrap_or(Hash256::ZERO);
 
-        // Execute batches: within each batch, TXs run in parallel.
-        // Batches run sequentially (they may have cross-batch dependencies).
-        // Batch indices are the original canonical transaction indices.
         for batch in &batches {
             let batch_results: Vec<(usize, bool, u64)> = batch
                 .par_iter()
@@ -3488,7 +2964,7 @@ impl StateDB {
                     let tx = &transactions[idx];
                     self.mark_tx_accounts_dirty(tx);
                     let result = if tx.sig_verified {
-                        self.execute_tx(tx) // Pre-verified (faucet/RPC) - skip sig check
+                        self.execute_tx(tx)
                     } else if tx.is_unsigned() {
                         Err(StateError::ExecutionError("unsigned transaction".into()))
                     } else if self.verify_transaction_signature(tx).is_err() {
@@ -3520,7 +2996,6 @@ impl StateDB {
             }
         }
 
-        // Unwrap all receipts (all slots should be filled)
         let receipts: Vec<TxReceipt> = receipts
             .into_iter()
             .enumerate()
@@ -3539,18 +3014,7 @@ impl StateDB {
             })
             .collect();
 
-        // Build block (same as sequential path)
-        // Refund matured, unchallenged Tier 2 attestation bonds at this height
-        // BEFORE the state root is computed so refunds land in this block.
-        // Bounded, deterministic, and a no-op when nothing has matured (always
-        // so on the bond==0 community-worker demo path). Applied uniformly to
-        // every real block-application path so the bond lifecycle advances the
-        // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
-        // A coordinated binding change due at this height belongs INSIDE this
-        // block, exactly as the sweep above does: it has to be in the state
-        // before the root is taken, or it is a change only the nodes that ran
-        // this particular path ever make.
         self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
@@ -3597,7 +3061,6 @@ impl StateDB {
         Ok((block, final_receipts))
     }
 
-    /// Execute a block with sequential verification (original path).
     pub fn execute_block_verified(
         &self,
         transactions: &[Transaction],
@@ -3610,7 +3073,6 @@ impl StateDB {
         self.execute_block_verified_at(transactions, producer, timestamp)
     }
 
-    /// Sequential verified execution with a canonical consensus timestamp.
     pub fn execute_block_verified_at(
         &self,
         transactions: &[Transaction],
@@ -3629,14 +3091,6 @@ impl StateDB {
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         let _native_guard = self.native_inference_execution.lock();
         if self.native_inference_context.read().is_some() {
-            // A private protocol-4 chain runs nothing else, so every block of
-            // it is a native block. A MIGRATED chain is still protocol 3 with
-            // paid inference added: only its native blocks take the native
-            // execution path, and everything else - a transfer, a faucet
-            // claim, a reward, an empty block - takes the ordinary one, with
-            // the v3 admission that validates those families. Routing them
-            // all through the native path would admit an ordinary transaction
-            // and then fail to execute it.
             let migrated = self.native_migration.read().is_some();
             let native_block = transactions
                 .iter()
@@ -3667,11 +3121,7 @@ impl StateDB {
             .map(|b| b.hash)
             .unwrap_or(Hash256::ZERO);
 
-        // ── Batch Ed25519 signature verification ──────────────────────────
-        // Collect all unverified Ed25519 signatures and verify them in a single
-        // batch operation (~2x faster than individual verification).
-        // Transactions already verified at mempool insertion are skipped.
-        let mut batch_sig_valid = vec![None; transactions.len()]; // None = needs individual check
+        let mut batch_sig_valid = vec![None; transactions.len()];
         let recovery_domain = self.transaction_domain_hash();
         {
             let mut ed_indices: Vec<usize> = Vec::new();
@@ -3681,9 +3131,8 @@ impl StateDB {
 
             for (i, tx) in transactions.iter().enumerate() {
                 if tx.is_unsigned() || tx.sig_verified {
-                    continue; // unsigned handled below; pre-verified skipped
+                    continue;
                 }
-                // Hash integrity check
                 let expected_hash = match recovery_domain {
                     Some(domain) => tx.compute_hash_in_domain(&domain),
                     None => tx.compute_hash(),
@@ -3697,11 +3146,6 @@ impl StateDB {
                     signature,
                 } = &tx.signature
                 {
-                    // Batch verification proves that `public_key` signed the
-                    // hash, but it does not bind that key to `tx.from`.
-                    // Without this check an attacker could sign a transfer
-                    // from a funded victim with the attacker's own valid key;
-                    // an all-valid batch would then skip `verify_signature`.
                     if arc_crypto::address_from_ed25519_pubkey(public_key) != tx.from {
                         batch_sig_valid[i] = Some(false);
                         continue;
@@ -3717,22 +3161,19 @@ impl StateDB {
                         ed_vks.push(vk);
                         continue;
                     }
-                    batch_sig_valid[i] = Some(false); // malformed
+                    batch_sig_valid[i] = Some(false);
                 }
-                // Non-Ed25519 signatures fall through to individual verification
             }
 
             if !ed_indices.is_empty() {
                 let msg_refs: Vec<&[u8]> = ed_msgs.iter().map(|m| m.as_slice()).collect();
                 match arc_crypto::signature::batch_verify_ed25519(&msg_refs, &ed_sigs, &ed_vks) {
                     Ok(()) => {
-                        // All valid
                         for &idx in &ed_indices {
                             batch_sig_valid[idx] = Some(true);
                         }
                     }
                     Err(_) => {
-                        // Batch failed - fall back to individual verification to find bad ones
                         for &idx in &ed_indices {
                             let valid = self
                                 .verify_transaction_signature(&transactions[idx])
@@ -3744,18 +3185,13 @@ impl StateDB {
             }
         }
 
-        // Execute each transaction with signature verification.
-        // Skip re-verification for transactions already verified at mempool insertion
-        // or batch-verified above.
         for (i, tx) in transactions.iter().enumerate() {
             self.mark_tx_accounts_dirty(tx);
             let result = if tx.sig_verified {
-                // Pre-verified (faucet/RPC) - skip sig check
                 self.execute_tx(tx)
             } else if tx.is_unsigned() {
                 Err(StateError::ExecutionError("unsigned transaction".into()))
             } else if let Some(valid) = batch_sig_valid[i] {
-                // Batch-verified above
                 if valid {
                     self.execute_tx(tx)
                 } else {
@@ -3786,24 +3222,12 @@ impl StateDB {
             });
         }
 
-        // Build Merkle tree from transaction hashes
-        // Refund matured, unchallenged Tier 2 attestation bonds at this height
-        // BEFORE the state root is computed so refunds land in this block.
-        // Bounded, deterministic, and a no-op when nothing has matured (always
-        // so on the bond==0 community-worker demo path). Applied uniformly to
-        // every real block-application path so the bond lifecycle advances the
-        // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
-        // A coordinated binding change due at this height belongs INSIDE this
-        // block, exactly as the sweep above does: it has to be in the state
-        // before the root is taken, or it is a change only the nodes that ran
-        // this particular path ever make.
         self.apply_due_binding_change_locked()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
 
-        // Compute state root
         let state_root = self.compute_state_root();
 
         let header = BlockHeader {
@@ -3821,7 +3245,6 @@ impl StateDB {
 
         let block = Block::new(header, tx_hashes);
 
-        // Update receipts with block hash and Merkle inclusion proofs
         for (i, receipt) in receipts.iter_mut().enumerate() {
             receipt.block_hash = block.hash;
             if let Some(proof) = tree.proof(i) {
@@ -3829,7 +3252,6 @@ impl StateDB {
             }
         }
 
-        // Index receipts, tx locations, account transactions, and full tx bodies
         for (i, tx) in transactions.iter().enumerate() {
             self.receipts.insert(tx.hash.0, receipts[i].clone());
             self.tx_index.insert(tx.hash.0, (height, i as u32));
@@ -3837,17 +3259,14 @@ impl StateDB {
             self.full_transactions.insert(tx.hash.0, tx.clone());
         }
 
-        // Store block + WAL
         self.blocks.insert(height, Box::new(block.clone()));
         self.wal
             .append(WalOp::SetBlock(height, block.clone()), height);
         self.persist_restart_artifacts(transactions, &receipts, height);
 
-        // WAL checkpoint at block boundary
         self.wal.append(WalOp::Checkpoint(state_root), height);
         self.durable_wal_barrier()?;
 
-        // Check if we should take a snapshot
         let count = self.snapshot_counter.fetch_add(1, Ordering::Relaxed);
         if count > 0 && count.is_multiple_of(10_000) {
             tracing::info!("Snapshot trigger at block {}", height);
@@ -3856,12 +3275,6 @@ impl StateDB {
         Ok((block, receipts))
     }
 
-    /// Execute a block with GPU-accelerated batch signature verification.
-    ///
-    /// Combines MetalVerifier batch Ed25519 verification with Block-STM
-    /// parallel execution. This is the production path - signatures are
-    /// verified in a single GPU dispatch, then only valid transactions
-    /// are executed.
     pub fn execute_block_gpu_verified(
         &self,
         transactions: &[Transaction],
@@ -3888,10 +3301,8 @@ impl StateDB {
             .map(|b| b.hash)
             .unwrap_or(Hash256::ZERO);
 
-        // ── Phase 1: GPU batch signature verification ────────────────────
         let mut verifier = MetalVerifier::new();
 
-        // Separate Ed25519 signatures (batch-verifiable) from others
         let mut ed_indices: Vec<usize> = Vec::new();
         let mut ed_tasks: Vec<VerifyTask> = Vec::new();
         let mut other_indices: Vec<usize> = Vec::new();
@@ -3899,13 +3310,12 @@ impl StateDB {
         let recovery_domain = self.transaction_domain_hash();
 
         for (i, tx) in transactions.iter().enumerate() {
-            // Hash integrity check
             let expected_hash = match recovery_domain {
                 Some(domain) => tx.compute_hash_in_domain(&domain),
                 None => tx.compute_hash(),
             };
             if expected_hash != tx.hash {
-                continue; // sig_valid[i] stays false
+                continue;
             }
 
             match &tx.signature {
@@ -3913,9 +3323,6 @@ impl StateDB {
                     public_key,
                     signature,
                 } => {
-                    // GPU/CPU batch verifiers validate the signature against
-                    // the supplied public key; authorize the claimed sender
-                    // separately before accepting the fast-path result.
                     if signature.len() == 64
                         && arc_crypto::address_from_ed25519_pubkey(public_key) == tx.from
                     {
@@ -3928,7 +3335,6 @@ impl StateDB {
                         });
                         ed_indices.push(i);
                     }
-                    // else sig_valid[i] stays false (wrong length)
                 }
                 _ => {
                     other_indices.push(i);
@@ -3936,7 +3342,6 @@ impl StateDB {
             }
         }
 
-        // Batch verify all Ed25519 signatures (GPU or CPU parallel)
         if !ed_tasks.is_empty() {
             let result = verifier.batch_verify(&ed_tasks);
             let invalid_set: std::collections::HashSet<usize> =
@@ -3946,18 +3351,15 @@ impl StateDB {
             }
         }
 
-        // Verify non-Ed25519 signatures individually (Secp256k1, ML-DSA, Falcon)
         for &i in &other_indices {
             let tx = &transactions[i];
             sig_valid[i] = tx.signature.verify(&tx.hash, &tx.from).is_ok();
         }
 
-        // ── Phase 2: Execute valid-signature transactions ────────────────
         let mut receipts = Vec::with_capacity(transactions.len());
         let mut tx_hashes = Vec::with_capacity(transactions.len());
 
         if transactions.len() >= 16 {
-            // Block-STM parallel path for large batches
             let batches = block_stm::partition_batches(transactions);
 
             receipts.resize(
@@ -4014,7 +3416,6 @@ impl StateDB {
                 }
             }
         } else {
-            // Sequential fallback for small batches
             for (i, tx) in transactions.iter().enumerate() {
                 self.mark_tx_accounts_dirty(tx);
                 let result = if !sig_valid[i] {
@@ -4043,7 +3444,6 @@ impl StateDB {
             }
         }
 
-        // ── Phase 3: Finalize block ──────────────────────────────────────
         let total_gas: u64 = receipts.iter().map(|r| r.gas_used).sum();
         if total_gas > gas_costs::BLOCK_GAS_LIMIT * 80 / 100 {
             tracing::warn!(
@@ -4053,17 +3453,7 @@ impl StateDB {
             );
         }
 
-        // Refund matured, unchallenged Tier 2 attestation bonds at this height
-        // BEFORE the state root is computed so refunds land in this block.
-        // Bounded, deterministic, and a no-op when nothing has matured (always
-        // so on the bond==0 community-worker demo path). Applied uniformly to
-        // every real block-application path so the bond lifecycle advances the
-        // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
-        // A coordinated binding change due at this height belongs INSIDE this
-        // block, exactly as the sweep above does: it has to be in the state
-        // before the root is taken, or it is a change only the nodes that ran
-        // this particular path ever make.
         self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
@@ -4117,7 +3507,6 @@ impl StateDB {
         Ok((block, receipts))
     }
 
-    /// Execute a block with parallel state sharding.
     pub fn execute_block_parallel(
         &self,
         transactions: &[Transaction],
@@ -4189,17 +3578,7 @@ impl StateDB {
             })
             .collect();
 
-        // Refund matured, unchallenged Tier 2 attestation bonds at this height
-        // BEFORE the state root is computed so refunds land in this block.
-        // Bounded, deterministic, and a no-op when nothing has matured (always
-        // so on the bond==0 community-worker demo path). Applied uniformly to
-        // every real block-application path so the bond lifecycle advances the
-        // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
-        // A coordinated binding change due at this height belongs INSIDE this
-        // block, exactly as the sweep above does: it has to be in the state
-        // before the root is taken, or it is a change only the nodes that ran
-        // this particular path ever make.
         self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
@@ -4249,13 +3628,6 @@ impl StateDB {
         Ok((block, receipts))
     }
 
-    /// Block-STM parallel execution - partitions transactions into conflict-free
-    /// batches based on static access-set analysis, then executes each batch
-    /// in parallel with rayon.
-    ///
-    /// Compared to sender-sharding (`execute_block_parallel`), this also
-    /// parallelises across different *receivers* and any other disjoint account
-    /// sets, extracting more concurrency from typical workloads.
     pub fn execute_block_stm(
         &self,
         transactions: &[Transaction],
@@ -4280,22 +3652,17 @@ impl StateDB {
             .map(|b| b.hash)
             .unwrap_or(Hash256::ZERO);
 
-        // Mark all accounts dirty for incremental state root (B1).
         for tx in transactions {
             self.mark_tx_accounts_dirty(tx);
         }
 
-        // Partition into conflict-free batches.
         let batches = block_stm::partition_batches(transactions);
 
-        // Execute batches: within each batch, txs run in parallel;
-        // batches themselves run sequentially to respect dependencies.
         let mut receipt_success = vec![false; transactions.len()];
         let mut receipt_gas = vec![0u64; transactions.len()];
 
         for batch in &batches {
             if batch.len() == 1 {
-                // Single tx -- no rayon overhead
                 let idx = batch[0];
                 match self.execute_tx(&transactions[idx]) {
                     Ok(gas) => {
@@ -4307,7 +3674,6 @@ impl StateDB {
                     }
                 }
             } else {
-                // Parallel execution within the batch
                 let results: Vec<(usize, bool, u64)> = batch
                     .par_iter()
                     .map(|&idx| match self.execute_tx(&transactions[idx]) {
@@ -4322,7 +3688,6 @@ impl StateDB {
             }
         }
 
-        // Build receipts, Merkle tree, block -- same as execute_block_parallel.
         let tx_hashes: Vec<Hash256> = transactions.iter().map(|tx| tx.hash).collect();
         let receipts: Vec<TxReceipt> = transactions
             .iter()
@@ -4340,17 +3705,7 @@ impl StateDB {
             })
             .collect();
 
-        // Refund matured, unchallenged Tier 2 attestation bonds at this height
-        // BEFORE the state root is computed so refunds land in this block.
-        // Bounded, deterministic, and a no-op when nothing has matured (always
-        // so on the bond==0 community-worker demo path). Applied uniformly to
-        // every real block-application path so the bond lifecycle advances the
-        // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
-        // A coordinated binding change due at this height belongs INSIDE this
-        // block, exactly as the sweep above does: it has to be in the state
-        // before the root is taken, or it is a change only the nodes that ran
-        // this particular path ever make.
         self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
@@ -4400,7 +3755,6 @@ impl StateDB {
         Ok((block, receipts))
     }
 
-    /// Optimistic parallel execution - pre-sorted by sender nonce for maximum throughput.
     pub fn execute_optimistic(&self, transactions: &[Transaction]) -> (usize, usize) {
         let mut shards: HashMap<[u8; 32], Vec<&Transaction>> = HashMap::new();
         for tx in transactions {
@@ -4428,13 +3782,10 @@ impl StateDB {
         (success, transactions.len())
     }
 
-    /// Start background indexer threads for async hash→(height, index) mapping.
-    /// Call once before benchmark execution begins.
     #[cfg(feature = "benchmark-tools")]
     pub fn start_benchmark_indexer(self: &Arc<Self>) {
         let (tx, rx) = crossbeam::channel::unbounded::<IndexerBatch>();
 
-        // Spawn 4 indexer threads - each computes hashes and inserts hash→(height, index)
         for thread_id in 0..4u32 {
             let rx = rx.clone();
             let state = Arc::clone(self);
@@ -4446,7 +3797,6 @@ impl StateDB {
                         for (shard_idx, (sender, receiver)) in
                             batch.senders.iter().zip(batch.receivers.iter()).enumerate()
                         {
-                            // Precompute body_bytes + base hasher for this shard
                             let body_bytes = bincode::serialize(&TxBody::Transfer(TransferBody {
                                 to: *receiver,
                                 amount: 1,
@@ -4463,7 +3813,6 @@ impl StateDB {
                                 let nonce = nonce_start + j;
                                 let hash =
                                     compute_benchmark_tx_hash(&base_hasher, nonce, &body_bytes);
-                                // Single DashMap insert: hash → (height, global_index)
                                 state.tx_index.insert(hash.0, (batch.height, global_idx));
                                 global_idx += 1;
                             }
@@ -4473,9 +3822,6 @@ impl StateDB {
                 .expect("spawn indexer thread");
         }
 
-        // Store the sender - we need unsafe to set the field on Arc<Self>
-        // since start_benchmark_indexer is called once at startup.
-        // Safety: called exactly once before any concurrent access to indexer_tx.
         #[allow(invalid_reference_casting)]
         unsafe {
             let self_mut = &mut *(Arc::as_ptr(self) as *mut Self);
@@ -4484,13 +3830,6 @@ impl StateDB {
         tracing::info!("Benchmark indexer started (4 threads)");
     }
 
-    /// Fully verifiable benchmark block execution.
-    ///
-    /// Every transaction has a real blake3 hash (same algorithm as Transaction::compute_hash).
-    /// Block tx_root is a real Merkle root computed from all tx hashes.
-    /// Block state_root is computed from all account states.
-    /// Every tx is reconstructable on-demand from deterministic parameters.
-    /// Merkle inclusion proofs are generated on-demand when queried.
     #[cfg(feature = "benchmark-tools")]
     pub fn execute_block_benchmark(
         &self,
@@ -4526,7 +3865,6 @@ impl StateDB {
         let txs_per_sender = tx_per_block / num_senders;
         let current_nonce_base = *nonce_base;
 
-        // ── Cache sender/receiver arrays for on-demand reconstruction ───
         {
             let mut s = self.benchmark_senders.write();
             if s.is_none() {
@@ -4542,7 +3880,6 @@ impl StateDB {
         self.benchmark_txs_per_sender
             .store(txs_per_sender, Ordering::Relaxed);
 
-        // ── Apply net balance deltas (100 DashMap ops total) ────────────
         for (sender, receiver) in senders.iter().zip(receivers.iter()) {
             self.dirty_accounts.insert(sender.0);
             self.dirty_accounts.insert(receiver.0);
@@ -4555,9 +3892,6 @@ impl StateDB {
             }
         }
 
-        // ── Generate real tx hashes in parallel (rayon-sharded) ─────────
-        // Each shard precomputes body_bytes + base blake3 hasher.
-        // Only the nonce varies per tx - huge optimization.
         let shard_data: Vec<(Hash256, Hash256, u64)> = senders
             .iter()
             .zip(receivers.iter())
@@ -4568,7 +3902,6 @@ impl StateDB {
         let all_hashes: Vec<Hash256> = shard_data
             .par_iter()
             .flat_map(|(sender, receiver, nonce_start)| {
-                // Precompute body_bytes once per shard (same for all txs in shard)
                 let body_bytes = bincode::serialize(&TxBody::Transfer(TransferBody {
                     to: *receiver,
                     amount: 1,
@@ -4576,7 +3909,6 @@ impl StateDB {
                 }))
                 .expect("serializable");
 
-                // Precompute base hasher through tx_type + from
                 let mut base_hasher = blake3::Hasher::new_derive_key("ARC-chain-tx-v1");
                 base_hasher.update(&[TxType::Transfer as u8]);
                 base_hasher.update(sender.as_ref());
@@ -4587,10 +3919,8 @@ impl StateDB {
             })
             .collect();
 
-        // ── Real Merkle root from all tx hashes ─────────────────────────
         let tx_root = compute_merkle_root_only(all_hashes);
 
-        // ── Real state_root from all account states (~30μs for 100 accts)
         let state_root = self.compute_state_root();
 
         let header = BlockHeader {
@@ -4609,15 +3939,11 @@ impl StateDB {
             state_diff: None,
         };
 
-        // Empty tx_hashes vec - 10M hashes would be 320MB per block.
-        // txs are reconstructable on-demand from nonce_base + deterministic params.
         let block = Block::new(header, vec![]);
         self.blocks.insert(height, Box::new(block.clone()));
 
-        // ── Store nonce_base for on-demand reconstruction ───────────────
         self.benchmark_nonces.insert(height, current_nonce_base);
 
-        // ── Queue to async indexer for hash→(height,index) mapping ──────
         if let Some(ref indexer) = self.indexer_tx {
             let batch = IndexerBatch {
                 block_hash: block.hash,
@@ -4630,26 +3956,14 @@ impl StateDB {
             let _ = indexer.send(batch);
         }
 
-        // Update atomic counter immediately (for /stats)
         self.benchmark_tx_count
             .fetch_add(tx_per_block, Ordering::Relaxed);
 
-        // Advance nonce base for next block
         *nonce_base += tx_per_block;
 
         Ok(block)
     }
 
-    /// Execute a block of pre-signed transactions with full verification.
-    ///
-    /// 1. Batch verify Ed25519 signatures (parallel rayon chunks)
-    /// 2. Per-tx execution via execute_tx() (rayon-sharded by sender)
-    /// 3. Real Merkle root from tx hashes
-    /// 4. Real state_root from all account states
-    /// 5. Async index for hash→(height, idx) mapping
-    ///
-    /// This is the "honest" benchmark path - every tx is signed, verified,
-    /// individually executed with nonce/balance checks, and queryable.
     pub fn execute_block_signed_benchmark(
         &self,
         transactions: &[Transaction],
@@ -4683,13 +3997,9 @@ impl StateDB {
         let t0 = std::time::Instant::now();
         let recovery_domain = self.transaction_domain_hash();
 
-        // ── 1. Batch verify Ed25519 signatures (parallel chunks) ──────────
-        // Extract (message, signature, verifying_key) for batch verification.
-        // We verify in parallel chunks of 256 for optimal batch_verify performance.
         let sig_valid: Vec<bool> = transactions
             .par_chunks(256)
             .flat_map(|chunk| {
-                // Try batch verify the whole chunk first (fast path)
                 let mut messages = Vec::with_capacity(chunk.len());
                 let mut sigs = Vec::with_capacity(chunk.len());
                 let mut vks = Vec::with_capacity(chunk.len());
@@ -4701,10 +4011,6 @@ impl StateDB {
                             public_key,
                             signature,
                         } => {
-                            // The batch primitive does not check either hash
-                            // integrity or the ARC address derived from the
-                            // verifying key. Both are consensus authorization
-                            // requirements, even on the benchmark path.
                             let expected_hash = match recovery_domain {
                                 Some(domain) => tx.compute_hash_in_domain(&domain),
                                 None => tx.compute_hash(),
@@ -4737,17 +4043,14 @@ impl StateDB {
 
                 if valid && !messages.is_empty() {
                     if arc_crypto::batch_verify_ed25519(&messages, &sigs, &vks).is_ok() {
-                        // All valid in this chunk
                         vec![true; chunk.len()]
                     } else {
-                        // Batch failed - fall back to individual verification
                         chunk
                             .iter()
                             .map(|tx| self.verify_transaction_signature(tx).is_ok())
                             .collect()
                     }
                 } else {
-                    // Non-Ed25519 or parse error - verify individually
                     chunk
                         .iter()
                         .map(|tx| self.verify_transaction_signature(tx).is_ok())
@@ -4758,8 +4061,6 @@ impl StateDB {
 
         let t1 = t0.elapsed();
 
-        // ── 2. Per-tx execution (rayon-sharded by sender) ─────────────────
-        // Group transactions by sender for parallel execution.
         let mut shards: HashMap<[u8; 32], Vec<(usize, &Transaction, bool)>> = HashMap::new();
         for (i, tx) in transactions.iter().enumerate() {
             shards
@@ -4771,12 +4072,11 @@ impl StateDB {
         let shard_results: Vec<Vec<(usize, bool)>> = shards
             .into_par_iter()
             .map(|(_sender, mut txs)| {
-                // Sort by nonce within shard for correct ordering
                 txs.sort_unstable_by_key(|(_, tx, _)| tx.nonce);
                 let mut results = Vec::with_capacity(txs.len());
                 for (idx, tx, sig_ok) in txs {
                     let success = if !sig_ok {
-                        false // Signature verification failed
+                        false
                     } else {
                         self.mark_tx_accounts_dirty(tx);
                         self.execute_tx(tx).is_ok()
@@ -4787,7 +4087,6 @@ impl StateDB {
             })
             .collect();
 
-        // Merge shard results back into original order
         let mut receipt_success = vec![false; tx_count];
         for shard in shard_results {
             for (idx, success) in shard {
@@ -4797,20 +4096,16 @@ impl StateDB {
 
         let t2 = t0.elapsed();
 
-        // ── 3. Collect tx hashes ──────────────────────────────────────────
         let tx_hashes: Vec<Hash256> = transactions.iter().map(|tx| tx.hash).collect();
 
-        // ── 4. Real Merkle root ───────────────────────────────────────────
         let tx_root = compute_merkle_root_only(tx_hashes);
 
         let t3 = t0.elapsed();
 
-        // ── 5. Real state root ────────────────────────────────────────────
         let state_root = self.compute_state_root();
 
         let t4 = t0.elapsed();
 
-        // ── 6. Create block ───────────────────────────────────────────────
         let header = BlockHeader {
             height,
             timestamp: std::time::SystemTime::now()
@@ -4827,17 +4122,13 @@ impl StateDB {
             state_diff: None,
         };
 
-        // Store tx hashes in the Block for /block/{height}/txs listing
         let block_tx_hashes: Vec<Hash256> = transactions.iter().map(|tx| tx.hash).collect();
         let block = Block::new(header, block_tx_hashes);
         self.blocks.insert(height, Box::new(block.clone()));
 
-        // ── 7. Store success flags for receipt reconstruction ────────────
         self.signed_block_data
             .insert(height, (vec![], receipt_success, block.hash));
 
-        // ── 8. Build indexes in parallel ─────────────────────────────────
-        // Hash→(height,idx) index + full tx bodies for /tx/{hash}/full
         transactions.par_iter().enumerate().for_each(|(i, tx)| {
             self.tx_index.insert(tx.hash.0, (height, i as u32));
             self.full_transactions.insert(tx.hash.0, tx.clone());
@@ -4845,7 +4136,6 @@ impl StateDB {
 
         let t5 = t0.elapsed();
 
-        // ── 9. Update atomic counter ──────────────────────────────────────
         self.benchmark_tx_count
             .fetch_add(tx_count as u64, Ordering::Relaxed);
 
@@ -4862,8 +4152,6 @@ impl StateDB {
         Ok(block)
     }
 
-    /// Reconstruct a benchmark transaction on-demand from (height, tx_index).
-    /// Returns the full Transaction object with correct hash and real ed25519 signature.
     #[cfg(feature = "benchmark-tools")]
     pub fn reconstruct_benchmark_tx(&self, height: u64, tx_index: u32) -> Option<Transaction> {
         let nonce_base = self.benchmark_nonces.get(&height)?;
@@ -4888,8 +4176,6 @@ impl StateDB {
 
         let mut tx = Transaction::new_transfer(sender, receiver, 1, nonce);
 
-        // Sign with the deterministic ed25519 keypair for this sender.
-        // This reconstructs a verifiable signature on demand (~8μs).
         let sk = arc_crypto::benchmark_keypair(shard_idx as u8);
         use ed25519_dalek::Signer;
         let sig = sk.sign(tx.hash.as_bytes());
@@ -4902,14 +4188,11 @@ impl StateDB {
         Some(tx)
     }
 
-    /// Deterministic transaction reconstruction is deliberately unavailable
-    /// in production/default builds.
     #[cfg(not(feature = "benchmark-tools"))]
     pub fn reconstruct_benchmark_tx(&self, _height: u64, _tx_index: u32) -> Option<Transaction> {
         None
     }
 
-    /// Reconstruct a benchmark receipt on-demand from (height, tx_index).
     pub fn reconstruct_benchmark_receipt(&self, height: u64, tx_index: u32) -> Option<TxReceipt> {
         let tx = self.reconstruct_benchmark_tx(height, tx_index)?;
         let block = self.blocks.get(&height)?;
@@ -4922,13 +4205,11 @@ impl StateDB {
             success: true,
             gas_used: 0,
             value_commitment: None,
-            inclusion_proof: None, // Use /tx/{hash}/proof for on-demand proof
+            inclusion_proof: None,
             logs: vec![],
         })
     }
 
-    /// Reconstruct a Merkle inclusion proof for a benchmark transaction.
-    /// This is expensive (~130ms for 10M txs) - only called on-demand for /tx/{hash}/proof.
     #[cfg(feature = "benchmark-tools")]
     pub fn reconstruct_benchmark_proof(
         &self,
@@ -4948,7 +4229,6 @@ impl StateDB {
             return None;
         }
 
-        // Rebuild all hashes for this block (parallel)
         let shard_data: Vec<(Hash256, Hash256, u64)> = senders_ref
             .iter()
             .zip(receivers_ref.iter())
@@ -4975,12 +4255,10 @@ impl StateDB {
             })
             .collect();
 
-        // Build full Merkle tree and extract proof
         let tree = MerkleTree::from_leaves(all_hashes);
         tree.proof(tx_index as usize)
     }
 
-    /// Deterministic benchmark proofs depend on the gated reconstruction path.
     #[cfg(not(feature = "benchmark-tools"))]
     pub fn reconstruct_benchmark_proof(
         &self,
@@ -4990,17 +4268,13 @@ impl StateDB {
         None
     }
 
-    /// Reconstruct a benchmark transaction by looking up its hash in tx_index,
-    /// then reconstructing from deterministic parameters.
     pub fn get_benchmark_tx_by_hash(&self, tx_hash: &[u8; 32]) -> Option<Transaction> {
         let (height, idx) = *self.tx_index.get(tx_hash)?;
         self.reconstruct_benchmark_tx(height, idx)
     }
 
-    /// Look up or reconstruct a receipt for a benchmark transaction by hash.
     pub fn get_benchmark_receipt_by_hash(&self, tx_hash: &[u8; 32]) -> Option<TxReceipt> {
         let (height, idx) = *self.tx_index.get(tx_hash)?;
-        // Try signed block data first (from execute_block_signed_benchmark)
         if let Some(block_data) = self.signed_block_data.get(&height) {
             let (txs_vec, success_flags, block_hash) = &*block_data;
             if let Some(tx) = txs_vec.get(idx as usize) {
@@ -5017,14 +4291,9 @@ impl StateDB {
                 });
             }
         }
-        // Fall back to deterministic reconstruction
         self.reconstruct_benchmark_receipt(height, idx)
     }
 
-    /// Get a page of benchmark transactions for a block.
-    /// First tries signed_block_txs (from execute_block_signed_benchmark),
-    /// then falls back to deterministic reconstruction (from execute_block_benchmark).
-    /// Used by /block/{height}/txs?offset=0&limit=100
     pub fn get_benchmark_block_txs(
         &self,
         height: u64,
@@ -5038,7 +4307,6 @@ impl StateDB {
         let tx_count = block.header.tx_count;
         let end = (offset + limit).min(tx_count);
 
-        // Try signed block data first (stored by execute_block_signed_benchmark)
         if let Some(block_data) = self.signed_block_data.get(&height) {
             let (txs_vec, _, _) = &*block_data;
             return (offset as usize..end as usize)
@@ -5046,7 +4314,6 @@ impl StateDB {
                 .collect();
         }
 
-        // Fall back to deterministic reconstruction (unsigned benchmark)
         let mut txs = Vec::new();
         for idx in offset..end {
             if let Some(tx) = self.reconstruct_benchmark_tx(height, idx) {
@@ -5056,8 +4323,6 @@ impl StateDB {
         txs
     }
 
-    /// Compute the gas cost for a transaction based on its type.
-    /// This is a pure function -- no state access required.
     fn gas_cost_for_tx(tx: &Transaction) -> u64 {
         match &tx.body {
             TxBody::Transfer(_) => gas_costs::TRANSFER,
@@ -5087,7 +4352,7 @@ impl StateDB {
             TxBody::InferenceAttestation(_) => gas_costs::INFERENCE_ATTESTATION,
             TxBody::CommunityInferenceReward(_) => gas_costs::COMMUNITY_INFERENCE_REWARD,
             TxBody::InferenceChallenge(_) => gas_costs::INFERENCE_CHALLENGE,
-            TxBody::InferenceRegister(_) => gas_costs::INFERENCE_ATTESTATION, // same gas as attestation
+            TxBody::InferenceRegister(_) => gas_costs::INFERENCE_ATTESTATION,
             TxBody::InferenceEscrowOpen(_) => gas_costs::INFERENCE_ESCROW_OPEN,
             TxBody::InferenceEscrowRelease(_) => gas_costs::INFERENCE_ESCROW_RELEASE,
             TxBody::InferenceEscrowRefund(_) => gas_costs::INFERENCE_ESCROW_REFUND,
@@ -5106,14 +4371,6 @@ impl StateDB {
         }
     }
 
-    /// Protocol v3 deliberately exposes a tiny, audited transaction surface.
-    ///
-    /// Keep this match exhaustive (no wildcard): adding a new `TxType` (and
-    /// therefore a new `TxBody::tx_type()` mapping) must fail compilation
-    /// until the new family is explicitly classified. Most
-    /// legacy families remain decodable/replayable, but cannot enter new v3
-    /// consensus state until their authorization, atomicity, and conservation
-    /// invariants are proven.
     fn v3_transaction_family_policy(tx_type: TxType) -> V3TransactionFamilyPolicy {
         match tx_type {
             TxType::Transfer | TxType::CommunityInferenceReward | TxType::FaucetClaim => {
@@ -5166,41 +4423,10 @@ impl StateDB {
         }
     }
 
-    /// Execute a single transaction against state, enforcing gas metering.
-    ///
-    /// Returns the gas consumed on success. When `gas_limit == 0` (backward
-    /// compat / benchmark mode), an effectively unlimited gas budget is used
-    /// so that no existing transaction can fail due to gas exhaustion.
-    /// Refuse a validator-registry change while a native inference binding
-    /// is active.
-    ///
-    /// The binding freezes the committee it was activated for, and every block
-    /// re-checks that the live registry still matches it. Before this guard, a
-    /// Stake, JoinValidator or UpdateStake transaction was simply executed, the
-    /// registry moved, and from then on EVERY block failed that check - one
-    /// transaction wedged the chain, and a restart could not recover because
-    /// activation re-checks the same thing (D2).
-    ///
-    /// Refusing here keeps both guarantees and removes the wedge: the offending
-    /// transaction fails with a receipt, the registry does not move, the binding
-    /// is never silently rebound, and the next block executes normally.
-    ///
-    /// The committee of a native-inference chain is therefore fixed for the life
-    /// of its binding. Changing it is an explicit migration - a new activation
-    /// on a fresh genesis - never a side effect of a staking transaction.
     pub fn refuse_registry_change_under_native_binding(&self) -> Result<(), StateError> {
-        // A MIGRATED chain supports versioned bindings, so the committee is
-        // not frozen: the registry moves, new requests are refused until the
-        // operator publishes the binding that names the new committee, and
-        // work already admitted settles under the binding that accepted it.
-        // Staking and validator admission therefore keep working, which on a
-        // public chain they have to.
         if self.native_migration.read().is_some() {
             return Ok(());
         }
-        // A private protocol-4 chain runs nothing but native inference, so a
-        // registry change cannot execute there anyway; this stays as the
-        // defence in depth it was.
         if self.native_inference_context.read().is_some() {
             return Err(StateError::ExecutionError(
                 "the validator registry is frozen by the active native inference binding; \
@@ -5211,7 +4437,6 @@ impl StateDB {
         Ok(())
     }
 
-    /// True for transactions that would change the validator registry.
     pub fn is_registry_change(tx: &Transaction) -> bool {
         matches!(
             tx.body,
@@ -5230,15 +4455,13 @@ impl StateDB {
         if self.active_protocol_version().major == 3 {
             self.validate_v3_transaction_envelope(tx)?;
         }
-        // --- Gas metering setup ---
         let effective_limit = if tx.gas_limit > 0 {
             tx.gas_limit
         } else {
-            gas_costs::BLOCK_GAS_LIMIT // unlimited for backward compat
+            gas_costs::BLOCK_GAS_LIMIT
         };
         let mut gas = GasMeter::new(effective_limit);
 
-        // Charge the operation-specific gas cost up front
         let op_cost = Self::gas_cost_for_tx(tx);
         if let Err(e) = gas.charge(op_cost) {
             return Err(StateError::ExecutionError(format!("gas: {}", e)));
@@ -5311,10 +4534,6 @@ impl StateDB {
                     return Ok(gas.consumed);
                 }
 
-                // Build the complete transition from detached snapshots. A
-                // missing sender, bad nonce, insufficient funds, nonce
-                // overflow, or recipient overflow must fail without creating
-                // or partially updating any account.
                 let mut sender =
                     self.get_account(&tx.from)
                         .ok_or(StateError::InsufficientBalance {
@@ -5338,9 +4557,6 @@ impl StateDB {
                 }
 
                 if body.to == tx.from {
-                    // A self-transfer conserves value and consumes exactly one
-                    // nonce; applying debit and credit to separate snapshots
-                    // would otherwise overwrite one half of the transition.
                     sender.nonce = next_nonce;
                     self.accounts.insert(tx.from.0, sender.clone());
                     if self.use_jmt {
@@ -5473,8 +4689,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::Stake(body) => {
-                // The native inference binding froze this committee; see
-                // `refuse_registry_change_under_native_binding`.
                 self.refuse_registry_change_under_native_binding()?;
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
@@ -5489,7 +4703,6 @@ impl StateDB {
                     .ok_or_else(|| StateError::ExecutionError("stake nonce overflow".into()))?;
 
                 if body.is_stake {
-                    // --- Stake: move funds from balance to staked_balance ---
                     if sender.balance < body.amount {
                         return Err(StateError::InsufficientBalance {
                             have: sender.balance,
@@ -5521,7 +4734,6 @@ impl StateDB {
                     sender.staked_balance = new_account_stake;
                     self.validators.insert(tx.from.0, new_stake);
 
-                    // Register as validator if crossing threshold
                     if prev_stake < Self::MIN_VALIDATOR_STAKE
                         && new_stake >= Self::MIN_VALIDATOR_STAKE
                     {
@@ -5532,9 +4744,6 @@ impl StateDB {
                         );
                     }
                 } else {
-                    // --- Unstake only the validator-map component. The same
-                    // account field may also contain an inference-provider
-                    // bond, which is not withdrawable through this tx. ---
                     let prev_stake = self.validators.get(&tx.from.0).map(|v| *v).unwrap_or(0);
                     if prev_stake < body.amount {
                         return Err(StateError::InsufficientBalance {
@@ -5570,7 +4779,6 @@ impl StateDB {
                         self.validators.insert(tx.from.0, new_stake);
                     }
 
-                    // Log validator removal if dropping below threshold
                     if prev_stake >= Self::MIN_VALIDATOR_STAKE
                         && new_stake < Self::MIN_VALIDATOR_STAKE
                     {
@@ -5589,7 +4797,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::WasmCall(body) => {
-                // --- Contract lookup ---
                 let bytecode = self
                     .get_contract(&body.contract)
                     .ok_or(StateError::ContractNotFound(body.contract))?;
@@ -5597,26 +4804,11 @@ impl StateDB {
                 let is_evm = bytecode.len() < 4 || &bytecode[..4] != WASM_MAGIC;
 
                 if is_evm {
-                    // State-changing EVM execution used to happen in arc-node
-                    // *after* this executor had computed and durably
-                    // checkpointed the block state root. That made the live
-                    // account/storage state differ from the authenticated
-                    // block and made restart fail on the trailing WAL writes.
-                    //
-                    // Protocol v3 therefore fails closed until EVM effects
-                    // can be produced and applied atomically inside this
-                    // canonical transition. This check deliberately precedes
-                    // sender lookup/creation, nonce changes, balance changes,
-                    // storage writes, logs, and WAL appends.
                     return Err(StateError::ExecutionError(
                         "state-changing EVM calls are unavailable until canonical pre-root execution is activated"
                             .to_string(),
                     ));
                 } else {
-                    // --- WASM contract ---
-                    // Use a detached sender candidate so lookup failures above
-                    // and future preflight failures cannot fabricate an
-                    // account merely by submitting a rejected call.
                     let mut sender = self
                         .get_account(&tx.from)
                         .unwrap_or_else(|| Account::new(tx.from, 0));
@@ -5626,7 +4818,6 @@ impl StateDB {
                             got: tx.nonce,
                         });
                     }
-                    // Value transfer (WASM runtime doesn't handle it internally).
                     if body.value > 0 {
                         if sender.balance < body.value {
                             return Err(StateError::InsufficientBalance {
@@ -5645,7 +4836,6 @@ impl StateDB {
                         );
                     }
 
-                    // WASM execution via wasmer with full host imports.
                     {
                         use std::sync::Mutex as StdMutex;
                         use wasmer::{
@@ -5653,7 +4843,6 @@ impl StateDB {
                             Module as WasmModule, Store, imports,
                         };
 
-                        // Shared state for host functions
                         struct WasmHostState {
                             gas_used: std::sync::atomic::AtomicU64,
                             gas_limit: u64,
@@ -5690,7 +4879,6 @@ impl StateDB {
                         let mut store = Store::default();
                         let func_env = FunctionEnv::new(&mut store, host);
 
-                        // Host: use_gas(amount: i64)
                         let h_use_gas = Function::new_typed_with_env(
                             &mut store,
                             &func_env,
@@ -5708,7 +4896,6 @@ impl StateDB {
                             },
                         );
 
-                        // Host: log(ptr: i32, len: i32)
                         let h_log = Function::new_typed_with_env(
                             &mut store,
                             &func_env,
@@ -5727,7 +4914,6 @@ impl StateDB {
                             },
                         );
 
-                        // Host: storage_get(key_ptr: i32, val_ptr: i32) -> i32
                         let h_storage_get = Function::new_typed_with_env(
                             &mut store,
                             &func_env,
@@ -5764,7 +4950,6 @@ impl StateDB {
                             },
                         );
 
-                        // Host: storage_set(key_ptr: i32, val_ptr: i32, val_len: i32)
                         let h_storage_set = Function::new_typed_with_env(
                             &mut store,
                             &func_env,
@@ -5796,7 +4981,6 @@ impl StateDB {
                             },
                         );
 
-                        // Host: caller(ptr: i32) - write caller address to WASM memory
                         let h_caller = Function::new_typed_with_env(
                             &mut store,
                             &func_env,
@@ -5809,7 +4993,6 @@ impl StateDB {
                             },
                         );
 
-                        // Host: self_address(ptr: i32)
                         let h_self_address = Function::new_typed_with_env(
                             &mut store,
                             &func_env,
@@ -5822,7 +5005,6 @@ impl StateDB {
                             },
                         );
 
-                        // Host: block_height() -> i64
                         let h_block_height = Function::new_typed_with_env(
                             &mut store,
                             &func_env,
@@ -5831,7 +5013,6 @@ impl StateDB {
                             },
                         );
 
-                        // Host: tx_value() -> i64
                         let h_tx_value = Function::new_typed_with_env(
                             &mut store,
                             &func_env,
@@ -5840,7 +5021,6 @@ impl StateDB {
                             },
                         );
 
-                        // Host: gas_remaining() -> i64
                         let h_gas_remaining = Function::new_typed_with_env(
                             &mut store,
                             &func_env,
@@ -5873,13 +5053,11 @@ impl StateDB {
                                 StateError::ExecutionError(format!("WASM instantiate: {}", e))
                             })?;
 
-                        // Wire up memory reference so host functions can access it
                         if let Ok(memory) = instance.exports.get_memory("memory") {
                             *func_env.as_mut(&mut store).memory.lock().unwrap() =
                                 Some(memory.clone());
                         }
 
-                        // Pre-populate storage cache from StateDB
                         if let Some(contract_storage) = self.storage.get(&body.contract.0) {
                             let mut cache = func_env.as_ref(&store).storage_cache.lock().unwrap();
                             for entry in contract_storage.iter() {
@@ -5896,7 +5074,6 @@ impl StateDB {
 
                         let call_result = func.call(&mut store, &[]);
 
-                        // Check gas exhaustion
                         let host_state = func_env.as_ref(&store);
                         let wasm_gas_used = host_state
                             .gas_used
@@ -5907,13 +5084,11 @@ impl StateDB {
                             return Err(StateError::ExecutionError("WASM out of gas".into()));
                         }
 
-                        // Charge WASM gas to the transaction gas meter
-                        let wasm_gas_charge = wasm_gas_used / 100; // Scale down: 100 WASM gas = 1 tx gas
+                        let wasm_gas_charge = wasm_gas_used / 100;
                         let _ = gas.charge(wasm_gas_charge);
 
                         match call_result {
                             Ok(_) => {
-                                // Flush storage writes to StateDB on success
                                 let writes =
                                     std::mem::take(&mut *host_state.storage_writes.lock().unwrap());
                                 for (key, value) in writes {
@@ -5928,11 +5103,8 @@ impl StateDB {
                                 );
                             }
                             Err(e) => {
-                                // Revert: do NOT flush storage writes
-                                // Revert value transfer if any
                                 if body.value > 0 {
                                     sender.balance = body.value;
-                                    // Persist reverted sender balance
                                     self.accounts.insert(tx.from.0, sender.clone());
 
                                     if let Some(mut contract_acct) =
@@ -5970,7 +5142,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::DeployContract(body) => {
-                // --- Sender validation ---
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -5986,26 +5157,21 @@ impl StateDB {
                     });
                 }
 
-                // --- Validate WASM bytecode ---
                 if body.bytecode.len() < 4 || &body.bytecode[..4] != WASM_MAGIC {
                     return Err(StateError::ExecutionError(
                         "invalid WASM bytecode: missing \0asm magic header".into(),
                     ));
                 }
 
-                // Charge additional gas for bytecode size
                 let bytecode_gas = body.bytecode.len() as u64 * gas_costs::TX_DATA_BYTE;
                 if let Err(e) = gas.charge(bytecode_gas) {
                     return Err(StateError::ExecutionError(format!("gas: {}", e)));
                 }
 
-                // --- Compute deterministic contract address ---
                 let contract_addr = compute_contract_address(&tx.from, tx.nonce);
 
-                // --- Store bytecode ---
                 self.deploy_contract(&contract_addr, body.bytecode.clone());
 
-                // --- Create contract account ---
                 let code_hash = hash_bytes(&body.bytecode);
                 let contract_acct = Account::new_contract(contract_addr, code_hash);
                 self.accounts.insert(contract_addr.0, contract_acct.clone());
@@ -6014,10 +5180,7 @@ impl StateDB {
                     self.height(),
                 );
 
-                // --- Constructor execution ---
                 if !body.constructor_args.is_empty() {
-                    // Compile the module and call `init` with full host imports.
-                    // Uses wasmer directly to avoid circular arc-vm dependency.
                     use std::sync::Mutex as StdMutex;
                     use wasmer::{
                         Function, FunctionEnv, FunctionEnvMut, Instance, Memory,
@@ -6233,7 +5396,6 @@ impl StateDB {
 
                         match call_result {
                             Ok(_) => {
-                                // Flush constructor storage writes to StateDB
                                 let writes =
                                     std::mem::take(&mut *host_state.storage_writes.lock().unwrap());
                                 for (key, value) in writes {
@@ -6245,7 +5407,6 @@ impl StateDB {
                                 );
                             }
                             Err(e) => {
-                                // Constructor failed - remove the deployed contract
                                 self.contracts.remove(&contract_addr.0);
                                 self.accounts.remove(&contract_addr.0);
                                 return Err(StateError::ExecutionError(format!(
@@ -6257,7 +5418,6 @@ impl StateDB {
                     }
                 }
 
-                // --- Debit sender ---
                 sender.balance -= total_cost;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
@@ -6293,10 +5453,7 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::JoinValidator(body) => {
-                // The native inference binding froze this committee; see
-                // `refuse_registry_change_under_native_binding`.
                 self.refuse_registry_change_under_native_binding()?;
-                // Deduct initial stake from sender's balance and register as validator
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -6341,13 +5498,10 @@ impl StateDB {
                     .ok_or_else(|| StateError::ExecutionError("account stake overflow".into()))?;
                 self.add_staking_pool_checked(body.initial_stake)?;
 
-                // Move only the new validator component. Any existing
-                // inference-provider bond remains locked alongside it.
                 sender.balance = new_balance;
                 sender.staked_balance = new_account_stake;
                 sender.nonce = next_nonce;
 
-                // Register in validator set
                 self.validators.insert(tx.from.0, body.initial_stake);
 
                 self.accounts.insert(tx.from.0, sender.clone());
@@ -6362,7 +5516,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::LeaveValidator => {
-                // Unstake everything and remove from validator set
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -6374,9 +5527,6 @@ impl StateDB {
                     StateError::ExecutionError("validator exit nonce overflow".into())
                 })?;
 
-                // Return exactly the validator-map component. Provider bonds
-                // and any other non-validator lock share staked_balance and
-                // must remain untouched.
                 let staked = self
                     .validators
                     .get(&tx.from.0)
@@ -6426,12 +5576,9 @@ impl StateDB {
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
-                // Actual reward distribution is epoch-based
                 Ok(gas.consumed)
             }
             TxBody::UpdateStake(body) => {
-                // The native inference binding froze this committee; see
-                // `refuse_registry_change_under_native_binding`.
                 self.refuse_registry_change_under_native_binding()?;
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
@@ -6453,7 +5600,6 @@ impl StateDB {
                 }
 
                 if body.new_stake > current_stake {
-                    // Increasing stake: deduct difference from balance
                     let diff = body.new_stake - current_stake;
                     if sender.balance < diff {
                         return Err(StateError::InsufficientBalance {
@@ -6472,7 +5618,6 @@ impl StateDB {
                     sender.balance = new_balance;
                     sender.staked_balance = new_account_stake;
                 } else if body.new_stake < current_stake {
-                    // Decreasing stake: return difference to balance
                     let diff = current_stake - body.new_stake;
                     let new_account_stake =
                         sender.staked_balance.checked_sub(diff).ok_or_else(|| {
@@ -6486,7 +5631,6 @@ impl StateDB {
                     sender.balance = new_balance;
                 }
 
-                // Update or remove validator entry
                 if body.new_stake == 0 {
                     self.validators.remove(&tx.from.0);
                 } else {
@@ -6507,10 +5651,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::Governance(body) => {
-                // Governance transactions record on-chain that a proposal was executed.
-                // The actual governance state (votes, proposal lifecycle) is managed by
-                // GovernanceState in arc-types; this TX type ensures the execution is
-                // recorded as a transaction with gas accounting and nonce tracking.
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -6535,7 +5675,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::BridgeLock(body) => {
-                // Lock tokens in the bridge escrow account for cross-chain transfer.
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -6550,14 +5689,12 @@ impl StateDB {
                     });
                 }
 
-                // Deduct from sender
                 sender.balance -= body.amount;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // Credit bridge escrow account (well-known address)
                 let escrow_addr = hash_bytes(b"ARC-bridge-escrow");
                 let mut escrow = self.get_or_create_account(&escrow_addr);
                 escrow.balance = body.amount;
@@ -6574,9 +5711,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::BridgeMint(body) => {
-                // Mint bridged tokens on ARC Chain from a source chain.
-                // Validate that a merkle proof is provided (full verification
-                // of the source chain proof is deferred to a future light client).
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -6590,13 +5724,11 @@ impl StateDB {
                     ));
                 }
 
-                // Increment sender nonce (bridge relayer)
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // Credit recipient
                 let mut recipient = self.get_or_create_account(&body.recipient);
                 recipient.balance = body.amount;
                 self.accounts.insert(body.recipient.0, recipient.clone());
@@ -6613,8 +5745,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::BatchSettle(body) => {
-                // --- Batch Settlement: net bilateral balances ---
-                // Validate entry count before any state access (DoS protection).
                 if body.entries.len() > gas_costs::BATCH_SETTLE_MAX_ENTRIES {
                     return Err(StateError::ExecutionError(format!(
                         "BatchSettle exceeds max entries: {} > {}",
@@ -6635,7 +5765,6 @@ impl StateDB {
                     });
                 }
 
-                // Compute total gross amount across all entries
                 let total_amount: u64 = body.entries.iter().map(|e| e.amount).sum();
                 if sender.balance < total_amount {
                     return Err(StateError::InsufficientBalance {
@@ -6644,21 +5773,18 @@ impl StateDB {
                     });
                 }
 
-                // Net balances per recipient (multiple entries to same agent get summed)
                 let mut net_credits: std::collections::HashMap<[u8; 32], u64> =
                     std::collections::HashMap::new();
                 for entry in &body.entries {
                     *net_credits.entry(entry.agent_id.0).or_insert(0) += entry.amount;
                 }
 
-                // Debit sender once for total
                 sender.balance -= total_amount;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // Credit each unique recipient once (netted)
                 for (agent_addr, net_amount) in &net_credits {
                     let agent_address = Hash256(*agent_addr);
                     let mut agent = self.get_or_create_account(&agent_address);
@@ -6671,7 +5797,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::ChannelOpen(body) => {
-                // --- Open State Channel: lock funds ---
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -6686,23 +5811,15 @@ impl StateDB {
                     });
                 }
 
-                // Lock funds: debit from balance (held in channel escrow)
                 sender.balance -= body.deposit;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // Record channel deposit in a deterministic escrow address
-                // Channel escrow = BLAKE3("arc-channel" || channel_id)
                 let escrow_addr = hash_bytes(&[b"arc-channel", body.channel_id.as_ref()].concat());
                 let mut escrow = self.get_or_create_account(&escrow_addr);
                 escrow.balance = body.deposit;
-                // Store channel participants in escrow metadata:
-                //   code_hash  = opener address (tx.from)
-                //   storage_root = counterparty address
-                // These are unused for escrow accounts (no contract code / no storage)
-                // and allow ChannelClose to credit both parties correctly.
                 escrow.code_hash = tx.from;
                 escrow.storage_root = body.counterparty;
                 self.accounts.insert(escrow_addr.0, escrow.clone());
@@ -6712,7 +5829,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::ChannelClose(body) => {
-                // --- Close State Channel: release funds by mutual agreement ---
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -6722,13 +5838,10 @@ impl StateDB {
                 }
                 sender.nonce += 1;
 
-                // Load channel escrow
                 let escrow_addr = hash_bytes(&[b"arc-channel", body.channel_id.as_ref()].concat());
                 let escrow = self.get_or_create_account(&escrow_addr);
                 let total_locked = escrow.balance;
 
-                // Authorization: only the channel opener or counterparty can close.
-                // Opener is stored in escrow.code_hash, counterparty in escrow.storage_root.
                 let opener_addr = escrow.code_hash;
                 let counterparty_addr_stored = escrow.storage_root;
                 if tx.from != opener_addr && tx.from != counterparty_addr_stored {
@@ -6737,16 +5850,12 @@ impl StateDB {
                     ));
                 }
 
-                // Reject close if there is an active dispute whose challenge period
-                // has not yet expired. escrow.staked_balance stores the challenge
-                // expiry height (0 = no dispute).
                 if escrow.staked_balance > 0 && self.height() < escrow.staked_balance {
                     return Err(StateError::ExecutionError(
                         "channel close: active dispute in progress, wait for challenge period to expire".to_string(),
                     ));
                 }
 
-                // Validate final balances don't exceed locked funds
                 let claimed_total = body
                     .opener_balance
                     .saturating_add(body.counterparty_balance);
@@ -6757,22 +5866,17 @@ impl StateDB {
                     )));
                 }
 
-                // Drain escrow
                 let mut escrow_mut = self.get_or_create_account(&escrow_addr);
                 escrow_mut.balance = 0;
                 self.accounts.insert(escrow_addr.0, escrow_mut.clone());
                 self.wal
                     .append(WalOp::SetAccount(escrow_addr, escrow_mut), self.height());
 
-                // Credit opener - ADD back their channel share to existing balance
                 sender.balance += body.opener_balance;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // Credit counterparty - address was stored in escrow.storage_root
-                // during ChannelOpen (see above). This is the definitive on-chain
-                // record of who the counterparty is.
                 let counterparty_addr = escrow.storage_root;
                 if body.counterparty_balance > 0 && counterparty_addr != Hash256::ZERO {
                     let mut counterparty = self.get_or_create_account(&counterparty_addr);
@@ -6788,15 +5892,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::ChannelDispute(body) => {
-                // --- Dispute State Channel: submit latest signed state ---
-                //
-                // Escrow fields used for dispute tracking:
-                //   escrow.nonce          = highest accepted state_nonce (0 = no dispute yet)
-                //   escrow.staked_balance  = challenge_expiry height (0 = no active dispute)
-                //   escrow.balance         = total locked funds (set during ChannelOpen)
-                //   escrow.code_hash       = opener address
-                //   escrow.storage_root    = counterparty address
-
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -6809,7 +5904,6 @@ impl StateDB {
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // Validate escrow exists and has locked funds
                 let escrow_addr = hash_bytes(&[b"arc-channel", body.channel_id.as_ref()].concat());
                 let mut escrow = self.get_or_create_account(&escrow_addr);
                 if escrow.balance == 0 {
@@ -6818,22 +5912,18 @@ impl StateDB {
                     ));
                 }
 
-                // Authorization: only the channel opener or counterparty can dispute.
                 if tx.from != escrow.code_hash && tx.from != escrow.storage_root {
                     return Err(StateError::ExecutionError(
                         "channel dispute: sender is neither opener nor counterparty".to_string(),
                     ));
                 }
 
-                // Validate challenge_period is reasonable (1..=100_000 blocks).
                 if body.challenge_period == 0 || body.challenge_period > 100_000 {
                     return Err(StateError::ExecutionError(
                         "channel dispute: challenge_period must be 1..=100000".to_string(),
                     ));
                 }
 
-                // If a previous dispute exists and its challenge period has expired,
-                // the state is already finalized - no further disputes allowed.
                 if escrow.staked_balance > 0 && self.height() >= escrow.staked_balance {
                     return Err(StateError::ExecutionError(
                         "channel dispute: challenge period has expired, state is finalized"
@@ -6841,8 +5931,6 @@ impl StateDB {
                     ));
                 }
 
-                // State nonce must be strictly higher than the previously disputed state.
-                // This prevents replay attacks with old channel states.
                 if escrow.staked_balance > 0 && body.state_nonce <= escrow.nonce {
                     return Err(StateError::ExecutionError(format!(
                         "channel dispute: state_nonce {} must exceed previously disputed nonce {}",
@@ -6850,7 +5938,6 @@ impl StateDB {
                     )));
                 }
 
-                // Validate balance conservation: claimed split must not exceed locked funds.
                 let claimed_total = body
                     .opener_balance
                     .saturating_add(body.counterparty_balance);
@@ -6861,7 +5948,6 @@ impl StateDB {
                     )));
                 }
 
-                // Update dispute state in escrow.
                 let challenge_expiry = self.height() + body.challenge_period;
                 escrow.nonce = body.state_nonce;
                 escrow.staked_balance = challenge_expiry;
@@ -6872,7 +5958,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::ShardProof(body) => {
-                // --- Shard Proof: verify and record STARK proof of shard block ---
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -6885,33 +5970,26 @@ impl StateDB {
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // Validate proof is non-empty
                 if body.proof_data.is_empty() {
                     return Err(StateError::ExecutionError(
                         "shard proof: empty proof data".to_string(),
                     ));
                 }
 
-                // Validate state root transition is non-trivial
                 if body.prev_state_root == body.post_state_root && body.tx_count > 0 {
                     return Err(StateError::ExecutionError(
                         "shard proof: state root unchanged despite transactions".to_string(),
                     ));
                 }
 
-                // --- Cryptographic STARK verification (when stwo-prover feature is on) ---
-                // Constructs a RecursiveVerifierInput from the ShardProofBody fields
-                // and calls verify_recursive_proof to check the binding hash in the
-                // proof receipt. This ensures the proof was generated by a real Stwo
-                // prover over the claimed state transition.
                 #[cfg(feature = "stwo-prover")]
                 {
                     let recursive_input = arc_crypto::stwo_air::RecursiveVerifierInput {
                         child_hashes: vec![body.block_hash.0],
                         child_start_states: vec![body.prev_state_root.0],
                         child_end_states: vec![body.post_state_root.0],
-                        merkle_siblings: vec![vec![]], // single-child: no siblings needed
-                        expected_merkle_root: body.block_hash.0, // single-child: root = child hash
+                        merkle_siblings: vec![vec![]],
+                        expected_merkle_root: body.block_hash.0,
                     };
                     if !arc_crypto::stwo_air::verify_recursive_proof(
                         &recursive_input,
@@ -6923,9 +6001,6 @@ impl StateDB {
                     }
                 }
 
-                // Record verified shard proof - store proof hash in a deterministic
-                // address derived from shard_id + block_height.
-                // This creates an on-chain receipt that shard X's block Y was proven.
                 let mut proof_input = Vec::new();
                 proof_input.extend_from_slice(b"arc-shard-proof");
                 proof_input.extend_from_slice(&body.shard_id.to_le_bytes());
@@ -6933,8 +6008,6 @@ impl StateDB {
                 let proof_key = hash_bytes(&proof_input);
                 let proof_hash = hash_bytes(&body.proof_data);
                 let mut proof_record = self.get_or_create_account(&proof_key);
-                // Store proof hash in the "balance" field as a u64 fingerprint
-                // (first 8 bytes of BLAKE3 hash). Full proof data is in the TX itself.
                 proof_record.balance =
                     u64::from_le_bytes(proof_hash.0[..8].try_into().unwrap_or([0u8; 8]));
                 proof_record.nonce = body.block_height;
@@ -6945,18 +6018,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::InferenceAttestation(body) => {
-                // --- Tier 2 Optimistic Inference Attestation ---
-                //
-                // This transaction records a provider's signed model/input/
-                // output commitment and optionally locks a challenge bond. It
-                // does NOT pay a reward by itself: a raw self-signed
-                // attestation has no coordinator-issued job or assignment and
-                // used to let anyone drain the treasury with bond=0. Verified
-                // community jobs are paid by `CommunityInferenceReward`.
-
-                // 1. Verify sender nonce against a detached account. A stale
-                // transaction from a previously unseen sender must not create
-                // an unpersisted zero account on its failure path.
                 let mut sender = self
                     .get_account(&tx.from)
                     .unwrap_or_else(|| Account::new(tx.from, 0));
@@ -6970,7 +6031,6 @@ impl StateDB {
                     StateError::ExecutionError("inference attestation nonce overflow".to_string())
                 })?;
 
-                // 2. Verify sender has sufficient balance for the bond.
                 if sender.balance < body.bond {
                     return Err(StateError::InsufficientBalance {
                         have: sender.balance,
@@ -6978,14 +6038,6 @@ impl StateDB {
                     });
                 }
 
-                // 3. Prebuild optional escrow state before the first write.
-                //    bond == 0 (community-worker path): nothing to lock, so no
-                //    escrow is created. bond > 0: lock the bond in a
-                //    deterministic escrow keyed by BLAKE3("arc-inference" ||
-                //    attestation_hash) and queue it for release after
-                //    `challenge_period` blocks. See the escrow encoding at the
-                //    top of this file (code_hash = attester, nonce = release
-                //    height, storage_root = MAGIC|status).
                 let escrow_candidate = if body.bond > 0 {
                     let escrow_addr = hash_bytes(&[b"arc-inference", tx.hash.as_ref()].concat());
                     if self.accounts.contains_key(&escrow_addr.0) {
@@ -7003,8 +6055,8 @@ impl StateDB {
                         })?;
                     let mut escrow = Account::new(escrow_addr, 0);
                     escrow.balance = body.bond;
-                    escrow.code_hash = tx.from; // refund target
-                    escrow.nonce = release_height; // maturation deadline
+                    escrow.code_hash = tx.from;
+                    escrow.nonce = release_height;
                     let mut sr = [0u8; 32];
                     sr[..8].copy_from_slice(&ATTEST_ESCROW_MAGIC);
                     sr[8] = ATTEST_STATUS_OPEN;
@@ -7014,7 +6066,6 @@ impl StateDB {
                     None
                 };
 
-                // 4. Commit only after every fallible precondition succeeded.
                 sender.balance = sender.balance.checked_sub(body.bond).ok_or_else(|| {
                     StateError::ExecutionError(
                         "inference attestation balance underflow".to_string(),
@@ -7030,8 +6081,6 @@ impl StateDB {
                     self.wal
                         .append(WalOp::SetAccount(escrow_addr, escrow), self.height());
 
-                    // Queue for the maturation sweep. Buckets are kept sorted
-                    // so the per-block drain order is deterministic.
                     let mut q = self.pending_bond_releases.lock();
                     let bucket = q.entry(release_height).or_default();
                     if let Err(pos) = bucket.binary_search(&escrow_addr.0) {
@@ -7051,9 +6100,6 @@ impl StateDB {
                             .to_string(),
                     ));
                 }
-                // The outer signer is an active-validator aggregator. It does
-                // not by itself certify off-chain verification; the bounded
-                // approval quorum below is the authorization boundary.
                 if !self.is_validator(&tx.from) {
                     return Err(StateError::ExecutionError(format!(
                         "community inference reward: signer {} is not an active validator",
@@ -7220,22 +6266,9 @@ impl StateDB {
                     )));
                 }
 
-                // All cheap structural, certificate, and replay checks happen
-                // before the approval quorum's Ed25519 work. No state has been
-                // mutated yet, so every failure remains atomic.
                 self.verify_community_reward_validator_approvals(body)?;
 
-                // Rewards are all-or-nothing. Partial tail payouts made worker
-                // selection depend on parallel lock order and could fork state.
                 let reward = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
-                // Validate the recipient credit before mutating the treasury.
-                // State transitions are not automatically rolled back when an
-                // executor arm returns an error, so every fallible check must
-                // happen before the first write.
-                // Build a detached candidate account. `get_or_create_account`
-                // inserts immediately, which would mutate state even when the
-                // treasury check below fails. Failed reward execution must be
-                // atomic and must not leave an un-WALed zero-balance worker.
                 let mut worker = self
                     .get_account(&body.worker)
                     .unwrap_or_else(|| Account::new(body.worker, 0));
@@ -7261,9 +6294,6 @@ impl StateDB {
                     )
                 })?;
 
-                // Marker candidates are detached too. Although the addresses
-                // are cryptographic hashes, reject every semantic collision so
-                // a future hash/domain change cannot overwrite a live account.
                 if job_marker_addr == certificate_marker_addr
                     || job_marker_addr == body.worker
                     || certificate_marker_addr == body.worker
@@ -7379,8 +6409,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::InferenceChallenge(body) => {
-                // --- Tier 2 Inference Challenge (Fraud Proof) ---
-                // 1. Verify sender nonce
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -7389,7 +6417,6 @@ impl StateDB {
                     });
                 }
 
-                // 2. Verify sender has sufficient balance for challenger bond
                 if sender.balance < body.challenger_bond {
                     return Err(StateError::InsufficientBalance {
                         have: sender.balance,
@@ -7397,7 +6424,6 @@ impl StateDB {
                     });
                 }
 
-                // 3. Look up the attestation escrow
                 let escrow_addr =
                     hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
                 let escrow = self.get_or_create_account(&escrow_addr);
@@ -7408,18 +6434,12 @@ impl StateDB {
                     ));
                 }
 
-                // 4. Debit challenger bond and increment nonce
                 sender.balance -= body.challenger_bond;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // 5. Lock challenger's bond in the same escrow AND mark the
-                //    escrow CHALLENGED so the bond-maturation sweep leaves it
-                //    locked. A disputed/slashed bond must never be auto-refunded
-                //    to the attester; it stays escrowed pending dispute
-                //    resolution (see the escrow-encoding note at file top).
                 let total_bond = escrow.balance + body.challenger_bond;
                 let mut escrow = escrow.clone();
                 escrow.balance = total_bond;
@@ -7432,21 +6452,9 @@ impl StateDB {
                 self.wal
                     .append(WalOp::SetAccount(escrow_addr, escrow), self.height());
 
-                // 6. Dispute resolution: if challenger_output_hash differs from the
-                //    attested output, the dispute is recorded.  On-chain re-execution
-                //    via precompile 0x0A determines the winner.  For now, the dispute
-                //    is recorded and validators resolve it at challenge period expiry.
-                //    Full resolution would call the AI precompile and compare outputs;
-                //    the winner receives both bonds and the loser is slashed.
-
                 Ok(gas.consumed)
             }
             TxBody::InferenceRegister(body) => {
-                // --- Register as Inference Provider ---
-                // Validators declare hardware tier and lock a stake bond.
-                // The chain maintains a registry in sender's account metadata:
-                //   staked_balance += stake_bond (locked)
-                //   nonce field tracks the declared tier
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -7455,7 +6463,6 @@ impl StateDB {
                     });
                 }
 
-                // Validate tier (1-4)
                 if body.tier == 0 || body.tier > 4 {
                     return Err(StateError::ExecutionError(format!(
                         "inference register: invalid tier {}, must be 1-4",
@@ -7463,7 +6470,6 @@ impl StateDB {
                     )));
                 }
 
-                // Validate sufficient balance for stake bond
                 if sender.balance < body.stake_bond {
                     return Err(StateError::InsufficientBalance {
                         have: sender.balance,
@@ -7471,7 +6477,6 @@ impl StateDB {
                     });
                 }
 
-                // Validate minimum stake for tier
                 let min_stakes = [0u64, 1_000, 5_000, 10_000, 25_000];
                 let min_stake = min_stakes[body.tier as usize];
                 if body.stake_bond < min_stake {
@@ -7481,7 +6486,6 @@ impl StateDB {
                     )));
                 }
 
-                // Lock stake: move from balance to staked_balance
                 sender.balance -= body.stake_bond;
                 sender.staked_balance += body.stake_bond;
                 sender.nonce += 1;
@@ -7492,11 +6496,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::InferenceEscrowOpen(body) => {
-                // Milestone B: payer locks `max_fee` in a deterministic
-                // escrow account keyed by request_id. Metadata (model_id,
-                // max_tokens, timeout_blocks, payer) is committed into the
-                // account's storage_root so release/refund callers must
-                // prove they know the same fields by rehashing.
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -7522,14 +6521,12 @@ impl StateDB {
                     )));
                 }
 
-                // Debit payer.
                 sender.balance -= body.max_fee;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // Credit escrow + stash metadata commitment.
                 let commitment = InferenceEscrowOpenBody::metadata_commitment(
                     &tx.from,
                     &body.model_id,
@@ -7538,8 +6535,6 @@ impl StateDB {
                 );
                 let mut escrow = existing;
                 escrow.balance = body.max_fee;
-                // Abuse `nonce` as the opened-at block height. Refund
-                // re-reads this to enforce the timeout.
                 escrow.nonce = self.height();
                 escrow.storage_root = Hash256(commitment);
                 self.accounts.insert(escrow_addr_bytes, escrow.clone());
@@ -7549,10 +6544,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::InferenceEscrowRelease(body) => {
-                // Milestone B: distribute the locked max_fee per the
-                // RoleRevenueConfig split (40% proposer / 25% replicas /
-                // 15% observer pool / 20% treasury). Any rounding goes to
-                // treasury so total is always conserved.
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -7589,13 +6580,11 @@ impl StateDB {
                     ));
                 }
 
-                // Advance release-submitter nonce.
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // 40/25/15/20 split; treasury absorbs all truncation residue.
                 let total = escrow.balance;
                 let proposer_share = total * 40 / 100;
                 let replicas_pool = total * 25 / 100;
@@ -7604,7 +6593,6 @@ impl StateDB {
                 let replicas_paid = per_replica * body.replicas.len() as u64;
                 let treasury_share = total - proposer_share - replicas_paid - observer_share;
 
-                // Credit proposer.
                 let mut proposer_acc = self.get_or_create_account(&body.proposer);
                 proposer_acc.balance += proposer_share;
                 self.accounts.insert(body.proposer.0, proposer_acc.clone());
@@ -7613,7 +6601,6 @@ impl StateDB {
                     self.height(),
                 );
 
-                // Credit each replica.
                 for r in &body.replicas {
                     let mut rep = self.get_or_create_account(r);
                     rep.balance += per_replica;
@@ -7621,22 +6608,18 @@ impl StateDB {
                     self.wal.append(WalOp::SetAccount(*r, rep), self.height());
                 }
 
-                // Credit observer pool.
                 let mut obs = self.get_or_create_account(&body.observer_pool);
                 obs.balance += observer_share;
                 self.accounts.insert(body.observer_pool.0, obs.clone());
                 self.wal
                     .append(WalOp::SetAccount(body.observer_pool, obs), self.height());
 
-                // Credit treasury (includes rounding residue).
                 let mut tre = self.get_or_create_account(&body.treasury);
                 tre.balance += treasury_share;
                 self.accounts.insert(body.treasury.0, tre.clone());
                 self.wal
                     .append(WalOp::SetAccount(body.treasury, tre), self.height());
 
-                // Zero the escrow and clear the commitment so the same
-                // request_id can't be released/refunded twice.
                 let mut released = escrow;
                 released.balance = 0;
                 released.storage_root = Hash256::ZERO;
@@ -7647,13 +6630,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::ModelRegistration(body) => {
-                // Milestone C: register a model; fee transfers to treasury.
-                // Milestone E anti-spam: fee is floored at
-                // MIN_MODEL_REGISTRATION_FEE (1000 ARC). Stored in a
-                // deterministic account keyed by model_id, with metadata
-                // committed into storage_root so later queries (or
-                // ModelRequest validation) can verify the model exists
-                // with the expected config.
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -7673,8 +6649,6 @@ impl StateDB {
                         need: fee,
                     });
                 }
-                // Reject duplicate registrations (same model_id already
-                // on-chain). Keeps the registry tamper-evident.
                 let registry_addr_bytes = ModelRegistrationBody::registry_account(&body.model_id);
                 let registry_addr = Hash256(registry_addr_bytes);
                 let existing = self.get_or_create_account(&registry_addr);
@@ -7684,7 +6658,6 @@ impl StateDB {
                     ));
                 }
 
-                // Debit payer; pay fee to treasury.
                 sender.balance -= fee;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
@@ -7698,7 +6671,6 @@ impl StateDB {
                 self.wal
                     .append(WalOp::SetAccount(treasury, tre), self.height());
 
-                // Write the registry entry.
                 let commitment = ModelRegistrationBody::metadata_commitment(
                     body.n_layers,
                     body.d_model,
@@ -7707,11 +6679,9 @@ impl StateDB {
                     &body.royalty_recipient,
                 );
                 let mut reg = existing;
-                reg.nonce = self.height(); // registered_at
+                reg.nonce = self.height();
                 reg.storage_root = Hash256(commitment);
-                // Park the paid fee in `balance` - a future Milestone E
-                // patch can meter royalty payouts from this pool.
-                reg.balance = 0; // fees already sent to treasury; reg holds no value today
+                reg.balance = 0;
                 self.accounts.insert(registry_addr_bytes, reg.clone());
                 self.wal
                     .append(WalOp::SetAccount(registry_addr, reg), self.height());
@@ -7719,10 +6689,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::ModelRequest(body) => {
-                // Milestone C: record demand. No fund movement today -
-                // the request sits on-chain for workers to observe and
-                // claim against. Future patch: bond_per_layer_epoch is
-                // escrowed here and released to claiming workers.
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -7738,11 +6704,6 @@ impl StateDB {
                 let req_addr_bytes = ModelRequestBody::request_account(&body.request_id);
                 let req_addr = Hash256(req_addr_bytes);
                 let mut req = self.get_or_create_account(&req_addr);
-                // Encode request state in existing account slots:
-                //   balance      = bond_per_layer_epoch (for planner weighting)
-                //   nonce        = posted_at height
-                //   storage_root = hash(model_id || target_k_replication ||
-                //                       max_wait_secs || requester)
                 req.balance = body.bond_per_layer_epoch;
                 req.nonce = self.height();
                 let mut meta = Vec::new();
@@ -7758,9 +6719,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::ShardCoverageClaim(body) => {
-                // Milestone C: worker locks a bond for the epoch.
-                // Slashing on non-serve is handled by a future verifier
-                // path (#31-style challenge + proof).
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -7791,16 +6749,11 @@ impl StateDB {
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // Lock bond in the deterministic claim account. Ranges
-                // are committed via storage_root so slashing/release can
-                // verify what was claimed without a separate DashMap.
                 let claim_addr_bytes =
                     ShardCoverageClaimBody::claim_account(&body.model_id, &body.node_pubkey);
                 let claim_addr = Hash256(claim_addr_bytes);
                 let mut claim = self.get_or_create_account(&claim_addr);
                 if claim.balance != 0 {
-                    // Refund and reset: the worker is renewing their
-                    // claim. Return the prior bond to tx.from first.
                     return Err(StateError::ExecutionError(
                         "shard coverage claim: prior claim still active - \
                          release or wait for epoch end before re-claiming"
@@ -7824,10 +6777,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::CapacityAdvertisement(body) => {
-                // Milestone D: record capacity advertisement. Pure
-                // metadata write - no funds move. Planner reads these
-                // plus open requests + current shard_registry to compute
-                // assignments.
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -7848,10 +6797,6 @@ impl StateDB {
                 let cap_addr_bytes = CapacityAdvertisementBody::capacity_account(&body.node_pubkey);
                 let cap_addr = Hash256(cap_addr_bytes);
                 let mut cap = self.get_or_create_account(&cap_addr);
-                // Encode capacity in storage_root so a replay of history
-                // reconstructs the same snapshot. A later patch can also
-                // store ram/vram/bandwidth individually in a sidecar
-                // DashMap for fast planner reads.
                 let mut meta = Vec::new();
                 meta.extend_from_slice(&body.ram_bytes.to_le_bytes());
                 meta.extend_from_slice(&body.vram_bytes.to_le_bytes());
@@ -7860,7 +6805,7 @@ impl StateDB {
                 meta.extend_from_slice(&body.stake.to_le_bytes());
                 meta.extend_from_slice(&(body.region.len() as u32).to_le_bytes());
                 meta.extend_from_slice(body.region.as_bytes());
-                cap.nonce = self.height(); // advertised_at
+                cap.nonce = self.height();
                 cap.storage_root = arc_crypto::hash_bytes(&meta);
                 self.accounts.insert(cap_addr_bytes, cap.clone());
                 self.wal
@@ -7869,12 +6814,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::ShardAssignmentProposal(body) => {
-                // Milestone D: record planner output. The hash of the
-                // input snapshot lets any full node recompute the
-                // assignment deterministically and check the proposer
-                // got the same answer. Actual enforcement (workers
-                // follow their assignment or lose claims) happens at
-                // /assignments/for_me read time, not here.
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -7892,10 +6831,6 @@ impl StateDB {
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // Derive a proposal-specific account from the input
-                // snapshot hash so replays collide and the latest
-                // proposer for a given input wins (last-write in
-                // block order).
                 let prop_addr = Hash256(
                     arc_crypto::hash_bytes(
                         &[b"arc-planner-proposal", body.input_snapshot_hash.0.as_ref()].concat(),
@@ -7903,8 +6838,6 @@ impl StateDB {
                     .0,
                 );
                 let mut prop = self.get_or_create_account(&prop_addr);
-                // Serialize compact representation into storage_root so
-                // the exact assignment replayed from history matches.
                 let mut buf = Vec::new();
                 buf.extend_from_slice(&body.epoch_blocks.to_le_bytes());
                 buf.extend_from_slice(&body.input_snapshot_hash.0);
@@ -7925,11 +6858,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::InferenceEscrowRefund(body) => {
-                // Milestone B: original payer reclaims funds after the
-                // `timeout_blocks` window elapses with no release. Only
-                // callable by the payer - identity proved by rehashing
-                // the same fields used at open and matching the stored
-                // commitment.
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -7971,7 +6899,6 @@ impl StateDB {
                     )));
                 }
 
-                // Refund locked balance to payer.
                 sender.balance += escrow.balance;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
@@ -7988,18 +6915,8 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::InferenceRequest(body) => {
-                // Tier 1 on-chain inference request. Locks `max_reward` in
-                // a deterministic escrow and records request metadata that
-                // every full node can reconstruct on replay.
-                //
-                // The committee is NOT derived here — it's derived at
-                // InferenceVote apply time using the commit block hash of
-                // *this* tx as the VRF seed. We record the anchor height
-                // in the escrow nonce so vote-apply knows which seed
-                // (block_hash_at_anchor_height) to use.
                 use arc_types::transaction as ttx;
 
-                // ── 1. Bounds checks (chain-enforced invariants) ──
                 if body.input_blob.len() > ttx::TIER1_INPUT_BLOB_MAX {
                     return Err(StateError::ExecutionError(format!(
                         "tier1 request: input_blob {} > max {}",
@@ -8036,8 +6953,6 @@ impl StateDB {
                         body.tier
                     )));
                 }
-                // Verify input_hash matches blob (chain-side check; the
-                // client may have computed it lazily).
                 let computed = hash_bytes(&body.input_blob);
                 if computed != body.input_hash {
                     return Err(StateError::ExecutionError(
@@ -8045,7 +6960,6 @@ impl StateDB {
                     ));
                 }
 
-                // ── 2. Verify sender nonce + balance ──
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -8060,14 +6974,12 @@ impl StateDB {
                     });
                 }
 
-                // ── 3. Debit max_reward, bump nonce ──
                 sender.balance -= body.max_reward;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // ── 4. Create request escrow ──
                 let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 let mut escrow = self.get_or_create_account(&escrow_addr);
                 if escrow.balance != 0 || escrow.code_hash != Hash256::ZERO {
@@ -8076,17 +6988,12 @@ impl StateDB {
                     ));
                 }
                 escrow.balance = body.max_reward;
-                // Anchor height in nonce for vote-apply to read.
                 escrow.nonce = self.height();
-                // Status byte 0 = Open. First byte of code_hash holds status.
                 let mut status_bytes = [0u8; 32];
                 status_bytes[0] = TIER1_STATUS_OPEN;
-                // Bytes [1..9] hold deadline_blocks (relative) for easy lookup.
                 status_bytes[1..9].copy_from_slice(&body.deadline_blocks.to_le_bytes());
-                // Byte 9 holds committee_size.
                 status_bytes[9] = body.committee_size;
                 escrow.code_hash = Hash256(status_bytes);
-                // Metadata commitment in storage_root.
                 let mut meta = Vec::new();
                 meta.extend_from_slice(&body.model_id.0);
                 meta.extend_from_slice(&body.input_hash.0);
@@ -8101,52 +7008,34 @@ impl StateDB {
                 self.wal
                     .append(WalOp::SetAccount(escrow_addr, escrow), self.height());
 
-                // Store the requester address so finalize knows whom to refund.
                 self.set_storage(
                     &escrow_addr,
                     hash_bytes(b"tier1.requester"),
                     tx.from.0.to_vec(),
                 );
-                // Store the prompt blob so committee members can fetch it
-                // from chain state if they missed the original tx.
                 self.set_storage(
                     &escrow_addr,
                     hash_bytes(b"tier1.input_blob"),
                     body.input_blob.clone(),
                 );
-                // Initialize empty vote list.
                 self.set_storage(
                     &escrow_addr,
                     hash_bytes(b"tier1.votes"),
                     bincode::serialize(&Vec::<(Address, Hash256)>::new()).unwrap_or_default(),
                 );
-                // Persist the request_id at a known storage key so a node
-                // restart can rebuild `tier1_pending` (which is in-memory
-                // and otherwise lost). Without this, the validator task
-                // wakes up after restart with an empty pending index and
-                // never finalizes the requests it can no longer see. The
-                // bug surfaced 2026-06-04 on the testnet — requests
-                // 0x9d9df698 + 0xbc754b43 stuck Open through two rolling
-                // restarts because the index was never rehydrated.
                 self.set_storage(
                     &escrow_addr,
                     hash_bytes(b"tier1.request_id"),
                     body.request_id.to_vec(),
                 );
 
-                // Index the open request for the validator inference task
-                // to poll. The anchor height equals the escrow's nonce,
-                // also used for committee seed derivation.
                 self.tier1_pending.insert(body.request_id, self.height());
 
                 Ok(gas.consumed)
             }
             TxBody::InferenceVote(body) => {
-                // Tier 1 committee member vote. Re-derive the committee
-                // deterministically and reject votes from non-members.
                 use arc_types::transaction as ttx;
 
-                // ── 1. Bounds checks ──
                 if let Some(blob) = &body.output_blob {
                     if blob.len() > ttx::TIER1_OUTPUT_BLOB_MAX {
                         return Err(StateError::ExecutionError(format!(
@@ -8155,7 +7044,6 @@ impl StateDB {
                             ttx::TIER1_OUTPUT_BLOB_MAX
                         )));
                     }
-                    // Verify hash matches blob if blob attached.
                     let computed = hash_bytes(blob);
                     if computed != body.output_hash {
                         return Err(StateError::ExecutionError(
@@ -8164,7 +7052,6 @@ impl StateDB {
                     }
                 }
 
-                // ── 2. Verify sender nonce ──
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -8173,7 +7060,6 @@ impl StateDB {
                     });
                 }
 
-                // ── 3. Look up request escrow ──
                 let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 let escrow = self.get_or_create_account(&escrow_addr);
                 if escrow.balance == 0 {
@@ -8190,17 +7076,6 @@ impl StateDB {
                 }
                 let committee_size = escrow.code_hash.0[9] as usize;
 
-                // ── 4. Derive committee deterministically ──
-                // The committee seed is recomputed from state-controlled
-                // fields, NOT from `body.committee_seed`. A voter-supplied
-                // seed would let a malicious member grind their address
-                // into the committee. The published `body.committee_seed`
-                // is advisory only — the security gate is this re-derive.
-                //
-                // Seed = BLAKE3("tier1-seed" || request_id || anchor_height_LE).
-                // anchor_height is `escrow.nonce`, set at apply_inference_request
-                // time from `self.height()`. The validator inference task uses
-                // the same derivation to learn which requests select it.
                 let mut seed_input: Vec<u8> = Vec::with_capacity(64);
                 seed_input.extend_from_slice(b"tier1-seed");
                 seed_input.extend_from_slice(&body.request_id);
@@ -8212,7 +7087,6 @@ impl StateDB {
                     .iter()
                     .map(|kv| Hash256(*kv.key()))
                     .collect();
-                // Deterministic ordering before scoring (HashMap iteration is not).
                 eligible.sort_by_key(|a| a.0);
                 let mut scored: Vec<(Address, Hash256)> = eligible
                     .into_iter()
@@ -8236,7 +7110,6 @@ impl StateDB {
                     )));
                 }
 
-                // ── 5. Load existing votes, reject duplicates, append ──
                 let key = hash_bytes(b"tier1.votes");
                 let existing = self.get_storage(&escrow_addr, &key).unwrap_or_default();
                 let mut votes: Vec<(Address, Hash256)> =
@@ -8252,22 +7125,18 @@ impl StateDB {
                 })?;
                 self.set_storage(&escrow_addr, key, encoded);
 
-                // ── 6. If voter attached blob, store it for the requester ──
                 if let Some(blob) = &body.output_blob {
-                    // Only the first attached blob is kept (saves space).
                     let blob_key = hash_bytes(b"tier1.output_blob");
                     if self.get_storage(&escrow_addr, &blob_key).is_none() {
                         self.set_storage(&escrow_addr, blob_key, blob.clone());
                     }
                 }
 
-                // ── 7. Bump signer nonce ──
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // ── 8. Flip status to Voting (if still Open) ──
                 if status == TIER1_STATUS_OPEN {
                     let mut updated = escrow.clone();
                     updated.code_hash.0[0] = TIER1_STATUS_VOTING;
@@ -8279,12 +7148,8 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::InferenceFinalize(body) => {
-                // Tier 1 finalize. Deterministic — first submitter wins,
-                // subsequent submissions reject because status flips to
-                // Finalized/Refunded after the first apply.
                 use arc_types::transaction as ttx;
 
-                // ── 1. Verify sender nonce (any signer can submit; only nonce check) ──
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -8297,7 +7162,6 @@ impl StateDB {
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // ── 2. Look up request escrow ──
                 let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 let escrow = self.get_or_create_account(&escrow_addr);
                 if escrow.balance == 0 {
@@ -8318,14 +7182,12 @@ impl StateDB {
                 let anchor_height = escrow.nonce;
                 let now = self.height();
 
-                // ── 3. Load votes ──
                 let key = hash_bytes(b"tier1.votes");
                 let votes_bytes = self.get_storage(&escrow_addr, &key).unwrap_or_default();
                 let votes: Vec<(Address, Hash256)> =
                     bincode::deserialize(&votes_bytes).unwrap_or_default();
                 let vote_count = votes.len();
 
-                // ── 4. Determine if finalization is eligible ──
                 let timeout_reached = now >= anchor_height.saturating_add(deadline_blocks);
                 let all_voted = vote_count >= committee_size;
                 if !timeout_reached && !all_voted {
@@ -8338,7 +7200,6 @@ impl StateDB {
                     )));
                 }
 
-                // ── 5. Aggregate votes ──
                 let min_agreement: usize = (committee_size / 2 + 1).max(1);
                 let mut tally: std::collections::HashMap<[u8; 32], usize> =
                     std::collections::HashMap::new();
@@ -8351,7 +7212,6 @@ impl StateDB {
                     .map(|(h, c)| (Hash256(*h), *c))
                     .unwrap_or((Hash256::ZERO, 0));
 
-                // ── 6. Look up requester ──
                 let requester_bytes = self
                     .get_storage(&escrow_addr, &hash_bytes(b"tier1.requester"))
                     .unwrap_or_default();
@@ -8368,11 +7228,9 @@ impl StateDB {
                 let max_reward = escrow.balance;
                 let new_status: u8;
                 if majority.1 >= min_agreement {
-                    // Consensus reached: pay agreeing voters, rebate requester, treasury cut.
                     let voters_pool = max_reward * ttx::TIER1_REWARD_SHARE_VOTERS_BPS / 10_000;
                     let refund = max_reward * ttx::TIER1_REWARD_SHARE_REFUND_BPS / 10_000;
                     let treasury = max_reward * ttx::TIER1_REWARD_SHARE_TREASURY_BPS / 10_000;
-                    // Anti-rounding remainder goes to treasury.
                     let remainder = max_reward.saturating_sub(voters_pool + refund + treasury);
 
                     let agreeing: Vec<Address> = votes
@@ -8387,14 +7245,12 @@ impl StateDB {
                     };
                     let voter_rem = voters_pool.saturating_sub(per_voter * agreeing.len() as u64);
 
-                    // Credit each agreeing voter.
                     for v in &agreeing {
                         let mut acct = self.get_or_create_account(v);
                         acct.balance = acct.balance.saturating_add(per_voter);
                         self.accounts.insert(v.0, acct.clone());
                         self.wal.append(WalOp::SetAccount(*v, acct), self.height());
                     }
-                    // Rebate to requester.
                     {
                         let mut acct = self.get_or_create_account(&requester);
                         acct.balance = acct.balance.saturating_add(refund);
@@ -8402,7 +7258,6 @@ impl StateDB {
                         self.wal
                             .append(WalOp::SetAccount(requester, acct), self.height());
                     }
-                    // Treasury (faucet_pool_address doubles as treasury sink for testnet).
                     let treasury_addr = arc_types::transaction::faucet_pool_address();
                     {
                         let mut acct = self.get_or_create_account(&treasury_addr);
@@ -8414,14 +7269,12 @@ impl StateDB {
                             .append(WalOp::SetAccount(treasury_addr, acct), self.height());
                     }
                     new_status = TIER1_STATUS_FINALIZED;
-                    // Record final output hash in escrow's storage_root for reads.
                     self.set_storage(
                         &escrow_addr,
                         hash_bytes(b"tier1.final_output_hash"),
                         majority.0.0.to_vec(),
                     );
                 } else {
-                    // Disagreement or timeout: refund payer minus anti-spam fee.
                     let fee = ttx::TIER1_ANTI_SPAM_FEE.min(max_reward);
                     let refund = max_reward - fee;
                     {
@@ -8442,7 +7295,6 @@ impl StateDB {
                     new_status = TIER1_STATUS_REFUNDED;
                 }
 
-                // ── 7. Zero escrow + flip status ──
                 let mut closed = escrow.clone();
                 closed.balance = 0;
                 closed.code_hash.0[0] = new_status;
@@ -8450,8 +7302,6 @@ impl StateDB {
                 self.wal
                     .append(WalOp::SetAccount(escrow_addr, closed), self.height());
 
-                // Drop from the pending index so the inference task stops
-                // polling this request.
                 self.tier1_pending.remove(&body.request_id);
 
                 Ok(gas.consumed)
@@ -8460,13 +7310,6 @@ impl StateDB {
                 if self.active_protocol_version().major == 3 {
                     self.validate_v3_faucet_admission(tx, body)?;
                 }
-                // Validator-authorized faucet drain. The signer (tx.from)
-                // must be in the active validator set — that authorization
-                // is what lets us debit a shared pool the signer doesn't
-                // own. Validator-set membership is deterministic across
-                // every seed (loaded from genesis.toml + on-chain
-                // JoinValidator txs), so this check produces the same
-                // accept/reject decision everywhere.
                 if !self.is_validator(&tx.from) {
                     return Err(StateError::ExecutionError(format!(
                         "faucet claim: signer {} is not an active validator",
@@ -8480,24 +7323,6 @@ impl StateDB {
                         arc_types::transaction::FAUCET_CLAIM_MAX
                     )));
                 }
-
-                // No signer-nonce check or bump. A validator-signed
-                // FaucetClaim is authorized by the Ed25519 signature plus
-                // is_validator(tx.from) — both deterministic across peers.
-                // The canonical recipient marker below provides chain-wide
-                // exactly-once protection even when different validators sign
-                // distinct transaction hashes for the same recipient. RPC
-                // rate limits are only an additional abuse control.
-                //
-                // We INTENTIONALLY do NOT enforce signer.nonce == tx.nonce
-                // here. Peers' committed-state nonce for a validator
-                // diverges from the validator's local nonce when commit-log
-                // heights drift (a common condition on this testnet — see
-                // memory/project_arc_session_handoff_20260510.md). A strict
-                // check causes spurious InvalidNonce rejections that block
-                // cross-seed propagation of the funded balance — exactly
-                // the bug v0.7.1 was meant to fix. Signer balance is also
-                // not touched: the pool is the shared source.
 
                 let pool_addr = arc_types::transaction::faucet_pool_address();
                 let protocol_v3 = self.active_protocol_version().major == 3;
@@ -8536,10 +7361,6 @@ impl StateDB {
                     )));
                 }
 
-                // Validate every fallible condition against detached account
-                // copies before the first write. A failed faucet transaction
-                // must be atomic and must never leave a debited pool or a
-                // fabricated recipient account.
                 let mut pool = self.get_account(&pool_addr).ok_or_else(|| {
                     StateError::ExecutionError(
                         "faucet claim: system faucet pool account is not prefunded".into(),
@@ -8597,13 +7418,6 @@ impl StateDB {
         }
     }
 
-    // ── Pipeline support ────────────────────────────────────────────────────
-    // Public wrappers for the 4-stage pipeline (B3), which executes on
-    // separate threads and needs direct access to individual operations.
-
-    /// Public wrapper around the private `execute_tx()` - used by the pipeline
-    /// execute stage which runs on a dedicated thread.
-    /// Returns gas consumed on success.
     pub fn execute_tx_pub(&self, tx: &Transaction) -> Result<u64, StateError> {
         if self.native_inference_context.read().is_some() {
             return Err(StateError::ExecutionError(
@@ -8619,16 +7433,10 @@ impl StateDB {
         self.execute_tx(tx)
     }
 
-    /// Public wrapper around `mark_tx_accounts_dirty()` for the pipeline.
     pub fn mark_tx_accounts_dirty_pub(&self, tx: &Transaction) {
         self.mark_tx_accounts_dirty(tx);
     }
 
-    /// Commit a batch of already-executed transactions into a block.
-    ///
-    /// Called by the pipeline commit stage.  The caller has already run
-    /// `execute_tx()` for each transaction and recorded success/failure
-    /// in `receipt_success`.
     pub fn commit_executed_block(
         &self,
         transactions: &[Transaction],
@@ -8675,17 +7483,7 @@ impl StateDB {
             })
             .collect();
 
-        // Refund matured, unchallenged Tier 2 attestation bonds at this height
-        // BEFORE the state root is computed so refunds land in this block.
-        // Bounded, deterministic, and a no-op when nothing has matured (always
-        // so on the bond==0 community-worker demo path). Applied uniformly to
-        // every real block-application path so the bond lifecycle advances the
-        // same way regardless of which execution engine sealed the block.
         self.sweep_matured_bond_releases(height);
-        // A coordinated binding change due at this height belongs INSIDE this
-        // block, exactly as the sweep above does: it has to be in the state
-        // before the root is taken, or it is a change only the nodes that ran
-        // this particular path ever make.
         self.apply_due_binding_change_in_block()?;
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
@@ -8732,8 +7530,6 @@ impl StateDB {
         self.wal.append(WalOp::Checkpoint(state_root), height);
         self.durable_wal_barrier()?;
 
-        // Auto-prune old state every 100 blocks unless in archive mode.
-        // Archive nodes keep full history for block explorers and analytics.
         if !self.archive_mode && height % 100 == 0 {
             self.prune_old_state(1000);
             self.prune_old_receipts(1000);
@@ -8742,27 +7538,7 @@ impl StateDB {
         Ok((block, receipts))
     }
 
-    /// Refund matured, unchallenged Tier 2 attestation bonds to their original
-    /// attesters and zero the escrows.
-    ///
-    /// Runs during block commit at the new `current_height`. Deterministic and
-    /// bounded: it drains up to [`MAX_BOND_RELEASES_PER_BLOCK`] escrows whose
-    /// release height is `<= current_height`, visiting them in
-    /// `pending_bond_releases` order (ascending release height, then ascending
-    /// escrow address — no map-iteration-order or wall-clock dependence). Each
-    /// escrow is validated against live account state before refunding.
-    /// Missing/already-zeroed escrows are dropped; CHALLENGED escrows are
-    /// dropped with the bond left locked pending dispute resolution; an OPEN,
-    /// matured escrow has its `balance` refunded to the attester
-    /// (`escrow.code_hash`) and is then zeroed.
-    ///
-    /// Conservation: every unit removed from an escrow is credited to exactly
-    /// one attester — a pure move, never a mint. Returns the number of bonds
-    /// refunded.
     pub fn sweep_matured_bond_releases(&self, current_height: u64) -> usize {
-        // Phase 1: under the queue lock, collect up to the per-block cap of due
-        // escrow addresses and remove them from the queue. Kept short so the
-        // account mutations below run without holding the queue lock.
         let due: Vec<[u8; 32]> = {
             let mut q = self.pending_bond_releases.lock();
             let mut picked: Vec<[u8; 32]> = Vec::new();
@@ -8784,27 +7560,23 @@ impl StateDB {
             picked
         };
 
-        // Phase 2: refund each due escrow (order is already deterministic).
         let mut refunded = 0usize;
         for escrow_key in due {
             let escrow_addr = Hash256(escrow_key);
             let escrow = match self.accounts.get(&escrow_key) {
                 Some(e) => e.clone(),
-                None => continue, // already pruned/resolved
+                None => continue,
             };
             if escrow.balance == 0 {
-                continue; // already resolved
+                continue;
             }
             if escrow.storage_root.0[..8] != ATTEST_ESCROW_MAGIC {
-                continue; // not a Tier 2 attestation escrow
+                continue;
             }
             if escrow.storage_root.0[8] != ATTEST_STATUS_OPEN {
-                continue; // challenged/slashed: leave locked
+                continue;
             }
             if current_height < escrow.nonce {
-                // Not actually matured — defensive; the queue key equals the
-                // release height, so this only fires on a corrupt rebuild.
-                // Re-queue and skip rather than refund early.
                 let mut q = self.pending_bond_releases.lock();
                 let bucket = q.entry(escrow.nonce).or_default();
                 if let Err(pos) = bucket.binary_search(&escrow_key) {
@@ -8816,8 +7588,6 @@ impl StateDB {
             let attester = escrow.code_hash;
             let amount = escrow.balance;
 
-            // Credit the attester (mirrors the FaucetClaim credit conventions:
-            // JMT leaf update when enabled, WAL append when active).
             {
                 let mut acct = self
                     .accounts
@@ -8837,8 +7607,6 @@ impl StateDB {
             }
             self.dirty_accounts.insert(attester.0);
 
-            // Zero the escrow and clear the MAGIC (marks it resolved: a later
-            // challenge sees balance==0 and a rebuild will not re-queue it).
             {
                 let mut esc = self
                     .accounts
@@ -8864,15 +7632,6 @@ impl StateDB {
         refunded
     }
 
-    /// Rebuild `pending_bond_releases` from surviving escrow accounts. Call
-    /// once at startup after any WAL replay / snapshot load (parallel to
-    /// [`rebuild_tier1_pending`]), since the queue is a derived, in-memory
-    /// index with no WAL op of its own.
-    ///
-    /// Strategy: scan every account whose `storage_root` carries the Tier 2
-    /// attestation MAGIC and is still OPEN with a non-zero balance, and
-    /// re-queue it under its release height (`escrow.nonce`). Zeroed/challenged
-    /// escrows are skipped. Returns the count re-queued.
     pub fn rebuild_pending_bond_releases(&self) -> usize {
         let mut q = self.pending_bond_releases.lock();
         q.clear();
@@ -8899,8 +7658,6 @@ impl StateDB {
         rebuilt
     }
 
-    /// Test/introspection helper: number of escrows currently queued for
-    /// bond release across all maturation heights.
     #[cfg(test)]
     fn pending_bond_release_count(&self) -> usize {
         self.pending_bond_releases
@@ -8910,15 +7667,6 @@ impl StateDB {
             .sum()
     }
 
-    /// Enable no-pruning mode and prove whether this data set is complete from
-    /// the *initial* protocol-v3 recovery boundary.
-    ///
-    /// Merely toggling archive mode cannot establish historical completeness:
-    /// a node may already have pruned transaction bodies or receipts. The
-    /// proof walks every v3-and-later block once and binds its committed
-    /// transaction vector to the tx index, full body, and exact receipt. A
-    /// future recovery checkpoint that omits any earlier v3 row therefore
-    /// stays incomplete even though pruning is disabled after import.
     pub fn enable_archive_mode(&mut self) -> bool {
         self.archive_mode = true;
         self.archive_history_boundary
@@ -8947,9 +7695,6 @@ impl StateDB {
         true
     }
 
-    /// True only after [`Self::enable_archive_mode`] proved every canonical
-    /// transaction and receipt from the initial v3 recovery boundary. New
-    /// archive blocks are checked incrementally before extending the claim.
     pub fn archive_reward_history_complete_since_v3_recovery(&self) -> bool {
         if !self.archive_mode || self.recovery_context().is_none() {
             return false;
@@ -8969,9 +7714,6 @@ impl StateDB {
             return true;
         }
         if !self.verify_archive_history_range(verified.saturating_add(1), current) {
-            // A block can be observed between the height increment and its
-            // final index publication. Return a transient false without
-            // destroying the already-proven prefix.
             return false;
         }
         self.archive_history_verified_through
@@ -8983,11 +7725,6 @@ impl StateDB {
         if from > through {
             return true;
         }
-        // A later recovery epoch changes the signing domain. Reward bodies
-        // retain their exact historical domain, and every protected recovery
-        // rollout mines canonical reward canaries, so the archive can verify
-        // all retained transaction bodies without incorrectly applying only
-        // today's domain to older v3 blocks.
         let mut recovery_domains = HashSet::new();
         if let Some(domain) = self.transaction_domain_hash() {
             recovery_domains.insert(domain);
@@ -9045,9 +7782,6 @@ impl StateDB {
         true
     }
 
-    /// Prune old JMT state, keeping the last `keep_versions` versions.
-    /// This frees memory for historical state that is no longer needed for
-    /// rollback or proofs.
     pub fn prune_old_state(&self, keep_versions: u64) {
         if self.archive_mode {
             return;
@@ -9059,11 +7793,6 @@ impl StateDB {
         }
     }
 
-    /// Prune receipts, tx_index, full_transactions, and account_txs entries
-    /// for blocks older than `keep_blocks` blocks behind the current height.
-    ///
-    /// This prevents unbounded memory growth at high TPS by discarding
-    /// historical receipt data that is no longer needed for normal operation.
     pub fn prune_old_receipts(&self, keep_blocks: u64) {
         if self.archive_mode {
             return;
@@ -9074,29 +7803,16 @@ impl StateDB {
         }
         let cutoff = current - keep_blocks;
 
-        // Remove receipts whose block_height is at or below the cutoff.
         self.receipts
             .retain(|_, receipt| receipt.block_height > cutoff);
 
-        // Remove tx_index entries that point to pruned blocks.
         self.tx_index
             .retain(|_, &mut (block_height, _)| block_height > cutoff);
 
-        // Remove full transactions for pruned blocks.
-        self.full_transactions.retain(|hash, _| {
-            // If we have no tx_index entry left for this hash, it was pruned.
-            self.tx_index.contains_key(hash)
-        });
+        self.full_transactions
+            .retain(|hash, _| self.tx_index.contains_key(hash));
     }
 
-    /// Collect state rent from all accounts using the given rent configuration.
-    ///
-    /// For each account:
-    /// - Deduct one epoch of rent from the balance.
-    /// - If the balance falls below the dust threshold, the account is
-    ///   considered dormant (balance is left as-is for grace period tracking).
-    ///
-    /// Returns `(rent_collected, dormant_count)`.
     pub fn collect_rent(&self, config: &StateRentConfig) -> (u64, u64) {
         let rent = config.rent_per_epoch();
         if rent == 0 {
@@ -9106,24 +7822,20 @@ impl StateDB {
         let mut total_collected: u64 = 0;
         let mut dormant_count: u64 = 0;
 
-        // Iterate all accounts and deduct rent.
         let keys: Vec<[u8; 32]> = self.accounts.iter().map(|e| *e.key()).collect();
         for key in keys {
             if let Some(mut entry) = self.accounts.get_mut(&key) {
                 let account = entry.value_mut();
 
-                // Skip accounts that are already below dust threshold (dormant).
                 if config.is_dormant(account.balance) {
                     dormant_count += 1;
                     continue;
                 }
 
-                // Deduct rent.
                 let deducted = account.balance.min(rent);
                 account.balance = account.balance.saturating_sub(rent);
                 total_collected += deducted;
 
-                // Check if account became dormant after deduction.
                 if config.is_dormant(account.balance) {
                     dormant_count += 1;
                 }
@@ -9135,21 +7847,16 @@ impl StateDB {
         (total_collected, dormant_count)
     }
 
-    /// Look up a transaction receipt by tx hash.
-    /// Takes the publication read lock; callers must hold no StateDB map guard.
     pub fn get_receipt(&self, tx_hash: &[u8; 32]) -> Option<TxReceipt> {
         let _publication = self.native_inference_publication.read();
         self.receipts.get(tx_hash).map(|r| r.clone())
     }
 
-    /// Look up transaction location (block_height, tx_index) by tx hash.
-    /// Takes the publication read lock; callers must hold no StateDB map guard.
     pub fn get_tx_location(&self, tx_hash: &[u8; 32]) -> Option<(u64, u32)> {
         let _publication = self.native_inference_publication.read();
         self.tx_index.get(tx_hash).map(|r| *r)
     }
 
-    /// Get all transaction hashes involving an account address.
     pub fn get_account_txs(&self, address: &[u8; 32]) -> Vec<Hash256> {
         self.account_txs
             .get(address)
@@ -9157,7 +7864,6 @@ impl StateDB {
             .unwrap_or_default()
     }
 
-    /// Get a range of blocks [from, to] with a maximum limit.
     pub fn get_block_range(&self, from: u64, to: u64, limit: usize) -> Vec<Block> {
         let mut blocks = Vec::new();
         let end = to.min(from.saturating_add(limit as u64).saturating_sub(1));
@@ -9169,9 +7875,6 @@ impl StateDB {
         blocks
     }
 
-    /// Persist the non-account records required to reconstruct a complete
-    /// post-block state. The checkpoint is appended only after these records,
-    /// and callers fsync immediately after the checkpoint.
     fn persist_restart_artifacts(
         &self,
         transactions: &[Transaction],
@@ -9204,20 +7907,11 @@ impl StateDB {
         }
     }
 
-    /// Index a transaction's sender and recipient addresses for `account_txs` lookups.
-    /// Caps per-account history at 10K entries to prevent unbounded memory growth.
     fn index_account_tx(&self, tx: &Transaction) {
         const MAX_TX_HISTORY: usize = 10_000;
-        // Index the sender first and DROP the DashMap entry guard before
-        // touching any other account. Holding a shard guard while calling
-        // `account_txs.entry(other_key)` deadlocks whenever the outer and
-        // inner keys land on the same shard - which happens for free when
-        // `other_key == tx.from.0` (e.g. an InferenceEscrowRelease whose
-        // coordinator is also the proposer).
         {
             let mut entry = self.account_txs.entry(tx.from.0).or_default();
             if entry.len() >= MAX_TX_HISTORY {
-                // Remove oldest 10% to amortize truncation cost
                 let drain_count = MAX_TX_HISTORY / 10;
                 entry.drain(..drain_count);
             }
@@ -9271,7 +7965,6 @@ impl StateDB {
             | TxBody::UpdateStake(_) => {}
             TxBody::Governance(_) => {}
             TxBody::BridgeLock(_) => {
-                // Escrow account is well-known; index it
                 let escrow_addr = hash_bytes(b"ARC-bridge-escrow");
                 self.account_txs
                     .entry(escrow_addr.0)
@@ -9377,9 +8070,7 @@ impl StateDB {
                     .or_default()
                     .push(tx.hash);
             }
-            TxBody::InferenceRegister(_) => {
-                // Registration modifies sender's staked_balance; sender is already tracked.
-            }
+            TxBody::InferenceRegister(_) => {}
             TxBody::InferenceEscrowOpen(body) => {
                 let escrow_addr = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 self.account_txs
@@ -9436,10 +8127,7 @@ impl StateDB {
                 let cap_addr = CapacityAdvertisementBody::capacity_account(&body.node_pubkey);
                 self.account_txs.entry(cap_addr).or_default().push(tx.hash);
             }
-            TxBody::ShardAssignmentProposal(_) => {
-                // Assignment proposals are indexed by input-hash; sender
-                // account already tracked above.
-            }
+            TxBody::ShardAssignmentProposal(_) => {}
             TxBody::FaucetClaim(body) => {
                 self.account_txs
                     .entry(body.recipient.0)
@@ -9461,9 +8149,6 @@ impl StateDB {
                     .push(tx.hash);
             }
             TxBody::InferenceRequest(body) => {
-                // Index against the request escrow address so a polling
-                // client (`GET /inference/onchain/result/:id`) can find
-                // the create tx by request_id.
                 let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 self.account_txs
                     .entry(escrow_addr.0)
@@ -9513,7 +8198,6 @@ impl StateDB {
         }
     }
 
-    /// Mark all accounts affected by a transaction as dirty for incremental state root.
     fn mark_tx_accounts_dirty(&self, tx: &Transaction) {
         self.dirty_accounts.insert(tx.from.0);
         match &tx.body {
@@ -9539,7 +8223,6 @@ impl StateDB {
                 self.dirty_accounts.insert(body.beneficiary.0);
             }
             TxBody::DeployContract(_) => {
-                // The contract address is deterministic - mark it dirty
                 let contract_addr = compute_contract_address(&tx.from, tx.nonce);
                 self.dirty_accounts.insert(contract_addr.0);
             }
@@ -9569,8 +8252,6 @@ impl StateDB {
             TxBody::ChannelClose(body) => {
                 let escrow_addr = hash_bytes(&[b"arc-channel", body.channel_id.as_ref()].concat());
                 self.dirty_accounts.insert(escrow_addr.0);
-                // Also mark the counterparty as dirty - their balance is modified during close.
-                // The counterparty address is stored in the escrow account's storage_root.
                 if let Some(escrow) = self.accounts.get(&escrow_addr.0)
                     && escrow.storage_root != Hash256::ZERO
                 {
@@ -9655,9 +8336,7 @@ impl StateDB {
                     hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
                 self.dirty_accounts.insert(escrow_addr.0);
             }
-            TxBody::InferenceRegister(_) => {
-                // Sender account is already marked dirty (line above match).
-            }
+            TxBody::InferenceRegister(_) => {}
             TxBody::InferenceEscrowOpen(body) => {
                 let escrow_addr = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 self.dirty_accounts.insert(escrow_addr);
@@ -9714,20 +8393,11 @@ impl StateDB {
                 self.dirty_accounts.insert(marker.0);
             }
             TxBody::InferenceRequest(body) => {
-                // Request: signer balance debited + escrow created.
                 let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 self.dirty_accounts.insert(escrow_addr.0);
             }
-            TxBody::InferenceVote(_body) => {
-                // Vote: only signer nonce + escrow.code_hash flip — both already covered
-                // (signer via the top-of-function insert; escrow not balance-affected).
-            }
+            TxBody::InferenceVote(_body) => {}
             TxBody::InferenceFinalize(body) => {
-                // Finalize: escrow zeroed, agreeing voters + requester + treasury credited.
-                // Exact voter set depends on stored vote bucket which we can't read here
-                // (this runs before/parallel-to execute_tx in some paths). Mark the escrow
-                // and the treasury; agreeing voters are marked by execute_tx via direct
-                // accounts.insert (which the dirty tracker also picks up).
                 let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 self.dirty_accounts.insert(escrow_addr.0);
                 let treasury_addr = arc_types::transaction::faucet_pool_address();
@@ -9755,31 +8425,16 @@ impl StateDB {
         }
     }
 
-    /// Compute the state root using the persistent incremental Merkle tree.
-    ///
-    /// **Common case** (existing accounts modified): rehash k dirty accounts
-    /// and recompute only the k affected paths → O(k log n).
-    ///
-    /// **Cold start or structural change** (new / removed accounts): full
-    /// rebuild → O(n).  This is the same cost as the old approach but
-    /// happens rarely (most blocks only modify existing accounts).
     fn compute_state_root(&self) -> Hash256 {
-        // Protocol-v3 recovery commits every consensus-relevant persisted
-        // domain. Legacy nodes retain the account-only Merkle root exactly.
         if let Some(context) = self.recovery_context() {
             return self.compute_recovery_state_root(&context);
         }
 
-        // Delegate to JMT if enabled.
         if self.use_jmt {
             return self.compute_state_root_jmt();
         }
 
         let mut tree = self.incremental_merkle.lock();
-        // Atomically collect and remove all dirty keys.
-        // We remove only the keys we collected so that any new keys added
-        // between iter() and remove() remain in the set for the next root
-        // computation (avoids the iter()+clear() race condition).
         let dirty_keys: Vec<[u8; 32]> = {
             let keys: Vec<[u8; 32]> = self.dirty_accounts.iter().map(|k| *k).collect();
             for k in &keys {
@@ -9791,9 +8446,6 @@ impl StateDB {
         let cold_start = tree.is_empty() && !self.accounts.is_empty();
 
         if cold_start {
-            // First time: bulk-build the keyed tree. Calling `update` once per
-            // account rebuilds its index on every structural insertion and is
-            // quadratic for production snapshots.
             let pairs: Vec<([u8; 32], Hash256)> = self
                 .accounts
                 .iter()
@@ -9810,7 +8462,6 @@ impl StateDB {
             return tree.root();
         }
 
-        // Rehash dirty accounts and update the tree.
         let mut changed_indices: Vec<usize> = Vec::with_capacity(dirty_keys.len());
         let mut structure_changed = false;
 
@@ -9824,7 +8475,6 @@ impl StateDB {
                     structure_changed = true;
                 }
             } else {
-                // Account was removed.
                 if tree.remove(key) {
                     structure_changed = true;
                 }
@@ -9840,21 +8490,8 @@ impl StateDB {
         tree.root()
     }
 
-    /// Compute state root using the Jellyfish Merkle Tree (incremental).
-    ///
-    /// Reads dirty accounts, hashes their current state, updates JMT leaves,
-    /// and returns the new root. Much faster than `compute_state_root()` for
-    /// blocks with few dirty accounts since the JMT maintains a sorted leaf
-    /// set and only recomputes the binary Merkle tree on `root_hash()`.
-    ///
-    /// Note: this consumes `dirty_accounts` just like `compute_state_root()`
-    /// does, so only one of the two should be called per block.
     fn compute_state_root_jmt(&self) -> Hash256 {
         let mut jmt = self.jmt.lock();
-        // Atomically collect and remove all dirty keys.
-        // We remove only the keys we collected so that any new keys added
-        // between iter() and remove() remain in the set for the next root
-        // computation (avoids the iter()+clear() race condition).
         let dirty_keys: Vec<[u8; 32]> = {
             let keys: Vec<[u8; 32]> = self.dirty_accounts.iter().map(|k| *k).collect();
             for k in &keys {
@@ -9867,7 +8504,6 @@ impl StateDB {
             return jmt.root_hash();
         }
 
-        // Cold start: populate JMT with all existing accounts.
         if jmt.is_empty() && !self.accounts.is_empty() {
             for entry in self.accounts.iter() {
                 let addr = *entry.key();
@@ -9878,13 +8514,11 @@ impl StateDB {
             return jmt.root_hash();
         }
 
-        // Update only dirty leaves.
         for key in &dirty_keys {
             if let Some(account) = self.accounts.get(key) {
                 let hash = hash_bytes(&bincode::serialize(account.value()).unwrap_or_default());
                 jmt.update_leaf(*key, hash);
             } else {
-                // Account was removed.
                 jmt.remove_leaf(key);
             }
         }
@@ -9892,20 +8526,12 @@ impl StateDB {
         jmt.root_hash()
     }
 
-    /// Enable the JMT for state root computation.
-    ///
-    /// When enabled, `compute_state_root()` delegates to
-    /// `compute_state_root_jmt()` instead of using IncrementalMerkle.
-    /// Initializes the JMT with all existing accounts on first call.
     pub fn enable_jmt(&mut self) {
-        // Native protocol-4 WAL recovery has one fixed account-root backend.
-        // Switching an active chain's hash algorithm is not a cache toggle.
         if self.native_inference_context.read().is_some() {
             tracing::warn!("JMT root switch ignored for the activated native protocol-4 candidate");
             return;
         }
         self.use_jmt = true;
-        // Initialize JMT with all existing accounts.
         let mut jmt = self.jmt.lock();
         for entry in self.accounts.iter() {
             let addr = *entry.key();
@@ -9915,24 +8541,19 @@ impl StateDB {
         }
     }
 
-    /// Get the JMT state root without consuming dirty accounts.
-    /// Useful for querying the current JMT root without side effects.
     pub fn jmt_root(&self) -> Hash256 {
         let mut jmt = self.jmt.lock();
         jmt.root_hash()
     }
 
-    /// Whether the JMT is enabled for state root computation.
     pub fn is_jmt_enabled(&self) -> bool {
         self.use_jmt
     }
 
-    /// Total number of accounts.
     pub fn account_count(&self) -> usize {
         self.accounts.len()
     }
 
-    /// Return all accounts with a non-zero staked balance (validators).
     pub fn get_staked_accounts(&self) -> Vec<(Address, Account)> {
         self.accounts
             .iter()
@@ -9941,54 +8562,28 @@ impl StateDB {
             .collect()
     }
 
-    /// Total number of blocks.
     pub fn block_count(&self) -> u64 {
         *self.height.read()
     }
 
-    /// Return the WAL's first fatal durability error, if any.
     pub fn wal_failure(&self) -> Option<WalError> {
         self.wal.failure()
     }
 
-    /// Return the directory containing the active state WAL.
-    ///
-    /// Benchmark/in-memory states use a null WAL and return `None`.
     pub fn persistence_dir(&self) -> Option<std::path::PathBuf> {
         self.wal.directory().map(Path::to_path_buf)
     }
 
-    /// Flush WAL to disk and report whether the barrier was durable.
     pub fn try_sync_wal(&self) -> Result<(), StateError> {
         self.durable_wal_barrier()
     }
 
-    /// Best-effort compatibility wrapper for shutdown callers. Consensus block
-    /// paths use the fallible barrier directly and never acknowledge failures.
     pub fn sync_wal(&self) {
         if let Err(error) = self.try_sync_wal() {
             tracing::error!(error = %error, "WAL shutdown sync failed");
         }
     }
 
-    // -----------------------------------------------------------------------
-    // State Sync Protocol (A5)
-    // -----------------------------------------------------------------------
-
-    /// Export the current state as a snapshot for state sync.
-    /// New nodes can download this to bootstrap without replaying from genesis.
-    /// Capture exactly the state that WAL replay reconstructs, so a snapshot
-    /// plus the WAL tail after it reaches the same state as replaying
-    /// everything. Anything `apply_wal_op` does not write is deliberately
-    /// excluded - including it would make the two paths disagree.
-    ///
-    /// History - blocks, receipts, bodies, event logs - is captured for the
-    /// most recent `snapshot_history_window` heights only. Capturing all of it
-    /// made every snapshot proportional to the length of the chain, and one
-    /// is rewritten every interval inside the consensus loop: quadratic I/O
-    /// over a node's life, and a stall that grew with every snapshot. The
-    /// older history is not lost - it is in the WAL, and opening a node
-    /// rebuilds it from there (see `is_history_op`).
     pub fn export_durable_snapshot(&self) -> snapshot::SnapshotPayload {
         let height = self.height();
         let window = self.snapshot_history_window.load(Ordering::Acquire).max(1);
@@ -10070,12 +8665,6 @@ impl StateDB {
         payload
     }
 
-    /// Install a verified snapshot into this (empty) state.
-    ///
-    /// Every row is applied through the SAME `apply_wal_op` path that replay
-    /// uses, so there is one implementation of what each record means. A
-    /// second implementation here would be a second thing to keep in step,
-    /// and the whole point of the snapshot is that it agrees with replay.
     pub fn install_durable_snapshot(&self, payload: &snapshot::SnapshotPayload) {
         for (address, account) in &payload.accounts {
             self.apply_wal_op(&WalOp::SetAccount(*address, account.clone()));
@@ -10107,16 +8696,12 @@ impl StateDB {
             self.native_inference_pending
                 .insert(request_id.0, *admission_height);
         }
-        // `height` is raised by each SetBlock, but a snapshot taken with no
-        // block at the tip must still report its own height.
         let mut height = self.height.write();
         if payload.height > *height {
             *height = payload.height;
         }
     }
 
-    /// The history part of a snapshot payload: its blocks, receipts, bodies
-    /// and event logs, through `apply_wal_op` like everything else.
     fn install_history_window(&self, payload: &snapshot::SnapshotPayload) {
         for (height, block) in &payload.blocks {
             self.apply_wal_op(&WalOp::SetBlock(*height, block.clone()));
@@ -10135,19 +8720,11 @@ impl StateDB {
         }
     }
 
-    /// The anchor round of the latest adopted checkpoint, if this node ever
-    /// adopted one: consensus must never resume scanning below the round
-    /// after it, whatever its other records say.
     pub fn rebase_anchor_round(&self) -> Option<u64> {
         let round = self.rebase_anchor_round.load(Ordering::Acquire);
         (round > 0).then_some(round)
     }
 
-    /// Empty the STATE a rebase replaces - accounts, storage, contracts,
-    /// identities, validators, native pending, staking pool - but not the
-    /// history this node already holds, its height, or configuration
-    /// (recovery context, reward activation), which adoption requires to be
-    /// unchanged.
     fn clear_state_for_rebase(&self) {
         self.accounts.clear();
         self.storage.clear();
@@ -10157,47 +8734,20 @@ impl StateDB {
         self.native_inference_pending.clear();
         self.dirty_accounts.clear();
         self.staking_pool.store(0, Ordering::Release);
-        // The community-reward activation height is configuration on an
-        // account-only-root chain (set from genesis at startup); adoption
-        // requires the checkpoint to carry this node's own value, so it is
-        // left as it is rather than reset to "disabled".
         *self.incremental_merkle.lock() = IncrementalMerkle::new();
     }
 
-    /// Rebuild every index a rebase cannot carry, from the adopted state, so
-    /// that a live rebase leaves memory as a restart of the same WAL would:
-    /// the open path rebuilds the native pending index from storage, and
-    /// startup rebuilds the Tier 1 and bond-release indexes.
     pub fn rebuild_after_rebase(&self) -> Result<(), StateError> {
-        // Bound before the `if let`: an `if let` scrutinee temporary lives
-        // for the whole body, and the body reaches `get_storage`, which takes
-        // the publication lock. Holding the context guard across that is the
-        // context -> publication order, the reverse of activation's.
         let context = self.native_inference_context.read().clone();
         if let Some(context) = context {
             self.rebuild_native_inference_pending(context.commitment()?)?;
         }
-        // Unlike the bond-release rebuild, this one only inserts.
         self.tier1_pending.clear();
         self.rebuild_tier1_pending();
         self.rebuild_pending_bond_releases();
         Ok(())
     }
 
-    /// Adopt a certified checkpoint, durably, before anything in memory moves.
-    ///
-    /// The caller has already verified the checkpoint envelope against this
-    /// node's own committee and domain, the payload digest, and that `tip`
-    /// is the certified block (see `CheckpointEnvelope::verify_resume_point`).
-    /// This proves again, in a scratch state, that the payload reproduces the
-    /// root `tip` carries - a record that would not replay must never be
-    /// written - then appends and fsyncs a `WalOp::Rebase` and applies it.
-    ///
-    /// It replaces the memory-only install a checkpoint used to get (lost at
-    /// the next restart, with no durable trace), and it is what lets a node
-    /// that already has history - one down longer than its peers' DAG
-    /// retention - rejoin at all. `payload` must be the output of
-    /// [`Self::plan_checkpoint_adoption`]: only what the certificate covers.
     pub fn rebase_onto_checkpoint(
         &self,
         payload: &snapshot::SnapshotPayload,
@@ -10207,9 +8757,6 @@ impl StateDB {
     ) -> Result<(), StateError> {
         let _guard = self.native_inference_execution.lock();
         self.require_healthy_wal()?;
-        // Only a planned adoption (`plan_checkpoint_adoption`) is written: the
-        // same shape open-time validation requires of a Rebase record, so a
-        // payload that skipped planning cannot break the next open.
         if !payload.receipts.is_empty()
             || !payload.event_logs.is_empty()
             || !payload.full_transactions.is_empty()
@@ -10232,14 +8779,7 @@ impl StateDB {
                 self.height()
             )));
         }
-        // The planner's preconditions again, immediately before the write:
-        // protocol 4 with selection rule v2, strict ordering, and every
-        // account filed under its own address.
         checkpoint_adoption::adoption_preconditions(self, payload)?;
-        // The history window itself, re-derived here rather than trusted from
-        // the planner: this is the last point before the blocks become
-        // durable, and a caller that assembled a payload by hand must not be
-        // able to write a window that does not chain to its certified tip.
         checkpoint_adoption::verify_history_window(&payload.blocks, tip)?;
         let scratch = Self::new();
         scratch.install_durable_snapshot(payload);
@@ -10248,10 +8788,6 @@ impl StateDB {
                 "checkpoint payload does not reproduce its tip's state root".into(),
             ));
         }
-        // Everything the rebuild after the write will check, checked here
-        // first: every native metadata row decodes, belongs to its escrow and
-        // matches that escrow's certified storage root. A failure after the
-        // record is durable would stop this node on every restart.
         if let Some(context) = self.native_inference_context.read().clone() {
             let commitment = context.commitment()?;
             *scratch.native_inference_context.write() = Some(context);
@@ -10267,41 +8803,20 @@ impl StateDB {
         self.wal
             .append(WalOp::Rebase(Box::new(record.clone())), height);
         self.durable_wal_barrier()?;
-        // The swap itself is exclusive: readers of native state (RPC, the
-        // worker) see the state before the rebase or after it, never the
-        // cleared or half-installed state.
-        //
-        // Nothing inside this block may call a public accessor. `get_account`,
-        // `get_storage`, `height`, `get_block`, `get_receipt` and
-        // `get_state_root` all take this same lock for read, and it is not
-        // reentrant: `get_state_root` here, and `get_storage` under
-        // `rebuild_after_rebase`, each deadlocked the adopting node against
-        // itself until its test was first run.
         {
             let _publication = self.native_inference_publication.write();
             self.apply_wal_op(&WalOp::Rebase(Box::new(record)));
             let adopted = self.compute_state_root();
             if adopted != tip.header.state_root {
-                // Durable and verified in scratch, so this cannot happen short
-                // of a bug; refuse loudly rather than run on a state nobody
-                // certified.
                 return Err(StateError::PersistenceError(format!(
                     "adopted checkpoint produced root {adopted}, expected {}",
                     tip.header.state_root
                 )));
             }
         }
-        // Derived indexes are rebuilt after the certified state is published,
-        // with the ordinary accessors. A reader between the two sees adopted,
-        // certified state whose native pending index is still filling; the
-        // worker picks those requests up on its next poll.
         self.rebuild_after_rebase()
     }
 
-    /// Empty everything a snapshot or replay would repopulate.
-    ///
-    /// Used to back out a snapshot whose state root did not verify, so a
-    /// refused snapshot leaves no residue for the full replay that follows.
     fn clear_replayable_state(&self) {
         self.accounts.clear();
         self.storage.clear();
@@ -10323,12 +8838,6 @@ impl StateDB {
         *self.incremental_merkle.lock() = IncrementalMerkle::new();
     }
 
-    /// Install the snapshot in `dir`, if there is one that verifies.
-    ///
-    /// Returns the WAL sequence already contained in it, so replay can resume
-    /// strictly after that point. `None` means "replay everything", which is
-    /// always correct - a snapshot is an optimisation over a durable log, so
-    /// refusing one can never cost correctness.
     fn adopt_snapshot_if_trustworthy(&self, dir: &Path) -> Option<snapshot::SnapshotManifestV1> {
         let verified = match snapshot::load(dir) {
             Ok(verified) => verified,
@@ -10348,10 +8857,6 @@ impl StateDB {
             );
             return Some(verified.manifest);
         }
-        // A digest proves the bytes are the ones that were written. It does
-        // not prove they describe the state they claim to, which is why the
-        // root is recomputed here - and why a mismatch backs the install out
-        // entirely rather than continuing on top of it.
         tracing::error!(
             expected = %verified.manifest.identity.state_root,
             %found,
@@ -10361,15 +8866,6 @@ impl StateDB {
         None
     }
 
-    /// Publish a snapshot of this state next to its WAL.
-    ///
-    /// The resume point is read AFTER the state is captured, never before: a
-    /// sequence taken first could name a record the capture did not include,
-    /// and replay would then skip it. `sequence()` is the NEXT number to hand
-    /// out, so it is exactly "the first record this snapshot does not
-    /// contain". Reading it after the capture can only make it too LOW, which
-    /// re-applies a record the snapshot already had - and every WAL op is
-    /// idempotent, so that direction is safe. Too high would lose a block.
     pub fn publish_durable_snapshot(
         &self,
     ) -> Result<snapshot::SnapshotManifestV1, snapshot::SnapshotError> {
@@ -10418,39 +8914,28 @@ impl StateDB {
         Snapshot {
             block_height: self.height(),
             state_root: self.get_state_root(),
-            wal_sequence: 0, // WAL sequence not tracked in StateDB directly
+            wal_sequence: 0,
             accounts,
             storage,
             contracts,
         }
     }
 
-    /// Import a snapshot to bootstrap state from a peer.
-    /// Replaces all current state with the snapshot data.
-    ///
-    /// **Security**: After loading the snapshot data, recomputes the Merkle
-    /// state root and verifies it matches `expected_state_root`.  If the roots
-    /// diverge the imported state is rolled back and an error is returned.
-    /// This prevents a malicious peer from injecting fabricated account
-    /// balances via a crafted snapshot.
     pub fn import_snapshot(
         &self,
         snapshot: &Snapshot,
         expected_state_root: Hash256,
     ) -> Result<(), StateError> {
-        // Clear existing state
         self.accounts.clear();
         self.contracts.clear();
         self.storage.clear();
         *self.incremental_merkle.lock() = IncrementalMerkle::new();
         self.dirty_accounts.clear();
 
-        // Load accounts
         for (addr, account) in &snapshot.accounts {
             self.accounts.insert(addr.0, account.clone());
         }
 
-        // Load contract storage
         for (addr, storage_entries) in &snapshot.storage {
             let storage_map = DashMap::new();
             for (key, value) in storage_entries {
@@ -10459,18 +8944,12 @@ impl StateDB {
             self.storage.insert(addr.0, storage_map);
         }
 
-        // Load contracts
         for (addr, bytecode) in &snapshot.contracts {
             self.contracts.insert(addr.0, bytecode.clone());
         }
 
-        // ── Verify state root ────────────────────────────────────────────
-        // Recompute the Merkle root from the freshly-loaded accounts and
-        // compare against the expected root (e.g. from consensus or the
-        // snapshot header).  A mismatch means the snapshot is tampered.
         let computed_root = self.compute_state_root();
         if computed_root != expected_state_root {
-            // Roll back: clear everything we just loaded
             self.accounts.clear();
             self.contracts.clear();
             self.storage.clear();
@@ -10482,20 +8961,10 @@ impl StateDB {
             )));
         }
 
-        // Update height only after verification passes
         *self.height.write() = snapshot.block_height;
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Propose-Verify Protocol (C1)
-    // -----------------------------------------------------------------------
-
-    /// Export a state diff from the set of dirty accounts.
-    ///
-    /// Called by the proposer after executing a block.  Returns the list of
-    /// accounts that changed and the new state root.  Verifiers receive this
-    /// diff and call `apply_state_diff()` to cheaply confirm correctness.
     pub fn export_state_diff(&self, dirty_keys: &[Address]) -> arc_types::StateDiff {
         use arc_types::{AccountChange, StateDiff};
 
@@ -10514,14 +8983,6 @@ impl StateDB {
         StateDiff { changes, new_root }
     }
 
-    /// Atomically apply a state diff whose declared root matches the resulting
-    /// state. A malformed or mismatched diff leaves both accounts and the
-    /// incremental state-root cache exactly as they were before this call.
-    ///
-    /// This is only a safe *application primitive*. A self-consistent diff does
-    /// not prove that its changes were produced by a committed block, so
-    /// consensus must authenticate its sender and independently execute the
-    /// committed transactions before treating the diff as valid.
     pub fn apply_state_diff(&self, diff: &arc_types::StateDiff) -> Result<Hash256, StateError> {
         use std::collections::HashSet;
 
@@ -10535,9 +8996,6 @@ impl StateDB {
         }
         self.require_healthy_wal()?;
 
-        // Flush any state changes that predate this diff so rollback has a
-        // stable root to restore. Reject ambiguous/malformed change sets before
-        // the first write.
         let original_root = self.compute_state_root();
         let mut seen = HashSet::with_capacity(diff.changes.len());
         for change in &diff.changes {
@@ -10555,9 +9013,6 @@ impl StateDB {
             }
         }
 
-        // Snapshot exactly the keys this diff may mutate. No WAL entry is
-        // emitted until validation succeeds, so a rejected diff has no durable
-        // side effects either.
         let originals: Vec<([u8; 32], Option<Account>)> = diff
             .changes
             .iter()
@@ -10600,8 +9055,6 @@ impl StateDB {
             )));
         }
 
-        // Persist only a fully validated diff. This keeps restart state aligned
-        // with the in-memory state without making rejected writes durable.
         let height = self.height();
         for change in &diff.changes {
             self.wal.append(
@@ -10614,22 +9067,15 @@ impl StateDB {
         Ok(computed_root)
     }
 
-    /// Verify and atomically apply a state diff.
     pub fn verify_state_diff(&self, diff: &arc_types::StateDiff) -> bool {
         self.apply_state_diff(diff).is_ok()
     }
 
-    /// Collect the current dirty account addresses (snapshot for export_state_diff).
     pub fn drain_dirty_addresses(&self) -> Vec<Address> {
         let keys: Vec<[u8; 32]> = self.dirty_accounts.iter().map(|k| *k).collect();
         keys.into_iter().map(Hash256).collect()
     }
 
-    // -----------------------------------------------------------------------
-    // Identity Registry
-    // -----------------------------------------------------------------------
-
-    /// Register an on-chain identity for an account.
     pub fn register_identity(&self, identity: Identity) {
         self.identities.insert(identity.address.0, identity.clone());
         self.wal.append(
@@ -10638,13 +9084,10 @@ impl StateDB {
         );
     }
 
-    /// Look up the identity record for an address.
     pub fn get_identity(&self, address: &Address) -> Option<Identity> {
         self.identities.get(&address.0).map(|i| i.clone())
     }
 
-    /// Check whether an address is compliant:
-    /// identity exists, is Verified or Institutional, not expired, not sanctioned.
     pub fn is_compliant(&self, address: &Address) -> bool {
         match self.get_identity(address) {
             Some(id) => {
@@ -10662,36 +9105,20 @@ impl StateDB {
         }
     }
 
-    /// Number of registered identities.
     pub fn identity_count(&self) -> usize {
         self.identities.len()
     }
 
-    // -----------------------------------------------------------------------
-    // Light Client Proofs
-    // -----------------------------------------------------------------------
-
-    /// Compute the current Merkle state root from all accounts.
-    ///
-    /// Accounts are serialised with bincode, hashed, then sorted to ensure a
-    /// deterministic tree regardless of DashMap iteration order.
-    /// Takes the publication read lock; callers must hold no StateDB map guard.
     pub fn get_state_root(&self) -> Hash256 {
         let _publication = self.native_inference_publication.read();
         self.compute_state_root()
     }
 
-    /// Generate a `StateProof` for the account at `address`.
-    ///
-    /// Uses the persistent incremental Merkle tree (sorted by address) to
-    /// generate the inclusion proof.  Ensures the state root is up-to-date
-    /// first by calling `compute_state_root()`.
     pub fn generate_state_proof(&self, address: &Hash256) -> Result<StateProof, StateError> {
         let account = self
             .get_account(address)
             .ok_or(StateError::AccountNotFound(*address))?;
 
-        // Ensure the incremental tree is current.
         let _root = self.compute_state_root();
 
         let tree = self.incremental_merkle.lock();
@@ -10719,7 +9146,6 @@ impl StateDB {
         })
     }
 
-    /// Generate a `HeaderProof` for the block at the given height.
     pub fn generate_header_proof(&self, height: u64) -> Result<HeaderProof, StateError> {
         let block = self
             .get_block(height)
@@ -10732,10 +9158,6 @@ impl StateDB {
         })
     }
 
-    /// Generate a `TxInclusionProof` for a transaction by its hash.
-    ///
-    /// Looks up the block containing the transaction, rebuilds the tx Merkle
-    /// tree, and produces the inclusion proof.
     pub fn generate_tx_inclusion_proof(
         &self,
         tx_hash: &Hash256,
@@ -10761,7 +9183,6 @@ impl StateDB {
         })
     }
 
-    /// Generate a compact `LightSnapshot` of the current chain state.
     pub fn generate_light_snapshot(&self) -> LightSnapshot {
         let height = self.height();
         let state_root = self.compute_state_root();
@@ -10785,16 +9206,6 @@ impl StateDB {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Chunked Snapshot Sync Protocol
-    // -----------------------------------------------------------------------
-
-    /// Export the full account state as a chunked snapshot.
-    ///
-    /// Accounts are sorted by address for deterministic ordering, then split
-    /// into fixed-size chunks.  Each chunk carries a BLAKE3 integrity proof.
-    /// The returned manifest contains metadata and a root hash derived from
-    /// all chunk proofs.
     pub fn export_chunked_snapshot(
         &self,
         chunk_size: usize,
@@ -10803,7 +9214,6 @@ impl StateDB {
         let version = self.height();
         let state_root = self.compute_state_root();
 
-        // Collect and sort all accounts by address for deterministic chunking.
         let mut all_accounts: Vec<(Address, Account)> = self
             .accounts
             .iter()
@@ -10813,7 +9223,7 @@ impl StateDB {
 
         let total_accounts = all_accounts.len() as u64;
         let total_chunks = if all_accounts.is_empty() {
-            1 // Even empty state produces one (empty) chunk
+            1
         } else {
             all_accounts.len().div_ceil(chunk_size) as u32
         };
@@ -10836,7 +9246,6 @@ impl StateDB {
             });
         }
 
-        // Handle the empty-state case: produce a single empty chunk.
         if chunks.is_empty() {
             let empty_data =
                 bincode::serialize(&Vec::<(Address, Account)>::new()).expect("serializable");
@@ -10852,7 +9261,6 @@ impl StateDB {
             });
         }
 
-        // Manifest hash = BLAKE3( version || state_root || total_accounts || total_chunks || chunk_size || all chunk proofs )
         let manifest_hash = Self::compute_manifest_hash(
             version,
             &state_root,
@@ -10874,8 +9282,6 @@ impl StateDB {
         (manifest, chunks)
     }
 
-    /// Export a single chunk by index (for streaming to a peer without
-    /// materialising the entire snapshot in memory).
     pub fn export_snapshot_chunk(
         &self,
         chunk_index: u32,
@@ -10923,29 +9329,11 @@ impl StateDB {
         })
     }
 
-    /// Import a single snapshot chunk into this state database.
-    ///
-    /// Verifies the chunk's BLAKE3 proof before inserting accounts.
-    /// Returns the number of accounts imported from this chunk.
-    ///
-    /// On the first chunk (`chunk_index == 0`) of a fresh-state sync
-    /// (height == 0), wipes any pre-import accounts/contracts/storage so the
-    /// recomputed merkle root matches the source. Without this, fresh nodes
-    /// keep their genesis-init validator account, which the source snapshot
-    /// doesn't contain, and `finalize_sync` rejects the imported state with
-    /// "state root mismatch" — the exact failure mode that stranded LHR at
-    /// round 0 after every `--reset-state`.
     pub fn import_snapshot_chunk(&self, chunk: &StateSnapshot) -> Result<u32, StateError> {
-        // The legacy HTTP snapshot carries only self-hashes supplied by one
-        // peer: it has no validator quorum certificate, canonical block proof,
-        // storage/contracts, or crash-atomic activation record. It is useful
-        // only for ephemeral tests/benchmarks and must never overwrite a node
-        // whose state is expected to survive restart.
         if self.is_persistent() {
             return Err(StateError::UnauthenticatedPersistentStateSync);
         }
 
-        // Verify chunk proof: re-hash the chunk's account data and compare.
         let chunk_data = bincode::serialize(&chunk.accounts).expect("serializable");
         let computed_proof = hash_bytes(&chunk_data);
         if computed_proof != chunk.chunk_proof {
@@ -10969,16 +9357,11 @@ impl StateDB {
         Ok(count)
     }
 
-    /// Verify that the current account state matches the expected manifest root.
-    ///
-    /// Recomputes the Merkle state root from the accounts DashMap and compares
-    /// against `manifest.state_root`.
     pub fn verify_snapshot_integrity(&self, manifest: &SnapshotManifest) -> bool {
         let computed = self.compute_state_root();
         computed == manifest.state_root
     }
 
-    /// Create a `SyncProgress` tracker from a received manifest.
     pub fn begin_sync(manifest: SnapshotManifest) -> SyncProgress {
         let total = manifest.total_chunks as usize;
         SyncProgress {
@@ -10990,14 +9373,10 @@ impl StateDB {
         }
     }
 
-    /// Returns `true` when every chunk in the snapshot has been received.
     pub fn is_sync_complete(progress: &SyncProgress) -> bool {
         progress.received_chunks.iter().all(|&received| received)
     }
 
-    /// Record a successfully imported chunk in the progress tracker.
-    ///
-    /// Returns `Err` if the chunk index is out of range.
     pub fn record_chunk(
         progress: &mut SyncProgress,
         chunk: &StateSnapshot,
@@ -11017,13 +9396,8 @@ impl StateDB {
         Ok(())
     }
 
-    /// Default number of accounts per chunk when serving snapshots to peers.
     const DEFAULT_CHUNK_SIZE: usize = 1000;
 
-    /// Export just the manifest metadata (lightweight - no account data).
-    ///
-    /// Peers request the manifest first to learn the chunk count, then
-    /// download individual chunks in parallel via `export_snapshot_chunk`.
     pub fn export_snapshot_manifest(&self) -> SnapshotManifest {
         let chunk_size = Self::DEFAULT_CHUNK_SIZE;
         let total_accounts = self.accounts.len() as u64;
@@ -11036,7 +9410,6 @@ impl StateDB {
         let version = self.height();
         let state_root = self.compute_state_root();
 
-        // Hash the manifest metadata (excluding manifest_hash itself).
         let pre_hash_data = bincode::serialize(&(
             version,
             &state_root,
@@ -11057,11 +9430,6 @@ impl StateDB {
         }
     }
 
-    /// Finalize a chunked sync: verify the imported state root matches the manifest.
-    ///
-    /// After all chunks have been imported via `import_snapshot_chunk`, call this
-    /// to recompute the state root and verify integrity. Updates the internal
-    /// block height to match the snapshot version.
     pub fn finalize_sync(&self, progress: &SyncProgress) -> Result<(), StateError> {
         if self.is_persistent() {
             return Err(StateError::UnauthenticatedPersistentStateSync);
@@ -11073,11 +9441,6 @@ impl StateDB {
             });
         }
 
-        // Verify against the most recent chunk's state_root (which describes
-        // the actual accounts we imported), not the manifest's state_root
-        // (which was captured earlier and is stale by the time chunks were
-        // generated on a chain that's producing blocks live). Falls back to
-        // manifest's state_root if no chunks were received.
         let expected = progress
             .latest_chunk_state_root
             .unwrap_or(progress.manifest.state_root);
@@ -11089,13 +9452,11 @@ impl StateDB {
             });
         }
 
-        // Update height to match snapshot
         *self.height.write() = progress.manifest.version;
 
         Ok(())
     }
 
-    /// Compact state summary for monitoring dashboards and health checks.
     pub fn state_summary(&self) -> StateSummary {
         let total_balance: u128 = self
             .accounts
@@ -11110,7 +9471,6 @@ impl StateDB {
         }
     }
 
-    /// Internal: compute the deterministic manifest hash from its fields.
     fn compute_manifest_hash(
         version: u64,
         state_root: &Hash256,
@@ -11138,10 +9498,6 @@ impl Default for StateDB {
     }
 }
 
-/// Compute the blake3 hash for a benchmark transfer transaction.
-/// Uses the exact same algorithm as Transaction::compute_hash() but with
-/// a precomputed base hasher (tx_type + from already hashed) and body_bytes.
-/// Only the nonce varies per call - enables massive parallelism.
 #[cfg(feature = "benchmark-tools")]
 #[inline]
 fn compute_benchmark_tx_hash(
@@ -11152,14 +9508,11 @@ fn compute_benchmark_tx_hash(
     let mut h = base_hasher.clone();
     h.update(&nonce.to_le_bytes());
     h.update(body_bytes);
-    h.update(&0u64.to_le_bytes()); // fee = 0
-    h.update(&0u64.to_le_bytes()); // gas_limit = 0
+    h.update(&0u64.to_le_bytes());
+    h.update(&0u64.to_le_bytes());
     Hash256(*h.finalize().as_bytes())
 }
 
-/// Compute Merkle root from leaf hashes without storing intermediate levels.
-/// Uses parallel pair hashing via rayon. Consumes the input vector.
-/// Peak memory: ~1.5x the input size (old level + new half-size level).
 fn compute_merkle_root_only(mut leaves: Vec<Hash256>) -> Hash256 {
     if leaves.is_empty() {
         return Hash256::ZERO;
@@ -11167,7 +9520,6 @@ fn compute_merkle_root_only(mut leaves: Vec<Hash256>) -> Hash256 {
     if leaves.len() == 1 {
         return leaves[0];
     }
-    // Pad to even length
     if !leaves.len().is_multiple_of(2) {
         leaves.push(*leaves.last().unwrap());
     }
@@ -11400,8 +9752,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Each block as its serialized bytes: `Block` has no `PartialEq`, and
-    /// equal bytes mean equal fields.
     fn block_bytes(blocks: &[Block]) -> Vec<Vec<u8>> {
         blocks
             .iter()
@@ -11409,14 +9759,8 @@ mod tests {
             .collect()
     }
 
-    /// The block table keeps every committed block. Its hashbrown shards size
-    /// an empty bucket like a full one and double their bucket arrays when
-    /// 7/8 full, so with `Block` (about 300 bytes) inline each doubling
-    /// allocated about 300 bytes per new bucket at once. A boxed entry is a
-    /// height and a pointer. Storing `Block` inline again fails this test.
     #[test]
     fn block_table_entry_is_a_height_and_a_pointer() {
-        // dashmap stores `(K, SharedValue<V>)`, which is the size of `(K, V)`.
         fn entry_size<K, V, S>(_: &dashmap::DashMap<K, V, S>) -> usize {
             std::mem::size_of::<(K, V)>()
         }
@@ -11424,10 +9768,6 @@ mod tests {
         assert!(entry_size(&state.blocks) <= 16);
     }
 
-    /// Every reader of the block table returns the whole block that was
-    /// stored. A replayed block at a stored height replaces it, and the
-    /// replaced block's transactions leave `tx_index`. A clear empties the
-    /// table, and a snapshot's history window writes the blocks back.
     #[test]
     fn block_table_returns_stored_blocks_after_insert_overwrite_and_clear() {
         let state = StateDB::with_genesis(&[(addr(1), 1_000)]);
@@ -11479,8 +9819,6 @@ mod tests {
         assert_eq!(state.get_tx_location(&new_tx.0), Some((3, 0)));
     }
 
-    /// A restart rebuilds the block table from the WAL, and every block reads
-    /// back exactly as it was stored before the restart.
     #[test]
     fn block_table_after_restart_holds_the_same_blocks() {
         let dir = persistent_test_dir("block-table-restart");
@@ -11675,9 +10013,6 @@ mod tests {
         assert!(matches!(error, StateError::PersistenceError(_)));
         assert_eq!(state.wal_failure().unwrap().operation(), "fsync");
 
-        // The in-memory mutation happened before the filesystem reported the
-        // failure, but the sticky latch prevents any subsequent block attempt
-        // from advancing state or being acknowledged.
         let failed_height = state.height();
         let retry = state
             .execute_block(&[], addr(99))
@@ -12009,13 +10344,11 @@ mod tests {
         let address = kp.address();
         let state = StateDB::with_genesis(&[(address, 1_000_000)]);
 
-        // Signed transaction should succeed
         let mut tx = Transaction::new_transfer(address, addr(2), 500, 0);
         tx.sign(&kp).unwrap();
         let (_, receipts) = state.execute_block_verified(&[tx], addr(99)).unwrap();
         assert!(receipts[0].success);
 
-        // Unsigned transaction should fail in verified mode
         let tx2 = Transaction::new_transfer(address, addr(2), 500, 1);
         let (_, receipts2) = state.execute_block_verified(&[tx2], addr(99)).unwrap();
         assert!(!receipts2[0].success);
@@ -12031,10 +10364,6 @@ mod tests {
         let starting_balance = 1_000_000;
         let state = StateDB::with_genesis(&[(victim.address(), starting_balance)]);
 
-        // The transaction hash commits to the victim as `from`, while the
-        // cryptographically valid signature and public key belong to the
-        // attacker. A bare Ed25519 batch check succeeds for that supplied key;
-        // the executor must still reject the ARC-address mismatch.
         let mut forged = Transaction::new_transfer(victim.address(), recipient, 500, 0);
         forged.sign(&attacker).unwrap();
         assert!(forged.verify_signature().is_err());
@@ -12219,8 +10548,6 @@ mod tests {
         );
         assert_eq!(first_block.hash, second_block.hash);
 
-        // The next block also shares the same parent hash, proving divergence
-        // is not merely deferred one height.
         let (first_next, _) = first
             .execute_block_adaptive_at(&[], producer, 1_800_000_000_456)
             .unwrap();
@@ -12313,12 +10640,10 @@ mod tests {
         let user = addr(1);
         let attestor = addr(99);
 
-        // No identity yet
         assert!(state.get_identity(&user).is_none());
         assert!(!state.is_compliant(&user));
         assert_eq!(state.identity_count(), 0);
 
-        // Register a verified US identity
         let id = Identity {
             address: user,
             level: IdentityLevel::Verified,
@@ -12326,7 +10651,7 @@ mod tests {
             proof_hash: hash_bytes(b"kyc-proof-001"),
             country_code: *b"US",
             attested_at: 1_000_000,
-            expires_at: 0, // never expires
+            expires_at: 0,
         };
         state.register_identity(id.clone());
 
@@ -12336,7 +10661,6 @@ mod tests {
         assert_eq!(fetched.country_code, *b"US");
         assert!(state.is_compliant(&user));
 
-        // Anonymous level is NOT compliant
         let anon = Identity {
             address: addr(2),
             level: IdentityLevel::Anonymous,
@@ -12349,7 +10673,6 @@ mod tests {
         state.register_identity(anon);
         assert!(!state.is_compliant(&addr(2)));
 
-        // Sanctioned country is NOT compliant
         let sanctioned = Identity {
             address: addr(3),
             level: IdentityLevel::Institutional,
@@ -12362,7 +10685,6 @@ mod tests {
         state.register_identity(sanctioned);
         assert!(!state.is_compliant(&addr(3)));
 
-        // Expired identity is NOT compliant
         let expired = Identity {
             address: addr(4),
             level: IdentityLevel::Verified,
@@ -12370,7 +10692,7 @@ mod tests {
             proof_hash: hash_bytes(b"exp"),
             country_code: *b"DE",
             attested_at: 1_000_000,
-            expires_at: 1, // expired long ago
+            expires_at: 1,
         };
         state.register_identity(expired);
         assert!(!state.is_compliant(&addr(4)));
@@ -12380,25 +10702,19 @@ mod tests {
 
     #[test]
     fn test_propose_verify_state_diff() {
-        // Proposer: execute a block and export state diff.
-        // The proposer knows affected accounts from the tx bodies.
         let proposer_state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 0)]);
         let tx = Transaction::new_transfer(addr(1), addr(2), 500, 0);
         let (block, _receipts) = proposer_state.execute_block(&[tx], addr(99)).unwrap();
 
-        // Derive affected addresses from tx body (same as mark_tx_accounts_dirty)
         let affected = vec![addr(1), addr(2)];
         let diff = proposer_state.export_state_diff(&affected);
         assert_eq!(diff.new_root, block.header.state_root);
 
-        // Verifier: apply the state diff (without re-executing)
         let verifier_state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 0)]);
         let verifier_root = verifier_state.apply_state_diff(&diff).unwrap();
 
-        // Root must match the diff's declared root
         assert_eq!(verifier_root, diff.new_root);
 
-        // Verifier's accounts should reflect the transfer
         let sender = verifier_state.get_account(&addr(1)).unwrap();
         assert_eq!(sender.balance, 999_500);
         let receiver = verifier_state.get_account(&addr(2)).unwrap();
@@ -12407,17 +10723,14 @@ mod tests {
 
     #[test]
     fn test_propose_verify_detects_fraud() {
-        // Proposer sends a fraudulent diff (wrong new_root)
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
         let tx = Transaction::new_transfer(addr(1), addr(2), 100, 0);
         state.execute_block(&[tx], addr(99)).unwrap();
 
         let affected = vec![addr(1), addr(2)];
         let mut diff = state.export_state_diff(&affected);
-        diff.new_root = Hash256([0xDE; 32]); // tamper with the root
+        diff.new_root = Hash256([0xDE; 32]);
 
-        // A bad root rejects atomically; no attacker-controlled account state
-        // survives the failed verification.
         let verifier = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
         let before_root = verifier.get_state_root();
         let before_sender = verifier.get_account(&addr(1)).unwrap();
@@ -12435,7 +10748,6 @@ mod tests {
         let addr1 = hash_bytes(&[1]);
         let addr2 = hash_bytes(&[2]);
 
-        // Create some accounts
         db.accounts.insert(addr1.0, Account::new(addr1, 1000));
         db.accounts.insert(
             addr2.0,
@@ -12449,7 +10761,6 @@ mod tests {
             },
         );
 
-        // Mark as dirty
         db.dirty_accounts.insert(addr1.0);
         db.dirty_accounts.insert(addr2.0);
 
@@ -12467,7 +10778,6 @@ mod tests {
         let addr1 = hash_bytes(&[1]);
         let addr2 = hash_bytes(&[2]);
 
-        // Proposer executes transactions
         proposer_db.accounts.insert(
             addr1.0,
             Account {
@@ -12485,11 +10795,9 @@ mod tests {
         proposer_db.dirty_accounts.insert(addr1.0);
         proposer_db.dirty_accounts.insert(addr2.0);
 
-        // Export diff
         let affected = vec![addr1, addr2];
         let diff = proposer_db.export_state_diff(&affected);
 
-        // Verifier applies diff
         assert!(verifier_db.verify_state_diff(&diff));
     }
 
@@ -12500,7 +10808,6 @@ mod tests {
 
         let addr1 = hash_bytes(&[1]);
 
-        // Proposer creates a diff
         proposer_db.accounts.insert(
             addr1.0,
             Account {
@@ -12517,10 +10824,8 @@ mod tests {
         let affected = vec![addr1];
         let mut diff = proposer_db.export_state_diff(&affected);
 
-        // Tamper with the root -- simulate fraud
         diff.new_root = Hash256([0xFF; 32]);
 
-        // Verifier detects fraud
         assert!(!verifier_db.verify_state_diff(&diff));
         assert!(verifier_db.get_account(&addr1).is_none());
     }
@@ -12583,15 +10888,10 @@ mod tests {
         assert_eq!(state.get_state_root(), before_root);
     }
 
-    // -----------------------------------------------------------------------
-    // Chunked Snapshot Sync Protocol tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_chunked_snapshot_export_single_chunk() {
         let state = StateDB::with_genesis(&[(addr(1), 1_000), (addr(2), 2_000)]);
 
-        // chunk_size large enough to fit everything in one chunk
         let (manifest, chunks) = state.export_chunked_snapshot(100);
 
         assert_eq!(manifest.total_chunks, 1);
@@ -12612,20 +10912,17 @@ mod tests {
             .collect();
         let state = StateDB::with_genesis(&prefunded);
 
-        // chunk_size = 3 → should produce ceil(10/3) = 4 chunks
         let (manifest, chunks) = state.export_chunked_snapshot(3);
 
         assert_eq!(manifest.total_chunks, 4);
         assert_eq!(manifest.total_accounts, 10);
         assert_eq!(chunks.len(), 4);
 
-        // First 3 chunks have 3 accounts, last has 1
         assert_eq!(chunks[0].accounts.len(), 3);
         assert_eq!(chunks[1].accounts.len(), 3);
         assert_eq!(chunks[2].accounts.len(), 3);
         assert_eq!(chunks[3].accounts.len(), 1);
 
-        // Each chunk has correct index
         for (i, chunk) in chunks.iter().enumerate() {
             assert_eq!(chunk.chunk_index, i as u32);
             assert_eq!(chunk.total_chunks, 4);
@@ -12642,7 +10939,6 @@ mod tests {
 
         let (_manifest, chunks) = source.export_chunked_snapshot(2);
 
-        // Import into a fresh state
         let dest = StateDB::new();
         let mut total_imported = 0u32;
         for chunk in &chunks {
@@ -12651,13 +10947,11 @@ mod tests {
         }
         assert_eq!(total_imported, 5);
 
-        // Verify all accounts are present with correct balances
         for i in 0u8..5 {
             let acct = dest.get_account(&addr(i)).expect("account should exist");
             assert_eq!(acct.balance, (i as u64 + 1) * 1_000);
         }
 
-        // State root must match the source
         let dest_root = dest.compute_state_root();
         assert_eq!(dest_root, source_root);
     }
@@ -12669,26 +10963,22 @@ mod tests {
         let (_manifest, chunks) = state.export_chunked_snapshot(10);
         assert_eq!(chunks.len(), 1);
 
-        // Valid chunk should import successfully
         let dest = StateDB::new();
         assert!(dest.import_snapshot_chunk(&chunks[0]).is_ok());
 
-        // Tamper with the chunk proof → verification must fail
         let mut tampered = StateSnapshot {
             version: chunks[0].version,
             state_root: chunks[0].state_root,
             accounts: chunks[0].accounts.clone(),
             chunk_index: chunks[0].chunk_index,
             total_chunks: chunks[0].total_chunks,
-            chunk_proof: Hash256([0xFF; 32]), // bad proof
+            chunk_proof: Hash256([0xFF; 32]),
         };
         let dest2 = StateDB::new();
         let err = dest2.import_snapshot_chunk(&tampered).unwrap_err();
         assert!(matches!(err, StateError::ChunkVerificationFailed));
 
-        // Tamper with account data (different from proof) → also fails
         tampered.accounts[0].1.balance = 999_999_999;
-        // chunk_proof still the original, but data changed → mismatch
         tampered.chunk_proof = chunks[0].chunk_proof;
         let dest3 = StateDB::new();
         let err2 = dest3.import_snapshot_chunk(&tampered).unwrap_err();
@@ -12702,12 +10992,10 @@ mod tests {
         let (m1, _) = state.export_chunked_snapshot(2);
         let (m2, _) = state.export_chunked_snapshot(2);
 
-        // Same state + same chunk_size → same manifest hash
         assert_eq!(m1.manifest_hash, m2.manifest_hash);
         assert_eq!(m1.state_root, m2.state_root);
         assert_eq!(m1.total_chunks, m2.total_chunks);
 
-        // Different chunk_size → different manifest hash
         let (m3, _) = state.export_chunked_snapshot(1);
         assert_ne!(m3.manifest_hash, m1.manifest_hash);
     }
@@ -12723,14 +11011,13 @@ mod tests {
         ]);
 
         let (manifest, chunks) = state.export_chunked_snapshot(2);
-        assert_eq!(manifest.total_chunks, 3); // ceil(5/2) = 3
+        assert_eq!(manifest.total_chunks, 3);
 
         let mut progress = StateDB::begin_sync(manifest);
         assert!(!StateDB::is_sync_complete(&progress));
         assert_eq!(progress.verified_chunks, 0);
         assert_eq!(progress.total_accounts_imported, 0);
 
-        // Import chunks out of order (simulating parallel download)
         let dest = StateDB::new();
 
         let count1 = dest.import_snapshot_chunk(&chunks[2]).unwrap();
@@ -12765,7 +11052,6 @@ mod tests {
         assert_eq!(chunks[0].chunk_index, 0);
         assert_eq!(chunks[0].total_chunks, 1);
 
-        // Importing an empty chunk should succeed
         let dest = StateDB::new();
         let count = dest.import_snapshot_chunk(&chunks[0]).unwrap();
         assert_eq!(count, 0);
@@ -12782,37 +11068,29 @@ mod tests {
         assert_eq!(summary.block_height, 0);
         assert_ne!(summary.state_root, Hash256::ZERO);
 
-        // After a transfer the summary should update
         let tx = Transaction::new_transfer(addr(1), addr(4), 100, 0);
         state.execute_block(&[tx], addr(99)).unwrap();
 
         let summary2 = state.state_summary();
-        assert_eq!(summary2.account_count, 4); // addr(4) created
-        // Total balance unchanged (transfer is zero-sum ignoring fees)
+        assert_eq!(summary2.account_count, 4);
         assert_eq!(summary2.total_balance, 1_750_000);
         assert_eq!(summary2.block_height, 1);
     }
-
-    // ── Receipt pruning tests ─────────────────────────────────────────────
 
     #[test]
     fn test_prune_old_receipts() {
         let state = StateDB::with_genesis(&[(addr(1), 10_000_000), (addr(2), 10_000_000)]);
 
-        // Execute several blocks to build up receipts.
         for i in 0..5 {
             let tx = Transaction::new_transfer(addr(1), addr(2), 100, i);
             state.execute_block(&[tx], addr(99)).unwrap();
         }
 
         assert_eq!(state.height(), 5);
-        // Should have 5 receipts (one tx per block).
         assert_eq!(state.receipts.len(), 5);
 
-        // Prune keeping only last 2 blocks → blocks 4,5 kept, blocks 1,2,3 pruned.
         state.prune_old_receipts(2);
 
-        // Only receipts from blocks 4 and 5 should remain.
         assert_eq!(state.receipts.len(), 2);
         for entry in state.receipts.iter() {
             assert!(
@@ -12830,7 +11108,6 @@ mod tests {
         let tx = Transaction::new_transfer(addr(1), addr(2), 100, 0);
         state.execute_block(&[tx], addr(99)).unwrap();
 
-        // keep_blocks > current height → nothing pruned.
         state.prune_old_receipts(1000);
         assert_eq!(state.receipts.len(), 1);
     }
@@ -12942,8 +11219,6 @@ mod tests {
         assert!(state.enable_archive_mode());
         assert!(state.archive_reward_history_complete_since_v3_recovery());
 
-        // A node that ran without archive retention and lost a historical row
-        // cannot regain the lifetime claim merely by toggling the flag later.
         state.archive_mode = false;
         state.receipts.remove(&transaction_hash.0);
         assert!(!state.enable_archive_mode());
@@ -13148,21 +11423,15 @@ mod tests {
         assert!(!wrong_body.archive_reward_history_complete_since_v3_recovery());
     }
 
-    // ── State rent tests ──────────────────────────────────────────────────
-
     #[test]
     fn test_collect_rent_deducts_balance() {
-        let state = StateDB::with_genesis(&[
-            (addr(1), 5_000_000),  // above dust threshold (1_000_000)
-            (addr(2), 10_000_000), // above dust threshold
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), 5_000_000), (addr(2), 10_000_000)]);
 
         let config = StateRentConfig::default();
-        let rent = config.rent_per_epoch(); // 128
+        let rent = config.rent_per_epoch();
 
         let (collected, dormant) = state.collect_rent(&config);
 
-        // Both accounts should have rent deducted.
         assert_eq!(collected, rent * 2);
         assert_eq!(dormant, 0);
 
@@ -13175,15 +11444,14 @@ mod tests {
 
     #[test]
     fn test_collect_rent_marks_dormant() {
-        // Account with balance just above dust threshold → rent pushes it below.
-        let balance = 1_000_100; // dust = 1_000_000, rent = 128 → after: 999_972 < 1_000_000
+        let balance = 1_000_100;
         let state = StateDB::with_genesis(&[(addr(1), balance)]);
 
         let config = StateRentConfig::default();
         let (collected, dormant) = state.collect_rent(&config);
 
         assert_eq!(collected, config.rent_per_epoch());
-        assert_eq!(dormant, 1); // became dormant after deduction
+        assert_eq!(dormant, 1);
 
         let acct = state.get_account(&addr(1)).unwrap();
         assert!(config.is_dormant(acct.balance));
@@ -13191,19 +11459,16 @@ mod tests {
 
     #[test]
     fn test_collect_rent_skips_already_dormant() {
-        let state = StateDB::with_genesis(&[
-            (addr(1), 500), // well below dust threshold
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), 500)]);
 
         let config = StateRentConfig::default();
         let (collected, dormant) = state.collect_rent(&config);
 
-        // Already dormant → no rent deducted.
         assert_eq!(collected, 0);
         assert_eq!(dormant, 1);
 
         let acct = state.get_account(&addr(1)).unwrap();
-        assert_eq!(acct.balance, 500); // unchanged
+        assert_eq!(acct.balance, 500);
     }
 
     #[test]
@@ -13219,8 +11484,6 @@ mod tests {
         assert_eq!(collected, 0);
         assert_eq!(dormant, 0);
     }
-
-    // ── Channel integration tests ────────────────────────────────────────
 
     use arc_types::transaction::{
         BridgeLockBody, BridgeMintBody, ChannelCloseBody, ChannelDisputeBody, ChannelOpenBody,
@@ -13264,16 +11527,14 @@ mod tests {
         let (_, receipts) = state.execute_block(&[tx], addr(99)).unwrap();
         assert!(receipts[0].success, "ChannelOpen should succeed");
 
-        // Sender balance debited
         let sender = state.get_account(&addr(1)).unwrap();
         assert_eq!(sender.balance, 900_000);
 
-        // Escrow created with deposit
         let escrow_addr = hash_bytes(&[b"arc-channel", channel_id.as_ref()].concat());
         let escrow = state.get_account(&escrow_addr).unwrap();
         assert_eq!(escrow.balance, 100_000);
-        assert_eq!(escrow.code_hash, addr(1)); // opener
-        assert_eq!(escrow.storage_root, addr(2)); // counterparty
+        assert_eq!(escrow.code_hash, addr(1));
+        assert_eq!(escrow.storage_root, addr(2));
     }
 
     #[test]
@@ -13281,7 +11542,6 @@ mod tests {
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 0)]);
         let channel_id = hash_bytes(b"test-channel-2");
 
-        // Open
         let open_tx = make_channel_tx(
             addr(1),
             0,
@@ -13296,7 +11556,6 @@ mod tests {
         let (_, r) = state.execute_block(&[open_tx], addr(99)).unwrap();
         assert!(r[0].success);
 
-        // Close (opener closes, split 60K/40K)
         let close_tx = make_channel_tx(
             addr(1),
             1,
@@ -13312,16 +11571,13 @@ mod tests {
         let (_, r) = state.execute_block(&[close_tx], addr(99)).unwrap();
         assert!(r[0].success, "ChannelClose should succeed");
 
-        // Escrow drained
         let escrow_addr = hash_bytes(&[b"arc-channel", channel_id.as_ref()].concat());
         let escrow = state.get_account(&escrow_addr).unwrap();
         assert_eq!(escrow.balance, 0);
 
-        // Opener credited
         let opener = state.get_account(&addr(1)).unwrap();
-        assert_eq!(opener.balance, 960_000); // 900K + 60K
+        assert_eq!(opener.balance, 960_000);
 
-        // Counterparty credited
         let counterparty = state.get_account(&addr(2)).unwrap();
         assert_eq!(counterparty.balance, 40_000);
     }
@@ -13331,7 +11587,6 @@ mod tests {
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 500_000)]);
         let channel_id = hash_bytes(b"test-channel-3");
 
-        // Open channel
         let open_tx = make_channel_tx(
             addr(1),
             0,
@@ -13345,7 +11600,6 @@ mod tests {
         );
         state.execute_block(&[open_tx], addr(99)).unwrap();
 
-        // Dispute from counterparty (addr(2))
         let dispute_tx = make_channel_tx(
             addr(2),
             0,
@@ -13362,12 +11616,11 @@ mod tests {
         let (_, r) = state.execute_block(&[dispute_tx], addr(99)).unwrap();
         assert!(r[0].success, "ChannelDispute should succeed");
 
-        // Check escrow state updated
         let escrow_addr = hash_bytes(&[b"arc-channel", channel_id.as_ref()].concat());
         let escrow = state.get_account(&escrow_addr).unwrap();
-        assert_eq!(escrow.nonce, 5); // state_nonce recorded
-        assert!(escrow.staked_balance > 0); // challenge_expiry set
-        assert_eq!(escrow.balance, 100_000); // funds still locked
+        assert_eq!(escrow.nonce, 5);
+        assert!(escrow.staked_balance > 0);
+        assert_eq!(escrow.balance, 100_000);
     }
 
     #[test]
@@ -13375,7 +11628,6 @@ mod tests {
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 500_000)]);
         let channel_id = hash_bytes(b"test-channel-4");
 
-        // Open
         let open_tx = make_channel_tx(
             addr(1),
             0,
@@ -13389,7 +11641,6 @@ mod tests {
         );
         state.execute_block(&[open_tx], addr(99)).unwrap();
 
-        // First dispute with nonce 10
         let d1 = make_channel_tx(
             addr(2),
             0,
@@ -13406,7 +11657,6 @@ mod tests {
         let (_, r) = state.execute_block(&[d1], addr(99)).unwrap();
         assert!(r[0].success);
 
-        // Second dispute with lower nonce (5) - should fail
         let d2 = make_channel_tx(
             addr(1),
             1,
@@ -13415,7 +11665,7 @@ mod tests {
                 opener_balance: 80_000,
                 counterparty_balance: 20_000,
                 other_party_sig: vec![0u8; 64],
-                state_nonce: 5, // lower than 10!
+                state_nonce: 5,
                 challenge_period: 100,
             }),
             TxType::ChannelDispute,
@@ -13429,7 +11679,6 @@ mod tests {
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 500_000)]);
         let channel_id = hash_bytes(b"test-channel-5");
 
-        // Open
         let open_tx = make_channel_tx(
             addr(1),
             0,
@@ -13443,7 +11692,6 @@ mod tests {
         );
         state.execute_block(&[open_tx], addr(99)).unwrap();
 
-        // Dispute (sets challenge_expiry far in the future)
         let dispute_tx = make_channel_tx(
             addr(2),
             0,
@@ -13453,14 +11701,13 @@ mod tests {
                 counterparty_balance: 40_000,
                 other_party_sig: vec![0u8; 64],
                 state_nonce: 1,
-                challenge_period: 100_000, // very long
+                challenge_period: 100_000,
             }),
             TxType::ChannelDispute,
         );
         let (_, r) = state.execute_block(&[dispute_tx], addr(99)).unwrap();
         assert!(r[0].success);
 
-        // Try to close - should fail (active dispute)
         let close_tx = make_channel_tx(
             addr(1),
             1,
@@ -13485,7 +11732,6 @@ mod tests {
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 500_000)]);
         let channel_id = hash_bytes(b"test-channel-6");
 
-        // Open with 100K deposit
         let open_tx = make_channel_tx(
             addr(1),
             0,
@@ -13499,14 +11745,13 @@ mod tests {
         );
         state.execute_block(&[open_tx], addr(99)).unwrap();
 
-        // Dispute claiming more than deposited - should fail
         let dispute_tx = make_channel_tx(
             addr(2),
             0,
             TxBody::ChannelDispute(ChannelDisputeBody {
                 channel_id,
                 opener_balance: 80_000,
-                counterparty_balance: 40_000, // 80K + 40K = 120K > 100K!
+                counterparty_balance: 40_000,
                 other_party_sig: vec![0u8; 64],
                 state_nonce: 1,
                 challenge_period: 100,
@@ -13538,21 +11783,20 @@ mod tests {
         assert!(r[0].success, "InferenceRegister should succeed");
 
         let acct = state.get_account(&addr(1)).unwrap();
-        assert_eq!(acct.balance, 95_000); // 100K - 5K
-        assert_eq!(acct.staked_balance, 5_000); // locked
+        assert_eq!(acct.balance, 95_000);
+        assert_eq!(acct.staked_balance, 5_000);
     }
 
     #[test]
     fn test_inference_register_rejects_insufficient_stake() {
         let state = StateDB::with_genesis(&[(addr(1), 100_000)]);
 
-        // Tier 2 requires 5K minimum, try with only 1K
         let tx = make_channel_tx(
             addr(1),
             0,
             TxBody::InferenceRegister(InferenceRegisterBody {
                 tier: 2,
-                stake_bond: 1_000, // below min for tier 2
+                stake_bond: 1_000,
             }),
             TxType::InferenceRegister,
         );
@@ -13597,8 +11841,6 @@ mod tests {
         assert!(state.execute_tx(&register).is_ok());
         assert_state(975_000, 25_000, 0, 0, 1);
 
-        // A provider bond alone is never validator stake and cannot be
-        // withdrawn through the generic unstake transaction.
         let steal_provider_bond = make_channel_tx(
             worker,
             1,
@@ -13690,12 +11932,9 @@ mod tests {
         );
         assert_eq!(state.total_staked(), StateDB::MIN_VALIDATOR_STAKE);
 
-        // A corrupt pool also fails before changing the account or map.
         state.staking_pool.store(0, Ordering::Release);
         let error = state.execute_tx(&leave).unwrap_err();
         assert!(error.to_string().contains("balance overflow"));
-        // Remove the balance-overflow condition so the pool check becomes the
-        // first failing invariant.
         let mut account = state.get_account(&validator).unwrap();
         account.balance = 0;
         state.accounts.insert(validator.0, account);
@@ -13716,9 +11955,6 @@ mod tests {
     fn recovery_v3_allowlist_classifies_every_family_and_rejects_unsafe_mutations() {
         use V3TransactionFamilyPolicy::{Allowed, Denied};
 
-        // Every currently defined transaction family is classified here, and
-        // the production match is exhaustive. A new TxType therefore fails
-        // compilation until it receives an explicit v3 policy and a test row.
         let policies = [
             (TxType::Transfer, Allowed),
             (TxType::Settle, Denied),
@@ -14011,9 +12247,6 @@ mod tests {
             );
         }
 
-        // Raw zero-bond attestations are intentionally not a v3 ingress
-        // family. Otherwise an attacker can generate unlimited fresh keys and
-        // permanently create one zero-balance nonce account per transaction.
         for index in 0..32u8 {
             let fresh_worker = arc_crypto::KeyPair::generate_ed25519();
             assert!(state.get_account(&fresh_worker.address()).is_none());
@@ -14045,7 +12278,6 @@ mod tests {
             "rejected raw-attestation flood wrote WAL"
         );
 
-        // A real recovery member is frozen just like an outsider.
         let member = &validators[0];
         for body in [
             TxBody::LeaveValidator,
@@ -14163,8 +12395,6 @@ mod tests {
         assert!(state.execute_tx(&zero_fee).is_err());
         assert_eq!(state.get_account(&sender.address()).unwrap().balance, 100);
 
-        // A v3 self-transfer is rejected: without a fee-bearing value move it
-        // is an inexpensive way to grow permanent history.
         let mut self_transfer = make_channel_tx(
             sender.address(),
             0,
@@ -14188,7 +12418,6 @@ mod tests {
         assert_eq!(after_self.balance, 100);
         assert_eq!(after_self.nonce, 0);
 
-        // Recipient overflow fails before sender debit/nonce/WAL mutation.
         state.wal.sync().unwrap();
         let before_sender = state.get_account(&sender.address()).unwrap();
         let before_overflow = state.get_account(&overflow_receiver.address()).unwrap();
@@ -14232,8 +12461,6 @@ mod tests {
             before_wal
         );
 
-        // Missing senders and a forged sig_verified hint both fail without
-        // materializing an account.
         let missing = arc_crypto::KeyPair::generate_ed25519();
         let mut missing_tx = make_channel_tx(
             missing.address(),
@@ -14277,7 +12504,6 @@ mod tests {
             bincode::serialize(&before_sender).unwrap()
         );
 
-        // A normal domain-signed transfer commits both account candidates.
         let mut transfer = make_channel_tx(
             sender.address(),
             0,
@@ -14548,8 +12774,6 @@ mod tests {
             assert_eq!(sum_all_balances(&state), initial_supply);
         }
 
-        // Create one legitimate marker, then prove it cannot be used as a
-        // recipient in a second claim.
         let mut valid = make_channel_tx(
             validator.address(),
             0,
@@ -14575,9 +12799,6 @@ mod tests {
                 .contains("legacy marker semantics")
         );
 
-        // Simulate a pre-v3 transfer to the old predictable marker without
-        // inflating supply. Its ordinary EOA shape cannot suppress the new
-        // protected marker and must remain untouched.
         let mut pool_for_dust = state.get_account(&pool).unwrap();
         pool_for_dust.balance -= 1;
         state.accounts.insert(pool.0, pool_for_dust);
@@ -14614,18 +12835,10 @@ mod tests {
         assert_eq!(sum_all_balances(&state), supply_after_valid);
     }
 
-    // ── Milestone B: InferenceEscrow integration tests ───────────────────
-    //
-    // All tests use real balance deltas - no mocks. The acceptance criterion
-    // from PLAN.md is "payer pays N ARC; balances on serving replicas
-    // increase by their share; total conserved."
-
     use arc_types::transaction::{
         InferenceEscrowOpenBody, InferenceEscrowRefundBody, InferenceEscrowReleaseBody,
     };
 
-    /// Convenience: same 32-byte request_id in every test, keyed on test name
-    /// so concurrent-cargo-test runs don't collide on the escrow DashMap.
     fn req(tag: &[u8]) -> [u8; 32] {
         hash_bytes(&[b"req-", tag].concat()).0
     }
@@ -14654,16 +12867,13 @@ mod tests {
         let (_, receipts) = state.execute_block(&[tx], addr(99)).unwrap();
         assert!(receipts[0].success, "InferenceEscrowOpen should succeed");
 
-        // Payer balance debited.
         let payer = state.get_account(&addr(1)).unwrap();
         assert_eq!(payer.balance, 990_000);
         assert_eq!(payer.nonce, 1);
 
-        // Escrow account holds the max_fee.
         let escrow_addr = Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
         let escrow = state.get_account(&escrow_addr).unwrap();
         assert_eq!(escrow.balance, 10_000);
-        // The escrow's storage_root commits to the payer's identity.
         let expected = InferenceEscrowOpenBody::metadata_commitment(&addr(1), &model_id(), 32, 10);
         assert_eq!(escrow.storage_root.0, expected);
     }
@@ -14685,7 +12895,6 @@ mod tests {
         );
         let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
         assert!(!r[0].success, "open should reject insufficient balance");
-        // Payer balance unchanged.
         assert_eq!(state.get_account(&addr(1)).unwrap().balance, 100);
     }
 
@@ -14726,8 +12935,6 @@ mod tests {
 
     #[test]
     fn test_escrow_release_distributes_40_25_15_20_and_conserves_total() {
-        // addr(1) = payer, addr(2) = proposer, addr(3..=5) = replicas,
-        // addr(10) = observer pool, addr(11) = treasury.
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
         let request_id = req(b"release-split");
 
@@ -14744,7 +12951,7 @@ mod tests {
             TxType::InferenceEscrowOpen,
         );
         let release = make_channel_tx(
-            addr(2), // proposer submits release
+            addr(2),
             0,
             TxBody::InferenceEscrowRelease(InferenceEscrowReleaseBody {
                 request_id,
@@ -14774,12 +12981,6 @@ mod tests {
         let escrow_addr = Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
         let escrow = state.get_account(&escrow_addr).unwrap();
 
-        // 40% proposer, 25% replicas (split 3 ways evenly with rounding → treasury),
-        // 15% observer, 20% treasury (+ rounding residue).
-        // 10_000 × 40 / 100 = 4_000
-        // 10_000 × 25 / 100 = 2_500 → 833 × 3 = 2_499; 1 residue to treasury
-        // 10_000 × 15 / 100 = 1_500
-        // treasury = 10_000 - 4_000 - 2_499 - 1_500 = 2_001
         assert_eq!(proposer.balance, 4_000);
         assert_eq!(r1.balance, 833);
         assert_eq!(r2.balance, 833);
@@ -14787,21 +12988,17 @@ mod tests {
         assert_eq!(obs.balance, 1_500);
         assert_eq!(tre.balance, 2_001);
 
-        // Conservation: payer is short 10_000; beneficiaries are up 10_000.
         let credited =
             proposer.balance + r1.balance + r2.balance + r3.balance + obs.balance + tre.balance;
         assert_eq!(credited, 10_000);
         assert_eq!(payer.balance, 990_000);
 
-        // Escrow zeroed + commitment cleared so it can't be replayed.
         assert_eq!(escrow.balance, 0);
         assert_eq!(escrow.storage_root, Hash256::ZERO);
     }
 
     #[test]
     fn test_escrow_release_rejects_wrong_payer() {
-        // Open as addr(1); release names addr(42) as payer - metadata
-        // commitment won't match, release must fail.
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
         let request_id = req(b"wrong-payer");
         let open = make_channel_tx(
@@ -14821,7 +13018,7 @@ mod tests {
             0,
             TxBody::InferenceEscrowRelease(InferenceEscrowReleaseBody {
                 request_id,
-                payer: addr(42), // LIE
+                payer: addr(42),
                 model_id: model_id(),
                 max_tokens: 32,
                 timeout_blocks: 10,
@@ -14836,7 +13033,6 @@ mod tests {
         let (_, rs) = state.execute_block(&[open, bad_release], addr(99)).unwrap();
         assert!(rs[0].success);
         assert!(!rs[1].success, "release with wrong payer must fail");
-        // Escrow still holds funds; nobody got paid.
         let escrow_addr = Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
         assert_eq!(state.get_account(&escrow_addr).unwrap().balance, 5_000);
     }
@@ -14868,7 +13064,7 @@ mod tests {
                 timeout_blocks: 10,
                 output_hash: hash_bytes(b"x"),
                 proposer: addr(2),
-                replicas: vec![], // empty
+                replicas: vec![],
                 observer_pool: addr(10),
                 treasury: addr(11),
             }),
@@ -14881,8 +13077,6 @@ mod tests {
 
     #[test]
     fn test_escrow_refund_after_timeout_returns_funds_to_payer() {
-        // Open with timeout_blocks=2, then advance 3 blocks, then refund
-        // succeeds and payer is whole.
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
         let request_id = req(b"refund-timeout");
         let open = make_channel_tx(
@@ -14901,13 +13095,12 @@ mod tests {
         assert!(r[0].success);
         assert_eq!(state.get_account(&addr(1)).unwrap().balance, 992_500);
 
-        // Advance 3 empty blocks so `now >= opened_at + timeout_blocks`.
         let _ = state.execute_block(&[], addr(99)).unwrap();
         let _ = state.execute_block(&[], addr(99)).unwrap();
         let _ = state.execute_block(&[], addr(99)).unwrap();
 
         let refund = make_channel_tx(
-            addr(1), // only payer can refund
+            addr(1),
             1,
             TxBody::InferenceEscrowRefund(InferenceEscrowRefundBody {
                 request_id,
@@ -14927,7 +13120,6 @@ mod tests {
 
     #[test]
     fn test_escrow_refund_rejected_before_timeout() {
-        // Open with timeout=10; refund at block 2 must fail.
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
         let request_id = req(b"too-early");
         let open = make_channel_tx(
@@ -14960,7 +13152,6 @@ mod tests {
 
     #[test]
     fn test_escrow_refund_rejects_non_payer() {
-        // addr(1) opens; addr(2) tries to refund → rejected (not original payer).
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 100_000)]);
         let request_id = req(b"not-your-money");
         let open = make_channel_tx(
@@ -14978,12 +13169,11 @@ mod tests {
         let (_, r) = state.execute_block(&[open], addr(99)).unwrap();
         assert!(r[0].success);
 
-        // Advance timeout
         let _ = state.execute_block(&[], addr(99)).unwrap();
         let _ = state.execute_block(&[], addr(99)).unwrap();
 
         let refund = make_channel_tx(
-            addr(2), // not the payer
+            addr(2),
             0,
             TxBody::InferenceEscrowRefund(InferenceEscrowRefundBody {
                 request_id,
@@ -14996,11 +13186,6 @@ mod tests {
         let (_, rs) = state.execute_block(&[refund], addr(99)).unwrap();
         assert!(!rs[0].success, "non-payer must not be able to refund");
     }
-
-    // ── Milestones C+D: model registry / requests / claims / capacity ──
-    //
-    // MVP tests - exercise the happy path plus the critical reject paths
-    // (duplicate registration, insufficient balance, empty ranges).
 
     use arc_types::transaction::{
         CapacityAdvertisementBody, MIN_MODEL_REGISTRATION_FEE, ModelRegistrationBody,
@@ -15032,19 +13217,16 @@ mod tests {
         let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
         assert!(r[0].success, "model registration should succeed");
 
-        // Payer debited by the min fee.
         assert_eq!(
             state.get_account(&addr(1)).unwrap().balance,
             10_000 - MIN_MODEL_REGISTRATION_FEE
         );
-        // Treasury credited.
         let treasury = hash_bytes(b"arc-treasury");
         assert_eq!(
             state.get_account(&treasury).unwrap().balance,
             MIN_MODEL_REGISTRATION_FEE
         );
 
-        // Registry entry exists with a non-zero commitment.
         let reg_addr = Hash256(ModelRegistrationBody::registry_account(&test_model_id()));
         let reg = state.get_account(&reg_addr).unwrap();
         assert_ne!(reg.storage_root, Hash256::ZERO);
@@ -15086,8 +13268,6 @@ mod tests {
 
     #[test]
     fn test_model_registration_fee_floors_at_min() {
-        // Registration fee below the min is raised to MIN. Payer pays
-        // the higher amount regardless of what they passed.
         let state = StateDB::with_genesis(&[(addr(1), 10_000)]);
         let tx = make_channel_tx(
             addr(1),
@@ -15099,7 +13279,7 @@ mod tests {
                 n_layers: 32,
                 d_model: 4096,
                 quantization: "int16".into(),
-                registration_fee: 1, // below floor
+                registration_fee: 1,
                 royalty_recipient: addr(1),
             }),
             TxType::ModelRegistration,
@@ -15156,9 +13336,7 @@ mod tests {
         let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
         assert!(r[0].success);
 
-        // Bond debited from payer.
         assert_eq!(state.get_account(&addr(1)).unwrap().balance, 95_000);
-        // Claim account holds bond.
         let claim_addr = Hash256(ShardCoverageClaimBody::claim_account(
             &test_model_id(),
             &node_pubkey,
@@ -15183,7 +13361,6 @@ mod tests {
         );
         let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
         assert!(!r[0].success);
-        // Payer untouched.
         assert_eq!(state.get_account(&addr(1)).unwrap().balance, 100_000);
     }
 
@@ -15215,8 +13392,6 @@ mod tests {
 
     #[test]
     fn test_escrow_release_cannot_be_replayed() {
-        // After a successful release, a second release on the same
-        // request_id must fail (escrow cleared).
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
         let request_id = req(b"no-replay");
         let open = make_channel_tx(
@@ -15263,16 +13438,8 @@ mod tests {
         assert!(!rs[2].success, "second release must fail (escrow cleared)");
     }
 
-    // ── FaucetClaim: validator-authorized faucet drain (P0 fix) ──────────
-    //
-    // Lives at the bottom of the test module so the helpers above (`addr`,
-    // `make_channel_tx`) are in scope.
-
     use arc_types::transaction::{FAUCET_CLAIM_MAX, FaucetClaimBody};
 
-    /// Convenience: seed a validator at `signer` with stake = MIN_VALIDATOR_STAKE
-    /// so `is_validator(&signer)` returns true without paying the
-    /// JoinValidator-debit / nonce-bump path.
     fn seed_validator(state: &StateDB, signer: Address) {
         state
             .validators
@@ -15289,10 +13456,7 @@ mod tests {
         let pool_addr = arc_types::transaction::faucet_pool_address();
         let validator = addr(7);
         let recipient = addr(42);
-        let state = StateDB::with_genesis(&[
-            (pool_addr, 1_000_000_000),
-            (validator, 0), // validator doesn't need balance — pool is debited
-        ]);
+        let state = StateDB::with_genesis(&[(pool_addr, 1_000_000_000), (validator, 0)]);
         seed_validator(&state, validator);
 
         let tx = make_channel_tx(
@@ -15312,9 +13476,6 @@ mod tests {
         assert_eq!(recv.balance, 10_000, "recipient credited 10_000");
         let pool = state.get_account(&pool_addr).expect("pool exists");
         assert_eq!(pool.balance, 999_990_000, "pool debited 10_000");
-        // Signer nonce is INTENTIONALLY not bumped — see executor arm.
-        // Validators are read from state on signing-side anyway, so a
-        // missing-account here is also acceptable.
         if let Some(signer) = state.get_account(&validator) {
             assert_eq!(signer.balance, 0, "signer balance untouched");
         }
@@ -15325,7 +13486,6 @@ mod tests {
         let pool_addr = arc_types::transaction::faucet_pool_address();
         let not_a_validator = addr(8);
         let state = StateDB::with_genesis(&[(pool_addr, 1_000_000), (not_a_validator, 0)]);
-        // Deliberately do NOT seed_validator.
 
         let tx = make_channel_tx(
             not_a_validator,
@@ -15343,7 +13503,6 @@ mod tests {
             "FaucetClaim signed by non-validator must be rejected"
         );
 
-        // Pool untouched, recipient never created.
         let pool = state.get_account(&pool_addr).unwrap();
         assert_eq!(pool.balance, 1_000_000);
         assert!(
@@ -15396,9 +13555,7 @@ mod tests {
     fn test_faucet_claim_rejects_insufficient_pool_balance() {
         let pool_addr = arc_types::transaction::faucet_pool_address();
         let validator = addr(11);
-        let state = StateDB::with_genesis(&[
-            (pool_addr, 500), // not enough for a 1_000 claim
-        ]);
+        let state = StateDB::with_genesis(&[(pool_addr, 500)]);
         seed_validator(&state, validator);
 
         let tx = make_channel_tx(
@@ -15412,7 +13569,6 @@ mod tests {
         );
         let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
         assert!(!r[0].success, "underfunded pool must reject the claim");
-        // Pool balance unchanged.
         assert_eq!(state.get_account(&pool_addr).unwrap().balance, 500);
         assert!(
             state
@@ -15436,8 +13592,6 @@ mod tests {
         seed_validator(&state, validator_a);
         seed_validator(&state, validator_b);
 
-        // These are distinct, independently authorized transactions, exactly
-        // as a recipient could obtain by calling two public validators.
         let claim_a = make_channel_tx(
             validator_a,
             0,
@@ -15513,16 +13667,9 @@ mod tests {
 
     #[test]
     fn test_faucet_claim_propagates_via_serialize_roundtrip() {
-        // Mirrors the real peer-propagation path: build + sign on one
-        // state, serialize, deserialize on a SEPARATE state, run through
-        // execute_block. Catches the bug the P0 fix exists to fix —
-        // before the fix, a null-signed faucet tx serialized over the
-        // wire would deserialize with sig_verified=false on the peer,
-        // get its signature checked, fail, and never apply.
         use arc_crypto::KeyPair;
         let pool_addr = arc_types::transaction::faucet_pool_address();
 
-        // Seed an Ed25519 validator on the proposer side.
         let kp = KeyPair::generate_ed25519();
         let validator = kp.address();
 
@@ -15536,8 +13683,6 @@ mod tests {
         let peer_state = StateDB::with_genesis(&[(pool_addr, 100_000_000)]);
         seed_validator(&peer_state, validator);
 
-        // sig_verified is `#[serde(default)]` so the peer deserializes
-        // with the flag cleared — same as a real network hop.
         let peer_tx: Transaction = bincode::deserialize(&wire).expect("deserialize tx");
         assert!(
             !peer_tx.sig_verified,
@@ -15560,9 +13705,6 @@ mod tests {
         assert_eq!(pool.balance, 99_990_000, "peer debits pool by 10_000");
     }
 
-    // ── Tier 1 on-chain inference state transitions ──
-
-    /// Build an unsigned tier1 InferenceRequest tx for tests.
     fn build_tier1_request(
         from: Address,
         nonce: u64,
@@ -15659,7 +13801,6 @@ mod tests {
     fn tier1_request_locks_escrow_and_records_metadata() {
         let requester = addr(1);
         let state = StateDB::with_genesis(&[(requester, 100)]);
-        // Register a validator so block production has a proposer.
         state
             .validators
             .insert(addr(99).0, StateDB::MIN_VALIDATOR_STAKE);
@@ -15669,12 +13810,10 @@ mod tests {
         let (_, receipts) = state.execute_block(&[tx], addr(99)).unwrap();
         assert!(receipts[0].success, "request must succeed");
 
-        // Requester balance debited.
         let r = state.get_account(&requester).unwrap();
         assert_eq!(r.balance, 90);
         assert_eq!(r.nonce, 1);
 
-        // Escrow holds the locked reward.
         let escrow_addr = hash_bytes(&[b"arc-infreq", req_id.as_ref()].concat());
         let escrow = state.get_account(&escrow_addr).unwrap();
         assert_eq!(escrow.balance, 10);
@@ -15690,7 +13829,6 @@ mod tests {
             .validators
             .insert(addr(99).0, StateDB::MIN_VALIDATOR_STAKE);
 
-        // Construct an oversized prompt directly.
         use arc_crypto::Signature;
         use arc_types::transaction::{
             InferenceRequestBody, TIER1_INPUT_BLOB_MAX, Transaction, TxBody, TxType,
@@ -15729,8 +13867,6 @@ mod tests {
 
     #[test]
     fn tier1_full_consensus_payout() {
-        // Single-validator committee. Validator votes for its own
-        // request, finalize pays out (after escrow rebate + treasury).
         let validator = addr(10);
         let state = StateDB::with_genesis(&[(validator, 1_000_000)]);
         state
@@ -15738,42 +13874,32 @@ mod tests {
             .insert(validator.0, StateDB::MIN_VALIDATOR_STAKE);
 
         let req_id = [7u8; 32];
-        // Tx 1: request (nonce 0)
         let tx1 = build_tier1_request(validator, 0, req_id, 100, 1, 20);
         let (block1, r1) = state.execute_block(&[tx1], validator).unwrap();
         assert!(r1[0].success);
 
-        // Committee seed = block hash of tx1's commit block.
         let committee_seed = block1.hash;
 
-        // Tx 2: vote (nonce 1)
         let output_hash = hash_bytes(b"the answer");
         let tx2 = build_tier1_vote(validator, 1, req_id, committee_seed, output_hash);
         let (_, r2) = state.execute_block(&[tx2], validator).unwrap();
         assert!(r2[0].success, "vote must succeed");
 
-        // Tx 3: finalize (nonce 2). vote_count = 1 = committee_size → eligible.
         let tx3 = build_tier1_finalize(validator, 2, req_id);
         let (_, r3) = state.execute_block(&[tx3], validator).unwrap();
         assert!(r3[0].success, "finalize must succeed");
 
-        // Escrow zeroed + status Finalized.
         let escrow_addr = hash_bytes(&[b"arc-infreq", req_id.as_ref()].concat());
         let escrow = state.get_account(&escrow_addr).unwrap();
         assert_eq!(escrow.balance, 0);
         assert_eq!(escrow.code_hash.0[0], TIER1_STATUS_FINALIZED);
 
-        // Validator received 70% of 100 = 70 (voters share) + 20 (refund) = 90 back.
-        // Treasury got 10.
         let final_validator = state.get_account(&validator).unwrap();
-        // started 1_000_000, locked 100 in tx1, then earned voters+refund=90,
-        // so balance = 999_900 + 90 = 999_990
         assert_eq!(final_validator.balance, 999_990);
 
         let treasury = state
             .get_account(&arc_types::transaction::faucet_pool_address())
             .unwrap();
-        // Treasury starts at 0 in this genesis, gets +10.
         assert_eq!(treasury.balance, 10);
     }
 
@@ -15791,27 +13917,23 @@ mod tests {
         let (_, r1) = state.execute_block(&[tx1], addr(99)).unwrap();
         assert!(r1[0].success);
 
-        // Advance past deadline (5 blocks).
         for _ in 0..6 {
             state.execute_block(&[], addr(99)).unwrap();
         }
 
-        // Finalize with no votes → timeout refund.
         let tx2 = build_tier1_finalize(addr(99), 0, req_id);
         let (_, r2) = state.execute_block(&[tx2], addr(99)).unwrap();
         assert!(r2[0].success, "finalize on timeout must succeed");
 
         let after = state.get_account(&requester).unwrap();
-        // requester started 1000, locked 50, gets back 49 (50 - 1 anti-spam) → 999.
         assert_eq!(after.balance, 1000 - max_reward + (max_reward - 1));
     }
 
     #[test]
     fn tier1_vote_from_non_committee_rejected() {
         let alice = addr(30);
-        let bob = addr(31); // Not a validator → not in committee.
+        let bob = addr(31);
         let state = StateDB::with_genesis(&[(alice, 1000), (bob, 1000)]);
-        // Only alice is a validator.
         state
             .validators
             .insert(alice.0, StateDB::MIN_VALIDATOR_STAKE);
@@ -15822,7 +13944,6 @@ mod tests {
         assert!(r1[0].success);
         let committee_seed = block1.hash;
 
-        // bob tries to vote → must fail.
         let tx2 = build_tier1_vote(bob, 0, req_id, committee_seed, hash_bytes(b"x"));
         let (_, r2) = state.execute_block(&[tx2], alice).unwrap();
         assert!(
@@ -15831,16 +13952,8 @@ mod tests {
         );
     }
 
-    // ── Tier 2 attestation bonds + authorized community rewards ────────────
-    //
-    // Raw attestations only commit model/input/output and lock an optional
-    // challenge bond. Treasury income is a separate validator-authorized,
-    // job-bound and replay-marked state transition.
-
     const REWARD: u64 = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
 
-    /// Total spendable + staked balance across every account (escrows and the
-    /// treasury included). The conservation invariant for all tests below.
     fn sum_all_balances(state: &StateDB) -> u128 {
         state
             .accounts
@@ -16262,9 +14375,6 @@ mod tests {
                 .contains("legacy marker semantics")
         );
 
-        // A pre-upgrade ordinary transfer could only create a balance-bearing
-        // EOA at the old predictable hash. It must not permanently suppress
-        // the protected v3 marker and cannot be overwritten by reward state.
         state
             .accounts
             .insert(legacy_job_marker.0, Account::new(legacy_job_marker, 1));
@@ -16348,7 +14458,6 @@ mod tests {
             worker_after_first
         );
 
-        // Exercise every epoch cap with valid consensus-marker metadata.
         *state.height.write() = 1;
         let epoch = state.height() / V3_COMMUNITY_REWARD_EPOCH_BLOCKS;
         let worker_budget = community_reward_worker_budget_address(epoch, &worker.address());
@@ -16508,15 +14617,12 @@ mod tests {
         let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
         assert!(r[0].success);
 
-        // Attester: start − bond, nonce +1. Raw attestations do not pay.
         let w = state.get_account(&worker).unwrap();
         assert_eq!(w.balance, worker_start - bond);
         assert_eq!(w.nonce, 1);
 
-        // Treasury is untouched until an authorized reward transaction.
         assert_eq!(state.get_account(&pool).unwrap().balance, treasury_start);
 
-        // Bond locked in escrow, tagged OPEN, refund target = worker.
         let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
         let esc = state.get_account(&escrow_addr).unwrap();
         assert_eq!(esc.balance, bond);
@@ -16543,7 +14649,6 @@ mod tests {
             0,
             "an unattached self-signed attestation must never earn"
         );
-        // No escrow account is created for a zero bond.
         let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
         assert!(
             state
@@ -16776,8 +14881,6 @@ mod tests {
             .collect();
         let worker = arc_crypto::KeyPair::generate_ed25519();
         let unit = StateDB::MIN_VALIDATOR_STAKE;
-        // Three identities satisfy the 3-of-4 count requirement, but the
-        // omitted validator owns most of the active stake.
         let stakes = [
             (&validators[0], unit),
             (&validators[1], unit),
@@ -16805,8 +14908,6 @@ mod tests {
             .collect();
         let worker = arc_crypto::KeyPair::generate_ed25519();
         let unit = StateDB::MIN_VALIDATOR_STAKE;
-        // Three identities meet the 3-of-4 count policy, but their stake is
-        // exactly 6/9 = 2/3. Reward authorization requires strictly >2/3.
         let stakes = [
             (&validators[0], unit),
             (&validators[1], unit),
@@ -17080,7 +15181,6 @@ mod tests {
         seed_validator(&state, validator.address());
         activate_community_rewards(&state);
 
-        // execute_block increments height to 1 before applying this claim.
         let reward = make_signed_community_reward(&validator, &worker, 1, b"expired", 0);
         let (_, receipt) = state.execute_block(&[reward], validator.address()).unwrap();
         assert!(!receipt[0].success);
@@ -17138,9 +15238,6 @@ mod tests {
 
     #[test]
     fn attestation_unfunded_attester_still_insufficient_balance() {
-        // A worker whose balance is below the bond must still fail with the
-        // unchanged InsufficientBalance error — the treasury-funded reward does
-        // NOT relax the bond check.
         let pool = arc_types::transaction::faucet_pool_address();
         let worker = addr(62);
         let bond = REWARD;
@@ -17155,7 +15252,6 @@ mod tests {
             err
         );
 
-        // Treasury untouched (reward never paid), worker untouched.
         assert_eq!(state.get_account(&pool).unwrap().balance, 10 * REWARD);
         let w = state.get_account(&worker).unwrap();
         assert_eq!(w.balance, 100);
@@ -17167,7 +15263,7 @@ mod tests {
     fn raw_attestation_never_drains_partial_treasury() {
         let pool = arc_types::transaction::faucet_pool_address();
         let worker = addr(63);
-        let treasury_start = REWARD / 5; // less than a full reward
+        let treasury_start = REWARD / 5;
         let state = StateDB::with_genesis(&[(pool, treasury_start), (worker, 0)]);
         let before = sum_all_balances(&state);
 
@@ -17182,8 +15278,6 @@ mod tests {
 
     #[test]
     fn attestation_treasury_absent_skips_reward() {
-        // With no faucet-pool account at all, the reward is skipped (no panic,
-        // no synthetic balance) and the attester is simply −bond into escrow.
         let worker = addr(64);
         let bond = REWARD / 4;
         let state = StateDB::with_genesis(&[(worker, REWARD)]);
@@ -17221,7 +15315,6 @@ mod tests {
         let worker_after_attest = state.get_account(&worker).unwrap().balance;
         assert_eq!(worker_after_attest, 2 * REWARD - bond);
 
-        // Not released before the window: a sweep one block early is a no-op.
         assert_eq!(state.sweep_matured_bond_releases(release_h - 1), 0);
         assert_eq!(state.get_account(&escrow_addr).unwrap().balance, bond);
         assert_eq!(
@@ -17229,14 +15322,12 @@ mod tests {
             worker_after_attest
         );
 
-        // Released exactly at the deadline: escrow → 0, worker regains the bond.
         assert_eq!(state.sweep_matured_bond_releases(release_h), 1);
         assert_eq!(state.get_account(&escrow_addr).unwrap().balance, 0);
         assert_eq!(
             state.get_account(&worker).unwrap().balance,
             worker_after_attest + bond
         );
-        // Idempotent: sweeping again does nothing.
         assert_eq!(state.sweep_matured_bond_releases(release_h), 0);
         assert_eq!(sum_all_balances(&state), before, "supply conserved");
     }
@@ -17256,14 +15347,12 @@ mod tests {
         ]);
         let before = sum_all_balances(&state);
 
-        // Block 1: attestation.
         let att = make_attestation(worker, 0, bond, cp, b"job-challenged");
         let att_hash = att.hash;
         assert!(state.execute_block(&[att], addr(99)).unwrap().1[0].success);
         let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
         let release_h = state.get_account(&escrow_addr).unwrap().nonce;
 
-        // Block 2: challenge (challenger bonds ch_bond).
         let challenge = make_channel_tx(
             challenger,
             0,
@@ -17276,13 +15365,10 @@ mod tests {
         );
         assert!(state.execute_block(&[challenge], addr(99)).unwrap().1[0].success);
 
-        // Escrow now holds both bonds and is marked CHALLENGED.
         let esc = state.get_account(&escrow_addr).unwrap();
         assert_eq!(esc.balance, bond + ch_bond);
         assert_eq!(esc.storage_root.0[8], ATTEST_STATUS_CHALLENGED);
 
-        // A challenged/slashed escrow is NEVER auto-refunded, at the deadline or
-        // long after it.
         assert_eq!(state.sweep_matured_bond_releases(release_h), 0);
         assert_eq!(state.sweep_matured_bond_releases(release_h + 100), 0);
         assert_eq!(
@@ -17295,14 +15381,11 @@ mod tests {
 
     #[test]
     fn conservation_across_faucet_attestation_challenge_release() {
-        // A full multi-step scenario mixing every settlement operation; the
-        // total balance (treasury + workers + challenger + escrows) is invariant
-        // after every single block.
         let pool = arc_types::transaction::faucet_pool_address();
         let validator = addr(70);
-        let worker_c = addr(71); // community worker (bond 0)
-        let worker_b = addr(72); // bonded worker whose bond is later released
-        let worker_x = addr(73); // bonded worker whose attestation is challenged
+        let worker_c = addr(71);
+        let worker_b = addr(72);
+        let worker_x = addr(73);
         let challenger = addr(74);
         let state = StateDB::with_genesis(&[
             (pool, 50 * REWARD),
@@ -17326,7 +15409,6 @@ mod tests {
             };
         }
 
-        // Block 1: faucet the community worker.
         let faucet = make_channel_tx(
             validator,
             0,
@@ -17339,24 +15421,20 @@ mod tests {
         assert!(state.execute_block(&[faucet], validator).unwrap().1[0].success);
         conserved!();
 
-        // Block 2: community worker attests (bond 0); no implicit reward.
         let a_c = make_attestation(worker_c, 0, 0, 5, b"c");
         assert!(state.execute_block(&[a_c], validator).unwrap().1[0].success);
         conserved!();
 
-        // Block 3: bonded worker (release path) attests, cp = 4 → matures at 7.
         let a_b = make_attestation(worker_b, 0, REWARD, 4, b"b");
         let hb = a_b.hash;
         assert!(state.execute_block(&[a_b], validator).unwrap().1[0].success);
         conserved!();
 
-        // Block 4: bonded worker (challenge path) attests with a long window.
         let a_x = make_attestation(worker_x, 0, REWARD, 50, b"x");
         let hx = a_x.hash;
         assert!(state.execute_block(&[a_x], validator).unwrap().1[0].success);
         conserved!();
 
-        // Block 5: challenge worker_x's attestation.
         let ch = make_channel_tx(
             challenger,
             0,
@@ -17370,8 +15448,6 @@ mod tests {
         assert!(state.execute_block(&[ch], validator).unwrap().1[0].success);
         conserved!();
 
-        // Advance empty blocks until worker_b's bond matures; the in-block
-        // sweep refunds it during ordinary block application.
         let esc_b = hash_bytes(&[b"arc-inference", hb.as_ref()].concat());
         let release_b = state.get_account(&esc_b).unwrap().nonce;
         assert!(release_b > state.height(), "not matured yet");
@@ -17380,9 +15456,7 @@ mod tests {
             conserved!();
         }
 
-        // worker_b's bond was auto-released by the sweep.
         assert_eq!(state.get_account(&esc_b).unwrap().balance, 0);
-        // worker_x's escrow remains locked (challenged), never auto-released.
         let esc_x = hash_bytes(&[b"arc-inference", hx.as_ref()].concat());
         assert_eq!(state.get_account(&esc_x).unwrap().balance, 3 * REWARD);
         assert_eq!(
@@ -17394,9 +15468,6 @@ mod tests {
 
     #[test]
     fn rebuild_pending_bond_releases_recovers_open_escrows() {
-        // Restart durability: the in-memory release queue is rebuilt from the
-        // surviving OPEN escrow accounts, and a rebuilt queue releases exactly
-        // like the original.
         let pool = arc_types::transaction::faucet_pool_address();
         let worker = addr(75);
         let bond = REWARD / 2;
@@ -17408,14 +15479,11 @@ mod tests {
         let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
         let release_h = state.get_account(&escrow_addr).unwrap().nonce;
 
-        // Simulate a restart: the queue is empty but the escrow account
-        // survives. Rebuild it from account state.
         state.pending_bond_releases.lock().clear();
         assert_eq!(state.pending_bond_release_count(), 0);
         assert_eq!(state.rebuild_pending_bond_releases(), 1);
         assert_eq!(state.pending_bond_release_count(), 1);
 
-        // The rebuilt queue releases at the correct deadline.
         assert_eq!(state.sweep_matured_bond_releases(release_h - 1), 0);
         assert_eq!(state.sweep_matured_bond_releases(release_h), 1);
         assert_eq!(state.get_account(&escrow_addr).unwrap().balance, 0);

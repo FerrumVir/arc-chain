@@ -1,8 +1,3 @@
-//! ARC Chain Testnet Faucet
-//!
-//! A simple HTTP service that distributes test ARC tokens to developers.
-//! Rate-limited to 1 claim per address per hour.
-
 use axum::{
     extract::State,
     http::StatusCode,
@@ -18,17 +13,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
-/// Faucet account index - deterministic derivation from the same genesis seed.
-/// Index 99 is reserved for the faucet.
 const FAUCET_ACCOUNT_INDEX: u8 = 99;
 
-/// Amount of ARC tokens per claim.
 const CLAIM_AMOUNT: u64 = 1000;
 
-/// Rate limit window (1 hour).
 const RATE_LIMIT_SECS: u64 = 3600;
 
-/// Derive the faucet address deterministically (same as genesis accounts in arc-bench).
 fn faucet_address() -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&[FAUCET_ACCOUNT_INDEX]);
@@ -36,7 +26,6 @@ fn faucet_address() -> String {
     hex::encode(hash.as_bytes())
 }
 
-/// Hex encoding helper (inline to avoid another dependency).
 mod hex {
     pub fn encode(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{:02x}", b)).collect()
@@ -55,19 +44,12 @@ struct Cli {
     port: u16,
 }
 
-/// Shared application state.
 struct AppState {
-    /// Node RPC URL.
     node_url: String,
-    /// Rate limit tracker: address -> last claim time.
     claims: Mutex<HashMap<String, Instant>>,
-    /// Faucet wallet address.
     faucet_address: String,
-    /// Total claims today (resets on restart).
     total_claims: Mutex<u64>,
-    /// Current nonce for the faucet account (incremented per claim).
     nonce: Mutex<u64>,
-    /// HTTP client for RPC calls.
     http: reqwest::Client,
 }
 
@@ -141,7 +123,6 @@ async fn main() {
     axum::serve(listener, app).await.expect("Server error");
 }
 
-/// GET /health
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_string(),
@@ -149,7 +130,6 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     })
 }
 
-/// GET /status
 async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     let claims_today = *state.total_claims.lock().await;
     Json(StatusResponse {
@@ -161,14 +141,12 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
     })
 }
 
-/// POST /claim
 async fn claim(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ClaimRequest>,
 ) -> impl IntoResponse {
     let address = req.address.trim().to_lowercase();
 
-    // Validate address format (64 hex chars)
     if address.len() != 64 || !address.chars().all(|c| c.is_ascii_hexdigit()) {
         return (
             StatusCode::BAD_REQUEST,
@@ -178,13 +156,6 @@ async fn claim(
         );
     }
 
-    // Proxy to the chain node's built-in /faucet/claim endpoint. The chain
-    // owns the faucet account, knows its current nonce, applies state under
-    // consensus, and rate-limits per-address. We just pass through.
-    //
-    // (Submitting a Transfer here directly fails: the faucet account has no
-    // private key, so any unsigned Transfer is rejected by /tx/submit. The
-    // chain's /faucet/claim is a privileged path that signs internally.)
     let url = format!("{}/faucet/claim", state.node_url);
     let payload = serde_json::json!({ "address": address });
     let result = state.http.post(&url).json(&payload).send().await;
@@ -199,8 +170,6 @@ async fn claim(
                 let mut total = state.total_claims.lock().await;
                 *total += 1;
             }
-            // Mirror the chain's rate-limit decision locally for fast rejects
-            // before another network hop next time.
             {
                 let mut claims = state.claims.lock().await;
                 claims.insert(address.clone(), Instant::now());
@@ -226,7 +195,6 @@ async fn claim(
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             tracing::error!("Node returned {}: {}", status, text);
-            // Pass the chain's status code through (e.g. 429 for rate limits).
             let mapped = match status.as_u16() {
                 429 => StatusCode::TOO_MANY_REQUESTS,
                 400 => StatusCode::BAD_REQUEST,
@@ -250,7 +218,6 @@ async fn claim(
     }
 }
 
-/// GET / - Simple HTML faucet page.
 async fn index_page(State(state): State<Arc<AppState>>) -> Html<String> {
     Html(format!(
         r#"<!DOCTYPE html>

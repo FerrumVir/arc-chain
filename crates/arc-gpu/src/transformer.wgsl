@@ -1,32 +1,19 @@
-// ─── GPU-Resident Integer Transformer ──────────────────────────────────────────
-//
-// Full forward pass on GPU: embed → (layernorm → QKV → RoPE → attention →
-// output proj → residual → layernorm → FFN → residual) × N_layers → LM head.
-//
-// All intermediate data stays on GPU. Single command buffer per token.
-// Activations: i32 (sufficient range for Q16 values in typical LLM range).
-// Weights: packed i8 in u32 arrays. KV cache: packed i8 in u32 arrays.
-//
-// Dispatched as multiple @compute kernels chained in one command buffer.
-
-// ─── Shared Types ─────────────────────────────────────────────────────────────
-
 struct MatmulParams {
     in_size: u32,
     out_size: u32,
-    scale_offset: u32, // offset into scales buffer for this matrix's per-row scales
+    scale_offset: u32,
     _pad: u32,
 }
 
 struct LayerNormParams {
-    size: u32,   // d_model
+    size: u32,
     _p1: u32,
     _p2: u32,
     _p3: u32,
 }
 
 struct RopeParams {
-    pos: u32,      // current sequence position
+    pos: u32,
     d_head: u32,
     n_heads: u32,
     _pad: u32,
@@ -36,24 +23,17 @@ struct AttnParams {
     d_head: u32,
     n_heads: u32,
     n_kv_heads: u32,
-    seq_len: u32,   // full sequence length (pos + 1)
+    seq_len: u32,
     d_kv: u32,
-    attn_scale: i32,  // 1/sqrt(d_head) in Q16
+    attn_scale: i32,
     _p1: u32,
     _p2: u32,
 }
-
-// ─── Extract signed i8 from packed u32 ────────────────────────────────────────
 
 fn ext_i8(packed: u32, idx: u32) -> i32 {
     let byte = (packed >> (idx * 8u)) & 0xFFu;
     return i32(byte) - i32((byte >> 7u) * 256u);
 }
-
-// ─── Kernel: i8×i8→i32 Matmul ────────────────────────────────────────────────
-// Each thread computes one output row.
-// weights: packed i8, input: packed i8, output: i32 accumulators.
-// Per-row scale applied after accumulation.
 
 @group(0) @binding(0) var<storage, read> mm_weights: array<u32>;
 @group(0) @binding(1) var<storage, read> mm_input: array<u32>;
@@ -73,7 +53,6 @@ fn matmul(@builtin(global_invocation_id) gid: vec3<u32>) {
     var acc2: i32 = 0;
     var acc3: i32 = 0;
 
-    // 4-way ILP: process 4 packed u32s (16 i8 values) per iteration
     let quads = packed_cols / 4u;
     for (var j: u32 = 0u; j < quads; j = j + 1u) {
         let j4 = j * 4u;
@@ -96,7 +75,6 @@ fn matmul(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     var acc = acc0 + acc1 + acc2 + acc3;
 
-    // Remainder
     for (var j = quads * 4u; j < packed_cols; j = j + 1u) {
         let w = mm_weights[row_off + j];
         let i = mm_input[j];
@@ -107,10 +85,6 @@ fn matmul(@builtin(global_invocation_id) gid: vec3<u32>) {
     let scale = mm_scales[mm_params.scale_offset + row];
     mm_output[row] = acc * (scale >> 8);
 }
-
-// ─── Kernel: LayerNorm ────────────────────────────────────────────────────────
-// Reduction over d_model elements using workgroup shared memory.
-// input → output (normalized), gamma applied element-wise.
 
 @group(0) @binding(0) var<storage, read> ln_input: array<i32>;
 @group(0) @binding(1) var<storage, read_write> ln_output: array<i32>;
@@ -127,7 +101,6 @@ fn layernorm(
     let size = ln_params.size;
     let tid = lid.x;
 
-    // Step 1: compute partial sums for mean
     var local_sum: i32 = 0;
     for (var i = tid; i < size; i = i + 256u) {
         local_sum += ln_input[i];
@@ -135,7 +108,6 @@ fn layernorm(
     ln_shared[tid] = local_sum;
     workgroupBarrier();
 
-    // Reduce to get total sum
     for (var stride = 128u; stride > 0u; stride = stride >> 1u) {
         if (tid < stride) {
             ln_shared[tid] += ln_shared[tid + stride];
@@ -145,11 +117,10 @@ fn layernorm(
     let mean = ln_shared[0] / i32(size);
     workgroupBarrier();
 
-    // Step 2: compute variance
     var local_var: i32 = 0;
     for (var i = tid; i < size; i = i + 256u) {
         let d = ln_input[i] - mean;
-        local_var += (d * d) >> 16; // Q16 shift
+        local_var += (d * d) >> 16;
     }
     ln_shared[tid] = local_var;
     workgroupBarrier();
@@ -162,23 +133,18 @@ fn layernorm(
     }
     let variance = ln_shared[0] / i32(size);
 
-    // isqrt approximation (Newton-Raphson would be complex in WGSL)
-    // Use simple bit-shifting approximation
     let inv_std = 65536 / max(1, i32(sqrt(f32(max(1, variance + 1)))));
     workgroupBarrier();
 
-    // Step 3: normalize and scale by gamma
     for (var i = tid; i < size; i = i + 256u) {
         let norm = ((ln_input[i] - mean) * inv_std) >> 16;
         ln_output[i] = (norm * ln_gamma[i]) >> 16;
     }
 }
 
-// ─── Kernel: Quantize i32 → packed i8 (for matmul input) ─────────────────────
-
 @group(0) @binding(0) var<storage, read> q_input: array<i32>;
 @group(0) @binding(1) var<storage, read_write> q_output: array<u32>;
-@group(0) @binding(2) var<storage, read_write> q_scale: array<i32>; // single element: scale factor
+@group(0) @binding(2) var<storage, read_write> q_scale: array<i32>;
 
 var<workgroup> q_shared_max: array<i32, 256>;
 
@@ -188,9 +154,8 @@ fn quantize_i32_to_i8(
     @builtin(num_workgroups) nwg: vec3<u32>
 ) {
     let tid = lid.x;
-    let size = nwg.x * 256u; // approximate
+    let size = nwg.x * 256u;
 
-    // Find abs max using workgroup reduction
     var local_max: i32 = 0;
     for (var i = tid; i < size; i = i + 256u) {
         let v = q_input[i];
@@ -214,7 +179,6 @@ fn quantize_i32_to_i8(
     }
     workgroupBarrier();
 
-    // Quantize and pack into u32
     for (var i = tid; i < (size + 3u) / 4u; i = i + 256u) {
         let base = i * 4u;
         var packed: u32 = 0u;
@@ -226,16 +190,14 @@ fn quantize_i32_to_i8(
     }
 }
 
-// ─── Kernel: RoPE ─────────────────────────────────────────────────────────────
-
-@group(0) @binding(0) var<storage, read_write> rope_data: array<i32>; // Q/K vectors
+@group(0) @binding(0) var<storage, read_write> rope_data: array<i32>;
 @group(0) @binding(1) var<storage, read> rope_cos: array<i32>;
 @group(0) @binding(2) var<storage, read> rope_sin: array<i32>;
 @group(0) @binding(3) var<uniform> rope_params: RopeParams;
 
 @compute @workgroup_size(256)
 fn rope(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x; // index into d_head/2 elements across all heads
+    let idx = gid.x;
     let half = rope_params.d_head / 2u;
     let total = rope_params.n_heads * half;
     if (idx >= total) { return; }
@@ -255,21 +217,18 @@ fn rope(@builtin(global_invocation_id) gid: vec3<u32>) {
     rope_data[base + i + half] = ((x0 * sin_val) >> 16) + ((x1 * cos_val) >> 16);
 }
 
-// ─── Kernel: Attention (scores + softmax + weighted V) ────────────────────────
-// One workgroup per head. Computes full attention for that head.
-
-@group(0) @binding(0) var<storage, read> attn_q: array<i32>;        // [n_heads × d_head]
-@group(0) @binding(1) var<storage, read> attn_k_cache: array<u32>;  // packed i8 KV cache
+@group(0) @binding(0) var<storage, read> attn_q: array<i32>;
+@group(0) @binding(1) var<storage, read> attn_k_cache: array<u32>;
 @group(0) @binding(2) var<storage, read> attn_v_cache: array<u32>;
 @group(0) @binding(3) var<storage, read> attn_k_scales: array<i32>;
 @group(0) @binding(4) var<storage, read> attn_v_scales: array<i32>;
-@group(0) @binding(5) var<storage, read_write> attn_output: array<i32>; // [n_heads × d_head]
+@group(0) @binding(5) var<storage, read_write> attn_output: array<i32>;
 @group(0) @binding(6) var<uniform> attn_params: AttnParams;
 
-var<workgroup> attn_scores: array<i32, 2048>; // max seq len
+var<workgroup> attn_scores: array<i32, 2048>;
 var<workgroup> smx_shared: array<i32, 32>;
 
-@compute @workgroup_size(32) // one thread per sequence position (up to 32)
+@compute @workgroup_size(32)
 fn attention(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>
@@ -280,7 +239,6 @@ fn attention(
     let seq = attn_params.seq_len;
     let kv_h = head * attn_params.n_kv_heads / attn_params.n_heads;
 
-    // Each thread computes scores for multiple positions
     for (var j = tid; j < seq; j = j + 32u) {
         var dot: i32 = 0;
         let q_off = head * dh;
@@ -297,7 +255,6 @@ fn attention(
     }
     workgroupBarrier();
 
-    // Phase 1: Parallel max-find
     var local_max: i32 = -999999;
     for (var j = tid; j < seq; j = j + 32u) {
         local_max = max(local_max, attn_scores[j]);
@@ -313,7 +270,6 @@ fn attention(
     let max_val = smx_shared[0];
     workgroupBarrier();
 
-    // Phase 2: Parallel exp + sum
     var local_sum: i32 = 0;
     for (var j = tid; j < seq; j = j + 32u) {
         let x = attn_scores[j] - max_val;
@@ -333,7 +289,6 @@ fn attention(
     let sum_exp = smx_shared[0];
     workgroupBarrier();
 
-    // Phase 3: Parallel normalize
     if (sum_exp > 0) {
         for (var j = tid; j < seq; j = j + 32u) {
             attn_scores[j] = (attn_scores[j] * 65536) / sum_exp;
@@ -341,7 +296,6 @@ fn attention(
     }
     workgroupBarrier();
 
-    // Weighted V sum (each thread handles d_head/32 dimensions)
     let dims_per_thread = max(1u, dh / 32u);
     let d_start = tid * dims_per_thread;
     let d_end = min(dh, d_start + dims_per_thread);
@@ -359,8 +313,6 @@ fn attention(
     }
 }
 
-// ─── Kernel: SiLU gate * up ───────────────────────────────────────────────────
-
 @group(0) @binding(0) var<storage, read_write> silu_gate: array<i32>;
 @group(0) @binding(1) var<storage, read> silu_up: array<i32>;
 
@@ -368,11 +320,9 @@ fn attention(
 fn silu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     let g = silu_gate[i];
-    let silu_g = select(g >> 2, g, g > 0); // SiLU approx
+    let silu_g = select(g >> 2, g, g > 0);
     silu_gate[i] = (silu_g * silu_up[i]) >> 16;
 }
-
-// ─── Kernel: Residual Add ─────────────────────────────────────────────────────
 
 @group(0) @binding(0) var<storage, read_write> res_hidden: array<i32>;
 @group(0) @binding(1) var<storage, read> res_add: array<i32>;
@@ -382,10 +332,8 @@ fn residual_add(@builtin(global_invocation_id) gid: vec3<u32>) {
     res_hidden[gid.x] += res_add[gid.x];
 }
 
-// ─── Kernel: Argmax ───────────────────────────────────────────────────────────
-
 @group(0) @binding(0) var<storage, read> argmax_input: array<i32>;
-@group(0) @binding(1) var<storage, read_write> argmax_result: array<u32>; // [best_idx, best_val]
+@group(0) @binding(1) var<storage, read_write> argmax_result: array<u32>;
 
 var<workgroup> argmax_shared_idx: array<u32, 256>;
 var<workgroup> argmax_shared_val: array<i32, 256>;
@@ -428,10 +376,6 @@ fn argmax(
     }
 }
 
-// ─── Kernel: Fused LayerNorm + Quantize ─────────────────────────────────────
-// Combines layernorm + quantize_i32_to_i8 into a single dispatch.
-// Bindings: input(ro), packed_output(rw), gamma(ro), params(uniform), scale(rw)
-
 @group(0) @binding(0) var<storage, read> lnq_input: array<i32>;
 @group(0) @binding(1) var<storage, read_write> lnq_output: array<u32>;
 @group(0) @binding(2) var<storage, read> lnq_gamma: array<i32>;
@@ -447,7 +391,6 @@ fn layernorm_quantize(
     let size = lnq_params.size;
     let tid = lid.x;
 
-    // Phase 1: compute partial sums for mean
     var local_sum: i32 = 0;
     for (var i = tid; i < size; i = i + 256u) {
         local_sum += lnq_input[i];
@@ -464,7 +407,6 @@ fn layernorm_quantize(
     let mean = lnq_shared[0] / i32(size);
     workgroupBarrier();
 
-    // Phase 2: compute variance
     var local_var: i32 = 0;
     for (var i = tid; i < size; i = i + 256u) {
         let d = lnq_input[i] - mean;
@@ -483,7 +425,6 @@ fn layernorm_quantize(
     let inv_std = 65536 / max(1, i32(sqrt(f32(max(1, variance + 1)))));
     workgroupBarrier();
 
-    // Phase 3: find absmax of normalized values (for quantization scale)
     var local_max: i32 = 0;
     for (var i = tid; i < size; i = i + 256u) {
         let norm = ((lnq_input[i] - mean) * inv_std) >> 16;
@@ -508,7 +449,6 @@ fn layernorm_quantize(
     }
     workgroupBarrier();
 
-    // Phase 4: normalize, scale by gamma, quantize and pack into u32
     let packed_count = (size + 3u) / 4u;
     for (var i = tid; i < packed_count; i = i + 256u) {
         let base = i * 4u;

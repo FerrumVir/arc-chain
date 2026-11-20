@@ -36,7 +36,6 @@ one_shot_workflow_is_exact_main_protected_and_create_only() {
         'ARC_VALIDATOR_VAULT_CIPHERTEXT_B64' \
         'ARC_VALIDATOR_VAULT_PASSPHRASE' \
         'ARC_VALIDATOR_VAULT_RESTORE_CERT_B64' \
-        'This protected job never checks out repository content' \
         'Inline-decrypt, canonicalize, and public-key rewrap' \
         '/usr/bin/python3 -I - "$plain_tar" "$canonical_tar"' \
         'canonical_tar="$work_dir/validator-vault.canonical.tar"' \

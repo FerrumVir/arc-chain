@@ -22,7 +22,6 @@ import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
 import { PLAIN_COPY } from "../lib/plain-copy";
 import { setTheme, useTheme, type Theme } from "../lib/theme";
 
-/** The compute-contribution switch's mutation, so Save can wait for it. */
 const COMPUTE_CONTRIBUTION_MUTATION_KEY = ["compute-contribution"];
 
 export function Settings() {
@@ -39,14 +38,8 @@ function SettingsForm() {
   const setOnboarded = useAppStore((s) => s.setOnboarded);
   const setConfig = useAppStore((s) => s.setConfig);
   const setIdentity = useAppStore((s) => s.setIdentity);
-  // No Save while compute contribution is switching. The native side keeps
-  // the stored contribution state on a Settings save anyway; this also keeps
-  // a snapshot taken before the switch out of the UI store.
   const contributionPending =
     useIsMutating({ mutationKey: COMPUTE_CONTRIBUTION_MUTATION_KEY }) > 0;
-  // Defaults now match the real ones (types.ts DEFAULT_NODE_CONFIG and the
-  // Rust NodeConfig::default). The RPC field used to default to 9944 while
-  // onboarding wrote 9090 and the node bound 9090.
   const [rpcPort, setRpcPort] = useState(
     config?.rpcPort ?? DEFAULT_NODE_CONFIG.rpcPort,
   );
@@ -62,9 +55,6 @@ function SettingsForm() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
-  // One app-wide updater state is shared by startup, periodic, and manual
-  // checks. Settings only renders it; navigating here cannot start a second
-  // polling loop or race a background check.
   const update = useUpdaterSnapshot();
   const updateInstallPolicy = useQuery({
     queryKey: ["update-install-policy"],
@@ -79,9 +69,6 @@ function SettingsForm() {
     autoUpdate !== savedAutoUpdate ||
     autoInstallUpdates !== savedAutoInstallUpdates;
 
-  // Native config hydration can complete after the first render. Keep the
-  // form aligned with the persisted preference without overwriting a user's
-  // in-progress toggle for unrelated config updates.
   useEffect(() => {
     setAutoUpdate(config?.autoUpdate ?? DEFAULT_NODE_CONFIG.autoUpdate);
   }, [config?.autoUpdate]);
@@ -93,9 +80,6 @@ function SettingsForm() {
   }, [config?.autoInstallUpdates]);
 
   const save = async () => {
-    // Previously `if (!config) return;` — so on a fresh install, where
-    // config is null, Save silently did nothing and never showed the Saved
-    // state. Fall back to defaults instead of no-oping, and surface errors.
     setSaveError(null);
     setSaving(true);
     const next: NodeConfig = {
@@ -110,10 +94,6 @@ function SettingsForm() {
       await api.saveConfig(next);
       setConfig(next);
       setSaved(true);
-      // 2.5s, not 1.5s. A confirmation short enough to miss isn't a
-      // confirmation - and this screen now also runs a polling status query
-      // for the core slider, so on a loaded machine the old window could
-      // close before the user (or a test) saw it.
       setTimeout(() => setSaved(false), 2500);
     } catch (e) {
       setSaveError(e instanceof Error ? e.message : String(e));
@@ -165,10 +145,6 @@ function SettingsForm() {
               onChange={(e) => setP2pPort(parseInt(e.target.value, 10) || 0)}
               data-testid="input-p2p-port"
             />
-            {/* The old hint claimed "P2P port is automatically RPC + 1".
-                It is not — p2pPort is an independent stored field, so
-                raising RPC to 9500 left P2P on 9091. It is now an explicit
-                input rather than a false promise. */}
             <span className="field-hint">
               Default 9091. UDP/QUIC, used to reach other nodes. Set
               independently of the RPC port.
@@ -338,9 +314,6 @@ function SettingsForm() {
                 ? "Automatic checks run after startup and every 24 hours. Signed app updates may install and restart ARC automatically only after native worker safety confirms inference has drained."
                 : "Automatic checks run after startup and every 24 hours. Background checks never install an update."}
         </p>
-        {/* A failed check is usually a connection, and ARC retries by itself: one plain sentence, with the
-            controller's text behind Show details. An install the updater could not finish is the one case that
-            needs the person (quit and reopen), and reads like the strip on Home. */}
         <p
           style={{
             fontSize: "var(--text-sm)",
@@ -461,9 +434,6 @@ function SettingsForm() {
                 <div style={{ color: "var(--warning)", fontWeight: 500, marginBottom: 2 }}>
                   Keep your recovery phrase safe
                 </div>
-                {/* store.rs writes the identity, phrase included, to
-                    store.json in the app data folder as plain JSON. Nothing
-                    in the app sends the phrase over the network. */}
                 <div
                   style={{ fontSize: "var(--text-sm)", color: "var(--text-secondary)" }}
                   data-testid="recovery-phrase-storage"
@@ -498,10 +468,6 @@ function SettingsForm() {
                 "Reset the app? This forgets your identity on this device. Funds stay on-chain.",
               )
             ) {
-              // Full reset: clear identity + config + onboarded flag so the
-              // wizard actually runs again. (The Rust store would still hold
-              // the keys on disk - a full wipe requires `Uninstall` which
-              // removes the app-data dir.)
               setIdentity(null);
               setConfig(null);
               setOnboarded(false);
@@ -518,17 +484,6 @@ function SettingsForm() {
   );
 }
 
-/**
- * The answer to running ARC jobs on this computer.
- *
- * Nothing downloads a model or switches the node to worker mode without this
- * switch being on (here, on the onboarding step where it starts on for a
- * computer that can run the model, or through the observer banner).
- * Turning it on downloads the model if needed (resumable, verified), switches
- * to worker mode and restarts the node; turning it off returns to observer
- * mode at once. While it is on, a note states how much of the processor jobs
- * may use: the core cap the node runs with, or the stored one.
- */
 function ComputeConsent() {
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
@@ -541,15 +496,12 @@ function ComputeConsent() {
   const ineligible = tier === "none";
   const enabled = contributionChosen && !ineligible;
   const [progress, setProgress] = useState<ModelDownloadProgress | null>(null);
-  // The running node reports when it had to start without its model (the
-  // file is missing or unreadable). Same query as the core slider below.
   const { data: status } = useQuery({
     queryKey: ["status"],
     queryFn: api.nodeStatus,
     refetchInterval: 3000,
   });
   const modelUnavailable = status?.modelUnavailable ?? null;
-  // The same core count the Compute contribution slider shows.
   const coreCap = status?.workerThreads ?? config?.workerThreads ?? null;
   const logicalCores = status?.cpuCores ?? null;
 
@@ -559,9 +511,6 @@ function ComputeConsent() {
     onMutate: () => setProgress(null),
     onSuccess: (saved) => setConfig(saved),
   });
-  // Re-run the existing download flow for a model file that has gone
-  // missing: it reuses a verified copy if one is on disk, otherwise
-  // downloads it, then restarts a running node with it.
   const redownload = useMutation({
     mutationKey: COMPUTE_CONTRIBUTION_MUTATION_KEY,
     mutationFn: () => api.promoteConsentedInstall(),
@@ -730,18 +679,6 @@ function ComputeConsent() {
   );
 }
 
-/**
- * How many CPU cores the node contributes.
- *
- * There was previously no such control at any layer — not in the UI, not in
- * NodeConfig, not in the node's CLI — so rayon silently took every logical
- * core and there was no way to raise or lower it.
- *
- * Applying tries a live reconfigure first and only restarts if the node
- * can't do it in place; the result message says which happened, because
- * "applied live" and "restarted your node" are very different things to
- * have just done to someone mid-demo.
- */
 function ComputeContribution() {
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
@@ -806,11 +743,6 @@ function ComputeContribution() {
           {apply.isPending ? "Applying…" : "Apply"}
         </button>
       </div>
-      {/* The mechanism, in one sentence, with no multiplier implied.
-          This hint used to read "More cores means more work served — and more
-          earnings", which states a causal link from cores to ARC that does not
-          exist: the network routes work by its own scheduling, and a node with
-          every core dedicated earns nothing if it is sent nothing. */}
       <span className="field-hint">
         Cores your node may use for inference and verification. More cores
         serve each hop faster, at the cost of responsiveness elsewhere on this
@@ -849,16 +781,6 @@ function ComputeContribution() {
   );
 }
 
-/**
- * What this node is actually contributing, next to the slider that sets it.
- *
- * The slider on its own says what was requested. This says what happened —
- * which is a different thing, and the gap between them is the interesting part
- * (a node that is stopped, or was launched before the last change, contributes
- * what it was started with, not what the slider reads).
- *
- * Read from the LOCAL node. Every figure is a measurement or absent.
- */
 function ActualContribution() {
   const { data: c } = useQuery({
     queryKey: ["node-contribution"],
@@ -896,8 +818,6 @@ function ActualContribution() {
     ]);
   }
   if (c.layersHeld) {
-    // layerCount is a UNION of the layers held, not a sum over replicas, so
-    // "6 of 32" is honest even when two ranges overlap.
     const held =
       c.layerCount != null
         ? c.totalLayers != null
@@ -909,14 +829,10 @@ function ActualContribution() {
   if (c.runsServed != null) {
     rows.push(["Pipeline runs served", formatInt(c.runsServed)]);
   }
-  // Kept separate from runs served: a cache hit is not work performed, and
-  // summing the two would inflate the count of hops this node actually ran.
   if (c.cacheHits != null) {
     rows.push(["Served from cache", formatInt(c.cacheHits)]);
   }
   if (c.hopMsMean != null) {
-    // The sample count is part of the claim: a mean over 2 samples and a mean
-    // over 200 are not the same statement.
     rows.push([
       "Measured time per hop",
       c.hopSamples != null
@@ -965,8 +881,6 @@ function ActualContribution() {
           ))}
         </div>
       )}
-      {/* The host's own reason for having no timing, shown verbatim rather
-          than leaving the row silently missing. */}
       {c.hopMsMean == null && c.hopUnavailableReason && (
         <p
           style={{
@@ -1003,15 +917,6 @@ function ActualContribution() {
   );
 }
 
-/**
- * Startup state, stated plainly — whether the app is configured to start the
- * node and whether the OS login item that can reopen the app is registered.
- *
- * It has to be truthful about what resumes, not just that something does.
- * Auto-start brings the process back, but the role depends on whether a model
- * path is configured. Neither process state nor role proves exact-artifact
- * eligibility, assignment, authorization, or payment.
- */
 function PersistenceCard() {
   const config = useAppStore((s) => s.config);
 
@@ -1029,7 +934,6 @@ function PersistenceCard() {
   const autoStart = config?.autoStart ?? DEFAULT_NODE_CONFIG.autoStart;
   const hasModel = !!config?.modelPath;
   const running = !!status?.running;
-  // A node that is off by choice is not red (lib/connection.ts).
   const connection = describeConnection(status);
 
   return (
@@ -1067,10 +971,6 @@ function PersistenceCard() {
             {autoStart ? "on" : "off"}
           </dd>
           <dt>Registered with the OS</dt>
-          {/* The login item is the mechanism that survives a full reboot, and
-              it is registered independently of the config flag. Reported
-              separately so a disagreement between the two is visible rather
-              than averaged into one reassuring line. */}
           <dd data-testid="persistence-login-item">
             {loginItem === undefined
               ? <Skeleton width="10ch" />
@@ -1124,7 +1024,6 @@ function InferenceModeToggle() {
   );
 }
 
-/** One switch for the whole look: the site's engraved language or the original dark theme (lib/theme.ts). */
 function AppearanceToggle() {
   const theme = useTheme();
   const options: { value: Theme; title: string; body: string }[] = [

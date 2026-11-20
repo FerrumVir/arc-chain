@@ -46,7 +46,6 @@ class UpdateInputTests(unittest.TestCase):
             (self.inputs / name).write_bytes(value)
 
     def five_live_fixture(self):
-        """The real six-host fixtures with ams declared offline and the other five live."""
         fixtures = SCRIPT.parent / "tests" / "fixtures"
         config = json.loads((fixtures / "host-config-six-current-20260927.json").read_text())
         proof = json.loads((fixtures / "six-host-before-cfd-20260927.json").read_text())
@@ -64,7 +63,6 @@ class UpdateInputTests(unittest.TestCase):
         return config, proof, declared
 
     def write_declared_inputs(self, mutate=None):
-        """Owner inputs for a five-live update, bound the way the assembler binds them."""
         config, proof, declared = self.five_live_fixture()
         (self.inputs / "host-config.json").write_text(json.dumps(config))
         (self.inputs / "quorum-proof.json").write_text(json.dumps(proof))

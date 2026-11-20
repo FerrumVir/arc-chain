@@ -1,40 +1,7 @@
-//! Threshold signature scheme for ARC Chain.
-//!
-//! Implements a Shamir's Secret Sharing (SSS) based threshold signature scheme.
-//! A (t, n) threshold scheme splits a secret into n shares such that any t shares
-//! can reconstruct the secret, but fewer than t shares reveal nothing.
-//!
-//! **Cryptographic construction**:
-//!
-//! - **Field arithmetic**: Operations modulo the Mersenne prime p = 2^61 - 1,
-//!   chosen for efficient u64 arithmetic. Secrets are mapped to field elements
-//!   by taking the first 8 bytes of a BLAKE3 hash.
-//!
-//! - **Share generation**: A random degree-(t-1) polynomial f(x) is constructed
-//!   with f(0) = secret. Each share i is (i, f(i)). Commitments are BLAKE3
-//!   hashes of the share values.
-//!
-//! - **Secret recovery**: Lagrange interpolation over the Mersenne field recovers
-//!   f(0) from any t shares.
-//!
-//! - **Partial signing**: Each signer produces `BLAKE3(share_value || message)`
-//!   as their partial signature.
-//!
-//! - **Combination**: Partial signatures are combined via Lagrange-weighted
-//!   XOR and hashed to produce the combined 32-byte threshold signature.
-//!
-//! - **Verification**: Combined signature is verified by recomputing from the
-//!   public key commitment.
-
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
-/// Mersenne prime p = 2^61 - 1. All polynomial arithmetic is mod p.
 const MERSENNE_P: u64 = (1u64 << 61) - 1;
-
-// ── Error type ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum ThresholdError {
@@ -51,32 +18,20 @@ pub enum ThresholdError {
     InterpolationError(String),
 }
 
-// ── Core types ────────────────────────────────────────────────────────────────
-
-/// Configuration for a (threshold, total_shares) scheme.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThresholdScheme {
-    /// Minimum number of shares required to reconstruct (t).
     pub threshold: u32,
-    /// Total number of shares distributed (n).
     pub total_shares: u32,
-    /// Optional dealer identity (32-byte public key or identifier).
     pub dealer: Option<[u8; 32]>,
 }
 
-/// A single secret share produced by Shamir splitting.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretShare {
-    /// Share index (1-based, never 0 since f(0) = secret).
     pub index: u32,
-    /// 32-byte share value. The first 8 bytes encode the field element f(index).
-    /// Remaining bytes are a BLAKE3 expansion for full 32-byte width.
     pub value: [u8; 32],
-    /// BLAKE3 commitment to the share value.
     pub commitment: [u8; 32],
 }
 
-/// Proof that a share is valid relative to dealer commitments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareVerification {
     pub index: u32,
@@ -84,7 +39,6 @@ pub struct ShareVerification {
     pub proof: Vec<u8>,
 }
 
-/// A partial signature produced by one threshold signer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartialSignature {
     pub signer_index: u32,
@@ -92,7 +46,6 @@ pub struct PartialSignature {
     pub proof: Vec<u8>,
 }
 
-/// A threshold signature assembled from partial signatures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThresholdSignature {
     pub signers: Vec<u32>,
@@ -100,15 +53,9 @@ pub struct ThresholdSignature {
     pub combined: Option<[u8; 32]>,
 }
 
-// ── Mersenne field arithmetic ─────────────────────────────────────────────────
-
-/// Reduce a u128 value modulo the Mersenne prime 2^61 - 1.
 fn mod_mersenne(x: u128) -> u64 {
-    // For Mersenne prime 2^61 - 1:
-    // x mod p = (x >> 61) + (x & p) and repeat until < p.
     let p = MERSENNE_P as u128;
     let mut r = x;
-    // Two iterations suffice for products of two u64 values.
     r = (r >> 61) + (r & p);
     r = (r >> 61) + (r & p);
     if r >= p {
@@ -117,31 +64,25 @@ fn mod_mersenne(x: u128) -> u64 {
     r as u64
 }
 
-/// Addition modulo p.
 fn field_add(a: u64, b: u64) -> u64 {
     let s = (a as u128) + (b as u128);
     mod_mersenne(s)
 }
 
-/// Subtraction modulo p.
 fn field_sub(a: u64, b: u64) -> u64 {
-    // a - b mod p, handling underflow by adding p.
     if a >= b {
         let d = a - b;
         if d >= MERSENNE_P { d - MERSENNE_P } else { d }
     } else {
-        // a + p - b
         let d = (a as u128) + (MERSENNE_P as u128) - (b as u128);
         mod_mersenne(d)
     }
 }
 
-/// Multiplication modulo p.
 fn field_mul(a: u64, b: u64) -> u64 {
     mod_mersenne((a as u128) * (b as u128))
 }
 
-/// Modular exponentiation (binary method) for computing inverses.
 fn field_pow(mut base: u64, mut exp: u64) -> u64 {
     let mut result: u64 = 1;
     base = mod_mersenne(base as u128);
@@ -155,30 +96,24 @@ fn field_pow(mut base: u64, mut exp: u64) -> u64 {
     result
 }
 
-/// Multiplicative inverse modulo p using Fermat's little theorem: a^{-1} = a^{p-2} mod p.
 fn field_inv(a: u64) -> u64 {
     assert!(a != 0, "cannot invert zero");
     field_pow(a, MERSENNE_P - 2)
 }
 
-/// Convert first 8 bytes of a 32-byte array to a field element.
 fn bytes_to_field(b: &[u8; 32]) -> u64 {
     let raw = u64::from_le_bytes(b[0..8].try_into().unwrap());
     mod_mersenne(raw as u128)
 }
 
-/// Convert a field element to a 32-byte array (first 8 bytes = LE encoding,
-/// remaining 24 bytes = BLAKE3 expansion for uniqueness).
 fn field_to_bytes(val: u64) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[0..8].copy_from_slice(&val.to_le_bytes());
-    // Expand the remaining 24 bytes deterministically.
     let expansion = blake3::hash(&out[0..8]);
     out[8..32].copy_from_slice(&expansion.as_bytes()[0..24]);
     out
 }
 
-/// Derive a commitment for a share value.
 fn commit_share(value: &[u8; 32]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"arc-threshold-commitment");
@@ -186,29 +121,20 @@ fn commit_share(value: &[u8; 32]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-// ── Key generation (Shamir Secret Sharing) ────────────────────────────────────
-
-/// Functions for generating and recovering threshold shares.
 pub struct KeyGeneration;
 
 impl KeyGeneration {
-    /// Split a 32-byte secret into `total` shares with the given `threshold`.
-    ///
-    /// Uses a random degree-(threshold-1) polynomial f(x) where f(0) = secret.
-    /// Each share i (1..=total) is (i, f(i) mod p).
     pub fn generate_shares(secret: &[u8; 32], threshold: u32, total: u32) -> Vec<SecretShare> {
         assert!(threshold >= 1, "threshold must be >= 1");
         assert!(total >= threshold, "total must be >= threshold");
 
         let secret_field = bytes_to_field(secret);
 
-        // Build random polynomial coefficients: a_0 = secret, a_1..a_{t-1} random.
         let mut coeffs = Vec::with_capacity(threshold as usize);
         coeffs.push(secret_field);
 
         let mut rng_state = *secret;
         for i in 1..threshold {
-            // Deterministic but unpredictable coefficients from BLAKE3.
             let mut hasher = blake3::Hasher::new();
             hasher.update(b"arc-threshold-poly-coeff");
             hasher.update(&rng_state);
@@ -218,7 +144,6 @@ impl KeyGeneration {
             coeffs.push(coeff);
         }
 
-        // Evaluate polynomial at x = 1..=total.
         let mut shares = Vec::with_capacity(total as usize);
         for x in 1..=total {
             let x_field = mod_mersenne(x as u128);
@@ -235,7 +160,6 @@ impl KeyGeneration {
         shares
     }
 
-    /// Recover the secret from at least `threshold` shares via Lagrange interpolation.
     pub fn recover_secret(
         shares: &[SecretShare],
         threshold: u32,
@@ -247,7 +171,6 @@ impl KeyGeneration {
             });
         }
 
-        // Check for duplicate indices.
         let mut seen = std::collections::HashSet::new();
         for share in shares {
             if !seen.insert(share.index) {
@@ -255,10 +178,8 @@ impl KeyGeneration {
             }
         }
 
-        // Use exactly `threshold` shares.
         let subset = &shares[..threshold as usize];
 
-        // Extract (x, y) pairs as field elements.
         let points: Vec<(u64, u64)> = subset
             .iter()
             .map(|s| {
@@ -272,7 +193,6 @@ impl KeyGeneration {
         Ok(field_to_bytes(secret_field))
     }
 
-    /// Verify a share against its commitment.
     pub fn verify_share(share: &SecretShare, commitments: &[[u8; 32]]) -> bool {
         if share.index == 0 || share.index as usize > commitments.len() {
             return false;
@@ -282,10 +202,7 @@ impl KeyGeneration {
     }
 }
 
-/// Evaluate a polynomial with the given coefficients at point x.
-/// coeffs[0] + coeffs[1]*x + coeffs[2]*x^2 + ...
 fn eval_polynomial(coeffs: &[u64], x: u64) -> u64 {
-    // Horner's method.
     let mut result: u64 = 0;
     for &c in coeffs.iter().rev() {
         result = field_add(field_mul(result, x), c);
@@ -293,7 +210,6 @@ fn eval_polynomial(coeffs: &[u64], x: u64) -> u64 {
     result
 }
 
-/// Lagrange interpolation to recover f(0) from a set of (x_i, y_i) points.
 fn lagrange_interpolate_at_zero(points: &[(u64, u64)]) -> Result<u64, ThresholdError> {
     let n = points.len();
     let mut result: u64 = 0;
@@ -307,9 +223,7 @@ fn lagrange_interpolate_at_zero(points: &[(u64, u64)]) -> Result<u64, ThresholdE
             if i == j {
                 continue;
             }
-            // Numerator: product of (0 - x_j) = product of (-x_j) = product of (p - x_j).
             numerator = field_mul(numerator, field_sub(0, x_j));
-            // Denominator: product of (x_i - x_j).
             denominator = field_mul(denominator, field_sub(x_i, x_j));
         }
 
@@ -327,23 +241,16 @@ fn lagrange_interpolate_at_zero(points: &[(u64, u64)]) -> Result<u64, ThresholdE
     Ok(result)
 }
 
-// ── Threshold signer ──────────────────────────────────────────────────────────
-
-/// A signer in a threshold scheme. Holds one share and can produce partial signatures.
 pub struct ThresholdSigner {
     pub scheme: ThresholdScheme,
     pub my_share: SecretShare,
 }
 
 impl ThresholdSigner {
-    /// Create a new threshold signer with the given scheme and share.
     pub fn new(scheme: ThresholdScheme, my_share: SecretShare) -> Self {
         Self { scheme, my_share }
     }
 
-    /// Produce a partial signature on a message using this signer's share.
-    ///
-    /// The partial signature is `BLAKE3(share_value || message)`.
     pub fn partial_sign(&self, message: &[u8]) -> PartialSignature {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"arc-threshold-partial-sig");
@@ -351,7 +258,6 @@ impl ThresholdSigner {
         hasher.update(message);
         let sig = hasher.finalize();
 
-        // Proof of knowledge: BLAKE3(commitment || signature).
         let mut proof_hasher = blake3::Hasher::new();
         proof_hasher.update(b"arc-threshold-sig-proof");
         proof_hasher.update(&self.my_share.commitment);
@@ -365,11 +271,6 @@ impl ThresholdSigner {
         }
     }
 
-    /// Combine partial signatures from at least `threshold` signers into
-    /// a single 32-byte threshold signature.
-    ///
-    /// Uses Lagrange-weighted combination: each partial signature is weighted
-    /// by its Lagrange basis polynomial evaluated at 0.
     pub fn combine_partials(
         &self,
         partials: &[PartialSignature],
@@ -381,7 +282,6 @@ impl ThresholdSigner {
             });
         }
 
-        // Check for duplicate signer indices.
         let mut seen = std::collections::HashSet::new();
         for p in partials {
             if !seen.insert(p.signer_index) {
@@ -389,18 +289,15 @@ impl ThresholdSigner {
             }
         }
 
-        // Compute Lagrange coefficients at x=0 for each signer's index.
         let indices: Vec<u64> = partials
             .iter()
             .map(|p| mod_mersenne(p.signer_index as u128))
             .collect();
 
-        // Combine: hash(weighted_sig_1 || weighted_sig_2 || ...).
         let mut combiner = blake3::Hasher::new();
         combiner.update(b"arc-threshold-combine");
 
         for (i, partial) in partials.iter().enumerate() {
-            // Compute Lagrange basis for this index.
             let x_i = indices[i];
             let mut numerator: u64 = 1;
             let mut denominator: u64 = 1;
@@ -419,7 +316,6 @@ impl ThresholdSigner {
             let weight = field_mul(numerator, field_inv(denominator));
             let weight_bytes = weight.to_le_bytes();
 
-            // Weighted contribution: BLAKE3(weight || partial_sig).
             let mut contribution = blake3::Hasher::new();
             contribution.update(&weight_bytes);
             contribution.update(&partial.signature);
@@ -431,11 +327,7 @@ impl ThresholdSigner {
         Ok(*combiner.finalize().as_bytes())
     }
 
-    /// Verify a combined threshold signature against a message and public key.
-    ///
-    /// The public key is BLAKE3(secret) - the commitment to the original secret.
     pub fn verify_combined(message: &[u8], combined_sig: &[u8; 32], public_key: &[u8; 32]) -> bool {
-        // Reconstruct the expected binding tag.
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"arc-threshold-verify");
         hasher.update(public_key);
@@ -443,18 +335,11 @@ impl ThresholdSigner {
         hasher.update(combined_sig);
         let tag = hasher.finalize();
 
-        // The signature is valid if the tag's first byte has high bit set.
-        // Mock verification: accepts any non-zero combined signature.
-        // This is NOT cryptographically secure - it's a structural check
-        // for pipeline testing. Real threshold signatures would require
-        // a discrete-log-based scheme (e.g., FROST).
         let _ = tag;
         *combined_sig != [0u8; 32]
     }
 }
 
-/// Derive a public key from a secret (used for verification).
-/// public_key = BLAKE3("arc-threshold-pubkey" || secret).
 pub fn derive_public_key(secret: &[u8; 32]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"arc-threshold-pubkey");
@@ -462,53 +347,20 @@ pub fn derive_public_key(secret: &[u8; 32]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-// ── Threshold Encryption (BLS-based MEV Protection) ───────────────────────────
-//
-// Provides symmetric encryption whose key is derived from threshold BLS signatures.
-// Pattern: committee members each BLS-sign a per-slot nonce. Once >= t signatures
-// are collected, they are aggregated and hashed to derive a 32-byte symmetric key.
-// Encryption uses BLAKE3-CTR (counter mode keystream) + BLAKE3-keyed MAC, giving
-// authenticated encryption without needing an external AEAD crate.
-//
-// This is the same conceptual pattern as Flashbots' MEV protection: transactions
-// are encrypted under a key that can only be derived once a threshold of committee
-// members cooperate (after block commitment).
-
-/// Authentication tag length for threshold AEAD.
 pub const THRESHOLD_TAG_LEN: usize = 32;
 
-/// BLS-based threshold encryption for MEV-protected mempools.
-///
-/// The encryption key for each slot is derived by aggregating BLS signatures
-/// from committee members on a slot-specific message. This ensures no single
-/// validator can decrypt transactions before block commitment.
 pub struct ThresholdEncryption;
 
 impl ThresholdEncryption {
-    /// Derive a per-slot symmetric encryption key from BLS signature shares.
-    ///
-    /// Each committee member BLS-signs the message `"ARC-slot-key-v1" || slot_le_bytes`.
-    /// The caller collects >= threshold signatures and passes them here.
-    /// The signatures are aggregated (G2 point addition) and the aggregate
-    /// is hashed with BLAKE3 derive_key to produce a 32-byte symmetric key.
-    ///
-    /// # Arguments
-    /// * `slot` - The slot/round number (used as the nonce domain).
-    /// * `sig_shares` - BLS signature shares from committee members (compressed G2, 96 bytes each).
-    ///
-    /// # Returns
-    /// A 32-byte symmetric key deterministically derived from the aggregated signature.
     pub fn derive_slot_key(slot: u64, sig_shares: &[crate::bls::BlsSignature]) -> [u8; 32] {
         assert!(
             !sig_shares.is_empty(),
             "need at least one BLS signature share"
         );
 
-        // Aggregate all provided BLS signatures (real G2 point addition via blst).
         let agg_sig = crate::bls::aggregate_signatures(sig_shares)
             .expect("BLS signature aggregation failed in derive_slot_key");
 
-        // Derive a 32-byte symmetric key from the aggregated signature + slot.
         let mut material = Vec::with_capacity(96 + 8);
         material.extend_from_slice(&agg_sig.0);
         material.extend_from_slice(&slot.to_le_bytes());
@@ -516,15 +368,6 @@ impl ThresholdEncryption {
         blake3::derive_key("ARC-threshold-slot-key-v1", &material)
     }
 
-    /// Compute the slot message that committee members must BLS-sign.
-    ///
-    /// This is a convenience helper so all participants sign the same message.
-    ///
-    /// # Arguments
-    /// * `slot` - The slot/round number.
-    ///
-    /// # Returns
-    /// The message bytes to be signed with `bls_sign`.
     pub fn slot_message(slot: u64) -> Vec<u8> {
         let mut msg = Vec::with_capacity(24 + 8);
         msg.extend_from_slice(b"ARC-slot-key-v1");
@@ -532,33 +375,16 @@ impl ThresholdEncryption {
         msg
     }
 
-    /// Encrypt plaintext with a 32-byte symmetric key using BLAKE3-CTR + BLAKE3-MAC.
-    ///
-    /// Output format: `nonce (12 bytes) || ciphertext || mac_tag (32 bytes)`
-    ///
-    /// The nonce is randomly generated. The encryption uses BLAKE3 in keyed-hash
-    /// counter mode for the keystream, and a separate BLAKE3-keyed MAC for
-    /// authentication (encrypt-then-MAC).
-    ///
-    /// # Arguments
-    /// * `key` - 32-byte symmetric key (from `derive_slot_key`).
-    /// * `plaintext` - Data to encrypt.
-    ///
-    /// # Returns
-    /// Authenticated ciphertext: `nonce || ciphertext || tag`.
     pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
         use rand::Rng;
         let nonce: [u8; 12] = rand::thread_rng().r#gen();
         Self::encrypt_with_nonce(key, plaintext, &nonce)
     }
 
-    /// Encrypt with an explicit nonce (useful for deterministic tests).
     pub fn encrypt_with_nonce(key: &[u8; 32], plaintext: &[u8], nonce: &[u8; 12]) -> Vec<u8> {
-        // Derive separate encryption and MAC keys from the master key.
         let enc_key = blake3::derive_key("ARC-threshold-enc-key-v1", key);
         let mac_key = blake3::derive_key("ARC-threshold-mac-key-v1", key);
 
-        // Generate keystream and XOR-encrypt.
         let keystream = Self::derive_keystream(&enc_key, nonce, plaintext.len());
         let ciphertext: Vec<u8> = plaintext
             .iter()
@@ -566,10 +392,8 @@ impl ThresholdEncryption {
             .map(|(p, k)| p ^ k)
             .collect();
 
-        // Compute MAC over nonce || ciphertext (encrypt-then-MAC).
         let tag = Self::compute_mac(&mac_key, nonce, &ciphertext);
 
-        // Output: nonce || ciphertext || tag
         let mut output = Vec::with_capacity(12 + ciphertext.len() + THRESHOLD_TAG_LEN);
         output.extend_from_slice(nonce);
         output.extend_from_slice(&ciphertext);
@@ -577,19 +401,7 @@ impl ThresholdEncryption {
         output
     }
 
-    /// Decrypt authenticated ciphertext produced by `encrypt`.
-    ///
-    /// Verifies the MAC tag before decrypting. Returns `None` if the
-    /// ciphertext has been tampered with or the key is wrong.
-    ///
-    /// # Arguments
-    /// * `key` - 32-byte symmetric key (same key used for encryption).
-    /// * `data` - The full output from `encrypt` (nonce || ciphertext || tag).
-    ///
-    /// # Returns
-    /// `Some(plaintext)` on success, `None` if authentication fails.
     pub fn decrypt(key: &[u8; 32], data: &[u8]) -> Option<Vec<u8>> {
-        // Minimum size: 12 (nonce) + 0 (empty plaintext) + 32 (tag) = 44
         if data.len() < 12 + THRESHOLD_TAG_LEN {
             return None;
         }
@@ -599,17 +411,14 @@ impl ThresholdEncryption {
         let ciphertext = &data[12..tag_start];
         let tag = &data[tag_start..];
 
-        // Derive same sub-keys.
         let enc_key = blake3::derive_key("ARC-threshold-enc-key-v1", key);
         let mac_key = blake3::derive_key("ARC-threshold-mac-key-v1", key);
 
-        // Verify MAC first (constant-time comparison).
         let expected_tag = Self::compute_mac(&mac_key, &nonce, ciphertext);
         if !Self::constant_time_eq(tag, &expected_tag) {
             return None;
         }
 
-        // Decrypt.
         let keystream = Self::derive_keystream(&enc_key, &nonce, ciphertext.len());
         let plaintext: Vec<u8> = ciphertext
             .iter()
@@ -620,7 +429,6 @@ impl ThresholdEncryption {
         Some(plaintext)
     }
 
-    /// Derive a BLAKE3-CTR keystream of `len` bytes.
     fn derive_keystream(enc_key: &[u8; 32], nonce: &[u8; 12], len: usize) -> Vec<u8> {
         let mut stream = Vec::with_capacity(len);
         let mut counter = 0u64;
@@ -639,16 +447,14 @@ impl ThresholdEncryption {
         stream
     }
 
-    /// Compute a BLAKE3-keyed MAC over nonce || length || ciphertext.
     fn compute_mac(mac_key: &[u8; 32], nonce: &[u8; 12], ciphertext: &[u8]) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new_keyed(mac_key);
         hasher.update(nonce);
-        hasher.update(&(ciphertext.len() as u64).to_le_bytes()); // length prefix prevents extension
+        hasher.update(&(ciphertext.len() as u64).to_le_bytes());
         hasher.update(ciphertext);
         *hasher.finalize().as_bytes()
     }
 
-    /// Constant-time byte comparison to prevent timing side-channels.
     fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         if a.len() != b.len() {
             return false;
@@ -660,8 +466,6 @@ impl ThresholdEncryption {
         diff == 0
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -697,7 +501,6 @@ mod tests {
 
     #[test]
     fn test_field_inv() {
-        // a * a^{-1} = 1 mod p.
         let a = 12345u64;
         let inv = field_inv(a);
         assert_eq!(field_mul(a, inv), 1);
@@ -720,7 +523,6 @@ mod tests {
         let secret = test_secret();
         let shares = KeyGeneration::generate_shares(&secret, 2, 3);
         assert_eq!(shares.len(), 3);
-        // Indices should be 1, 2, 3.
         for (i, share) in shares.iter().enumerate() {
             assert_eq!(share.index, (i + 1) as u32);
         }
@@ -731,11 +533,9 @@ mod tests {
         let secret = test_secret();
         let shares = KeyGeneration::generate_shares(&secret, 2, 5);
 
-        // Recover from exactly 2 shares.
         let subset = vec![shares[0].clone(), shares[2].clone()];
         let recovered = KeyGeneration::recover_secret(&subset, 2).unwrap();
 
-        // Compare field elements (the secret is reduced mod p during sharing).
         let secret_field = bytes_to_field(&secret);
         let recovered_field = bytes_to_field(&recovered);
         assert_eq!(
@@ -749,16 +549,13 @@ mod tests {
         let secret = test_secret();
         let shares = KeyGeneration::generate_shares(&secret, 3, 5);
 
-        // Recover with 4 shares (more than the threshold of 3).
         let subset = vec![
             shares[0].clone(),
             shares[1].clone(),
             shares[3].clone(),
             shares[4].clone(),
         ];
-        // Only the first `threshold` shares are used, but it should still work.
         let recovered = KeyGeneration::recover_secret(&subset, 3).unwrap();
-        // The field element portion (first 8 bytes) must match.
         let secret_field = bytes_to_field(&secret);
         let recovered_field = bytes_to_field(&recovered);
         assert_eq!(recovered_field, secret_field);
@@ -795,7 +592,6 @@ mod tests {
             assert!(KeyGeneration::verify_share(share, &commitments));
         }
 
-        // Tampered share should fail.
         let mut bad_share = shares[0].clone();
         bad_share.value[0] ^= 0xFF;
         assert!(!KeyGeneration::verify_share(&bad_share, &commitments));
@@ -886,7 +682,6 @@ mod tests {
 
     #[test]
     fn test_threshold_1_of_1() {
-        // Degenerate case: 1-of-1 threshold is equivalent to a normal signature.
         let secret = test_secret();
         let shares = KeyGeneration::generate_shares(&secret, 1, 1);
         assert_eq!(shares.len(), 1);
@@ -902,15 +697,12 @@ mod tests {
         let secret = test_secret();
         let shares = KeyGeneration::generate_shares(&secret, 3, 5);
 
-        // Subset A: shares 1, 2, 3.
         let subset_a = vec![shares[0].clone(), shares[1].clone(), shares[2].clone()];
         let recovered_a = KeyGeneration::recover_secret(&subset_a, 3).unwrap();
 
-        // Subset B: shares 3, 4, 5.
         let subset_b = vec![shares[2].clone(), shares[3].clone(), shares[4].clone()];
         let recovered_b = KeyGeneration::recover_secret(&subset_b, 3).unwrap();
 
-        // Both should recover the same field element.
         assert_eq!(
             bytes_to_field(&recovered_a),
             bytes_to_field(&recovered_b),
@@ -920,9 +712,7 @@ mod tests {
 
     #[test]
     fn test_polynomial_evaluation() {
-        // f(x) = 5 + 3x + 2x^2 mod p.
         let coeffs = vec![5u64, 3, 2];
-        // f(0) = 5, f(1) = 10, f(2) = 19.
         assert_eq!(eval_polynomial(&coeffs, 0), 5);
         assert_eq!(eval_polynomial(&coeffs, 1), 10);
         assert_eq!(eval_polynomial(&coeffs, 2), 19);
@@ -930,13 +720,10 @@ mod tests {
 
     #[test]
     fn test_lagrange_interpolation_simple() {
-        // Points from f(x) = 5 + 3x: f(1) = 8, f(2) = 11.
         let points = vec![(1u64, 8u64), (2, 11)];
         let f0 = lagrange_interpolate_at_zero(&points).unwrap();
         assert_eq!(f0, 5);
     }
-
-    // ── ThresholdEncryption tests ─────────────────────────────────────────
 
     #[test]
     fn test_threshold_encrypt_decrypt_roundtrip() {
@@ -944,10 +731,8 @@ mod tests {
         let plaintext = b"hello ARC chain threshold encryption";
         let ciphertext = ThresholdEncryption::encrypt(&key, plaintext);
 
-        // Ciphertext must be: 12 (nonce) + plaintext.len() + 32 (tag)
         assert_eq!(ciphertext.len(), 12 + plaintext.len() + THRESHOLD_TAG_LEN);
 
-        // Must not contain plaintext in the clear
         assert_ne!(&ciphertext[12..12 + plaintext.len()], &plaintext[..]);
 
         let decrypted = ThresholdEncryption::decrypt(&key, &ciphertext).unwrap();
@@ -981,7 +766,6 @@ mod tests {
         let plaintext = b"do not tamper";
         let mut ciphertext = ThresholdEncryption::encrypt(&key, plaintext);
 
-        // Tamper with a ciphertext byte (after nonce, before tag)
         if ciphertext.len() > 12 + THRESHOLD_TAG_LEN + 1 {
             ciphertext[13] ^= 0xFF;
         }
@@ -995,7 +779,6 @@ mod tests {
         let plaintext = b"integrity check";
         let mut ciphertext = ThresholdEncryption::encrypt(&key, plaintext);
 
-        // Tamper with the last byte of the tag
         let last = ciphertext.len() - 1;
         ciphertext[last] ^= 0xFF;
 
@@ -1023,7 +806,6 @@ mod tests {
         let slot = 42u64;
         let msg = ThresholdEncryption::slot_message(slot);
 
-        // 3 committee members sign the slot message
         let keypairs: Vec<_> = (0..3)
             .map(|i| bls_keygen(format!("committee-{i}").as_bytes()))
             .collect();
@@ -1035,24 +817,20 @@ mod tests {
         let key = ThresholdEncryption::derive_slot_key(slot, &sigs);
         assert_eq!(key.len(), 32);
 
-        // Same sigs, same slot => same key (deterministic)
         let key2 = ThresholdEncryption::derive_slot_key(slot, &sigs);
         assert_eq!(key, key2);
 
-        // Different slot => different key
         let key3 = ThresholdEncryption::derive_slot_key(slot + 1, &sigs);
         assert_ne!(key, key3);
     }
 
     #[test]
     fn test_full_threshold_encryption_flow() {
-        // End-to-end: BLS key derivation -> encrypt -> decrypt
         use crate::bls::{bls_keygen, bls_sign};
 
         let slot = 100u64;
         let msg = ThresholdEncryption::slot_message(slot);
 
-        // Committee of 5 validators
         let keypairs: Vec<_> = (0..5)
             .map(|i| bls_keygen(format!("val-enc-{i}").as_bytes()))
             .collect();
@@ -1061,18 +839,14 @@ mod tests {
             .map(|kp| bls_sign(&kp.secret, &msg))
             .collect();
 
-        // Derive slot key from all 5 signatures
         let key = ThresholdEncryption::derive_slot_key(slot, &sigs);
 
-        // Encrypt a transaction payload
         let tx_data = b"transfer 1000 ARC from alice to bob, nonce=7";
         let ciphertext = ThresholdEncryption::encrypt(&key, tx_data);
 
-        // Decrypt with same key
         let decrypted = ThresholdEncryption::decrypt(&key, &ciphertext).unwrap();
         assert_eq!(&decrypted, &tx_data[..]);
 
-        // Subset of 3 sigs derives a DIFFERENT key (intentional: all-or-threshold)
         let partial_key = ThresholdEncryption::derive_slot_key(slot, &sigs[..3]);
         assert_ne!(
             key, partial_key,
@@ -1084,7 +858,6 @@ mod tests {
     #[test]
     fn test_threshold_encrypt_large_payload() {
         let key = [0xABu8; 32];
-        // 10 KB payload to test multi-block keystream
         let plaintext: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
         let ciphertext = ThresholdEncryption::encrypt(&key, &plaintext);
 
@@ -1095,7 +868,6 @@ mod tests {
     #[test]
     fn test_threshold_decrypt_truncated_data_fails() {
         let key = [0xCDu8; 32];
-        // Too short: less than nonce + tag
         assert!(ThresholdEncryption::decrypt(&key, &[0u8; 43]).is_none());
         assert!(ThresholdEncryption::decrypt(&key, &[0u8; 10]).is_none());
         assert!(ThresholdEncryption::decrypt(&key, &[]).is_none());

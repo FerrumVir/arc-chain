@@ -1,18 +1,3 @@
-//! ARC Chain - Inference Benchmark for Paper Evidence
-//!
-//! Loads real neural network models, executes inference through the
-//! InferenceEngine, and measures:
-//! - Forward pass latency per model size
-//! - Determinism verification (100 runs, bitwise identical)
-//! - Attestation throughput (InferenceAttestation TX processing)
-//! - On-chain recording via StateDB
-//!
-//! Outputs JSON to stdout for the paper benchmark suite.
-//!
-//! Usage:
-//!   cargo run --release --bin arc-bench-inference
-//!   cargo run --release --bin arc-bench-inference -- --model /tmp/arc-models/mlp-1024x6.arc
-
 use arc_crypto::{Hash256, hash_bytes};
 use arc_state::StateDB;
 use arc_types::*;
@@ -44,8 +29,6 @@ fn main() {
         "determinism_verified": true,
     });
 
-    // ── Benchmark 1: Built-in models (various sizes) ────────────────────
-
     let model_configs = vec![
         ("4-layer MLP (1K params)", 32, 16, 4),
         ("6-layer MLP (50K params)", 128, 64, 6),
@@ -59,12 +42,11 @@ fn main() {
         let model_id = hash_bytes(&model_bytes);
         let param_count = count_params(&model);
 
-        // Load into engine
         let mut engine = InferenceEngine::new(InferenceConfig {
             max_loaded_models: 16,
             default_timeout_ms: 5_000,
             max_tokens: 256,
-            temperature: 0.0, // deterministic
+            temperature: 0.0,
         });
 
         let info = arc_vm::inference::ModelInfo {
@@ -79,12 +61,10 @@ fn main() {
             .load_model_with_weights(model_id.0, info, &model_bytes)
             .expect("Failed to load model");
 
-        // Warm up
         let input = random_input(*input_dim);
         let request = make_request(model_id.0, &input);
         let _ = engine.run_inference(&request);
 
-        // Benchmark: 100 inference calls
         let mut latencies = Vec::with_capacity(100);
         let mut first_output = None;
         let mut all_deterministic = true;
@@ -95,7 +75,6 @@ fn main() {
             let elapsed_us = start.elapsed().as_micros() as u64;
             latencies.push(elapsed_us);
 
-            // Check determinism
             let output_hash = hash_bytes(format!("{:?}", result.output).as_bytes());
             if i == 0 {
                 first_output = Some(output_hash);
@@ -150,8 +129,6 @@ fn main() {
         }
     }
 
-    // ── Benchmark 2: External model file (if provided) ──────────────────
-
     if let Some(path) = model_path {
         eprintln!("\n  Loading external model: {}", path);
         match std::fs::read(&path) {
@@ -201,8 +178,6 @@ fn main() {
         }
     }
 
-    // ── Benchmark 3: Attestation TX throughput ──────────────────────────
-
     eprintln!("\n  Benchmarking InferenceAttestation TX throughput...");
     {
         let state = StateDB::with_genesis(&[(hash_bytes(b"attester"), 10_000_000)]);
@@ -235,7 +210,6 @@ fn main() {
             attestation_txs.push(tx);
         }
 
-        // Recompute hashes
         for tx in &mut attestation_txs {
             tx.hash = tx.compute_hash();
         }
@@ -263,12 +237,8 @@ fn main() {
         });
     }
 
-    // ── Output JSON ─────────────────────────────────────────────────────
-
     println!("{}", serde_json::to_string_pretty(&results).unwrap());
 }
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn build_model(hidden: usize, input_dim: usize, depth: usize) -> arc_vm::inference::NeuralNet {
     use arc_vm::inference::{Layer, NeuralNet};
@@ -276,7 +246,6 @@ fn build_model(hidden: usize, input_dim: usize, depth: usize) -> arc_vm::inferen
     let mut layers = Vec::new();
     let mut rng_state: u64 = 42;
 
-    // Simple LCG for deterministic "random" weights
     let mut next_f32 = || -> f32 {
         rng_state = rng_state
             .wrapping_mul(6364136223846793005)
@@ -284,7 +253,6 @@ fn build_model(hidden: usize, input_dim: usize, depth: usize) -> arc_vm::inferen
         ((rng_state >> 33) as f32 / u32::MAX as f32 - 0.5) * 0.1
     };
 
-    // Input layer
     let weights: Vec<Vec<f32>> = (0..hidden)
         .map(|_| (0..input_dim).map(|_| next_f32()).collect())
         .collect();
@@ -292,7 +260,6 @@ fn build_model(hidden: usize, input_dim: usize, depth: usize) -> arc_vm::inferen
     layers.push(Layer::Dense { weights, bias });
     layers.push(Layer::ReLU);
 
-    // Hidden layers
     for _ in 0..depth - 2 {
         let weights: Vec<Vec<f32>> = (0..hidden)
             .map(|_| (0..hidden).map(|_| next_f32()).collect())
@@ -302,8 +269,7 @@ fn build_model(hidden: usize, input_dim: usize, depth: usize) -> arc_vm::inferen
         layers.push(Layer::ReLU);
     }
 
-    // Output layer
-    let output_dim = 10; // classification
+    let output_dim = 10;
     let weights: Vec<Vec<f32>> = (0..output_dim)
         .map(|_| (0..hidden).map(|_| next_f32()).collect())
         .collect();

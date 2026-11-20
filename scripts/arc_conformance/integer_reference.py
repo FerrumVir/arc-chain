@@ -1,12 +1,3 @@
-"""Independent reference executor for ARC's per-row INT8 integer profile.
-
-Written from docs/protocol/integer-profile-contract-v1.md, not translated
-line by line from the Rust engine, so that agreement between the two is
-evidence that the written contract is complete. Every value is a Python int;
-each operation is checked against the signed 64-bit domain the contract
-defines, and leaving that domain raises DomainError instead of wrapping.
-"""
-
 from __future__ import annotations
 
 FRAC_BITS = 16
@@ -18,7 +9,7 @@ I32_MAX = (1 << 31) - 1
 
 
 class DomainError(ArithmeticError):
-    """An intermediate left the domain in which the profile is defined."""
+    pass
 
 
 def i64(value: int, what: str = "value") -> int:
@@ -28,7 +19,6 @@ def i64(value: int, what: str = "value") -> int:
 
 
 def tdiv(a: int, b: int) -> int:
-    """Signed division truncating toward zero (Rust `/` on integers)."""
     if b == 0:
         raise DomainError("division by zero")
     q = abs(a) // abs(b)
@@ -36,7 +26,6 @@ def tdiv(a: int, b: int) -> int:
 
 
 def trem(a: int, b: int) -> int:
-    """Remainder with the sign of the dividend (Rust `%` on integers)."""
     return a - tdiv(a, b) * b
 
 
@@ -45,15 +34,12 @@ def mul(a: int, b: int, what: str = "product") -> int:
 
 
 def shr(a: int, bits: int = FRAC_BITS) -> int:
-    """Arithmetic right shift: floor division by 2**bits."""
     return a >> bits
 
 
-# --- exp ---------------------------------------------------------------------
-
 EXP_LUT_SIZE = 4096
 EXP_LUT_RANGE = 16 * ONE
-EXP_DECAY = 65281  # round(exp(-1/256) * 2**16)
+EXP_DECAY = 65281
 
 
 def _build_exp_lut() -> list[int]:
@@ -81,10 +67,7 @@ def integer_exp(x: int) -> int:
     return lo + tdiv((hi - lo) * frac, step)
 
 
-# --- inverse square root -------------------------------------------------------
-
 def integer_isqrt(x: int) -> int:
-    """Q16 approximation of 1/sqrt(x / 2**16) by five Newton steps."""
     if x <= 0:
         return ONE * 100
     bits = x.bit_length() - 1
@@ -101,13 +84,11 @@ def integer_isqrt(x: int) -> int:
     return y
 
 
-# --- operators -------------------------------------------------------------------
-
 def rms_norm(values: list[int], gamma: list[int]) -> list[int]:
     n = len(values)
     if n == 0:
         return []
-    sq_sum = sum(v * v for v in values)  # 128-bit accumulator in the contract
+    sq_sum = sum(v * v for v in values)
     if sq_sum >= 1 << 127:
         raise DomainError("rms_norm square sum exceeds signed 128-bit range")
     mean_sq = i64((sq_sum // n) >> FRAC_BITS, "rms_norm mean square")
@@ -121,12 +102,9 @@ def rms_norm(values: list[int], gamma: list[int]) -> list[int]:
 
 
 def matmul_rows(rows: list[list[int]], scales: list[int], x: list[int]) -> list[int]:
-    """Per-row symmetric INT8 projection: (sum_j w_ij * x_j) * s_i >> 16."""
     out = []
     for row, scale in zip(rows, scales):
         products = [w * v for w, v in zip(row, x)]
-        # The accumulator may be formed in any order: the domain bounds the
-        # sum of magnitudes, so no partial sum in any order can overflow.
         if sum(abs(p) for p in products) > I64_MAX:
             raise DomainError("matmul row magnitude exceeds signed 64-bit range")
         out.append(shr(mul(sum(products), scale, "matmul acc*scale")))
@@ -165,11 +143,6 @@ def silu(x: int) -> int:
 
 def attention_head(q: list[int], keys: list[list[int]], values: list[list[int]],
                    attn_scale: int) -> list[int]:
-    """Causal attention for one head with the sequential online softmax.
-
-    The accumulator is rescaled whenever a strictly larger score appears, in
-    position order; that order is part of the arithmetic, not an optimisation.
-    """
     running_max = tdiv(I64_MIN, 2)
     running_sum = 0
     out = [0] * len(q)
@@ -193,7 +166,6 @@ def attention_head(q: list[int], keys: list[list[int]], values: list[list[int]],
 
 
 def kv_head(head: int, n_heads: int, n_kv_heads: int) -> int:
-    """Grouped-query attention: consecutive query heads share one KV head."""
     return head * n_kv_heads // n_heads
 
 
@@ -206,7 +178,6 @@ def argmax(values: list[int]) -> int:
 
 
 def repetition_penalty(logits: list[int], generated: list[int]) -> list[int]:
-    """Scale the logit of each of the 64 most recent tokens, once per occurrence."""
     logits = list(logits)
     for token in list(reversed(generated))[:64]:
         if 0 <= token < len(logits):
@@ -218,8 +189,6 @@ def repetition_penalty(logits: list[int], generated: list[int]) -> list[int]:
 def repetition_penalty_select(logits: list[int], generated: list[int]) -> int:
     return argmax(repetition_penalty(logits, generated))
 
-
-# --- model -----------------------------------------------------------------------
 
 LEGACY_SPLIT_HALF = "INT8 integer (per-row, cross-platform deterministic)"
 GGUF_INTERLEAVED = "arc.gguf-llama.i8-per-row.rope-interleaved.v1"
@@ -330,7 +299,6 @@ class Model:
         return self.logits(hidden)
 
     def generate_v2(self, prompt, max_tokens, eos_tokens, repetition_penalty=True):
-        """Generation v2: one BOS forward, prompt prefill, reuse final logits."""
         cache = self.new_cache()
         logits = self.forward(self.bos_token, cache)
         for token in prompt:
@@ -348,7 +316,6 @@ class Model:
         return generated
 
     def generate_v1(self, prompt, max_tokens, eos_tokens):
-        """Historical generation: the last prompt token is forwarded twice."""
         cache = self.new_cache()
         self.forward(self.bos_token, cache)
         for token in prompt:

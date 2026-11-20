@@ -1,5 +1,3 @@
-//! Debug: trace values through the forward pass to find where output goes wrong.
-
 use arc_inference::cached_integer_model::{KVCache, load_cached_model};
 use arc_inference::integer_lut::*;
 
@@ -18,16 +16,9 @@ fn main() {
         cfg.n_layers, d, cfg.n_heads, cfg.n_kv_heads, cfg.d_ff, cfg.vocab_size
     );
 
-    // Token "What" = 1724
     let tok = 1724u32;
     let idx = tok as usize;
 
-    // Embedding.
-    //
-    // Read from embedding_q16, not embedding_i8. Embeddings are stored at full
-    // Q16 precision precisely because INT8 destroys values around 1e-6, so
-    // dequantising the I8 copy here would print numbers the engine does not
-    // use. embedding_i8 is retained only for weight_hash / save_weights.
     let hidden: Vec<i64> = model.embedding_q16[idx * d..(idx + 1) * d].to_vec();
     println!("\n=== Embedding (token {}) ===", tok);
     println!("Q16 (no dequant) first8={:?}", &hidden[0..8]);
@@ -38,10 +29,8 @@ fn main() {
         hidden.iter().sum::<i64>() / d as i64
     );
 
-    // First layer forward
     let layer = &model.layers[0];
 
-    // RMSNorm
     let n = d as i64;
     let mut sq_sum: i64 = 0;
     for &x in &hidden {
@@ -68,7 +57,6 @@ fn main() {
         normed.iter().max().unwrap()
     );
 
-    // Full forward pass for 1 token
     let mut cache = KVCache::new(cfg.n_layers);
     let logits = model.forward_one_token(tok, &mut cache);
 
@@ -80,7 +68,6 @@ fn main() {
         logits.iter().max().unwrap()
     );
 
-    // Top 5 tokens
     let mut indexed: Vec<(usize, i64)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
     indexed.sort_by_key(|x| std::cmp::Reverse(x.1));
     println!("\nTop 5 tokens:");
@@ -95,7 +82,6 @@ fn main() {
         );
     }
 
-    // Check SiLU for a few values
     println!("\n=== SiLU check ===");
     for x_f in [-2.0f64, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0] {
         let x = (x_f * ONE as f64) as i64;

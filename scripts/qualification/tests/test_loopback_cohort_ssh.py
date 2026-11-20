@@ -77,7 +77,7 @@ class LoopbackCohortSshTests(unittest.TestCase):
         helper.close()
         self.assertEqual(children.stopped, ([sshd, agent], 5))
         self.assertFalse(helper._private_dir)
-        helper.close()  # idempotent
+        helper.close()
 
     def test_close_fails_if_owned_daemon_was_not_reaped(self):
         class Process:

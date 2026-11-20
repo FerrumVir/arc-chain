@@ -1,23 +1,5 @@
 name: CPU matrix kernels
 
-# Exactness gate for the CPU limb kernels in
-# crates/arc-inference/src/canonical_simd.rs: NEON SDOT and SMMLA (i8mm) on
-# arm64; AVX2, AVX-VNNI and AVX-512 VNNI on x86-64, for multi-row calls and,
-# with SMMLA and VNNI, one-row calls. Every kernel the runner's CPU has must
-# give outputs byte-identical to the scalar kernel in the unit tests, the
-# golden vectors (with the kernel pinned for the whole process), the
-# execution-mode suite (one leg per kernel) and the batched-prefill
-# conformance tests (once per kernel, pinned).
-#
-# Each leg first logs the CPU model and flags, the features the process
-# detects and the kernels it can run, and checks that detection agrees with
-# the flags the OS reports. A kernel the runner's CPU lacks is not exercised
-# on that runner, and the log says so. Hosted x86-64 hosts vary (AMD EPYC
-# 7763 has no AVX-512; EPYC 9V74 has AVX-512 VNNI), so two Linux x86-64 legs
-# run. ci.yml and golden-vectors.yml run only for pull requests into main, so
-# this workflow also carries rustfmt and clippy for the code it covers, and a
-# node job that lints arc-node and tests the kernel report it logs at model
-# load and serves from GET /node/threads and /node/info.
 on:
   pull_request:
     paths:
@@ -52,15 +34,14 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      # Keep this dated toolchain aligned with rust-toolchain.toml.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-03-16
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
         with:
           shared-key: cpu-matrix-lint-${{ matrix.runner }}
       - name: rustfmt
@@ -73,9 +54,6 @@ jobs:
         if: runner.arch == 'ARM64'
         run: |
           set -euo pipefail
-          # ci.yml lints on x86-64 only, so arm64-only code elsewhere in the
-          # crate has never been linted. A compile error, or any diagnostic in
-          # the files below, fails this step; other diagnostics are listed.
           status=0
           cargo clippy -p arc-inference --all-targets --features candle --locked \
             --message-format=short 2>&1 | tee "$RUNNER_TEMP/clippy.txt" || status=$?
@@ -103,7 +81,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Record the CPU and the kernels its flags allow
@@ -153,17 +131,15 @@ jobs:
           expect="${expect# }"
           echo "kernels the OS's CPU flags allow: ${expect:-not checked on this OS}"
           echo "ARC_EXPECT_BATCHED_KERNELS=$expect" >> "$GITHUB_ENV"
-      # Keep this dated toolchain aligned with rust-toolchain.toml.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-03-16
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
         with:
           shared-key: cpu-matrix-${{ matrix.leg }}
       - name: Detected CPU features and multi-row kernels
         run: |
           set -euo pipefail
-          # The test runs in crates/arc-inference, so the list lands there.
           ARC_BATCHED_KERNELS_OUT=batched-kernels.txt \
             cargo test -p arc-inference --lib --locked batched_kernel_report -- --nocapture
           echo "multi-row kernels on this runner: $(tr '\n' ' ' < crates/arc-inference/batched-kernels.txt)"
@@ -174,13 +150,6 @@ jobs:
       - name: Golden vectors and batched prefill with each kernel pinned
         run: |
           set -euo pipefail
-          # Per kernel, two processes. The first enables the vector path for
-          # the whole process and runs the known-answer golden tests that
-          # decode one token at a time (the worker's path), with the report
-          # showing the kernel the process selected. The second runs the
-          # batched-prefill conformance tests, which switch the path
-          # themselves. The list has no trailing newline, hence the
-          # `|| [ -n ... ]`.
           while IFS= read -r kernel || [ -n "$kernel" ]; do
             if [ -z "$kernel" ]; then continue; fi
             echo "::group::golden one-row decode on $kernel"
@@ -196,22 +165,18 @@ jobs:
           done < crates/arc-inference/batched-kernels.txt
 
   node:
-    # arc-node logs the selected kernels at model load and serves them from
-    # GET /node/threads and /node/info. ci.yml lints and tests arc-node only
-    # for pull requests into main, so this job does it for this one.
     name: node kernel report (linux-x86-64)
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      # Keep this dated toolchain aligned with rust-toolchain.toml.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-03-16
           components: clippy
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
         with:
           shared-key: cpu-matrix-node
       - name: clippy, arc-node, warnings denied

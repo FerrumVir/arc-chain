@@ -1,10 +1,3 @@
-//! Exit codes (sysexits.h values) and error classification.
-//!
-//! Supervisors restart the bridge whatever it returns, so the codes exist for
-//! people and tests: a refusal means "this machine will never be bridged as
-//! is", a temporary failure means "try again later", and unavailable means
-//! the network or GitHub could not deliver the pinned release.
-
 use std::fmt;
 
 pub const EX_OK: i32 = 0;
@@ -35,22 +28,18 @@ fn classified(code: i32, message: impl Into<String>) -> anyhow::Error {
     })
 }
 
-/// The invocation or machine is not something the bridge will ever touch.
 pub fn refused(message: impl Into<String>) -> anyhow::Error {
     classified(EX_CONFIG, message)
 }
 
-/// The command line is not a recognized v0.7 invocation.
 pub fn usage(message: impl Into<String>) -> anyhow::Error {
     classified(EX_USAGE, message)
 }
 
-/// Safe to retry later without any change on this machine.
 pub fn temporary(message: impl Into<String>) -> anyhow::Error {
     classified(EX_TEMPFAIL, message)
 }
 
-/// The pinned release could not be fetched.
 pub fn unavailable(message: impl Into<String>) -> anyhow::Error {
     classified(EX_UNAVAILABLE, message)
 }

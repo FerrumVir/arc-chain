@@ -570,8 +570,6 @@ await test("address transaction history is bounded and paged only when the node 
   const legacyRecord = result.records.find((record) => record.source.id === "legacy");
   assert.equal(v3Record.historyState, "served");
   assert.deepEqual(v3Record.txHashes, [hex("1"), hex("2"), hex("3")]);
-  // A 404 on this specific route means the route itself is absent on that
-  // node - an older version - never "this address has no history".
   assert.equal(legacyRecord.historyState, "not-served");
   assert.deepEqual(legacyRecord.txHashes, []);
 });
@@ -633,7 +631,6 @@ await test("latest block fallback rejects non-404 errors, unsafe heights, and mi
 });
 
 await test("lookup failures use their own abort controller and render the intended error", () => {
-  // Block, blocks-page, transaction, native request and address inspectors each own one.
   assert.equal((source.match(/state\.lookupController = controller;/g) || []).length, 5);
   assert.doesNotMatch(source, /signal: state\.lookupController\.signal/);
   assert.doesNotMatch(source, /if \(!signal\.aborted\) inspectorError\("Block"/);
@@ -686,10 +683,6 @@ await test("legacy explorer entry redirects to the composite explorer", () => {
   assert.doesNotMatch(legacyHtml, /innerHTML|RPC_BENCH|bench-latest/);
 });
 
-// #/tx/<value> and #/address/<value> reach queryTransaction/queryAddress
-// straight from the URL fragment, bypassing the search form's classifyLookup.
-// An unvalidated value is interpolated into the RPC path, so dot segments walk
-// out of /tx/ and query an unrelated endpoint on an approved node.
 await test("fragment lookups refuse values that are not 32-byte hashes before any request", async () => {
   const calls = [];
   const fetchImpl = mockFetch({}, calls);
@@ -706,8 +699,6 @@ await test("fragment lookups refuse values that are not 32-byte hashes before an
   assert.equal(calls.length, 0);
 });
 
-// A minimal DOM so boot()'s render layer can be exercised. Every field the
-// explorer touches is present; nothing schedules real time or network work.
 function fakeElement(tag) {
   return {
     tagName: tag,
@@ -961,12 +952,10 @@ await test("a failed refresh clears canonical evidence instead of leaving stale 
   app.boot();
   await dom.settled;
 
-  // The verified-canonical render is reachable end to end, not a dead branch.
   assert.equal(dom.said("banner-title"), "Canonical recovery verified");
   assert.equal(dom.said("blocks-status"), "3 shown · v3 1");
   assert.equal(dom.byId.get("blocks-body").children.length, 3);
   assert.equal(dom.said("metric-height").replace(/\D/g, ""), String(H + 11));
-  // A non-array /validators payload must not render "undefined records returned".
   assert.equal(dom.said("metric-validator-note"), "Validator records unavailable");
 
   snapshotReachable = false;
@@ -1085,8 +1074,6 @@ await test("native request answers carry each source's own reported height, neve
       [`https://r1.example.test/native-inference/receipt/${id}`]: { body: pendingReceipt },
       "https://r1.example.test/health": { body: { height: H + 4 } },
       [`https://r2.example.test/native-inference/receipt/${id}`]: { body: pendingReceipt },
-      // r2's /health is deliberately unmocked (404): its height must read as
-      // unavailable, never silently borrowed from r1.
     }),
   });
   const r1 = result.answers.find((answer) => answer.source.id === "r1");
@@ -1142,9 +1129,6 @@ await test("the request inspector names replicas that returned nothing, and says
     settlement_credits: [{ payee: hex("2"), amount: 10 }, { payee: hex("3"), amount: 90 }],
     admission_transaction: { block_height: H + 3 }, terminal_transaction: { block_height: H + 5 },
   };
-  // Boot the page on the request's deep link and wait for the inspector to
-  // leave its loading state. Everything but the receipt and /health answers
-  // 503, so the home panels stay paused and only the route is exercised.
   async function inspect(receiptFor) {
     const dom = installFakeDom(domConfig, async (url) => {
       const parsed = new URL(url);

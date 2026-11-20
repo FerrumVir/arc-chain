@@ -1,12 +1,4 @@
 #!/usr/bin/env bash
-# Legacy compatibility entry point.
-#
-# This script previously created an ad-hoc private key, configured 500,000 ARC
-# of validator stake, and exposed a deterministic validator seed in service
-# argv. That path is permanently retired. The supported installer runs a
-# stake-zero community observer and keeps its non-production identity out of
-# argv; production validators require separately provisioned keyfiles and an
-# approved complete genesis.
 set -Eeuo pipefail
 
 printf '%s\n' \

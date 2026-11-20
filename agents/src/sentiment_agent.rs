@@ -1,25 +1,3 @@
-//! Sentiment Agent - On-chain AI agent for binary text sentiment classification.
-//!
-//! Demonstrates:
-//! - Building a small 3-layer neural net (Dense 128->64->2 with ReLU + Softmax)
-//! - Serializing model weights using the NeuralNet binary format
-//! - Registering as an agent on-chain via RegisterAgent TX
-//! - Processing inference requests through the inference precompile (0x0A)
-//! - Settling payments via zero-fee Settle TX
-//!
-//! # Architecture
-//!
-//! ```text
-//! ┌─────────────┐     RegisterAgent TX      ┌──────────────┐
-//! │  Sentiment   │ ─────────────────────────>│  ARC Chain   │
-//! │    Agent     │     Inference Request     │              │
-//! │              │ <────────────────────────>│  Precompile  │
-//! │  (3-layer    │     Settle TX (0-fee)     │    0x0A      │
-//! │   neural     │ ─────────────────────────>│              │
-//! │   net)       │                           │              │
-//! └─────────────┘                           └──────────────┘
-//! ```
-
 use arc_crypto::signature::Signature;
 use arc_crypto::{Hash256, hash_bytes};
 use arc_types::transaction::{RegisterBody, SettleBody, Transaction, TxBody, TxType};
@@ -28,44 +6,22 @@ use arc_vm::agent::{
 };
 use arc_vm::inference::{InferenceConfig, InferenceEngine, Layer, ModelInfo, NeuralNet};
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Agent name registered on-chain.
 const AGENT_NAME: &str = "sentiment-classifier-v1";
 
-/// Inference precompile address (0x0A).
 #[allow(dead_code)]
 const INFERENCE_PRECOMPILE: u8 = 0x0A;
 
-/// Input dimension: simple bag-of-words encoding uses 128 features.
 const INPUT_DIM: usize = 128;
 
-/// Hidden layer dimension.
 const HIDDEN_DIM: usize = 64;
 
-/// Output dimension: [positive, negative].
 const OUTPUT_DIM: usize = 2;
 
-// ---------------------------------------------------------------------------
-// Model construction
-// ---------------------------------------------------------------------------
-
-/// Build a small 3-layer sentiment classification neural network.
-///
-/// Architecture: Dense(128->64) -> ReLU -> Dense(64->2) -> Softmax
-///
-/// Weights are initialized with a simple deterministic pattern so that the
-/// model produces consistent (though untrained) outputs suitable for
-/// demonstration and testing.
 fn build_sentiment_model() -> NeuralNet {
-    // Layer 1: Dense 128 -> 64
     let mut weights_1 = Vec::with_capacity(HIDDEN_DIM);
     for i in 0..HIDDEN_DIM {
         let mut row = Vec::with_capacity(INPUT_DIM);
         for j in 0..INPUT_DIM {
-            // Xavier-like initialization scaled down for stability.
             let val = ((i as f32 * 7.0 + j as f32 * 13.0) % 100.0 - 50.0) / 500.0;
             row.push(val);
         }
@@ -73,7 +29,6 @@ fn build_sentiment_model() -> NeuralNet {
     }
     let bias_1 = vec![0.01_f32; HIDDEN_DIM];
 
-    // Layer 2: Dense 64 -> 2
     let mut weights_2 = Vec::with_capacity(OUTPUT_DIM);
     for i in 0..OUTPUT_DIM {
         let mut row = Vec::with_capacity(HIDDEN_DIM);
@@ -103,15 +58,11 @@ fn build_sentiment_model() -> NeuralNet {
     }
 }
 
-/// Encode text into a fixed-size feature vector using a simple bag-of-bytes
-/// approach. Each byte of the input text increments the corresponding bucket
-/// (mod INPUT_DIM), then the vector is L2-normalized.
 fn encode_text(text: &str) -> Vec<f32> {
     let mut features = vec![0.0_f32; INPUT_DIM];
     for &b in text.as_bytes() {
         features[b as usize % INPUT_DIM] += 1.0;
     }
-    // L2 normalize
     let norm: f32 = features.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
         for f in &mut features {
@@ -121,15 +72,10 @@ fn encode_text(text: &str) -> Vec<f32> {
     features
 }
 
-// ---------------------------------------------------------------------------
-// Transaction helpers
-// ---------------------------------------------------------------------------
-
-/// Construct a RegisterAgent transaction for the sentiment agent.
 fn build_register_tx(owner: Hash256, nonce: u64) -> Transaction {
     let body = TxBody::RegisterAgent(RegisterBody {
         agent_name: AGENT_NAME.to_string(),
-        capabilities: vec![0x01], // sentiment classification capability
+        capabilities: vec![0x01],
         endpoint: "arc://agents/sentiment-classifier-v1".to_string(),
         protocol: hash_bytes(b"sentiment-classification-v1"),
         metadata: serde_json::to_vec(&serde_json::json!({
@@ -158,7 +104,6 @@ fn build_register_tx(owner: Hash256, nonce: u64) -> Transaction {
     }
 }
 
-/// Construct a Settle TX for a completed inference request (zero fee).
 fn build_settle_tx(
     from: Hash256,
     agent_addr: Hash256,
@@ -168,7 +113,7 @@ fn build_settle_tx(
     let body = TxBody::Settle(SettleBody {
         agent_id: agent_addr,
         service_hash,
-        amount: 0, // zero-fee settlement
+        amount: 0,
         usage_units: 1,
         amount_commitment: None,
     });
@@ -188,16 +133,11 @@ fn build_settle_tx(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Sentiment result
-// ---------------------------------------------------------------------------
-
-/// Result of a sentiment classification.
 #[derive(Debug, Clone)]
 pub struct SentimentResult {
     pub label: String,
     pub confidence: f64,
-    pub scores: [f64; 2], // [positive, negative]
+    pub scores: [f64; 2],
 }
 
 impl std::fmt::Display for SentimentResult {
@@ -213,14 +153,9 @@ impl std::fmt::Display for SentimentResult {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
 fn main() {
     println!("=== ARC Chain Sentiment Agent ===\n");
 
-    // 1. Build the neural network model.
     println!(
         "[1/5] Building 3-layer sentiment model (Dense {}->{}->{})",
         INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM
@@ -233,18 +168,15 @@ fn main() {
         model.output_size
     );
 
-    // 2. Serialize model weights.
     println!("[2/5] Serializing model weights to NeuralNet binary format");
     let model_bytes = model.to_bytes();
     println!("      Serialized model size: {} bytes", model_bytes.len());
 
-    // Verify round-trip deserialization.
     let model_restored =
         NeuralNet::from_bytes(&model_bytes).expect("model round-trip deserialization failed");
     assert_eq!(model.layers.len(), model_restored.layers.len());
     println!("      Round-trip deserialization verified");
 
-    // 3. Register agent on-chain.
     println!("[3/5] Constructing RegisterAgent transaction");
     let owner = hash_bytes(b"sentiment-agent-owner");
     let register_tx = build_register_tx(owner, 0);
@@ -253,7 +185,6 @@ fn main() {
         register_tx.tx_type, register_tx.hash
     );
 
-    // Register in the agent registry.
     let mut registry = AgentRegistry::new();
     let agent_id_bytes: [u8; 32] = hash_bytes(AGENT_NAME.as_bytes()).0;
     let agent_id = AgentId(agent_id_bytes);
@@ -284,7 +215,6 @@ fn main() {
         .expect("activation failed");
     println!("      Agent registered and activated: {:?}", agent_id);
 
-    // 4. Deploy model into inference engine.
     println!("[4/5] Loading model into inference engine");
     let config = InferenceConfig {
         max_loaded_models: 10,
@@ -311,7 +241,6 @@ fn main() {
         hex::encode(&model_id[..8])
     );
 
-    // 5. Process sample inference requests.
     println!("[5/5] Processing inference requests\n");
 
     let test_texts = [
@@ -324,10 +253,8 @@ fn main() {
     ];
 
     for (i, text) in test_texts.iter().enumerate() {
-        // Encode text to feature vector.
         let features = encode_text(text);
 
-        // Run forward pass through the model.
         let output = model.forward(&features);
         assert_eq!(output.len(), OUTPUT_DIM, "unexpected output dimension");
 
@@ -348,7 +275,6 @@ fn main() {
         println!("  Request {}: \"{}\"", i + 1, text);
         println!("    Result: {}", result);
 
-        // Record the action in the agent registry.
         let action = AgentAction {
             agent_id,
             action_type: ActionType::Inference,
@@ -362,7 +288,6 @@ fn main() {
             .execute_action(&agent_id, action)
             .expect("action execution failed");
 
-        // Build a Settle TX for the completed inference.
         let service_hash = hash_bytes(text.as_bytes());
         let settle_tx =
             build_settle_tx(owner, Hash256(agent_id_bytes), service_hash, (i + 1) as u64);
@@ -370,7 +295,6 @@ fn main() {
         println!();
     }
 
-    // Print final agent state.
     let final_agent = registry.get(&agent_id).expect("agent not found");
     println!("--- Agent Summary ---");
     println!("  Name:          {}", final_agent.name);

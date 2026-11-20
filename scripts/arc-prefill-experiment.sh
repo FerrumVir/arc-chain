@@ -1,16 +1,4 @@
 #!/bin/bash
-# Watchdogged launcher for the E1(b) batched-prefill experiment.
-#
-# Why this exists: the first 500-token attempt on this 16 GB host produced no
-# output at all and was followed by a WindowServer watchdog panic. The machine
-# was already ~21 GB into swap when it launched, because product test suites
-# were running at the same time. This script therefore (a) refuses to start a
-# second model-loading experiment, (b) samples memory every 2 s, (c) kills the
-# run if pressure crosses a bound instead of letting the host wedge, and
-# (d) records the command, samples, exit status and outcome durably so an
-# interruption cannot erase the evidence again.
-#
-# usage: arc-prefill-experiment.sh TAG PROMPT_LEN CHUNK REPEATS
 set -u
 
 TAG="${1:?tag}"; LEN="${2:?prompt_len}"; CHUNK="${3:-64}"; REPS="${4:-2}"; MAXWALL="${5:-1800}"
@@ -19,16 +7,6 @@ BIN="${HOME}/work/arc-chain-readiness-20260919/target/release/examples/batched_p
 GGUF="${HOME}/.arc/models/standard.gguf"
 LOCK=/tmp/arc-model-experiment.lock
 
-# Bounds. Baseline swap is captured at launch; the run is killed if swap grows
-# past baseline+DELTA or past ABS, or if the process RSS exceeds RSS_CAP.
-# Bounds are absolute, not baseline-relative. The first attempt used a
-# baseline+4 GB bound and tripped 14 s into model loading: on a host with
-# ~60 MB free, macOS evicts the loader's own just-written pages, so swap grows
-# at roughly the allocation rate while process RSS stays low. That is expected
-# during a 7.8 GB load and is not by itself the wedge condition. The wedge
-# condition observed on 2026-09-19 was ~21 GB of swap with the UI starved, so
-# the cap sits well below it and a wall-clock bound catches a run that thrashes
-# without tripping any single threshold.
 SWAP_ABS_MB=14000
 RSS_CAP_MB=11500
 SAMPLE_SEC=2
@@ -36,9 +14,6 @@ SAMPLE_SEC=2
 swap_used_mb() { sysctl -n vm.swapusage | sed -E 's/.*used = ([0-9.]+)M.*/\1/'; }
 free_mb() { vm_stat | awk '/Pages free/{gsub(/\./,"",$3); printf "%.0f", $3*16384/1048576}'; }
 
-# Single-experiment lock. macOS ships neither flock nor a usable shlock in all
-# images, so this is a plain PID file: stale entries from the reboot are
-# reclaimed, a live one refuses.
 if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
   echo "REFUSED: model experiment PID $(cat "$LOCK") is still running" >&2; exit 3
 fi
@@ -64,8 +39,6 @@ BASE_SWAP=$(swap_used_mb)
 echo "t_s,rss_mb,swap_used_mb,free_mb,pageins_per_s,load1" > "$S.mem.csv"
 echo "RUNNING" > "$S.status"
 
-# nice: keep the window server ahead of the benchmark so a slow run degrades
-# into a slow run rather than an unresponsive desktop.
 nice -n 5 "$BIN" "$GGUF" "$LEN" "$CHUNK" "$REPS" > "$S.jsonl" 2> "$S.log" &
 PID=$!
 T0=$(date +%s); PEAK=0; VERDICT=""

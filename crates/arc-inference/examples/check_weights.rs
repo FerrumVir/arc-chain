@@ -1,5 +1,3 @@
-//! Check raw GGUF weight values to find quantization/loading bugs.
-
 fn main() {
     use candle_core::Device;
     use candle_core::quantized::gguf_file;
@@ -10,7 +8,6 @@ fn main() {
     let mut reader = std::fs::File::open(&path).unwrap();
     let content = gguf_file::Content::read(&mut reader).unwrap();
 
-    // Print first 8 values of key tensors
     let device = Device::Cpu;
     let mut check = |name: &str| match content.tensor(&mut reader, name, &device) {
         Ok(qt) => {

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Adversarial tests for server-side GitHub release verification."""
 
 from __future__ import annotations
 

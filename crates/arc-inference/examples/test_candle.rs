@@ -1,5 +1,3 @@
-//! Test candle float backend with proper tokenizer from GGUF vocab.
-
 use arc_inference::cached_integer_model::load_cached_model;
 use arc_inference::candle_backend::GgufEngine;
 
@@ -12,12 +10,10 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
 
-    // Load integer model just for the tokenizer
     println!("Loading tokenizer from GGUF...");
     let int_model = load_cached_model(&path).unwrap();
     println!("Vocab: {} entries", int_model.vocab.len());
 
-    // Load candle model for inference
     let engine = GgufEngine::new(120_000);
     let model_id = engine.load_gguf_file(&path).unwrap();
     println!("Candle model loaded: {}", hex::encode(&model_id.0[..8]));
@@ -32,8 +28,7 @@ fn main() {
     ];
 
     for prompt in &prompts {
-        // Use proper SentencePiece tokenizer from the integer model
-        let mut tokens: Vec<u32> = vec![1]; // BOS
+        let mut tokens: Vec<u32> = vec![1];
         tokens.extend(int_model.encode(prompt));
 
         println!(

@@ -1,27 +1,18 @@
-/**
- * PLACEHOLDER COPY. Every string in this module is a draft awaiting approval
- * from TJ and the CTO. Components take their wording from here and nowhere
- * else, so the approved copy replaces these values and no component changes.
- */
 export const PLAIN_COPY = {
   startFailure: {
-    // Draft wording; copy approval remains a release gate.
     otherDesktop: {
       title: "ARC is already open on this computer.",
       body: "Look for the ARC icon near the clock (Windows) or in the menu bar (Mac) and open it from there. You can close this window.",
     },
     closing: { title: "ARC is closing", body: "Please wait while your node closes." },
-    /** Launch-time reconciliation is still closing the last session. */
     reconciling: {
       title: "ARC is finishing your node's last session",
       body: "This can take a few minutes after the computer restarts. Your node starts when it's done.",
     },
-    /** The previous session's shutdown or its recovery did not finish. */
     blocked: {
       title: "ARC can't start your node yet",
       body: "Its last session didn't close cleanly, and ARC couldn't finish closing it. Nothing was deleted.",
     },
-    /** A path, permission, migration or another desktop needs fixing. */
     needsRepair: {
       title: "ARC needs something fixed before it can start your node",
       bodyThenRestart:
@@ -29,7 +20,6 @@ export const PLAIN_COPY = {
       bodyThenRetry:
         "Fix what the details below describe, then try again. Nothing was deleted.",
     },
-    /** The release or model download failed in transit. */
     network: {
       title: "ARC couldn't download what it needs",
       body: "Check your internet connection, then try again.",
@@ -38,12 +28,10 @@ export const PLAIN_COPY = {
       title: "ARC couldn't start your node",
       body: "Nothing was deleted. The details below say what went wrong.",
     },
-    /** An update ARC couldn't finish holds the node; only quitting ARC releases it. */
     updateUnfinished: {
       title: "ARC couldn't finish an update. Quit ARC and open it again.",
       body: "Your node stays stopped until then. Nothing was deleted.",
     },
-    /** Added under the sentence when a newer version is ready. */
     updateReady: "A newer version is ready, and it may fix this.",
   },
   actions: {
@@ -64,11 +52,9 @@ export const PLAIN_COPY = {
     updateArc: "Update ARC",
     continueToArc: "Continue to ARC",
   },
-  /** Home: the chat, renamed, and the screen ARC opens on. */
   home: {
     navLabel: "Ask ARC",
     title: "Ask ARC",
-    /** The proposal's line B: true today. */
     promise: "ARC is a network of computers that answer AI questions for each other.",
     explanation: "Ask a question and one of them answers. Share your computer and it answers for others.",
     askTitle: "Ask for free",
@@ -83,7 +69,6 @@ export const PLAIN_COPY = {
     ask: "Ask",
     emptyTitle: "Ask ARC anything.",
   },
-  /** The one-line node strip on Home: one sentence, at most one button. */
   nodeStrip: {
     ready: "Your computer is ready to answer questions.",
     computing: "Your computer is answering a question right now.",
@@ -97,17 +82,9 @@ export const PLAIN_COPY = {
     online: (n: number) => `${n} ${n === 1 ? "computer is" : "computers are"} online.`,
     registered: (n: number) => `${n} ${n === 1 ? "computer has" : "computers have"} registered.`,
     checking: "Checking your node…",
-    /** Running, and the connection is not known yet (older status shapes). */
     running: "Your node is running.",
-    /**
-     * Running, and a peer or a coordinator answered. The desktop's own probe
-     * is what reached the coordinator, so the connection is ARC's, not a
-     * claim about the node's P2P (an observer never talks to coordinators).
-     */
     runningConnected: "Your node is running, and ARC is connected to the network.",
-    /** Running, and nothing on the network has answered yet. */
     runningConnecting: "Your node is running, and ARC is connecting to the network…",
-    /** Running, and nothing has answered for a while: calm, no red, nothing to press. */
     runningUnreachable:
       "Your node is running, but ARC can't reach the network yet. Check your internet connection.",
     starting: "Your node is starting. Loading the AI model can take a few minutes.",
@@ -120,23 +97,15 @@ export const PLAIN_COPY = {
     modelWaitingMetered:
       "The AI model download is waiting for a connection without a data limit; ARC will check again automatically.",
     off: "Your node is off.",
-    /** Off, and no coordinator answered either: the computer is offline, not the node broken. */
     offUnreachable:
       "Your node is off, and ARC can't reach the network. Check your internet connection.",
     crashed: "Your node stopped unexpectedly.",
-    // Draft recovery copy: approval required before release.
     crashRetry: (minutes: number) =>
       `Your node stopped unexpectedly; ARC will try again in ${minutes} ${minutes === 1 ? "minute" : "minutes"}.`,
     updateAvailable: "A new version of ARC is ready.",
     updating: "Updating ARC. It will restart by itself in a moment.",
-    /** A relaunch or install the updater couldn't finish; only a reopen clears it. */
     updateFailed: "ARC couldn't finish an update. Quit ARC and open it again.",
   },
-  /**
-   * How the node reaches the network, in plain words. A community node has no
-   * peers by design (arc-net admits only the validators), so it is connected
-   * when a coordinator answers, and "0 peers" is normal, not a fault.
-   */
   connection: {
     labels: {
       checking: "Checking",
@@ -152,50 +121,35 @@ export const PLAIN_COPY = {
     unreachable:
       "Your node is off, and ARC can't reach the network. Check your internet connection.",
     connecting: "Your node is running, and ARC is connecting to the network…",
-    /** Too long without an answer from any coordinator. */
     connectingLong:
       "ARC can't reach the network yet. Check your internet connection; it keeps trying.",
-    /** The node itself has a peer (health "live"), so the node is connected. */
     connected: "Your node is connected to the ARC network.",
     connectedPeers: (peers: string) =>
       `Your node is connected to the ARC network with ${peers}.`,
-    /**
-     * A coordinator answered the desktop's own probe. That is ARC's
-     * connection; the node has no peers, and an observer never talks to a
-     * coordinator, so the sentence does not say the node is connected.
-     */
     connectedCoordinator: (host: string) =>
       `Your node is running, and ARC is connected to the network through ${host}. ARC reaches the network through coordinators rather than node to node, so 0 peers is normal.`,
-    /** The sidebar's second line while running. */
     viaPeers: (peers: string) => peers,
     viaCoordinator: (host: string) => `via ${host}`,
     viaConnecting: "connecting…",
-    /** The Peers tile's explanation. */
     peersInfo:
       "Other nodes your node has a direct connection to. Community nodes connect through coordinators and normally show 0 peers; the number says nothing about work or rewards.",
   },
-  /** Ask ARC: what the thread says while a question is out and when it isn't answered. */
   ask: {
     answerLength: "Answer length",
     sending: "Sending…",
     askingNode: "Asking your node…",
     askingNetwork: "Asking the ARC network…",
     stoppedWaiting: "You stopped waiting",
-    /** Added to the waiting note after a minute. */
     slow: "The network is taking longer than usual.",
     waitNote: "You can keep using ARC while you wait, or stop waiting below. A late answer still appears here.",
     stoppedNote: "A late answer still appears here.",
-    /** No answer came back, and nothing says the request is still running. */
     noAnswer: "The network didn't answer this time.",
     noAnswerNote: "Try again in a moment.",
-    /** The request was sent and may still be running somewhere. */
     unknownOutcome: "The network didn't answer, and the request may still be running.",
     unknownOutcomeNote: "Sending it again starts a second job. Waiting a minute first is safer.",
-    /** No request was sent at all. */
     notSent: "Nothing could take this question right now.",
     notSentNote: "Nothing was sent, so trying again is safe.",
     sendAgainAnyway: "Send again anyway",
-    /** The composer's button while a question is out. */
     asking: "Asking…",
   },
   answer: {
@@ -230,18 +184,12 @@ export const PLAIN_COPY = {
     stopFailed: "ARC couldn't stop your node.",
     stopFailedBody: "It is still running. The details below say what went wrong.",
     crashedBody: "Start it again when you're ready. The details below say what the node reported.",
-    /** The node reported a problem that is not a crash: the start it made by itself failed. */
     reportedBody: "The details below say what the node reported.",
   },
   wallet: {
     balanceUnavailable: "Balance unavailable right now. ARC keeps trying.",
-    /** Refused before or by the host: nothing can have been included. */
     faucetFailed: "The faucet claim didn't go through.",
     sendFailed: "The transfer didn't go through.",
-    /**
-     * The request went out and no usable answer came back. The host may have
-     * accepted it, so the next step is to look before sending again.
-     */
     faucetUnconfirmed:
       "ARC didn't get a confirmation for this faucet claim. Check your balance before claiming again.",
     sendUnconfirmed:
@@ -249,45 +197,18 @@ export const PLAIN_COPY = {
   },
   setup: {
     welcomeTitle: "Welcome to ARC",
-    /**
-     * The compute step. On a computer that can run the ARC model (the tier
-     * native code recommends), contributing starts on and the model downloads
-     * in the background after setup; the switch and Skip turn it off.
-     *
-     * What the body states is what this release does, and nothing more: the
-     * node starts at low OS priority (node_manager.rs `configure_node_process`),
-     * jobs use at most a quarter of the logical cores (commands.rs
-     * `default_worker_threads`), a node with the model loaded holds about
-     * 8 GB, and nothing pauses it on battery. Closing the window hides ARC
-     * to the tray, where the node keeps running until ARC is quit (lib.rs
-     * `on_window_event`; with no tray, closing the window quits ARC and
-     * stops the node). That is why the Settings note says "while ARC Node
-     * is running", not "while the app is open". No rule that waits for idle
-     * time, battery, heat or free memory exists yet, so none is promised
-     * here or in `settings.computeShare`.
-     *
-     * The same title and body are the one-time question asked of an install
-     * from before this default (components/ComputePromptDialog.tsx).
-     */
     compute: {
       title: "Share your computer's spare power",
       body: "ARC Node can run AI jobs for the ARC network on this computer. It uses up to a quarter of your processor, at low priority so your own apps come first, and about 8 GB of memory while it is ready for jobs. It keeps running on battery. First it downloads the ARC model, about 4 GB, in the background. You can turn this off here or at any time in Settings.",
       control: "Contribute compute",
-      /**
-       * In place of the body below the memory floor (`recommended_tier` is
-       * "none"): the step starts off there, and a model chosen anyway
-       * downloads during setup, before the node starts.
-       */
       belowMemoryFloor:
         "This computer has less than 16 GB of memory, which the ARC model needs, so this starts off. If you turn it on, setup downloads the model (about 4 GB) before your node starts. ARC Node can then run AI jobs for the ARC network on this computer. It uses up to a quarter of your processor, at low priority so your own apps come first, and about 8 GB of memory while it is ready for jobs. It keeps running on battery.",
-      /** The two buttons of the one-time question for an existing install. */
       turnOn: "Turn on",
       notNow: "Not now",
     },
     readyTitle: "Ready to start",
     readyWithModel: (size: string | null) =>
       `ARC downloads its AI model${size ? ` (${size})` : ""} and starts your node. This takes a few minutes.`,
-    /** Compute on, where the model downloads after setup. */
     readyWithModelInBackground: (size: string | null) =>
       `ARC starts your node, then downloads its AI model${size ? ` (${size})` : ""} in the background. Your node can run AI jobs once the model is ready.`,
     readyWithoutModel:
@@ -300,7 +221,6 @@ export const PLAIN_COPY = {
     connecting: "Connecting to the ARC network…",
     connectingStill: "Still connecting…",
     connectingLong: "Taking longer than usual. ARC keeps trying for a little longer.",
-    /** A coordinator answered ARC (named), or the node itself found a peer (null). */
     connected: (via: string | null) =>
       via ? `ARC is connected to the network via ${via} ✓` : "Your node is connected to the ARC network ✓",
   },
@@ -314,16 +234,6 @@ export const PLAIN_COPY = {
     startupUnknown: "ARC could not confirm whether it can open when you log in.",
     startupModel: "Your node can answer questions after its model is ready.",
     startupNoModel: "Your node needs a model before it can answer questions.",
-    /**
-     * Under Settings > Contribute compute while it is on: how much of the
-     * processor AI jobs may use, at what priority, and how much memory the
-     * node holds. `threads` is the node's core cap (null: no cap, every
-     * core) and `cores` this computer's logical cores. A setup that turns
-     * compute on stores a quarter of them; a cap someone set, or none on an
-     * install from before that, is stated as it is. The priority and the
-     * memory do not depend on the cap: the node starts at low priority
-     * whatever its width, and holds the model either way.
-     */
     computeShare: (threads: number | null, cores: number) => {
       const share =
         threads === null || threads >= cores
@@ -334,13 +244,7 @@ export const PLAIN_COPY = {
       return `Uses up to ${share} at low priority, and about 8 GB of memory while ARC Node is running. It keeps running on battery. Turn this off to stop ARC jobs and free that memory.`;
     },
   },
-  /**
-   * Launch found node data from an earlier install whose app data was gone
-   * and set it aside (renamed, never deleted). One sentence, during setup and
-   * on every screen after it, until dismissed.
-   */
   previousInstall: {
-    /** `path` is where the data was moved to; it stays visible in the sentence. */
     sentence: (path: string) =>
       `ARC found node data from an earlier install and set it aside (${path}). If you had a wallet, restore it with your 12 words; your node will sync again from the start.`,
     dismiss: "Dismiss this notice",
@@ -351,19 +255,12 @@ export const PLAIN_COPY = {
       `Version ${version} installs as soon as ARC finishes closing your node's last session.`,
     manualInstallOnly: (version: string) =>
       `Version ${version} can't install from inside ARC on this computer. Download it from the release page and install it by hand.`,
-    /**
-     * macOS: ARC runs from somewhere its updater can't replace it (the
-     * mounted disk image, a copy macOS runs from a temporary read-only place,
-     * another drive). Shown on Home from launch and when an update is refused.
-     */
     wrongLocation:
       "ARC can't update itself from where it's running. Quit ARC, drag ARC Node into your Applications folder, then open it from there.",
     autoInstallDescription:
       "On by default. ARC downloads updates in the background and installs them when no jobs are running, then restarts. Updates can install even when your node can't start.",
-    /** The check itself failed, usually a connection. ARC retries on its own. */
     checkFailed:
       "ARC couldn't check for updates right now. It tries again later, and you can check again here.",
-    /** An install that did not complete; the node may have been stopped for it. */
     installFailed: "The update didn't install. You can try again here.",
   },
 } as const;

@@ -1,13 +1,3 @@
-//! Export complete selected-layer INT8 rows for a `tensor_row_stdio_worker`.
-//!
-//! Usage:
-//! cargo run -p arc-inference --example tensor_row_layer_bundle_export --features candle --release -- \\
-//!   --model /absolute/path/model.gguf --expected-blake3 <64-hex-digits> \\
-//!   --worker-id sidecar-1 --layers 0,1,4 --output-dir /absolute/path/bundle
-//!
-//! The exporter loads the full GGUF into memory to verify and canonicalize it.
-//! It is a bundle-construction tool, not a low-memory worker runtime.
-
 use arc_crypto::Hash256;
 use arc_inference::cached_integer_model::{
     CachedIntegerModel, CachedLayer, GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, I8Weights,
@@ -21,8 +11,6 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// Keep in sync with tensor_row_stdio_worker.rs. Both the largest individual
-// row file and the sum loaded from its rows/ directory must fit this bound.
 const STDIO_WORKER_MAX_BYTES: usize = 1_073_741_824;
 const MAX_WORKER_ID_BYTES: usize = 64;
 
@@ -107,8 +95,6 @@ fn serialized_row_file_bytes(
                 .and_then(|scale_bytes| data_bytes.checked_add(scale_bytes))
         })
         .ok_or_else(|| "row payload size overflow".to_string())?;
-    // ARCROW01 header: magic, artifact, profile length+bytes, layer, tensor,
-    // start/end, worker length+bytes, column count and row count.
     let header = 85usize
         .checked_add(profile_bytes)
         .and_then(|n| n.checked_add(worker_bytes))
@@ -344,7 +330,6 @@ fn run() -> Result<(), String> {
     let requested_output = PathBuf::from(output_arg);
     let (output, output_name) = check_output_target(&requested_output)?;
 
-    // Validate exact source bytes before loading or writing anything.
     let artifact =
         ModelArtifactCommitment::from_path(&model_path).map_err(|error| error.to_string())?;
     verify_artifact_hash(artifact.model_id(), expected_hash)?;
@@ -374,7 +359,6 @@ fn run() -> Result<(), String> {
     }
     let layer_ranges = merged_layer_ranges(&layers)?;
 
-    // Stage beside the destination, keeping publication on the same filesystem.
     let mut staging = create_staging_dir(
         output.parent().expect("normalized output parent"),
         &output_name,

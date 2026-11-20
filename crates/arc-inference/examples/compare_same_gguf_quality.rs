@@ -1,10 +1,3 @@
-//! Sequential same-GGUF quality comparison for the corrected ARC Llama profile.
-//!
-//! It runs the pinned local llama.cpp reference process and ARC in separate
-//! processes/scopes for every case, writes one JSON object per completed case,
-//! and uses a separately committed pure-greedy ARC diagnostic mode so the
-//! source and ARC sampling semantics are directly comparable.
-
 use arc_inference::cached_integer_model::{
     GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, GGUF_LLAMA_GREEDY_GENERATION_SEMANTICS_V1,
     load_cached_model_canonical_i8_interleaved_rope,
@@ -108,9 +101,6 @@ fn case_record(
             Ok(result) => result,
             Err(error) => return json!({ "case": case_name, "error": error }),
         };
-    // This is only a rendering check. Actual sampled source IDs are captured
-    // by `capture_llama_simple_trace`; they must never be reconstructed from
-    // completion text because SPM has non-unique leading-space segmentations.
     let reference_completion_retokenized_ids = tokenizer
         .encode_prompt(&reference_text)
         .map(|mut ids| {
@@ -119,8 +109,6 @@ fn case_record(
         })
         .unwrap_or_default();
 
-    // The model is allocated only after the reference child has exited. This
-    // scope ends before the next reference case starts.
     let arc = (|| -> Result<Value, String> {
         let load_start = Instant::now();
         let model = load_cached_model_canonical_i8_interleaved_rope(model_path)
@@ -133,9 +121,6 @@ fn case_record(
             .encode_prompt(&prompt)
             .map_err(|error| format!("ARC SPM prompt tokenizer: {error}"))?;
         let tokenizer_match = encoded_arc_prompt_ids == reference_prompt_ids;
-        // Always feed the source's exact token IDs into both generation
-        // comparisons. This isolates arithmetic/generation quality even when
-        // the separately recorded text tokenizer gate fails.
         let arc_prompt_ids = reference_prompt_ids.clone();
         let generation_start = Instant::now();
         let (tokens, output_hash) = model

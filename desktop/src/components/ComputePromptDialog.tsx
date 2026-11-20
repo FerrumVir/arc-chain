@@ -3,7 +3,6 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api } from "../lib/tauri";
 import { useAppStore } from "../lib/store";
 
-/** Visible acknowledgement is separate from claiming the pending notice. */
 export function ComputePromptDialog({ onClose }: { onClose: () => void }) {
   const setConfig = useAppStore((s) => s.setConfig);
   const [busy, setBusy] = useState(false);
@@ -14,8 +13,6 @@ export function ComputePromptDialog({ onClose }: { onClose: () => void }) {
   const savedKeepAwake = useAppStore((s) => s.config?.keepAwakeWhileSharing === true);
   const [keepAwake, setKeepAwake] = useState(savedKeepAwake);
 
-  // Existing dialogs have no shared focus scope. Keep this notice's focus
-  // boundary in its current markup, including on older supported WebViews.
   useLayoutEffect(() => {
     const dialog = dialogRef.current!;
     const previousFocus = document.activeElement;
@@ -34,22 +31,17 @@ export function ComputePromptDialog({ onClose }: { onClose: () => void }) {
           && previousFocus !== document.body) {
         previousFocus.focus();
       }
-      // A launch-time notice often has no invoking control. Return the user
-      // to the current page's navigation item instead of leaving focus on body.
       if (document.activeElement === document.body || dialog.contains(document.activeElement)) {
         document.querySelector<HTMLElement>('nav [aria-current="page"]')?.focus();
       }
     };
   }, []);
 
-  // Saving disables every control. Park focus on the modal while pending,
-  // then return to the control that initiated the save (also after an error).
   useLayoutEffect(() => {
     if (busy) dialogRef.current?.focus();
     else lastControlRef.current?.focus();
   }, [busy]);
 
-  // Dismissing the notice leaves sharing and the independent opt-in intact.
   useEffect(() => {
     return api.whenMainWindowSeen(() => {
       void api.acknowledgeComputeNotice().catch(() => undefined);
@@ -102,7 +94,6 @@ export function ComputePromptDialog({ onClose }: { onClose: () => void }) {
         const first = controls[0];
         const last = controls[controls.length - 1];
         const active = document.activeElement;
-        // Wrap both ends explicitly so Tab never leaves for browser chrome.
         if (!first || active === event.currentTarget
             || (event.shiftKey ? active === first : active === last)) {
           event.preventDefault();

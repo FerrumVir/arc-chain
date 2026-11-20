@@ -1,12 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { seedOnboarded } from "./helpers";
 
-// The native paid-request journey on the browser model of a protocol-4 chain
-// (src/lib/native-mock.ts). It exercises the screen and the lifecycle wiring:
-// signing, admission, certification, settlement, expiry, refund, withdrawal
-// and a restart. The Rust signing path is covered by native_paid.rs tests and
-// the post-soak live acceptance run, not by this mock.
-
 async function openNative(page: Page, flag: true | "incompatible" = true) {
   await seedOnboarded(page);
   await page.addInitScript((value) => {
@@ -57,10 +51,8 @@ test.describe("native paid requests", () => {
     await expect(page.getByTestId("native-review")).toHaveCount(0);
     const row = page.getByTestId("native-request-row").first();
     await expect(row).toHaveAttribute("data-phase", /submitted|awaiting_certificate/);
-    // Admission moves the reservation into escrow.
     await expect(row).toHaveAttribute("data-phase", "awaiting_certificate", { timeout: 15_000 });
     await expect(page.getByTestId("native-reserved")).toContainText("Reserved in escrow: 1 ARC");
-    // Certification settles: the price is paid, the rest returns.
     await expect(row).toHaveAttribute("data-phase", "finalized", { timeout: 15_000 });
     await expect(row.getByTestId("native-output")).toContainText("test executor output, not an answer");
     await expect(row.getByTestId("native-output")).toContainText("reconciles with the reservation");
@@ -74,7 +66,6 @@ test.describe("native paid requests", () => {
     const row = page.getByTestId("native-request-row").first();
     await expect(row).toHaveAttribute("data-phase", "refund_due", { timeout: 20_000 });
     await expect(row.getByTestId("native-request-phase")).toContainText("claim the reservation back");
-    // The reservation is still held until the refund lands.
     await expect(page.getByTestId("native-reserved")).toContainText("Reserved in escrow: 2 ARC");
     await row.getByTestId("btn-native-refund").click();
     await expect(row).toHaveAttribute("data-phase", /refund_submitted|refunded/);
@@ -112,8 +103,6 @@ test.describe("native paid requests", () => {
 
   test("only an unsigned request can be withdrawn; a signed one has no hide button", async ({ page }) => {
     await openNative(page);
-    // The first request holds the account's nonce until a block admits it,
-    // so the second waits unsigned and can be withdrawn.
     await submitPrompt(page, "[hold] holds the nonce");
     await submitPrompt(page, "second, still unsigned");
     const rows = page.getByTestId("native-request-row");
@@ -128,8 +117,6 @@ test.describe("native paid requests", () => {
 
   test("on a protocol-4 chain the wallet explains that ARC cannot be transferred", async ({ page }) => {
     await openNative(page);
-    // Its blocks carry only native paid-inference transactions (D13): the
-    // node refuses a transfer or faucet claim, so the wallet offers neither.
     await page.getByTestId("nav-wallet").click();
     await expect(page.getByTestId("send-unavailable")).toContainText("cannot be transferred here");
     await page.getByTestId("send-recipient").fill("11".repeat(32));

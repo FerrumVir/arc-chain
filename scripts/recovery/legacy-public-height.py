@@ -56,7 +56,7 @@ UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 
 
 class HeightReceiptError(RuntimeError):
-    """Fail-closed input, network, or receipt error."""
+    pass
 
 
 def fail(message: str) -> NoReturn:
@@ -287,7 +287,7 @@ def build_receipt(source_main: str, freeze_sha: str, timeout: float) -> dict[str
             name = pending[future]
             try:
                 rows_by_name[name] = future.result()
-            except Exception as error:  # aggregate all six diagnostics without accepting a partial sample
+            except Exception as error:
                 errors.append(f"{name}: {error}")
     if errors:
         fail("legacy public-height sample failed: " + "; ".join(sorted(errors)))

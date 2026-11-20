@@ -10,19 +10,6 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
 }
 
-/**
- * One-time CTA for users who onboarded on a v0.5.x desktop (which defaulted
- * everyone to `role: "observer"` with no model). Without this, that cohort
- * stays passive validators forever — peers ≥ 1, attestations always 0,
- * earnings always 0 — because the chain only dispatches inference to nodes
- * that announced a model via `--community-mode`. v0.6.0 onboards new users
- * as workers from the start; this component is the migration path for
- * everyone already on the network.
- *
- * Triggers when the loaded config has `role: "observer"` OR `modelPath` is
- * null. User picks a tier (or dismisses), we download the GGUF, swap
- * config to worker, restart arc-node so the new model is picked up.
- */
 export function ObserverUpgradeBanner() {
   const config = useAppStore((s) => s.config);
   const setStoreConfig = useAppStore((s) => s.setConfig);
@@ -42,8 +29,6 @@ export function ObserverUpgradeBanner() {
   const [progress, setProgress] = useState<ModelDownloadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // Show the banner only when the loaded config exists AND it's an
-  // observer-style config. Don't render anything during the brief load gap.
   const isObserverConfig =
     !!config && !computeContributionEnabled(config) && (config.role === "observer" || config.modelPath == null);
 
@@ -93,13 +78,6 @@ export function ObserverUpgradeBanner() {
     setError(null);
     try {
       setStage("downloading");
-      // Clicking "Download & enable worker mode" is the user's explicit
-      // consent to contribute compute. The native command records it,
-      // reuses or downloads this machine's model tier (progress arrives on
-      // `model-download-progress`), switches the config to worker mode and
-      // restarts the node so arc-node re-reads --model + --community-mode.
-      // A whole-config `saveConfig` cannot make that change: once onboarding
-      // has stored a config, it keeps the stored contribution state.
       const saved = await api.setComputeContribution(true);
       setStoreConfig(saved);
 

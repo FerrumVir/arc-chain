@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Create one hash-bound, create-only ARC pre-tag candidate archive."""
 
 from __future__ import annotations
 

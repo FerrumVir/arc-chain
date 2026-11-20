@@ -1,38 +1,3 @@
-//! Stwo Circle STARK AIR definitions for ARC Chain.
-//!
-//! Provides the Algebraic Intermediate Representation (AIR) constraints and trace
-//! generation for proving block state transitions using StarkWare's Stwo prover.
-//!
-//! ## Architecture
-//!
-//! The AIR proves that the prover has valid knowledge of a block's state diffs.
-//! Each row of the execution trace represents one state diff (address, old_hash,
-//! new_hash). The constraints enforce structural validity of the witness data.
-//!
-//! ## Field
-//!
-//! Stwo operates over the Mersenne-31 field (M31): p = 2^31 - 1 = 2_147_483_647.
-//! Each 32-byte hash is decomposed into 16 × 16-bit limbs, each fitting in M31.
-//!
-//! ## Usage
-//!
-//! ```ignore
-//! use arc_crypto::stwo_air;
-//!
-//! let input = BlockProofInput { /* ... */ };
-//! let (proof_data, proving_time_ms) = stwo_air::prove_block(&input);
-//! let valid = stwo_air::verify_block_proof(&input, &proof_data);
-//! ```
-
-// ---------------------------------------------------------------------------
-// Imports - upstream Stwo (used for both stwo-prover and stwo-icicle features)
-// ---------------------------------------------------------------------------
-//
-// `stwo-icicle` extends `stwo-prover` (adds ICICLE GPU crates for future
-// GPU Backend integration). Both features use the same upstream stwo +
-// SimdBackend proving path. When a native IcicleBackend becomes available
-// in upstream stwo, this module gains a cfg-gated ProverBackend swap.
-
 use stwo::core::air::Component;
 use stwo::core::channel::Blake2sChannel;
 use stwo::core::fields::m31::{BaseField, M31};
@@ -55,16 +20,6 @@ use std::time::Instant;
 
 use crate::stark::BlockProofInput;
 
-// ---------------------------------------------------------------------------
-// ICICLE GPU device initialization (stwo-icicle feature only)
-// ---------------------------------------------------------------------------
-
-/// Ensures the ICICLE runtime is initialized (GPU path only).
-/// Uses `Once` to guarantee single initialization across all prove calls.
-///
-/// Currently a no-op beyond device selection - the proving pipeline still
-/// uses `SimdBackend` (CPU). When upstream stwo adds an `IcicleBackend`,
-/// this initializer will be called before GPU-accelerated proving.
 #[cfg(feature = "stwo-icicle")]
 pub fn ensure_icicle_initialized() {
     use std::sync::Once;
@@ -77,44 +32,18 @@ pub fn ensure_icicle_initialized() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Number of M31 limbs to represent a 32-byte hash.
-/// Each limb holds 16 bits (2 bytes), so 32 bytes = 16 limbs.
 pub const HASH_LIMBS: usize = 16;
 
-/// Base for u64 → 2-limb M31 decomposition.
-/// value = lo + hi * LIMB_BASE, where lo = value & 0xFFFF and hi = value >> 16.
-/// Both limbs fit in M31 for values < 2^47.
-pub const LIMB_BASE: u32 = 1 << 16; // 65536
+pub const LIMB_BASE: u32 = 1 << 16;
 
-/// Maximum value for the low limb (16 bits): 0..65535.
-pub const LIMB_LO_MAX: u32 = LIMB_BASE - 1; // 65535
+pub const LIMB_LO_MAX: u32 = LIMB_BASE - 1;
 
-/// Number of transfer-related columns:
-///   has_transfer (1) + sender_bal_before (2) + sender_bal_after (2) +
-///   receiver_bal_before (2) + receiver_bal_after (2) + amount (2) +
-///   sender_nonce_before (1) + sender_nonce_after (1) + fee (1) +
-///   sufficient_balance_aux (1) = 15
 pub const TRANSFER_COLS: usize = 15;
 
-/// Number of trace columns per row:
-/// 1 (active flag) + 16 (state diff hash limbs) + 15 (transfer data) = 32
 pub const TRACE_COLS: usize = 1 + HASH_LIMBS + TRANSFER_COLS;
 
-/// Minimum log2 of trace rows (Stwo/SIMD requires at least 16 rows).
 pub const MIN_LOG_SIZE: u32 = 4;
 
-// ---------------------------------------------------------------------------
-// Field element conversion
-// ---------------------------------------------------------------------------
-
-/// Convert a 32-byte hash into 16 M31 field elements (16-bit limbs).
-///
-/// Each pair of bytes is interpreted as a little-endian u16, which always
-/// fits in M31 (max u16 = 65535 << 2^31 - 1).
 pub fn bytes32_to_m31_limbs(bytes: &[u8; 32]) -> [M31; HASH_LIMBS] {
     let mut limbs = [M31::from(0u32); HASH_LIMBS];
     for (i, chunk) in bytes.chunks_exact(2).enumerate() {
@@ -124,7 +53,6 @@ pub fn bytes32_to_m31_limbs(bytes: &[u8; 32]) -> [M31; HASH_LIMBS] {
     limbs
 }
 
-/// Convert 16 M31 limbs back to a 32-byte hash.
 pub fn m31_limbs_to_bytes32(limbs: &[M31; HASH_LIMBS]) -> [u8; 32] {
     let mut bytes = [0u8; 32];
     for (i, limb) in limbs.iter().enumerate() {
@@ -134,12 +62,6 @@ pub fn m31_limbs_to_bytes32(limbs: &[M31; HASH_LIMBS]) -> [u8; 32] {
     bytes
 }
 
-/// Decompose a u64 value into 2 M31 field elements (base-2^16 limbs).
-///
-/// `lo = value & 0xFFFF` (low 16 bits), `hi = value >> 16`.
-/// For values < 2^47, both limbs fit in M31 (max 2^31 - 1).
-///
-/// Returns `(lo, hi)`.
 pub fn u64_to_m31_limbs(value: u64) -> Result<(M31, M31), String> {
     let lo = (value & 0xFFFF) as u32;
     let hi = (value >> 16) as u32;
@@ -153,58 +75,15 @@ pub fn u64_to_m31_limbs(value: u64) -> Result<(M31, M31), String> {
     Ok((M31::from(lo), M31::from(hi)))
 }
 
-/// Reconstruct a u64 from 2 M31 limbs (base-2^16).
 pub fn m31_limbs_to_u64(lo: M31, hi: M31) -> u64 {
     (lo.0 as u64) + ((hi.0 as u64) << 16)
 }
 
-// ---------------------------------------------------------------------------
-// AIR definition - ArcBlockWitnessEval
-// ---------------------------------------------------------------------------
-//
-/// AIR for ARC Chain block state transition proof.
-///
-/// **Trace layout** (32 columns per row):
-///
-/// | Col   | Name                  | Description                              |
-/// |-------|-----------------------|------------------------------------------|
-/// |  0    | `active`              | 1 if real data, 0 if padding             |
-/// | 1–16  | `diff_hash[0–15]`     | M31 limbs of BLAKE3(addr‖old‖new)        |
-/// | 17    | `has_transfer`         | 1 if row has transfer data, 0 otherwise  |
-/// | 18    | `sender_bal_before_lo` | Low 16 bits of sender balance before     |
-/// | 19    | `sender_bal_before_hi` | High bits of sender balance before       |
-/// | 20    | `sender_bal_after_lo`  | Low 16 bits of sender balance after      |
-/// | 21    | `sender_bal_after_hi`  | High bits of sender balance after        |
-/// | 22    | `recv_bal_before_lo`   | Low 16 bits of receiver balance before   |
-/// | 23    | `recv_bal_before_hi`   | High bits of receiver balance before     |
-/// | 24    | `recv_bal_after_lo`    | Low 16 bits of receiver balance after    |
-/// | 25    | `recv_bal_after_hi`    | High bits of receiver balance after      |
-/// | 26    | `amount_lo`           | Low 16 bits of transfer amount           |
-/// | 27    | `amount_hi`           | High bits of transfer amount             |
-/// | 28    | `sender_nonce_before` | Sender nonce before (fits in M31)        |
-/// | 29    | `sender_nonce_after`  | Sender nonce after (fits in M31)         |
-/// | 30    | `fee`                 | Transaction fee (fits in M31, < 2^31)    |
-/// | 31    | `suf_bal_aux`         | Auxiliary: sender_bal_after (combined)    |
-///
-/// **Constraints** (all polynomials that must equal 0 on the trace):
-///
-///  1. `active` is boolean: `active^2 - active = 0`
-///  2. `has_transfer` is boolean: `has_transfer^2 - has_transfer = 0`
-///  3. `has_transfer` implies `active`: `has_transfer * (1 - active) = 0`
-///  4. (x16) Hash padding: `limb * (1 - active) = 0` for each hash limb
-///  5. Balance debit: `has_transfer * (sender_after - sender_before + amount + fee) = 0`
-///  6. Balance credit: `has_transfer * (recv_after - recv_before - amount) = 0`
-///  7. Nonce increment: `has_transfer * (nonce_after - nonce_before - 1) = 0`
-///  8. Sufficient balance aux: `has_transfer * (suf_bal_aux - sender_after) = 0`
-///  9. (x14) Transfer padding: `col * (1 - has_transfer) = 0` for each transfer column
-///
-/// Degree bound: `log_size + 1` (all constraints are degree-2: active * linear_expr).
 #[derive(Clone)]
 pub struct ArcBlockWitnessEval {
     pub log_size: u32,
 }
 
-/// Type alias for the FrameworkComponent wrapping our AIR.
 pub type ArcBlockWitnessComponent = FrameworkComponent<ArcBlockWitnessEval>;
 
 impl FrameworkEval for ArcBlockWitnessEval {
@@ -217,135 +96,72 @@ impl FrameworkEval for ArcBlockWitnessEval {
     }
 
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
-        // ---------------------------------------------------------------
-        // Read all 32 columns in order
-        // ---------------------------------------------------------------
-
-        // Column 0: active flag
         let active = eval.next_trace_mask();
 
-        // Columns 1–16: state diff hash limbs
         let mut hash_limbs = Vec::with_capacity(HASH_LIMBS);
         for _ in 0..HASH_LIMBS {
             hash_limbs.push(eval.next_trace_mask());
         }
 
-        // Column 17: has_transfer flag (1 if transfer data present, 0 otherwise)
         let has_transfer = eval.next_trace_mask();
 
-        // Columns 18–19: sender balance before (lo, hi)
         let sbb_lo = eval.next_trace_mask();
         let sbb_hi = eval.next_trace_mask();
 
-        // Columns 20–21: sender balance after (lo, hi)
         let sba_lo = eval.next_trace_mask();
         let sba_hi = eval.next_trace_mask();
 
-        // Columns 22–23: receiver balance before (lo, hi)
         let rbb_lo = eval.next_trace_mask();
         let rbb_hi = eval.next_trace_mask();
 
-        // Columns 24–25: receiver balance after (lo, hi)
         let rba_lo = eval.next_trace_mask();
         let rba_hi = eval.next_trace_mask();
 
-        // Columns 26–27: amount (lo, hi)
         let amt_lo = eval.next_trace_mask();
         let amt_hi = eval.next_trace_mask();
 
-        // Column 28: sender nonce before
         let nonce_before = eval.next_trace_mask();
 
-        // Column 29: sender nonce after
         let nonce_after = eval.next_trace_mask();
 
-        // Column 30: fee
         let fee = eval.next_trace_mask();
 
-        // Column 31: sufficient balance auxiliary witness
         let suf_bal_aux = eval.next_trace_mask();
 
-        // ---------------------------------------------------------------
-        // Limb base as a BaseField constant
-        // ---------------------------------------------------------------
         let base = BaseField::from(LIMB_BASE);
         let one = BaseField::from(1u32);
 
-        // ---------------------------------------------------------------
-        // Combined values (in M31 arithmetic): val = lo + hi * LIMB_BASE
-        // ---------------------------------------------------------------
         let sender_before = sbb_lo.clone() + sbb_hi.clone() * base;
         let sender_after = sba_lo.clone() + sba_hi.clone() * base;
         let recv_before = rbb_lo.clone() + rbb_hi.clone() * base;
         let recv_after = rba_lo.clone() + rba_hi.clone() * base;
         let amount = amt_lo.clone() + amt_hi.clone() * base;
 
-        // ---------------------------------------------------------------
-        // Constraint 1: active is boolean - active² - active = 0
-        // ---------------------------------------------------------------
         eval.add_constraint(active.clone() * active.clone() - active.clone());
 
-        // ---------------------------------------------------------------
-        // Constraint 2: has_transfer is boolean - has_transfer² - has_transfer = 0
-        // ---------------------------------------------------------------
         eval.add_constraint(has_transfer.clone() * has_transfer.clone() - has_transfer.clone());
 
-        // ---------------------------------------------------------------
-        // Constraint 3: has_transfer implies active
-        //   has_transfer · (1 - active) = 0
-        //   i.e. if has_transfer=1 then active must be 1
-        // ---------------------------------------------------------------
         eval.add_constraint(has_transfer.clone() - active.clone() * has_transfer.clone());
 
-        // ---------------------------------------------------------------
-        // Constraint 4 (x16): padding rows have zero hash limbs
-        //   limb · (1 - active) = limb - active · limb = 0
-        // ---------------------------------------------------------------
         for limb in &hash_limbs {
             eval.add_constraint(limb.clone() - active.clone() * limb.clone());
         }
 
-        // ---------------------------------------------------------------
-        // Constraint 5: balance debit (sender)
-        //   has_transfer · (sender_after - sender_before + amount + fee) = 0
-        //   i.e. sender_after = sender_before - amount - fee
-        // ---------------------------------------------------------------
         eval.add_constraint(
             has_transfer.clone()
                 * (sender_after.clone() - sender_before.clone() + amount.clone() + fee.clone()),
         );
 
-        // ---------------------------------------------------------------
-        // Constraint 6: balance credit (receiver)
-        //   has_transfer · (recv_after - recv_before - amount) = 0
-        //   i.e. recv_after = recv_before + amount
-        // ---------------------------------------------------------------
         eval.add_constraint(
             has_transfer.clone() * (recv_after.clone() - recv_before.clone() - amount.clone()),
         );
 
-        // ---------------------------------------------------------------
-        // Constraint 7: nonce increment
-        //   has_transfer · (nonce_after - nonce_before - 1) = 0
-        // ---------------------------------------------------------------
         eval.add_constraint(
             has_transfer.clone() * (nonce_after.clone() - nonce_before.clone() - E::F::from(one)),
         );
 
-        // ---------------------------------------------------------------
-        // Constraint 8: sufficient balance auxiliary consistency
-        //   has_transfer · (suf_bal_aux - sender_after) = 0
-        //   The prover sets suf_bal_aux = sender_bal_after (combined value).
-        //   Since constraint 5 enforces sender_after = sender_before - amount - fee,
-        //   and the trace generator rejects underflow (u64 arithmetic),
-        //   this witness proves sender had sufficient balance.
-        // ---------------------------------------------------------------
         eval.add_constraint(has_transfer.clone() * (suf_bal_aux.clone() - sender_after.clone()));
 
-        // ---------------------------------------------------------------
-        // Constraints 9–22 (x14): transfer columns zero when has_transfer=0
-        //   col · (1 - has_transfer) = col - has_transfer · col = 0
-        // ---------------------------------------------------------------
         let transfer_data_cols = [
             sbb_lo,
             sbb_hi,
@@ -370,80 +186,10 @@ impl FrameworkEval for ArcBlockWitnessEval {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Dense Layer AIR (inference proving)
-// ---------------------------------------------------------------------------
-//
-// Proves, over M31:  output[i] = Σ_j weight[i][j] · input[j] + bias[i]
-//
-// ## Trace layout
-//
-// One row per multiply-accumulate. Row `r` corresponds to output neuron
-// `i = r / in_size` and input index `j = r % in_size`. Rows past
-// `out_size · in_size` are padding and are forced to zero.
-//
-// Preprocessed columns (tree 0) are derived **only from the public dimensions**
-// `(in_size, out_size, log_size)`, so the prover cannot choose them:
-//
-// | Column      | Meaning                                        |
-// |-------------|------------------------------------------------|
-// | `is_active` | 1 if `r < out_size · in_size`, else 0          |
-// | `is_start`  | 1 if the row begins a neuron (`j == 0`)        |
-// | `is_last`   | 1 if the row ends a neuron (`j == in_size-1`)  |
-//
-// Trace columns (tree 1), supplied by the prover:
-//
-// | Column    | Meaning                                          |
-// |-----------|--------------------------------------------------|
-// | `weight`  | weight[i][j]                                     |
-// | `input`   | input[j]                                         |
-// | `product` | weight · input                                   |
-// | `acc`     | running dot-product accumulator for neuron `i`   |
-// | `output`  | claimed output[i] — nonzero only when `is_last`  |
-// | `bias`    | bias[i] — nonzero only when `is_last`            |
-//
-// ## Constraints (6, all degree ≤ 2)
-//
-// 1. `product − weight · input = 0`
-//    Multiplication is correct. Holds on padding rows because 5 and 6 zero
-//    the factors there.
-//
-// 2. `acc − is_start·product − (is_active − is_start)·(acc_prev + product) = 0`
-//    The accumulation chain. At a neuron's first row `acc = product`; on every
-//    later row `acc = acc_prev + product`; on padding `acc = 0`. `acc_prev` is
-//    the row-offset −1 mask. Row 0 wraps to the final row, but row 0 always has
-//    `is_start = 1`, so the wrapped value is multiplied by zero.
-//
-// 3. `output − is_last·(acc + bias) = 0`
-//    Binds the claimed output to the completed accumulator. This is the
-//    constraint that makes the proof mean "the dot product is correct" rather
-//    than "some multiplications happened".
-//
-// 4. `bias − is_last·bias = 0`      bias is zero off the neuron's last row
-// 5. `weight − is_active·weight = 0`  padding rows carry no weight
-// 6. `input − is_active·input = 0`    padding rows carry no input
-//
-// Constraints 4–6 are canonicalisation: they make the trace — and therefore the
-// commitment — a deterministic function of `(weights, input, output, bias)`,
-// which is what lets a 152-byte receipt be reproduced by an independent party.
-//
-// ## What this does and does not prove
-//
-// Proven: the claimed outputs are the correct dot products **of the M31
-// reductions** of the trace's weights and inputs.
-//
-// Not proven: that trace weights equal the model's weights (that binding comes
-// from the receipt's weight hash plus deterministic re-execution), and that no
-// value wrapped modulo 2^31 − 1. Range-checking the accumulator to rule out
-// field wrap needs a lookup argument and is not implemented here.
-
-/// Number of prover-supplied columns in the Dense layer STARK trace.
 pub const DENSE_STARK_COLS: usize = 6;
 
-/// Number of preprocessed (verifier-derived) columns for the Dense layer AIR.
 pub const DENSE_STARK_PP_COLS: usize = 3;
 
-/// Preprocessed column identifiers, in commit order.
 fn dense_pp_ids() -> Vec<stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId> {
     use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
     ["dense_is_active", "dense_is_start", "dense_is_last"]
@@ -454,7 +200,6 @@ fn dense_pp_ids() -> Vec<stwo_constraint_framework::preprocessed_columns::PrePro
         .collect()
 }
 
-/// AIR evaluator for Dense layer forward pass.
 #[derive(Clone)]
 pub struct DenseLayerStarkEval {
     pub log_size: u32,
@@ -474,7 +219,6 @@ impl FrameworkEval for DenseLayerStarkEval {
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 
-        // Preprocessed selectors - fixed by the public dimensions.
         let is_active = eval.get_preprocessed_column(PreProcessedColumnId {
             id: "dense_is_active".to_string(),
         });
@@ -485,8 +229,6 @@ impl FrameworkEval for DenseLayerStarkEval {
             id: "dense_is_last".to_string(),
         });
 
-        // Trace columns. `acc` is read at offsets [0, -1] so the accumulation
-        // chain can reference the previous row.
         let weight = eval.next_trace_mask();
         let input = eval.next_trace_mask();
         let product = eval.next_trace_mask();
@@ -494,23 +236,18 @@ impl FrameworkEval for DenseLayerStarkEval {
         let output = eval.next_trace_mask();
         let bias = eval.next_trace_mask();
 
-        // 1. product = weight * input
         eval.add_constraint(product.clone() - weight.clone() * input.clone());
 
-        // 2. accumulation chain with per-neuron reset
         eval.add_constraint(
             acc.clone()
                 - is_start.clone() * product.clone()
                 - (is_active.clone() - is_start.clone()) * (acc_prev + product),
         );
 
-        // 3. output binds to the completed accumulator
         eval.add_constraint(output.clone() - is_last.clone() * (acc + bias.clone()));
 
-        // 4. bias only on a neuron's last row
         eval.add_constraint(bias.clone() - is_last * bias);
 
-        // 5-6. padding rows carry no factors
         eval.add_constraint(weight.clone() - is_active.clone() * weight);
         eval.add_constraint(input.clone() - is_active * input);
 
@@ -518,8 +255,6 @@ impl FrameworkEval for DenseLayerStarkEval {
     }
 }
 
-/// Build the preprocessed selector columns for a Dense layer of the given
-/// public dimensions. Depends on nothing the prover controls.
 pub fn generate_dense_preprocessed_trace(
     in_size: usize,
     out_size: usize,
@@ -558,19 +293,12 @@ pub fn generate_dense_preprocessed_trace(
     [is_active, is_start, is_last]
         .into_iter()
         .map(|mut col| {
-            // Constraint 2 reads a row offset, so the values must sit in
-            // circle-domain bit-reversed order, not coset order.
             bit_reverse_coset_to_circle_domain_order(&mut col);
             CircleEvaluation::new(domain, col.into_iter().collect())
         })
         .collect()
 }
 
-/// Generate the Dense layer STARK trace.
-///
-/// The `output` slice is written into the trace **as claimed** - it is not
-/// recomputed. A wrong claim therefore violates constraint 3 and the proof
-/// fails to verify, which is what makes this AIR binding.
 pub fn generate_dense_stark_trace(
     weights: &[i64],
     input: &[i64],
@@ -581,8 +309,6 @@ pub fn generate_dense_stark_trace(
     generate_dense_stark_trace_with_bias(weights, input, output, &[], in_size, out_size)
 }
 
-/// As [`generate_dense_stark_trace`], with an explicit bias vector. An empty
-/// `bias` is treated as all zeros.
 pub fn generate_dense_stark_trace_with_bias(
     weights: &[i64],
     input: &[i64],
@@ -602,8 +328,6 @@ pub fn generate_dense_stark_trace_with_bias(
 
     let mut row = 0usize;
     for i in 0..out_size {
-        // Accumulate in the field, not in i64: for wide layers the true integer
-        // sum can exceed i64, and the constraint is a statement about M31.
         let mut acc = M31::from(0u32);
         for j in 0..in_size {
             if row >= trace_size {
@@ -620,7 +344,6 @@ pub fn generate_dense_stark_trace_with_bias(
             cols[2][row] = prod;
             cols[3][row] = acc;
             if j == in_size - 1 {
-                // Claimed output and bias land on the neuron's final row.
                 cols[4][row] = to_m31(output[i]);
                 cols[5][row] = if bias.is_empty() {
                     M31::from(0u32)
@@ -641,7 +364,6 @@ pub fn generate_dense_stark_trace_with_bias(
         .collect()
 }
 
-/// Map an i64 into M31, preserving the ring homomorphism for negatives.
 fn to_m31(v: i64) -> M31 {
     const M31_MOD: u64 = (1u64 << 31) - 1;
     let v_abs = (v.unsigned_abs() % M31_MOD) as u32;
@@ -652,36 +374,8 @@ fn to_m31(v: i64) -> M31 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Packed Dense Layer AIR - K multiply-accumulates per row
-// ---------------------------------------------------------------------------
-//
-// The one-MAC-per-row layout costs 9 cells per multiply-accumulate and makes a
-// 2^24-row trace for a 7B attention projection. Proving cost is dominated by
-// FFTs and FRI over that trace, and a tall-thin trace is close to the worst
-// shape to hand them.
-//
-// This layout puts PACK_K MACs on a single row, which cuts the row count by
-// PACK_K and the cells per MAC from 9 to about 3.2:
-//
-//   columns: w[0..K] | x[0..K] | p[0..K] | acc | out | bias   = 3K + 3
-//   rows:    out_size * (in_size / K)
-//
-// Constraints (all degree <= 2):
-//   1. p_i - w_i * x_i = 0                              (K constraints)
-//   2. acc - is_start*S - (is_active - is_start)*(acc_prev + S) = 0, S = sum p_i
-//   3. out - is_last*(acc + bias) = 0
-//   4. bias - is_last*bias = 0
-//   5. w_i - is_active*w_i = 0, x_i - is_active*x_i = 0  (2K constraints)
-//
-// Same soundness argument as the unpacked AIR: the selectors are preprocessed
-// from the public dimensions, so the prover cannot choose where a dot product
-// starts or ends, and `out` is bound to the completed accumulator.
-
-/// Multiply-accumulates packed into one trace row.
 pub const PACK_K: usize = 32;
 
-/// Trace columns for the packed layout: 3*K value columns + acc + out + bias.
 pub const PACKED_STARK_COLS: usize = 3 * PACK_K + 3;
 
 fn packed_pp_ids() -> Vec<stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId> {
@@ -728,31 +422,25 @@ impl FrameworkEval for PackedDenseEval {
         let out = eval.next_trace_mask();
         let bias = eval.next_trace_mask();
 
-        // 1. each product is correct
         for i in 0..PACK_K {
             eval.add_constraint(p[i].clone() - w[i].clone() * x[i].clone());
         }
 
-        // running sum of this row's products
         let mut row_sum = p[0].clone();
         for item in p.iter().take(PACK_K).skip(1) {
             row_sum += item.clone();
         }
 
-        // 2. accumulation chain with per-neuron reset
         eval.add_constraint(
             acc.clone()
                 - is_start.clone() * row_sum.clone()
                 - (is_active.clone() - is_start.clone()) * (acc_prev + row_sum),
         );
 
-        // 3. output binds to the completed accumulator
         eval.add_constraint(out.clone() - is_last.clone() * (acc + bias.clone()));
 
-        // 4. bias only on a neuron's final row
         eval.add_constraint(bias.clone() - is_last * bias);
 
-        // 5. padding rows carry no factors
         for i in 0..PACK_K {
             eval.add_constraint(w[i].clone() - is_active.clone() * w[i].clone());
             eval.add_constraint(x[i].clone() - is_active.clone() * x[i].clone());
@@ -762,13 +450,11 @@ impl FrameworkEval for PackedDenseEval {
     }
 }
 
-/// Rows needed for a packed trace of the given dimensions.
 pub fn packed_log_size(in_size: usize, out_size: usize) -> u32 {
     let rows_per_neuron = in_size.div_ceil(PACK_K);
     compute_log_size(out_size * rows_per_neuron)
 }
 
-/// Preprocessed selectors for the packed layout.
 pub fn generate_packed_preprocessed_trace(
     in_size: usize,
     out_size: usize,
@@ -805,7 +491,6 @@ pub fn generate_packed_preprocessed_trace(
         .collect()
 }
 
-/// Packed trace. `output` is written as claimed, not recomputed.
 pub fn generate_packed_trace(
     weights: &[i64],
     input: &[i64],
@@ -865,8 +550,6 @@ pub fn generate_packed_trace(
         .collect()
 }
 
-/// Prove a Dense layer with the packed AIR. Same statement as
-/// [`try_prove_dense_stark`], a much cheaper trace.
 pub fn try_prove_dense_packed(
     weights: &[i64],
     input: &[i64],
@@ -961,12 +644,6 @@ pub fn try_prove_dense_packed(
     Ok((data, len, start.elapsed().as_millis() as u64))
 }
 
-/// Prove a Dense layer forward pass with a REAL Circle STARK proof.
-///
-/// Panics if the claimed `output` is not the correct dot product - use
-/// [`try_prove_dense_stark`] to get the failure as a `Result`.
-///
-/// Returns (proof_bytes, proof_size, proving_time_ms).
 pub fn prove_dense_stark(
     weights: &[i64],
     input: &[i64],
@@ -978,8 +655,6 @@ pub fn prove_dense_stark(
         .expect("Dense layer STARK proving failed")
 }
 
-/// Prove a Dense layer forward pass, returning an error instead of panicking
-/// when the constraints do not hold.
 pub fn try_prove_dense_stark(
     weights: &[i64],
     input: &[i64],
@@ -1034,17 +709,14 @@ pub fn try_prove_dense_stark(
         CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(config, &twiddles);
     commitment_scheme.set_store_polynomials_coefficients();
 
-    // Tree 0: preprocessed selectors
     let mut tree_builder = commitment_scheme.tree_builder();
     tree_builder.extend_evals(preprocessed);
     tree_builder.commit(prover_channel);
 
-    // Tree 1: execution trace
     let mut tree_builder = commitment_scheme.tree_builder();
     tree_builder.extend_evals(trace);
     tree_builder.commit(prover_channel);
 
-    // Create AIR component
     let pp_ids = dense_pp_ids();
     let component = DenseLayerStarkComponent::new(
         &mut TraceLocationAllocator::new_with_preprocessed_columns(&pp_ids),
@@ -1052,7 +724,6 @@ pub fn try_prove_dense_stark(
         SecureField::zero(),
     );
 
-    // Generate STARK proof
     let proof = stwo_prover_mod::prove::<SimdBackend, Blake2sMerkleChannel>(
         &[&component],
         prover_channel,
@@ -1060,7 +731,6 @@ pub fn try_prove_dense_stark(
     )
     .map_err(|e| format!("Dense layer STARK proving failed: {e:?}"))?;
 
-    // Inline verification
     let verifier_channel = &mut Blake2sChannel::default();
     let mut verifier_scheme = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
     let sizes = component.trace_log_degree_bounds();
@@ -1075,7 +745,6 @@ pub fn try_prove_dense_stark(
     )
     .map_err(|e| format!("Dense layer STARK verification failed: {e:?}"))?;
 
-    // Serialize proof
     let commitment_roots: Vec<[u8; 32]> = proof
         .commitments
         .iter()
@@ -1085,7 +754,6 @@ pub fn try_prove_dense_stark(
         })
         .collect();
 
-    // Bind the receipt to the actual computation, not just to the trace shape.
     let hash_i64 = |vals: &[i64]| -> [u8; 32] {
         let mut h = blake3::Hasher::new();
         for v in vals {
@@ -1130,11 +798,6 @@ pub fn try_prove_dense_stark(
     Ok((proof_data, proof_size, proving_time_ms))
 }
 
-// ---------------------------------------------------------------------------
-// Trace generation
-// ---------------------------------------------------------------------------
-
-/// Compute the minimum log2 trace size for a given number of state diffs.
 pub fn compute_log_size(n_diffs: usize) -> u32 {
     if n_diffs <= 1 {
         return MIN_LOG_SIZE;
@@ -1143,7 +806,6 @@ pub fn compute_log_size(n_diffs: usize) -> u32 {
     log.max(MIN_LOG_SIZE)
 }
 
-/// Hash a single state diff into 32 bytes using BLAKE3.
 fn hash_state_diff(addr: &[u8; 32], old_hash: &[u8; 32], new_hash: &[u8; 32]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key("ARC-stwo-state-diff-v1");
     hasher.update(addr);
@@ -1152,17 +814,6 @@ fn hash_state_diff(addr: &[u8; 32], old_hash: &[u8; 32], new_hash: &[u8; 32]) ->
     *hasher.finalize().as_bytes()
 }
 
-/// Generate the execution trace for a block's state transitions.
-///
-/// Returns `TRACE_COLS` CircleEvaluations (one per column), each with `2^log_size` rows.
-/// Active rows contain real state diff data and transfer witness data;
-/// padding rows are all zeros.
-///
-/// The number of active rows is `max(state_diffs.len(), transfers.len())`.
-/// If `transfers` is shorter than `state_diffs`, extra rows get zero transfer data
-/// (which still satisfies the constraints because the balance/nonce equations
-/// hold for all-zero inputs: 0 = 0 - 0 - 0 and 0 = 0 + 0 trivially).
-/// If `transfers` is longer, extra rows get dummy hash data.
 pub fn generate_block_witness_trace(
     input: &BlockProofInput,
     log_size: u32,
@@ -1170,28 +821,16 @@ pub fn generate_block_witness_trace(
     let size = 1usize << log_size;
     let _n_active = input.state_diffs.len().max(input.transfers.len());
 
-    // Column 0: active flags
     let mut active_col: Vec<BaseField> = vec![M31::from(0u32); size];
 
-    // Columns 1–16: diff hash limbs
     let mut hash_cols: Vec<Vec<BaseField>> = (0..HASH_LIMBS)
         .map(|_| vec![M31::from(0u32); size])
         .collect();
 
-    // Columns 17–31: transfer data (15 columns)
-    //  0: has_transfer flag
-    //  1: sender_bal_before_lo, 2: sender_bal_before_hi
-    //  3: sender_bal_after_lo,  4: sender_bal_after_hi
-    //  5: recv_bal_before_lo,   6: recv_bal_before_hi
-    //  7: recv_bal_after_lo,    8: recv_bal_after_hi
-    //  9: amount_lo,           10: amount_hi
-    // 11: sender_nonce_before, 12: sender_nonce_after
-    // 13: fee,                 14: suf_bal_aux
     let mut transfer_cols: Vec<Vec<BaseField>> = (0..TRANSFER_COLS)
         .map(|_| vec![M31::from(0u32); size])
         .collect();
 
-    // Populate hash data from state_diffs
     for (i, (addr, old_hash, new_hash)) in input.state_diffs.iter().enumerate() {
         if i >= size {
             break;
@@ -1206,15 +845,12 @@ pub fn generate_block_witness_trace(
         }
     }
 
-    // Populate transfer witness data
     for (i, tw) in input.transfers.iter().enumerate() {
         if i >= size {
             break;
         }
-        // Mark active (may already be 1 from state_diffs)
         active_col[i] = M31::from(1u32);
 
-        // Mark has_transfer
         transfer_cols[0][i] = M31::from(1u32);
 
         let (sbb_lo, sbb_hi) =
@@ -1233,8 +869,6 @@ pub fn generate_block_witness_trace(
             M31::from(tw.fee as u32)
         };
 
-        // Auxiliary: sender_bal_after as a combined M31 value
-        // suf_bal_aux = sender_bal_after (combined) = sba_lo + sba_hi * LIMB_BASE
         let suf_bal_aux_val = sba_lo + sba_hi * BaseField::from(LIMB_BASE);
 
         transfer_cols[1][i] = sbb_lo;
@@ -1252,11 +886,6 @@ pub fn generate_block_witness_trace(
         transfer_cols[13][i] = fee_val;
         transfer_cols[14][i] = suf_bal_aux_val;
     }
-
-    // For rows that have transfers but no state_diffs (transfers.len > state_diffs.len),
-    // we need a dummy hash. The active flag is already set; generate a zero hash.
-    // The padding constraint on hash limbs only applies when active=0, so any values work.
-    // We use the zero hash which satisfies the constraint trivially.
 
     let domain = CanonicCoset::new(log_size).circle_domain();
 
@@ -1276,27 +905,8 @@ pub fn generate_block_witness_trace(
     trace
 }
 
-// ---------------------------------------------------------------------------
-// Prove / Verify
-// ---------------------------------------------------------------------------
-
-/// Serialized Stwo proof data stored in `BlockProof.proof_data`.
-///
-/// Format:
-/// ```text
-/// [4 bytes] version (0x01)
-/// [4 bytes] log_size
-/// [4 bytes] n_commitment_trees
-/// [4 bytes] pow_bits
-/// [4 bytes] log_blowup_factor
-/// [4 bytes] n_queries
-/// For each commitment tree:
-///   [32 bytes] root hash
-/// [32 bytes] BLAKE3 binding hash of the full proof
-/// ```
 const PROOF_VERSION: u32 = 1;
 
-/// Proof receipt: serialized metadata from a Stwo STARK proof.
 #[derive(Debug, Clone)]
 pub struct StwoproofReceipt {
     pub version: u32,
@@ -1309,7 +919,6 @@ pub struct StwoproofReceipt {
 }
 
 impl StwoproofReceipt {
-    /// Serialize to bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend_from_slice(&self.version.to_le_bytes());
@@ -1325,7 +934,6 @@ impl StwoproofReceipt {
         data
     }
 
-    /// Deserialize from bytes.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < 24 {
             return None;
@@ -1370,25 +978,10 @@ impl StwoproofReceipt {
     }
 }
 
-/// Generate a real Stwo STARK proof for a block.
-///
-/// Returns `(proof_data, proof_size_bytes, proving_time_ms)`.
-///
-/// The proof_data contains a serialized `StwoproofReceipt` - the Merkle
-/// commitment roots and config parameters. The full STARK proof is verified
-/// inline during proving to ensure correctness.
-///
-/// # Backend
-///
-/// Uses upstream stwo `SimdBackend` (CPU SIMD). When `stwo-icicle` is enabled,
-/// the ICICLE crates are available for future GPU Backend integration but
-/// the proving path is identical.
 pub fn prove_block(input: &BlockProofInput) -> (Vec<u8>, usize, u64) {
     try_prove_block(input).expect("Stwo STARK proving failed")
 }
 
-/// As [`prove_block`], but returns an error instead of panicking when the
-/// witness does not satisfy the AIR.
 pub fn try_prove_block(input: &BlockProofInput) -> Result<(Vec<u8>, usize, u64), String> {
     let start = Instant::now();
 
@@ -1403,30 +996,25 @@ pub fn try_prove_block(input: &BlockProofInput) -> Result<(Vec<u8>, usize, u64),
             .half_coset,
     );
 
-    // --- Prover side ---
     let prover_channel = &mut Blake2sChannel::default();
     let mut commitment_scheme =
         CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(config, &twiddles);
     commitment_scheme.set_store_polynomials_coefficients();
 
-    // Tree 0: preprocessed trace (empty for our AIR)
     let mut tree_builder = commitment_scheme.tree_builder();
     tree_builder.extend_evals(vec![]);
     tree_builder.commit(prover_channel);
 
-    // Tree 1: main execution trace
     let mut tree_builder = commitment_scheme.tree_builder();
     tree_builder.extend_evals(trace);
     tree_builder.commit(prover_channel);
 
-    // Create the AIR component
     let component = ArcBlockWitnessComponent::new(
         &mut TraceLocationAllocator::default(),
         ArcBlockWitnessEval { log_size },
-        SecureField::zero(), // no logup interaction
+        SecureField::zero(),
     );
 
-    // Generate the STARK proof
     let proof = stwo_prover_mod::prove::<SimdBackend, Blake2sMerkleChannel>(
         &[&component],
         prover_channel,
@@ -1434,12 +1022,10 @@ pub fn try_prove_block(input: &BlockProofInput) -> Result<(Vec<u8>, usize, u64),
     )
     .map_err(|e| format!("Stwo STARK proving failed: {e:?}"))?;
 
-    // --- Verifier side (inline verification) ---
     let verifier_channel = &mut Blake2sChannel::default();
     let mut verifier_scheme = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
 
     let sizes = component.trace_log_degree_bounds();
-    // Commit each tree's commitments in the same order as the prover
     verifier_scheme.commit(proof.commitments[0], &sizes[0], verifier_channel);
     verifier_scheme.commit(proof.commitments[1], &sizes[1], verifier_channel);
 
@@ -1451,19 +1037,15 @@ pub fn try_prove_block(input: &BlockProofInput) -> Result<(Vec<u8>, usize, u64),
     )
     .map_err(|e| format!("Stwo STARK inline verification failed: {e:?}"))?;
 
-    // --- Build proof receipt ---
-    // Extract commitment roots as raw bytes
     let commitment_roots: Vec<[u8; 32]> = proof
         .commitments
         .iter()
         .map(|c| {
-            // Blake2s hash is 32 bytes - extract via Debug format and hash
             let repr = format!("{:?}", c);
             *blake3::hash(repr.as_bytes()).as_bytes()
         })
         .collect();
 
-    // Binding hash: covers block data + proof commitments
     let mut binding_hasher = blake3::Hasher::new_derive_key("ARC-stwo-binding-v1");
     binding_hasher.update(&input.block_hash);
     binding_hasher.update(&input.prev_state_root);
@@ -1491,17 +1073,12 @@ pub fn try_prove_block(input: &BlockProofInput) -> Result<(Vec<u8>, usize, u64),
     Ok((proof_data, proof_size, proving_time_ms))
 }
 
-/// Verify a Stwo proof receipt.
-///
-/// Checks that the receipt is structurally valid and the binding hash
-/// matches the block data. Full re-verification requires re-proving.
 pub fn verify_block_proof(input: &BlockProofInput, proof_data: &[u8]) -> bool {
     let receipt = match StwoproofReceipt::from_bytes(proof_data) {
         Some(r) => r,
         None => return false,
     };
 
-    // Re-derive the binding hash from block data + commitment roots
     let mut binding_hasher = blake3::Hasher::new_derive_key("ARC-stwo-binding-v1");
     binding_hasher.update(&input.block_hash);
     binding_hasher.update(&input.prev_state_root);
@@ -1515,94 +1092,22 @@ pub fn verify_block_proof(input: &BlockProofInput, proof_data: &[u8]) -> bool {
     receipt.binding_hash == expected_binding
 }
 
-// ---------------------------------------------------------------------------
-// Recursive Verifier AIR - inner-circuit STARK recursion
-// ---------------------------------------------------------------------------
-//
-// The RecursiveVerifierAIR proves, inside a STARK circuit, that child proof
-// verification was performed correctly. This is the critical piece that
-// separates inner-circuit recursion from external verification:
-//
-// - External: verify children outside STARK, then aggregate hashes
-// - Inner-circuit: the STARK proof itself attests that verification happened
-//
-// Since computing BLAKE3 inside M31 arithmetic is infeasible, we use a
-// COMMITMENT approach: the prover commits to the Merkle computation results
-// in the trace, and the AIR constraints enforce structural consistency
-// (state chain continuity, Merkle path structure, active/padding discipline).
-// The actual BLAKE3 hash verification is done in the trace generator.
-
-/// Number of trace columns for the recursive verifier AIR.
-///
-/// Layout:
-///   active              (1 col)  - boolean, 1 for real child proof rows
-///   child_hash_limbs   (16 cols) - M31 decomposition of child proof hash
-///   child_start_state  (16 cols) - M31 decomposition of child's start_state_root
-///   child_end_state    (16 cols) - M31 decomposition of child's end_state_root
-///   merkle_sibling     (16 cols) - M31 limbs of Merkle sibling at this depth
-///   merkle_computed    (16 cols) - M31 limbs of computed Merkle node
-///   chain_valid         (1 col)  - boolean, 1 if child_i.end == child_{i+1}.start
-///   Total: 82 columns
 pub const RECURSIVE_VERIFIER_COLS: usize = 82;
 
-/// Input data for the recursive verifier circuit.
-///
-/// The prover supplies the child proof metadata and Merkle path data.
-/// The trace generator verifies BLAKE3 hashes outside the circuit and
-/// commits the results into trace columns. The AIR then constrains the
-/// structural relationships.
 #[derive(Debug, Clone)]
 pub struct RecursiveVerifierInput {
-    /// BLAKE3 hash of each child proof (content-addressed ID).
     pub child_hashes: Vec<[u8; 32]>,
-    /// Start state root of each child proof.
     pub child_start_states: Vec<[u8; 32]>,
-    /// End state root of each child proof.
     pub child_end_states: Vec<[u8; 32]>,
-    /// Merkle path siblings for each child (one sibling per depth level).
     pub merkle_siblings: Vec<Vec<[u8; 32]>>,
-    /// Expected Merkle root over all child hashes.
     pub expected_merkle_root: [u8; 32],
 }
 
-// ---------------------------------------------------------------------------
-// AIR definition - ArcRecursiveVerifierEval
-// ---------------------------------------------------------------------------
-
-/// AIR for recursive proof verification.
-///
-/// **Trace layout** (82 columns per row):
-///
-/// | Cols     | Name                    | Description                                |
-/// |----------|-------------------------|--------------------------------------------|
-/// | 0        | `active`                | 1 if real child proof row, 0 if padding    |
-/// | 1–16     | `child_hash[0–15]`      | M31 limbs of child proof hash              |
-/// | 17–32    | `start_state[0–15]`     | M31 limbs of child's start_state_root      |
-/// | 33–48    | `end_state[0–15]`       | M31 limbs of child's end_state_root        |
-/// | 49–64    | `merkle_sibling[0–15]`  | M31 limbs of Merkle sibling                |
-/// | 65–80    | `merkle_computed[0–15]` | M31 limbs of computed Merkle node          |
-/// | 81       | `chain_valid`           | 1 if state chain is valid at this row      |
-///
-/// **Constraints**:
-///
-///  1. `active` is boolean: `active^2 - active = 0`
-///  2. `chain_valid` is boolean: `chain_valid^2 - chain_valid = 0`
-///  3. `chain_valid` implies `active`: `chain_valid * (1 - active) = 0`
-///  4. (x64) Padding: all hash/state/Merkle limb columns zero when `active=0`
-///  5. (x16) State chain continuity (next-row constraint):
-///     `chain_valid_next * (end_state_limbs[j]_curr - start_state_limbs[j]_next) = 0`
-///  6. (x16) Merkle structural consistency:
-///     `active * (merkle_computed[j] - child_hash[j] - merkle_sibling[j]) = 0`
-///
-///     The computed Merkle node must be the "sum" of child hash and sibling in M31,
-///     representing the commitment to the hash preimage. The actual BLAKE3 is
-///     verified in the trace generator.
 #[derive(Clone)]
 pub struct ArcRecursiveVerifierEval {
     pub log_size: u32,
 }
 
-/// Type alias for the FrameworkComponent wrapping the recursive verifier AIR.
 pub type ArcRecursiveVerifierComponent = FrameworkComponent<ArcRecursiveVerifierEval>;
 
 impl FrameworkEval for ArcRecursiveVerifierEval {
@@ -1611,71 +1116,45 @@ impl FrameworkEval for ArcRecursiveVerifierEval {
     }
 
     fn max_constraint_log_degree_bound(&self) -> u32 {
-        // Degree-2 constraints (active * linear_expr), same as block AIR
         self.log_size + 1
     }
 
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
-        // ---------------------------------------------------------------
-        // Read all 82 columns in order
-        // ---------------------------------------------------------------
-
-        // Column 0: active flag
         let active = eval.next_trace_mask();
 
-        // Columns 1–16: child proof hash limbs
         let mut child_hash_limbs = Vec::with_capacity(HASH_LIMBS);
         for _ in 0..HASH_LIMBS {
             child_hash_limbs.push(eval.next_trace_mask());
         }
 
-        // Columns 17–32: child start state limbs
         let mut start_state_limbs = Vec::with_capacity(HASH_LIMBS);
         for _ in 0..HASH_LIMBS {
             start_state_limbs.push(eval.next_trace_mask());
         }
 
-        // Columns 33–48: child end state limbs
         let mut end_state_limbs = Vec::with_capacity(HASH_LIMBS);
         for _ in 0..HASH_LIMBS {
             end_state_limbs.push(eval.next_trace_mask());
         }
 
-        // Columns 49–64: Merkle sibling limbs
         let mut merkle_sibling_limbs = Vec::with_capacity(HASH_LIMBS);
         for _ in 0..HASH_LIMBS {
             merkle_sibling_limbs.push(eval.next_trace_mask());
         }
 
-        // Columns 65–80: Merkle computed node limbs
         let mut merkle_computed_limbs = Vec::with_capacity(HASH_LIMBS);
         for _ in 0..HASH_LIMBS {
             merkle_computed_limbs.push(eval.next_trace_mask());
         }
 
-        // Column 81: chain_valid flag
         let chain_valid = eval.next_trace_mask();
 
-        // ---------------------------------------------------------------
-        // Constraint 1: active is boolean - active^2 - active = 0
-        // ---------------------------------------------------------------
         eval.add_constraint(active.clone() * active.clone() - active.clone());
 
-        // ---------------------------------------------------------------
-        // Constraint 2: chain_valid is boolean - chain_valid^2 - chain_valid = 0
-        // ---------------------------------------------------------------
         eval.add_constraint(chain_valid.clone() * chain_valid.clone() - chain_valid.clone());
 
-        // ---------------------------------------------------------------
-        // Constraint 3: chain_valid implies active
-        //   chain_valid * (1 - active) = 0
-        // ---------------------------------------------------------------
         eval.add_constraint(chain_valid.clone() - active.clone() * chain_valid.clone());
 
-        // ---------------------------------------------------------------
-        // Constraint 4 (x64): padding - all limb columns zero when active=0
-        //   limb * (1 - active) = limb - active * limb = 0
-        // ---------------------------------------------------------------
         for limb in &child_hash_limbs {
             eval.add_constraint(limb.clone() - active.clone() * limb.clone());
         }
@@ -1692,16 +1171,6 @@ impl FrameworkEval for ArcRecursiveVerifierEval {
             eval.add_constraint(limb.clone() - active.clone() * limb.clone());
         }
 
-        // ---------------------------------------------------------------
-        // Constraint 5 (x16): Merkle structural consistency
-        //   active * (merkle_computed[j] - child_hash[j] - merkle_sibling[j]) = 0
-        //
-        //   The Merkle computed node is committed as the M31 "sum" of the
-        //   child hash and its sibling. The actual BLAKE3 hash is verified
-        //   in the trace generator; the circuit constrains that the committed
-        //   values are structurally consistent (the computed node incorporates
-        //   both the child hash and the sibling).
-        // ---------------------------------------------------------------
         for j in 0..HASH_LIMBS {
             eval.add_constraint(
                 active.clone()
@@ -1711,33 +1180,10 @@ impl FrameworkEval for ArcRecursiveVerifierEval {
             );
         }
 
-        // ---------------------------------------------------------------
-        // Constraint 6: chain_valid padding - chain_valid column zero when active=0
-        //   chain_valid * (1 - active) = 0  (already covered by constraint 3)
-        //   But we also constrain: chain_valid is 0 on padding rows.
-        //   This is already implied by constraint 3 above.
-        // ---------------------------------------------------------------
-
         eval
     }
 }
 
-// ---------------------------------------------------------------------------
-// Trace generation for recursive verifier
-// ---------------------------------------------------------------------------
-
-/// Generate the execution trace for the recursive verifier AIR.
-///
-/// Returns `RECURSIVE_VERIFIER_COLS` CircleEvaluations, each with `2^log_size` rows.
-/// Active rows contain real child proof data; padding rows are all zeros.
-///
-/// The trace generator performs BLAKE3 verification outside the circuit:
-/// - Verifies each child hash is well-formed
-/// - Computes Merkle nodes from child hashes and siblings
-/// - Checks state chain continuity (child_i.end == child_{i+1}.start)
-///
-/// The circuit then constrains the structural relationships between these
-/// committed values.
 pub fn generate_recursive_verifier_trace(
     input: &RecursiveVerifierInput,
     log_size: u32,
@@ -1745,64 +1191,51 @@ pub fn generate_recursive_verifier_trace(
     let size = 1usize << log_size;
     let n_children = input.child_hashes.len();
 
-    // Column 0: active flags
     let mut active_col: Vec<BaseField> = vec![M31::from(0u32); size];
 
-    // Columns 1–16: child hash limbs
     let mut hash_cols: Vec<Vec<BaseField>> = (0..HASH_LIMBS)
         .map(|_| vec![M31::from(0u32); size])
         .collect();
 
-    // Columns 17–32: start state limbs
     let mut start_cols: Vec<Vec<BaseField>> = (0..HASH_LIMBS)
         .map(|_| vec![M31::from(0u32); size])
         .collect();
 
-    // Columns 33–48: end state limbs
     let mut end_cols: Vec<Vec<BaseField>> = (0..HASH_LIMBS)
         .map(|_| vec![M31::from(0u32); size])
         .collect();
 
-    // Columns 49–64: Merkle sibling limbs
     let mut sibling_cols: Vec<Vec<BaseField>> = (0..HASH_LIMBS)
         .map(|_| vec![M31::from(0u32); size])
         .collect();
 
-    // Columns 65–80: Merkle computed node limbs
     let mut computed_cols: Vec<Vec<BaseField>> = (0..HASH_LIMBS)
         .map(|_| vec![M31::from(0u32); size])
         .collect();
 
-    // Column 81: chain_valid flags
     let mut chain_valid_col: Vec<BaseField> = vec![M31::from(0u32); size];
 
-    // Populate active rows
     for i in 0..n_children {
         if i >= size {
             break;
         }
         active_col[i] = M31::from(1u32);
 
-        // Child hash limbs
         let hash_limbs = bytes32_to_m31_limbs(&input.child_hashes[i]);
         for (j, limb) in hash_limbs.iter().enumerate() {
             hash_cols[j][i] = *limb;
         }
 
-        // Start state limbs
         let start_limbs = bytes32_to_m31_limbs(&input.child_start_states[i]);
         for (j, limb) in start_limbs.iter().enumerate() {
             start_cols[j][i] = *limb;
         }
 
-        // End state limbs
         let end_limbs = bytes32_to_m31_limbs(&input.child_end_states[i]);
         for (j, limb) in end_limbs.iter().enumerate() {
             end_cols[j][i] = *limb;
         }
 
-        // Merkle sibling: use the first sibling from the Merkle path
-        // (the path at depth 0, i.e., the direct sibling of this leaf)
         let sibling = if !input.merkle_siblings.is_empty()
             && i < input.merkle_siblings.len()
             && !input.merkle_siblings[i].is_empty()
@@ -1816,64 +1249,48 @@ pub fn generate_recursive_verifier_trace(
             sibling_cols[j][i] = *limb;
         }
 
-        // Merkle computed node: hash_limbs + sibling_limbs (M31 addition)
-        // This is the commitment: the actual BLAKE3 hash was verified by
-        // the trace generator. The circuit constrains:
-        //   merkle_computed[j] = child_hash[j] + merkle_sibling[j]
         for j in 0..HASH_LIMBS {
             computed_cols[j][i] = hash_limbs[j] + sibling_limbs[j];
         }
 
-        // Chain validity: check if child_i.end_state == child_{i+1}.start_state
-        // For the last child (or single child), chain_valid is 1 (vacuously true)
         if i + 1 < n_children {
             if input.child_end_states[i] == input.child_start_states[i + 1] {
                 chain_valid_col[i] = M31::from(1u32);
             }
-            // else: chain_valid stays 0 (state discontinuity)
         } else {
-            // Last active row: chain_valid = 1 (no successor to check)
             chain_valid_col[i] = M31::from(1u32);
         }
     }
 
-    // Assemble trace columns
     let domain = CanonicCoset::new(log_size).circle_domain();
 
     let mut trace = Vec::with_capacity(RECURSIVE_VERIFIER_COLS);
 
-    // Col 0: active
     trace.push(CircleEvaluation::new(
         domain,
         active_col.into_iter().collect(),
     ));
 
-    // Cols 1–16: child hash
     for col in hash_cols {
         trace.push(CircleEvaluation::new(domain, col.into_iter().collect()));
     }
 
-    // Cols 17–32: start state
     for col in start_cols {
         trace.push(CircleEvaluation::new(domain, col.into_iter().collect()));
     }
 
-    // Cols 33–48: end state
     for col in end_cols {
         trace.push(CircleEvaluation::new(domain, col.into_iter().collect()));
     }
 
-    // Cols 49–64: Merkle sibling
     for col in sibling_cols {
         trace.push(CircleEvaluation::new(domain, col.into_iter().collect()));
     }
 
-    // Cols 65–80: Merkle computed
     for col in computed_cols {
         trace.push(CircleEvaluation::new(domain, col.into_iter().collect()));
     }
 
-    // Col 81: chain_valid
     trace.push(CircleEvaluation::new(
         domain,
         chain_valid_col.into_iter().collect(),
@@ -1883,22 +1300,8 @@ pub fn generate_recursive_verifier_trace(
     trace
 }
 
-// ---------------------------------------------------------------------------
-// Prove / Verify - Recursive Verifier
-// ---------------------------------------------------------------------------
-
-/// Binding domain for recursive proof receipts (distinct from block proofs).
 const RECURSIVE_BINDING_DOMAIN: &str = "ARC-stwo-recursive-binding-v1";
 
-/// Generate a Stwo STARK proof of recursive child proof verification.
-///
-/// The proof attests that the prover correctly verified all child proofs
-/// and that their state roots form a valid chain. This is the inner-circuit
-/// recursive verification - the STARK proof itself proves the verification.
-///
-/// Returns `(proof_data, proof_size_bytes, proving_time_ms)` where
-/// `proof_data` is a serialized `StwoproofReceipt` with the recursive
-/// binding domain.
 pub fn prove_recursive(input: &RecursiveVerifierInput) -> (Vec<u8>, usize, u64) {
     let start = Instant::now();
 
@@ -1913,30 +1316,25 @@ pub fn prove_recursive(input: &RecursiveVerifierInput) -> (Vec<u8>, usize, u64) 
             .half_coset,
     );
 
-    // --- Prover side ---
     let prover_channel = &mut Blake2sChannel::default();
     let mut commitment_scheme =
         CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(config, &twiddles);
     commitment_scheme.set_store_polynomials_coefficients();
 
-    // Tree 0: preprocessed trace (empty for our AIR)
     let mut tree_builder = commitment_scheme.tree_builder();
     tree_builder.extend_evals(vec![]);
     tree_builder.commit(prover_channel);
 
-    // Tree 1: main execution trace
     let mut tree_builder = commitment_scheme.tree_builder();
     tree_builder.extend_evals(trace);
     tree_builder.commit(prover_channel);
 
-    // Create the recursive verifier AIR component
     let component = ArcRecursiveVerifierComponent::new(
         &mut TraceLocationAllocator::default(),
         ArcRecursiveVerifierEval { log_size },
-        SecureField::zero(), // no logup interaction
+        SecureField::zero(),
     );
 
-    // Generate the STARK proof
     let proof = stwo_prover_mod::prove::<SimdBackend, Blake2sMerkleChannel>(
         &[&component],
         prover_channel,
@@ -1944,7 +1342,6 @@ pub fn prove_recursive(input: &RecursiveVerifierInput) -> (Vec<u8>, usize, u64) 
     )
     .expect("Stwo recursive STARK proving failed");
 
-    // --- Verifier side (inline verification) ---
     let verifier_channel = &mut Blake2sChannel::default();
     let mut verifier_scheme = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
 
@@ -1960,7 +1357,6 @@ pub fn prove_recursive(input: &RecursiveVerifierInput) -> (Vec<u8>, usize, u64) 
     )
     .expect("Stwo recursive STARK inline verification failed");
 
-    // --- Build proof receipt ---
     let commitment_roots: Vec<[u8; 32]> = proof
         .commitments
         .iter()
@@ -1970,7 +1366,6 @@ pub fn prove_recursive(input: &RecursiveVerifierInput) -> (Vec<u8>, usize, u64) 
         })
         .collect();
 
-    // Binding hash: covers recursive verifier data + proof commitments
     let mut binding_hasher = blake3::Hasher::new_derive_key(RECURSIVE_BINDING_DOMAIN);
     binding_hasher.update(&input.expected_merkle_root);
     binding_hasher.update(&(input.child_hashes.len() as u32).to_le_bytes());
@@ -2005,18 +1400,12 @@ pub fn prove_recursive(input: &RecursiveVerifierInput) -> (Vec<u8>, usize, u64) 
     (proof_data, proof_size, proving_time_ms)
 }
 
-/// Verify a recursive STARK proof receipt.
-///
-/// Checks that the receipt is structurally valid and the binding hash
-/// matches the recursive verifier input data. This validates that the
-/// prover generated a real STARK proof of child proof verification.
 pub fn verify_recursive_proof(input: &RecursiveVerifierInput, proof_data: &[u8]) -> bool {
     let receipt = match StwoproofReceipt::from_bytes(proof_data) {
         Some(r) => r,
         None => return false,
     };
 
-    // Re-derive the binding hash from recursive verifier data + commitment roots
     let mut binding_hasher = blake3::Hasher::new_derive_key(RECURSIVE_BINDING_DOMAIN);
     binding_hasher.update(&input.expected_merkle_root);
     binding_hasher.update(&(input.child_hashes.len() as u32).to_le_bytes());
@@ -2036,10 +1425,6 @@ pub fn verify_recursive_proof(input: &RecursiveVerifierInput, proof_data: &[u8])
 
     receipt.binding_hash == expected_binding
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -2131,7 +1516,7 @@ mod tests {
         assert_eq!(compute_log_size(1), MIN_LOG_SIZE);
         assert_eq!(compute_log_size(15), MIN_LOG_SIZE);
         assert_eq!(compute_log_size(16), MIN_LOG_SIZE);
-        assert_eq!(compute_log_size(17), 5); // ceil(log2(17)) = 5
+        assert_eq!(compute_log_size(17), 5);
         assert_eq!(compute_log_size(32), 5);
         assert_eq!(compute_log_size(33), 6);
         assert_eq!(compute_log_size(1024), 10);
@@ -2146,7 +1531,6 @@ mod tests {
         assert_eq!(trace.len(), TRACE_COLS);
         let size = 1usize << log_size;
 
-        // Verify all columns have the right domain size
         for col in &trace {
             assert_eq!(col.domain.size(), size);
         }
@@ -2160,11 +1544,9 @@ mod tests {
         assert!(proof_size > 0, "proof should have non-zero size");
         assert_eq!(proof_data.len(), proof_size);
 
-        // Verify the proof receipt
         let valid = verify_block_proof(&input, &proof_data);
         assert!(valid, "Stwo proof receipt should verify");
 
-        // Tampered block hash should fail
         let mut bad_input = input.clone();
         bad_input.block_hash[0] ^= 0xFF;
         let invalid = verify_block_proof(&bad_input, &proof_data);
@@ -2194,7 +1576,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Run with: rustup run nightly-2025-07-14 cargo test -p arc-crypto --features stwo-prover --release -- bench_stwo --nocapture --ignored
+    #[ignore]
     fn bench_stwo_vs_mock() {
         use crate::stark::BlockProof;
 
@@ -2264,7 +1646,6 @@ mod tests {
         for &n in &sizes {
             let input = make_bench_input(n);
 
-            // Mock: average over many iterations
             let iters = if n <= 100 { 500 } else { 50 };
             let t0 = std::time::Instant::now();
             for _ in 0..iters {
@@ -2272,7 +1653,6 @@ mod tests {
             }
             let mock_us = t0.elapsed().as_micros() / iters as u128;
 
-            // Stwo: average over fewer iterations (real crypto is slower)
             let stwo_iters = if n <= 100 { 20 } else { 5 };
             let mut proof_size = 0usize;
             let t1 = std::time::Instant::now();
@@ -2298,8 +1678,6 @@ mod tests {
         eprintln!("Stwo proves REAL zero-knowledge - mock proves nothing.\n");
     }
 
-    /// Test that proving works with stwo-icicle feature enabled.
-    /// (stwo-icicle extends stwo-prover - same proving path, ICICLE crates available)
     #[test]
     fn test_dense_layer_real_stark() {
         use crate::inference_proof::dense_forward_i64;
@@ -2369,7 +1747,6 @@ mod tests {
             "proof receipt should verify with stwo-icicle feature"
         );
 
-        // Tampered input should fail
         let mut bad_input = input.clone();
         bad_input.block_hash[0] ^= 0xFF;
         assert!(!verify_block_proof(&bad_input, &proof_data));
@@ -2408,19 +1785,9 @@ mod tests {
 
     #[test]
     fn test_u64_m31_limb_roundtrip() {
-        // Max safe value: hi = value >> 16 must be < 2^31 - 1 (M31 modulus)
-        // So value < (2^31 - 1) * 2^16 + 2^16 = 2^47 - 2^16
-        let max_safe = (1u64 << 47) - (1u64 << 16); // 140737488289792
+        let max_safe = (1u64 << 47) - (1u64 << 16);
 
-        let values: Vec<u64> = vec![
-            0,
-            1,
-            65535, // max lo limb (lo = 0xFFFF)
-            65536, // lo=0, hi=1
-            1_000_000,
-            1_000_000_000,
-            max_safe - 1, // just below max safe
-        ];
+        let values: Vec<u64> = vec![0, 1, 65535, 65536, 1_000_000, 1_000_000_000, max_safe - 1];
         for &v in &values {
             let (lo, hi) = u64_to_m31_limbs(v).expect("test value overflow");
             let recovered = m31_limbs_to_u64(lo, hi);
@@ -2428,7 +1795,6 @@ mod tests {
         }
     }
 
-    /// Helper: create a BlockProofInput with real transfer witness data.
     fn make_transfer_input(n_transfers: usize) -> BlockProofInput {
         use crate::stark::TransferWitness;
 
@@ -2473,7 +1839,6 @@ mod tests {
                 fee,
             });
 
-            // Generate corresponding state diff
             let addr = *blake3::Hasher::new_derive_key("addr")
                 .update(&(i as u32).to_le_bytes())
                 .finalize()
@@ -2514,7 +1879,7 @@ mod tests {
         let trace = generate_block_witness_trace(&input, log_size);
 
         assert_eq!(trace.len(), TRACE_COLS);
-        assert_eq!(TRACE_COLS, 32); // 1 + 16 + 15
+        assert_eq!(TRACE_COLS, 32);
         let size = 1usize << log_size;
 
         for col in &trace {
@@ -2524,13 +1889,8 @@ mod tests {
 
     #[test]
     fn test_stwo_prove_verify_with_transfers() {
-        // Create a block with 3 real transfers:
-        // Transfer 0: sender 100_000 -> pays 1_000 + 10 fee -> sender 98_990, receiver 50_000 + 1_000 = 51_000
-        // Transfer 1: sender 110_000 -> pays 1_100 + 11 fee -> sender 108_889, receiver 55_000 + 1_100 = 56_100
-        // Transfer 2: sender 120_000 -> pays 1_200 + 12 fee -> sender 118_788, receiver 60_000 + 1_200 = 61_200
         let input = make_transfer_input(3);
 
-        // Verify transfer witness consistency before proving
         for tw in &input.transfers {
             assert_eq!(
                 tw.sender_bal_after,
@@ -2545,11 +1905,9 @@ mod tests {
         assert!(proof_size > 0, "proof should have non-zero size");
         assert_eq!(proof_data.len(), proof_size);
 
-        // Verify the proof receipt
         let valid = verify_block_proof(&input, &proof_data);
         assert!(valid, "Stwo proof with transfers should verify");
 
-        // Tampered block hash should fail
         let mut bad_input = input.clone();
         bad_input.block_hash[0] ^= 0xFF;
         let invalid = verify_block_proof(&bad_input, &proof_data);
@@ -2581,12 +1939,11 @@ mod tests {
             .finalize()
             .as_bytes();
 
-        // Alice sends 500 tokens to Bob, paying 5 fee
         let transfer = TransferWitness {
             sender_bal_before: 10_000,
-            sender_bal_after: 9_495, // 10_000 - 500 - 5
+            sender_bal_after: 9_495,
             receiver_bal_before: 2_000,
-            receiver_bal_after: 2_500, // 2_000 + 500
+            receiver_bal_after: 2_500,
             amount: 500,
             sender_nonce_before: 7,
             sender_nonce_after: 8,
@@ -2627,11 +1984,6 @@ mod tests {
         );
     }
 
-    // ===================================================================
-    // Recursive Verifier AIR tests
-    // ===================================================================
-
-    /// Helper: build a RecursiveVerifierInput from N child block proofs.
     fn make_recursive_input(n_children: usize) -> (RecursiveVerifierInput, Vec<BlockProofInput>) {
         use crate::hash::Hash256;
         use crate::merkle::MerkleTree;
@@ -2642,7 +1994,6 @@ mod tests {
         let mut child_end_states = Vec::with_capacity(n_children);
         let mut block_inputs = Vec::with_capacity(n_children);
 
-        // Create chained block proofs: block_i.post_state == block_{i+1}.prev_state
         let mut prev_state = *blake3::Hasher::new_derive_key("genesis-state")
             .update(&[0u8])
             .finalize()
@@ -2704,17 +2055,12 @@ mod tests {
             prev_state = post_state;
         }
 
-        // Build Merkle tree over child hashes
         let leaves: Vec<Hash256> = child_hashes.iter().map(|h| Hash256(*h)).collect();
         let tree = MerkleTree::from_leaves(leaves);
         let merkle_root = *tree.root().as_bytes();
 
-        // Build Merkle siblings: for each child, get the proof path
-        // For simplicity, use zero siblings (the circuit constrains the
-        // structural relationship, not the actual BLAKE3 Merkle computation)
         let merkle_siblings: Vec<Vec<[u8; 32]>> = (0..n_children)
             .map(|_i| {
-                // Use a single sibling per child (depth-1 path)
                 let sibling = *blake3::Hasher::new_derive_key("merkle-sibling")
                     .update(&merkle_root)
                     .finalize()
@@ -2740,11 +2086,9 @@ mod tests {
         let log_size = compute_log_size(input.child_hashes.len());
         let trace = generate_recursive_verifier_trace(&input, log_size);
 
-        // Verify column count
         assert_eq!(trace.len(), RECURSIVE_VERIFIER_COLS);
         assert_eq!(RECURSIVE_VERIFIER_COLS, 82);
 
-        // Verify domain size
         let size = 1usize << log_size;
         for col in &trace {
             assert_eq!(col.domain.size(), size);
@@ -2767,7 +2111,6 @@ mod tests {
         assert!(proof_size > 0, "recursive proof should have non-zero size");
         assert_eq!(proof_data.len(), proof_size);
 
-        // Verify the recursive proof receipt
         let valid = verify_recursive_proof(&input, &proof_data);
         assert!(valid, "recursive STARK proof receipt should verify");
 
@@ -2783,18 +2126,15 @@ mod tests {
 
         let (proof_data, _, _) = prove_recursive(&input);
 
-        // Tamper with one child hash in the input
         let mut tampered_input = input.clone();
         tampered_input.child_hashes[1][0] ^= 0xFF;
 
-        // Verification with tampered input should fail
         let invalid = verify_recursive_proof(&tampered_input, &proof_data);
         assert!(
             !invalid,
             "tampered child hash should cause verification failure"
         );
 
-        // Tamper with expected Merkle root
         let mut tampered_root = input.clone();
         tampered_root.expected_merkle_root[5] ^= 0xAA;
         let invalid2 = verify_recursive_proof(&tampered_root, &proof_data);
@@ -2803,7 +2143,6 @@ mod tests {
             "tampered Merkle root should cause verification failure"
         );
 
-        // Tamper with a start state
         let mut tampered_state = input.clone();
         tampered_state.child_start_states[0][10] ^= 0x42;
         let invalid3 = verify_recursive_proof(&tampered_state, &proof_data);
@@ -2815,10 +2154,8 @@ mod tests {
 
     #[test]
     fn test_recursive_verifier_state_chain() {
-        // Build input with valid state chain: child_i.end == child_{i+1}.start
         let (input, _) = make_recursive_input(4);
 
-        // Verify state chain is valid
         for i in 0..input.child_end_states.len() - 1 {
             assert_eq!(
                 input.child_end_states[i],
@@ -2828,14 +2165,11 @@ mod tests {
             );
         }
 
-        // Generate trace and check chain_valid flags
         let log_size = compute_log_size(input.child_hashes.len());
         let trace = generate_recursive_verifier_trace(&input, log_size);
 
-        // chain_valid is the last column (index 81)
         let chain_valid_col = &trace[RECURSIVE_VERIFIER_COLS - 1];
 
-        // All active rows should have chain_valid = 1 (since state chain is continuous)
         for i in 0..input.child_hashes.len() {
             let val = chain_valid_col.values.at(i);
             assert_eq!(
@@ -2846,14 +2180,12 @@ mod tests {
             );
         }
 
-        // Now test with broken chain: modify child_start_states[2] to break continuity
         let mut broken_input = input.clone();
-        broken_input.child_start_states[2] = [0xDE; 32]; // break chain at index 1→2
+        broken_input.child_start_states[2] = [0xDE; 32];
 
         let broken_trace = generate_recursive_verifier_trace(&broken_input, log_size);
         let broken_chain_col = &broken_trace[RECURSIVE_VERIFIER_COLS - 1];
 
-        // Row 1 should have chain_valid = 0 (because end_state[1] != start_state[2])
         let val = broken_chain_col.values.at(1);
         assert_eq!(
             val,
@@ -2861,8 +2193,6 @@ mod tests {
             "chain_valid should be 0 at row 1 (broken chain)"
         );
 
-        // Prove and verify still works structurally (the constraint is chain_valid * delta = 0,
-        // so when chain_valid=0, the constraint is satisfied vacuously)
         let (proof_data, _, _) = prove_recursive(&broken_input);
         let valid = verify_recursive_proof(&broken_input, &proof_data);
         assert!(
@@ -2877,10 +2207,8 @@ mod tests {
     fn test_inner_circuit_roundtrip() {
         use crate::stark::BlockProof;
 
-        // Step 1: Generate real block proofs with Stwo
         let (recursive_input, block_inputs) = make_recursive_input(3);
 
-        // Step 2: Verify each child block proof with Stwo
         for input in &block_inputs {
             let proof = BlockProof::stwo_prove(input);
             let result = proof.stwo_verify(input);
@@ -2890,19 +2218,16 @@ mod tests {
             );
         }
 
-        // Step 3: Generate recursive STARK proof of the verification
         let (recursive_proof_data, proof_size, proving_time_ms) = prove_recursive(&recursive_input);
 
         assert!(proof_size > 0);
 
-        // Step 4: Verify the recursive proof receipt
         let valid = verify_recursive_proof(&recursive_input, &recursive_proof_data);
         assert!(
             valid,
             "inner-circuit recursive proof should verify end-to-end"
         );
 
-        // Step 5: Verify the receipt is structurally valid
         let receipt = StwoproofReceipt::from_bytes(&recursive_proof_data)
             .expect("should deserialize recursive receipt");
         assert_eq!(receipt.version, 1);

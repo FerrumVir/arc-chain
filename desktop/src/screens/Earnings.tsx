@@ -35,10 +35,6 @@ export function Earnings() {
       receipt,
     ]),
   );
-  // The legacy attestation feed is 0x16 computation claims. It must never
-  // make the reward screen look funded. Only the selected host's mined reward
-  // receipt index can establish that a receipt exists; a zero-valued receipt
-  // must not be relabelled as "no receipt."
   const hasConfirmedRewards =
     earnings?.fromChain === true && earnings.attestations > 0;
   const hasCompleteCanonicalHistory =
@@ -68,16 +64,10 @@ export function Earnings() {
         </div>
       </div>
 
-      {/* Primary home for the projection. Placed above retained-window totals
-          because "what will this earn me" is the question people arrive with,
-          and it is the one figure that must never be guessed. */}
       <div style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-projection">
         <ProjectedEarnings />
       </div>
 
-      {/* An unavailable/malformed receipt index is not a confirmed zero. Keep
-          it separate from the valid candidate response whose retained row
-          count is exactly zero. */}
       {earnings == null ? (
         <Card style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-loading" aria-busy="true">
           <CardHeader title="Checking retained reward receipts…" />
@@ -163,8 +153,6 @@ export function Earnings() {
           <Card>
             <div className="stat-label">Today</div>
             <div className="big-number" style={{ marginTop: "var(--space-2)" }}>
-              {/* null ≠ 0. The chain not reporting a daily figure is not the
-                  same as having earned nothing today. */}
               {earnings?.todayArc != null ? (
                 <>
                   <NumberTicker value={earnings.todayArc} digits={2} />
@@ -210,9 +198,6 @@ export function Earnings() {
           </Card>
           <Card>
             <div className="stat-label">Last reward receipt</div>
-            {/* Replaces the old invented "Pending" card. The candidate
-                endpoint reports the block of the last successful mined 0x25
-                reward receipt; absent remains absent. */}
             <div className="big-number" style={{ marginTop: "var(--space-2)" }}>
               {earnings?.lastPayoutBlock != null ? (
                 <span style={{ fontSize: "0.7em" }}>
@@ -381,10 +366,6 @@ export function Earnings() {
                       : ""}COMPUTED + PAID`
                     : `COMPUTED · NOT PAYMENT · ${a.mine ? "yours" : "network"}`}
                 </div>
-                {/* Was openExternal to a hardcoded LAX :3200 URL — the wrong
-                    host for this session and not a block explorer. Resolves
-                    against the pinned chain host instead, which is the only
-                    place this hash can be confirmed. */}
                 <button
                   className="btn btn-ghost btn-sm"
                   onClick={() => lookupHash(a.txHash)}

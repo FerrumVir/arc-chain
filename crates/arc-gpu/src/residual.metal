@@ -1,10 +1,3 @@
-// UNTESTED — requires hardware validation on Apple Silicon
-//
-// Element-wise residual addition: hidden[i] += projected[i]
-// Ported from transformer.wgsl residual_add kernel — must produce identical output.
-//
-// Dispatch: ceil(d_model / 256) threadgroups, 256 threads each.
-
 #include <metal_stdlib>
 using namespace metal;
 

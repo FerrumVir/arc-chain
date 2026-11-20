@@ -1,12 +1,3 @@
-//! Coordinator orchestration for twin execution v0.
-//!
-//! The rules live in `crate::twin`; this module wires them into the community
-//! queue, the claim and submit handlers, validator recomputation, settlement,
-//! the demand pump and the read endpoints. Twin dispatch and the demand pump
-//! are off unless the operator enables them, and nothing here changes a
-//! consensus rule: rewards still need five independently recomputing
-//! validators. See `docs/twin-execution.md`.
-
 use super::*;
 use crate::twin::{
     self, ClaimDecision, DemandKind, DemandSource, LegOutput, LegStatus, RecomputeReason,
@@ -15,19 +6,11 @@ use crate::twin::{
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
-/// How long a group waits for its sibling leg to be claimed after the first
-/// leg finished, before it resolves without it.
 const TWIN_SIBLING_CLAIM_WINDOW_MS: u64 = 30_000;
 const TWIN_WATCHDOG_TICK_MS: u64 = 2_000;
-/// Caller open-group cap; also the shared cap on the default serial path.
 const TWIN_OPEN_GROUP_CAP: usize = 64;
-/// Leg job ids remembered after resolution, so late legs are recognized
-/// instead of being verified and settled as ordinary jobs.
 const TWIN_RESOLVED_LEG_CAP: usize = 1_024;
-/// Extra time a caller waits beyond the dispatch budget for resolution.
 const TWIN_RESOLUTION_GRACE_SECS: u64 = 60;
-/// Longest wait for this coordinator's single twin recomputation slot when
-/// validators must decide (mismatch, fallback or reward).
 const TWIN_RECOMPUTE_WAIT_SECS: u64 = 600;
 const TWIN_SPOT_CHECKS_PER_HOUR: u32 = 6;
 const TWIN_SPOT_CHECK_BURST: u32 = 2;
@@ -36,7 +19,6 @@ const PUBLIC_DEMO_BURST: u32 = 6;
 const WORKER_STATE_CAP: usize = COMMUNITY_WORKER_REGISTRY_MAX;
 const RECENT_RECEIPTS_MAX: usize = 50;
 
-/// Per-worker twin tallies since this coordinator started.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub(super) struct WorkerTwinTally {
     pub(super) legs_verified: u64,
@@ -44,8 +26,6 @@ pub(super) struct WorkerTwinTally {
     pub(super) legs_unverified: u64,
 }
 
-/// What `/workers/scoreboard` adds to a worker's row when twin execution or
-/// the demand pump is enabled.
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct WorkerTwinRow {
     pub(super) region: Option<twin::RegionTag>,
@@ -92,8 +72,6 @@ struct TwinInner {
     groups: HashMap<String, TwinGroup>,
     leg_to_group: HashMap<String, (String, usize)>,
     resolved_legs: VecDeque<String>,
-    // Pump-only tombstones survive caller churn. Issued IDs are retained until
-    // expiry AND removal of the pending record, including delayed cleanup.
     pump_legs: HashMap<String, u64>,
     pump_queue: VecDeque<WorkItem>,
     regions: HashMap<String, twin::RegionTag>,
@@ -109,16 +87,12 @@ struct TwinInner {
     demand_counter: u64,
 }
 
-/// Result handed to whoever dispatched the group.
 pub(super) struct TwinGroupOutcome {
     pub(super) receipt: twin::TwinReceipt,
-    /// The verified leg's result. `None` unless the verdict is `verified`.
     pub(super) chosen: Option<WorkResult>,
-    /// Present when validators recomputed and confirmed the chosen output.
     pub(super) verification: Option<CommunityVerificationSummary>,
 }
 
-/// A twin (two legs) or replay (one leg plus a verified reference) job.
 pub(super) struct TwinDispatchRequest {
     pub(super) input: String,
     pub(super) max_tokens: u32,
@@ -181,7 +155,6 @@ struct ResolutionAccounting {
     contradicted_reference: Option<(usize, String)>,
 }
 
-/// Coordinator-local twin execution state. One instance per `NodeState`.
 pub(super) struct CommunityTwinState {
     pub(super) config: TwinConfig,
     secret: [u8; 32],
@@ -259,8 +232,6 @@ fn worker_facts(
     }
 }
 
-/// `(different locality, different platform)`, each unknown when either
-/// side lacks the fact.
 fn pair_differences(
     left: &twin::WorkerFacts,
     right: &twin::WorkerFacts,
@@ -331,9 +302,6 @@ impl CommunityTwinState {
         if self.config.fan_out() {
             let pumps = self.pump_groups.load(Ordering::Acquire);
             if group.source.is_pump() {
-                // Keep pump use within half the original group budget. Caller
-                // capacity stays 64: completed dispatchers can leave resolving
-                // caller groups behind, so reserving only 32 is not sufficient.
                 if pumps >= self.config.demand_max_groups.min(TWIN_OPEN_GROUP_CAP / 2) {
                     return Err("the demand pump is at its open-group capacity");
                 }
@@ -405,8 +373,6 @@ impl CommunityTwinState {
         workers
     }
 
-    /// Atomically decide a claim for a twin leg and, when accepted, bind the
-    /// leg to the claimer.
     fn decide_and_record_claim(
         &self,
         job_id: &str,
@@ -421,8 +387,6 @@ impl CommunityTwinState {
         let Some((group_id, leg_index)) = inner.leg_to_group.get(job_id).cloned() else {
             return ClaimDecision::Accept;
         };
-        // A resolved or resolving group's queued leg is accepted here so the
-        // claim handler's pending lookup expires it instead of re-queueing it.
         let Some(group) = inner
             .groups
             .get(&group_id)
@@ -534,9 +498,6 @@ impl CommunityTwinState {
         }
     }
 
-    /// Return a declined leg to the queue while its group still has
-    /// collection time. A declining worker never started computing (it won a
-    /// concurrent job elsewhere), so another independent worker can take it.
     fn reopen_declined_leg(&self, job_id: &str, now: u64) -> Option<(WorkItem, Hash256, u64)> {
         let mut guard = self.inner.lock();
         let inner = &mut *guard;
@@ -556,9 +517,6 @@ impl CommunityTwinState {
         Some(reopened)
     }
 
-    /// Record a leg's terminal submission. Returns the group id and whether
-    /// every leg is now terminal, or `None` for a leg whose group already
-    /// resolved.
     fn record_submission(
         &self,
         job_id: &str,
@@ -624,7 +582,6 @@ impl CommunityTwinState {
         WatchdogAction::Wait
     }
 
-    /// Move a collecting group to resolving exactly once and snapshot it.
     fn begin_resolution(&self, group_id: &str) -> Option<ResolutionInput> {
         let mut guard = self.inner.lock();
         let inner = &mut *guard;
@@ -896,9 +853,6 @@ impl CommunityTwinState {
     }
 }
 
-// ─── Entry points used by rpc.rs ────────────────────────────────────────────
-
-/// Twin dispatch needs the operator switch and at least two live workers.
 pub(super) fn twin_dispatch_ready(node: &NodeState) -> bool {
     node.community_twin.config.twin_execution && live_inference_worker_count(node) >= 2
 }
@@ -907,8 +861,6 @@ pub(super) fn is_twin_leg(node: &NodeState, job_id: &str) -> bool {
     node.community_twin.is_twin_leg(job_id)
 }
 
-/// Pairing decision for a dequeued twin leg, recorded atomically when it is
-/// accepted. `None` for ordinary jobs.
 pub(super) fn claim_decision(
     node: &NodeState,
     job_id: &str,
@@ -971,9 +923,6 @@ pub(super) fn may_claim(node: &NodeState, job_id: &str, worker: &str) -> bool {
     claim_decision_inner(node, job_id, worker, false).is_none_or(|d| d == ClaimDecision::Accept)
 }
 
-/// Separate queue keeps fan-out pump legs out of the caller's bounded channel.
-/// Called only after routing has examined caller work; refused legs stay here
-/// while the same claimer tries every other candidate.
 pub(super) fn poll_pump(
     node: &NodeState,
     worker: &str,
@@ -985,8 +934,6 @@ pub(super) fn poll_pump(
     {
         return None;
     }
-    // Inspect a bounded ID snapshot without rotating refused legs through the
-    // queue. Release the twin lock before the eligibility check takes it again.
     let candidates: Vec<_> = node
         .community_twin
         .inner
@@ -1037,7 +984,6 @@ fn is_fanout_pump_leg(node: &NodeState, job_id: &str) -> bool {
 
 fn prune_pump_memory(node: &NodeState) {
     let now = now_unix_ms();
-    // Snapshot first: never hold the twin mutex while locking pending records.
     let expired: Vec<String> = node
         .community_twin
         .inner
@@ -1063,7 +1009,6 @@ fn prune_pump_memory(node: &NodeState) {
     }
 }
 
-/// The `no_work` reason for a refused or deferred claim.
 pub(super) fn refusal_reason(decision: ClaimDecision) -> Option<&'static str> {
     match decision {
         ClaimDecision::Accept => None,
@@ -1071,7 +1016,6 @@ pub(super) fn refusal_reason(decision: ClaimDecision) -> Option<&'static str> {
     }
 }
 
-/// Undo an accepted twin claim whose pending assignment vanished.
 pub(super) fn release_claim(node: &NodeState, job_id: &str, worker_id: &str) {
     node.community_twin.release_claim(job_id, worker_id);
 }
@@ -1100,8 +1044,6 @@ fn queue_live_pump_leg(node: &NodeState, item: WorkItem) -> bool {
     unclaimed
 }
 
-/// Put a dequeued item back for another worker. If the queue is full the
-/// pending record is dropped so no dispatcher waits on a lost item.
 pub(super) fn requeue_item(node: &NodeState, item: WorkItem) {
     if is_fanout_pump_leg(node, &item.job_id) {
         queue_live_pump_leg(node, item);
@@ -1117,7 +1059,6 @@ pub(super) fn requeue_item(node: &NodeState, item: WorkItem) {
     }
 }
 
-/// Re-insert a reopened leg's pending record and put it back on the queue.
 fn requeue_twin_leg(
     node: &NodeState,
     item: WorkItem,
@@ -1164,9 +1105,6 @@ fn requeue_twin_leg(
     true
 }
 
-/// Record a twin leg's authenticated submission. The comparison and any
-/// validator recomputation run in a node-owned task, so the worker's HTTP
-/// request is not held open and a dropped connection cannot cancel them.
 pub(super) fn submit_twin_leg(
     node: &NodeState,
     reservation: PendingSubmissionReservation,
@@ -1242,8 +1180,6 @@ pub(super) fn submit_twin_leg(
     }
 }
 
-/// Dispatch a twin (two legs) or replay (one leg) job and wait for its
-/// resolution. Pre-enqueue failures are safe for a local fallback.
 pub(super) async fn dispatch_twin(
     node: &NodeState,
     request: TwinDispatchRequest,
@@ -1340,8 +1276,6 @@ async fn dispatch_twin_started(
         .ok_or_else(|| {
             CommunityDispatchError::before_enqueue("community assignment expiry overflow")
         })?;
-    // Legs run in parallel, so collection gets half the reviewed budget; the
-    // other half covers any validator recomputation and reward approvals.
     let collect_deadline_unix_ms =
         submitted_at_unix_ms.saturating_add(timeout_secs.saturating_mul(1_000) / 2);
     let transaction_domain = node
@@ -1416,8 +1350,6 @@ async fn dispatch_twin_started(
         collecting_only: true,
     });
 
-    // Dropping a reservation removes an unclaimed leg immediately and keeps
-    // a claimed leg for its bounded late-submit grace, as for single jobs.
     let mut reservations = Vec::with_capacity(pending_specs.len());
     for (item, assignment_epoch, job_nonce) in &pending_specs {
         match results.entry(item.job_id.clone()) {
@@ -1428,8 +1360,6 @@ async fn dispatch_twin_started(
                 ));
             }
             Entry::Vacant(entry) => {
-                // Twin legs report through their group, never through a
-                // per-leg dispatcher channel.
                 let (leg_sender, _unused_receiver) =
                     tokio::sync::oneshot::channel::<CommunityDispatchOutcome>();
                 entry.insert(PendingCommunityWork {
@@ -1486,7 +1416,6 @@ async fn dispatch_twin_started(
     outcome
 }
 
-/// Screen and rate-limit a caller request marked `public_demo`.
 pub(super) fn admit_public_demo(
     node: &NodeState,
     prompt: &str,
@@ -1494,8 +1423,6 @@ pub(super) fn admit_public_demo(
     node.community_twin.admit_public_demo(prompt, now_unix_ms())
 }
 
-/// The `/inference/run` response for a twin-executed request. Output text is
-/// returned only for a verified group.
 pub(super) fn twin_inference_response(
     node: &NodeState,
     input_text: &str,
@@ -1602,7 +1529,6 @@ pub(super) fn twin_inference_response(
     response
 }
 
-/// Start the demand pump when the operator enabled it.
 pub(super) fn spawn_community_demand_pump(node: &NodeState) {
     if !node.community_twin.config.demand_pump {
         return;
@@ -1636,7 +1562,6 @@ pub(super) fn spawn_community_demand_pump(node: &NodeState) {
     });
 }
 
-/// Scoreboard summary, present only when twin execution or the pump is on.
 pub(super) fn scoreboard_summary(node: &NodeState) -> Option<Value> {
     let config = node.community_twin.config;
     if !config.twin_execution && !config.demand_pump {
@@ -1662,7 +1587,6 @@ pub(super) fn scoreboard_summary(node: &NodeState) -> Option<Value> {
     }))
 }
 
-/// Per-worker rows for the scoreboard; empty while both switches are off.
 pub(super) fn worker_rows(node: &NodeState) -> HashMap<String, WorkerTwinRow> {
     let config = node.community_twin.config;
     if !config.twin_execution && !config.demand_pump {
@@ -1681,8 +1605,6 @@ impl CommunityAuthenticatedPayload for twin::CommunityRegionReport {
     }
 }
 
-/// POST /community/region: a registered worker's signed round-trip times to
-/// the validator origins. Only the coarse label is ever published.
 pub(super) async fn community_region_signed(
     AxumState(node): AxumState<NodeState>,
     Json(signed): Json<CommunitySignedRequest<twin::CommunityRegionReport>>,
@@ -1705,7 +1627,6 @@ pub(super) async fn community_region_signed(
     })))
 }
 
-/// GET /community/twin_stats
 pub(super) async fn community_twin_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let now = now_unix_ms();
     let config = node.community_twin.config;
@@ -1768,7 +1689,6 @@ pub(super) async fn community_twin_stats(AxumState(node): AxumState<NodeState>) 
     Json(body)
 }
 
-/// GET /community/twin/{job_id}: the receipt for a twin group or either leg.
 pub(super) async fn community_twin_receipt(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(job_id): axum::extract::Path<String>,
@@ -1785,7 +1705,6 @@ pub(super) async fn community_twin_receipt(
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
-/// GET /community/twin_receipts?limit=N: the newest receipts.
 pub(super) async fn community_twin_receipts(
     AxumState(node): AxumState<NodeState>,
     Query(params): Query<HashMap<String, String>>,
@@ -1802,8 +1721,6 @@ pub(super) async fn community_twin_receipts(
         "receipts": receipts,
     }))
 }
-
-// ─── Resolution ─────────────────────────────────────────────────────────────
 
 fn spawn_twin_watchdog(node: &NodeState, group_id: String) {
     let task_node = node.clone();
@@ -1850,8 +1767,6 @@ async fn resolve_until_shutdown(
     }
 }
 
-/// The comparable commitments of a leg that submitted a successful result in
-/// the canonical execution profile.
 fn leg_output(leg: &LegSnapshot) -> Option<LegOutput> {
     if leg.status != LegStatus::Submitted {
         return None;
@@ -1875,8 +1790,6 @@ fn canonical_leg_output(canonical: &CommunityCanonicalRecompute) -> LegOutput {
     }
 }
 
-/// The first leg that could carry a protocol reward: caller demand, a
-/// comparable output, a worker certificate and remaining issuance capacity.
 fn reward_candidate_leg(
     node: &NodeState,
     input: &ResolutionInput,
@@ -1921,8 +1834,6 @@ async fn run_twin_recompute(
     let _permit = if reason == RecomputeReason::SpotCheck
         || (source.is_pump() && node.community_twin.config.fan_out())
     {
-        // A spot check never queues: it runs only while this validator is
-        // not already recomputing for an approval or another twin group.
         if node.community_approval_permits.available_permits() == 0 {
             return Err(RecomputeStatus::SkippedBusy);
         }
@@ -1948,9 +1859,6 @@ async fn run_twin_recompute(
     Ok((recomputed, elapsed_ms))
 }
 
-/// Settlement for the verified leg of caller demand. A reward is requested
-/// only when validators recomputed and confirmed this exact output, because
-/// every approval asserts that validator's own recomputation.
 async fn twin_settlement(
     node: &NodeState,
     leg: &LegSnapshot,
@@ -2095,10 +2003,6 @@ async fn resolve_twin_group(node: &NodeState, group_id: &str) {
         reference_output.as_ref(),
         recompute_outcome,
     );
-    // The reward recomputation ran because `reward_leg` qualified (certificate
-    // and issuance capacity). When validators found that leg valid, serve and
-    // settle it, rather than whichever valid leg comes first, which may lack a
-    // certificate or issuance capacity. Valid legs carry identical outputs.
     if let Some(index) = reward_leg
         && classification.leg_valid.get(index).copied().flatten() == Some(true)
     {
@@ -2113,9 +2017,6 @@ async fn resolve_twin_group(node: &NodeState, group_id: &str) {
         _ => None,
     };
 
-    // Worker health counters, exactly as for single jobs: a verified leg is
-    // a success, a leg validators proved wrong or the worker reported as
-    // failed is a failure, and unverifiable work changes nothing.
     let mut leg_outcomes = Vec::new();
     for (index, leg) in input.legs.iter().enumerate() {
         let Some(worker_id) = leg.worker.as_deref() else {
@@ -2384,17 +2285,11 @@ async fn resolve_twin_group(node: &NodeState, group_id: &str) {
     }
 }
 
-// ─── Demand ─────────────────────────────────────────────────────────────────
-
-/// Process-local randomness from the OS CSPRNG through UUIDv4, the same
-/// source the signed community request nonces use. Six of the 128 bits are
-/// fixed by the UUID format; folding both halves keeps the result mixed.
 fn random_u64() -> u64 {
     let value = uuid::Uuid::new_v4().as_u128();
     (value as u64) ^ ((value >> 64) as u64)
 }
 
-/// 244 random bits for the per-process spot-check key.
 fn random_secret() -> [u8; 32] {
     let mut secret = [0u8; 32];
     secret[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
@@ -2409,7 +2304,6 @@ fn jittered_interval(base_secs: u64) -> Duration {
     Duration::from_millis(base_ms.saturating_sub(jitter).saturating_add(offset))
 }
 
-/// Idle eligible workers currently long-polling this coordinator.
 fn idle_eligible_workers(node: &NodeState) -> Vec<String> {
     let idle: Vec<String> = node
         .community_active_jobs
@@ -2446,8 +2340,6 @@ async fn run_demand_tick(node: &NodeState) -> Result<(), &'static str> {
 
 async fn run_demand_tick_inner(node: &NodeState) -> Result<(), &'static str> {
     let state = &node.community_twin;
-    // Generated demand never competes with callers: it starts only while
-    // every public inference slot is free and holds at most one of them.
     if node.public_inference_permits.available_permits() < PUBLIC_INFERENCE_CONCURRENCY {
         return Err("caller inference is in flight");
     }
@@ -2603,14 +2495,11 @@ async fn run_fanout_tick(node: &NodeState, model_id: Hash256) -> Result<(), &'st
                     }
                 }
             });
-            // Registration is synchronous before this signal. The next plan
-            // therefore sees all open groups and their unclaimed legs.
             if started_rx.await.is_err() {
                 break;
             }
         }
         planned_groups += 1;
-        // Top up only at ticks, even if a very fast group completes mid-tick.
         if planned_groups >= state.config.demand_max_groups {
             break;
         }
@@ -2713,7 +2602,6 @@ mod tests {
         }
     }
 
-    /// A failed (`declined = false`) or declined (`declined = true`) result.
     fn failed(job_id: &str, worker_id: &str, declined: bool) -> WorkResult {
         WorkResult {
             output_tokens: None,
@@ -2768,7 +2656,6 @@ mod tests {
         let awaiting = submit(&node, result(&first, "w1", "four")).await;
         assert_eq!(awaiting["twin"]["status"], "awaiting_sibling");
 
-        // The worker that ran the first leg may not take its twin.
         let refused = claim(&node, "w1").await;
         assert_eq!(refused["status"], "no_work");
         assert_eq!(refused["reason"], twin::REASON_SAME_WORKER);
@@ -2856,7 +2743,6 @@ mod tests {
             assert_eq!(entry.value().0.success_count, 0, "{id}");
             assert_eq!(entry.value().0.failure_count, 0, "{id}");
         }
-        // Generated demand never records a reference it could not verify.
         assert!(node.community_twin.inner.lock().references.is_empty());
         let response = twin_inference_response(&node, "x x", outcome, 2, 5, false);
         assert_eq!(response["success"], false);
@@ -2882,7 +2768,6 @@ mod tests {
         assert_eq!(outcome.receipt.validator_recompute.reason, None);
         assert_eq!(outcome.receipt.verdict, Verdict::Unverified);
         assert_eq!(outcome.receipt.legs[1].status, LegStatus::Failed);
-        // A worker-reported failure counts against that worker, as today.
         assert_eq!(
             node.community_workers
                 .get("w2")
@@ -2905,7 +2790,6 @@ mod tests {
         wait_for_pending(&node, 2).await;
         let first = job_of(&claim(&node, "w1").await);
         let second = job_of(&claim(&node, "w2").await);
-        // w2 won a concurrent job elsewhere and declines without computing.
         let requeued = submit(&node, failed(&second, "w2", true)).await;
         assert_eq!(requeued["twin"]["status"], "requeued");
         let again = job_of(&claim(&node, "w3").await);
@@ -2919,7 +2803,6 @@ mod tests {
         let counters = node.community_twin.inner.lock().counters.clone();
         assert_eq!(counters.legs_requeued, 1);
         assert_eq!(counters.groups_matched, 1);
-        // Declining is not a failure.
         assert_eq!(
             node.community_workers
                 .get("w2")
@@ -2964,9 +2847,6 @@ mod tests {
         let second = job_of(&claim(&node, "w2").await);
         submit(&node, result(&first, "w1", "four")).await;
 
-        // Resolve while the sibling is still computing: it is abandoned and
-        // the caller job falls back to validator recomputation, which this
-        // fixture cannot reach.
         resolve_twin_group(&node, &first).await;
         let outcome = outcome_of(dispatcher).await;
         assert_eq!(outcome.receipt.legs[1].status, LegStatus::Abandoned);
@@ -3038,7 +2918,6 @@ mod tests {
             Some("europe")
         );
 
-        // An unregistered signer is refused before anything is stored.
         let stranger = arc_crypto::KeyPair::generate_ed25519();
         let mut foreign = report;
         foreign.worker_id = format!("0x{}", stranger.address().to_hex());
@@ -3166,7 +3045,6 @@ mod tests {
                 ..enabled()
             },
         );
-        // Model the production caller channel, independently of the pump queue.
         let (tx, rx) = tokio::sync::mpsc::channel(COMMUNITY_WORK_QUEUE_CAP);
         node.community_work_tx = Some(Arc::new(tx));
         node.community_work_queue = Some(Arc::new(tokio::sync::Mutex::new(rx)));
@@ -3237,7 +3115,6 @@ mod tests {
                 assert_eq!(summary["pump_groups_in_flight"], expected);
                 assert_eq!(summary["pump_max_groups"], 8);
                 assert_eq!(summary["idle_eligible_workers"], idle);
-                // Repeating a tick cannot spend workers already promised to legs.
                 run_demand_tick(&node).await.unwrap();
                 assert_eq!(
                     node.community_twin.pump_groups.load(Ordering::Acquire),
@@ -3296,8 +3173,6 @@ mod tests {
         run_demand_tick(&node).await.unwrap();
         node.community_active_jobs.remove("worker-0");
         let first = job_of(&claim(&node, "worker-0").await);
-        // Emulate another poll after this worker becomes idle. Its sibling
-        // refuses it; another independent group's leg is returned immediately.
         node.community_active_jobs.remove("worker-0");
         let other = tokio::time::timeout(Duration::from_millis(100), claim(&node, "worker-0"))
             .await
@@ -3306,7 +3181,6 @@ mod tests {
         let inner = node.community_twin.inner.lock();
         assert_ne!(inner.leg_to_group[&first].0, inner.leg_to_group[&other].0);
         drop(inner);
-        // Reduce the live idle pool to the reserve. No pump work may leave it.
         for id in ["worker-3", "worker-4", "worker-5"] {
             node.community_active_jobs.remove(id);
         }
@@ -3319,7 +3193,7 @@ mod tests {
 
     #[tokio::test]
     async fn fanout_open_slots_include_resolution_and_preserve_caller_capacity() {
-        let node = fanout_node(0, 0, 50); // normalized to 32, never 50 concurrent groups
+        let node = fanout_node(0, 0, 50);
         let state = &node.community_twin;
         for i in 0..32 {
             let id = format!("pump-{i}");
@@ -3421,8 +3295,6 @@ mod tests {
             TWIN_RESOLVED_LEG_CAP
         );
         assert!(is_twin_leg(&node, &job));
-        // Even an expired tombstone stays while delayed cleanup leaves a
-        // pending record that could still accept a submit.
         node.community_twin
             .inner
             .lock()
@@ -3449,13 +3321,11 @@ mod tests {
         let group = node.community_twin.inner.lock().leg_to_group[&job]
             .0
             .clone();
-        // A decline consumes the old pending record, then reopens the leg.
         node.community_work_results.as_ref().unwrap().remove(&job);
         let (item, epoch, nonce) = node
             .community_twin
             .reopen_declined_leg(&job, now_unix_ms())
             .unwrap();
-        // Force the watchdog to win the race before re-insertion.
         resolve_twin_group(&node, &group).await;
         assert!(!requeue_twin_leg(&node, item.clone(), epoch, nonce));
         requeue_item(&node, item);
@@ -3523,8 +3393,6 @@ mod tests {
         assert_eq!(node.public_inference_permits.available_permits(), 2);
     }
 
-    /// The reviewer regression now covers a complete long poll, including
-    /// serial-with-reserve and fan-out, with a strict once-per-leg bound.
     #[tokio::test(start_paused = true)]
     async fn review_refused_claim_retry_does_not_hot_loop() {
         for (reserve, max_groups) in [(0, 1), (4, 1), (0, 8)] {
@@ -3551,7 +3419,6 @@ mod tests {
                 assert_eq!(refusals, 0, "eligibility peeks must not record refusals");
                 assert!(start.elapsed() >= Duration::from_secs(COMMUNITY_CLAIM_TIMEOUT_SECS));
             }
-            // The refused leg remains available to a different worker.
             node.community_active_jobs.remove("worker-1");
             assert_ne!(job_of(&claim(&node, "worker-1").await), first);
             dispatcher.abort();
@@ -3570,7 +3437,6 @@ mod tests {
             node.community_active_jobs.remove("worker-0");
             let poll_node = node.clone();
             let waiting = tokio::spawn(async move { claim(&poll_node, "worker-0").await });
-            // Let the same poll encounter the refused sibling before new work.
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert!(!waiting.is_finished());
             let second_dispatch = spawn_dispatch(&node, DemandSource::PublicRequest);
@@ -3592,8 +3458,6 @@ mod tests {
         }
     }
 
-    /// Deterministically interleave selection and claim, exactly where the
-    /// handler can race. A new sibling claim makes the selected leg ineligible.
     #[tokio::test(start_paused = true)]
     async fn fanout_selection_race_refuses_once_and_keeps_other_work_reachable() {
         for (reason, new_work) in [
@@ -3638,8 +3502,6 @@ mod tests {
                 assert_eq!(decision.and_then(refusal_reason), Some(reason));
                 poll.refuse(&node, selected.clone());
             }
-            // Even if the raced condition clears, this poll must not pick that
-            // leg again. A fresh poll or another worker may still take it.
             drop(caller_permit);
             for i in 1..6 {
                 node.community_active_jobs
@@ -3689,11 +3551,10 @@ mod tests {
         }
     }
 
-    /// Concurrent claimers must never leave fewer than the reserve idle.
     #[tokio::test]
     async fn review_concurrent_claims_keep_reserve() {
         for round in 0..20 {
-            let node = fanout_node(8, 0, 8); // effective reserve 2
+            let node = fanout_node(8, 0, 8);
             run_demand_tick(&node).await.unwrap();
             assert_eq!(node.community_twin.pump_groups.load(Ordering::Acquire), 3);
             for id in ["worker-5", "worker-6", "worker-7"] {
@@ -3730,9 +3591,6 @@ mod tests {
         }
     }
 
-    /// A fan-out pump dispatch cancelled while collecting releases its slot,
-    /// leaves no queued legs, and a late result from its claimed leg stays a
-    /// non-reward late leg.
     #[tokio::test]
     async fn review_cancelled_fanout_group_late_leg_is_not_settled() {
         let node = fanout_node(6, 0, 8);
@@ -3760,7 +3618,6 @@ mod tests {
         assert!(late.get("settlement").is_none());
     }
 
-    /// No new flag: pump legs still use the shared caller channel and ring.
     #[tokio::test]
     async fn review_default_pump_uses_shared_channel_and_ring() {
         let node = fanout_node(4, 0, 1);

@@ -1,9 +1,3 @@
-//! Process-local benchmark identities backed by operating-system entropy.
-//!
-//! Single-process benchmarks do not need reproducible private keys. Fresh
-//! identities prevent their signing material from becoming a reusable public
-//! mutation credential.
-
 use arc_crypto::{Hash256, KeyPair};
 
 pub fn signing_keypairs(count: usize) -> Vec<(KeyPair, Hash256)> {

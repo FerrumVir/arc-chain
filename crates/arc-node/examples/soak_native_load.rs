@@ -1,36 +1,3 @@
-//! Offered native-inference load for the recorded soak (checklist R8).
-//!
-//!     soak_native_load --rpc 9960,9961,9962,9963 --rate 0.2 --duration 600 \
-//!                      --out workload.jsonl --requester-seed soak --tuple m,p,g,a \
-//!                      [--input-hex LE_U32_TOKEN_IDS --max-tokens 8 --executor-label …]
-//!
-//! Offers signed native-inference requests at a fixed rate, round-robin across
-//! the given nodes, and follows each one to a terminal receipt on ANY replica.
-//! Every offered item is written to `--out` as one JSON line the soak analyzer
-//! accounts for: finalized / refunded / rejected-with-reason / submit_error /
-//! still pending at the drained end, with latency, attempts and the node that
-//! accepted it.
-//!
-//! Ingress admits exactly the nonce that is valid at the next height, so a
-//! requester cannot queue a second request behind a first that is not yet
-//! included. The driver therefore runs `--requesters` independent requester
-//! accounts, each with at most one request in flight (submitted until it
-//! reaches a terminal receipt). An offer that finds every requester busy is
-//! counted as backpressure, not silently dropped. A request that no replica
-//! has included after `--lost-after` seconds, while its sender's nonce has
-//! not moved on any node, is presumed lost: its requester resynchronises its
-//! nonce from the chain and carries on, and the item stays on a watch list
-//! so a late inclusion is still accounted for at the end.
-//!
-//! Requests are built exactly as the protocol tests build them, from the same
-//! types - a Python reimplementation of the signed, bincode-framed envelope
-//! would be a second definition of the wire format to keep in step.
-//!
-//! This drives the protocol and settlement path. With the deterministic test
-//! executor it qualifies nothing about inference quality; that is stated in
-//! every record's `executor` field so the evidence cannot be mistaken for a
-//! real-model result.
-
 use arc_crypto::signature::KeyPair;
 use arc_crypto::{Hash256, hash_bytes};
 use arc_types::inference_contract::{
@@ -80,8 +47,6 @@ fn get_json(port: u16, path: &str) -> Option<serde_json::Value> {
 }
 
 fn requester_keypair(seed: &str, slot: usize) -> KeyPair {
-    // Slot 0 keeps the single-requester derivation, so older runs' funded
-    // address is still slot 0's.
     let material = if slot == 0 {
         seed.to_string()
     } else {
@@ -91,7 +56,6 @@ fn requester_keypair(seed: &str, slot: usize) -> KeyPair {
     KeyPair::Ed25519(ed25519_dalek::SigningKey::from_bytes(&bytes))
 }
 
-/// One offered request, from first offer to its terminal record.
 struct Item {
     record: serde_json::Map<String, serde_json::Value>,
     request_id: Hash256,
@@ -115,15 +79,11 @@ struct Driver {
     domain: InferenceDomain,
     tuple: Vec<Hash256>,
     executor: String,
-    /// Fixed input for every request (`--input-hex`): little-endian u32
-    /// token ids for the real executor. Absent: a unique text per request,
-    /// which only the deterministic test executor accepts.
     input: Option<Vec<u8>>,
     max_tokens: u32,
     out: std::fs::File,
     lost_after: f64,
     requesters: Vec<Requester>,
-    /// Presumed lost; still polled so a late inclusion is accounted for.
     watch: Vec<Item>,
     turn: usize,
     offered: u64,
@@ -136,8 +96,6 @@ impl Driver {
         let _ = self.out.flush();
     }
 
-    /// The highest nonce any replica reports for `address` (a lagging node's
-    /// view is behind, never ahead).
     fn chain_nonce(&self, address: &Hash256) -> Option<u64> {
         self.ports
             .iter()
@@ -153,7 +111,6 @@ impl Driver {
             if let Some(status) = get_json(*port, &path)
                 .and_then(|r| r["observed_status"].as_str().map(str::to_string))
             {
-                // A terminal status on any replica wins over "Pending".
                 if status != "Pending" {
                     return Some(status);
                 }
@@ -178,8 +135,6 @@ impl Driver {
             generation_hash: self.tuple[2],
             assignment_hash: self.tuple[3],
             max_tokens: self.max_tokens,
-            // Four bytes per generated token id, and never below what the
-            // test executor returns.
             max_output_bytes: (self.max_tokens * 4).max(128),
             execution_price: 10,
             reserved_max_payment: 100,
@@ -207,10 +162,6 @@ impl Driver {
         (tx, request_id)
     }
 
-    /// Offer one request from an idle requester. Every node is tried once,
-    /// starting from the round-robin turn: a node that is down, not ready, or
-    /// has not yet applied the block that made this nonce current is a reason
-    /// to try the next node, not a verdict on the request.
     fn offer(&mut self) {
         self.offered += 1;
         let Some(slot) = (0..self.requesters.len())
@@ -280,9 +231,6 @@ impl Driver {
             } else {
                 format!("node {node}: HTTP {code}: {body:.160}")
             };
-            // A nonce refusal on the first node that answers may mean this
-            // driver's view is stale (a request it presumed lost was included
-            // after all): resynchronise once from the chain and retry here.
             if code == 400 && body.contains("nonce") && !resynced {
                 resynced = true;
                 if let Some(chain) = self.chain_nonce(&key.address())
@@ -302,8 +250,6 @@ impl Driver {
         if answered {
             record.insert("final_status".into(), "rejected".into());
         } else {
-            // No node answered at all: nothing was accepted and the nonce was
-            // not consumed.
             record.insert("final_status".into(), "submit_error".into());
         }
         self.write(&record);
@@ -319,7 +265,6 @@ impl Driver {
         self.write(&item.record);
     }
 
-    /// Follow every in-flight request; free its requester when it settles.
     fn poll(&mut self) {
         for slot in 0..self.requesters.len() {
             let Slot::InFlight(item) = &self.requesters[slot].slot else {
@@ -345,12 +290,8 @@ impl Driver {
                 continue;
             }
             if status.is_some() || age < self.lost_after {
-                // Included (Pending) or still young: keep waiting.
                 continue;
             }
-            // Old, and no replica has even included it. If the sender's nonce
-            // has not moved anywhere, the request is gone (typically held only
-            // by a node that was killed before gossiping it).
             let address = self.requesters[slot].key.address();
             match self.chain_nonce(&address) {
                 Some(chain) if chain <= nonce => {
@@ -363,12 +304,9 @@ impl Driver {
                     self.requesters[slot].next_nonce = chain;
                     self.watch.push(item);
                 }
-                // Included after all (the receipt is just slow to appear), or
-                // no node answered: keep waiting.
                 _ => {}
             }
         }
-        // A presumed-lost request that turns up after all is accounted for.
         let mut still = Vec::new();
         for item in std::mem::take(&mut self.watch) {
             match self.receipt_status(&item.request_id).as_deref() {
@@ -412,9 +350,6 @@ fn main() {
         .map(|n| n.parse().expect("--requesters N"))
         .unwrap_or(4)
         .max(1);
-    // Before anything else: the orchestrator asks for the requesters'
-    // addresses to fund them in genesis, before any node exists to answer
-    // --rpc. One address per line, slot order.
     if std::env::args().any(|a| a == "--print-requester") {
         for slot in 0..count {
             println!("{}", requester_keypair(&seed, slot).address().to_hex());
@@ -461,7 +396,6 @@ fn main() {
         .open(&out_path)
         .expect("open --out");
 
-    // The domain every request binds to, from the first node that answers.
     let ctx = loop {
         if let Some(ctx) = ports
             .iter()
@@ -512,7 +446,6 @@ fn main() {
         driver.poll();
         std::thread::sleep(Duration::from_millis(250));
     }
-    // Drain: a bounded chance to settle, then whatever is left is pending.
     let drain_until = Instant::now() + Duration::from_secs(90);
     while (driver.busy() || !driver.watch.is_empty()) && Instant::now() < drain_until {
         driver.poll();

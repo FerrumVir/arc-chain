@@ -18,7 +18,6 @@ import { formatUptime } from "../lib/format";
 import { PLAIN_COPY } from "../lib/plain-copy";
 import type { Route } from "../lib/store";
 
-// Home first: the chat answers whatever state the node is in.
 const NAV: Array<{ id: Route; label: string; icon: typeof LayoutDashboard }> = [
   { id: "inference", label: PLAIN_COPY.home.navLabel, icon: Sparkles },
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -39,10 +38,8 @@ export function Sidebar() {
     refetchInterval: 2000,
   });
 
-  // The connection in plain words (lib/connection.ts). Through v0.8.14 a
-  // connected community node read "Running · 0 peers" here, which looked broken.
   const connection = describeConnection(status);
-  const checking = status === undefined;   // no status yet: the node may well be running or starting
+  const checking = status === undefined;
 
   return (
     <aside className="sidebar" data-testid="sidebar">

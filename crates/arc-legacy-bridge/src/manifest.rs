@@ -1,10 +1,3 @@
-//! The owner-signed `SHA256SUMS` release manifest.
-//!
-//! Format and rules mirror the release publisher (`release.yml`, "sealed
-//! release manifest") and `install.sh`: four fixed metadata lines naming the
-//! schema, repository, tag, and source commit, then one `<sha256>  <name>`
-//! record per asset with no duplicates and no other metadata.
-
 use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow, ensure};
@@ -85,8 +78,6 @@ fn header(line: &str, prefix: &str) -> Result<String> {
 }
 
 impl ReleaseManifest {
-    /// The signed manifest must name the pinned repository, tag, and commit,
-    /// and list exactly the pinned digest for every asset the bridge uses.
     pub fn check_pins(&self, pins: &Pins) -> Result<()> {
         ensure!(
             self.repository == pins.repository,

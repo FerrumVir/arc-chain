@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Wait for one immutable GitHub Actions run attempt, never the moving latest attempt.
 set -Eeuo pipefail
 
 die() {

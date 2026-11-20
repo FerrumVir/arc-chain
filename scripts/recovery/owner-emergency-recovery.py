@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""Verify one GitHub-owner-authenticated ARC emergency-recovery approval.
-
-This helper deliberately handles public recovery identities and hashes only. It
-never opens a validator key, seed, checkpoint payload, OAuth configuration, or
-other secret-bearing input. The repository owner dispatches a no-secret
-protected-main workflow; this helper authenticates that exact successful run
-attempt and its GitHub artifact, then materializes a create-only mode-0400
-receipt immediately before the offline signer is invoked.
-"""
 
 from __future__ import annotations
 
@@ -67,8 +58,6 @@ UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 SAFE_PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
-# The order is the checked-in recovered genesis order and the physical signing
-# order.  SGP remains the unused recovery member for this five-signature pass.
 PRODUCTION_VALIDATORS: tuple[tuple[str, str, int], ...] = (
     ("NYC", "adf4ff16f997c871c16f3897e67881311d08f975f28ebdcf79e86ea9e3b99d0f", 6_666_667),
     ("LAX", "44d20543df6e76696da2ebbbd79e4243cd41729fa5b890e2618991e489314780", 6_666_667),
@@ -82,7 +71,7 @@ UNUSED_RECOVERY_MEMBER = PRODUCTION_VALIDATORS[-1][0]
 
 
 class ApprovalError(ValueError):
-    """The proposed or sealed owner authorization is unsafe or inconsistent."""
+    pass
 
 
 def fail(message: str) -> NoReturn:
@@ -369,8 +358,6 @@ def create_receipt_pair(path: Path, raw: bytes) -> str:
     try:
         _entry_absent(parent_fd, name, "owner emergency-recovery receipt")
         _entry_absent(parent_fd, sidecar_name, "owner emergency-recovery receipt sidecar")
-        # The sidecar is staged first and the receipt is the completion marker.
-        # A crash or race leaves evidence behind and never permits overwrite.
         _create_at(
             parent_fd,
             sidecar_name,

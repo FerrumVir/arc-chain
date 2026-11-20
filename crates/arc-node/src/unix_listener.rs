@@ -1,10 +1,3 @@
-//! Permission-sealed Unix listeners used by the production RPC origin plane.
-//!
-//! A loopback TCP port is not an identity boundary: any local process can bind
-//! a crashed service's port and impersonate it.  These helpers require an
-//! owner-controlled systemd-style runtime directory, bind one exact socket,
-//! set its mode to `0660`, and remove only the inode created by this process.
-
 #![cfg(unix)]
 
 use std::{
@@ -22,7 +15,6 @@ const RUNTIME_DIRECTORY_MODE: u32 = 0o750;
 const LISTENER_MODE: u32 = 0o660;
 
 fn effective_ids() -> (u32, u32) {
-    // SAFETY: geteuid/getegid are side-effect-free POSIX process queries.
     unsafe { (libc::geteuid(), libc::getegid()) }
 }
 
@@ -107,7 +99,6 @@ fn remove_stale_socket(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Owns one socket inode and removes only that inode when the server exits.
 pub(crate) struct UnixSocketGuard {
     path: PathBuf,
     device: u64,
@@ -134,7 +125,6 @@ impl Drop for UnixSocketGuard {
     }
 }
 
-/// Bind one sealed Unix listener and retain a cleanup guard for its exact inode.
 pub(crate) fn bind(path: &Path) -> anyhow::Result<(tokio::net::UnixListener, UnixSocketGuard)> {
     validate_path(path)?;
     validate_parent(path)?;
@@ -179,8 +169,6 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o750)).unwrap();
         let (_, egid) = effective_ids();
-        // Some systems create temporary directories with an inherited group.
-        // SAFETY: chown receives one live NUL-terminated path and preserves uid.
         let path = std::ffi::CString::new(directory.path().as_os_str().as_bytes()).unwrap();
         let result = unsafe { libc::chown(path.as_ptr(), u32::MAX, egid) };
         assert_eq!(result, 0);

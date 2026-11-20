@@ -1,8 +1,3 @@
-//! Generate STARK proofs at varying dimensions and save to files.
-//! Each proof is a real Circle STARK (Stwo) proving a Dense layer computation.
-//!
-//! Usage: cargo run --example generate_proofs --features stwo-icicle --release -- /tmp/proofs
-
 use arc_crypto::inference_proof::{dense_forward_i64, prove_sharded_dense};
 use arc_crypto::stwo_air::prove_dense_stark;
 use std::io::Write;
@@ -13,10 +8,7 @@ fn main() {
     let output_dir = args.get(1).map(|s| s.as_str()).unwrap_or("/tmp/proofs");
     std::fs::create_dir_all(output_dir).unwrap();
 
-    // 60 proofs at varying dimensions (representing different model scales)
     let configs: Vec<(usize, usize, &str)> = vec![
-        // (out_size, in_size, label)
-        // Small models (1B scale) - fast proofs
         (32, 64, "1b-attn-q"),
         (32, 64, "1b-attn-k"),
         (32, 64, "1b-attn-v"),
@@ -27,7 +19,6 @@ fn main() {
         (32, 64, "1b-lm-head-s1"),
         (32, 64, "1b-lm-head-s2"),
         (32, 64, "1b-lm-head-s3"),
-        // Medium models (7B scale)
         (64, 128, "7b-attn-q"),
         (64, 128, "7b-attn-k"),
         (64, 128, "7b-attn-v"),
@@ -38,7 +29,6 @@ fn main() {
         (128, 128, "7b-layer-0"),
         (128, 128, "7b-layer-1"),
         (128, 128, "7b-layer-2"),
-        // Large models (13B scale)
         (128, 256, "13b-attn-q"),
         (128, 256, "13b-attn-k"),
         (128, 256, "13b-attn-v"),
@@ -49,7 +39,6 @@ fn main() {
         (256, 256, "13b-layer-0"),
         (256, 256, "13b-layer-1"),
         (256, 256, "13b-layer-2"),
-        // 50B scale (sharded dimensions)
         (256, 512, "50b-shard-0"),
         (256, 512, "50b-shard-1"),
         (256, 512, "50b-shard-2"),
@@ -60,7 +49,6 @@ fn main() {
         (512, 512, "50b-layer-k"),
         (512, 512, "50b-layer-v"),
         (512, 512, "50b-layer-o"),
-        // 70B scale
         (512, 1024, "70b-ffn-gate"),
         (512, 1024, "70b-ffn-up"),
         (1024, 512, "70b-ffn-down"),
@@ -71,12 +59,10 @@ fn main() {
         (1024, 1024, "70b-full-layer"),
         (256, 1024, "70b-shard-a"),
         (256, 1024, "70b-shard-b"),
-        // Stress tests
         (1024, 512, "stress-1"),
         (512, 1024, "stress-2"),
         (1024, 1024, "stress-max-1"),
         (1024, 1024, "stress-max-2"),
-        // Folded multi-layer proofs
         (128, 128, "folded-layer-0"),
         (128, 128, "folded-layer-1"),
         (128, 128, "folded-layer-2"),
@@ -98,7 +84,6 @@ fn main() {
         let out_size = *out_size;
         let in_size = *in_size;
 
-        // Deterministic weights from label hash
         let mut rng: u64 = 0;
         for b in label.bytes() {
             rng = rng.wrapping_mul(31).wrapping_add(b as u64);
@@ -120,12 +105,10 @@ fn main() {
             prove_dense_stark(&weights, &input, &output, in_size, out_size);
         let elapsed = start.elapsed().as_millis();
 
-        // Save proof to file
         let filename = format!("{:03}-{}.stark", idx, label);
         let path = format!("{}/{}", output_dir, filename);
         std::fs::write(&path, &proof_data).unwrap();
 
-        // Compute hashes for verification
         let input_hash = arc_crypto::hash_bytes(
             &input
                 .iter()
@@ -162,7 +145,6 @@ fn main() {
 
     let total_elapsed = total_start.elapsed();
 
-    // Save manifest
     let manifest_path = format!("{}/manifest.json", output_dir);
     let manifest_json = serde_json::to_string_pretty(&manifest).unwrap();
     std::fs::write(&manifest_path, &manifest_json).unwrap();

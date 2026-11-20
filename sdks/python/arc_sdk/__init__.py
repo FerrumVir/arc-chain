@@ -1,34 +1,3 @@
-"""
-ARC Chain Python SDK.
-
-A complete Python client for interacting with the ARC Chain blockchain,
-including transaction building, Ed25519 signing, and RPC communication.
-
-Usage::
-
-    from arc_sdk import ArcClient, KeyPair, TransactionBuilder
-
-    # Connect to a node
-    client = ArcClient("http://localhost:9944")
-
-    # Generate a key pair
-    kp = KeyPair.generate()
-    print(f"Address: {kp.address()}")
-
-    # Build and sign a transfer
-    transaction_domain = client.get_transaction_domain()
-    tx = TransactionBuilder.transfer(
-        from_addr=kp.address(),
-        to_addr="0" * 64,
-        amount=1000,
-        transaction_domain=transaction_domain,
-    )
-    signed_tx = TransactionBuilder.sign(tx, kp)
-
-    # Submit
-    tx_hash = client.submit_transaction(signed_tx)
-"""
-
 from .client import ArcClient
 from .crypto import KeyPair
 from .transaction import TransactionBuilder
@@ -73,12 +42,10 @@ __all__ = [
     "ArcClient",
     "KeyPair",
     "TransactionBuilder",
-    # Agent Runner (connect any AI model to ARC Chain)
     "AgentRunner",
     "openai_runner",
     "ollama_runner",
     "openclaw_runner",
-    # ABI encoding/decoding
     "encode_abi",
     "decode_abi",
     "encode_function_call",
@@ -86,13 +53,11 @@ __all__ = [
     "decode_function_input",
     "function_selector",
     "keccak256",
-    # Errors
     "ArcError",
     "ArcConnectionError",
     "ArcTransactionError",
     "ArcValidationError",
     "ArcCryptoError",
-    # Types
     "Account",
     "Block",
     "BlockHeader",

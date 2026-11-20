@@ -1,15 +1,11 @@
 import { test, type Page } from "@playwright/test";
 import { clearState, seedOnboarded, walkToLaunch } from "./helpers";
 
-// The launch screen (index.html #boot) covers the app until the saved identity and config load, then fades out and is
-// removed. A gallery shot taken before that pictures the launch screen, so every shot waits for it to go.
 async function shot(page: Page, options: Parameters<Page["screenshot"]>[0]) {
   await page.locator("#boot").waitFor({ state: "detached" });
   await page.screenshot(options);
 }
 
-// Captures a gallery of the finished UI. Failing this suite does NOT fail CI -
-// it's meant for design review. Run with: npx playwright test screenshots.spec.ts
 test.describe("Screenshot gallery", () => {
   test("onboarding - welcome", async ({ page }) => {
     await clearState(page);
@@ -30,7 +26,6 @@ test.describe("Screenshot gallery", () => {
   test("onboarding - launch ready", async ({ page }) => {
     await clearState(page);
     await page.goto("/");
-    // Four steps, not three - see walkToLaunch in helpers.ts.
     await walkToLaunch(page);
     await page.waitForSelector('[data-testid="step-launch"]');
     await shot(page, { path: "screenshots/03-onboarding-launch.png" });

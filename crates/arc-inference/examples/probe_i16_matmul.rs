@@ -1,14 +1,7 @@
-// Bottom-up: single row of known f32 weights, known f32 input, ground-truth dot product,
-// compare against I16::quantize_f32 + matmul_i16_into AND I16::from_i8 + matmul_i16_into.
-// If quantize_f32 path diverges from from_i8 path at known ground truth, we localize
-// whether the bug is in the quantizer, the matmul, or both.
 use arc_inference::cached_integer_model::{I8Weights, I16Weights};
 
 const ONE: i64 = 1 << 16;
 
-// Expose the private matmul by re-declaring the minimal i16×i64 dot logic.
-// Mirrors the scalar branch of matmul_i16_into + dot_i16_i64_scalar so we
-// can call it on our hand-built I16Weights.
 fn matmul_i16_scalar(weights: &I16Weights, input: &[i64]) -> Vec<i64> {
     let n_rows = weights.n_rows;
     let n_cols = weights.n_cols;
@@ -40,12 +33,9 @@ fn matmul_i8_scalar(weights: &I8Weights, input: &[i64]) -> Vec<i64> {
 }
 
 fn main() {
-    // Row of 8 f32 weights with abs_max > 5 so I8 scale truncation doesn't trigger
     let f32_weights: Vec<f32> = vec![1.0, -2.0, 0.5, 3.0, -1.5, 2.5, -0.8, 1.2];
-    // f32 input at "Q16 real magnitudes"
     let f32_input: Vec<f32> = vec![1.2, -0.8, 0.5, 2.1, -1.0, 0.7, 1.5, -0.3];
 
-    // Ground truth
     let truth: f32 = f32_weights
         .iter()
         .zip(f32_input.iter())
@@ -55,7 +45,6 @@ fn main() {
     println!("Expected Q16:    {}", (truth * ONE as f32).round() as i64);
     println!();
 
-    // Q16 input (i64)
     let input_q16: Vec<i64> = f32_input
         .iter()
         .map(|&x| (x * ONE as f32).round() as i64)
@@ -63,7 +52,6 @@ fn main() {
     println!("Input Q16: {:?}", input_q16);
     println!();
 
-    // Path A: I16::quantize_f32 → matmul
     let w_a = I16Weights::quantize_f32(&f32_weights, 1, 8);
     println!("I16::quantize_f32:");
     println!("  data   = {:?}", w_a.data);
@@ -76,7 +64,6 @@ fn main() {
     );
     println!();
 
-    // Path B: I8::quantize_f32 → I16::from_i8 → matmul
     let w_i8 = I8Weights::quantize_f32(&f32_weights, 1, 8);
     let w_b = I16Weights::from_i8(&w_i8);
     println!("I8::quantize_f32 + I16::from_i8:");
@@ -92,7 +79,6 @@ fn main() {
     );
     println!();
 
-    // Path C: I8::quantize_f32 + i8 matmul (baseline, known to work)
     let out_c = matmul_i8_scalar(&w_i8, &input_q16);
     println!("I8 matmul baseline (works in production):");
     println!(
@@ -102,7 +88,6 @@ fn main() {
     );
     println!();
 
-    // Error analysis
     println!("=== Comparison ===");
     let truth_q16 = (truth * ONE as f32).round() as i64;
     println!("truth_q16:           {}", truth_q16);

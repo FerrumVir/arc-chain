@@ -13,43 +13,20 @@ use std::os::unix::fs::PermissionsExt;
 const MAX_STORE_BYTES: u64 = 1024 * 1024;
 static NEXT_STORE_SIDECAR: AtomicU64 = AtomicU64::new(0);
 
-// Previously used the `directories` crate to resolve the app-data dir, but
-// that crate returns a read-only path on Android (hits `Read-only file
-// system (os error 30)` when save() tries to write). The canonical fix is
-// to use Tauri's PathResolver which returns the per-platform writable dir:
-//   macOS  → ~/Library/Application Support/network.arc.desktop
-//   Linux  → ~/.local/share/network.arc.desktop
-//   Windows→ %APPDATA%/network.arc.desktop
-//   Android→ /data/user/0/network.arc.desktop/files
-//   iOS    → <app sandbox>/Documents
-// The resolved path is supplied by lib.rs `setup()` and stored in AppState.
-
 #[derive(Default, Serialize, Deserialize)]
 pub struct Store {
     pub identity: Option<Identity>,
     pub config: Option<NodeConfig>,
     #[serde(default)]
     pub data_migration_notice: Option<DataMigrationNotice>,
-    /// Launch set node data from an earlier install aside (`previous_install`).
-    /// Shown until dismissed; written to a store that may hold nothing else.
     #[serde(default)]
     pub previous_install_notice: Option<PreviousInstallNotice>,
 }
 
-/// How [`Store::load_from_with_outcome`] found the store on disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreLoadOutcome {
-    /// Nothing was there when the load began: no app-data directory, or one
-    /// with no `store.json`, no rollback copy and no synced sidecar. A first
-    /// launch, or app data that was deleted.
     Absent,
-    /// A store was read and validated, from `store.json` or a recovered
-    /// candidate.
     Loaded,
-    /// Something was there but could not be read or validated: an insecure
-    /// directory, a refused or contended open, an oversize file, invalid
-    /// JSON. The returned store is empty and must never be written back over
-    /// the file it stands in for.
     Failed,
 }
 
@@ -58,8 +35,6 @@ impl Store {
         dir.join("store.json")
     }
 
-    /// Inspect a canonical store without recovery or writes before testing
-    /// whether a pre-single-instance desktop still owns this data directory.
     pub fn load_for_owner_probe(dir: &Path) -> Option<Self> {
         let file = arc_crypto::secret_file::open_private(&Self::file(dir)).ok()?;
         let mut bytes = Zeroizing::new(Vec::new());
@@ -76,13 +51,7 @@ impl Store {
         Self::load_from_with_outcome(dir).0
     }
 
-    /// Load the store and say how it was found. A caller that acts on "no
-    /// store" (launch setting an earlier install's node data aside) must
-    /// require [`StoreLoadOutcome::Absent`]: a store that is present but
-    /// cannot be read also loads empty, and writing that emptiness back
-    /// would erase the identity it could not read.
     pub fn load_from_with_outcome(dir: &Path) -> (Self, StoreLoadOutcome) {
-        // Decided before anything below can create the directory.
         let absent = store_files_absent(dir);
         if let Err(error) = secure_store_directory(dir) {
             tracing::error!(
@@ -98,11 +67,6 @@ impl Store {
             return (store, StoreLoadOutcome::Loaded);
         }
 
-        // Windows replacement uses a complete `.previous` rollback file, and
-        // every platform writes a fully fsynced `.store.json.<pid>.tmp` before
-        // replacement. A power loss between those renames must not make the
-        // wallet identity and node configuration appear erased. Prefer the
-        // newest valid synced candidate, then rewrite a canonical store.json.
         let mut candidates = Vec::new();
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
@@ -137,16 +101,9 @@ impl Store {
             );
             match store.save_to(dir) {
                 Ok(()) => {
-                    // A PID-named temp is not the destination moved by
-                    // save_to(), so remove the recovered stale copy only after
-                    // the canonical replacement is durable.
                     let _ = fs::remove_file(&candidate);
                 }
                 Err(error) => {
-                    // The in-memory recovery is still safer than silently
-                    // returning an empty identity. Auto-start migration
-                    // separately fails closed if it cannot persist its new
-                    // data-dir pointer. Keep the candidate for the next retry.
                     tracing::error!(
                         %error,
                         "recovered ARC identity store in memory but could not restore store.json"
@@ -181,9 +138,6 @@ impl Store {
             }
         }
 
-        // The store contains the recovery phrase. Never expose a partially
-        // written JSON document after a crash, and never rely on the caller's
-        // umask for its confidentiality.
         let (temporary, mut file) = create_store_sidecar(dir)?;
         let mut pending = PendingStoreSidecar(Some(temporary.clone()));
         let encoded = Zeroizing::new(serde_json::to_vec_pretty(self)?);
@@ -198,15 +152,6 @@ impl Store {
         Ok(())
     }
 
-    /// Fence an unbound v0.7 WAL before a newly updated v0.8 desktop can
-    /// auto-start its matched protocol-v3 node.
-    ///
-    /// Older desktop builds used the same `~/.arc` root for executables,
-    /// models, and chain state. Renaming that directory would therefore move
-    /// things that are not chain history; rewriting/deleting its WAL would
-    /// destroy forensic evidence. Instead, retain every old byte in place and
-    /// atomically persist only a config pointer to a new, empty `data-v3*`
-    /// child. A later launch sees that fresh path and does not migrate again.
     pub fn protect_legacy_v07_data(&mut self) -> anyhow::Result<Option<DataMigrationNotice>> {
         let Some(config) = self.config.as_ref() else {
             return Ok(None);
@@ -215,9 +160,6 @@ impl Store {
         self.protect_legacy_v07_data_at(&legacy_dir)
     }
 
-    /// Fence a live v0.7 process's exact data path. Public Windows tags could
-    /// resolve `~/.arc` relative to the child cwd when HOME was absent, so the
-    /// persisted config string alone is not always the directory being used.
     pub fn protect_legacy_v07_data_at(
         &mut self,
         legacy_dir: &Path,
@@ -225,12 +167,6 @@ impl Store {
         self.protect_legacy_v07_data_at_inner(legacy_dir, false)
     }
 
-    /// Fence the exact data directory advertised by a currently live v0.7
-    /// desktop process. Even an empty directory is unsafe to reuse: the old
-    /// process may still be initializing and can create/write its WAL after
-    /// this preflight. The caller has already proven the strict public-tag
-    /// argv/seed/executable identity and will reconcile that process only
-    /// after this new pointer is durably persisted.
     pub fn protect_running_legacy_v07_data_at(
         &mut self,
         legacy_dir: &Path,
@@ -264,13 +200,6 @@ impl Store {
         let state_wal = legacy_dir.join("state.wal");
         let dag_wal = legacy_dir.join("dag-wal");
 
-        // A syntactically authenticated marker means this is protocol-v3
-        // state. Its exact hash remains arc-node's authority; the desktop must
-        // not guess whether a different valid hash belongs to this network.
-        // A malformed regular marker is different: arc-node can never replay
-        // it safely. Preserve that entire ambiguous directory and explicitly
-        // fence it behind a fresh pointer instead of allowing an opaque startup
-        // failure or editing the marker in place.
         let malformed_binding_reason = match fs::symlink_metadata(&binding) {
             Ok(metadata) if metadata.file_type().is_file() => {
                 let bytes = if metadata.len() <= 1024 {
@@ -301,9 +230,6 @@ impl Store {
             Err(error) => return Err(error.into()),
         };
 
-        // v0.7 always persisted state.wal. Retain dag-wal as a second
-        // discriminator for interrupted/partial old nodes without treating
-        // ~/.arc/bin or ~/.arc/models as chain history.
         if !exact_legacy_process_is_live
             && malformed_binding_reason.is_none()
             && !state_wal.exists()
@@ -363,9 +289,6 @@ impl Store {
     }
 }
 
-/// Whether nothing of a store exists at `dir`: no directory, or a directory
-/// without `store.json`, its rollback copy or a synced sidecar. Inspected
-/// without following links, and before the directory is created.
 fn store_files_absent(dir: &Path) -> bool {
     match fs::symlink_metadata(dir) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
@@ -396,9 +319,6 @@ pub(crate) fn secure_store_directory(dir: &Path) -> anyhow::Result<()> {
             let parent = dir.parent().ok_or_else(|| {
                 anyhow::anyhow!("identity store directory has no parent: {}", dir.display())
             })?;
-            // Tauri supplies an OS-owned per-user app-data root. Parents may
-            // not exist on a first launch, but no secret bytes are written
-            // until the final app directory is securely created and validated.
             fs::create_dir_all(parent)?;
             arc_crypto::secret_file::secure_private_directory(dir)?;
             Ok(())
@@ -458,9 +378,6 @@ fn replace_atomically(temporary: &Path, destination: &Path) -> anyhow::Result<()
 
     #[cfg(not(unix))]
     {
-        // std::fs::rename cannot replace an existing Windows destination.
-        // Keep the old complete file as a rollback point until the new one is
-        // in place, then remove it.
         let backup = destination.with_extension("json.previous");
         match arc_crypto::secret_file::open_private_owned_migration(&backup) {
             Ok(file) => {
@@ -498,12 +415,9 @@ mod tests {
         ))
     }
 
-    /// Launch tells an absent store from one it could not read: only the
-    /// first may be acted on as "no store", and neither is written back.
     #[test]
     fn load_outcome_tells_absent_from_loaded_from_failed() {
         let dir = test_dir();
-        // No directory, then a private directory with nothing in it.
         let (store, outcome) = Store::load_from_with_outcome(&dir);
         assert_eq!(outcome, StoreLoadOutcome::Absent);
         assert!(store.identity.is_none());
@@ -529,8 +443,6 @@ mod tests {
             Some("11".repeat(32))
         );
 
-        // The same file, made unreadable three ways, each left exactly as it
-        // was by the load that failed on it.
         let path = dir.join("store.json");
         let valid = std::fs::read(&path).unwrap();
         let mut bom = b"\xEF\xBB\xBF".to_vec();
@@ -547,8 +459,6 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), bytes, "{label}");
             assert!(!dir.join("store.json.previous").exists(), "{label}");
         }
-        // A sidecar alone is a store that is present: a recovery candidate,
-        // never "absent".
         std::fs::remove_file(&path).unwrap();
         write_private_fixture(&dir.join(".store.json.4242.tmp"), b"{partial");
         assert_eq!(Store::load_from_with_outcome(&dir).1, StoreLoadOutcome::Failed);
@@ -766,7 +676,6 @@ mod tests {
         };
         store.save_to(&app_dir).unwrap();
 
-        // First v0.8 launch after the updater: move only the active pointer.
         let mut upgraded = Store::load_from(&app_dir);
         let notice = upgraded
             .protect_legacy_v07_data()
@@ -796,8 +705,6 @@ mod tests {
             "wallet/node identity must survive migration"
         );
 
-        // Relaunch: the persisted pointer is already fresh, so no second
-        // archive directory is allocated and the notice remains available.
         let mut relaunched = Store::load_from(&app_dir);
         let active = relaunched.config.as_ref().unwrap().data_dir.clone();
         assert!(relaunched.protect_legacy_v07_data().unwrap().is_none());

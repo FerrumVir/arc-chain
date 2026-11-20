@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""Live-verify and privately stage one protected-main pre-tag artifact.
-
-This module is the production trust boundary shared by the macOS runtime canary
-and validator-vault restore/install helpers.  A caller-selected receipt is never
-an authorization input: every invocation performs fresh unauthenticated public
-GitHub REST checks for the protected ``main`` branch, exact successful preflight
-run/attempt, and exact unexpired Actions artifact ID before opening its raw ZIP.
-"""
 
 from __future__ import annotations
 
@@ -79,9 +71,6 @@ RUST_TARGETS = {
     "windows-x86_64": "x86_64-pc-windows-msvc",
 }
 
-# The release-signing-preflight workflow uploads exactly these nine groups, in
-# this reviewed order.  Set proofs fail closed unless the run's complete
-# artifact listing and the caller's rows both match this tuple exactly.
 PRETAG_GROUPS = (
     ("headless", "linux-x86_64"),
     ("headless", "linux-arm64"),
@@ -96,7 +85,7 @@ PRETAG_GROUPS = (
 
 
 class ProvenanceError(ValueError):
-    """The live API or candidate bytes violate the protected artifact contract."""
+    pass
 
 
 def fail(message: str) -> NoReturn:
@@ -245,8 +234,6 @@ class ApiDocument:
 
 
 class CurlApiClient:
-    """Small config-free public GitHub JSON client with a fixed trust store."""
-
     def __init__(
         self,
         curl: Path,
@@ -356,10 +343,6 @@ class CurlApiClient:
         if re.search(r"(?:[?&])_arc_proof=", endpoint) is not None:
             fail("GitHub REST endpoint supplied the reserved proof nonce")
         self.counter += 1
-        # GitHub's anonymous REST edge may return a fresh request ID with an
-        # Age of zero while reusing the cached response Date for up to its
-        # advertised s-maxage.  A unique URL per GET prevents that stale Date
-        # from making the strict initial/final proof ordering nondeterministic.
         separator = "&" if "?" in endpoint else "?"
         try:
             proof_nonce = os.urandom(32).hex()
@@ -545,8 +528,6 @@ def validate_canonical_provenance(
         "protected_main",
     ),
 ) -> dict[str, Any]:
-    """Validate one complete v1 proof and all internal cross-bindings."""
-
     proof = exact_object(
         value,
         {"schema", "live", "api", "artifact"},
@@ -841,8 +822,6 @@ def prove_live_api(
     kind: str,
     platform: str,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Prove one artifact, checking protected main as the final API read."""
-
     workflow = client.get_json(
         f"/repos/{REPOSITORY}/actions/workflows/release-signing-preflight.yml",
         label="preflight workflow",
@@ -871,8 +850,6 @@ def prove_live_api(
         run_id=run_id,
         run_attempt=run_attempt,
     )
-    # This is intentionally last.  Consumers publish immediately after their
-    # final reproof, so main cannot move during earlier API reads unnoticed.
     branch = client.get_json(
         f"/repos/{REPOSITORY}/branches/{PROTECTED_BRANCH}", label="protected main"
     )
@@ -931,8 +908,6 @@ def prove_live_api_set(
     run_attempt: int,
     rows: Sequence[dict[str, Any]],
 ) -> tuple[tuple[dict[str, Any], ...], tuple[list[dict[str, Any]], ...]]:
-    """Prove the exact nine-artifact preflight set in four public API reads."""
-
     normalized = _normalize_live_set_rows(rows)
     workflow = client.get_json(
         f"/repos/{REPOSITORY}/actions/workflows/release-signing-preflight.yml",
@@ -998,8 +973,6 @@ def prove_live_api_set(
         )
         validated.append((row, name, digest, size))
 
-    # The protected branch must be the final security-relevant read after the
-    # complete artifact set has already been fetched and validated.
     branch = client.get_json(
         f"/repos/{REPOSITORY}/branches/{PROTECTED_BRANCH}", label="protected main"
     )
@@ -1278,8 +1251,6 @@ class VerifiedArtifact:
     _fixed_now: int | None
 
     def recheck(self) -> FinalLiveReproof:
-        """Freshly re-prove the same live tuple immediately before publication."""
-
         self._client.now = (
             int(time.time()) if self._fixed_now is None else int(self._fixed_now)
         )
@@ -1318,16 +1289,12 @@ class VerifiedArtifact:
 
 @dataclass(frozen=True)
 class FinalLiveReproofSet:
-    """Ordered full provenances returned by one shared four-request reproof."""
-
     proofs: tuple[FinalLiveReproof, ...]
     api_request_count: int
 
 
 @dataclass(frozen=True)
 class VerifiedArtifactSet:
-    """The exact ordered nine-group artifact set in one private transaction."""
-
     transaction_root: Path
     artifacts: tuple[VerifiedArtifact, ...]
     _client: CurlApiClient
@@ -1340,8 +1307,6 @@ class VerifiedArtifactSet:
         return self._client.counter
 
     def recheck(self) -> FinalLiveReproofSet:
-        """Re-prove all nine live tuples with four shared API reads."""
-
         self._client.now = (
             int(time.time()) if self._fixed_now is None else int(self._fixed_now)
         )
@@ -1566,14 +1531,6 @@ def final_live_reproof(
     ca_bundle_sha256: str,
     now: int | None = None,
 ) -> FinalLiveReproof:
-    """Fresh API-only reproof of one previously verified complete provenance.
-
-    The raw ZIP is deliberately not reopened.  The returned object is a second
-    full canonical ``arc.protected-pretag-artifact.v1`` provenance with the
-    identical artifact section and live tuple, but fresh API bodies, request
-    IDs, response timestamps, and minimum live timestamp.
-    """
-
     if not isinstance(initial_provenance_bytes, bytes) or not (
         0 < len(initial_provenance_bytes) <= MAX_API_BYTES
     ):
@@ -1672,8 +1629,6 @@ def pretag_actions_proof(
     ca_bundle_sha256: str,
     now: int | None = None,
 ) -> Iterator[VerifiedArtifact]:
-    """Yield stable private payloads only while their live proof is in scope."""
-
     _validate_common_inputs(
         expected_commit=expected_commit,
         expected_run_id=expected_run_id,
@@ -1730,8 +1685,6 @@ def pretag_actions_proof(
             fixed_now=now,
         )
     finally:
-        # The directory is created by this invocation and contains only files
-        # created through O_EXCL under its mode-0700 boundary.
         shutil.rmtree(root, ignore_errors=True)
 
 
@@ -1786,12 +1739,6 @@ def pretag_actions_set_proof(
     ca_bundle_sha256: str,
     now: int | None = None,
 ) -> Iterator[VerifiedArtifactSet]:
-    """Privately materialize the exact nine groups with four shared API reads.
-
-    Each row has exactly ``raw_actions_zip``, ``expected_artifact_id``, ``kind``,
-    and ``platform`` and must follow :data:`PRETAG_GROUPS` order.
-    """
-
     _validate_common_inputs(
         expected_commit=expected_commit,
         expected_run_id=expected_run_id,
@@ -1880,8 +1827,6 @@ def final_live_set_reproof(
     ca_bundle_sha256: str,
     now: int | None = None,
 ) -> FinalLiveReproofSet:
-    """Fresh four-request API-only reproof of an ordered nine-proof set."""
-
     _validate_common_inputs(
         expected_commit=expected_commit,
         expected_run_id=expected_run_id,
@@ -2024,8 +1969,5 @@ def final_live_set_reproof(
         shutil.rmtree(root, ignore_errors=True)
 
 
-# Descriptive compatibility alias for callers that prefer a verb phrase.  Both
-# names enter the same mandatory live public-API transaction; neither accepts a
-# local receipt or injectable trust decision.
 verified_protected_pretag_artifact = pretag_actions_proof
 verified_protected_pretag_artifact_set = pretag_actions_set_proof

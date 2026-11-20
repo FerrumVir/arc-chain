@@ -1,16 +1,5 @@
-//! AI-native blockchain types for the ARC Chain.
-//!
-//! This module provides all AI/ML-related types including model registry,
-//! model sharding, inference marketplace, on-chain chat, model marketplace,
-//! inference caching, and compute credits.
-
 use std::collections::HashMap;
 
-// ============================================================================
-// Model Registry (#43)
-// ============================================================================
-
-/// Unique identifier for a registered model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ModelId(pub [u8; 32]);
 
@@ -24,7 +13,6 @@ impl ModelId {
     }
 }
 
-/// Quantization format for model weights.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Quantization {
     F32,
@@ -36,7 +24,6 @@ pub enum Quantization {
     AWQ,
 }
 
-/// Parameters describing a model's architecture and size.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelParameters {
     pub parameter_count: u64,
@@ -44,7 +31,6 @@ pub struct ModelParameters {
     pub architecture: String,
 }
 
-/// The category of an AI model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelType {
     LLM,
@@ -55,7 +41,6 @@ pub enum ModelType {
     Custom(String),
 }
 
-/// Full metadata for a registered model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelMetadata {
     pub id: ModelId,
@@ -69,7 +54,6 @@ pub struct ModelMetadata {
     pub parameters: ModelParameters,
 }
 
-/// On-chain registry of AI models.
 #[derive(Debug, Default)]
 pub struct ModelRegistry {
     models: HashMap<ModelId, ModelMetadata>,
@@ -82,7 +66,6 @@ impl ModelRegistry {
         }
     }
 
-    /// Register a new model. Returns an error if the model ID already exists.
     pub fn register(&mut self, metadata: ModelMetadata) -> Result<(), String> {
         if self.models.contains_key(&metadata.id) {
             return Err(format!("Model {:?} already registered", metadata.id));
@@ -91,17 +74,14 @@ impl ModelRegistry {
         Ok(())
     }
 
-    /// Look up a model by its ID.
     pub fn lookup(&self, id: &ModelId) -> Option<&ModelMetadata> {
         self.models.get(id)
     }
 
-    /// List all models owned by a given address.
     pub fn list_by_owner(&self, owner: &[u8; 32]) -> Vec<&ModelMetadata> {
         self.models.values().filter(|m| &m.owner == owner).collect()
     }
 
-    /// List all models of a given type.
     pub fn list_by_type(&self, model_type: &ModelType) -> Vec<&ModelMetadata> {
         self.models
             .values()
@@ -109,17 +89,11 @@ impl ModelRegistry {
             .collect()
     }
 
-    /// Return the total number of registered models.
     pub fn count(&self) -> usize {
         self.models.len()
     }
 }
 
-// ============================================================================
-// Model Sharding (#45)
-// ============================================================================
-
-/// Status of a model shard on the network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShardStatus {
     Pending,
@@ -129,7 +103,6 @@ pub enum ShardStatus {
     Migrating,
 }
 
-/// Configuration for sharding a model across nodes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShardConfig {
     pub model_id: ModelId,
@@ -138,7 +111,6 @@ pub struct ShardConfig {
     pub redundancy_factor: u8,
 }
 
-/// A single shard of a model distributed across the network.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelShard {
     pub shard_id: u32,
@@ -148,7 +120,6 @@ pub struct ModelShard {
     pub status: ShardStatus,
 }
 
-/// Assignment of a shard to a specific node with load information.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShardAssignment {
     pub shard: ModelShard,
@@ -156,11 +127,6 @@ pub struct ShardAssignment {
     pub load_percentage: f64,
 }
 
-// ============================================================================
-// Inference Marketplace (#48)
-// ============================================================================
-
-/// Priority level for inference requests.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Priority {
     Low,
@@ -169,7 +135,6 @@ pub enum Priority {
     Critical,
 }
 
-/// Input payload for an inference request.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InferenceInput {
     Text(String),
@@ -179,7 +144,6 @@ pub enum InferenceInput {
     Structured(Vec<u8>),
 }
 
-/// Output payload from an inference result.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InferenceOutput {
     Text(String),
@@ -189,14 +153,12 @@ pub enum InferenceOutput {
     Classification(Vec<(String, f64)>),
 }
 
-/// Cryptographic proof that an inference was computed correctly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultProof {
     pub merkle_root: [u8; 32],
     pub commitment: [u8; 32],
 }
 
-/// A request for model inference on the marketplace.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InferenceRequest {
     pub id: [u8; 32],
@@ -208,7 +170,6 @@ pub struct InferenceRequest {
     pub priority: Priority,
 }
 
-/// The result of a completed inference.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InferenceResult {
     pub request_id: [u8; 32],
@@ -219,16 +180,14 @@ pub struct InferenceResult {
     pub proof: ResultProof,
 }
 
-/// Status of an inference request in the marketplace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InferenceRequestStatus {
     Open,
-    Claimed([u8; 32]), // provider who claimed it
+    Claimed([u8; 32]),
     Completed,
     Disputed,
 }
 
-/// Decentralized marketplace for inference requests and results.
 #[derive(Debug, Default)]
 pub struct InferenceMarketplace {
     requests: HashMap<[u8; 32], InferenceRequest>,
@@ -245,7 +204,6 @@ impl InferenceMarketplace {
         }
     }
 
-    /// Submit a new inference request to the marketplace.
     pub fn submit_request(&mut self, request: InferenceRequest) -> Result<(), String> {
         if self.requests.contains_key(&request.id) {
             return Err("Request ID already exists".to_string());
@@ -256,7 +214,6 @@ impl InferenceMarketplace {
         Ok(())
     }
 
-    /// Claim an open inference request as a provider.
     pub fn claim_request(
         &mut self,
         request_id: &[u8; 32],
@@ -273,7 +230,6 @@ impl InferenceMarketplace {
         }
     }
 
-    /// Submit the result of a completed inference.
     pub fn submit_result(&mut self, result: InferenceResult) -> Result<(), String> {
         let request_id = &result.request_id;
         match self.statuses.get(request_id) {
@@ -295,7 +251,6 @@ impl InferenceMarketplace {
         }
     }
 
-    /// Dispute a completed inference result.
     pub fn dispute_result(&mut self, request_id: &[u8; 32]) -> Result<(), String> {
         match self.statuses.get(request_id) {
             Some(InferenceRequestStatus::Completed) => {
@@ -308,27 +263,19 @@ impl InferenceMarketplace {
         }
     }
 
-    /// Get the result for a completed inference.
     pub fn get_result(&self, request_id: &[u8; 32]) -> Option<&InferenceResult> {
         self.results.get(request_id)
     }
 
-    /// Get an inference request by its ID.
     pub fn get_request(&self, request_id: &[u8; 32]) -> Option<&InferenceRequest> {
         self.requests.get(request_id)
     }
 
-    /// Return the total number of requests in the marketplace.
     pub fn request_count(&self) -> usize {
         self.requests.len()
     }
 }
 
-// ============================================================================
-// On-chain Chat / Inference (#71)
-// ============================================================================
-
-/// Configuration for a chat inference call.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatConfig {
     pub max_tokens: u32,
@@ -348,7 +295,6 @@ impl Default for ChatConfig {
     }
 }
 
-/// A single message in an on-chain chat session.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatMessage {
     pub id: [u8; 32],
@@ -361,7 +307,6 @@ pub struct ChatMessage {
     pub cost: u64,
 }
 
-/// An on-chain chat session consisting of multiple messages.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatSession {
     pub id: [u8; 32],
@@ -384,23 +329,16 @@ impl ChatSession {
         }
     }
 
-    /// Append a message to the session and update the total cost.
     pub fn add_message(&mut self, message: ChatMessage) {
         self.total_cost += message.cost;
         self.messages.push(message);
     }
 
-    /// Return the number of messages in this session.
     pub fn message_count(&self) -> usize {
         self.messages.len()
     }
 }
 
-// ============================================================================
-// Model Marketplace (#72)
-// ============================================================================
-
-/// A review left on a model listing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelReview {
     pub reviewer: [u8; 32],
@@ -409,7 +347,6 @@ pub struct ModelReview {
     pub timestamp: u64,
 }
 
-/// A model listed for sale on the marketplace.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelListing {
     pub model_id: ModelId,
@@ -422,20 +359,17 @@ pub struct ModelListing {
 }
 
 impl ModelListing {
-    /// Add a review and recalculate the average rating.
     pub fn add_review(&mut self, review: ModelReview) {
         self.reviews.push(review);
         let total: f64 = self.reviews.iter().map(|r| r.rating as f64).sum();
         self.rating = total / self.reviews.len() as f64;
     }
 
-    /// Increment the total inference counter.
     pub fn record_inference(&mut self) {
         self.total_inferences += 1;
     }
 }
 
-/// Aggregate statistics for the model marketplace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketplaceStats {
     pub total_models: u64,
@@ -443,11 +377,6 @@ pub struct MarketplaceStats {
     pub total_revenue: u64,
 }
 
-// ============================================================================
-// Inference Caching (#74)
-// ============================================================================
-
-/// Policy for cache eviction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CachePolicy {
     LRU,
@@ -456,7 +385,6 @@ pub enum CachePolicy {
     Custom,
 }
 
-/// A cached inference result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CacheEntry {
     pub key: [u8; 32],
@@ -468,7 +396,6 @@ pub struct CacheEntry {
     pub ttl: u64,
 }
 
-/// Statistics for a cache instance.
 #[derive(Debug, Clone, Default)]
 pub struct CacheStats {
     pub total_entries: u64,
@@ -477,7 +404,6 @@ pub struct CacheStats {
     pub total_evictions: u64,
 }
 
-/// Inference result cache with configurable eviction policies.
 #[derive(Debug)]
 pub struct InferenceCache {
     entries: HashMap<[u8; 32], CacheEntry>,
@@ -496,10 +422,8 @@ impl InferenceCache {
         }
     }
 
-    /// Retrieve a cached entry by key, incrementing the hit count.
     pub fn get(&mut self, key: &[u8; 32]) -> Option<&CacheEntry> {
         if self.entries.contains_key(key) {
-            // Increment hit count - we need to use get_mut then return immutable ref
             if let Some(entry) = self.entries.get_mut(key) {
                 entry.hit_count += 1;
             }
@@ -511,7 +435,6 @@ impl InferenceCache {
         }
     }
 
-    /// Insert or update a cache entry. Evicts entries if the cache is full.
     pub fn put(&mut self, entry: CacheEntry) {
         if self.entries.len() >= self.max_entries && !self.entries.contains_key(&entry.key) {
             self.evict_one();
@@ -520,23 +443,18 @@ impl InferenceCache {
         self.stats.total_entries = self.entries.len() as u64;
     }
 
-    /// Evict a single entry based on the cache policy.
     fn evict_one(&mut self) {
         let key_to_remove = match self.policy {
-            CachePolicy::LRU | CachePolicy::TTL | CachePolicy::Custom => {
-                // LRU: evict the entry with the lowest hit_count (approximation)
-                self.entries
-                    .iter()
-                    .min_by_key(|(_, e)| e.hit_count)
-                    .map(|(k, _)| *k)
-            }
-            CachePolicy::LFU => {
-                // LFU: evict the least frequently used entry
-                self.entries
-                    .iter()
-                    .min_by_key(|(_, e)| e.hit_count)
-                    .map(|(k, _)| *k)
-            }
+            CachePolicy::LRU | CachePolicy::TTL | CachePolicy::Custom => self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.hit_count)
+                .map(|(k, _)| *k),
+            CachePolicy::LFU => self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.hit_count)
+                .map(|(k, _)| *k),
         };
 
         if let Some(key) = key_to_remove {
@@ -546,7 +464,6 @@ impl InferenceCache {
         }
     }
 
-    /// Remove a specific entry from the cache.
     pub fn evict(&mut self, key: &[u8; 32]) -> bool {
         if self.entries.remove(key).is_some() {
             self.stats.total_evictions += 1;
@@ -557,12 +474,10 @@ impl InferenceCache {
         }
     }
 
-    /// Return current cache statistics.
     pub fn stats(&self) -> &CacheStats {
         &self.stats
     }
 
-    /// Clear all entries from the cache.
     pub fn clear(&mut self) {
         let count = self.entries.len() as u64;
         self.entries.clear();
@@ -570,22 +485,15 @@ impl InferenceCache {
         self.stats.total_entries = 0;
     }
 
-    /// Return the number of entries currently cached.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Return whether the cache is empty.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 }
 
-// ============================================================================
-// Compute Credits (#75)
-// ============================================================================
-
-/// The reason for a credit transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreditReason {
     InferencePurchase,
@@ -595,7 +503,6 @@ pub enum CreditReason {
     Bonus,
 }
 
-/// A compute credit balance for a network participant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComputeCredit {
     pub owner: [u8; 32],
@@ -616,13 +523,11 @@ impl ComputeCredit {
         }
     }
 
-    /// Available balance (total balance minus locked).
     pub fn available(&self) -> u64 {
         self.balance.saturating_sub(self.locked)
     }
 }
 
-/// A record of a credit transfer between accounts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreditTransaction {
     pub from: [u8; 32],
@@ -632,7 +537,6 @@ pub struct CreditTransaction {
     pub timestamp: u64,
 }
 
-/// Ledger managing compute credit balances and transactions.
 #[derive(Debug, Default)]
 pub struct CreditLedger {
     accounts: HashMap<[u8; 32], ComputeCredit>,
@@ -647,20 +551,18 @@ impl CreditLedger {
         }
     }
 
-    /// Get or create an account for the given address.
     fn ensure_account(&mut self, owner: [u8; 32]) -> &mut ComputeCredit {
         self.accounts
             .entry(owner)
             .or_insert_with(|| ComputeCredit::new(owner))
     }
 
-    /// Deposit credits into an account.
     pub fn deposit(&mut self, owner: [u8; 32], amount: u64, reason: CreditReason, timestamp: u64) {
         let account = self.ensure_account(owner);
         account.balance += amount;
         account.earned += amount;
         self.transactions.push(CreditTransaction {
-            from: [0u8; 32], // system mint
+            from: [0u8; 32],
             to: owner,
             amount,
             reason,
@@ -668,7 +570,6 @@ impl CreditLedger {
         });
     }
 
-    /// Withdraw credits from an account. Fails if insufficient available balance.
     pub fn withdraw(
         &mut self,
         owner: [u8; 32],
@@ -688,7 +589,7 @@ impl CreditLedger {
         account.spent += amount;
         self.transactions.push(CreditTransaction {
             from: owner,
-            to: [0u8; 32], // system burn
+            to: [0u8; 32],
             amount,
             reason,
             timestamp,
@@ -696,7 +597,6 @@ impl CreditLedger {
         Ok(())
     }
 
-    /// Lock credits in an account (e.g., for pending inference).
     pub fn lock(&mut self, owner: [u8; 32], amount: u64) -> Result<(), String> {
         let account = self.ensure_account(owner);
         if account.available() < amount {
@@ -710,7 +610,6 @@ impl CreditLedger {
         Ok(())
     }
 
-    /// Unlock previously locked credits.
     pub fn unlock(&mut self, owner: [u8; 32], amount: u64) -> Result<(), String> {
         let account = self.ensure_account(owner);
         if account.locked < amount {
@@ -723,7 +622,6 @@ impl CreditLedger {
         Ok(())
     }
 
-    /// Transfer credits between two accounts.
     pub fn transfer(
         &mut self,
         from: [u8; 32],
@@ -732,7 +630,6 @@ impl CreditLedger {
         reason: CreditReason,
         timestamp: u64,
     ) -> Result<(), String> {
-        // Check sender balance first
         {
             let sender = self.ensure_account(from);
             if sender.available() < amount {
@@ -743,13 +640,11 @@ impl CreditLedger {
                 ));
             }
         }
-        // Debit sender
         {
             let sender = self.accounts.get_mut(&from).unwrap();
             sender.balance -= amount;
             sender.spent += amount;
         }
-        // Credit receiver
         {
             let receiver = self.ensure_account(to);
             receiver.balance += amount;
@@ -765,31 +660,22 @@ impl CreditLedger {
         Ok(())
     }
 
-    /// Get the current balance for an account.
     pub fn balance(&self, owner: &[u8; 32]) -> Option<&ComputeCredit> {
         self.accounts.get(owner)
     }
 
-    /// Return all recorded transactions.
     pub fn transaction_history(&self) -> &[CreditTransaction] {
         &self.transactions
     }
 
-    /// Return the total number of accounts.
     pub fn account_count(&self) -> usize {
         self.accounts.len()
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- Helpers ---
 
     fn test_model_id(seed: u8) -> ModelId {
         ModelId::new([seed; 32])
@@ -816,8 +702,6 @@ mod tests {
             },
         }
     }
-
-    // --- Model Registry Tests ---
 
     #[test]
     fn test_registry_register_and_lookup() {
@@ -892,8 +776,6 @@ mod tests {
         registry.register(test_model_metadata(2)).unwrap();
         assert_eq!(registry.count(), 2);
     }
-
-    // --- Inference Marketplace Tests ---
 
     fn test_inference_request(seed: u8) -> InferenceRequest {
         InferenceRequest {
@@ -971,7 +853,7 @@ mod tests {
 
         let result = InferenceResult {
             request_id: req_id,
-            provider: test_address(99), // wrong provider
+            provider: test_address(99),
             output: InferenceOutput::Text("bad".to_string()),
             compute_time_ms: 100,
             cost: 100,
@@ -1006,7 +888,6 @@ mod tests {
             .unwrap();
 
         market.dispute_result(&req_id).unwrap();
-        // Disputing again should fail (already disputed)
         assert!(market.dispute_result(&req_id).is_err());
     }
 
@@ -1024,7 +905,7 @@ mod tests {
             provider,
             output: InferenceOutput::Text("expensive".to_string()),
             compute_time_ms: 100,
-            cost: 9999, // exceeds max_cost of 1000
+            cost: 9999,
             proof: ResultProof {
                 merkle_root: [0; 32],
                 commitment: [0; 32],
@@ -1032,8 +913,6 @@ mod tests {
         };
         assert!(market.submit_result(result).is_err());
     }
-
-    // --- Chat Session Tests ---
 
     #[test]
     fn test_chat_session_add_messages() {
@@ -1068,8 +947,6 @@ mod tests {
         assert_eq!(session.total_cost, 180);
     }
 
-    // --- Model Marketplace Tests ---
-
     #[test]
     fn test_model_listing_add_review() {
         let mut listing = ModelListing {
@@ -1102,8 +979,6 @@ mod tests {
         listing.record_inference();
         assert_eq!(listing.total_inferences, 2);
     }
-
-    // --- Inference Cache Tests ---
 
     #[test]
     fn test_cache_put_and_get() {
@@ -1147,7 +1022,6 @@ mod tests {
                 ttl: 3600,
             });
         }
-        // Cache should have evicted one entry to make room for the 3rd
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.stats().total_evictions, 1);
     }
@@ -1166,7 +1040,7 @@ mod tests {
         });
         assert!(cache.evict(&test_address(1)));
         assert!(cache.is_empty());
-        assert!(!cache.evict(&test_address(1))); // already gone
+        assert!(!cache.evict(&test_address(1)));
     }
 
     #[test]
@@ -1188,8 +1062,6 @@ mod tests {
         assert!(cache.is_empty());
         assert_eq!(cache.stats().total_evictions, 5);
     }
-
-    // --- Compute Credits Tests ---
 
     #[test]
     fn test_credit_deposit_and_balance() {
@@ -1237,7 +1109,6 @@ mod tests {
         assert_eq!(account.locked, 400);
         assert_eq!(account.available(), 600);
 
-        // Withdraw should respect locked balance
         assert!(
             ledger
                 .withdraw(owner, 700, CreditReason::InferencePurchase, 200)
@@ -1298,8 +1169,6 @@ mod tests {
         assert_eq!(history[2].reason, CreditReason::InferencePurchase);
     }
 
-    // --- Shard Tests ---
-
     #[test]
     fn test_shard_config_and_status() {
         let config = ShardConfig {
@@ -1327,8 +1196,6 @@ mod tests {
         };
         assert!((assignment.load_percentage - 42.5).abs() < f64::EPSILON);
     }
-
-    // --- ChatConfig Default Test ---
 
     #[test]
     fn test_chat_config_default() {

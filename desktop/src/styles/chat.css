@@ -1,9 +1,3 @@
-/* ─────────────────────────────────────────────────────────────────────
-   Inference as a conversation. Written against the design tokens only, so it
-   reads in both themes (engraved and classic).
-   ───────────────────────────────────────────────────────────────────── */
-
-/* The chat column is the same width as every other screen, so its header lines up with theirs. */
 .chat-screen {
   --chat-band-h: clamp(120px, 13vw, 168px);
   min-height: 100%;
@@ -11,7 +5,6 @@
   flex-direction: column;
 }
 
-/* Leave the first explanation visible above the composer on an empty Home. */
 .chat-screen-empty {
   --chat-band-h: 88px;
 }
@@ -21,8 +14,6 @@
 .chat-screen-empty .chat-empty {
   gap: var(--space-2);
 }
-/* The strip can wrap, add download guidance, or expand error details. Keep
-   the empty introduction and composer in flow at every window height. */
 .chat-screen-empty .composer,
 .chat-screen-empty .chat-band {
   position: relative;
@@ -30,8 +21,6 @@
   bottom: auto;
 }
 
-/* The conversation as an aqueduct (ChatAqueduct): full width of the column, above the thread. It stays in view at
-   the top while the thread scrolls, as the composer does at the bottom, so the arch for a prompt is seen going up. */
 .chat-band {
   position: sticky;
   top: calc(-1 * var(--main-pad));
@@ -76,7 +65,6 @@
   flex-shrink: 0;
 }
 
-/* ── The thread ───────────────────────────────────────────────────── */
 .thread {
   flex: 1;
   display: flex;
@@ -88,7 +76,6 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
-  /* clear of the band that stays at the top */
   scroll-margin-top: calc(var(--chat-band-h) + var(--space-4));
 }
 
@@ -138,7 +125,6 @@
   align-items: baseline;
   gap: var(--space-2) var(--space-3);
 }
-/* the Arc device: a small arch, the mark of the network's answer */
 .answer-mark {
   width: 14px;
   height: 8px;
@@ -294,7 +280,6 @@
   color: var(--warning);
 }
 
-/* ── What happened, stage by stage ────────────────────────────────── */
 .stages {
   list-style: none;
   display: grid;
@@ -348,7 +333,6 @@
   color: var(--text-muted);
 }
 
-/* ── The evidence ─────────────────────────────────────────────────── */
 .evidence {
   display: flex;
   flex-direction: column;
@@ -512,9 +496,6 @@
   color: var(--text-muted);
   line-height: 1.5;
 }
-/* A question that got no answer: the sentence is the message, in the thread's own voice. The text that came
-   back sits behind "Show details", monospace and copyable, never as the headline (through v0.8.14 it was a
-   red box holding the raw error). */
 .answer-failed .answer-by {
   color: var(--text);
 }
@@ -532,7 +513,6 @@
   word-break: break-word;
 }
 
-/* ── The empty thread: what to try and what Arc checks ────────────── */
 .chat-empty {
   margin: var(--space-2) auto 0;
   max-width: 720px;
@@ -617,9 +597,6 @@
   color: var(--text-muted);
 }
 
-/* ── Native paid requests (protocol-4 chains only) ────────────────── */
-/* A plate of its own above the conversation: the chain it reads, the balance it can spend, the request form,
-   and each request followed from its receipt. Colours follow the request's phase, never a guess. */
 .native-card {
   margin-bottom: var(--space-8);
 }
@@ -770,9 +747,6 @@
   color: var(--text-muted);
 }
 
-/* ── The composer, pinned to the bottom of the screen ─────────────── */
-/* The scroll area (.main) keeps a padding under its content (--main-pad, app.css); the pinned composer reaches
-   down through it so no text slides by underneath. */
 .composer {
   position: sticky;
   bottom: calc(-1 * var(--main-pad));
@@ -938,7 +912,6 @@
   }
 }
 
-/* Motion while an answer is on its way, and when it lands (the global reduced-motion rule in reset.css stops both). */
 .stage.wait::before {
   animation: stage-wait 1.6s ease-in-out infinite;
 }
@@ -957,8 +930,6 @@
   animation: arrive var(--dur-slow) var(--ease-out) both;
 }
 
-/* Short desktop windows cannot fit the illustration, answer and composer at
-   once. Let them scroll normally so the proof and empty-state copy stay reachable. */
 @media (max-height: 760px) {
   .chat-band,
   .composer {
@@ -969,8 +940,6 @@
   .chat-screen-empty .chat-band {
     display: none;
   }
-  /* Put the first action before the explanation on short windows. The
-     explanation remains in flow and can be read below the question box. */
   .chat-screen-empty .thread {
     order: 1;
     flex: 0;

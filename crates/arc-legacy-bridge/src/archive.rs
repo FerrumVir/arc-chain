@@ -1,12 +1,3 @@
-//! "Archive in place": the v0.7 data directory stays exactly where and what it
-//! is. The bridge never opens a v0.7 file for writing, never renames or
-//! deletes one, and never follows a link inside it. It only records a
-//! stat-level manifest (path, type, size, modification time) so anyone can
-//! later check that nothing changed. Content hashes are left to explicit
-//! verification (`--legacy-bridge-verify-archive`, and the CI acceptance
-//! test) so a multi-gigabyte WAL does not delay the first v0.8 start past the
-//! v0.7 updater's 30-second health window.
-
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -52,7 +43,6 @@ pub struct ArchiveSummary {
     pub entries: usize,
 }
 
-/// Stat every entry below the v0.7 data directory without following links.
 pub fn snapshot(layout: &Layout) -> Result<(Vec<Entry>, bool)> {
     let mut entries = Vec::new();
     let root = &layout.legacy_data_dir;
@@ -141,7 +131,6 @@ fn excluded_names(layout: &Layout) -> Vec<String> {
     }
 }
 
-/// The newest archive record for this node, if any.
 pub fn latest(layout: &Layout) -> Result<Option<(PathBuf, ArchiveRecord)>> {
     let mut best: Option<(u32, PathBuf)> = None;
     let listing = match fs::read_dir(&layout.node_dir) {
@@ -175,8 +164,6 @@ pub fn latest(layout: &Layout) -> Result<Option<(PathBuf, ArchiveRecord)>> {
     Ok(Some((path, record)))
 }
 
-/// Record the v0.7 data directory, writing a new generation only if it
-/// changed since the newest record.
 pub fn ensure(layout: &Layout, log: &mut Log) -> Result<ArchiveSummary> {
     let (entries, truncated) = snapshot(layout)?;
     let previous = latest(layout)?;
@@ -226,7 +213,6 @@ pub fn ensure(layout: &Layout, log: &mut Log) -> Result<ArchiveSummary> {
     })
 }
 
-/// Compare the current tree with a record: (added, removed, changed) paths.
 pub fn diff(record: &ArchiveRecord, current: &[Entry]) -> (Vec<String>, Vec<String>, Vec<String>) {
     let before: std::collections::BTreeMap<&str, &Entry> = record
         .entries
@@ -255,7 +241,6 @@ pub fn diff(record: &ArchiveRecord, current: &[Entry]) -> (Vec<String>, Vec<Stri
     (added, removed, changed)
 }
 
-/// Hash every regular file under `dir` (used by the explicit verify command).
 pub fn content_digests(dir: &Path, entries: &[Entry]) -> Result<Vec<(String, String)>> {
     let mut digests = Vec::new();
     for entry in entries.iter().filter(|entry| entry.kind == "file") {

@@ -1,28 +1,3 @@
-//! Keep a consented install contributing without a relaunch.
-//!
-//! An install whose user said yes to compute becomes a worker once its model
-//! is on disk. Before this module, a model download that stalled or failed was
-//! retried only at the next launch or on a click, so a computer that is never
-//! restarted could stay an observer for weeks. A worker whose model file went
-//! missing was never repaired on its own either.
-//!
-//! While the install still needs its model, a background loop calls the same
-//! promotion path every [`RETRY_INTERVAL`], and soon after the computer wakes
-//! from sleep. It ends once the install is a worker with a readable model,
-//! the user turns compute off, or the computer is below the memory floor.
-//! A full disk is a wait, rechecked each interval.
-//!
-//! The pieces are kept apart so they can be tested without hardware or real
-//! time:
-//! - [`SingleFlight`]: one promotion at a time in this process. A user call
-//!   that finds one running waits for it and gets its result; a background
-//!   tick that finds one running skips.
-//! - [`DownloadConditions`]: mains power and metered network, behind one
-//!   trait. Background ticks never pull the model on battery or on a network
-//!   the OS reports as metered; a download the user starts is never gated.
-//! - [`plan_tick`] and [`RetrySchedule`]: pure decisions over facts and times.
-//! - [`background_tick`]: one tick, generic over its environment.
-
 use std::future::Future;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
@@ -31,30 +6,18 @@ use tokio::sync::watch;
 
 use crate::commands::PromotionNeed;
 
-/// How often the loop retries while the install still needs its model.
 pub(crate) const RETRY_INTERVAL: Duration = Duration::from_secs(20 * 60);
-/// How soon after a wake from sleep the loop retries. Long enough for Wi-Fi
-/// to reconnect.
 pub(crate) const AFTER_WAKE_DELAY: Duration = Duration::from_secs(90);
 
-// ── Single-flight ─────────────────────────────────────────────────────────
-
-/// At most one run of an async operation at a time, in this process.
-///
-/// Callers that join a run in flight receive a clone of its result. If the
-/// running caller is dropped before it finishes, joined callers receive
-/// `interrupted()` from their own call, and the next call starts afresh.
 pub(crate) struct SingleFlight<T> {
     slot: StdMutex<Slot<T>>,
 }
 
 struct Slot<T> {
-    /// Numbers runs, so a finished run never clears a newer one.
     next_run: u64,
     running: Option<(u64, watch::Receiver<Option<T>>)>,
 }
 
-/// Clears the slot when the leading run ends, finished or dropped.
 struct Leader<'a, T> {
     flight: &'a SingleFlight<T>,
     run: u64,
@@ -99,7 +62,6 @@ impl<T: Clone + Send + Sync> SingleFlight<T> {
         }
     }
 
-    /// Whether a run is in flight now.
     #[cfg(test)]
     pub(crate) fn in_flight(&self) -> bool {
         self.slot
@@ -133,14 +95,11 @@ impl<T: Clone + Send + Sync> SingleFlight<T> {
         Fut: Future<Output = T>,
     {
         let value = run().await;
-        // Free the slot before publishing: a caller arriving after this point
-        // starts a new run instead of receiving a finished one.
         leader.release();
         let _ = leader.result.send(Some(value.clone()));
         value
     }
 
-    /// Run `run`, or wait for the run in flight and return its result.
     pub(crate) async fn run_or_join<F, Fut>(&self, run: F, interrupted: impl FnOnce() -> T) -> T
     where
         F: FnOnce() -> Fut,
@@ -158,8 +117,6 @@ impl<T: Clone + Send + Sync> SingleFlight<T> {
         }
     }
 
-    /// Run `run` unless a run is in flight; `None` means one was, and nothing
-    /// ran. Never waits for the other run.
     pub(crate) async fn run_unless_busy<F, Fut>(&self, run: F) -> Option<T>
     where
         F: FnOnce() -> Fut,
@@ -172,38 +129,24 @@ impl<T: Clone + Send + Sync> SingleFlight<T> {
     }
 }
 
-// ── Power and network ─────────────────────────────────────────────────────
-
-/// Where the computer draws power from, as far as the OS reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PowerSource {
-    /// Mains, or a computer with no battery.
     Mains,
     Battery,
-    /// The OS could not establish mains power. Downloads may proceed; idle holds may not.
     Unknown,
 }
 
-/// What a background download checks before it pulls gigabytes. One trait,
-/// so the scheduler tests need no real hardware.
 pub(crate) trait DownloadConditions {
     fn power_source(&self) -> PowerSource;
-    /// `Some(true)` when the OS reports the network as metered, `Some(false)`
-    /// when it reports it as unmetered, `None` when it cannot be read.
     fn network_metered(&self) -> Option<bool>;
 }
 
-/// Who asked for the download.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Trigger {
-    /// Onboarding, Settings, the observer banner, the one-time question:
-    /// never gated.
     User,
-    /// The retry loop.
     Background,
 }
 
-/// Why a background tick did nothing this time and will try again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SkipReason {
     OnBattery,
@@ -211,12 +154,9 @@ pub(crate) enum SkipReason {
     DiskFull {
         needed_bytes: u64,
     },
-    /// Another promotion is running in this process.
     InFlight,
 }
 
-/// Whether a download for `trigger` may start under `conditions`. An unknown
-/// metered state proceeds.
 pub(crate) fn download_gate(
     trigger: Trigger,
     conditions: &impl DownloadConditions,
@@ -233,14 +173,6 @@ pub(crate) fn download_gate(
     Ok(())
 }
 
-/// The OS readings.
-///
-/// - Power: Windows `GetSystemPowerStatus`, macOS IOKit power sources, Linux
-///   `/sys/class/power_supply`. A computer with no battery counts as mains.
-/// - Metered: Linux NetworkManager's `Metered` property, read through
-///   `busctl`. Windows and macOS report it only through WinRT and
-///   Network.framework, which this app does not link, so there it is unknown
-///   and treated as unmetered.
 pub(crate) struct SystemConditions;
 
 impl DownloadConditions for SystemConditions {
@@ -280,14 +212,7 @@ mod platform {
         ) -> u8;
     }
 
-    /// `IOPSGetProvidingPowerSourceType` names the source: "AC Power",
-    /// "Battery Power" or "UPS Power". A Mac without a battery reports
-    /// "AC Power". Unknown/UPS retain the download gate's permissive policy
-    /// but cannot acquire an opt-in mains-only idle hold.
     pub(super) fn power_source() -> PowerSource {
-        // SAFETY: the snapshot is a CF object we own and release once; the
-        // providing type is borrowed from it (the "Get" rule) and read before
-        // the release.
         unsafe {
             let snapshot = IOPSCopyPowerSourcesInfo();
             if snapshot.is_null() {
@@ -326,11 +251,7 @@ mod platform {
     use super::PowerSource;
     use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 
-    /// `ACLineStatus` 0 is offline (on battery), 1 online, 255 unknown;
-    /// `BatteryFlag` 128 means the computer has no battery.
     pub(super) fn power_source() -> PowerSource {
-        // SAFETY: GetSystemPowerStatus fills the struct we pass and nothing
-        // else.
         let mut status: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
         if unsafe { GetSystemPowerStatus(&mut status) } == 0 {
             return PowerSource::Unknown;
@@ -373,9 +294,6 @@ mod platform {
         super::linux_power_source(&supplies)
     }
 
-    /// NetworkManager's global `Metered` property, read with `busctl`, which
-    /// ships with systemd. Missing tools or a missing NetworkManager mean
-    /// unknown.
     pub(super) fn network_metered() -> Option<bool> {
         let output = std::process::Command::new("busctl")
             .args([
@@ -424,7 +342,6 @@ fn windows_power_source(ac_line_status: u8, battery_flag: u8) -> PowerSource {
     }
 }
 
-/// One entry of `/sys/class/power_supply`.
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 struct PowerSupply {
     kind: String,
@@ -433,9 +350,6 @@ struct PowerSupply {
     status: Option<String>,
 }
 
-/// A computer is on battery when it has a system battery (not a mouse or a
-/// headset: `scope` "Device"), no external supply is online, and a battery is
-/// discharging.
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 fn linux_power_source(supplies: &[PowerSupply]) -> PowerSource {
     let system_batteries: Vec<&PowerSupply> = supplies
@@ -462,8 +376,6 @@ fn linux_power_source(supplies: &[PowerSupply]) -> PowerSource {
     }
 }
 
-/// `busctl get-property` prints `u <n>`. NetworkManager's `NMMetered`: 0
-/// unknown, 1 yes, 2 no, 3 guessed yes, 4 guessed no.
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 fn parse_networkmanager_metered(output: &str) -> Option<bool> {
     let value: u32 = output.trim().strip_prefix("u ")?.trim().parse().ok()?;
@@ -474,26 +386,18 @@ fn parse_networkmanager_metered(output: &str) -> Option<bool> {
     }
 }
 
-// ── The plan for one tick ─────────────────────────────────────────────────
-
-/// Why the loop ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StopReason {
     NoConsent,
     Ineligible,
-    /// A worker with a readable model.
     Ready,
 }
 
-/// What the loop knows at a tick, apart from power and network.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PromotionFacts {
     pub need: PromotionNeed,
-    /// A worker's configured model file is missing or unreadable.
     pub model_unavailable: bool,
-    /// The computer meets the memory floor for the model.
     pub model_fits: bool,
-    /// Downloading the model would not fit on the disk.
     pub disk_space_needed: Option<u64>,
 }
 
@@ -504,7 +408,6 @@ pub(crate) enum TickPlan {
     Promote,
 }
 
-/// Decide a background tick.
 pub(crate) fn plan_tick(facts: PromotionFacts, conditions: &impl DownloadConditions) -> TickPlan {
     match facts.need {
         PromotionNeed::NoConsent => return TickPlan::Stop(StopReason::NoConsent),
@@ -512,7 +415,6 @@ pub(crate) fn plan_tick(facts: PromotionFacts, conditions: &impl DownloadConditi
         PromotionNeed::Ready if !facts.model_unavailable => {
             return TickPlan::Stop(StopReason::Ready)
         }
-        // A worker whose model is gone: download it again, if it still fits.
         PromotionNeed::Ready if !facts.model_fits => return TickPlan::Stop(StopReason::Ineligible),
         PromotionNeed::Ready | PromotionNeed::Promote => {}
     }
@@ -525,17 +427,12 @@ pub(crate) fn plan_tick(facts: PromotionFacts, conditions: &impl DownloadConditi
     }
 }
 
-/// When the next tick is due. Times are monotonic; on platforms where the
-/// monotonic clock stops during sleep, a deadline set before sleep is late
-/// after it, which is why a wake moves it forward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RetrySchedule {
     due: Instant,
 }
 
 impl RetrySchedule {
-    /// The first background tick comes one interval after the loop starts;
-    /// the launch has already tried once.
     pub(crate) fn new(now: Instant) -> Self {
         Self {
             due: now + RETRY_INTERVAL,
@@ -566,14 +463,8 @@ impl RetrySchedule {
     }
 }
 
-// ── One tick ──────────────────────────────────────────────────────────────
-
-/// What a tick reads and runs. Production reads the store and hardware and
-/// runs the shared promotion; tests script both.
 pub(crate) trait TickEnv {
     fn facts(&self) -> impl Future<Output = PromotionFacts> + Send;
-    /// Run the shared promotion unless one is in flight; `None` means one
-    /// was, and nothing ran.
     fn promote_unless_busy(&self) -> impl Future<Output = Option<Result<(), String>>> + Send;
 }
 
@@ -606,8 +497,6 @@ pub(crate) async fn background_tick<E: TickEnv>(
     }
 }
 
-/// Keep only a typed reason, never a path or an arbitrary download error in
-/// the status payload. Eligibility is rechecked by node_status before display.
 static DOWNLOAD_WAIT: StdMutex<Option<crate::types::ModelDownloadWait>> = StdMutex::new(None);
 
 pub(crate) fn waiting_status() -> Option<crate::types::ModelDownloadWait> {
@@ -636,12 +525,6 @@ pub(crate) fn record_outcome(outcome: &TickOutcome) {
     *DOWNLOAD_WAIT.lock().unwrap_or_else(|e| e.into_inner()) = wait_for_outcome(outcome);
 }
 
-// ── The loop ──────────────────────────────────────────────────────────────
-
-/// Retry promotion in the background until [`TickOutcome::ends_loop`]. Started
-/// once, after startup reconciliation succeeded. Installs with node auto-start
-/// off are included: the model downloads and the configuration becomes a
-/// worker, and the node stays stopped until the user starts it.
 pub(crate) async fn run_retry_loop(app: tauri::AppHandle) {
     use tauri::Manager as _;
 
@@ -649,8 +532,6 @@ pub(crate) async fn run_retry_loop(app: tauri::AppHandle) {
     let mut wakes_open = true;
     let mut schedule = RetrySchedule::new(Instant::now());
     let mut power = SystemConditions.power_source();
-    // The same OS readings used by the download gate, sampled without any
-    // dependency on a visible WebView. Detection + retry takes at most 35 s.
     let mut power_samples = tokio::time::interval(Duration::from_secs(30));
     power_samples.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     power_samples.tick().await;
@@ -748,8 +629,6 @@ mod tests {
         }
     }
 
-    // ── single-flight ──
-
     #[tokio::test]
     async fn a_user_call_joins_the_run_in_flight_and_gets_its_result() {
         let flight: Arc<SingleFlight<Result<u32, String>>> = Arc::new(SingleFlight::new());
@@ -783,7 +662,6 @@ mod tests {
             || Err("interrupted".into()),
         );
         tokio::pin!(joiner);
-        // Polled once, it joins the run and waits.
         assert!(tokio::time::timeout(Duration::from_millis(20), &mut joiner)
             .await
             .is_err());
@@ -832,7 +710,6 @@ mod tests {
 
         release.send(()).unwrap();
         assert_eq!(leader.await.unwrap(), Ok(1));
-        // Once the run finished, the next tick runs.
         assert_eq!(
             flight.run_unless_busy(|| async { Ok(3) }).await,
             Some(Ok(3))
@@ -870,8 +747,6 @@ mod tests {
             Some(Ok(6))
         );
     }
-
-    // ── power and network ──
 
     #[test]
     fn a_background_tick_on_battery_skips() {
@@ -1007,8 +882,6 @@ mod tests {
         assert_eq!(parse_networkmanager_metered("s \"yes\""), None);
     }
 
-    // ── the plan ──
-
     #[test]
     fn the_loop_stops_on_ready_no_consent_and_ineligible_but_waits_for_disk() {
         assert_eq!(
@@ -1126,8 +999,6 @@ mod tests {
         );
     }
 
-    // ── timing ──
-
     #[test]
     fn ticks_come_every_twenty_minutes_and_soon_after_a_wake() {
         let start = Instant::now();
@@ -1138,22 +1009,17 @@ mod tests {
         schedule.after_tick(tick);
         assert_eq!(schedule.due_at(), tick + Duration::from_secs(20 * 60));
 
-        // A wake brings the next tick forward to shortly after it...
         let woke = tick + Duration::from_secs(60);
         schedule.on_wake(woke);
         assert_eq!(schedule.due_at(), woke + AFTER_WAKE_DELAY);
-        // ...and a second wake never pushes it back.
         schedule.on_wake(woke + Duration::from_secs(30));
         assert_eq!(schedule.due_at(), woke + AFTER_WAKE_DELAY);
 
-        // A wake just before a tick that is already due sooner keeps it.
         let mut close = RetrySchedule::new(start);
         let almost = close.due_at() - Duration::from_secs(10);
         close.on_wake(almost);
         assert_eq!(close.due_at(), start + RETRY_INTERVAL);
     }
-
-    // ── one tick, end to end over a scripted environment ──
 
     struct ScriptedEnv {
         facts: PromotionFacts,

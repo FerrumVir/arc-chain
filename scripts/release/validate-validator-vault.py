@@ -20,7 +20,7 @@ MAX_PATH_DEPTH = 4
 
 
 class VaultValidationError(ValueError):
-    """The decrypted vault is not a bounded, safe tar archive."""
+    pass
 
 
 def reject(message: str) -> "NoReturn":
@@ -60,8 +60,6 @@ def validate_archive(path: Path) -> None:
     file_count = 0
     total_file_bytes = 0
     try:
-        # `r:` deliberately rejects compressed input. The source is an
-        # encrypted plain tar, so no decompression-bomb surface is needed.
         with tarfile.open(path, mode="r:") as archive:
             members = archive.getmembers()
             if not members or len(members) > MAX_MEMBERS:
