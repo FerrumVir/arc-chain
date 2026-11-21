@@ -109,7 +109,7 @@ jobs:
           dist/arc-node-linux-x86_64 --version | tee dist/version.txt
           grep -qF "arc-node $(jq -er .bridge_version crates/arc-legacy-bridge/pins/active.json) " dist/version.txt
           (cd dist && sha256sum arc-node-linux-x86_64 | tee SHA256SUMS)
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: bridge-linux-x86_64
           path: dist/
@@ -135,7 +135,7 @@ jobs:
           bash tests/legacy-bridge/headless-v07-acceptance.sh dist/arc-node-linux-x86_64 evidence/headless
       - name: Keep the evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: evidence-headless-linux
           path: evidence/
@@ -218,7 +218,7 @@ jobs:
           done
       - name: Keep the evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: evidence-desktop-linux
           path: evidence/
@@ -287,7 +287,7 @@ jobs:
             --evidence evidence/desktop-windows
       - name: Keep the evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: evidence-desktop-windows
           path: evidence/
@@ -343,7 +343,7 @@ jobs:
             --evidence evidence/desktop-macos
       - name: Keep the evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: evidence-desktop-macos
           path: evidence/

@@ -259,7 +259,7 @@ jobs:
 
       - id: upload
         name: Upload owner-authenticated approval
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # gitleaks:allow
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # gitleaks:allow
         with:
           name: arc-owner-emergency-recovery-${{ inputs.expected_main_sha }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: approval/OWNER-EMERGENCY-RECOVERY.json
