@@ -53,7 +53,7 @@ jobs:
         with:
           shared-key: clippy
           save-if: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: '3.12'
       - name: Python dependencies
@@ -131,7 +131,7 @@ jobs:
         with:
           toolchain: nightly-2026-03-16
           components: clippy, rustfmt
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: '3.12'
       - name: Python dependencies
@@ -235,7 +235,7 @@ jobs:
         with:
           toolchain: nightly-2026-03-16
           components: clippy, rustfmt
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: '3.12'
       - name: Python dependencies (Hugging Face tokenizers and transformers, no torch)
@@ -281,7 +281,7 @@ jobs:
         with:
           toolchain: nightly-2026-03-16
           components: clippy, rustfmt
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: '3.12'
       - name: Python dependencies (reference executor)
@@ -353,7 +353,7 @@ jobs:
         with:
           toolchain: nightly-2026-03-16
           components: clippy, rustfmt
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: '3.12'
       - name: Python dependencies (CPU torch and transformers for the BF16 reference)
@@ -425,7 +425,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: '3.12'
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
