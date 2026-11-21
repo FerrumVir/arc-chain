@@ -108,7 +108,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Download exact publication evidence by immutable artifact ID
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ steps.selection.outputs.artifact_id }}
           path: release-published-download
@@ -188,7 +188,7 @@ jobs:
           persist-credentials: false
 
       - name: Download exact release binding by artifact ID
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.bind-release.outputs.artifact_id }}
           path: binding
@@ -703,7 +703,7 @@ jobs:
           persist-credentials: false
 
       - name: Download exact release binding by artifact ID
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.bind-release.outputs.artifact_id }}
           path: binding
@@ -979,7 +979,7 @@ jobs:
           persist-credentials: false
 
       - name: Download exact release binding by artifact ID
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.bind-release.outputs.artifact_id }}
           path: binding
@@ -1254,7 +1254,7 @@ jobs:
           persist-credentials: false
 
       - name: Download exact binding
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ needs.bind-release.outputs.artifact_id }}
           path: binding
@@ -1350,7 +1350,7 @@ jobs:
             ' > component-artifacts.json
 
       - name: Download exact Linux component artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ steps.components.outputs.linux_id }}
           path: components/linux
@@ -1360,7 +1360,7 @@ jobs:
           digest-mismatch: error
 
       - name: Download exact macOS arm64 component artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ steps.components.outputs.macos_arm64_id }}
           path: components/macos-arm64
@@ -1370,7 +1370,7 @@ jobs:
           digest-mismatch: error
 
       - name: Download exact macOS x86_64 component artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ steps.components.outputs.macos_x86_64_id }}
           path: components/macos-x86_64
@@ -1380,7 +1380,7 @@ jobs:
           digest-mismatch: error
 
       - name: Download exact Windows component artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ steps.components.outputs.windows_id }}
           path: components/windows
