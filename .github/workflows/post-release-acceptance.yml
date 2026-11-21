@@ -159,7 +159,7 @@ jobs:
 
       - id: upload
         name: Upload immutable release binding
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: arc-published-release-binding-${{ inputs.release_run_id }}-attempt-${{ inputs.release_run_attempt }}
           path: |
@@ -611,7 +611,7 @@ jobs:
 
       - name: Upload Linux failure evidence
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: arc-published-acceptance-linux-x86_64-failure-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: evidence-linux
@@ -672,7 +672,7 @@ jobs:
 
       - id: upload
         name: Upload Linux acceptance and evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: arc-published-acceptance-linux-x86_64-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: artifact
@@ -955,7 +955,7 @@ jobs:
 
       - id: upload
         name: Upload macOS component receipt
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: arc-published-acceptance-${{ matrix.platform }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: artifact
@@ -1233,7 +1233,7 @@ jobs:
 
       - id: upload
         name: Upload Windows component receipt
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: arc-published-acceptance-windows-x86_64-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: artifact
@@ -1443,7 +1443,7 @@ jobs:
 
       - id: upload
         name: Upload canonical published-artifact acceptance receipt
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: arc-published-artifact-acceptance-v0.8.23-${{ inputs.release_source_sha }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: canonical
