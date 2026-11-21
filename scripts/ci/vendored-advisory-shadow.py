@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import json
 import pathlib
+import re
 import sys
 import tomllib
 from typing import Any
@@ -456,6 +457,30 @@ def report_entries(report: dict[str, Any]) -> list[tuple[str, str | None, dict[s
     return entries
 
 
+ADVISORY_ID = re.compile(r"RUSTSEC-\d{4}-\d{4}|GHSA(?:-[23456789cfghjmpqrvwx]{4}){3}")
+DATED_REASON = re.compile(r"\d{4}-\d{2}-\d{2}\b")
+REMOVAL_CONDITION = re.compile(r"\bremove\b", re.IGNORECASE)
+IGNORE_ENTRY_FORM = (
+    '[[advisories.ignore]] with id = "RUSTSEC-YYYY-NNNN" and reason = '
+    '"YYYY-MM-DD <who accepted the risk>: <why it is not exploitable here>; remove when <condition>"'
+)
+
+
+def ignored_advisory_id(entry: Any) -> str:
+    if not isinstance(entry, dict) or set(entry) != {"id", "reason"}:
+        fail(f"cargo-deny advisory ignore entry {entry!r} needs an id and a reason: write it as {IGNORE_ENTRY_FORM}")
+    advisory_id = entry["id"]
+    reason = entry["reason"]
+    if not isinstance(advisory_id, str) or not ADVISORY_ID.fullmatch(advisory_id):
+        fail(f"cargo-deny advisory ignore id {advisory_id!r} is not a RUSTSEC or GHSA id")
+    if not isinstance(reason, str) or not DATED_REASON.match(reason) or not REMOVAL_CONDITION.search(reason):
+        fail(
+            f"cargo-deny advisory ignore reason for {advisory_id} must start with the date it was added "
+            f"and name its removal condition: write it as {IGNORE_ENTRY_FORM}"
+        )
+    return advisory_id
+
+
 def load_policy(path: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
     try:
         deny = tomllib.loads(path.read_text())
@@ -469,9 +494,10 @@ def load_policy(path: pathlib.Path) -> tuple[dict[str, Any], list[str]]:
         or advisories.get("yanked") != "deny"
     ):
         fail("cargo-deny advisory policy shape drifted")
-    ignored = advisories.get("ignore")
-    if not isinstance(ignored, list) or not all(isinstance(item, str) for item in ignored):
+    ignored_entries = advisories.get("ignore")
+    if not isinstance(ignored_entries, list):
         fail("cargo-deny advisory ignore policy shape drifted")
+    ignored = [ignored_advisory_id(entry) for entry in ignored_entries]
     if len(set(ignored)) != len(ignored):
         fail("cargo-deny advisory ignore policy contains duplicates")
     return advisories, ignored

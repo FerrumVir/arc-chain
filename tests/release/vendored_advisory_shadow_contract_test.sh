@@ -187,7 +187,7 @@ import tempfile
 import tomllib
 
 helper, real_deny_path = map(pathlib.Path, sys.argv[1:])
-repository_ignored = tomllib.loads(real_deny_path.read_text())["advisories"]["ignore"]
+repository_ignored = [entry["id"] for entry in tomllib.loads(real_deny_path.read_text())["advisories"]["ignore"]]
 registry_source = "registry+https://github.com/rust-lang/crates.io-index"
 
 
@@ -291,6 +291,37 @@ with tempfile.TemporaryDirectory(prefix="arc-root-advisory-report.") as temporar
         raise SystemExit("registry-shadow policy retained repository suppressions")
     if "RUSTSEC-2024-0436" not in repository_ignored:
         raise SystemExit("suppression visibility fixture is no longer present in repository policy")
+    policy_head = '[advisories]\nversion = 2\nunsound = "all"\nyanked = "deny"\n'
+    for label, ignore_toml, expected in (
+        ("a bare id", 'ignore = ["RUSTSEC-2099-0001"]\n', "needs an id and a reason"),
+        ("a table without a reason", 'ignore = [{ id = "RUSTSEC-2099-0001" }]\n', "needs an id and a reason"),
+        (
+            "an undated reason",
+            'ignore = [{ id = "RUSTSEC-2099-0001", reason = "unreachable here; remove on upgrade" }]\n',
+            "must start with the date it was added",
+        ),
+        (
+            "a reason with no removal condition",
+            'ignore = [{ id = "RUSTSEC-2099-0001", reason = "2026-11-20 owner: unreachable here" }]\n',
+            "must start with the date it was added",
+        ),
+        (
+            "a malformed id",
+            'ignore = [{ id = "RUSTSEC-99", reason = "2026-11-20 owner: unreachable here; remove on upgrade" }]\n',
+            "is not a RUSTSEC or GHSA id",
+        ),
+    ):
+        candidate_path = temporary / "candidate-deny.toml"
+        candidate_path.write_text(policy_head + ignore_toml)
+        candidate = subprocess.run(
+            [sys.executable, str(helper), "write-policy", str(candidate_path), str(temporary / "candidate-shadow.toml")],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        if candidate.returncode == 0 or expected not in candidate.stdout:
+            raise SystemExit(f"write-policy accepted {label}: {candidate.stdout}")
     clean = run(base_report, [base_summary], 0, temporary)
     if clean.returncode:
         raise SystemExit(f"clean root report failed: {clean.stdout}")

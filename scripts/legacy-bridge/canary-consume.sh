@@ -7,13 +7,34 @@ expected=""
 apply=false
 arc_dir="${ARC_DIR:-$HOME/.arc}"
 
+usage() {
+    cat <<'EOF'
+Consume a legacy-bridge canary release on ONE v0.7 headless machine.
+
+Before the bridge release is marked "Latest", no v0.7 updater can see it.
+This script performs exactly the steps the v0.7.11 arc-auto-update.sh
+performs once a release is "Latest", but against an explicit tag, and adds
+the digest check the old updater never had:
+
+  download releases/download/<tag>/arc-node-<platform>, require the SHA-256
+  from the handoff SHA256SUMS, keep bin/arc-node.prev, move the launcher into
+  bin/arc-node, write version.txt, restart the v0.7 service, wait 30 s, and
+  roll back exactly as the v0.7 updater would if /health does not answer.
+
+It prints the plan and changes nothing unless --apply is given.
+
+Usage:
+  bash canary-consume.sh --tag v0.7.14 --expect-sha256 <hex> [--apply] [--arc-dir ~/.arc]
+EOF
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --tag) tag="$2"; shift 2 ;;
         --expect-sha256) expected="$2"; shift 2 ;;
         --apply) apply=true; shift ;;
         --arc-dir) arc_dir="$2"; shift 2 ;;
-        -h | --help) sed -n '2,19p' "$0"; exit 0 ;;
+        -h | --help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 64 ;;
     esac
 done

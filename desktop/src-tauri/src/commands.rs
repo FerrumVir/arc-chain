@@ -3396,7 +3396,7 @@ async fn ensure_binary_inner(app: &AppHandle) -> Result<BinaryStatus, String> {
         .map_err(|failure| paths::redact_home_text(&failure.to_string()))
 }
 
-async fn ensure_binary_inner_classified(app: &AppHandle) -> Result<BinaryStatus, StartupFailure> {
+async fn ensure_binary_inner_classified(_app: &AppHandle) -> Result<BinaryStatus, StartupFailure> {
     if let Some(p) = crate::node_manager::env_binary_override() {
         if p.exists() {
             tracing::info!("using arc-node from env override: {}", p.display());
@@ -3469,15 +3469,12 @@ async fn ensure_binary_inner_classified(app: &AppHandle) -> Result<BinaryStatus,
     }
 
     match download_arc_node(&target).await {
-        Ok(total_bytes) => {
-            let _ = app;
-            Ok(BinaryStatus {
-                path: target.to_string_lossy().into_owned(),
-                downloaded_bytes: total_bytes,
-                total_bytes,
-                already_installed: false,
-            })
-        }
+        Ok(total_bytes) => Ok(BinaryStatus {
+            path: target.to_string_lossy().into_owned(),
+            downloaded_bytes: total_bytes,
+            total_bytes,
+            already_installed: false,
+        }),
         Err(e) => {
             if let Some(dev) = crate::node_manager::dev_build_binary() {
                 tracing::warn!(
@@ -4977,9 +4974,6 @@ pub async fn remove_model(tier: String) -> CmdResult<()> {
     cleanup_model_partials(&p, None)?;
     Ok(())
 }
-
-#[allow(dead_code)]
-fn _path_helper(_: &Path) {}
 
 #[cfg(test)]
 mod model_readiness_tests {

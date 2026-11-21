@@ -24,8 +24,11 @@ search for the symbol and re-check the line before you quote it.
 7. **Write no code comments.** Make the code say it with a name, a type or a
    smaller function. Put the reason for a change in the commit message or PR.
    `python3 scripts/ci/no_comments.py` fails CI on any comment. It allows only
-   tool directives, license lines, clap `///` help text and a Python module
-   docstring that the module reads through `__doc__`.
+   tool directives, license lines, clap `///` help text, PowerShell
+   comment-based help at the top of a script, and a Python module docstring
+   that the module reads through `__doc__`. It skips `vendor/`, `docs/`,
+   `papers/`, data such as genesis, seed and non-code fixture files, six
+   SHA-256-pinned files, and minified or source-map output.
 8. **Turn corrections into checks.** When a review finds a mistake that can
    happen again, add a test, lint rule or script that fails on it. A sentence
    in this file is the last resort, not the fix.

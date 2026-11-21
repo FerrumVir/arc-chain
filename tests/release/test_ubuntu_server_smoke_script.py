@@ -32,7 +32,10 @@ def run_block() -> str:
 def container_script(platform: str) -> str:
     block = run_block().replace("${{ matrix.platform }}", platform)
     lines = block.splitlines()
-    start = max(i for i, line in enumerate(lines) if "docker run --rm" in line)
+    nested = [i for i, line in enumerate(lines) if line.rstrip().endswith("bash -ceu '")]
+    if len(nested) != 1:
+        raise AssertionError(f"expected one nested container script, found {len(nested)}")
+    start = max(i for i in range(nested[0]) if "docker run --rm" in lines[i])
     end = next(i for i in range(start + 1, len(lines)) if lines[i].strip() == "'")
     docker_call = "\n".join(lines[start : end + 1])
     return textwrap.dedent(docker_call)

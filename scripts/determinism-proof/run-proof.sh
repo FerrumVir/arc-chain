@@ -18,7 +18,24 @@ shard=""
 deadline=""
 
 usage() {
-  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+  cat <<'EOF'
+Run ARC's cross-platform determinism proof on this machine (macOS or Linux)
+and print the combined SHA-256 of its transcript.
+
+The pinned Llama-2-7B-Chat Q4_K_M weights, the fixed prompts in prompts.json
+and greedy decoding produce a byte-identical transcript on every CPU platform
+the CI proof covers. Compare the printed hash with the published value in
+docs/determinism-proof.md (also in expected-sha256.txt). CPU only.
+
+Usage:
+  scripts/determinism-proof/run-proof.sh [--kernel scalar|simd] [--model PATH]
+      [--out-dir DIR] [--max-new-tokens N] [--prompt-limit N]
+      [--shard K/COUNT] [--deadline-seconds S]
+
+Needs rustup (the repository pins its toolchain), curl, about 5 GB of disk
+for the model and about 8 GB of free memory; less memory works, slowly,
+through swap. docs/determinism-proof.md lists measured CI run times.
+EOF
 }
 
 while [ "$#" -gt 0 ]; do

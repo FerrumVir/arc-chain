@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Test-only phase override for the archive dispatcher signal lifecycle contract.
-# shellcheck disable=SC2034 # sourced cleanup consumes the four root variables
+# shellcheck disable=SC2034
 
 capture_phase() {
     begin_temporary_scope
@@ -111,9 +110,6 @@ while True:
 }
 
 if [ "${ARC_SIGNAL_GATE_REMOVE_FAIL_ONCE:-false}" = true ]; then
-    # Force the dispatcher's first authoritative sweep to fail. The
-    # cleanup-only guardian must acknowledge ownership before the parent may
-    # return, then retry until the exact private gate is absent.
     archive_remove_dispatch_gate() {
         local gate="$1"
         if mkdir "$ARC_SIGNAL_CASE_DIR/gate-remove-failed-once" 2>/dev/null; then
@@ -125,9 +121,6 @@ if [ "${ARC_SIGNAL_GATE_REMOVE_FAIL_ONCE:-false}" = true ]; then
 fi
 
 if [ "${ARC_SIGNAL_SENTINEL_MOVE_FAIL_ONCE:-false}" = true ]; then
-    # Model the guardian killing the sentinel's external mv child during
-    # escalation. The sentinel shell must survive the 137 and retry through the
-    # existing FINALIZE handshake instead of abandoning the credential gate.
     archive_sentinel_atomic_move() {
         local source="$1" destination="$2"
         if [ "${ARC_SIGNAL_SENTINEL_MOVE_HAS_FAILED:-false}" = false ] && \
