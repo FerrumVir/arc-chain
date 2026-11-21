@@ -14,7 +14,7 @@ dev = [
 [build-system]
 requires = [
     "hatchling==1.27.0",
-    "packaging==24.2",
+    "packaging==26.3",
     "pathspec==0.12.1",
     "pluggy==1.5.0",
     "tomli==2.2.1; python_version < '3.11'",
