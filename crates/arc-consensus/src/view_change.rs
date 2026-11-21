@@ -216,6 +216,11 @@ impl SkipCertificate {
         }
         let mut seen = HashSet::new();
         let mut signing = 0u64;
+        let mut transcripts = Vec::with_capacity(self.votes.len());
+        let mut signatures = Vec::with_capacity(self.votes.len());
+        let mut voters = Vec::with_capacity(self.votes.len());
+        let mut members_stake = Vec::with_capacity(self.votes.len());
+
         for (index, vote) in self.votes.iter().enumerate() {
             if vote.domain != self.domain
                 || vote.validator_set_hash != self.validator_set_hash
@@ -231,6 +236,34 @@ impl SkipCertificate {
             if !seen.insert(vote.voter) {
                 return Err(CertificateError::DuplicateVoter(vote.voter));
             }
+            let validator = set
+                .get_validator(&vote.voter)
+                .ok_or(CertificateError::UnknownVoter(vote.voter))?;
+            members_stake.push(validator.stake);
+            transcripts.push(vote.transcript());
+            signatures.push(&vote.signature);
+            voters.push(vote.voter);
+        }
+
+        if !signatures.is_empty()
+            && arc_crypto::batch_verify_arc_ed25519(&transcripts, &signatures, &voters).is_ok()
+        {
+            for stake in members_stake {
+                signing = signing
+                    .checked_add(stake)
+                    .expect("unique voter stake cannot exceed the checked set total");
+            }
+            if signing < set.quorum {
+                return Err(CertificateError::BelowQuorum {
+                    signing,
+                    quorum: set.quorum,
+                });
+            }
+            return Ok(signing);
+        }
+
+        signing = 0;
+        for vote in &self.votes {
             let stake = vote.verify_against(set)?;
             signing = signing
                 .checked_add(stake)
@@ -367,6 +400,11 @@ impl FinalityCertificate {
         }
         let mut seen = HashSet::new();
         let mut signing = 0u64;
+        let mut transcripts = Vec::with_capacity(self.votes.len());
+        let mut signatures = Vec::with_capacity(self.votes.len());
+        let mut voters = Vec::with_capacity(self.votes.len());
+        let mut members_stake = Vec::with_capacity(self.votes.len());
+
         for (index, vote) in self.votes.iter().enumerate() {
             if vote.domain != self.domain
                 || vote.validator_set_hash != self.validator_set_hash
@@ -380,6 +418,34 @@ impl FinalityCertificate {
             if !seen.insert(vote.voter) {
                 return Err(CertificateError::DuplicateVoter(vote.voter));
             }
+            let validator = set
+                .get_validator(&vote.voter)
+                .ok_or(CertificateError::UnknownVoter(vote.voter))?;
+            members_stake.push(validator.stake);
+            transcripts.push(vote.transcript());
+            signatures.push(&vote.signature);
+            voters.push(vote.voter);
+        }
+
+        if !signatures.is_empty()
+            && arc_crypto::batch_verify_arc_ed25519(&transcripts, &signatures, &voters).is_ok()
+        {
+            for stake in members_stake {
+                signing = signing
+                    .checked_add(stake)
+                    .expect("unique voter stake cannot exceed the checked set total");
+            }
+            if signing < set.quorum {
+                return Err(CertificateError::BelowQuorum {
+                    signing,
+                    quorum: set.quorum,
+                });
+            }
+            return Ok(signing);
+        }
+
+        signing = 0;
+        for vote in &self.votes {
             let stake = vote.verify_against(set)?;
             signing = signing
                 .checked_add(stake)

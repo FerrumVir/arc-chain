@@ -466,6 +466,65 @@ pub fn batch_verify_ed25519(
         .map_err(|_| SignatureError::BatchVerifyFailed)
 }
 
+pub fn batch_verify_arc_ed25519(
+    message_hashes: &[Hash256],
+    signatures: &[&Signature],
+    expected_addresses: &[Hash256],
+) -> Result<(), SignatureError> {
+    if message_hashes.len() != signatures.len() || signatures.len() != expected_addresses.len() {
+        return Err(SignatureError::InvalidLength {
+            expected: message_hashes.len(),
+            got: signatures.len(),
+        });
+    }
+    if signatures.is_empty() {
+        return Ok(());
+    }
+
+    let mut msg_refs = Vec::with_capacity(signatures.len());
+    let mut sigs = Vec::with_capacity(signatures.len());
+    let mut vks = Vec::with_capacity(signatures.len());
+
+    for ((msg_hash, sig), expected_addr) in message_hashes
+        .iter()
+        .zip(signatures)
+        .zip(expected_addresses)
+    {
+        let Signature::Ed25519 {
+            public_key,
+            signature,
+        } = sig
+        else {
+            return Err(SignatureError::InvalidSignature);
+        };
+        let derived = address_from_ed25519_pubkey(public_key);
+        if derived != *expected_addr {
+            return Err(SignatureError::AddressMismatch {
+                expected: expected_addr.to_hex(),
+                got: derived.to_hex(),
+            });
+        }
+        if signature.len() != 64 {
+            return Err(SignatureError::InvalidLength {
+                expected: 64,
+                got: signature.len(),
+            });
+        }
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(public_key)
+            .map_err(|_| SignatureError::InvalidPublicKey)?;
+        let sig_bytes: [u8; 64] = signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| SignatureError::InvalidSignature)?;
+        let dalek_sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+
+        msg_refs.push(msg_hash.as_bytes().as_slice());
+        sigs.push(dalek_sig);
+        vks.push(vk);
+    }
+
+    batch_verify_ed25519(&msg_refs, &sigs, &vks)
+}
 pub fn batch_verify_ml_dsa(
     messages: &[&[u8]],
     signatures: &[[u8; ML_DSA_SIG_LEN]],
@@ -493,6 +552,30 @@ pub fn batch_verify_ml_dsa(
     }
 }
 
+pub fn ml_dsa_batch_verify(keys: &[&[u8]], messages: &[&[u8]], signatures: &[&[u8]]) -> Vec<bool> {
+    use fips204::traits::{SerDes, Verifier};
+    use rayon::prelude::*;
+
+    keys.par_iter()
+        .zip(messages.par_iter())
+        .zip(signatures.par_iter())
+        .map(|((pk_bytes, msg), sig_bytes)| {
+            let pk_arr: [u8; ML_DSA_PK_LEN] = match (*pk_bytes).try_into() {
+                Ok(arr) => arr,
+                Err(_) => return false,
+            };
+            let pk = match fips204::ml_dsa_65::PublicKey::try_from_bytes(pk_arr) {
+                Ok(pk) => pk,
+                Err(_) => return false,
+            };
+            let sig_arr: [u8; ML_DSA_SIG_LEN] = match (*sig_bytes).try_into() {
+                Ok(arr) => arr,
+                Err(_) => return false,
+            };
+            pk.verify(msg, &sig_arr, &[])
+        })
+        .collect()
+}
 pub fn batch_verify_falcon512(
     messages: &[&[u8]],
     signatures: &[&[u8]],
@@ -777,6 +860,54 @@ mod tests {
     }
 
     #[test]
+    fn batch_verify_arc_ed25519_all_valid() {
+        let count = 5;
+        let mut keypairs = Vec::with_capacity(count);
+        let mut messages = Vec::with_capacity(count);
+        let mut signatures = Vec::with_capacity(count);
+        let mut addresses = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let kp = KeyPair::generate_ed25519();
+            let msg = hash_bytes(format!("arc ed25519 batch msg {i}").as_bytes());
+            let sig = kp.sign(&msg).expect("sign ok");
+            addresses.push(kp.address());
+            messages.push(msg);
+            signatures.push(sig);
+            keypairs.push(kp);
+        }
+
+        let sig_refs: Vec<&Signature> = signatures.iter().collect();
+        batch_verify_arc_ed25519(&messages, &sig_refs, &addresses).expect("batch verify ok");
+    }
+
+    #[test]
+    fn batch_verify_arc_ed25519_detects_bad_signature_and_mismatched_address() {
+        let count = 4;
+        let mut messages = Vec::with_capacity(count);
+        let mut signatures = Vec::with_capacity(count);
+        let mut addresses = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let kp = KeyPair::generate_ed25519();
+            let msg = hash_bytes(format!("arc ed25519 test {i}").as_bytes());
+            let sig = kp.sign(&msg).expect("sign ok");
+            addresses.push(kp.address());
+            messages.push(msg);
+            signatures.push(sig);
+        }
+
+        let mut bad_addresses = addresses.clone();
+        bad_addresses[1] = hash_bytes(b"attacker address");
+        let sig_refs: Vec<&Signature> = signatures.iter().collect();
+        assert!(batch_verify_arc_ed25519(&messages, &sig_refs, &bad_addresses).is_err());
+
+        let mut bad_messages = messages.clone();
+        bad_messages[2] = hash_bytes(b"tampered message");
+        assert!(batch_verify_arc_ed25519(&bad_messages, &sig_refs, &addresses).is_err());
+    }
+
+    #[test]
     fn batch_verify_ml_dsa_5_signatures() {
         let count = 5;
         let mut messages: Vec<Vec<u8>> = Vec::with_capacity(count);
@@ -838,6 +969,75 @@ mod tests {
         assert!(batch_verify_ml_dsa(&msg_refs, &signatures, &public_keys).is_err());
     }
 
+    #[test]
+    fn ml_dsa_batch_verify_all_valid() {
+        let count = 4;
+        let mut messages: Vec<Vec<u8>> = Vec::with_capacity(count);
+        let mut signatures: Vec<Vec<u8>> = Vec::with_capacity(count);
+        let mut public_keys: Vec<Vec<u8>> = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let kp = KeyPair::generate_ml_dsa();
+            let msg = hash_bytes(format!("ml dsa batch message {i}").as_bytes());
+            let sig = kp.sign(&msg).expect("sign ok");
+            match sig {
+                Signature::MlDsa65 {
+                    public_key,
+                    signature,
+                } => {
+                    messages.push(msg.as_bytes().to_vec());
+                    signatures.push(signature);
+                    public_keys.push(public_key);
+                }
+                _ => panic!("expected MlDsa65"),
+            }
+        }
+
+        let pk_refs: Vec<&[u8]> = public_keys.iter().map(|p| p.as_slice()).collect();
+        let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
+        let sig_refs: Vec<&[u8]> = signatures.iter().map(|s| s.as_slice()).collect();
+
+        let results = ml_dsa_batch_verify(&pk_refs, &msg_refs, &sig_refs);
+        assert_eq!(results.len(), count);
+        assert!(results.iter().all(|&v| v));
+    }
+
+    #[test]
+    fn ml_dsa_batch_verify_detects_bad_signature() {
+        let count = 3;
+        let mut messages: Vec<Vec<u8>> = Vec::with_capacity(count);
+        let mut signatures: Vec<Vec<u8>> = Vec::with_capacity(count);
+        let mut public_keys: Vec<Vec<u8>> = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let kp = KeyPair::generate_ml_dsa();
+            let msg = hash_bytes(format!("ml dsa batch test {i}").as_bytes());
+            let sig = kp.sign(&msg).expect("sign ok");
+            match sig {
+                Signature::MlDsa65 {
+                    public_key,
+                    signature,
+                } => {
+                    messages.push(msg.as_bytes().to_vec());
+                    signatures.push(signature);
+                    public_keys.push(public_key);
+                }
+                _ => panic!("expected MlDsa65"),
+            }
+        }
+
+        messages[1] = hash_bytes(b"tampered message").as_bytes().to_vec();
+
+        let pk_refs: Vec<&[u8]> = public_keys.iter().map(|p| p.as_slice()).collect();
+        let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
+        let sig_refs: Vec<&[u8]> = signatures.iter().map(|s| s.as_slice()).collect();
+
+        let results = ml_dsa_batch_verify(&pk_refs, &msg_refs, &sig_refs);
+        assert_eq!(results.len(), count);
+        assert!(results[0], "first should be valid");
+        assert!(!results[1], "second should be invalid");
+        assert!(results[2], "third should be valid");
+    }
     #[test]
     fn falcon512_sign_and_verify() {
         let kp = KeyPair::generate_falcon512();
