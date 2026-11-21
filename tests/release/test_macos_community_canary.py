@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Hermetic contract tests for the macOS pre-tag community canary helper."""
 
 from __future__ import annotations
 
@@ -36,8 +35,6 @@ def completed(argv: tuple[str, ...], returncode: int = 0, stdout: str = "", stde
 
 
 class FakePlatform(canary.PlatformCommands):
-    """Model launchd/ps/lsof and the exact preflight CLI without real processes."""
-
     def __init__(self) -> None:
         self.uid = os.getuid()
         self.loaded = False
@@ -509,10 +506,6 @@ class CanaryFixture:
 
 class MacosCommunityCanaryTests(unittest.TestCase):
     def setUp(self) -> None:
-        # Linux normally places TemporaryDirectory under world-writable /tmp,
-        # which the production canary deliberately rejects for operator inputs.
-        # Keep the hermetic fixture under the canonical operator home instead;
-        # TemporaryDirectory still owns and removes the isolated 0700 leaf.
         fixture_parent = Path.home().resolve(strict=True)
         self.temporary = tempfile.TemporaryDirectory(
             prefix=".arc-canary-contract-", dir=fixture_parent
@@ -1472,13 +1465,11 @@ class MacosCommunityCanaryTests(unittest.TestCase):
         self.assertEqual(0o400, stat.S_IMODE(paths.model.stat().st_mode))
         self.assertEqual(1, paths.model.stat().st_nlink)
 
-        # The external operator input is no longer a runtime dependency.
         self.fixture.model.chmod(0o600)
         self.fixture.model.write_bytes(b"external source changed after materialization\n")
         self.controller.start()
         self.controller.stop()
 
-        # Managed bytes are private/create-only and are re-proved before use.
         paths.model.chmod(0o600)
         paths.model.write_bytes(b"managed model mutation\n")
         paths.model.chmod(0o400)

@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Fail-closed Google Drive readiness gate for the destructive fleet-freeze edge.
 set -Eeuo pipefail
 umask 077
 
@@ -25,8 +24,6 @@ die() {
 
 cleanup() {
     if [ "$CANARY_PRESENT" = true ] && [ -n "$CANARY_REMOTE" ]; then
-        # This is a create-unique canary owned by this invocation. Cleanup is
-        # best effort on an already-failing path and never targets a directory.
         "$RCLONE_BIN" deletefile "$CANARY_REMOTE" --drive-use-trash=false \
             >/dev/null 2>&1 || true
     fi
@@ -338,9 +335,6 @@ for row in nodes:
 if set(sizes) != EXPECTED:
     raise SystemExit("freeze plan does not bind the exact six archive source names")
 
-# Three times the sealed source allocation plus 32 GiB covers compression/tar
-# expansion, capture/binding evidence, and the shared recovery artifacts. The
-# largest single-object reservation independently includes another 4 GiB.
 total_source = sum(sizes.values())
 archive_reservation = 3 * total_source + 32 * GIB
 largest_object_reservation = 3 * max(sizes.values()) + 4 * GIB
@@ -502,9 +496,6 @@ run_rclone_clean "config-show capability inspection" "$TEMP_ROOT/config-show-hel
     config show --help
 inspect_config_show_capability "$TEMP_ROOT/config-show-help"
 
-# This benign read is deliberately first: rclone refreshes an expired OAuth
-# access token and persists the refreshed selected-remote token before the
-# credential bytes are streamed in memory to the fixed Drive API helper.
 run_rclone_clean "capacity inspection" "$TEMP_ROOT/about-before.json" \
     about "$REMOTE_ROOT" --json --contimeout 10s --timeout 20s \
     --retries 2 --low-level-retries 2
@@ -544,8 +535,6 @@ if [ "$MODE" = execute ]; then
     run_rclone_clean "canary upload" /dev/null \
         copyto "$CANARY_LOCAL" "$CANARY_REMOTE" --immutable --metadata \
         --drive-stop-on-upload-limit --retries 1 --low-level-retries 2
-    # Only an upload that returned cleanly may authorize cleanup deletion. A
-    # failed immutable create is never guessed to own a pre-existing object.
     CANARY_PRESENT=true
     run_rclone_clean "canary download" "$CANARY_DOWNLOAD" cat "$CANARY_REMOTE"
     [ "$(hash_file "$CANARY_DOWNLOAD")" = "$CANARY_SHA" ] || \
@@ -562,9 +551,6 @@ if [ "$MODE" = execute ]; then
     CANARY_PRESENT=false
     CANARY_DELETED=true
 
-    # Narrow the credential/configuration TOCTOU window: the exact effective
-    # tool, OAuth client, account, and Drive permission identity must still
-    # match after the mutating canary.
     run_rclone_clean "post-canary version inspection" \
         "$TEMP_ROOT/rclone-version-after" version
     [ "$(inspect_rclone_version "$TEMP_ROOT/rclone-version-after")" = "$ACTUAL_RCLONE_VERSION" ] || \

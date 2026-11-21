@@ -29,7 +29,6 @@ PRODUCTION_BINARY = "production_partial_row_conformance"
 
 
 def production_cohort_config(manifests, runtime, ssh, shared_worker):
-    """Fixture configuration; pins are derived by the Rust pin-config mode next."""
     return {"max_workers": len(manifests), "duplicate_per_mille": 50, "spot_rows_per_stage": 2,
             "workers": [{"id": manifest["worker_id"], "ssh_program": str(ssh.ssh_program),
                          "target": ssh.target, "known_hosts": str(ssh.known_hosts),
@@ -45,7 +44,6 @@ def production_cohort_config(manifests, runtime, ssh, shared_worker):
 
 
 def compare_production_cohort(reference, actual, owners):
-    """Tokens/commitment plus production integration; no claim of production logit tracing."""
     if (reference.get("schema") != "arc.low-residency-conformance.v1"
             or reference.get("mode") != "reference"
             or actual.get("schema") != "arc.production-partial-cohort-conformance.v1"
@@ -141,7 +139,6 @@ def write_json(path, value, indent=2):
 
 
 def kernel_environment(base, kernel, census=False):
-    """Return an explicit child env; never let reference inherit coordinator mode."""
     return dict(base, ARC_FAST_CANONICAL_KERNEL="1" if kernel == "fast" else "0",
                 ARC_QUALIFICATION_SIMD_CENSUS="1" if census else "0")
 
@@ -234,12 +231,10 @@ def read_numbers(path):
 
 
 def cgroup_snapshot():
-    """Read only the caller's existing cgroup; never create or reset one."""
     try:
         member = next(line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines()
                       if line.startswith("0::"))
         candidate = Path("/sys/fs/cgroup") / member.lstrip("/")
-        # In a cgroup namespace the mount itself can already represent our group.
         if not (candidate / "memory.current").exists():
             candidate = Path("/sys/fs/cgroup")
         result = {"path": str(candidate)}
@@ -268,8 +263,6 @@ def resources(directory):
     if group is None:
         raise RuntimeError("cgroup memory constraint unreadable; refusing unmeasured capacity")
     if group["max"] is not None:
-        # Reclaimable inactive file cache is not a resident row heap. Preserve
-        # both raw and adjusted readings; this remains a preflight, not RSS proof.
         group_available = max(0, group["max"] - group["current"] + group["inactive_file"])
         available = min(available, group_available)
     return {"physical_bytes_sysconf": physical, "mem_available_bytes": info["MemAvailable"],
@@ -286,7 +279,6 @@ def require_capacity(snapshot, memory, disk=0):
 
 
 def validate_layout_plan(plan, partitions):
-    """Do not let an older inspector silently run the layer-only proof."""
     expected = "layers" if partitions is None else "partial-rows"
     if plan.get("layout") != expected:
         raise RuntimeError("inspected layout differs from requested proof")
@@ -371,7 +363,6 @@ def validate_trace(trace, report):
 
 
 def compare(reference, coordinator):
-    """Equality excludes timing/RSS; never let empty matching reports pass."""
     for key in ("schema", "artifact_blake3", "artifact_bytes", "profile", "graph", "prompt_token_ids",
                 "max_tokens", "generation_semantics", "warmup_count", "binary_blake3"):
         if key not in reference or reference[key] != coordinator.get(key):
@@ -476,7 +467,6 @@ class Children:
         return process
 
     def stop(self, processes, timeout=20):
-        """Gracefully stop selected long-lived daemons for final diagnostics."""
         running = [process for process in processes if process.poll() is None]
         for process in running:
             try:
@@ -664,7 +654,6 @@ def run(args):
             manifest = json.loads((dest / "manifest.json").read_text())
             validate_export_manifest(spec, manifest, plan, package["artifact"]["blake3"])
             manifests.append((dest, manifest))
-        # Short private runtime paths avoid Unix sockaddr length limits on CI.
         runtime = Path(tempfile.mkdtemp(prefix="arc-proof-", dir="/tmp"))
         pins = {}
         if args.production_cohort:
@@ -714,8 +703,6 @@ def run(args):
             config.append({"worker_id": manifest["worker_id"], "socket": str(socket),
                            "assignments": [entry["assignment"] for entry in manifest["files"]]})
             remaining_rows -= manifest["serialized_row_bytes"]
-        # Compact assignments keep even 16 x 225 projections within the
-        # coordinator's existing 1 MiB configuration bound.
         if len(json.dumps(config, sort_keys=True).encode()) + 1 > 1024 * 1024:
             raise RuntimeError("worker assignment configuration exceeds 1 MiB")
         write_json(output / "workers.json", config, indent=None)
@@ -733,8 +720,6 @@ def run(args):
             children.wait(coordinator, args.timeout_seconds)
         finally:
             if args.production_cohort:
-                # Close SSH descendants even when their parent already exited;
-                # on timeout this also terminates the still-running coordinator.
                 try:
                     os.killpg(coordinator.pid, signal.SIGTERM)
                 except ProcessLookupError:

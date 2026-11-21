@@ -1,35 +1,22 @@
-//! Evolutionary refinement - mutate and crossover partial solutions.
-//!
-//! Takes candidates found by the synthesizer and beam search, then applies
-//! genetic operators (swap, extend, truncate, crossover) to evolve better
-//! programs. Each candidate is scored by fitness (exact match rate) and
-//! cell accuracy (fraction of cells correct across all training pairs).
-
 use crate::search::beam::{BeamConfig, beam_search};
 use crate::search::enumerate::*;
 use crate::{Color, Grid};
 use std::time::Instant;
 
-// ============================================================
-// Data structures
-// ============================================================
-
-/// A candidate program with fitness metadata.
 #[derive(Clone, Debug)]
 pub struct Candidate {
     pub steps: Vec<String>,
-    pub fitness: f64,       // examples_solved / total (0.0-1.0)
-    pub cell_accuracy: f64, // cells_correct / total_cells (0.0-1.0)
+    pub fitness: f64,
+    pub cell_accuracy: f64,
     pub generation: u8,
 }
 
-/// Configuration for the evolutionary search.
 pub struct EvolutionConfig {
-    pub n_initial: usize,     // initial candidates per generation (default 16)
-    pub n_parents: usize,     // top parents to select (default 4)
-    pub n_offspring: usize,   // offspring per parent (default 4)
-    pub n_generations: usize, // total generations (default 4)
-    pub timeout_ms: u64,      // wall-clock timeout (default 60_000)
+    pub n_initial: usize,
+    pub n_parents: usize,
+    pub n_offspring: usize,
+    pub n_generations: usize,
+    pub timeout_ms: u64,
 }
 
 impl Default for EvolutionConfig {
@@ -44,7 +31,6 @@ impl Default for EvolutionConfig {
     }
 }
 
-/// Result of a successful evolutionary search.
 pub struct EvolutionResult {
     pub steps: Vec<String>,
     pub test_outputs: Vec<Grid>,
@@ -52,14 +38,6 @@ pub struct EvolutionResult {
     pub generation: u8,
 }
 
-// ============================================================
-// Program execution
-// ============================================================
-
-/// Apply a program (sequence of primitive names) to an input grid.
-///
-/// For binary operations, the second argument is always the original input
-/// grid (following the same convention as beam search).
 fn apply_program_by_name(
     steps: &[String],
     catalog: &[TypedPrimitive],
@@ -92,15 +70,6 @@ fn apply_program_by_name(
     }
 }
 
-// ============================================================
-// Scoring
-// ============================================================
-
-/// Score a candidate's program on training pairs.
-///
-/// Returns `(fitness, cell_accuracy)` where:
-/// - `fitness` = fraction of examples where output matches exactly
-/// - `cell_accuracy` = fraction of all cells correct across all examples
 pub fn score_candidate(
     steps: &[String],
     train_pairs: &[(Grid, Grid)],
@@ -117,12 +86,10 @@ pub fn score_candidate(
     for (input, expected) in train_pairs {
         match apply_program_by_name(steps, catalog, input) {
             Some(ref result) => {
-                // Check exact match
                 if result == expected {
                     exact_matches += 1;
                 }
 
-                // Count cell accuracy (dimension must match)
                 if result.len() == expected.len()
                     && !result.is_empty()
                     && result[0].len() == expected[0].len()
@@ -137,13 +104,11 @@ pub fn score_candidate(
                         }
                     }
                 } else {
-                    // Wrong dimensions: count expected cells as total, 0 correct
                     let cells = expected.len() * expected.first().map_or(0, |r| r.len());
                     total_cells += cells;
                 }
             }
             None => {
-                // Program failed to produce output
                 let cells = expected.len() * expected.first().map_or(0, |r| r.len());
                 total_cells += cells;
             }
@@ -160,11 +125,6 @@ pub fn score_candidate(
     (fitness, cell_accuracy)
 }
 
-// ============================================================
-// Mutation strategies
-// ============================================================
-
-/// Collect unique colors from training data.
 fn collect_colors(train_pairs: &[(Grid, Grid)]) -> Vec<Color> {
     let mut colors: Vec<u8> = Vec::new();
     for (inp, out) in train_pairs {
@@ -187,7 +147,6 @@ fn collect_colors(train_pairs: &[(Grid, Grid)]) -> Vec<Color> {
     colors
 }
 
-/// Find all primitives whose input type matches the given type.
 fn type_valid_ops<'a>(
     catalog: &'a [TypedPrimitive],
     input_type: &DagType,
@@ -203,8 +162,6 @@ fn type_valid_ops<'a>(
         .collect()
 }
 
-/// Determine the output type of a program's last step given the catalog.
-/// Returns `Grid` for an empty program (the initial state is always a Grid).
 fn output_type_of(steps: &[String], catalog: &[TypedPrimitive]) -> DagType {
     if steps.is_empty() {
         return DagType::Grid;
@@ -217,16 +174,10 @@ fn output_type_of(steps: &[String], catalog: &[TypedPrimitive]) -> DagType {
     DagType::Grid
 }
 
-/// **Swap**: Replace one step with another type-valid operation.
-///
-/// For each position in the program, we try replacing it with every other
-/// primitive that has the same input type. We validate the whole chain
-/// after the swap to ensure types still line up.
 fn mutate_swap(parent: &Candidate, catalog: &[TypedPrimitive]) -> Vec<Candidate> {
     let mut offspring = Vec::new();
 
     for pos in 0..parent.steps.len() {
-        // Determine the input type at this position
         let input_type = if pos == 0 {
             DagType::Grid
         } else {
@@ -237,17 +188,15 @@ fn mutate_swap(parent: &Candidate, catalog: &[TypedPrimitive]) -> Vec<Candidate>
 
         for op in &valid_ops {
             if op.name == parent.steps[pos].as_str() {
-                continue; // skip identity swap
+                continue;
             }
 
-            // Check that the output type of this op is compatible with the
-            // next step (if any).
             if pos + 1 < parent.steps.len() {
                 let next_name = &parent.steps[pos + 1];
                 if let Some(next_prim) = catalog.iter().find(|p| p.name == next_name.as_str())
                     && next_prim.input_types[0] != op.output_type
                 {
-                    continue; // type mismatch with next step
+                    continue;
                 }
             }
 
@@ -266,7 +215,6 @@ fn mutate_swap(parent: &Candidate, catalog: &[TypedPrimitive]) -> Vec<Candidate>
     offspring
 }
 
-/// **Extend**: Append a type-valid operation to the end.
 fn mutate_extend(parent: &Candidate, catalog: &[TypedPrimitive]) -> Vec<Candidate> {
     let tail_type = output_type_of(&parent.steps, catalog);
     let valid_ops = type_valid_ops(catalog, &tail_type);
@@ -286,7 +234,6 @@ fn mutate_extend(parent: &Candidate, catalog: &[TypedPrimitive]) -> Vec<Candidat
         .collect()
 }
 
-/// **Truncate**: Remove the last step.
 fn mutate_truncate(parent: &Candidate) -> Option<Candidate> {
     if parent.steps.len() <= 1 {
         return None;
@@ -301,10 +248,6 @@ fn mutate_truncate(parent: &Candidate) -> Option<Candidate> {
     })
 }
 
-/// **Crossover**: Take prefix of parent A + suffix of parent B.
-///
-/// The junction must be type-compatible: the output type at the split
-/// point in A must equal the input type expected at the split point in B.
 fn crossover(a: &Candidate, b: &Candidate, catalog: &[TypedPrimitive]) -> Vec<Candidate> {
     let mut offspring = Vec::new();
 
@@ -312,7 +255,6 @@ fn crossover(a: &Candidate, b: &Candidate, catalog: &[TypedPrimitive]) -> Vec<Ca
         let type_at_a = output_type_of(&a.steps[..split_a], catalog);
 
         for split_b in 1..b.steps.len() {
-            // The type leaving A's prefix must match the type B's suffix expects
             let suffix_input = if split_b < b.steps.len() {
                 if let Some(prim) = catalog.iter().find(|p| p.name == b.steps[split_b].as_str()) {
                     prim.input_types[0].clone()
@@ -340,18 +282,6 @@ fn crossover(a: &Candidate, b: &Candidate, catalog: &[TypedPrimitive]) -> Vec<Ca
     offspring
 }
 
-// ============================================================
-// Main evolutionary loop
-// ============================================================
-
-/// Run evolutionary refinement.
-///
-/// 1. **Generation 1**: Run beam search with various small configs to seed
-///    initial candidates.
-/// 2. **Generations 2-N**: Select top parents, apply mutation/extension/
-///    crossover to produce offspring.
-/// 3. Return the best candidate that achieves `fitness >= 1.0`, verified
-///    on all training pairs and applied to test inputs.
 pub fn evolve(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -363,16 +293,11 @@ pub fn evolve(
 
     let start = Instant::now();
 
-    // Build catalog
     let colors = collect_colors(train_pairs);
     let catalog = build_primitive_catalog(&colors);
 
-    // ----------------------------------------------------------
-    // Generation 1: seed candidates from beam search
-    // ----------------------------------------------------------
     let mut population: Vec<Candidate> = Vec::new();
 
-    // Try beam search with a few small configurations to get diverse seeds
     let beam_configs = [
         BeamConfig {
             beam_width: 50,
@@ -407,7 +332,6 @@ pub fn evolve(
                 generation: 1,
             };
 
-            // If we already have a perfect solution, verify and return
             if fitness >= 1.0 - f64::EPSILON
                 && let Some(result) =
                     try_produce_result(&candidate, train_pairs, test_inputs, &catalog)
@@ -419,7 +343,6 @@ pub fn evolve(
         }
     }
 
-    // Also seed single-step candidates from the catalog
     if population.len() < config.n_initial {
         for prim in &catalog {
             if prim.input_types.len() == 1 && prim.input_types[0] == DagType::Grid {
@@ -438,7 +361,6 @@ pub fn evolve(
         }
     }
 
-    // Also seed two-step candidates from top single-step parents
     {
         let mut singles = population.clone();
         singles.sort_by(|a, b| {
@@ -461,10 +383,8 @@ pub fn evolve(
         }
     }
 
-    // Score and sort initial population
     sort_population(&mut population);
 
-    // Check for perfect candidate in generation 1
     if let Some(best) = population.first()
         && best.fitness >= 1.0 - f64::EPSILON
         && let Some(result) = try_produce_result(best, train_pairs, test_inputs, &catalog)
@@ -472,39 +392,31 @@ pub fn evolve(
         return Some(result);
     }
 
-    // ----------------------------------------------------------
-    // Generations 2..N: evolve
-    // ----------------------------------------------------------
     for generation in 2..=(config.n_generations as u8) {
         if start.elapsed().as_millis() as u64 > config.timeout_ms {
             break;
         }
 
-        // Select top parents
         let parents: Vec<Candidate> = population.iter().take(config.n_parents).cloned().collect();
 
         let mut offspring: Vec<Candidate> = Vec::new();
 
         for parent in &parents {
-            // Swap mutations (limited to avoid combinatorial explosion)
             let swaps = mutate_swap(parent, &catalog);
             for child in swaps.into_iter().take(config.n_offspring) {
                 offspring.push(child);
             }
 
-            // Extension mutations
             let extensions = mutate_extend(parent, &catalog);
             for child in extensions.into_iter().take(config.n_offspring) {
                 offspring.push(child);
             }
 
-            // Truncation
             if let Some(child) = mutate_truncate(parent) {
                 offspring.push(child);
             }
         }
 
-        // Crossover between pairs of parents
         for i in 0..parents.len() {
             for j in (i + 1)..parents.len() {
                 let crosses = crossover(&parents[i], &parents[j], &catalog);
@@ -514,7 +426,6 @@ pub fn evolve(
             }
         }
 
-        // Score all offspring
         for child in &mut offspring {
             let (fitness, cell_accuracy) = score_candidate(&child.steps, train_pairs, &catalog);
             child.fitness = fitness;
@@ -522,12 +433,10 @@ pub fn evolve(
             child.generation = generation;
         }
 
-        // Merge offspring into population, sort, truncate
         population.extend(offspring);
         sort_population(&mut population);
         population.truncate(config.n_initial * 2);
 
-        // Check for perfect candidate
         if let Some(best) = population.first()
             && best.fitness >= 1.0 - f64::EPSILON
             && let Some(result) = try_produce_result(best, train_pairs, test_inputs, &catalog)
@@ -536,16 +445,9 @@ pub fn evolve(
         }
     }
 
-    // No perfect solution found
     None
 }
 
-// ============================================================
-// Helpers
-// ============================================================
-
-/// Sort population by fitness (descending), breaking ties by cell_accuracy,
-/// then by shorter program length.
 fn sort_population(pop: &mut [Candidate]) {
     pop.sort_by(|a, b| {
         b.fitness
@@ -560,14 +462,12 @@ fn sort_population(pop: &mut [Candidate]) {
     });
 }
 
-/// Verify a candidate on all training pairs and produce test outputs.
 fn try_produce_result(
     candidate: &Candidate,
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
     catalog: &[TypedPrimitive],
 ) -> Option<EvolutionResult> {
-    // Verify on all training pairs
     for (input, expected) in train_pairs {
         match apply_program_by_name(&candidate.steps, catalog, input) {
             Some(ref result) if result == expected => {}
@@ -575,7 +475,6 @@ fn try_produce_result(
         }
     }
 
-    // Apply to all test inputs
     let mut test_outputs = Vec::new();
     for test_input in test_inputs {
         match apply_program_by_name(&candidate.steps, catalog, test_input) {
@@ -592,10 +491,6 @@ fn try_produce_result(
     })
 }
 
-// ============================================================
-// Tests
-// ============================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,7 +503,6 @@ mod tests {
         let colors = collect_colors(&pairs);
         let catalog = build_primitive_catalog(&colors);
 
-        // rot90 should match
         let steps = vec!["rot90".to_string()];
         let (fitness, cell_accuracy) = score_candidate(&steps, &pairs, &catalog);
         assert!((fitness - 1.0).abs() < 1e-9);
@@ -631,12 +525,11 @@ mod tests {
     #[test]
     fn test_score_candidate_empty_program() {
         let input = vec![vec![1, 2], vec![3, 4]];
-        let output = vec![vec![1, 2], vec![3, 4]]; // identity
+        let output = vec![vec![1, 2], vec![3, 4]];
         let pairs = vec![(input, output)];
         let colors = collect_colors(&pairs);
         let catalog = build_primitive_catalog(&colors);
 
-        // Empty program returns the input unchanged
         let steps: Vec<String> = vec![];
         let (fitness, cell_accuracy) = score_candidate(&steps, &pairs, &catalog);
         assert!((fitness - 1.0).abs() < 1e-9);
@@ -654,7 +547,6 @@ mod tests {
             generation: 1,
         };
         let extensions = mutate_extend(&parent, &catalog);
-        // rot90 outputs Grid, so there should be many Grid->* ops
         assert!(!extensions.is_empty());
         for ext in &extensions {
             assert_eq!(ext.steps.len(), 2);
@@ -728,7 +620,6 @@ mod tests {
         };
 
         let crosses = crossover(&a, &b, &catalog);
-        // All crossover children should have valid type chains
         for child in &crosses {
             assert!(!child.steps.is_empty());
         }

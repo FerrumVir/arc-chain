@@ -1,17 +1,3 @@
-//! ARC Chain - Soak / Stress Test Benchmark
-//!
-//! Runs a sustained stress test for a configurable duration, continuously
-//! submitting batches through the full pipeline and reporting live metrics
-//! every interval:
-//!   - Current / Average / Peak / Min TPS
-//!   - Total transactions processed
-//!   - Success rate
-//!   - Memory usage (RSS)
-//!   - Progress bar
-//!
-//! Usage:
-//!   cargo run --release --bin arc-bench-soak -- --duration 300 --batch-size 10000
-
 mod ephemeral_keys;
 
 use arc_crypto::Hash256;
@@ -21,8 +7,6 @@ use arc_types::Transaction;
 use clap::Parser;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-// ── CLI ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
 #[command(
@@ -46,8 +30,6 @@ struct Args {
     #[arg(long, default_value = "10")]
     report_interval: u64,
 }
-
-// ── Formatting helpers ───────────────────────────────────────────────────────
 
 fn format_tps(tps: f64) -> String {
     if tps >= 1_000_000.0 {
@@ -85,7 +67,6 @@ fn progress_bar(fraction: f64, width: usize) -> String {
     )
 }
 
-/// Resident set size in bytes (macOS / Linux).
 fn rss_bytes() -> u64 {
     #[allow(deprecated)]
     #[cfg(target_os = "macos")]
@@ -110,7 +91,6 @@ fn rss_bytes() -> u64 {
     }
     #[cfg(target_os = "linux")]
     {
-        // /proc/self/statm: columns are in pages
         if let Ok(statm) = std::fs::read_to_string("/proc/self/statm")
             && let Some(rss_pages) = statm.split_whitespace().nth(1)
             && let Ok(pages) = rss_pages.parse::<u64>()
@@ -136,8 +116,6 @@ fn format_bytes(b: u64) -> String {
         format!("{} B", b)
     }
 }
-
-// ── Transaction pre-signing ──────────────────────────────────────────────────
 
 fn presign_transactions(
     sender_count: u8,
@@ -175,8 +153,6 @@ fn presign_transactions(
 
     (transactions, genesis)
 }
-
-// ── Interval metrics ─────────────────────────────────────────────────────────
 
 struct IntervalSnapshot {
     tps: f64,
@@ -250,8 +226,6 @@ impl SoakMetrics {
     }
 }
 
-// ── Dashboard printing ───────────────────────────────────────────────────────
-
 const SEPARATOR: &str = "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}";
 
 fn print_dashboard(
@@ -277,9 +251,6 @@ fn print_dashboard(
         format_tps(metrics.avg_tps(elapsed_secs))
     );
     println!("  Peak TPS:       {}", format_tps(metrics.peak_tps));
-    // `min_tps` is initialised to the sentinel f64::MAX and only ever replaced
-    // by an assignment, never by arithmetic, so this is a sentinel identity
-    // test ("no sample recorded yet"), not a comparison of computed floats.
     #[allow(clippy::float_cmp)]
     let min_tps_display = if metrics.min_tps == f64::MAX {
         "N/A".to_string()
@@ -299,7 +270,6 @@ fn print_final_report(total_duration: Duration, metrics: &SoakMetrics) {
     let avg_tps = metrics.avg_tps(elapsed_secs);
     let std_dev = metrics.std_dev();
 
-    // Pass if success rate >= 99.9% and we processed at least *some* transactions
     let passed = metrics.success_rate() >= 99.9 && metrics.total_txs > 0;
 
     println!();
@@ -310,9 +280,6 @@ fn print_final_report(total_duration: Duration, metrics: &SoakMetrics) {
     println!("  Total Txs:      {}", format_count(metrics.total_txs));
     println!("  Average TPS:    {}", format_tps(avg_tps));
     println!("  Peak TPS:       {}", format_tps(metrics.peak_tps));
-    // `min_tps` is initialised to the sentinel f64::MAX and only ever replaced
-    // by an assignment, never by arithmetic, so this is a sentinel identity
-    // test ("no sample recorded yet"), not a comparison of computed floats.
     #[allow(clippy::float_cmp)]
     let min_tps_display = if metrics.min_tps == f64::MAX {
         "N/A".to_string()
@@ -335,8 +302,6 @@ fn print_final_report(total_duration: Duration, metrics: &SoakMetrics) {
     println!();
 }
 
-// ── Main ─────────────────────────────────────────────────────────────────────
-
 fn main() {
     let args = Args::parse();
 
@@ -356,7 +321,6 @@ fn main() {
     println!("  CPU cores:        {}", rayon::current_num_threads());
     println!("{}", SEPARATOR);
 
-    // ── Pre-sign one batch worth of transactions (reused every iteration) ────
     println!();
     print!(
         "  Pre-signing {} transactions with Ed25519... ",
@@ -371,7 +335,6 @@ fn main() {
         format_tps(args.batch_size as f64 / sign_elapsed.as_secs_f64())
     );
 
-    // ── Build pipeline ───────────────────────────────────────────────────────
     let state = Arc::new(StateDB::with_genesis(&genesis));
     let config = PipelineConfig {
         execution_mode: ExecutionMode::BlockSTM,
@@ -383,7 +346,6 @@ fn main() {
     let pipeline = Pipeline::with_config(Arc::clone(&state), config);
     let producer = genesis[0].0;
 
-    // ── Soak loop ────────────────────────────────────────────────────────────
     println!();
     println!("  Starting soak test...");
 
@@ -400,7 +362,6 @@ fn main() {
             break;
         }
 
-        // Submit a batch
         let submit_result = pipeline.submit(PipelineBatch {
             transactions: transactions.clone(),
             producer,
@@ -411,13 +372,11 @@ fn main() {
             pending_batches += 1;
         }
 
-        // Drain available results (non-blocking)
         while let Some(result) = pipeline.try_recv() {
             interval_success += result.success_count as u64;
             pending_batches = pending_batches.saturating_sub(1);
         }
 
-        // Report at interval
         if last_report.elapsed() >= report_interval {
             let interval_secs = last_report.elapsed().as_secs_f64();
             let current_tps = interval_submitted as f64 / interval_secs;
@@ -432,7 +391,6 @@ fn main() {
         }
     }
 
-    // ── Drain remaining pipeline results ─────────────────────────────────────
     if interval_submitted > 0 || pending_batches > 0 {
         let drain_deadline = Instant::now() + Duration::from_secs(30);
         while pending_batches > 0 && Instant::now() < drain_deadline {
@@ -444,14 +402,12 @@ fn main() {
             }
         }
 
-        // Record final partial interval
         if interval_submitted > 0 {
             let interval_secs = last_report.elapsed().as_secs_f64();
             metrics.record_interval(interval_submitted, interval_success, interval_secs);
         }
     }
 
-    // ── Final report ─────────────────────────────────────────────────────────
     let actual_duration = soak_start.elapsed();
     print_final_report(actual_duration, &metrics);
 }

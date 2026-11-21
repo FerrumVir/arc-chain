@@ -1,15 +1,3 @@
-//! Key generation, keyfile serialization and deserialization for ARC Chain.
-//!
-//! Keyfile format (JSON):
-//! ```json
-//! {
-//!   "scheme": "ed25519",
-//!   "secret_key": "<hex>",
-//!   "public_key": "<hex>",
-//!   "address": "<hex>"
-//! }
-//! ```
-
 use anyhow::{Context, Result, bail, ensure};
 use arc_crypto::signature::KeyPair;
 use arc_crypto::{Hash256, hash_bytes};
@@ -28,7 +16,6 @@ const MAX_LEGACY_SEED_BYTES: u64 = 4096;
 const KEYFILE_VALIDATION_CHALLENGE: &[u8] = b"ARC-keyfile-public-secret-consistency-v1";
 static NEXT_PRIVATE_SIDECAR: AtomicU64 = AtomicU64::new(0);
 
-/// JSON-serializable keyfile representation.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Keyfile {
@@ -44,7 +31,6 @@ impl Drop for Keyfile {
     }
 }
 
-/// Generate a new keypair for the given signature scheme.
 pub fn generate_keypair(scheme: &str) -> Result<KeyPair> {
     match scheme {
         "ed25519" => Ok(KeyPair::generate_ed25519()),
@@ -58,7 +44,6 @@ pub fn generate_keypair(scheme: &str) -> Result<KeyPair> {
     }
 }
 
-/// Save a keypair to a JSON keyfile with restricted permissions (0600).
 pub fn save_keyfile(keypair: &KeyPair, path: &str) -> Result<()> {
     let keyfile = keypair_to_keyfile(keypair);
     let json =
@@ -120,7 +105,6 @@ fn create_private_sidecar(path: &Path) -> Result<(std::path::PathBuf, File)> {
     bail!("could not allocate a unique private keyfile sidecar")
 }
 
-/// Load a keypair from a JSON keyfile.
 pub fn load_keyfile(path: &str) -> Result<KeyPair> {
     let path = Path::new(path);
     let file = arc_crypto::secret_file::open_private(path).with_context(|| {
@@ -163,7 +147,6 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
         .with_context(|| format!("failed to sync keyfile directory for {}", path.display()))
 }
 
-/// Convert a `KeyPair` to a serializable `Keyfile`.
 fn keypair_to_keyfile(keypair: &KeyPair) -> Keyfile {
     let (scheme, secret_key_bytes, public_key_bytes) = match keypair {
         KeyPair::Ed25519(sk) => (
@@ -196,7 +179,6 @@ fn keypair_to_keyfile(keypair: &KeyPair) -> Keyfile {
     }
 }
 
-/// Reconstruct a `KeyPair` from a `Keyfile`.
 fn keyfile_to_keypair(keyfile: &Keyfile) -> Result<KeyPair> {
     let sk_bytes =
         Zeroizing::new(hex::decode(&keyfile.secret_key).context("invalid hex in secret_key")?);
@@ -258,7 +240,6 @@ fn keyfile_to_keypair(keyfile: &Keyfile) -> Result<KeyPair> {
     Ok(keypair)
 }
 
-/// Run the keygen command: generate a keypair, save it, and print summary.
 pub fn run(scheme: &str, output: &str) -> Result<()> {
     let keypair = generate_keypair(scheme)?;
     let address = keypair.address();
@@ -274,12 +255,6 @@ pub fn run(scheme: &str, output: &str) -> Result<()> {
     Ok(())
 }
 
-/// Convert one protected legacy validator-seed file to an Ed25519 keyfile.
-///
-/// This migration-only path deliberately accepts no seed on argv or through
-/// the environment. It reproduces the historical validator derivation byte
-/// for byte, publishes the output without replacement, and verifies the
-/// resulting public key and address before reporting success.
 pub fn run_legacy_seed_file(input: &str, output: &str) -> Result<()> {
     let keypair = keypair_from_legacy_seed_file(Path::new(input))?;
     let expected_address = keypair.address();
@@ -298,7 +273,6 @@ pub fn run_legacy_seed_file(input: &str, output: &str) -> Result<()> {
     Ok(())
 }
 
-/// Validate a private keyfile and print only its public ARC address.
 pub fn run_verify_keyfile(path: &str) -> Result<()> {
     let keypair = load_keyfile(path)?;
     println!("{}", keypair.address().to_hex());

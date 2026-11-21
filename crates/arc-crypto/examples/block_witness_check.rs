@@ -1,10 +1,3 @@
-//! Does the block AIR actually constrain balances and nonces?
-//!
-//! Builds a valid block witness, proves it, then tries three forgeries that a
-//! chain must never accept.
-//!
-//! Usage: cargo run --release --example block_witness_check --features stwo-prover
-
 use arc_crypto::stark::{BlockProofInput, TransferWitness};
 use arc_crypto::stwo_air::try_prove_block;
 
@@ -58,19 +51,16 @@ fn main() {
         }
     }
 
-    // Money printed from nothing: receiver credited without sender debit.
     let mut minted = good.clone();
     minted[0].receiver_bal_after += 1;
     print!("\n2. Receiver credited an extra unit ... ");
     check_rejected(&minted);
 
-    // Sender keeps the fee.
     let mut free_fee = good.clone();
     free_fee[1].sender_bal_after += free_fee[1].fee;
     print!("3. Sender does not pay the fee     ... ");
     check_rejected(&free_fee);
 
-    // Replay: nonce does not advance.
     let mut replay = good.clone();
     replay[2].sender_nonce_after = replay[2].sender_nonce_before;
     print!("4. Nonce not incremented (replay)  ... ");

@@ -1,37 +1,13 @@
-//! Native timing signals for work that must not depend on WebView timers.
-//!
-//! The main window is usually hidden in the tray. A hidden WebView's timers
-//! can be throttled (Tauri's `backgroundThrottling: "disabled"` is honoured
-//! only on macOS 14 and later), and nothing in the WebView learns that the
-//! computer slept. This module runs in Rust and sends the WebView an
-//! `app-signal` event:
-//!
-//! - `tick` every [`SIGNAL_TICK`], so the update controller can run checks
-//!   whose wall-clock time has come even if its own timers were held back;
-//! - `wake` after the computer wakes from sleep;
-//! - `focus` and `shown`, sent from `lib.rs` and `tray.rs` when the main
-//!   window gains focus or the tray shows it.
-//!
-//! A wake is seen as a gap: a short interval tick that arrives much later
-//! than it should, measured on either the wall clock or the monotonic clock.
-//! On macOS and Linux the monotonic clock stops during sleep, so the wall
-//! clock shows the gap; where the monotonic clock keeps counting, the late
-//! tick shows it. Rust code waiting for a wake subscribes with [`subscribe`].
-
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 
 use tauri::{AppHandle, Emitter};
 use tokio::sync::watch;
 
-/// The event the WebView listens to.
 pub(crate) const APP_SIGNAL_EVENT: &str = "app-signal";
 
-/// How often the detector samples the clocks.
 const SAMPLE_EVERY: Duration = Duration::from_secs(15);
-/// A sample this much later than expected counts as a wake.
 const WAKE_GAP: Duration = Duration::from_secs(60);
-/// How often the WebView gets a `tick`.
 const SIGNAL_TICK: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -48,23 +24,19 @@ struct AppSignal {
     reason: SignalReason,
 }
 
-/// Send `reason` to the WebView. Best effort.
 pub(crate) fn emit_signal(app: &AppHandle, reason: SignalReason) {
     let _ = app.emit(APP_SIGNAL_EVENT, AppSignal { reason });
 }
 
-/// Counts wakes. The sender lives for the process.
 fn wake_sender() -> &'static watch::Sender<u64> {
     static WAKES: OnceLock<watch::Sender<u64>> = OnceLock::new();
     WAKES.get_or_init(|| watch::channel(0).0)
 }
 
-/// A receiver whose `changed()` resolves at the next wake.
 pub(crate) fn subscribe() -> watch::Receiver<u64> {
     wake_sender().subscribe()
 }
 
-/// Compares consecutive clock samples.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WakeDetector {
     last_monotonic: Instant,
@@ -81,9 +53,6 @@ impl WakeDetector {
         }
     }
 
-    /// Record a sample; `true` when the time since the last one, on either
-    /// clock, exceeds the period by more than [`WAKE_GAP`]. A wall clock set
-    /// backwards counts as no time.
     pub(crate) fn observe(&mut self, monotonic: Instant, wall: SystemTime) -> bool {
         let monotonic_elapsed = monotonic.saturating_duration_since(self.last_monotonic);
         let wall_elapsed = wall
@@ -95,7 +64,6 @@ impl WakeDetector {
     }
 }
 
-/// Start the detector and the `tick` signal. Call once, from setup.
 pub(crate) fn spawn(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut samples = tokio::time::interval(SAMPLE_EVERY);
@@ -138,7 +106,6 @@ mod tests {
 
     #[test]
     fn a_wall_clock_gap_with_a_stopped_monotonic_clock_is_a_wake() {
-        // macOS and Linux: the monotonic clock does not count sleep.
         let start = Instant::now();
         let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let mut detector = WakeDetector::new(start, wall, PERIOD);
@@ -146,7 +113,6 @@ mod tests {
             start + Duration::from_secs(15),
             wall + Duration::from_secs(3 * 3600)
         ));
-        // The next regular sample is not another wake.
         assert!(!detector.observe(
             start + Duration::from_secs(30),
             wall + Duration::from_secs(3 * 3600 + 15)
@@ -155,7 +121,6 @@ mod tests {
 
     #[test]
     fn a_late_monotonic_sample_is_a_wake() {
-        // Where the monotonic clock counts sleep, the tick itself is late.
         let start = Instant::now();
         let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let mut detector = WakeDetector::new(start, wall, PERIOD);

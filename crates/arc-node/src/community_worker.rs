@@ -1,39 +1,21 @@
-//! Local status of this process's community worker, and the optional
-//! keep-awake guard held while it computes a job.
-//!
-//! One arc-node process runs at most one community worker, so the status is
-//! a process-wide value installed by the worker at startup and served by the
-//! node's own `GET /community/worker/status`. The desktop app reads it from
-//! 127.0.0.1 to show whether the worker is polling or computing and how many
-//! jobs it completed and had verified. Counters cover this process's
-//! lifetime; they are local observations, not chain or reward evidence.
-
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Route on the node's own RPC that serves [`CommunityWorkerStatus::snapshot`].
 pub const COMMUNITY_WORKER_STATUS_PATH: &str = "/community/worker/status";
 
-/// Snapshot schema; bump it when a field changes meaning.
 pub const COMMUNITY_WORKER_STATUS_SCHEMA: &str = "arc.community.worker-status.v1";
 
-/// Pause between claim rounds while coordinators answer normally.
 pub const CLAIM_IDLE_REPOLL: Duration = Duration::from_millis(500);
 
-/// Longest pause between claim rounds while no coordinator answers.
 pub const CLAIM_RETRY_CAP: Duration = Duration::from_secs(30);
 
-/// What the worker is doing right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerState {
-    /// Long-polling coordinators for an assignment.
     Polling,
-    /// Executing an assignment.
     Computing,
-    /// No coordinator answered the last claim round; retrying with backoff.
     Reconnecting,
 }
 
@@ -55,20 +37,13 @@ impl WorkerState {
     }
 }
 
-/// How one claimed assignment ended, from this worker's side.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobOutcome {
-    /// The coordinator accepted the result. `verified` is true when its
-    /// response reports the output passed the authenticated replica quorum.
     Completed { verified: bool },
-    /// Declined before compute: malformed, mismatched, or quiescing.
     Declined,
-    /// Compute failed, or the coordinator rejected or never acknowledged
-    /// the result.
     Failed,
 }
 
-/// Live counters for this process's community worker.
 #[derive(Debug)]
 pub struct CommunityWorkerStatus {
     worker_id: String,
@@ -87,7 +62,6 @@ pub struct CommunityWorkerStatus {
     last_registration_unix_ms: AtomicU64,
 }
 
-/// What `GET /community/worker/status` returns.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct CommunityWorkerSnapshot {
     pub schema: &'static str,
@@ -95,14 +69,9 @@ pub struct CommunityWorkerSnapshot {
     pub public_name: String,
     pub state: WorkerState,
     pub coordinators_total: u32,
-    /// Coordinators that accepted this worker's last registration or
-    /// heartbeat.
     pub coordinators_registered: u32,
-    /// Assignments received since this process started.
     pub jobs_claimed: u64,
-    /// Results the coordinator accepted.
     pub jobs_completed: u64,
-    /// Accepted results the coordinator reported as quorum-verified.
     pub jobs_verified: u64,
     pub jobs_failed: u64,
     pub jobs_declined: u64,
@@ -152,7 +121,6 @@ impl CommunityWorkerStatus {
         self.state.store(state.encode(), Ordering::Relaxed);
     }
 
-    /// Record how many coordinators accepted one registration/heartbeat round.
     pub fn record_registration_round(&self, accepted: usize) {
         let accepted = u32::try_from(accepted).unwrap_or(u32::MAX);
         self.coordinators_registered
@@ -213,19 +181,14 @@ impl CommunityWorkerStatus {
 
 static INSTALLED: OnceLock<Arc<CommunityWorkerStatus>> = OnceLock::new();
 
-/// Publish this process's worker status. A process has one worker, so the
-/// first installation wins and is returned.
 pub fn install(status: Arc<CommunityWorkerStatus>) -> Arc<CommunityWorkerStatus> {
     INSTALLED.get_or_init(|| status).clone()
 }
 
-/// The installed worker status, if this process runs a community worker.
 pub fn installed() -> Option<Arc<CommunityWorkerStatus>> {
     INSTALLED.get().cloned()
 }
 
-/// Whether a coordinator's `/community/submit_work` response reports that
-/// the output passed its authenticated replica quorum.
 pub fn submit_response_is_quorum_verified(body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -233,14 +196,6 @@ pub fn submit_response_is_quorum_verified(body: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Pause before the next claim round after `failed_rounds` consecutive
-/// rounds in which no coordinator answered at all.
-///
-/// The worker used to re-poll every 500 ms whatever happened, so a worker
-/// that was offline, unregistered, or waking from sleep sent two signed
-/// requests per second to every coordinator. Normal long-poll completions
-/// (`no_work`) still re-poll after 500 ms; failures back off 1 s, 2 s, 4 s ...
-/// up to [`CLAIM_RETRY_CAP`].
 pub fn claim_retry_delay(failed_rounds: u32) -> Duration {
     if failed_rounds == 0 {
         return CLAIM_IDLE_REPOLL;
@@ -251,13 +206,6 @@ pub fn claim_retry_delay(failed_rounds: u32) -> Duration {
         .min(CLAIM_RETRY_CAP)
 }
 
-/// Whether the wall clock advanced by more than three registration
-/// intervals between two rounds: the machine slept or the process was
-/// suspended. Coordinators prune a worker after 90 s without a heartbeat,
-/// so the next round must register again instead of heartbeating.
-///
-/// Monotonic clocks stop during sleep on macOS and Linux, which is why the
-/// wall clock is compared.
 pub fn wall_clock_gap_suggests_sleep(
     previous_round: SystemTime,
     now: SystemTime,
@@ -267,25 +215,10 @@ pub fn wall_clock_gap_suggests_sleep(
         .is_ok_and(|gap| gap > interval.saturating_mul(3))
 }
 
-/// Pause before a coordinator that answered a claim with 404 is registered
-/// with again at the claim loop's request, after the immediate first try.
 pub const REREGISTER_COOLDOWN: Duration = Duration::from_secs(15);
 
-/// Spread repeated re-registrations across workers by up to this much, so a
-/// coordinator that restarted is not hit by every worker on the same tick.
 pub const REREGISTER_JITTER_MAX: Duration = Duration::from_secs(5);
 
-/// Coordinators whose claim long-poll answered 404 ("unknown worker"),
-/// waiting for the registration task to register with them again.
-///
-/// The first report for a coordinator wakes the registration task at once:
-/// a coordinator that restarted knows no workers, and waiting for the next
-/// one-minute registration tick would leave this worker idle there. Later
-/// reports for the same coordinator within [`REREGISTER_COOLDOWN`] plus a
-/// jitter are coalesced, so a coordinator that keeps answering 404 costs one
-/// signed registration per cooldown instead of one per 500 ms claim round,
-/// and only the reported coordinators are registered with again; the others
-/// keep their 15 s heartbeat cadence.
 pub struct ReregistrationQueue {
     state: Mutex<ReregistrationState>,
     wakeup: tokio::sync::Notify,
@@ -295,9 +228,7 @@ pub struct ReregistrationQueue {
 
 #[derive(Default)]
 struct ReregistrationState {
-    /// Coordinators to register with at the next wakeup, in a stable order.
     pending: BTreeSet<String>,
-    /// The earliest instant each coordinator may be queued again.
     next_allowed: HashMap<String, Instant>,
 }
 
@@ -321,14 +252,10 @@ impl ReregistrationQueue {
         }
     }
 
-    /// Queue `coordinator` for registration and wake the registration task.
-    /// Returns `false`, waking nothing, when the coordinator was queued less
-    /// than a cooldown ago: that request stands, or has just been served.
     pub fn request(&self, coordinator: &str) -> bool {
         self.request_at(coordinator, Instant::now())
     }
 
-    /// [`Self::request`] at a given instant, for tests.
     pub fn request_at(&self, coordinator: &str, now: Instant) -> bool {
         let jitter = self.jitter();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -348,15 +275,11 @@ impl ReregistrationQueue {
         true
     }
 
-    /// The coordinators queued since the last call.
     pub fn take_pending(&self) -> Vec<String> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         std::mem::take(&mut state.pending).into_iter().collect()
     }
 
-    /// Resolves once a coordinator has been queued. A request made while
-    /// nobody waits is remembered until the next call, like
-    /// [`tokio::sync::Notify::notify_one`].
     pub async fn notified(&self) {
         self.wakeup.notified().await;
     }
@@ -367,7 +290,6 @@ impl ReregistrationQueue {
         if max_ms == 0 {
             return Duration::ZERO;
         }
-        // Fresh random keys on every call; the node crate has no rand.
         let roll = std::collections::hash_map::RandomState::new()
             .build_hasher()
             .finish();
@@ -375,7 +297,6 @@ impl ReregistrationQueue {
     }
 }
 
-// Shared OS implementation; per-job call sites and semantics are unchanged.
 #[path = "../../../shared/keep_awake.rs"]
 mod keep_awake;
 pub use keep_awake::{KeepAwake, keep_awake_helper_command};
@@ -477,7 +398,6 @@ mod tests {
             before + Duration::from_secs(46),
             interval
         ));
-        // A clock set backwards is not a sleep.
         assert!(!wall_clock_gap_suggests_sleep(
             before,
             before - Duration::from_secs(600),
@@ -490,18 +410,12 @@ mod tests {
         let queue = ReregistrationQueue::with_cooldown(Duration::from_secs(15), Duration::ZERO);
         let start = Instant::now();
         let failing = "https://a.example";
-        // The first 404 is recovered at once, with that coordinator alone.
         assert!(queue.request_at(failing, start));
         assert_eq!(queue.take_pending(), vec![failing.to_string()]);
-        // Another coordinator answers idle, so the claim loop re-polls every
-        // 500 ms and the failing one keeps answering 404: every report
-        // within the cooldown is coalesced, and the idle coordinator is
-        // never queued because it never asked.
         for round in 1..30u64 {
             assert!(!queue.request_at(failing, start + Duration::from_millis(500 * round)));
         }
         assert!(queue.take_pending().is_empty());
-        // After the cooldown, one more registration, and the cycle repeats.
         assert!(queue.request_at(failing, start + Duration::from_secs(15)));
         assert_eq!(queue.take_pending(), vec![failing.to_string()]);
         assert!(!queue.request_at(failing, start + Duration::from_secs(29)));
@@ -514,8 +428,6 @@ mod tests {
             ReregistrationQueue::with_cooldown(Duration::from_secs(15), Duration::from_secs(5));
         let start = Instant::now();
         assert!(queue.request_at("https://a.example", start));
-        // A second coordinator's first 404 is not held back by the first's
-        // cooldown.
         assert!(queue.request_at("https://b.example", start + Duration::from_secs(7)));
         assert_eq!(
             queue.take_pending(),
@@ -524,8 +436,6 @@ mod tests {
                 "https://b.example".to_string()
             ]
         );
-        // Within the cooldown a report is coalesced whatever the jitter; a
-        // cooldown plus the whole jitter later it is accepted.
         assert!(!queue.request_at("https://a.example", start + Duration::from_millis(14_999)));
         assert!(queue.request_at("https://a.example", start + Duration::from_secs(20)));
         assert!(!queue.request_at("https://b.example", start + Duration::from_millis(21_999)));
@@ -573,8 +483,6 @@ mod tests {
     }
 }
 
-/// Build the immutable success claim from the exact generated tokens. Older
-/// coordinators reject unknown fields, so the claim response negotiates tokens.
 pub fn successful_work_result(
     claim: &serde_json::Value,
     job_id: String,

@@ -1,11 +1,4 @@
 #!/usr/bin/env bash
-# Opt-in destructive integration test for the recovery-owned cgroup v2 leaf.
-#
-# This test starts and stops disposable systemd units, freezes cgroups, and
-# sends SIGKILL during cleanup. Run it only in a disposable Linux VM/container:
-#
-#   sudo ARC_RUN_DISPOSABLE_SYSTEMD255_TEST=I_UNDERSTAND_THIS_MUTATES_A_DISPOSABLE_HOST \
-#     tests/integration/recovery_owned_leaf_systemd255_test.sh
 
 set -Eeuo pipefail
 
@@ -85,7 +78,6 @@ cleanup() {
     local status=$? current_device current_inode
     trap - EXIT INT TERM
 
-    # Thaw only the inode captured by this test. Never follow a reused path.
     if [[ -n "$leaf" && -d "$leaf" && -n "$leaf_device" && -n "$leaf_inode" ]]; then
         read -r current_device current_inode < <(stat -Lc '%d %i' "$leaf") || true
         if [[ "$current_device" == "$leaf_device" && "$current_inode" == "$leaf_inode" ]]; then
@@ -96,8 +88,6 @@ cleanup() {
         printf '0' >"$base/cgroup.freeze" 2>/dev/null || true
     fi
 
-    # The worker catches TERM by design; SIGKILL is test cleanup only and is
-    # sent solely to the PID/start pair created and captured by this script.
     if same_worker; then
         kill -KILL "$worker_pid" 2>/dev/null || true
     fi
@@ -120,8 +110,6 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# A scope, not a service, models the detached root-login writer. systemd-run
-# waits outside the scope while the caught-TERM busy worker is its sole member.
 systemd-run --quiet --scope --unit="$scope_unit" --slice="$parent_slice" \
     /bin/bash -c 'trap : TERM HUP; while :; do :; done' &
 runner_pid=$!
@@ -177,9 +165,6 @@ systemctl daemon-reload
 [[ "$(systemctl show "$scope_unit" --property=IgnoreOnIsolate --value)" == "yes" ]] || die "scope isolate safety was not applied"
 [[ "$(systemctl show "$scope_unit" --property=KillMode --value)" == "process" ]] || die "scope KillMode safety was not applied"
 
-# Freeze the parent first. Arm the child's *local* freeze request before moving
-# the exact worker, then release the parent. This distinguishes an independent
-# child barrier from an inherited frozen state.
 printf '1' >"$base/cgroup.freeze"
 wait_event "$base/cgroup.events" frozen 1 || die "parent cgroup did not freeze"
 leaf="$base/arc-recovery-writer"
@@ -209,8 +194,6 @@ read -r stable_start stable_ticks < <(proc_values "$worker_pid") || die "worker 
 [[ "$before_ticks" == "$stable_ticks" ]] || die "worker CPU advanced while owned leaf was frozen"
 read -r before_sigpnd before_shdpnd < <(awk '/^SigPnd:/ { p=$2 } /^ShdPnd:/ { s=$2 } END { print p, s }' "/proc/$worker_pid/status")
 
-# Stopping the implicit Slice dependency makes PID 1 stop/thaw the scope. The
-# parent is allowed to transition; the independently frozen owned leaf is not.
 systemctl stop "$parent_slice"
 [[ "$(systemctl show "$scope_unit" --property=ActiveState --value)" == "inactive" ]] || die "scope did not take the adversarial dependency stop"
 [[ "$(systemctl show "$scope_unit" --property=SubState --value)" == "dead" ]] || die "scope did not reach dead substate"
@@ -233,8 +216,6 @@ read -r stopped_start_2 stopped_ticks_2 < <(proc_values "$worker_pid") || die "w
 read -r after_sigpnd after_shdpnd < <(awk '/^SigPnd:/ { p=$2 } /^ShdPnd:/ { s=$2 } END { print p, s }' "/proc/$worker_pid/status")
 [[ "$after_sigpnd" == "$before_sigpnd" && "$after_shdpnd" == "$before_shdpnd" ]] || die "scope dependency stop injected a signal"
 
-# Match the recovery controller: open the exact directory without following a
-# symlink, re-check dev/inode on the fd, then openat/write the freezer file.
 python3 - "$leaf" "$leaf_device" "$leaf_inode" <<'PY'
 import os
 import sys

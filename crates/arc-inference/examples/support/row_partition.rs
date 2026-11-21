@@ -1,4 +1,3 @@
-//! Offline export/proof bounds, not production placement capabilities.
 use arc_inference::tensor_parallel::MAX_ROW_WORKERS_PER_STAGE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,8 +25,6 @@ impl RowPartition {
         Ok(())
     }
 
-    /// Floor boundaries in canonical output-row order, including Q/K after
-    /// permutation. u128 intermediates avoid overflow on supported targets.
     pub fn range(self, rows: usize) -> Result<(usize, usize), String> {
         self.validate()?;
         if rows < self.count {

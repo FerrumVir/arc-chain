@@ -1,16 +1,3 @@
-"""How much libm error can the Q16 RoPE table absorb before an entry changes?
-
-`compute_rope_tables` builds the table with host `powf`, `cos` and `sin`,
-none of which IEEE 754 requires to be correctly rounded. This recomputes
-every entry from a 50-digit evaluation of the same f64 angles and reports:
-
-* whether this host's libm reproduces the correctly-rounded table;
-* the smallest distance of any exact value from a rounding boundary; and
-* the libm error, in ulps, that the table provably tolerates.
-
-    python3 -m arc_conformance.rope_margin [d_head max_seq base]
-"""
-
 from __future__ import annotations
 
 import math
@@ -44,7 +31,7 @@ TWO_PI = 2 * PI
 
 
 def exact_cos_sin(angle: float) -> tuple[Decimal, Decimal]:
-    x = Decimal(angle)  # exact binary value of the f64 angle
+    x = Decimal(angle)
     x = x - TWO_PI * (x / TWO_PI).to_integral_value()
     x2 = x * x
     cos_sum, sin_sum = Decimal(1), x
@@ -80,7 +67,6 @@ def round_decimal_half_away(value: Decimal) -> int:
 
 
 def boundary_distance(value: Decimal) -> Decimal:
-    """Distance from the nearest x.5 boundary, in Q16 units."""
     frac = abs(value) - int(abs(value))
     return abs(frac - Decimal("0.5"))
 
@@ -96,13 +82,13 @@ def analyse(d_head: int, max_seq: int, base: float) -> dict:
     pow_mismatches = 0
     min_margin = Decimal(1)
     min_margin_at = None
-    worst_cos_budget_ulps = math.inf  # tolerable cos/sin error, in ulps of the result
-    worst_pow_budget_ulps = math.inf  # tolerable pow error, in ulps of pow
+    worst_cos_budget_ulps = math.inf
+    worst_pow_budget_ulps = math.inf
     freqs = []
     for i in range(half):
         exponent = 2.0 * i / d_head
         host_pow = base ** exponent
-        cr_pow = float(exact_pow(base, exponent))  # nearest f64 to the exact power
+        cr_pow = float(exact_pow(base, exponent))
         if host_pow != cr_pow:
             pow_mismatches += 1
         freqs.append((1.0 / host_pow, host_pow))
@@ -121,9 +107,6 @@ def analyse(d_head: int, max_seq: int, base: float) -> dict:
                 margin = boundary_distance(scaled)
                 if margin < min_margin:
                     min_margin, min_margin_at = margin, (pos, i)
-                # Error budgets, in Q16 units: a cos/sin error of e moves the
-                # scaled value by 65536*e; a relative pow error r moves the
-                # angle by about angle*r and the value by 65536*|partner|*angle*r.
                 result_ulp = ulp(float(abs(exact))) if exact != 0 else 5e-324
                 cos_budget = float(margin) / (ref.ONE * result_ulp)
                 worst_cos_budget_ulps = min(worst_cos_budget_ulps, cos_budget)

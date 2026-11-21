@@ -6,11 +6,8 @@ import type { ChatTurn } from "../../lib/chat";
 import { hostLabel } from "../../lib/hosts";
 import { prefersReducedMotion } from "../Engraving";
 
-/** What an answer has shown so far about being checked and recorded. Only observed facts, never expectations. */
 export interface AnswerFacts {
-  /** A second computer re-ran it and agreed (authenticated quorum). */
   agreed: boolean;
-  /** Block height of an independently fetched, successful mined receipt, or null. */
   height: number | null;
 }
 
@@ -20,13 +17,6 @@ interface Told {
   height: number | null;
 }
 
-/**
- * The conversation drawn as an aqueduct, one arch per answer, in the house engraving. Sending a prompt starts the next
- * arch at the end: the pier rises and the timber frame goes up; a stone hangs from the crane while no answer has come
- * back. The answer arriving sets the stones and the keystone, and the water runs into the new span. A second computer
- * agreeing knocks the frame away; a mined receipt cuts its block into the arch's tablet. Every step is a real event of
- * the turn; nothing is drawn ahead of it.
- */
 export function ChatAqueduct({
   turns,
   facts,
@@ -35,7 +25,6 @@ export function ChatAqueduct({
 }: {
   turns: ChatTurn[];
   facts: Record<string, AnswerFacts>;
-  /** Called with a turn id when its arch is clicked. */
   onPick?: (turnId: string) => void;
   style?: CSSProperties;
 }) {
@@ -53,7 +42,6 @@ export function ChatAqueduct({
     if (!canvas.current) return;
     const a = window.ArchChain.mount(canvas.current, { chat: true, reduced: prefersReducedMotion(), far: far.current ?? undefined, near: near.current ?? undefined });
     api.current = a;
-    // the conversation so far: its answered turns are finished arches; a turn still waiting is the arch being built
     const { turns: ts, facts: fs } = latest.current;
     const done = ts.filter((t) => t.status === "answered");
     a.load(done.map((t) => ({ checked: fs[t.id]?.agreed ? true : null, height: fs[t.id]?.height ?? null })));
@@ -89,7 +77,6 @@ export function ChatAqueduct({
       const was = told.current.get(t.id);
       if (!was) {
         if (t.status !== "pending") continue;
-        // only one arch is built at a time: a turn the person stopped waiting for gives its site to the new prompt
         for (const [id, w] of told.current) {
           if (w.status === "pending") {
             a.failed();

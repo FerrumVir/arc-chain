@@ -1,28 +1,5 @@
 name: Modern model (SmolLM3-3B)
 
-# Evidence for the additional integer profile arc.hf-llama.i8-dyadic-row.q16.v1
-# (docs/protocol/integer-profile-hf-llama-dyadic-v1.md). Nothing here changes
-# the network's canonical model or any consensus or native-inference binding.
-#
-#   unit       clippy, unit tests, the Python reference tests, and a tiny
-#              SmolLM3-shaped model converted and run by both the Rust engine
-#              and the independent Python executor.
-#   matrix     ubuntu x86-64, windows x86-64, macOS arm64, macOS x86-64: the
-#              tiny model always; with the `smollm3-proof` label also the real
-#              SmolLM3-3B, downloaded from Hugging Face at a pinned revision,
-#              converted on the runner, run with the scalar and SIMD kernels.
-#   reference  (label) the Python executor prepares its own package from the
-#              same BF16 bytes and re-derives every golden logits vector.
-#   quality    (label) perplexity on a public-domain text vs the BF16 model.
-#   report     one table of package hashes, matrix digests and CI tok/s.
-#
-# workflow_dispatch only works from the default branch, so the pull request is
-# the trigger: paths below, plus the label for the multi-gigabyte jobs. The
-# paths are the modern profile and the two modules it calls (canonical_simd,
-# model_package), not all of arc-inference: the matrix job takes two of the
-# account's scarce macOS runners, and ci.yml's test job already runs the modern
-# unit tests (cargo test --workspace --lib) on Linux, Windows and Apple Silicon.
-
 on:
   pull_request:
     branches: [main]
@@ -43,8 +20,6 @@ on:
 permissions:
   contents: read
 
-# One group per commit: a new push does not cancel the evidence of the previous
-# one (macOS runners are scarce and their queued legs would restart).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: true
@@ -52,8 +27,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: '0'
-  # Release optimisation without fat LTO: the same kernels, a much shorter
-  # build. Integer results cannot depend on optimisation settings.
   CARGO_PROFILE_RELEASE_LTO: 'off'
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
   SOURCE_MANIFEST: docs/protocol/packages/smollm3-3b.source.json
@@ -65,30 +38,26 @@ env:
 jobs:
   unit:
     name: unit + tiny Rust/Python cross-check
-    # Adding an unrelated label must not re-run anything (pattern shared with
-    # determinism-proof.yml).
     if: github.event.action != 'labeled' || github.event.label.name == 'smollm3-proof'
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-03-16
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
         with:
           shared-key: clippy
           save-if: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
       - name: Python dependencies
         run: python -m pip install --disable-pip-version-check "$PY_NUMPY" "$PY_BLAKE3"
-      # Same feature set as the shipped node (arc-node enables candle); without
-      # it, candle-only helpers in existing code are reported as dead.
       - name: Clippy (arc-inference with candle, all targets, deny warnings)
         run: cargo clippy -p arc-inference --all-targets --features candle --locked -- -D warnings
       - name: Unit tests (modern profile, tables, operators, tokenizer, package)
@@ -135,7 +104,7 @@ jobs:
           print(json.dumps(digests, indent=1))
           assert len(set(digests.values())) == 1, "Rust scalar, Rust SIMD and Python generation differ"
           PY
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
           name: tiny-unit
@@ -151,22 +120,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macos-15 is Apple Silicon (NEON dotprod); macos-15-intel, ubuntu and
-        # windows are x86-64 (AVX2).
         os: [ubuntu-latest, windows-latest, macos-15, macos-15-intel]
     env:
       PROOF: ${{ contains(github.event.pull_request.labels.*.name, 'smollm3-proof') }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      # Install every component rust-toolchain.toml lists up front; letting
-      # cargo auto-install them hit a rustup component conflict on runners.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-03-16
           components: clippy, rustfmt
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
       - name: Python dependencies
@@ -178,7 +143,6 @@ jobs:
           set -euo pipefail
           case "$RUNNER_OS" in
             Linux)
-              # Use whichever of / and /mnt has more free space.
               if [ "$(df --output=avail -B1 /mnt | tail -1)" -gt "$(df --output=avail -B1 / | tail -1)" ]; then
                 sudo mkdir -p /mnt/arc-model
                 sudo chown "$(id -u):$(id -g)" /mnt/arc-model
@@ -187,7 +151,6 @@ jobs:
                 dir="$HOME/arc-model"
               fi
               ;;
-            # Windows: RUNNER_TEMP is on D:, which has far more room than C:.
             *) dir="$RUNNER_TEMP/arc-model" ;;
           esac
           mkdir -p "$dir" "$RUNNER_TEMP/evidence"
@@ -252,7 +215,7 @@ jobs:
               --tokenizer "$MODEL_DIR/tokenizer.json" --cases "$CASES" --kernel "$kernel" \
               --out "$EVIDENCE/smollm3-run-$kernel.json"
           done
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
           name: evidence-${{ matrix.os }}
@@ -265,16 +228,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      # Install every component rust-toolchain.toml lists up front; letting
-      # cargo auto-install them hit a rustup component conflict on runners.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-03-16
           components: clippy, rustfmt
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
       - name: Python dependencies (Hugging Face tokenizers and transformers, no torch)
@@ -298,7 +259,7 @@ jobs:
           python scripts/arc_modern/hf_checks.py compare-tokens --model-dir "$RUNNER_TEMP/tok" \
             --corpus "$ev/tokenizer-corpus.jsonl" --rust "$ev/tokenizer-rust.jsonl" \
             --out "$ev/tokenizer-check.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
           name: evidence-tokenizer
@@ -313,16 +274,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      # Install every component rust-toolchain.toml lists up front; letting
-      # cargo auto-install them hit a rustup component conflict on runners.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-03-16
           components: clippy, rustfmt
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
       - name: Python dependencies (reference executor)
@@ -372,7 +331,7 @@ jobs:
           cd scripts
           python -m arc_conformance.modern_reference verify-run --package "$MODEL_DIR/rust.arcipkg" \
             --run "$EVIDENCE/reference-rust-run.json" --out "$EVIDENCE/python-golden.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
           name: evidence-reference
@@ -387,16 +346,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      # Install every component rust-toolchain.toml lists up front; letting
-      # cargo auto-install them hit a rustup component conflict on runners.
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-03-16
           components: clippy, rustfmt
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
       - name: Python dependencies (CPU torch and transformers for the BF16 reference)
@@ -425,7 +382,6 @@ jobs:
       - name: Perplexity on two public-domain texts, integer engine then BF16 reference
         run: |
           set -euo pipefail
-          # Peak resident memory of conversion and serving (GNU time, if installed).
           timed() {
             local name="$1"
             shift
@@ -452,7 +408,7 @@ jobs:
             "Federal Register 2026-20493 (public domain, published after the model's data cutoff), first 1024 tokens"
           run_text alice scripts/arc_modern/data/alice_ch1.txt \
             "Alice in Wonderland ch. 1 (public domain, likely memorised), first 1024 tokens"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
           name: evidence-quality
@@ -466,13 +422,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.12'
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           path: ${{ runner.temp }}/all
       - name: Hash matrix, reference and quality summary
@@ -535,7 +491,7 @@ jobs:
           PY
           fi
           exit "$status"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
           name: modern-model-report

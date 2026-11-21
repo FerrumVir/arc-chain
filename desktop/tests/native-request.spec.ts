@@ -176,10 +176,8 @@ test.describe("submit refusals", () => {
     for (let attempt = 0; attempt < RETRY_ATTEMPT_LIMIT * 3; attempt += 1) {
       state = run(state, { type: "submit_started" }, { type: "submit_refused", status: 503, body });
     }
-    // The signed bytes can still be admitted: still in flight, with the reason.
     expect(state.phase).toBe("submitting");
     expect(state.reason).toContain("rebuilding its DAG");
-    // Once the chain is past its expiry it can never be admitted: dropped.
     state = reduce(state, { type: "receipt", receipt: null, height: 100 });
     expect(state.phase).toBe("dropped");
   });
@@ -230,10 +228,8 @@ test.describe("cancellation follows finality", () => {
     const withdrawn = reduce(queued, { type: "withdraw" });
     expect(withdrawn.phase).toBe("withdrawn");
     expect(phaseLabel(withdrawn)).toContain("nothing was signed or sent");
-    // Withdrawn is final: it cannot be signed later.
     expect(reduce(withdrawn, { type: "sign_started" }).phase).toBe("withdrawn");
 
-    // Once signed there is nothing to withdraw: a button that hid it would lie.
     for (const state of [
       reduce(queued, { type: "sign_started" }),
       submitted(),
@@ -246,13 +242,11 @@ test.describe("cancellation follows finality", () => {
   test("an admitted request becomes refundable exactly when the next block may refund it", () => {
     const admitted = reduce(submitted(100), { type: "receipt", height: 90, receipt: receipt("Pending") });
     expect(admitted.phase).toBe("awaiting_certificate");
-    // The next block is height + 1; the chain refunds at or past the expiry.
     const early = reduce(admitted, { type: "receipt", height: 98, receipt: receipt("Pending") });
     expect(early.phase).toBe("awaiting_certificate");
     const due = reduce(admitted, { type: "receipt", height: 99, receipt: receipt("Pending") });
     expect(due.phase).toBe("refund_due");
     expect(phaseLabel(due)).toContain("claim the reservation back");
-    // The receipt's own expiry wins over what the app remembered.
     const byReceipt = reduce(submitted(1_000), {
       type: "receipt",
       height: 99,
@@ -273,14 +267,11 @@ test.describe("cancellation follows finality", () => {
     state = run(state, { type: "refund_started" }, { type: "refund_ok", txHash: "ef".repeat(32) });
     expect(state.phase).toBe("refund_submitted");
     expect(state.refundTxHash).toBe("ef".repeat(32));
-    // Still pending on chain: the refund is not in a block yet.
     state = reduce(state, { type: "receipt", height: 101, receipt: receipt("Pending") });
     expect(state.phase).toBe("refund_submitted");
-    // A refused refund goes back to claimable with the reason.
     const refused = reduce(state, { type: "refund_refused", reason: "rate limited" });
     expect(refused.phase).toBe("refund_due");
     expect(refused.reason).toBe("rate limited");
-    // The chain returns the reservation.
     state = reduce(state, {
       type: "receipt",
       height: 102,
@@ -348,15 +339,12 @@ test.describe("resubmission and restart", () => {
       nonce: 1,
       expiresAt: 100,
     }, { type: "submit_started" });
-    // The first attempt timed out: delivery unknown.
     let state = reduce(signing, { type: "network_error", message: "timed out" });
     expect(state.mayBeDelivered).toBe(true);
     state = run(state, { type: "submit_started" }, { type: "submit_refused", status: 400, body: "request is expired" });
     expect(state.phase).toBe("submitted");
-    // The copy that got through was admitted: the receipt moves it on.
     state = reduce(state, { type: "receipt", height: 60, receipt: receipt("Pending") });
     expect(state.phase).toBe("awaiting_certificate");
-    // A clean first refusal is still final.
     expect(reduce(signing, { type: "submit_refused", status: 400, body: "insufficient balance: have 1, need 2" }).phase).toBe("rejected");
   });
 
@@ -412,11 +400,8 @@ test.describe("resubmission and restart", () => {
     expect(first.refundTxHash).toBe("03".repeat(32));
     expect(first.promptPreview).toBe("first");
     const second = states.find((state) => state.requestId === "cd".repeat(32))!;
-    // A remembered refusal is the reason, not a verdict: another copy may
-    // have been admitted, so the receipt or the expiry decides.
     expect(second.phase).toBe("submitted");
     expect(second.reason).toContain("insufficient balance");
-    // The receipt still decides: a restored request that the chain finalized is finalized.
     const settled = reduce(first, { type: "receipt", height: 1_000, receipt: receipt("Refunded") });
     expect(settled.phase).toBe("refunded");
   });

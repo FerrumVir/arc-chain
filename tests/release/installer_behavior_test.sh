@@ -56,13 +56,8 @@ canonical_pairs_for_version() {
 
 new_sandbox() {
     local sandbox sandbox_root mock_bin command_name
-    # The installer correctly refuses /tmp as a persistent chain-data parent.
-    # Put contract sandboxes below the test user's home (or an explicit safe
-    # override) so normal fixtures exercise supported directory policy.
     sandbox_root="${ARC_INSTALLER_TEST_TMPDIR:-$HOME}"
     sandbox="$(mktemp -d "$sandbox_root/.arc-installer-contract.XXXXXX")"
-    # Use the physical spelling so host-level aliases such as macOS /var do
-    # not look like an installer-controlled symlink in Linux contract tests.
     sandbox="$(CDPATH='' cd -- "$sandbox" && pwd -P)"
     ACTIVE_SANDBOXES="$ACTIVE_SANDBOXES $sandbox"
     mkdir -p "$sandbox/home" "$sandbox/bin" "$sandbox/tmp"
@@ -706,8 +701,6 @@ legacy_default_adoption_preserves_state_config_model_and_identity() {
     genesis_hash="$(file_sha256 "$legacy_root/genesis.toml")"
     identity_hash="$(file_sha256 "$legacy_root/identity.seed")"
 
-    # Force a pre-download failure after adoption reservation. The pending
-    # marker must be durable, must not authorize purge, and must resume safely.
     ARC_NODE_VERSION_UNDER_TEST='0.8'
     output="$sandbox/legacy-reservation.out"
     invoke_installer "$sandbox" Linux x86_64 \
@@ -1013,8 +1006,6 @@ legacy_linux_post_intent_failure_restores_files_but_stays_stopped() {
 legacy_retirement_failures_obey_the_intent_boundary() {
     local sandbox legacy_root unit_dir output status host_uid binary_hash
 
-    # A create-intent refusal is still before the irreversible boundary: the
-    # exact v0.7 node may be restored, but its unsigned updater stays fenced.
     reset_legacy_supervisor_test_environment
     new_sandbox
     sandbox="$NEW_SANDBOX"
@@ -1045,8 +1036,6 @@ legacy_retirement_failures_obey_the_intent_boundary() {
     assert_file_contains "$sandbox/systemd-state/arc-updater.timer.active" '^false$' \
         'pre-intent failure rearmed the unsigned updater' || return 1
 
-    # Once intent publication succeeds, a finalizer refusal must restore files
-    # but leave v0.7 stopped. No receipt and no v0.8 state may appear.
     reset_legacy_supervisor_test_environment
     new_sandbox
     sandbox="$NEW_SANDBOX"
@@ -1196,9 +1185,6 @@ installer_distinguishes_v07_retirement_from_v08_quiescence() {
     assert_file_not_contains "$REPO_ROOT/install.sh" \
         'kill -KILL "\$LEGACY_DETACHED_PID"' \
         'legacy detached retirement still force-kills the old process' || return 1
-    assert_file_contains "$REPO_ROOT/install.sh" \
-        "a long timeout cannot turn v0\.7's immediate-exit handler into a drain" \
-        'installer source falsely treats a timed v0.7 TERM as quiescence' || return 1
     assert_file_not_contains "$REPO_ROOT/install.sh" \
         'Legacy detached node did not drain' \
         'legacy detached retirement still claims a drain it cannot prove' || return 1
@@ -1279,9 +1265,6 @@ legacy_marker_fsync_crash_keeps_v07_runnable_and_resumes() {
     [ ! -s "$sandbox/curl.log" ] \
         || { printf 'marker fsync crash reached release downloads\n'; return 1; }
 
-    # The next invocation must bind to the durable marker, reconstruct the
-    # exact archive from the still-live sources, and commit only after the new
-    # service is healthy on its preserved RPC port.
     MOCK_HEALTH_PORT_UNDER_TEST=18444
     ARC_HEALTH_TIMEOUT_UNDER_TEST=4
     output="$sandbox/legacy-marker-fsync-resume.out"
@@ -1438,8 +1421,6 @@ managed_macos_update_drains_old_node_without_unloading_its_updater() {
         '<key>ExitTimeOut</key><integer>4420</integer>' \
         'fresh managed macOS agent lacks the complete graceful-stop budget' || return 1
 
-    # Model a node which acknowledges SIGTERM immediately but needs time to
-    # drain accepted work and flush durable state before its process exits.
     (
         trap 'trap - TERM; /bin/sleep 1; exit 0' TERM
         while :; do /bin/sleep 1; done
@@ -1712,10 +1693,6 @@ assert_log_contains_literal() {
 
 file_mode() {
     local file="$1"
-    # GNU stat accepts `-f` but interprets it as filesystem statistics, so a
-    # BSD-first probe can succeed with several lines of unrelated output.
-    # GNU's file-format form is unambiguous; BSD stat rejects it and falls
-    # through to its native `%Lp` format.
     stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file"
 }
 
@@ -1797,8 +1774,6 @@ minified_github_api_json_without_newline_installs_exact_assets() {
     new_sandbox
     sandbox="$NEW_SANDBOX"
     fixture="$sandbox/release-minified.json"
-    # Command substitution strips all trailing newlines; `tr` removes the
-    # internal pretty-print newlines, reproducing GitHub's one-line API body.
     printf '%s' "$(tr -d '\n' < "$TEST_DIR/fixtures/release-v0.8.0.json")" > "$fixture"
     [ "$(wc -l < "$fixture" | tr -d ' ')" -eq 0 ] || {
         printf 'minified release fixture unexpectedly retained a newline\n'

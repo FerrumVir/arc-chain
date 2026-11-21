@@ -1,12 +1,3 @@
-//! Minimal OpenSSH `SSHSIG` verification for the release-manifest signature.
-//!
-//! This is the check `install.sh` performs with
-//! `ssh-keygen -Y verify -f <allowed signers> -I arc-release -n arc-release-manifest-v1`,
-//! where the allowed-signers file holds exactly one Ed25519 key. Accepting a
-//! signature therefore means: the blob is a version-1 SSHSIG, it was made by
-//! that exact key, for that exact namespace, over SHA-512 or SHA-256 of the
-//! message (PROTOCOL.sshsig), and the Ed25519 signature verifies strictly.
-
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -19,7 +10,6 @@ const ARMOR_END: &str = "-----END SSH SIGNATURE-----";
 const KEY_TYPE: &str = "ssh-ed25519";
 const MAX_ARMORED_BYTES: usize = 16 * 1024;
 
-/// Parse an OpenSSH `ssh-ed25519 AAAA...` public key into its 32 key bytes.
 pub fn parse_ed25519_public_key(openssh: &str) -> Result<[u8; 32]> {
     let mut parts = openssh.split_whitespace();
     let kind = parts
@@ -45,7 +35,6 @@ pub fn parse_ed25519_public_key(openssh: &str) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-/// Verify an armored SSHSIG over `message` for `namespace` and `trusted_key`.
 pub fn verify(
     armored: &str,
     message: &[u8],
@@ -161,7 +150,6 @@ fn put_string(out: &mut Vec<u8>, value: &[u8]) {
     out.extend_from_slice(value);
 }
 
-/// Reader for SSH wire-format `uint32` and length-prefixed `string` fields.
 struct Reader<'a> {
     data: &'a [u8],
     offset: usize,
@@ -255,7 +243,6 @@ mod tests {
         assert!(verify(&no_footer, MANIFEST, NAMESPACE, &release_key()).is_err());
         let trailing = format!("{SIGNATURE}\nextra\n");
         assert!(verify(&trailing, MANIFEST, NAMESPACE, &release_key()).is_err());
-        // Mutate decoded bytes, not a suffix that changes with each release.
         let original = dearmor(SIGNATURE).unwrap();
         let shortened = &original[..original.len() - 1];
         assert_ne!(shortened, original.as_slice());

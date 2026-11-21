@@ -1,37 +1,22 @@
-//! Ethereum event watcher.
-//!
-//! Polls an Ethereum JSON-RPC endpoint for `Locked(address,uint256,uint256)` events
-//! emitted by the ArcBridge.sol contract and returns parsed lock events.
-
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::config::RelayerConfig;
 
-// keccak256("Locked(address,uint256,uint256)")
-// Precomputed topic0 for the Lock event.
 pub const LOCKED_EVENT_TOPIC: &str =
     "0x9f1ec8c880f76798e7b793325d625e9b60e4082a553c98f42b6cda368dd60008";
 
-/// A parsed Lock event from ArcBridge.sol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockEvent {
-    /// Ethereum address that locked tokens.
     pub sender: [u8; 20],
-    /// Amount of ARC tokens locked (in wei).
     pub amount: u128,
-    /// Lock nonce from the contract.
     pub nonce: u64,
-    /// Block number the event was emitted in.
     pub block_number: u64,
-    /// Transaction hash containing the event.
     pub tx_hash: [u8; 32],
-    /// Log index within the block.
     pub log_index: u64,
 }
 
-/// Watches Ethereum for Lock events on the ArcBridge contract.
 pub struct EthWatcher {
     client: reqwest::Client,
     eth_rpc_url: String,
@@ -41,7 +26,6 @@ pub struct EthWatcher {
 }
 
 impl EthWatcher {
-    /// Create a new EthWatcher from the relayer configuration.
     pub fn new(config: &RelayerConfig) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -52,18 +36,11 @@ impl EthWatcher {
         }
     }
 
-    /// Set the starting block for scanning (e.g. loaded from the database).
-    // Nothing calls this yet. The config carries a `db_path`, but the relayer
-    // has no persistence layer, so the resume point is never restored at
-    // startup. Deleting this setter would hide that gap instead of closing it:
-    // the fix is a caller that loads the saved block and calls this, not the
-    // removal of the only way to set it. Kept, with the lint silenced here only.
     #[allow(dead_code)]
     pub fn set_last_scanned_block(&mut self, block: u64) {
         self.last_scanned_block = block;
     }
 
-    /// Get the current block number from the Ethereum node.
     pub async fn get_current_block(&self) -> Result<u64> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -90,8 +67,6 @@ impl EthWatcher {
         parse_hex_u64(hex_str)
     }
 
-    /// Poll for new Lock events between `last_scanned_block+1` and
-    /// `current_block - confirmations`.
     pub async fn poll_lock_events(&mut self) -> Result<Vec<LockEvent>> {
         let current_block = self.get_current_block().await?;
         let confirmed_block = current_block.saturating_sub(self.confirmations);
@@ -118,7 +93,6 @@ impl EthWatcher {
         Ok(events)
     }
 
-    /// Fetch logs matching the Locked event from the Ethereum node.
     async fn get_logs(&self, from_block: u64, to_block: u64) -> Result<Vec<LockEvent>> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -163,13 +137,6 @@ impl EthWatcher {
     }
 }
 
-/// Parse a single Ethereum log entry into a LockEvent.
-///
-/// Log layout for `Locked(address indexed sender, uint256 amount, uint256 indexed nonce)`:
-/// - topics[0]: event signature hash
-/// - topics[1]: sender address (indexed, left-padded to 32 bytes)
-/// - topics[2]: nonce (indexed, left-padded to 32 bytes)
-/// - data: amount (uint256, 32 bytes)
 fn parse_lock_event(log: &serde_json::Value) -> Result<LockEvent> {
     let topics = log["topics"].as_array().context("missing topics")?;
 
@@ -177,7 +144,6 @@ fn parse_lock_event(log: &serde_json::Value) -> Result<LockEvent> {
         anyhow::bail!("expected at least 3 topics, got {}", topics.len());
     }
 
-    // topics[1] = sender address (last 20 bytes of 32-byte word)
     let sender_hex = topics[1].as_str().context("missing sender topic")?;
     let sender_bytes = decode_hex_bytes(sender_hex)?;
     let mut sender = [0u8; 20];
@@ -185,20 +151,16 @@ fn parse_lock_event(log: &serde_json::Value) -> Result<LockEvent> {
         sender.copy_from_slice(&sender_bytes[sender_bytes.len() - 20..]);
     }
 
-    // topics[2] = nonce
     let nonce_hex = topics[2].as_str().context("missing nonce topic")?;
     let nonce = parse_hex_u64(nonce_hex)?;
 
-    // data = amount (uint256)
     let data_hex = log["data"].as_str().context("missing data field")?;
     let data_bytes = decode_hex_bytes(data_hex)?;
     let amount = parse_uint256_as_u128(&data_bytes)?;
 
-    // Block number
     let block_hex = log["blockNumber"].as_str().context("missing blockNumber")?;
     let block_number = parse_hex_u64(block_hex)?;
 
-    // Transaction hash
     let tx_hash_hex = log["transactionHash"]
         .as_str()
         .context("missing transactionHash")?;
@@ -208,7 +170,6 @@ fn parse_lock_event(log: &serde_json::Value) -> Result<LockEvent> {
         tx_hash.copy_from_slice(&tx_hash_bytes);
     }
 
-    // Log index
     let log_index_hex = log["logIndex"].as_str().unwrap_or("0x0");
     let log_index = parse_hex_u64(log_index_hex)?;
 
@@ -222,25 +183,20 @@ fn parse_lock_event(log: &serde_json::Value) -> Result<LockEvent> {
     })
 }
 
-/// Decode a hex string (with optional 0x prefix) into bytes.
 fn decode_hex_bytes(hex_str: &str) -> Result<Vec<u8>> {
     let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     hex::decode(stripped).context("invalid hex string")
 }
 
-/// Parse a hex string (with optional 0x prefix) into a u64.
 fn parse_hex_u64(hex_str: &str) -> Result<u64> {
     let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     u64::from_str_radix(stripped, 16).context("invalid hex u64")
 }
 
-/// Parse the first 32 bytes of data as a big-endian uint256, returning as u128.
-/// Returns an error if the value exceeds u128::MAX.
 fn parse_uint256_as_u128(data: &[u8]) -> Result<u128> {
     if data.len() < 32 {
         anyhow::bail!("data too short for uint256: {} bytes", data.len());
     }
-    // Check that the upper 16 bytes are zero (fits in u128).
     for &b in &data[..16] {
         if b != 0 {
             anyhow::bail!("uint256 value exceeds u128::MAX");
@@ -269,7 +225,6 @@ mod tests {
         data[31] = 1;
         assert_eq!(parse_uint256_as_u128(&data).unwrap(), 1);
 
-        // 1 ETH = 10^18
         let eth = 1_000_000_000_000_000_000u128;
         let eth_bytes = eth.to_be_bytes();
         data[16..32].copy_from_slice(&eth_bytes);

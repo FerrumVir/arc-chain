@@ -1,30 +1,3 @@
-"""Backup, verify and restore one ARC node data directory (R6).
-
-    python3 -m arc_ops.backup backup  --data-dir DIR --out ARCHIVE.tar.gz [--binary PATH]
-    python3 -m arc_ops.backup verify  ARCHIVE.tar.gz
-    python3 -m arc_ops.backup restore ARCHIVE.tar.gz --data-dir NEW_DIR
-
-A backup is taken only from a STOPPED node. A running node holds an
-exclusive kernel lock on `<data-dir>/.arc-node.lock`; the backup takes that
-same lock, non-blocking, and keeps it for the whole copy - so it refuses a
-running node, and a node started during the backup refuses to start instead
-of writing underneath it. A live copy of a WAL, a snapshot and a signing
-record taken at different instants is not a state any node was ever in.
-
-The archive carries MANIFEST.json: every file's path, size and sha256, the
-genesis binding, the snapshot identity (height), the size of the state WAL,
-and - if given - the binary that last ran this store and its digest.
-`verify` re-hashes every member; `restore` verifies first, refuses a
-non-empty target, and verifies again after extracting.
-
-What a restore may be opened with is in docs/operations/backup-restore-upgrade.md:
-a store written by a newer binary can contain records an older one refuses
-(a snapshot v2, a WalOp::Rebase), so rolling back is restoring the pre-upgrade
-backup with the pre-upgrade binary, never pointing an old binary at a new store.
-
-Exit: 0 success, 1 refused or failed.
-"""
-
 import argparse
 import fcntl
 import hashlib
@@ -54,7 +27,6 @@ class NodeRunning(Exception):
 
 
 def hold_node_lock(data_dir: str):
-    """Take the node's own data-directory lock, or raise NodeRunning."""
     path = os.path.join(data_dir, ".arc-node.lock")
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
@@ -71,7 +43,6 @@ def _files(data_dir: str) -> List[str]:
         for name in names:
             full = os.path.join(root, name)
             rel = os.path.relpath(full, data_dir)
-            # Lock files carry no state; a restored node recreates them.
             if name == ".arc-node.lock" or name.endswith(".tmp"):
                 continue
             out.append(rel)
@@ -89,9 +60,6 @@ def backup(data_dir: str, out: str, binary: Optional[str] = None) -> Dict[str, A
             full = os.path.join(data_dir, rel)
             members.append({"path": rel, "bytes": os.path.getsize(full),
                             "sha256": _sha256(full),
-                            # The node refuses its own store if a private file
-                            # is not exactly 0600, so the mode is part of what
-                            # a backup has to carry.
                             "mode": stat.S_IMODE(os.stat(full).st_mode)})
         manifest: Dict[str, Any] = {
             "format": FORMAT,
@@ -175,12 +143,6 @@ def restore(archive: str, data_dir: str) -> Dict[str, Any]:
                 out.write(src.read())
                 out.flush()
                 os.fsync(out.fileno())
-            # Content is not enough: a store restored with default permissions
-            # is one the node refuses to open ("private file ... must have mode
-            # 0600"), so a backup that only round-tripped bytes was useless in
-            # exactly the situation it exists for. The archive's own mode is
-            # authoritative; the manifest's copy is cross-checked when present
-            # so an edited archive cannot widen a private file.
             mode = stat.S_IMODE(member.mode)
             recorded = m.get("mode")
             if recorded is not None and recorded != mode:

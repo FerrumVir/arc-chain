@@ -36,7 +36,6 @@ def require(condition, message):
 
 def git(root: Path, *arguments: str, data: bytes | None = None) -> bytes:
     env = dict(os.environ)
-    # Do not repurpose HOME or the user's index/configuration.
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null",
                GIT_TERMINAL_PROMPT="0", GIT_NO_REPLACE_OBJECTS="1")
     for name in ("GIT_INDEX_FILE", "GIT_DIR", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY",
@@ -85,11 +84,6 @@ def reject_secret_fields(value, depth=0):
 
 
 def validate_public_fields(name, value):
-    """Reject extra operational fields before creating any public Git objects.
-
-    Semantic completeness is independently checked by the protected producer.
-    This is a closed field contract, not a general detector for encoded secrets.
-    """
     def fields(row, allowed):
         require(isinstance(row, dict) and set(row) <= set(allowed.split()),
                 "unexpected public operational field in " + name)
@@ -154,8 +148,6 @@ def validate_bindings(payloads: dict[str, bytes], main: str):
     require(checkpoint.get("checkpoint_sha256") == hashlib.sha256(payloads["recovery.arcchkpt"]).hexdigest()
             and checkpoint.get("checkpoint_size") == len(payloads["recovery.arcchkpt"]),
             "raw checkpoint differs from owner attestation")
-    # A six-host update keeps its original proof key. Only an attestation that names
-    # declared-offline validators records its proof as a live-host proof.
     declared = attestation.get("declared_offline_validators")
     proof_key, other_key = (("fresh_live_host_proof", "fresh_six_host_proof") if declared else
                             ("fresh_six_host_proof", "fresh_live_host_proof"))
@@ -214,8 +206,6 @@ def read_commit(root: Path, commit: str, main: str) -> dict[str, bytes]:
     require(parents == f"{commit} {main}", "input commit must have exact main as its sole parent")
     require(int(git(root, "cat-file", "-s", f"{commit}^{{tree}}").strip()) <= 2048,
             "input root tree exceeds the bounded contract")
-    # Only flat root blobs are allowed. Never traverse an attacker-supplied
-    # subtree before enforcing its mode and exact membership.
     rows = git(root, "ls-tree", "-z", "--full-tree", commit).split(b"\0")
     payloads = {}
     for row in filter(None, rows):

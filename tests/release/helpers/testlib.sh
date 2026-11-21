@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
 
-# Tiny dependency-free test helpers for the release contract suite.
-# The caller intentionally controls `set` flags so an assertion failure can be
-# reported without aborting the rest of the suite.
-
 TESTS_RUN=0
 TESTS_PASSED=0
 TESTS_FAILED=0

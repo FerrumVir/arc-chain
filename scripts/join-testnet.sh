@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Compatibility entry point for the supported stake-zero headless installer.
-#
-# The old script built an arbitrary checkout, generated a short-lived seed on
-# every run, and launched without an explicit stake/community role. That is not
-# a safe way to join the forked public testnet. Keep this familiar filename,
-# but make it use the exact-tagged, checksummed installer contract.
 set -Eeuo pipefail
 
 REPO_ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"

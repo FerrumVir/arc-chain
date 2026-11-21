@@ -1,31 +1,20 @@
-/**
- * ARC Chain SDK - TypeScript type definitions.
- *
- * Interfaces matching the ARC Chain RPC response shapes.
- */
 import type { U64 } from "./u64";
 export type { U64 } from "./u64";
-/** 32-byte hex-encoded hash (BLAKE3 digest, no `0x` prefix). */
 export type Hash256 = string;
-/** 32-byte hex-encoded account address (BLAKE3 of pubkey). */
 export type Address = string;
-/** Transaction type discriminant matching the Rust TxType enum. */
 export type TxType = "Transfer" | "Settle" | "Swap" | "Escrow" | "Stake" | "WasmCall" | "MultiSig" | "DeployContract" | "RegisterAgent" | "JoinValidator" | "LeaveValidator" | "ClaimRewards" | "UpdateStake";
-/** Transfer body. */
 export interface TransferBody {
     type: "Transfer";
     to: string;
     amount: U64;
     amount_commitment?: string | null;
 }
-/** Contract deployment body. */
 export interface DeployContractBody {
     type: "DeployContract";
     bytecode: string;
     constructor_args: string;
     state_rent_deposit: U64;
 }
-/** WASM contract call body. */
 export interface WasmCallBody {
     type: "WasmCall";
     contract: string;
@@ -34,14 +23,12 @@ export interface WasmCallBody {
     value: U64;
     gas_limit: U64;
 }
-/** Stake/unstake body. */
 export interface StakeBody {
     type: "Stake";
     amount: U64;
     is_stake: boolean;
     validator: string;
 }
-/** Settlement body. */
 export interface SettleBody {
     type: "Settle";
     agent_id: string;
@@ -50,7 +37,6 @@ export interface SettleBody {
     usage_units: U64;
     amount_commitment?: string | null;
 }
-/** Channel open body. */
 export interface ChannelOpenBody {
     type: "ChannelOpen";
     channel_id: Hash256;
@@ -58,7 +44,6 @@ export interface ChannelOpenBody {
     deposit: number;
     timeout_blocks: number;
 }
-/** Channel close body. */
 export interface ChannelCloseBody {
     type: "ChannelClose";
     channel_id: Hash256;
@@ -67,7 +52,6 @@ export interface ChannelCloseBody {
     counterparty_sig: number[];
     state_nonce: number;
 }
-/** Channel dispute body. */
 export interface ChannelDisputeBody {
     type: "ChannelDispute";
     channel_id: Hash256;
@@ -77,18 +61,14 @@ export interface ChannelDisputeBody {
     state_nonce: number;
     challenge_period: number;
 }
-/** Union of all transaction body types. */
 export type TxBody = TransferBody | DeployContractBody | WasmCallBody | StakeBody | SettleBody | ChannelOpenBody | ChannelCloseBody | ChannelDisputeBody;
-/** Alias for TxBody used by older code. */
 export type TransactionBody = TxBody;
-/** Ed25519 signature payload. */
 export interface Ed25519Signature {
     Ed25519: {
         public_key: string;
         signature: string;
     };
 }
-/** An unsigned or signed transaction. */
 export interface Transaction {
     tx_type: TxType;
     from: string;
@@ -98,21 +78,17 @@ export interface Transaction {
     body: TxBody;
     hash: string;
     signature: Ed25519Signature | null;
-    /** Exact domain used for the signing hash; null on pre-v3 chains. */
     transaction_domain: string | null;
     to?: string;
     amount?: U64;
 }
-/** Transfer builder output before signing. */
 export interface TransferTransaction extends Omit<Transaction, "tx_type" | "body"> {
     tx_type: "Transfer";
     body: TransferBody;
 }
-/** Transfer builder output after signing. */
 export interface SignedTransferTransaction extends Omit<TransferTransaction, "signature"> {
     signature: Ed25519Signature;
 }
-/** Exact flat write contract accepted by `POST /tx/submit`. */
 export interface SignedTransferSubmitPayload {
     from: Address;
     to: Address;
@@ -122,7 +98,6 @@ export interface SignedTransferSubmitPayload {
     tx_type?: "Transfer";
     signature: string;
     public_key: string;
-    /** Checked against `/network/info` and omitted from the HTTP body. */
     transaction_domain: string | null;
 }
 export interface Account {

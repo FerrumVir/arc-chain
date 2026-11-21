@@ -1,31 +1,15 @@
-//! Proof compression utilities.
-//!
-//! Provides lossless compression/decompression for ZK proofs, proof
-//! aggregation via Merkle commitments, and batch streaming compression
-//! with statistics.
-
 use crate::hash::{Hash256, hash_bytes, hash_pair};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
-// ---------------------------------------------------------------------------
-// Compression types
-// ---------------------------------------------------------------------------
-
-/// Compression algorithm used on proof data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompressionType {
-    /// No compression (pass-through).
     None,
-    /// Run-length encoding.
     RunLength,
-    /// Dictionary-based compression (byte-pair encoding).
     Dictionary,
-    /// Hybrid: run-length followed by dictionary pass.
     Hybrid,
 }
 
-/// A compressed proof blob.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompressedProof {
     pub original_size: usize,
@@ -34,7 +18,6 @@ pub struct CompressedProof {
     pub proof_type: String,
 }
 
-/// Statistics from a compression operation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompressionStats {
     pub original_bytes: usize,
@@ -43,14 +26,6 @@ pub struct CompressionStats {
     pub time_us: u64,
 }
 
-// ---------------------------------------------------------------------------
-// Run-length encoding
-// ---------------------------------------------------------------------------
-
-/// Encode bytes using run-length encoding.
-///
-/// Format: for each run, emit `[count, byte]`.  Counts are stored as a
-/// single byte (max run = 255).  Non-repeating bytes get count = 1.
 fn rle_encode(data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
         return Vec::new();
@@ -72,7 +47,6 @@ fn rle_encode(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Decode run-length encoded data.
 fn rle_decode(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -85,30 +59,19 @@ fn rle_decode(data: &[u8]) -> Vec<u8> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// Dictionary compression (simple byte-pair encoding)
-// ---------------------------------------------------------------------------
-
-/// Simple dictionary-based compression.
-///
-/// Finds the most frequent adjacent byte pair and replaces it with a single
-/// unused byte.  Repeats until no improvement or no unused bytes remain.
-/// Output format: `[num_rules, (replacement, first, second)*, encoded_data*]`
 fn dict_encode(data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
-        return vec![0]; // zero rules
+        return vec![0];
     }
 
     let mut working = data.to_vec();
-    let mut rules: Vec<(u8, u8, u8)> = Vec::new(); // (replacement, first, second)
+    let mut rules: Vec<(u8, u8, u8)> = Vec::new();
 
-    // Up to 16 replacement rounds to keep things bounded.
     for _ in 0..16 {
         if working.len() < 2 {
             break;
         }
 
-        // Find unused byte value.
         let mut used = [false; 256];
         for &b in &working {
             used[b as usize] = true;
@@ -118,7 +81,6 @@ fn dict_encode(data: &[u8]) -> Vec<u8> {
             None => break,
         };
 
-        // Find most frequent pair.
         let mut freq = std::collections::HashMap::<(u8, u8), usize>::new();
         for pair in working.windows(2) {
             *freq.entry((pair[0], pair[1])).or_default() += 1;
@@ -126,7 +88,6 @@ fn dict_encode(data: &[u8]) -> Vec<u8> {
         let best = freq.into_iter().max_by_key(|&(_, c)| c);
         match best {
             Some(((a, b), count)) if count >= 2 => {
-                // Replace all occurrences.
                 let mut new = Vec::with_capacity(working.len());
                 let mut i = 0;
                 while i < working.len() {
@@ -156,7 +117,6 @@ fn dict_encode(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Decode dictionary-compressed data.
 fn dict_decode(data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
         return Vec::new();
@@ -167,7 +127,6 @@ fn dict_decode(data: &[u8]) -> Vec<u8> {
         return Vec::new();
     }
 
-    // Read rules in order.
     let mut rules = Vec::with_capacity(num_rules);
     for i in 0..num_rules {
         let base = 1 + i * 3;
@@ -179,7 +138,6 @@ fn dict_decode(data: &[u8]) -> Vec<u8> {
 
     let mut working = data[1 + num_rules * 3..].to_vec();
 
-    // Apply rules in reverse order.
     for &(replacement, a, b) in rules.iter().rev() {
         let mut expanded = Vec::with_capacity(working.len());
         for &byte in &working {
@@ -196,25 +154,15 @@ fn dict_decode(data: &[u8]) -> Vec<u8> {
     working
 }
 
-// ---------------------------------------------------------------------------
-// Public compress / decompress API
-// ---------------------------------------------------------------------------
-
-/// Compress proof bytes using a simple but effective scheme.
-///
-/// Tries all compression strategies and picks the smallest result.
 pub fn compress_proof(proof_bytes: &[u8]) -> CompressedProof {
     let original_size = proof_bytes.len();
 
-    // Try each strategy.
     let none_data = proof_bytes.to_vec();
     let rle_data = rle_encode(proof_bytes);
     let dict_data = dict_encode(proof_bytes);
 
-    // Hybrid: RLE then dictionary.
     let hybrid_data = dict_encode(&rle_encode(proof_bytes));
 
-    // Pick smallest.
     let candidates = [
         (CompressionType::None, none_data),
         (CompressionType::RunLength, rle_data),
@@ -232,25 +180,18 @@ pub fn compress_proof(proof_bytes: &[u8]) -> CompressedProof {
     }
 }
 
-/// Decompress a previously compressed proof.
 pub fn decompress_proof(compressed: &CompressedProof) -> Vec<u8> {
     match compressed.compression_type {
         CompressionType::None => compressed.compressed_data.clone(),
         CompressionType::RunLength => rle_decode(&compressed.compressed_data),
         CompressionType::Dictionary => dict_decode(&compressed.compressed_data),
         CompressionType::Hybrid => {
-            // Reverse: dict_decode then rle_decode.
             let after_dict = dict_decode(&compressed.compressed_data);
             rle_decode(&after_dict)
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Proof aggregation
-// ---------------------------------------------------------------------------
-
-/// An aggregated proof combining multiple sub-proofs under a Merkle root.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AggregatedProof {
     pub sub_proofs: Vec<Vec<u8>>,
@@ -260,7 +201,6 @@ pub struct AggregatedProof {
     pub compressed_size: usize,
 }
 
-/// Aggregates multiple proofs into a single aggregated proof structure.
 pub struct ProofAggregator {
     proofs: Vec<Vec<u8>>,
     public_inputs: Vec<Vec<u64>>,
@@ -274,25 +214,20 @@ impl ProofAggregator {
         }
     }
 
-    /// Add a proof with its public inputs.
     pub fn add_proof(&mut self, proof: Vec<u8>, public_inputs: Vec<u64>) {
         self.proofs.push(proof);
         self.public_inputs.push(public_inputs);
     }
 
-    /// Number of proofs collected so far.
     pub fn count(&self) -> usize {
         self.proofs.len()
     }
 
-    /// Aggregate all collected proofs.
     pub fn aggregate(&self) -> AggregatedProof {
         let total_original_size: usize = self.proofs.iter().map(|p| p.len()).sum();
 
-        // Compute Merkle root over proof hashes.
         let merkle_root = self.compute_merkle_root();
 
-        // Compress each sub-proof.
         let compressed_proofs: Vec<Vec<u8>> = self
             .proofs
             .iter()
@@ -310,7 +245,6 @@ impl ProofAggregator {
         }
     }
 
-    /// Verify an aggregated proof by recomputing the Merkle root.
     pub fn verify_aggregated(&self, proof: &AggregatedProof) -> bool {
         if proof.count != self.proofs.len() {
             return false;
@@ -320,7 +254,6 @@ impl ProofAggregator {
         expected_root == proof.merkle_root
     }
 
-    /// Compute Merkle root of all proof hashes.
     fn compute_merkle_root(&self) -> [u8; 32] {
         if self.proofs.is_empty() {
             return [0u8; 32];
@@ -328,7 +261,6 @@ impl ProofAggregator {
 
         let mut leaves: Vec<Hash256> = self.proofs.iter().map(|p| hash_bytes(p)).collect();
 
-        // Pad to even length.
         if !leaves.len().is_multiple_of(2) {
             leaves.push(*leaves.last().unwrap());
         }
@@ -360,12 +292,6 @@ impl Default for ProofAggregator {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Batch compressor (streaming)
-// ---------------------------------------------------------------------------
-
-/// Streaming batch compressor that accumulates proofs and compresses them
-/// incrementally, tracking statistics.
 pub struct BatchCompressor {
     compressed: Vec<CompressedProof>,
     stats: CompressionStats,
@@ -384,7 +310,6 @@ impl BatchCompressor {
         }
     }
 
-    /// Add and compress a proof, updating running statistics.
     pub fn add(&mut self, proof_bytes: &[u8]) {
         let start = Instant::now();
         let cp = compress_proof(proof_bytes);
@@ -402,17 +327,14 @@ impl BatchCompressor {
         self.compressed.push(cp);
     }
 
-    /// Number of proofs compressed so far.
     pub fn count(&self) -> usize {
         self.compressed.len()
     }
 
-    /// Current cumulative statistics.
     pub fn stats(&self) -> &CompressionStats {
         &self.stats
     }
 
-    /// Consume the compressor and return all compressed proofs.
     pub fn finish(self) -> Vec<CompressedProof> {
         self.compressed
     }
@@ -423,10 +345,6 @@ impl Default for BatchCompressor {
         Self::new()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -458,12 +376,10 @@ mod tests {
 
     #[test]
     fn test_rle_highly_repetitive() {
-        // 1000 zeroes should compress well with RLE.
         let data = vec![0u8; 1000];
         let compressed = compress_proof(&data);
         let decompressed = decompress_proof(&compressed);
         assert_eq!(decompressed, data);
-        // Should be much smaller.
         assert!(
             compressed.compressed_data.len() < data.len(),
             "RLE should compress repetitive data"
@@ -516,7 +432,7 @@ mod tests {
         agg.add_proof(vec![3, 4], vec![2]);
 
         let mut aggregated = agg.aggregate();
-        aggregated.merkle_root = [0xFF; 32]; // tamper
+        aggregated.merkle_root = [0xFF; 32];
         assert!(!agg.verify_aggregated(&aggregated));
     }
 
@@ -532,7 +448,7 @@ mod tests {
         assert!(stats.original_bytes > 0);
         assert!(stats.compressed_bytes > 0);
         assert!(stats.ratio > 0.0);
-        assert!(stats.ratio <= 1.5); // sanity - should not be wildly worse
+        assert!(stats.ratio <= 1.5);
     }
 
     #[test]
@@ -560,7 +476,6 @@ mod tests {
         let data = vec![0u8; 2000];
         let compressed = compress_proof(&data);
         let ratio = compressed.compressed_data.len() as f64 / data.len() as f64;
-        // Repetitive data should compress to well under 10%.
         assert!(
             ratio < 0.1,
             "2000 zeros should compress to <10%, got {ratio:.4}"

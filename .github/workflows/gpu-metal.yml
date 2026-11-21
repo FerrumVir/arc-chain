@@ -1,15 +1,5 @@
 name: Metal GPU (self-hosted)
 
-# Optional, and never a required check. Runs ARC's GPU kernel tests (arc-gpu,
-# including the portable WGSL/wgpu kernels) on the real Apple GPU of ARC's own
-# Mac Studio runner. GitHub's macOS VMs only expose a paravirtual GPU.
-# See docs/self-hosted-runner.md.
-#
-# Opt in by adding the `gpu-metal` label to a pull request whose branch is in
-# this repository, or start it from the Actions tab. Pull requests from forks
-# never run here. When the runner is offline the job waits in the queue until
-# GitHub drops it (after 24 hours). It never blocks a merge.
-
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
@@ -32,14 +22,10 @@ jobs:
       (github.event.action != 'labeled' || github.event.label.name == 'gpu-metal'))
     runs-on: [self-hosted, macOS, ARM64, metal]
     timeout-minutes: 60
-    # Job-level, so a run that is skipped (for example, another label added)
-    # never cancels a Metal run that is already in progress.
     concurrency:
       group: gpu-metal-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: true
     steps:
-      # Start from an empty workspace and keep the Rust toolchain in the
-      # runner's own home (docs/self-hosted-runner.md).
       - name: Prepare self-hosted runner
         shell: bash
         run: |
@@ -60,18 +46,16 @@ jobs:
             echo "GIT_CONFIG_NOSYSTEM=1"
           } >> "$GITHUB_ENV"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Show the GPU under test
         run: system_profiler SPDisplaysDataType | grep -E 'Chipset Model|Total Number of Cores|Metal'
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-03-16
-      # Serial: the tests share one GPU device.
       - name: arc-gpu tests on the Apple GPU
         run: cargo test -p arc-gpu --tests --locked -- --test-threads=1 --nocapture
-      # Panics unless a real GPU device with a compiled Metal pipeline exists.
       - name: LLM-sized GPU benchmark (requires a real Metal GPU)
         run: cargo test -p arc-gpu --lib --locked gpu_matmul::tests::bench_matmul_4096 -- --exact --ignored --test-threads=1 --nocapture
       - name: Clean up self-hosted runner

@@ -1,7 +1,3 @@
-// ─── ARC Agent ────────────────────────────────────────────────
-// High-level agent abstraction for building autonomous agents
-// on ARC Chain. Manages wallet, nonce, retries, spending limits.
-
 import {
   TxType,
 } from "./types";
@@ -36,21 +32,19 @@ export class ArcAgent {
     this.config = {
       address: wallet.address,
       maxGas: config?.maxGas ?? 1_000_000,
-      maxSpend: config?.maxSpend ?? BigInt("1000000000000000000"), // 1 ARC
+      maxSpend: config?.maxSpend ?? BigInt("1000000000000000000"),
       allowedTypes: config?.allowedTypes ?? Object.values(TxType) as TxType[],
       autoRetry: config?.autoRetry ?? true,
       maxRetries: config?.maxRetries ?? 3,
     };
   }
 
-  /** Create agent with a new random wallet */
   static create(rpcUrl: string, config?: Partial<AgentConfig>): ArcAgent {
     const client = new ArcClient({ rpcUrl });
     const wallet = ArcWallet.create();
     return new ArcAgent(client, wallet, config);
   }
 
-  /** Create agent from an existing private key */
   static fromKey(
     rpcUrl: string,
     privateKey: string,
@@ -61,35 +55,27 @@ export class ArcAgent {
     return new ArcAgent(client, wallet, config);
   }
 
-  /** Initialize agent - sync nonce from chain */
   async init(): Promise<void> {
     await this.wallet.syncNonce(this.client);
     this._initialized = true;
   }
 
-  /** Agent's address */
   get address(): Address {
     return this.wallet.address;
   }
 
-  /** Total amount spent this session */
   get totalSpent(): bigint {
     return this._totalSpent;
   }
 
-  /** Transaction count this session */
   get txCount(): number {
     return this._txCount;
   }
 
-  /** Get current balance */
   async getBalance(): Promise<bigint> {
     return this.client.getBalance(this.wallet.address);
   }
 
-  // ─── Transaction Methods ───────────────────────────────
-
-  /** Send ARC tokens to an address */
   async transfer(to: Address, amount: bigint): Promise<TxReceipt> {
     this.assertAllowed("Transfer" as TxType);
     this.assertSpendLimit(amount);
@@ -104,7 +90,6 @@ export class ArcAgent {
     return receipt;
   }
 
-  /** Settle an agent-to-agent payment */
   async settle(
     to: Address,
     amount: bigint,
@@ -123,7 +108,6 @@ export class ArcAgent {
     return receipt;
   }
 
-  /** Execute a token swap */
   async swap(to: Address, amount: bigint): Promise<TxReceipt> {
     this.assertAllowed("Swap" as TxType);
     this.assertSpendLimit(amount);
@@ -132,7 +116,6 @@ export class ArcAgent {
     return this.submitWithRetry(tx);
   }
 
-  /** Stake tokens */
   async stake(amount: bigint): Promise<TxReceipt> {
     this.assertAllowed("Stake" as TxType);
     this.assertSpendLimit(amount);
@@ -141,7 +124,6 @@ export class ArcAgent {
     return this.submitWithRetry(tx);
   }
 
-  /** Call a WASM smart contract */
   async callContract(
     contract: Address,
     data: Uint8Array,
@@ -157,14 +139,10 @@ export class ArcAgent {
     return this.submitWithRetry(tx);
   }
 
-  /** Submit multiple transactions as a batch */
   async submitBatch(txs: SignedTransaction[]): Promise<BatchResult> {
     return this.client.submitBatch(txs);
   }
 
-  // ─── Escrow ────────────────────────────────────────────
-
-  /** Create an escrow (holds funds until condition met or timeout) */
   async createEscrow(params: EscrowParams): Promise<TxReceipt> {
     this.assertAllowed("Escrow" as TxType);
     this.assertSpendLimit(params.amount);
@@ -189,15 +167,11 @@ export class ArcAgent {
     return this.submitWithRetry(tx);
   }
 
-  // ─── Block & Proof Access ──────────────────────────────
-
-  /** Get latest block height */
   async getChainHeight(): Promise<number> {
     const info = await this.client.info();
     return info.chain_height;
   }
 
-  /** Subscribe to new blocks */
   onBlock(
     callback: (block: { height: number; tx_count: number }) => void,
     pollInterval?: number
@@ -212,7 +186,6 @@ export class ArcAgent {
     );
   }
 
-  /** Verify a transaction was included in a block */
   async verifyTx(txHash: Hash256): Promise<boolean> {
     try {
       const proof = await this.client.getMerkleProof(txHash);
@@ -221,8 +194,6 @@ export class ArcAgent {
       return false;
     }
   }
-
-  // ─── Internals ─────────────────────────────────────────
 
   private assertAllowed(txType: TxType): void {
     if (!this.config.allowedTypes.includes(txType)) {
@@ -252,7 +223,6 @@ export class ArcAgent {
       } catch (err) {
         lastError = err as Error;
         if (attempt < maxAttempts - 1) {
-          // Exponential backoff
           await new Promise((r) => setTimeout(r, 100 * 2 ** attempt));
         }
       }

@@ -1,29 +1,3 @@
-"""One native request's receipt on every replica, reconciled (P9).
-
-    python3 -m arc_ops.receipts --nodes 127.0.0.1:9960,127.0.0.1:9961 ID [ID ...]
-    python3 -m arc_ops.receipts --run RUN_DIR --journal native-requests.json
-
-The explorer, the desktop and a headless client all read the same
-`/native-inference/receipt/{request_id}`. This reads it from every replica and
-checks, per request:
-
-- every replica that knows the request records the same settlement: status,
-  output hash, terminal height and credits. Newer optional fields (expiry,
-  requester, certified output bytes) are compared only where both replicas
-  report them, so a node that has not been upgraded yet is missing detail,
-  not a disagreement - the rule `explorer/native-receipts.js` applies;
-- a settled request's credits add up to exactly its reservation;
-- when the requester is reported: a finalized request returns exactly
-  reservation - price to the requester, and a refunded one the whole
-  reservation.
-
-It prints one summary per request, with the fields the explorer and desktop
-show, so each can be checked against it. Read-only.
-
-Exit: 0 every request reconciles, 1 any disagrees or fails arithmetic,
-2 too few replicas answered for some request.
-"""
-
 import argparse
 import json
 import os
@@ -55,7 +29,6 @@ def optional_fields_agree(receipts: List[Dict[str, Any]]) -> bool:
 
 
 def arithmetic(receipt: Dict[str, Any]) -> List[str]:
-    """What is wrong with one replica's settlement, if anything."""
     problems: List[str] = []
     status = receipt.get("observed_status")
     if status not in TERMINAL:
@@ -99,7 +72,6 @@ def reconcile(nodes: List[str], request_id: str, fetch: Fetch = http_fetch) -> D
         "asked": len(nodes),
         "answered": len(known),
         "problems": problems,
-        # What the explorer and the desktop must show for this request.
         "observed_status": sample.get("observed_status"),
         "output_hash": sample.get("output_hash"),
         "execution_price": sample.get("execution_price"),
@@ -110,7 +82,6 @@ def reconcile(nodes: List[str], request_id: str, fetch: Fetch = http_fetch) -> D
 
 
 def request_ids_from_journal(path: str) -> List[str]:
-    """Request ids a desktop journal (`native-requests.json`) recorded."""
     with open(path) as fh:
         journal = json.load(fh)
     seen: List[str] = []

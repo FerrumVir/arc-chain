@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-# ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain - Check On-Chain Inference Attestations
-#
-# Lists recent inference-attestation records returned by one selected node.
-# This is a node-local retained view, not proof of every inference or payment.
-#
-# Usage:
-#   ./scripts/check-attestations.sh                   # Your local node
-#   ./scripts/check-attestations.sh 140.82.16.112:9090 # Remote node
-#   ./scripts/check-attestations.sh "" 20             # Last 20 attestations
-# ─────────────────────────────────────────────────────────────────────────────
 set -e
 
 NODE="${1:-localhost:9944}"

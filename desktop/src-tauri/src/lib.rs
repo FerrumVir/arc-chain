@@ -118,45 +118,15 @@ pub struct AppState {
     pub store: Arc<Mutex<store::Store>>,
     pub data_dir: Arc<Mutex<PathBuf>>,
     pub http: reqwest::Client,
-    /// Maps an in-flight Tier 1 request_id to the seed VPS that accepted the
-    /// submit. Each seed runs its own chain, so the poll must hit the same
-    /// host. In-memory only — survives only for the lifetime of the process,
-    /// which is fine because Tier 1 requests finalize in seconds.
     pub tier1_routes: Arc<Mutex<HashMap<String, String>>>,
-    /// Exact receipt identity + origin captured natively from a successful
-    /// inference response. Receipt polling must match this entry; an IPC caller
-    /// cannot select a different allowlisted seed after the fact.
     pub community_receipt_routes: Arc<Mutex<HashMap<String, CommunityReceiptRoute>>>,
-    /// Once a community inference returns a settlement identity, all chain
-    /// reads in this process stay on that exact coordinator.  Production
-    /// validators are intentionally independent chains; electing a different,
-    /// merely fresher seed for Earnings or Explorer can make a just-confirmed
-    /// payment disappear or cross-bind it to unrelated block history.
     pub community_chain_host: Arc<Mutex<Option<String>>>,
-    /// Serializes community inference writes so two IPC requests cannot race
-    /// the session's first immutable receipt-origin selection.
     pub community_inference_write: Arc<Mutex<()>>,
-    /// The immutable seed elected by the first session chain read, plus when
-    /// it was elected. An unavailable source remains unavailable rather than
-    /// silently switching wallets or reward history to an independent chain.
     pub chain_host: Arc<Mutex<Option<(commands::ChainHostChoice, std::time::Instant)>>>,
-    /// Serializes wallet writes so two UI clicks cannot sign the same account
-    /// nonce concurrently. This lock never contains the recovery phrase.
     pub wallet_write: Arc<Mutex<()>>,
     pub auto_update_requests: Arc<Mutex<Option<auto_update::RequestFence>>>,
-    /// Whether a system tray icon was actually created. Gates hide-to-tray:
-    /// on a desktop with no tray, hiding the window makes the app
-    /// unreachable.
     pub has_tray: Arc<std::sync::atomic::AtomicBool>,
-    /// Authoritative native fail-closed fence for an unresolved data
-    /// migration preflight and for launch-time reconciliation. Every command
-    /// that can start arc-node consults this state; a WebView Start/Restart
-    /// click cannot bypass a startup failure and replay an ambiguous legacy
-    /// WAL. While reconciliation runs, only its own recovery launch may pass
-    /// (`start_fence::StartAccess::StartupRecovery`).
     pub data_migration_error: Arc<Mutex<Option<start_fence::StartFence>>>,
-    /// Cancels the single per-launch auto-start transaction and its bounded-
-    /// rate network retry loop when Stop, Quit, update, or settings disable it.
     pub startup_retry_cancel: tokio::sync::watch::Sender<()>,
 }
 
@@ -178,14 +148,6 @@ pub struct CommunityReceiptRoute {
     pub receipt_url: String,
 }
 
-/// Node data from an earlier install whose app data is gone is set aside
-/// (`previous_install`) while the launch-time fence is held: before
-/// reconciliation, when nothing holds the directory any more, and again after
-/// reconciliation has drained a node that was still running there. Returns
-/// the notice to record when the directory moved. `app_data_absent` is
-/// whether no identity store existed when this launch began; a store that
-/// exists, readable or not, means this install may own the directory, and
-/// nothing moves.
 async fn set_aside_previous_install_data(
     node: &mut node_manager::NodeManager,
     configured_data_dir: &str,
@@ -245,10 +207,6 @@ async fn set_aside_previous_install_data(
     }
 }
 
-/// Persist the set-aside notice so it shows until dismissed, also across a
-/// restart. Called only after a move, which requires that no store existed
-/// at launch, so this never writes over a store that did not load; the
-/// shared store may by now hold the identity onboarding created meanwhile.
 async fn record_previous_install_notice(state: &AppState, notice: types::PreviousInstallNotice) {
     let mut store = state.store.lock().await;
     store.previous_install_notice = Some(notice);
@@ -261,32 +219,6 @@ async fn record_previous_install_notice(state: &AppState, notice: types::Previou
     }
 }
 
-/// Launch-time reconciliation of the managed node an earlier desktop process
-/// left behind, run while the launch-time start fence is held.
-///
-/// Before anything reads the configured data directory, and again after the
-/// node that may have held it is drained, a directory left by an earlier
-/// install whose app data is gone is set aside (`previous_install`). Its
-/// armed receipt goes with it: the recovery launch that receipt would need
-/// requires an identity this install does not have, which through v0.8.14
-/// refused every Start with "managed-node durability recovery failed: no
-/// identity" until ARC restarted. Each move is recorded the moment it
-/// happens, so a stop failure further down cannot hide it from the user.
-///
-/// It drains any desktop-managed child left by an older app process,
-/// including one listening on a fallback port. It runs even when auto-start
-/// is off or migration persistence failed: those states forbid starting a
-/// node but must not leave the pre-update child alive. A stop failure is a
-/// hard startup boundary; do not race two versions against one data
-/// directory. When the previous node exited without acknowledging its final
-/// WAL barrier, it then runs the one quarantined recovery launch that clears
-/// that receipt.
-///
-/// Every `Err` is the reason the caller keeps node start and binary
-/// replacement refused until ARC restarts. The signed app update still takes
-/// the fenced boundary past it (`start_fence::app_update_boundary`), except
-/// behind a legacy v0.7 refusal. No path leaves the fence to the caller's
-/// guesswork: the caller resolves it from this result alone.
 async fn reconcile_previous_managed_node(
     handle: &tauri::AppHandle,
     state: &AppState,
@@ -295,8 +227,6 @@ async fn reconcile_previous_managed_node(
     legacy_migration_block: Option<String>,
     legacy_windows_stop: Option<(types::DataMigrationNotice, Zeroizing<String>)>,
 ) -> Result<(), String> {
-    // A directory nothing holds any more moves before anything reads it, and
-    // the move is recorded at once, in its own lock scope.
     let set_aside_before_reconciliation = {
         let mut node = state.node.lock().await;
         set_aside_previous_install_data(
@@ -372,10 +302,6 @@ async fn reconcile_previous_managed_node(
                 )));
             }
         }
-        // The node just drained may have been the holder. With it gone, an
-        // earlier install's directory is set aside now, and a receipt it
-        // left armed needs no recovery launch: nothing of this install ever
-        // ran there, and the directory keeps every byte.
         if set_aside_before_reconciliation.is_none() {
             set_aside_after_drain = set_aside_previous_install_data(
                 &mut node,
@@ -399,9 +325,6 @@ async fn reconcile_previous_managed_node(
     }
 
     if managed_recovery_required {
-        // This is the step the launch-time fence waits for, so it uses the
-        // one transaction allowed through it. Through v0.8.12 it checked the
-        // fence like a WebView click and refused itself on every launch.
         if let Err(error) = commands::recover_managed_shutdown_inner(handle, state).await {
             tracing::error!(
                 %error,
@@ -419,11 +342,7 @@ async fn reconcile_previous_managed_node(
 fn configured_http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
-        // A signed transaction is bound to the elected origin. Never allow a
-        // gateway redirect to move that POST to another scheme or host.
         .redirect(reqwest::redirect::Policy::none())
-        // Interactive launches may use an explicitly configured proxy, but
-        // reqwest must never replay a wallet or inference write by itself.
         .retry(reqwest::retry::never())
         .build()
         .map_err(|error| format!("build redirect-fenced desktop HTTP client: {error}"))
@@ -452,10 +371,6 @@ pub fn run() {
         )
         .init();
 
-    // Acceptance is a shipped-executable native-core proof, not a UI test.
-    // Branch before constructing Tauri so no WebView page, plugin, tray,
-    // updater, autostart hook, or IPC handler can run alongside its one-shot
-    // inference. The separately sealed AppImage gate covers real UI → IPC.
     if let Some(request) = production_acceptance {
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -483,16 +398,11 @@ pub fn run() {
     }
 
     let node = Arc::new(Mutex::new(node_manager::NodeManager::new()));
-    // Store starts empty; `setup()` resolves the per-platform writable
-    // data dir via Tauri's PathResolver and loads from there.
     let store = Arc::new(Mutex::new(store::Store::default()));
     let data_dir = Arc::new(Mutex::new(PathBuf::new()));
     let http = match configured_http_client() {
         Ok(http) => http,
         Err(error) => {
-            // Falling back to a default client here would silently re-enable
-            // redirects for wallet and inference traffic. If the constrained
-            // transport cannot be constructed, refuse to start instead.
             eprintln!("ARC desktop refused an unconstrained HTTP fallback: {error}");
             std::process::exit(70);
         }
@@ -526,15 +436,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        // Needed so the frontend can call `relaunch()` from
-        // `@tauri-apps/plugin-process` after `update.downloadAndInstall()`
-        // finishes. Without this, the new installer runs but the app stays
-        // dead until the user manually relaunches.
         .plugin(tauri_plugin_process::init())
-        // Auto-launch on OS login. LaunchAgent = macOS launchd user-scoped
-        // LoginItem, Linux XDG autostart, Windows Run key. `--minimized`
-        // tells the app to start with the window hidden to the tray so
-        // the user doesn't get a window on every reboot.
         .plugin(
             tauri_plugin_autostart::init(
                 MacosLauncher::LaunchAgent,
@@ -546,22 +448,16 @@ pub fn run() {
             if desktop_instance::show_startup_failure(app.handle()) {
                 return Ok(());
             }
-            // Resolve the per-platform writable dir NOW (AppHandle available).
             let resolver = app.path();
             let resolved = resolver
                 .app_data_dir()
                 .unwrap_or_else(|_| std::env::temp_dir());
             tracing::info!("app data dir: {}", resolved.display());
 
-            // Give paths::home_dir() a last-resort value for the case where
-            // neither HOME nor USERPROFILE is set. Must happen before
-            // anything resolves ~/.arc.
             if let Ok(home) = resolver.home_dir() {
                 paths::set_home_fallback(home);
             }
 
-            // An older desktop has no instance guard. Probe before defaults,
-            // migration, autostart registration or any store write.
             if let Some(existing) = store::Store::load_for_owner_probe(&resolved) {
                 if let Some(config) = existing.config.as_ref() {
                     if !legacy_upgrade::config_uses_v07_layout(config, &paths::home_dir()) {
@@ -572,8 +468,6 @@ pub fn run() {
                                     *data_dir.lock().await = resolved;
                                     *data_migration_error.lock().await = Some(start_fence::StartFence::OtherDesktop);
                                 });
-                                // This refused copy owns no node and installs no tray.
-                                // Closing its only window exits and releases its instance lease.
                                 return Ok(());
                             }
                         }
@@ -581,13 +475,8 @@ pub fn run() {
                 }
             }
 
-            // Load existing store from the resolved dir, if any.
             let (mut loaded_store, store_load) =
                 store::Store::load_from_with_outcome(&resolved);
-            // Only an absent store lets launch set an earlier install's node
-            // data aside. A store that is present but unreadable loads empty
-            // too; that install owns its directory, and nothing is written
-            // over the store it could not read.
             let app_data_absent_at_launch = previous_install::app_data_was_absent(store_load);
             if store_load == store::StoreLoadOutcome::Failed {
                 tracing::error!(
@@ -609,19 +498,9 @@ pub fn run() {
                 }
                 _ => Ok(None),
             };
-            // A v0.7 desktop kept `dataDir` at the ~/.arc root itself (v0.7.11
-            // `types.rs` default "~/.arc"); every v0.8 build defaults to a
-            // `data-v3*` child. Read this before the fence below rewrites the
-            // pointer: a v0.7 install whose node never ran has no WAL to fence
-            // and no bridge record, yet must still be asked before it
-            // contributes compute.
             let config_uses_v07_layout = loaded_store.config.as_ref().is_some_and(|config| {
                 legacy_upgrade::config_uses_v07_layout(config, &paths::home_dir())
             });
-            // A v0.7 desktop stored unbound chain state in the same ~/.arc
-            // root as binaries and models. Fence that WAL before deriving the
-            // auto-start config: old bytes stay untouched while only the
-            // persisted data-dir pointer moves to a fresh protocol-v3 child.
             let migration_result = match legacy_process_data_dir {
                 Ok(Some(path)) => loaded_store.protect_running_legacy_v07_data_at(&path),
                 Ok(None) => loaded_store.protect_legacy_v07_data(),
@@ -670,10 +549,6 @@ pub fn run() {
                     )
                 }
             };
-            // A v0.7 install that reached this build (normally through the
-            // v0.7 legacy bridge release) is asked once whether to keep
-            // contributing compute. Until it answers, it auto-starts as an
-            // observer without a model: no compute without consent.
             let startup_hold = legacy_upgrade::hold_at_startup(
                 &mut loaded_store,
                 &resolved,
@@ -693,8 +568,6 @@ pub fn run() {
             if let Some(error) = startup_hold.persist_error {
                 tracing::error!(%error, "could not persist the held observer config");
             }
-            // This launch keeps the default in memory even if persisting it
-            // fails; the next launch applies it again.
             if let Err(error) =
                 auto_update::apply_unattended_install_default(&mut loaded_store, &resolved)
             {
@@ -719,8 +592,6 @@ pub fn run() {
                 .as_ref()
                 .map(|c| c.auto_start)
                 .unwrap_or(true);
-            // Capture what we need for the auto-start decision before the
-            // store moves into the shared mutex.
             let start_config = loaded_store.config.clone().unwrap_or_default();
             let has_identity = loaded_store.identity.is_some();
             let has_config = loaded_store.config.is_some();
@@ -736,8 +607,6 @@ pub fn run() {
             let migration_error_shared = data_migration_error.clone();
             let node_shared = app.state::<AppState>().node.clone();
             let configured_rpc_port = start_config.rpc_port;
-            // Binary replacement and node start wait for launch-time
-            // reconciliation below; only its own recovery launch may pass.
             let startup_fence = start_fence::at_launch(migration_failure_reason.clone());
             tauri::async_runtime::block_on(async move {
                 *store_shared.lock().await = loaded_store;
@@ -749,23 +618,10 @@ pub fn run() {
                     .configure_rpc_port_if_stopped(configured_rpc_port);
             });
 
-            // Sync the autostart plugin with what the user chose during
-            // onboarding (default: on).
-            //
-            // enable() is re-run on every launch even when the OS already
-            // reports it enabled, because the stored login item embeds an
-            // absolute path: the macOS LaunchAgent plist names the .app
-            // (dangling as soon as the user drags it from ~/Downloads to
-            // /Applications — the single most common install flow), and the
-            // Linux XDG .desktop names the executable, which for an AppImage
-            // is a /tmp/.mount_XXXX path that changes every run. Re-enabling
-            // rewrites the entry with the current location, so it self-heals.
             let autostart = app.autolaunch();
             let enabled_now = autostart.is_enabled().unwrap_or(false);
             if autostart_desired {
                 if let Err(e) = autostart.enable() {
-                    // No longer swallowed: a login item that silently failed
-                    // to register looks identical to one that worked.
                     tracing::warn!("could not register the login item: {}", e);
                 }
             } else if enabled_now {
@@ -774,14 +630,6 @@ pub fn run() {
                 }
             }
 
-            // Build the system tray icon. Gives the user a way to open the
-            // window after hide-to-tray, and a real Quit so arc-node can
-            // be stopped explicitly.
-            //
-            // Failure is NOT fatal, and is recorded: stock GNOME ships no
-            // AppIndicator host, so the tray silently does not appear. Hiding
-            // the window to a tray that isn't there left the app with no way
-            // to reopen it and no way to quit except `pkill`.
             match tray::install(app.handle()) {
                 Ok(()) => has_tray.store(true, std::sync::atomic::Ordering::SeqCst),
                 Err(e) => {
@@ -793,9 +641,6 @@ pub fn run() {
                 }
             }
 
-            // Keep managed-node crash supervision alive while the window is
-            // hidden. It reuses NodeManager's exact launch plan and lifecycle
-            // lock, and has no effect on an intentional Stop/Quit.
             let supervisor_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -814,14 +659,8 @@ pub fn run() {
                 }
             });
 
-            // Wake detection and the periodic `app-signal` tick, from Rust so
-            // a hidden, throttled WebView still runs its update checks.
             wake::spawn(app.handle().clone());
 
-            // If the app was launched with `--minimized` (set by the
-            // autostart plugin on login), keep the window hidden and
-            // let the tray be the only surface until the user clicks it.
-            // Without a tray there is no other surface, so ignore the flag.
             let launched_minimized = std::env::args().any(|a| a == "--minimized");
             if launch_visibility::hide_on_launch(
                 launched_minimized,
@@ -834,15 +673,6 @@ pub fn run() {
                 }
             }
 
-            // ── Start the node on launch ────────────────────────────────
-            //
-            // `auto_start` previously drove only the OS login item, so the
-            // Settings copy — "Automatically launch the node whenever ARC
-            // opens" — was simply untrue. Nothing in the app started
-            // arc-node after onboarding finished, and because the Dashboard's
-            // Start button was unreachable (it read a remote seed and
-            // therefore always believed the node was running), quitting and
-            // reopening left the user with no way to run their node at all.
             let should_start =
                 start_config.auto_start && has_identity && migration_allows_autostart;
             let handle = app.handle().clone();
@@ -852,11 +682,6 @@ pub fn run() {
                 };
                 let mut startup_cancel = startup_retry_cancel_receiver.clone();
 
-                // Adopt an already-running local node only when it is the
-                // exact matched version. A v0.7 child deliberately survives
-                // the old GUI's Tauri relaunch on some platforms; treating
-                // any HTTP 200 as compatible left the v0.8 desktop driving
-                // that stale process and its unbound WAL indefinitely.
                 match commands::probe_local_node_compatibility(
                     &state.http,
                     start_config.rpc_port,
@@ -871,10 +696,6 @@ pub fn run() {
                         );
                     }
                     commands::LocalNodeCompatibility::Exact => {
-                        // `auto_start=false` must also clean up a desktop child
-                        // left by an older updater. NodeManager only targets
-                        // ARC-managed executable paths, so a separately
-                        // installed system service remains operator-owned.
                         tracing::info!(
                             version = commands::EXPECTED_NODE_VERSION,
                             port = start_config.rpc_port,
@@ -891,9 +712,6 @@ pub fn run() {
                     }
                 }
 
-                // Drain any desktop-managed child left by an older app
-                // process and recover an unacknowledged shutdown (see
-                // `reconcile_previous_managed_node`).
                 let reconciliation = reconcile_previous_managed_node(
                     &handle,
                     &state,
@@ -904,10 +722,6 @@ pub fn run() {
                 )
                 .await;
                 let reconciled = reconciliation.is_ok();
-                // Every outcome replaces the launch-time fence. Only after the
-                // exact old/detached process boundary is clear may WebView
-                // Start/Ensure/Update entrypoints mutate or spawn; a failure
-                // becomes an explicit refusal, never a stale "in progress".
                 let mut fence = state.data_migration_error.lock().await;
                 if !matches!(*fence, Some(start_fence::StartFence::MigrationRefused(_))) {
                     *fence = start_fence::after_startup_reconciliation(reconciliation);
@@ -926,13 +740,6 @@ pub fn run() {
                     return;
                 }
 
-                // Keep retrying a consented install's model download, or a
-                // worker's missing model, until it can take jobs. Started
-                // only now that reconciliation succeeded; it runs whether or
-                // not the node auto-starts (with auto-start off the model
-                // downloads and the node stays stopped). The launch's own
-                // attempt below comes first; the loop's first tick follows
-                // one interval later.
                 tauri::async_runtime::spawn(background_promotion::run_retry_loop(handle.clone()));
 
                 if !should_start {
@@ -957,7 +764,6 @@ pub fn run() {
                         (store.config.as_ref().is_some_and(|config| config.auto_start),
                             store.identity.is_some())
                     };
-                    // Refusals hold until restart; retrying must never bypass them.
                     let fenced = state.data_migration_error.lock().await.is_some();
                     if !autostart_allowed(auto_start, has_identity, fenced) {
                         break;
@@ -973,11 +779,6 @@ pub fn run() {
                     match outcome {
                         Ok(()) => {
                             tracing::info!("auto-started arc-node on launch");
-                            // A user who opted in to contributing compute but
-                            // is not a worker yet (an interrupted model
-                            // download, or consent given while offline) is
-                            // finished here, so the install takes jobs without
-                            // another click. No-op without consent.
                             commands::promote_consented_install_on_startup(&handle, &state).await;
                             break;
                         }
@@ -1007,10 +808,6 @@ pub fn run() {
 
             Ok(())
         })
-        // Window-close hides to tray instead of exiting. arc-node
-        // (spawned as our child) keeps running. Real exit is via the
-        // tray → Quit menu item, which calls app.exit() after stopping
-        // arc-node cleanly.
         .on_window_event(|window, event| {
             if let WindowEvent::Focused(true) = event {
                 if window.label() == "main" {
@@ -1019,9 +816,6 @@ pub fn run() {
             }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
-                    // Only hide-to-tray if there is a tray to hide to.
-                    // Otherwise let the close proceed, stopping arc-node
-                    // first so we don't strand an orphaned child process.
                     let tray_present = window
                         .app_handle()
                         .try_state::<AppState>()
@@ -1282,12 +1076,6 @@ mod startup_retry_tests {
 
 #[cfg(test)]
 mod startup_reconciliation_tests {
-    /// Launch-time reconciliation reports every outcome through its `Result`
-    /// and the startup task resolves the fence from it in exactly one place,
-    /// so no early return can leave the launch-time "in progress" fence
-    /// behind. (Through v0.8.12 an invalid receipt returned early and left it
-    /// up for the whole session.) The recovery launch, the one transaction
-    /// that may pass that fence, is started from reconciliation only.
     #[test]
     fn every_reconciliation_exit_resolves_the_launch_fence() {
         let source = include_str!("lib.rs");
@@ -1299,8 +1087,6 @@ mod startup_reconciliation_tests {
             .find("fn configured_http_client()")
             .expect("end of reconciliation function")];
 
-        // Needles are assembled at run time so this test's own text never
-        // matches them.
         let fence_write = [
             "let mut fence = state.",
             "data_migration_error.lock().await;",

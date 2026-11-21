@@ -19,8 +19,6 @@ printf 'safe committed bytes\n' >"$REPOSITORY/config.txt"
 git -C "$REPOSITORY" add config.txt
 git -C "$REPOSITORY" commit -qm initial
 
-# Construct a credential-shaped marker at runtime so this regression test does
-# not itself place a detector fixture in the release tree.
 staged_marker="$(printf '%s%s' 'staged-credential-' 'must-be-scanned')"
 printf '%s\n' "$staged_marker" >"$REPOSITORY/config.txt"
 git -C "$REPOSITORY" add config.txt

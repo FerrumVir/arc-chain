@@ -1,22 +1,6 @@
-//! The model package manifest (`arc.model-package.v1`) on the node side.
-//!
-//! `scripts/arc_conformance/package_manifest.py` derives a manifest from an
-//! artifact, a profile and a generation contract; a reviewer approves a
-//! package by the manifest's hash. This module checks a pinned manifest
-//! against what the node actually loaded, so a node never executes a package
-//! other than the one approved: the manifest's own hash, the artifact bytes,
-//! the profile and generation commitments, the graph, the tokenizer, the
-//! tensor inventory and the KV cost must all be what this node measured.
-//!
-//! The manifest hash is BLAKE3 over Python's canonical JSON
-//! (`json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=True)`)
-//! of every field but `manifest_blake3`. [`canonical_json`] reproduces that
-//! encoding exactly, including Python's float `repr`.
-
 use serde_json::Value;
 
 pub const PACKAGE_SCHEMA: &str = "arc.model-package.v1";
-/// A manifest is a few kilobytes; anything near this is not one.
 pub const MAX_MANIFEST_BYTES: usize = 1 << 20;
 
 #[derive(Debug, thiserror::Error)]
@@ -37,9 +21,6 @@ pub enum PackageError {
     },
 }
 
-/// Python's `repr(float)`: the shortest digits that round-trip, fixed
-/// notation for decimal exponents from -4 to 16, scientific otherwise with
-/// a signed, at-least-two-digit exponent.
 pub fn python_float_repr(value: f64) -> Result<String, PackageError> {
     if !value.is_finite() {
         return Err(PackageError::Encoding(format!("non-finite number {value}")));
@@ -52,7 +33,6 @@ pub fn python_float_repr(value: f64) -> Result<String, PackageError> {
         }
         .to_string());
     }
-    // Rust's `{:e}` prints the shortest round-trip digits: "d.ddde-7".
     let formatted = format!("{:e}", value.abs());
     let (mantissa, exponent) = formatted
         .split_once('e')
@@ -61,7 +41,6 @@ pub fn python_float_repr(value: f64) -> Result<String, PackageError> {
     let exponent: i32 = exponent
         .parse()
         .map_err(|_| PackageError::Encoding(formatted.clone()))?;
-    // The decimal point sits `decpt` digits into `digits`.
     let decpt = exponent + 1;
     let body = if decpt <= -4 || decpt > 16 {
         let (first, rest) = digits.split_at(1);
@@ -98,8 +77,6 @@ fn write_string(text: &str, out: &mut String) {
             '\t' => out.push_str("\\t"),
             '\u{08}' => out.push_str("\\b"),
             '\u{0c}' => out.push_str("\\f"),
-            // ensure_ascii: everything outside ' '..='~' as \uXXXX, astral
-            // characters as a surrogate pair, lowercase hex.
             c if !(' '..='~').contains(&c) => {
                 let mut units = [0u16; 2];
                 for unit in c.encode_utf16(&mut units) {
@@ -140,7 +117,6 @@ fn write_value(value: &Value, out: &mut String) -> Result<(), PackageError> {
             out.push(']');
         }
         Value::Object(map) => {
-            // Python sorts keys by code point; UTF-8 byte order is the same.
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
             out.push('{');
@@ -158,14 +134,12 @@ fn write_value(value: &Value, out: &mut String) -> Result<(), PackageError> {
     Ok(())
 }
 
-/// Python's canonical encoding of `value`.
 pub fn canonical_json(value: &Value) -> Result<String, PackageError> {
     let mut out = String::new();
     write_value(value, &mut out)?;
     Ok(out)
 }
 
-/// BLAKE3 (hex) of the canonical encoding of every field but `manifest_blake3`.
 pub fn manifest_body_blake3(manifest: &Value) -> Result<String, PackageError> {
     let mut body = manifest
         .as_object()
@@ -176,7 +150,6 @@ pub fn manifest_body_blake3(manifest: &Value) -> Result<String, PackageError> {
     Ok(blake3::hash(encoded.as_bytes()).to_hex().to_string())
 }
 
-/// What a node measured of the package it loaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedPackage {
     pub artifact_blake3: String,
@@ -231,9 +204,6 @@ fn expect_u64(manifest: &Value, path: &str, expected: u64) -> Result<(), Package
     Ok(())
 }
 
-/// Check the manifest at `bytes` is the one pinned by `pinned_blake3` and
-/// describes exactly the package this node loaded. Every refusal names the
-/// field.
 pub fn verify_loaded_package(
     bytes: &[u8],
     pinned_blake3: &str,
@@ -301,9 +271,6 @@ pub fn verify_loaded_package(
             found: eos.to_string(),
         });
     }
-    // The engine stops only on the EOS ids above. A tokenizer that also
-    // declares end-of-turn/end-of-message ids would keep generating past the
-    // model's real stop, so such a package is refused; padding is harmless.
     let ignored = field(&manifest, "tokenizer.ignored_special_ids")?;
     let stops_ignored: Vec<&str> = ignored
         .as_object()
@@ -364,9 +331,6 @@ mod tests {
 
     #[test]
     fn strings_and_keys_are_written_as_python_writes_them() {
-        // Expected: Python's own `json.dumps(value, sort_keys=True,
-        // separators=(",", ":"), ensure_ascii=True)`, pasted verbatim. Every
-        // character outside ' '..='~' is escaped, astral ones as surrogates.
         let value = serde_json::json!({"b": "é\n\"\\\u{7f}", "a": [true, null, 1, -2], "😀": 1});
         assert_eq!(
             canonical_json(&value).unwrap(),
@@ -491,8 +455,6 @@ mod tests {
 
     #[test]
     fn a_package_whose_tokenizer_stops_where_the_engine_does_not_is_refused() {
-        // A correctly hashed manifest for a tokenizer that declares an
-        // end-of-turn id: approving it would not make the engine stop there.
         let mut manifest: Value = serde_json::from_str(CANONICAL_MANIFEST).unwrap();
         manifest["tokenizer"]["ignored_special_ids"] = serde_json::json!({"eot_token_id": 7});
         let hash = manifest_body_blake3(&manifest).unwrap();
@@ -505,7 +467,6 @@ mod tests {
             }
             other => panic!("expected the tokenizer refusal, got {other:?}"),
         }
-        // Padding does not affect stopping.
         manifest["tokenizer"]["ignored_special_ids"] = serde_json::json!({"padding_token_id": 0});
         let hash = manifest_body_blake3(&manifest).unwrap();
         manifest["manifest_blake3"] = Value::from(hash.clone());
@@ -515,12 +476,10 @@ mod tests {
 
     #[test]
     fn an_edited_or_unpinned_manifest_is_refused() {
-        // Another package entirely.
         match verify_loaded_package(CANONICAL_MANIFEST.as_bytes(), &"44".repeat(32), &loaded()) {
             Err(PackageError::Mismatch { field, .. }) => assert!(field.contains("pinned")),
             other => panic!("expected the pin to refuse, got {other:?}"),
         }
-        // A field edited without re-hashing.
         let edited = CANONICAL_MANIFEST.replace("\"max_seq\": 4096", "\"max_seq\": 8192");
         assert_ne!(edited, CANONICAL_MANIFEST);
         match verify_loaded_package(edited.as_bytes(), CANONICAL_MANIFEST_BLAKE3, &loaded()) {

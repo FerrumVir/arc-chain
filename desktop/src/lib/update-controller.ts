@@ -4,37 +4,13 @@ import { isStartupReconciliationInProgress } from "./start-failure";
 
 export const UPDATE_STARTUP_DELAY_MS = 5_000;
 export const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1_000;
-/** Retries for a failed check or a failed update download. */
 export const UPDATE_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 15 * 60_000] as const;
-/**
- * How often an automatic install waiting for inference to finish tries
- * again. It keeps trying while the same update stays waiting.
- */
 export const UPDATE_BUSY_RETRY_MS = 60 * 60 * 1_000;
-/**
- * The least time between two checks started by a signal (the window shown
- * or focused, a wake from sleep). Release discovery reads the GitHub API,
- * which allows an address 60 unauthenticated requests an hour.
- */
 export const UPDATE_SIGNAL_MIN_GAP_MS = 15 * 60_000;
 
-/**
- * What the native shell tells the controller (`wake.rs`):
- * - `tick`: sent every few minutes from Rust. Runs any check or retry whose
- *   time has come, in case the hidden WebView's own timers were held back.
- * - `wake`: the computer woke from sleep.
- * - `focus`, `shown`: the main window gained focus or the tray showed it.
- */
 export type UpdateSignal = "tick" | "wake" | "focus" | "shown";
-/** How often a verified update retries while launch reconciliation runs. */
 export const UPDATE_RECONCILIATION_RETRY_MS = 60_000;
 
-/**
- * What both native update preparations refuse with on macOS when the updater
- * can't replace ARC where it runs (`update_location.rs`). They refuse before
- * anything stops or is fenced. update-controller.spec.ts pins it against the
- * Rust source.
- */
 export const NATIVE_WRONG_LOCATION =
   "ARC can't update itself from where it's running. Quit ARC, drag ARC Node into your Applications folder, then open it from there.";
 
@@ -53,22 +29,13 @@ export type UpdateDownloadEvent =
   | { event: "Progress"; data: { chunkLength: number } }
   | { event: "Finished" };
 
-/**
- * The small surface we use from Tauri's signed updater resource.
- * Keeping it structural makes the scheduler deterministic to unit-test
- * without replacing or weakening the native updater implementation.
- */
 export interface UpdateCandidate {
   version: string;
-  /** False for Linux .deb/.rpm installs owned by the package manager. */
   canInstall?: boolean;
-  /** Exact next step shown when `canInstall` is false. */
   installInstructions?: string;
-  /** Download and signature-verify without mutating the installed bundle. */
   download: (
     onEvent?: (event: UpdateDownloadEvent) => void,
   ) => Promise<void>;
-  /** Begin bundle mutation. Any return or rejection is an irreversible fence boundary. */
   install: () => Promise<void>;
   close?: () => Promise<void>;
 }
@@ -88,13 +55,9 @@ export interface UpdateSnapshot {
 export interface UpdateRuntime {
   supported: boolean;
   check: () => Promise<UpdateCandidate | null>;
-  /** Stop/reap arc-node and retain its cross-process lifecycle fence. */
   prepareRelaunch: () => Promise<void>;
-  /** Commit the one-way native boundary immediately before install handoff. */
   beginHandoff: () => Promise<void>;
-  /** Atomically release or resume after a strictly pre-handoff failure. */
   abortRelaunch: () => Promise<void>;
-  /** Atomically prepare only when native inference admission is quiescent. */
   tryPrepareAutoUpdateRelaunch?: () => Promise<AutoUpdatePrepareResult>;
   relaunch: () => Promise<void>;
   now?: () => number;
@@ -110,11 +73,6 @@ export interface UpdateSchedule {
 
 type UpdateCheckSource = "automatic" | "manual" | "retry";
 
-/**
- * Injectable timer surface. Production uses the browser timers below; tests
- * provide a deterministic clock so cadence and cancellation do not depend on
- * wall-clock sleeps.
- */
 export interface UpdateTimers {
   setTimeout: (callback: () => void, delayMs: number) => unknown;
   clearTimeout: (handle: unknown) => void;
@@ -153,13 +111,6 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/**
- * Owns the updater lifecycle for the whole app.
- *
- * There is intentionally one controller rather than one query per screen:
- * startup, periodic, and manual checks all share the same in-flight promise,
- * so navigation and React renders cannot create overlapping network checks.
- */
 export class UpdateController {
   private snapshot: UpdateSnapshot = IDLE_SNAPSHOT;
   private readonly listeners = new Set<() => void>();
@@ -172,8 +123,6 @@ export class UpdateController {
   private intervalTimer: unknown | null = null;
   private retryTimer: unknown | null = null;
   private autoInstallRetryTimer: unknown | null = null;
-  // When each pending timer is due, on the wall clock. A `tick` signal runs
-  // an overdue one at once.
   private intervalDueAt: number | null = null;
   private retryDueAt: number | null = null;
   private autoInstallRetryDueAt: number | null = null;
@@ -215,7 +164,6 @@ export class UpdateController {
     return () => this.listeners.delete(listener);
   };
 
-  /** Enable or cancel background checks. Safe to call repeatedly. */
   setAutoChecksEnabled(enabled: boolean): void {
     if (!enabled) this.setAutoInstallEnabled(false);
     if (enabled === this.autoChecksEnabled) return;
@@ -224,8 +172,6 @@ export class UpdateController {
     this.autoChecksEnabled = enabled;
     this.automaticFailureCount = 0;
 
-    // Browser previews and tests without the native shell keep the manual
-    // unsupported state, but must never schedule calls to a missing plugin.
     if (!enabled || !this.runtime.supported) return;
 
     this.startupTimer = this.timers.setTimeout(() => {
@@ -246,21 +192,11 @@ export class UpdateController {
 
   private runIntervalCheck(): void {
     this.scheduleIntervalCheck();
-    // A bounded retry sequence owns the cadence after a recent failure.
-    // When retries are exhausted, a new ordinary interval starts a fresh
-    // sequence in case connectivity has returned.
     if (this.retryTimer !== null) return;
     this.automaticFailureCount = 0;
     void this.checkForUpdates("automatic");
   }
 
-  /**
-   * A signal from the native shell. Every signal first runs whatever is
-   * overdue: the periodic check, a failed-check retry, a waiting install.
-   * A wake, a focus or a show also checks now, unless an update is already
-   * found (its own retries handle it) or a check started less than
-   * `signalMinGapMs` ago.
-   */
   signal(signal: UpdateSignal): void {
     if (!this.autoChecksEnabled || !this.runtime.supported) return;
     if (this.snapshot.restartRequired) return;
@@ -305,7 +241,6 @@ export class UpdateController {
     }
   }
 
-  /** Enable unattended installs only when automatic discovery is also enabled. */
   setAutoInstallEnabled(enabled: boolean): void {
     const next = enabled && this.autoChecksEnabled && this.runtime.supported;
     if (next === this.autoInstallEnabled) return;
@@ -315,8 +250,6 @@ export class UpdateController {
     this.clearAutoInstallRetryTimer();
     this.autoInstallDeferralCount = 0;
 
-    // An automatic wait for the last session ends with unattended installs;
-    // a wait that an Install press started keeps going.
     if (
       !next &&
       this.reconciliationRetryTimer !== null &&
@@ -331,8 +264,6 @@ export class UpdateController {
       }
     }
 
-    // Saving explicit opt-in can apply to a signed candidate already found by
-    // an earlier check. The currently installed bundle never changes here.
     if (
       next &&
       this.candidate &&
@@ -343,10 +274,6 @@ export class UpdateController {
     }
   }
 
-  /**
-   * Check the signed Tauri update manifest. Concurrent callers share one
-   * promise; checks never run while an install is active.
-   */
   checkForUpdates(
     source: UpdateCheckSource = "manual",
   ): Promise<UpdateSnapshot> {
@@ -362,10 +289,6 @@ export class UpdateController {
       return Promise.resolve(this.snapshot);
     }
 
-    // Once installation succeeded, this running process is deliberately
-    // frozen on the ready state until it exits. Re-checking from the old
-    // binary could rediscover and reinstall the same release after a failed
-    // relaunch.
     if (this.snapshot.restartRequired) return Promise.resolve(this.snapshot);
 
     if (this.installInFlight) return this.installInFlight;
@@ -474,10 +397,6 @@ export class UpdateController {
     return check;
   }
 
-  /**
-   * Download and install only after an explicit user action. A successful
-   * install is marked ready before requesting an immediate app relaunch.
-   */
   installAvailableUpdate(): Promise<UpdateSnapshot> {
     return this.startInstall(null);
   }
@@ -512,10 +431,6 @@ export class UpdateController {
 
     if (this.installInFlight) return this.installInFlight;
 
-    // The UI disables Install during a check, but retain the invariant at the
-    // controller boundary too. A stale/programmatic click must not race a
-    // candidate replacement; it simply observes the check result and the user
-    // can confirm the newly reported version.
     if (this.checkInFlight) return this.checkInFlight;
 
     if (!this.candidate) {
@@ -577,9 +492,6 @@ export class UpdateController {
       let handoffStarted = false;
       let verifiedDownloaded = alreadyDownloaded;
       try {
-        // Download and verify while the node keeps running. Tauri retains the
-        // verified payload in its resource table; only the install step mutates
-        // the app bundle, so there is no reason to interrupt inference yet.
         if (!alreadyDownloaded) await candidate.download((event) => {
           if (event.event === "Started") {
             this.setSnapshot({
@@ -609,9 +521,6 @@ export class UpdateController {
         this.downloadedCandidate = candidate;
         verifiedDownloaded = true;
 
-        // An explicit opt-out during network transfer is honored before any
-        // native lifecycle fence is requested. The verified bundle remains
-        // available for a later manual install.
         if (automatic && !this.isAutoInstallCurrent(autoInstallGeneration)) {
           this.setSnapshot({
             ...this.snapshot,
@@ -624,9 +533,6 @@ export class UpdateController {
           return this.snapshot;
         }
 
-        // Establish the native durability boundary only after the complete
-        // payload has passed signature verification, immediately before the
-        // updater may mutate the app bundle.
         if (automatic) {
           let outcome: AutoUpdatePrepareResult;
           try {
@@ -634,13 +540,8 @@ export class UpdateController {
           } catch (error) {
             const detail = errorMessage(error);
             const lastSession = isStartupReconciliationInProgress(detail);
-            // The native abort waits for the recovery launch to release the
-            // node, which can take a while; say why the install is waiting.
             if (lastSession) this.showWaitingForLastSession(version);
             try {
-              // The IPC may fail after native quiescence was established.
-              // Abort is safe before beginUpdateHandoff and avoids leaving the
-              // node fenced when the result itself is unavailable.
               await this.runtime.abortRelaunch();
             } catch (abortError) {
               this.setSnapshot({
@@ -655,7 +556,6 @@ export class UpdateController {
             }
             if (lastSession) {
               if (!this.isAutoInstallCurrent(autoInstallGeneration)) {
-                // Unattended installs were turned off during the abort.
                 this.setSnapshot({
                   ...this.snapshot,
                   phase: "available",
@@ -668,10 +568,6 @@ export class UpdateController {
               }
               return this.waitForLastSession(candidate, version, true);
             }
-            // The location refusal is the whole story, and the Settings
-            // install is refused the same way; moving ARC takes a quit, so
-            // nothing retries it. A legacy v0.7 refusal also refuses the
-            // Settings install.
             const wrongLocation = detail.includes(NATIVE_WRONG_LOCATION);
             this.setSnapshot({
               ...this.snapshot,
@@ -727,8 +623,6 @@ export class UpdateController {
             return this.snapshot;
           }
 
-          // The preference may have changed while native quiescence drained
-          // jobs. Release the exact pre-handoff fence before returning control.
           if (!this.isAutoInstallCurrent(autoInstallGeneration)) {
             try {
               await this.runtime.abortRelaunch();
@@ -758,11 +652,6 @@ export class UpdateController {
           await this.runtime.prepareRelaunch();
         }
 
-        // Seal the one-way native boundary before calling the pinned Tauri
-        // installer. IPC itself can disconnect after native code commits, so
-        // mark this irreversible before awaiting the command. From this point
-        // a rejection cannot prove that the old bundle is intact and must
-        // never release the node/update fence or resume the old node.
         handoffStarted = true;
         await this.runtime.beginHandoff();
         await candidate.install();
@@ -830,9 +719,6 @@ export class UpdateController {
           return this.waitForLastSession(candidate, version, false);
         }
         if (detail.includes(NATIVE_WRONG_LOCATION)) {
-          // Refused before anything stopped: the node runs on, and the
-          // verified update stays offered with the one step that lets it
-          // install.
           this.setSnapshot({
             ...this.snapshot,
             phase: "available",
@@ -863,7 +749,6 @@ export class UpdateController {
     return install;
   }
 
-  /** Test/app teardown: stop timers and release any native update handle. */
   dispose(): void {
     this.setAutoInstallEnabled(false);
     this.clearTimers();
@@ -920,8 +805,6 @@ export class UpdateController {
     }, delayMs);
   }
 
-  // Not part of clearTimers: a settings save re-enables background checks,
-  // and must not drop an install the user already asked for.
   private clearReconciliationRetryTimer(): void {
     if (this.reconciliationRetryTimer !== null) {
       this.timers.clearTimeout(this.reconciliationRetryTimer);
@@ -942,16 +825,6 @@ export class UpdateController {
     });
   }
 
-  /**
-   * Launch-time reconciliation still owns the node, possibly mid-way through
-   * a WAL replay. Never interrupt it: keep the verified candidate and try the
-   * same install again on a fixed cadence. Once reconciliation ends, native
-   * preparation either stops the node as usual or, behind a start refusal,
-   * takes the fenced boundary, so the wait ends in the install.
-   *
-   * One timer serves both paths. An Install press upgrades a pending
-   * automatic wait, so turning unattended installs off cannot drop it.
-   */
   private waitForLastSession(
     candidate: UpdateCandidate,
     version: string,
@@ -999,11 +872,6 @@ export class UpdateController {
     }, delayMs);
   }
 
-  /**
-   * Inference was still running. Try again every `busyRetryMs` for as long
-   * as the same update keeps waiting; this never uses up the failure
-   * retries.
-   */
   private scheduleBusyInstallRetry(candidate: UpdateCandidate): void {
     if (
       !this.autoInstallEnabled ||

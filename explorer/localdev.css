@@ -1,5 +1,3 @@
-/* Local-development view only. It wears the explorer's engraved look (styles.css), but its banner stays loud and
-   deliberately un-production, so a screenshot of this page can never be mistaken for canonical explorer data. */
 .localdev-banner {
   display: flex;
   flex-wrap: wrap;
@@ -58,7 +56,6 @@ main > .panel { margin-bottom: 18px; }
 .panel > .localdev-balance { margin: 4px 22px 16px; }
 .localdev-detail-grid dt, .localdev-balance dt { color: var(--ink-muted); }
 .localdev-detail-grid dd, .localdev-balance dd { margin: 0; word-break: break-all; }
-/* numbers are text with tabular figures; addresses and hashes are set in the monospace face */
 .localdev-detail-grid dd code, .localdev-balance dd code, #localdev-balance-address { font-family: var(--font-mono); }
 #localdev-native-replicas[data-agree="false"] { color: var(--bad); font-weight: 600; }
 

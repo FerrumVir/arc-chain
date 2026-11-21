@@ -26,45 +26,12 @@ import type {
   RecentBlocks,
 } from "../lib/types";
 
-/**
- * The Network screen: check the chain, any time, without leaving the app.
- *
- * Everything here reads one selected chain host and attributes every value to
- * it. Fleet-wide canonicality, the signed legacy checkpoint, and preserved
- * forks belong in the composite explorer, which audits those sources instead
- * of blending them into one unqualified number.
- *
- * This screen replaced an "Explorer" button that opened
- * `http://140.82.16.112:3200` — a hardcoded LAX IP, serving a network
- * dashboard rather than a block explorer, for a chain that is usually not the
- * one the session is reading.
- */
-
-/**
- * Block age past which the chain is lagging.
- *
- * Blocks seal continuously on a healthy host, so hundreds of seconds already
- * means something is wrong. Kept well below the stall threshold so a
- * degrading host is visible before it is fully stopped.
- */
 const BLOCK_AGE_WARN_SECS = 300;
 
-/**
- * Block age past which the host is not sealing blocks at all.
- *
- * This exists because `/health` cannot be trusted to say so. Four of the six
- * live seeds have not produced a block in roughly six days while still
- * answering `status: "ok"` with a healthy peer count, because their DAG rounds
- * keep advancing after block production stops. A user looking at a green
- * health pill has no way to know their work can never settle. One hour is far
- * beyond any legitimate gap.
- */
 const BLOCK_AGE_STALL_SECS = 3600;
 
-/** ARC base units per whole ARC, for rendering validator stake. */
 const ARC_BASE_UNITS = 1_000_000_000;
 
-/** Public composite explorer deployed from this repository's Pages artifact. */
 const COMPOSITE_EXPLORER_URL =
   "https://ferrumvir.github.io/arc-chain/explorer/";
 
@@ -93,16 +60,9 @@ export function Network() {
     refetchInterval: 15_000,
   });
 
-  // The host every number on this screen came from. Falls back to the status
-  // poll's copy so the header can still attribute figures while the overview
-  // request is in flight.
   const host = overview?.sourceHost ?? status?.chainHost ?? null;
 
   const age = overview?.lastBlockAgeSecs ?? null;
-  // Two independent signals: our own block-age reading, and the host's own
-  // verdict. Either is enough to warn. They are combined rather than one
-  // preferred, because a host that has stopped sealing is exactly the host
-  // whose self-report is least worth trusting alone.
   const hostSaysStopped = overview?.isBlockProducing === false;
   const stalled =
     (age !== null && age >= BLOCK_AGE_STALL_SECS) ||
@@ -115,10 +75,6 @@ export function Network() {
       <div className="page-header">
         <div>
           <h1 className="page-title">Network</h1>
-          {/* The subtitle never asserts which network this is unless the host
-              said so. `/info` reports the constant string "ARC Chain" on every
-              deployment, so it cannot tell a testnet from a mainnet and is
-              deliberately not used as a substitute. */}
           <p className="page-subtitle" data-testid="network-identity">
             {overview === undefined ? (
               <>Reading {hostLabelVerbose(host)}…</>
@@ -127,9 +83,6 @@ export function Network() {
                 <strong>{overview.networkName}</strong>, read from{" "}
                 {hostLabelVerbose(host)}
                 {overview.hostVersion && <> running arc-node {overview.hostVersion}</>}.
-                {/* The ONLY statement this app makes about mainnet, and only
-                    when the host's genesis declares it. `null` means the host
-                    did not say, and then neither does the UI. */}
                 {overview.declaresMainnet === true && (
                   <>
                     {" "}
@@ -184,7 +137,6 @@ export function Network() {
         </div>
       )}
 
-      {/* The warning that `/health` cannot give. */}
       {(stalled || lagging) && (
         <div
           role="alert"
@@ -301,8 +253,6 @@ export function Network() {
   );
 }
 
-/** A stat that renders an em dash and a reason-free blank rather than a zero
- *  when the host did not report it. */
 function StatCard({
   label,
   value,
@@ -313,15 +263,11 @@ function StatCard({
 }: {
   label: string;
   value: string | null;
-  /** The first read has not come back: a placeholder, not the em dash that means "not reported". */
   loading?: boolean;
   icon: typeof Blocks;
   note?: string;
   tone?: "warning" | "danger";
 }) {
-  // The value carries the testid, not the card: a testid on the wrapper makes
-  // `toHaveText` match the label and footnote too, which turns an assertion
-  // about a number into an assertion about prose.
   const slug = label.toLowerCase().replace(/[^a-z]+/g, "-");
   return (
     <Card data-testid={`net-card-${slug}`}>
@@ -348,7 +294,6 @@ function StatCard({
                 : undefined,
         }}
       >
-        {/* null = the host did not report it. Never rendered as 0. */}
         {loading ? (
           <Skeleton width="4ch" height="0.8em" />
         ) : (
@@ -370,15 +315,6 @@ function StatCard({
   );
 }
 
-/**
- * Paste a hash, get an honest answer.
- *
- * The three outcomes are deliberately distinct. A 404 from `/tx/{hash}` is NOT
- * evidence that a hash is fake: the endpoint returns a receipt, and a
- * transaction still in the mempool has none. Telling a user who just submitted
- * an attestation that their hash is "invalid" would be wrong and would send
- * them looking for a bug that isn't there.
- */
 function TxLookupCard({
   prefill,
   onConsumePrefill,
@@ -392,14 +328,11 @@ function TxLookupCard({
     mutationFn: (h: string) => api.lookupTx(h),
   });
 
-  // Arriving here from an attestation row's "look up" button.
   useEffect(() => {
     if (!prefill) return;
     setHash(prefill);
     lookup.mutate(prefill);
     onConsumePrefill();
-    // `lookup` is a stable mutation object; re-running on its identity would
-    // loop the request.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prefill]);
 
@@ -528,7 +461,6 @@ function TxLookupCard({
             </>
           )}
 
-          {/* The important one. "Not found" is what a pending tx looks like. */}
           {result.status === "not_found" && (
             <div data-testid="tx-status-not-found">
               <div
@@ -589,15 +521,6 @@ function TxLookupCard({
   );
 }
 
-/**
- * Active vs registered validators.
- *
- * `/validators` reports one flat list with no such distinction, so the split is
- * derived here by counting stake > 0. It matters: zero-stake entries are
- * counted by `/health` and by the endpoint's own `count`, which inflates the
- * apparent size of the validator set above the number of nodes that can
- * actually lead a round.
- */
 function ValidatorSplit({
   overview,
 }: {
@@ -696,7 +619,6 @@ function ValidatorSplit({
   );
 }
 
-/** Recent blocks, newest first, with on-demand transaction expansion. */
 function RecentBlocksCard({
   blocks,
   loading,
@@ -758,7 +680,6 @@ function RecentBlocksCard({
                   </div>
                   <div className="feed-item-meta">
                     <span className="mono">{formatHash(b.hash, 10)}</span>
-                    {/* Omitted rather than shown as 0 when unreported. */}
                     {b.txCount != null && (
                       <span>
                         {formatInt(b.txCount)} tx
@@ -796,7 +717,6 @@ function RecentBlocksCard({
   );
 }
 
-/** Fetched only when a block is expanded — never on the polling path. */
 function BlockTxList({ height }: { height: number }) {
   const lookupHash = useAppStore((s) => s.lookupHash);
   const { data, isLoading } = useQuery({
@@ -884,18 +804,6 @@ function BlockTxList({ height }: { height: number }) {
   );
 }
 
-/**
- * Recent mined inference activity, filtered to protocol inference records.
- *
- * The deployed seeds pad `/inference/attestations` with unrelated transactions
- * tagged `tx_type: "Other"` once genuine rows run out — at `limit=500` some
- * seeds returned 500 padding rows and zero real ones. Presenting those as
- * inference evidence on a screen whose whole job is letting someone check the
- * chain would be the worst place in the app to get this wrong. Rows are kept
- * only when the host labelled them `Inference` or
- * `CommunityInferenceReward`; how many were dropped is
- * stated rather than hidden.
- */
 function RecentInferenceCard({
   attestations,
   host,
@@ -906,8 +814,6 @@ function RecentInferenceCard({
   const lookupHash = useAppStore((s) => s.lookupHash);
 
   const all = attestations ?? [];
-  // A row with no tx_type at all is kept: older adapters did not carry the
-  // field, and dropping those would empty the list on hosts that are fine.
   const real = all.filter((a) =>
     a.txType == null
     || a.txType === "Inference"

@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Format only first-party workspace packages.
-#
-# `cargo fmt --all` also walks the vendored Stwo path dependencies. Rewriting
-# audited third-party source creates a huge, unauditable diff and makes future
-# vendor updates harder to verify. This wrapper asks Cargo for the actual ARC
-# workspace members and formats each package explicitly.
 set -euo pipefail
 
 MODE="${1:-format}"

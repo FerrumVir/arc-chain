@@ -45,7 +45,6 @@ for (const viewport of [{ width: 1280, height: 820 }, { width: 960, height: 640 
       const checkbox = page.getByTestId("compute-notice-keep-awake");
       await expectFocusInside(page, gotIt);
       await expect(checkbox).not.toBeChecked();
-      // Two full cycles per direction: every enabled control, both wrap points.
       for (let cycle = 0; cycle < 2; cycle++) {
         for (const target of [turnOff, checkbox, gotIt]) await step(page, "Tab", target);
         for (const target of [checkbox, turnOff, gotIt]) await step(page, "Shift+Tab", target);
@@ -55,7 +54,6 @@ for (const viewport of [{ width: 1280, height: 820 }, { width: 960, height: 640 
       await screenshot(page, `focus-forward-wrap-${viewport.width}`);
       await step(page, "Shift+Tab", turnOff);
       await screenshot(page, `focus-reverse-wrap-${viewport.width}`);
-      // The modal also rejects focus attempts from background app code.
       await page.getByTestId("btn-start").evaluate((button: HTMLElement) => button.focus());
       await expectFocusInside(page, turnOff);
       await page.keyboard.press("Escape");
@@ -116,7 +114,6 @@ for (const viewport of [{ width: 1280, height: 820 }, { width: 960, height: 640 
       await expect(previous).toBeVisible();
       await expect(page.locator("#boot")).toHaveCount(0);
       await expect(page.getByTestId(noticeId)).toHaveCount(0);
-      // Focus without changing route, while the notice is still deferred.
       await previous.focus();
       await page.evaluate(() => {
         (window as unknown as { __ARC_MOCK_WINDOW_HIDDEN__: boolean }).__ARC_MOCK_WINDOW_HIDDEN__ = false;
@@ -134,7 +131,6 @@ for (const viewport of [{ width: 1280, height: 820 }, { width: 960, height: 640 
       const checkbox = page.getByTestId("compute-notice-keep-awake");
       await expectFocusInside(page, page.getByTestId("compute-prompt-not-now"));
       await step(page, "Shift+Tab", checkbox);
-      // Delay only subsequent mock IPC, without slowing the app's boot.
       await page.evaluate(() => history.replaceState(null, "", "/?slow=1500"));
       await page.keyboard.press("Space");
       await expect(checkbox).toBeDisabled();

@@ -1,13 +1,9 @@
-//! `arc block <height>` - display block details.
-
 use crate::rpc::RpcClient;
 use anyhow::Result;
 
 pub async fn run(rpc: &RpcClient, height: u64) -> Result<()> {
     let data = rpc.get_block(height).await?;
 
-    // Fields may be at top level or nested under "header" depending on the
-    // serialization format. Check both locations.
     let header = data.get("header");
 
     let block_height = data

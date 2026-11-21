@@ -1,59 +1,8 @@
 #!/usr/bin/env bash
-# Separate-process, separate-store multi-node fixture.
-#
-# Why this exists: every "multi-node" test in this repo runs all nodes inside
-# ONE OS process (crates/arc-node/tests/multi_node.rs uses real localhost TCP
-# but a single test binary), and every native-inference "restart" is a
-# drop-and-reopen of a Rust struct against the same directory. Neither
-# establishes replica agreement or survives a real process death.
-#
-# It also exists because the soak harness could not peer its nodes: --benchmark
-# forbids --genesis (main.rs:5566), so each node seeded its own
-# single-validator set and the transport correctly refused the mismatch. The
-# fix is the one the review named - a SHARED disposable genesis plus an
-# external workload - not weakening that isolation guard.
-#
-# Phases:
-#   1. derive each node's validator address from its deterministic dev seed
-#   2. write a shared disposable genesis naming all of them
-#   3. start N separate processes, each with its OWN data dir, peered
-#   4. require a real quorum: every node healthy, peers > 0, validators == N
-#   5. observe chain progress and compare state roots AT A COMMON HEIGHT
-#   6. kill one node, restart it, require it to rejoin and catch up
-#
-# usage: arc-multinode-fixture.sh [--nodes N] [--binary PATH] [--settle SECONDS]
-#
-# NOTE, 2026-09-20: the restart stage currently cannot pass at ANY committee
-# size, and the two reasons are different:
-#   N = 3  survivors hold 13,333,334 against a quorum of 13,333,335 - one base
-#          unit short - so a stall there measures the committee, not recovery.
-#          The premise check below reports this instead of proceeding quietly.
-#   N >= 4 the survivor arithmetic works, but the chain cannot commit at all:
-#          a node can advance a round without one member's block, and if that
-#          member is the round leader the commit cursor halts for good. See
-#          outputs/.../round3/d6-committee-size-sweep.txt and the two
-#          arc-consensus unit tests named there.
-# Stages 1-5b remain meaningful at N = 3 and are the agreement evidence.
 set -uo pipefail
 
-# Default 4, not 3, and the reason is arithmetic rather than taste.
-#
-# The consensus quorum is stake-weighted at just over two thirds. With 3 equal
-# validators a node logs
-#   total_stake=20000001 quorum=13333335
-# and two survivors hold 13333334 - exactly ONE short. Killing a member of a
-# 3-node committee therefore cannot make progress, and the "restart recovery"
-# test would be measuring a committee that never had quorum rather than a
-# recovery defect. At 4 nodes the three survivors hold 20000001 against a
-# ~17777779 quorum, so progress while one is down is genuinely expected.
-#
-# The threshold is NOT weakened to make the test pass; the committee is sized so
-# the premise holds.
 NODES=${NODES:-4}
 BINARY=${BINARY:-target/debug/arc-node}
-# Snapshot often enough that the restart stage actually recovers FROM one
-# rather than only from a full WAL replay. The gate should exercise the path a
-# long-running node uses, not the empty-chain special case.
 SNAPSHOT_EVERY=${SNAPSHOT_EVERY:-100}
 SETTLE=${SETTLE:-45}
 WORKLOAD=${WORKLOAD:-12}
@@ -62,38 +11,14 @@ BASE_RPC=9980
 BASE_P2P=9180
 WORK="/tmp/arc-multinode-$(date +%Y%m%d-%H%M%S)"
 STAKE=6666667
-# Well-known faucet pool address, taken from the repo genesis.toml.
 FAUCET_POOL="2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"
 
 EXIT_STATUS=0; FAILURES=(); PIDS=(); ADDRS=(); CLEANED=0
-# Set only by the last line of the script. Any early exit - an error, `set -u`
-# firing, an interrupt - leaves it 0, and the report fails. A run that did not
-# finish is not a run that passed.
 PHASES_COMPLETE=0
 fail() { FAILURES+=("$1"); EXIT_STATUS=1; echo "  FAIL: $1"; }
 ok()   { echo "  ok: $1"; }
 
 
-# ── agreement selector (shared by the live run and the self-test) ───────────
-#
-# Rewritten after review found three false-pass paths in the previous version,
-# all reproduced on small inputs with no node running:
-#
-#   the saved three-node CSV with ALL ROOT FIELDS BLANK          -> OK
-#   three rows carrying three DIFFERENT heights                  -> OK
-#   identities 8, 9, 10 when the intended nodes are 0, 1, 2      -> OK
-#
-# The blank roots were not a fluke. `GET /block/{height}` returns a raw
-# `arc_types::Block`, so `height`, `tx_root` and `state_root` live under
-# `header`; the old extractor read them from the TOP level, got empty strings
-# every time, and the selector counted one shared empty value as agreement.
-#
-# Now every row must carry the requested height, three well-formed 32-byte
-# hashes, and a node identity from exactly the intended set, and all three
-# committed values must agree. An absent field fails; it never becomes shared
-# evidence.
-#
-# agreement_verdict FILE EXPECTED_NODES TARGET -> "OK <hash>" | "BAD <reason>"
 agreement_verdict() {
     awk -F, -v want="$2" -v target="$3" '
         function bad(msg) { printf "BAD %s\n", msg; aborted = 1; exit }
@@ -125,14 +50,7 @@ agreement_verdict() {
         }' "$1"
 }
 
-# Walk EVERY height from 1 to TARGET on every replica and compare the full
-# header, not a sample. A sampled height is exactly what hid the round-575
-# duplicate: node 3 produced two canonical blocks for one anchor, so every
-# later height on that replica was offset by one, and a single late sample
-# showed a differing hash with a matching state root - which is unreadable as
-# evidence. Comparing hash AND parent at every height names the FIRST
-# divergence instead of a symptom far above it.
-full_history_agreement() { # TARGET FILE
+full_history_agreement() {
     local target="$1" file="$2" i from to
     for i in $(seq 0 $((NODES-1))); do
         : > "$file.node-$i.ndjson"
@@ -165,8 +83,6 @@ for n in range(nodes):
                     if height is None:
                         continue
                     strip = lambda v: str(v or "").replace("0x", "")
-                    # The block hash commits to the whole header, state root
-                    # included, so hash + parent is the canonical-chain test.
                     chain[int(height)] = (
                         strip(b.get("hash")),
                         strip(b.get("parent_hash")),
@@ -188,8 +104,6 @@ if not covered:
     print("UNAVAILABLE: no height is present on every replica")
     sys.exit(3)
 
-# A replica missing heights the others have is itself a divergence, not a
-# reason to compare only the intersection.
 missing = []
 for n in range(nodes):
     gap = sorted(h for h in range(1, target + 1) if h not in chains[n])
@@ -220,11 +134,7 @@ sys.exit(1)
 PYEOF
 }
 
-# Collect one coherent /block/{target} response per node into FILE.
-# The response is parsed ONCE per node, so a height can never be paired with a
-# root taken from a different request. The node identity written here is the
-# loop index, which phase 4 has already bound to a verified validator address.
-collect_agreement() { # FILE TARGET
+collect_agreement() {
     local file="$1" target="$2" i body
     echo "target,node,height,hash,tx_root,state_root" > "$file"
     for i in $(seq 0 $((NODES-1))); do
@@ -264,48 +174,40 @@ if [[ "${1:-}" == "--self-test" ]]; then
     [[ "$v" == OK* ]] && echo "  PASS A: three intended replicas, one hash/tx_root/state_root -> $v" \
         || { echo "  FAIL A: $v"; rm -f "$t"; exit 1; }
 
-    # The exact defect from the review: the saved CSV with blank roots.
     printf '%s\n801,0,801,%s,,\n801,1,801,%s,,\n801,2,801,%s,,\n' "$hdr" "$H" "$H" "$H" > "$t"
     v=$(agreement_verdict "$t" 3 801)
     [[ "$v" == BAD*tx_root* ]] && echo "  PASS B: blank roots rejected -> $v" \
         || { echo "  FAIL B: expected a blank-root rejection, got: $v"; rm -f "$t"; exit 1; }
 
-    # Rows for three different heights.
     printf '%s\n900,0,900,%s,%s,%s\n900,1,901,%s,%s,%s\n900,2,902,%s,%s,%s\n' \
         "$hdr" "$H" "$T" "$R" "$H" "$T" "$R" "$H" "$T" "$R" > "$t"
     v=$(agreement_verdict "$t" 3 900)
     [[ "$v" == BAD*height* ]] && echo "  PASS C: wrong reported height rejected -> $v" \
         || { echo "  FAIL C: $v"; rm -f "$t"; exit 1; }
 
-    # Identities outside the intended set.
     printf '%s\n900,8,900,%s,%s,%s\n900,9,900,%s,%s,%s\n900,10,900,%s,%s,%s\n' \
         "$hdr" "$H" "$T" "$R" "$H" "$T" "$R" "$H" "$T" "$R" > "$t"
     v=$(agreement_verdict "$t" 3 900)
     [[ "$v" == BAD*intended\ set* ]] && echo "  PASS D: identities outside the intended set rejected -> $v" \
         || { echo "  FAIL D: $v"; rm -f "$t"; exit 1; }
 
-    # Repeated samples from one node.
     printf '%s\n900,1,900,%s,%s,%s\n900,1,900,%s,%s,%s\n900,1,900,%s,%s,%s\n' \
         "$hdr" "$H" "$T" "$R" "$H" "$T" "$R" "$H" "$T" "$R" > "$t"
     v=$(agreement_verdict "$t" 3 900)
     [[ "$v" == BAD*more\ than\ once* ]] && echo "  PASS E: duplicate identity rejected -> $v" \
         || { echo "  FAIL E: $v"; rm -f "$t"; exit 1; }
 
-    # A missing replica.
     printf '%s\n900,0,900,%s,%s,%s\n900,1,900,%s,%s,%s\n' "$hdr" "$H" "$T" "$R" "$H" "$T" "$R" > "$t"
     v=$(agreement_verdict "$t" 3 900)
     [[ "$v" == BAD*intended\ replicas* ]] && echo "  PASS F: missing replica rejected -> $v" \
         || { echo "  FAIL F: $v"; rm -f "$t"; exit 1; }
 
-    # Malformed hash.
     printf '%s\n900,0,900,not-a-hash,%s,%s\n900,1,900,%s,%s,%s\n900,2,900,%s,%s,%s\n' \
         "$hdr" "$T" "$R" "$H" "$T" "$R" "$H" "$T" "$R" > "$t"
     v=$(agreement_verdict "$t" 3 900)
     [[ "$v" == BAD*block\ hash* ]] && echo "  PASS G: malformed block hash rejected -> $v" \
         || { echo "  FAIL G: $v"; rm -f "$t"; exit 1; }
 
-    # Disagreeing state roots with matching hashes: block-hash equality alone
-    # must not be accepted as a root comparison.
     R2="dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
     printf '%s\n900,0,900,%s,%s,%s\n900,1,900,%s,%s,%s\n900,2,900,%s,%s,%s\n' \
         "$hdr" "$H" "$T" "$R" "$H" "$T" "$R2" "$H" "$T" "$R" > "$t"
@@ -350,7 +252,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-json_field() { # port path field
+json_field() {
   local raw code body
   raw=$(curl -s -w '\n%{http_code}' --max-time 4 "http://127.0.0.1:$1$2" 2>/dev/null) || return 1
   code=${raw##*$'\n'}; body=${raw%$'\n'*}
@@ -364,7 +266,7 @@ if not isinstance(d,dict) or k not in d or d[k] is None: sys.exit(1)
 print(d[k])' "$3" 2>/dev/null || return 1
 }
 
-nget() { # port path -> body; fails unless HTTP 200 AND valid JSON
+nget() {
   local raw code body
   raw=$(curl -s -w '\n%{http_code}' --max-time 6 "http://127.0.0.1:$1$2" 2>/dev/null) || return 1
   code=${raw##*$'\n'}; body=${raw%$'\n'*}
@@ -375,10 +277,7 @@ nget() { # port path -> body; fails unless HTTP 200 AND valid JSON
 
 nfield() { json_field "$@"; }
 
-# A node that does not answer is not a node at height 0. Defaulting the two to
-# the same value is how a dead process reads as "no progress"; every comparison
-# built on it then describes something that was not measured.
-height_or_fail() { # port label
+height_or_fail() {
   local h; h=$(nfield "$1" /health height)
   if [[ -z "$h" || ! "$h" =~ ^[0-9]+$ ]]; then
     fail "node on port $1 ($2) did not report a height; it is unreachable, not at height 0"
@@ -387,7 +286,7 @@ height_or_fail() { # port label
   printf '%s' "$h"
 }
 
-wait_healthy() { # port timeout
+wait_healthy() {
   local deadline=$(( $(date +%s) + $2 ))
   while [[ $(date +%s) -lt $deadline ]]; do
     json_field "$1" /health status >/dev/null && return 0
@@ -400,12 +299,7 @@ mkdir -p "$WORK"
 echo "=== multi-node fixture: $NODES separate processes, separate stores ==="
 echo "work dir: $WORK"
 
-# ── Phase 1: derive validator addresses from deterministic dev seeds ─────────
 echo ""
-# A stale binary silently tests the wrong code. `cargo test --lib` does not
-# build the arc-node BINARY, so a fix can be committed, the suite can pass, and
-# this fixture can still exercise the previous build - which cost one full run
-# and produced a verdict identical to the one before it.
 if [[ -f "$BINARY" ]]; then
   newest_source=$(find crates -name '*.rs' -newer "$BINARY" -print -quit 2>/dev/null)
   if [[ -n "$newest_source" ]]; then
@@ -436,7 +330,6 @@ for i in $(seq 0 $((NODES-1))); do
   ADDRS+=("$a"); echo "  node $i -> $a"
 done
 
-# ── Phase 2: shared disposable genesis ──────────────────────────────────────
 echo ""
 echo "[2/6] writing shared disposable genesis"
 GEN="$WORK/genesis.toml"
@@ -444,16 +337,9 @@ GEN="$WORK/genesis.toml"
   echo '[chain]'
   echo 'name = "arc-multinode-fixture"'
   echo 'chain_id = "0x415243"'
-  # false, honestly: this is a disposable fixture genesis, not an approved
-  # production validator set. main.rs:6667 refuses seed-derived identities on a
-  # genesis that CLAIMS completeness, and that guard is right - the fix is to
-  # not make a false claim, rather than to bypass the check.
   echo 'validator_set_complete = false'
   echo "instance_id = \"fixture-$$-$(date -u +%s)\""
   echo ''
-  # The faucet pool is a well-known address (the first account in the repo's own
-  # genesis.toml). Without it funded, /faucet/claim returns HTTP 500 "Faucet pool
-  # account not funded", which is exactly what the first workload attempt hit.
   echo '[[accounts]]'
   echo "address = \"$FAUCET_POOL\""
   echo 'balance = 1_000_000_000_000'
@@ -467,10 +353,6 @@ GEN="$WORK/genesis.toml"
 } > "$GEN"
 echo "  $GEN ($(grep -c '\[\[validators\]\]' "$GEN") validators)"
 
-# ── Phase 3: start N separate processes with separate stores ────────────────
-# Reserve the ports before starting anything. Without this an unrelated local
-# listener on one of them can be mistaken for a test child, and every
-# subsequent assertion is then made against someone else's process.
 echo ""
 echo "[3/6] reserving ports and starting $NODES separate processes"
 for i in $(seq 0 $((NODES-1))); do
@@ -482,18 +364,6 @@ for i in $(seq 0 $((NODES-1))); do
   done
 done
 ok "ports $BASE_RPC-$((BASE_RPC+NODES-1)) and $BASE_P2P-$((BASE_P2P+NODES-1)) are free"
-# Topology: STAGGERED startup with an incremental peer list. Node i is started
-# only after nodes 0..i-1 are healthy, and dials exactly those. This produces a
-# full mesh while ensuring no two nodes ever dial each other simultaneously.
-#
-# Both earlier attempts failed on that distinction. A full mesh started all at
-# once (every node dialing every node, including itself) timed out on every
-# link. A pure star (all followers dialing only the seed) connected and
-# authenticated, but nodes 1 and 2 never saw each other, the DAG never
-# committed a round, and consensus reported "Round stalled, but no
-# authenticated quorum view-change certificate is available". The repo's own
-# passing transport test (tests/multi_node.rs::test_two_nodes_connect) starts
-# its two nodes sequentially, which is the property being reproduced here.
 for i in $(seq 0 $((NODES-1))); do
   d="$WORK/node-$i"; rm -rf "$d"; mkdir -p "$d"
   PEER_ARGS=()
@@ -516,14 +386,11 @@ for i in $(seq 0 $((NODES-1))); do
   sleep 4
 done
 
-# ── Phase 4: require a real quorum ──────────────────────────────────────────
 echo ""
 echo "[4/6] requiring every node healthy, peered, and agreeing on the set"
 echo "  settling ${SETTLE}s for peering and block production..."
 sleep "$SETTLE"
 for i in $(seq 0 $((NODES-1))); do
-  # Identity check: this port must be serving the validator this fixture
-  # derived for index i, not some other node that happens to be listening.
   id=$(nfield "$((BASE_RPC+i))" /node/info validator 2>/dev/null || echo "")
   if [[ "$id" == "${ADDRS[$i]}" ]]; then
     ok "node $i presents the expected validator identity"
@@ -537,17 +404,6 @@ for i in $(seq 0 $((NODES-1))); do
   [[ "${v:-0}" -eq "$NODES" ]] || fail "node $i sees ${v:-?} validators, expected $NODES"
 done
 
-# ── Phase 5a: bounded EXTERNAL workload ─────────────────────────────────────
-#
-# Without transactions the nodes commit empty blocks, the state root never
-# changes, and "all nodes agree on the root" is agreement on a constant - which
-# proves almost nothing. This drives real state changes from OUTSIDE the nodes,
-# which is also what lets the fixture avoid --benchmark entirely (that flag
-# forbids --genesis, and a shared genesis is what makes peering possible).
-#
-# /faucet/claim takes only a recipient address, so no client-side transaction
-# signing is needed. Each claim goes to a distinct random address because the
-# faucet is rate-limited per address.
 echo ""
 echo "[5a/6] driving a bounded external workload (${WORKLOAD} faucet claims)"
 ROOT_BEFORE=$(json_field "$BASE_RPC" /sync/snapshot/info state_root 2>/dev/null || echo "")
@@ -571,16 +427,6 @@ else
   fail "state root did not change under the external workload (agreement would be over a constant)"
 fi
 
-# ── Phase 5: agreement at ONE explicit target height, across ALL replicas ───
-#
-# The previous version sampled each node's CURRENT head every few seconds and
-# then looked for a height that appeared twice. That had two false-pass paths:
-# it counted rows rather than distinct node identities (two samples from one
-# node satisfied it), and it correlated a height from one snapshot request with
-# a root from another.
-#
-# Now: choose a target above every head, wait for every node to reach it, then
-# ask each node for that HISTORICAL block in a single coherent response.
 echo ""
 echo "[5/6] agreement at one explicit target height across all $NODES replicas"
 TARGET=0
@@ -612,20 +458,9 @@ else
   fail "agreement at height $TARGET: ${VERDICT#BAD }"
 fi
 
-# ── Phase 5b: live RPC-backed user journeys ─────────────────────────────────
-#
-# Gate 5 was being claimed on 214 Playwright tests that all run against
-# `mockInvoke` (desktop/src/lib/tauri.ts), with the four specs that touch a real
-# node unconditionally skipped. That is mock coverage and establishes no live
-# journey.
-#
-# The explorer's own live gate (explorer/test-live.mjs) cannot supply one here:
-# it requires an approved recovery checkpoint and all SIX production maintenance
-# interlocks, so it is bound to the production fleet, not to anything
-# reproducible locally. These journeys run against the REAL nodes above instead.
 echo ""
 echo "[5b/6] live RPC-backed user journeys against a real node"
-jget() { # path -> body; fails unless HTTP 200 AND valid JSON
+jget() {
   local raw code body
   raw=$(curl -s -w '\n%{http_code}' --max-time 6 "http://127.0.0.1:$BASE_RPC$1" 2>/dev/null) || return 1
   code=${raw##*$'\n'}; body=${raw%$'\n'*}
@@ -652,7 +487,6 @@ ACC=$(jget "/account/${ADDRS[0]}") && ok "account journey: /account/{address} is
   || fail "live /account failed"
 echo "    validator balance=$(jfield "$ACC" balance) nonce=$(jfield "$ACC" nonce)"
 
-# The payment journey that gate 5 actually needs: claim -> mined -> readable.
 RECIP=$(python3 -c "import secrets;print(secrets.token_hex(32))")
 BEFORE=$(jfield "$(jget "/account/$RECIP" || echo '{}')" balance); BEFORE=${BEFORE:-0}
 CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 -X POST \
@@ -679,32 +513,12 @@ MISSING=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "http://127.0.0.1:
 [[ "$MISSING" != "200" ]] && ok "error journey: a nonexistent block is refused (HTTP $MISSING), not fabricated" \
   || fail "error journey: a nonexistent block returned HTTP 200"
 
-# ── Phase 6: real process death, restart, and CONTINUED consensus ───────────
-#
-# The previous gate accepted `AFTER >= BEFORE`, and the saved run was
-# 1558 -> 1558. That shows a reopen at the persisted height, not recovery: it
-# passes for a node that comes back and then does nothing. This requires the
-# restarted node to rejoin, accept NEW state-changing work, advance BEYOND its
-# pre-kill height, and agree with the surviving replicas on the result.
-#
-# With 3 validators, killing one leaves 2 - which retains quorum, so the chain
-# is expected to keep moving while the node is down. No threshold is weakened
-# to make this pass.
 echo ""
 echo
 echo "[5c/6] a quorum finality certificate a client can verify without trusting the server"
-# /block/{h} reports what THIS node committed - a local observation. A client
-# that does not already trust the node cannot check it. /finality/{h} returns
-# the committee's signed certificate, which is checkable against a validator
-# set and chain domain the client holds independently. They are different
-# facts and the fixture asserts the difference rather than assuming it.
 FH=$(nfield "$BASE_RPC" /health height); FH=${FH:-0}
 FTARGET=$(( FH > 8 ? FH - 4 : 0 ))
 if [[ $FTARGET -gt 0 ]]; then
-  # The body goes to a FILE, not a pipe: `python3 -` reads its program from
-  # stdin, so a heredoc and a pipe cannot both feed it. Piping the body while
-  # heredoc-ing the script silently gave python an empty stdin and reported
-  # "response was not JSON" about a response that was perfectly fine.
   curl -s -m 6 "http://127.0.0.1:$BASE_RPC/finality/$FTARGET" > "$WORK/finality.json" || true
   FVERDICT=$(python3 - "$FTARGET" "$WORK/finality.json" <<'PYEOF'
 import json, sys
@@ -745,8 +559,6 @@ fi
 echo "[6/6] killing node $((NODES-1)), restarting it, and requiring recovery"
 LAST=$((NODES-1))
 
-# Verify the premise before relying on it: the survivors must actually retain
-# quorum, or a stall proves nothing about recovery.
 QUORUM_OK=$(python3 -c "
 s=$STAKE; n=$NODES
 total=n*s; surv=(n-1)*s; q=total*2//3+1
@@ -769,7 +581,6 @@ done
 [[ $gone -eq 1 ]] && ok "node $LAST process is gone (SIGKILL, verified by PID)" \
   || fail "node $LAST survived SIGKILL"
 
-# The survivors must keep making progress without it.
 sleep 20
 SURV=$(height_or_fail "$BASE_RPC" "surviving node 0")
 [[ "$SURV" -gt "$BEFORE" ]] && ok "surviving quorum kept advancing while node $LAST was down ($BEFORE -> $SURV)" \
@@ -783,13 +594,6 @@ for j in $(seq 0 $((LAST-1))); do plist="${plist}127.0.0.1:$((BASE_P2P+j)),"; do
           --stake "$STAKE" --snapshot-every-blocks "$SNAPSHOT_EVERY" \
           > "$WORK/node-$LAST.restart.log" 2>&1 &
 PIDS[$LAST]=$!
-# A healthy port is NOT proof that OUR process came back. A leaked node from an
-# earlier run, started from the same dev seed, presents the same validator
-# identity on the same port - so the identity check below passes while every
-# height read afterwards describes a stranger. That is exactly what happened on
-# 2026-09-20: the restarted node refused to start because it could not bind
-# 9183, and the fixture went on to report "reopened at 439" about a process from
-# a previous run. The PID is the only thing that distinguishes them.
 RESTART_PID=${PIDS[$LAST]}
 if wait_healthy "$((BASE_RPC+LAST))" 90 && kill -0 "$RESTART_PID" 2>/dev/null; then
   ok "node $LAST restarted from its persisted store (pid $RESTART_PID alive)"
@@ -805,12 +609,10 @@ else
     tail -15 "$WORK/node-$LAST.restart.log" | sed 's/^/      /'
   fi
 fi
-# Identity must still be the fixture's node, not some other local listener.
 RID=$(nfield "$((BASE_RPC+LAST))" /node/info validator)
 [[ "$RID" == "${ADDRS[$LAST]}" ]] && ok "restarted node still presents the expected validator identity" \
   || fail "restarted node identity is ${RID:0:16}..., expected ${ADDRS[$LAST]:0:16}..."
 
-# Rejoin: peers back, then NEW state-changing work.
 sleep 25
 RP=$(nfield "$((BASE_RPC+LAST))" /health peers); RP=${RP:-0}
 [[ "$RP" -ge 1 ]] && ok "node $LAST rejoined the mesh (peers=$RP)" \
@@ -839,7 +641,6 @@ echo "  node $LAST height: before kill=$BEFORE after recovery=$AFTER"
 [[ "$AFTER" -gt "$BEFORE" ]] && ok "node $LAST advanced BEYOND its pre-kill height (not merely reopened)" \
   || fail "node $LAST only reopened at $AFTER; it never advanced past its pre-kill height $BEFORE"
 
-# Finally: all replicas must agree again, on a block minted after the restart.
 TARGET2=$(( AFTER + 3 ))
 echo "  re-verifying agreement at height $TARGET2 after recovery"
 deadline=$(( $(date +%s) + 180 )); allthere=0
@@ -858,7 +659,6 @@ if [[ $allthere -eq 1 ]]; then
   [[ "$V2" == OK* ]] && ok "all $NODES replicas agree at height $TARGET2 AFTER the restart (${V2#OK })" \
     || fail "post-restart agreement at $TARGET2: ${V2#BAD }"
 
-  # One height is a sample. The gate is every height.
   echo "  comparing the FULL canonical history on all $NODES replicas (1..$TARGET2)"
   FULL=$(full_history_agreement "$TARGET2" "$WORK/full-history" 2>&1) || true
   case "$FULL" in
@@ -873,9 +673,6 @@ if [[ $allthere -eq 1 ]]; then
        fail "full canonical history DIVERGES across replicas" ;;
   esac
 
-  # Snapshot-backed recovery, stated from the restarted node's own log. If it
-  # replayed the whole WAL instead, the restart stage above passed without ever
-  # exercising the snapshot path.
   RLOG="$WORK/node-$LAST.restart.log"
   if grep -q "Installed a verified state snapshot" "$RLOG" 2>/dev/null; then
     ok "the restarted node recovered FROM a verified snapshot, replaying only the WAL tail"

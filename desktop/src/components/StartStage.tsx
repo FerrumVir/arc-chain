@@ -1,22 +1,9 @@
-// The dashboard while the node starts and catches up: the whole content area
-// becomes the aqueduct, built one real step at a time.
-//
-// Every phase is read from the node's status by the Dashboard, never from a
-// timer: checking files (start requested, no process yet), loading the model
-// (process up, RPC not bound, a model configured), opening the RPC port (the
-// same, with no model to load), finding peers (RPC answering, not yet live),
-// catching up (the chain host is more than a few blocks ahead), and live.
-// No step claims a percentage the node does not report; the only number shown
-// is the real gap between the local and the chain height, or the local height.
-
 import { ChevronDown } from "lucide-react";
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { Aqueduct } from "./Aqueduct";
 import type { ArchChainPhase } from "../lib/aqueduct/archchain";
 import { formatInt } from "../lib/format";
 
-// A community node has no peers by design, so the step after the RPC port
-// opens is reaching the network's coordinators, not "finding peers".
 const STEP: Record<"survey" | "model" | "rpc" | "peers", string> = {
   survey: "Checking files",
   model: "Loading the model",
@@ -32,18 +19,12 @@ export function StartStage({
   onDetails,
 }: {
   phase: ArchChainPhase;
-  /** The node's own height; used while catching up and once live. */
   localHeight: number | null;
-  /** The selected chain host's height, the target while catching up. */
   chainHeight: number | null;
-  /** The node controls (Starting, Restart, Stop), rendered once, here, while the stage is up. */
   actions: ReactNode;
-  /** Scroll to the rest of the dashboard. */
   onDetails: () => void;
 }) {
   const stage = useRef<HTMLElement>(null);
-  // The stage fills the visible content area: the scroll area's own height, measured, so it stays right with
-  // the titlebar, the phone tab bar and the preview banner in or out.
   const [areaHeight, setAreaHeight] = useState<number | null>(null);
   useLayoutEffect(() => {
     const main = stage.current?.closest(".main");
@@ -64,7 +45,6 @@ export function StartStage({
         ? `${formatInt(toGo)} ${toGo === 1 ? "block" : "blocks"} to go`
         : "Catching up with the chain"
       : phase === "live"
-        // A community node holds no blocks of its own (height 0): it is connected, not at "Block 0".
         ? localHeight != null && localHeight > 0
           ? `Block ${formatInt(localHeight)}`
           : "Connected"
@@ -77,7 +57,6 @@ export function StartStage({
       : phase === "live"
         ? `The node is live${localHeight != null ? ` at block ${formatInt(localHeight)}` : ""}, drawn as the aqueduct it is building.`
         : `The node starting, drawn as the first arch of an aqueduct being built: ${STEP[phase].toLowerCase()}.`;
-  // One short announcement per phase; the block count is left out so it is not read aloud at every poll.
   const announcement = phase === "sync" ? "Catching up with the chain." : phase === "live" ? "Your node is live." : `Starting your node: ${STEP[phase].toLowerCase()}.`;
 
   return (
@@ -96,7 +75,6 @@ export function StartStage({
         progress={null}
         height={phase === "sync" || phase === "live" ? localHeight : null}
         label={label}
-        // served: the running count of inference requests this node has served, once the node reports one.
       />
       <div className="start-stage-top">
         <div className="start-stage-copy">

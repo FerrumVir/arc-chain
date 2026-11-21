@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Fail-closed validator for genesis.toml files shipped in ARC releases."""
 
 from __future__ import annotations
 
@@ -112,10 +111,6 @@ def validate(path: Path) -> tuple[bool, int, int | None]:
             "genesis.chain.community_rewards_v1_activation_height",
             positive=False,
         )
-        # StateDB reserves u64::MAX as the in-memory sentinel for "absent".
-        # Shipping that value would make the semantic genesis hash say Some
-        # while runtime state treats it as None, so the release contract must
-        # reject it (and values Rust's u64 TOML field cannot represent).
         if activation_height >= (1 << 64) - 1:
             fail(
                 "genesis.chain.community_rewards_v1_activation_height must be "

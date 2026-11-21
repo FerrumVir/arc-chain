@@ -1,16 +1,7 @@
-"""
-ARC Chain SDK — Error types.
-
-Provides a hierarchy of exceptions for RPC communication failures,
-transaction-specific errors, and general SDK errors.
-"""
-
 from __future__ import annotations
 
 
 class ArcError(Exception):
-    """Base exception for all ARC SDK errors."""
-
     def __init__(self, message: str, status_code: int | None = None, detail: str | None = None):
         self.message = message
         self.status_code = status_code
@@ -27,8 +18,6 @@ class ArcError(Exception):
 
 
 class ArcConnectionError(ArcError):
-    """Raised when the SDK cannot reach the ARC Chain RPC node."""
-
     def __init__(self, message: str, url: str | None = None, cause: Exception | None = None):
         self.url = url
         self.cause = cause
@@ -39,8 +28,6 @@ class ArcConnectionError(ArcError):
 
 
 class ArcTransactionError(ArcError):
-    """Raised when a transaction submission or query fails."""
-
     def __init__(
         self,
         message: str,
@@ -56,8 +43,6 @@ class ArcTransactionError(ArcError):
 
 
 class ArcValidationError(ArcError):
-    """Raised when local validation of transaction parameters fails."""
-
     def __init__(self, message: str, field: str | None = None):
         self.field = field
         super().__init__(message)
@@ -67,8 +52,6 @@ class ArcValidationError(ArcError):
 
 
 class ArcCryptoError(ArcError):
-    """Raised for cryptographic operation failures (signing, verification, key generation)."""
-
     def __init__(self, message: str, operation: str | None = None):
         self.operation = operation
         super().__init__(message)

@@ -4,17 +4,6 @@ import { api } from "../lib/tauri";
 import { PLAIN_COPY } from "../lib/plain-copy";
 import { ProblemNotice } from "./ProblemNotice";
 
-/**
- * Shown when the Rust side reports that our child arc-node process died on
- * its own: one plain sentence, one button to start it again, and the node's
- * exit text behind "Show details". Dismiss clears the crash state without
- * restarting. Through v0.8.14 the exit text was the body of the banner.
- *
- * The start itself belongs to the Dashboard (`onStartAgain`): clearing the
- * crash unmounts this banner, so an error kept here would vanish with it.
- * The Dashboard keeps that error the way Home does and shows it as the
- * start-failure panel.
- */
 export function CrashBanner({
   message,
   onStartAgain,

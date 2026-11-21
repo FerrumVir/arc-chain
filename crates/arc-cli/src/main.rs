@@ -1,14 +1,3 @@
-//! ARC Chain CLI - key management, queries, and transactions.
-//!
-//! Usage:
-//!   arc keygen --scheme ed25519 --output my-key.json
-//!   arc balance <address>
-//!   arc transfer --from key.json --to <address> --amount 1000
-//!   arc info
-//!   arc block <height>
-//!   arc tx <hash>
-//!   arc faucet <address>
-
 mod commands;
 mod keygen;
 mod rpc;

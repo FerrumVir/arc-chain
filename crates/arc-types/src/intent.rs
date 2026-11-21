@@ -1,171 +1,105 @@
-// Add to lib.rs: pub mod intent;
-
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-// ─── Intent ─────────────────────────────────────────────────────────────────
-
-/// User intent - a declarative transaction request.
-///
-/// Users declare WHAT they want (e.g. "swap 100 USDC for at least 99 DAI"),
-/// not HOW it happens. Solvers compete to fulfill intents optimally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Intent {
-    /// Unique identifier (BLAKE3 hash of signable content).
     pub intent_id: [u8; 32],
-    /// Address of the user who created this intent.
     pub creator: [u8; 32],
-    /// The declarative operation requested.
     pub intent_type: IntentType,
-    /// Execution constraints the solver must satisfy.
     pub constraints: Vec<Constraint>,
-    /// Block height after which this intent expires.
     pub deadline: u64,
-    /// Maximum gas the user is willing to pay.
     pub max_gas: u64,
-    /// Tip paid to the winning solver (in ARC).
     pub tip: u64,
-    /// Block height at which this intent was created.
     pub created_at: u64,
-    /// Current lifecycle status.
     pub status: IntentStatus,
-    /// User nonce (replay protection).
     pub nonce: u64,
 }
 
-/// The kind of operation an intent declares.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IntentType {
-    /// Swap token A for token B at the best available price.
     Swap {
         token_in: [u8; 32],
         token_out: [u8; 32],
         amount_in: u128,
         min_amount_out: u128,
     },
-    /// Transfer tokens to a recipient.
     Transfer {
         token: [u8; 32],
         recipient: [u8; 32],
         amount: u128,
     },
-    /// Bridge tokens to another chain.
     Bridge {
         token: [u8; 32],
         dest_chain: u64,
         dest_address: [u8; 20],
         amount: u128,
     },
-    /// Provide liquidity optimally across available pools.
     ProvideLiquidity {
         token_a: [u8; 32],
         token_b: [u8; 32],
         amount: u128,
-        /// Optional min/max price for concentrated liquidity positions.
         price_range: Option<(u128, u128)>,
     },
-    /// Stake ARC tokens for yield.
     Stake {
         amount: u64,
-        /// Minimum acceptable APY in basis points.
         min_apy_bps: u16,
     },
-    /// Batch multiple operations atomically.
     Batch {
         intents: Vec<IntentType>,
-        /// If true, all sub-intents must succeed or the entire batch reverts.
         require_all: bool,
     },
-    /// Custom intent with arbitrary action descriptor and payload.
-    Custom { action: String, data: Vec<u8> },
+    Custom {
+        action: String,
+        data: Vec<u8>,
+    },
 }
 
-/// Constraint on how an intent may be executed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Constraint {
-    /// Maximum price slippage in basis points (e.g. 50 = 0.5%).
     MaxSlippage(u16),
-    /// Maximum gas price the user will accept.
     MaxGasPrice(u64),
-    /// Minimum output amount required.
     MinOutputAmount(u128),
-    /// Exact output amount required (no more, no less).
     ExactOutputAmount(u128),
-    /// Block height deadline for execution.
     DeadlineBlock(u64),
-    /// Prefer this solver if available.
     PreferredSolver([u8; 32]),
-    /// Exclude this solver from consideration.
     ExcludeSolver([u8; 32]),
-    /// Maximum number of blocks the execution may take.
     MaxExecutionTime(u64),
-    /// Require all solution steps to execute atomically.
     RequireAtomicExecution,
 }
 
-/// Lifecycle status of an intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IntentStatus {
-    /// Submitted to the pool, awaiting a solver.
     Pending,
-    /// A solver has committed to fulfilling this intent.
     Matched,
-    /// Currently being executed on-chain.
     Executing,
-    /// Successfully completed.
     Fulfilled,
-    /// Execution failed.
     Failed,
-    /// Deadline block height passed without fulfillment.
     Expired,
-    /// Cancelled by the creator.
     Cancelled,
 }
 
-// ─── Solution ───────────────────────────────────────────────────────────────
-
-/// A solver's proposed execution plan for fulfilling an intent.
-///
-/// Solvers stake tokens as collateral - if the solution fails or violates
-/// constraints, the stake is slashed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Solution {
-    /// Unique identifier (BLAKE3 hash of solution content).
     pub solution_id: [u8; 32],
-    /// The intent this solution fulfills.
     pub intent_id: [u8; 32],
-    /// Address of the solver submitting this solution.
     pub solver: [u8; 32],
-    /// Ordered execution steps.
     pub steps: Vec<SolutionStep>,
-    /// Total estimated gas for all steps.
     pub estimated_gas: u64,
-    /// Expected output amount for the user.
     pub expected_output: u128,
-    /// Solver's collateral backing this solution.
     pub solver_stake: u64,
-    /// Quality score (higher = better for the user). Used for ranking.
     pub score: u64,
-    /// Block height when this solution was submitted.
     pub submitted_at: u64,
 }
 
-/// A single atomic step within a solution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolutionStep {
-    /// The type of on-chain action.
     pub action: StepAction,
-    /// Target contract address for the call.
     pub target_contract: [u8; 32],
-    /// ABI-encoded call data.
     pub call_data: Vec<u8>,
-    /// Value transferred with the call (in native token).
     pub value: u128,
-    /// Estimated gas for this step.
     pub gas_estimate: u64,
 }
 
-/// Action type for a solution step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StepAction {
     Swap,
@@ -176,37 +110,18 @@ pub enum StepAction {
     Custom(String),
 }
 
-// ─── Solver ─────────────────────────────────────────────────────────────────
-
-/// Registered solver that competes to fulfill intents.
-///
-/// Solvers stake ARC tokens as collateral and build reputation through
-/// successful fulfillments. Higher reputation unlocks priority matching.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Solver {
-    /// Solver's on-chain address.
     pub address: [u8; 32],
-    /// Staked ARC tokens (collateral).
     pub stake: u64,
-    /// Reputation score based on historical performance.
     pub reputation_score: u64,
-    /// Total number of intents successfully solved.
     pub total_solved: u64,
-    /// Total number of intents where execution failed.
     pub total_failed: u64,
-    /// Types of intents this solver specializes in.
     pub specializations: Vec<String>,
-    /// Whether this solver is currently accepting intents.
     pub is_active: bool,
-    /// Block height when this solver registered.
     pub registered_at: u64,
 }
 
-// ─── Intent Pool ────────────────────────────────────────────────────────────
-
-/// In-memory pool of pending intents, proposed solutions, and registered solvers.
-///
-/// Analogous to a mempool but for declarative intents rather than raw transactions.
 pub struct IntentPool {
     pending: Vec<Intent>,
     solutions: Vec<Solution>,
@@ -214,9 +129,6 @@ pub struct IntentPool {
     capacity: usize,
 }
 
-// ─── Errors ─────────────────────────────────────────────────────────────────
-
-/// Errors that can occur during intent pool operations.
 #[derive(Debug, Error)]
 pub enum IntentError {
     #[error("intent pool is at capacity ({0} intents)")]
@@ -235,10 +147,7 @@ pub enum IntentError {
     InsufficientSolverStake { have: u64, need: u64 },
 }
 
-// ─── Implementations ────────────────────────────────────────────────────────
-
 impl Intent {
-    /// Create a new swap intent.
     pub fn new_swap(
         creator: [u8; 32],
         token_in: [u8; 32],
@@ -269,7 +178,6 @@ impl Intent {
         intent
     }
 
-    /// Create a new transfer intent.
     pub fn new_transfer(
         creator: [u8; 32],
         token: [u8; 32],
@@ -298,10 +206,6 @@ impl Intent {
         intent
     }
 
-    /// Compute the intent ID as the BLAKE3 hash of all signable fields.
-    ///
-    /// Covers: `creator || intent_type || constraints || deadline || max_gas || tip || nonce`
-    /// Does NOT include `intent_id`, `created_at`, or `status`.
     pub fn compute_id(&self) -> [u8; 32] {
         let type_bytes = bincode::serialize(&self.intent_type).expect("serializable");
         let constraint_bytes = bincode::serialize(&self.constraints).expect("serializable");
@@ -317,17 +221,14 @@ impl Intent {
         *hasher.finalize().as_bytes()
     }
 
-    /// Returns true if this intent has passed its deadline.
     pub fn is_expired(&self, current_height: u64) -> bool {
         current_height >= self.deadline
     }
 
-    /// Add an execution constraint to this intent.
     pub fn add_constraint(&mut self, constraint: Constraint) {
         self.constraints.push(constraint);
     }
 
-    /// Returns the max slippage constraint (in basis points), if set.
     pub fn max_slippage(&self) -> Option<u16> {
         self.constraints.iter().find_map(|c| match c {
             Constraint::MaxSlippage(bps) => Some(*bps),
@@ -337,7 +238,6 @@ impl Intent {
 }
 
 impl Solution {
-    /// Create a new solution for an intent.
     pub fn new(
         intent_id: [u8; 32],
         solver: [u8; 32],
@@ -361,7 +261,6 @@ impl Solution {
         solution
     }
 
-    /// Compute the solution ID as the BLAKE3 hash of all fields.
     pub fn compute_id(&self) -> [u8; 32] {
         let steps_bytes = bincode::serialize(&self.steps).expect("serializable");
 
@@ -374,19 +273,16 @@ impl Solution {
         *hasher.finalize().as_bytes()
     }
 
-    /// Total gas estimate across all steps.
     pub fn total_gas(&self) -> u64 {
         self.steps.iter().map(|s| s.gas_estimate).sum()
     }
 
-    /// Number of execution steps.
     pub fn step_count(&self) -> usize {
         self.steps.len()
     }
 }
 
 impl Solver {
-    /// Create a new solver with the given address and initial stake.
     pub fn new(address: [u8; 32], stake: u64) -> Self {
         Self {
             address,
@@ -400,9 +296,6 @@ impl Solver {
         }
     }
 
-    /// Fraction of intents that were solved successfully (0.0 to 1.0).
-    ///
-    /// Returns 0.0 if no intents have been attempted.
     pub fn success_rate(&self) -> f64 {
         let total = self.total_solved + self.total_failed;
         if total == 0 {
@@ -411,23 +304,18 @@ impl Solver {
         self.total_solved as f64 / total as f64
     }
 
-    /// Record a successful intent fulfillment.
     pub fn record_success(&mut self) {
         self.total_solved += 1;
-        // Reputation grows with successful solves.
         self.reputation_score = self.reputation_score.saturating_add(10);
     }
 
-    /// Record a failed intent fulfillment.
     pub fn record_failure(&mut self) {
         self.total_failed += 1;
-        // Reputation decays on failure.
         self.reputation_score = self.reputation_score.saturating_sub(20);
     }
 }
 
 impl IntentPool {
-    /// Create a new intent pool with the given maximum capacity.
     pub fn new(capacity: usize) -> Self {
         Self {
             pending: Vec::new(),
@@ -437,18 +325,13 @@ impl IntentPool {
         }
     }
 
-    /// Submit a new intent to the pool.
-    ///
-    /// Rejects duplicates, expired intents, and submissions when the pool is full.
     pub fn submit_intent(&mut self, intent: Intent) -> Result<(), IntentError> {
         if self.pending.len() >= self.capacity {
             return Err(IntentError::PoolFull(self.capacity));
         }
-        // Check for duplicate intent IDs.
         if self.pending.iter().any(|i| i.intent_id == intent.intent_id) {
             return Err(IntentError::DuplicateIntent);
         }
-        // Reject already-expired intents (deadline 0 is treated as immediate expiry).
         if intent.status != IntentStatus::Pending {
             return Err(IntentError::InvalidConstraint);
         }
@@ -456,11 +339,7 @@ impl IntentPool {
         Ok(())
     }
 
-    /// Submit a solution for a pending intent.
-    ///
-    /// The solver must be registered in the pool.
     pub fn submit_solution(&mut self, solution: Solution) -> Result<(), IntentError> {
-        // Verify the solver is registered.
         let solver_registered = self.solvers.iter().any(|s| s.address == solution.solver);
         if !solver_registered {
             return Err(IntentError::SolverNotRegistered);
@@ -469,12 +348,7 @@ impl IntentPool {
         Ok(())
     }
 
-    /// Find the best solution for a given intent, selected by highest score.
-    ///
-    /// Returns `None` if no solutions exist for this intent.
-    /// Removes the winning solution from the pool on match.
     pub fn match_intent(&mut self, intent_id: &[u8; 32]) -> Option<Solution> {
-        // Find the index of the best-scoring solution for this intent.
         let best_idx = self
             .solutions
             .iter()
@@ -486,32 +360,24 @@ impl IntentPool {
         best_idx.map(|idx| self.solutions.remove(idx))
     }
 
-    /// View all pending intents.
     pub fn pending_intents(&self) -> &[Intent] {
         &self.pending
     }
 
-    /// Expire and remove all intents whose deadline has passed.
-    ///
-    /// Returns the number of intents expired.
     pub fn expire_old(&mut self, current_height: u64) -> usize {
         let before = self.pending.len();
         self.pending.retain(|i| !i.is_expired(current_height));
         before - self.pending.len()
     }
 
-    /// Register a new solver in the pool.
     pub fn register_solver(&mut self, solver: Solver) {
         self.solvers.push(solver);
     }
 
-    /// Number of registered solvers.
     pub fn solver_count(&self) -> usize {
         self.solvers.len()
     }
 }
-
-// ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -528,8 +394,6 @@ mod tests {
         tok[31] = n;
         tok
     }
-
-    // ── Intent creation ──
 
     #[test]
     fn test_create_swap_intent() {
@@ -589,8 +453,6 @@ mod tests {
         }
     }
 
-    // ── Expiration ──
-
     #[test]
     fn test_intent_expiration() {
         let intent = Intent::new_swap(
@@ -615,8 +477,6 @@ mod tests {
         assert!(intent.is_expired(200), "should be expired after deadline");
     }
 
-    // ── Constraints ──
-
     #[test]
     fn test_intent_constraints() {
         let mut intent = Intent::new_swap(
@@ -638,8 +498,6 @@ mod tests {
         assert_eq!(intent.max_slippage(), Some(50));
         assert_eq!(intent.constraints.len(), 3);
     }
-
-    // ── Solutions ──
 
     #[test]
     fn test_solution_creation() {
@@ -672,8 +530,6 @@ mod tests {
         assert_ne!(solution.solution_id, [0u8; 32], "ID must be computed");
     }
 
-    // ── Solver reputation ──
-
     #[test]
     fn test_solver_reputation() {
         let mut solver = Solver::new(test_addr(1), 10_000);
@@ -683,7 +539,6 @@ mod tests {
         assert_eq!(solver.total_failed, 0);
         assert!(solver.is_active);
 
-        // Record 8 successes, 2 failures.
         for _ in 0..8 {
             solver.record_success();
         }
@@ -694,11 +549,8 @@ mod tests {
         assert_eq!(solver.total_solved, 8);
         assert_eq!(solver.total_failed, 2);
         assert!((solver.success_rate() - 0.8).abs() < f64::EPSILON);
-        // Reputation: 8*10 - 2*20 = 40
         assert_eq!(solver.reputation_score, 40);
     }
-
-    // ── Intent Pool ──
 
     #[test]
     fn test_intent_pool_submit() {
@@ -751,21 +603,17 @@ mod tests {
         let intent_id = intent.intent_id;
         pool.submit_intent(intent).expect("submit ok");
 
-        // Register two solvers.
         pool.register_solver(Solver::new(test_addr(50), 5000));
         pool.register_solver(Solver::new(test_addr(51), 8000));
 
-        // Solver A: score 100.
         let mut sol_a = Solution::new(intent_id, test_addr(50), vec![], 990, 5000);
         sol_a.score = 100;
         pool.submit_solution(sol_a).expect("solution a ok");
 
-        // Solver B: score 200 (better).
         let mut sol_b = Solution::new(intent_id, test_addr(51), vec![], 995, 8000);
         sol_b.score = 200;
         pool.submit_solution(sol_b).expect("solution b ok");
 
-        // Best match should be solver B (higher score).
         let best = pool.match_intent(&intent_id).expect("should find match");
         assert_eq!(best.solver, test_addr(51));
         assert_eq!(best.score, 200);
@@ -785,7 +633,6 @@ mod tests {
 
         assert_eq!(pool.pending_intents().len(), 3);
 
-        // Expire at block 100: intents with deadline <= 100 are removed.
         let expired = pool.expire_old(100);
         assert_eq!(expired, 2, "two intents should expire (deadline 50 and 80)");
         assert_eq!(pool.pending_intents().len(), 1);
@@ -865,7 +712,6 @@ mod tests {
 
         assert_eq!(a.intent_id, b.intent_id, "same inputs must produce same ID");
 
-        // Different nonce produces different ID.
         let c = Intent::new_swap(
             test_addr(1),
             test_token(10),

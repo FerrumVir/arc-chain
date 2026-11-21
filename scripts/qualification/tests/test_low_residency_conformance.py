@@ -1,4 +1,3 @@
-"""Small offline runner tests. No model, network, compiler or resident weights."""
 import copy
 import importlib.util
 import io
@@ -93,10 +92,10 @@ class Comparison(unittest.TestCase):
 
         mutations = [
             changed("positions", report("reference")["measured"]["positions"][:-1]),
-            changed("output_token_ids", [3]),  # short output without EOS
-            changed("output_token_ids", [2, 3]),  # continued after EOS
-            changed("output_token_ids", [3, 3, 2]),  # budget exceeded
-            changed("output_token_ids", [3, 9]),  # outside vocabulary
+            changed("output_token_ids", [3]),
+            changed("output_token_ids", [2, 3]),
+            changed("output_token_ids", [3, 3, 2]),
+            changed("output_token_ids", [3, 9]),
             changed("output_hash", "z" * 64),
             changed("forward_ms", [1]),
             changed("forward_ms", [1, float("nan"), 1]),
@@ -307,7 +306,7 @@ class KernelQualification(unittest.TestCase):
             elif case == 4:
                 assignment["execution_profile"] = "wrong"
             elif case == 5:
-                manifest["files"].pop()  # LMHead
+                manifest["files"].pop()
             elif case == 6:
                 manifest["files"].append(copy.deepcopy(manifest["files"][0]))
             elif case == 7:

@@ -23,8 +23,6 @@ export function Logs() {
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  // Follow new lines only while the reader is at the bottom. Someone who scrolled up to read is left where they are;
-  // this used to pull them back down at every 2 s poll.
   const followRef = useRef(true);
   useEffect(() => {
     const el = scrollRef.current;
@@ -35,13 +33,6 @@ export function Logs() {
     if (el) followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 32;
   };
 
-  // The write happens in Rust behind a native save dialog.
-  //
-  // This used to build a Blob and click a synthetic `<a download>`.
-  // WKWebView (the macOS webview) doesn't implement the download attribute
-  // for blob: URLs without a host-side download delegate, so the button was
-  // a silent no-op on macOS while working on Windows and Linux. Handing logs
-  // to support is the entire purpose of this button.
   const save = useMutation({
     mutationFn: () => api.saveLogs(),
   });

@@ -1,17 +1,3 @@
-//! Multi-engine solver - orchestrates synthesizer, diff-synth, exhaustive, beam search, augmentation, evolution, and LLM.
-//!
-//! Runs each engine in sequence with a time budget.  Returns as soon as any
-//! engine finds a program that maps every training input to its expected output.
-//!
-//! Engine priority (with default time budgets):
-//! - **1.** **Synthesizer** (~10%) - exhaustive DFS up to depth 5, fast for simple tasks
-//! - **1.5** **Diff-synth** (~20%) - diff-guided synthesis: analyze how output differs from input
-//! - **1.8** **Exhaustive** (~15%) - deterministic DFS over ALL type-valid programs, no pruning
-//! - **2.** **Beam search** (~10%) - fitness-guided parallel search
-//! - **3.** **Augmented beam search** (~30%) - D4 + PoE voting over beam search
-//! - **4.** **Evolution** (~30%) - genetic refinement of partial solutions
-//! - **5.** **LLM-guided** (remaining time) - Ollama LLM picks operations step by step
-
 use crate::Grid;
 use crate::search::augmentation;
 use crate::search::beam::{BeamConfig, beam_search, beam_search_steered, exhaustive_search};
@@ -22,17 +8,13 @@ use crate::search::steering;
 use crate::search::synthesizer;
 use std::time::Instant;
 
-// ============================================================
-// Configuration
-// ============================================================
-
 pub struct SolverConfig {
-    pub timeout_ms: u64,        // total wall-clock timeout per task (default 30_000)
-    pub use_augmentation: bool, // enable D4 + color perm + PoE (default true)
-    pub use_evolution: bool,    // enable evolutionary refinement (default true)
-    pub use_llm: bool,          // enable LLM-guided search via Ollama (default false)
-    pub beam_width: usize,      // beam search width (default 200)
-    pub max_depth: usize,       // beam search max depth (default 6)
+    pub timeout_ms: u64,
+    pub use_augmentation: bool,
+    pub use_evolution: bool,
+    pub use_llm: bool,
+    pub beam_width: usize,
+    pub max_depth: usize,
     pub verbose: bool,
     pub steering_model: Option<std::sync::Arc<steering::SteeringModel>>,
 }
@@ -52,30 +34,13 @@ impl Default for SolverConfig {
     }
 }
 
-// ============================================================
-// Result
-// ============================================================
-
 pub struct SolveResult {
     pub test_outputs: Vec<Grid>,
-    pub engine: &'static str, // which engine solved it
+    pub engine: &'static str,
     pub program: Vec<String>,
     pub time_ms: u64,
 }
 
-// ============================================================
-// Main solver
-// ============================================================
-
-/// Solve a single ARC-AGI task using all engines in sequence.
-///
-/// Engine priority:
-/// - 1.   Synthesizer (5-level, ~10% time budget) -- fast, covers simple tasks
-/// - 1.5  Diff-synth (~20% time budget) -- diff-guided synthesis
-/// - 1.8  Exhaustive (~15% time budget) -- all type-valid programs, no pruning
-/// - 2.   Beam search (~10% time budget) -- type-driven parallel search
-/// - 3.   Augmented beam search (~30% time budget) -- D4 + PoE over beam search
-/// - 4.   Evolution (~30% time budget) -- refine partial solutions
 pub fn solve(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -89,17 +54,12 @@ pub fn solve(
     let elapsed = || start.elapsed().as_millis() as u64;
     let remaining = || config.timeout_ms.saturating_sub(elapsed());
 
-    // ----------------------------------------------------------
-    // Engine 1: Synthesizer (~10%)
-    // ----------------------------------------------------------
     let synth_budget = config.timeout_ms / 10;
     if config.verbose {
         eprintln!("[solver] engine 1: synthesizer (budget={}ms)", synth_budget);
     }
 
     if let Some(sr) = synthesizer::synthesize(train_pairs, test_inputs, synth_budget) {
-        // Cross-validate: if >=3 pairs, hold out each pair and re-solve with the rest.
-        // This catches overfitting (programs that pass training but fail on new data).
         let cv_ok = if train_pairs.len() >= 3 {
             (0..train_pairs.len()).all(|hold_out| {
                 let sub_pairs: Vec<_> = train_pairs
@@ -121,7 +81,7 @@ pub fn solve(
                 }
             })
         } else {
-            true // not enough pairs for CV
+            true
         };
 
         if cv_ok {
@@ -151,16 +111,12 @@ pub fn solve(
         return None;
     }
 
-    // ----------------------------------------------------------
-    // Engine 1.5: Diff-guided synthesis (~20%)
-    // ----------------------------------------------------------
     let diff_budget = config.timeout_ms * 20 / 100;
     if config.verbose {
         eprintln!("[solver] engine 1.5: diff_synth (budget={}ms)", diff_budget);
     }
 
     if let Some(dr) = diff_synth::diff_synthesize(train_pairs, test_inputs, diff_budget) {
-        // Cross-validate diff_synth results too
         let cv_ok = if train_pairs.len() >= 2 {
             (0..train_pairs.len()).all(|hold_out| {
                 let sub_pairs: Vec<_> = train_pairs
@@ -211,10 +167,7 @@ pub fn solve(
         return None;
     }
 
-    // ----------------------------------------------------------
-    // Engine 1.8: Exhaustive deterministic search (~15%)
-    // ----------------------------------------------------------
-    let exhaust_budget = config.timeout_ms * 5 / 100; // only 5% - fast depth-3 search
+    let exhaust_budget = config.timeout_ms * 5 / 100;
     if config.verbose {
         eprintln!(
             "[solver] engine 1.8: exhaustive search (budget={}ms, depth=3)",
@@ -231,7 +184,6 @@ pub fn solve(
                 program
             );
         }
-        // Apply program to all test inputs
         if let Some(test_outputs) = apply_to_all_tests(&program, train_pairs, test_inputs) {
             return Some(SolveResult {
                 test_outputs,
@@ -246,9 +198,6 @@ pub fn solve(
         return None;
     }
 
-    // ----------------------------------------------------------
-    // Engine 2: Beam search (~10%)
-    // ----------------------------------------------------------
     let beam_budget = config.timeout_ms * 10 / 100;
     if config.verbose {
         eprintln!(
@@ -273,8 +222,6 @@ pub fn solve(
                 program
             );
         }
-        // beam_search returns output for the first test input only.
-        // Apply the program to all test inputs.
         if let Some(test_outputs) = apply_to_all_tests(&program, train_pairs, test_inputs) {
             return Some(SolveResult {
                 test_outputs,
@@ -289,9 +236,6 @@ pub fn solve(
         return None;
     }
 
-    // ----------------------------------------------------------
-    // Engine 3: Augmented beam search (~30%)
-    // ----------------------------------------------------------
     if config.use_augmentation {
         let aug_budget = config.timeout_ms * 30 / 100;
         if config.verbose {
@@ -302,16 +246,15 @@ pub fn solve(
         }
 
         let aug_beam_config = BeamConfig {
-            beam_width: config.beam_width / 2, // smaller width per augmentation
+            beam_width: config.beam_width / 2,
             max_depth: config.max_depth.min(4),
-            timeout_ms: aug_budget / 8, // each of 8 D4 transforms gets 1/8
+            timeout_ms: aug_budget / 8,
         };
 
         let aug_results = augmentation::solve_with_augmentation(
             train_pairs,
             test_inputs,
             |aug_train, aug_tests| {
-                // Wrap beam search as a multi-test solver
                 let mut outputs: Vec<Option<Grid>> = Vec::new();
                 for test_input in aug_tests {
                     match beam_search(
@@ -327,7 +270,6 @@ pub fn solve(
             },
         );
 
-        // Check if augmentation produced valid outputs for all test inputs
         if !aug_results.is_empty() && aug_results.iter().all(|r| r.is_some()) {
             let test_outputs: Vec<Grid> = aug_results.into_iter().map(|r| r.unwrap()).collect();
             if config.verbose {
@@ -346,11 +288,8 @@ pub fn solve(
         return None;
     }
 
-    // ----------------------------------------------------------
-    // Engine 4: Evolution (~30%)
-    // ----------------------------------------------------------
     if config.use_evolution {
-        let evo_budget = remaining(); // give evolution all remaining time
+        let evo_budget = remaining();
         if config.verbose {
             eprintln!("[solver] engine 4: evolution (budget={}ms)", evo_budget);
         }
@@ -385,9 +324,6 @@ pub fn solve(
         return None;
     }
 
-    // ----------------------------------------------------------
-    // Engine 5: LLM-guided search (remaining time)
-    // ----------------------------------------------------------
     if config.use_llm {
         let llm_budget = remaining();
         if config.verbose {
@@ -425,14 +361,10 @@ pub fn solve(
     None
 }
 
-/// Solve and evaluate against known test output.
-///
-/// Returns `(correct, result)` where `correct` is true iff the solver's
-/// output matches the ground truth for every test input.
 pub fn solve_and_score(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
-    test_outputs: &[Grid], // ground truth
+    test_outputs: &[Grid],
     config: &SolverConfig,
 ) -> (bool, Option<SolveResult>) {
     match solve(train_pairs, test_inputs, config) {
@@ -449,12 +381,6 @@ pub fn solve_and_score(
     }
 }
 
-// ============================================================
-// Helpers
-// ============================================================
-
-/// Apply a program (by name) to all test inputs using the catalog built
-/// from the training pairs' colors.
 fn apply_to_all_tests(
     program: &[String],
     train_pairs: &[(Grid, Grid)],
@@ -494,7 +420,6 @@ fn apply_to_all_tests(
     Some(outputs)
 }
 
-/// Apply a sequence of named primitives to an input grid.
 fn apply_program_local(
     steps: &[String],
     catalog: &[crate::search::enumerate::TypedPrimitive],
@@ -529,15 +454,10 @@ fn apply_program_local(
     }
 }
 
-// ============================================================
-// Tests
-// ============================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Simple rotation task: the synthesizer should pick it up immediately.
     #[test]
     fn test_solver_dispatches_to_synthesizer() {
         let input = vec![vec![1, 0], vec![0, 0]];
@@ -556,7 +476,6 @@ mod tests {
         let result = solve(&train_pairs, &test_inputs, &config);
         assert!(result.is_some());
         let sr = result.unwrap();
-        // Should be solved by synthesizer or beam search (fast engines)
         assert!(
             sr.engine == "synthesizer" || sr.engine == "beam_search",
             "expected synthesizer or beam_search, got {}",
@@ -565,7 +484,6 @@ mod tests {
         assert_eq!(sr.test_outputs, vec![output]);
     }
 
-    /// Color replacement task.
     #[test]
     fn test_solver_color_replace() {
         let input = vec![vec![1, 0, 2], vec![2, 1, 0]];
@@ -585,11 +503,10 @@ mod tests {
         assert_eq!(sr.test_outputs, vec![output]);
     }
 
-    /// Multi-step task: vmirror.
     #[test]
     fn test_solver_multistep() {
         let input = vec![vec![1, 2], vec![3, 4]];
-        let output = vec![vec![2, 1], vec![4, 3]]; // vmirror
+        let output = vec![vec![2, 1], vec![4, 3]];
 
         let train_pairs = vec![(input.clone(), output.clone())];
         let test_inputs = vec![input];
@@ -606,7 +523,6 @@ mod tests {
         assert_eq!(sr.test_outputs, vec![output]);
     }
 
-    /// solve_and_score reports correct=true for a solvable task.
     #[test]
     fn test_solve_and_score_correct() {
         let input = vec![vec![1, 0], vec![0, 0]];
@@ -626,12 +542,11 @@ mod tests {
         assert!(result.is_some());
     }
 
-    /// solve_and_score reports correct=false when ground truth differs.
     #[test]
     fn test_solve_and_score_incorrect() {
         let input = vec![vec![1, 0], vec![0, 0]];
         let output = vec![vec![0, 1], vec![0, 0]];
-        let wrong_gt = vec![vec![9, 9], vec![9, 9]]; // wrong ground truth
+        let wrong_gt = vec![vec![9, 9], vec![9, 9]];
         let train_pairs = vec![(input.clone(), output)];
         let test_inputs = vec![input];
         let test_outputs = vec![wrong_gt];
@@ -647,11 +562,10 @@ mod tests {
         assert!(!correct);
     }
 
-    /// Disabling all optional engines still works (synthesizer + beam only).
     #[test]
     fn test_solver_no_optional_engines() {
         let input = vec![vec![1, 2], vec![3, 4]];
-        let output = vec![vec![3, 1], vec![4, 2]]; // rot90
+        let output = vec![vec![3, 1], vec![4, 2]];
 
         let train_pairs = vec![(input.clone(), output.clone())];
         let test_inputs = vec![input];
@@ -670,7 +584,6 @@ mod tests {
         assert_eq!(sr.test_outputs, vec![output]);
     }
 
-    /// Empty inputs return None without panicking.
     #[test]
     fn test_solver_empty_input() {
         let config = SolverConfig::default();
@@ -678,7 +591,6 @@ mod tests {
         assert!(solve(&[(vec![vec![1]], vec![vec![2]])], &[], &config,).is_none());
     }
 
-    /// The engine field correctly identifies which engine solved it.
     #[test]
     fn test_engine_field() {
         let input = vec![vec![1, 0], vec![0, 0]];
@@ -704,7 +616,6 @@ mod tests {
         );
     }
 
-    /// Multiple test inputs are all solved.
     #[test]
     fn test_solver_multiple_test_inputs() {
         let input1 = vec![vec![1, 0], vec![0, 0]];

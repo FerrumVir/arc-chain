@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Desktop release baseline authentication and unchanged quorum contracts."""
 import copy
 import hashlib
 import importlib.util
@@ -77,7 +76,6 @@ class PreviousReleaseTests(unittest.TestCase):
                     ("arc-node-linux-x86_64", b"binary", "b" * 64)])]
             with mock.patch.object(previous, "PUBLIC_KEY", public_key):
                 self.assertEqual(previous.verify_manifest(r, manifest, signature)["binary_sha256"], "b" * 64)
-                # Update the API digest too: the cryptographic check must still reject forgery.
                 tampered = manifest.replace(b"b" * 64, b"c" * 64)
                 forged = copy.deepcopy(r)
                 forged["assets"][0]["digest"] = "sha256:" + hashlib.sha256(tampered).hexdigest()
@@ -108,8 +106,6 @@ class PreviousReleaseTests(unittest.TestCase):
 
 
 class ConsecutiveDesktopUpdateTests(unittest.TestCase):
-    """All API reads are fixtures; manifests use real ephemeral SSH signatures."""
-
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -136,7 +132,6 @@ class ConsecutiveDesktopUpdateTests(unittest.TestCase):
     def api(self, *args):
         self.reads.append(args[-1])
         if args[-1].endswith("/releases?per_page=100"):
-            # API order and page boundaries must not determine version order.
             return json.dumps([[r] for r in reversed(self.rows)]).encode()
         return self.payloads[int(args[-1].rsplit("/", 1)[1])]
 
@@ -185,7 +180,6 @@ class ConsecutiveDesktopUpdateTests(unittest.TestCase):
 
     def replace_desktop(self, value, **kwargs):
         self.rows.pop()
-        # Fresh filenames avoid any interactive ssh-keygen overwrite prompt.
         self.root = self.root / "replacement"
         self.root.mkdir()
         self.desktop = self.add_release("v0.8.20", value, **kwargs)
@@ -680,13 +674,11 @@ class PracticeSuffixTests(unittest.TestCase):
                                         suffix[:index + 1] + [bad] + suffix[index + 2:]))
             for name, bad_suffix in invalid:
                 for native in (False, True):
-                    # A matching observed tail cannot make a malformed owner pin valid.
                     for direct in (False, True):
                         config, proof = self.fixture(bad_suffix, native)
                         with self.subTest(mutation=name, suffix=suffix, native=native, direct=direct), \
                              self.assertRaisesRegex(existing.validator.GateError, "argv_suffix"):
                             self.check(config, proof, direct=direct)
-                    # A valid pin also rejects a changed tail in either proof sample.
                     for sample in (0, 1):
                         config, proof = self.fixture(suffix, native)
                         row = proof["samples"][sample]["nodes"][0]

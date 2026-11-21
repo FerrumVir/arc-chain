@@ -1,18 +1,3 @@
-//! Run the node's package-manifest check against a real artifact without a
-//! qualification record (model package contract v1, section 7).
-//!
-//! Real execution needs a reference-qualification record, and none may be
-//! written before its evidence exists (M4). This runs the same comparison the
-//! node runs at startup - the same `package_facts` and
-//! `verify_package_manifest` - on the loaded model, tokenizer and header, so
-//! the Rust side's vocabulary digest, tensor inventory digest and canonical
-//! JSON can be checked against the Python-derived manifest now.
-//!
-//! Heavy: loads the canonical model. Run in a model window:
-//!   cargo run --release -p arc-node --example package_manifest_check -- \
-//!     ~/.arc/models/standard.gguf docs/protocol/packages/llama-2-7b-q4km.manifest.json \
-//!     fecaf64104b3be988ff5f3ddf3c38e6739787f9cd390b64835dc59aecb0309bf
-
 use arc_crypto::Hash256;
 use arc_node::native_inference::{package_facts, verify_package_manifest};
 use std::io::Read;

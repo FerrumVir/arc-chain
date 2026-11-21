@@ -63,7 +63,6 @@ def verify_app(app: Path) -> str:
 
 
 def seal_and_repackage(bundle_root: Path) -> dict[str, str]:
-    """Seal the one Tauri app and regenerate both shipped macOS formats."""
     bundle_root = bundle_root.resolve(strict=True)
     app_dir = bundle_root / "macos"
     dmg_dir = bundle_root / "dmg"
@@ -80,8 +79,6 @@ def seal_and_repackage(bundle_root: Path) -> dict[str, str]:
     archive = one_match(app_dir, "*.app.tar.gz", "app updater archive")
     dmg = one_match(dmg_dir, "*.dmg", "disk image")
 
-    # Use Apple's ad-hoc identity to seal the executable, Info.plist, and
-    # resources. Updater-signing remains a separate later workflow step.
     run([str(CODE_SIGN), "--force", "--deep", "--sign", "-", str(app)])
     source_hash = verify_app(app)
 
@@ -97,8 +94,6 @@ def seal_and_repackage(bundle_root: Path) -> dict[str, str]:
         mount.mkdir()
         attached = False
         try:
-            # Tauri's updater expects an app-root tarball. Keep the archive
-            # rooted at exactly `ARC Node.app/`, with executable modes intact.
             run([str(TAR), "-czf", str(archive_tmp), "-C", str(app_dir), APP_NAME],
                 env={**os.environ, "COPYFILE_DISABLE": "1"})
             with tempfile.TemporaryDirectory(prefix="arc-app-archive-", dir=work) as extract_raw:
@@ -130,7 +125,6 @@ def seal_and_repackage(bundle_root: Path) -> dict[str, str]:
             archive_tmp.unlink(missing_ok=True)
             dmg_tmp.unlink(missing_ok=True)
 
-    # Recheck the exact outputs after the atomic replacements.
     with tempfile.TemporaryDirectory(prefix="arc-final-app-", dir=bundle_root) as temp:
         root = Path(temp)
         run([str(TAR), "-xzf", str(archive), "-C", str(root)],

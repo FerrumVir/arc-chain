@@ -1,5 +1,3 @@
-//! `arc tx <hash>` - display transaction details.
-
 use crate::rpc::RpcClient;
 use anyhow::Result;
 
@@ -29,12 +27,10 @@ pub async fn run(rpc: &RpcClient, hash: &str) -> Result<()> {
     println!("  Nonce:  {}", nonce);
     println!("  Fee:    {} ARC", fee);
 
-    // Print body details based on type
     if let Some(body) = data.get("body") {
         print_body(tx_type, body);
     }
 
-    // Print status - may be at top level or nested under "receipt"
     let (success, gas_used) = if let Some(receipt) = data.get("receipt") {
         (
             receipt.get("success").and_then(|v| v.as_bool()),
@@ -84,7 +80,6 @@ fn print_body(tx_type: &str, body: &serde_json::Value) {
             }
         }
         _ => {
-            // For other types, print the raw body compactly
             if let Ok(s) = serde_json::to_string(body) {
                 if s.len() <= 200 {
                     println!("  Body:   {}", s);

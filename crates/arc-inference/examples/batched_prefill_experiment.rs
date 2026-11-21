@@ -1,29 +1,9 @@
-//! E1(b): batched multi-token prefill, measured against token-at-a-time on the
-//! real canonical-I8 artifact.
-//!
-//! Four configurations are measured so batching and vectorisation can be told
-//! apart, which is the whole point of giving them separate switches:
-//!
-//!   scalar / token-at-a-time    (the original path)
-//!   scalar / batched
-//!   SIMD   / token-at-a-time    (**the primary baseline**)
-//!   SIMD   / batched            (the candidate)
-//!
-//! Exactness is checked before any timing is reported: every logit at every
-//! position of the target prompt, plus a continuation decode afterwards so the
-//! persisted KV state is validated and not just the prefill's internal
-//! consistency. Whether the optimised paths were actually used is counted, so a
-//! silent fallback can never be reported as a speedup.
-//!
-//! usage: batched_prefill_experiment GGUF [prompt_len] [chunk] [repeats]
-
 use arc_inference::cached_integer_model::{CachedIntegerModel, KVCache};
 use arc_inference::{canonical_prefill, canonical_simd};
 use std::time::Instant;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn max_rss_bytes() -> Option<u64> {
-    // SAFETY: getrusage with a zeroed, correctly sized out-parameter.
     unsafe {
         let mut u: libc::rusage = std::mem::zeroed();
         if libc::getrusage(libc::RUSAGE_SELF, &mut u) == 0 {
@@ -47,8 +27,6 @@ fn fresh(model: &CachedIntegerModel) -> KVCache {
     KVCache::new(model.config.n_layers)
 }
 
-/// Token-at-a-time prefill. Returns logits for every position, which is what
-/// `forward_one_token` produces whether or not the caller wants them.
 fn taat(model: &CachedIntegerModel, tokens: &[u32], cache: &mut KVCache) -> Vec<Vec<i64>> {
     tokens
         .iter()
@@ -106,23 +84,12 @@ fn main() -> Result<(), String> {
         ));
     }
 
-    // Fixed real Llama-2 ids, independent of any kernel's output.
     let base: [u32; 16] = [
         1, 6324, 29892, 306, 29915, 29885, 263, 1243, 310, 278, 1904, 29889, 887, 508, 1065, 372,
     ];
     let prompt: Vec<u32> = (0..prompt_len).map(|i| base[i % base.len()]).collect();
     let decode_ids: [u32; 4] = [306, 29915, 29885, 263];
 
-    // ── Phase A: exactness at every position, plus continuation decode ──────
-    //
-    // Memory-lean by construction. The naive version held two full KV caches
-    // (1.05 GB each at 500 positions, because the cache is i64) plus two full
-    // logit sets (128 MB each) and was OOM-killed on this 16 GB host. Instead:
-    // each pass keeps ONE cache, digests each position's logits as it goes, and
-    // the batched pass is driven in slices so its logits never accumulate. A
-    // BLAKE3 digest over all 32,000 i64 values of a position is a full
-    // comparison of that position; the final slice is additionally compared
-    // element by element so an exact-value claim is also directly evidenced.
     fn digest(v: &[i64]) -> [u8; 32] {
         let mut h = blake3::Hasher::new();
         for x in v {
@@ -240,16 +207,6 @@ fn main() -> Result<(), String> {
         return Err("EXACTNESS FAILURE - batched prefill is not conformant".into());
     }
 
-    // ── Phase B: timing, production shape ───────────────────────────────────
-    //
-    // Measurement environment caveat, recorded because it dominates the
-    // numbers: this host runs the 6.9 GB resident model on 16 GB of RAM while
-    // already deep in swap, so wall-clock samples are heavily contended. The
-    // protocol is therefore built for that: the two SIMD configurations (the
-    // primary comparison Codex specified) are interleaved A/B within every
-    // repeat so contention hits both alike, and `min` is reported alongside the
-    // median as the least-contended estimator. The two scalar configurations
-    // are sampled once each and reported separately, as secondary context.
     let mut obs: Vec<(&str, Vec<f64>)> = vec![
         ("scalar_token_at_a_time", vec![]),
         ("scalar_batched", vec![]),
@@ -281,7 +238,6 @@ fn main() -> Result<(), String> {
         Ok(())
     };
 
-    // One discarded warm cycle per SIMD configuration.
     sample(2, &mut obs)?;
     sample(3, &mut obs)?;
     obs[2].1.clear();
@@ -302,7 +258,6 @@ fn main() -> Result<(), String> {
             sample(2, &mut obs)?;
         }
     }
-    // Secondary: the original scalar path, one sample each.
     sample(0, &mut obs)?;
     sample(1, &mut obs)?;
     set_mode(false, false);
@@ -313,7 +268,6 @@ fn main() -> Result<(), String> {
         .map(|(_, v)| v.iter().cloned().fold(f64::INFINITY, f64::min))
         .collect();
     let (s_taat, s_bat) = (med[0], med[1]);
-    // Primary ratio from the least-contended sample of each SIMD config.
     let (x_taat, x_bat) = (mins[2], mins[3]);
 
     println!(

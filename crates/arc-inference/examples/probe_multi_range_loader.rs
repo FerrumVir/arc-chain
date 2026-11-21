@@ -1,17 +1,5 @@
-// Probe: verify load_cached_model_ranges loads the union of disjoint ranges
-// correctly. For the same GGUF:
-//   A) load_cached_model_ranges(path, &[(0, 4), (24, 28)])
-//   B) load_cached_model_shard(path, 0, 4) and load_cached_model_shard(path, 24, 28)
-// The merged A must have exactly the layers populated in {0..4, 24..28},
-// match B's weights bit-for-bit on those slots, and have empty placeholders
-// everywhere else.
-//
-// This is the local precondition for the 3×-replication deploy: each seed
-// will load multiple disjoint ranges in one process and must serve each
-// range identically to a single-range node of the same configuration.
 use arc_inference::cached_integer_model::{load_cached_model_ranges, load_cached_model_shard};
 
-/// `$HOME/.arc-models/llama-2-7b.gguf`, resolved at run time.
 fn model_path() -> String {
     let home = std::env::var("HOME").expect("HOME is set");
     format!("{home}/.arc-models/llama-2-7b.gguf")
@@ -57,7 +45,6 @@ fn main() {
     let merged_bytes: Vec<usize> = merged.layers.iter().map(layer_bytes).collect();
     summarize("MERGED", &merged_flags, &merged_bytes);
 
-    // Expected slots: union of all ranges.
     let expected: Vec<bool> = (0..n)
         .map(|i| ranges.iter().any(|&(s, e)| i >= s && i < e))
         .collect();
@@ -69,15 +56,12 @@ fn main() {
     );
     eprintln!("  membership OK");
 
-    // Embedding must be present (range [0,4) includes 0)
     assert!(
         !merged.embedding_q16.is_empty(),
         "embedding should be loaded when 0 is in ranges"
     );
     eprintln!("  embedding loaded (len={})", merged.embedding_q16.len());
 
-    // Output head must be present iff n is in any range end - range (24,28) does NOT include n_layers=32,
-    // so output head must be EMPTY in merged.
     let covers_tail = ranges.iter().any(|&(_, e)| e == n);
     if covers_tail {
         assert!(
@@ -92,7 +76,6 @@ fn main() {
     }
     eprintln!("  output_head tail-coverage={} OK", covers_tail);
 
-    // B) cross-check against single-range loads for each range
     for &(s, e) in &ranges {
         eprintln!("B) comparing against load_cached_model_shard({s}, {e}) ...");
         let single =
@@ -101,7 +84,6 @@ fn main() {
         for i in s..e {
             let a = &merged.layers[i];
             let b = &single.layers[i];
-            // Minimum structural check: same n_rows + same memory footprint.
             assert_eq!(a.wq.n_rows, b.wq.n_rows, "wq.n_rows differs at layer {i}");
             assert_eq!(
                 a.w_down.n_rows, b.w_down.n_rows,
@@ -112,8 +94,6 @@ fn main() {
                 layer_bytes(b),
                 "layer {i} byte size differs"
             );
-            // Weight-data equality: cheap-ish (per-layer ~200 MB on 7B; we still
-            // compare fully to catch any silent drift from the merge).
             assert_eq!(a.wq.data, b.wq.data, "wq bytes differ at layer {i}");
             assert_eq!(
                 a.w_down.data, b.w_down.data,

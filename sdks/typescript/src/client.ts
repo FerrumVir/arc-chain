@@ -1,10 +1,3 @@
-/**
- * ARC Chain SDK - RPC client.
- *
- * Typed HTTP client for all ARC Chain RPC endpoints.
- * Uses the native `fetch` API (Node 18+, Deno, Bun, browsers).
- */
-
 import type {
   Account,
   BatchResult,
@@ -33,10 +26,6 @@ import {
 } from "./u64";
 
 const MAX_TX_SUBMIT_BATCH_SIZE = 64;
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
 
 export class ArcError extends Error {
   statusCode?: number;
@@ -72,27 +61,11 @@ export class ArcTransactionError extends ArcError {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Client
-// ---------------------------------------------------------------------------
-
 export interface ArcClientOptions {
-  /** Request timeout in milliseconds (default 30000). */
   timeout?: number;
-  /** Extra HTTP headers to include in every request. */
   headers?: Record<string, string>;
 }
 
-/**
- * HTTP client for the ARC Chain RPC API.
- *
- * Usage:
- * ```ts
- * const client = new ArcClient("http://localhost:9090");
- * const info = await client.getChainInfo();
- * console.log(info.block_height);
- * ```
- */
 export class ArcClient {
   readonly rpcUrl: string;
   private timeout: number;
@@ -106,8 +79,6 @@ export class ArcClient {
       ...options.headers,
     };
   }
-
-  // -- Internal helpers --
 
   private async _get<T = unknown>(path: string, params?: Record<string, string | number>): Promise<T> {
     let url = `${this.rpcUrl}${path}`;
@@ -192,18 +163,10 @@ export class ArcClient {
     return parseJsonWithBigInts<T>(await resp.text());
   }
 
-  // -- Block endpoints --
-
-  /**
-   * GET /block/{height} -- Fetch a block by height.
-   */
   async getBlock(height: number): Promise<Block> {
     return this._get<Block>(`/block/${height}`);
   }
 
-  /**
-   * GET /blocks -- Paginated block listing.
-   */
   async getBlocks(
     fromHeight: number = 0,
     toHeight?: number,
@@ -214,9 +177,6 @@ export class ArcClient {
     return this._get(`/blocks`, params);
   }
 
-  /**
-   * GET /block/{height}/txs -- Paginated transaction listing for a block.
-   */
   async getBlockTxs(
     height: number,
     offset: number = 0,
@@ -225,41 +185,20 @@ export class ArcClient {
     return this._get(`/block/${height}/txs`, { offset, limit });
   }
 
-  /**
-   * GET /block/{height}/proofs -- All Merkle proofs for transactions in a block.
-   */
   async getBlockProofs(height: number): Promise<Record<string, unknown>> {
     return this._get(`/block/${height}/proofs`);
   }
 
-  // -- Account endpoints --
-
-  /**
-   * GET /account/{address} -- Fetch an account by address.
-   */
   async getAccount(address: string): Promise<Account> {
     return this._get<Account>(`/account/${address}`);
   }
 
-  /**
-   * GET /account/{address}/txs -- Transaction hashes involving an account.
-   */
   async getAccountTxs(
     address: string
   ): Promise<{ address: string; tx_count: number; tx_hashes: string[] }> {
     return this._get(`/account/${address}/txs`);
   }
 
-  // -- Transaction endpoints --
-
-  /**
-   * POST /tx/submit -- Submit a transaction to the mempool.
-   *
-   * Accepts either a raw RPC-format object or a signed Transaction from
-   * TransactionBuilder.sign().
-   *
-   * @returns Transaction hash string.
-   */
   async submitTransaction(
     tx: SignedTransferSubmitPayload | SignedTransferTransaction,
   ): Promise<string> {
@@ -269,30 +208,18 @@ export class ArcClient {
     return data.tx_hash;
   }
 
-  /**
-   * GET /tx/{hash} -- Look up a transaction receipt by hash.
-   */
   async getTransaction(txHash: string): Promise<Receipt> {
     return this._get<Receipt>(`/tx/${txHash}`);
   }
 
-  /**
-   * GET /tx/{hash}/full -- Full transaction body with type-specific fields.
-   */
   async getFullTransaction(txHash: string): Promise<Record<string, unknown>> {
     return this._get(`/tx/${txHash}/full`);
   }
 
-  /**
-   * GET /tx/{hash}/proof -- Merkle inclusion proof for a transaction.
-   */
   async getTxProof(txHash: string): Promise<Record<string, unknown>> {
     return this._get(`/tx/${txHash}/proof`);
   }
 
-  /**
-   * POST /tx/submit_batch -- Submit multiple transactions.
-   */
   async submitBatch(
     txs: Array<SignedTransferSubmitPayload | SignedTransferTransaction>,
   ): Promise<BatchResult> {
@@ -313,7 +240,6 @@ export class ArcClient {
     });
   }
 
-  /** Return the current v3 signing domain, or null for a pre-v3 node. */
   async getTransactionDomain(): Promise<string | null> {
     let value: Record<string, unknown>;
     try {
@@ -411,48 +337,26 @@ export class ArcClient {
     }
   }
 
-  // -- Chain info & stats --
-
-  /**
-   * GET /info -- Chain information.
-   */
   async getChainInfo(): Promise<ChainInfo> {
     return this._get<ChainInfo>("/info");
   }
 
-  /**
-   * GET /stats -- Chain statistics.
-   */
   async getStats(): Promise<ChainStats> {
     return this._get<ChainStats>("/stats");
   }
 
-  /**
-   * GET /health -- Node health status.
-   */
   async getHealth(): Promise<HealthInfo> {
     return this._get<HealthInfo>("/health");
   }
 
-  /**
-   * GET /node/info -- Validator node information.
-   */
   async getNodeInfo(): Promise<NodeInfo> {
     return this._get<NodeInfo>("/node/info");
   }
 
-  // -- Contract endpoints --
-
-  /**
-   * GET /contract/{address} -- Contract bytecode info.
-   */
   async getContractInfo(address: string): Promise<ContractInfo> {
     return this._get<ContractInfo>(`/contract/${address}`);
   }
 
-  /**
-   * POST /contract/{address}/call -- Read-only contract call.
-   */
   async callContract(
     address: string,
     func: string,
@@ -470,30 +374,14 @@ export class ArcClient {
     return this._post<ContractCallResult>(`/contract/${address}/call`, body);
   }
 
-  // -- Light client & sync --
-
-  /**
-   * GET /light/snapshot -- Lightweight snapshot for light client bootstrapping.
-   */
   async getLightSnapshot(): Promise<LightSnapshot> {
     return this._get<LightSnapshot>("/light/snapshot");
   }
 
-  /**
-   * GET /sync/snapshot/info -- Metadata about available state sync snapshot.
-   */
   async getSyncSnapshotInfo(): Promise<SyncSnapshotInfo> {
     return this._get<SyncSnapshotInfo>("/sync/snapshot/info");
   }
 
-  // -- ETH JSON-RPC --
-
-  /**
-   * POST /eth -- Send an ETH-compatible JSON-RPC request.
-   *
-   * Supports methods like eth_chainId, eth_blockNumber,
-   * eth_getBalance, eth_call, eth_estimateGas, etc.
-   */
   async ethCall(method: string, params: unknown[] = []): Promise<EthRpcResponse> {
     return this._post<EthRpcResponse>("/eth", {
       jsonrpc: "2.0",

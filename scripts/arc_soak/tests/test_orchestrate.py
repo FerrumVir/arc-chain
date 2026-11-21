@@ -1,5 +1,3 @@
-"""Fast tests for the orchestrator's pure helpers. No nodes."""
-
 import json
 import os
 import sys
@@ -45,7 +43,6 @@ class ProvenanceParsing(unittest.TestCase):
             "429f095c6447cb7885b4d0fc8be80a24c165c12738e4d5f282b47143eaa51a47")
         self.assertEqual(rec["dirty_files"], "0")
         self.assertEqual(rec["source_revision"], "a283e9dfa7c2c1257886eb406165c305c9a15eda")
-        # Trailing annotations are not part of the value.
         self.assertEqual(rec["input_digest"],
                          "745a7111d2b94ee3891c75f4a8a343e03230606bd3cece800b473ce522078d10")
 
@@ -60,8 +57,6 @@ class JsonlFreshness(unittest.TestCase):
 
 
 class NativeRequesterFunding(unittest.TestCase):
-    """Genesis must fund exactly the accounts the load driver will sign with."""
-
     def _fake_driver(self, lines):
         path = os.path.join(tempfile.mkdtemp(), "driver")
         with open(path, "w") as fh:
@@ -94,8 +89,6 @@ class NativeRequesterFunding(unittest.TestCase):
 
 
 class ExtraFunding(unittest.TestCase):
-    """`--fund` adds a genesis account, e.g. a desktop wallet for a journey."""
-
     def test_addresses_and_amounts_are_parsed_and_defaulted(self):
         wallet = "AB" * 32
         self.assertEqual(
@@ -112,8 +105,6 @@ class ExtraFunding(unittest.TestCase):
 
 
 class NativeWorkers(unittest.TestCase):
-    """--native-workers: every node holds protocol-4 state, some execute."""
-
     def _cfg(self, **extra):
         values = dict(base_rpc=9960, base_p2p=9160, nodes=4, work="/tmp/x", binary="/b",
                       stake=1, snapshot_every=500, workload="native")
@@ -139,8 +130,6 @@ class NativeWorkers(unittest.TestCase):
 
 
 class RealModel(unittest.TestCase):
-    """--real-model: the real executor's flags and a tuple from the manifest."""
-
     MANIFEST = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
         __file__)))), "..", "docs", "protocol", "packages", "llama-2-7b-q4km.manifest.json")
 
@@ -172,8 +161,6 @@ class RealModel(unittest.TestCase):
         self.assertEqual(orchestrate.driver_executor_args_for(test_cfg), [])
 
     def test_run_json_and_every_record_carry_the_executor_the_nodes_run(self):
-        # run.json used to say "deterministic-test-executor" for every native
-        # run, a real-model run included, while its records said otherwise.
         real = types.SimpleNamespace(workload="native", real_model="/m.gguf",
                                      qualification="/q.json", input_hex="01000000",
                                      max_tokens=4)
@@ -191,9 +178,6 @@ class RealModel(unittest.TestCase):
 
 
 class HostPower(unittest.TestCase):
-    """A long run refuses to start on battery: a sleep on low battery froze
-    the 2026-09-22 soak for 71 minutes."""
-
     BATTERY = ("Now drawing from 'Battery Power'\n -InternalBattery-0 (id=21954659)\t85%; "
                "discharging; (no estimate) present: true\n")
     AC = ("Now drawing from 'AC Power'\n -InternalBattery-0 (id=21954659)\t100%; charged; "
@@ -231,8 +215,6 @@ class BinarySelfReport(unittest.TestCase):
 
 
 class Drills(unittest.TestCase):
-    """The R6 drill step on a real (stopped) store, without starting nodes."""
-
     def setUp(self):
         import tempfile
         self.tmp = tempfile.TemporaryDirectory()
@@ -272,7 +254,6 @@ class Drills(unittest.TestCase):
         self.assertEqual(self.node.binary, "/bin/echo")
         self.assertEqual(self.node.binary_sha256, "b" * 64)
         self.assertIs(self.soak.upgraded, self.node)
-        # The upgraded binary writes to the store...
         with open(os.path.join(self.node.data_dir, "state.wal"), "ab") as fh:
             fh.write(b"+written-by-v2")
 
@@ -292,8 +273,6 @@ class FaultPlanning(unittest.TestCase):
         return orchestrate.Config(orchestrate.build_parser().parse_args(self.ARGS + list(extra)))
 
     def test_a_short_run_still_gets_one_fault_after_its_baseline(self):
-        # A huge interval does not mean "no faults": the first one always
-        # comes once the baseline is measured, if there is time to recover.
         self.assertEqual(self.config("--fault-every-secs", "100000").planned_faults, 1)
 
     def test_no_faults_means_none(self):
@@ -308,7 +287,7 @@ class FaultPlanning(unittest.TestCase):
         cfg = self.config("--fault-kinds", "restore,kill", "--minutes", "30")
         self.assertEqual([cfg.fault_kind(k) for k in range(4)], ["restore", "kill", "kill", "kill"])
         with self.assertRaises(SystemExit):
-            self.config("--fault-kinds", "upgrade")  # no upgrade binary
+            self.config("--fault-kinds", "upgrade")
         with self.assertRaises(SystemExit):
             self.config("--fault-kinds", "rollback,upgrade",
                         "--upgrade-binary", "/bin/sh", "--upgrade-provenance", "/dev/null")

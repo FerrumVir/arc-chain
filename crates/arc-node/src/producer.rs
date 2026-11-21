@@ -4,14 +4,10 @@ use arc_state::StateDB;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-/// Maximum transactions per block.
 const MAX_TXS_PER_BLOCK: usize = 100_000;
 
-/// Block production interval in milliseconds.
-const BLOCK_INTERVAL_MS: u64 = 100; // 10 blocks/sec
+const BLOCK_INTERVAL_MS: u64 = 100;
 
-/// Run the block producer loop.
-/// Drains the mempool every BLOCK_INTERVAL_MS and produces a block.
 pub async fn run_block_producer(state: Arc<StateDB>, mempool: Arc<Mempool>, producer: Hash256) {
     info!(
         "Block producer started (interval={}ms, max_txs={})",

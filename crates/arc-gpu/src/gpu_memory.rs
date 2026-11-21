@@ -1,93 +1,45 @@
-//! GPU-resident account buffer using wgpu unified/managed memory.
-//!
-//! On Apple Silicon (Metal), wgpu buffers with `MAP_READ | MAP_WRITE | STORAGE`
-//! are backed by unified memory - CPU and GPU share the same physical pages.
-//! Zero copy, zero sync overhead.
-//!
-//! On devices without mappable primary buffers, a staging buffer handles
-//! CPU↔GPU transfers. `sync_to_gpu()` copies staging → device-local;
-//! `sync_from_gpu()` does the reverse.
-//!
-//! On systems without a GPU, `CpuOnly` mode uses a plain `Vec<u8>` backing store
-//! so callers don't need conditional logic.
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{info, warn};
 
-/// How GPU memory is managed on this system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryModel {
-    /// Apple Silicon - `MAP_READ | MAP_WRITE | STORAGE` on a single buffer.
-    /// CPU pointer and GPU pointer are the same physical memory. Zero copy.
     UnifiedMetal,
-    /// Staged path - separate staging buffer + device-local storage buffer.
-    /// Used by discrete GPUs and devices without mappable primary buffers; it
-    /// requires explicit `sync_to_gpu()` / `sync_from_gpu()` calls.
     ManagedDiscrete,
-    /// No GPU available - backed by a CPU-side `Vec<u8>`.
     CpuOnly,
 }
 
-/// 128-byte GPU-friendly representation of an account.
-///
-/// Aligned to 128 bytes to match GPU cache lines on both Metal (128B) and
-/// NVIDIA (128B L1 cache line). All fields are fixed-size for direct memcpy
-/// into GPU storage buffers.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub struct GpuAccountRepr {
-    pub address: [u8; 32],      // 32
-    pub balance: u64,           // 8
-    pub nonce: u64,             // 8
-    pub code_hash: [u8; 32],    // 32
-    pub storage_root: [u8; 32], // 32
-    pub staked_balance: u64,    // 8
-    pub _padding: [u8; 8],      // 8  → total = 128
+    pub address: [u8; 32],
+    pub balance: u64,
+    pub nonce: u64,
+    pub code_hash: [u8; 32],
+    pub storage_root: [u8; 32],
+    pub staked_balance: u64,
+    pub _padding: [u8; 8],
 }
 
-// Safety: GpuAccountRepr is #[repr(C)], all fields are plain data, no padding gaps.
 unsafe impl bytemuck::Pod for GpuAccountRepr {}
 unsafe impl bytemuck::Zeroable for GpuAccountRepr {}
 
-/// Size of one account slot in bytes.
-pub const ACCOUNT_SLOT_SIZE: usize = std::mem::size_of::<GpuAccountRepr>(); // 128
+pub const ACCOUNT_SLOT_SIZE: usize = std::mem::size_of::<GpuAccountRepr>();
 
-/// GPU-resident account buffer.
-///
-/// Manages a flat array of `GpuAccountRepr` entries in GPU-accessible memory.
-/// Slot-based addressing: each account occupies a fixed 128-byte slot indexed
-/// by a `usize` slot number.
 pub struct GpuAccountBuffer {
-    /// The memory model detected for this system.
     memory_model: MemoryModel,
-    /// Maximum number of account slots.
     capacity: usize,
-    // --- Unified / Metal path ---
-    /// On Metal: a single wgpu buffer that is both GPU-accessible and host-mapped.
-    /// On discrete: the device-local STORAGE buffer (not host-visible).
     gpu_buffer: Option<wgpu::Buffer>,
-    /// On discrete GPUs: host-visible staging buffer for CPU reads/writes.
     staging_buffer: Option<wgpu::Buffer>,
-    /// wgpu device handle (kept alive for sync operations).
     device: Option<wgpu::Device>,
-    /// wgpu queue handle (kept alive for sync operations).
     queue: Option<wgpu::Queue>,
-    // --- CPU-only fallback ---
-    /// Plain memory backing when no GPU is available.
     cpu_backing: Option<Vec<u8>>,
-    /// Number of slots currently written.
     len: AtomicUsize,
 }
 
-// Safety: wgpu Device/Queue/Buffer are Send+Sync. cpu_backing is Vec which is Send+Sync.
 unsafe impl Send for GpuAccountBuffer {}
 unsafe impl Sync for GpuAccountBuffer {}
 
 impl GpuAccountBuffer {
-    /// Probe the GPU and allocate a buffer for `max_accounts` account slots.
-    ///
-    /// Detects a Metal device with mappable primary buffers vs the staged path
-    /// vs no-GPU, and creates the appropriate buffer configuration.
     pub fn new(max_accounts: usize) -> Result<Self, crate::GpuError> {
         let buf_size = (max_accounts * ACCOUNT_SLOT_SIZE) as u64;
 
@@ -131,7 +83,6 @@ impl GpuAccountBuffer {
             ..Default::default()
         }))
         .or_else(|_| {
-            // Retry without MAPPABLE_PRIMARY_BUFFERS - discrete GPUs may not support it.
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("ARC GPU State"),
                 required_features: wgpu::Features::empty(),
@@ -147,9 +98,6 @@ impl GpuAccountBuffer {
         Self::from_device(max_accounts, &gpu_info, device, queue)
     }
 
-    /// Build the account buffer from a device whose enabled features are
-    /// authoritative. A Metal backend without `MAPPABLE_PRIMARY_BUFFERS` must
-    /// use the same staging path as other backends.
     fn from_device(
         max_accounts: usize,
         gpu_info: &wgpu::AdapterInfo,
@@ -169,8 +117,6 @@ impl GpuAccountBuffer {
 
         match memory_model {
             MemoryModel::UnifiedMetal => {
-                // Single buffer: STORAGE + MAP_READ + MAP_WRITE.
-                // On Metal unified memory this is zero-copy.
                 let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("ARC GPU State (unified)"),
                     size: buf_size,
@@ -182,7 +128,6 @@ impl GpuAccountBuffer {
                     mapped_at_creation: true,
                 });
 
-                // Zero-initialize the mapped region.
                 {
                     let mut view = buffer.slice(..).get_mapped_range_mut();
                     view.fill(0);
@@ -210,7 +155,6 @@ impl GpuAccountBuffer {
                 })
             }
             MemoryModel::ManagedDiscrete => {
-                // Two buffers: device-local STORAGE + host-visible staging.
                 let storage = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("ARC GPU State (device)"),
                     size: buf_size,
@@ -223,15 +167,10 @@ impl GpuAccountBuffer {
                 let staging = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("ARC GPU State (staging)"),
                     size: buf_size,
-                    // CPU writes use queue.write_buffer; reads go through a
-                    // separate MAP_READ | COPY_DST readback buffer. Mapping
-                    // this staging buffer is unnecessary and MAP_READ and
-                    // MAP_WRITE are restricted to different copy directions.
                     usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: true,
                 });
 
-                // Zero-initialize staging.
                 {
                     let mut view = staging.slice(..).get_mapped_range_mut();
                     view.fill(0);
@@ -262,7 +201,6 @@ impl GpuAccountBuffer {
         }
     }
 
-    /// Create a CPU-only fallback (no GPU).
     pub fn cpu_only(max_accounts: usize) -> Self {
         let buf_size = max_accounts * ACCOUNT_SLOT_SIZE;
         info!(
@@ -282,31 +220,22 @@ impl GpuAccountBuffer {
         }
     }
 
-    /// Which memory model this buffer is using.
     pub fn memory_model(&self) -> MemoryModel {
         self.memory_model
     }
 
-    /// Maximum number of account slots.
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
-    /// Number of slots that have been written at least once.
     pub fn len(&self) -> usize {
         self.len.load(Ordering::Relaxed)
     }
 
-    /// True when no slot has been written yet.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Write an account into a specific slot.
-    ///
-    /// On Metal: writes directly to unified memory (zero copy).
-    /// On discrete: writes to the staging buffer (call `sync_to_gpu()` to flush).
-    /// On CPU-only: writes to the backing Vec.
     pub fn write_account(&self, slot: usize, account: &GpuAccountRepr) {
         assert!(
             slot < self.capacity,
@@ -319,22 +248,17 @@ impl GpuAccountBuffer {
 
         match self.memory_model {
             MemoryModel::UnifiedMetal => {
-                // On Metal unified memory, write via queue.write_buffer which is
-                // the standard zero-copy path for mapped buffers.
                 if let (Some(queue), Some(buffer)) = (&self.queue, &self.gpu_buffer) {
                     queue.write_buffer(buffer, offset as u64, bytes);
                 }
             }
             MemoryModel::ManagedDiscrete => {
-                // Write to staging buffer via queue.write_buffer.
                 if let (Some(queue), Some(staging)) = (&self.queue, &self.staging_buffer) {
                     queue.write_buffer(staging, offset as u64, bytes);
                 }
             }
             MemoryModel::CpuOnly => {
-                // Safety: we own the Vec and slot is bounds-checked.
                 if let Some(backing) = &self.cpu_backing {
-                    // Vec is behind a shared ref, but we guarantee non-overlapping slot writes.
                     let ptr = backing.as_ptr() as *mut u8;
                     unsafe {
                         std::ptr::copy_nonoverlapping(
@@ -347,16 +271,9 @@ impl GpuAccountBuffer {
             }
         }
 
-        // Track high-water mark.
         let _ = self.len.fetch_max(slot + 1, Ordering::Relaxed);
     }
 
-    /// Read an account from a specific slot.
-    ///
-    /// On Metal: reads from unified memory via a staging copy (queue.write_buffer
-    /// data must be flushed before it's visible to map_async).
-    /// On discrete: reads from staging buffer (call `sync_from_gpu()` first if GPU modified data).
-    /// On CPU-only: reads from the backing Vec.
     pub fn read_account(&self, slot: usize) -> GpuAccountRepr {
         assert!(
             slot < self.capacity,
@@ -369,14 +286,10 @@ impl GpuAccountBuffer {
 
         match self.memory_model {
             MemoryModel::UnifiedMetal => {
-                // On Metal, queue.write_buffer stages data internally.
-                // To read back, we need to copy from the main buffer to a
-                // temporary read-back buffer via the command encoder, then map it.
                 let device = self.device.as_ref().unwrap();
                 let queue = self.queue.as_ref().unwrap();
                 let src_buffer = self.gpu_buffer.as_ref().unwrap();
 
-                // Submit any pending writes.
                 queue.submit(None::<wgpu::CommandBuffer>);
 
                 let readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -410,13 +323,10 @@ impl GpuAccountBuffer {
                 }
             }
             MemoryModel::ManagedDiscrete => {
-                // On discrete GPUs, read from the staging buffer.
-                // Caller should have called sync_from_gpu() first if GPU modified data.
                 let device = self.device.as_ref().unwrap();
                 let queue = self.queue.as_ref().unwrap();
                 let staging = self.staging_buffer.as_ref().unwrap();
 
-                // Flush any pending queue.write_buffer calls.
                 queue.submit(None::<wgpu::CommandBuffer>);
 
                 let readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -460,7 +370,6 @@ impl GpuAccountBuffer {
         }
     }
 
-    /// Batch write multiple accounts into consecutive slots starting at `start_slot`.
     pub fn write_batch(&self, start_slot: usize, accounts: &[GpuAccountRepr]) {
         let end = start_slot + accounts.len();
         assert!(end <= self.capacity, "batch write exceeds capacity");
@@ -492,11 +401,6 @@ impl GpuAccountBuffer {
         let _ = self.len.fetch_max(end, Ordering::Relaxed);
     }
 
-    /// Flush staging buffer → device-local buffer.
-    ///
-    /// **No-op on Metal** (unified memory).
-    /// **No-op on CPU-only**.
-    /// On discrete GPUs, encodes a `copy_buffer_to_buffer` and submits.
     pub fn sync_to_gpu(&self) {
         if self.memory_model != MemoryModel::ManagedDiscrete {
             return;
@@ -516,10 +420,6 @@ impl GpuAccountBuffer {
         }
     }
 
-    /// Flush device-local buffer → staging buffer for CPU readback.
-    ///
-    /// **No-op on Metal** (unified memory).
-    /// **No-op on CPU-only**.
     pub fn sync_from_gpu(&self) {
         if self.memory_model != MemoryModel::ManagedDiscrete {
             return;
@@ -540,18 +440,13 @@ impl GpuAccountBuffer {
         }
     }
 
-    /// Return a reference to the GPU storage buffer (for binding in compute shaders).
     pub fn storage_buffer(&self) -> Option<&wgpu::Buffer> {
         self.gpu_buffer.as_ref()
     }
 
-    /// Securely zero all buffer memory and drop GPU resources.
-    ///
-    /// Writes zeros over the entire mapped range to prevent sensitive account data
-    /// (balances, nonces) from persisting in GPU/unified memory after shutdown.
     pub fn secure_shutdown(mut self) {
         let buf_size = self.capacity * ACCOUNT_SLOT_SIZE;
-        let zeros = vec![0u8; buf_size.min(4 * 1024 * 1024)]; // 4MB chunks
+        let zeros = vec![0u8; buf_size.min(4 * 1024 * 1024)];
 
         match self.memory_model {
             MemoryModel::UnifiedMetal => {
@@ -584,14 +479,11 @@ impl GpuAccountBuffer {
         }
 
         info!("GPU state buffer securely zeroed and released");
-        // Drop order: buffers, then device, then queue - wgpu handles cleanup.
     }
 }
 
 impl Drop for GpuAccountBuffer {
     fn drop(&mut self) {
-        // Best-effort zeroing on drop (secure_shutdown is preferred).
-        // We can't do async map here, but queue.write_buffer is synchronous-enough.
         if self.memory_model == MemoryModel::CpuOnly
             && let Some(ref mut backing) = self.cpu_backing
         {
@@ -662,7 +554,6 @@ mod tests {
 
     #[test]
     fn test_gpu_buffer_allocation() {
-        // This test will use real GPU if available, CPU fallback otherwise.
         let buf = GpuAccountBuffer::new(10_000).expect("should not fail");
         println!("Memory model: {:?}", buf.memory_model());
         assert!(buf.capacity() == 10_000);
@@ -678,7 +569,7 @@ mod tests {
         };
 
         buf.write_account(0, &acct);
-        buf.sync_to_gpu(); // no-op on Metal/CPU
+        buf.sync_to_gpu();
 
         let read = buf.read_account(0);
         assert_eq!(read.balance, 42);
@@ -707,9 +598,6 @@ mod tests {
                 }
             };
 
-        // Request the baseline feature set even when the adapter advertises
-        // MAPPABLE_PRIMARY_BUFFERS; the actual device must force the staged
-        // path instead of accidentally exercising the unified Metal path.
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("ARC GPU State staged-buffer regression"),
             required_features: wgpu::Features::empty(),
@@ -739,8 +627,6 @@ mod tests {
         buf.sync_from_gpu();
         assert_eq!(buf.read_account(0), first);
 
-        // Write a distinct value to device storage, then exercise the reverse
-        // device→staging sync and staging→readback mapping path.
         let second = GpuAccountRepr {
             address: [0x22; 32],
             balance: 29,
@@ -771,6 +657,5 @@ mod tests {
         };
         buf.write_account(0, &acct);
         buf.secure_shutdown();
-        // Buffer is consumed - no way to read after shutdown.
     }
 }

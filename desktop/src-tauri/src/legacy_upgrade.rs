@@ -1,18 +1,3 @@
-//! One question, asked once, when a stranded v0.7 install reaches this app.
-//!
-//! Released v0.7 desktops can only update by clicking "Install" on GitHub's
-//! "Latest" release, which the v0.7 legacy bridge release points at this app. The
-//! v0.7 app never asked whether the computer should contribute compute on the
-//! new network, so the first launch here asks: "Your ARC node is upgrading to
-//! the new network. Keep contributing compute?". Until the user answers, the
-//! install runs as an observer without a model, even if v0.7 ran it as a
-//! worker. The answer is recorded through `commands::set_compute_contribution`,
-//! the same path as the Settings switch, so "Yes" downloads and verifies the
-//! model if needed and promotes the node, and "Not now" keeps it an observer.
-//!
-//! The pending question lives in its own file beside `store.json`, so the
-//! store and config formats are unchanged.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,36 +14,19 @@ pub const QUESTION_FILE: &str = "legacy-compute-question.json";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LegacyComputeQuestion {
-    /// The v0.7 role before the node was held as an observer.
     pub previous_role: String,
-    /// The v0.7 model path before the node was held as an observer.
     pub previous_model_path: Option<String>,
-    /// Why this launch counts as the first one after a v0.7 install.
     pub detected_by: String,
     pub recorded_unix_ms: u64,
 }
 
-/// What startup saw that can mark an install as coming from v0.7.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct V07Signals {
-    /// The WAL fence created a migration notice on this launch.
     pub fenced_this_launch: bool,
-    /// The saved configuration still uses the v0.7 data layout, read before
-    /// the fence ran (`config_uses_v07_layout`).
     pub config_uses_v07_layout: bool,
-    /// A migration notice kept from an earlier launch fenced the v0.7 root.
     pub fenced_v07_root_earlier: bool,
 }
 
-/// Fenced v0.7 chain data (on this launch, or kept from an earlier one), the
-/// bridge's record of having run under the v0.7 app, or a saved
-/// configuration that still uses the v0.7 data layout marks an install that
-/// came from v0.7. The layout covers v0.7.10/v0.7.11 desktops whose node
-/// never started, because their updater returned 404: they have no WAL to
-/// fence and may have no bridge record, but their owner has still never been
-/// asked. The earlier notice and the WAL kept at the `~/.arc` root cover a v0.7
-/// install whose first v0.8 launch was a build without this question; the
-/// WAL outlives the notice, which the user can dismiss.
 pub fn detect_v07_origin(signals: V07Signals, home: &Path) -> Option<&'static str> {
     if signals.fenced_this_launch {
         Some("v0.7 chain data was fenced on this launch")
@@ -75,29 +43,16 @@ pub fn detect_v07_origin(signals: V07Signals, home: &Path) -> Option<&'static st
     }
 }
 
-/// Every v0.6.0..=v0.7.11 desktop stored `dataDir` as the literal `"~/.arc"`
-/// (`types.rs` default, `Onboarding.tsx`, `Dashboard.tsx`; no screen could
-/// change it). Every v0.8 build defaults to a `data-v3*` child.
 pub const V07_DATA_DIR: &str = "~/.arc";
 
-/// Whether the saved configuration still uses the v0.7 desktop data layout:
-/// `dataDir` at the `~/.arc` root. The WAL fence moves the pointer, so this
-/// must be read before the fence runs.
 pub fn config_uses_v07_layout(config: &NodeConfig, home: &Path) -> bool {
     config.data_dir == V07_DATA_DIR || expand_against(&config.data_dir, home) == v07_root(home)
 }
 
-/// Whether a kept migration notice fenced the v0.7 root itself, rather than a
-/// malformed v0.8 `data-v3*` directory.
 pub fn notice_fenced_v07_root(notice: Option<&DataMigrationNotice>, home: &Path) -> bool {
     notice.is_some_and(|notice| Path::new(&notice.legacy_data_dir) == v07_root(home))
 }
 
-/// Whether the `~/.arc` root still holds a v0.7 WAL: `state.wal` or `dag-wal`
-/// without a valid `genesis.network-hash`. The fence keeps those bytes in
-/// place and only moves the pointer, so they outlive a dismissed notice. A v0.8
-/// install never writes there (its default is a `data-v3*` child), and a v0.8
-/// node that did run at the root wrote a valid hash beside its WAL.
 pub fn v07_wal_kept_at_root(home: &Path) -> bool {
     let root = v07_root(home);
     let has_wal = ["state.wal", "dag-wal"]
@@ -106,7 +61,6 @@ pub fn v07_wal_kept_at_root(home: &Path) -> bool {
     has_wal && !has_valid_network_hash(&root.join("genesis.network-hash"))
 }
 
-/// The same syntactic check the WAL fence applies to `genesis.network-hash`.
 fn has_valid_network_hash(path: &Path) -> bool {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() && metadata.len() <= 1024 => {
@@ -125,7 +79,6 @@ fn v07_root(home: &Path) -> PathBuf {
     home.join(".arc")
 }
 
-/// `paths::expand_tilde` against an explicit home directory.
 fn expand_against(path: &str, home: &Path) -> PathBuf {
     match path.strip_prefix("~/") {
         Some(rest) => home.join(rest),
@@ -134,8 +87,6 @@ fn expand_against(path: &str, home: &Path) -> PathBuf {
     }
 }
 
-/// The bridge writes `~/.arc/legacy-bridge/nodes/desktop-*/bridge-state.json`
-/// when the v0.7 app starts it.
 pub fn legacy_bridge_ran(home: &Path) -> bool {
     let nodes = home.join(".arc").join("legacy-bridge").join("nodes");
     fs::read_dir(nodes)
@@ -168,32 +119,22 @@ pub fn clear(dir: &Path) -> anyhow::Result<()> {
     }
 }
 
-/// What `hold_until_answered` did.
 #[derive(Debug, Default)]
 pub struct Hold {
-    /// The install is held as an observer without a model.
     pub held: bool,
-    /// Holding it changed the config (the caller persists it).
     pub changed: bool,
-    /// The question could not be recorded. The config is held anyway.
     pub record_error: Option<anyhow::Error>,
 }
 
-/// Startup: hold compute back until the question is answered, and record the
-/// question the first time. The hold is applied before anything is written,
-/// so a question that cannot be recorded still never lets an unasked v0.7
-/// install start as a worker.
 pub fn hold_until_answered(
     config: &mut NodeConfig,
     dir: &Path,
     origin: Option<&str>,
     now_unix_ms: u64,
 ) -> Hold {
-    // An explicit answer, from this question or the Settings switch, wins.
     if config.compute_consent.is_some() {
         return Hold::default();
     }
-    // Any file here, even one that no longer parses, is a pending question.
     let record_as = if dir.join(QUESTION_FILE).exists() {
         match load(dir) {
             Some(_) => None,
@@ -221,18 +162,12 @@ pub fn hold_until_answered(
     }
 }
 
-/// What `hold_at_startup` did, for the startup log.
 #[derive(Debug, Default)]
 pub struct StartupHold {
     pub hold: Hold,
-    /// The held config could not be written to `store.json`.
     pub persist_error: Option<anyhow::Error>,
 }
 
-/// The startup step `lib.rs` runs after the WAL fence and before anything
-/// can start the node: find a v0.7 origin, hold the stored config until the
-/// question is answered, and persist the held config. `config_uses_v07_layout`
-/// must have been read before the fence.
 pub fn hold_at_startup(
     store: &mut Store,
     app_data_dir: &Path,
@@ -248,13 +183,9 @@ pub fn hold_at_startup(
     };
     let origin = detect_v07_origin(signals, home);
     let Some(config) = store.config.as_mut() else {
-        // No stored config: onboarding runs, and its model step asks.
         return StartupHold::default();
     };
     let hold = hold_until_answered(config, app_data_dir, origin, now_unix_ms);
-    // Persist whenever the hold changed the config, and also when the
-    // question could not be recorded: the stored observer config is then
-    // what keeps a later launch from starting the old worker config.
     let persist_error = if hold.changed || hold.record_error.is_some() {
         store.save_to(app_data_dir).err()
     } else {
@@ -273,7 +204,6 @@ pub fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The pending question, or `None` once the user has answered anywhere.
 #[tauri::command]
 pub async fn load_legacy_compute_question(
     state: State<'_, AppState>,
@@ -293,10 +223,6 @@ pub async fn load_legacy_compute_question(
     Ok(load(&dir))
 }
 
-/// Record the answer exactly as the Settings switch does, then retire the
-/// question. The consent is persisted before any model download starts, so
-/// a failed download still leaves "Yes" recorded and startup promotion
-/// retries it.
 #[tauri::command]
 pub async fn answer_legacy_compute_question(
     app: AppHandle,
@@ -314,10 +240,6 @@ pub async fn answer_legacy_compute_question(
         .and_then(|config| config.compute_consent)
         == Some(contribute);
     if recorded {
-        // This was the compute question already, so the one-time question
-        // for installs from before the default is not asked after it. Recorded
-        // first: a failed `clear` leaves the answer standing, and the marker
-        // is what keeps a "Not now" from being asked again at the next launch.
         crate::commands::note_compute_question_answered(&dir);
         clear(&dir).map_err(|error| error.to_string())?;
     }
@@ -329,12 +251,9 @@ mod tests {
     use super::*;
     use crate::commands::{compute_contribution_enabled, promotion_need, PromotionNeed};
 
-    /// `store.json` as every released v0.6.0..=v0.7.11 desktop wrote it.
-    /// `tests/legacy-bridge/check_v07_fixtures.py` checks it against each tag.
     const V07_DESKTOP_STORES: &str =
         include_str!("../../../tests/legacy-bridge/fixtures/v07-desktop-stores.json");
 
-    /// A private home directory and app-data directory per test.
     struct Machine {
         root: tempfile::TempDir,
     }
@@ -361,19 +280,16 @@ mod tests {
                 .join("network.arc.desktop")
         }
 
-        /// Install a store exactly as an older desktop left it.
         fn install_store(&self, store: &Store) {
             fs::create_dir_all(self.arc_root()).unwrap();
             store.save_to(&self.app_data()).unwrap();
         }
 
-        /// A v0.7 node that ran wrote its WAL at the `~/.arc` root.
         fn v07_node_ran(&self) {
             fs::create_dir_all(self.arc_root()).unwrap();
             fs::write(self.arc_root().join("state.wal"), b"v0.7 wal").unwrap();
         }
 
-        /// What the bridge writes when the v0.7 app starts it.
         fn bridge_ran_under_the_v07_app(&self) {
             let node = self
                 .arc_root()
@@ -384,9 +300,6 @@ mod tests {
             fs::write(node.join("bridge-state.json"), b"{}").unwrap();
         }
 
-        /// The startup sequence of `lib.rs` from loading the store to the
-        /// held config: layout read, WAL fence (persisted as `lib.rs` does),
-        /// then `hold_at_startup`. Returns the store the node would start with.
         fn launch(&self, now_unix_ms: u64) -> (Store, StartupHold) {
             let mut store = Store::load_from(&self.app_data());
             let config_uses_v07_layout = store
@@ -427,8 +340,6 @@ mod tests {
         v07_store("onboarding-worker").config.unwrap()
     }
 
-    /// The node starts as an observer without a model, never promotes, and is
-    /// waiting for the question.
     fn assert_held(store: &Store, machine: &Machine) {
         let config = store.config.as_ref().expect("config");
         assert_eq!(config.role, "observer");
@@ -440,7 +351,6 @@ mod tests {
         assert_eq!(launched.role, "observer");
         assert_eq!(launched.model_path, None);
         assert!(load(&machine.app_data()).is_some(), "question pending");
-        // What the next launch reads back is held too.
         let persisted = Store::load_from(&machine.app_data()).config.unwrap();
         assert_eq!(persisted.role, "observer");
         assert_eq!(persisted.model_path, None);
@@ -489,7 +399,6 @@ mod tests {
         let (store, outcome) = machine.launch(1);
         assert!(outcome.hold.changed);
         assert_held(&store, &machine);
-        // The fence moved the pointer to a fresh v3 child.
         assert!(store.config.as_ref().unwrap().data_dir.contains("data-v3"));
         assert_eq!(
             load(&machine.app_data()).unwrap().detected_by,
@@ -499,8 +408,6 @@ mod tests {
 
     #[test]
     fn a_v07_node_that_never_ran_is_held() {
-        // v0.7.10/v0.7.11: the updater returned 404, so no WAL and no bridge
-        // record; the layout is the only signal.
         let machine = Machine::new();
         machine.install_store(&v07_store("onboarding-worker"));
         let (store, _) = machine.launch(1);
@@ -526,10 +433,6 @@ mod tests {
 
     #[test]
     fn a_v07_install_first_opened_by_a_build_without_the_question_is_still_held() {
-        // A v0.7 desktop updated to a v0.8 build without this question (for
-        // example one marked Latest before the bridge): its WAL was fenced
-        // there, and it ran as a worker without being asked. The kept notice
-        // that fenced the v0.7 root marks it on the first launch here.
         let machine = Machine::new();
         machine.install_store(&v07_store("onboarding-worker"));
         machine.v07_node_ran();
@@ -549,9 +452,6 @@ mod tests {
 
     #[test]
     fn a_v07_install_whose_earlier_notice_was_dismissed_is_still_held() {
-        // As above, then the owner dismissed that build's migration notice
-        // (`dismiss_data_migration_notice`). The v0.7 WAL the fence kept at
-        // the ~/.arc root still marks the install.
         let machine = Machine::new();
         machine.install_store(&v07_store("onboarding-worker"));
         machine.v07_node_ran();
@@ -569,7 +469,6 @@ mod tests {
             load(&machine.app_data()).unwrap().detected_by,
             "v0.7 chain data is still kept at the ~/.arc root"
         );
-        // And on every launch after that.
         let (store, _) = machine.launch(2);
         assert_held(&store, &machine);
     }
@@ -580,7 +479,6 @@ mod tests {
         let root = machine.arc_root();
         fs::create_dir_all(&root).unwrap();
         assert!(!v07_wal_kept_at_root(&machine.home()));
-        // Binaries, models and a fresh v0.8 data-v3 child are not chain data.
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::create_dir_all(root.join("models")).unwrap();
         fs::create_dir_all(root.join("data-v3")).unwrap();
@@ -592,10 +490,8 @@ mod tests {
             fs::create_dir_all(&root).unwrap();
             fs::write(root.join(wal), b"v0.7").unwrap();
             assert!(v07_wal_kept_at_root(&machine.home()), "{wal}");
-            // A malformed hash is not a v0.8 binding.
             fs::write(root.join("genesis.network-hash"), b"not a hash").unwrap();
             assert!(v07_wal_kept_at_root(&machine.home()), "{wal}");
-            // A v0.8 node that ran at the root bound its WAL to the network.
             fs::write(
                 root.join("genesis.network-hash"),
                 format!("{}\n", "ab".repeat(32)),
@@ -627,8 +523,6 @@ mod tests {
             let machine = Machine::new();
             machine.install_store(&v07_store("onboarding-worker"));
             let (mut store, _) = machine.launch(1);
-            // `set_compute_contribution` records the answer under the store
-            // lock, then the question is cleared.
             store.config.as_mut().unwrap().compute_consent = Some(contribute);
             store.save_to(&machine.app_data()).unwrap();
             clear(&machine.app_data()).unwrap();
@@ -650,7 +544,6 @@ mod tests {
     fn an_unrecordable_question_still_holds_the_node() {
         let machine = Machine::new();
         machine.install_store(&v07_store("onboarding-worker"));
-        // A directory where the record goes: the rename cannot replace it.
         fs::create_dir_all(machine.app_data().join(QUESTION_FILE).join("occupied")).unwrap();
         let (store, outcome) = machine.launch(1);
         assert!(outcome.hold.held);
@@ -680,7 +573,6 @@ mod tests {
 
     #[test]
     fn a_v07_install_that_never_finished_onboarding_is_left_to_onboarding() {
-        // No stored config: onboarding's model step is the consent question.
         let machine = Machine::new();
         machine.install_store(&Store::default());
         machine.v07_node_ran();
@@ -692,7 +584,6 @@ mod tests {
 
     #[test]
     fn v08_installs_are_never_asked() {
-        // A fresh install.
         let machine = Machine::new();
         machine.install_store(&Store {
             config: Some(NodeConfig::default()),
@@ -703,8 +594,6 @@ mod tests {
         assert_eq!(store.config.unwrap().role, NodeConfig::default().role);
         assert!(load(&machine.app_data()).is_none());
 
-        // A v0.8.10 worker keeps #138's rule (a worker with a model from
-        // before the question counts as opted in).
         let machine = Machine::new();
         let worker = NodeConfig {
             role: "worker".into(),

@@ -1,15 +1,3 @@
-"""Fail-closed recovery journal primitives for the ARC freeze v5 protocol.
-
-This module deliberately contains no production host implementation.  It
-validates pinned inputs, constructs and validates canonical journal events,
-and delegates the four permitted host mutations to an explicitly supplied
-adapter.  The default adapter refuses every mutation.
-
-Canonical JSON in this protocol is UTF-8, has lexicographically sorted object
-keys, uses compact separators, rejects duplicate keys/non-finite numbers, and
-ends with exactly one LF byte.
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -431,11 +419,11 @@ _OFFLINE_RECONCILIATION_KEYS = frozenset(
 
 
 class FreezeValidationError(ValueError):
-    """A pinned input or journal value violates the v5 contract."""
+    pass
 
 
 class MutationRefused(RuntimeError):
-    """A host mutation was attempted without an explicit reviewed adapter."""
+    pass
 
 
 class BarrierState(str, Enum):
@@ -463,10 +451,8 @@ class FreezeNode:
     sha256: str
 
     def value(self) -> dict[str, Any]:
-        """Return a fresh decoded copy of the pinned node contract."""
-
         value = parse_canonical_json(self.canonical_bytes, label=f"node {self.name}")
-        if not isinstance(value, dict):  # Defensive; construction already proved this.
+        if not isinstance(value, dict):
             raise FreezeValidationError(f"node {self.name} is not an object")
         return value
 
@@ -488,7 +474,7 @@ class PinnedFreezePlan:
 
     def value(self) -> dict[str, Any]:
         value = parse_canonical_json(self.canonical_bytes, label="freeze plan")
-        if not isinstance(value, dict):  # Defensive; construction already proved this.
+        if not isinstance(value, dict):
             raise FreezeValidationError("freeze plan is not an object")
         return value
 
@@ -535,12 +521,6 @@ class BarrierInference:
 
 @runtime_checkable
 class HostMutationAdapter(Protocol):
-    """Reviewed host operations required by a recovery executor.
-
-    Implementations are responsible for identity-safe, race-safe operations
-    and must return only after the requested state has been read back.
-    """
-
     def durable_unlink_allow_marker(self, path: str) -> DurableUnlinkEvidence:
         ...
 
@@ -552,8 +532,6 @@ class HostMutationAdapter(Protocol):
 
 
 class FailClosedHostMutationAdapter:
-    """Default adapter: importing/using the library cannot mutate a host."""
-
     @staticmethod
     def _refuse(operation: str) -> None:
         raise MutationRefused(
@@ -573,8 +551,6 @@ class FailClosedHostMutationAdapter:
 
 
 class RecoveryMutations:
-    """Small injectable boundary around all host-changing operations."""
-
     def __init__(self, adapter: HostMutationAdapter | None = None) -> None:
         self._adapter = adapter if adapter is not None else FailClosedHostMutationAdapter()
 
@@ -618,8 +594,6 @@ def _reject_nonfinite(token: str) -> Any:
 
 
 def canonical_json_bytes(value: Any) -> bytes:
-    """Encode a journal value in ARC's deterministic canonical form."""
-
     try:
         encoded = json.dumps(
             value,
@@ -634,8 +608,6 @@ def canonical_json_bytes(value: Any) -> bytes:
 
 
 def parse_canonical_json(raw: bytes, *, label: str = "journal") -> Any:
-    """Decode canonical JSON, rejecting duplicates and alternate encodings."""
-
     if not isinstance(raw, bytes):
         raise TypeError("canonical JSON input must be bytes")
     try:
@@ -664,8 +636,6 @@ def validate_secure_stat(
     label: str = "file",
     expected_uid: int = 0,
 ) -> None:
-    """Require a regular, pinned-owner, immutable-by-mode input inode."""
-
     if not stat.S_ISREG(details.st_mode):
         raise FreezeValidationError(f"{label} is not a regular file")
     if details.st_uid != expected_uid:
@@ -682,8 +652,6 @@ def open_regular_nofollow(
     expected_uid: int = 0,
     label: str = "file",
 ) -> int:
-    """Open a secure input and return its descriptor to the caller."""
-
     if not hasattr(os, "O_NOFOLLOW"):
         raise FreezeValidationError("O_NOFOLLOW is unavailable; refusing unsafe open")
     flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
@@ -706,8 +674,6 @@ def read_regular_nofollow(
     label: str = "file",
     maximum_bytes: int = MAX_JOURNAL_BYTES,
 ) -> bytes:
-    """Read a stable secure regular file without following a final symlink."""
-
     if isinstance(maximum_bytes, bool) or not isinstance(maximum_bytes, int) or maximum_bytes <= 0:
         raise ValueError("maximum_bytes must be a positive integer")
     descriptor = open_regular_nofollow(path, expected_uid=expected_uid, label=label)
@@ -1110,11 +1076,6 @@ def _validate_prepare_barrier(
                 f"node {node_name} activation closure {unit} has an alias or following target"
             )
         state = states[unit]
-        # MainPID is a service-only property.  Older prepared contracts can
-        # contain systemd's empty rendering for an inert timer, while the
-        # canonical unit-state row represents the same quiescent value as 0.
-        # Normalize only this exact timer field; an empty service MainPID still
-        # fails closed below.
         closure_main_pid = row["MainPID"]
         if unit == "arc-node-update.timer" and closure_main_pid == "":
             closure_main_pid = "0"
@@ -1233,7 +1194,7 @@ def _validate_prepare_barrier(
             raise FreezeValidationError(
                 f"node {node_name} detached writer relationship is not the exact root-session shape"
             )
-    else:  # The caller validates this first; retain a local fail-closed guard.
+    else:
         raise FreezeValidationError(f"node {node_name} supervision mode is unreviewed")
 
 
@@ -1399,8 +1360,6 @@ def validate_pinned_freeze_plan(
     expected_node_names: Sequence[str] = ARC_NODE_ORDER,
     expected_sentinels: Sequence[str] = ARC_SENTINEL_ORDER,
 ) -> PinnedFreezePlan:
-    """Validate a complete canonical v5 plan pinned by an out-of-band digest."""
-
     expected_sha256 = _require_hash(expected_sha256, "expected freeze-plan digest")
     observed_sha256 = hashlib.sha256(raw).hexdigest()
     if observed_sha256 != expected_sha256:
@@ -1712,14 +1671,6 @@ def infer_barrier_state(
     allow_marker_exists: bool,
     durable_unlink: DurableUnlinkEvidence | None = None,
 ) -> BarrierInference:
-    """Infer the barrier state from marker truth, never from a commit claim.
-
-    Same-boot commit requires evidence that the allow marker was unlinked and
-    its parent directory fsynced.  After a reboot, marker absence itself proves
-    that the unlink survived durable storage.  Marker absence without either
-    proof is ambiguous and fails closed.
-    """
-
     receipt = validate_prepare_receipt(prepare_receipt)
     observed_boot_id = _require_uuid(observed_boot_id, "observed boot id")
     if not isinstance(allow_marker_exists, bool):

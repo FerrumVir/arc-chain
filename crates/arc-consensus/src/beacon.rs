@@ -1,18 +1,8 @@
-//! Beacon chain shard coordinator for hierarchical sharding.
-//!
-//! The beacon chain coordinates multiple independent shards, each running its
-//! own DAG consensus. It collects state roots from all shards per epoch,
-//! computes a global state root, manages shard assignments for validators,
-//! and handles cross-shard settlement.
-
 use arc_crypto::{Hash256, hash_pair};
 use dashmap::DashMap;
 use thiserror::Error;
 
-/// Address is a 256-bit hash derived from a public key.
 pub type Address = Hash256;
-
-// ── Errors ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum BeaconError {
@@ -26,22 +16,13 @@ pub enum BeaconError {
     InsufficientSignatures,
 }
 
-// ── Configuration ───────────────────────────────────────────────────────────
-
-/// Beacon chain configuration.
 #[derive(Debug, Clone)]
 pub struct BeaconConfig {
-    /// Number of active shards.
     pub num_shards: u32,
-    /// Blocks per epoch (shard root collection interval).
     pub epoch_length: u64,
-    /// Minimum validators per shard for liveness.
     pub min_validators_per_shard: u32,
 }
 
-// ── Attestation ─────────────────────────────────────────────────────────────
-
-/// A shard's state attestation submitted to the beacon chain.
 #[derive(Debug, Clone)]
 pub struct ShardAttestation {
     pub shard_id: u32,
@@ -53,9 +34,6 @@ pub struct ShardAttestation {
     pub validator_signatures: Vec<(Address, Vec<u8>)>,
 }
 
-// ── Epoch Summary ───────────────────────────────────────────────────────────
-
-/// Summary returned after advancing an epoch.
 #[derive(Debug, Clone)]
 pub struct EpochSummary {
     pub epoch: u64,
@@ -64,24 +42,16 @@ pub struct EpochSummary {
     pub global_root: Hash256,
 }
 
-// ── Beacon State ────────────────────────────────────────────────────────────
-
-/// The beacon chain state.
 pub struct BeaconState {
     pub config: BeaconConfig,
     pub current_epoch: u64,
-    /// Latest attestation per shard.
     pub shard_roots: DashMap<u32, ShardAttestation>,
-    /// Global state root = Merkle(shard_0_root, shard_1_root, ...).
     pub global_root: Hash256,
-    /// Validator -> shard assignment.
     pub shard_assignments: DashMap<Address, u32>,
-    /// Shard -> list of validators.
     pub shard_validators: DashMap<u32, Vec<Address>>,
 }
 
 impl BeaconState {
-    /// Create a new beacon state from the given configuration.
     pub fn new(config: BeaconConfig) -> Self {
         let shard_validators = DashMap::new();
         for i in 0..config.num_shards {
@@ -98,10 +68,6 @@ impl BeaconState {
         }
     }
 
-    /// Submit a shard attestation to the beacon chain.
-    ///
-    /// Validates that the shard_id is in range and the epoch matches the current epoch,
-    /// then stores the attestation.
     pub fn submit_attestation(&self, att: ShardAttestation) -> Result<(), BeaconError> {
         if att.shard_id >= self.config.num_shards {
             return Err(BeaconError::InvalidShardId(
@@ -121,17 +87,12 @@ impl BeaconState {
         Ok(())
     }
 
-    /// Compute the global state root as a Merkle root of all shard state roots.
-    ///
-    /// Shards without an attestation contribute `Hash256::ZERO`.
-    /// Uses BLAKE3-based hashing via `arc_crypto::hash_pair`.
     pub fn compute_global_root(&self) -> Hash256 {
         let num_shards = self.config.num_shards;
         if num_shards == 0 {
             return Hash256::ZERO;
         }
 
-        // Collect shard roots in order.
         let mut leaves: Vec<Hash256> = Vec::with_capacity(num_shards as usize);
         for i in 0..num_shards {
             let root = self
@@ -142,11 +103,9 @@ impl BeaconState {
             leaves.push(root);
         }
 
-        // Pad to next power of two for a balanced Merkle tree.
         let mut size = leaves.len().next_power_of_two();
         leaves.resize(size, Hash256::ZERO);
 
-        // Iteratively compute Merkle root.
         while size > 1 {
             let mut next = Vec::with_capacity(size / 2);
             for pair in leaves.chunks(2) {
@@ -159,10 +118,6 @@ impl BeaconState {
         leaves[0]
     }
 
-    /// Advance to the next epoch.
-    ///
-    /// Computes the global root, increments the epoch counter, clears shard
-    /// attestations, and returns a summary of the completed epoch.
     pub fn advance_epoch(&mut self) -> EpochSummary {
         let global_root = self.compute_global_root();
         self.global_root = global_root;
@@ -186,11 +141,7 @@ impl BeaconState {
         }
     }
 
-    /// Assign a validator to a shard, picking the shard with the fewest validators.
-    ///
-    /// Returns the assigned shard_id.
     pub fn assign_validator(&self, validator: Address, _stake: u64) -> u32 {
-        // Find the shard with the fewest validators.
         let mut min_shard = 0u32;
         let mut min_count = u64::MAX;
 
@@ -206,7 +157,6 @@ impl BeaconState {
             }
         }
 
-        // Record the assignment.
         self.shard_assignments.insert(validator, min_shard);
         self.shard_validators
             .entry(min_shard)
@@ -216,18 +166,12 @@ impl BeaconState {
         min_shard
     }
 
-    /// Deterministically map an account address to a shard.
-    ///
-    /// Uses the first 4 bytes of the address interpreted as a big-endian u32,
-    /// modulo the number of shards.
     pub fn get_shard_for_account(&self, address: &Address) -> u32 {
         let bytes = address.as_bytes();
         let val = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         val % self.config.num_shards
     }
 }
-
-// ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -295,7 +239,6 @@ mod tests {
     fn test_global_root_deterministic() {
         let state = BeaconState::new(test_config());
 
-        // Submit attestations for all 4 shards.
         for i in 0..4 {
             state
                 .submit_attestation(make_attestation(i, 0, 100))
@@ -316,13 +259,11 @@ mod tests {
     fn test_global_root_changes_with_different_attestations() {
         let state = BeaconState::new(test_config());
 
-        // Only shard 0.
         state
             .submit_attestation(make_attestation(0, 0, 100))
             .unwrap();
         let root_partial = state.compute_global_root();
 
-        // Now add shard 1.
         state
             .submit_attestation(make_attestation(1, 0, 200))
             .unwrap();
@@ -338,7 +279,6 @@ mod tests {
     fn test_validator_assignment_load_balancing() {
         let state = BeaconState::new(test_config());
 
-        // Assign 8 validators; should spread evenly across 4 shards.
         let mut shard_counts = [0u32; 4];
         for i in 0..8u8 {
             let addr = make_address(i);
@@ -346,7 +286,6 @@ mod tests {
             shard_counts[shard as usize] += 1;
         }
 
-        // Each shard should have exactly 2 validators.
         for (i, &count) in shard_counts.iter().enumerate() {
             assert_eq!(
                 count, 2,
@@ -393,7 +332,6 @@ mod tests {
         let mut state = BeaconState::new(test_config());
         assert_eq!(state.current_epoch, 0);
 
-        // Submit attestations with known tx counts.
         state
             .submit_attestation(make_attestation(0, 0, 1000))
             .unwrap();
@@ -411,7 +349,6 @@ mod tests {
         assert_ne!(summary.global_root, Hash256::ZERO);
         assert_eq!(state.current_epoch, 1);
 
-        // Shard roots should be cleared after epoch advance.
         assert!(state.shard_roots.is_empty());
     }
 
@@ -432,14 +369,12 @@ mod tests {
     fn test_multiple_epochs() {
         let mut state = BeaconState::new(test_config());
 
-        // Epoch 0
         state
             .submit_attestation(make_attestation(0, 0, 100))
             .unwrap();
         let s0 = state.advance_epoch();
         assert_eq!(s0.epoch, 0);
 
-        // Epoch 1 - attestations must use epoch 1 now.
         state
             .submit_attestation(make_attestation(0, 1, 200))
             .unwrap();

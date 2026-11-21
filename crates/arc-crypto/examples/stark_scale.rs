@@ -1,10 +1,3 @@
-//! How large a single Circle STARK can this machine actually prove?
-//!
-//! Walks a ladder of Dense-layer sizes up to a full Llama-2-7B attention
-//! projection in one proof. Every entry is a real proof, verified inline.
-//!
-//! Usage: cargo run --release --example stark_scale --features stwo-prover
-
 use arc_crypto::inference_proof::dense_forward_i64;
 use arc_crypto::stwo_air::try_prove_dense_stark;
 use std::io::Write;

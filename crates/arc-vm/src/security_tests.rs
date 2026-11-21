@@ -1,16 +1,5 @@
-//! Security Testing Utilities
-//!
-//! Provides a security scanner with pluggable checks, adversarial testing
-//! primitives, severity-graded findings, and report generation for smart
-//! contracts deployed on ARC Chain.
-
 use std::fmt;
 
-// ---------------------------------------------------------------------------
-// Security checks
-// ---------------------------------------------------------------------------
-
-/// Known vulnerability patterns the scanner can detect.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SecurityCheck {
     Reentrancy,
@@ -42,11 +31,6 @@ impl fmt::Display for SecurityCheck {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Severity
-// ---------------------------------------------------------------------------
-
-/// Severity rating for a security finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Severity {
     Informational,
@@ -68,11 +52,6 @@ impl fmt::Display for Severity {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Findings & report
-// ---------------------------------------------------------------------------
-
-/// A single security finding produced by the scanner.
 #[derive(Debug, Clone)]
 pub struct SecurityFinding {
     pub check: SecurityCheck,
@@ -82,7 +61,6 @@ pub struct SecurityFinding {
     pub recommendation: String,
 }
 
-/// Aggregated security report.
 #[derive(Debug, Clone)]
 pub struct SecurityReport {
     pub findings: Vec<SecurityFinding>,
@@ -95,7 +73,6 @@ pub struct SecurityReport {
 }
 
 impl SecurityReport {
-    /// Build a report from a list of findings and total check count.
     pub fn from_findings(findings: Vec<SecurityFinding>, total_checks: usize) -> Self {
         let critical = findings
             .iter()
@@ -114,7 +91,6 @@ impl SecurityReport {
             .filter(|f| f.severity == Severity::Low)
             .count();
 
-        // Score: 100 minus weighted deductions.
         let deduction = (critical as f64 * 25.0)
             + (high as f64 * 15.0)
             + (medium as f64 * 8.0)
@@ -152,11 +128,6 @@ impl fmt::Display for SecurityReport {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Adversarial testing
-// ---------------------------------------------------------------------------
-
-/// Classification of adversarial attack vectors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttackType {
     DoubleSpend,
@@ -169,7 +140,6 @@ pub enum AttackType {
     Reentrancy,
 }
 
-/// Expected outcome of an adversarial test.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttackOutcome {
     Prevented,
@@ -178,7 +148,6 @@ pub enum AttackOutcome {
     Vulnerable,
 }
 
-/// Specification for an adversarial test scenario.
 #[derive(Debug, Clone)]
 pub struct AdversarialTest {
     pub name: String,
@@ -188,18 +157,12 @@ pub struct AdversarialTest {
     pub expected_outcome: AttackOutcome,
 }
 
-// ---------------------------------------------------------------------------
-// Security Scanner
-// ---------------------------------------------------------------------------
-
-/// Pattern-matching security scanner for smart contract bytecode.
 pub struct SecurityScanner {
     pub checks: Vec<SecurityCheck>,
     pub results: Vec<SecurityFinding>,
 }
 
 impl SecurityScanner {
-    /// Create a new scanner with no checks enabled.
     pub fn new() -> Self {
         Self {
             checks: Vec::new(),
@@ -207,14 +170,12 @@ impl SecurityScanner {
         }
     }
 
-    /// Add a single check to the scanner.
     pub fn add_check(&mut self, check: SecurityCheck) {
         if !self.checks.contains(&check) {
             self.checks.push(check);
         }
     }
 
-    /// Add all standard security checks.
     pub fn add_all_checks(&mut self) {
         let all = vec![
             SecurityCheck::Reentrancy,
@@ -233,14 +194,6 @@ impl SecurityScanner {
         }
     }
 
-    /// Scan contract bytecode for known vulnerability patterns.
-    ///
-    /// This is a mock/heuristic scanner that demonstrates the framework.
-    /// It looks for byte patterns that loosely correspond to known issues:
-    /// - `0xF1` (CALL opcode) repeated - potential reentrancy
-    /// - `0x01`/`0x02` (ADD/MUL) without `0x11` (GT) guard - overflow
-    /// - `0x42` (TIMESTAMP) - timestamp dependence
-    /// - `0xFF` (SELFDESTRUCT) - unprotected self-destruct
     pub fn scan_contract(&mut self, bytecode: &[u8]) -> SecurityReport {
         self.results.clear();
         let total_checks = self.checks.len();
@@ -254,20 +207,10 @@ impl SecurityScanner {
         SecurityReport::from_findings(self.results.clone(), total_checks)
     }
 
-    /// Run a single adversarial test. Mock implementation that determines
-    /// outcome based on attack type and payload size heuristics.
     pub fn run_adversarial(&self, test: &AdversarialTest) -> AttackOutcome {
-        // Heuristic: attacks with small payloads are usually prevented;
-        // large payloads may indicate the system is vulnerable.
         match test.attack_type {
-            AttackType::DoubleSpend | AttackType::Replay => {
-                // These are typically prevented by nonce tracking.
-                AttackOutcome::Prevented
-            }
-            AttackType::Sybil | AttackType::Eclipse => {
-                // Detected by reputation/peer systems but not fully prevented.
-                AttackOutcome::Detected
-            }
+            AttackType::DoubleSpend | AttackType::Replay => AttackOutcome::Prevented,
+            AttackType::Sybil | AttackType::Eclipse => AttackOutcome::Detected,
             AttackType::Griefing => AttackOutcome::Mitigated,
             AttackType::Sandwich | AttackType::FlashLoan => {
                 if test.attack_payload.len() > 256 {
@@ -286,19 +229,13 @@ impl SecurityScanner {
         }
     }
 
-    /// Generate a report from the currently accumulated results.
     pub fn generate_report(&self) -> SecurityReport {
         SecurityReport::from_findings(self.results.clone(), self.checks.len())
     }
 
-    // -----------------------------------------------------------------------
-    // Internal pattern matchers
-    // -----------------------------------------------------------------------
-
     fn run_check(&self, check: &SecurityCheck, bytecode: &[u8]) -> Option<SecurityFinding> {
         match check {
             SecurityCheck::Reentrancy => {
-                // Look for multiple CALL opcodes (0xF1) - naive reentrancy pattern.
                 let call_count = bytecode.iter().filter(|&&b| b == 0xF1).count();
                 if call_count >= 2 {
                     Some(SecurityFinding {
@@ -321,7 +258,7 @@ impl SecurityScanner {
             SecurityCheck::IntegerOverflow => {
                 let has_add = bytecode.contains(&0x01);
                 let has_mul = bytecode.contains(&0x02);
-                let has_guard = bytecode.contains(&0x11); // GT
+                let has_guard = bytecode.contains(&0x11);
                 if (has_add || has_mul) && !has_guard {
                     Some(SecurityFinding {
                         check: SecurityCheck::IntegerOverflow,
@@ -365,7 +302,6 @@ impl SecurityScanner {
                 }
             }
             SecurityCheck::UnauthorizedAccess => {
-                // Look for lack of CALLER (0x33) checks.
                 if !bytecode.contains(&0x33) && bytecode.len() > 10 {
                     Some(SecurityFinding {
                         check: SecurityCheck::UnauthorizedAccess,
@@ -381,7 +317,6 @@ impl SecurityScanner {
                 }
             }
             SecurityCheck::DenialOfService => {
-                // Detect unbounded loops: JUMPDEST (0x5B) followed by JUMP (0x56) many times.
                 let jumps = bytecode.iter().filter(|&&b| b == 0x56).count();
                 let jumpdests = bytecode.iter().filter(|&&b| b == 0x5B).count();
                 if jumps > 5 && jumpdests > 5 {
@@ -399,7 +334,6 @@ impl SecurityScanner {
                 }
             }
             SecurityCheck::FrontRunning => {
-                // Heuristic: if both GASPRICE (0x3A) and ORIGIN (0x32) are present.
                 if bytecode.contains(&0x3A) && bytecode.contains(&0x32) {
                     Some(SecurityFinding {
                         check: SecurityCheck::FrontRunning,
@@ -416,7 +350,6 @@ impl SecurityScanner {
                 }
             }
             SecurityCheck::OracleManipulation => {
-                // Heuristic: external calls (0xF1) combined with SSTORE (0x55).
                 if bytecode.contains(&0xF1) && bytecode.contains(&0x55) {
                     Some(SecurityFinding {
                         check: SecurityCheck::OracleManipulation,
@@ -433,7 +366,6 @@ impl SecurityScanner {
                 }
             }
             SecurityCheck::FlashLoan => {
-                // Heuristic: large value transfers (CALLVALUE 0x34) + external call.
                 if bytecode.contains(&0x34) && bytecode.contains(&0xF1) {
                     Some(SecurityFinding {
                         check: SecurityCheck::FlashLoan,
@@ -450,7 +382,6 @@ impl SecurityScanner {
                 }
             }
             SecurityCheck::PrivilegeEscalation => {
-                // Heuristic: DELEGATECALL (0xF4) present.
                 if bytecode.contains(&0xF4) {
                     Some(SecurityFinding {
                         check: SecurityCheck::PrivilegeEscalation,
@@ -475,10 +406,6 @@ impl Default for SecurityScanner {
         Self::new()
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -510,7 +437,6 @@ mod tests {
     fn test_scan_clean_bytecode() {
         let mut scanner = SecurityScanner::new();
         scanner.add_all_checks();
-        // Completely benign bytecode - no suspicious opcodes.
         let bytecode = vec![0x60, 0x00, 0x60, 0x00, 0x33, 0x11, 0x00];
         let report = scanner.scan_contract(&bytecode);
         assert_eq!(report.critical, 0);
@@ -522,7 +448,6 @@ mod tests {
     fn test_scan_detects_reentrancy() {
         let mut scanner = SecurityScanner::new();
         scanner.add_check(SecurityCheck::Reentrancy);
-        // Two CALL opcodes.
         let bytecode = vec![0x60, 0xF1, 0x60, 0xF1, 0x00];
         let report = scanner.scan_contract(&bytecode);
         assert_eq!(report.critical, 1);
@@ -533,7 +458,6 @@ mod tests {
     fn test_scan_detects_integer_overflow() {
         let mut scanner = SecurityScanner::new();
         scanner.add_check(SecurityCheck::IntegerOverflow);
-        // ADD opcode without GT guard.
         let bytecode = vec![0x60, 0x01, 0x60, 0x02, 0x00];
         let report = scanner.scan_contract(&bytecode);
         assert_eq!(report.high, 1);
@@ -543,7 +467,6 @@ mod tests {
     fn test_scan_no_overflow_with_guard() {
         let mut scanner = SecurityScanner::new();
         scanner.add_check(SecurityCheck::IntegerOverflow);
-        // ADD + GT guard present.
         let bytecode = vec![0x60, 0x01, 0x11, 0x00];
         let report = scanner.scan_contract(&bytecode);
         assert_eq!(report.high, 0);
@@ -588,7 +511,7 @@ mod tests {
             name: "sandwich_large".to_string(),
             attack_type: AttackType::Sandwich,
             setup: vec![],
-            attack_payload: vec![0xAA; 512], // > 256 bytes
+            attack_payload: vec![0xAA; 512],
             expected_outcome: AttackOutcome::Vulnerable,
         };
         let outcome = scanner.run_adversarial(&test);
@@ -602,7 +525,7 @@ mod tests {
             name: "sandwich_small".to_string(),
             attack_type: AttackType::Sandwich,
             setup: vec![],
-            attack_payload: vec![0xAA; 64], // <= 256 bytes
+            attack_payload: vec![0xAA; 64],
             expected_outcome: AttackOutcome::Mitigated,
         };
         let outcome = scanner.run_adversarial(&test);
@@ -628,7 +551,6 @@ mod tests {
             },
         ];
         let report = SecurityReport::from_findings(findings, 10);
-        // 100 - 25 (critical) - 15 (high) = 60
         assert!((report.score - 60.0).abs() < f64::EPSILON);
         assert_eq!(report.critical, 1);
         assert_eq!(report.high, 1);

@@ -1,8 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { prefersReducedMotion } from "./Engraving";
 
-// Smoothly animate a numeric value to a new target. Uses rAF and easeOutQuart. With the OS "reduce motion" setting
-// the new value is shown at once.
 export function NumberTicker({
   value,
   digits = 2,

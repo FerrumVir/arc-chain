@@ -1,7 +1,3 @@
-//! Unpacked vs packed Dense AIR: same statement, different trace shape.
-//!
-//! Usage: cargo run --release --example air_shootout --features stwo-prover
-
 use arc_crypto::inference_proof::dense_forward_i64;
 use arc_crypto::stwo_air::{
     DENSE_STARK_COLS, PACK_K, PACKED_STARK_COLS, compute_log_size, packed_log_size,
@@ -76,7 +72,6 @@ fn main() {
         let _ = std::io::stdout().flush();
     }
 
-    // ── soundness: the packed AIR must reject the same forgeries ─────────
     println!("\n=== packed AIR soundness ===");
     let (out_size, in_size) = (64usize, 256usize);
     let weights = make_data("sw", out_size * in_size);

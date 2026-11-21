@@ -1,8 +1,3 @@
-# Retired v2 cloud deployment shortcuts.
-#
-# Only `make help` is an active, local target. Every former cloud, SSH,
-# monitoring, service, or teardown target fails before invoking a command.
-
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 

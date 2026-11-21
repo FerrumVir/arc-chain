@@ -339,8 +339,22 @@ PY
         'deterministic crypto signer is not feature-gated' || return 1
     assert_file_contains "$CRYPTO_LIB" 'pub use signature::\{benchmark_address, benchmark_keypair\}' \
         'gated benchmark signers are not isolated from default crypto exports' || return 1
-    assert_file_contains "$STATE_LIB" 'Deterministic transaction reconstruction is deliberately unavailable' \
-        'default state build lacks an inert deterministic-reconstruction boundary' || return 1
+    python3 - "$STATE_LIB" <<'PY' || {
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+inert = (
+    '    #[cfg(not(feature = "benchmark-tools"))]\n'
+    "    pub fn reconstruct_benchmark_tx(&self, _height: u64, _tx_index: u32) -> Option<Transaction> {\n"
+    "        None\n"
+    "    }\n"
+)
+raise SystemExit(0 if inert in source else 1)
+PY
+        printf 'default state build lacks an inert deterministic-reconstruction boundary\n'
+        return 1
+    }
     assert_file_contains "$NODE_BENCHMARK" 'cfg\(feature = "benchmark-tools"\)' \
         'node benchmark signing pool is not feature-gated' || return 1
 

@@ -1,22 +1,3 @@
-"""Conservation of value on a native-inference network, from balances (P7).
-
-    python3 -m arc_ops.conservation --run RUN_DIR [--reservation 100]
-
-Receipt arithmetic can be internally consistent and still be wrong about
-money. This audits the STATE: for every account the soak funded at genesis
-(its validators and the load driver's requesters) it reads the balance on
-every replica and checks
-
-    sum(balances) + reservation * pending_requests == sum(genesis balances)
-
-i.e. value only ever moved between those accounts and the escrows of
-requests still pending - none created, none destroyed - and every replica
-holds the same balances. Native transactions carry no fee, and this chain
-mints no block reward, so there is no other term. Read-only.
-
-Exit: 0 conserved and identical, 1 violated, 2 could not read enough.
-"""
-
 import argparse
 import json
 import os
@@ -35,9 +16,6 @@ def accounts_from_run(run: Dict[str, Any]) -> List[str]:
 
 
 def genesis_from_run(run: Dict[str, Any], each: int) -> Dict[str, int]:
-    """Every funded account's genesis balance: `each` for the harness's own
-    accounts, the stated amount for an account added with `--fund` (for
-    example a desktop wallet), which pays validators like any requester."""
     genesis = {a: each for a in accounts_from_run(run)}
     for entry in (run.get("workload") or {}).get("extra_funded") or []:
         genesis[entry["address"]] = int(entry["base_units"])
@@ -46,15 +24,10 @@ def genesis_from_run(run: Dict[str, Any], each: int) -> Dict[str, int]:
 
 def audit(nodes: List[str], accounts: List[str], genesis_each: int, reservation: int,
           fetch=http_fetch, genesis: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
-    # `reservation * pending` assumes every pending request reserved the same
-    # amount (the load driver's). Audit a mixed workload, such as a desktop
-    # journey beside the driver, once the other requests have settled.
     expected = (sum(genesis[a] for a in accounts) if genesis is not None
                 else genesis_each * len(accounts))
     per_node: Dict[str, Any] = {}
     for node in nodes:
-        # Read pending BEFORE and AFTER the balances: if a request settled in
-        # between, the snapshot straddles two states - retry once.
         for _ in range(3):
             before = (fetch(node, "/consensus/diagnostics") or {}).get("state_native_pending")
             height_before = (fetch(node, "/health") or {}).get("height")

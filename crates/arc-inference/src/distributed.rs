@@ -1,55 +1,21 @@
-//! Distributed Inference - Model Sharding and Pipeline-Parallel Execution
-//!
-//! Splits a model across N nodes at transformer layer boundaries.
-//! Each node holds a contiguous range of layers and forwards activations
-//! to the next node in the pipeline. The final node produces logits
-//! and sends the token back to the coordinator.
-//!
-//! Architecture:
-//! ```text
-//! Node A (layers 0-10)  →  Node B (layers 11-20)  →  ...  →  Node N (layers L-1, LM head)
-//!     embed + layers         receive hidden, run          run final layers + argmax
-//!     → send hidden          layers → send hidden         → send token_id back
-//! ```
-//!
-//! For MoE models, experts are distributed across nodes. The router on each
-//! node sends tokens to the expert-holding node and gathers results.
-//!
-//! Determinism guarantee: All activations are i64 fixed-point Q16. Serialized
-//! as little-endian bytes with BLAKE3 integrity hashes. Bit-for-bit identical
-//! across x86, ARM, and GPU.
-
 use arc_crypto::Hash256;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-// ─── Shard Registry ─────────────────────────────────────────────────────────
-
-/// Describes which layers/experts a single node holds for a given model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardAssignment {
-    /// Node's validator address.
     pub node_address: Hash256,
-    /// Layer range: [start_layer, end_layer). The node computes these layers.
     pub start_layer: u32,
     pub end_layer: u32,
-    /// For MoE: which expert indices this node holds (empty for dense models).
     pub expert_indices: Vec<u32>,
-    /// Node's socket address for direct activation forwarding.
     pub socket_addr: String,
-    /// GPU capability tier (0 = CPU only).
     pub gpu_tier: u8,
-    /// Available VRAM/RAM in bytes.
     pub available_memory: u64,
 }
 
-/// Registry tracking all shard assignments for all models across the network.
-/// Thread-safe for concurrent access from consensus loop and RPC handlers.
 pub struct ShardRegistry {
-    /// model_id → ordered list of shard assignments (sorted by start_layer).
     models: DashMap<Hash256, Vec<ShardAssignment>>,
-    /// node_address → list of (model_id, shard) pairs this node holds.
     node_shards: DashMap<Hash256, Vec<(Hash256, ShardAssignment)>>,
 }
 
@@ -67,23 +33,17 @@ impl ShardRegistry {
         }
     }
 
-    /// Register a shard assignment. Idempotent - updates if already exists.
     pub fn register_shard(&self, model_id: Hash256, shard: ShardAssignment) {
-        // Add to model registry
         let mut model_shards = self.models.entry(model_id).or_default();
-        // Remove existing assignment for this node if any
         model_shards.retain(|s| s.node_address != shard.node_address);
         model_shards.push(shard.clone());
-        // Keep sorted by start_layer for pipeline ordering
         model_shards.sort_by_key(|s| s.start_layer);
 
-        // Add to node registry
         let mut node_entries = self.node_shards.entry(shard.node_address).or_default();
         node_entries.retain(|(mid, _)| *mid != model_id);
         node_entries.push((model_id, shard));
     }
 
-    /// Remove all shard assignments for a node (e.g., node went offline).
     pub fn remove_node(&self, node_address: &Hash256) {
         if let Some((_, node_entries)) = self.node_shards.remove(node_address) {
             for (model_id, _) in &node_entries {
@@ -94,12 +54,10 @@ impl ShardRegistry {
         }
     }
 
-    /// Get the pipeline (ordered shard assignments) for a model.
     pub fn get_pipeline(&self, model_id: &Hash256) -> Option<Vec<ShardAssignment>> {
         self.models.get(model_id).map(|v| v.clone())
     }
 
-    /// Get the next shard holder in the pipeline after a given layer.
     pub fn next_shard_holder(
         &self,
         model_id: &Hash256,
@@ -113,17 +71,15 @@ impl ShardRegistry {
         })
     }
 
-    /// Check if all layers of a model are covered by registered shards.
     pub fn is_model_fully_covered(&self, model_id: &Hash256, total_layers: u32) -> bool {
         if let Some(shards) = self.models.get(model_id) {
             if shards.is_empty() {
                 return false;
             }
-            // Check contiguous coverage from 0 to total_layers
             let mut covered_to = 0u32;
             for shard in shards.iter() {
                 if shard.start_layer > covered_to {
-                    return false; // gap
+                    return false;
                 }
                 covered_to = covered_to.max(shard.end_layer);
             }
@@ -133,7 +89,6 @@ impl ShardRegistry {
         }
     }
 
-    /// Get all shards for a specific node.
     pub fn get_node_shards(&self, node_address: &Hash256) -> Vec<(Hash256, ShardAssignment)> {
         self.node_shards
             .get(node_address)
@@ -141,13 +96,11 @@ impl ShardRegistry {
             .unwrap_or_default()
     }
 
-    /// How many models have full pipeline coverage.
     pub fn fully_covered_models(&self) -> Vec<Hash256> {
         self.models
             .iter()
             .filter_map(|entry| {
                 let model_id = *entry.key();
-                // We don't know total_layers here, so check for contiguous coverage from 0
                 let shards = entry.value();
                 if shards.is_empty() {
                     return None;
@@ -162,16 +115,11 @@ impl ShardRegistry {
             .collect()
     }
 
-    /// Total number of registered shard-holding nodes across all models.
     pub fn total_shard_nodes(&self) -> usize {
         self.node_shards.len()
     }
 }
 
-// ─── Model Partitioner ──────────────────────────────────────────────────────
-
-/// Compute the optimal shard assignment for a model across N available nodes.
-/// Balances layer count per node based on available memory and GPU capability.
 pub fn compute_shard_plan(
     _model_id: Hash256,
     total_layers: u32,
@@ -182,8 +130,6 @@ pub fn compute_shard_plan(
         return Vec::new();
     }
 
-    // Simple strategy: distribute layers proportionally to available memory.
-    // Nodes with more memory get more layers. GPU nodes get slight priority.
     let total_weight: f64 = nodes
         .iter()
         .map(|n| {
@@ -201,7 +147,6 @@ pub fn compute_shard_plan(
         let fraction = weight / total_weight;
 
         let layer_count = if i == nodes.len() - 1 {
-            // Last node gets remaining layers (avoid rounding gaps)
             total_layers - current_layer
         } else {
             ((total_layers as f64 * fraction).round() as u32).max(1)
@@ -213,7 +158,7 @@ pub fn compute_shard_plan(
             node_address: node.address,
             start_layer: current_layer,
             end_layer,
-            expert_indices: Vec::new(), // Dense model - no expert assignment
+            expert_indices: Vec::new(),
             socket_addr: node.socket_addr.clone(),
             gpu_tier: node.gpu_tier,
             available_memory: node.available_memory,
@@ -228,9 +173,6 @@ pub fn compute_shard_plan(
     assignments
 }
 
-/// Compute expert-parallel shard plan for MoE models.
-/// Each node is assigned a subset of experts. The router token dispatch
-/// happens at inference time based on the gating network output.
 pub fn compute_expert_shard_plan(
     _model_id: Hash256,
     total_layers: u32,
@@ -242,8 +184,6 @@ pub fn compute_expert_shard_plan(
         return Vec::new();
     }
 
-    // Assign experts round-robin across nodes.
-    // Each node gets all layers but only a subset of experts.
     let experts_per_node = (num_experts as f64 / nodes.len() as f64).ceil() as u32;
 
     let mut assignments = Vec::new();
@@ -275,7 +215,6 @@ pub fn compute_expert_shard_plan(
     assignments
 }
 
-/// Node capability info used for shard planning.
 #[derive(Debug, Clone)]
 pub struct NodeCapability {
     pub address: Hash256,
@@ -284,22 +223,16 @@ pub struct NodeCapability {
     pub available_memory: u64,
 }
 
-// ─── Activation Serialization ───────────────────────────────────────────────
-
-/// Serialize i64 activations to bytes (little-endian) with BLAKE3 integrity hash.
-/// This is the wire format for passing hidden states between shard holders.
 pub fn serialize_activations(activations: &[i64]) -> (Vec<u8>, Hash256) {
     let bytes: Vec<u8> = activations.iter().flat_map(|v| v.to_le_bytes()).collect();
     let hash = arc_crypto::hash_bytes(&bytes);
     (bytes, hash)
 }
 
-/// Deserialize i64 activations from bytes and verify integrity hash.
 pub fn deserialize_activations(
     bytes: &[u8],
     expected_hash: &Hash256,
 ) -> Result<Vec<i64>, InferenceShardError> {
-    // Verify integrity
     let actual_hash = arc_crypto::hash_bytes(bytes);
     if actual_hash != *expected_hash {
         return Err(InferenceShardError::ActivationIntegrityFailed {
@@ -308,7 +241,6 @@ pub fn deserialize_activations(
         });
     }
 
-    // Deserialize
     if !bytes.len().is_multiple_of(8) {
         return Err(InferenceShardError::InvalidActivationSize { size: bytes.len() });
     }
@@ -321,37 +253,21 @@ pub fn deserialize_activations(
     Ok(activations)
 }
 
-// ─── Pipeline Coordinator ───────────────────────────────────────────────────
-
-/// Tracks the state of a distributed inference request as it flows through
-/// the pipeline of shard-holding nodes.
 #[derive(Debug, Clone)]
 pub struct PipelineState {
-    /// Unique request ID.
     pub request_id: Hash256,
-    /// Model being inferred.
     pub model_id: Hash256,
-    /// Current position in the pipeline (which shard is computing).
     pub current_shard_idx: usize,
-    /// Total shards in the pipeline.
     pub total_shards: usize,
-    /// Generated tokens so far.
     pub generated_tokens: Vec<u32>,
-    /// Max tokens to generate.
     pub max_tokens: u32,
-    /// Input prompt tokens.
     pub prompt_tokens: Vec<u32>,
-    /// Timestamp when request started (for timeout).
     pub started_at: std::time::Instant,
 }
 
-/// Coordinates distributed inference across shard-holding nodes.
 pub struct PipelineCoordinator {
-    /// Active inference requests being processed.
     active_requests: DashMap<Hash256, PipelineState>,
-    /// Shard registry for looking up pipeline assignments.
     pub registry: Arc<ShardRegistry>,
-    /// Pending results (token_id) keyed by request_id.
     results: DashMap<Hash256, Vec<u32>>,
 }
 
@@ -364,8 +280,6 @@ impl PipelineCoordinator {
         }
     }
 
-    /// Start a new distributed inference request.
-    /// Returns the first shard assignment (where to send the initial embedding).
     pub fn start_inference(
         &self,
         request_id: Hash256,
@@ -397,8 +311,6 @@ impl PipelineCoordinator {
         Ok(pipeline[0].clone())
     }
 
-    /// Record that a shard has completed and produced a token.
-    /// Returns the next action: either forward to next shard or inference complete.
     pub fn on_shard_result(&self, request_id: &Hash256, token_id: u32) -> PipelineAction {
         let mut state = match self.active_requests.get_mut(request_id) {
             Some(s) => s,
@@ -407,9 +319,7 @@ impl PipelineCoordinator {
 
         state.generated_tokens.push(token_id);
 
-        // Check if we've generated enough tokens or hit EOS
         if state.generated_tokens.len() as u32 >= state.max_tokens || token_id == 2 {
-            // EOS token = 2 (standard)
             let tokens = state.generated_tokens.clone();
             let req_id = *request_id;
             drop(state);
@@ -418,7 +328,6 @@ impl PipelineCoordinator {
             return PipelineAction::Complete { tokens };
         }
 
-        // Need another token - restart pipeline from shard 0
         state.current_shard_idx = 0;
         let model_id = state.model_id;
         drop(state);
@@ -431,12 +340,10 @@ impl PipelineCoordinator {
         }
     }
 
-    /// Get completed results for a request.
     pub fn get_result(&self, request_id: &Hash256) -> Option<Vec<u32>> {
         self.results.get(request_id).map(|v| v.clone())
     }
 
-    /// Remove stale requests older than timeout_secs.
     pub fn evict_stale(&self, timeout_secs: u64) {
         let cutoff = std::time::Duration::from_secs(timeout_secs);
         let stale: Vec<Hash256> = self
@@ -450,38 +357,24 @@ impl PipelineCoordinator {
         }
     }
 
-    /// Number of active inference requests.
     pub fn active_count(&self) -> usize {
         self.active_requests.len()
     }
 }
 
-/// What the coordinator tells the caller to do next.
 #[derive(Debug)]
 pub enum PipelineAction {
-    /// Inference is complete. Here are the generated tokens.
     Complete { tokens: Vec<u32> },
-    /// Need another token. Send embedding to first shard.
     NextToken { first_shard: ShardAssignment },
-    /// The pipeline is broken (shards went offline).
     PipelineBroken,
-    /// Request not found (already completed or timed out).
     RequestNotFound,
 }
-
-// ─── Shard Forward Pass (Layer-Level Execution) ─────────────────────────────
 
 use super::cached_integer_model::{
     CachedIntegerModel, KVCache, QuantizedInput, apply_rope, layernorm, matmul_fast_preq, silu_i64,
 };
 use super::integer_lut::{FRAC_BITS, ONE, argmax_i64, integer_exp};
 
-/// Execute a subset of transformer layers on locally-held shard weights.
-/// Takes an input hidden state (from the previous shard or embedding layer)
-/// and produces an output hidden state (for the next shard or LM head).
-///
-/// This is the core of pipeline-parallel inference. Each call processes
-/// layers [start_layer, end_layer) and writes KV cache entries for those layers.
 pub fn forward_shard_layers(
     model: &CachedIntegerModel,
     hidden_input: &[i64],
@@ -495,7 +388,6 @@ pub fn forward_shard_layers(
 
     let mut hidden = hidden_input.to_vec();
 
-    // Pre-allocate buffers (reused across layers)
     let mut q = vec![0i64; d];
     let mut k_buf = vec![0i64; cfg.d_kv];
     let mut v_buf = vec![0i64; cfg.d_kv];
@@ -511,7 +403,6 @@ pub fn forward_shard_layers(
         let layer = &model.layers[layer_idx];
         let q4_layer = model.q4_layers.as_ref().map(|ql| &ql[layer_idx]);
 
-        // Dispatch macro matching the main forward pass
         macro_rules! dispatch_matmul {
             ($q4w:expr, $i8w:expr, $inq:expr, $raw:expr, $in_sz:expr, $out:expr) => {{
                 if let Some(q4w) = $q4w {
@@ -522,11 +413,9 @@ pub fn forward_shard_layers(
             }};
         }
 
-        // LayerNorm
         let normed = layernorm(&hidden, &layer.attn_norm);
         let normed_q = QuantizedInput::from_i64(&normed);
 
-        // Q/K/V projections
         dispatch_matmul!(
             q4_layer.map(|l| &l.wq),
             &layer.wq,
@@ -552,7 +441,6 @@ pub fn forward_shard_layers(
             &mut v_buf
         );
 
-        // RoPE
         for h in 0..cfg.n_heads {
             apply_rope(
                 &mut q[h * cfg.d_head..(h + 1) * cfg.d_head],
@@ -572,12 +460,9 @@ pub fn forward_shard_layers(
             );
         }
 
-        // KV cache
         cache.push_k(layer_idx, &k_buf);
         cache.push_v(layer_idx, &v_buf);
 
-        // Flash attention with online softmax (scalar path for distributed.rs).
-        // O(d_head) memory per head instead of O(full_seq) for scores array.
         let full_seq = token_position + 1;
         let head_results: Vec<Vec<i64>> = (0..cfg.n_heads)
             .map(|h| {
@@ -632,7 +517,6 @@ pub fn forward_shard_layers(
             attn_out[h * cfg.d_head..(h + 1) * cfg.d_head].copy_from_slice(head_out);
         }
 
-        // Wo projection + residual
         let attn_out_q = QuantizedInput::from_i64(&attn_out);
         dispatch_matmul!(
             q4_layer.map(|l| &l.wo),
@@ -646,7 +530,6 @@ pub fn forward_shard_layers(
             hidden[i] += projected[i];
         }
 
-        // FFN
         let normed_ff = layernorm(&hidden, &layer.ffn_norm);
         let normed_ff_q = QuantizedInput::from_i64(&normed_ff);
 
@@ -667,12 +550,10 @@ pub fn forward_shard_layers(
             &mut up
         );
 
-        // SiLU gate * up
         for j in 0..cfg.d_ff {
             gate[j] = (silu_i64(gate[j]) * up[j]) >> FRAC_BITS;
         }
 
-        // W_down + residual
         let gate_q = QuantizedInput::from_i64(&gate);
         dispatch_matmul!(
             q4_layer.map(|l| &l.w_down),
@@ -690,8 +571,6 @@ pub fn forward_shard_layers(
     hidden
 }
 
-/// Execute the final layers: final LayerNorm + LM head → logits → argmax.
-/// Called by the last shard in the pipeline.
 pub fn forward_final(model: &CachedIntegerModel, hidden: &[i64]) -> (u32, Hash256) {
     let cfg = &model.config;
     let normed = layernorm(hidden, &model.final_norm);
@@ -716,16 +595,8 @@ pub fn forward_final(model: &CachedIntegerModel, hidden: &[i64]) -> (u32, Hash25
     (token_id, logits_hash)
 }
 
-// ─── Distributed Inference Cache ────────────────────────────────────────────
-
-/// Network-wide deterministic inference cache.
-/// Key: BLAKE3(model_id || input_tokens). Value: output tokens + hash.
-/// Because inference is deterministic (integer-only), identical inputs ALWAYS
-/// produce identical outputs. Cache hits skip the entire pipeline.
 pub struct DistributedCache {
-    /// Local cache: key → (output_tokens, output_hash, hit_count).
     entries: DashMap<Hash256, CacheEntry>,
-    /// Maximum entries before eviction.
     max_entries: usize,
 }
 
@@ -746,7 +617,6 @@ impl DistributedCache {
         }
     }
 
-    /// Compute cache key from model ID and input tokens.
     pub fn cache_key(model_id: &Hash256, input_tokens: &[u32]) -> Hash256 {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&model_id.0);
@@ -756,7 +626,6 @@ impl DistributedCache {
         Hash256(*hasher.finalize().as_bytes())
     }
 
-    /// Look up a cached result. Returns output tokens if found.
     pub fn get(&self, key: &Hash256) -> Option<Vec<u32>> {
         self.entries.get_mut(key).map(|mut e| {
             e.hit_count += 1;
@@ -764,7 +633,6 @@ impl DistributedCache {
         })
     }
 
-    /// Insert a new cache entry.
     pub fn insert(&self, key: Hash256, entry: CacheEntry) {
         if self.entries.len() >= self.max_entries {
             self.evict_lru();
@@ -772,7 +640,6 @@ impl DistributedCache {
         self.entries.insert(key, entry);
     }
 
-    /// Evict the least-recently-used entry (lowest hit count).
     fn evict_lru(&self) {
         if let Some(min_entry) = self.entries.iter().min_by_key(|e| e.value().hit_count) {
             let key = *min_entry.key();
@@ -781,36 +648,26 @@ impl DistributedCache {
         }
     }
 
-    /// Number of cached entries.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Max entries before LRU eviction kicks in.
     pub fn capacity(&self) -> usize {
         self.max_entries
     }
 
-    /// Check if empty.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// Check if a key is present WITHOUT bumping hit_count.
-    /// Used by /inference/cache_check so a "is this warm?" probe doesn't
-    /// distort LRU ordering.
     pub fn contains(&self, key: &Hash256) -> bool {
         self.entries.contains_key(key)
     }
 
-    /// Total cumulative hit_count across every entry in the cache.
-    /// Reflects how many times the cache has saved a full pipeline walk.
     pub fn total_hits(&self) -> u64 {
         self.entries.iter().map(|e| e.value().hit_count).sum()
     }
 }
-
-// ─── Errors ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
 pub enum InferenceShardError {
@@ -829,8 +686,6 @@ pub enum InferenceShardError {
     #[error("shard node offline: {node}")]
     NodeOffline { node: Hash256 },
 }
-
-// ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -933,14 +788,12 @@ mod tests {
         let plan = compute_shard_plan(model_id, 80, 670.0, &nodes);
         assert_eq!(plan.len(), 3);
 
-        // Verify contiguous coverage
         assert_eq!(plan[0].start_layer, 0);
         assert_eq!(plan.last().unwrap().end_layer, 80);
         for i in 1..plan.len() {
             assert_eq!(plan[i].start_layer, plan[i - 1].end_layer);
         }
 
-        // GPU node with more memory should get more layers
         assert!(plan[0].end_layer - plan[0].start_layer >= plan[1].end_layer - plan[1].start_layer);
     }
 
@@ -980,7 +833,7 @@ mod tests {
     fn test_activation_integrity_check() {
         let activations: Vec<i64> = vec![1, 2, 3, 4];
         let (mut bytes, hash) = serialize_activations(&activations);
-        bytes[0] ^= 0xFF; // corrupt one byte
+        bytes[0] ^= 0xFF;
         let result = deserialize_activations(&bytes, &hash);
         assert!(result.is_err());
     }
@@ -1036,13 +889,11 @@ mod tests {
         assert_eq!(first_shard.start_layer, 0);
         assert_eq!(coord.active_count(), 1);
 
-        // Simulate receiving tokens
         match coord.on_shard_result(&req_id, 100) {
-            PipelineAction::NextToken { .. } => {} // need more tokens
+            PipelineAction::NextToken { .. } => {}
             other => panic!("Expected NextToken, got {:?}", other),
         }
 
-        // Send EOS token
         match coord.on_shard_result(&req_id, 2) {
             PipelineAction::Complete { tokens } => {
                 assert_eq!(tokens, vec![100, 2]);

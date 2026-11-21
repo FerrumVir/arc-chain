@@ -28,7 +28,6 @@ class Arithmetic(unittest.TestCase):
         self.assertTrue(all(a <= b for a, b in zip(ref.EXP_LUT, ref.EXP_LUT[1:])))
 
     def test_isqrt_is_the_five_step_newton_iterate(self):
-        # Not round(2**16 / sqrt(128)) = 5793: the contract is the algorithm.
         self.assertEqual(ref.integer_isqrt(128 * ref.ONE), 5795)
         self.assertEqual(ref.integer_isqrt(0), 100 * ref.ONE)
 

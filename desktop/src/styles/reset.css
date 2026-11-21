@@ -38,11 +38,6 @@ textarea,
   cursor: text;
 }
 
-/* The window chrome (titlebar, sidebar, buttons) stays unselectable like a
-   native app, but anything a person may need to quote or report can be
-   selected and copied: the page itself, error banners, status lines,
-   dialogs, logs and code. Through v0.8.14 the body rule above made every
-   error message impossible to copy. */
 main,
 [role="alert"],
 [role="alertdialog"],
@@ -56,7 +51,6 @@ code,
   user-select: text;
 }
 
-/* A click on a control never starts a text selection. */
 button,
 [role="button"],
 .btn {
@@ -106,7 +100,6 @@ h6 {
   line-height: var(--leading-tight);
 }
 
-/* Custom scrollbar - thin, subtle, matches theme */
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
@@ -123,20 +116,17 @@ h6 {
   background: var(--border-bright);
 }
 
-/* Selection */
 ::selection {
   background: rgba(99, 102, 241, 0.3);
   color: var(--text);
 }
 
-/* Focus ring - accessible, brand-consistent */
 :focus-visible {
   outline: 2px solid var(--border-focus);
   outline-offset: 2px;
   border-radius: var(--radius-xs);
 }
 
-/* Respect reduced-motion */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

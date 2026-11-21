@@ -1,17 +1,8 @@
 "use strict";
-/**
- * ARC Chain SDK - RPC client.
- *
- * Typed HTTP client for all ARC Chain RPC endpoints.
- * Uses the native `fetch` API (Node 18+, Deno, Bun, browsers).
- */
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ArcClient = exports.ArcTransactionError = exports.ArcConnectionError = exports.ArcError = void 0;
 const u64_1 = require("./u64");
 const MAX_TX_SUBMIT_BATCH_SIZE = 64;
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
 class ArcError extends Error {
     constructor(message, statusCode, detail) {
         super(message);
@@ -38,16 +29,6 @@ class ArcTransactionError extends ArcError {
     }
 }
 exports.ArcTransactionError = ArcTransactionError;
-/**
- * HTTP client for the ARC Chain RPC API.
- *
- * Usage:
- * ```ts
- * const client = new ArcClient("http://localhost:9090");
- * const info = await client.getChainInfo();
- * console.log(info.block_height);
- * ```
- */
 class ArcClient {
     constructor(rpcUrl, options = {}) {
         this.rpcUrl = rpcUrl.replace(/\/+$/, "");
@@ -57,7 +38,6 @@ class ArcClient {
             ...options.headers,
         };
     }
-    // -- Internal helpers --
     async _get(path, params) {
         let url = `${this.rpcUrl}${path}`;
         if (params) {
@@ -117,83 +97,42 @@ class ArcClient {
         }
         return (0, u64_1.parseJsonWithBigInts)(await resp.text());
     }
-    // -- Block endpoints --
-    /**
-     * GET /block/{height} -- Fetch a block by height.
-     */
     async getBlock(height) {
         return this._get(`/block/${height}`);
     }
-    /**
-     * GET /blocks -- Paginated block listing.
-     */
     async getBlocks(fromHeight = 0, toHeight, limit = 20) {
         const params = { from: fromHeight, limit };
         if (toHeight !== undefined)
             params.to = toHeight;
         return this._get(`/blocks`, params);
     }
-    /**
-     * GET /block/{height}/txs -- Paginated transaction listing for a block.
-     */
     async getBlockTxs(height, offset = 0, limit = 100) {
         return this._get(`/block/${height}/txs`, { offset, limit });
     }
-    /**
-     * GET /block/{height}/proofs -- All Merkle proofs for transactions in a block.
-     */
     async getBlockProofs(height) {
         return this._get(`/block/${height}/proofs`);
     }
-    // -- Account endpoints --
-    /**
-     * GET /account/{address} -- Fetch an account by address.
-     */
     async getAccount(address) {
         return this._get(`/account/${address}`);
     }
-    /**
-     * GET /account/{address}/txs -- Transaction hashes involving an account.
-     */
     async getAccountTxs(address) {
         return this._get(`/account/${address}/txs`);
     }
-    // -- Transaction endpoints --
-    /**
-     * POST /tx/submit -- Submit a transaction to the mempool.
-     *
-     * Accepts either a raw RPC-format object or a signed Transaction from
-     * TransactionBuilder.sign().
-     *
-     * @returns Transaction hash string.
-     */
     async submitTransaction(tx) {
         const payload = this._normalizeSignedTransfer(tx);
         await this._assertTransactionDomain(tx.transaction_domain);
         const data = await this._post("/tx/submit", payload);
         return data.tx_hash;
     }
-    /**
-     * GET /tx/{hash} -- Look up a transaction receipt by hash.
-     */
     async getTransaction(txHash) {
         return this._get(`/tx/${txHash}`);
     }
-    /**
-     * GET /tx/{hash}/full -- Full transaction body with type-specific fields.
-     */
     async getFullTransaction(txHash) {
         return this._get(`/tx/${txHash}/full`);
     }
-    /**
-     * GET /tx/{hash}/proof -- Merkle inclusion proof for a transaction.
-     */
     async getTxProof(txHash) {
         return this._get(`/tx/${txHash}/proof`);
     }
-    /**
-     * POST /tx/submit_batch -- Submit multiple transactions.
-     */
     async submitBatch(txs) {
         if (txs.length > MAX_TX_SUBMIT_BATCH_SIZE) {
             throw new RangeError(`transaction batch exceeds the maximum of ${MAX_TX_SUBMIT_BATCH_SIZE} items`);
@@ -209,7 +148,6 @@ class ArcClient {
             transactions: normalized,
         });
     }
-    /** Return the current v3 signing domain, or null for a pre-v3 node. */
     async getTransactionDomain() {
         let value;
         try {
@@ -284,41 +222,21 @@ class ArcClient {
                 `node requires ${advertised ?? "legacy-v1"}`);
         }
     }
-    // -- Chain info & stats --
-    /**
-     * GET /info -- Chain information.
-     */
     async getChainInfo() {
         return this._get("/info");
     }
-    /**
-     * GET /stats -- Chain statistics.
-     */
     async getStats() {
         return this._get("/stats");
     }
-    /**
-     * GET /health -- Node health status.
-     */
     async getHealth() {
         return this._get("/health");
     }
-    /**
-     * GET /node/info -- Validator node information.
-     */
     async getNodeInfo() {
         return this._get("/node/info");
     }
-    // -- Contract endpoints --
-    /**
-     * GET /contract/{address} -- Contract bytecode info.
-     */
     async getContractInfo(address) {
         return this._get(`/contract/${address}`);
     }
-    /**
-     * POST /contract/{address}/call -- Read-only contract call.
-     */
     async callContract(address, func, calldata, fromAddr, gasLimit = 1000000) {
         (0, u64_1.assertU64)(gasLimit, "gas_limit");
         const body = {
@@ -331,26 +249,12 @@ class ArcClient {
             body.from = fromAddr;
         return this._post(`/contract/${address}/call`, body);
     }
-    // -- Light client & sync --
-    /**
-     * GET /light/snapshot -- Lightweight snapshot for light client bootstrapping.
-     */
     async getLightSnapshot() {
         return this._get("/light/snapshot");
     }
-    /**
-     * GET /sync/snapshot/info -- Metadata about available state sync snapshot.
-     */
     async getSyncSnapshotInfo() {
         return this._get("/sync/snapshot/info");
     }
-    // -- ETH JSON-RPC --
-    /**
-     * POST /eth -- Send an ETH-compatible JSON-RPC request.
-     *
-     * Supports methods like eth_chainId, eth_blockNumber,
-     * eth_getBalance, eth_call, eth_estimateGas, etc.
-     */
     async ethCall(method, params = []) {
         return this._post("/eth", {
             jsonrpc: "2.0",

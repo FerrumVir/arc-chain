@@ -12,9 +12,6 @@ dev = [
 ]
 
 [build-system]
-# PEP 517 installs these in an isolated environment before executing the
-# backend, so every executable build-time dependency is pinned by exact
-# reviewed version rather than resolved from a mutable range.
 requires = [
     "hatchling==1.27.0",
     "packaging==24.2",

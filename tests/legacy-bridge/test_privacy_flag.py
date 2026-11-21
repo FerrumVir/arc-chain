@@ -1,4 +1,3 @@
-"""Exercise the actual harness assignment under errexit; never run the harness/node."""
 import json
 from pathlib import Path
 import subprocess

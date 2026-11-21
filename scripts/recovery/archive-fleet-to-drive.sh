@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Two-phase six-validator freeze, checkpoint binding, and content-verified archive.
-# Dry-run is the default for both mutating phases.
 set -Eeuo pipefail
 umask 077
 
@@ -84,11 +82,6 @@ ARC_OPERATOR_GH_TOKEN=""
 ARC_OPERATOR_GH_HOME=""
 
 cleanup_temporary_root() {
-    # Only ever installed as the invocation EXIT trap. Every rm was previously
-    # unchecked, so a partial sweep -- the pinned SSH identity or the rclone
-    # config surviving on a read-only mount, a busy file, a chmod'd parent --
-    # was indistinguishable from a clean one. Report each surviving root by
-    # exact path so an operator can remove it before retrying.
     local cleanup_status=0 root
     ARC_OPERATOR_GH_TOKEN=""
     for root in "$ARCHIVE_FLEET_TEMP_ROOT" "$ARCHIVE_FLEET_PINNED_ROOT" \
@@ -104,10 +97,6 @@ cleanup_temporary_root() {
 }
 
 begin_temporary_scope() {
-    # Each dispatched command runs as the leader of its supervised process
-    # group. Never inherit ownership of a caller's temporary roots or
-    # initialized wrappers: every invocation allocates and cleans only its own
-    # private runtime state.
     ARCHIVE_FLEET_TEMP_ROOT=""
     ARCHIVE_FLEET_PINNED_ROOT=""
     ARCHIVE_FLEET_PINNED_TRANSPORT_ROOT=""
@@ -613,8 +602,6 @@ ssh_remote_exact() {
             remote_command="$quoted_argument"
         fi
     done
-    # OpenSSH does not transmit an argv array.  Exactly one shell-quoted
-    # command string after the destination is the only safe representation.
     ssh "${SSH_OPTIONS[@]}" "$SSH_USER@$host" "$remote_command"
 }
 
@@ -1331,9 +1318,6 @@ PY
 }
 
 audit_writers() {
-    # This command pins the SSH identity into a private temporary transport
-    # root.  Install cleanup before argument validation or transport setup so
-    # both successful plans and every fail-closed exit remove that copy.
     begin_temporary_scope
     local legacy_validators="" output=""
     while [ "$#" -gt 0 ]; do
@@ -1684,8 +1668,6 @@ supervisor_context_sha256 = hashlib.sha256(
     (json.dumps(supervisor_context, sort_keys=True, separators=(",", ":")) + "\n").encode()
 ).hexdigest()
 
-# Flush the helper's enablement-link removals again from this independent audit
-# process before sealing the precommit boot projection.
 os.sync()
 allow_marker = pathlib.Path("/etc/arc-recovery/legacy-start-allowed")
 allow_payload = b"schema=arc.recovery.legacy-start-allow.v1\n"
@@ -1753,9 +1735,6 @@ for prepare_unit in prepare_units:
     unit_states[prepare_unit] = {
         "active_state": prepare_prop("ActiveState"),
         "sub_state": prepare_prop("SubState"),
-        # MainPID is not a property of timer units, so systemd returns an
-        # empty value for arc-node-update.timer.  Normalize that service-only
-        # property to the same quiescent zero represented by inactive services.
         "main_pid": int(prepare_prop("MainPID") or "0"),
         "job": prepare_prop("Job") or "0",
         "enablement": enabled_result.stdout.strip(),
@@ -1763,11 +1742,6 @@ for prepare_unit in prepare_units:
     activation_closure[prepare_unit] = {
         name: prepare_prop(name) for name in closure_properties
     }
-    # MainPID is not defined for timer units.  systemd may render that
-    # service-only property as either an empty string or "0", depending on
-    # whether the timer came from a full vendor unit or the inert recovery
-    # anchor.  Seal one canonical quiescent representation so the state row
-    # and activation-closure row cannot disagree semantically.
     if (prepare_unit.endswith(".timer")
             and not activation_closure[prepare_unit]["MainPID"]):
         activation_closure[prepare_unit]["MainPID"] = "0"
@@ -2208,8 +2182,6 @@ PY
 }
 
 seal_freeze_plan() {
-    # Python receives a private HOME even for this local-only command.  Keep
-    # that runtime root invocation-scoped on success and failure.
     begin_temporary_scope
     local window="" output="" legacy_validators="" writer_contracts=""
     local drive_remote_root="$DRIVE_REMOTE" drive_client_sha="" drive_account_sha=""
@@ -2674,8 +2646,6 @@ PY' \
 }
 
 prepare_writers() {
-    # Plan mode still authenticates the transport contract.  Its private SSH
-    # identity copy must disappear before the plan command returns.
     begin_temporary_scope
     local legacy_validators="" output="" execute=false
     while [ "$#" -gt 0 ]; do
@@ -2747,9 +2717,6 @@ run_remote() {
             remote_command="$quoted_argument"
         fi
     done
-    # OpenSSH concatenates every argument after the destination without
-    # preserving argv boundaries.  Pass one fully quoted command string so the
-    # remote login shell reconstructs the exact /bin/bash -c vector.
     ssh "${SSH_OPTIONS[@]}" "$SSH_USER@$host" "$remote_command"
 }
 
@@ -3336,8 +3303,6 @@ PY
 }
 
 verify_offline_stop_phase() {
-    # The challenged verifier allocates a private Python HOME before its
-    # evidence scratch directory.  Own both from the first instruction.
     begin_temporary_scope
     local freeze_plan="" evidence="" evidence_sha="" known_hosts="" known_sha=""
     local identity="" challenge="" python_path="" python_sha="" ssh_sha=""
@@ -4063,9 +4028,6 @@ def validate_generation(path):
         raise SystemExit("live-observation generation Drive binding differs")
     return value, raw
 
-# Complete an interrupted durable partial -> no-replace hard-link publish.
-# A crash after link but before unlink leaves one inode with nlink=2; that is
-# an explicit recoverable intermediate, never a malformed final receipt.
 for partial in sorted(root.glob(".*.json.partial")):
     try:
         partial_value, partial_raw = validate_generation(partial)
@@ -4136,9 +4098,6 @@ if selected.exists() or selected.is_symlink():
     raise SystemExit(0)
 
 now = datetime.datetime.now(datetime.timezone.utc)
-# No unselected generation crosses a capture invocation boundary.  A crash
-# before selection is powerless and the next invocation gets a new nonce even
-# when the capacity receipt bytes happen to be identical.
 generation = secrets.token_hex(32)
 created_at = now.strftime(utc_format)
 value = {
@@ -4170,12 +4129,6 @@ PY
 
 reconcile_local_create_only_resume_links() {
     local selection="$1" maintenance_root="$2"
-    # The capture-wide lock is held by the caller.  Every local create-only
-    # publisher links `name.partial` to `name` before unlinking the partial.
-    # Heal the complete protected maintenance-input tree before any resume
-    # reader or dynamic re-probe opens it.  Otherwise a sealed final-absent
-    # partial in a sibling evidence directory could conflict with newly
-    # sampled timestamp/counter bytes and wedge an already-quarantined capture.
     python3 - "$selection" "$maintenance_root" <<'PY'
 import os,pathlib,stat,sys
 selection=pathlib.Path(sys.argv[1]);maintenance_root=pathlib.Path(sys.argv[2])
@@ -4245,8 +4198,6 @@ for partial in candidates:
     same=(partial_details.st_dev,partial_details.st_ino)==(
         terminal_details.st_dev,terminal_details.st_ino)
     if not same:
-        # A separate nlink=1 partial is producer-owned recovery state and does
-        # not make the already-terminal artifact unsafe for a resume reader.
         if terminal_details.st_nlink!=1:
             raise SystemExit("create-only terminal has an unexplained link")
         continue
@@ -4420,12 +4371,8 @@ if round_root.exists() or round_root.is_symlink():
         _readiness,readiness_raw=locked(path,"quarantine readiness")
         dispatch_path=path.with_name("mutation-dispatch.json")
         if not (dispatch_path.exists() or dispatch_path.is_symlink()):
-            # Local readiness is built before dispatch publication and before
-            # any remote readiness send; alone it is a powerless crash prefix.
             continue
         _dispatch,dispatch_raw=locked(dispatch_path,"mutation dispatch")
-        # A fully validated release is historical evidence for its own exact
-        # selection.  Skip it before comparing against a later replacement.
         if zero_progress_released(path.parent,authorization_raw,readiness_raw,dispatch_raw):
             continue
         if ((authorization.get("capture_id"),authorization.get("freeze_plan_sha256"),
@@ -4469,9 +4416,6 @@ if round_root.exists() or round_root.is_symlink():
             bound=True
 if bound:
     print("bound",generation);raise SystemExit(0)
-# Every unbound selection is invocation-local.  Even a wall-fresh selection is
-# rotated on a new invocation; a released round-1 dispatch has exact all-six
-# live/unfenced proofs. Later-round releases leave their positive prefix bound.
 print("rotate",generation)
 PY
 }
@@ -4988,8 +4932,6 @@ for node, row in zip(nodes, rows):
         raise SystemExit(f"live-observation selection status differs for {node}")
     started = datetime.datetime.strptime(row["created_at"], utc_format).replace(tzinfo=datetime.timezone.utc)
     completed = datetime.datetime.strptime(row["completed_at"], utc_format).replace(tzinfo=datetime.timezone.utc)
-    # Node UTC is audit-only; exact status roots and the generation nonce bind
-    # causality.  Only a node's own start/completion pair must not regress.
     if started > completed:
         raise SystemExit(f"live-observation selection node timeline regressed for {node}")
     normalized.append({key: row[key] for key in (
@@ -5230,9 +5172,6 @@ capture_all_live_observations() {
         fi
     done
     if [ "$complete_count" -ne 6 ]; then
-        # A partial retry may capture only while every sealed writer is still
-        # live and unfenced. This fleet-wide read-only barrier prevents filling
-        # a missing receipt after any other writer has crossed its stop fence.
         for node in nyc lax ams lhr nrt sgp; do
             (
                 run_live_observations_eligibility_exact \
@@ -5345,17 +5284,6 @@ remote_readiness_node() {
         return 0
     fi
     if ! run_stopped_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" "$node" >/dev/null; then
-    # Post-quarantine resume compatibility. This capture's own round-1
-    # persistent restart fence stops the sealed systemd supervisor by design
-    # (fence dependency plus condition-only drop-in), so a crash after round 1
-    # leaves a writer that is byte-exact with the seal but whose supervisor is
-    # inactive. Accept that state only when every writer, disk, and capacity
-    # assertion of the exact-live probe passes, the supervisor is inactive with
-    # no pending job behind the round fence drop-in and fence-unit dependency,
-    # the owned nft table is installed, and the active round's
-    # persistent-restart-fence receipt binds this exact capture, freeze plan,
-    # and sealed writer identity. Detached root-session writers keep the
-    # exact-live path above.
     if [ "$writer_supervision_mode" = systemd-unit ] \
         && ssh_remote_exact "$host" /bin/sh -c \
             'set -eu; capture=$1 pid=$2 start=$3 boot=$4 writer_cgroup_sha=$5 unit=$6 executable=$7 exe_sha=$8 argv_sha=$9 data=${10} model=${11} model_sha=${12} model_size=${13} capture_id=${14} freeze_sha=${15}; test "$(cat /proc/sys/kernel/random/boot_id)" = "$boot"; test -d "/proc/$pid"; test "$(awk '\''{print $22}'\'' "/proc/$pid/stat")" = "$start"; test "$(cat "/proc/$pid/comm")" = arc-node; test "$(pgrep -x arc-node)" = "$pid"; test "$(sha256sum "/proc/$pid/cgroup" | cut -d" " -f1)" = "$writer_cgroup_sha"; grep -Fq "$unit" "/proc/$pid/cgroup"; test "$(readlink "/proc/$pid/exe")" = "$executable"; test "$(sha256sum "/proc/$pid/exe" | cut -d" " -f1)" = "$exe_sha"; test "$(sha256sum "/proc/$pid/cmdline" | cut -d" " -f1)" = "$argv_sha"; test -d "$data" && test ! -L "$data" && test -s "$data/state.wal"; test -f "$model" && test ! -L "$model"; test "$(stat -c %s "$model")" = "$model_size"; test "$(sha256sum "$model" | cut -d" " -f1)" = "$model_sha"; command -v curl >/dev/null; command -v python3 >/dev/null; command -v sha256sum >/dev/null; command -v zstd >/dev/null; command -v tar >/dev/null; command -v systemctl >/dev/null; command -v nft >/dev/null; test ! -e /root/arc-recovery-captures || { test -d /root/arc-recovery-captures && test ! -L /root/arc-recovery-captures; }; { test ! -e "$capture" || { test -d "$capture" && test ! -L "$capture"; }; }; case "$(systemctl show "$unit" --property=ActiveState --value)" in inactive|failed) ;; *) exit 1;; esac; test "$(systemctl show "$unit" --property=MainPID --value)" = 0; case "$(systemctl show "$unit" --property=Job --value)" in ""|0) ;; *) exit 1;; esac; case " $(systemctl show "$unit" --property=DropInPaths --value) " in *" /etc/systemd/system/$unit.d/zzzy-arc-recovery-network-fence.conf "*) ;; *) exit 1;; esac; case " $(systemctl show "$unit" --property=Requires --value) " in *" arc-legacy-maintenance-fence.service "*) ;; *) exit 1;; esac; case " $(systemctl show "$unit" --property=After --value) " in *" arc-legacy-maintenance-fence.service "*) ;; *) exit 1;; esac; test "$(systemctl show arc-legacy-maintenance-fence.service --property=ActiveState --value)" = active; nft list table inet arc_legacy_maintenance_v1 >/dev/null; active=/run/arc-recovery/active-network-fence; test "$(stat -c %u:%g:%a:%h "$active")" = 0:0:400:1; round="$(cat "$active")"; case "$round" in /etc/arc-recovery/network-fence-rounds/"$capture_id"/[0-9a-f]*) ;; *) exit 1;; esac; test -d "$round" && test ! -L "$round"; python3 - "$round" "$capture_id" "$freeze_sha" "$pid" "$start" "$boot" "$unit" <<'"'"'PY2'"'"'
@@ -5418,12 +5346,6 @@ remote_readiness() {
         die "remote readiness log root is missing or unsafe"
     readiness_log_root="$log_root/remote-readiness"
     mkdir -m 700 -- "$readiness_log_root"
-    # Each host re-hashes its multi-gigabyte model and current data capacity.
-    # Run the six independent, read-only probes concurrently so that cold disk
-    # caches cannot consume the 300-second first-quarantine selection lease.
-    # The dispatcher phase owns a background process group, so close stdin for
-    # every worker: an ssh client must never inherit the controlling terminal
-    # and stop the guarded phase with SIGTTIN.
     for node in nyc lax ams lhr nrt sgp; do
         (
             remote_readiness_node "$capture_id" "$freeze_sha" "$freeze_plan" "$node"
@@ -6073,8 +5995,6 @@ if (set(observation_selection)!=selection_fields
         or observation_selection.get("labels")!=["diagnostic","noncanonical","nonreward"]):
     raise SystemExit("maintenance evidence bundle live-observation selection differs")
 datetime.datetime.strptime(observation_selection["selected_at"],"%Y-%m-%dT%H:%M:%S.%fZ")
-# Selection UTC and node transition UTC are audit-only across hosts.  The
-# authorization/readiness/dispatch/ledger hash chain is the causal boundary.
 ledger,ledger_bytes=locked(ledger_path,"quarantine generation ledger")
 import importlib.util
 spec=importlib.util.spec_from_file_location("arc_quarantine_rounds",rounds_module_raw)
@@ -8195,12 +8115,6 @@ PY
 
 quarantine_attempt_binds_live_observation_selection() {
     local attempt_root="$1" freeze_sha="$2" capture_id="$3"
-    # Authorization, acceptances, and a locally sealed readiness are all
-    # powerless crash prefixes: dispatch is published before readiness is sent
-    # to any node.  Only dispatch/result/transition evidence can bind a stale
-    # attempt to its observation selection.  A complete exact-target
-    # zero-progress release proves an otherwise-binding dispatch was inert;
-    # any positive immutable prefix continues to bind the selection itself.
     if quarantine_attempt_has_valid_zero_progress_release "$attempt_root" \
             "$freeze_sha" "$capture_id"; then
         return 1
@@ -8250,13 +8164,6 @@ print(",".join(names))
 PY
 )"
     IFS=',' read -r -a names <<< "$targets"
-    # A durable positive result is the terminal closure for this attempt.  Its
-    # embedded BOOTTIME-expired proofs make an old nft apply impossible, but a
-    # remaining live writer may legitimately stop later.  Never run another
-    # old-attempt applied/stopped status probe after the result is sealed: that
-    # could append a stopped transition and make the immutable result disagree
-    # with its own crash-resume closure.  Validate the exact existing bytes,
-    # finish the prefix copy, and let a later round own every remaining node.
     if [ -f "$result" ] && [ ! -L "$result" ]; then
         python3 -B -I "$QUARANTINE_ROUND_DRIVER" build-result \
             --round-number "$round_number" --round-root "$round_root" \
@@ -8269,9 +8176,6 @@ value=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 raise SystemExit(0 if isinstance(value.get("transitions"),list) and value["transitions"] else 1)
 PY
         then
-            # Historical/diagnostic zero-progress results remain attempt-local.
-            # They are never transition-ledger members and cannot authorize an
-            # immutable positive prefix, even before their challenged release.
             return 2
         fi
         final_round_root="$round_root/round-$round_number"
@@ -8411,8 +8315,6 @@ PY
                 ) > "$log_root/$node-round-$round_number-apply.log" 2>&1 &
                 pids+=("$!")
             done
-            # Individual failures are an expected partial-round state.  Do not
-            # roll back a successful fence and do not authorize a late retry.
             for index in "${!pids[@]}"; do wait "${pids[$index]}" || true; done
         fi
     fi
@@ -8420,10 +8322,6 @@ PY
     applied_count=0
     for node in "${names[@]}"; do [ ! -f "$applied_root/$node.json" ] || applied_count=$((applied_count + 1)); done
     if [ "$applied_count" -lt "${#names[@]}" ]; then
-        # Do not sleep against the operator wall-clock deadline: a backward
-        # step could turn a bounded node BOOTTIME lease into an unbounded local
-        # wait.  Query immediately; an incomplete attempt is re-challenged for
-        # zero progress on the next capture invocation.
         for node in "${names[@]}"; do
             [ ! -f "$applied_root/$node.json" ] || continue
             temporary="$log_root/$node-round-$round_number-final-applied-status.new.json"
@@ -8509,9 +8407,6 @@ run_quarantine_generation_rounds() {
         die "quarantine round validator is missing or unsafe"
     tracked_source_hash "$QUARANTINE_ROUND_DRIVER" >/dev/null
     tracked_source_hash "$QUARANTINE_ROUND_MODULE" >/dev/null
-    # Re-read the immutable operator receipts immediately before the first
-    # command that can quarantine a writer.  Supplied hashes alone are not an
-    # observation provenance boundary.
     verify_live_observation_selection_exact "$observation_selection" \
         "$observation_selection_sha" "$observation_generation_receipt" \
         "$observation_generation" "$observation_generation_receipt_sha" \
@@ -8846,9 +8741,6 @@ PY
 }
 
 capture_phase() {
-    # Plan mode initializes both SSH and Drive transports.  Register cleanup
-    # before parsing or validating anything so OAuth/identity copies never
-    # survive a successful plan or a fail-closed exit.
     begin_temporary_scope
     local freeze_plan="" offline_stop_output="" legacy_height_receipt=""
     local legacy_height_receipt_sha="" legacy_height_sample_output=""
@@ -8983,9 +8875,6 @@ capture_phase() {
 
     [ "$(freeze_plan_hash "$freeze_plan")" = "$freeze_sha" ] || \
         die "freeze plan or source bindings changed before execution"
-    # Pin the sampler and its local imports into this invocation's private
-    # root. Both sampling and verification execute these immutable bytes with
-    # bytecode generation disabled.
     LEGACY_HEIGHT_TOOL="$(pin_legacy_public_height_toolchain \
         "$ARCHIVE_FLEET_PINNED_ROOT/legacy-height-toolchain")"
     if [ -f "$legacy_height_receipt" ] && [ ! -L "$legacy_height_receipt" ]; then
@@ -9044,10 +8933,6 @@ capture_phase() {
     local maintenance_input_root
     maintenance_input_root="$(prepare_protected_maintenance_directory \
         "${offline_stop_output}.maintenance-inputs")"
-    # Serialize the complete capture-wide selection -> authorization boundary
-    # independently of caller-selected output paths.  The fixed, uid-scoped
-    # /tmp root is owner-only beneath the root-owned sticky directory; the
-    # capture-id child is the lock inode on both Darwin and Linux.
     local capture_state_lock_dir
     capture_state_lock_dir="$(python3 - "$capture_id" <<'PY'
 import os,pathlib,re,stat,sys
@@ -9069,8 +8954,6 @@ for path in (base,base/capture):
 print(base/capture)
 PY
 )"
-    # FD 8 is unused by the orchestrator (FD 9 is reserved inside the remote
-    # helper wrapper) and is compatible with the operator's macOS Bash 3.2.
     exec 8<"$capture_state_lock_dir"
     python3 - 8 <<'PY'
 import errno,fcntl,sys
@@ -9108,8 +8991,6 @@ PY
             observation_resume_state=unbound
             ;;
         rotate)
-            # Selection replacement is allowed only before any mutation intent
-            # and only while every exact sealed writer remains live/unfenced.
             for observation_node in nyc lax ams lhr nrt sgp; do
                 run_live_observations_eligibility_exact "$freeze_plan" "$freeze_sha" \
                     "$capture_id" "$prior_observation_generation" "$observation_node" \
@@ -9180,10 +9061,6 @@ PY
     local quarantine_generation_ledger_sha
     local observation_selection_sha operator_selection_monotonic_ns
     local operator_selection_realtime_ns
-    # Slow, independent model/data/disk verification must complete before the
-    # first-quarantine selection and its dual operator clocks are created.
-    # Otherwise cold caches can consume the bounded 300-second lease before
-    # every node has durably accepted the shared readiness artifact.
     remote_readiness "$capture_id" "$freeze_sha" "$freeze_plan" "$log_root"
     observation_selection_sha="$(seal_live_observation_selection "$observation_selection" \
         "$observation_generation_receipt" "$live_observation_statuses" \
@@ -9420,9 +9297,6 @@ PY
     verify_quarantine_maintenance_inputs "$quarantine_root" "$freeze_sha" \
         "$capture_id" "$legacy_height_receipt" "$quarantine_challenge" \
         "$quarantine_stability_proof" "$quarantine_generation_ledger"
-    # A historical stability proof is never substituted for the live boundary.
-    # Re-run the full remote AST/tool/unit/status proof on every host immediately
-    # before the stop transaction; fence drift leaves the writer untouched.
     for quarantine_node in "${active_quarantine_nodes[@]}"; do
         run_quarantine_status_exact "$freeze_plan" "$freeze_sha" "$capture_id" \
             "$quarantine_node" > "$log_root/$quarantine_node-pre-stop-status.json"
@@ -9479,8 +9353,6 @@ PY
             "$node_round" "$node_authorization_sha" "$node_readiness_sha" \
             "$node_transition_sha" > "$log_root/$node-stopped-status.json"
     done
-    # Only seal the all-stopped boundary after all six exact final remote
-    # stopped-status proofs have completed successfully.
     all_controlled_stopped_at="$(reserve_stop_boundary_timestamp \
         "$offline_stop_output" all-controlled-stopped "$freeze_sha" "$capture_id")"
     [ "$(manifest_field "$freeze_plan" quorum_proof.controlled_quorum_unavailable_after_all_stops)" = true ] || \
@@ -9556,10 +9428,6 @@ PY
     done
     [ "$failed" -eq 0 ] || die \
         "at least one final stopped snapshot/WAL pair lacks an exact recovery-export head"
-    # Retain the full, freshly revalidated monitor receipt for every active
-    # network-quarantine transition.  Its
-    # semantic-interpreter identity is required later to run the fail-closed
-    # public late-fork interlock without trusting an ambient host Python.
     pids=(); names=(); failed=0
     for node in "${active_quarantine_nodes[@]}"; do
         if [ -e "$quarantine_root/$node-monitor.json" ] \
@@ -9902,8 +9770,6 @@ PY
 }
 
 verify_installed_keys_phase() {
-    # The identity verifier pins Python and SSH state before its proof scratch
-    # root; keep every copy inside one invocation-scoped cleanup boundary.
     begin_temporary_scope
     local freeze_plan="" manifest="" cli="" cli_sha="" validators="" validators_sha=""
     local install_receipt="" install_sha="" restore_receipt="" restore_sha=""
@@ -10166,9 +10032,6 @@ stream_bundle_to_drive() {
         *) die "remote stream inventory classification is invalid for $node" ;;
     esac
 
-    # Staging is a sibling of the exact capture destination. Interrupted,
-    # unpredictable objects are never accepted as archive members and are not
-    # guessed at or deleted by a retry (which could race another authorized run).
     local partial_root="${destination%/*}/.arc-recovery-partials/$capture_id/$manifest_sha"
 
     local source_hash_size remote_hash_size
@@ -12103,10 +11966,6 @@ PY
 )
 
 verify_complete_phase() {
-    # ``verify-complete`` is also the production rollout's pre-GO archive
-    # preflight.  Keep every pinned transport/config copy and metadata scratch
-    # inside this function's subprocess, and remove it on both success and any
-    # fail-closed exit.
     begin_temporary_scope
     local destination="" expected_complete_sha="" expected_manifest_sha="" expected_sums_sha="" expected_prearchive_sha=""
     local verify_live_captures=false
@@ -12294,9 +12153,6 @@ for path in paths:
             or before.st_size<=0 or identity(before)!=identity(visible)
             or identity(before)!=identity(after)):
         raise SystemExit(f"archive work reservation input is unsafe: {path}")
-# Shared inputs are streamed from their sealed source descriptors. Work-root
-# demand is therefore bounded metadata, inventories, receipts, and pipeline
-# buffers rather than the sum of snapshot/WAL/release artifact sizes.
 required = 1024 * 1024**2 + len(paths) * 1024**2
 filesystem = os.statvfs(root)
 available = filesystem.f_bavail * filesystem.f_frsize
@@ -12313,9 +12169,6 @@ PY
 }
 
 seal_phase() {
-    # Seal plans authenticate SSH and Drive before any GO check.  Install the
-    # invocation cleanup boundary first so all private transport copies are
-    # removed on plan, success, and every ordinary error path.
     begin_temporary_scope
     local freeze_plan="" manifest="" validators="" finalization_intent="" work_root=""
     local validator_install_receipt="" vault_restore_receipt=""
@@ -12554,9 +12407,6 @@ PY
     local expected_go="GO $manifest_sha FREEZE $freeze_sha CAPTURE $capture_id DEST $destination_sha LEGACY_WAL $policy"
     [ "${ARC_RECOVERY_GO:-}" = "$expected_go" ] || \
         die "execution requires ARC_RECOVERY_GO='$expected_go'"
-    # Prove the independently authenticated GitHub anchor channel before the
-    # first execute-mode remote mutation, so a missing token/scope/account
-    # cannot strand an otherwise completed Drive upload.
     configure_github_anchor_transport
 
     [ "$(freeze_plan_hash "$freeze_plan")" = "$freeze_sha" ] || \
@@ -12800,9 +12650,6 @@ PY
         "$shared_root" legacy-live-observations.json
 
     local drive_seal_log="$log_root/drive-seal-preflight.log"
-    # Re-prove write/read/hash/delete at the final upload boundary.  A stale
-    # read-only account/capacity check cannot prove that the pinned OAuth
-    # principal still has the mutation permissions required to finish seal.
     run_drive_prefreeze_gate execute "$freeze_plan" "$freeze_sha" "$capture_id" \
         archive-seal > "$drive_seal_log"
     local drive_seal_receipt drive_seal_attempt_receipt
@@ -12831,9 +12678,6 @@ if (value.get("freeze_plan_sha256"), value.get("capture_id"), value.get("rollout
     raise SystemExit("existing COMPLETE belongs to a different freeze/capture/prearchive rollout")
 PY
         local gist_anchor_receipt="${finalization_intent}.gist-anchor.json"
-        # The independent provider is the recovery source when the operator
-        # disk copy was lost.  It is re-fetched and exact-matched even when a
-        # local cache still exists.
         fetch_verify_or_recover_complete_gist_anchor \
             "$log_root/existing-COMPLETE.json" "$finalization_intent" "$gist_anchor_receipt"
         local expected_complete_sha expected_intent_sha expected_manifest_sha expected_sums_sha
@@ -12869,8 +12713,6 @@ PY
         stream_shared_input_to_drive "$shared_descriptor" "$destination" "$log_root"
     done
 
-    # Stream at most three exact fenced sources concurrently. No full capture,
-    # working-data, or compressed-bundle copy is created on a validator.
     local upload_order=(nyc lax ams lhr nrt sgp)
     local upload_index
     failed=0
@@ -12952,8 +12794,6 @@ PY
         --drive-stop-on-upload-limit \
         --retries 5 --low-level-retries 20
     rclone check "$metadata_root" "$destination" --checksum --one-way --checkers 4
-    # This is deliberately the final remote mutation. A failed or partial run
-    # remains resumable, but no consumer may accept it as complete.
     upload_immutable "$complete_root/COMPLETE.json" "$destination/COMPLETE.json"
     verify_remote_complete "$destination" "$complete_root/COMPLETE.json" \
         "$metadata_root/ARCHIVE-MANIFEST.json" \
@@ -12967,18 +12807,9 @@ PY
 }
 
 archive_write_current_process_id() {
-    # Bash 3.2 keeps $$ fixed in subshells.  A short-lived /bin/sh reports the
-    # actual PID of the Bash process that spawned it through its PPID. Write it
-    # directly: command substitution would insert another Bash process.
     /bin/sh -c 'printf "%s\n" "$PPID"' > "$1"
 }
 
-# Supervisor and phase-bootstrap captures deliberately use backticks.
-# Bash 5.2 can run a pending INT trap while parsing a $() capture, interpret the
-# handler under the unfinished substitution parser, and exit 2 before recording
-# or forwarding the signal. Legacy capture parsing avoids that parser state.
-# Keep these simple, nonnested captures and their quoting intact. The contract
-# suite schedules this window explicitly and separately exercises full cleanup.
 # shellcheck disable=SC2006
 archive_process_field() {
     local field="$1" pid="$2" value
@@ -12996,7 +12827,6 @@ archive_process_field() {
 archive_process_exists() {
     local state
     builtin kill -0 -- "$1" 2>/dev/null || return 1
-    # A transient ps failure is not proof that a killable process exited.
     state="`/bin/ps -o stat= -p "$1" 2>/dev/null`" || return 0
     state="${state//[[:space:]]/}"
     case "$state" in Z*) return 1 ;; *) return 0 ;; esac
@@ -13036,10 +12866,6 @@ archive_stop_and_kill_group_members_except() {
     local process_pid process_pgid process_state excluded skip snapshot attempt
     local all_stopped=false
     local -a targets=()
-    # SIGSTOP is uncatchable. While the sentinel anchors the PGID, freezing the
-    # complete group prevents a target from exiting/reusing its PID between the
-    # identity snapshot and exact KILL. Always CONT the excluded owners before
-    # returning so a pending phase trap can run.
     builtin kill -s STOP -- "-$wanted" 2>/dev/null || return 1
     for ((attempt = 0; attempt < 250; attempt += 1)); do
         all_stopped=true
@@ -13058,8 +12884,6 @@ archive_stop_and_kill_group_members_except() {
         builtin kill -s CONT -- "-$wanted" 2>/dev/null || true
         return 1
     fi
-    # Re-snapshot only while every member is stopped. No member can spawn or
-    # voluntarily exit during target selection.
     snapshot="$(LC_ALL=C /bin/ps -ax -o pid= -o pgid= -o stat= 2>/dev/null)" || {
         builtin kill -s CONT -- "-$wanted" 2>/dev/null || true
         return 1
@@ -13080,10 +12904,6 @@ archive_stop_and_kill_group_members_except() {
         done
         [ "$skip" = true ] || targets+=("$process_pid")
     done <<< "$snapshot"
-    # Bash 3.2 treats "${targets[@]}" on an empty array as an unbound-variable
-    # fatal under set -u, which no caller-side "|| true" can suppress. Dying
-    # here leaves the entire group SIGSTOPped by the kill above with the CONT
-    # below never reached. The ${x[@]+...} guard keeps the expansion legal.
     for process_pid in ${targets[@]+"${targets[@]}"}; do
         builtin kill -s KILL -- "$process_pid" 2>/dev/null || true
     done
@@ -13098,8 +12918,6 @@ archive_send_sentinel_command() {
         case "$argument" in HUP|INT|TERM) ;; *) return 2 ;; esac
         ;; *) return 2 ;;
     esac
-    # Never let a missing FIFO turn the redirection into a regular file.  The
-    # gate is private, but its disappearance is also the completion signal.
     [ -p "$fifo" ] && [ ! -L "$fifo" ] || return 1
     if exec 8<> "$fifo"; then
         printf '%s\t%s\t%s\n' "$stop_token" "$verb" "$argument" >&8 || {
@@ -13157,8 +12975,6 @@ archive_terminate_guardian_job() {
     [ "$observed_parent" = "$sentinel_pid" ] || return 1
     [ "$observed_pgid" = "$watchdog_pgid" ] || return 1
     [ "$watchdog_pid" = "$watchdog_pgid" ] || return 1
-    # The guardian is this sentinel's sole job. A job-spec resolves through
-    # Bash's unreaped child table and therefore cannot target a recycled PID.
     builtin kill -s STOP -- '%+' 2>/dev/null || return 1
     for ((attempt = 0; attempt < 250; attempt += 1)); do
         all_stopped=true
@@ -13183,11 +12999,6 @@ archive_terminate_guardian_job() {
 }
 
 archive_sentinel_atomic_move() {
-    # The guardian drains the phase group that also contains this sentinel. It
-    # excludes the sentinel shell itself, but an external mv is a separate group
-    # member and can be killed during escalation. Drain-time callers put this
-    # helper in an explicit failure-tolerant list and rely on their existing
-    # receipt handshakes to retry or fail closed.
     /bin/mv -f "$1" "$2"
 }
 
@@ -13206,9 +13017,6 @@ archive_dispatch_sentinel() {
     IFS= read -r sentinel_pid < "$gate/sentinel.pid.partial" || exit 125
     sentinel_pgid="$(archive_process_field pgid "$sentinel_pid")" || exit 125
     [ "$sentinel_pgid" = "$phase_pgid" ] || exit 125
-    # Open the endpoint before publishing readiness. Otherwise a writer could
-    # successfully open its own RDWR descriptor, lose a command when it closes,
-    # and mistake that unacknowledged write for delivery.
     exec 9<> "$fifo"
     (umask 077; printf '%s\t%s\t%s\n' "$sentinel_pid" "$sentinel_pgid" "$stop_token" \
         > "$gate/sentinel.ready.partial")
@@ -13219,13 +13027,8 @@ archive_dispatch_sentinel() {
         mkdir "$gate/test-phase-stopped-once" 2>/dev/null; then
         builtin kill -s STOP -- "$phase_pid"
     fi
-    # Read/write keeps bootstrap nonblocking. Only this sentinel interprets
-    # authenticated control messages and it is itself a member of the phase
-    # group, so it can never signal a recycled numeric PGID.
     while :; do
         request_token=""; request_verb=""; request_argument=""
-        # Bash 3.2 accepts only integral read timeouts. A control write wakes
-        # this immediately; one second also gives portable lease pacing.
         IFS=$'\t' read -r -t 1 -u 9 request_token request_verb request_argument || true
         if [ "$request_token" = "$stop_token" ]; then
             case "$request_verb:$request_argument" in
@@ -13296,25 +13099,10 @@ archive_dispatch_sentinel() {
                         guardian_finalized=true
                 fi
                 watchdog_pid=""; watchdog_pgid=""
-                # Gate the sweep on the guardian receipt ALONE. The sentinel
-                # runs inside phase_pgid (set +m before the fork; asserted at
-                # sentinel start), so its own /bin/ps command-substitution
-                # children are members of the group being counted and are not
-                # in the exclusion list -- the predicate is structurally always
-                # true here, which made this sweep unreachable and stranded the
-                # 0700 gate (the phase TMPDIR holding id_ed25519, known_hosts
-                # and rclone.conf) on every guardian-kill path.
-                # It is also redundant: the guardian leads its own PGID
-                # (watchdog_pid == watchdog_pgid, :13329), so its identical
-                # calls are sound, and it writes guardian.finalized only after
-                # its anchor-validated drain loop has emptied the group.
                 if [ "$guardian_finalized" = true ]; then
                     (umask 077; printf '%s\t%s\t%s\n' "$sentinel_pid" "$stop_token" \
                         "$guardian_failed" > "$gate/sentinel.complete.partial") && \
                         /bin/mv -f "$gate/sentinel.complete.partial" "$gate/sentinel.complete"
-                    # Preserve the terminal receipt until the live supervisor
-                    # acknowledges it. If that lease is gone, sweep anyway;
-                    # a resumed supervisor treats missing receipt as failure.
                     for ((attempt = 0; attempt < 250; attempt += 1)); do
                         if [ -f "$gate/supervisor.complete.ack" ] && \
                             [ ! -L "$gate/supervisor.complete.ack" ]; then
@@ -13331,7 +13119,6 @@ archive_dispatch_sentinel() {
                     archive_remove_dispatch_gate_until_absent "$gate"
                     return 0
                 fi
-                # Any unplanned guardian exit closes the mutation boundary.
                 guardian_failed=true
                 (umask 077; printf '%s\n' "$stop_token" \
                     > "$gate/guardian.failed.partial") && \
@@ -13354,10 +13141,6 @@ archive_dispatch_sentinel() {
             if [ $((SECONDS - watchdog_last_seen_at)) -ge 3 ] || \
                 { [ ! -f "$gate/watchdog.ready" ] && \
                     [ $((SECONDS - watchdog_started_at)) -ge 3 ]; }; then
-                # The guardian is an unreaped direct child and its separate
-                # process group is the sentinel's sole job. Stop/kill/reap that
-                # exact job before any replacement; if it cannot be stopped,
-                # retain the sentinel and gate indefinitely.
                 if archive_terminate_guardian_job "$watchdog_pid" "$watchdog_pgid" "$sentinel_pid"; then
                     guardian_failed=true
                     (umask 077; printf '%s\n' "$stop_token" \
@@ -13383,9 +13166,6 @@ archive_dispatch_sentinel() {
                     supervisor_last_seen_at="$SECONDS"
                 fi
             fi
-            # A stopped, killed, or wedged supervisor loses its mutation lease.
-            # It has no numeric PGID capability, so a later resume cannot hit a
-            # released/reused group after this fail-closed finalization.
             [ $((SECONDS - supervisor_last_seen_at)) -lt 3 ] || guardian_finalizing=true
         elif [ "$armed" = false ]; then
             observed_parent="$(archive_process_field ppid "$phase_pid")" || observed_parent=""
@@ -13414,12 +13194,7 @@ archive_stop_dispatch_sentinel() {
             /bin/sleep 0.02
             continue
         }
-        # A different group proves that the anchored process exited and its PID
-        # was reused. Never signal that unrelated replacement.
         [ "$observed_pgid" = "$phase_pgid" ] || return 0
-        # Opening the private FIFO read/write never blocks even if the sentinel
-        # exits between identity validation and this cooperative exact-token
-        # stop. Do not numeric-kill across that PID-reuse window.
         if [ -p "$fifo" ] && [ ! -L "$fifo" ] && exec 8<> "$fifo"; then
             printf '%s\tFINALIZE\t\n' "$stop_token" >&8 || true
             exec 8>&-
@@ -13446,10 +13221,6 @@ archive_write_phase_override_snapshot() {
     local gate="$1" partial="$1/phase-overrides.sh.partial"
     local function_name override_names="${ARC_ARCHIVE_DISPATCH_TEST_OVERRIDE_NAMES:-}"
     local IFS=$' \t\n'
-    # The executable production CLI rejects overrides below. Sourced contract
-    # tests may name only the few test doubles that the fresh phase interpreter
-    # must retain; never serialize the whole shell function table (Bash 3.2
-    # cannot round-trip some heredoc definitions emitted by `declare -f`).
     (umask 077; : > "$partial") || return 1
     for function_name in $override_names; do
         case "$function_name" in
@@ -13493,9 +13264,6 @@ archive_dispatch_forward_signal() {
     fi
     if [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_FORWARDED" = false ]; then
         if [ "$ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED" = true ]; then
-            # After the arm handshake, only the in-group sentinel may interpret
-            # the numeric phase PGID. This parent writes an authenticated FIFO
-            # command and later requires the sentinel's acknowledgement.
             if archive_send_sentinel_command "$ARC_ARCHIVE_DISPATCH_GATE" \
                 "$ARC_ARCHIVE_DISPATCH_STOP_TOKEN" SIGNAL \
                 "$ARC_ARCHIVE_DISPATCH_SIGNAL"; then
@@ -13503,9 +13271,6 @@ archive_dispatch_forward_signal() {
             fi
         else
             if [ "$ARC_ARCHIVE_DISPATCH_PHASE_JOB_ACTIVE" = true ]; then
-                # The shell job table cannot resolve a completed job to a
-                # recycled numeric PID. The phase is the sole parent job until
-                # validated sentinel-anchored group signaling takes over.
                 if builtin kill -s "$ARC_ARCHIVE_DISPATCH_SIGNAL" -- '%%' 2>/dev/null; then
                     ARC_ARCHIVE_DISPATCH_SIGNAL_FORWARDED=true
                 fi
@@ -13518,8 +13283,6 @@ archive_restore_signal_trap() {
     local saved="$1" signal="$2"
     trap - "$signal"
     if [ -n "$saved" ]; then
-        # `trap -p` emits shell-quoted Bash syntax; evaluating only that
-        # interpreter-generated value restores the caller's exact handler.
         # shellcheck disable=SC2294
         eval "$saved"
     fi
@@ -13541,8 +13304,6 @@ archive_dispatch_phase() {
                 "$gate/sentinel.fifo" "$stop_token"; \
         fi; \
         exit "$bootstrap_exit_status"' EXIT
-    # Bootstrap signals are recorded, not allowed to orphan a half-published
-    # sentinel. They become exact exits immediately after readiness is durable.
     trap 'bootstrap_signal_status=129' HUP
     trap 'bootstrap_signal_status=130' INT
     trap 'bootstrap_signal_status=143' TERM
@@ -13596,9 +13357,6 @@ archive_dispatch_phase() {
         fi
         /bin/sleep 0.02
     done
-    # Keep this as a direct simple command. Placing a phase function in an
-    # if/!/&&/|| condition disables errexit throughout that function and could
-    # let a failed precondition continue into a later mutation.
     "$command_name" "$@" </dev/null
 }
 
@@ -13639,9 +13397,6 @@ archive_dispatch_parent_watchdog() {
                 fi
             fi
             observed_parent="$(archive_process_field ppid "$watchdog_pid")" || observed_parent=""
-            # A guardian never acts on a numeric phase PGID after losing the
-            # sentinel that anchors it. Retain the gate and exit harmlessly;
-            # normal teardown always has the sentinel reap this child first.
             [ "$observed_parent" = "$sentinel_parent_pid" ] || return 125
             /bin/sleep 0.02
         done
@@ -13649,8 +13404,6 @@ archive_dispatch_parent_watchdog() {
 
     [ "$guardian_mode" = finalize ] || return 125
     archive_guardian_anchor_valid "$watchdog_pid" "$sentinel_pid" "$phase_pgid" || return 125
-    # The in-group sentinel anchors phase_pgid throughout this drain. Give the
-    # phase a bounded cooperative path before exact stopped-member KILL.
     builtin kill -s TERM -- "-$phase_pgid" 2>/dev/null || true
     for ((attempt = 0; attempt < 250; attempt += 1)); do
         heartbeat_sequence=$((heartbeat_sequence + 1))
@@ -13661,9 +13414,6 @@ archive_dispatch_parent_watchdog() {
         /bin/sleep 0.02
     done
     if archive_process_exists "$phase_pid"; then
-        # A foreground child may ignore TERM while Bash defers its trap. Kill
-        # only the other group members. Releasing Bash's already-pending TERM
-        # lets its EXIT handler run without a second signal interrupting it.
         archive_stop_and_kill_group_members_except "$phase_pgid" \
             "$phase_pid" "$sentinel_pid" || true
         for ((attempt = 0; attempt < 250; attempt += 1)); do
@@ -13676,8 +13426,6 @@ archive_dispatch_parent_watchdog() {
         done
     fi
     if archive_process_exists "$phase_pid"; then
-        # No software can make an EXIT trap run in a permanently wedged Bash.
-        # Bound the guardian instead of permitting post-parent mutations.
         archive_stop_and_kill_group_members_except "$phase_pgid" "$sentinel_pid" || true
     fi
     if archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid"; then
@@ -13693,17 +13441,12 @@ archive_dispatch_parent_watchdog() {
         done
     fi
     if archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid"; then
-        # The cleanup owner is already gone, so only signal-ignoring leaked
-        # descendants remain and can be force-killed without interrupting it.
         archive_stop_and_kill_group_members_except "$phase_pgid" "$sentinel_pid" || true
         for ((attempt = 0; attempt < 250; attempt += 1)); do
             archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid" || break
             /bin/sleep 0.02
         done
     fi
-    # A KILL-pending task can remain temporarily visible while uninterruptible.
-    # Retain the sentinel/gate and retry exact member kills until every mutable
-    # member is truly gone; only then release the PGID anchor by exact PID.
     while archive_process_group_has_members_except "$phase_pgid" "$sentinel_pid"; do
         heartbeat_sequence=$((heartbeat_sequence + 1))
         archive_guardian_publish_heartbeat "$gate" "$watchdog_pid" "$watchdog_pgid" \
@@ -13719,7 +13462,6 @@ archive_dispatch_parent_watchdog() {
     return 0
 }
 
-# See the signal-safe capture rationale above archive_process_field.
 # shellcheck disable=SC2006
 dispatch_archive_command() {
     local command_name="$1"
@@ -13801,9 +13543,6 @@ dispatch_archive_command() {
 
     if [ "$setup_status" -eq 0 ] && [ "$ARC_ARCHIVE_DISPATCH_SIGNAL_STATUS" -eq 0 ]; then
         set -m
-        # A fresh Bash boundary restores errexit even when the caller invokes
-        # this dispatcher under if/!/&&/||. Remove every environment-imported
-        # function before sourcing the exact orchestrator and narrow test file.
         BASH_ENV=/dev/null ENV=/dev/null /bin/bash --noprofile --norc -Eeuo pipefail -c '
 for imported_function in $(builtin compgen -A function); do
     builtin unset -f "$imported_function"
@@ -14093,9 +13832,6 @@ archive_dispatch_phase "${phase_arguments[@]}"
                 /bin/mv -f "$gate/supervisor.complete.ack.partial" \
                     "$gate/supervisor.complete.ack" || setup_status=125
         else
-            # The sentinel may have failed closed while this supervisor was
-            # stopped. Absence without the sticky terminal receipt is not a
-            # normal success proof.
             setup_status=125
         fi
         ARC_ARCHIVE_DISPATCH_GROUP_VALIDATED=false

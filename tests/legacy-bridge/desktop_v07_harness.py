@@ -48,7 +48,6 @@ WINDOWS = os.name == "nt"
 CREATE_NO_WINDOW = 0x08000000
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 REPO = "FerrumVir/arc-chain"
-# Not a wallet anyone uses: a fixed phrase so leaks are easy to search for.
 SEED_PHRASE = "harness amber cabin echo hazard orbit planet quantum rally sunset velvet window"
 
 HERE = Path(__file__).resolve().parent
@@ -60,11 +59,7 @@ def creation_flags() -> int:
     return CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP if WINDOWS else 0
 
 
-# ---------------------------------------------------------------- v0.7.11 --
-
-
 def platform_release_asset() -> str:
-    """commands.rs:1120-1128"""
     machine = platform.machine().lower()
     if sys.platform == "darwin":
         return "arc-node-macos-arm64" if machine in ("arm64", "aarch64") else "arc-node-macos-x86_64"
@@ -76,19 +71,16 @@ def platform_release_asset() -> str:
 
 
 def managed_binary_path(home: Path) -> Path:
-    """node_manager.rs:455-465"""
     return home / ".arc" / "bin" / ("arc-node.exe" if WINDOWS else "arc-node")
 
 
 def resolve_data_dir(value: str, home: Path) -> Path:
-    """node_manager.rs:483-491"""
     if value.startswith("~/"):
         return home / value[2:]
     return Path(value)
 
 
 def read_arc_node_version(binary: Path) -> str | None:
-    """commands.rs:1097-1118"""
     try:
         output = subprocess.run(
             [str(binary), "--version"],
@@ -105,7 +97,6 @@ def read_arc_node_version(binary: Path) -> str | None:
 
 
 def ensure_binary(home: Path, github: str, desktop_version: str) -> dict[str, object]:
-    """commands.rs:974-1075; `desktop_version` is the app's CARGO_PKG_VERSION."""
     target = managed_binary_path(home)
     if target.exists():
         version = read_arc_node_version(target)
@@ -126,7 +117,6 @@ def ensure_binary(home: Path, github: str, desktop_version: str) -> dict[str, ob
             os.replace(temporary, target)
             break
         except PermissionError:
-            # Windows releases a just-killed process's image lock lazily.
             if attempt == 19:
                 raise
             time.sleep(0.5)
@@ -145,7 +135,6 @@ def port_available(port: int) -> bool:
 
 
 def choose_port_pair(rpc: int, p2p: int) -> tuple[int, int]:
-    """node_manager.rs:498-512"""
     for index in range(5):
         if port_available(rpc + index * 10) and port_available(p2p + index * 10):
             return rpc + index * 10, p2p + index * 10
@@ -153,8 +142,6 @@ def choose_port_pair(rpc: int, p2p: int) -> tuple[int, int]:
 
 
 class DesktopNode:
-    """node_manager.rs:96-240 (start) and 317-327 (stop)."""
-
     def __init__(self, home: Path, resources: dict[str, Path], log_path: Path) -> None:
         self.home = home
         self.resources = resources
@@ -208,17 +195,11 @@ class DesktopNode:
 
 
 def start_node(node: DesktopNode, github: str, desktop_version: str, config: dict[str, object]) -> list[str]:
-    """commands.rs:98-127: ensure_binary(...)? then NodeManager::start."""
     ensure_binary(node.home, github, desktop_version)
     return node.start(config)
 
 
-# -------------------------------------------------------------- fixtures --
-
-
 class FakeGitHub(ThreadingHTTPServer):
-    """GitHub's release download and latest-redirect routes, from memory."""
-
     def __init__(self) -> None:
         super().__init__(("127.0.0.1", 0), Handler)
         self.releases: dict[str, dict[str, bytes]] = {}
@@ -275,7 +256,6 @@ def wait_health(port: int, seconds: int) -> dict[str, object]:
 
 
 def process_tree(pid: int) -> list[dict[str, object]]:
-    """The process and its children: id, executable path, and command line."""
     if WINDOWS:
         script = (
             f"Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -eq {pid} -or $_.ParentProcessId -eq {pid} }} "
@@ -291,7 +271,6 @@ def process_tree(pid: int) -> list[dict[str, object]]:
             for row in rows
         ]
     if sys.platform == "darwin":
-        # No /proc on macOS; after exec, `comm` is the node's own executable.
         def ps(field: str) -> str:
             return subprocess.run(
                 ["ps", "-o", f"{field}=", "-p", str(pid)], capture_output=True, text=True, check=True
@@ -328,12 +307,6 @@ def pid_alive(pid: int) -> bool:
 
 
 def assert_no_seed(paths: list[Path], extra: str) -> list[str]:
-    """Search everything the bridge wrote for the v0.7 seed phrase.
-
-    Windows refuses reads of files the running node holds open exclusively
-    (its own WAL and locks, which it created after the bridge exec'd it and
-    which never saw the seed). Those are listed, not silently passed.
-    """
     needle = SEED_PHRASE.encode("utf-8")
     assert SEED_PHRASE not in extra, "the seed phrase reached the bridged node's command line"
     unreadable: list[str] = []
@@ -349,9 +322,6 @@ def assert_no_seed(paths: list[Path], extra: str) -> list[str]:
             if needle in payload:
                 raise AssertionError(f"the seed phrase leaked into {path}")
     return unreadable
-
-
-# -------------------------------------------------------------- scenario --
 
 
 def run(args: argparse.Namespace) -> None:
@@ -378,7 +348,7 @@ def run(args: argparse.Namespace) -> None:
     github = FakeGitHub()
     threading.Thread(target=github.serve_forever, daemon=True).start()
     github.releases["v0.7.7"] = {asset: args.legacy_node.read_bytes()}
-    github.releases["v0.7.11"] = {"latest.json": b"{}"}  # desktop-only, like the real one
+    github.releases["v0.7.11"] = {"latest.json": b"{}"}
     bridge_tag = "v" + pins["bridge_version"]
     github.releases[bridge_tag] = {asset: args.bridge.read_bytes()}
     config = {"rpc_port": 9944, "p2p_port": 9945, "data_dir": "~/.arc", "role": "worker", "model_path": None}
@@ -426,7 +396,6 @@ def run(args: argparse.Namespace) -> None:
     running = node_process(node.process.pid, node_binary)
     report["node_process"] = {k: v for k, v in running.items() if k != "cmdline"}
     cmdline = str(running["cmdline"])
-    # A privacy-safe pin registers as a stake-0 community observer; any other pin must run read-only.
     for required in ("--stake 0", "--min-stake 0", "--community-mode" if privacy_safe else "--no-community"):
         assert required in cmdline, f"{required} missing from {cmdline}"
     if privacy_safe:
@@ -485,8 +454,6 @@ def run(args: argparse.Namespace) -> None:
 
 
 def check_source(repo: Path) -> None:
-    """The constructs this harness reproduces, read back from tag v0.7.11."""
-
     def show(path: str) -> str:
         return subprocess.run(
             ["git", "-C", str(repo), "show", f"v0.7.11:{path}"], capture_output=True, text=True, check=True

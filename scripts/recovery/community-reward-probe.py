@@ -28,9 +28,6 @@ CANONICAL_PROFILE = "INT8 integer (per-row, cross-platform deterministic)"
 RECOVERY_PROBE_PREFIX = b"ARC-RCV-PROBE1\0\0"
 PROBE_ID_DOMAIN = b"ARC-recovery-reward-probe-id-v1\0"
 COORDINATOR_DOMAIN = b"ARC-recovery-reward-probe-coordinator-v1\0"
-# A node labels a verification with one of these methods when at least one
-# layer range had only two live replicas and was verified 2-of-2. This probe
-# still requires 2-of-3 on every range and position, and says why it refuses.
 TWO_REPLICA_VERIFICATION_METHODS = frozenset(
     {
         "authenticated_shard_quorum_2_of_2_per_range",
@@ -219,7 +216,6 @@ def require_reward_transaction_state(
     field: str,
     allowed_statuses: set[str],
 ) -> str:
-    """Validate the complete fail-closed 0x25 receipt state machine."""
     status = settlement.get("status")
     if status not in allowed_statuses:
         fail(f"{field}.status is not an allowed transaction state: {status!r}")

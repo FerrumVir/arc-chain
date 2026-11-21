@@ -1,10 +1,3 @@
-//! On-chain inference runtime with VRF committee selection and EIP-1559 gas lane.
-//!
-//! This crate provides:
-//! - `Int4Runtime`: Deterministic INT4 inference execution
-//! - `committee`: VRF-based committee selection for tiered inference
-//! - `gas`: EIP-1559-style inference gas lane with separate base fee
-
 pub mod block_i8;
 pub mod cached_integer_model;
 pub mod candle_backend;
@@ -21,34 +14,16 @@ pub mod llama_spm_tokenizer;
 pub mod low_residency;
 pub mod model_artifact;
 pub mod model_package;
-/// Modern Llama-family models (SmolLM3-3B) on the integer engine: an
-/// additional profile with its own package format and CLI (`arc-modern`).
-/// Nothing in consensus or native inference refers to it.
 pub mod modern;
 pub mod q4_engine;
 #[cfg(unix)]
 pub mod row_service;
 pub mod streaming;
-/// Private-cohort, within-query tensor row partitioning.  This deliberately
-/// has no dependency on validator RPC or the public layer-pipeline endpoint.
 pub mod tensor_parallel;
 
 #[cfg(test)]
 mod golden_vectors;
 
-// Patent-pending integer/ASIC inference paths. The implementation files for
-// these modules (ternary_engine.rs, ternary_hybrid.rs, int8_asic.rs,
-// int16_asic.rs, sha256_isa.rs, asic_families.rs, asic_parallel.rs,
-// asic_batched.rs, mining_asic_node.rs, economics.rs) live in a private
-// branch and the author's working tree only - they are intentionally NOT in
-// the public repo until patents are filed.
-//
-// To keep the rest of the crate (and the chain release build) compiling
-// without those files, the public default exposes empty stub types under
-// `crate::ternary_engine` and `crate::ternary_hybrid` that satisfy the
-// signatures referenced from `cached_integer_model.rs`. The full code path
-// is only reachable when the `experimental-ip` feature is on, which requires
-// the real implementation files to be present at the canonical paths.
 #[cfg(feature = "experimental-ip")]
 #[rustfmt::skip]
 pub mod ternary_engine;
@@ -82,12 +57,6 @@ pub mod economics;
 
 #[cfg(not(feature = "experimental-ip"))]
 pub mod ternary_engine {
-    //! Stub: real implementation lives outside the public repo until patents
-    //! file. Public types exposed here only to satisfy struct-field references
-    //! in `cached_integer_model.rs`. Functions panic if reached - the
-    //! corresponding `enable_ternary*` paths in `CachedIntegerModel` are
-    //! gated behind the `experimental-ip` feature, so they cannot be called
-    //! in this build.
     use crate::cached_integer_model::I8Weights;
 
     pub struct TernaryWeights;
@@ -107,8 +76,6 @@ pub mod ternary_engine {
 
 #[cfg(not(feature = "experimental-ip"))]
 pub mod ternary_hybrid {
-    //! Stub mirror of `ternary_engine` for the hybrid (ternary + sparse INT8
-    //! outliers) path. See the `ternary_engine` stub for full rationale.
     use crate::cached_integer_model::I8Weights;
 
     pub struct TernaryHybridWeights;
@@ -138,8 +105,6 @@ use arc_crypto::Hash256;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-// ─── Errors ──────────────────────────────────────────────────────────────────
-
 #[derive(Error, Debug)]
 pub enum InferenceError {
     #[error("model not found: {0}")]
@@ -161,26 +126,15 @@ pub enum InferenceError {
     Runtime(String),
 }
 
-// ─── Types ───────────────────────────────────────────────────────────────────
-
-/// Hardware tiers for inference capability.
-///
-/// Validators register for a tier based on their hardware. The chain uses
-/// this to determine which validators can execute which models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum InferenceTier {
-    /// ≤20B INT4 parameters. Min 16GB. Every validator runs it.
     Tier1 = 1,
-    /// 20-50B INT4 parameters. Min 64GB. VRF committee of 7.
     Tier2 = 2,
-    /// 50-100B INT4 parameters. Min 128GB+. VRF committee of 7.
     Tier3 = 3,
-    /// 100B+ parameters. H100/Mac Studio 192GB. VRF committee of 7.
     Tier4 = 4,
 }
 
 impl InferenceTier {
-    /// Minimum stake required for this tier (in ARC base units).
     pub fn min_stake(&self) -> u64 {
         match self {
             Self::Tier1 => 1_000,
@@ -190,22 +144,19 @@ impl InferenceTier {
         }
     }
 
-    /// Maximum model parameters (in billions) for this tier.
     pub fn max_params_b(&self) -> u64 {
         match self {
             Self::Tier1 => 20,
             Self::Tier2 => 50,
             Self::Tier3 => 100,
-            Self::Tier4 => u64::MAX, // unlimited
+            Self::Tier4 => u64::MAX,
         }
     }
 
-    /// Whether this tier requires VRF committee selection.
     pub fn requires_committee(&self) -> bool {
         matches!(self, Self::Tier2 | Self::Tier3 | Self::Tier4)
     }
 
-    /// From u8 value.
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             1 => Some(Self::Tier1),
@@ -217,68 +168,36 @@ impl InferenceTier {
     }
 }
 
-/// An inference request to be executed on-chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
-    /// BLAKE3 hash of model weights (content-addressed).
     pub model_id: Hash256,
-    /// Input data (prompt bytes, token IDs, etc.).
     pub input: Vec<u8>,
-    /// Which tier this model belongs to.
     pub tier: InferenceTier,
-    /// Maximum tokens to generate.
     pub max_tokens: u32,
 }
 
-/// Result of an inference execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceResult {
-    /// BLAKE3 hash of the output.
     pub output_hash: Hash256,
-    /// Raw output bytes.
     pub output: Vec<u8>,
-    /// Number of tokens consumed/generated.
     pub tokens_used: u32,
-    /// Execution time in milliseconds.
     pub elapsed_ms: u64,
-    /// Whether this was deterministic (INT4 path).
     pub deterministic: bool,
 }
 
-// ─── INT4 Runtime ────────────────────────────────────────────────────────────
-
-/// ARC-INT4 model format header.
-///
-/// Integer-rational scale factors for determinism:
-/// `real_value = int4_value * numerator / denominator`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelHeader {
-    /// Model identifier (BLAKE3 of full weights).
     pub model_id: Hash256,
-    /// Number of parameters.
     pub num_params: u64,
-    /// Number of layers.
     pub num_layers: u32,
-    /// Hidden dimension.
     pub hidden_dim: u32,
-    /// Vocabulary size.
     pub vocab_size: u32,
-    /// Scale factor numerator (integer rational for determinism).
     pub scale_numerator: i64,
-    /// Scale factor denominator (integer rational for determinism).
     pub scale_denominator: i64,
 }
 
-/// Deterministic INT4 inference runtime.
-///
-/// All arithmetic is integer-only for cross-platform determinism.
-/// INT4 values are stored as nibbles, unpacked to i8 for computation.
-/// Scale factors use integer rationals (numerator/denominator) instead
-/// of floating point.
 pub struct Int4Runtime {
-    /// Maximum execution time per inference call.
     pub timeout_ms: u64,
-    /// Loaded model headers (model_id → header).
     models: dashmap::DashMap<[u8; 32], ModelHeader>,
 }
 
@@ -290,20 +209,14 @@ impl Int4Runtime {
         }
     }
 
-    /// Register a model header (weights are loaded separately via content-addressed storage).
     pub fn register_model(&self, header: ModelHeader) {
         self.models.insert(header.model_id.0, header);
     }
 
-    /// Check if a model is registered.
     pub fn has_model(&self, model_id: &Hash256) -> bool {
         self.models.contains_key(&model_id.0)
     }
 
-    /// Execute inference on a registered model.
-    ///
-    /// This is the deterministic INT4 execution path. All arithmetic is integer-only.
-    /// The output is guaranteed to be identical across all platforms (x86, ARM, GPU).
     pub fn execute(&self, request: &InferenceRequest) -> Result<InferenceResult, InferenceError> {
         let start = std::time::Instant::now();
 
@@ -312,7 +225,6 @@ impl Int4Runtime {
             .get(&request.model_id.0)
             .ok_or_else(|| InferenceError::ModelNotFound(hex::encode(request.model_id.0)))?;
 
-        // Verify model fits in requested tier
         let params_b = header.num_params / 1_000_000_000;
         if params_b > request.tier.max_params_b() {
             return Err(InferenceError::ModelTooLarge {
@@ -322,16 +234,6 @@ impl Int4Runtime {
             });
         }
 
-        // Deterministic inference dispatch.
-        //
-        // The real integer-only inference engine is in `integer_engine.rs`
-        // and `cached_integer_model.rs` (i64 fixed-point, NEON/AVX2 SIMD,
-        // bitwise deterministic across platforms). The GGUF loading path
-        // is in `gguf_integer.rs` behind the `candle` feature flag.
-        //
-        // This Int4Runtime entry point currently uses a hash-based mock
-        // for integration testing. Connect to CachedIntegerModel for real
-        // transformer inference.
         let output = deterministic_mock_inference(
             &request.model_id,
             &request.input,
@@ -361,10 +263,6 @@ impl Int4Runtime {
     }
 }
 
-/// Deterministic mock inference using BLAKE3 hashing.
-///
-/// Produces identical output for the same (model_id, input, max_tokens)
-/// across all platforms. This is a placeholder for the real candle INT4 backend.
 fn deterministic_mock_inference(
     model_id: &Hash256,
     input: &[u8],
@@ -375,7 +273,6 @@ fn deterministic_mock_inference(
     let mut output = Vec::new();
     let tokens = max_tokens.min(256);
 
-    // Generate deterministic token IDs via iterated BLAKE3
     let mut state = Vec::with_capacity(32 + input.len() + 8);
     state.extend_from_slice(&model_id.0);
     state.extend_from_slice(input);
@@ -387,7 +284,6 @@ fn deterministic_mock_inference(
         let hash = blake3::hash(&state);
         let token_bytes = &hash.as_bytes()[..4];
         output.extend_from_slice(token_bytes);
-        // Feed hash back into state for next token
         state.truncate(32 + input.len() + 16);
         state.extend_from_slice(hash.as_bytes());
     }
@@ -470,7 +366,6 @@ mod tests {
             max_tokens: 50,
         };
 
-        // Run twice - must produce identical output
         let r1 = runtime.execute(&request).unwrap();
         let r2 = runtime.execute(&request).unwrap();
         assert_eq!(r1.output, r2.output);
@@ -484,7 +379,7 @@ mod tests {
 
         runtime.register_model(ModelHeader {
             model_id,
-            num_params: 50_000_000_000, // 50B
+            num_params: 50_000_000_000,
             num_layers: 64,
             hidden_dim: 8192,
             vocab_size: 100000,
@@ -495,7 +390,7 @@ mod tests {
         let request = InferenceRequest {
             model_id,
             input: b"test".to_vec(),
-            tier: InferenceTier::Tier1, // Tier1 max is 20B
+            tier: InferenceTier::Tier1,
             max_tokens: 1,
         };
 

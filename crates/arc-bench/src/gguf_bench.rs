@@ -1,12 +1,3 @@
-//! GGUF Model Inference Benchmark
-//!
-//! Loads a real GGUF model via candle backend, runs inference,
-//! and verifies determinism across multiple runs.
-//!
-//! Usage:
-//!   cargo run --release --bin arc-bench-gguf --features candle -- --model /tmp/arc-models/tinyllama-1.1b-q4.gguf
-//!   cargo run --release --bin arc-bench-gguf --features candle -- --model /tmp/arc-models/llama-7b-q4.gguf
-
 use arc_inference::candle_backend::GgufEngine;
 use std::time::Instant;
 
@@ -45,8 +36,7 @@ fn main() {
     );
     eprintln!();
 
-    // Load model
-    let engine = GgufEngine::new(60_000); // 60s timeout
+    let engine = GgufEngine::new(60_000);
     let load_start = Instant::now();
     let model_id = engine
         .load_gguf_file(&model_path)
@@ -56,42 +46,24 @@ fn main() {
     eprintln!("  Load time:  {:.2}s", load_time.as_secs_f64());
     eprintln!();
 
-    // Detect model type from path and use appropriate prompt tokens.
-    // Llama-3 uses a different chat template than Llama-2.
     let is_llama3 = model_path.contains("3.1")
         || model_path.contains("llama-3")
         || model_path.contains("Llama-3");
 
     let input_tokens: Vec<u32> = if is_llama3 {
-        // Llama-3.1 Instruct format:
-        // <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nWhat is 2+2?<|eot_id|>
-        // <|start_header_id|>assistant<|end_header_id|>\n\n
         vec![
-            128000, // <|begin_of_text|>
-            128006, // <|start_header_id|>
-            882,    // user
-            128007, // <|end_header_id|>
-            271,    // \n\n
-            3923, 374, 220, 17, 10, 17, 30,     // What is 2+2?
-            128009, // <|eot_id|>
-            128006, // <|start_header_id|>
-            78191,  // assistant
-            128007, // <|end_header_id|>
-            271,    // \n\n
+            128000, 128006, 882, 128007, 271, 3923, 374, 220, 17, 10, 17, 30, 128009, 128006,
+            78191, 128007, 271,
         ]
     } else {
-        // Llama-2-Chat format: [INST] What is 2+2? [/INST]
         vec![
-            1, // BOS
-            518, 25580, 29962, // [INST]
-            1724, 338, 29871, 29906, 29974, 29906, 29973, // What is 2+2?
-            518, 29914, 25580, 29962, // [/INST]
+            1, 518, 25580, 29962, 1724, 338, 29871, 29906, 29974, 29906, 29973, 518, 29914, 25580,
+            29962,
         ]
     };
     eprintln!("  Input tokens: {:?}", input_tokens);
     eprintln!();
 
-    // Run inference multiple times and check determinism
     let mut output_hashes = Vec::new();
     let mut latencies = Vec::new();
 
@@ -111,7 +83,6 @@ fn main() {
                 hex_encode(&result.output_hash.0[..8])
             );
 
-            // Print generated token IDs
             let tokens: Vec<u32> = result
                 .output
                 .chunks(4)
@@ -130,10 +101,8 @@ fn main() {
         output_hashes.push(result.output_hash);
     }
 
-    // Check determinism
     let all_match = output_hashes.windows(2).all(|w| w[0] == w[1]);
 
-    // Statistics
     latencies.sort();
     let avg = latencies.iter().sum::<u64>() as f64 / latencies.len() as f64;
     let p50 = latencies[latencies.len() / 2];
@@ -164,7 +133,6 @@ fn main() {
     );
     eprintln!();
 
-    // JSON output
     let json = serde_json::json!({
         "benchmark": "GgufInference",
         "model_path": model_path,

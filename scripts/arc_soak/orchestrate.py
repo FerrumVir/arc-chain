@@ -1,27 +1,3 @@
-"""Run a recorded ARC soak. Records everything; judges nothing.
-
-    python3 -m arc_soak.orchestrate --self-test --binary B --provenance P
-    python3 -m arc_soak.orchestrate --hours 24  --binary B --provenance P
-
-The verdict and the process exit status come ONLY from `arc_soak.analyze`,
-which is run on every exit path - normal completion, an exception, SIGINT or
-SIGTERM. An orchestrator that dies part-way leaves `completed: false`, and the
-analyzer turns that into INCOMPLETE, never PASS.
-
-What is recorded
-----------------
-run.json          configuration, identities, provenance binding, thresholds,
-                  and - rewritten at the end - completion and duration
-samples.jsonl     per node per sample: liveness, identity, height, round,
-                  peers, finalized height, RSS, CPU, disk, log bytes
-agreement.jsonl   per check: every intended replica's response at one height
-faults.jsonl      per fault: kill, restart, and each recovery phase separately
-workload.jsonl    per offered item: submission, acceptance, settlement, latency
-node-<i>.<k>.log  each process incarnation's own log
-
-Starting it is a deliberate act. Nothing schedules it.
-"""
-
 import argparse
 import concurrent.futures
 import hashlib
@@ -48,10 +24,8 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 class Abort(Exception):
-    """A condition under which the run cannot continue meaningfully."""
+    pass
 
-
-# ── small utilities ──────────────────────────────────────────────────────────
 
 def now() -> float:
     return time.time()
@@ -67,7 +41,6 @@ def sha256_file(path: str) -> str:
 
 def http_json(port: int, path: str, timeout: float = 5.0,
               body: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
-    """(status, parsed JSON or text). Status 0 means no HTTP response at all."""
     url = f"http://127.0.0.1:{port}{path}"
     data = None
     headers = {}
@@ -115,13 +88,9 @@ def dir_bytes(path: str) -> int:
 
 
 def read_provenance(path: str) -> Dict[str, str]:
-    """Parse the record written by scripts/arc-build-provenance.sh."""
     out: Dict[str, str] = {}
     with open(path) as fh:
         for line in fh:
-            # Keys contain digits (`binary_sha256`); an earlier `[a-z_]+`
-            # could not match that key, and the guard refused a correct
-            # record - failing closed, but for the wrong reason.
             m = re.match(r"^([a-z0-9_]+):\s*(.*?)\s*$", line)
             if m:
                 out[m.group(1)] = m.group(2).split()[0] if m.group(2) else ""
@@ -132,15 +101,13 @@ class JsonlWriter:
     def __init__(self, path: str):
         self.path = path
         self.lock = threading.Lock()
-        open(path, "x").close()   # fresh: refuse to append to an old run
+        open(path, "x").close()
 
     def write(self, obj: Dict[str, Any]) -> None:
         line = json.dumps(obj, sort_keys=True, default=str)
         with self.lock, open(self.path, "a") as fh:
             fh.write(line + "\n")
 
-
-# ── node processes ───────────────────────────────────────────────────────────
 
 class Node:
     def __init__(self, cfg: "Config", index: int):
@@ -153,15 +120,12 @@ class Node:
         self.proc: Optional[subprocess.Popen] = None
         self.incarnation = 0
         self.scheduled_down = False
-        # The binary this node runs, and its recorded digest. An upgrade
-        # drill changes them for one node; everything else runs cfg.binary.
         self.binary = cfg.binary
         self.binary_sha256: Optional[str] = None
 
     def args(self, genesis: str) -> List[str]:
         peers = ",".join(f"127.0.0.1:{self.cfg.base_p2p + j}"
                          for j in range(self.cfg.nodes) if j != self.index)
-        # A single-node chain (a real-model P8 run on one host) has no peers.
         peer_args = ["--peers", peers] if peers else []
         return [self.binary, "--rpc", f"127.0.0.1:{self.rpc}",
                 "--p2p-port", str(self.p2p), "--data-dir", self.data_dir,
@@ -172,8 +136,6 @@ class Node:
                     ["--native-inference-activation",
                      os.path.join(self.cfg.work, "activation.json")]
                     if self.cfg.workload == "native" else []) + (
-                    # Every node holds the protocol-4 state; only the first
-                    # `native_workers` execute and vote (see --native-workers).
                     self.executor_args()
                     if self.cfg.workload == "native"
                     and self.index < getattr(self.cfg, "native_workers", self.cfg.nodes)
@@ -183,8 +145,6 @@ class Node:
         real = getattr(self.cfg, "real_model", None)
         if not real:
             return ["--native-inference-runtime", "--enable-native-inference-requests", "--native-inference-test-executor"]
-        # The real canonical executor: it verifies the artifact's bytes, the
-        # qualification record and the package manifest before it loads.
         return ["--native-inference-runtime", "--enable-native-inference-requests", "--native-inference-artifact", real,
                 "--native-inference-qualification", self.cfg.qualification,
                 "--native-package-manifest", self.cfg.package_manifest]
@@ -221,7 +181,6 @@ class Node:
             self.proc.wait(timeout=10)
 
     def ready_identity(self) -> Optional[str]:
-        """The identity this node's RPC reports, if it is up and answering."""
         if not self.alive():
             return None
         code, health = http_json(self.rpc, "/health", timeout=3)
@@ -236,12 +195,6 @@ class Node:
 
 
 def binary_self_report(health: Any, expected_sha256: str) -> str:
-    """Compare a node's self-reported executable digest with the recorded one.
-
-    "match" or "absent" (a binary that predates the field). A different
-    digest means the process under test is not the recorded build, and the
-    run's evidence would describe the wrong binary: that aborts the run.
-    """
     reported = health.get("binary_sha256") if isinstance(health, dict) else None
     if not reported:
         return "absent"
@@ -252,7 +205,6 @@ def binary_self_report(health: Any, expected_sha256: str) -> str:
 
 
 def derive_identity(cfg: "Config", index: int) -> str:
-    """Start the binary briefly and read the validator address it prints."""
     d = os.path.join(cfg.work, f"ident-{index}")
     os.makedirs(d)
     log = os.path.join(cfg.work, f"ident-{index}.txt")
@@ -279,20 +231,10 @@ def derive_identity(cfg: "Config", index: int) -> str:
     raise Abort(f"could not read node {index}'s validator identity")
 
 
-# ── configuration ────────────────────────────────────────────────────────────
-
 FAULT_KINDS = ("kill", "restore", "upgrade", "rollback")
 
 
 def parse_fault_kinds(text: Optional[str]) -> List[str]:
-    """`"kill,restore,upgrade,rollback"` -> one kind per fault index (R6 drills).
-
-    kill: SIGKILL and restart (the default for every unlisted index);
-    restore: SIGKILL, back the store up, wipe it, restore it, restart;
-    upgrade: SIGKILL, back the store up, restart on --upgrade-binary;
-    rollback: SIGKILL the upgraded node, restore its pre-upgrade backup, and
-    restart it on the original binary.
-    """
     if not text:
         return []
     kinds = [part.strip() for part in text.split(",") if part.strip()]
@@ -306,11 +248,6 @@ def parse_fault_kinds(text: Optional[str]) -> List[str]:
 
 
 def real_model_tuple(manifest_path: str) -> List[str]:
-    """The activation tuple for the real canonical executor, read from the
-    approved package manifest: artifact BLAKE3, profile commitment,
-    generation commitment, and the harness's fixed assignment hash. The node
-    checks this manifest against the artifact it loads, so a manifest that
-    names another artifact stops the run at startup, not later."""
     with open(manifest_path) as fh:
         manifest = json.load(fh)
     try:
@@ -325,15 +262,10 @@ def real_model_tuple(manifest_path: str) -> List[str]:
     return tuple_
 
 
-# 100 ARC in base units: enough for many paid requests at the desktop's defaults.
 DEFAULT_FUND_BASE_UNITS = 100_000_000_000
 
 
 def parse_funding(values: Optional[List[str]]) -> List[Tuple[str, int]]:
-    """`--fund ADDRESS[:BASE_UNITS]` accounts genesis also funds - for
-    example a desktop wallet for a product journey on a protocol-4 chain,
-    which admits no transfers. Refuses anything that is not a 32-byte hex
-    address, a non-positive amount, or an address listed twice."""
     out: List[Tuple[str, int]] = []
     for value in values or []:
         address, _, amount = value.partition(":")
@@ -355,7 +287,6 @@ def parse_funding(values: Optional[List[str]]) -> List[Tuple[str, int]]:
 
 
 def parse_fault_indices(text: Optional[str]) -> Set[int]:
-    """`"1,3"` -> {1, 3}. Empty or None -> no long faults."""
     if not text:
         return set()
     try:
@@ -377,15 +308,11 @@ class Config:
     def __init__(self, a: argparse.Namespace):
         self.mode = "self-test" if a.self_test else "soak"
         if a.self_test:
-            # Long enough that the analyzer's minimum baseline (60 s after a
-            # 30 s warm-up) and minimum recovered window (60 s after a 30 s
-            # settle) both fit around one fault - otherwise a self-test could
-            # only ever come back INCOMPLETE.
             self.duration = 540.0
             self.sample_s = 5.0
             self.warmup_s = 30.0
             self.baseline_s = 150.0
-            self.fault_every_s = 1e9      # exactly one fault
+            self.fault_every_s = 1e9
             self.planned_faults = 1
         else:
             if not a.hours and not a.minutes:
@@ -395,13 +322,9 @@ class Config:
             self.warmup_s = 60.0
             self.baseline_s = 600.0
             self.fault_every_s = float(a.fault_every_secs)
-            # Faults are scheduled only while enough time remains to measure
-            # the recovery that follows.
             usable = self.duration - self.warmup_s - self.baseline_s - 300
             self.planned_faults = max(0, int(usable // self.fault_every_s) + 1) if usable > 0 else 0
             if a.no_faults:
-                # A measurement run (growth, throughput) - never a soak: the
-                # analyzer cannot pass a run that recovered from nothing.
                 self.planned_faults = 0
         self.binary = os.path.abspath(a.binary)
         self.provenance = os.path.abspath(a.provenance)
@@ -411,9 +334,6 @@ class Config:
         self.stake = 6666667
         self.snapshot_every = a.snapshot_every
         self.down_s = a.down_secs
-        # Faults listed here stay down for long_down_s instead: long enough
-        # to outlast the peers' DAG retention, so the victim cannot rejoin
-        # from history and must adopt an authenticated checkpoint (C11).
         self.long_down_s = a.long_down_secs
         self.long_faults = parse_fault_indices(a.long_faults)
         if self.long_faults and self.long_down_s <= 0:
@@ -437,11 +357,8 @@ class Config:
         if not 0 <= self.native_workers <= a.nodes:
             raise SystemExit("--native-workers must be between 0 and --nodes")
         self.load_driver = os.path.abspath(a.load_driver) if a.load_driver else None
-        # A fixed execution tuple the activation allows and every request uses.
         self.native_tuple = [hashlib.sha256(f"arc-soak-{k}".encode()).hexdigest()
                              for k in ("model", "profile", "generation", "assignment")]
-        # Real canonical executor (P8): paths the owner supplies; the harness
-        # never writes a qualification record.
         self.real_model = os.path.abspath(a.real_model) if getattr(a, "real_model", None) else None
         self.qualification = getattr(a, "qualification", None)
         self.package_manifest = getattr(a, "package_manifest", None)
@@ -464,8 +381,6 @@ class Config:
         self.work = os.path.abspath(a.work or f"/tmp/arc-soak-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}")
 
 
-# ── the run ──────────────────────────────────────────────────────────────────
-
 class Soak:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -478,19 +393,17 @@ class Soak:
         self.agreement: Optional[JsonlWriter] = None
         self.faults: Optional[JsonlWriter] = None
         self.workload_log: Optional[JsonlWriter] = None
-        self.fault_state: Optional[Dict[str, Any]] = None   # the fault in flight
+        self.fault_state: Optional[Dict[str, Any]] = None
         self.fault_lock = threading.Lock()
         self.last_heights: Dict[int, int] = {}
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 
-    # -- run.json --------------------------------------------------------
     def write_run(self) -> None:
         tmp = os.path.join(self.cfg.work, "run.json.tmp")
         with open(tmp, "w") as fh:
             json.dump(self.run, fh, indent=2, sort_keys=True, default=str)
         os.replace(tmp, os.path.join(self.cfg.work, "run.json"))
 
-    # -- setup -----------------------------------------------------------
     def prepare(self) -> None:
         cfg = self.cfg
         if os.path.exists(cfg.work) and os.listdir(cfg.work):
@@ -509,7 +422,6 @@ class Soak:
                 "the record describes.")
         for node in self.nodes:
             node.binary_sha256 = used
-        # An upgrade drill's binary is held to the same rule as the main one.
         self.upgrade_sha256: Optional[str] = None
         self.pre_upgrade: Optional[Tuple[int, str, str, str]] = None
         self.upgraded: Optional[Node] = None
@@ -546,12 +458,9 @@ class Soak:
                            "input_digest": prov.get("input_digest"),
                            "command": prov.get("command")},
             "host": " ".join(os.uname()),
-            # Which harness recorded and judged this run. A verdict is only as
-            # good as the code that reached it.
             "harness": {
                 "orchestrate_sha256": sha256_file(os.path.abspath(__file__)),
                 "analyze_sha256": sha256_file(os.path.abspath(analyze.__file__)),
-                # The workload is evidence too: bind the exact driver binary.
                 "load_driver": cfg.load_driver,
                 "load_driver_sha256": (sha256_file(cfg.load_driver)
                                        if cfg.load_driver else None),
@@ -562,9 +471,6 @@ class Soak:
                          "native_rate_per_s": cfg.native_rate if cfg.workload == "native" else None,
                          "native_requesters": (cfg.native_requesters
                                                if cfg.workload == "native" else None),
-                         # Deterministic-executor evidence exercises protocol and
-                         # settlement and qualifies nothing about model quality.
-                         # The same label the driver writes into every record.
                          "executor": executor_label_for(cfg)},
             "thresholds": {"recovery_budget_s": cfg.recovery_budget_s},
             "nodes": [],
@@ -574,8 +480,6 @@ class Soak:
         self.agreement = JsonlWriter(os.path.join(cfg.work, "agreement.jsonl"))
         self.faults = JsonlWriter(os.path.join(cfg.work, "faults.jsonl"))
         self.workload_log = JsonlWriter(os.path.join(cfg.work, "workload.jsonl"))
-        # Bounded per-node consensus counters at every tick, so a throughput
-        # question is answered from a timeline rather than from log lines.
         self.diag = JsonlWriter(os.path.join(cfg.work, "diag.jsonl"))
         self.events = open(os.path.join(cfg.work, "events.log"), "a")
         for node in self.nodes:
@@ -585,9 +489,6 @@ class Soak:
                               "p2p": n.p2p, "role": "seed" if n.index == 0 else "member"}
                              for n in self.nodes]
         self.write_run()
-        # One chain-run identity per soak. It reaches the certificate domain
-        # (genesis network hash), so certificates and checkpoints from an
-        # earlier soak of this same genesis cannot verify against this one.
         instance = "soak-{}-{}".format(
             time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), os.getpid())
         self.run["chain_instance_id"] = instance
@@ -625,9 +526,6 @@ class Soak:
         return driver_executor_args_for(self.cfg)
 
     def native_requesters(self) -> List[str]:
-        """The driver's requester accounts, one per concurrent request, which
-        genesis must fund. Asked of the driver itself so the two can never
-        disagree about the derivation."""
         cfg = self.cfg
         out = subprocess.run(
             [cfg.load_driver, "--print-requester", "--requester-seed", "soak",
@@ -661,7 +559,6 @@ class Soak:
                 binary_self_report(health, node.binary_sha256 or self.run["binary_sha256"])
         self.note("all validators answering with their own identities")
 
-    # -- sampling --------------------------------------------------------
     def probe(self, node: Node) -> Dict[str, Any]:
         t = now()
         rec: Dict[str, Any] = {"t": t, "elapsed": t - self.started_t, "node": node.index,
@@ -705,7 +602,6 @@ class Soak:
         self.tick = getattr(self, "tick", -1) + 1
         recs = list(self.pool.map(self.probe, self.nodes))
         for r in recs:
-            # One shared tick identity per sample: the analyzer groups by it.
             r["tick"] = self.tick
             r["tick_t"] = tick_t
             self.samples.write(r)
@@ -745,12 +641,8 @@ class Soak:
         replicas = list(self.pool.map(ask, self.nodes))
         rec = {"t": now(), "target": target, "replicas": replicas}
         self.agreement.write(rec)
-        # A full agreement that includes a recovering node is a recovery phase.
         with self.fault_lock:
             f = self.fault_state
-            # Only a height ABOVE what the node held before it was killed
-            # counts: agreement on blocks it already had shows nothing about
-            # whether it recovered.
             if (f and f.get("process_ready_t") and not f.get("agreement_t")
                     and target > (f.get("pre_kill_height") or 0)):
                 victim = f["node"]
@@ -761,10 +653,7 @@ class Soak:
                         and all(analyze._int(r.get("height")) == target for r in valid)):
                     f["agreement_t"] = now()
 
-    # -- faults ----------------------------------------------------------
     def pick_victim(self, k: int) -> Tuple[Node, List[str]]:
-        """Fault 0 hits the seed; later ones rotate, preferring an existing
-        laggard every other time so the seed-plus-laggard shape recurs."""
         if k == 0:
             return self.nodes[0], ["seed"]
         heights = {i: h for i, h in self.last_heights.items()}
@@ -776,8 +665,6 @@ class Soak:
         return n, ["seed" if n.index == 0 else "member"]
 
     def drill(self, k: int, kind: str, victim: Node, f: Dict[str, Any]) -> None:
-        """What happens to a killed node's store and binary before it restarts
-        (R6). The node is dead, so its store lock is free for the backup tool."""
         if kind == "kill":
             return
         archive = os.path.join(self.cfg.work, f"backup-fault-{k}-node-{victim.index}.tar.gz")
@@ -858,12 +745,7 @@ class Soak:
                     if (h is not None and others and not f.get("caught_up_t")
                             and h >= max(others) - 3):
                         f["caught_up_t"] = now()
-                # New work, submitted AFTER the restart through another node,
-                # seen from the restarted node's own state.
                 if not f.get("first_new_work_t") and self.cfg.workload == "native":
-                    # A protocol-4 chain refuses the faucet; use the workload's
-                    # own requests instead: one submitted after the restart,
-                    # finalized, and visible on the restarted node.
                     rid = self._native_request_settled_after(f["restart_t"])
                     if rid is not None:
                         code, receipt = http_json(victim.rpc, f"/native-inference/receipt/{rid}",
@@ -907,7 +789,6 @@ class Soak:
         self.note(f"fault {k}: {f['outcome']} ({phases})")
 
     def _native_request_settled_after(self, t: float) -> Optional[str]:
-        """A native request the driver submitted after `t` that has settled."""
         try:
             with open(os.path.join(self.cfg.work, "workload.jsonl")) as fh:
                 for line in fh:
@@ -922,10 +803,7 @@ class Soak:
             return None
         return None
 
-    # -- workload --------------------------------------------------------
     def faucet_workload(self) -> None:
-        """State-changing work through the faucet: each claim is a transfer
-        signed by the receiving node, mined, and tracked to its receipt."""
         pending: Dict[str, Dict[str, Any]] = {}
         interval = 1.0 / max(self.cfg.faucet_rate, 1e-6)
         next_submit = now()
@@ -956,8 +834,6 @@ class Soak:
                         self.workload_log.write(item)
             self._resolve(pending)
             time.sleep(0.2)
-        # Drain: give accepted items a bounded chance to settle, then record
-        # whatever is left as unresolved for the analyzer to account.
         deadline = now() + 60
         while pending and now() < deadline:
             self._resolve(pending)
@@ -987,7 +863,6 @@ class Soak:
                 self.workload_log.write(item)
                 del pending[key]
 
-    # -- main loop -------------------------------------------------------
     def execute(self) -> None:
         cfg = self.cfg
         self.start_all()
@@ -999,9 +874,6 @@ class Soak:
         driver = None
         if cfg.workload == "native":
             ports = ",".join(str(n.rpc) for n in self.nodes)
-            # The driver runs for the planned duration and then drains itself,
-            # so the last items are settled or explicitly left pending - never
-            # cut off mid-flight by the orchestrator.
             driver = subprocess.Popen(
                 [cfg.load_driver, "--rpc", ports, "--rate", str(cfg.native_rate),
                  "--duration", str(int(cfg.duration)),
@@ -1131,15 +1003,10 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-# A laptop that sleeps on low battery freezes every process of a run: on
-# 2026-09-22 a 24-hour soak lost 71 minutes that way, and the chain's heights
-# still rose across the gap. A run longer than this refuses to start on
-# battery power unless the operator accepts that risk.
 BATTERY_REFUSAL_S = 1800.0
 
 
 def parse_power(text: str) -> Optional[Dict[str, Any]]:
-    """`pmset -g batt` output: the power source and the charge, when shown."""
     source = re.search(r"Now drawing from '([^']+)'", text)
     if not source:
         return None
@@ -1148,7 +1015,6 @@ def parse_power(text: str) -> Optional[Dict[str, Any]]:
 
 
 def host_power() -> Optional[Dict[str, Any]]:
-    """This host's power source where the platform reports it (macOS)."""
     if sys.platform != "darwin":
         return None
     try:
@@ -1160,7 +1026,6 @@ def host_power() -> Optional[Dict[str, Any]]:
 
 def battery_refusal(duration_s: float, power: Optional[Dict[str, Any]],
                     allowed: bool) -> Optional[str]:
-    """Why a run must not start on this power, or None."""
     if allowed or power is None or duration_s <= BATTERY_REFUSAL_S:
         return None
     if power.get("source") != "Battery Power":
@@ -1171,19 +1036,14 @@ def battery_refusal(duration_s: float, power: Optional[Dict[str, Any]],
 
 
 def executor_label_for(cfg: Any) -> Optional[str]:
-    """The executor a native run's nodes execute requests with, as recorded in
-    run.json and in every workload record. A real-model run must never carry
-    the deterministic executor's label, or the reverse."""
     if getattr(cfg, "workload", None) != "native":
         return None
     if getattr(cfg, "real_model", None):
         return f"canonical-i8-real-model qualification={cfg.qualification}"
-    # The load driver's own default label.
     return "deterministic-test-executor"
 
 
 def driver_executor_args_for(cfg: Any) -> List[str]:
-    """The load driver's input for the executor the nodes run."""
     if not getattr(cfg, "real_model", None):
         return []
     return ["--input-hex", cfg.input_hex, "--max-tokens", str(cfg.max_tokens),
@@ -1210,8 +1070,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         soak.note(f"ABORTED: {soak.run['abort_reason']}")
     finally:
         soak.shutdown()
-    # Rename per-incarnation logs into the analyzer's node-*.log glob? They
-    # already match it (node-<i>.<k>.log).
     code = analyze.main([cfg.work])
     print(f"exit status {code} ({[k for k, v in analyze.EXIT_CODES.items() if v == code][0]})")
     return code

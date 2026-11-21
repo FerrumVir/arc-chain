@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Semantic and hostile-mutation gates for ARC privileged workflow steps."""
 
 from __future__ import annotations
 
@@ -95,16 +94,10 @@ PRE_SECRET_COMMANDS = {
     "sha256sum", "shasum", "sort", "tr", "wc",
 }
 
-# These are the three exact workflow-inline Python validators allowed to run in
-# a protected job before or while signing/recovery material can become
-# available.  Pinning the bodies closes the otherwise enormous ``python -``
-# escape hatch: a changed validator must receive an explicit security review
-# and corresponding contract update.
 REVIEWED_PRIVILEGED_PYTHON_SHA256 = {
     "7f2abec0d11ea6f177af1b7aa84a2982743f57bad66eda07d42d9c64357dc282",
     "dc5630726239b434b993c503a2463bab77c590ba24da1b906a77ea2f45dbdb9a",
     "e4a38bf1f2fdeb64ee5b6b90fa55718c1389e6f93715a80a6fc9697ee1ce66f5",
-    # Reviewed exact-profile v1/v2 branching and mutually exclusive asset sets.
     "ceafd24894b00ea4f856186484c3a9592451939b354df0c4429009551ca737a5",
     "065304ed7128e46aae2cceb5390058705180223f97300dc55ac3bf5b1c1ee0f4",
 }
@@ -154,7 +147,6 @@ PUBLISH_COMMANDS = {
 
 
 def _without_heredoc_bodies(text: str) -> str:
-    """Keep shell command lines but remove only non-expanding heredoc data."""
     output: list[str] = []
     terminator: str | None = None
     for line in text.splitlines():
@@ -176,7 +168,6 @@ def _without_heredoc_bodies(text: str) -> str:
 
 
 def _balanced_substitution(text: str, opening: int) -> tuple[str, int]:
-    """Return one $(...), <(...), or >(...) body and the character after it."""
     depth, index, quote = 1, opening + 1, None
     body_start = index
     while index < len(text):
@@ -210,7 +201,6 @@ def _balanced_substitution(text: str, opening: int) -> tuple[str, int]:
 
 
 def _shell_code_and_substitutions(text: str) -> tuple[str, list[str]]:
-    """Remove data quotes/comments while retaining executable substitutions."""
     output: list[str] = []
     substitutions: list[str] = []
     index = 0
@@ -257,8 +247,6 @@ def _shell_code_and_substitutions(text: str) -> tuple[str, list[str]]:
             if end >= len(text):
                 raise BoundaryError("unterminated double quote in privileged step")
             value = "".join(content)
-            # A quoted absolute/dynamic executable still occupies command-head
-            # position and must not disappear merely because it was quoted.
             if re.fullmatch(
                 r"(?:[A-Za-z_][A-Za-z0-9_.-]*|/[A-Za-z0-9_./${}-]+|"
                 r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?(?:/[A-Za-z0-9_./${}-]+)?)",
@@ -270,8 +258,6 @@ def _shell_code_and_substitutions(text: str) -> tuple[str, list[str]]:
             index = end + 1
             continue
         if text.startswith("$((", index):
-            # Arithmetic expansion cannot select an executable. Keep it out of
-            # the command-head grammar without mistaking it for $().
             end = text.find("))", index + 3)
             if end < 0:
                 raise BoundaryError("unterminated arithmetic expansion in privileged step")
@@ -299,7 +285,6 @@ def _shell_code_and_substitutions(text: str) -> tuple[str, list[str]]:
 
 
 def shell_command_heads(run: str) -> set[str]:
-    """Extract every executable command head from the reviewed Bash subset."""
     functions = set(re.findall(r"(?m)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{", run))
     for declaration in re.finditer(
         r"(?m)^\s*[A-Za-z_][A-Za-z0-9_]*\s*\(\)\s*\{(?P<body>[^\n]*)$", run
@@ -363,7 +348,6 @@ def shell_command_heads(run: str) -> set[str]:
 
 
 def privileged_dynamic_syntax(run: str) -> tuple[bool, bool]:
-    """Report executable $'…'/$"…" and backticks outside literal quotes."""
     dynamic_quote = legacy_substitution = False
     quote: str | None = None
     index = 0
@@ -613,7 +597,6 @@ def reject_repo_execution(text: str, *, label: str, allow_inline_python: bool = 
 
 
 def backup_manifest_public_key_awk(text: str) -> str:
-    """Return the exact inline canonicalizer exercised by backup readiness."""
     start = text.find("          canonicalize_manifest_public_key() {")
     if start < 0:
         raise BoundaryError("backup readiness lacks the manifest public-key canonicalizer")
@@ -1166,12 +1149,14 @@ class PrivilegedWorkflowBoundaryTests(unittest.TestCase):
             validate_publish_authority(mutated)
 
     def test_rejects_checkout_or_git_hook_surface_in_write_job(self) -> None:
+        first_step = "    steps:\n      - name: Download the sealed release handoff by immutable ID"
         mutated = self.texts["release"].replace(
-            "    steps:\n      # This privileged job deliberately has no checkout.",
+            first_step,
             "    steps:\n      - uses: actions/checkout@deadbeef\n\n"
-            "      # This privileged job deliberately has no checkout.",
+            "      - name: Download the sealed release handoff by immutable ID",
             1,
         )
+        self.assertNotEqual(mutated, self.texts["release"])
         with self.assertRaises(BoundaryError):
             validate_publish_authority(mutated)
 

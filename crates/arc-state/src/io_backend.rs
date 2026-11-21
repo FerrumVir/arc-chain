@@ -1,41 +1,15 @@
-//! Platform I/O backend abstraction for the WAL.
-//!
-//! Provides an `IoBackend` trait with multiple implementations:
-//! - `StdBackend`: Standard BufWriter<File> (default, works everywhere)
-//! - `DirectBackend`: Uses F_NOCACHE (macOS) or O_DIRECT (Linux) to bypass
-//!   kernel page cache, reducing double-buffering for write-heavy workloads.
-//! - `PreallocBackend`: Pre-allocates files in 64MB chunks with a 4MB write buffer
-//!   to reduce fragmentation and syscalls on write-heavy workloads.
-//! - `BatchWriter<B>`: Wraps any IoBackend to coalesce multiple small writes into
-//!   fewer large writes, critical for WAL entry batching.
-//! - `StatsBackend<B>`: Wraps any IoBackend to track I/O statistics (bytes, calls,
-//!   throughput) for benchmarking and observability.
-//! - `DevNullBackend`: Tracks call counts but discards data. Useful for benchmarking
-//!   execution speed without I/O overhead.
-
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::time::Instant;
 
-// ── IoBackend Trait ─────────────────────────────────────────────────────────
-
-/// Trait for WAL I/O backends.
 pub trait IoBackend: Send + 'static {
-    /// Write a buffer to the backend.
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()>;
-    /// Flush any internal buffers.
     fn flush(&mut self) -> io::Result<()>;
-    /// Sync data to persistent storage (fsync/fdatasync).
     fn sync_data(&mut self) -> io::Result<()>;
-    /// Total bytes written through this backend.
     fn bytes_written(&self) -> u64;
 }
 
-// ── StdBackend ──────────────────────────────────────────────────────────────
-
-/// Standard BufWriter-based backend. Works on all platforms.
-/// Uses a 256KB buffer for batching small writes.
 pub struct StdBackend {
     writer: BufWriter<File>,
     total_bytes: u64,
@@ -72,12 +46,6 @@ impl IoBackend for StdBackend {
     }
 }
 
-// ── DirectBackend ───────────────────────────────────────────────────────────
-
-/// Direct I/O backend that bypasses the kernel page cache.
-/// On macOS: uses F_NOCACHE via fcntl.
-/// On Linux: uses O_DIRECT (would need aligned buffers - simplified here).
-/// Falls back to StdBackend + F_NOCACHE hint on macOS.
 pub struct DirectBackend {
     writer: BufWriter<File>,
     total_bytes: u64,
@@ -87,11 +55,9 @@ impl DirectBackend {
     pub fn new(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
 
-        // Platform-specific cache bypass hints
         #[cfg(target_os = "macos")]
         {
             use std::os::unix::io::AsRawFd;
-            // F_NOCACHE = 48 on macOS - tells the kernel not to cache this file's data
             unsafe {
                 libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
             }
@@ -100,14 +66,11 @@ impl DirectBackend {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;
-            // On Linux, we'd ideally use O_DIRECT, but that requires page-aligned
-            // buffers. Instead, use posix_fadvise DONTNEED to hint the kernel.
             unsafe {
                 libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
             }
         }
 
-        // Use a larger buffer (512KB) since we're bypassing page cache
         Ok(Self {
             writer: BufWriter::with_capacity(512 * 1024, file),
             total_bytes: 0,
@@ -136,45 +99,24 @@ impl IoBackend for DirectBackend {
     }
 }
 
-// ── PreallocBackend ─────────────────────────────────────────────────────────
-
-/// Default pre-allocation chunk size: 64 MB.
 const PREALLOC_CHUNK: u64 = 64 * 1024 * 1024;
-/// Default write buffer capacity: 4 MB.
 const PREALLOC_BUFFER_CAP: usize = 4 * 1024 * 1024;
 
-/// Pre-allocated buffered I/O backend.
-///
-/// On creation, pre-extends the file to 64 MB (using `ftruncate` on macOS,
-/// `fallocate` on Linux) to reduce filesystem fragmentation. Maintains a
-/// 4 MB userspace write buffer and flushes on sync or when the buffer is full.
-/// When the file's logical write position approaches the pre-allocated boundary,
-/// the file is extended by another 64 MB chunk.
 pub struct PreallocBackend {
     file: File,
     buffer: Vec<u8>,
     buffer_capacity: usize,
-    /// Logical size of the file (actual data written, not the pre-allocated extent).
     file_size: u64,
-    /// Total pre-allocated extent of the file on disk.
     preallocated_size: u64,
-    /// Cumulative bytes written through this backend (for stats).
     total_bytes_written: u64,
-    /// Number of sync_data calls (for benchmarking).
     syncs: u64,
 }
 
 impl PreallocBackend {
-    /// Create a new PreallocBackend for the file at `path`.
-    ///
-    /// * Pre-allocates the file to 64 MB if it is smaller.
-    /// * Opens the file for writing (create if missing, does NOT use append mode
-    ///   because we seek to the logical end ourselves to support pre-allocation).
     pub fn new(path: &Path) -> io::Result<Self> {
         Self::with_capacity(path, PREALLOC_BUFFER_CAP, PREALLOC_CHUNK)
     }
 
-    /// Create with custom buffer capacity and pre-allocation chunk size.
     pub fn with_capacity(
         path: &Path,
         buffer_capacity: usize,
@@ -182,27 +124,18 @@ impl PreallocBackend {
     ) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
-            // MUST NOT truncate: an existing WAL segment's contents are the
-            // data we are here to preserve. The code below reads the current
-            // file length and seeks to the logical end so pre-allocation does
-            // not clobber it. Stated explicitly rather than left to the
-            // default, because `create(true)` without a truncate decision is
-            // exactly the shape of an accidental data-loss bug.
             .truncate(false)
             .read(true)
             .write(true)
             .open(path)?;
 
-        // Determine the current logical file size (actual data).
         let meta = file.metadata()?;
         let file_size = meta.len();
 
-        // Pre-allocate if the file is smaller than one chunk.
         let preallocated_size = if file_size < prealloc_chunk {
             Self::preallocate_file(&file, prealloc_chunk)?;
             prealloc_chunk
         } else {
-            // Round up to next chunk boundary.
             let chunks = file_size.div_ceil(prealloc_chunk);
             let target = chunks * prealloc_chunk;
             if target > file_size {
@@ -211,7 +144,6 @@ impl PreallocBackend {
             target
         };
 
-        // Seek to the logical end so writes append at the right position.
         use std::io::Seek;
         let mut f = &file;
         f.seek(io::SeekFrom::Start(file_size))?;
@@ -227,25 +159,18 @@ impl PreallocBackend {
         })
     }
 
-    /// Return the number of sync_data calls made on this backend.
     pub fn sync_count(&self) -> u64 {
         self.syncs
     }
 
-    /// Return the current logical file size (actual data, not the pre-allocated extent).
     pub fn logical_file_size(&self) -> u64 {
         self.file_size
     }
 
-    /// Return the current pre-allocated extent on disk.
     pub fn preallocated_size(&self) -> u64 {
         self.preallocated_size
     }
 
-    // ── internal helpers ────────────────────────────────────────────────────
-
-    /// Pre-allocate (extend) the file to `size` bytes.
-    /// Uses `fallocate` on Linux, `ftruncate` on macOS/others.
     fn preallocate_file(file: &File, size: u64) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         {
@@ -259,13 +184,11 @@ impl PreallocBackend {
 
         #[cfg(not(target_os = "linux"))]
         {
-            // macOS and others: use ftruncate to extend the file.
             file.set_len(size)?;
             Ok(())
         }
     }
 
-    /// Flush the userspace buffer to the kernel.
     fn flush_buffer(&mut self) -> io::Result<()> {
         if self.buffer.is_empty() {
             return Ok(());
@@ -274,7 +197,6 @@ impl PreallocBackend {
         self.file_size += self.buffer.len() as u64;
         self.buffer.clear();
 
-        // Extend pre-allocation if we're within one buffer-capacity of the boundary.
         if self.file_size + self.buffer_capacity as u64 >= self.preallocated_size {
             let new_size = self.preallocated_size + PREALLOC_CHUNK;
             Self::preallocate_file(&self.file, new_size)?;
@@ -288,14 +210,11 @@ impl IoBackend for PreallocBackend {
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         self.total_bytes_written += buf.len() as u64;
 
-        // If the incoming data alone exceeds the buffer capacity, bypass the buffer
-        // entirely to avoid a double-copy.
         if buf.len() >= self.buffer_capacity {
             self.flush_buffer()?;
             self.file.write_all(buf)?;
             self.file_size += buf.len() as u64;
 
-            // Extend pre-allocation if needed.
             if self.file_size + self.buffer_capacity as u64 >= self.preallocated_size {
                 let new_size = self.preallocated_size + PREALLOC_CHUNK;
                 Self::preallocate_file(&self.file, new_size)?;
@@ -306,7 +225,6 @@ impl IoBackend for PreallocBackend {
 
         self.buffer.extend_from_slice(buf);
 
-        // Auto-flush when the buffer is full.
         if self.buffer.len() >= self.buffer_capacity {
             self.flush_buffer()?;
         }
@@ -321,11 +239,6 @@ impl IoBackend for PreallocBackend {
         self.flush_buffer()?;
         self.file.sync_data()?;
 
-        // Truncate the file back to logical size so readers don't see zero-fill.
-        // (Only needed if preallocated_size > file_size, which is the common case.)
-        // NOTE: We intentionally do NOT truncate here - the zeros beyond file_size
-        // are only visible if something reads past the logical data. The WAL reader
-        // already handles short reads / zero-length entries gracefully.
         self.syncs += 1;
         Ok(())
     }
@@ -337,47 +250,30 @@ impl IoBackend for PreallocBackend {
 
 impl Drop for PreallocBackend {
     fn drop(&mut self) {
-        // Best-effort: flush remaining buffer and truncate to logical size.
         let _ = self.flush_buffer();
         let _ = self.file.set_len(self.file_size);
         let _ = self.file.sync_all();
     }
 }
 
-// ── BatchWriter ─────────────────────────────────────────────────────────────
-
-/// Default batch capacity: 1 MB.
 const BATCH_DEFAULT_CAPACITY: usize = 1024 * 1024;
-/// Default auto-flush threshold: 512 KB.
 const BATCH_DEFAULT_FLUSH_THRESHOLD: usize = 512 * 1024;
 
-/// Batched write coalescing wrapper.
-///
-/// Wraps any `IoBackend` and coalesces multiple small writes into fewer large
-/// writes. This is critical for WAL workloads where individual entries are small
-/// (tens to hundreds of bytes) but disk I/O is most efficient with large
-/// sequential writes.
 pub struct BatchWriter<B: IoBackend> {
     inner: B,
     batch: Vec<u8>,
     batch_capacity: usize,
     auto_flush_threshold: usize,
-    /// Cumulative bytes that have entered the batch (including those already flushed).
     total_batched: u64,
-    /// Number of times the batch has been flushed to the inner backend.
     total_flushes: u64,
-    /// Number of individual write_all calls received.
     write_calls: u64,
 }
 
 impl<B: IoBackend> BatchWriter<B> {
-    /// Create a new BatchWriter wrapping `inner` with default settings
-    /// (1 MB capacity, 512 KB auto-flush threshold).
     pub fn new(inner: B) -> Self {
         Self::with_capacity(inner, BATCH_DEFAULT_CAPACITY, BATCH_DEFAULT_FLUSH_THRESHOLD)
     }
 
-    /// Create a BatchWriter with custom capacity and flush threshold.
     pub fn with_capacity(inner: B, batch_capacity: usize, auto_flush_threshold: usize) -> Self {
         Self {
             inner,
@@ -390,34 +286,26 @@ impl<B: IoBackend> BatchWriter<B> {
         }
     }
 
-    /// Number of individual write_all calls received by this BatchWriter.
     pub fn write_calls(&self) -> u64 {
         self.write_calls
     }
 
-    /// Number of flush-to-inner events.
     pub fn flush_count(&self) -> u64 {
         self.total_flushes
     }
 
-    /// Total bytes that have entered the batch.
     pub fn total_batched(&self) -> u64 {
         self.total_batched
     }
 
-    /// Current pending batch size in bytes.
     pub fn pending(&self) -> usize {
         self.batch.len()
     }
 
-    /// Consume the BatchWriter and return the inner backend.
     pub fn into_inner(mut self) -> B {
-        // Best-effort flush before handing back the inner backend.
         let _ = self.flush_batch();
         self.inner
     }
-
-    // ── internal ────────────────────────────────────────────────────────────
 
     fn flush_batch(&mut self) -> io::Result<()> {
         if self.batch.is_empty() {
@@ -435,8 +323,6 @@ impl<B: IoBackend> IoBackend for BatchWriter<B> {
         self.write_calls += 1;
         self.total_batched += buf.len() as u64;
 
-        // If a single write exceeds the batch capacity, flush existing batch
-        // then write directly through to the inner backend.
         if buf.len() >= self.batch_capacity {
             self.flush_batch()?;
             self.inner.write_all(buf)?;
@@ -467,9 +353,6 @@ impl<B: IoBackend> IoBackend for BatchWriter<B> {
     }
 }
 
-// ── IoStats + StatsBackend ──────────────────────────────────────────────────
-
-/// I/O statistics tracker.
 #[derive(Debug, Clone)]
 pub struct IoStats {
     pub bytes_written: u64,
@@ -478,9 +361,7 @@ pub struct IoStats {
     pub read_calls: u64,
     pub sync_calls: u64,
     pub flush_calls: u64,
-    /// Computed: `bytes_written / write_calls` (0.0 if no writes).
     pub avg_write_size: f64,
-    /// Peak observed instantaneous write rate in bytes/second.
     pub peak_write_rate_bps: f64,
 }
 
@@ -500,7 +381,6 @@ impl Default for IoStats {
 }
 
 impl IoStats {
-    /// Recalculate derived fields.
     fn recalculate(&mut self) {
         self.avg_write_size = if self.write_calls > 0 {
             self.bytes_written as f64 / self.write_calls as f64
@@ -510,16 +390,13 @@ impl IoStats {
     }
 }
 
-/// Wrapper that adds I/O statistics tracking to any backend.
 pub struct StatsBackend<B: IoBackend> {
     inner: B,
     stats: IoStats,
-    /// Instant of the last write call (for rate calculation).
     last_write_time: Instant,
 }
 
 impl<B: IoBackend> StatsBackend<B> {
-    /// Wrap an existing backend with statistics tracking.
     pub fn new(inner: B) -> Self {
         Self {
             inner,
@@ -528,18 +405,15 @@ impl<B: IoBackend> StatsBackend<B> {
         }
     }
 
-    /// Return a snapshot of the current I/O statistics.
     pub fn stats(&self) -> IoStats {
         self.stats.clone()
     }
 
-    /// Reset all statistics counters to zero.
     pub fn reset_stats(&mut self) {
         self.stats = IoStats::default();
         self.last_write_time = Instant::now();
     }
 
-    /// Consume the StatsBackend and return the inner backend.
     pub fn into_inner(self) -> B {
         self.inner
     }
@@ -556,7 +430,6 @@ impl<B: IoBackend> IoBackend for StatsBackend<B> {
         self.stats.write_calls += 1;
         self.stats.recalculate();
 
-        // Update peak write rate (bytes / elapsed seconds since last write).
         let elapsed_secs = elapsed.as_secs_f64();
         if elapsed_secs > 0.0 {
             let rate = buf.len() as f64 / elapsed_secs;
@@ -584,13 +457,6 @@ impl<B: IoBackend> IoBackend for StatsBackend<B> {
     }
 }
 
-// ── DevNullBackend ──────────────────────────────────────────────────────────
-
-/// A /dev/null backend that tracks call counts but discards all data.
-///
-/// Useful for benchmarking execution speed without any I/O overhead. Unlike
-/// a completely no-op backend, this one increments counters so you can verify
-/// that the expected number of writes/syncs occurred.
 pub struct DevNullBackend {
     total_bytes: u64,
     write_calls: u64,
@@ -608,17 +474,14 @@ impl DevNullBackend {
         }
     }
 
-    /// Number of write_all calls.
     pub fn write_calls(&self) -> u64 {
         self.write_calls
     }
 
-    /// Number of flush calls.
     pub fn flush_calls(&self) -> u64 {
         self.flush_calls
     }
 
-    /// Number of sync_data calls.
     pub fn sync_calls(&self) -> u64 {
         self.sync_calls
     }
@@ -652,26 +515,15 @@ impl IoBackend for DevNullBackend {
     }
 }
 
-// ── BackendType + Factory ───────────────────────────────────────────────────
-
-/// Selects which I/O backend to instantiate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendType {
-    /// DevNullBackend - discards data, tracks counts.
     Null,
-    /// StdBackend - BufWriter<File> (256 KB buffer).
     Standard,
-    /// DirectBackend - cache-bypass hints + BufWriter (512 KB buffer).
     Direct,
-    /// PreallocBackend - 64 MB pre-allocation + 4 MB write buffer.
     Prealloc,
-    /// BatchWriter wrapping StdBackend - coalesces small writes.
     Batched,
 }
 
-/// Create the best available I/O backend for the current platform.
-///
-/// This is the original two-argument factory preserved for backward compatibility.
 pub fn create_backend(path: &Path, use_direct: bool) -> io::Result<Box<dyn IoBackend>> {
     if use_direct {
         Ok(Box::new(DirectBackend::new(path)?))
@@ -680,10 +532,6 @@ pub fn create_backend(path: &Path, use_direct: bool) -> io::Result<Box<dyn IoBac
     }
 }
 
-/// Create an I/O backend by type.
-///
-/// For the `Null` variant, `path` is ignored (no file is opened).
-/// For all other variants, `path` is the file to open/create.
 pub fn create_backend_typed(
     backend_type: BackendType,
     path: &Path,
@@ -700,8 +548,6 @@ pub fn create_backend_typed(
     }
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,8 +558,6 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
         dir.join(name)
     }
-
-    // ── Existing tests (preserved) ──────────────────────────────────────────
 
     #[test]
     fn std_backend_write_and_sync() {
@@ -763,8 +607,6 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    // ── New tests ───────────────────────────────────────────────────────────
-
     #[test]
     fn test_prealloc_backend_write_and_read() {
         let path = tmp_path("prealloc_wr.bin");
@@ -776,10 +618,8 @@ mod tests {
             backend.write_all(payload).unwrap();
             backend.sync_data().unwrap();
             assert_eq!(backend.bytes_written(), payload.len() as u64);
-            // Drop triggers truncate-to-logical-size + sync.
         }
 
-        // After drop, file should be truncated to logical size.
         let data = fs::read(&path).unwrap();
         assert_eq!(&data[..], payload);
         let _ = fs::remove_file(&path);
@@ -790,8 +630,6 @@ mod tests {
         let path = tmp_path("prealloc_extend.bin");
         let _ = fs::remove_file(&path);
 
-        // Use a tiny pre-allocation chunk (1 KB) and tiny buffer (256 bytes)
-        // so we can test auto-extension without writing 64 MB of data.
         let chunk: u64 = 1024;
         let buf_cap: usize = 256;
 
@@ -801,14 +639,12 @@ mod tests {
             let initial_prealloc = backend.preallocated_size();
             assert_eq!(initial_prealloc, chunk);
 
-            // Write more than one chunk worth of data.
             let block = vec![0xABu8; 512];
             for _ in 0..4 {
                 backend.write_all(&block).unwrap();
             }
             backend.flush().unwrap();
 
-            // Pre-allocated size should have grown beyond the initial chunk.
             assert!(
                 backend.preallocated_size() > initial_prealloc,
                 "preallocated_size ({}) should have grown past initial ({})",
@@ -817,7 +653,6 @@ mod tests {
             );
         }
 
-        // Verify the logical data is intact after drop.
         let data = fs::read(&path).unwrap();
         assert_eq!(data.len(), 512 * 4);
         assert!(data.iter().all(|&b| b == 0xAB));
@@ -826,29 +661,20 @@ mod tests {
 
     #[test]
     fn test_batch_writer_coalesces_writes() {
-        // Use DevNullBackend as the inner so we can count actual flush-throughs.
         let inner = DevNullBackend::new();
-        // 1 KB capacity, 512 byte flush threshold.
         let mut batch = BatchWriter::with_capacity(inner, 1024, 512);
 
-        // Write 10 small chunks (50 bytes each = 500 bytes, under threshold).
         for _ in 0..10 {
             batch.write_all(&[0u8; 50]).unwrap();
         }
-        // Nothing should have been flushed yet (500 < 512 threshold).
         assert_eq!(batch.flush_count(), 0);
         assert_eq!(batch.write_calls(), 10);
         assert_eq!(batch.pending(), 500);
 
-        // One more write pushes us to 550 bytes, over the 512 threshold.
         batch.write_all(&[0u8; 50]).unwrap();
-        // The batch should have auto-flushed.
         assert_eq!(batch.flush_count(), 1);
         assert_eq!(batch.pending(), 0);
 
-        // The inner backend should have received exactly ONE write_all call
-        // (the coalesced batch), not 11.
-        // We can check via bytes_written: 550 bytes total.
         assert_eq!(batch.bytes_written(), 550);
     }
 
@@ -858,21 +684,16 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         let inner = StdBackend::new(&path).unwrap();
-        // 256 byte capacity, 128 byte threshold.
         let mut batch = BatchWriter::with_capacity(inner, 256, 128);
 
-        // Write 64 bytes - under threshold, should stay in batch.
         batch.write_all(&[b'A'; 64]).unwrap();
         assert_eq!(batch.flush_count(), 0);
 
-        // Write another 128 bytes - total 192, over 128 threshold => auto-flush.
         batch.write_all(&[b'B'; 128]).unwrap();
         assert_eq!(batch.flush_count(), 1);
 
-        // Explicit sync flushes any remaining + syncs inner.
         batch.sync_data().unwrap();
 
-        // Verify file contents.
         let data = fs::read(&path).unwrap();
         assert_eq!(data.len(), 192);
         assert_eq!(&data[..64], &[b'A'; 64]);
@@ -910,7 +731,6 @@ mod tests {
         let s = stats_be.stats();
         assert_eq!(s.bytes_written, 400);
         assert_eq!(s.write_calls, 3);
-        // avg_write_size should be 400 / 3 ≈ 133.33
         assert!((s.avg_write_size - 133.333).abs() < 1.0);
         assert_eq!(stats_be.bytes_written(), 400);
     }
@@ -920,14 +740,12 @@ mod tests {
         let path = tmp_path("factory_typed.bin");
         let _ = fs::remove_file(&path);
 
-        // Null backend - no file needed.
         {
             let mut be = create_backend_typed(BackendType::Null, &path).unwrap();
             be.write_all(b"gone").unwrap();
             assert_eq!(be.bytes_written(), 4);
         }
 
-        // Standard backend.
         {
             let _ = fs::remove_file(&path);
             let mut be = create_backend_typed(BackendType::Standard, &path).unwrap();
@@ -936,7 +754,6 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), b"std");
         }
 
-        // Direct backend.
         {
             let _ = fs::remove_file(&path);
             let mut be = create_backend_typed(BackendType::Direct, &path).unwrap();
@@ -945,17 +762,15 @@ mod tests {
             assert_eq!(fs::read(&path).unwrap(), b"direct");
         }
 
-        // Prealloc backend.
         {
             let _ = fs::remove_file(&path);
             let mut be = create_backend_typed(BackendType::Prealloc, &path).unwrap();
             be.write_all(b"prealloc").unwrap();
             be.sync_data().unwrap();
-            drop(be); // drop truncates to logical size
+            drop(be);
             assert_eq!(fs::read(&path).unwrap(), b"prealloc");
         }
 
-        // Batched backend.
         {
             let _ = fs::remove_file(&path);
             let mut be = create_backend_typed(BackendType::Batched, &path).unwrap();
@@ -976,12 +791,9 @@ mod tests {
         be.flush().unwrap();
         be.sync_data().unwrap();
 
-        // Bytes are tracked even though data is discarded.
-        assert_eq!(be.bytes_written(), 41); // 22 + 19
+        assert_eq!(be.bytes_written(), 41);
         assert_eq!(be.write_calls(), 2);
         assert_eq!(be.flush_calls(), 1);
         assert_eq!(be.sync_calls(), 1);
-
-        // But there is no file to read - all data was discarded.
     }
 }

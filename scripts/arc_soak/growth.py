@@ -46,7 +46,6 @@ def _read(path: str) -> List[dict]:
 
 
 def fit(points: List[Tuple[float, float]]) -> Optional[Tuple[float, float]]:
-    """Least-squares slope and r for (x, y); None when x does not vary."""
     n = len(points)
     if n < 3:
         return None
@@ -63,7 +62,6 @@ def fit(points: List[Tuple[float, float]]) -> Optional[Tuple[float, float]]:
 
 
 def series(run_dir: str, skip_s: float) -> Dict[Tuple[int, int], Dict[str, List[Tuple[float, float]]]]:
-    """(node, incarnation) -> metric -> [(height, value)] over the steady window."""
     diag = _read(os.path.join(run_dir, "diag.jsonl"))
     samples = _read(os.path.join(run_dir, "samples.jsonl"))
     first_t: Dict[Tuple[int, int], float] = {}
@@ -80,8 +78,6 @@ def series(run_dir: str, skip_s: float) -> Dict[Tuple[int, int], Dict[str, List[
         if not isinstance(h, (int, float)) or rec.get("t", 0) < first_t[key] + skip_s:
             continue
         for name, value in d.items():
-            # Sizes only: a cumulative counter (a `_us` time total, say) grows
-            # by definition and is not a collection.
             if (name.startswith(PREFIXES) and not name.endswith(COUNTER_SUFFIXES)
                     and isinstance(value, (int, float))):
                 out[key][name].append((float(h), float(value)))

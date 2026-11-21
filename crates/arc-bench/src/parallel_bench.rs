@@ -1,12 +1,3 @@
-//! ARC Chain - Parallel Execution Benchmark
-//!
-//! Compares all three execution modes side-by-side:
-//!   1. Sequential (baseline)
-//!   2. Block-STM (optimistic parallel)
-//!   3. Block-STM + State Coalescing (parallel + batched I/O)
-//!
-//! Also benchmarks GPU Ed25519 verification vs CPU.
-
 mod ephemeral_keys;
 
 use arc_crypto::Hash256;
@@ -46,7 +37,6 @@ fn format_tps(tps: f64) -> String {
     }
 }
 
-/// Pre-sign a batch of transactions using real Ed25519 keypairs.
 fn presign_transactions(
     sender_count: u8,
     total_txs: usize,
@@ -84,8 +74,6 @@ fn presign_transactions(
     (transactions, genesis)
 }
 
-/// Run one benchmark pass with a given execution mode.
-/// Returns (success_count, elapsed, mode_name).
 fn run_mode(
     mode_name: &str,
     config: PipelineConfig,
@@ -111,7 +99,6 @@ fn run_mode(
         batches_submitted += 1;
     }
 
-    // Collect results
     let timeout = Duration::from_secs(120);
     let deadline = Instant::now() + timeout;
     let mut results_received = 0usize;
@@ -138,7 +125,6 @@ fn run_mode(
     (total_success, elapsed)
 }
 
-/// Benchmark GPU (Metal) vs CPU Ed25519 batch verification.
 fn bench_gpu_verify(count: usize) {
     use arc_gpu::metal_verify::{MetalVerifier, VerifyTask};
     use ed25519_dalek::Signer;
@@ -150,7 +136,6 @@ fn bench_gpu_verify(count: usize) {
     );
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    // Generate signed messages as VerifyTasks
     let mut tasks = Vec::with_capacity(count);
     let keypairs = (0..count.clamp(1, 200))
         .map(|_| ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng))
@@ -179,7 +164,6 @@ fn bench_gpu_verify(count: usize) {
         }
     );
 
-    // CPU-only path
     let cpu_result = verifier.batch_verify_cpu(&tasks);
     let cpu_rate = count as f64 / (cpu_result.elapsed_us as f64 / 1_000_000.0);
     println!(
@@ -190,7 +174,6 @@ fn bench_gpu_verify(count: usize) {
         cpu_result.valid
     );
 
-    // GPU path (Metal on Apple Silicon, CPU fallback otherwise)
     verifier.reset_stats();
     let gpu_result = verifier.batch_verify(&tasks);
     let gpu_rate = count as f64 / (gpu_result.elapsed_us as f64 / 1_000_000.0);
@@ -251,7 +234,6 @@ fn main() {
     );
     println!("    CPU cores:      {}", rayon::current_num_threads());
 
-    // Pre-sign transactions once
     println!();
     print!("  Pre-signing {} transactions with Ed25519... ", args.txs);
     let sign_start = Instant::now();
@@ -263,7 +245,6 @@ fn main() {
         format_tps(args.txs as f64 / sign_elapsed.as_secs_f64())
     );
 
-    // Define all 6 mode combinations
     struct BenchMode {
         name: &'static str,
         verify: VerifyMode,
@@ -335,10 +316,8 @@ fn main() {
         results.push((mode.name, success, tps));
     }
 
-    // ── Standalone GPU vs CPU verification ───────────────────────────────
     bench_gpu_verify(args.txs);
 
-    // ── Summary ─────────────────────────────────────────────────────────────
     let baseline_tps = results[0].2;
 
     println!();
@@ -377,7 +356,6 @@ fn main() {
     );
     println!();
 
-    // Projections using best mode
     println!("    MULTI-NODE PROJECTIONS (propose-verify, ETH-weighted):");
     println!(
         "      10 nodes:   {} TPS",

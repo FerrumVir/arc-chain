@@ -5,16 +5,6 @@ use arc_types::*;
 use rayon::prelude::*;
 use std::time::Instant;
 
-// ─────────────────────────────────────────────────────────────────────
-//  ARC Chain Benchmark Suite - Path to 1 Billion TPS
-//
-//  Phase 1: Single-core baseline
-//  Phase 2: Multi-core (Rayon parallel sharded execution)
-//  Phase 3: Multi-core + compact transactions (250 bytes)
-//  Phase 4: Simulated multi-node cluster (N nodes x single-node TPS)
-//  Phase 5: Projected GPU acceleration (Metal / Vulkan compute)
-// ─────────────────────────────────────────────────────────────────────
-
 fn main() {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
@@ -26,7 +16,6 @@ fn main() {
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 
-    // ── System Info ──────────────────────────────────────────────
     let num_cores = rayon::current_num_threads();
     let gpu = probe_gpu();
     println!("  System:");
@@ -36,18 +25,13 @@ fn main() {
     println!("    Compact TX size:    {} bytes", COMPACT_TX_SIZE);
     println!();
 
-    // ── Track all phase results for the final scaling table ──────
     let mut phase_results: Vec<(&str, f64, String)> = Vec::new();
 
-    // ═══════════════════════════════════════════════════════════════
-    //  PHASE 1: Single-Core Baseline
-    // ═══════════════════════════════════════════════════════════════
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  PHASE 1: Single-Core Baseline");
     println!("  (1 CPU core, standard 768-byte transactions, sequential)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    // 1a: Raw single-core BLAKE3 throughput
     let n_raw = 2_000_000usize;
     let raw_data: Vec<Vec<u8>> = (0..n_raw)
         .map(|i| {
@@ -57,7 +41,6 @@ fn main() {
         })
         .collect();
 
-    // Force single-threaded for baseline
     let start = Instant::now();
     let _: Vec<Hash256> = raw_data
         .iter()
@@ -76,7 +59,6 @@ fn main() {
         n_raw / 1_000_000,
     );
 
-    // 1b: Sequential state execution (1 sender)
     let genesis_accounts: Vec<(Hash256, u64)> = (0..100u8)
         .map(|i| (hash_bytes(&[i]), u64::MAX / 2))
         .collect();
@@ -111,9 +93,6 @@ fn main() {
     }
     println!();
 
-    // ═══════════════════════════════════════════════════════════════
-    //  PHASE 2: Multi-Core Parallel (Rayon)
-    // ═══════════════════════════════════════════════════════════════
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  PHASE 2: Multi-Core Parallel Execution (Rayon)");
     println!(
@@ -122,7 +101,6 @@ fn main() {
     );
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    // 2a: Parallel BLAKE3 throughput
     let n_par = 5_000_000usize;
     let par_data: Vec<Vec<u8>> = (0..n_par)
         .map(|i| {
@@ -139,7 +117,7 @@ fn main() {
         .collect();
     let refs: Vec<&[u8]> = par_data.iter().map(|d| d.as_slice()).collect();
 
-    let _ = cpu_batch_commit(&refs[..1000]); // warmup
+    let _ = cpu_batch_commit(&refs[..1000]);
     let start = Instant::now();
     let _results = cpu_batch_commit(&refs);
     let elapsed = start.elapsed();
@@ -151,7 +129,6 @@ fn main() {
         n_par / 1_000_000,
     );
 
-    // 2b: Parallel sharded state execution (many senders)
     let num_agents = 10_000u32;
     let agent_accounts: Vec<(Hash256, u64)> = (0..num_agents)
         .map(|i| (hash_bytes(&i.to_le_bytes()), u64::MAX / 2))
@@ -187,7 +164,6 @@ fn main() {
         );
     }
 
-    // 2c: Full pipeline - hash + execute + merkle
     let n_full = 5_000_000usize;
     let phase2_full_tps = {
         let state = StateDB::with_genesis(&agent_accounts);
@@ -205,7 +181,6 @@ fn main() {
 
         let start = Instant::now();
 
-        // Step 1: BLAKE3 commit all transactions (parallel)
         let tx_bytes: Vec<Vec<u8>> = transactions
             .par_iter()
             .map(|tx| bincode::serialize(tx).unwrap())
@@ -213,7 +188,6 @@ fn main() {
         let refs: Vec<&[u8]> = tx_bytes.iter().map(|b| b.as_slice()).collect();
         let _commits = cpu_batch_commit(&refs);
 
-        // Step 2: Parallel sharded state execution
         let (_block, receipts) = state
             .execute_block_parallel(&transactions, hash_bytes(&[0]))
             .unwrap();
@@ -239,9 +213,6 @@ fn main() {
     ));
     println!();
 
-    // ═══════════════════════════════════════════════════════════════
-    //  PHASE 3: Multi-Core + Compact Transactions (250 bytes)
-    // ═══════════════════════════════════════════════════════════════
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  PHASE 3: Compact Transactions (250 bytes)");
     println!(
@@ -250,7 +221,6 @@ fn main() {
     );
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    // 3a: BLAKE3 throughput with compact 250-byte payloads
     let n_compact_hash = 5_000_000usize;
     let compact_data: Vec<[u8; COMPACT_TX_SIZE]> = (0..n_compact_hash)
         .map(|i| {
@@ -261,7 +231,7 @@ fn main() {
         .collect();
     let compact_refs: Vec<&[u8]> = compact_data.iter().map(|d| d.as_slice()).collect();
 
-    let _ = cpu_batch_commit(&compact_refs[..1000]); // warmup
+    let _ = cpu_batch_commit(&compact_refs[..1000]);
     let start = Instant::now();
     let _results = cpu_batch_commit(&compact_refs);
     let elapsed = start.elapsed();
@@ -273,9 +243,6 @@ fn main() {
         n_compact_hash / 1_000_000,
     );
 
-    // 3b: Optimistic execution with compact transactions
-    // We still use the full Transaction type for state execution
-    // but the compact format reduces hash/serialization overhead
     let n_compact_exec = 5_000_000usize;
     let phase3_tps = {
         let state = StateDB::with_genesis(&agent_accounts);
@@ -293,7 +260,6 @@ fn main() {
 
         let start = Instant::now();
 
-        // Step 1: Hash compact representations (250 bytes instead of ~768)
         let compact_txs: Vec<[u8; COMPACT_TX_SIZE]> = transactions
             .par_iter()
             .map(|tx| {
@@ -307,7 +273,6 @@ fn main() {
         let compact_refs: Vec<&[u8]> = compact_txs.iter().map(|d| d.as_slice()).collect();
         let _commits = cpu_batch_commit(&compact_refs);
 
-        // Step 2: Optimistic parallel state execution (pre-sorted by nonce)
         let (success, total) = state.execute_optimistic(&transactions);
 
         let elapsed = start.elapsed();
@@ -336,21 +301,15 @@ fn main() {
     ));
     println!();
 
-    // ═══════════════════════════════════════════════════════════════
-    //  PHASE 4: Simulated Multi-Node Cluster
-    // ═══════════════════════════════════════════════════════════════
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  PHASE 4: Multi-Node Cluster Simulation");
     println!("  (Sender-address sharding is embarrassingly parallel -");
     println!("   N nodes processing N shards = Nx throughput)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    // Use the best single-node TPS from Phase 3
     let single_node_tps = phase3_tps;
 
-    // Network overhead factor: real-world cross-node communication
-    // reduces theoretical scaling by ~10-15%
-    let network_efficiency = 0.88; // 88% of theoretical (conservative)
+    let network_efficiency = 0.88;
 
     let node_configs: Vec<(u32, &str)> = vec![
         (1, "Single node (baseline)"),
@@ -383,9 +342,6 @@ fn main() {
     ));
     println!();
 
-    // ═══════════════════════════════════════════════════════════════
-    //  PHASE 5: Real GPU-Accelerated Hashing (Measured)
-    // ═══════════════════════════════════════════════════════════════
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  PHASE 5: GPU-Accelerated Hashing (MEASURED)");
     println!("  (Metal/Vulkan compute shaders - real BLAKE3 on GPU)");
@@ -403,7 +359,6 @@ fn main() {
     );
     println!();
 
-    // 5a: Warm up GPU pipeline
     let n_gpu = 500_000usize;
     let gpu_data: Vec<Vec<u8>> = (0..n_gpu)
         .map(|i| {
@@ -420,10 +375,8 @@ fn main() {
         .collect();
     let gpu_refs: Vec<&[u8]> = gpu_data.iter().map(|d| d.as_slice()).collect();
 
-    // Warm up
     let _ = gpu_batch_commit(&gpu_refs[..5000]);
 
-    // 5b: Benchmark GPU hashing with increasing batch sizes
     let mut gpu_hash_tps = 0.0f64;
     for batch in [50_000usize, 100_000, 250_000, 500_000] {
         if batch > n_gpu {
@@ -456,7 +409,6 @@ fn main() {
         }
     }
 
-    // 5c: CPU comparison at same batch size for direct comparison
     let cpu_compare_refs: Vec<&[u8]> = gpu_data[..500_000.min(n_gpu)]
         .iter()
         .map(|d| d.as_slice())
@@ -484,14 +436,8 @@ fn main() {
         gpu_hash_tps
     );
 
-    // For single-node TPS with GPU: hashing on GPU, execution on CPU
-    // The pipeline TPS is limited by the slower of hashing vs execution
     let gpu_single_node_tps = if gpu_hash_tps > 0.0 {
-        // GPU removes hashing bottleneck; state execution is now the limiter
-        // Approximate: GPU pipeline TPS ≈ min(gpu_hash_tps, cpu_exec_tps * 1.2)
-        // where cpu_exec_tps ≈ phase3_tps (since hash was part of the pipeline)
-        // With GPU handling hashing, the full pipeline gets a boost
-        let exec_tps = phase3_tps * 1.5; // CPU freed from hashing gets more exec bandwidth
+        let exec_tps = phase3_tps * 1.5;
         gpu_hash_tps.min(exec_tps)
     } else {
         single_node_tps
@@ -502,7 +448,6 @@ fn main() {
     );
     println!();
 
-    // Multi-node + GPU projections
     let gpu_cluster_configs: Vec<(u32, &str)> = vec![
         (2, "2-node (MacBook + Hetzner)"),
         (32, "32-node GPU cluster"),
@@ -537,9 +482,6 @@ fn main() {
     ));
     println!();
 
-    // ═══════════════════════════════════════════════════════════════
-    //  SCALING SUMMARY TABLE
-    // ═══════════════════════════════════════════════════════════════
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║                    SCALING PATH SUMMARY                    ║");
     println!("╠══════════════════════════════════════════════════════════════╣");
@@ -547,10 +489,6 @@ fn main() {
     let baseline_tps = phase_results[0].1;
     for (name, tps, desc) in &phase_results {
         let multiplier = tps / baseline_tps;
-        // Not `clamp`: `min(30.0).max(1.0)` and `clamp(1.0, 30.0)` disagree when
-        // `multiplier` is NaN (a zero baseline TPS makes it NaN). min/max return
-        // 30.0 there, clamp returns NaN, which casts to a bar length of 0. Keep
-        // the existing full-bar-on-NaN rendering rather than change output.
         #[allow(clippy::manual_clamp)]
         let bar_len = ((multiplier.log10() + 1.0) * 8.0).min(30.0).max(1.0) as usize;
         let bar: String = "#".repeat(bar_len);
@@ -564,7 +502,6 @@ fn main() {
     println!("╠══════════════════════════════════════════════════════════════╣");
     println!("║                                                            ║");
 
-    // Milestones
     let milestones = vec![
         (1_000_000.0, "1M TPS - 1000x Solana"),
         (10_000_000.0, "10M TPS - Real-time AI settlement"),
@@ -582,7 +519,6 @@ fn main() {
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 
-    // ── Comparison vs Existing L1s ──────────────────────────────
     println!("  ┌─────────────────────────────────────────────────────┐");
     println!("  │  vs. existing L1 blockchains:                       │");
     println!("  │    Ethereum:       ~30 TPS                          │");
@@ -600,7 +536,6 @@ fn main() {
     println!("  └─────────────────────────────────────────────────────┘");
     println!();
 
-    // ── Cryptographic Guarantees ─────────────────────────────────
     println!("  All transactions include:");
     println!("    - BLAKE3 committed (domain-separated, SIMD-accelerated)");
     println!("    - Merkle-tree verifiable (O(log n) inclusion proofs)");

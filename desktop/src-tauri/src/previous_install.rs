@@ -1,29 +1,3 @@
-//! Node data left behind by an earlier ARC install whose app data is gone.
-//!
-//! Tauri's stock Windows uninstaller offers a "Delete the application data"
-//! checkbox. Ticked during a manual "uninstall before installing" upgrade, it
-//! removes `%APPDATA%\network.arc.desktop` (store.json with the identity and
-//! config, and the validator keyfile) but leaves the node's data directory,
-//! `~/.arc/data-v3`, in place with the previous install's desktop lifecycle
-//! files. The new install then launches with no identity next to that data.
-//! Launch-time reconciliation can still drain a node that is running there,
-//! but when that node is already gone and its shutdown receipt is still
-//! armed, the one recovery launch that would clear it needs an identity, so
-//! reconciliation failed with "no identity - run onboarding" and every Start
-//! was refused until ARC restarted.
-//!
-//! When the directory provably came from a desktop that managed a node there
-//! and this install's app data did not exist at launch, nothing of this
-//! install can own it: a node needs the stored identity to start. It is set
-//! aside by renaming it beside itself (`data-v3.previous-install-<UTC>`),
-//! never deleted, and the install starts fresh. The gate is the store's
-//! absence, not an empty identity: a store that is present but could not be
-//! read also loads empty (`store::StoreLoadOutcome::Failed`), and that
-//! install owns its directory and must never have its store written over.
-//! Every other guard stays: a directory a live node or another ARC desktop
-//! holds, a linked path, a doubt of any kind leaves it in place and today's
-//! reconciliation runs as before.
-
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -33,38 +7,20 @@ use crate::node_manager;
 use crate::paths;
 use crate::store::StoreLoadOutcome;
 
-/// Inserted between the directory's name and the UTC stamp of the set-aside:
-/// `data-v3.previous-install-20261024T141500Z`.
 pub const SET_ASIDE_INFIX: &str = ".previous-install-";
 const SET_ASIDE_MAX_ATTEMPTS: u32 = 1_000;
 
-/// What launch decided about the configured node data directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
-    /// Leave it: this install's app data existed at launch (readable or
-    /// not), the directory is absent, or no desktop ever managed a node
-    /// there.
     Keep,
-    /// Evidence of a previous install, but a live holder or a doubt. Today's
-    /// reconciliation runs unchanged; the reason is for the log.
     Held(String),
-    /// Renamed from `from` to `to`, with every byte kept.
     SetAside { from: PathBuf, to: PathBuf },
 }
 
-/// Whether launch may set a previous install's directory aside, from how the
-/// identity store loaded. Only a store that was absent qualifies: an empty
-/// store that stands in for one that could not be read belongs to a live
-/// install, and the notice such a move records would be written over the
-/// unread identity.
 pub fn app_data_was_absent(outcome: StoreLoadOutcome) -> bool {
     outcome == StoreLoadOutcome::Absent
 }
 
-/// Set the configured data directory aside when it provably belongs to a
-/// previous install that no longer exists on this computer and nothing live
-/// holds it. `app_data_absent` is [`app_data_was_absent`] for this launch's
-/// store load; when it is false the directory is kept, whatever is in it.
 pub fn set_aside_if_previous_install(
     data_dir: &Path,
     app_data_absent: bool,
@@ -97,18 +53,12 @@ fn try_set_aside(data_dir: &Path, now: SystemTime) -> Result<Decision, String> {
             ));
         }
     }
-    // Links anywhere on the configured path are refused exactly as the
-    // lifecycle lock refuses them; the rename below must never act through
-    // one.
     node_manager::validate_configured_directory_ancestry_no_link(data_dir)
         .map_err(|error| error.to_string())?;
     if !left_by_a_desktop_managed_node(data_dir)? {
         return Ok(Decision::Keep);
     }
 
-    // The same sibling lock every desktop takes before it publishes, moves
-    // or rebarriers this directory name. Taken without waiting: a desktop
-    // that is working on the directory right now is a live holder.
     let namespace = arc_crypto::secret_file::try_acquire_private_directory_namespace_lock(data_dir)
         .map_err(|error| {
             let shown = paths::display_with_home_redacted(data_dir);
@@ -135,8 +85,6 @@ fn try_set_aside(data_dir: &Path, now: SystemTime) -> Result<Decision, String> {
     ensure_nothing_live_holds(&canonical)?;
 
     let to = set_aside_target(data_dir, now)?;
-    // Every probe handle above is closed: Windows refuses to rename a
-    // directory while a file beneath it is open.
     std::fs::rename(data_dir, &to).map_err(|error| {
         format!(
             "could not set aside the node data directory {}: {error}",
@@ -156,11 +104,6 @@ fn try_set_aside(data_dir: &Path, now: SystemTime) -> Result<Decision, String> {
     })
 }
 
-/// Only a desktop that spawned arc-node there writes the private shutdown
-/// token and the exact executable identity. A fresh install's own launch
-/// publishes the lifecycle locks and the namespace proof before onboarding,
-/// so those are not evidence, and a node run by hand never has the control
-/// directory at all.
 fn left_by_a_desktop_managed_node(data_dir: &Path) -> Result<bool, String> {
     let control_dir = data_dir.join(arc_crypto::secret_file::DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
     match std::fs::symlink_metadata(&control_dir) {
@@ -208,9 +151,6 @@ fn left_by_a_desktop_managed_node(data_dir: &Path) -> Result<bool, String> {
     Ok(found)
 }
 
-/// The three holders a live ARC leaves: another desktop's lifecycle owner
-/// lock, arc-node's own exclusive data-directory lock, and a process whose
-/// command line names this directory. All three must be absent.
 fn ensure_nothing_live_holds(canonical: &Path) -> Result<(), String> {
     let shown = paths::display_with_home_redacted(canonical);
     let owner_lock = canonical
@@ -256,8 +196,6 @@ fn ensure_nothing_live_holds(canonical: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// A process launched against this directory: arc-node's `--data-dir`, or
-/// the desktop shutdown token beneath it.
 fn process_naming_directory(canonical: &Path) -> Option<sysinfo::Pid> {
     let mut system = sysinfo::System::new();
     node_manager::refresh_process_command_metadata(&mut system);
@@ -313,7 +251,6 @@ fn set_aside_target(data_dir: &Path, now: SystemTime) -> Result<PathBuf, String>
     ))
 }
 
-/// `20261024T141500Z`: sortable, no characters a file system refuses.
 pub fn utc_stamp(now: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(now)
         .format("%Y%m%dT%H%M%SZ")
@@ -329,20 +266,15 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     const CONTROL: &str = arc_crypto::secret_file::DESKTOP_SHUTDOWN_CONTROL_DIR_NAME;
-    /// 2026-10-24T14:15:00Z.
     const NOW_SECS: u64 = 1_792_851_300;
     const STAMP: &str = "20261024T141500Z";
-    /// The launch of an install whose app data was deleted.
     const APP_DATA_ABSENT: bool = true;
-    /// The launch of an install whose app data exists, readable or not.
     const APP_DATA_PRESENT: bool = false;
 
     fn now() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(NOW_SECS)
     }
 
-    /// A private root beneath the resolved temporary directory (macOS
-    /// exposes it through the `/var` link, which production paths reject).
     fn test_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "arc-desktop-previous-install-{label}-{}-{}",
@@ -360,9 +292,6 @@ mod tests {
         arc_crypto::secret_file::durably_publish_new_private(path, contents).unwrap();
     }
 
-    /// What a previous install leaves: the control directory with the
-    /// shutdown token, the executable identity, an armed receipt and the
-    /// lifecycle files, next to chain data.
     fn previous_install_data(root: &Path) -> PathBuf {
         let data = root.join("data-v3");
         let control = data.join(CONTROL);
@@ -420,8 +349,6 @@ mod tests {
         assert!(STAMP.chars().all(|c| c.is_ascii_alphanumeric()));
     }
 
-    /// Only an absent store opens the gate. An empty store that stands in
-    /// for one that could not be read is a live install's.
     #[test]
     fn only_an_absent_store_opens_the_gate() {
         assert!(app_data_was_absent(StoreLoadOutcome::Absent));
@@ -439,8 +366,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A fresh install's own first launch publishes the lifecycle locks and
-    /// the namespace proof before onboarding; that is not a previous install.
     #[test]
     fn this_installs_own_pre_onboarding_directory_is_kept() {
         let root = test_root("own-fresh");
@@ -464,8 +389,6 @@ mod tests {
             Decision::Keep
         );
         assert!(data.is_dir());
-        // A node run by hand, with no desktop control directory, is not
-        // ARC's to move either.
         let manual = root.join("manual");
         std::fs::create_dir_all(manual.join("dag-wal")).unwrap();
         std::fs::write(manual.join(".arc-node.lock"), b"").unwrap();
@@ -500,8 +423,6 @@ mod tests {
             .join(arc_crypto::secret_file::DESKTOP_SHUTDOWN_RECEIPT_FILE_NAME)
             .is_file());
 
-        // A second launch finds nothing at the configured path and keeps
-        // the set-aside directory as it is.
         assert_eq!(
             set_aside_if_previous_install(&data, APP_DATA_ABSENT, now()),
             Decision::Keep
@@ -510,9 +431,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// The field case end to end: the app-data directory is gone, the node
-    /// data is not. The store loads as absent, and only then does the
-    /// directory move.
     #[test]
     fn an_absent_store_beside_previous_install_data_sets_it_aside() {
         let root = test_root("store-absent");
@@ -535,8 +453,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// The same-install case: a store with an identity loads, so this
-    /// install may own the directory, whatever the control directory holds.
     #[test]
     fn a_store_with_an_identity_keeps_the_directory_and_the_store() {
         let root = test_root("store-identity");
@@ -566,15 +482,11 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A store that is present but cannot be read loads empty exactly like
-    /// an absent one. It is a live install's wallet: the node data stays, and
-    /// the store is not written.
     #[test]
     fn an_unreadable_store_keeps_the_directory_and_the_store() {
         let root = test_root("store-unreadable");
         let data = previous_install_data(&root);
         let fixtures: Vec<(&str, Vec<u8>)> = vec![
-            // A UTF-8 byte-order mark in front of otherwise valid JSON.
             (
                 "bom",
                 [
@@ -583,13 +495,11 @@ mod tests {
                 ]
                 .concat(),
             ),
-            // Over the 1 MiB bound the reader enforces.
             ("oversize", vec![b' '; 1024 * 1024 + 1]),
             ("truncated", br#"{"identity":{"address":"11"#.to_vec()),
         ];
         for (label, bytes) in fixtures {
             let app_data = root.join(format!("app-data-{label}"));
-            // The directory exists and is private; only the store is wrong.
             assert_eq!(
                 Store::load_from_with_outcome(&app_data).1,
                 StoreLoadOutcome::Absent
@@ -613,7 +523,6 @@ mod tests {
             );
         }
 
-        // A store the private opener refuses: a link in place of the file.
         #[cfg(unix)]
         {
             let app_data = root.join("app-data-linked");
@@ -670,8 +579,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// Present app data, readable or not, keeps the directory whatever the
-    /// control directory holds.
     #[test]
     fn present_app_data_keeps_the_directory() {
         let root = test_root("same-install");
@@ -729,8 +636,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A desktop that is publishing or rebarriering the directory name holds
-    /// the sibling namespace lock; the set-aside never waits for it.
     #[test]
     fn a_directory_whose_namespace_is_locked_is_refused() {
         let root = test_root("namespace-locked");
@@ -768,7 +673,6 @@ mod tests {
             .is_symlink());
         assert_untouched(&real);
 
-        // A linked control directory inside a real data directory.
         let other = root.join("other-data-v3");
         std::fs::create_dir_all(&other).unwrap();
         std::os::unix::fs::symlink(real.join(CONTROL), other.join(CONTROL)).unwrap();
@@ -779,7 +683,6 @@ mod tests {
         assert!(other.is_dir());
         assert_untouched(&real);
 
-        // A linked token file inside a real control directory.
         let third = root.join("third-data-v3");
         arc_crypto::secret_file::secure_private_directory_tree(&third.join(CONTROL)).unwrap();
         std::os::unix::fs::symlink(

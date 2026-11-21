@@ -1265,8 +1265,6 @@ struct RecoveryLegacyDagNamespace {
     inspected_tail: Vec<RecoveryLegacyDagSegment>,
 }
 
-/// Stable no-follow metadata identity projected in
-/// `(device, inode, mode, uid, gid, nlink, mtime_ns, ctime_ns)` order.
 type RecoveryMetadataProjection = (u64, u64, u32, u32, u32, u64, i64, i64);
 
 #[cfg(unix)]
@@ -1311,9 +1309,6 @@ fn recovery_metadata_projection(
     Ok((0, 0, 0, 0, 0, 1, modified_ns, 0))
 }
 
-/// Hash one recovery input through a no-follow descriptor and prove that its
-/// inode/size/timestamps did not change while read. The caller repeats this
-/// after the legacy loader so concurrent source drift is fail-closed.
 fn recovery_read_only_input(path: &Path, label: &str) -> Result<RecoveryReadOnlyInput> {
     use sha2::{Digest, Sha256};
     use std::io::BufReader;
@@ -1772,9 +1767,6 @@ fn build_legacy_dag_round_inspection(dag_wal_dir: &str) -> Result<serde_json::Va
         segment_names: names_before.clone(),
         inspected_tail: content,
     };
-    // Hash the same key-sorted JSON Value that is emitted below.  Consumers
-    // can therefore reproduce the root from the embedded object without
-    // depending on Rust struct field declaration order.
     let namespace_value = serde_json::to_value(&namespace)?;
     let namespace_bytes = serde_json::to_vec(&namespace_value)?;
     let namespace_sha256 = hex::encode(Sha256::digest(&namespace_bytes));
@@ -2022,9 +2014,6 @@ fn recovery_copy_exact_wal_prefix(
     drop(fixed);
     let copied_sha256 = hex::encode(copied_hasher.finalize());
 
-    // Read the same prefix again through the held descriptor.  Appends after
-    // the selected boundary are allowed; any change to the accepted bytes is
-    // rejected before the pair can be published.
     source_file
         .seek(SeekFrom::Start(0))
         .context("failed to rewind source WAL for prefix recheck")?;
@@ -2096,19 +2085,12 @@ const RECOVERY_DAG_BINDING_VERSION: u16 = 2;
 const RECOVERY_DAG_BINDING_FILE: &str = "recovery-dag.binding.json";
 const RECOVERY_DAG_PIN_SCHEMA: &str = "arc.recovery.dag-generation-pin.v1";
 
-/// Local DAG persistence is useful only after it is bound to the signed
-/// checkpoint which created its consensus domain. This small readable file is
-/// not a trust root: every field is re-derived from the stored ARCCHKPT at
-/// every startup and any mismatch aborts the node.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RecoveryDagBinding {
     format_version: u16,
     manifest_hash: Hash256,
     consensus_domain: arc_consensus::ConsensusDomain,
-    /// Domain-separated commitment to the fixed validator identities, public
-    /// keys, and stakes in the signed ARCCHKPT manifest. This deliberately
-    /// never follows mutable post-transition validator state.
     validator_set_commitment: Hash256,
     source_height: u64,
     transition_height: u64,
@@ -2237,9 +2219,6 @@ impl RecoveryDagRollover for LiveRecoveryDagRollover {
 
         let selected_pin = current.pin;
         let expected_active_pin = writer.inspection().pin();
-        // Dropping the writer releases the store's advisory lock. No other
-        // consensus task can append because the outer writer slot remains
-        // exclusively locked until this method returns.
         drop(writer);
         let (records, summary) = stream_recovery_generation_records(
             &self.store,
@@ -2361,9 +2340,6 @@ fn write_recovery_dag_pin_atomically(
     })
 }
 
-/// Preserve recovered validator state exactly. Re-seeding the genesis set
-/// after post-H+1 WAL replay rewinds legitimate validator changes and creates
-/// a different state root on a rolling restart.
 fn prepare_replayed_consensus_state(
     state: &StateDB,
     genesis_validators: &[(Hash256, u64)],
@@ -2387,11 +2363,6 @@ fn prepare_replayed_consensus_state(
             "Recovered validator/state replay rechecked against its canonical block"
         );
     } else if !genesis_validators.is_empty() {
-        // A native-inference chain's committee is frozen by its binding, which
-        // is restored from the WAL when the state opens - before this point.
-        // Refuse a genesis whose committee differs, naming the difference,
-        // BEFORE re-seeding: the persistent state is fine, and the remedy is to
-        // restore the activation-time genesis (D2).
         if let Some(binding) = state.native_inference_context() {
             arc_state::inference_contract_state::genesis_committee_matches_binding(
                 genesis_validators,
@@ -2432,9 +2403,6 @@ fn sync_directory(path: &Path) -> Result<()> {
         .sync_all()
         .with_context(|| format!("failed to fsync directory {}", path.display()))?;
     #[cfg(not(unix))]
-    // Windows recovery namespace mutations use MoveFileExW with
-    // MOVEFILE_WRITE_THROUGH at each publication site; it has no documented
-    // equivalent of Unix parent-directory fsync.
     let _ = path;
     Ok(())
 }
@@ -2462,19 +2430,12 @@ fn restore_legacy_dag_wal_and_read_round(dag_wal_path: &Path) -> Result<u64> {
             )
         },
     )?;
-    // The process-lifetime node data lock is already held by this point; the
-    // parent-sibling namespace lock closes the absent-name race while the
-    // child directory is moved away and back.
     namespace_lock.rebarrier_existing().with_context(|| {
         format!(
             "failed to rebarrier legacy DAG WAL directory namespace {}",
             dag_wal_path.display()
         )
     })?;
-    // `WalWriter` can be interrupted while an existing Windows segment is in
-    // its deterministic write-through sibling. Restore every such segment
-    // before deriving the consensus round; restoring only when the writer is
-    // opened would leave the engine initialized from an incomplete view.
     arc_state::wal::restore_interrupted_wal_namespace_rebarriers(namespace_lock.target())
         .with_context(|| {
             format!(
@@ -2487,10 +2448,6 @@ fn restore_legacy_dag_wal_and_read_round(dag_wal_path: &Path) -> Result<u64> {
     ))
 }
 
-/// Process-lifetime advisory lock for one node data directory. The lock file
-/// may remain after a crash, but the kernel lock is released automatically;
-/// this prevents two self-heal/systemd processes from opening the same state
-/// and consensus WALs concurrently without creating a stale-PID blocker.
 struct NodeDataDirLock {
     _file: File,
     startup_namespace: Option<arc_crypto::secret_file::PreparedPrivateDirectoryNamespaceLock>,
@@ -2531,10 +2488,6 @@ fn acquire_node_data_dir_lock(
         "node data-directory parent {} is not a directory",
         parent.display()
     );
-    // This lock remains addressable beside the data directory while the data
-    // directory itself moves away and back. An in-directory lock alone is not
-    // sufficient: a racing startup could otherwise create a second directory
-    // during that brief absent-name window.
     let namespace_lock =
         match arc_crypto::secret_file::try_acquire_private_directory_namespace_lock(data_dir) {
             Ok(lock) => lock,
@@ -2573,9 +2526,6 @@ fn acquire_node_data_dir_lock(
             });
         }
     }
-    // Run this on both first creation and every retry. A prior attempt may
-    // have made the leaf visible before its parent-directory fsync reported a
-    // late error; merely syncing a child lock file cannot prove the leaf name.
     arc_crypto::secret_file::create_private_directory_tree(&locked_data_dir).with_context(
         || {
             format!(
@@ -2605,14 +2555,6 @@ fn acquire_node_data_dir_lock(
     let path = locked_data_dir.join(".arc-node.lock");
     let file = open_and_try_lock_node_data_file(&path, &locked_data_dir)?;
 
-    // NTFS denies renaming a directory while any descendant handle remains
-    // open (MS-FSA 2.1.5.15.12). Probe the inner in-directory lock first. An
-    // exact desktop proof safely avoids the move while its lifecycle handle is
-    // live; otherwise close our handle, rebarrier, and reacquire before any
-    // mutation. The stable sibling lock remains held throughout, and that
-    // second probe catches a same-version racer in the real-move branch.
-    // Released v0.7 binaries honor neither lock; first upgrade must fully
-    // quiesce the old process and use the documented fresh v0.8 data path.
     #[cfg(windows)]
     let (file, prepared_namespace) = if desktop_namespace_is_proven {
         let prepared = namespace_lock
@@ -2696,12 +2638,6 @@ fn open_and_try_lock_node_data_file(path: &Path, locked_data_dir: &Path) -> Resu
             locked_data_dir.display()
         )
     })?;
-    // A plain Windows create inherits the private data directory's ACEs
-    // rather than carrying its own protected DACL, and the desktop's private
-    // file checks refuse an inherited DACL. Give the lock ARC's protected
-    // private DACL through a second handle on the same file. This is best
-    // effort: the desktop repairs the lock itself as well, and a standalone
-    // node must not stop over the permissions of a pid marker.
     #[cfg(windows)]
     if let Err(error) = arc_crypto::secret_file::open_owned_private_read_write_repairing(path) {
         tracing::warn!(
@@ -2803,9 +2739,6 @@ fn cleanup_recovery_dag_binding_staging(path: &Path, wal_dir: &Path) -> Result<(
         return Ok(());
     }
     if let Err(error) = sync_directory(wal_dir) {
-        // The active binding never references a staging name. A late barrier
-        // error can only resurrect the exact inert artifact, which the next
-        // startup validates and retries.
         tracing::warn!(path = %path.display(), %error, "recovery DAG binding staging cleanup barrier will be retried");
     }
     Ok(())
@@ -2826,11 +2759,6 @@ fn activate_recovery_dag_binding(wal_dir: &Path, binding: &RecoveryDagBinding) -
                     metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
                     "staged recovery DAG binding must be a regular file"
                 );
-                // An unlink whose directory fsync reported a late failure can
-                // be resurrected after the verified active binding was
-                // published. A partial staged file or an identical complete
-                // one is harmless cleanup residue; only a different valid
-                // binding remains ambiguous and fails closed.
                 if let Ok(staged) = read_recovery_dag_binding(&binding_tmp_path) {
                     ensure!(
                         staged == *binding,
@@ -2936,9 +2864,6 @@ fn archive_legacy_dag_wal(data_dir: &Path, manifest_hash: Hash256) -> Result<Opt
             requested_legacy.display()
         )
     })?;
-    // Retain the parent-sibling namespace lock through the create-only archive
-    // rename so no startup can create a replacement live directory between
-    // restoration and archival.
     let legacy = namespace_lock.target().to_path_buf();
     let requested_archive = legacy
         .parent()
@@ -2988,10 +2913,6 @@ fn archive_legacy_dag_wal(data_dir: &Path, manifest_hash: Hash256) -> Result<Opt
     match (legacy_metadata.as_ref(), archive_metadata.as_ref()) {
         (None, None) => return Ok(None),
         (None, Some(_)) => {
-            // A write-through source-to-archive rename can become visible but
-            // report a late flush error. Retry must prove that exact visible
-            // archive before publishing a recovery binding that depends on
-            // preservation of the legacy history.
             arc_crypto::secret_file::create_private_directory_tree(&archive).with_context(
                 || {
                     format!(
@@ -3248,8 +3169,6 @@ fn validate_recovery_generation_anchor(
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("recovery DAG anchor round overflows"))?
     } else {
-        // Compatibility for generations published before an omitted leader
-        // could make consensus rounds differ from canonical block counts.
         contiguous_next_round
     };
     ensure!(
@@ -3323,10 +3242,6 @@ fn initialize_recovery_generation_store(
         }
     } else {
         let generation = if startup.wal_dir.join("CURRENT").exists() {
-            // Initial generation publication deliberately precedes the
-            // independent pin. Recover that one crash window only when the
-            // selected generation is the exact empty transition boundary; no
-            // live consensus writer can have opened before the pin existed.
             let generation = store
                 .load_current(&binding, None)
                 .context("failed to inspect unpinned initial recovery DAG generation")?;
@@ -3426,9 +3341,6 @@ fn initialize_recovery_generation_store(
     current = store
         .rebarrier_current_pointer(&binding, current.pin)
         .context("failed to rebarrier selected recovery DAG CURRENT")?;
-    // Re-publish the exact selected external pin after every validation and
-    // repair path. A prior replace can be visible despite a late namespace
-    // durability error; no live writer may open until this barrier succeeds.
     write_recovery_dag_pin_atomically(
         &startup.data_dir,
         startup.binding.manifest_hash,
@@ -3576,9 +3488,6 @@ fn replay_recovery_dag_generation(
     let mut committed_hashes = Vec::new();
     let mut transactions = std::collections::HashMap::<[u8; 32], arc_types::Transaction>::new();
     let mut transaction_payloads = std::collections::HashMap::<[u8; 32], Vec<u8>>::new();
-    // A block's parent quorum can depend on an absence certificate. Rebuild
-    // that authority from the exact durable quorum signatures before replaying
-    // any block; an own signing observation is not a quorum certificate.
     for record in records {
         if record.kind == RetainedRecordKind::AbsenceCertificate {
             let certificate: arc_consensus::view_change::SkipCertificate =
@@ -3649,9 +3558,6 @@ fn replay_recovery_dag_generation(
                         error
                     )
                 })?;
-                // Active generations keep their immutable startup cursor;
-                // reconstruct every later live round only from the same
-                // quorum of validated blocks that advanced it originally.
                 let _ = engine.advance_round();
             }
             RetainedRecordKind::RoundCursor => {
@@ -3697,14 +3603,7 @@ fn replay_recovery_dag_generation(
         )?;
     }
 
-    // The state WAL fsync deliberately precedes the separate DAG commit
-    // cursor fsync. A crash in that narrow window leaves exactly one extra
-    // canonical state block. Reconstruct the next real consensus decision,
-    // including causally justified skipped leaders, and its state binding, then
-    // ask the caller to append the missing commit record before networking.
     let repaired_commit = if commits.checked_add(1) == Some(expected_commits) {
-        // Re-run the actual commit rule, including causally justified omitted
-        // leaders. A local absence vote alone cannot select this next block.
         let candidate = engine
             .restore_next_recovery_commit_from_local_wal()
             .map_err(|error| anyhow::anyhow!("cannot repair next DAG decision: {error}"))?;
@@ -3764,9 +3663,6 @@ fn compact_replayed_recovery_generation(
         .checked_sub(startup.binding.transition_height)
         .ok_or_else(|| anyhow::anyhow!("recovery DAG committed-block count underflows"))?;
     let next_dag_round = if baseline.height == current.manifest.baseline_state.height {
-        // The preceding generation has already compacted away the anchor's
-        // block body. Reuse its independently pinned, state-validated binding;
-        // requiring that pruned body would make an ordinary reopen impossible.
         validate_recovery_generation_anchor(state, startup, current)?;
         baseline.dag_anchor = current.manifest.baseline_state.dag_anchor.clone();
         current.manifest.dag_cursor.next_dag_round
@@ -3803,10 +3699,6 @@ fn compact_replayed_recovery_generation(
         "replayed DAG window exceeds its hard round-span bound"
     );
 
-    // Every commit in the staged delta is now bound into `baseline`. Preserve
-    // only bodies/blocks/cursors/certificates needed for future decisions,
-    // in their original physical order. The exact floor round is the sole
-    // parent-compaction boundary accepted by the consensus replay API.
     let retained: Vec<_> = records
         .iter()
         .filter(|record| {
@@ -3929,12 +3821,6 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
                 format!("/proc/self/fd/{}", data_dir_handle.as_raw_fd())
             };
             #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-            // macOS exposes `/dev/fd/N` for the descriptor itself, but does
-            // not reliably support opening child pathnames such as
-            // `/dev/fd/N/state.wal`.  Keep the independently opened no-follow
-            // directory descriptor as the identity pin and use the original
-            // pathname for traversal; the before/after descriptor + pathname
-            // projection checks below still fail closed on replacement.
             let loader_data_dir = data_dir.clone();
             #[cfg(not(unix))]
             let loader_data_dir = data_dir.clone();
@@ -4788,8 +4674,6 @@ fn native_assignment_policy_report(
     }))
 }
 
-/// Return the first candidate whose complete SHA-256 matches the canonical
-/// community artifact. A similarly named or same-sized GGUF is not eligible.
 fn discover_matching_model(candidates: Vec<String>, expected_sha: &str) -> Option<String> {
     for path in candidates {
         if !std::path::Path::new(&path).is_file() {
@@ -4812,10 +4696,6 @@ fn discover_matching_model(candidates: Vec<String>, expected_sha: &str) -> Optio
     None
 }
 
-/// Look for the canonical Llama-2-7B Chat GGUF in standard community-node
-/// locations. Covers both the seed convention (`llama2-7b.gguf`) and the
-/// historical non-chat filename, but accepts bytes only when the full digest
-/// matches [`TESTNET_MODEL_SHA256`].
 fn auto_discover_model() -> Option<String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let candidates = vec![
@@ -4829,8 +4709,6 @@ fn auto_discover_model() -> Option<String> {
     discover_matching_model(candidates, TESTNET_MODEL_SHA256)
 }
 
-/// Stream a file through SHA-256 in-process. This works identically on Linux,
-/// macOS and Windows and keeps memory bounded for multi-gigabyte GGUF files.
 fn sha256_of(path: &str) -> Option<String> {
     sha256_of_with_shutdown(path, None)
 }
@@ -4861,33 +4739,13 @@ fn sha256_of_with_shutdown(
     Some(hex::encode(hasher.finalize()))
 }
 
-/// SHA256 of the canonical testnet Llama-2-7B Q4_K_M GGUF that every seed
-/// runs. Community workers must use exactly these Llama-2-7B Chat Q4_K_M
-/// bytes. The similarly named non-chat Q4_K_M artifact has a different digest
-/// and is not interchangeable. For a migration, change this and every URL in
-/// `DEFAULT_MODEL_SOURCES` together.
 const TESTNET_MODEL_SHA256: &str =
     "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa";
 
-/// Primary download sources for the canonical testnet GGUF, tried in order.
-/// First source whose advertised sha matches TESTNET_MODEL_SHA256 wins.
-/// Operators override the list at runtime with ARC_MODEL_URL (comma-
-/// separated; e.g. `ARC_MODEL_URL=https://my-mirror/llama2-7b.gguf`).
-///
-/// HuggingFace is the primary host: free, CDN-backed (CloudFront), supports
-/// git-lfs for 4-GB+ files, and works behind any NAT (HTTPS only). Add
-/// mirrors by appending URLs here, no recompile needed for ad-hoc mirrors
-/// via the env var.
 const DEFAULT_MODEL_SOURCES: &[&str] = &[
     "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf",
 ];
 
-/// Resolve a HuggingFace `/resolve/<immutable-revision>/` URL to its matching
-/// `/raw/<immutable-revision>/` form,
-/// which returns the git-lfs pointer text (~200 bytes) for large files.
-/// The pointer contains the file's real sha256 — letting us fail in 1 KB
-/// instead of 4 GB on a misconfigured mirror. Returns None for non-HF URLs
-/// or non-LFS files (those will be sha-verified the slow way after download).
 fn hf_lfs_pointer_sha(url: &str) -> Option<String> {
     let raw_url = url.replace("/resolve/", "/raw/");
     if raw_url == url {
@@ -4909,11 +4767,6 @@ fn hf_lfs_pointer_sha(url: &str) -> Option<String> {
     None
 }
 
-/// Download URL to `tmp` with resume support (`curl -C -` — partial files
-/// from prior interrupted runs are continued, not restarted) and verify
-/// sha256. Returns true only when the on-disk bytes hash to expected_sha.
-/// Cleans up the partial on sha mismatch so a poisoned file can't infect
-/// a later retry's resume.
 async fn download_and_verify(
     url: &str,
     tmp: &str,
@@ -4971,18 +4824,6 @@ async fn download_and_verify(
     true
 }
 
-/// Download the canonical testnet GGUF to $HOME/.arc-models/llama2-7b.gguf
-/// from the first source whose sha matches TESTNET_MODEL_SHA256. Tries the
-/// LFS pointer first (fast fail on misconfigured URLs), then the full file
-/// with resume support, then sha-verifies. Returns the local path on success.
-///
-/// Idempotent: returns the existing local path if the file is already
-/// present (auto_discover_model() would normally catch that earlier — this
-/// guard is kept so direct callers can reuse the function safely).
-///
-/// Sources come from ARC_MODEL_URL (comma-separated) if set, else from
-/// DEFAULT_MODEL_SOURCES. Only invoked when `--community` was explicit, so
-/// other run modes never silently fetch multi-GB files.
 async fn auto_download_model(shutdown_requested: &std::sync::atomic::AtomicBool) -> Option<String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let target_dir = format!("{}/.arc-models", home);
@@ -5039,9 +4880,6 @@ async fn auto_download_model(shutdown_requested: &std::sync::atomic::AtomicBool)
         }
         tracing::info!("--community: trying {}", url);
 
-        // 1) Fast LFS pre-check: HuggingFace `/raw/` URL returns the LFS
-        //    pointer (~200 B) containing the file's sha. Skip 4-GB pulls
-        //    against URLs whose advertised sha doesn't match.
         if let Some(remote_sha) = hf_lfs_pointer_sha(url) {
             if remote_sha != TESTNET_MODEL_SHA256 {
                 tracing::warn!(
@@ -5054,7 +4892,6 @@ async fn auto_download_model(shutdown_requested: &std::sync::atomic::AtomicBool)
             tracing::info!("  LFS sha pre-check OK ({})", remote_sha);
         }
 
-        // 2) Download with resume + final sha verification.
         if download_and_verify(url, &tmp, TESTNET_MODEL_SHA256, shutdown_requested).await {
             if let Err(e) = std::fs::rename(&tmp, &target) {
                 tracing::warn!("  rename {} -> {} failed: {}", tmp, target, e);
@@ -5079,9 +4916,6 @@ async fn auto_download_model(shutdown_requested: &std::sync::atomic::AtomicBool)
     None
 }
 
-/// Best-effort detection of total system RAM in MB. Reads /proc/meminfo on
-/// Linux; falls back to 8192 (8 GB) on macOS / non-Linux or on parse failure.
-/// Used by validator auto-shard to advertise capacity to the seed.
 fn detect_ram_mb() -> u64 {
     if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
         for line in meminfo.lines() {
@@ -5098,18 +4932,6 @@ fn detect_ram_mb() -> u64 {
     8192
 }
 
-/// Ask a seed for our shard assignment by POSTing /shards/join. Used by
-/// validators that didn't pass an explicit --shard-range; the seed finds
-/// the biggest uncovered layer gap in the pipeline and returns a range
-/// for this node to hold. Returns `Some((start, end))` on success.
-///
-/// The exact source-artifact commitment is sent with the join request so the
-/// assignment cannot enter a pipeline for same-shape, different-weight bytes.
-///
-/// The node's public label for the shard registry.
-///
-/// Deliberately never derived from validator signing material: this string is
-/// POSTed to every seed and handed out by GET /shards.
 fn public_node_name(cli: &Cli) -> String {
     if let Some(n) = cli.node_name.as_deref() {
         let n = n.trim();
@@ -5125,17 +4947,10 @@ fn public_node_name(cli: &Cli) -> String {
     format!("arc-{}", &hex::encode(digest.0)[..8])
 }
 
-// Called only when a community worker loop will start. Validators keep their
-// existing prefill setting, and an explicit zero preserves the support opt-out.
 fn community_worker_batched_prefill_default(stake: u64, setting: Option<&str>) -> bool {
     stake == 0 && setting != Some("0")
 }
 
-/// The label this community worker registers under on every coordinator's
-/// public scoreboard, plus why a `--node-name` nickname was not used.
-///
-/// Never derived from the hostname, user name, data directory, or any other
-/// machine metadata: see [`rpc::community_public_name`].
 fn community_registration_name(
     worker_id: &str,
     requested: Option<&str>,
@@ -5164,10 +4979,6 @@ fn parse_validator_http_audience_hash(value: &str, field: &str) -> Result<Hash25
         .map_err(|error| anyhow::anyhow!("invalid {field}: {error}"))
 }
 
-/// Resolve the exact validator and recovery domain that an authenticated HTTP
-/// mutation targets. Callers may cache this result, but must evict it after a
-/// failed request so a recovery transition can never keep using stale domain
-/// metadata.
 async fn fetch_validator_http_audience(
     client: &reqwest::Client,
     rpc_base: &str,
@@ -5240,11 +5051,6 @@ async fn post_signed_shard_announcement(
         .with_context(|| format!("POST authenticated shard announcement to {rpc_base}"))?;
     let status = response.status();
     if !status.is_success() {
-        // The peer says exactly why it refused, in the response body. Throwing
-        // that away is what turned a fleet-wide discovery outage into a
-        // mystery: 3,360 refusals were logged in three hours and not one
-        // carried a reason, so the cause had to be reconstructed from source.
-        // Bounded, because a peer's body is untrusted input.
         let body = response.text().await.unwrap_or_default();
         let reason: String = body.chars().take(300).collect();
         bail!(
@@ -5290,10 +5096,6 @@ async fn sleep_or_runtime_shutdown(
     }
 }
 
-/// Keep every locally held range live at each explicitly configured
-/// coordinator. The receiver authenticates the holder, destination audience,
-/// recovery domain, exact artifact and execution profile before mutating its
-/// registry. Read-only topology responses are never imported as a fallback.
 #[cfg(test)]
 async fn run_signed_shard_announcement_loop(
     shards: Vec<rpc::ShardInfo>,
@@ -5318,7 +5120,6 @@ async fn run_signed_shard_announcement_loop_inner(
     keypair: arc_crypto::KeyPair,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) {
-    // Let the local RPC listener start before the first self-announcement.
     if sleep_or_runtime_shutdown(
         &mut shutdown,
         std::time::Duration::from_secs(SHARD_ANNOUNCEMENT_STARTUP_DELAY_SECS),
@@ -5389,13 +5190,6 @@ async fn run_signed_shard_announcement_loop_inner(
     }
 }
 
-/// POST one authenticated community mutation. A new timestamp and CSPRNG
-/// nonce are signed for every attempt; callers must invoke this again for a
-/// retry or a different coordinator rather than reusing the wire envelope.
-/// Read the audience a signed community request must bind to from a
-/// coordinator's `/network/info`. Coordinators publish both hashes
-/// 0x-prefixed, like every RPC hash, so parse them exactly as the other
-/// validator HTTP audiences are parsed.
 fn community_audience_from_network_info(
     info: &serde_json::Value,
 ) -> Result<(Hash256, Option<Hash256>)> {
@@ -5431,12 +5225,6 @@ fn community_audience_from_network_info(
     Ok((target_coordinator, transaction_domain))
 }
 
-/// Worker side of region tags v0. Every ten minutes, time `GET /health` on
-/// each configured community RPC origin (best of three, after a
-/// `/network/info` request has opened the connection) and send the round
-/// trips, signed, to every origin. Coordinators keep only the nearest
-/// validator's coarse region label; no IP or raw round trip is published.
-/// Coordinators without the endpoint answer 404, which is ignored.
 async fn run_community_region_probe_loop(
     targets: Vec<String>,
     keypair: arc_crypto::KeyPair,
@@ -5494,8 +5282,6 @@ async fn run_community_region_probe_loop(
     }
 }
 
-/// Best of three `GET /health` round trips to one community RPC origin,
-/// labelled with the validator address that origin reports.
 async fn measure_community_origin_rtt(
     client: &reqwest::Client,
     origin: &str,
@@ -5571,16 +5357,10 @@ async fn post_signed_community<T: serde::Serialize>(
         .with_context(|| format!("POST authenticated community mutation to {rpc_base}{path}"))
 }
 
-/// What one coordinator answered to a community claim long-poll.
 enum ClaimPoll {
-    /// An assignment for this worker.
     Work(String, serde_json::Value),
-    /// The long-poll ended normally without work (`no_work`).
     Idle,
-    /// The coordinator (by RPC base) does not know this worker: it
-    /// restarted, or pruned the registration while this machine slept.
     NotRegistered(String),
-    /// No usable answer: network error, timeout, or an unexpected status.
     Unreachable,
 }
 
@@ -5650,16 +5430,11 @@ async fn decline_community_assignment(
     }
 }
 
-/// Heartbeat interval for community presence; every fourth round registers.
 const COMMUNITY_PRESENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 const COMMUNITY_SUBMIT_LATE_GRACE_SECS: u64 = 5 * 60;
 const COMMUNITY_ASSIGNMENT_CLOCK_SKEW_SECS: u64 = 60;
 const COMMUNITY_SUBMIT_BACKOFF_BASE_MS: u64 = 250;
 const COMMUNITY_SUBMIT_BACKOFF_CAP_MS: u64 = 30_000;
-// Background admission closes at the lifecycle signal. A community assignment
-// already owned at that edge can use the complete public request window plus
-// its crash/late-submit grace; the managed-service contract then retains 120s
-// for task joins and the final WAL durability barrier.
 const MANAGED_NODE_STOP_BUDGET_SECS: u64 = 4_420;
 const _: () = assert!(
     rpc::PUBLIC_INFERENCE_REQUEST_TIMEOUT_SECS + COMMUNITY_SUBMIT_LATE_GRACE_SECS + 120
@@ -5764,9 +5539,6 @@ fn community_submit_deadline_unix_ms(submitted_at_unix_ms: i64) -> Option<i64> {
     submitted_at_unix_ms.checked_add(i64::try_from(budget_ms).ok()?)
 }
 
-/// Validate an authenticated coordinator's wall-clock assignment metadata and
-/// return a monotonic duration to the stricter of its exact expiry and the
-/// public protocol's 4,000-second ceiling plus late-submit grace.
 fn community_submit_window(
     submitted_at_unix_ms: i64,
     expires_at_unix_ms: u64,
@@ -5832,11 +5604,6 @@ fn community_log_body(body: &str) -> String {
     }
 }
 
-/// Submit one immutable result to its assigning coordinator. Each attempt
-/// invokes `post_signed_community` again, so a timeout-after-server-success is
-/// recovered idempotently with a fresh HTTP nonce and signature while the
-/// WorkResult, job id, output and signed attestation remain byte-for-byte
-/// semantically identical.
 async fn submit_community_result_with_retry(
     client: &reqwest::Client,
     coordinator: &str,
@@ -5955,9 +5722,6 @@ async fn submit_community_result_with_retry(
     }
 }
 
-/// A stake-zero node may continue providing outbound community inference
-/// while the shipped production genesis awaits its public validator keys.
-/// It must not treat that placeholder as a consensus validator set.
 fn is_genesis_migration_observer(
     genesis: Option<&config::GenesisConfig>,
     stake: u64,
@@ -5968,9 +5732,6 @@ fn is_genesis_migration_observer(
         && genesis.is_some_and(|config| !config.chain.validator_set_complete)
 }
 
-/// Consensus/P2P is a staked validator role. A complete production genesis
-/// must not turn stake-zero community/full-model workers into unauthenticated
-/// validator transport participants merely because migration mode ended.
 fn chain_participation_allowed(
     stake: u64,
     migration_observer: bool,
@@ -5986,12 +5747,6 @@ struct NodeRuntimeRoles {
 }
 
 fn node_runtime_roles(chain_participation_enabled: bool, protocol_major: u16) -> NodeRuntimeRoles {
-    // Protocol v3 intentionally keeps paid Tier-1 inference dark until its
-    // authorization path is complete, and consensus rejects legacy vote and
-    // finalize transactions. Do not rebuild restored legacy requests into an
-    // unbounded background compute task that cannot produce an admissible v3
-    // transaction or fit the managed service's shutdown contract. Chain
-    // participation is independent and must remain enabled for v3 validators.
     NodeRuntimeRoles {
         chain_participation: chain_participation_enabled,
         tier1_background_inference: chain_participation_enabled && protocol_major < 3,
@@ -6058,8 +5813,6 @@ fn benchmark_mode_enabled(_cli: &Cli) -> bool {
     false
 }
 
-/// Keep deliberately predictable benchmark signers inside one isolated
-/// process-local development network. This has no public-network override.
 #[cfg(feature = "benchmark-tools")]
 fn validate_benchmark_runtime(
     cli: &Cli,
@@ -6119,9 +5872,6 @@ fn identity_requires_persistent_role(cli: &Cli, community_rpc_urls: &[String]) -
         || cli.shard_end.is_some()
 }
 
-/// Validate the identity/network boundary before any signing identity is
-/// loaded or derived. Returns whether a fresh process-ephemeral stake-zero
-/// observer is permitted.
 fn validate_identity_runtime(
     cli: &Cli,
     rpc_addr: &str,
@@ -6201,15 +5951,12 @@ async fn auto_shard_join(
         return None;
     }
     let url = format!("{rpc_base}/shards/join");
-    // Every joiner presents the BLAKE3 commitment of the exact source
-    // artifact. Shape metadata cannot distinguish different weights.
     let model_id_hex = hex::encode(model_artifact_id.0);
 
     let body = serde_json::json!({
         "socket_addr": advertised_socket,
         "node_name": public_node_name(cli),
         "model_id": model_id_hex,
-        // The model's own header, not an assumption about which model it is.
         "model_name": shape.name.clone().unwrap_or_else(|| shape.architecture.clone()),
         "execution_profile": execution_profile,
         "total_layers": shape.block_count,
@@ -6264,19 +6011,13 @@ fn advertised_shard_rpc_origin(cli: &Cli, rpc_addr: &str) -> Result<String> {
     Ok(canonical)
 }
 
-/// Process status for the final shutdown durability barrier. Keeping this
-/// decision pure makes the fail-closed contract regression-testable without
-/// terminating the test process.
 fn shutdown_exit_code(wal_result: &Result<(), arc_state::StateError>) -> i32 {
     if wal_result.is_ok() { 0 } else { 1 }
 }
 
 fn exit_after_clean_shutdown() -> ! {
-    // The fmt subscriber writes synchronously to stdout; there is no logging
-    // worker to drain. Flush both streams before skipping runtime/heap drops.
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-    // This exits the whole process, including from the Windows node thread.
     std::process::exit(0);
 }
 
@@ -6433,10 +6174,6 @@ fn constant_time_token_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
         == 0
 }
 
-/// Consume one local request file and authenticate its exact 32-byte token and
-/// target process. Every read is through the existing cross-platform private
-/// no-follow handle boundary. A valid request for an older PID is stale and is
-/// removed; malformed or unauthenticated input remains fail-closed.
 fn take_authenticated_desktop_shutdown_request(
     control: &DesktopShutdownControl,
 ) -> Result<Option<DesktopShutdownReceiptIdentity>> {
@@ -6452,10 +6189,6 @@ fn take_authenticated_desktop_shutdown_request(
             });
         }
     };
-    // Parse only the stable snapshot behind this validated no-follow handle.
-    // Once the handle exists, every bounded malformed/stale request is
-    // consumed as a one-shot message. That makes a crash-torn legacy request
-    // recoverable instead of permanently wedging future graceful stops.
     let parsed = (|| -> Result<Option<DesktopShutdownReceiptIdentity>> {
         ensure!(
             request_file.metadata()?.len() <= DESKTOP_SHUTDOWN_FILE_MAX_BYTES,
@@ -6522,14 +6255,6 @@ fn take_authenticated_desktop_shutdown_request(
             receipt_nonce.zeroize();
             return Ok(None);
         }
-        // `prepare_desktop_shutdown_control` already validated that this
-        // exact nonce binds the private capability, executable bytes, genesis
-        // bytes, and canonical data directory before the watcher was armed.
-        // Compare against that validated nonce here instead of synchronously
-        // re-hashing a large executable on the lifecycle worker: otherwise a
-        // shutdown request waiting at the startup lock can lose the race to
-        // network admission on slow disks. The final WAL-safe acknowledgement
-        // independently revalidates the durable receipt before it is written.
         ensure!(
             constant_time_token_eq(&control.armed_receipt_nonce, &receipt_nonce),
             "desktop shutdown request has no armed durable receipt"
@@ -6667,13 +6392,6 @@ async fn wait_for_desktop_worker_quiescence(
     }
 }
 
-/// Close HTTP and background-work admission from one synchronous signal edge.
-///
-/// HTTP handlers that Axum already accepted are not cancelled by this watch
-/// notification; each server drains them before returning. Background loops
-/// use the second notification to stop admitting compute immediately. The
-/// separate transport/consensus signal remains open until both HTTP servers
-/// have drained, preserving the dependencies of already-accepted writes.
 fn broadcast_node_shutdown(
     shutdown_requested: &std::sync::atomic::AtomicBool,
     http_shutdown: &tokio::sync::watch::Sender<bool>,
@@ -6684,26 +6402,13 @@ fn broadcast_node_shutdown(
     let _ = http_shutdown.send(true);
 }
 
-/// How often the main runtime proves that it can still run a task.
 #[cfg(unix)]
 const RUNTIME_HEARTBEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
-/// After SIGTERM, how long the main runtime may go without running a task
-/// before the process gives up on a graceful shutdown and exits.
-///
-/// This is a no-progress deadline, not a total one. A graceful stop may
-/// legitimately take much longer than this while it drains accepted work,
-/// joins writers and runs the WAL barrier, and the service unit's stop timeout
-/// already bounds that. A runtime that cannot run a one-second timer task for
-/// this long cannot finish any of it, so waiting longer only delays the
-/// service manager's kill.
 #[cfg(unix)]
 const SHUTDOWN_STALL_EXIT_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
-/// Exit status when the deadline above fires. Non-zero, so the stop is never
-/// recorded as clean and any armed shutdown receipt stays armed.
 #[cfg(unix)]
 const SHUTDOWN_STALL_EXIT_CODE: i32 = 1;
 
-/// Decides when a shutdown has stopped making progress.
 #[cfg(any(unix, test))]
 struct ShutdownStallWatch {
     last_beat: u64,
@@ -6721,8 +6426,6 @@ impl ShutdownStallWatch {
         }
     }
 
-    /// Returns how long the runtime has gone without a heartbeat, once that
-    /// reaches the limit. Any new heartbeat restarts the clock.
     fn observe(&mut self, beat: u64, now: Instant) -> Option<std::time::Duration> {
         if beat != self.last_beat {
             self.last_beat = beat;
@@ -6734,8 +6437,6 @@ impl ShutdownStallWatch {
     }
 }
 
-/// Count, on the current (main) runtime, one tick per `RUNTIME_HEARTBEAT_EVERY`.
-/// The counter stops when no worker is free to run the task.
 #[cfg(unix)]
 fn spawn_runtime_heartbeat() -> Arc<std::sync::atomic::AtomicU64> {
     let beat = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -6751,13 +6452,6 @@ fn spawn_runtime_heartbeat() -> Arc<std::sync::atomic::AtomicU64> {
     beat
 }
 
-/// Receive SIGTERM on a dedicated OS thread with its own small runtime, then
-/// run `on_sigterm` there and start the no-progress deadline.
-///
-/// The handler was a task on the node's main runtime, so a node whose runtime
-/// workers were all blocked never saw SIGTERM and could only be SIGKILLed. A
-/// signal wakes every listening runtime, so this thread's runtime receives it
-/// whatever state the main runtime is in. Returns once the handler is armed.
 #[cfg(unix)]
 fn spawn_sigterm_thread(
     runtime_heartbeat: Arc<std::sync::atomic::AtomicU64>,
@@ -6793,8 +6487,6 @@ fn spawn_sigterm_thread(
             if !received {
                 return;
             }
-            // Start the deadline before the shutdown edge, which takes locks
-            // that a stuck task could hold.
             let started = std::thread::Builder::new()
                 .name("arc-shutdown-deadline".to_string())
                 .spawn(move || exit_when_shutdown_stalls(&runtime_heartbeat));
@@ -6811,15 +6503,6 @@ fn spawn_sigterm_thread(
     Ok(())
 }
 
-/// Wait while the main runtime keeps running tasks; once it has gone
-/// `SHUTDOWN_STALL_EXIT_AFTER` without one, exit with a non-zero status.
-///
-/// Exiting here is no less safe for persistent state than the SIGKILL the
-/// service manager would otherwise send later: the consensus signing record
-/// is replaced only by a fsynced temporary file renamed over it, and a
-/// signature is released only after that returns, so an exit at any instant
-/// leaves either the old record or the new one and never an unrecorded
-/// signature. The state WAL is replayed on start as after any crash.
 #[cfg(unix)]
 fn exit_when_shutdown_stalls(runtime_heartbeat: &std::sync::atomic::AtomicU64) {
     use std::sync::atomic::Ordering;
@@ -6858,9 +6541,6 @@ fn complete_startup_shutdown_if_requested(
         .map_err(|_| anyhow::anyhow!("desktop shutdown receipt lock was poisoned"))?
         .is_some();
     if state.is_none() && authenticated_desktop_shutdown {
-        // A recovery receipt can be cleared only after StateDB has opened and
-        // replayed. Keep advancing initialization with admission already
-        // closed until a state-aware barrier can run.
         return Ok(false);
     }
     if let Some(state) = state {
@@ -6872,11 +6552,6 @@ fn complete_startup_shutdown_if_requested(
             .map_err(|_| anyhow::anyhow!("desktop shutdown receipt lock was poisoned"))?
             .take()
         {
-            // A receipt inherited from a prior crash/nonzero exit is a
-            // recovery fence. It may be acknowledged during startup only
-            // after StateDB has opened and replayed and its WAL barrier has
-            // succeeded. The state=None path below deliberately leaves it
-            // armed so an early exit cannot launder a failed prior shutdown.
             receipt.acknowledge()?;
         }
         tracing::info!(
@@ -6890,10 +6565,6 @@ fn complete_startup_shutdown_if_requested(
     Ok(true)
 }
 
-// Keep one scheduler worker available for lifecycle admission while startup
-// performs unavoidable synchronous hashing/recovery/model work on the main
-// future. A one-vCPU host must still observe SIGTERM or the authenticated
-// desktop request within the managed shutdown budget.
 fn p2p_listen_ip(
     p2p_port: u16,
     benchmark_mode: bool,
@@ -6906,9 +6577,6 @@ fn p2p_listen_ip(
     }
 }
 
-/// Select the certificate identity once, before any DAG recovery or signing.
-/// Recovery certificates share the exact recovery domain with DAG decisions;
-/// only chains without a recovery context use the genesis/epoch-zero identity.
 fn install_startup_consensus_domains(
     engine: &arc_consensus::ConsensusEngine,
     genesis_hash: Hash256,
@@ -6928,12 +6596,6 @@ fn install_startup_consensus_domains(
 
 #[cfg(windows)]
 fn main() -> Result<()> {
-    // The MSVC process entry thread reserves a substantially smaller stack
-    // than ARC's Unix entry threads. Keep the large async node/recovery
-    // future off that fixed entry stack so adding a fail-closed recovery
-    // field cannot make an otherwise normal Windows node overflow before it
-    // reaches lifecycle admission. The reservation is virtual address space;
-    // pages are committed only as they are used.
     let node = std::thread::Builder::new()
         .name("arc-node-main".to_string())
         .stack_size(8 * 1024 * 1024)
@@ -6952,8 +6614,6 @@ fn main() -> Result<()> {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn run_arc_node() -> Result<()> {
-    // Colour codes only for a person at a terminal; in a log file they are
-    // bytes on every line that every reader has to strip.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("arc=info".parse()?))
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
@@ -6964,10 +6624,6 @@ async fn run_arc_node() -> Result<()> {
         cli.legacy_v3_wire,
     ));
 
-    // The legacy peer snapshot protocol is not quorum-authenticated and is
-    // intentionally retired. Reject it before community model discovery,
-    // config loading, data-directory locking, genesis binding, or any network
-    // access so an invalid invocation cannot contaminate a fresh recovery dir.
     if let Some(peer) = &cli.sync_from {
         bail!(
             "--sync-from {peer} uses the retired unauthenticated snapshot protocol; import the published quorum-certified ARCCHKPT with --recovery-checkpoint and --approved-recovery-manifest-hash"
@@ -6989,12 +6645,6 @@ async fn run_arc_node() -> Result<()> {
             cli.enable_native_inference_requests,
         ));
 
-    // Arm lifecycle capture before community auto-download, config work,
-    // persistent recovery/replay, or model loading. The signal edge records
-    // intent synchronously in an atomic and closes both admission channels;
-    // each potentially long startup phase observes that intent before the
-    // next phase. This prevents the OS default action from bypassing the WAL
-    // barrier during initialization.
     let shutdown_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (background_admission_shutdown_tx, background_admission_shutdown_rx) =
@@ -7025,8 +6675,6 @@ async fn run_arc_node() -> Result<()> {
             }
         });
     }
-    // SIGTERM is received on its own OS thread, not on this runtime, so a
-    // runtime whose workers are all blocked still sees `systemctl stop`.
     #[cfg(unix)]
     {
         let shutdown_requested = shutdown_requested.clone();
@@ -7046,17 +6694,10 @@ async fn run_arc_node() -> Result<()> {
         })
         .context("failed to install SIGTERM handler before node initialization")?;
     }
-    // ctrl_c installs its platform handler on first poll. Yield before any
-    // synchronous startup phase so that listener is polled. The SIGTERM
-    // thread above has already confirmed its handler is armed.
     tokio::task::yield_now().await;
     tracing::info!("lifecycle signal handlers armed before node initialization");
     let mut runtime_tasks = Vec::<tokio::task::JoinHandle<()>>::new();
 
-    // ── --community: one-flag community-node setup ─────────────────────
-    // Forces stake=0 + community_mode=true, and auto-discovers a local
-    // GGUF if --model wasn't explicitly set. Lets home/residential
-    // operators run `arc-node --community` with zero other flags.
     if cli.community {
         if cli.stake != 0 {
             tracing::info!(
@@ -7069,9 +6710,6 @@ async fn run_arc_node() -> Result<()> {
     }
     if (cli.community || cli.community_mode || cli.stake == 0) && cli.model.is_none() {
         cli.model = auto_discover_model();
-        // If --community was explicit and nothing was found on disk, auto-download
-        // the sha-pinned Llama-2-7B Q4_K_M GGUF from HuggingFace. Sha-mismatch or
-        // any failure falls through to None and we print the manual instructions.
         if cli.model.is_none() && cli.community {
             cli.model = auto_download_model(&shutdown_requested).await;
         }
@@ -7105,9 +6743,6 @@ async fn run_arc_node() -> Result<()> {
         return Ok(());
     }
 
-    // ── Load config file and merge with CLI args ────────────────────────
-    // Priority: explicit CLI arg > config file value > hardcoded default.
-    // We use clap's ArgMatches to detect which args were explicitly provided.
     let matches = Cli::command().get_matches_from(std::env::args_os());
 
     let mut node_cfg = if let Some(config_path) = &cli.config {
@@ -7118,7 +6753,6 @@ async fn run_arc_node() -> Result<()> {
         config::NodeConfig::default()
     };
 
-    // Resolve each setting: CLI explicit > config file > default
     let rpc_addr = if matches.value_source("rpc") == Some(clap::parser::ValueSource::CommandLine) {
         cli.rpc.clone()
     } else {
@@ -7144,13 +6778,6 @@ async fn run_arc_node() -> Result<()> {
             node_cfg.p2p.port
         };
 
-    // --community is treated as an explicit CLI override of stake (the post-
-    // parse block forces cli.stake = 0 for that flag). Without this short-
-    // circuit, matches.value_source() — which only reflects what was on the
-    // actual command line, not later mutations — would fall through to
-    // node_cfg.validator.stake (5M by default) and silently restore a
-    // validator stake on a node the operator explicitly asked to be a
-    // stake-0 community worker.
     let stake = if cli.community
         || matches.value_source("stake") == Some(clap::parser::ValueSource::CommandLine)
     {
@@ -7165,8 +6792,6 @@ async fn run_arc_node() -> Result<()> {
         } else {
             node_cfg.storage.data_dir.clone()
         };
-    // Clap validates the handoff nonce during the first parse, before model
-    // discovery/download, config loading, filesystem locking, or networking.
     let desktop_lifecycle_nonce = cli.desktop_lifecycle_nonce;
     let mut data_dir_lock =
         acquire_node_data_dir_lock(Path::new(&data_dir), desktop_lifecycle_nonce.as_ref())?;
@@ -7215,8 +6840,6 @@ async fn run_arc_node() -> Result<()> {
             )
             .await;
         }));
-        // The first interval tick is immediate. Poll the watcher once before
-        // persistent recovery or model work can monopolize this future.
         tokio::task::yield_now().await;
         tracing::info!("authenticated desktop shutdown watcher armed before persistent state");
     }
@@ -7232,9 +6855,6 @@ async fn run_arc_node() -> Result<()> {
             node_cfg.validator.min_stake
         };
 
-    // Identity precedence: CLI / environment, then node config. Production
-    // staked nodes are allowed only the keyfile path; resolve_identity below
-    // rejects every seed-bearing production configuration.
     let validator_key_file = match matches.value_source("validator_key_file") {
         Some(clap::parser::ValueSource::CommandLine)
         | Some(clap::parser::ValueSource::EnvVariable) => cli.validator_key_file.clone(),
@@ -7253,21 +6873,17 @@ async fn run_arc_node() -> Result<()> {
             node_cfg.rpc.eth_port
         };
 
-    // Peers: merge CLI peers + config peers + seeds file
     let mut peers = if !cli.peers.is_empty() {
         cli.peers.clone()
     } else {
         node_cfg.p2p.peers.clone()
     };
 
-    // Load additional seeds from file (if provided)
     if let Some(ref seeds_path) = cli.seeds_file {
         match std::fs::read_to_string(seeds_path) {
             Ok(contents) => {
                 let seed_peers: Vec<String> = contents
                     .lines()
-                    // Strip inline comments (everything after #) then trim whitespace.
-                    // Supports format: "149.28.32.76:9091    # NYC (US East)"
                     .map(|l| l.split('#').next().unwrap_or("").trim())
                     .filter(|l| !l.is_empty())
                     .map(|l| l.to_string())
@@ -7281,13 +6897,9 @@ async fn run_arc_node() -> Result<()> {
         }
     }
 
-    // Deduplicate peers
     peers.sort();
     peers.dedup();
 
-    // Community/reward RPC trust is explicit and independent of P2P. A QUIC
-    // peer address says nothing about an HTTP port, TLS certificate, gateway,
-    // or reverse-proxy origin, so never synthesize one from `peers`.
     let raw_community_rpc_urls = if !cli.community_rpc_urls.is_empty() {
         cli.community_rpc_urls.clone()
     } else {
@@ -7348,7 +6960,6 @@ async fn run_arc_node() -> Result<()> {
         );
     }
 
-    // Benchmark settings exist only in explicitly opted-in tool builds.
     #[cfg(feature = "benchmark-tools")]
     let _bench_batch =
         if matches.value_source("bench_batch") == Some(clap::parser::ValueSource::CommandLine) {
@@ -7401,8 +7012,6 @@ async fn run_arc_node() -> Result<()> {
         node_cfg.benchmark.rayon_threads
     };
 
-    // ── Configure rayon thread pool ─────────────────────────────────────
-    // In benchmark mode, limit rayon to leave CPU for signing threads
     #[cfg(feature = "benchmark-tools")]
     if benchmark_mode {
         rayon::ThreadPoolBuilder::new()
@@ -7411,15 +7020,6 @@ async fn run_arc_node() -> Result<()> {
             .ok();
     }
 
-    // ── Validate stake ──────────────────────────────────────────────────
-    // Community-mode workers are stake-0 by definition (no slashing, no
-    // consensus role) — they register via /community/register and route
-    // inference via the seed dispatch. The min_stake gate is for actual
-    // validators, so we bypass it whenever the node is in community-mode-
-    // equivalent state (--community, --community-mode, or --stake 0).
-    // The existing community_mode auto-derive (line ~1188) already treats
-    // stake==0 as community, so this is just the same intent applied
-    // earlier in the boot flow.
     let community_mode_intent = cli.community || cli.community_mode || stake == 0;
     if !community_mode_intent && stake < min_stake {
         eprintln!(
@@ -7429,9 +7029,6 @@ async fn run_arc_node() -> Result<()> {
         std::process::exit(1);
     }
 
-    // ── Fail-closed genesis + validator identity preflight ─────────────
-    // This runs before any validator joins P2P, advertises stake, or asks a
-    // remote seed for a shard assignment.
     let genesis_cfg = cli
         .genesis
         .as_deref()
@@ -7486,8 +7083,6 @@ async fn run_arc_node() -> Result<()> {
                 config::verify_staked_identity(&genesis_validators, validator_address, stake)?;
             }
             None if cli.insecure_dev_validator_seed => {
-                // Preserve single-node development ergonomics while keeping
-                // the bypass unmistakable and impossible without the flag.
                 genesis_validators.push((validator_address, stake));
                 config::verify_staked_identity(&genesis_validators, validator_address, stake)?;
             }
@@ -7497,7 +7092,6 @@ async fn run_arc_node() -> Result<()> {
         }
     }
 
-    // Best-effort removal of copied legacy seed material after derivation.
     if let Some(seed) = validator_seed.as_mut() {
         seed.zeroize();
     }
@@ -7515,17 +7109,12 @@ async fn run_arc_node() -> Result<()> {
         tracing::warn!("╚══════════════════════════════════════════════════════════════╝");
     }
 
-    // Give the already-armed lifecycle listeners one final scheduling edge
-    // before artifact hashing can synchronously occupy this startup future.
     tokio::task::yield_now().await;
     if complete_startup_shutdown_if_requested(&shutdown_requested, None, &desktop_shutdown_receipt)?
     {
         return Ok(());
     }
 
-    // Establish one exact model identity before any shard registration or
-    // inference-capability advertisement. Failure to open/read --model is a
-    // startup error: proceeding with a guessed identity would mix weights.
     let model_artifact = cli
         .model
         .as_deref()
@@ -7533,11 +7122,6 @@ async fn run_arc_node() -> Result<()> {
         .transpose()
         .context("cannot establish the exact --model artifact commitment")?;
     let model_artifact_id = model_artifact.as_ref().map(|artifact| artifact.model_id());
-    // What model it is comes from the file's own GGUF header, and this build
-    // must have a conformant integer adapter for that architecture - anything
-    // else is refused here rather than forced through the Llama path. ARC's
-    // own `.arc-int8` cache is produced from a supported GGUF and carries its
-    // own config, so it has no GGUF header to read.
     let model_shape = match cli.model.as_deref() {
         Some(path) if !path.ends_with(".arc-int8") => {
             let shape = arc_inference::gguf_meta::read_shape_from_path(Path::new(path))
@@ -7558,9 +7142,6 @@ async fn run_arc_node() -> Result<()> {
         _ => None,
     };
 
-    // Ask for a shard only after the signing identity and genesis membership
-    // have passed validation, so a misconfigured validator performs no remote
-    // mutation before failing startup.
     if cli.auto_shard_join
         && stake > 0
         && cli.model.is_some()
@@ -7610,10 +7191,6 @@ async fn run_arc_node() -> Result<()> {
         }
     }
 
-    // ── Loud warning: local stake must match approved membership ────────
-    // Remote peers ignore self-reported stake for consensus membership and
-    // voting power. A nonzero value is meaningful only when the local
-    // identity and stake are present in the approved genesis/checkpoint.
     if stake > 0 && !peers.is_empty() {
         let public_peers: Vec<&String> = peers
             .iter()
@@ -7644,7 +7221,6 @@ async fn run_arc_node() -> Result<()> {
         }
     }
 
-    // ── Determine stake tier for display ───────────────────────────────
     let tier = arc_consensus::StakeTier::from_stake(stake)
         .map(|t| format!("{:?}", t))
         .unwrap_or_else(|| "Below minimum".to_string());
@@ -7652,10 +7228,6 @@ async fn run_arc_node() -> Result<()> {
     tracing::info!("╔═══════════════════════════════════════╗");
     tracing::info!("║   ARC Chain - Agent Runtime Chain     ║");
     tracing::info!("║   ARC Node v{:<26}║", env!("CARGO_PKG_VERSION"));
-    // Open our own executable now, before anything could replace the file,
-    // and hash it on another thread: /health reports the build this process
-    // actually runs, without delaying the node's start (the digest is logged
-    // when it is ready).
     arc_node::build_identity::begin();
     tracing::info!("╚═══════════════════════════════════════╝");
     tracing::info!("Validator  : {}", validator_address);
@@ -7689,14 +7261,6 @@ async fn run_arc_node() -> Result<()> {
         tracing::info!("Peers      : {:?}", peers);
     }
 
-    // ── Genesis accounts - prefunded for testing ────────────────────────
-    // Priority: --genesis file > hardcoded defaults.
-    // In benchmark mode (without --genesis), use deterministic ed25519
-    // keypair-derived addresses so signatures can be verified.
-    // Chain identity as DECLARED by the genesis file. Only a genesis file can
-    // name the network, so a node started without --genesis carries None here
-    // and GET /network/info reports the name and chain_id as null with a
-    // reason rather than inventing one (and never says "mainnet").
     let genesis_chain_identity: Option<rpc::ChainIdentity> =
         genesis_cfg.as_ref().map(|cfg| rpc::ChainIdentity {
             name: cfg.chain.name.clone(),
@@ -7725,8 +7289,6 @@ async fn run_arc_node() -> Result<()> {
     } else if benchmark_mode {
         #[cfg(feature = "benchmark-tools")]
         {
-            // Benchmark mode: deterministic ed25519 keypair-derived addresses.
-            // This code and its predictable keys do not exist in default builds.
             (0..100u8)
                 .map(|i| (arc_crypto::benchmark_address(i), 1_000_000_000_000))
                 .collect()
@@ -7736,7 +7298,6 @@ async fn run_arc_node() -> Result<()> {
             bail!("benchmark mode is unavailable in this default build")
         }
     } else {
-        // Default: blake3-hashed addresses for testing
         (0..100u8)
             .map(|i| (hash_bytes(&[i]), 1_000_000_000_000))
             .collect()
@@ -7795,9 +7356,6 @@ async fn run_arc_node() -> Result<()> {
             recovery_import,
         )
         .context("failed to initialize genesis/recovery-bound persistent state")?;
-        // Check recovered state before activation, archive changes, or any
-        // new canonical operation. A migrated native chain still reports v3,
-        // so the native binding and migration record must also be absent.
         if cli.legacy_v3_wire {
             validate_legacy_v3_wire_state(
                 db.active_protocol_version().major,
@@ -7805,9 +7363,6 @@ async fn run_arc_node() -> Result<()> {
                 db.native_migration().is_some(),
             )?;
         }
-        // The process-lifetime inner lock now protects the open WAL. Release
-        // the stable sibling startup guard only after replay/import and every
-        // namespace-dependent state decision has completed successfully.
         data_dir_lock.finish_persistent_state_startup();
         db.set_community_rewards_v1_activation_height(reward_activation_height);
         match reward_activation_height {
@@ -7838,23 +7393,10 @@ async fn run_arc_node() -> Result<()> {
                 "Archive mode ENABLED - no future pruning; historical completeness reported only after full v3 index verification"
             );
         }
-        // Legacy state still needs its configured validator seed. Recovered
-        // state already contains the exact H+1 validator map plus any later
-        // WAL changes; preserve it and fail if replay no longer matches the
-        // canonical block root.
         prepare_replayed_consensus_state(&db, &genesis_validators)?;
         db
     });
 
-    // Rebuild the in-memory Tier 1 pending-request index from on-disk
-    // escrow state. `tier1_pending` has no WAL op of its own; after a
-    // restart it starts empty even though the OPEN/VOTING escrows survive
-    // in the account map. Without this, the InferenceValidatorTask wakes
-    // up unable to see any outstanding requests and never finalizes them.
-    // The index uses `tier1.request_id` storage entries written by
-    // InferenceRequest.apply — escrows applied before that storage entry
-    // existed (pre-2026-06-04) can't be recovered automatically and stay
-    // stuck.
     rebuild_replayed_derived_indexes(&state);
     if complete_startup_shutdown_if_requested(
         &shutdown_requested,
@@ -7872,17 +7414,6 @@ async fn run_arc_node() -> Result<()> {
         return Ok(());
     }
 
-    // ── Private protocol-4 native inference activation (default OFF) ────────
-    //
-    // Previously nothing in this binary referenced the native contract at all:
-    // every caller of `activate_native_inference` was in `#[cfg(test)]`, so the
-    // contract could not be configured, activated or exercised outside unit
-    // tests. This is the operator seam.
-    //
-    // Fail-closed in both directions: an absent flag never touches the
-    // contract, and a present flag that cannot be satisfied aborts startup
-    // rather than continuing half-configured. It does NOT enable production
-    // model execution - the executor's own qualification gate is untouched.
     if cli.print_migration_record {
         let activation_path = cli
             .native_inference_activation
@@ -7947,10 +7478,6 @@ async fn run_arc_node() -> Result<()> {
                     commitment.to_hex()
                 );
             }
-            // A migration that has not reached its coordinated height is the
-            // normal state of every validator between being configured and
-            // the chain arriving there. The node runs on and activates at
-            // that height; it does not refuse to start.
             Err(
                 error @ arc_node::native_inference::ActivationConfigError::MigrationPending {
                     ..
@@ -7961,9 +7488,6 @@ async fn run_arc_node() -> Result<()> {
                     activation_path.display()
                 );
             }
-            // Likewise a binding update between being configured and the
-            // chain reaching its coordinated height: the binding in force is
-            // unchanged and this node keeps serving under it.
             Err(
                 error @ arc_node::native_inference::ActivationConfigError::BindingUpdatePending {
                     ..
@@ -7985,19 +7509,9 @@ async fn run_arc_node() -> Result<()> {
 
     let mempool = Arc::new(Mempool::new(10_000_000));
 
-    // ── Private protocol-4 native worker runtime (default OFF) ──────────────
-    //
-    // Activation writes contract state; it does not execute anything. Without
-    // this loop a request can be admitted with no process to run it and no
-    // finalization to settle it. Bounded and cancellable: it sleeps between
-    // empty polls, backs off on error, stops after repeated failures rather
-    // than hot-looping, and is shut down explicitly below.
     let native_runtime_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut native_runtime_handle: Option<arc_node::native_inference::NativeRuntimeHandle> = None;
-    // The finalize sink is shared: the runtime emits this validator's votes into
-    // it, and the consensus loop gossips them and feeds peers' votes back in.
     let mut native_vote_relay: Option<Arc<arc_node::native_inference::NativeFinalizeSink>> = None;
-    // What the native worker executes, for the context and tokenize endpoints.
     let mut native_serving: Option<Arc<arc_node::native_inference::NativeServing>> = None;
     if cli.native_row_workers.is_some() && !cli.native_inference_runtime {
         anyhow::bail!(
@@ -8020,10 +7534,6 @@ async fn run_arc_node() -> Result<()> {
             context.allowed_executions.first().copied().ok_or_else(|| {
                 anyhow::anyhow!("activated context has an empty execution allowlist")
             })?;
-        // Built per branch: the two executor types are different, so the
-        // runtime is generic over them and the parts cannot be shared by move.
-        // `DecisionStore::open` is a directory handle, so rebuilding it is
-        // cheap and lands on the same durable path either way.
         let shared_sink = Arc::new(ni::NativeFinalizeSink::new(
             state.clone(),
             mempool.clone(),
@@ -8045,11 +7555,6 @@ async fn run_arc_node() -> Result<()> {
             let signer = Arc::new(ni::KeyPairVoteSigner::new(validator_keypair.clone()));
             Ok((signer, shared_sink.clone(), store))
         };
-        // The deterministic test executor loads no model and never consults
-        // this field; it is carried only so its output is domain-separated by
-        // execution identity. It is `false` because nothing here qualified
-        // anything, and writing `true` next to a comment saying startup cannot
-        // decide that is exactly the defect being removed.
         #[cfg(feature = "native-test-executor")]
         let test_identity = ni::CanonicalI8Qualification {
             artifact_hash: allowed.model_hash,
@@ -8091,9 +7596,6 @@ async fn run_arc_node() -> Result<()> {
         native_runtime_handle = match started {
             Some(handle) => Some(handle),
             None => {
-                // Resolve qualification FIRST. A missing or mismatched decision
-                // must cost nothing - it is rejected before the artifact is
-                // hashed or a multi-gigabyte model is loaded.
                 let decision = ni::resolve_real_execution_decision(
                     cli.native_inference_qualification.as_deref(),
                     &allowed,
@@ -8156,8 +7658,6 @@ async fn run_arc_node() -> Result<()> {
                             artifact.display()
                         )
                     })?;
-                // A budget below the smallest job would refuse every request
-                // and never say why.
                 if executor.max_positions() < ni::MIN_NATIVE_KV_POSITIONS {
                     anyhow::bail!(
                         "--native-kv-budget-bytes {} holds {} KV positions of this model; the \
@@ -8168,10 +7668,6 @@ async fn run_arc_node() -> Result<()> {
                         ni::MIN_NATIVE_KV_POSITIONS
                     );
                 }
-                // The tokenizer is read from the artifact the executor just
-                // verified and loaded. The package check needs its vocabulary,
-                // and /native-inference/tokenize then serves exactly the
-                // executor's input contract.
                 let tokenizer = artifact
                     .to_str()
                     .ok_or_else(|| anyhow::anyhow!("native artifact path is not UTF-8"))
@@ -8196,8 +7692,6 @@ async fn run_arc_node() -> Result<()> {
                     manifest = %decision.package_manifest_hash,
                     "native package manifest verified against the loaded artifact"
                 );
-                // After the package check: only the approved package is ever
-                // placed on this operator's machines.
                 let executor = match row_config {
                     Some(config) => {
                         let executor = executor
@@ -8237,20 +7731,6 @@ async fn run_arc_node() -> Result<()> {
         tracing::warn!("PRIVATE protocol-4 native worker runtime STARTED (bounded, cancellable)");
     }
 
-    // ── Initialize candle float backend FIRST (for coherent inference) ──────
-    // For GGUF files, load candle FIRST (lightweight Q4), then load tokenizer-only
-    // from the same GGUF. This avoids loading 7GB INT8 weights on 8GB nodes.
-    //
-    // EXCEPTION: shard holders (--shard-start / --shard-end set) do NOT load
-    // candle. Candle loads the FULL Q4 model (~4 GB on Llama-7B), and a shard
-    // holder never runs /inference/run - only /inference/forward_shard - so
-    // that 4 GB is pure waste. On 8 GB VPS this pushes the process into swap
-    // and destroys forward_shard latency (observed: 20+ seconds/token on
-    // swapping NYC). Disabling candle when the node is a shard-only role
-    // keeps the RSS under 4 GB and makes the integer path run at real speed.
-    // Parse --shard-range entries ("START:END") into a sorted Vec<(usize, usize)>.
-    // Fall back to the deprecated single --shard-start/--shard-end pair so
-    // existing launch scripts keep working through the rolling upgrade.
     let mut held_ranges: Vec<(usize, usize)> = Vec::new();
     for raw in &cli.shard_ranges {
         let (s, e) = raw
@@ -8331,17 +7811,12 @@ async fn run_arc_node() -> Result<()> {
                 }
             }
         } else {
-            (None, None) // .arc-int8 files use integer engine only
+            (None, None)
         }
     } else {
         (None, None)
     };
 
-    // ── Load the integer model or tokenizer from the committed artifact ──
-    // Model configuration and tokenization are part of model identity just as
-    // much as transformer weights. Never substitute a nearby "small tokenizer"
-    // artifact here: doing so would advertise the `--model` content hash while
-    // actually tokenizing with unrelated bytes.
     let inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>> =
         if let Some(model_path) = &cli.model {
             tracing::info!("Loading model from {}...", model_path);
@@ -8399,11 +7874,6 @@ async fn run_arc_node() -> Result<()> {
                         .sum::<usize>()
                         / (1024 * 1024);
                     let layers_held = model.layers.iter().filter(|l| l.is_loaded()).count();
-                    // I16 remains a local, nonreward optimization. Validator
-                    // shards and full community workers participate in signed
-                    // cross-node verification, so their arithmetic identity is
-                    // pinned above to canonical I8 and must never be silently
-                    // promoted based on host architecture.
                     let want_i16 = !is_shard_holder
                         && !cli.full_integer_worker
                         && (cli.enable_i16 || cfg!(target_arch = "aarch64"));
@@ -8420,10 +7890,6 @@ async fn run_arc_node() -> Result<()> {
                             std::env::consts::ARCH
                         );
                     }
-                    // The CPU kernel each kind of canonical INT8 projection
-                    // runs, and what became of an ARC_CANONICAL_BATCHED_KERNEL
-                    // pin. GET /node/threads reports the same, with each
-                    // kernel's projection count since start.
                     let kernels = arc_inference::canonical_simd::kernel_report();
                     if model.has_canonical_i8_profile() {
                         tracing::info!(
@@ -8446,8 +7912,6 @@ async fn run_arc_node() -> Result<()> {
                         mb_held,
                         model.config.vocab_size
                     );
-                    // Both kernels compute identical values; this records
-                    // which one runs, for operators comparing job times.
                     tracing::info!(
                         kernel = arc_inference::canonical_simd::effective_kernel_name(),
                         source = arc_inference::canonical_simd::kernel_choice_source(),
@@ -8497,17 +7961,14 @@ async fn run_arc_node() -> Result<()> {
         return Ok(());
     }
 
-    // ── Record boot time for uptime tracking ──────────────────────────
     let boot_time = Instant::now();
 
     let mut consensus_thread = None::<std::thread::JoinHandle<()>>;
 
-    // ── Create channels for P2P transport ↔ consensus ─────────────────
     let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(1000);
     let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(4000);
     let peer_count = Arc::new(AtomicU32::new(0));
 
-    // ── Start benchmark signing pool + indexer (if benchmark mode) ─────
     #[cfg(feature = "benchmark-tools")]
     let benchmark_pool = if benchmark_mode {
         state.start_benchmark_indexer();
@@ -8515,7 +7976,7 @@ async fn run_arc_node() -> Result<()> {
             bench_sender_start,
             bench_sender_count,
             bench_sign_threads,
-            10_000, // txs per batch
+            10_000,
         );
         tracing::info!(
             "Benchmark mode ACTIVE - ed25519 signed txs, senders {}-{}, async indexing",
@@ -8529,10 +7990,6 @@ async fn run_arc_node() -> Result<()> {
     #[cfg(not(feature = "benchmark-tools"))]
     let benchmark_pool: Option<Arc<BenchmarkPool>> = None;
 
-    // ── Start DAG consensus in background ─────────────────────────────
-    // Initialize the exact approved genesis validator identities and stakes.
-    // Seed addresses and transport discovery are connectivity inputs only;
-    // they never define or mutate voting membership.
     let peer_vals: Vec<(Hash256, u64)> = genesis_validators
         .iter()
         .filter(|(addr, _)| *addr != validator_address)
@@ -8552,9 +8009,6 @@ async fn run_arc_node() -> Result<()> {
     let dag_validators = Arc::new(parking_lot::RwLock::new(all_vals));
     let dag_round = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dag_committed = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    // Set when a consensus engine is actually started. A process without one
-    // must report that it holds no certificates rather than a 404 that reads
-    // as "not final".
     let mut rpc_consensus_engine: Option<Arc<arc_consensus::ConsensusEngine>> = None;
 
     if runtime_roles.chain_participation {
@@ -8562,14 +8016,11 @@ async fn run_arc_node() -> Result<()> {
         let mut consensus = ConsensusManager::new_with_keypair(
             validator_address,
             stake,
-            4, /* num_shards */
+            4,
             benchmark_mode,
             &peer_vals,
             validator_keypair.clone(),
         );
-        // Anti-equivocation decisions live next to the node's other durable
-        // state. Without a home for them this validator refuses to sign
-        // absence or finality transcripts at all, which is the safe default.
         consensus.signing_record_path =
             Some(Path::new(&data_dir).join("consensus-signing-record.bin"));
         if let Some(rounds) = cli.dag_retained_rounds {
@@ -8628,16 +8079,8 @@ async fn run_arc_node() -> Result<()> {
         consensus.dag_validators = Some(dag_validators.clone());
         consensus.dag_round = Some(dag_round.clone());
         consensus.dag_committed = Some(dag_committed.clone());
-        // Share the engine with the RPC surface so `/finality/{height}` can
-        // serve the committee's signed statement rather than this node's own
-        // claim about it.
         rpc_consensus_engine = Some(consensus.engine.clone());
         if let Some(startup) = recovery_dag_startup.as_ref() {
-            // Protocol v3 never opens the legacy segmented WAL. Select an
-            // independently pinned content-addressed generation, stage its
-            // bounded immutable+active stream, quarantine only a classified
-            // torn final active batch, and replay every block/commit before
-            // networking starts.
             let (store, selected_generation) =
                 initialize_recovery_generation_store(state.as_ref(), startup)?;
             let (staged_records, staged_summary) =
@@ -8654,10 +8097,6 @@ async fn run_arc_node() -> Result<()> {
                 &selected_generation,
                 &staged_records,
             )?;
-            // Certified-but-not-yet-committed replay blocks may become
-            // executable on the first consensus tick. Their exact bodies must
-            // be installed directly as availability preimages; the live
-            // mempool drain order is not a recovery guarantee.
             consensus.install_recovered_preimages(recovered_transactions.clone());
             let mut restored_transactions = 0usize;
             for transaction in recovered_transactions {
@@ -8677,10 +8116,6 @@ async fn run_arc_node() -> Result<()> {
             dag_round.store(recovered_round, std::sync::atomic::Ordering::SeqCst);
             dag_committed.store(recovered_committed, std::sync::atomic::Ordering::SeqCst);
 
-            // Advance the immutable baseline to the exact canonical state
-            // boundary and remove commit records now transitively bound by its
-            // block hash/root. Publication selects generation+empty active log
-            // atomically; the independent pin is advanced only afterwards.
             let active_generation = compact_replayed_recovery_generation(
                 &store,
                 state.as_ref(),
@@ -8722,38 +8157,14 @@ async fn run_arc_node() -> Result<()> {
                 "Recovery DAG cursor and bounded writer are pinned to the signed ARCCHKPT domain"
             );
         } else {
-            // Preserve the segmented WAL compatibility path only for legacy
-            // pre-recovery networks. Protocol-v3 startup above cannot reach it.
             let dag_wal_path = Path::new(&data_dir).join("dag-wal");
             let dag_wal_round = restore_legacy_dag_wal_and_read_round(&dag_wal_path)?;
-            // An adopted checkpoint is durable in the STATE, with its anchor
-            // round, before anything else moves; the commit record and the DAG
-            // WAL may predate it (a crash right after adopting). Resuming
-            // below the round after that anchor would re-apply old anchors as
-            // new heights, so it bounds both cursors from below.
             let rebase_cursor = state
                 .rebase_anchor_round()
                 .map(|round| round.saturating_add(1))
                 .unwrap_or(0);
             let recovered_round = dag_wal_round.max(rebase_cursor);
             if recovered_round > 0 {
-                // The highest WAL round does not prove that any earlier leader
-                // was committed, so the cursor is NOT taken from it. It comes
-                // from this node's own durable commit record - written only
-                // after a committed block crossed the durability barrier - which
-                // is the "exact local commit record" this path was waiting for.
-                //
-                // Without it the cursor stayed fail-closed at 0 forever: the
-                // scan restarted at a round whose blocks are no longer in
-                // memory, broke there, and the node rejoined the mesh, accepted
-                // transactions, and never committed another block. The 4-node
-                // fixture measured exactly that - "before kill=511 after
-                // recovery=511" with peers at 649.
-                // The record holds the LAST APPLIED round; the engine's cursor
-                // is the NEXT round to scan. Converting between them is the
-                // whole point of `next_round_to_scan` - restoring the applied
-                // round verbatim re-scanned it and appended a second canonical
-                // block for the same anchor, with no crash required.
                 let recovered_committed = {
                     let record = consensus.load_signing_record();
                     let next = record.next_round_to_scan();
@@ -8768,21 +8179,6 @@ async fn run_arc_node() -> Result<()> {
                     .engine
                     .restore_round_from_local_wal(recovered_round, recovered_committed);
 
-                // Restoring the cursors is not enough on its own: the
-                // engine's DAG starts EMPTY, and block validation is recursive
-                // - inserting a block at round R needs its parents at R-1 - so
-                // nothing this node later receives can be validated until the
-                // DAG is bootstrapped.
-                //
-                // Replaying the local DAG WAL was tried and does not work: the
-                // WAL is not a contiguous DAG. A restarted node found 31 blocks
-                // in it with a gap at round 1, against a chain at round 577.
-                // The parents it needs were never all persisted locally.
-                //
-                // So the bootstrap comes from peers, over the authenticated
-                // history path, starting at round 0 where parents are empty by
-                // definition. `ConsensusManager` requests it that way whenever
-                // its DAG is empty.
                 tracing::info!(
                     recovered_round,
                     recovered_committed,
@@ -8806,10 +8202,6 @@ async fn run_arc_node() -> Result<()> {
             );
         }
 
-        // Recovery replay and durable-writer setup are complete before any
-        // network input can arrive. Bind the authenticated QUIC endpoint and
-        // require an explicit readiness result before the consensus thread is
-        // allowed to start.
         let bootstrap_peers: Vec<SocketAddr> =
             peers.iter().filter_map(|peer| peer.parse().ok()).collect();
         let listen_ip = p2p_listen_ip(p2p_port, benchmark_mode, cli.insecure_dev_validator_seed);
@@ -8883,11 +8275,6 @@ async fn run_arc_node() -> Result<()> {
         let pool_clone = benchmark_pool.clone();
         let consensus_shutdown = runtime_shutdown_rx.clone();
         let consensus_exit_shutdown = runtime_shutdown_rx.clone();
-        // Run consensus on a dedicated thread with its own tokio runtime.
-        // This prevents broadcast/transport/RPC tasks from starving the
-        // consensus loop (the root cause of random freezes at ~4000 rounds).
-        // If the consensus thread panics, log the error and exit the process -
-        // a node without consensus is useless and should restart via systemd.
         consensus_thread = Some(
             std::thread::Builder::new()
                 .name("consensus".into())
@@ -8922,7 +8309,6 @@ async fn run_arc_node() -> Result<()> {
                             tracing::error!("CONSENSUS THREAD PANICKED: {:?}", panic_info);
                         }
                     }
-                    // Exit the process - a node without consensus must restart
                     std::process::exit(1);
                 })
                 .context("failed to spawn consensus thread")?,
@@ -8943,12 +8329,7 @@ async fn run_arc_node() -> Result<()> {
         }
     }
 
-    // ── Start ETH JSON-RPC server (MetaMask, Hardhat, Foundry) ──────────
     let eth_server_task = if eth_rpc_port > 0 {
-        // Keep this unauthenticated compatibility surface local by default.
-        // Operators that need remote access should publish it through an
-        // authenticated, rate-limited reverse proxy rather than exposing the
-        // raw JSON-RPC listener directly.
         let eth_addr = format!("127.0.0.1:{}", eth_rpc_port);
         let mut eth_node = rpc::build_node_state(
             state.clone(),
@@ -8963,7 +8344,6 @@ async fn run_arc_node() -> Result<()> {
             candle_model_id,
             model_artifact_id,
         );
-        // Same declared identity on the ETH port's state.
         eth_node.chain_identity = genesis_chain_identity.clone();
         tracing::info!("ETH RPC    : {} (MetaMask/Hardhat/Foundry)", eth_addr);
         let eth_shutdown = shutdown_rx.clone();
@@ -8974,7 +8354,6 @@ async fn run_arc_node() -> Result<()> {
         None
     };
 
-    // ── Start RPC server ────────────────────────────────────────────────
     if candle_engine.is_some() {
         tracing::info!("Inference  : ENABLED (candle Q4 float, coherent output)");
     } else if inference_model.is_some() {
@@ -8991,16 +8370,6 @@ async fn run_arc_node() -> Result<()> {
         }
     }
 
-    // ── Spawn Tier 1 on-chain inference validator task ──────────────────
-    // The task polls StateDB for open InferenceRequest escrows, checks
-    // committee membership (deterministic VRF over the validator set),
-    // runs candle inference locally for requests selecting it, and
-    // submits InferenceVote / InferenceFinalize txs. See
-    // `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md`.
-    //
-    // Safe to spawn without a model: missing engine/tokenizer/exact artifact
-    // identity makes this validator abstain. Synthetic fallback votes are
-    // forbidden because they would claim execution of bytes never loaded.
     if runtime_roles.tier1_background_inference {
         let validator_task = arc_node::inference_validator::InferenceValidatorTask::new(
             state.clone(),
@@ -9032,10 +8401,6 @@ async fn run_arc_node() -> Result<()> {
         );
     }
 
-    // Build one ShardInfo per held range if this node is a shard holder, then
-    // broadcast each so the network's shard registry records every replica
-    // slot this node contributes (supports nodes that hold multiple disjoint
-    // layer ranges for 3× replication).
     let shard_ranges_are_loaded = inference_model.as_ref().is_some_and(|model| {
         held_ranges.iter().all(|(start, end)| {
             *end <= model.layers.len()
@@ -9049,10 +8414,6 @@ async fn run_arc_node() -> Result<()> {
             "Configured shard ranges are not fully loaded; this node will not announce or serve them"
         );
     }
-    // --community-verify-profiles rope-interleaved-v1: a shard holder keeps
-    // the interleaved-RoPE Q/K rows of its resident layers beside its legacy
-    // model, so it can serve both profiles. Fail closed if the operator asked
-    // for it and it cannot be built.
     let interleaved_rope_qk: Option<Arc<arc_inference::cached_integer_model::InterleavedRopeQk>> =
         match (
             &inference_model,
@@ -9084,9 +8445,6 @@ async fn run_arc_node() -> Result<()> {
         (ranges, Some(model), Some(artifact_id))
             if !ranges.is_empty() && shard_ranges_are_loaded =>
         {
-            // NOT validator_seed for the node name: these announcements are
-            // POSTed to every seed every 15s and served publicly by GET
-            // /shards, and the desktop's seed is the wallet's BIP-39 phrase.
             rpc::shard_announcements(
                 model,
                 ranges,
@@ -9100,18 +8458,12 @@ async fn run_arc_node() -> Result<()> {
     };
     let shard_infos = shard_infos_for_broadcast.clone();
 
-    // Announce each held range directly to every explicit validator HTTP
-    // origin. Every mutation is signed for the exact destination validator
-    // and recovery domain; no raw or re-signed third-party announcement is
-    // emitted. Direct holder announcements are the only topology authority.
     if !shard_infos_for_broadcast.is_empty() {
         let sis: Vec<rpc::ShardInfo> = shard_infos_for_broadcast
             .iter()
             .chain(&interleaved_rope_shard_infos)
             .cloned()
             .collect();
-        // RPC origins are explicit TLS/gateway configuration. Never infer an
-        // HTTP port from a P2P bootstrap address.
         let announcement_targets = coordinator_rpc_bases.clone();
         if announcement_targets.is_empty() {
             tracing::info!(
@@ -9133,21 +8485,6 @@ async fn run_arc_node() -> Result<()> {
         }
     }
 
-    // ── Community-mode HTTP registration + heartbeat ──────────────────
-    // Spawned when --community-mode is set. Outbound HTTP only - works
-    // behind any NAT/residential firewall. Registers with every seed on
-    // startup + every 60s, sends a heartbeat every 15s to keep the
-    // registry entry alive. Signatures authenticate mutations but do not
-    // encrypt them; production deployments must supply TLS at a reverse proxy.
-    // Each seed's TTL is 90s so 5 missed
-    // heartbeats before eviction.
-    // Auto-enable community mode for observer nodes (stake=0).
-    // If you join with no stake, you're a community contributor - no flag needed.
-    //
-    // `--no-community` opts out. That escape hatch exists because --stake now
-    // defaults to 0: without it, a bare `arc-node --seeds-file <public seeds>`
-    // would start POSTing /community/register and /community/heartbeat to
-    // every seed listed. Read-only coordinators need to be able to say no.
     let community_mode = (cli.community_mode || stake == 0) && !cli.no_community;
     let community_networking = community_mode && !community_rpc_bases.is_empty();
     if cli.no_community && (cli.community_mode || stake == 0) {
@@ -9171,19 +8508,10 @@ async fn run_arc_node() -> Result<()> {
         tracing::info!("╚═══════════════════════════════════════╝");
     }
 
-    // The node's dedicated inference pool. The community worker loop below
-    // starts before the RPC server, so it holds this handle and `rpc::serve`
-    // attaches the same one: --threads, [inference] threads and the desktop's
-    // live POST /node/threads then size community jobs too. Unset, jobs run
-    // on rayon's global pool as before.
     let compute_pool = rpc::ComputePool::default();
 
     if community_networking {
         let worker_id = format!("0x{}", hex::encode(validator_address.0));
-        // Every validator serves this label on its public scoreboard. It is a
-        // validated `--node-name` nickname or `node-<short public-key hash>`,
-        // never the hostname: default computer names usually carry the
-        // owner's first name.
         let (public_worker_name, rejected_nickname) =
             community_registration_name(&worker_id, cli.node_name.as_deref());
         if let Some(reason) = rejected_nickname {
@@ -9231,10 +8559,6 @@ async fn run_arc_node() -> Result<()> {
         let community_rpc_targets_c = community_rpc_targets.clone();
         let registration_keypair = validator_keypair.clone();
         let mut registration_shutdown = Some(background_admission_shutdown_rx.clone());
-        // Local status for the desktop app (GET /community/worker/status),
-        // and the queue of coordinators the claim loop reports as no longer
-        // knowing this worker (registered with again, each at most once per
-        // cooldown).
         let worker_status = arc_node::community_worker::install(Arc::new(
             arc_node::community_worker::CommunityWorkerStatus::new(
                 worker_id.clone(),
@@ -9248,7 +8572,6 @@ async fn run_arc_node() -> Result<()> {
         let registration_wakeup = reregister.clone();
 
         runtime_tasks.push(tokio::spawn(async move {
-            // Settle before first POST
             if sleep_or_runtime_shutdown(
                 &mut registration_shutdown,
                 std::time::Duration::from_secs(5),
@@ -9266,15 +8589,6 @@ async fn run_arc_node() -> Result<()> {
                 Err(_) => return,
             };
 
-            // Advertise "inference" ONLY when a model is actually loaded.
-            //
-            // This was hardcoded to ["inference"] regardless. All three live
-            // registered workers reported `model: null` yet still counted as
-            // live inference workers on the seed side (which checks
-            // capabilities alone), so the router dispatched real jobs into a
-            // black hole and blocked in dispatch_to_community_worker for the
-            // full community_dispatch_timeout — 60 s at the desktop's 16-token
-            // default — before falling back to local.
             let capabilities: Vec<String> = if model_name_c.is_some() && model_id_c.is_some() {
                 vec!["inference".to_string()]
             } else {
@@ -9294,32 +8608,8 @@ async fn run_arc_node() -> Result<()> {
                 work_completed: None,
             };
 
-            // Register once, then heartbeat + re-register periodically.
-            //
-            // V3 intentionally contacts arc-node's authenticated RPC only.
-            // Retrying the old unsigned :3001 gateway would downgrade proof
-            // of possession and make rollout failures look like success.
-            //
-            // Seeds are contacted CONCURRENTLY. Serially, one unreachable
-            // seed's 5 s timeout delayed every seed after it, and with six
-            // seeds a full round could exceed the 15 s tick.
-            //
-            // Coordinators keep the registry in memory and prune a worker
-            // after 90 s without a heartbeat, so a coordinator restart or a
-            // sleeping laptop used to leave this worker unknown (every claim
-            // answered 404) until the next registration tick, up to a minute
-            // later. Register again immediately when a heartbeat gets 404,
-            // when the claim loop reports a 404, or when the wall clock shows
-            // the machine slept. A claim 404 names its coordinator, and that
-            // coordinator alone is registered with again, outside the 15 s
-            // schedule: at once the first time, then at most once per
-            // `REREGISTER_COOLDOWN` (the queue coalesces the rest).
             enum Round {
-                // The schedule: heartbeat everyone, register every fourth
-                // round.
                 Scheduled,
-                // The claim loop reported these coordinators as not knowing
-                // this worker: register with them alone.
                 Requested(Vec<String>),
             }
             let mut ticks: u64 = 0;
@@ -9339,8 +8629,6 @@ async fn run_arc_node() -> Result<()> {
                         "wall clock jumped (sleep or suspend); registering again with every coordinator"
                     );
                 }
-                // A requested round leaves the schedule alone; after a sleep
-                // every coordinator has to be registered with anyway.
                 let (targets, register_tick, scheduled) =
                     match std::mem::replace(&mut round, Round::Scheduled) {
                         Round::Requested(requested)
@@ -9430,8 +8718,6 @@ async fn run_arc_node() -> Result<()> {
                     }
                 }
                 if scheduled {
-                    // A requested round covers a subset; only a full round
-                    // says how many coordinators know this worker.
                     registration_status.record_registration_round(accepted);
                     ticks += 1;
                     next_scheduled = tokio::time::Instant::now() + COMMUNITY_PRESENCE_INTERVAL;
@@ -9451,7 +8737,6 @@ async fn run_arc_node() -> Result<()> {
             worker_id
         );
 
-        // Region tags v0 (opt-in): coarse, measured-latency pairing labels.
         if cli.community_region_probe && worker_model.is_some() {
             runtime_tasks.push(tokio::spawn(run_community_region_probe_loop(
                 community_rpc_targets.clone(),
@@ -9461,11 +8746,6 @@ async fn run_arc_node() -> Result<()> {
             )));
         }
 
-        // ── Community inference worker loop ──────────────────────────────
-        // Continuously long-poll /community/claim_work on all seeds. When
-        // a job arrives, run inference locally using the loaded model, then
-        // POST the result back to /community/submit_work. This is what
-        // makes community nodes provide REAL inference compute.
         if let (Some(model), Some((_, worker_model_id, worker_model_id_hash))) =
             (inference_model.clone(), worker_model.clone())
         {
@@ -9477,17 +8757,8 @@ async fn run_arc_node() -> Result<()> {
             }
             let worker_id_w = worker_id.clone();
             let community_rpc_targets_w = community_rpc_targets.clone();
-            // Worker keypair + address for signing InferenceAttestation txs
-            // (v0.7.0). On every successful submit we build a signed
-            // tx with `from = worker_address` so on-chain rewards accrue
-            // to the worker who actually did the work.
             let worker_keypair = validator_keypair.clone();
             let worker_address = validator_address;
-            // Per-process attestation nonce. Initialized on first submit
-            // by querying the chain for the worker's current account
-            // nonce (see init-from-chain block inside the loop), then
-            // incremented locally per attestation. If a future submit
-            // is rejected with InvalidNonce we re-query and reset.
             let attestation_nonce = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let attestation_nonce_initialized =
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -9510,7 +8781,7 @@ async fn run_arc_node() -> Result<()> {
                     return;
                 }
                 let client = match reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(35)) // 30s claim + 5s overhead
+                    .timeout(std::time::Duration::from_secs(35))
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
                 {
@@ -9535,26 +8806,6 @@ async fn run_arc_node() -> Result<()> {
                     {
                         break;
                     }
-                    // Long-poll EVERY seed at once and take the first to hand
-                    // us work.
-                    //
-                    // This used to be a sequential `for addr in seeds`, each
-                    // awaiting a long-poll of up to COMMUNITY_CLAIM_TIMEOUT_SECS
-                    // (30 s) on :9090 and then again on :3001. With six seeds
-                    // the worst-case revisit interval for any one seed was
-                    // ~6 minutes, against a dispatcher that gives up after at
-                    // most 60 s — so a job queued on seed 5 expired before the
-                    // worker got back around to asking. Every live seed
-                    // reported total_work_completed = 0 despite three
-                    // registered workers.
-                    //
-                    // Now: one in-flight claim per seed, first responder wins.
-                    // The remaining polls are drained in the background. If
-                    // two independent coordinators assign work at the same
-                    // instant, every extra assignment is explicitly declined
-                    // so its dispatcher falls back immediately instead of
-                    // silently losing the dequeued job when a request future
-                    // is canceled.
                     let claim_body = rpc::ClaimWorkRequest {
                         worker_id: worker_id_w.clone(),
                         capabilities: vec!["inference".to_string()],
@@ -9617,18 +8868,8 @@ async fn run_arc_node() -> Result<()> {
                         }
                     }
                     for coordinator in unregistered {
-                        // The registration task registers with this
-                        // coordinator now instead of at its next one-minute
-                        // registration tick. Repeats within the cooldown are
-                        // coalesced, and the other coordinators are left
-                        // alone.
                         reregister_w.request(&coordinator);
                     }
-                    // A request can already have consumed a remote queue item
-                    // by the time its future is canceled. Keep the remaining
-                    // polls alive and explicitly decline any additional jobs;
-                    // the seed then releases its worker slot and immediately
-                    // falls back to local inference.
                     if claimed.is_some() {
                         let decline_client = client.clone();
                         let decline_worker = worker_id_w.clone();
@@ -9651,10 +8892,6 @@ async fn run_arc_node() -> Result<()> {
                         });
                     }
 
-                    // A long-poll can return a job at the same instant the
-                    // lifecycle signal closes admission. Decline that claimed
-                    // item and drain the remaining claim futures; never begin
-                    // a new blocking inference after shutdown was requested.
                     if worker_shutdown
                         .as_ref()
                         .is_some_and(|receiver| *receiver.borrow())
@@ -9674,11 +8911,6 @@ async fn run_arc_node() -> Result<()> {
 
                     {
                         let Some((winner, job)) = claimed else {
-                            // Long-polls that ended normally re-poll at once;
-                            // a round in which no coordinator answered backs
-                            // off instead of re-sending signed claims every
-                            // 500 ms to coordinators that are down or
-                            // unreachable (offline laptop, captive portal).
                             failed_claim_rounds = if answered {
                                 0
                             } else {
@@ -9844,8 +9076,6 @@ async fn run_arc_node() -> Result<()> {
                                 job_id: job_id.clone(),
                                 worker_id: worker_id_w.clone(),
                                 success: false,
-                                // A coordinator identity mismatch is not a
-                                // model failure by this worker.
                                 declined: !assignment_model_matches
                                     || !assignment_execution_profile_matches,
                                 output: String::new(),
@@ -9886,17 +9116,8 @@ async fn run_arc_node() -> Result<()> {
                             max_tokens
                         );
 
-                        // Model generation is CPU-heavy and synchronous. Running it
-                        // directly inside this Tokio task starved registration,
-                        // heartbeat, claim, and submit I/O on small community hosts.
-                        // Move the complete encode/generate/decode path to Tokio's
-                        // blocking pool so networking remains responsive.
                         let start = std::time::Instant::now();
                         let inference_model = model.clone();
-                        // CachedIntegerModel owns the one configured BOS
-                        // forward. Passing a caller-prefixed BOS here made the
-                        // worker use a different prompt than ordinary sharded
-                        // inference and its independent shard verifier.
                         let inference_tokens = inference_model.encode(&input);
                         let generation_error = if inference_tokens.is_empty() {
                             Some("assigned prompt encoded to zero tokens".to_string())
@@ -9952,22 +9173,8 @@ async fn run_arc_node() -> Result<()> {
                         status_w.set_state(WorkerState::Computing);
                         let inference = tokio::task::spawn_blocking(move || {
                             let _worker_execution_permit = worker_execution_for_compute;
-                            // Created and dropped on this compute thread (the
-                            // Windows request is per thread). Inert unless
-                            // --prevent-sleep-during-jobs was given.
                             let _keep_awake = KeepAwake::begin(prevent_sleep_during_jobs);
-                            // Compute on the node's configured inference pool
-                            // (--threads, [inference] threads or POST
-                            // /node/threads); with none set, on rayon's global
-                            // pool as before. This thread waits for the job,
-                            // so the keep-awake request above stays in force.
                             compute_pool_for_job.install(|| {
-                                // The fallible model API is authoritative at
-                                // this untrusted boundary. It performs checked
-                                // context admission immediately before
-                                // allocating KV state; even a tokenizer-expanded
-                                // prompt can only become a typed worker failure,
-                                // never an indexing panic.
                                 let (generated, hash) = inference_model
                                     .try_generate(
                                         &inference_tokens,
@@ -10071,10 +9278,6 @@ async fn run_arc_node() -> Result<()> {
                             ms_per_tok
                         );
 
-                        // ── Build + sign the InferenceAttestation tx ──
-                        // First time only: query the chain for the worker's
-                        // current nonce and seed our local counter from
-                        // there. Subsequent attestations increment locally.
                         if !attestation_nonce_initialized.load(std::sync::atomic::Ordering::Relaxed)
                         {
                             let q_url =
@@ -10093,8 +9296,6 @@ async fn run_arc_node() -> Result<()> {
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
                         }
 
-                        // Build the InferenceAttestation body. Mirrors what
-                        // /inference/run does on the local-served path.
                         let input_hash = arc_crypto::hash_bytes(input.as_bytes());
 
                         let nonce =
@@ -10109,10 +9310,6 @@ async fn run_arc_node() -> Result<()> {
                                     input_hash,
                                     output_hash: hash,
                                     challenge_period: 100,
-                                    // Bond = 0 for testnet community attestations.
-                                    // Production tokenomics will require a non-zero
-                                    // bond — that lands with the inference-pool
-                                    // reward distribution in a later release.
                                     bond: 0,
                                     beneficiary: None,
                                 },
@@ -10163,10 +9360,6 @@ async fn run_arc_node() -> Result<()> {
                             | CommunitySubmitOutcome::LocalError => JobOutcome::Failed,
                         });
 
-                        // If a terminal response reports invalid_nonce, force
-                        // a chain re-query before building the next immutable
-                        // attestation. A network timeout is deliberately not
-                        // treated as rejection: the server may have succeeded.
                         if let Some(body) = submit_outcome.response_body()
                             && let Ok(body) = serde_json::from_str::<serde_json::Value>(body)
                             && let Some(attestation) = body.get("attestation")
@@ -10188,7 +9381,6 @@ async fn run_arc_node() -> Result<()> {
                             }
                         }
                     }
-                    // Brief sleep between poll rounds to avoid hammering
                     if sleep_or_runtime_shutdown(
                         &mut worker_shutdown,
                         std::time::Duration::from_millis(500),
@@ -10209,13 +9401,8 @@ async fn run_arc_node() -> Result<()> {
         }
     }
 
-    // Explicit HTTP(S) registry origins only. Consensus/P2P bootstrap
-    // addresses never become RPC destinations by port-number convention.
     let coordinator_seed_rpcs = coordinator_rpc_bases;
 
-    // Inference pool width: explicit --threads wins, then [inference] threads
-    // from the config file, else 0 = rayon's global pool (which honours
-    // RAYON_NUM_THREADS; see config::InferenceConfig).
     let compute_threads =
         if matches.value_source("threads") == Some(clap::parser::ValueSource::CommandLine) {
             cli.threads
@@ -10270,9 +9457,6 @@ async fn run_arc_node() -> Result<()> {
     )
     .await;
 
-    // Stop the native worker before the rest of the shutdown sequence so it
-    // cannot observe a half-torn-down state. `shutdown` joins the thread; the
-    // handle's Drop also cancels, so an early return cannot leak the loop.
     if let Some(handle) = native_runtime_handle.take() {
         tracing::info!("stopping the native worker runtime");
         native_runtime_cancel.store(true, std::sync::atomic::Ordering::Release);
@@ -10289,11 +9473,6 @@ async fn run_arc_node() -> Result<()> {
     };
 
     if shutdown_requested.load(std::sync::atomic::Ordering::SeqCst) {
-        // Both HTTP servers have now drained accepted handlers. Close the
-        // transport/consensus barrier only at this point, then join every
-        // runtime/background task and the dedicated consensus OS thread. Only
-        // that completed join set proves there can be no writer racing the
-        // final StateDB WAL fsync.
         let _ = runtime_shutdown_tx.send(true);
         let mut runtime_join_error = None::<String>;
         for task in runtime_tasks {
@@ -10319,9 +9498,6 @@ async fn run_arc_node() -> Result<()> {
             }
         }
 
-        // A failed fsync must never be logged or returned as a clean exit. Run
-        // it even when a prior join reported failure so the best available
-        // durable boundary is still established before systemd restarts us.
         let wal_result = state.try_sync_wal();
         if shutdown_exit_code(&wal_result) != 0 {
             let error = wal_result.expect_err("nonzero shutdown status requires WAL failure");
@@ -10340,17 +9516,11 @@ async fn run_arc_node() -> Result<()> {
             .map_err(|_| anyhow::anyhow!("desktop shutdown receipt lock was poisoned"))?
             .take()
         {
-            // This is the node's durable acknowledgement to its supervisor.
-            // A nonzero return, panic, forced kill, join failure, or WAL fsync
-            // failure reaches no removal path and leaves the receipt armed.
             receipt.acknowledge()?;
         }
         tracing::info!(
             "RPC handlers drained, node writers joined, WAL durability barrier completed, and the desktop receipt was acknowledged; shutdown is clean"
         );
-        // All mutation producers are joined and the WAL is already fsynced.
-        // Avoid paging state back in for Drop; the kernel releases file
-        // handles and advisory locks on process exit.
         exit_after_clean_shutdown();
     }
 
@@ -10382,8 +9552,6 @@ mod tests {
         let worker_id = format!("0x{}", keypair.address().to_hex());
         let default_name = format!("node-{}", &keypair.address().to_hex()[..8]);
 
-        // No --node-name: the default is `node-` plus a short hash of the
-        // worker public key (its address), with no machine metadata at all.
         assert_eq!(
             community_registration_name(&worker_id, None),
             (default_name.clone(), None)
@@ -10393,7 +9561,6 @@ mod tests {
             (default_name.clone(), None)
         );
 
-        // A valid nickname is used verbatim (trimmed).
         assert_eq!(
             community_registration_name(&worker_id, Some(" basement rig 2 ")),
             ("basement rig 2".to_string(), None)
@@ -10409,7 +9576,6 @@ mod tests {
             )
         );
 
-        // Hostname-shaped or unsafe nicknames fall back with a stated reason.
         for rejected in [
             "Adas-MacBook-Pro.local",
             "Adas-MacBook-Pro",
@@ -10426,15 +9592,12 @@ mod tests {
             );
         }
 
-        // The worker's own default label is accepted as an explicit nickname.
         let explicit_default = community_registration_name(&worker_id, Some(&*default_name));
         assert_eq!(explicit_default, (default_name, None));
     }
 
     #[test]
     fn community_audience_accepts_live_0x_prefixed_network_info() {
-        // Live v0.8.x coordinators publish 0x-prefixed hashes; before this
-        // parser existed every community registration failed before POSTing.
         let validator = "44".repeat(32);
         let domain = "3b".repeat(32);
         let live = json!({
@@ -10473,8 +9636,6 @@ mod tests {
         assert_eq!(engine.consensus_domain(), Some(recovery));
         assert_eq!(engine.certificate_domain(), Some(recovery));
 
-        // A chain without recovery keeps its legacy DAG hashing while its
-        // certificates are still bound to the actual genesis and set epoch.
         let from_genesis = ConsensusEngine::new(set, address);
         install_startup_consensus_domains(&from_genesis, genesis, None).unwrap();
         assert_eq!(from_genesis.consensus_domain(), None);
@@ -10642,9 +9803,6 @@ mod tests {
         }
     }
 
-    /// The migration-record tool must not be usable without the two inputs
-    /// that make its output meaningful: the activation config it derives the
-    /// binding from, and the coordinated height every validator will use.
     #[test]
     fn printing_a_migration_record_requires_its_config_and_its_height() {
         Cli::command().debug_assert();
@@ -10684,7 +9842,6 @@ mod tests {
         .expect("both inputs present");
         assert!(cli.print_migration_record);
         assert_eq!(cli.migration_activation_height, Some(1_570_000));
-        // And it stays off unless asked for.
         let plain = Cli::try_parse_from(["arc-node"]).expect("no flags is still valid");
         assert!(!plain.print_migration_record);
         assert_eq!(plain.migration_activation_height, None);
@@ -11056,13 +10213,10 @@ mod tests {
         let limit = std::time::Duration::from_secs(60);
         let start = Instant::now();
         let mut watch = ShutdownStallWatch::new(7, start, limit);
-        // A runtime that keeps beating is never cut off, however long the
-        // graceful shutdown takes.
         for second in 1..=600_u64 {
             let now = start + std::time::Duration::from_secs(second);
             assert_eq!(watch.observe(7 + second, now), None, "second {second}");
         }
-        // Once the beat stops, the deadline counts from the last beat.
         let last_beat = start + std::time::Duration::from_secs(600);
         assert_eq!(
             watch.observe(607, last_beat + std::time::Duration::from_secs(59)),
@@ -11073,7 +10227,6 @@ mod tests {
             Some(limit),
             "exits once the runtime has been silent for the whole limit"
         );
-        // A beat resets it.
         let resumed = last_beat + limit + std::time::Duration::from_secs(1);
         assert_eq!(watch.observe(608, resumed), None);
         assert_eq!(
@@ -11247,8 +10400,6 @@ mod tests {
         assert!(take_authenticated_desktop_shutdown_request(&control).is_err());
         assert!(!control.request_file.exists());
 
-        // A crash-torn/malformed legacy request is consumed after its stable
-        // private-handle snapshot, allowing the next atomic publication.
         let mut torn = arc_crypto::secret_file::create_new_private(&control.request_file).unwrap();
         torn.write_all(b"arc.desktop.shutdown.v1\npid=").unwrap();
         torn.sync_all().unwrap();
@@ -11366,8 +10517,6 @@ mod tests {
         });
         existing_started_rx.await.unwrap();
 
-        // This work appears after the lifecycle edge, modeling a claim/tick
-        // becoming ready near the end of a long accepted-handler drain.
         broadcast_node_shutdown(&requested, &http_tx, &background_tx);
         let _ = late_work_tx.send(());
         tokio::task::yield_now().await;
@@ -11437,9 +10586,6 @@ mod tests {
             ),
         ]);
 
-        // The coordinator authenticates the announced execution destination
-        // independently from the signed POST, so expose the holder's exact
-        // validator identity at its declared shard origin.
         let holder_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let holder_addr = holder_listener.local_addr().unwrap();
         let holder_origin = format!("http://{holder_addr}");
@@ -11823,8 +10969,6 @@ mod tests {
 
     #[test]
     fn community_context_helper_accepts_exact_boundary_and_rejects_plus_one() {
-        // try_generate owns the one internal BOS position; the worker passes
-        // only the raw one-token prompt.
         assert_eq!(community_generation_required_positions(1, 3), Some(5));
         assert!(community_generation_fits_context(1, 3, 5));
         assert!(!community_generation_fits_context(1, 4, 5));
@@ -12395,12 +11539,6 @@ mod tests {
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 
-    /// The desktop opens `.arc-node.lock` through ARC's private-file checks.
-    /// A plain Windows create inherited the data directory's ACEs, and the
-    /// desktop refused that lock ("Windows DACL inherits from its parent") on
-    /// every later launch. The node now leaves a lock that passes the strict
-    /// private contract on Windows, while still holding it, and an inherited
-    /// lock left by an older node is repaired too.
     #[test]
     fn node_data_lock_satisfies_the_private_file_contract_while_held() {
         let data_dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
@@ -12409,7 +11547,6 @@ mod tests {
         ));
         arc_crypto::secret_file::create_private_directory_tree(&data_dir).unwrap();
         let path = data_dir.join(".arc-node.lock");
-        // An older node's lock, created exactly as released binaries did.
         drop(
             OpenOptions::new()
                 .read(true)
@@ -12421,7 +11558,6 @@ mod tests {
         );
 
         let held = open_and_try_lock_node_data_file(&path, &data_dir).unwrap();
-        // On Unix an older lock keeps its mode here; the desktop repairs it.
         #[cfg(windows)]
         drop(arc_crypto::secret_file::open_private_read_write(&path).unwrap());
         assert!(
@@ -12474,8 +11610,6 @@ mod tests {
         std::fs::write(legacy.join("wal-00000000.bin"), b"late-visible-history").unwrap();
         let manifest_hash = hash_bytes(b"visible-legacy-archive-manifest");
         let archive = data_dir.join(format!("dag-wal.pre-recovery-{}", manifest_hash.to_hex()));
-        // Model the namespace state after a source-to-archive write-through
-        // move became visible but its caller observed a late error.
         arc_crypto::secret_file::windows_move_path_write_through(&legacy, &archive, false).unwrap();
         assert!(!legacy.exists());
 
@@ -12653,9 +11787,6 @@ mod tests {
         arc_crypto::secret_file::create_private_directory_tree(control_guard.target()).unwrap();
         control_guard.rebarrier_existing().unwrap();
         drop(control_guard);
-        // Match the desktop's real proof contract exactly: publish the child
-        // namespace first, then rebarrier the parent while no descendant
-        // handles remain, and only then publish the proof and lifecycle lock.
         data_guard.rebarrier_existing().unwrap();
         drop(data_guard);
         let session_nonce = [0x5au8; 32];
@@ -13121,8 +12252,6 @@ mod tests {
             retention_limits: RetentionLimits::default(),
         };
 
-        // Simulate process death after initial CURRENT publication but before
-        // the independent pin rename.
         let initial = store
             .create_initial(input.clone(), std::iter::empty())
             .unwrap();
@@ -13142,8 +12271,6 @@ mod tests {
             initial.pin
         );
 
-        // Simulate death after successor CURRENT rename but before advancing
-        // the independent pin. Only that exact direct successor is accepted.
         let successor = store
             .append(initial.pin, input, std::iter::empty())
             .unwrap();
@@ -13384,9 +12511,6 @@ mod tests {
             archived_legacy_wal: None,
         };
 
-        // Six real Ed25519 keys form the frozen committee. The deterministic
-        // leader at the first recovery round is the one absent member; the other
-        // five sign its authenticated NoBlock certificate.
         let keys: Vec<_> = (0..6)
             .map(|index| {
                 arc_crypto::KeyPair::from_ed25519_secret_bytes(
@@ -13408,9 +12532,6 @@ mod tests {
                 .is_ok()
         );
 
-        // One omitted leader round followed by five complete rounds gives the
-        // live two-round rule both (a) an anchor that causally proves the gap and
-        // (b) the R+1/R+2 support needed for the next canonical decision.
         let first_round: Vec<_> = validators
             .iter()
             .filter(|author| **author != absentee)
@@ -13442,9 +12563,6 @@ mod tests {
             .unwrap()
             .clone();
 
-        // Model the narrow crash window: the canonical state block is durable,
-        // but its separate DAG Commit record is absent. Replay must derive the
-        // next choice through `try_commit`, not from a local absence vote alone.
         let state = StateDB::with_genesis(&[(hash_bytes(b"gap-funded"), 100)]);
         state
             .execute_block_adaptive_at_with_proof(
@@ -13514,8 +12632,6 @@ mod tests {
             stage_recovery_generation_records(&store, &generation).unwrap();
         assert_eq!(staged, records);
 
-        // First restart repairs the already executed canonical state tail from
-        // the durable certificate plus the full causal DAG, with no Commit record.
         let first_engine = recovery_test_engine(&validators, &domain);
         let first =
             replay_recovery_dag_generation(&first_engine, &state, &startup, &generation, &staged)
@@ -13541,8 +12657,6 @@ mod tests {
         assert!(committed_replay.repaired_commit.is_none());
         assert_eq!(committed_replay.next_commit_round, candidate.round + 1);
 
-        // Storage integrity alone cannot authorize a certificate. Rehashing a
-        // changed envelope still has to pass domain/committee/quorum validation.
         for mutation in 0..4 {
             let mut invalid = staged.clone();
             match mutation {
@@ -13564,9 +12678,6 @@ mod tests {
             );
         }
 
-        // Compact only after the state block and its exact DAG anchor agree. The
-        // skipped leader's certificate is below the new floor; the canonical
-        // anchor, not a surviving local vote, preserves the chain-to-DAG mapping.
         let compacted = compact_replayed_recovery_generation(
             &store,
             &state,
@@ -13595,8 +12706,6 @@ mod tests {
                 && record.round > candidate.round
         }));
 
-        // Tampering with the retained anchor cannot rebind the canonical state
-        // root to a different DAG decision, even if the altered round is plausible.
         let mut tampered = compacted.clone();
         tampered
             .manifest
@@ -13607,9 +12716,6 @@ mod tests {
             .hash = hash_bytes(b"not-the-canonical-decision");
         assert!(validate_recovery_generation_anchor(&state, &startup, &tampered).is_err());
 
-        // Second restart uses the compacted canonical anchor as its trust floor;
-        // it reopens the retained suffix without recreating the pre-gap blocks or
-        // certifying another commit from discarded history.
         validate_recovery_generation_anchor(&state, &startup, &compacted).unwrap();
         let second_engine = recovery_test_engine(&validators, &domain);
         let second = replay_recovery_dag_generation(
@@ -13677,8 +12783,6 @@ mod tests {
         );
         assert!(!valid_domain_engine.has_skip_certificate(bootstrap, &absentee));
 
-        // Four equal-stake signatures total 20,000,000, one ARC below the six
-        // member committee's 20,000,001 quorum; the forged threshold is refused.
         let below_quorum =
             recovery_skip_certificate_for_test(&validators, &keys, domain, bootstrap, absentee, 4);
         let quorum_engine = recovery_test_engine(&validators, &domain);
@@ -13693,8 +12797,6 @@ mod tests {
                 .is_err()
         );
 
-        // Even five surviving authors (stake quorum) cannot advance the recovery
-        // round without a verified certificate for the sixth fixed member.
         let no_certificate_engine = recovery_test_engine(&validators, &domain);
         no_certificate_engine
             .install_recovery_cursor(binding.source_consensus_round)
@@ -13824,16 +12926,10 @@ mod tests {
                     dag_cursor: DagCursor {
                         committed_block_count: 0,
                         next_dag_round: bootstrap,
-                        // The immutable cursor predates the later staged
-                        // blocks; replay must re-derive +3 from their quorum.
                         current_round: bootstrap,
                         retention_floor_round: bootstrap,
                         retention_ceiling_round: recovery_retention_ceiling(bootstrap).unwrap(),
                     },
-                    // Four validators across three rounds plus one body and
-                    // one commit produce fourteen records. A sixteen-record
-                    // test limit crosses the 90% live-rollover watermark and
-                    // exercises rollover without a production-sized fixture.
                     retention_limits: RetentionLimits {
                         max_records: 16,
                         max_payload_bytes: 16 * 1024 * 1024,

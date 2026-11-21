@@ -1,9 +1,5 @@
-//! Enhanced Price Oracle
-//! Multi-source price aggregation with TWAP, staleness detection, and confidence scoring.
-
 use std::collections::HashMap;
 
-/// A trading pair (e.g., BTC/USD).
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct TradingPair {
     pub base: String,
@@ -23,7 +19,6 @@ impl TradingPair {
     }
 }
 
-/// Source of a price feed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PriceSource {
     Chainlink,
@@ -33,7 +28,6 @@ pub enum PriceSource {
     Aggregated,
 }
 
-/// A single price data point from a source.
 #[derive(Debug, Clone)]
 pub struct PriceFeed {
     pub pair: TradingPair,
@@ -44,7 +38,6 @@ pub struct PriceFeed {
     pub confidence: f64,
 }
 
-/// Aggregated price from multiple sources.
 #[derive(Debug, Clone)]
 pub struct AggregatedPrice {
     pub price: u64,
@@ -54,7 +47,6 @@ pub struct AggregatedPrice {
     pub timestamp: u64,
 }
 
-/// Oracle errors.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OracleError {
     PairNotFound,
@@ -76,34 +68,24 @@ impl std::fmt::Display for OracleError {
     }
 }
 
-/// Configuration for the price oracle.
 #[derive(Debug, Clone)]
 pub struct OracleConfig {
-    /// Minimum number of sources required for aggregation.
     pub min_sources: usize,
-    /// Maximum age in seconds before a price is considered stale.
     pub max_staleness_secs: u64,
-    /// Maximum allowed percentage deviation between sources.
     pub max_deviation_percent: f64,
 }
 
-/// Entry in the TWAP circular buffer.
 #[derive(Debug, Clone)]
 struct TwapEntry {
     price: u64,
     timestamp: u64,
 }
 
-/// Per-pair state maintained by the oracle.
 #[derive(Debug, Clone)]
 struct PairState {
-    /// Latest feeds per source
     feeds: HashMap<String, PriceFeed>,
-    /// Registered sources for this pair
     registered_sources: Vec<PriceSource>,
-    /// Circular buffer for TWAP computation
     twap_buffer: Vec<TwapEntry>,
-    /// Max entries in the TWAP buffer
     twap_capacity: usize,
 }
 
@@ -125,7 +107,6 @@ impl PairState {
     }
 }
 
-/// Multi-source price oracle with TWAP support.
 pub struct PriceOracle {
     config: OracleConfig,
     pairs: HashMap<String, PairState>,
@@ -133,7 +114,6 @@ pub struct PriceOracle {
 }
 
 impl PriceOracle {
-    /// Create a new price oracle with the given configuration.
     pub fn new(config: OracleConfig) -> Self {
         Self {
             config,
@@ -142,7 +122,6 @@ impl PriceOracle {
         }
     }
 
-    /// Register a price source for a trading pair.
     pub fn register_source(&mut self, pair: TradingPair, source: PriceSource) {
         let key = pair.key();
         let state = self
@@ -154,7 +133,6 @@ impl PriceOracle {
         }
     }
 
-    /// Update a price feed for a trading pair from a specific source.
     pub fn update_price(&mut self, feed: PriceFeed) -> Result<(), OracleError> {
         if feed.price == 0 {
             return Err(OracleError::InvalidPrice);
@@ -169,20 +147,14 @@ impl PriceOracle {
             .entry(key)
             .or_insert_with(|| PairState::new(self.twap_capacity));
 
-        // Add to TWAP buffer
         state.push_twap(feed.price, feed.timestamp);
 
-        // Store latest feed keyed by source
         let source_key = format!("{:?}", feed.source);
         state.feeds.insert(source_key, feed);
 
         Ok(())
     }
 
-    /// Get the aggregated price for a trading pair.
-    ///
-    /// Aggregates across all available sources, checking for minimum source
-    /// count and maximum deviation.
     pub fn get_price(&self, pair: &TradingPair) -> Result<AggregatedPrice, OracleError> {
         let key = pair.key();
         let state = self.pairs.get(&key).ok_or(OracleError::PairNotFound)?;
@@ -195,7 +167,6 @@ impl PriceOracle {
             return Err(OracleError::InsufficientSources);
         }
 
-        // Check deviation between sources
         let prices: Vec<u64> = feeds.iter().map(|f| f.price).collect();
         let min_price = *prices.iter().min().unwrap();
         let max_price = *prices.iter().max().unwrap();
@@ -206,13 +177,11 @@ impl PriceOracle {
             }
         }
 
-        // Weighted average by confidence
         let total_confidence: f64 = feeds.iter().map(|f| f.confidence).sum();
         let weighted_price = if total_confidence > 0.0 {
             let sum: f64 = feeds.iter().map(|f| f.price as f64 * f.confidence).sum();
             (sum / total_confidence) as u64
         } else {
-            // Simple average as fallback
             let sum: u64 = prices.iter().sum();
             sum / prices.len() as u64
         };
@@ -230,11 +199,6 @@ impl PriceOracle {
         })
     }
 
-    /// Compute the time-weighted average price over a given window.
-    ///
-    /// Uses the circular buffer of historical price entries.
-    /// The window_secs parameter specifies how far back from the latest
-    /// entry to include.
     pub fn get_twap(&self, pair: &TradingPair, window_secs: u64) -> Result<u64, OracleError> {
         let key = pair.key();
         let state = self.pairs.get(&key).ok_or(OracleError::PairNotFound)?;
@@ -246,7 +210,6 @@ impl PriceOracle {
         let latest_ts = state.twap_buffer.last().unwrap().timestamp;
         let cutoff = latest_ts.saturating_sub(window_secs);
 
-        // Filter entries within the window
         let entries: Vec<&TwapEntry> = state
             .twap_buffer
             .iter()
@@ -261,7 +224,6 @@ impl PriceOracle {
             return Ok(entries[0].price);
         }
 
-        // Time-weighted average: weight each price by the duration until the next entry
         let mut weighted_sum: u128 = 0;
         let mut total_weight: u128 = 0;
 
@@ -273,14 +235,11 @@ impl PriceOracle {
             }
         }
 
-        // Include the last entry with weight 1 if no time span was available
         if total_weight == 0 {
-            // All entries have the same timestamp; simple average
             let sum: u64 = entries.iter().map(|e| e.price).sum();
             return Ok(sum / entries.len() as u64);
         }
 
-        // Give the last entry a weight equal to the average interval
         let avg_interval = total_weight / (entries.len() as u128 - 1);
         weighted_sum += entries.last().unwrap().price as u128 * avg_interval;
         total_weight += avg_interval;
@@ -288,7 +247,6 @@ impl PriceOracle {
         Ok((weighted_sum / total_weight) as u64)
     }
 
-    /// Check if the price data for a pair is stale at the given timestamp.
     pub fn is_stale(&self, pair: &TradingPair, now: u64) -> bool {
         let key = pair.key();
         match self.pairs.get(&key) {
@@ -338,7 +296,6 @@ mod tests {
     #[test]
     fn test_update_and_get_price_single_source() {
         let mut oracle = PriceOracle::new(default_config());
-        // 5_000_000_000_000 == 50,000.00000000 at the feed's 8 decimals.
         oracle
             .update_price(feed(
                 btc_usd(),
@@ -380,7 +337,6 @@ mod tests {
 
         let agg = oracle.get_price(&btc_usd()).unwrap();
         assert_eq!(agg.sources, 2);
-        // Weighted: (50000*0.9 + 50100*0.8) / (0.9+0.8) = (45000+40080)/1.7 = 50047
         assert!(agg.price >= 50_000 && agg.price <= 50_100);
     }
 
@@ -449,10 +405,10 @@ mod tests {
             .update_price(feed(btc_usd(), 50_000, PriceSource::Chainlink, 1000))
             .unwrap();
 
-        assert!(!oracle.is_stale(&btc_usd(), 1100)); // 100s < 300s
-        assert!(!oracle.is_stale(&btc_usd(), 1300)); // 300s == 300s
-        assert!(oracle.is_stale(&btc_usd(), 1301)); // 301s > 300s
-        assert!(oracle.is_stale(&eth_usd(), 1000)); // not registered
+        assert!(!oracle.is_stale(&btc_usd(), 1100));
+        assert!(!oracle.is_stale(&btc_usd(), 1300));
+        assert!(oracle.is_stale(&btc_usd(), 1301));
+        assert!(oracle.is_stale(&eth_usd(), 1000));
     }
 
     #[test]
@@ -460,7 +416,6 @@ mod tests {
         let mut oracle = PriceOracle::new(default_config());
         oracle.register_source(btc_usd(), PriceSource::Chainlink);
         oracle.register_source(btc_usd(), PriceSource::Pyth);
-        // Duplicate registration should not add again
         oracle.register_source(btc_usd(), PriceSource::Chainlink);
 
         let state = oracle.pairs.get(&btc_usd().key()).unwrap();
@@ -471,7 +426,6 @@ mod tests {
     fn test_twap_basic() {
         let mut oracle = PriceOracle::new(default_config());
 
-        // Feed prices at different timestamps
         oracle
             .update_price(feed(btc_usd(), 100, PriceSource::Chainlink, 1000))
             .unwrap();
@@ -483,9 +437,6 @@ mod tests {
             .unwrap();
 
         let twap = oracle.get_twap(&btc_usd(), 100).unwrap();
-        // Entries: (100, 1000), (200, 1010), (150, 1020)
-        // Weights: 100*10=1000, 200*10=2000, 150*10=1500
-        // Total weight: 30, sum: 4500 => 150
         assert!(twap > 0);
         assert!((100..=200).contains(&twap));
     }

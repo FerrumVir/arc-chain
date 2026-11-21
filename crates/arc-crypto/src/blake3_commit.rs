@@ -2,18 +2,12 @@ use crate::hash::{Hash256, hash_bytes};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-/// A BLAKE3-based transaction commitment.
-/// This is the fast-path commitment used for throughput - each transaction
-/// is hashed into a 256-bit commitment that can be independently verified.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransactionCommitment {
-    /// The BLAKE3 hash of the serialized transaction data.
     pub hash: Hash256,
-    /// Domain separation tag so different transaction types never collide.
     pub domain: u8,
 }
 
-/// Domain tags for transaction types.
 pub mod domains {
     pub const TRANSFER: u8 = 0x01;
     pub const SETTLE: u8 = 0x02;
@@ -24,7 +18,6 @@ pub mod domains {
     pub const MULTISIG: u8 = 0x07;
 }
 
-/// Commit a single transaction. Domain-separated BLAKE3 hash.
 #[inline]
 pub fn commit_transaction(domain: u8, data: &[u8]) -> TransactionCommitment {
     let mut hasher = blake3::Hasher::new_derive_key("ARC-chain-tx-v1");
@@ -36,8 +29,6 @@ pub fn commit_transaction(domain: u8, data: &[u8]) -> TransactionCommitment {
     }
 }
 
-/// Batch-commit many transactions in parallel using Rayon.
-/// This is the core throughput function - splits work across all CPU cores.
 pub fn batch_commit_parallel(transactions: &[(u8, &[u8])]) -> Vec<TransactionCommitment> {
     transactions
         .par_iter()
@@ -45,13 +36,11 @@ pub fn batch_commit_parallel(transactions: &[(u8, &[u8])]) -> Vec<TransactionCom
         .collect()
 }
 
-/// Commit raw bytes without domain separation (for benchmarking raw BLAKE3 speed).
 #[inline]
 pub fn commit_raw(data: &[u8]) -> Hash256 {
     hash_bytes(data)
 }
 
-/// Batch-commit raw bytes in parallel (benchmarking raw throughput).
 pub fn batch_commit_raw_parallel(items: &[&[u8]]) -> Vec<Hash256> {
     items.par_iter().map(|data| hash_bytes(data)).collect()
 }
@@ -83,7 +72,6 @@ mod tests {
         ];
         let commits = batch_commit_parallel(&txns);
         assert_eq!(commits.len(), 3);
-        // Each should match individual commit
         assert_eq!(
             commits[0].hash,
             commit_transaction(domains::TRANSFER, b"tx1").hash

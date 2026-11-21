@@ -1,5 +1,3 @@
-//! `bridge-state.json`: what the bridge started and why. No secrets.
-
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -47,7 +45,6 @@ impl BridgeState {
     }
 }
 
-/// Which supervisor restarts this node, from the environment it set.
 pub fn detect_supervisor(desktop: bool) -> String {
     if desktop {
         return "desktop-app".to_string();
@@ -64,7 +61,6 @@ pub fn detect_supervisor(desktop: bool) -> String {
     "unsupervised".to_string()
 }
 
-/// The command an operator runs to restart the bridged node.
 pub fn restart_hint(supervisor: &str) -> String {
     if let Some(label) = supervisor.strip_prefix("launchd:") {
         format!("launchctl kickstart -k gui/$(id -u)/{label}")

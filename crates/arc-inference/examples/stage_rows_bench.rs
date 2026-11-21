@@ -1,44 +1,3 @@
-//! Per-row cost of a multi-row stage call against one-row stage calls, on the
-//! real network model. An internal measurement, not a product figure.
-//!
-//! The model is loaded as a community worker loads it
-//! (`load_cached_model_canonical_i8`, the legacy split-half canonical INT8
-//! profile). For a 2-stage and a 4-stage split of its layers, every stage
-//! holder first takes the same context, and then, for each k, the driver runs
-//! the next k positions through every stage two ways:
-//!
-//! * one `forward_shard_rows` call per stage carrying all k rows;
-//! * k `forward_shard_token` calls per stage, one row each.
-//!
-//! Both must hand on bit-identical hidden rows and logits, or the driver exits
-//! non-zero. After each run every holder is rolled back to the context with
-//! `rollback_rows`, so every run starts from the same caches. The report is
-//! the median, over `--repeats` runs, of the time per row summed over the
-//! stages.
-//!
-//! Kernels. `scalar` is the scalar kernel. Every other kernel turns the
-//! vectorised path on and pins the multi-row (batched) kernel by its label:
-//! `neon-sdot-limb` and `neon-i8mm-limb` on arm64, `avx2-limb`,
-//! `avx-vnni-limb` and `avx512-vnni-limb` on x86-64. `simd` is the base
-//! kernel of the architecture (SDOT or AVX2), `best` the one chosen
-//! automatically, and `all` (the default) is `scalar` plus every multi-row
-//! kernel this CPU has. One-row calls run the pinned kernel too when it is a
-//! matrix-extension kernel (SMMLA, VNNI), and the one-row kernel of the ISA
-//! (SDOT, AVX2) otherwise, so each kernel's ratio is against its own one-row
-//! pass; the report keeps the absolute times. It also records which kernel
-//! ran each k-row call, and exits non-zero if it was not the pinned one.
-//!
-//! Decode. With `--decode-tokens N` (default 16; 0 skips it) the driver also
-//! times the worker's own generation, `try_generate`, as `--full-integer-worker`
-//! calls it, with every kernel: `T(1 + N) - T(1)` over a `--decode-prompt`
-//! token prompt is N decode steps. Every kernel must return the same tokens
-//! and output hash, or the driver exits non-zero.
-//!
-//! usage: stage_rows_bench --model GGUF [--kernel all|scalar|simd|best|LABEL,...]
-//!        [--splits 2,4] [--context N] [--repeats N] [--ks 1,2,4,8,16,32,64]
-//!        [--decode-tokens N] [--decode-prompt N]
-//!        [--cpu NAME] [--out FILE.json] [--summary FILE.md]
-
 use arc_crypto::{Hash256, hash_bytes};
 use arc_inference::cached_integer_model::{
     CANONICAL_REWARD_INFERENCE_PROFILE, CachedIntegerModel, KVCache, ShardInput, ShardOutput,
@@ -48,7 +7,6 @@ use arc_inference::canonical_simd::{self, BatchedKernel};
 use serde_json::{Value, json};
 use std::time::Instant;
 
-/// `None` is the scalar kernel; `Some` pins a multi-row vectorised kernel.
 type KernelChoice = Option<BatchedKernel>;
 
 struct Args {
@@ -70,7 +28,6 @@ fn parse_count(text: &str) -> Result<usize, String> {
         .map_err(|_| format!("expected a whole number, got {text}"))
 }
 
-/// The architecture's base multi-row kernel (SDOT or AVX2).
 fn base_kernel() -> Result<BatchedKernel, String> {
     [BatchedKernel::NeonSdot, BatchedKernel::Avx2]
         .into_iter()
@@ -92,7 +49,6 @@ fn parse_kernels(text: &str) -> Result<Vec<KernelChoice>, String> {
             }
             "scalar" => kernels.push(None),
             "simd" => kernels.push(Some(base_kernel()?)),
-            // #185's spelling: the scalar and the base vectorised kernel.
             "both" => kernels.extend([None, Some(base_kernel()?)]),
             "best" => kernels
                 .push(Some(canonical_simd::best_batched_kernel().ok_or_else(
@@ -122,12 +78,10 @@ fn kernel_name(kernel: KernelChoice) -> &'static str {
     kernel.map_or("scalar", BatchedKernel::label)
 }
 
-/// Multi-row projections per kernel so far, in `BatchedKernel::ALL` order.
 fn batched_runs() -> [u64; 5] {
     BatchedKernel::ALL.map(canonical_simd::batched_kernel_runs)
 }
 
-/// The multi-row kernels that ran between two `batched_runs` snapshots.
 fn kernels_that_ran(before: [u64; 5], after: [u64; 5]) -> Vec<&'static str> {
     BatchedKernel::ALL
         .into_iter()
@@ -137,8 +91,6 @@ fn kernels_that_ran(before: [u64; 5], after: [u64; 5]) -> Vec<&'static str> {
         .collect()
 }
 
-/// The CPU model: `--cpu` if given, else `/proc/cpuinfo`'s model name, else
-/// Windows' `PROCESSOR_IDENTIFIER`.
 fn cpu_model(given: Option<&str>) -> String {
     if let Some(name) = given {
         return name.to_string();
@@ -224,11 +176,8 @@ fn hash_row(row: &[i64]) -> Hash256 {
     hash_bytes(&bytes)
 }
 
-/// Hashes of what every stage hands on, indexed `[stage][row]`: hidden rows
-/// at the cuts and logits on the last stage.
 type Handoffs = Vec<Vec<Hash256>>;
 
-/// One `forward_shard_rows` call per stage, carrying every row.
 fn run_rows(
     model: &CachedIntegerModel,
     ends: &[usize],
@@ -258,7 +207,6 @@ fn run_rows(
     Err("the last stage returned hidden rows".into())
 }
 
-/// One `forward_shard_token` call per stage and row.
 fn run_one_row_at_a_time(
     model: &CachedIntegerModel,
     ends: &[usize],
@@ -303,11 +251,6 @@ fn roll_back(
     Ok(())
 }
 
-/// The worker's own decode: `try_generate`, as `--full-integer-worker` calls
-/// it, with no EOS so a call generates exactly `max_tokens`. `T(1 + n) - T(1)`
-/// over the same prompt is `n` decode steps, without the prompt and the first
-/// token. Returns the median milliseconds per decoded token, and the longer
-/// call's tokens and output hash.
 fn decode_ms_per_token(
     model: &CachedIntegerModel,
     prompt: &[u32],
@@ -367,7 +310,6 @@ fn main() -> Result<(), String> {
         load_started.elapsed().as_secs_f64()
     );
 
-    // Fixed token ids that avoid the special tokens 0, 1 and 2.
     let token = |index: usize| 3 + u32::try_from(index * 7_919 % (vocab - 3)).unwrap();
     let context: Vec<u32> = (0..args.context).map(token).collect();
     let rows: Vec<u32> = (args.context..args.context + max_k).map(token).collect();
@@ -434,7 +376,6 @@ fn main() -> Result<(), String> {
                         ));
                     }
                 }
-                // The scalar kernel never enters the vectorised path.
                 let ran = if ran.is_empty() {
                     "scalar".to_string()
                 } else {
@@ -475,7 +416,6 @@ fn main() -> Result<(), String> {
         if args.decode_tokens > 0 {
             let (ms, generated, hash) =
                 decode_ms_per_token(&model, &decode_prompt, args.decode_tokens, args.repeats)?;
-            // The first kernel's generation is the reference for the rest.
             let reference = decode_reference.get_or_insert_with(|| (generated.clone(), hash));
             if reference.0 != generated || reference.1 != hash {
                 return Err(format!(

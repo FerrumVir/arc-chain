@@ -1,11 +1,5 @@
-// What happened to a prompt, in plain words: sent, served, checked, on chain.
-// Each stage shows only what the app observed or the node returned. A stage
-// the app has no evidence for yet stays open; it is never marked done ahead
-// of the event.
-
 import type { ReactNode } from "react";
 
-/** done: observed. wait: under way, or submitted but not confirmed. open: nothing yet. */
 export type StageState = "done" | "wait" | "open";
 
 export interface Stage {

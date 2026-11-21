@@ -258,13 +258,6 @@ test.describe("Dashboard", () => {
     await page.goto("/");
     const earnings = page.getByTestId("earnings-total");
     await expect(earnings).toBeVisible();
-    // Assert the FORMAT, not the magnitude.
-    //
-    // This used to assert `not.toHaveText(/^0\.00/)`, i.e. that earnings are
-    // non-zero. That is a property of the mock fixture, not of the app: zero
-    // is the correct and expected reading for a fresh identity on the real
-    // network, so the assertion would fail against live data while telling us
-    // nothing about whether the card renders.
     await expect(earnings).toHaveText(/[\d,]+\.\d{2}\s*ARC confirmed/);
   });
 
@@ -282,8 +275,6 @@ test.describe("Dashboard", () => {
     const earnings = page.getByTestId("earnings-total");
     await expect(earnings).toContainText("not confirmed");
     await expect(earnings).not.toContainText("17.50");
-    // The old `/inference/results` fallback returned count=99 here. It must
-    // not become 247.50 ARC either.
     await expect(earnings).not.toContainText("247.50");
     await page.getByTestId("nav-earnings").click();
     await expect(page.getByTestId("projection-unavailable")).toContainText(
@@ -544,8 +535,6 @@ test.describe("Dashboard", () => {
     await page.goto("/");
     const feed = page.getByTestId("attestation-feed");
     await expect(feed).toBeVisible();
-    // The other worker's raw 0x16 computation remains explicitly unpaid;
-    // only the two mined 0x25 rows receive the paid label.
     await expect(
       feed.getByText("COMPUTED · NOT PAYMENT · network", { exact: true }),
     ).toHaveCount(1);
@@ -561,8 +550,6 @@ test.describe("Dashboard", () => {
   }) => {
     await page.goto("/");
     const feed = page.getByTestId("attestation-feed");
-    // The other worker's flat-shaped activity carries no timestamp. The
-    // padding row is excluded, and neither may cause invented telemetry.
     await expect(feed.getByText("recent", { exact: true })).toHaveCount(1);
     await expect(feed.getByText("0 tokens")).toHaveCount(0);
     await expect(feed.getByText("0ms")).toHaveCount(0);
@@ -574,20 +561,15 @@ test.describe("Dashboard", () => {
     await page.goto("/");
     const payout = page.getByTestId("last-payout");
     await expect(payout).toBeVisible();
-    // Regression guard for the "20770d ago" bug: a block height must never
-    // reach the relative-time formatter.
     await expect(payout).not.toHaveText(/\d{3,}d ago/);
   });
 
   test("start / stop controls toggle node state", async ({ page }) => {
     await page.goto("/");
-    // Initial: mock state shows stopped (mockStartedAt null)
     const startBtn = page.getByTestId("btn-start");
     await expect(startBtn).toBeVisible();
     await startBtn.click();
-    // After start, stop button appears
     await expect(page.getByTestId("btn-stop")).toBeVisible({ timeout: 4000 });
-    // Sidebar status chip should flip to "Running"
     await expect(page.getByTestId("sidebar-status")).toContainText("Running");
     await page.getByTestId("btn-stop").click();
     await expect(page.getByTestId("btn-start")).toBeVisible({ timeout: 4000 });
@@ -596,7 +578,6 @@ test.describe("Dashboard", () => {
   test("restart really restarts: the node goes back through connecting", async ({ page }) => {
     await page.goto("/");
     await page.getByTestId("btn-start").click();
-    // While nothing on the network has answered, the connection line says so as status, not as a warning.
     const connecting = page.locator('[data-testid="connection-notice"][data-state="connecting"]');
     await expect(connecting).toBeVisible({ timeout: 4000 });
     await expect(connecting).toHaveAttribute("role", "status");
@@ -604,7 +585,6 @@ test.describe("Dashboard", () => {
     await expect(page.getByTestId("dashboard-subtitle")).toHaveText(
       PLAIN_COPY.nodeStrip.runningConnecting,
     );
-    // The mock reports "live" once the node has been up for 8 s.
     await expect(connecting).toBeHidden({ timeout: 20_000 });
     await expect(page.getByTestId("dashboard-subtitle")).toHaveText(
       PLAIN_COPY.nodeStrip.runningConnected,
@@ -612,7 +592,6 @@ test.describe("Dashboard", () => {
     const restart = page.getByTestId("btn-restart");
     await expect(restart).toBeEnabled();
     await restart.click();
-    // Uptime was reset by restart_node, so the node is connecting again.
     await expect(connecting).toBeVisible({ timeout: 8000 });
     await expect(page.getByTestId("btn-stop")).toBeVisible();
   });
@@ -629,10 +608,6 @@ test.describe("Dashboard", () => {
     await expect(restart).toHaveAttribute("title", /managed externally/);
   });
 
-  // An install that failed after its handoff keeps the update's fence until
-  // ARC exits. Start used to fail against it as "another ARC desktop
-  // currently owns the managed node lifecycle"; it is refused plainly now,
-  // and the Dashboard offers Home's one step instead of Start or Restart.
   test("while an update ARC couldn't finish holds the node, the Dashboard offers Quit ARC instead of Start", async ({
     page,
   }) => {
@@ -650,7 +625,6 @@ test.describe("Dashboard", () => {
     await expect(quit).toContainText(PLAIN_COPY.actions.quitArc);
     await expect(page.getByTestId("btn-start")).toHaveCount(0);
     await expect(page.getByTestId("btn-restart")).toHaveCount(0);
-    // The header carries the one sentence and the one step; no panel offers another try.
     await expect(page.getByTestId("mutation-error")).toHaveCount(0);
     await expect(page.getByTestId("btn-start-failure-retry")).toHaveCount(0);
   });
@@ -667,15 +641,12 @@ test.describe("Dashboard", () => {
     await page.goto("/");
     const feed = page.getByTestId("attestation-feed");
     await expect(feed).toBeVisible();
-    // Five real activities: three computations plus two distinct mined 0x25
-    // reward receipts. The old-seed padding row is excluded.
     await expect(feed.locator(".feed-item")).toHaveCount(5, { timeout: 8000 });
   });
 
   test("shows the node's compute width", async ({ page }) => {
     await page.goto("/");
     await page.getByTestId("btn-start").click();
-    // "add two cores" is only demonstrable if the current width is visible.
     await expect(page.getByTestId("compute-width")).toHaveText(
       /\d+|all/,
       { timeout: 8000 },

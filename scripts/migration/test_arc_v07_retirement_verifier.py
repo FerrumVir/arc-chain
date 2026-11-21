@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Hermetic adversarial tests for arc-v07-retirement-verifier.py."""
 
 from __future__ import annotations
 
@@ -39,8 +38,6 @@ def write(path: Path, payload: bytes, mode: int = 0o400) -> str:
 
 
 def ed25519_key_and_signature(seed: bytes, message: bytes) -> tuple[bytes, bytes]:
-    """Tiny deterministic test signer; production code contains verification only."""
-
     expanded = hashlib.sha512(seed).digest()
     scalar_bytes = bytearray(expanded[:32])
     scalar_bytes[0] &= 248
@@ -495,7 +492,6 @@ class RetirementTests(unittest.TestCase):
             verifier._blake3_short(b"abc").hex(),
             "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
         )
-        # RFC 8032, section 7.1, test vector 1 (empty message).
         public_key = bytes.fromhex(
             "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
         )

@@ -1,12 +1,3 @@
-//! Installing an authenticated checkpoint is a different trust boundary from
-//! importing history.
-//!
-//! History is self-authenticating block by block and the importer re-validates
-//! everything, so serving it is not a trust decision. A checkpoint is a
-//! committee's signed claim about a state the receiver adopts WITHOUT
-//! replaying how it got there. These tests pin the refusals that make that
-//! adoption safe, and then the one case where it is allowed to succeed.
-
 use arc_consensus::view_change::{
     CheckpointEnvelope, CheckpointError, FinalityVote, FinalityVoteCollector, SnapshotIdentity,
     validator_set_hash,
@@ -37,7 +28,6 @@ fn committee(n: usize, salt: &str) -> (ValidatorSet, Vec<KeyPair>) {
     (ValidatorSet::new(validators, 1), keys)
 }
 
-/// The payload a healthy node would serve, and its identity.
 fn snapshot_bytes(height: u64) -> (Vec<u8>, Hash256, SnapshotPayload) {
     let mut payload = SnapshotPayload {
         height,
@@ -55,7 +45,6 @@ fn snapshot_bytes(height: u64) -> (Vec<u8>, Hash256, SnapshotPayload) {
     (bytes, digest, payload)
 }
 
-/// The state root the payload actually produces, computed by installing it.
 fn root_of(payload: &SnapshotPayload) -> Hash256 {
     let scratch = StateDB::with_genesis(&[]);
     scratch.install_durable_snapshot(payload);
@@ -123,8 +112,6 @@ fn a_checkpoint_from_the_right_committee_verifies_and_installs() {
         .verify_payload(&bytes, &d, &set)
         .expect("a well-formed checkpoint from this committee must verify");
 
-    // Install exactly as the node does, then confirm the bytes described the
-    // state they named - the check a digest cannot make.
     let decoded = SnapshotPayload::decode(&bytes).expect("payload decodes");
     let state = StateDB::with_genesis(&[]);
     state.install_durable_snapshot(&decoded);
@@ -171,14 +158,12 @@ fn payload_bytes_the_certificate_does_not_authorise_are_refused() {
     let (bytes, digest, payload) = snapshot_bytes(500);
     let envelope = envelope_for(&set, &keys, &d, 500, root_of(&payload), digest);
 
-    // Same envelope, substituted payload.
     let (other_bytes, _, _) = snapshot_bytes(501);
     match envelope.verify_payload(&other_bytes, &d, &set) {
         Err(CheckpointError::DigestMismatch { .. }) => {}
         other => panic!("substituted bytes must be refused, got {other:?}"),
     }
 
-    // And a single flipped byte.
     let mut tampered = bytes.clone();
     let middle = tampered.len() / 2;
     tampered[middle] ^= 0xff;
@@ -195,7 +180,6 @@ fn a_certificate_below_quorum_authorises_nothing() {
     let (bytes, digest, payload) = snapshot_bytes(500);
     let root = root_of(&payload);
 
-    // Build a certificate, then strip votes until it is below quorum.
     let mut certificate = certify(&set, &keys, &d, 500, hash_bytes(b"committed-block"), root);
     certificate.votes.truncate(1);
     let envelope = CheckpointEnvelope {
@@ -216,22 +200,16 @@ fn a_certificate_below_quorum_authorises_nothing() {
 
 #[test]
 fn an_envelope_naming_a_state_root_the_payload_does_not_produce_is_caught_on_install() {
-    // The envelope can be internally consistent and still be wrong about the
-    // state: the committee signs a root, the digest pins the bytes, but only
-    // installing proves the bytes produce that root. The node recomputes it
-    // for exactly this case.
     let (set, keys) = committee(4, "root");
     let d = domain(b"arc.checkpoint.root");
     let (bytes, digest, _) = snapshot_bytes(500);
     let lying_root = hash_bytes(b"a-root-this-payload-does-not-produce");
     let envelope = envelope_for(&set, &keys, &d, 500, lying_root, digest);
 
-    // Everything checkable without the state passes.
     envelope
         .verify_payload(&bytes, &d, &set)
         .expect("the envelope is internally consistent");
 
-    // Installing is what catches it.
     let decoded = SnapshotPayload::decode(&bytes).expect("decodes");
     let state = StateDB::with_genesis(&[]);
     state.install_durable_snapshot(&decoded);
@@ -249,7 +227,6 @@ fn an_envelope_whose_certificate_covers_a_different_height_is_refused() {
     let (bytes, digest, payload) = snapshot_bytes(500);
     let root = root_of(&payload);
     let mut envelope = envelope_for(&set, &keys, &d, 500, root, digest);
-    // The certificate says 500; the snapshot claims 900.
     envelope.snapshot.height = 900;
 
     match envelope.verify_payload(&bytes, &d, &set) {
@@ -263,8 +240,6 @@ fn an_envelope_whose_certificate_covers_a_different_height_is_refused() {
 
 #[test]
 fn installing_a_checkpoint_replaces_state_wholesale_not_partially() {
-    // A node adopting a checkpoint must end up with the checkpoint's state,
-    // not the checkpoint merged into whatever it already had.
     let (bytes, _, _) = snapshot_bytes(500);
     let decoded = SnapshotPayload::decode(&bytes).expect("decodes");
 
@@ -278,9 +253,6 @@ fn installing_a_checkpoint_replaces_state_wholesale_not_partially() {
         Some(900),
         "the checkpoint's accounts must be present"
     );
-    // The pre-existing account is NOT part of the checkpoint. It surviving is
-    // the difference between adopting a state and merging into one, and it is
-    // why the node recomputes the state root after installing.
     let root_after = state.get_state_root();
     let clean = StateDB::with_genesis(&[]);
     clean.install_durable_snapshot(&decoded);

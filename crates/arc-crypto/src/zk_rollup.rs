@@ -1,18 +1,7 @@
-//! ZK Rollup framework.
-//!
-//! Provides types and logic for batching layer-2 transactions, computing
-//! state transitions, generating / verifying rollup proofs, sequencing
-//! batches, and handling fraud proofs / dispute resolution.
-
 use crate::hash::{Hash256, hash_bytes, hash_pair};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-// ---------------------------------------------------------------------------
-// Core types
-// ---------------------------------------------------------------------------
-
-/// The kind of zero-knowledge proof used by the rollup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RollupProofType {
     STARK,
@@ -21,7 +10,6 @@ pub enum RollupProofType {
     Groth16,
 }
 
-/// A single transaction within a rollup batch.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RollupTx {
     pub from: [u8; 32],
@@ -31,7 +19,6 @@ pub struct RollupTx {
     pub signature: Vec<u8>,
 }
 
-/// A proof attesting to the validity of a rollup batch.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RollupProof {
     pub proof_data: Vec<u8>,
@@ -40,7 +27,6 @@ pub struct RollupProof {
     pub proof_type: RollupProofType,
 }
 
-/// A batch of rollup transactions together with pre/post state roots.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RollupBatch {
     pub batch_id: u64,
@@ -50,7 +36,6 @@ pub struct RollupBatch {
     pub proof: Option<RollupProof>,
 }
 
-/// Configuration for the rollup.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RollupConfig {
     pub max_batch_size: usize,
@@ -70,7 +55,6 @@ impl Default for RollupConfig {
     }
 }
 
-/// An L1 batch submission record.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BatchSubmission {
     pub batch: RollupBatch,
@@ -79,7 +63,6 @@ pub struct BatchSubmission {
     pub bond_amount: u64,
 }
 
-/// A fraud proof challenging a specific batch.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FraudProof {
     pub batch_id: u64,
@@ -89,7 +72,6 @@ pub struct FraudProof {
     pub witness: Vec<u8>,
 }
 
-/// Outcome of a dispute resolution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DisputeResolution {
     ProverSlashed,
@@ -97,18 +79,12 @@ pub enum DisputeResolution {
     NoFraud,
 }
 
-// ---------------------------------------------------------------------------
-// Account & rollup state
-// ---------------------------------------------------------------------------
-
-/// A single account inside the rollup state.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RollupAccount {
     pub balance: u64,
     pub nonce: u64,
 }
 
-/// The full rollup state: an in-memory account map with Merkle-ised root.
 #[derive(Clone, Debug)]
 pub struct RollupState {
     accounts: HashMap<[u8; 32], RollupAccount>,
@@ -121,20 +97,15 @@ impl RollupState {
         }
     }
 
-    /// Get (or create) a mutable reference to an account.
     pub fn get_account(&self, addr: &[u8; 32]) -> RollupAccount {
         self.accounts.get(addr).cloned().unwrap_or_default()
     }
 
-    /// Credit an account (used for genesis / deposits).
     pub fn credit(&mut self, addr: [u8; 32], amount: u64) {
         let acct = self.accounts.entry(addr).or_default();
         acct.balance = acct.balance.saturating_add(amount);
     }
 
-    /// Compute a deterministic state root.
-    ///
-    /// Accounts are sorted by address, hashed pairwise into a Merkle tree.
     pub fn compute_state_root(&self) -> [u8; 32] {
         if self.accounts.is_empty() {
             return [0u8; 32];
@@ -155,7 +126,6 @@ impl RollupState {
                 .collect()
         };
 
-        // Pad to power of two.
         while leaves.len().count_ones() != 1 {
             leaves.push(Hash256::ZERO);
         }
@@ -176,9 +146,6 @@ impl RollupState {
         leaves[0].0
     }
 
-    /// Apply a batch of transactions, returning the new state root.
-    ///
-    /// Returns `Err` with the index of the first invalid transaction.
     pub fn apply_batch(&mut self, txs: &[RollupTx]) -> Result<[u8; 32], usize> {
         for (i, tx) in txs.iter().enumerate() {
             let sender = self.accounts.entry(tx.from).or_default();
@@ -197,15 +164,12 @@ impl RollupState {
         Ok(self.compute_state_root())
     }
 
-    /// Verify that a batch produces the claimed state transition.
     pub fn verify_batch(&self, batch: &RollupBatch) -> Result<bool, String> {
-        // Pre-state root must match.
         let current_root = self.compute_state_root();
         if current_root != batch.pre_state_root {
             return Err("pre-state root mismatch".into());
         }
 
-        // Apply on a clone and compare post-state root.
         let mut clone = self.clone();
         match clone.apply_batch(&batch.transactions) {
             Ok(root) => Ok(root == batch.post_state_root),
@@ -220,11 +184,6 @@ impl Default for RollupState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Verifier
-// ---------------------------------------------------------------------------
-
-/// Verifies rollup proofs and state transitions.
 pub struct RollupVerifier {
     config: RollupConfig,
 }
@@ -234,55 +193,38 @@ impl RollupVerifier {
         Self { config }
     }
 
-    /// Verify a rollup proof's structural validity.
-    ///
-    /// In a production system this would call a SNARK/STARK verifier; here we
-    /// check structural invariants and signature over public inputs.
     pub fn verify_proof(&self, proof: &RollupProof) -> bool {
-        // Proof data must be non-empty.
         if proof.proof_data.is_empty() {
             return false;
         }
-        // Public inputs must be non-empty.
         if proof.public_inputs.is_empty() {
             return false;
         }
-        // Verification key hash must not be zero.
         if proof.verification_key_hash == [0u8; 32] {
             return false;
         }
-        // Proof type must match config.
         if proof.proof_type != self.config.proof_type {
             return false;
         }
 
-        // Mock verification: BLAKE3 of proof_data must have leading zero
-        // nibble. This is NOT a ZK proof - it's a trivial PoW check for
-        // pipeline testing. Real STARK verification is in `stwo_air.rs`.
         let h = blake3::hash(&proof.proof_data);
         h.as_bytes()[0] < 0x10
     }
 
-    /// Verify a full state transition: proof + state roots.
     pub fn verify_state_transition(&self, batch: &RollupBatch) -> bool {
-        // Must have a proof.
         let proof = match &batch.proof {
             Some(p) => p,
             None => return false,
         };
 
-        // Verify the proof itself.
         if !self.verify_proof(proof) {
             return false;
         }
 
-        // Public inputs should encode pre and post state roots.
-        // Convention: first 4 u64 = pre_root (as 4×u64), next 4 = post_root.
         if proof.public_inputs.len() < 8 {
             return false;
         }
 
-        // Reconstruct roots from public inputs.
         let pre_root = u64s_to_bytes(&proof.public_inputs[0..4]);
         let post_root = u64s_to_bytes(&proof.public_inputs[4..8]);
 
@@ -290,7 +232,6 @@ impl RollupVerifier {
     }
 }
 
-/// Helper: pack 4 u64 → 32 bytes (little-endian).
 fn u64s_to_bytes(vals: &[u64]) -> [u8; 32] {
     let mut out = [0u8; 32];
     for (i, &v) in vals.iter().take(4).enumerate() {
@@ -299,7 +240,6 @@ fn u64s_to_bytes(vals: &[u64]) -> [u8; 32] {
     out
 }
 
-/// Helper: unpack 32 bytes → 4 u64 (little-endian).
 pub fn bytes_to_u64s(bytes: &[u8; 32]) -> Vec<u64> {
     (0..4)
         .map(|i| {
@@ -310,11 +250,6 @@ pub fn bytes_to_u64s(bytes: &[u8; 32]) -> Vec<u64> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Sequencer
-// ---------------------------------------------------------------------------
-
-/// Collects transactions and flushes them into batches.
 pub struct RollupSequencer {
     config: RollupConfig,
     pending: Vec<RollupTx>,
@@ -330,20 +265,14 @@ impl RollupSequencer {
         }
     }
 
-    /// Add a transaction to the pending queue.
     pub fn add_tx(&mut self, tx: RollupTx) {
         self.pending.push(tx);
     }
 
-    /// Number of pending transactions.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }
 
-    /// Flush pending transactions into a batch.
-    ///
-    /// Applies them to `state` and returns the resulting `RollupBatch`.
-    /// Returns `None` if no transactions are pending.
     pub fn flush_batch(&mut self, state: &mut RollupState) -> Option<RollupBatch> {
         if self.pending.is_empty() {
             return None;
@@ -370,13 +299,6 @@ impl RollupSequencer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Fraud proof helpers
-// ---------------------------------------------------------------------------
-
-/// Evaluate a fraud proof against a batch.
-///
-/// Returns the dispute resolution outcome.
 pub fn resolve_dispute(
     fraud: &FraudProof,
     batch: &RollupBatch,
@@ -386,30 +308,18 @@ pub fn resolve_dispute(
         return DisputeResolution::NoFraud;
     }
 
-    // Re-execute the batch on a clone of the state.
     let mut clone = state.clone();
     match clone.apply_batch(&batch.transactions) {
         Ok(actual_root) => {
             if actual_root != batch.post_state_root {
-                // The batch's claimed post-root is wrong - fraud confirmed.
                 DisputeResolution::ProverSlashed
-            } else if fraud.expected_root != actual_root {
-                // Challenger's expected root is wrong - no fraud.
-                DisputeResolution::NoFraud
             } else {
                 DisputeResolution::NoFraud
             }
         }
-        Err(_) => {
-            // Batch contains an invalid transaction - fraud confirmed.
-            DisputeResolution::ProverSlashed
-        }
+        Err(_) => DisputeResolution::ProverSlashed,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -487,7 +397,7 @@ mod tests {
     fn test_apply_batch_bad_nonce() {
         let mut state = RollupState::new();
         state.credit(alice(), 1000);
-        let tx = make_tx(alice(), bob(), 100, 999); // wrong nonce
+        let tx = make_tx(alice(), bob(), 100, 999);
         let result = state.apply_batch(&[tx]);
         assert!(result.is_err());
     }
@@ -527,7 +437,6 @@ mod tests {
 
         let tx = make_tx(alice(), bob(), 100, 0);
 
-        // Compute expected post root.
         let mut clone = state.clone();
         let post_root = clone.apply_batch(std::slice::from_ref(&tx)).unwrap();
 
@@ -556,13 +465,13 @@ mod tests {
             batch_id: 0,
             transactions: vec![tx],
             pre_state_root: pre_root,
-            post_state_root: [0xFFu8; 32], // wrong
+            post_state_root: [0xFFu8; 32],
             proof: None,
         };
 
         let result = state.verify_batch(&batch);
         assert!(result.is_ok());
-        assert!(!result.unwrap()); // verification fails
+        assert!(!result.unwrap());
     }
 
     #[test]
@@ -617,12 +526,11 @@ mod tests {
 
         let tx = make_tx(alice(), bob(), 100, 0);
 
-        // Batch claims a WRONG post root.
         let batch = RollupBatch {
             batch_id: 1,
             transactions: vec![tx],
             pre_state_root: pre_root,
-            post_state_root: [0xDE; 32], // fraudulent
+            post_state_root: [0xDE; 32],
             proof: None,
         };
 
@@ -701,7 +609,6 @@ mod tests {
         let b2 = seq.flush_batch(&mut state).unwrap();
         assert_eq!(b2.batch_id, 1);
 
-        // Post root of batch 1 should equal pre root of batch 2.
         assert_eq!(b1.post_state_root, b2.pre_state_root);
     }
 }

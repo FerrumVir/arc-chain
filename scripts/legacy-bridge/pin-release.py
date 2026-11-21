@@ -54,7 +54,7 @@ PLATFORM_ASSETS = [
     "testnet-seeds.txt",
 ]
 HOSTNAME_REGISTRATION = 'format!("{} ({})", public_node_name_c, hostname_c)'
-MODEL_SIZE = 4_081_004_224  # docs/HEADLESS_INSTALL.md, exact supported artifact size
+MODEL_SIZE = 4_081_004_224
 
 
 def fetch(url: str) -> bytes:

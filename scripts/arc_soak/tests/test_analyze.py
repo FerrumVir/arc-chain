@@ -1,19 +1,3 @@
-"""Synthetic tests for the soak analyzer. No nodes, no network, milliseconds.
-
-Every case Codex reproduced against the old reporter is here, and each one
-asserts on the PROCESS EXIT STATUS, because a printed FAIL that exits 0 is the
-defect being fixed:
-
-  * agreement failure, throughput failure  -> must exit non-zero
-  * missing / malformed / NaN / zero-baseline / thin throughput evidence
-                                           -> must never exit 0
-  * one valid hash plus three empty responses -> must not count as agreement
-  * a SAFETY VIOLATION line                -> must fail whatever else holds
-  * process readiness without the later recovery phases -> not recovery
-  * provenance naming a different binary   -> must fail
-  * an aborted run                         -> must not pass
-"""
-
 import json
 import math
 import os
@@ -51,8 +35,6 @@ def good_run(t0=1000.0, duration=900.0, faults=1, **extra):
 
 
 class RunDir:
-    """Builds a synthetic run directory in a temp dir."""
-
     def __init__(self):
         self.path = tempfile.mkdtemp(prefix="arc-soak-test-")
         self.run = good_run()
@@ -64,7 +46,6 @@ class RunDir:
 
     def healthy(self, rate=5.0, start=1000.0, end=1900.0, step=10.0, kill=None,
                 down_node=0, restart_after=20.0, rate_after=None):
-        """Four nodes advancing at `rate`; optionally one scheduled kill."""
         t = start
         h = 0.0
         while t <= end:
@@ -140,7 +121,6 @@ class RunDir:
 
 
 def passing():
-    """A run that genuinely meets every criterion."""
     d = RunDir().healthy(kill=1300.0)
     for t in (1100.0, 1200.0, 1500.0, 1700.0):
         d.agree(t, int((t - 1000) * 5) - 20)
@@ -153,7 +133,7 @@ class AnalyzerTests(unittest.TestCase):
         self.dirs = []
         import io
         self._stdout = sys.stdout
-        sys.stdout = io.StringIO()   # keep the test output readable
+        sys.stdout = io.StringIO()
 
     def tearDown(self):
         sys.stdout = self._stdout
@@ -164,22 +144,16 @@ class AnalyzerTests(unittest.TestCase):
         self.dirs.append(d)
         return d.verdict()
 
-    # ── the baseline: a genuine pass exits 0 ────────────────────────────────
     def test_a_run_meeting_every_criterion_passes_with_exit_zero(self):
         code, v = self.run_case(passing())
         self.assertEqual(v["status"], "PASS", v)
         self.assertEqual(code, 0)
 
     def test_per_node_probe_jitter_does_not_split_a_sample(self):
-        # The live orchestrator probes each node at a slightly different
-        # instant. Grouping by that per-probe time made the chain series
-        # alternate between nodes and the baseline dispersion undefined; the
-        # tick identity must hold a sample together.
         d = passing()
         for s in d.samples:
             s["tick_t"] = s["t"]
             s["t"] = s["t"] + 0.013 * s["node"]
-        # a laggard, so alternating between nodes WOULD matter
         for s in d.samples:
             if s["node"] == 3 and s["height"] is not None:
                 s["height"] = max(0, s["height"] - 40)
@@ -187,7 +161,6 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(v["status"], "PASS", v)
         self.assertIsNotNone(v["facts"]["throughput"]["baseline"]["cv"])
 
-    # ── Codex item 1: a printed failure must change the exit status ─────────
     def test_agreement_failure_exits_nonzero(self):
         d = passing()
         d.agree(1800.0, 3980, hashes=["cd" * 32, "cd" * 32, "cd" * 32, "01" * 32])
@@ -227,7 +200,6 @@ class AnalyzerTests(unittest.TestCase):
         code = analyze.main([d.path])
         self.assertNotEqual(code, 0)
 
-    # ── Codex item 2: missing / malformed performance evidence ──────────────
     def test_no_samples_is_incomplete_not_pass(self):
         d = passing()
         d.samples = []
@@ -252,7 +224,6 @@ class AnalyzerTests(unittest.TestCase):
 
     def test_a_zero_baseline_is_incomplete(self):
         d = RunDir().healthy(rate=0.0, kill=1300.0)
-        # heights stay at zero, so "every node has a height > 0" never holds
         d.agree(1100.0, 0)
         d.fault()
         code, v = self.run_case(d)
@@ -268,10 +239,6 @@ class AnalyzerTests(unittest.TestCase):
         self.assertTrue(any("baseline has" in r for r in v["incomplete"]), v)
 
     def test_an_unstable_baseline_is_incomplete(self):
-        # Monotonic but uneven: alternate small and large steps inside the
-        # baseline, so ONLY the dispersion check can object. (An earlier version
-        # of this test made heights go backwards and was caught by the stall
-        # detector instead - passing for the wrong reason.)
         d = RunDir()
         h = 0
         t = 1000.0
@@ -303,8 +270,6 @@ class AnalyzerTests(unittest.TestCase):
 
     def test_a_restarted_node_starting_lower_is_not_a_regression(self):
         d = passing()
-        # node 0 is scheduled down 1300-1320; its first reading after that is
-        # compared with nothing, because it is a new process.
         for s in d.samples:
             if s["node"] == 0 and s["t"] == 1320.0:
                 s["height"] = s["height"] - 40
@@ -327,7 +292,6 @@ class AnalyzerTests(unittest.TestCase):
         code, v = self.run_case(d)
         self.assertNotEqual(code, 0)
 
-    # ── Codex item 3: missing replicas must not count as agreement ──────────
     def test_one_valid_hash_and_three_failed_responses_is_not_agreement(self):
         d = RunDir().healthy(kill=1300.0)
         d.agree(1100.0, 100, drop=(1, 2, 3))
@@ -380,7 +344,6 @@ class AnalyzerTests(unittest.TestCase):
         code, v = self.run_case(d)
         self.assertEqual(v["status"], "FAIL")
 
-    # ── Codex item 4: safety violations decide the verdict ──────────────────
     def test_a_safety_violation_fails_a_run_that_otherwise_passes(self):
         d = passing()
         d.logs[2] = ("INFO fine\n2026-09-21T00:00:00Z ERROR arc_node::consensus: "
@@ -403,7 +366,6 @@ class AnalyzerTests(unittest.TestCase):
         code, v = self.run_case(d)
         self.assertNotEqual(code, 0)
 
-    # ── Codex item 5: readiness is not recovery ─────────────────────────────
     def test_process_ready_without_catch_up_is_not_recovery(self):
         d = RunDir().healthy(kill=1300.0)
         for t in (1100.0, 1200.0, 1500.0, 1700.0):
@@ -433,9 +395,6 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(v["status"], "FAIL")
 
     def test_a_host_pause_leaves_the_run_incomplete_although_heights_rose_across_it(self):
-        # The 2026-09-22 soak: the host hibernated for 71 minutes, and the
-        # first sample after it showed higher heights than the last one before
-        # it, so no stall was seen. 150 s without a sample here.
         d = passing()
         d.samples = [s for s in d.samples if not 1750 < s["t"] < 1900]
         code, v = self.run_case(d)
@@ -446,8 +405,6 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(v["facts"]["unobserved_s"], 150.0)
 
     def test_the_coverage_limit_follows_the_configured_sample_interval(self):
-        # At a 20 s interval, ten intervals (200 s) is the limit: 150 s is not
-        # a gap, and the run passes.
         d = passing()
         d.run["sample_interval_s"] = 20.0
         d.samples = [s for s in d.samples if not 1750 < s["t"] < 1900]
@@ -463,7 +420,6 @@ class AnalyzerTests(unittest.TestCase):
         code, v = self.run_case(d)
         self.assertEqual(v["status"], "FAIL")
 
-    # ── Codex item 6: workload accounting ───────────────────────────────────
     def test_a_required_workload_with_nothing_offered_fails(self):
         d = passing()
         d.run["workload"] = {"required": True}
@@ -499,8 +455,6 @@ class AnalyzerTests(unittest.TestCase):
         d.workload = [
             {"id": "a", "final_status": "finalized", "latency_s": 2.0,
              "accepted_by": 1, "submitted_t": 1100.0},
-            # node 0 is killed at 1300 - two hundred seconds later. That is
-            # not why this was lost.
             {"id": "b", "final_status": "pending", "accepted_by": 0, "submitted_t": 1100.0},
         ]
         code, v = self.run_case(d)
@@ -530,7 +484,6 @@ class AnalyzerTests(unittest.TestCase):
         code, v = self.run_case(d)
         self.assertEqual(v["status"], "FAIL")
 
-    # ── Codex item 7: provenance bound to the binary that ran ───────────────
     def test_provenance_for_a_different_binary_fails(self):
         d = passing()
         d.run["provenance"]["recorded_binary_sha256"] = "cd" * 32
@@ -543,7 +496,6 @@ class AnalyzerTests(unittest.TestCase):
         code, v = self.run_case(d)
         self.assertEqual(v["status"], "FAIL")
 
-    # ── robustness of the judge itself ──────────────────────────────────────
     def test_the_verdict_file_and_the_exit_status_always_agree(self):
         for build in (passing, lambda: RunDir()):
             d = build()

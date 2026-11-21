@@ -1,10 +1,3 @@
-//! Read-only RPC view over one content-verified legacy ARCCHKPT capture.
-//!
-//! This module deliberately does not construct [`arc_state::StateDB`]. It has
-//! no WAL, mempool, consensus engine, P2P transport, signing key, worker loop,
-//! or POST handler. The only state is an immutable, bounded ARCCHKPT payload
-//! loaded from an exact SHA-256-pinned regular file.
-
 use arc_crypto::Hash256;
 use arc_state::recovery::{ARCCHKPT_MAX_PAYLOAD_BYTES, ArcCheckpoint};
 use arc_types::{Account, Block, Transaction, TxReceipt};
@@ -98,18 +91,10 @@ fn same_open_file(path: &fs::Metadata, opened: &fs::Metadata) -> bool {
     }
     #[cfg(not(unix))]
     {
-        // Content is decoded from the already-opened, SHA-pinned byte string,
-        // so a later path replacement cannot alter the served view. Windows
-        // does not expose a stable inode through std; length/type checks retain
-        // the portable part of the pre-open safety contract.
         path.file_type().is_file() == opened.file_type().is_file()
     }
 }
 
-/// Read one exact, mode-read-only regular inode into memory.
-///
-/// The expected SHA-256 authenticates the bytes. Device/inode checks ensure a
-/// path swap cannot make the service describe a different file than it read.
 fn read_pinned_regular_file(
     path: &Path,
     expected_sha256: &str,
@@ -189,20 +174,14 @@ pub struct LegacyArchiveSpec {
     pub binding_index: PathBuf,
     pub checkpoint: PathBuf,
     pub binding: PathBuf,
-    /// Out-of-band root published by the finalized recovery rollout.
     pub expected_archive_manifest_sha256: String,
-    /// Out-of-band completion-marker root published by the finalized rollout.
     pub expected_complete_sha256: String,
-    /// Selects one exact validator row; all provenance is derived from files.
     pub node: String,
 }
 
 #[derive(Clone, Debug)]
 pub enum LegacyArchiveListen {
-    /// Retained for explicit local development and non-Unix operator hosts.
     Tcp(SocketAddr),
-    /// Production origin transport. Filesystem ownership and modes identify
-    /// the archive service to the reviewed filtering proxy.
     #[cfg(unix)]
     Unix(PathBuf),
 }
@@ -337,8 +316,6 @@ struct TransactionOccurrence {
     index: u32,
 }
 
-/// Immutable archive payload plus indexes derived solely from its verified
-/// block vector.
 pub struct LegacyArchiveView {
     checkpoint: ArcCheckpoint,
     provenance: LegacyArchiveProvenance,
@@ -997,8 +974,6 @@ async fn reject_non_get(request: axum::extract::Request, next: Next) -> Response
     next.run(request).await
 }
 
-/// Build the complete GET-only archive API. There is intentionally no merge
-/// with the validator router and no route that mutates state.
 pub fn router(view: Arc<LegacyArchiveView>) -> Router {
     Router::new()
         .route("/provenance", on(MethodFilter::GET, provenance))
@@ -1087,8 +1062,6 @@ mod tests {
             .unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o750)).unwrap();
         let path = std::ffi::CString::new(directory.path().as_os_str().as_bytes()).unwrap();
-        // SAFETY: chown receives a live NUL-terminated path, preserves uid,
-        // and selects the process's effective primary group.
         assert_eq!(
             unsafe { libc::chown(path.as_ptr(), u32::MAX, libc::getegid()) },
             0
@@ -1115,8 +1088,6 @@ mod tests {
         }
         #[cfg(not(unix))]
         {
-            // This branch is compiled only for Windows-like permission APIs;
-            // Clippy's world-writable warning applies to Unix mode bits.
             #[allow(clippy::permissions_set_readonly_false)]
             permissions.set_readonly(false);
         }

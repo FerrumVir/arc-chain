@@ -1,8 +1,3 @@
-//! Private two-machine proof harness.  It exports only the first eighth of
-//! every canonical tensor to one pinned-SSH sidecar, keeps the remaining rows
-//! local, and compares two complete token positions against the normal local
-//! canonical-I8 oracle.  It never contacts a validator or public RPC listener.
-
 use arc_crypto::Hash256;
 use arc_inference::cached_integer_model::{CachedIntegerModel, I8Weights, KVCache};
 use arc_inference::tensor_parallel::{

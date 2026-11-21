@@ -1,12 +1,3 @@
-// UNTESTED — requires hardware validation on Apple Silicon
-//
-// RoPE (Rotary Position Embedding) for Q and K vectors.
-// Ported from transformer.wgsl rope kernel — must produce identical output.
-//
-// Layout: data contains [n_heads x d_head] i32 values.
-// Each thread handles one (i, i+half) pair across all heads.
-// cos/sin tables are precomputed Q16 fixed-point, indexed by [pos * half + i].
-
 #include <metal_stdlib>
 using namespace metal;
 
@@ -38,7 +29,6 @@ kernel void rope_apply(
     const int x0 = data[base + i];
     const int x1 = data[base + i + half_d];
 
-    // Fixed-point Q16 rotation — matches WGSL: separate >> 16 per term
     data[base + i]          = ((x0 * cos_val) >> 16) - ((x1 * sin_val) >> 16);
     data[base + i + half_d] = ((x0 * sin_val) >> 16) + ((x1 * cos_val) >> 16);
 }

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Adversarial tests for the public post-release artifact boundary."""
 
 from __future__ import annotations
 

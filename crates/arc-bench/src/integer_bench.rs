@@ -1,10 +1,3 @@
-//! Integer Engine Cross-Platform Determinism Benchmark
-//!
-//! Builds a test transformer using the integer-only engine and runs
-//! multi-token generation. Outputs the hash for cross-platform comparison.
-//!
-//! Usage: cargo run --release --bin arc-bench-integer
-
 use arc_inference::integer_engine::build_test_model;
 use std::time::Instant;
 
@@ -29,7 +22,6 @@ fn main() {
     eprintln!("  Runs:     {}", runs);
     eprintln!();
 
-    // Build test models of increasing size
     let configs = vec![
         ("2-layer tiny (v=50, d=32, h=2, ff=64)", 50, 32, 2, 64, 2),
         (
@@ -59,10 +51,8 @@ fn main() {
         eprintln!("  Building {}...", name);
         let model = build_test_model(*vocab, *d_model, *n_heads, *d_ff, *n_layers);
 
-        // Warmup
         let _ = model.generate_with_hash(&prompt, max_tokens, 99);
 
-        // Benchmark
         let mut hashes = Vec::new();
         let mut latencies = Vec::new();
         let mut first_tokens = None;
@@ -81,10 +71,8 @@ fn main() {
             }
         }
 
-        // Check determinism
         let all_match = hashes.windows(2).all(|w| w[0] == w[1]);
 
-        // Statistics
         latencies.sort();
         let avg = latencies.iter().sum::<u64>() as f64 / latencies.len() as f64;
         let p50 = latencies[latencies.len() / 2];

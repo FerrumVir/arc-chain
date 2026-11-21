@@ -9,17 +9,6 @@ import { describeStartFailure } from "../lib/start-failure";
 
 const COPIED_RESET_MS = 2_500;
 
-/**
- * A node that would not start, in one plain sentence with one action. The
- * native error chain stays one click away for support, behind "Show details",
- * instead of being the message; when that text is the actionable part (a
- * repair, or an error nobody anticipated) it starts open. Through v0.8.13 the
- * chain was the message, and a stuck desktop showed a paragraph that repeated
- * itself.
- *
- * `onTryAgain` is for screens without their own retry button. Setup passes
- * `showAction={false}`: its own buttons lead with "Continue to ARC".
- */
 export function StartFailurePanel({
   error,
   onTryAgain,
@@ -35,8 +24,6 @@ export function StartFailurePanel({
   const updateAvailable = update.phase === "available" && update.canInstall;
   const installing = update.phase === "downloading" || update.phase === "ready";
   const view = describeStartFailure(error, { updateAvailable });
-  // A toggle applies to the error it was made on; a new error starts from
-  // its own default.
   const [toggled, setToggled] = useState<{ error: string; open: boolean } | null>(null);
   const open = toggled?.error === error ? toggled.open : view.detailsOpen;
   const [copied, setCopied] = useState<"idle" | "copied" | "failed">("idle");
@@ -49,14 +36,11 @@ export function StartFailurePanel({
   }, [copied]);
 
   const restartArc = () => {
-    // Relaunching runs launch-time reconciliation again. Outside the native
-    // shell (browser previews) a reload is the closest equivalent.
     if (isTauri) void relaunch();
     else window.location.reload();
   };
 
   const copyDetails = () => {
-    // Without a clipboard API the call throws before returning a promise.
     void Promise.resolve()
       .then(() => navigator.clipboard.writeText(view.details))
       .then(
@@ -92,8 +76,6 @@ export function StartFailurePanel({
           />
         )}
         <div style={{ flex: 1, minWidth: 0 }}>
-          {/* Only the sentence is announced. Buttons, details and progress
-              below change without re-reading it. */}
           <div role={waiting ? "status" : "alert"}>
             <div style={{ fontWeight: 600, marginBottom: 4 }} data-testid="start-failure-title">
               {view.title}
@@ -187,7 +169,6 @@ export function StartFailurePanel({
             </button>
           </div>
 
-          {/* The copy result, announced on its own. */}
           <span className="sr-only" aria-live="polite">
             {copied === "copied"
               ? PLAIN_COPY.actions.copied
@@ -202,7 +183,6 @@ export function StartFailurePanel({
             </div>
           )}
 
-          {/* Rendered while hidden so aria-controls always names a real element. */}
           <pre
             id={detailsId}
             hidden={!open}

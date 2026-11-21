@@ -288,8 +288,6 @@ def main() -> int:
     value["archive"]["prearchive_rollout_sha256"] = "0" * 64
     value["archive"]["prearchive_rollout_sha256"] = module.rollout.prearchive_projection_digest(value)
 
-    # Validate the generated production manifest with the same strict recovery
-    # validator used by release assembly before writing any handoff bytes.
     module.rollout.validate_manifest(value)
     manifest_payload = module.rollout.canonical_bytes(value)
     manifest_sha256 = hashlib.sha256(manifest_payload).hexdigest()

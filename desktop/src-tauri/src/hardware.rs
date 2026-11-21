@@ -3,34 +3,15 @@ use sysinfo::System;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// Product floor for running the canonical 7B worker, in marketed gigabytes
-/// (what the machine's spec sheet says: a "16 GB" laptop).
 pub const WORKER_MIN_NOMINAL_RAM_GB: u64 = 16;
 
-/// Memory capacities machines are sold with, in GiB.
 const MARKETED_RAM_SIZES_GB: &[u64] = &[
     2, 3, 4, 6, 8, 12, 16, 18, 20, 24, 32, 36, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024,
     1536, 2048,
 ];
 
-/// Largest share of a marketed size that firmware, integrated graphics, and
-/// the kernel are allowed to reserve before the OS reports its total (at
-/// least 1 GiB). 15% of 16 GiB is 2.4 GiB, which covers an AMD APU's 2 GiB
-/// UMA frame buffer.
 const MAX_RESERVED_PERCENT: u64 = 15;
 
-/// The marketed capacity ("16 GB") behind the memory the OS reports.
-///
-/// The OS total excludes memory reserved before the OS sees it. macOS
-/// (`hw.memsize`) reports exactly 16 GiB on a 16 GB Mac, but Windows
-/// (`GlobalMemoryStatusEx`) typically reports 15.7–15.9 GiB, Linux
-/// (`/proc/meminfo` `MemTotal`) 15.2–15.6 GiB, and a 16 GB AMD APU with a
-/// 2 GiB frame buffer about 13.9 GiB. Flooring those to whole GiB read
-/// "15 GB" and sent 16 GB Windows and Linux machines to observer mode.
-///
-/// The visible total maps to the smallest marketed size at or above it when
-/// the shortfall is within [`MAX_RESERVED_PERCENT`]; otherwise (a VM with an
-/// unusual size, say) it stays at whole GiB, rounded down.
 pub fn nominal_ram_gb(visible_bytes: u64) -> u64 {
     for &size_gb in MARKETED_RAM_SIZES_GB {
         let size_bytes = size_gb * GIB;
@@ -46,7 +27,6 @@ pub fn nominal_ram_gb(visible_bytes: u64) -> u64 {
     visible_bytes / GIB
 }
 
-/// Minimal launch-time facts: no process scan, GPU probe or system_profiler.
 pub(crate) fn compute_capacity() -> (u64, u32) {
     let mut sys = System::new();
     sys.refresh_memory_specifics(sysinfo::MemoryRefreshKind::new().with_ram());
@@ -89,9 +69,6 @@ pub fn detect() -> HardwareInfo {
     }
     .into();
 
-    // Recommend only a hardware-fitting role/model. Hardware cannot establish
-    // demand, assignment, validator authorization, or a mined reward receipt,
-    // so this API deliberately carries no earnings estimate.
     let (recommended_model, recommended_role) = recommend(ram_gb, gpu_vram_gb);
 
     HardwareInfo {
@@ -122,7 +99,6 @@ fn recommend(ram_gb: u64, _gpu_gb: Option<u64>) -> (&'static str, &'static str) 
 #[cfg(target_os = "macos")]
 fn detect_gpu() -> (Option<String>, Option<u64>) {
     use std::process::Command;
-    // system_profiler is slow but reliable on macOS
     let out = Command::new("system_profiler")
         .args(["SPDisplaysDataType", "-json"])
         .output();
@@ -138,7 +114,6 @@ fn detect_gpu() -> (Option<String>, Option<u64>) {
                 .and_then(|g| g.get("sppci_model"))
                 .and_then(|n| n.as_str())
                 .map(|s| s.to_string());
-            // On Apple Silicon, VRAM == unified memory
             let mut sys = sysinfo::System::new_all();
             sys.refresh_memory();
             let unified_gb = nominal_ram_gb(sys.total_memory());
@@ -148,29 +123,12 @@ fn detect_gpu() -> (Option<String>, Option<u64>) {
     }
 }
 
-/// Windows GPU detection via PowerShell CIM.
-///
-/// Replaces `wmic`, which Windows 11 24H2 and Server 2025 no longer install
-/// by default — the command simply failed to launch there, so VRAM read as 0,
-/// hardware reporting could not be trusted for safe model sizing. Production
-/// eligibility is now pinned to one 7B artifact and a 16 GB RAM floor; GPU
-/// discovery remains useful diagnostic information only.
-///
-/// Two further fixes over the old CSV parse:
-/// - It picked the *first* line containing a comma, which on a laptop is
-///   usually the integrated adapter rather than the discrete GPU. Adapters
-///   are now filtered and the highest-VRAM one wins.
-/// - `AdapterRAM` is a signed 32-bit field, so it saturates at 4095 MB for
-///   any card with more than 4 GB — exactly the cards worth detecting. The
-///   registry's `qwMemorySize` is 64-bit and is preferred when readable.
 #[cfg(target_os = "windows")]
 fn detect_gpu() -> (Option<String>, Option<u64>) {
     use std::os::windows::process::CommandExt;
     use std::process::Command;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    // Ask for every adapter plus the 64-bit registry VRAM value, so the
-    // 4 GB AdapterRAM ceiling only applies as a last resort.
     const SCRIPT: &str = r#"
 $ErrorActionPreference='SilentlyContinue'
 $reg = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\*' |
@@ -196,8 +154,6 @@ Get-CimInstance Win32_VideoController | ForEach-Object {
         Ok(v) => v,
         Err(_) => return (None, None),
     };
-    // ConvertTo-Json emits a bare object for a single adapter, an array for
-    // several.
     let adapters: Vec<serde_json::Value> = match parsed {
         serde_json::Value::Array(a) => a,
         other => vec![other],
@@ -208,8 +164,6 @@ Get-CimInstance Win32_VideoController | ForEach-Object {
         l.contains("basic display") || l.contains("basic render") || l.contains("remote display")
     };
 
-    // Prefer the adapter reporting the most VRAM; that is the discrete GPU
-    // whenever there is one.
     let best = adapters
         .iter()
         .filter_map(|a| {
@@ -234,7 +188,6 @@ Get-CimInstance Win32_VideoController | ForEach-Object {
 #[cfg(target_os = "linux")]
 fn detect_gpu() -> (Option<String>, Option<u64>) {
     use std::process::Command;
-    // Try nvidia-smi first, fall back to lspci
     let out = Command::new("nvidia-smi")
         .args([
             "--query-gpu=name,memory.total",
@@ -277,26 +230,20 @@ fn detect_gpu() -> (Option<String>, Option<u64>) {
 mod tests {
     use super::*;
 
-    /// `tenths` of a GiB, so the fixtures read like the OS dialogs do.
     fn gib_tenths(tenths: u64) -> u64 {
         tenths * GIB / 10
     }
 
     #[test]
     fn sixteen_gb_machines_count_as_sixteen_gb_on_every_os() {
-        // macOS: `hw.memsize` reports the full installed amount.
         assert_eq!(nominal_ram_gb(16 * GIB), 16);
-        // Windows: GlobalMemoryStatusEx excludes firmware and iGPU memory.
         for visible in [159, 158, 157, 154] {
             assert_eq!(nominal_ram_gb(gib_tenths(visible)), 16, "{visible}/10 GiB");
         }
-        // Linux: MemTotal also excludes kernel and crash-kernel reservations.
         for visible in [156, 152, 149] {
             assert_eq!(nominal_ram_gb(gib_tenths(visible)), 16, "{visible}/10 GiB");
         }
-        // A 16 GB AMD APU with a 2 GiB UMA frame buffer.
         assert_eq!(nominal_ram_gb(gib_tenths(139)), 16);
-        // Exactly what the old floor-to-GiB arithmetic turned into "15 GB".
         assert_eq!(nominal_ram_gb(16 * GIB - 1), 16);
         assert_eq!((16 * GIB - 1) / GIB, 15);
     }
@@ -311,14 +258,10 @@ mod tests {
 
     #[test]
     fn smaller_machines_keep_their_own_size_and_stay_observers() {
-        // 8 GB and 12 GB machines.
         assert_eq!(nominal_ram_gb(gib_tenths(77)), 8);
         assert_eq!(nominal_ram_gb(gib_tenths(116)), 12);
-        // A 12.5 GiB VM is too far below 16 GB to be a reserved 16 GB machine.
         assert_eq!(nominal_ram_gb(gib_tenths(125)), 12);
-        // 13.5 GiB is more than 15% below 16 GB.
         assert_eq!(nominal_ram_gb(gib_tenths(135)), 13);
-        // Failed detection never rounds up into eligibility.
         assert_eq!(nominal_ram_gb(0), 0);
         for visible in [
             0,
@@ -338,7 +281,6 @@ mod tests {
         assert_eq!(nominal_ram_gb(gib_tenths(235)), 24);
         assert_eq!(nominal_ram_gb(gib_tenths(313)), 32);
         assert_eq!(nominal_ram_gb(gib_tenths(628)), 64);
-        // Beyond the table, whole GiB rounded down.
         assert_eq!(nominal_ram_gb(4096 * GIB), 4096);
     }
 }

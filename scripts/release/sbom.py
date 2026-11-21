@@ -28,7 +28,6 @@ CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
 
 
 def parse_cargo_lock(text: str) -> list[dict]:
-    """The [[package]] blocks of a Cargo.lock (v3/v4)."""
     packages, current, in_deps = [], None, False
     for raw in text.splitlines():
         line = raw.strip()
@@ -74,7 +73,6 @@ def cargo_components(lock: str, origin: str) -> tuple[list[dict], list[dict]]:
         by_name.setdefault(package["name"], []).append(package)
 
     def resolve(spec: str) -> str | None:
-        # "name", "name version" or "name version (source)"
         parts = spec.split(" ", 2)
         candidates = by_name.get(parts[0], [])
         if len(parts) > 1:
@@ -108,7 +106,7 @@ def cargo_components(lock: str, origin: str) -> tuple[list[dict], list[dict]]:
 def npm_components(lock: dict, origin: str) -> list[dict]:
     components = []
     for path, package in sorted(lock.get("packages", {}).items()):
-        if not path:  # the root project itself
+        if not path:
             continue
         name = package.get("name") or path.split("node_modules/")[-1]
         version = package.get("version")

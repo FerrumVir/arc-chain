@@ -1,6 +1,3 @@
-/* App shell layout: titlebar + sidebar + main */
-
-/* The wrapper App.tsx animates between the wizard and the app: full height, no layout of its own. */
 .app-phase {
   height: 100%;
 }
@@ -133,7 +130,6 @@
   }
 }
 
-/* - Mobile: sidebar becomes a bottom tab bar, titlebar gets compact. - */
 @media (max-width: 768px) {
   .app-shell {
     grid-template-columns: 1fr;
@@ -165,21 +161,11 @@
   z-index: 0;
 }
 
-/* - Titlebar - draggable area, macOS-style - */
 .titlebar {
   grid-area: titlebar;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  /* No platform-specific padding by default.
-     This was unconditionally `0 var(--space-4) 0 80px` "to clear traffic
-     lights" — but traffic lights only exist on macOS, where
-     titleBarStyle: "Overlay" (a macOS-only tauri.conf key) floats them over
-     the web content. On Windows and Linux that key is ignored and a native
-     title bar is drawn ABOVE this one, so the 80px reserved nothing and just
-     shoved the app name into the middle of the bar with dead space beside
-     it. The macOS pad is applied via [data-platform] below, stamped on
-     <html> at boot by main.tsx. */
   padding: 0 var(--space-4);
   background: rgba(13, 13, 24, 0.7);
   backdrop-filter: blur(20px);
@@ -190,8 +176,6 @@
   position: relative;
 }
 
-/* macOS only: clear the traffic lights that Overlay mode floats over the
-   content. Scoped so Windows and Linux keep a symmetric bar. */
 [data-platform="macos"] .titlebar {
   padding-left: 80px;
 }
@@ -228,8 +212,6 @@
   color: var(--text-faint);
 }
 
-/* Phone width: one line, always. The synthetic-preview label moves out (the
-   full preview banner stays on screen) and GitHub keeps only its icon. */
 @media (max-width: 768px) {
   .titlebar,
   [data-platform="macos"] .titlebar {
@@ -255,7 +237,6 @@
   }
 }
 
-/* - Sidebar - */
 .sidebar {
   grid-area: sidebar;
   display: flex;
@@ -267,7 +248,6 @@
   position: relative;
 }
 
-/* The real arc wordmark, the tagline under it. */
 .sidebar-brand {
   display: flex;
   flex-direction: column;
@@ -346,9 +326,6 @@
   color: var(--text-secondary);
 }
 
-/* Phone width: the sidebar becomes a bottom tab bar. This block must come after the base sidebar rules above:
-   its selectors carry the same specificity, so placed earlier it lost the cascade and the bar showed the brand,
-   the footer, and a vertical nav spilling over the page. */
 @media (max-width: 768px) {
   .sidebar {
     flex-direction: row;
@@ -396,9 +373,6 @@
   }
 }
 
-/* - Main area - */
-/* --main-pad is the scroll area's padding. Screens that reach edge to edge (the
-   dashboard's start-up stage, the chat's pinned composer) step back through it. */
 .main {
   --main-pad: var(--space-8);
   grid-area: main;
@@ -467,10 +441,6 @@
   .onboarding-title {
     font-size: var(--text-3xl);
   }
-  /* Info popover becomes a fixed modal on mobile - avoids off-screen
-     clipping when the trigger sits near the left edge of a narrow viewport.
-     !important because the default rules use specific left/top that would
-     otherwise win at equal specificity. */
   .info-popover {
     position: fixed !important;
     top: 50% !important;
@@ -486,7 +456,6 @@
   .info-popover::before {
     display: none;
   }
-  /* Dashboard header actions sit below title, not beside it */
   [data-testid="dashboard"] .page-header > div:last-child {
     display: flex;
     gap: var(--space-2);
@@ -507,7 +476,6 @@
   margin-top: var(--space-2);
 }
 
-/* - Cards - */
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -558,7 +526,6 @@
   text-transform: uppercase;
 }
 
-/* - Grids - */
 .grid-stats {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -577,7 +544,6 @@
   }
 }
 
-/* - Buttons - */
 .btn {
   display: inline-flex;
   align-items: center;
@@ -592,7 +558,6 @@
   white-space: nowrap;
   cursor: pointer;
   user-select: none;
-  /* Minimum tap target for accessibility / mobile (Apple HIG: 44×44, Material: 48×48). */
   min-height: 40px;
   -webkit-tap-highlight-color: transparent;
 }
@@ -673,7 +638,6 @@
   border-radius: var(--radius-sm);
 }
 
-/* - Inputs - */
 .field {
   display: flex;
   flex-direction: column;
@@ -715,7 +679,6 @@
   letter-spacing: 0.02em;
 }
 
-/* - Pulse indicator - */
 .pulse-dot {
   position: relative;
   width: 8px;
@@ -743,7 +706,6 @@
 .pulse-dot.syncing {
   background: var(--warning);
 }
-/* Nothing reachable at all: this computer's connection, not a fault in ARC. Amber, not red. */
 .pulse-dot.offline {
   background: var(--warning);
 }
@@ -751,7 +713,6 @@
   animation: none;
   opacity: 0;
 }
-/* A node that is off by choice: no colour and no pulse. */
 .pulse-dot.off {
   background: var(--text-muted);
 }
@@ -771,7 +732,6 @@
   }
 }
 
-/* - Status pill - */
 .status-pill {
   display: inline-flex;
   align-items: center;
@@ -809,7 +769,6 @@
   color: var(--info);
 }
 
-/* - Connection notice: how the node reaches the network, as calm status (screens/Dashboard.tsx) - */
 .connection-notice {
   display: flex;
   flex-wrap: wrap;
@@ -841,7 +800,6 @@
   flex-basis: 100%;
 }
 
-/* - Plain details: the native text behind a one-sentence notice (Wallet, Settings) - */
 .plain-details {
   margin-top: var(--space-2);
   font-size: var(--text-xs);
@@ -880,7 +838,6 @@
   color: var(--info);
   margin-right: var(--space-2);
 }
-/* - Big number - */
 .big-number {
   font-size: var(--text-4xl);
   font-weight: var(--weight-semibold);
@@ -936,7 +893,6 @@
   color: var(--danger);
 }
 
-/* - Feed / list - */
 .feed {
   display: flex;
   flex-direction: column;
@@ -1001,7 +957,6 @@
   flex-shrink: 0;
 }
 
-/* - Progress bar - */
 .progress {
   width: 100%;
   height: 6px;
@@ -1017,14 +972,12 @@
   transition: width var(--dur-slow) var(--ease-out);
 }
 
-/* - Divider - */
 .divider {
   height: 1px;
   background: var(--border);
   margin: var(--space-6) 0;
 }
 
-/* - Empty state - */
 .empty {
   display: flex;
   flex-direction: column;
@@ -1053,7 +1006,6 @@
   font-size: var(--text-sm);
 }
 
-/* - Shimmer - */
 .shimmer {
   position: relative;
   overflow: hidden;
@@ -1079,7 +1031,6 @@
   }
 }
 
-/* - Onboarding-specific - */
 .onboarding {
   display: grid;
   grid-template-columns: 1fr;
@@ -1114,9 +1065,6 @@
   }
 }
 
-/* Scrolls a step that is taller than the window (the app allows 960x640),
-   so its action is never cut off. It is a sibling of .onboarding::before,
-   whose drifting gradient therefore stays clipped and never adds scroll. */
 .onboarding-scroll {
   position: absolute;
   inset: 0;
@@ -1188,7 +1136,6 @@
   background: var(--indigo-700);
 }
 
-/* - Role selector - */
 .role-grid {
   display: grid;
   grid-template-columns: 1fr;
@@ -1273,7 +1220,6 @@
   letter-spacing: var(--tracking-wider);
 }
 
-/* - Hardware summary - */
 .hardware-summary {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -1309,7 +1255,6 @@
   background: rgba(99, 102, 241, 0.06);
 }
 
-/* - Logs console - */
 .log-console {
   font-family: var(--font-mono);
   font-size: var(--text-sm);
@@ -1340,7 +1285,6 @@
 .log-level-error { color: var(--danger); }
 .log-level-ok { color: var(--success); }
 
-/* - Inline key-value - */
 .kv {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -1365,14 +1309,12 @@
   font-size: var(--text-xs);
 }
 
-/* - Mono hash display - */
 .hash {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   color: var(--text-muted);
 }
 
-/* - Info button + popover - */
 .info-btn {
   display: inline-grid;
   place-items: center;
@@ -1462,7 +1404,6 @@
   color: var(--arc-ink);
 }
 
-/* - Section heading - */
 .section-heading {
   display: flex;
   align-items: center;
@@ -1477,7 +1418,6 @@
 @keyframes spin { to { transform: rotate(360deg); } }
 .spin { animation: spin 1s linear infinite; }
 
-/* ── The start-up stage: while the node starts and catches up, the dashboard's visible area is the aqueduct ── */
 .start-stage {
   position: relative;
   display: block;
@@ -1495,7 +1435,6 @@
   width: 100%;
   height: 100%;
 }
-/* the words sit low, over the ground, so the channel along the top of the aqueduct stays clear for the water */
 .start-stage-top {
   position: absolute;
   left: 0;
@@ -1560,7 +1499,6 @@
   }
 }
 
-/* "Checking": no node status has arrived yet. Neutral, and still pulsing, so it never reads as Offline or Stopped. */
 .pulse-dot.checking {
   background: var(--text-muted);
 }
@@ -1569,7 +1507,6 @@
   color: var(--text-muted);
 }
 
-/* - Skeleton: loading placeholders (components/Skeleton.tsx), built on .shimmer - */
 .skeleton {
   display: inline-block;
   vertical-align: middle;
@@ -1584,7 +1521,6 @@
   width: 100%;
 }
 
-/* Loading rows for feeds: the same rhythm as .feed-item, so the list does not jump when real rows arrive. */
 .feed-loading {
   display: flex;
   flex-direction: column;
@@ -1602,7 +1538,6 @@
   border-bottom: none;
 }
 
-/* Content that arrives after a load fades in rather than popping. */
 @keyframes arrive {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: none; }
@@ -1618,7 +1553,6 @@
   padding: var(--space-2) 0;
 }
 
-/* A load that failed during onboarding: what happened and a way to retry, in place of a shimmer that never ends. */
 .onboarding-load-error {
   display: grid;
   gap: var(--space-3);

@@ -1,59 +1,34 @@
-// Add to lib.rs: pub mod wallet;
-
-//! Wallet SDK types for ARC Chain integration.
-//!
-//! Provides key management types, transaction building helpers,
-//! JSON-RPC request/response types, and chain info for wallet developers.
-
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// Key types
-// ---------------------------------------------------------------------------
-
-/// Supported key types for wallets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyType {
     Ed25519,
-    /// Ethereum-compatible elliptic curve.
     Secp256k1,
-    /// Post-quantum lattice-based signature (NIST round-3).
     Falcon512,
-    /// NIST post-quantum ML-DSA-65 (formerly Dilithium).
     MlDsa65,
 }
 
-/// Wallet key pair (public info only -- private key is never serialized).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletKey {
     pub key_type: KeyType,
     pub public_key: Vec<u8>,
     pub address: [u8; 32],
-    /// BIP-44 derivation path, if applicable.
     pub derivation_path: Option<String>,
     pub label: String,
 }
 
-// ---------------------------------------------------------------------------
-// Transaction request / signed payload
-// ---------------------------------------------------------------------------
-
-/// High-level transaction request -- what the user intends to do.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxRequest {
     pub from: [u8; 32],
     pub to: [u8; 32],
     pub value: u64,
     pub tx_type: TxRequestType,
-    /// `None` means "fetch from chain automatically".
     pub nonce: Option<u64>,
     pub gas_limit: Option<u64>,
     pub priority_fee: Option<u64>,
-    /// Arbitrary call data (contract calls).
     pub data: Option<Vec<u8>>,
 }
 
-/// Discriminant for [`TxRequest`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TxRequestType {
     Transfer,
@@ -71,7 +46,6 @@ pub enum TxRequestType {
     },
 }
 
-/// A fully signed transaction payload ready for submission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedTxPayload {
     pub tx_hash: [u8; 32],
@@ -81,11 +55,6 @@ pub struct SignedTxPayload {
     pub key_type: KeyType,
 }
 
-// ---------------------------------------------------------------------------
-// JSON-RPC 2.0
-// ---------------------------------------------------------------------------
-
-/// JSON-RPC 2.0 request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcRequest {
     pub jsonrpc: String,
@@ -94,7 +63,6 @@ pub struct RpcRequest {
     pub id: u64,
 }
 
-/// JSON-RPC parameter variants.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RpcParams {
@@ -103,7 +71,6 @@ pub enum RpcParams {
     Object(serde_json::Map<String, serde_json::Value>),
 }
 
-/// JSON-RPC 2.0 response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcResponse {
     pub jsonrpc: String,
@@ -112,7 +79,6 @@ pub struct RpcResponse {
     pub id: u64,
 }
 
-/// JSON-RPC error object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcError {
     pub code: i64,
@@ -120,11 +86,6 @@ pub struct RpcError {
     pub data: Option<serde_json::Value>,
 }
 
-// ---------------------------------------------------------------------------
-// Chain info
-// ---------------------------------------------------------------------------
-
-/// Describes a chain endpoint that a wallet connects to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChainInfo {
     pub chain_id: u64,
@@ -136,7 +97,6 @@ pub struct ChainInfo {
     pub is_testnet: bool,
 }
 
-/// Metadata for a chain's native currency.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrencyInfo {
     pub name: String,
@@ -144,11 +104,6 @@ pub struct CurrencyInfo {
     pub decimals: u8,
 }
 
-// ---------------------------------------------------------------------------
-// Balance / token queries
-// ---------------------------------------------------------------------------
-
-/// Result of a balance query for a single address.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BalanceResult {
     pub address: [u8; 32],
@@ -158,7 +113,6 @@ pub struct BalanceResult {
     pub pending_rewards: u64,
 }
 
-/// Balance of a single token held by an address.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenBalance {
     pub token_address: [u8; 32],
@@ -167,11 +121,6 @@ pub struct TokenBalance {
     pub balance: u128,
 }
 
-// ---------------------------------------------------------------------------
-// Transaction receipt / events
-// ---------------------------------------------------------------------------
-
-/// Receipt returned to the wallet after a transaction is confirmed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletTxReceipt {
     pub tx_hash: [u8; 32],
@@ -184,7 +133,6 @@ pub struct WalletTxReceipt {
     pub confirmations: u64,
 }
 
-/// Transaction lifecycle status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WalletTxStatus {
     Pending,
@@ -193,7 +141,6 @@ pub enum WalletTxStatus {
     Failed,
 }
 
-/// Simplified event log for wallet display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletEvent {
     pub event_type: String,
@@ -201,12 +148,7 @@ pub struct WalletEvent {
     pub data: serde_json::Value,
 }
 
-// ===========================================================================
-// Implementations
-// ===========================================================================
-
 impl WalletKey {
-    /// Create a new wallet key with a derived address (BLAKE3 hash of public key).
     pub fn new(key_type: KeyType, public_key: Vec<u8>, label: String) -> Self {
         let hash = blake3::hash(&public_key);
         let address: [u8; 32] = *hash.as_bytes();
@@ -219,7 +161,6 @@ impl WalletKey {
         }
     }
 
-    /// Human-readable short address: `"0xabcd...ef01"`.
     pub fn short_address(&self) -> String {
         let full = hex::encode(self.address);
         format!("0x{}...{}", &full[..4], &full[full.len() - 4..])
@@ -227,7 +168,6 @@ impl WalletKey {
 }
 
 impl TxRequest {
-    /// Convenience: simple value transfer.
     pub fn transfer(from: [u8; 32], to: [u8; 32], value: u64) -> Self {
         Self {
             from,
@@ -241,7 +181,6 @@ impl TxRequest {
         }
     }
 
-    /// Convenience: contract call with raw calldata.
     pub fn contract_call(from: [u8; 32], contract: [u8; 32], data: Vec<u8>) -> Self {
         Self {
             from,
@@ -255,7 +194,6 @@ impl TxRequest {
         }
     }
 
-    /// Rough gas estimate based on transaction type.
     pub fn estimated_gas(&self) -> u64 {
         match &self.tx_type {
             TxRequestType::Transfer => 21_000,
@@ -269,7 +207,6 @@ impl TxRequest {
 }
 
 impl ChainInfo {
-    /// ARC mainnet defaults.
     pub fn arc_mainnet() -> Self {
         Self {
             chain_id: 1,
@@ -286,7 +223,6 @@ impl ChainInfo {
         }
     }
 
-    /// ARC testnet defaults.
     pub fn arc_testnet() -> Self {
         Self {
             chain_id: 100,
@@ -305,7 +241,6 @@ impl ChainInfo {
 }
 
 impl RpcRequest {
-    /// Build a new JSON-RPC 2.0 request.
     pub fn new(method: &str, params: RpcParams, id: u64) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
@@ -315,19 +250,16 @@ impl RpcRequest {
         }
     }
 
-    /// `arc_getBalance` for the given address.
     pub fn get_balance(address: [u8; 32]) -> Self {
         let addr_hex = serde_json::Value::String(hex::encode(address));
         Self::new("arc_getBalance", RpcParams::Array(vec![addr_hex]), 1)
     }
 
-    /// `arc_getBlock` by height.
     pub fn get_block(height: u64) -> Self {
         let h = serde_json::Value::Number(serde_json::Number::from(height));
         Self::new("arc_getBlock", RpcParams::Array(vec![h]), 1)
     }
 
-    /// `arc_sendTransaction` with a raw signed transaction.
     pub fn send_transaction(raw_tx: Vec<u8>) -> Self {
         let tx_hex = serde_json::Value::String(hex::encode(raw_tx));
         Self::new("arc_sendTransaction", RpcParams::Array(vec![tx_hex]), 1)
@@ -335,7 +267,6 @@ impl RpcRequest {
 }
 
 impl RpcResponse {
-    /// Build a success response.
     pub fn success(id: u64, result: serde_json::Value) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
@@ -345,7 +276,6 @@ impl RpcResponse {
         }
     }
 
-    /// Build an error response.
     pub fn error(id: u64, code: i64, message: String) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
@@ -360,15 +290,9 @@ impl RpcResponse {
     }
 }
 
-// ===========================================================================
-// Tests
-// ===========================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- helpers -----------------------------------------------------------
 
     fn dummy_address(seed: u8) -> [u8; 32] {
         let mut addr = [0u8; 32];
@@ -380,14 +304,12 @@ mod tests {
         vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04]
     }
 
-    // ---- key tests ---------------------------------------------------------
-
     #[test]
     fn test_wallet_key_creation() {
         let key = WalletKey::new(KeyType::Ed25519, dummy_pubkey(), "main".to_string());
         assert_eq!(key.key_type, KeyType::Ed25519);
         assert_eq!(key.label, "main");
-        assert_ne!(key.address, [0u8; 32]); // derived, not zero
+        assert_ne!(key.address, [0u8; 32]);
         assert!(key.derivation_path.is_none());
     }
 
@@ -397,10 +319,8 @@ mod tests {
         let short = key.short_address();
         assert!(short.starts_with("0x"));
         assert!(short.contains("..."));
-        assert_eq!(short.len(), 13); // "0x" + 4 + "..." + 4
+        assert_eq!(short.len(), 13);
     }
-
-    // ---- tx request tests --------------------------------------------------
 
     #[test]
     fn test_tx_request_transfer() {
@@ -432,8 +352,6 @@ mod tests {
         assert_eq!(call.estimated_gas(), 100_000);
     }
 
-    // ---- chain info tests --------------------------------------------------
-
     #[test]
     fn test_chain_info_mainnet() {
         let info = ChainInfo::arc_mainnet();
@@ -450,8 +368,6 @@ mod tests {
         assert!(info.is_testnet);
         assert_eq!(info.native_currency.symbol, "tARC");
     }
-
-    // ---- RPC tests ---------------------------------------------------------
 
     #[test]
     fn test_rpc_request_creation() {
@@ -491,8 +407,6 @@ mod tests {
         assert_eq!(err.message, "Invalid request");
     }
 
-    // ---- serde roundtrip ---------------------------------------------------
-
     #[test]
     fn test_balance_result_serde() {
         let bal = BalanceResult {
@@ -517,8 +431,6 @@ mod tests {
         assert_eq!(back.pending_rewards, 5);
     }
 
-    // ---- key types ---------------------------------------------------------
-
     #[test]
     fn test_key_types() {
         let types = [
@@ -530,7 +442,6 @@ mod tests {
         for kt in &types {
             let key = WalletKey::new(*kt, dummy_pubkey(), format!("{:?}", kt));
             assert_eq!(key.key_type, *kt);
-            // serde roundtrip
             let json = serde_json::to_string(&key).expect("serialize");
             let back: WalletKey = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(back.key_type, *kt);

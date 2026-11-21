@@ -1,5 +1,3 @@
-//! `arc faucet <address>` - request testnet tokens from the faucet.
-
 use crate::rpc::RpcClient;
 use anyhow::Result;
 

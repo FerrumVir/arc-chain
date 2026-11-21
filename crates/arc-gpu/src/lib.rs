@@ -29,7 +29,6 @@ pub enum GpuError {
     Unavailable,
 }
 
-/// GPU acceleration status.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct GpuInfo {
     pub available: bool,
@@ -37,7 +36,6 @@ pub struct GpuInfo {
     pub backend: String,
 }
 
-/// Check if GPU compute is available and return device info.
 pub fn probe_gpu() -> GpuInfo {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
@@ -67,8 +65,6 @@ pub fn probe_gpu() -> GpuInfo {
     }
 }
 
-/// CPU-parallel BLAKE3 batch commit (fallback when GPU unavailable or for comparison).
-/// This is already extremely fast - BLAKE3 + Rayon across all cores.
 pub fn cpu_batch_commit(data: &[&[u8]]) -> Vec<Hash256> {
     data.par_iter()
         .map(|item| {
@@ -79,7 +75,6 @@ pub fn cpu_batch_commit(data: &[&[u8]]) -> Vec<Hash256> {
         .collect()
 }
 
-/// CPU-parallel batch commit with domain separation (production path).
 pub fn cpu_batch_commit_domain(transactions: &[(u8, &[u8])]) -> Vec<Hash256> {
     transactions
         .par_iter()
@@ -92,32 +87,15 @@ pub fn cpu_batch_commit_domain(transactions: &[(u8, &[u8])]) -> Vec<Hash256> {
         .collect()
 }
 
-/// GPU hardware profile for throughput estimation.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct GpuProfile {
     pub info: GpuInfo,
-    /// Number of GPU compute cores (estimated from known hardware).
     pub compute_cores: u32,
-    /// Estimated GPU memory bandwidth (GB/s).
     pub memory_bandwidth_gbps: f64,
-    /// Estimated hashes/second for BLAKE3 on this GPU.
     pub estimated_hash_rate: f64,
-    /// Multiplier over CPU throughput.
     pub cpu_multiplier: f64,
 }
 
-/// Estimate GPU hashing performance based on detected hardware.
-/// These are conservative projections based on known Metal/Vulkan compute benchmarks.
-///
-/// Reference data points:
-///   - M4 Pro (20 GPU cores):  ~1.5B hashes/s (Metal compute, 256-byte payloads)
-///   - M4 Max (40 GPU cores):  ~3.0B hashes/s
-///   - M4 Ultra (80 GPU cores): ~5.5B hashes/s
-///   - RTX 4090 (16384 cores):  ~8.0B hashes/s (Vulkan compute)
-///   - A100 (6912 cores):       ~4.0B hashes/s
-///
-/// For smaller payloads (128 bytes), multiply by ~1.8x.
-/// For larger payloads (512+ bytes), divide by ~1.5x.
 pub fn estimate_gpu_throughput(cpu_tps: f64) -> GpuProfile {
     let info = probe_gpu();
 
@@ -133,18 +111,13 @@ pub fn estimate_gpu_throughput(cpu_tps: f64) -> GpuProfile {
 
     let name_lower = info.name.to_lowercase();
 
-    // Estimate cores and bandwidth from GPU name
     let (cores, bw_gbps, base_hash_rate) = if name_lower.contains("ultra") {
-        // Apple M-series Ultra (fused die = 2x Max)
         (80, 800.0, 5_500_000_000.0)
     } else if name_lower.contains("max") {
-        // Apple M-series Max
         (40, 400.0, 3_000_000_000.0)
     } else if name_lower.contains("pro") && name_lower.contains("apple") {
-        // Apple M-series Pro
         (20, 200.0, 1_500_000_000.0)
     } else if name_lower.contains("apple") {
-        // Apple M-series base (8-10 GPU cores)
         (10, 100.0, 800_000_000.0)
     } else if name_lower.contains("4090") {
         (16384, 1008.0, 8_000_000_000.0)
@@ -155,7 +128,6 @@ pub fn estimate_gpu_throughput(cpu_tps: f64) -> GpuProfile {
     } else if name_lower.contains("h100") {
         (14592, 3350.0, 10_000_000_000.0)
     } else {
-        // Unknown GPU - conservative 5x over CPU
         (1024, 200.0, cpu_tps * 5.0)
     };
 
@@ -174,20 +146,15 @@ pub fn estimate_gpu_throughput(cpu_tps: f64) -> GpuProfile {
     }
 }
 
-/// Minimum batch size for GPU dispatch (below this, CPU is faster due to dispatch overhead).
 const GPU_MIN_BATCH: usize = 4096;
 
-/// Padded payload size in bytes - all inputs padded to this for uniform GPU dispatch.
 const PAYLOAD_PAD: usize = 256;
 
-/// GPU-accelerated batch commit using wgpu BLAKE3 compute shaders.
-/// Falls back to CPU if GPU is unavailable or batch is too small.
 pub fn gpu_batch_commit(data: &[&[u8]]) -> Result<Vec<Hash256>, GpuError> {
     if data.len() < GPU_MIN_BATCH {
         return Ok(cpu_batch_commit(data));
     }
 
-    // Initialize GPU
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
         ..Default::default()
@@ -219,14 +186,12 @@ pub fn gpu_batch_commit(data: &[&[u8]]) -> Result<Vec<Hash256>, GpuError> {
     let n = data.len() as u32;
     let stride_u32s = (PAYLOAD_PAD / 4) as u32;
 
-    // Pad input data to PAYLOAD_PAD bytes each, pack as u32 array
     let mut input_buf: Vec<u32> = vec![0u32; data.len() * (PAYLOAD_PAD / 4)];
     let mut lengths: Vec<u32> = Vec::with_capacity(data.len());
     for (i, item) in data.iter().enumerate() {
         let offset = i * (PAYLOAD_PAD / 4);
         let bytes_to_copy = item.len().min(PAYLOAD_PAD);
         lengths.push(bytes_to_copy as u32);
-        // Copy bytes into u32 slots (little-endian)
         for (j, chunk) in item[..bytes_to_copy].chunks(4).enumerate() {
             let mut word = [0u8; 4];
             word[..chunk.len()].copy_from_slice(chunk);
@@ -235,9 +200,8 @@ pub fn gpu_batch_commit(data: &[&[u8]]) -> Result<Vec<Hash256>, GpuError> {
     }
 
     let input_bytes = bytemuck::cast_slice(&input_buf);
-    let output_size = (data.len() * 8 * 4) as u64; // 8 u32s per hash
+    let output_size = (data.len() * 8 * 4) as u64;
 
-    // Create GPU buffers
     let input_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Input"),
         contents: input_bytes,
@@ -258,7 +222,6 @@ pub fn gpu_batch_commit(data: &[&[u8]]) -> Result<Vec<Hash256>, GpuError> {
         mapped_at_creation: false,
     });
 
-    // Params uniform: [num_items, stride_u32s]
     let params = [n, stride_u32s];
     let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Params"),
@@ -266,20 +229,17 @@ pub fn gpu_batch_commit(data: &[&[u8]]) -> Result<Vec<Hash256>, GpuError> {
         usage: wgpu::BufferUsages::UNIFORM,
     });
 
-    // Per-item lengths buffer
     let lengths_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Lengths"),
         contents: bytemuck::cast_slice(&lengths),
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    // Load shader
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("BLAKE3"),
         source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("blake3.wgsl"))),
     });
 
-    // Bind group layout (4 bindings: input, output, params, lengths)
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("BLAKE3 BGL"),
         entries: &[
@@ -364,7 +324,6 @@ pub fn gpu_batch_commit(data: &[&[u8]]) -> Result<Vec<Hash256>, GpuError> {
         ],
     });
 
-    // Dispatch compute
     let workgroup_size = 256u32;
     let num_workgroups = n.div_ceil(workgroup_size);
 
@@ -385,7 +344,6 @@ pub fn gpu_batch_commit(data: &[&[u8]]) -> Result<Vec<Hash256>, GpuError> {
     encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_size);
     queue.submit(Some(encoder.finish()));
 
-    // Read back results
     let buffer_slice = staging_buffer.slice(..);
     let (sender, receiver) = std::sync::mpsc::channel();
     buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -418,16 +376,6 @@ pub fn gpu_batch_commit(data: &[&[u8]]) -> Result<Vec<Hash256>, GpuError> {
     Ok(hashes)
 }
 
-// ─── GPU Merkle Root ─────────────────────────────────────────────────────────
-
-/// Compute a Merkle root from leaf hashes using GPU-accelerated BLAKE3.
-///
-/// Uses the existing GPU BLAKE3 batch hashing to compute each layer of the
-/// Merkle tree in parallel.  Falls back to CPU if GPU is unavailable or if
-/// the leaf count is below `GPU_MIN_BATCH`.
-///
-/// Layer computation: For N leaf hashes, concatenate pairs (64 bytes each),
-/// hash N/2 pairs → repeat until one root remains.
 pub fn gpu_merkle_root(leaves: &[Hash256]) -> Result<Hash256, GpuError> {
     if leaves.is_empty() {
         return Ok(Hash256([0u8; 32]));
@@ -438,13 +386,11 @@ pub fn gpu_merkle_root(leaves: &[Hash256]) -> Result<Hash256, GpuError> {
 
     let mut current: Vec<Hash256> = leaves.to_vec();
 
-    // Pad to even length with zero hash if needed
     if !current.len().is_multiple_of(2) {
         current.push(Hash256([0u8; 32]));
     }
 
     while current.len() > 1 {
-        // Concatenate pairs into 64-byte payloads
         let pairs: Vec<[u8; 64]> = current
             .chunks_exact(2)
             .map(|pair| {
@@ -457,14 +403,12 @@ pub fn gpu_merkle_root(leaves: &[Hash256]) -> Result<Hash256, GpuError> {
 
         let refs: Vec<&[u8]> = pairs.iter().map(|p| p.as_slice()).collect();
 
-        // Use GPU for large layers, CPU for small ones
         current = if refs.len() >= GPU_MIN_BATCH {
             gpu_batch_commit(&refs)?
         } else {
             cpu_batch_commit(&refs)
         };
 
-        // Pad again if odd
         if current.len() > 1 && !current.len().is_multiple_of(2) {
             current.push(Hash256([0u8; 32]));
         }
@@ -473,17 +417,6 @@ pub fn gpu_merkle_root(leaves: &[Hash256]) -> Result<Hash256, GpuError> {
     Ok(current[0])
 }
 
-// ─── GPU-accelerated Ed25519 batch verification ──────────────────────────────
-
-/// Batch verify Ed25519 signatures using CPU-parallel rayon.
-///
-/// This is the high-throughput verification path: rayon distributes
-/// individual verifications across all CPU cores.  For batches >= 1024,
-/// this achieves near-linear scaling.
-///
-/// **Note**: This is a CPU-parallel fallback used when the Metal/CUDA GPU
-/// pipeline is not available (non-macOS platforms or small batches).
-/// The actual GPU verification path is in `metal_verify::MetalVerifier`.
 pub fn cpu_batch_verify_ed25519(
     messages: &[&[u8]],
     signatures: &[ed25519_dalek::Signature],
@@ -492,9 +425,6 @@ pub fn cpu_batch_verify_ed25519(
     assert_eq!(messages.len(), signatures.len());
     assert_eq!(messages.len(), verifying_keys.len());
 
-    // For large batches, use rayon parallel iterator for per-signature verification.
-    // ed25519_dalek::verify_batch is already fast but gives all-or-nothing;
-    // we need per-signature results for selective re-execution.
     if messages.len() >= 256 {
         messages
             .par_iter()
@@ -528,14 +458,12 @@ mod tests {
         let refs: Vec<&[u8]> = items.iter().map(|b| b.as_slice()).collect();
         let results = cpu_batch_commit(&refs);
         assert_eq!(results.len(), 10_000);
-        // Deterministic
         assert_eq!(results[0], cpu_batch_commit(&[items[0].as_slice()])[0]);
     }
 
     #[test]
     fn test_gpu_probe() {
         let info = probe_gpu();
-        // Just check it doesn't crash - GPU may or may not be available in CI
         println!("GPU probe: {:?}", info);
     }
 
@@ -551,7 +479,6 @@ mod tests {
 
     #[test]
     fn test_gpu_batch_commit() {
-        // Use 5000 items (above GPU_MIN_BATCH=4096) to exercise GPU path
         let items: Vec<[u8; 128]> = (0..5000u32)
             .map(|i| {
                 let mut buf = [0u8; 128];
@@ -598,15 +525,12 @@ mod tests {
 
     #[test]
     fn test_gpu_merkle_root_basic() {
-        // 4 leaves → 2 parents → 1 root
         let leaves: Vec<Hash256> = (0..4u32)
             .map(|i| arc_crypto::hash_bytes(&i.to_le_bytes()))
             .collect();
         let root = gpu_merkle_root(&leaves).unwrap();
-        // Should be deterministic
         let root2 = gpu_merkle_root(&leaves).unwrap();
         assert_eq!(root, root2);
-        // Should differ from leaves
         assert_ne!(root, leaves[0]);
     }
 
@@ -628,7 +552,6 @@ mod tests {
         use ed25519_dalek::Signer;
         let mut rng = rand::thread_rng();
 
-        // Generate 100 keypairs and sign messages
         let keypairs: Vec<ed25519_dalek::SigningKey> = (0..100)
             .map(|_| ed25519_dalek::SigningKey::generate(&mut rng))
             .collect();
@@ -660,7 +583,6 @@ mod tests {
         let sig = kp.sign(msg.as_slice());
         let vk = kp.verifying_key();
 
-        // Valid then invalid
         let results = cpu_batch_verify_ed25519(
             &[msg.as_slice(), bad_msg.as_slice()],
             &[sig, sig],
@@ -672,7 +594,6 @@ mod tests {
 
     #[test]
     fn test_gpu_fallback_small_batch() {
-        // Below GPU_MIN_BATCH should use CPU fallback
         let items: Vec<[u8; 64]> = (0..100u32)
             .map(|i| {
                 let mut buf = [0u8; 64];

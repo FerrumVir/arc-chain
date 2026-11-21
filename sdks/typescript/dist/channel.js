@@ -1,18 +1,4 @@
 "use strict";
-/**
- * Off-chain bilateral payment channel for ARC Chain.
- *
- * Provides a Channel class with pay(), receive(), close(), and dispute()
- * methods for high-throughput off-chain transactions between two agents.
- *
- * @example
- * ```typescript
- * const channel = new Channel(channelId, myKeypair, counterpartyPubkey, deposit);
- * await channel.open(client);
- * const commitment = channel.pay(100);
- * // Send commitment to counterparty...
- * ```
- */
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.Channel = exports.ChannelState = void 0;
 function assertSafeU64Number(value, fieldName) {
@@ -20,7 +6,6 @@ function assertSafeU64Number(value, fieldName) {
         throw new RangeError(`${fieldName} must be a non-negative safe integer`);
     }
 }
-/** Channel lifecycle states. */
 var ChannelState;
 (function (ChannelState) {
     ChannelState["Opening"] = "Opening";
@@ -29,12 +14,6 @@ var ChannelState;
     ChannelState["Disputed"] = "Disputed";
     ChannelState["Closed"] = "Closed";
 })(ChannelState || (exports.ChannelState = ChannelState = {}));
-/**
- * Off-chain bilateral payment channel.
- *
- * Manages state transitions, signature verification, and balance conservation
- * for a two-party payment channel on ARC Chain.
- */
 class Channel {
     constructor(channelId, role, totalDeposit) {
         this.state = ChannelState.Opening;
@@ -53,25 +32,18 @@ class Channel {
             this.counterpartyBalance = totalDeposit;
         }
     }
-    /** Mark channel as open after on-chain ChannelOpen confirms. */
     confirmOpen() {
         if (this.state !== ChannelState.Opening) {
             throw new Error(`Cannot open: channel is ${this.state}`);
         }
         this.state = ChannelState.Open;
     }
-    /** Get this party's current balance. */
     myBalance() {
         return this.role === 'opener' ? this.openerBalance : this.counterpartyBalance;
     }
-    /** Get counterparty's current balance. */
     theirBalance() {
         return this.role === 'opener' ? this.counterpartyBalance : this.openerBalance;
     }
-    /**
-     * Transfer `amount` from this party to the counterparty.
-     * Returns a half-signed state commitment to send to the counterparty.
-     */
     pay(amount) {
         if (this.state !== ChannelState.Open) {
             throw new Error(`Cannot pay: channel is ${this.state}`);
@@ -93,7 +65,6 @@ class Channel {
         assertSafeU64Number(newCounter, 'counterpartyBalance');
         return this.proposeState(newOpener, newCounter);
     }
-    /** Propose a new state with arbitrary balances. */
     proposeState(openerBalance, counterpartyBalance) {
         if (this.state !== ChannelState.Open) {
             throw new Error(`Cannot propose: channel is ${this.state}`);
@@ -111,15 +82,11 @@ class Channel {
             nonce: newNonce,
             openerBalance,
             counterpartyBalance,
-            proposerSig: new Uint8Array(64), // Caller signs externally
+            proposerSig: new Uint8Array(64),
             acceptorSig: null,
         };
         return commitment;
     }
-    /**
-     * Receive and validate a state commitment from the counterparty.
-     * Updates local state if valid.
-     */
     receiveState(commitment) {
         if (this.state !== ChannelState.Open) {
             throw new Error(`Cannot receive: channel is ${this.state}`);
@@ -137,11 +104,9 @@ class Channel {
             BigInt(this.totalDeposit)) {
             throw new Error('Conservation violated');
         }
-        // In a full implementation, verify proposer's Ed25519 signature here.
-        // For now, accept the commitment and co-sign.
         const signed = {
             ...commitment,
-            acceptorSig: new Uint8Array(64), // Caller signs externally
+            acceptorSig: new Uint8Array(64),
         };
         this.nonce = commitment.nonce;
         this.openerBalance = commitment.openerBalance;
@@ -149,7 +114,6 @@ class Channel {
         this.history.push(signed);
         return signed;
     }
-    /** Finalize a state after receiving counterparty's co-signature. */
     finalizeState(commitment) {
         if (!commitment.acceptorSig) {
             throw new Error('Commitment not fully signed');
@@ -166,7 +130,6 @@ class Channel {
         this.counterpartyBalance = commitment.counterpartyBalance;
         this.history.push(commitment);
     }
-    /** Initiate cooperative close. */
     close() {
         if (this.state !== ChannelState.Open) {
             throw new Error(`Cannot close: channel is ${this.state}`);
@@ -181,7 +144,6 @@ class Channel {
             acceptorSig: null,
         };
     }
-    /** Get the latest fully-signed state for on-chain dispute submission. */
     dispute() {
         const latest = [...this.history].reverse().find((c) => c.acceptorSig !== null);
         if (!latest) {
@@ -189,11 +151,9 @@ class Channel {
         }
         return latest;
     }
-    /** Mark channel as closed after on-chain resolution. */
     confirmClosed() {
         this.state = ChannelState.Closed;
     }
-    /** Build a ChannelOpen transaction body. */
     static buildOpenBody(channelId, counterparty, deposit, timeoutBlocks = 100) {
         assertSafeU64Number(deposit, 'deposit');
         assertSafeU64Number(timeoutBlocks, 'timeoutBlocks');
@@ -205,7 +165,6 @@ class Channel {
             timeout_blocks: timeoutBlocks,
         };
     }
-    /** Build a ChannelClose transaction body. */
     static buildCloseBody(channelId, openerBalance, counterpartyBalance, counterpartySig, stateNonce) {
         assertSafeU64Number(openerBalance, 'openerBalance');
         assertSafeU64Number(counterpartyBalance, 'counterpartyBalance');
@@ -219,7 +178,6 @@ class Channel {
             state_nonce: stateNonce,
         };
     }
-    /** Build a ChannelDispute transaction body. */
     static buildDisputeBody(channelId, openerBalance, counterpartyBalance, otherPartySig, stateNonce, challengePeriod = 100) {
         assertSafeU64Number(openerBalance, 'openerBalance');
         assertSafeU64Number(counterpartyBalance, 'counterpartyBalance');

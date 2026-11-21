@@ -39,11 +39,6 @@ DESKTOP_GAPS="$REPO_ROOT/desktop/PRODUCTION_GAPS.md"
 CLAUDE_GUIDE="$REPO_ROOT/CLAUDE.md"
 RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
 CANDIDATE_VERSION=0.8.23
-# README.md and the install guides name the latest PUBLISHED release: its exact
-# tag URL, pinned version and installer digest. They keep naming it until the
-# candidate is published, and move to the candidate in the documentation change
-# that follows publication, together with these values. The installer digest
-# belongs to that published tag, not the unreleased installer in this tree.
 PUBLISHED_VERSION=0.8.16
 PUBLISHED_INSTALLER_SHA256=893e930610f6380fe6b75cca64ca84ff84f9e711a3da09345abe86b4a66f1e8e
 
@@ -330,9 +325,6 @@ desktop_and_release_notes_match_the_artifact_and_reward_contract() {
         }
     done
 
-    # The update sentence must match the shipped default (on since v0.8.14) and name
-    # the real Settings switches; "never download or install without confirmation"
-    # stayed in every release body after it stopped being true.
     flat_notes="$(printf '%s\n' "$release_notes" | sed -E 's/^[[:space:]]+//' | tr '\n' ' ')"
     if printf '%s\n' "$flat_notes" | grep -Fq -- 'without confirmation'; then
         printf 'generated release notes still claim updates wait for confirmation\n'
@@ -586,9 +578,6 @@ factual_candidate_copy_matches_source_and_release_gates() {
         printf 'desktop README retains a stale hard-coded test inventory\n'
         return 1
     fi
-    # The offline release-contract job intentionally does not install npm
-    # dependencies. When Playwright is present (full local/desktop CI), bind the
-    # human-readable inventory to Playwright's own collector as well.
     if [ -x "$REPO_ROOT/desktop/node_modules/.bin/playwright" ]; then
         playwright_inventory="$(
             cd "$REPO_ROOT/desktop" || exit 1
@@ -1017,11 +1006,6 @@ pathlib.Path(sys.argv[2]).write_text(
     "#!/usr/bin/env bash\n" + "\n".join(blocks), encoding="utf-8"
 )
 
-# ShellCheck catches variables that are never assigned, but it deliberately
-# performs flow-insensitive assignment discovery.  The production procedure is
-# run with `set -u`, so independently reject a parameter expansion that appears
-# lexically before its definition.  Ignore quoted heredoc bodies and single-
-# quoted jq/Python programs because those dollars are not shell expansions.
 combined = "\n".join(blocks)
 if not combined.startswith("set -Eeuo pipefail\n"):
     raise SystemExit("executable production procedure does not enable nounset first")
@@ -1109,9 +1093,6 @@ if undefined:
     )
     raise SystemExit(f"shell variable used before definition under set -u: {details}")
 
-# Prove the order checker itself fails when a real required assignment is
-# removed; this prevents a flow-insensitive regression from making the test
-# green merely because the variable is assigned somewhere later in the file.
 assignment = "protected_main_sha='<exact 40-character protected-main SHA after merge>'"
 if combined.count(assignment) != 1:
     raise SystemExit("protected-main assignment is absent or duplicated")
@@ -1340,9 +1321,6 @@ require(
 if "/Users/" in lima_canary_import[1]:
     raise SystemExit("Lima canary importer reads a macOS shared-mount path")
 
-# Every GitHub API or mutation must flow through the helper that gives exactly
-# one invocation an explicit phase-local token. Token discovery itself is the
-# sole direct gh command form, and tokens never appear in repository URLs.
 for token in (
     "pretag_gh_token", "owner_recovery_gh_token", "release_gh_token", "frontend_gh_token",
     "post_release_gh_token", "public_truth_gh_token",
@@ -1534,10 +1512,6 @@ PY
                 'operator runbook omits an exact Ubuntu path, hash, or materialized input' \
                 || return 1
         done
-        # The recovery README deliberately contains two separately marked
-        # native-macOS handoff/gate blocks. Apply the Ubuntu-path prohibition
-        # to every other executable/documented line, while the dedicated
-        # native-block contracts below validate those macOS paths exactly.
         if awk '
             /# BEGIN NATIVE MACOS / { native=1; next }
             /# END NATIVE MACOS / { native=0; next }

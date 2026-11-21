@@ -1,33 +1,4 @@
 #!/usr/bin/env python3
-"""Verify what scripts/release/build-local-artifacts.sh wrote, without touching it (R2).
-
-    python3 scripts/release/verify_local_artifacts.py OUTPUT_DIR
-
-Checks exactly the layout that script writes:
-
-  checksums   SHA256SUMS exists; every entry (relative to OUTPUT_DIR/collected,
-              as the script sums it) names a file that exists there with that
-              digest; no regular file the script would have summed is left out
-              - every file under collected/, and every desktop-unsigned/
-              UNSIGNED-* artifact, which the script copies into collected/.
-  provenance  the arc-node record under arc-node-provenance/ (the one
-              latest-provenance.txt names, or the only one present) reports a
-              successful build and a binary_sha256 equal to both
-              collected/arc-node and its immutable arc-node-<digest> copy; when
-              an arc CLI was built, arc-cli-provenance.txt matches collected/arc-cli.
-  sbom        arc-chain.cdx.json is JSON with bomFormat "CycloneDX", specVersion
-              "1.5" and a non-empty components list.
-  unsigned    nothing claims to be signed: no *.sig, *.minisig or *.ticket file,
-              no ticket stapled into an archived .app (Contents/CodeResources),
-              desktop-unsigned/NOT-A-RELEASE.txt present, and every desktop
-              artifact labelled UNSIGNED-. A ticket stapled into a .dmg cannot
-              be seen without Apple's tooling and is reported as a limit.
-
-Prints one JSON report. Exit: 0 every check passes, 1 any check fails,
-2 OUTPUT_DIR is missing or is not a build-local-artifacts output (it has
-neither collected/ nor arc-node-provenance/). Read-only: nothing under
-OUTPUT_DIR is written, moved or deleted.
-"""
 
 import hashlib
 import json
@@ -40,8 +11,6 @@ from typing import Any, Dict, List, Optional
 SUMS_LINE = re.compile(r"^([0-9a-f]{64})  (.+)$")
 RECORD_LINE = re.compile(r"^([a-z0-9_]+):\s*(.*?)\s*$")
 SIGNED_SUFFIXES = (".sig", ".minisig", ".ticket")
-# Where `xcrun stapler staple` puts a notarization ticket inside an app bundle
-# (distinct from the code signature's Contents/_CodeSignature/CodeResources).
 STAPLED_TICKET = re.compile(r"(^|/)[^/]+\.app/Contents/CodeResources$")
 NOT_A_RELEASE_TEXT = "NOT a signed production release"
 NODE_BINARIES = ("arc-node", "arc-cli")
@@ -56,8 +25,6 @@ def sha256_file(path: str) -> str:
 
 
 def read_record(path: str) -> Dict[str, str]:
-    """The `key: value` lines of an arc-build-provenance record, first word of
-    each value (the same rule as arc_soak.orchestrate.read_provenance)."""
     out: Dict[str, str] = {}
     with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
@@ -77,7 +44,6 @@ def _inside(path: str, root: str) -> bool:
 
 
 def _files(root: str) -> List[str]:
-    """Regular files under root, relative, sorted (what `find . -type f` sums)."""
     out = []
     for base, _dirs, names in os.walk(root):
         for name in names:
@@ -285,7 +251,6 @@ def check_unsigned(out_dir: str) -> Dict[str, Any]:
 
 
 def verify(out_dir: str) -> Optional[Dict[str, Any]]:
-    """The report, or None when OUTPUT_DIR is not a build-local-artifacts output."""
     out_dir = os.path.abspath(out_dir)
     if not os.path.isdir(out_dir) or not (os.path.isdir(os.path.join(out_dir, "collected"))
                                           or os.path.isdir(os.path.join(out_dir, "arc-node-provenance"))):

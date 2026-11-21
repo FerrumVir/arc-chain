@@ -1,7 +1,3 @@
-// Verifies the mobile layout at a typical phone viewport (iPhone 14 / Pixel 7).
-// Sidebar collapses to bottom tab bar, stat grid becomes single-column,
-// page header stacks vertically, tap targets hit the 44px floor.
-
 import { expect, test, devices } from "@playwright/test";
 import { seedOnboarded } from "./helpers";
 
@@ -44,7 +40,6 @@ test.describe("Mobile layout (Pixel 7, 412×915) - seeded", () => {
     const title = page.locator("h1.page-title").first();
     await expect(title).toBeVisible();
     const titleBox = await title.boundingBox();
-    // The dashboard says "Checking" until the first node status arrives; the mock node then reads as stopped.
     const startBtn = page.getByTestId("btn-start");
     await expect(startBtn).toBeVisible();
     const btnBox = await startBtn.boundingBox();
@@ -53,7 +48,6 @@ test.describe("Mobile layout (Pixel 7, 412×915) - seeded", () => {
 
   test("primary buttons meet 44px tap-target minimum", async ({ page }) => {
     await page.goto("/");
-    // Wait for the dashboard to know the node's state: before that it offers no primary action.
     await expect(page.getByTestId("btn-start")).toBeVisible();
     const buttons = page.locator(".btn-primary");
     const count = await buttons.count();
@@ -106,7 +100,6 @@ test.describe("Mobile layout (Pixel 7, 412×915) - seeded", () => {
     await page.goto("/");
     await page.getByTestId("nav-network").click();
     await expect(page.getByTestId("network-screen")).toBeVisible();
-    // Long hex hashes and the lookup form are the risks here.
     const viewportWidth = page.viewportSize()!.width;
     const scrollWidth = await page.evaluate(
       () => document.documentElement.scrollWidth,
@@ -121,7 +114,6 @@ test.describe("Mobile layout (Pixel 7, 412×915) - seeded", () => {
     await expect(input).toBeVisible();
     const submit = page.getByTestId("tx-lookup-submit");
     await expect(submit).toBeVisible();
-    // The input must not be squeezed out by the button on a narrow screen.
     const inputBox = await input.boundingBox();
     expect(inputBox!.width).toBeGreaterThan(180);
   });
@@ -141,7 +133,6 @@ test.describe("Mobile layout (Pixel 7, 412×915) - seeded", () => {
 });
 
 test.describe("Mobile layout (Pixel 7, 412×915) - onboarding", () => {
-  // Intentionally NO beforeEach - this test needs a fresh, un-seeded store.
   test("all four steps reachable at phone size", async ({ page }) => {
     await page.goto("/");
     await expect(page.getByTestId("step-welcome")).toBeVisible();
@@ -149,8 +140,6 @@ test.describe("Mobile layout (Pixel 7, 412×915) - onboarding", () => {
     await expect(page.getByTestId("step-identity")).toBeVisible();
     await page.getByTestId("btn-reveal-seed").click();
     await page.getByTestId("btn-continue-identity").click();
-    // The model picker must be usable at phone width too - it was missing
-    // from this walk entirely, so a layout break here went uncaught.
     await expect(page.getByTestId("step-model")).toBeVisible();
     await page.getByTestId("tier-skip").click();
     await page.getByTestId("btn-continue-model").click();

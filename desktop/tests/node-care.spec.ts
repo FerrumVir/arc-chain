@@ -17,8 +17,6 @@ import {
   type ReportInput,
 } from "../src/lib/node-care";
 
-// Pure logic: no page. What Node Care sends, and when it must not.
-
 const PLATFORM: NodeCarePlatform = {
   endpointConfigured: true,
   appVersion: "0.8.14",
@@ -65,7 +63,6 @@ const START_FAILED: ReportInput = {
   nodeVersion: "0.8.14",
 };
 
-// The text users posted screenshots of.
 const FIELD_MESSAGE =
   "Couldn't start arc-node: managed-node startup reconciliation is still in progress: ARC is checking how the previous node session ended before it starts or updates arc-node. Try again in a few seconds.";
 
@@ -109,7 +106,6 @@ test.describe("scrubbing", () => {
     expect(scrubMessage("signer dGhpcyBpcyBhIHNlY3JldCBrZXkgMTIzNDU2Nzg5MA== bad")).toBe("signer [redacted] bad");
     expect(scrubMessage("mail ops@example.com about it")).toBe("mail [redacted] about it");
     expect(scrubMessage("https://user:pw@host.example/x")).toBe("https://[redacted]/x");
-    // Ordinary long words survive.
     expect(scrubMessage("managed_node_startup_reconciliation_is_running")).toBe(
       "managed_node_startup_reconciliation_is_running",
     );
@@ -256,7 +252,6 @@ test.describe("the switch", () => {
     expect(await h.care.heartbeat("earning", "0.8.14")).toBe("not-configured");
     expect(h.sent).toHaveLength(0);
     expect(h.care.getSnapshot().queued).toBe(0);
-    // "See what's sent" still shows the payload, marked not sent.
     expect(h.care.getSnapshot().recent[0].delivery).toBe("not-configured");
   });
 });
@@ -267,7 +262,6 @@ test.describe("queue and limits", () => {
     await h.care.init();
     await h.care.markNoticeShown();
     for (let i = 0; i < QUEUE_MAX + 15; i++) {
-      // Distinct problems; skip the daily cap by moving a day each time.
       h.advance(HEARTBEAT_INTERVAL_MS + 1);
       await h.care.report({ ...START_FAILED, errorCode: `code-${i}` });
     }
@@ -278,7 +272,6 @@ test.describe("queue and limits", () => {
 
     h.control.sendOk = true;
     await h.care.flush();
-    // Items older than a week were dropped; the rest went.
     expect(h.care.getSnapshot().queued).toBe(0);
     expect(h.sent.length).toBeGreaterThan(0);
     expect(h.sent.length).toBeLessThanOrEqual(QUEUE_MAX);
@@ -291,7 +284,6 @@ test.describe("queue and limits", () => {
     expect(await h.care.report(START_FAILED)).toBe("sent");
     h.advance(60_000);
     expect(await h.care.report(START_FAILED)).toBe("rate-limited");
-    // Numbers in the message do not make it a new problem.
     expect(
       await h.care.report({ ...START_FAILED, message: START_FAILED.message + " (attempt 2)" }),
     ).toBe("sent");

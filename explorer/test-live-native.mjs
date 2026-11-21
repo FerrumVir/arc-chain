@@ -1,16 +1,4 @@
 #!/usr/bin/env node
-// The explorer's native receipt rules (native-receipts.js, shared by the
-// production explorer and the local-dev view) against a REAL local chain.
-// This is the explorer leg of P9: the same receipt, read by the explorer's
-// own rules, must agree across replicas and with what the desktop and
-// `python3 -m arc_ops.receipts` report for the same requests.
-//
-//   ARC_NATIVE_NODES=127.0.0.1:9960,127.0.0.1:9961,127.0.0.1:9962,127.0.0.1:9963 \
-//   ARC_NATIVE_REQUESTS=<id>,<id> node explorer/test-live-native.mjs
-//   (or ARC_NATIVE_JOURNAL=<desktop native-requests.json> instead of the ids)
-//
-// Skips (exit 0) unless ARC_NATIVE_NODES is set. Exit 1 on any disagreement
-// or unreconciled settlement.
 
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";

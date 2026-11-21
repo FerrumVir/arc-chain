@@ -1,6 +1,3 @@
-//! Entry point: a legacy v0.7 invocation is bridged and replaced by the
-//! pinned v0.8 node; `--legacy-bridge-*` arguments are operator commands.
-
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -52,8 +49,6 @@ fn dispatch(args: &[OsString]) -> Result<i32> {
     }
 }
 
-/// The first whitespace token after the program name is the version, which
-/// is what the v0.7 desktop and both v0.7 headless updaters read.
 pub fn version_line() -> String {
     let node = Pins::embedded()
         .map(|pins| pins.node_release.version)
@@ -190,8 +185,6 @@ fn announce(log: &mut Log, record: &BridgeState, pins: &Pins, next: &str) {
     log.info("------------------------------------------------------------");
 }
 
-/// Keep the binary the v0.7 updater moved aside (`bin/arc-node.prev`) so a
-/// later rollback can restore it even after another update. Best effort.
 fn preserve_previous_binary(layout: &Layout, log: &mut Log) {
     let previous = layout.root.join("bin").join("arc-node.prev");
     let preserved_dir = layout.bridge_dir.join(PRESERVED_DIR_NAME);
@@ -495,7 +488,6 @@ fn verify_archive(launcher: &Path, root: &Path, options: &OperatorOptions) -> Re
     Ok(if unchanged { EX_OK } else { 1 })
 }
 
-/// Put the pre-bridge binary back as `bin/arc-node` (headless, Unix only).
 fn rollback(launcher: &Path, root: &Path) -> Result<i32> {
     if cfg!(windows) {
         return Err(exit::refused(
@@ -569,8 +561,6 @@ fn rollback(launcher: &Path, root: &Path) -> Result<i32> {
         );
     println!("Restored arc-node {version} as {}.", launcher.display());
     println!("Restart the node to run it on its unchanged v0.7 data: {restart}");
-    // A running binary cannot be overwritten in place (ETXTBSY), so the
-    // reinstall instruction stages a copy and renames it, as v0.7 did.
     println!(
         "To bridge again later: cp {kept} {target}.new && mv {target}.new {target}, then restart.",
         kept = kept_launcher.display(),
@@ -589,7 +579,6 @@ mod tests {
         let tokens: Vec<&str> = line.split_whitespace().collect();
         assert_eq!(tokens[0], "arc-node");
         assert_eq!(tokens[1], env!("CARGO_PKG_VERSION"));
-        // scripts/auto-update.sh takes the first X.Y.Z it finds.
         let first_version = tokens
             .iter()
             .find(|token| {

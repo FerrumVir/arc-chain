@@ -1,33 +1,3 @@
-//! A bounded holding area for authenticated DAG blocks that arrived early.
-//!
-//! A block can be refused for two reasons that say nothing against it:
-//!
-//! * a parent it names is not in this node's DAG yet ([`MissingParents`]), or
-//! * it is more than one round ahead of this node ([`RoundTooFarAhead`]).
-//!
-//! Both are facts about the LOCAL node's arrival order. The node used to drop
-//! such blocks and rely on history requests, which are throttled. The soak
-//! diagnostics showed what that costs: a node that falls two rounds behind
-//! finds every live block either too far ahead or missing parents - one node
-//! accepted 2 of 83 - so it can only advance at the history throttle's pace,
-//! and at N=4, where the tip needs three blocks, two such nodes pin the whole
-//! network there.
-//!
-//! Holding changes nothing about validation. [`ConsensusEngine::receive_block`]
-//! checks membership, hash integrity, ordering and the signature BEFORE it
-//! looks at the round or the parents, so a block refused for either reason is
-//! already authenticated. A held block is only ever released back into that
-//! same `receive_block`; the one-round-ahead rule and every parent check still
-//! apply at insertion. What changes is only that an early block waits instead
-//! of vanishing. A block whose present parents are from the wrong round is
-//! malformed, not early, and is never held.
-//!
-//! The area is bounded in count, per author, and in age.
-//!
-//! [`MissingParents`]: crate::ConsensusError::MissingParents
-//! [`RoundTooFarAhead`]: crate::ConsensusError::RoundTooFarAhead
-//! [`ConsensusEngine::receive_block`]: crate::ConsensusEngine::receive_block
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -36,38 +6,24 @@ use arc_types::Transaction;
 
 use crate::{ConsensusEngine, ConsensusError, DagBlock};
 
-/// Blocks held at once - a few hundred rounds of a small committee.
 pub const MAX_PENDING_BLOCKS: usize = 2_048;
 
-/// Blocks held for any one author, so one validator cannot fill the area with
-/// validly signed blocks for rounds far in the future.
 pub const MAX_PENDING_PER_AUTHOR: usize = 256;
 
-/// How long a held block may wait before it is dropped. Long enough for a
-/// history round trip; short enough that a block whose parents never come does
-/// not occupy the area.
 pub const MAX_PENDING_AGE: Duration = Duration::from_secs(30);
 
 struct Held {
     block: DagBlock,
     transactions: Vec<Transaction>,
-    /// Parents still absent. Empty means the block is waiting only for this
-    /// node's round to come within one of it.
     missing: HashSet<Hash256>,
     since: Instant,
 }
 
-/// What happened to a block offered through [`receive_or_hold`].
 #[derive(Debug)]
 pub enum Offered {
-    /// Inserted into the DAG. The caller does its usual persistence and round
-    /// handling, then calls [`PendingBlocks::release_on`] with its hash.
     Accepted(DagBlock, Vec<Transaction>),
-    /// Early: held until its parents arrive or its round becomes reachable.
     Held,
-    /// Early, but the area refused it (duplicate or per-author cap).
     NotHeld(ConsensusError),
-    /// Refused on its merits.
     Rejected(ConsensusError),
 }
 
@@ -75,7 +31,6 @@ pub enum Offered {
 pub struct PendingBlocks {
     held: HashMap<Hash256, Held>,
     waiting_on: HashMap<Hash256, HashSet<Hash256>>,
-    /// arrival order, keyed on the hash's bytes (Hash256 is not Ord)
     order: BTreeMap<(Instant, [u8; 32]), ()>,
     per_author: HashMap<Hash256, usize>,
     pub evicted_full: u64,
@@ -100,8 +55,6 @@ impl PendingBlocks {
         self.held.contains_key(hash)
     }
 
-    /// Hold `block` until every hash in `missing` has been released, and - if
-    /// `missing` is empty - until its round is within one of this node's.
     pub fn hold(
         &mut self,
         block: DagBlock,
@@ -142,8 +95,6 @@ impl PendingBlocks {
         true
     }
 
-    /// `parent` is now in the DAG. Returns the held blocks that were waiting on
-    /// nothing else, lowest round first, removed from the area.
     pub fn release_on(&mut self, parent: &Hash256) -> Vec<(DagBlock, Vec<Transaction>)> {
         let Some(children) = self.waiting_on.remove(parent) else {
             return Vec::new();
@@ -165,7 +116,6 @@ impl PendingBlocks {
         ready
     }
 
-    /// Held blocks waiting only on this node's round, now within reach.
     pub fn release_up_to_round(&mut self, current_round: u64) -> Vec<(DagBlock, Vec<Transaction>)> {
         let reachable: Vec<Hash256> = self
             .held
@@ -184,8 +134,6 @@ impl PendingBlocks {
         out
     }
 
-    /// Everything held, lowest round first, removed - for a retry after a
-    /// history import that may have filled many parents at once.
     pub fn drain_all(&mut self) -> Vec<(DagBlock, Vec<Transaction>)> {
         let hashes: Vec<Hash256> = self.held.keys().copied().collect();
         let mut out: Vec<_> = hashes
@@ -197,7 +145,6 @@ impl PendingBlocks {
         out
     }
 
-    /// Drop blocks that have waited too long.
     pub fn expire(&mut self, now: Instant) -> usize {
         let stale: Vec<Hash256> = self
             .order
@@ -212,8 +159,6 @@ impl PendingBlocks {
         stale.len()
     }
 
-    /// The authors of held blocks, with the lowest round each is waiting
-    /// behind - who to ask for history, and from where.
     pub fn fetch_targets(&self) -> Vec<(Hash256, u64)> {
         let mut by_author: HashMap<Hash256, u64> = HashMap::new();
         for held in self.held.values() {
@@ -247,11 +192,6 @@ impl PendingBlocks {
     }
 }
 
-/// Decide what to do with a block `receive_block` just refused with `error`.
-///
-/// This is the one place the decision is made. The node loop calls it on its
-/// error path, and [`receive_or_hold`] - used by the tests - calls it too, so
-/// both exercise the same rule. It clones only when it actually holds.
 pub fn hold_if_early(
     engine: &ConsensusEngine,
     pending: &mut PendingBlocks,
@@ -263,7 +203,6 @@ pub fn hold_if_early(
     match error {
         ConsensusError::MissingParents { .. } | ConsensusError::RoundTooFarAhead { .. } => {
             match engine.absent_parents(block) {
-                // A present parent from the wrong round: malformed, not early.
                 None => Offered::Rejected(error),
                 Some(missing) => {
                     if pending.hold(block.clone(), transactions.to_vec(), missing, now) {
@@ -278,7 +217,6 @@ pub fn hold_if_early(
     }
 }
 
-/// Offer a block to the engine; hold it if it is merely early.
 pub fn receive_or_hold(
     engine: &ConsensusEngine,
     pending: &mut PendingBlocks,
@@ -345,7 +283,6 @@ mod tests {
         let t0 = Instant::now();
         for i in 0..(MAX_PENDING_BLOCKS + 10) {
             let parent = hash_bytes(&(i as u64).to_le_bytes());
-            // distinct authors so the per-author cap is not what bounds it
             let b = block(i as u64 + 1, &(i as u64).to_be_bytes(), vec![parent]);
             p.hold(
                 b,
@@ -366,7 +303,7 @@ mod tests {
         for i in 0..(MAX_PENDING_PER_AUTHOR + 5) {
             let parent = hash_bytes(&(i as u64).to_le_bytes());
             let mut b = block(i as u64 + 1, b"same-author", vec![parent]);
-            b.timestamp = i as u64; // distinct hashes, same author
+            b.timestamp = i as u64;
             b.hash = b.compute_hash();
             p.hold(b, vec![], vec![parent], t0);
         }

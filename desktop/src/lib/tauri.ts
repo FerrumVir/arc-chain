@@ -1,7 +1,3 @@
-// Thin Tauri IPC wrapper with a mock-mode fallback used in the browser (dev + Playwright).
-// Production: invoke the real Tauri command. Mock: return synthetic data so every screen
-// is visible without a running node.
-
 import type {
   AccountBalance,
   AutoUpdatePrepareResult,
@@ -59,29 +55,18 @@ import type { UpdateSignal } from "./update-controller";
 const IS_TAURI =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
-// Set by vite.config.ts: true only inside the production Tauri bundle. A
-// production build served off a web host has this true but no Tauri
-// internals - in that case mockInvoke() refuses to run to prevent a user
-// from opening DevTools and fabricating node state.
 declare const __ARC_PROD_TAURI__: boolean;
 const IS_PROD_TAURI_BUNDLE =
   typeof __ARC_PROD_TAURI__ !== "undefined" && __ARC_PROD_TAURI__;
 
-// Live mode - used by E2E tests against a real running arc-node (typically on
-// 127.0.0.1:9090 from the community installer). When `window.__ARC_LIVE__` is
-// truthy, the browser bypasses the mock layer and calls the node's HTTP RPC
-// directly, adapting the shapes the same way src-tauri/src/rpc_client.rs does.
 function liveBase(): string | null {
   if (typeof window === "undefined") return null;
-  // `__ARC_LIVE__` is an E2E-only browser seam. A packaged production bundle
-  // opened outside Tauri must stay blocked even if page script tries to set it.
   if (IS_PROD_TAURI_BUNDLE) return null;
   const port = (window as Window & { __ARC_LIVE__?: number | string }).__ARC_LIVE__;
   if (!port) return null;
   return `http://127.0.0.1:${port}`;
 }
 
-/** Browser-preview fixture amount for a successful mined 0x25 receipt. */
 const MOCK_REWARD_PER_RECEIPT = 2.5;
 
 const SETTLEMENT_WRITE_UNAVAILABLE =
@@ -130,11 +115,6 @@ function normalizeHash32(value: unknown): string | null {
   return /^[0-9a-fA-F]{64}$/.test(bare) ? `0x${bare.toLowerCase()}` : null;
 }
 
-/**
- * Parse only the candidate's mined-0x25 receipt/readiness contract.
- * Public v2 returns HTTP 200 for this path too, but its body is raw-0x16
- * count × constant display arithmetic. HTTP status is not a semantics gate.
- */
 function confirmedEarningsFromBody(body: unknown): Earnings | null {
   if (!body || typeof body !== "object") return null;
   const o = body as Record<string, unknown>;
@@ -177,9 +157,6 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
     typeof historyScope !== "string" ||
     historyDomain !== EARNINGS_HISTORY_DOMAIN ||
     responseAddress === null ||
-    // Archive mode describes configured retention. It does not certify that
-    // the host can prove complete history from the v3 recovery boundary.
-    // Such a host may still report a valid retained receipt window.
     (historyCompleteSinceRecovery
       ? archiveMode !== true || historyScope !== ARCHIVE_EARNINGS_SCOPE
       : historyScope !== RETAINED_EARNINGS_SCOPE)
@@ -261,9 +238,6 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
   const hostProjectedDailyArc = projection as number | null;
   const hostProjectionReason = projectionReason as string | null;
   if ((hostProjectedDailyArc === null) === (hostProjectionReason === null)) return null;
-  // Treat the host's numeric field as a candidate only. The exact receipt rows
-  // above, not `total_rewards` alone, establish the observation count used by
-  // the minimum-history gate.
   const observationGate = projectionObservationGate(o, confirmedReceipts.length);
   const projectedDailyArc = observationGate === null ? hostProjectedDailyArc : null;
   const projectedDailyUnavailableReason =
@@ -317,14 +291,13 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
   };
 }
 
-/** Mirrors commands.rs::COORDINATOR_HOSTS, NYC included. */
 const COORDINATOR_HOSTS = [
-  "https://149.28.32.76", // NYC
-  "https://140.82.16.112", // LAX
-  "https://136.244.109.1", // AMS
-  "https://104.238.171.11", // LHR
-  "https://202.182.107.41", // NRT
-  "https://149.28.153.31", // SGP
+  "https://149.28.32.76",
+  "https://140.82.16.112",
+  "https://136.244.109.1",
+  "https://104.238.171.11",
+  "https://202.182.107.41",
+  "https://149.28.153.31",
 ];
 
 const INFERENCE_PRE_DISPATCH_UNAVAILABLE =
@@ -472,11 +445,6 @@ function validateCommunityRewardReceiptExpectation(
   }
 }
 
-/**
- * Fail-closed adapter for the independently fetched canonical receipt. Every
- * identity and boolean/null combination is exact; an impossible or partial
- * state is not downgraded into a payment claim.
- */
 function parseCommunityRewardReceiptBody(
   body: unknown,
   expected: CommunityRewardReceiptExpectation,
@@ -578,26 +546,6 @@ function parseCommunityRewardReceiptBody(
   };
 }
 
-/**
- * Per-command mock overrides, for tests only.
- *
- * The endpoints behind the projection and Network screens are newer than the
- * deployed seeds, so their real-world behaviour today is a 404 that degrades
- * to a stated reason. Both the populated path and each degraded path have to
- * be exercisable, and a test cannot reach into a Rust process to make a seed
- * 404 on demand.
- *
- * This seam lives inside `mockInvoke` only. It is unreachable in the Tauri app
- * (which never calls the mock) and unreachable from a production bundle opened
- * outside Tauri (which refuses to mock at all — see the guard in
- * `mockInvoke`). Setting it cannot make the real app show a fabricated number.
- */
-/**
- * Preview seam: `?slow=1500` holds every mock reply that long, so the launch screen, the "Checking" states and the
- * loading placeholders can be seen and reviewed in the browser preview (the mock otherwise answers instantly). Like
- * `mockOverride`, it lives inside `mockInvoke` only: the Tauri app never calls the mock, and a production bundle
- * refuses to mock at all.
- */
 function mockLatencyMs(): number {
   if (typeof window === "undefined") return 0;
   const value = Number(new URLSearchParams(window.location.search).get("slow"));
@@ -612,12 +560,10 @@ function mockOverride<T>(cmd: string): T | undefined {
   return o[cmd] as T;
 }
 
-/** Strip an optional `0x` and lowercase. Mirrors rpc_client.rs::strip_0x. */
 function strip0x(s: string): string {
   return s.trim().replace(/^0[xX]/, "").toLowerCase();
 }
 
-/** ARC base units per whole ARC. Mirrors rpc_client.rs::ARC_BASE_UNITS. */
 const ARC_BASE_UNITS = 1_000_000_000;
 const MIN_PROJECTION_RECEIPTS = 3;
 const MIN_PROJECTION_WINDOW_MS = 86_400_000;
@@ -681,7 +627,6 @@ function numberField(value: Record<string, unknown> | null, key: string): number
   return typeof field === "number" && Number.isFinite(field) ? field : 0;
 }
 
-/** Adapt the node's common `/inference/run` envelope for browser-live tests. */
 function parseInferenceRunBody(
   body: unknown,
   servedLocally: boolean,
@@ -731,7 +676,6 @@ function parseInferenceRunBody(
       typeof inference.inference_ms === "number"
         ? numberField(inference, "inference_ms")
         : numberField(inference, "total_ms"),
-    // Keep the unpaid 0x16 claim separate from community 0x25 settlement.
     attestationStatus: stringField(attestation, "status") || undefined,
     attestationHash: stringField(attestation, "tx_hash") || undefined,
     txHash:
@@ -812,9 +756,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     return r.json();
   };
 
-  // Mirrors rpc_client.rs::get_detailed — keeps "this host has no such
-  // endpoint" (404) apart from "this host is unreachable", because the two
-  // degrade to different sentences in the UI.
   type Detailed =
     | { kind: "ok"; body: Record<string, unknown> }
     | { kind: "notFound" }
@@ -863,8 +804,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     }
     return null;
   };
-  // `/node/contribution` and `/network/info` nest their figures, so a flat
-  // lookup for "threads" returns the OBJECT and reads as absent.
   const at = (o: unknown, path: string): unknown => {
     let cur: unknown = o;
     for (const seg of path.split(".")) {
@@ -942,13 +881,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "dismiss_previous_install_notice":
       return undefined as T;
     case "node_status": {
-      // Mirror desktop/src-tauri/src/rpc_client.rs::fetch_status:
-      // if local /health is missing peers, probe the public seed
-      // coordinators in order. First 200 → set coordinatorUrl + flip
-      // health to "lite". This is what unlocks the v0.7.0 Client-mode
-      // banner in the dashboard. Pre-v0.7 the JS mock hardcoded
-      // coordinatorUrl: null so the banner was untestable in live mode.
-      // Probed concurrently, matching rpc_client.rs::probe_coordinator.
       const probeCoordinator = async (): Promise<string | null> => {
         const attempts = COORDINATOR_HOSTS.map(async (origin) => {
           const r = await fetch(`${origin}/health`, {
@@ -1055,10 +987,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       )) as T;
     }
     case "fetch_attestations": {
-      // Shape-tolerant, matching rpc_client.rs::fetch_attestations. The live
-      // seeds return flat tx records with no nested `inference` object, so
-      // reading only the nested shape produced blank rows with "0 tokens",
-      // "0ms" and a hardcoded "+2.50".
       try {
         const limit = (args as { limit?: number } | undefined)?.limit ?? 20;
         const r = await fetchJson(`/inference/attestations?limit=${limit}`);
@@ -1186,7 +1114,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         message: "Cleared cached peer list. Rebootstrapping from testnet seeds.",
       } as T;
     case "fetch_balance": {
-      // Identity address is stored in localStorage zustand under `arc-desktop-state-v1`.
       const stored = localStorage.getItem("arc-desktop-state-v1");
       const addr = stored
         ? (JSON.parse(stored).identity?.address as string | undefined)
@@ -1234,8 +1161,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       }
     }
     case "send_arc":
-      // Browser-live mode intentionally has no signing material. Never add a
-      // seed argument here: native Rust signing is the security boundary.
       throw new Error(
         "Sending ARC requires the native desktop app so signing stays in Rust.",
       );
@@ -1338,8 +1263,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           throw new Error(`inference error HTTP ${r.status}: ${detail}`);
         }
         const v = await r.json();
-        // liveBase() is 127.0.0.1 - this IS the local node, even when that
-        // coordinator dispatches the actual compute to a community worker.
         const result = parseInferenceRunBody(v, true, base);
         pinLiveCommunityReceiptRoute(result);
         return result as T;
@@ -1397,9 +1320,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         k?: number;
         chatTemplate?: boolean;
       };
-      // Health/readiness probing happens before this fallback is selected.
-      // Consensus is still compute/write work: choose one origin and never
-      // replay the same click elsewhere after a status/transport/parse error.
       const host = COORDINATOR_HOSTS[0];
       try {
         const r = await fetch(`${host}/inference/run_consensus`, {
@@ -1526,11 +1446,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         maxReward: v.max_reward,
       } as T;
     }
-    // ── Chain visibility + projection ────────────────────────────────────
-    // These mirror rpc_client.rs exactly. In live browser mode `base` is the
-    // local node, which is also the chain host being read, so every number
-    // below is attributable to one host — the same invariant the Rust side
-    // holds (CLAUDE.md rule 4).
     case "fetch_reward_economics": {
       const path = "/economics/rewards";
       const d = await getDetailed(path);
@@ -1550,8 +1465,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       if (d.kind !== "ok") {
         return { ...shell, unavailable: reason(path, d) } as T;
       }
-      // Prefer the exact `_base` integer and divide; the `_arc` floats are
-      // produced by dividing by 1e9 and carry rounding.
       const baseOrArc = (baseKey: string, arcKey: string) => {
         const b = numOf(d.body, [baseKey]);
         if (b !== null) return b / ARC_BASE_UNITS;
@@ -1571,9 +1484,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         treasuryBalanceUnavailableReason: strOf(d.body, [
           "treasury_balance_unavailable_reason",
         ]),
-        // `rewards_remaining` is a COUNT of fundable reward receipts, NOT an
-        // ARC amount. Renamed on ingest so no call site can mistake it for
-        // currency.
         attestationsRemaining: numOf(d.body, ["rewards_remaining"]),
         attestationsRemainingUnavailableReason: strOf(d.body, [
           "rewards_remaining_unavailable_reason",
@@ -1645,9 +1555,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         rateBase !== null
           ? rateBase / ARC_BASE_UNITS
           : numOf(d.body, ["reward_per_attestation_arc"]);
-      // `confirmedEarningsFromBody` has already reconciled this value against
-      // every exact successful mined 0x25 receipt row. Never trust a parallel
-      // host count when receipt identities are available.
       const attestationsTotal = confirmed.attestations;
       const observationGate = projectionObservationGate(
         d.body,
@@ -1671,8 +1578,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return {
         sourceHost: base,
         unavailable: null,
-        // The selected coordinator must report the payable amount. A local
-        // constant cannot prove remote rollout alignment.
         rewardPerAttestation: payableRate,
         rewardRateSource: payableRate !== null ? "chain" : "unknown",
         communityRewardsEnabled: nBool(
@@ -1708,11 +1613,8 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
               (attestationsTotal === 0
                 ? "No successful mined reward receipts are retained for this address, so there is no history to measure a rate from."
                 : `${base} reports ${attestationsTotal} successful mined reward receipt(s) for this address but no observed rate, so a per-day figure cannot be measured here.`)),
-        // `blocks_observed` on the wire.
         observedOverBlocks: numOf(d.body, ["blocks_observed"]),
-        // Shown verbatim: the host knows its own method, this build does not.
         rateCaveat: strOf(d.body, ["attestations_per_day_caveat"]),
-        // The bond is NOT on this endpoint — it comes from /economics/rewards.
       } as T;
     }
     case "fetch_node_contribution": {
@@ -1728,7 +1630,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       };
       const direct = await getDetailed("/node/contribution");
       if (direct.kind === "ok") {
-        // Nested: `threads`, `shards` and `own_compute_ms` are objects.
         const ranges =
           (at(direct.body, "shards.ranges") as
             | Array<Record<string, unknown>>
@@ -1746,17 +1647,11 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           unavailable: null,
           source: "contribution",
           threadsInUse: nNum(direct.body, "threads.in_use"),
-          // The host reports 0 when it could not read the core count. Zero
-          // cores is not a measurement, so fall back to ours.
           threadsAvailable: avail !== null && avail > 0 ? avail : cores,
           layersHeld: rendered.length > 0 ? rendered.join(", ") : null,
-          // A UNION of layers held, which the host computes. Summing the
-          // ranges would double-count replicated layers.
           layerCount: nNum(direct.body, "shards.layers_held"),
           totalLayers: nNum(direct.body, "shards.total_layers"),
           runsServed: numOf(direct.body, ["sharded_runs_total"]),
-          // `sharded_cache_hits` — no `_total` suffix here, unlike
-          // `sharded_runs_total` and `sharded_bytes_total`.
           cacheHits: numOf(direct.body, ["sharded_cache_hits"]),
           hopMsMean: nNum(direct.body, "own_compute_ms.mean_ms"),
           hopSamples: nNum(direct.body, "own_compute_ms.samples"),
@@ -1798,7 +1693,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
             ? numOf(threads.body, ["available", "cpu_cores", "max_threads"])
             : null) ?? cores,
         runsServed,
-        // /stats spells it with `_total`; /node/contribution does not.
         cacheHits:
           stats.kind === "ok"
             ? numOf(stats.body, [
@@ -1818,9 +1712,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       const iv = info.kind === "ok" ? info.body : null;
       const h = health.kind === "ok" ? health.body : null;
 
-      // Only /network/info may name the network. `/info` is deliberately not
-      // consulted: its `chain` field is the constant "ARC Chain" everywhere,
-      // so it cannot tell a testnet from a mainnet.
       const networkName = iv ? strOf(iv, ["network"]) : null;
 
       const rawValidators =
@@ -1837,9 +1728,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         })
         .filter((x): x is NonNullable<typeof x> => x !== null);
 
-      // /network/info applies the real min_active_stake threshold; counting
-      // stake > 0 only approximates it. Prefer the reported figures and record
-      // which was used, so an approximation is never shown as the host's own.
       const reportedActive = iv ? numOf(iv, ["validators_active"]) : null;
       const reportedRegistered = iv
         ? numOf(iv, ["validators_registered"])
@@ -1854,7 +1742,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           ? header.timestamp
           : null;
       const height = h ? numOf(h, ["height", "block_height"]) : null;
-      // Prefer the host's own age; fall back to computing it from the header.
       const lastBlockAgeSecs =
         (iv ? numOf(iv, ["last_block_age_secs"]) : null) ??
         (tsMs !== null ? Math.max(0, Math.floor((Date.now() - tsMs) / 1000)) : null);
@@ -1870,7 +1757,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           (iv ? strOf(iv, ["network_unavailable_reason"]) : null) ??
           (info.kind === "ok" ? null : reason("/network/info", info)),
         chainId: iv ? strOf(iv, ["chain_id"]) : null,
-        // The ONLY input allowed to make this app describe a network as mainnet.
         declaresMainnet: nBool(iv ?? {}, "declares_mainnet"),
         isBlockProducing: nBool(iv ?? {}, "is_block_producing"),
         isBlockProducingBasis: iv
@@ -1902,10 +1788,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         100,
         Math.max(1, (args as { limit?: number } | undefined)?.limit ?? 10),
       );
-      // The range must be computed. `/blocks` defaults `from` to 0, so
-      // `?limit=10` returns the ten OLDEST blocks starting at genesis — not
-      // the newest ten. Verified against the live NYC seed, which answered
-      // `?limit=2` with height 0. Anchor the window to the tip instead.
       const health = await getDetailed("/health");
       const tip =
         health.kind === "ok" ? numOf(health.body, ["height", "block_height"]) : null;
@@ -1934,10 +1816,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           .map((b) => {
             const height = typeof b.height === "number" ? b.height : null;
             if (height === null) return null;
-            // A zero timestamp is not a time: genesis carries `timestamp: 0`,
-            // and the UI's relative-time formatter renders that as "20770d
-            // ago". Same reasoning for an all-zero producer, which is a
-            // placeholder rather than an address.
             const ts = numOf(b, ["timestamp"]);
             const producer =
               typeof b.producer === "string" ? strip0x(b.producer) : null;
@@ -2025,8 +1903,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           gasUsed: numOf(d.body, ["gas_used"]),
         } as T;
       }
-      // A 404 is ALSO what a pending attestation looks like — /tx/{hash} is a
-      // receipt lookup and a mempool tx has no receipt. Never "invalid".
       if (d.kind === "notFound") {
         return { ...shell, unavailable: null, status: "not_found" } as T;
       }
@@ -2048,15 +1924,11 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return undefined as T;
     case "clear_crash":
       return undefined as T;
-    // The start fence is native; a browser has nothing that can refuse.
     case "node_start_block":
       return null as T;
-    // So is the app bundle the updater would replace.
     case "update_location_block":
       return null as T;
     case "ensure_binary":
-      // Browser (live mode) can't install a native binary - pretend it's
-      // already installed so the UI doesn't block onboarding.
       return {
         path: "/browser-live-mode",
         downloadedBytes: 0,
@@ -2088,9 +1960,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return "/browser-live-mode/.arc/models/standard.gguf" as T;
     case "remove_model":
       return undefined as T;
-    // Native paid requests: browser-live mode can read the chain but holds no
-    // signing material, so it describes the context and follows receipts and
-    // never signs, submits, or refunds.
     case "native_context": {
       const detailed = await getDetailed("/native-inference/context");
       if (detailed.kind === "notFound") return null as T;
@@ -2148,8 +2017,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       if (detailed.kind !== "ok") throw new Error("the receipt is unavailable");
       return { found: true, height: Number(health.height), receipt: detailed.body } as T;
     }
-    // Browser live mode has no native session election/cache. Do not guess
-    // another origin or contact production from the test harness.
     case "fetch_worker_network":
       return null as T;
     case "fetch_worker_status": {
@@ -2203,7 +2070,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     }
     case "load_legacy_compute_question":
       return null as T;
-    // A live gateway is not an install: there is no one-time question to ask.
     case "claim_compute_prompt":
       return false as T;
     case "set_compute_contribution":
@@ -2228,11 +2094,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
   }
 }
 
-// Mock state - only used in browser preview. Tauri env always hits the real backend.
 let mockStartedAt: number | null = null;
-// Browser-preview only: `window.__ARC_MOCK_CRASH__ = true` makes the stopped
-// node report an unexpected exit until `clear_crash` runs, so the crash
-// banner and the start after it can be exercised without a native host.
 let mockCrashCleared = false;
 function mockCrashed(): boolean {
   return (
@@ -2242,13 +2104,8 @@ function mockCrashed(): boolean {
 }
 let mockWorkerThreads: number | null = null;
 let mockConfig: NodeConfig | null = null;
-// Where the browser preview keeps the one-time compute question's marker, so
-// that it survives a reload the way the native marker file survives a launch.
 const MOCK_COMPUTE_PROMPT_KEY = "arc-mock-compute-prompt-shown-at";
 const mockLogs: LogEntry[] = [];
-// Explicit browser-preview fixture for a hypothetical host whose candidate
-// receipt contract is ready. These are static layout values, never a claim
-// about the public fleet and never increased merely because a process runs.
 const mockEarnings: Earnings = {
   totalArc: 5,
   todayArc: null,
@@ -2293,8 +2150,6 @@ const mockEarnings: Earnings = {
   fromChain: true,
 };
 
-// The mock deliberately exercises raw 0x16 claims, two distinct successful
-// mined 0x25 payment receipts, another worker's activity, and old-seed padding.
 const MOCK_ADDRESS = "99".repeat(32);
 
 const mockAttestations: Attestation[] = [
@@ -2335,9 +2190,6 @@ const mockAttestations: Attestation[] = [
     verified: true,
   },
   {
-    // Someone else's work, flat shape, no telemetry: no reward, no token
-    // count, no timestamp. The UI must render this without inventing any of
-    // the three.
     txHash: "0x14ab23bb8a4446f23a62033001cb22e1e9298d5ce1cfea8111762c1ca28335f2",
     inputPreview: "",
     outputHash: "",
@@ -2356,11 +2208,6 @@ const mockAttestations: Attestation[] = [
     verified: true,
   },
   {
-    // Old-seed PADDING. `/inference/attestations` on the deployed v0.7.9 seeds
-    // tops its list up with unrelated transactions tagged `tx_type: "Other"`
-    // once genuine attestation rows run out — at limit=500 some seeds returned
-    // 500 of these and zero real ones. The Network screen filters them out;
-    // this row is here so that filter is demonstrably doing something.
     txHash: "0x77cc23bb8a4446f23a62033001cb22e1e9298d5ce1cfea8111762c1ca2833aa1",
     inputPreview: "",
     outputHash: "",
@@ -2416,27 +2263,14 @@ const mockAttestations: Attestation[] = [
   },
 ];
 
-/** The seed the mock pretends to have pinned. Mirrors mock `node_status`. */
 const MOCK_CHAIN_HOST = "http://140.82.16.112:9090";
 
-/**
- * Fourteen validators, four of them at stake 0.
- *
- * This fixture preserves an older host response in which four registered
- * entries had zero stake. It exists to keep the Network screen's active versus
- * registered distinction testable; it is not a current fleet claim.
- */
 const MOCK_VALIDATORS = Array.from({ length: 14 }, (_, i) => ({
   address: `${(i + 1).toString(16).padStart(2, "0")}cda729e004c87fd15efc6b859ab567bbaba82ba95bdcf5f026082e0865e93${(i + 16).toString(16)}`,
   stake: i < 10 ? 500_000 * ARC_BASE_UNITS : 0,
   active: i < 10,
 }));
 
-/**
- * Recent blocks, descending. Heights and gaps are fixed literals rather than
- * derived from `Date.now()`: a fabricated "seconds ago" ladder that shifts on
- * every poll is exactly the class of invention this app removed.
- */
 const MOCK_BLOCKS = [
   { height: 123_469, gapSecs: 400, txCount: 2 },
   { height: 123_468, gapSecs: 407, txCount: 0 },
@@ -2501,32 +2335,22 @@ const DEFAULT_HARDWARE: HardwareInfo = {
 };
 
 async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
-  // Refuse to serve fake data from a production build. A user who managed
-  // to load the production bundle outside Tauri (opened dist/ in Safari,
-  // loaded it off a CDN, etc.) would otherwise see a fabricated dashboard.
   if (IS_PROD_TAURI_BUNDLE && !IS_TAURI && !liveBase()) {
     throw new Error(
       "ARC desktop is running outside its native host. Open the arc app, not the HTML bundle.",
     );
   }
-  // Preview latency (see `mockLatencyMs`), also after the production guard.
   const slow = mockLatencyMs();
   if (slow) await new Promise((resolve) => setTimeout(resolve, slow));
-  // Test seam (see `mockOverride`). Checked after the production guard above,
-  // so it cannot fabricate anything in a real bundle.
   const override = mockOverride<T>(cmd);
   if (override !== undefined) {
     await new Promise((r) => setTimeout(r, 20));
-    // `{ __reject: "text" }` makes the command fail with that text, the way a
-    // native CmdResult error reaches the UI, so the degraded wording can be
-    // exercised without a native host.
     if (override !== null && typeof override === "object" && "__reject" in override) {
       throw new Error(String((override as unknown as { __reject: unknown }).__reject));
     }
     return override;
   }
   await new Promise((r) => setTimeout(r, 120));
-  // The protocol-4 chain model answers native commands (see native-mock.ts).
   const native = mockNativeInvoke(cmd, args);
   if (native !== undefined) return native as T;
   switch (cmd) {
@@ -2544,9 +2368,6 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "load_identity":
       return null as T;
     case "complete_onboarding": {
-      // Mirrors commands.rs::complete_onboarding: a setup that turns compute
-      // on and names no core count takes a quarter of the cores, and a count
-      // already stored (the Settings slider, an earlier setup) is kept.
       const submitted = (args as { config?: NodeConfig } | undefined)?.config;
       if (submitted) {
         const setupDefault =
@@ -2562,9 +2383,6 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return undefined as T;
     }
     case "save_config": {
-      // Mirrors commands.rs::preserve_native_contribution_state: once a
-      // config is stored, a preference save keeps its contribution state
-      // and core count.
       const submitted = (args as { config?: NodeConfig } | undefined)?.config;
       if (submitted) {
         mockConfig = mockConfig
@@ -2607,14 +2425,8 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       const uptime = running
         ? Math.floor((Date.now() - mockStartedAt!) / 1000)
         : 0;
-      // Browser-preview only: a test can make the running node look like one
-      // this desktop process did not spawn (no child pid), the state in which
-      // Restart must be refused.
       const external =
         (globalThis as { __ARC_MOCK_EXTERNAL_NODE__?: boolean }).__ARC_MOCK_EXTERNAL_NODE__ === true;
-      // Mirrors rpc_client.rs: a stopped node still probes the public seeds, and
-      // one answering makes the health "lite" with that coordinator's origin,
-      // so the preview reads "Node off", not "No connection", like the real app.
       const previewCoordinator = "https://140.82.16.112";
       return {
         running,
@@ -2630,8 +2442,6 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         rpcPort: 9090,
         lastError: !running && mockCrashed() ? "arc-node exited unexpectedly (code 101)" : null,
         coordinatorUrl: running ? null : previewCoordinator,
-        // Chain numbers are the network's, not this node's - and the mock
-        // reflects the real testnet's stalled block production.
         chainHost: "http://140.82.16.112:9090",
         chainHeight: 123_469,
         chainRound: 9_596_644,
@@ -2677,10 +2487,6 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         avgTps: 33_221,
         latestBlock: 43_821,
       } as T;
-    // ── Chain visibility + projection ────────────────────────────────────
-    // Populated, so browser preview and the screenshot suite show the real
-    // layout. The 404 / no-history / degraded paths are reached by tests via
-    // `window.__ARC_MOCK__` — see `mockOverride`.
     case "fetch_reward_economics":
       return {
         sourceHost: MOCK_CHAIN_HOST,
@@ -2688,12 +2494,9 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         rewardPerAttestation: MOCK_REWARD_PER_RECEIPT,
         treasuryBalanceArc: 4_182_500,
         treasuryBalanceUnavailableReason: null,
-        // A COUNT of successful reward receipts the treasury can still fund:
-        // 4,182,500 ARC / 2.5 ARC = 1,673,000.
         attestationsRemaining: 1_673_000,
         attestationsRemainingUnavailableReason: null,
         treasuryIsFinite: true,
-        // Verified community reward certificates carry no worker bond.
         bondPerAttestation: 0,
         challengePeriodBlocks: null,
         bondRefundedAfterChallengePeriod: null,
@@ -2748,16 +2551,12 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         networkName: "arc-testnet-1",
         networkNameUnavailableReason: null,
         chainId: "arc-testnet-1",
-        // The host declares itself NOT mainnet. The UI must never say mainnet
-        // unless this is explicitly true.
         declaresMainnet: false,
         isBlockProducing: false,
         isBlockProducingBasis:
           "no block sealed within block_production_fresh_secs (120s)",
         hostVersion: "0.7.9",
         height: 123_469,
-        // Matches the mock node_status: the real testnet's block production
-        // is stalled, and the mock reflects that rather than a healthy fiction.
         lastBlockAgeSecs: 400,
         dagRound: 9_596_644,
         dagCommitted: 9_596_640,
@@ -2785,8 +2584,6 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         unavailable: null,
         height,
         txCount: n,
-        // Derived from the block's own tx_count so an expanded block never
-        // shows more rows than the list said it had.
         txs: Array.from({ length: n }, (_, i) => ({
           index: i,
           hash: strip0x(
@@ -2815,9 +2612,6 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           unavailable: `A transaction hash is 64 hex characters (an optional 0x prefix is fine). That one is ${hash.length}.`,
         } as T;
       }
-      // The first mock attestation is mined; anything else well-formed is
-      // treated as not yet in a block, which is the honest answer for a hash
-      // this host has no receipt for.
       const mined = strip0x(mockAttestations[0].txHash);
       if (hash === mined) {
         return {
@@ -2847,8 +2641,6 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         stakedBalanceArc: "0",
       } as T;
     case "faucet_claim":
-      // A faucet claim is an ordinary transfer, which the protocol-4 browser
-      // chain cannot include, as a real protocol-4 node refuses it.
       if (nativeMockEnabled()) {
         throw new Error(
           "a faucet claim is an ordinary transfer, which this chain cannot include",
@@ -2869,7 +2661,6 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         message: "Faucet claim was accepted and is waiting for a mined receipt.",
       } as T;
     case "send_arc":
-      // The protocol-4 browser chain carries only native transactions.
       if (nativeMockEnabled()) mockNativeTransfer();
       return {
         txHash:
@@ -2991,9 +2782,6 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     }
     case "tier1_result": {
       const { requestId } = args as { requestId: string };
-      // Walk through Open → Voting → Finalized over ~6 polls so the UI
-      // exercises every state. mockInvoke is stateless; we derive the
-      // "step" from a counter on globalThis to make it look animated.
       const w = globalThis as unknown as { __arcTier1Tick?: Record<string, number> };
       if (!w.__arcTier1Tick) w.__arcTier1Tick = {};
       const counter = (w.__arcTier1Tick[requestId] ?? 0) + 1;
@@ -3111,8 +2899,6 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return mockConfig as T;
     }
     case "accept_compute_prompt": {
-      // Mirrors commands.rs::accept_compute_prompt: consent, and a quarter of
-      // the cores unless a count is stored, as a setup that leaves compute on.
       const config = mockConfig ?? DEFAULT_NODE_CONFIG;
       mockConfig = {
         ...config,
@@ -3156,10 +2942,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "set_worker_threads": {
       const { threads } = args as { threads: number };
       mockWorkerThreads = threads;
-      // Persisted first, like commands.rs::set_worker_threads.
       mockConfig = { ...(mockConfig ?? DEFAULT_NODE_CONFIG), workerThreads: threads };
-      // Mirrors the real fallback: no /node/threads endpoint exists yet, so
-      // applying a new width restarts the node.
       if (mockStartedAt !== null) mockStartedAt = Date.now();
       return {
         workerThreads: threads,
@@ -3171,7 +2954,6 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       } as T;
     }
     case "ensure_binary":
-      // Mock path - no real download. Pretend it completed instantly.
       return {
         path: "/mock/.arc/bin/arc-node",
         downloadedBytes: 45_000_000,
@@ -3200,8 +2982,6 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "existing_model_for_tier":
       return null as T;
     case "download_model":
-      // In mock mode pretend the download finishes instantly. The real
-      // backend streams progress events; the mock skips that for speed.
       return "/mock/.arc/models/standard.gguf" as T;
     case "remove_model":
       return undefined as T;
@@ -3215,9 +2995,6 @@ async function realInvoke<T>(cmd: string, args?: unknown): Promise<T> {
   return invoke<T>(cmd, args as Record<string, unknown>);
 }
 
-// Node Care outside the native host: a browser preview has no report
-// endpoint and never sends. The notice counts as seen so previews and their
-// screenshots keep their layout; the switch still works in memory.
 let browserNodeCareState: string | null = JSON.stringify({
   v: 1,
   installId: "00000000000000000000000000000000",
@@ -3257,10 +3034,6 @@ export async function invoke<T>(cmd: string, args?: unknown): Promise<T> {
   return mockInvoke<T>(cmd, args);
 }
 
-/**
- * Told about every refused Start or Restart, so Node Care can report it
- * without each screen knowing about reporting. One listener; it must not throw.
- */
 let startFailureListener: ((error: unknown, stage: string) => void) | null = null;
 
 export function onStartNodeFailure(listener: ((error: unknown, stage: string) => void) | null) {
@@ -3272,21 +3045,13 @@ function noticeStartFailure<T>(promise: Promise<T>, stage: string): Promise<T> {
     try {
       startFailureListener?.(error, stage);
     } catch {
-      /* reporting never changes what the caller sees */
     }
     throw error;
   });
 }
 
-// ── The main window and native signals ─────────────────────────────────
-
 const APP_SIGNALS: readonly UpdateSignal[] = ["tick", "wake", "focus", "shown"];
 
-/**
- * Listen to the native `app-signal` event (`wake.rs`). Outside the native
- * shell there is none, and this never calls `handler`. Resolves to the
- * function that stops listening.
- */
 export async function listenForAppSignals(
   handler: (signal: UpdateSignal) => void,
 ): Promise<() => void> {
@@ -3300,11 +3065,6 @@ export async function listenForAppSignals(
   });
 }
 
-/**
- * Whether someone can see the main window. A login launch starts it hidden
- * in the tray (`--minimized`). In the browser preview,
- * `window.__ARC_MOCK_WINDOW_HIDDEN__ = true` stands for that hidden window.
- */
 async function isMainWindowVisible(): Promise<boolean> {
   if (IS_TAURI) {
     try {
@@ -3323,11 +3083,6 @@ async function isMainWindowVisible(): Promise<boolean> {
   return document.visibilityState !== "hidden";
 }
 
-/**
- * Call `onSeen` once, as soon as the main window is visible: now if it
- * already is, otherwise at the first focus, `visibilitychange` to visible,
- * or native focus or show. Returns the function that stops waiting.
- */
 function whenMainWindowSeen(onSeen: () => void): () => void {
   let done = false;
   let checking = false;
@@ -3374,27 +3129,12 @@ function whenMainWindowSeen(onSeen: () => void): () => void {
   return stop;
 }
 
-// Typed wrappers - call these, not invoke() directly.
-
 export const api = {
   detectHardware: () => invoke<HardwareInfo>("detect_hardware"),
   generateIdentity: () => invoke<Identity>("generate_identity"),
   loadIdentity: () => invoke<Identity | null>("load_identity"),
-  /**
-   * Fetch the BIP-39 recovery phrase for the backup screen.
-   *
-   * The result MUST NOT be persisted, logged, or put into app state that
-   * gets serialized. It exists only for as long as the user is looking at
-   * it. See `IdentityPublic` in the Rust types for why.
-   */
   revealSeedPhrase: () => invoke<string>("reveal_seed_phrase"),
   saveConfig: (config: NodeConfig) => invoke<void>("save_config", { config }),
-  /**
-   * Onboarding's one save: records the wizard's compute choice (consent,
-   * role, model) with the defaults. `saveConfig` never changes those fields
-   * once a config is stored; the Settings switch and the observer banner
-   * use `setComputeContribution` instead.
-   */
   completeOnboarding: (config: NodeConfig) =>
     invoke<void>("complete_onboarding", { config }),
   loadConfig: () => invoke<NodeConfig | null>("load_config"),
@@ -3402,38 +3142,19 @@ export const api = {
     invoke<DataMigrationNotice | null>("load_data_migration_notice"),
   dismissDataMigrationNotice: () =>
     invoke<void>("dismiss_data_migration_notice"),
-  /** Launch set node data from an earlier install aside, if it did. */
   loadPreviousInstallNotice: () =>
     invoke<PreviousInstallNotice | null>("load_previous_install_notice"),
   dismissPreviousInstallNotice: () =>
     invoke<void>("dismiss_previous_install_notice"),
-  /** The first-launch question for an install upgraded from v0.7, if pending. */
   loadLegacyComputeQuestion: () =>
     invoke<LegacyComputeQuestion | null>("load_legacy_compute_question"),
-  /** Answer it; recorded exactly like the Settings compute switch. */
   answerLegacyComputeQuestion: (contribute: boolean) =>
     invoke<NodeConfig>("answer_legacy_compute_question", { contribute }),
-  /**
-   * Launch: whether to ask this install, once, to turn on compute. Only an
-   * install that finished setup before compute started on by default, has it
-   * off, and can run the model gets true; native code writes its record of
-   * having asked before it answers, so true comes at most once per install.
-   */
   claimComputePrompt: () => invoke<boolean>("claim_compute_prompt"),
   acknowledgeComputeNotice: () => invoke<void>("acknowledge_compute_notice"),
   setKeepAwakeWhileSharing: (enabled: boolean) => invoke<NodeConfig>("set_keep_awake_while_sharing", { enabled }),
-  /** Whether the main window is visible now (hidden in the tray at login). */
   isMainWindowVisible,
-  /**
-   * Run `onSeen` once the main window is first visible. The one-time compute
-   * question is claimed only then, so a launch nobody sees never spends it.
-   */
   whenMainWindowSeen,
-  /**
-   * "Turn on" in that question: consent, and a quarter of the cores when no
-   * count is stored, as a setup that leaves compute on. The model download
-   * follows through `promoteConsentedInstall`.
-   */
   acceptComputePrompt: () => invoke<NodeConfig>("accept_compute_prompt"),
   startNode: (config: NodeConfig) =>
     noticeStartFailure(invoke<void>("start_node", { config }), "start"),
@@ -3446,9 +3167,7 @@ export const api = {
   restartNode: () => noticeStartFailure(invoke<void>("restart_node"), "restart"),
   resetPeerState: () => invoke<ResetPeerStateResult>("reset_peer_state"),
   nodeStatus: () => invoke<NodeStatus>("node_status"),
-  /** What a Start would be told by the start fence now; null when starts are open. */
   nodeStartBlock: () => invoke<string | null>("node_start_block"),
-  /** macOS: what an app update would be told about where ARC runs; null when it can update in place. */
   updateLocationBlock: () => invoke<string | null>("update_location_block"),
   fetchEarnings: () => invoke<Earnings>("fetch_earnings"),
   fetchAttestations: (limit = 20) =>
@@ -3456,35 +3175,23 @@ export const api = {
   fetchLogs: (limit = 200) => invoke<LogEntry[]>("fetch_logs", { limit }),
   fetchNetworkStats: () => invoke<NetworkStats>("fetch_network_stats"),
 
-  // ── Chain visibility + projection ──────────────────────────────────────
-  // Each of these resolves to a struct carrying `unavailable` rather than
-  // rejecting, because "this host does not serve that endpoint" is a fact to
-  // display, not an exception to swallow. Callers render the reason.
-  /** The finite reward treasury — the ceiling on any projection. */
   fetchRewardEconomics: () =>
     invoke<RewardEconomics>("fetch_reward_economics"),
-  /** Measured inputs for the earnings projection. */
   fetchEarningsProjection: () =>
     invoke<EarningsProjection>("fetch_earnings_projection"),
-  /** What the node on THIS machine is contributing. */
   fetchNodeContribution: () =>
     invoke<NodeContribution>("fetch_node_contribution"),
-  /** Height, block age, validator split and peers for the pinned host. */
   fetchNetworkOverview: () =>
     invoke<NetworkOverview>("fetch_network_overview"),
   fetchRecentBlocks: (limit = 10) =>
     invoke<RecentBlocks>("fetch_recent_blocks", { limit }),
-  /** Transactions in one block. Called on expand, never on the poll path. */
   fetchBlockTxs: (height: number, limit = 50) =>
     invoke<BlockTxs>("fetch_block_txs", { height, limit }),
-  /** Resolve one tx/attestation hash against the pinned host. */
   lookupTx: (hash: string) => invoke<TxLookup>("lookup_tx", { hash }),
   fetchBalance: () => invoke<AccountBalance>("fetch_balance"),
   faucetClaim: () => invoke<FaucetResult>("faucet_claim"),
   sendArc: (to: string, amountArc: string) =>
     invoke<WalletTxResult>("send_arc", { to, amountArc }),
-  // Protocol-4 native paid requests. Signing happens in Rust; these carry
-  // only the prompt, the user's price choices and public identifiers.
   nativeContext: () => invoke<NativeContextView | null>("native_context"),
   nativePrepare: (prompt: string) => invoke<PreparedInput>("native_prepare", { prompt }),
   nativeSubmit: (request: {
@@ -3503,10 +3210,6 @@ export const api = {
   nativeResubmit: (txHash: string) =>
     invoke<NativeSubmitResult>("native_resubmit", { txHash }),
   nativeJournal: () => invoke<NativeJournalEntry[]>("native_journal"),
-  // `chatTemplate` asks the serving node to apply the loaded model's own
-  // chat template. The client no longer wraps prompts in Llama-2's
-  // `[INST] ... [/INST]` tags, which were wrong for other architectures and
-  // got double-applied when the node templated too.
   runInference: (prompt: string, maxTokens = 32, chatTemplate = true) =>
     invoke<InferenceResult>("run_inference", { prompt, maxTokens, chatTemplate }),
   runInferenceViaCoordinator: (
@@ -3531,11 +3234,6 @@ export const api = {
       maxTokens,
       chatTemplate,
     }),
-  /**
-   * Independently fetch an exact 0x25 receipt from the host that served the
-   * inference. Native code pins/allowlists the origin and validates the full
-   * transaction, job, worker, URL, and state matrix.
-   */
   fetchCommunityRewardReceipt: (
     sourceHost: string,
     txHash: string,
@@ -3550,15 +3248,12 @@ export const api = {
       worker,
       receiptUrl,
     }),
-  // Write commands remain in the IPC surface for compatibility, but every
-  // native/browser implementation rejects them before signing or network I/O.
-  // `tier1Result` is read-only inspection for IDs created by older builds.
   tier1Submit: (
     prompt: string,
     maxTokens = 32,
     maxReward = 10,
     deadlineBlocks = 20,
-    committeeSize = 1, // TEMP: solo-chain testing; production should be 3-5
+    committeeSize = 1,
   ) =>
     invoke<Tier1Submitted>("tier1_submit", {
       prompt,
@@ -3583,29 +3278,15 @@ export const api = {
     }),
   clearCrash: () => invoke<void>("clear_crash"),
   openExternal: (url: string) => invoke<void>("open_external", { url }),
-  /**
-   * Write the log ring to a file via a native save dialog. Replaces a
-   * `Blob` + `<a download>` click, which WKWebView silently ignores — so
-   * the button did nothing at all on macOS.
-   */
   saveLogs: () => invoke<SavedLogs>("save_logs"),
-  /** Change how many cores the node contributes. */
   setWorkerThreads: (threads: number) =>
     invoke<ThreadsApplied>("set_worker_threads", { threads }),
-  /** Cached scoreboard counts from the elected coordinator; absent on failure. */
   fetchWorkerNetwork: () => invoke<WorkerNetwork | null>("fetch_worker_network"),
-  /** This machine's community worker: state and job counters (local node only). */
   fetchWorkerStatus: () => invoke<WorkerStatus>("fetch_worker_status"),
-  /**
-   * Turn compute contribution on (download the model if needed, worker mode,
-   * restart) or off (observer mode). Returns the saved config.
-   */
   setComputeContribution: (enabled: boolean) =>
     invoke<NodeConfig>("set_compute_contribution", { enabled }),
-  /** Finish enabling contribution for a user who already opted in. */
   promoteConsentedInstall: () =>
     invoke<NodeConfig>("promote_consented_install"),
-  /** Keep the computer awake while a job runs (applies at the next node start). */
   setPreventSleepDuringJobs: (enabled: boolean) =>
     invoke<NodeConfig>("set_prevent_sleep_during_jobs", { enabled }),
   ensureBinary: () => invoke<BinaryStatus>("ensure_binary"),
@@ -3621,16 +3302,8 @@ export const api = {
 };
 
 export const isTauri = IS_TAURI;
-/**
- * A plain Vite browser build is a visual test fixture, never a network client.
- * Keep this exported so every screen can make that boundary unmistakable.
- */
 export const isSyntheticPreview =
   !IS_TAURI && !IS_PROD_TAURI_BUNDLE && liveBase() === null;
 
-/**
- * A production Tauri bundle opened as ordinary HTML must render a blocker and
- * refuse every IPC call. It must never degrade into the synthetic preview.
- */
 export const isBlockedProductionBrowser =
   !IS_TAURI && IS_PROD_TAURI_BUNDLE;

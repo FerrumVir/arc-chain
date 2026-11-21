@@ -56,7 +56,6 @@ class ReleaseWorkflowVersionCheckTests(unittest.TestCase):
                 shutil.copy2(ROOT / relative, destination)
             package_json = fixture / "desktop/package.json"
             package = json.loads(package_json.read_text())
-            # Previously published v0.8.0 bytes cannot satisfy the v0.8.23 tag.
             package["version"] = "0.8.0"
             package_json.write_text(json.dumps(package))
 

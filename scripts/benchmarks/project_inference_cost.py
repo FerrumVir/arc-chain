@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""Project ARC inference cost against a published provider baseline.
-
-This is deliberately a calculator: it makes no API calls and never treats a
-missing cost or throughput measurement as zero.
-"""
 import argparse, json, math, sys
 
 def project(total_worker_hourly_usd=None, output_tokens=None, benchmark_duration_seconds=None,

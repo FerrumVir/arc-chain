@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Assemble the dependency-free ARC public console into one immutable directory.
 set -Eeuo pipefail
 umask 022
 
@@ -18,9 +17,6 @@ case "/$OUTPUT_DIR/" in
     *'/../'*|*'/./'*) die "output directory must not contain dot segments: $OUTPUT_DIR" ;;
 esac
 
-# Assemble beside the final destination and rename only after every contract
-# succeeds. Replacing a non-empty directory requires a sidecar receipt from an
-# earlier successful run, so a mistyped path cannot erase unrelated files.
 OUTPUT_BASENAME="$(basename -- "${OUTPUT_DIR%/}")"
 case "$OUTPUT_BASENAME" in
     ''|.|..|*[!A-Za-z0-9._-]*) die "unsafe output-directory basename: $OUTPUT_BASENAME" ;;
@@ -87,9 +83,6 @@ mkdir -p -- \
     "$OUTPUT_DIR/aqueduct" \
     "$OUTPUT_DIR/shared/frontend"
 
-# The source dashboard lives under dashboard/, but the deployed dashboard lives
-# at the public-site root. Rewrite every audited path whose relative base changes
-# during that move. Relative `./` links preserve the GitHub project-Pages prefix.
 sed \
     -e 's#content="../shared/frontend/arc-network.json"#content="./shared/frontend/arc-network.json"#' \
     -e 's#src="../shared/frontend/arc-network.js#src="./shared/frontend/arc-network.js#' \
@@ -116,8 +109,6 @@ if grep -Fq '../explorer/' "$OUTPUT_DIR/app.js"; then
     die "dashboard retained a source-tree-only receipt URL"
 fi
 cp -- explorer/index.html explorer/app.js explorer/native-receipts.js explorer/styles.css "$OUTPUT_DIR/explorer/"
-# The engraved theme's self-hosted fonts (with their SIL OFL licence) and the aqueduct band's scripts. Named one by one,
-# like everything else here, so nothing else in those folders can ship by accident.
 (cd dashboard/fonts && cp -- hanken-grotesk-latin-ext.woff2 hanken-grotesk-latin.woff2 jetbrains-mono-latin-ext.woff2 jetbrains-mono-latin.woff2 marcellus-latin-ext.woff2 marcellus-latin.woff2 OFL.txt "$OUTPUT_DIR/fonts/")
 (cd dashboard/aqueduct && cp -- engine.js archchain.js band.js "$OUTPUT_DIR/aqueduct/")
 (cd explorer/fonts && cp -- hanken-grotesk-latin-ext.woff2 hanken-grotesk-latin.woff2 jetbrains-mono-latin-ext.woff2 jetbrains-mono-latin.woff2 marcellus-latin-ext.woff2 marcellus-latin.woff2 OFL.txt "$OUTPUT_DIR/explorer/fonts/")
@@ -126,12 +117,6 @@ cp -- shared/frontend/arc-network.js shared/frontend/arc-network.json \
     shared/frontend/production-status.json \
     "$OUTPUT_DIR/shared/frontend/"
 
-# The legacy wallet is deliberately excluded: it stores a private key in
-# localStorage, imports live remote code, and calls plaintext/retired RPC
-# routes. Historical STATUS.md is also not a live product surface. Neither may
-# be reintroduced without a dedicated security and current-truth contract.
-
-# The console is already a complete static site; do not let Jekyll transform it.
 : > "$OUTPUT_DIR/.nojekyll"
 printf '%s\n' "$SOURCE_SHA" > "$OUTPUT_DIR/deployed-commit.txt"
 

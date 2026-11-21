@@ -1,5 +1,3 @@
-//! Typed program enumeration.
-
 use crate::primitives::grid;
 use crate::primitives::object;
 use crate::{Color, Grid, PosSet};
@@ -44,11 +42,8 @@ impl DagValue {
     }
 }
 
-/// The body of a catalog primitive: takes its already-evaluated arguments and
-/// returns the result, or `None` if the arguments do not fit.
 pub type PrimitiveApply = Box<dyn Fn(&[DagValue]) -> Option<DagValue> + Send + Sync>;
 
-/// A grid->grid transform paired with the name used for it in a program string.
 type NamedGridFn = (&'static str, fn(&Grid) -> Grid);
 
 pub struct TypedPrimitive {
@@ -61,7 +56,6 @@ pub struct TypedPrimitive {
 pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
     let mut cat: Vec<TypedPrimitive> = Vec::new();
 
-    // Unary Grid → Grid
     let g2g: Vec<NamedGridFn> = vec![
         ("rot90", grid::rot90),
         ("rot180", grid::rot180),
@@ -86,7 +80,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         });
     }
 
-    // Self-concat patterns
     let concat_patterns: Vec<NamedGridFn> = vec![
         ("hconcat_self", |g| grid::hconcat(g, g)),
         ("vconcat_self", |g| grid::vconcat(g, g)),
@@ -104,7 +97,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         });
     }
 
-    // Object extraction
     for (uni, diag, nobg, name) in [
         (true, true, true, "obj_TTT"),
         (true, false, true, "obj_TFT"),
@@ -127,7 +119,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         });
     }
 
-    // Object selectors
     cat.push(TypedPrimitive {
         name: "argmax_size",
         input_types: vec![DagType::Objects],
@@ -153,7 +144,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         }),
     });
 
-    // Object + Grid → Grid (subgrid)
     cat.push(TypedPrimitive {
         name: "subgrid",
         input_types: vec![DagType::Object, DagType::Grid],
@@ -167,7 +157,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         }),
     });
 
-    // Parameterized: replace colors
     for &c1 in colors {
         for &c2 in colors {
             if c1 == c2 {
@@ -189,7 +178,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         }
     }
 
-    // Grid + Color → Indices (ofcolor)
     for &c in colors {
         let name: &'static str = Box::leak(format!("ofcolor_{c}").into_boxed_str());
         cat.push(TypedPrimitive {
@@ -203,14 +191,12 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         });
     }
 
-    // Indices → Indices transformations
     cat.push(TypedPrimitive {
         name: "idx_backdrop",
         input_types: vec![DagType::Indices],
         output_type: DagType::Indices,
         apply: Box::new(|args| {
             if let DagValue::Indices(idx) = &args[0] {
-                // Backdrop of indices = bounding box
                 if idx.is_empty() {
                     return Some(DagValue::Indices(PosSet::new()));
                 }
@@ -270,7 +256,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         }),
     });
 
-    // Object → Indices (more region functions)
     for (name, f) in [
         ("obj_box", object::obj_box as fn(&crate::Object) -> PosSet),
         ("corners", object::corners as fn(&crate::Object) -> PosSet),
@@ -291,7 +276,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         });
     }
 
-    // Objects → merged Indices via region functions
     for (name, region_fn) in [
         (
             "mapply_delta",
@@ -336,7 +320,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         });
     }
 
-    // Objects → merged neighbor indices
     cat.push(TypedPrimitive {
         name: "mapply_neighbors",
         input_types: vec![DagType::Objects],
@@ -354,7 +337,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         }),
     });
 
-    // Indices + Grid + Color → Grid (fill)
     for &c in colors {
         let name: &'static str = Box::leak(format!("fill_idx_{c}").into_boxed_str());
         cat.push(TypedPrimitive {
@@ -384,7 +366,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         });
     }
 
-    // Objects → Object: colorfilter + first/argmax
     for &c in colors {
         let name: &'static str = Box::leak(format!("cf{c}_argmax").into_boxed_str());
         cat.push(TypedPrimitive {
@@ -404,7 +385,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         });
     }
 
-    // Object → Grid: cover (erase object)
     cat.push(TypedPrimitive {
         name: "cover",
         input_types: vec![DagType::Object, DagType::Grid],
@@ -418,7 +398,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         }),
     });
 
-    // Object movement (fixed offsets)
     for (dr, dc, name) in [
         (1isize, 0isize, "move_down"),
         (-1, 0, "move_up"),
@@ -439,7 +418,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         });
     }
 
-    // Object → Int (height, width, size)
     cat.push(TypedPrimitive {
         name: "obj_height",
         input_types: vec![DagType::Object],
@@ -477,7 +455,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         }),
     });
 
-    // Object → Color
     cat.push(TypedPrimitive {
         name: "obj_color",
         input_types: vec![DagType::Object],
@@ -491,7 +468,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         }),
     });
 
-    // Grid → Int (height, width)
     cat.push(TypedPrimitive {
         name: "grid_height",
         input_types: vec![DagType::Grid],
@@ -508,7 +484,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         }),
     });
 
-    // Grid → Color (most/least common)
     cat.push(TypedPrimitive {
         name: "mostcolor",
         input_types: vec![DagType::Grid],
@@ -522,7 +497,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         apply: Box::new(|args| Some(DagValue::Color(grid::leastcolor(args[0].as_grid()?)))),
     });
 
-    // Object selectors by height/width
     cat.push(TypedPrimitive {
         name: "argmax_height",
         input_types: vec![DagType::Objects],
@@ -569,7 +543,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         }),
     });
 
-    // First/last object
     cat.push(TypedPrimitive {
         name: "first_obj",
         input_types: vec![DagType::Objects],
@@ -595,7 +568,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         }),
     });
 
-    // Object → Indices (delta, backdrop, positions)
     cat.push(TypedPrimitive {
         name: "obj_delta",
         input_types: vec![DagType::Object],
@@ -633,7 +605,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         }),
     });
 
-    // Objects + Grid → Grid (paint all objects with a color)
     for &c in colors {
         let name: &'static str = Box::leak(format!("paint_all_{c}").into_boxed_str());
         cat.push(TypedPrimitive {
@@ -655,7 +626,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         });
     }
 
-    // switch_colors (symmetric, c1 < c2)
     for &c1 in colors {
         for &c2 in colors {
             if c1 >= c2 {
@@ -677,7 +647,6 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         }
     }
 
-    // Upscale/downscale
     for factor in [2usize, 3, 4, 5] {
         let name: &'static str = Box::leak(format!("upscale_{factor}").into_boxed_str());
         cat.push(TypedPrimitive {

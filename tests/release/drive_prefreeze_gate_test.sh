@@ -9,11 +9,6 @@ GATE="$REPO_ROOT/scripts/recovery/verify-drive-prefreeze.sh"
 IDENTITY_HELPER="$REPO_ROOT/scripts/recovery/drive-account-identity.py"
 IDENTITY_UNIT_TEST="$TEST_DIR/test_drive_account_identity.py"
 
-# Ubuntu exposes /usr/bin/python3 as a symlink, while the production gate
-# deliberately requires the reviewed interpreter itself to be a normalized,
-# executable regular non-symlink file. Resolve the system entrypoint once,
-# validate the exact production-shaped path and file metadata, then hash and
-# pin those resolved bytes below.
 SYSTEM_PYTHON3="$(python3 -I - <<'PY'
 import os
 import pathlib
@@ -483,8 +478,6 @@ token_config_and_tls_overrides_do_not_leak_or_bypass() (
 )
 
 identity_helper_unit_contract_and_real_rclone_capability() (
-    # Isolated mode ignores PYTHONDONTWRITEBYTECODE and PYTHONPYCACHEPREFIX.
-    # Keep this import-based test from writing caches beside reviewed source.
     "$SYSTEM_PYTHON3" -B -I "$IDENTITY_UNIT_TEST" || return 1
     ! grep -Fq 'config userinfo' "$GATE" || return 1
     ! grep -Fq 'config redacted' "$GATE" || return 1

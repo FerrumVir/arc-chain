@@ -12,11 +12,6 @@ type BodyFixtures = {
 const hex = "00";
 const prefixedHex = "0x00" as const;
 
-/**
- * Compile-only fixtures for the JSON projections returned by GET /tx/{hash}/full.
- * The mapped type makes additions to TransactionBody fail typecheck until this
- * contract is updated with the exact RPC shape.
- */
 export const rpcTransactionBodyFixtures = {
   Transfer: {
     type: "Transfer",
@@ -277,7 +272,6 @@ export const rpcTransactionBodyFixtures = {
   },
 } satisfies BodyFixtures;
 
-/** TxType wire discriminants; this record also makes 0x01..0x25 coverage explicit. */
 export const transactionTypeCodes = {
   Transfer: 0x01,
   Settle: 0x02,

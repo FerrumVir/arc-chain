@@ -14,7 +14,6 @@ const STATE_COPY: Record<string, string> = {
   reconnecting: "Reconnecting to coordinators",
 };
 
-/** One sentence for the worker's current state, from its own node. */
 export function workerStateCopy(status: WorkerStatus): string {
   if (!status.running) return "Not taking jobs";
   return (status.state && STATE_COPY[status.state]) || "Running";
@@ -24,14 +23,6 @@ function count(value: number | null): string {
   return value === null ? "—" : formatInt(value);
 }
 
-/**
- * What this computer has done for the network, read from its own node.
- *
- * "Completed" counts results a coordinator accepted; "verified" counts the
- * accepted results the coordinator reported as passing its replica quorum.
- * Both cover the time since the node last started. They are local
- * observations, not payment: rewards appear only as mined receipts.
- */
 export function WorkerJobsCard() {
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
@@ -42,10 +33,6 @@ export function WorkerJobsCard() {
     refetchInterval: 5000,
   });
 
-  // The app can finish enabling contribution in the background (after an
-  // interrupted download, at launch). When the node reports a worker this
-  // screen does not know about yet, reload the saved config so the observer
-  // banner and Settings catch up.
   const workerUnknownToUi =
     status?.running === true && !(config?.role === "worker" && config.modelPath);
   useEffect(() => {

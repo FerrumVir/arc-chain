@@ -1,28 +1,4 @@
 #!/usr/bin/env bash
-# Acceptance: a real v0.7.11 headless community install consumes the bridge
-# release (tag v<bridge_version> from the pins) through its own, unmodified
-# updater and systemd units.
-#
-#   1. The unmodified v0.7.11 scripts/install-community-node.sh installs the
-#      pinned v0.7.7 release binary (the last v0.7 release that shipped
-#      headless binaries) as a systemd service, exactly as in the field.
-#      The v0.7 node runs and writes genuine v0.7 state.
-#   2. The fake-github curl shim makes "Latest" the bridge release (v<bridge_version>).
-#      The installer-generated arc-auto-update.sh then runs as the real
-#      arc-updater.service: it downloads the bridge, keeps arc-node.prev,
-#      restarts arc-node.service, and applies its own 30-second health check.
-#   3. Assertions: the v0.7 data directory is byte-identical to its state at
-#      the moment systemd stopped v0.7 (captured by an ExecStartPre hook); the
-#      running process is the pinned, signature-verified v0.8 binary at stake
-#      0 in a fresh data directory, not participating in consensus; no seed
-#      leaks; re-runs are idempotent; a corrupted cache self-heals; rollback
-#      restores v0.7 on its untouched data; reinstall bridges again.
-#
-# Network: every live-network IP is rejected for the whole test, so neither
-# v0.7 nor v0.8 can register with or mutate the public testnet. github.com
-# stays reachable because the bridge downloads the real pinned v0.8 release.
-#
-# Usage: headless-v07-acceptance.sh <bridge-launcher> <evidence-dir>
 set -Eeuo pipefail
 
 bridge_binary="$(realpath "$1")"
@@ -70,8 +46,6 @@ wait_health() {
 main_pid() { systemctl show -p MainPID --value arc-node; }
 
 publish_latest() {
-    # GitHub's /releases/latest JSON as the v0.7 updater parses it: pretty
-    # printed, one key per line. Captured live (read-only) and retagged.
     local tag="$1"
     python3 - "$evidence/real-releases-latest.json" "$tag" "$state/api/releases-latest.json" <<'PY'
 import json, sys
@@ -313,8 +287,6 @@ sudo systemctl restart arc-node
 wait_health http://127.0.0.1:9944 60 || fail "v0.7.7 did not start after rollback"
 [ "$(readlink "/proc/$(main_pid)/exe")" = "$arc_dir/bin/arc-node" ]
 /usr/bin/curl -sf http://127.0.0.1:9944/health > "$evidence/health.after-rollback.json"
-# The restored v0.7 node owns its data again and may write to it. Observe
-# whether it does, so the archive expectation below matches what happened.
 v07_wrote=false
 for _ in $(seq 1 90); do
     python3 "$here/snapshot_tree.py" snapshot --root "$arc_dir/data" --out "$evidence/v07-data.after-rollback.json"
@@ -327,7 +299,6 @@ done
 printf 'restored v0.7 node wrote to its data after rollback: %s\n' "$v07_wrote"
 kept="$arc_dir/legacy-bridge/arc-node-bridge-$bridge_version"
 [ "$(sha "$kept")" = "$bridge_sha" ] || fail "rollback did not keep the bridge launcher"
-# The running v0.7.7 binary is busy; stage and rename, as the updater does.
 cp "$kept" "$arc_dir/bin/arc-node.new"
 mv "$arc_dir/bin/arc-node.new" "$arc_dir/bin/arc-node"
 sudo systemctl restart arc-node

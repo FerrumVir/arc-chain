@@ -26,8 +26,6 @@ SHA = re.compile(r"[0-9a-f]{64}\Z")
 COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 TAG = re.compile(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
 PLATFORMS = ("linux-x86_64", "linux-arm64", "macos-arm64", "macos-x86_64", "windows-x86_64")
-# The recovered chain's signed validator set. Every one of them is either a live,
-# observed host or, for at most two, explicitly declared offline by the owner input.
 VALIDATOR_COUNT = 6
 MAX_DECLARED_OFFLINE = 2
 ZERO_MARGIN_WARNING = "Zero margin: if any one live validator fails to restart, blocks stop until it is fixed."
@@ -82,14 +80,12 @@ def load_module(path: Path, name: str):
 
 
 def confirm_declared_offline(declared_sites, confirmed_sites) -> None:
-    """The offline set is explicit twice: in the owner host config and on the command line."""
     confirmed = list(confirmed_sites or ())
     need(len(confirmed) == len(set(confirmed)) and set(confirmed) == set(declared_sites),
          "declared-offline validators in the host config must equal the explicit --declared-offline confirmation")
 
 
 def declared_offline_rows(config: dict) -> list[dict]:
-    """The owner host config's declared-offline rows; the tracked validator checks the rest."""
     rows = config.get("declared_offline", [])
     need(isinstance(rows, list) and len(rows) <= MAX_DECLARED_OFFLINE and
          all(isinstance(row, dict) and isinstance(row.get("site"), str) and
@@ -102,7 +98,6 @@ def declared_offline_rows(config: dict) -> list[dict]:
 
 
 def declared_offline_authority(config: dict) -> dict[str, int]:
-    """Identity and stake of each declared-offline validator."""
     rows = declared_offline_rows(config)
     authority = {row["validator"]: row["stake"] for row in rows}
     need(len(authority) == len(rows), "a declared-offline validator identity is repeated")
@@ -112,7 +107,6 @@ def declared_offline_authority(config: dict) -> dict[str, int]:
 def strict_proof(proof_path: Path, config_path: Path, validator_path: Path,
                  expected_binary_sha256: str, now: float | None = None,
                  declared_offline_sites=(), *, profile: str = UPDATE_PROFILE) -> tuple[dict, dict]:
-    """Delegate all quorum semantics to the deployed, tested rollout validator."""
     proof, config = read_json(proof_path), read_json(config_path)
     validator = load_module(validator_path, "arc_rollout_current_profile_validator")
     need(callable(getattr(validator, "declared_offline_hosts", None)),
@@ -138,7 +132,6 @@ def strict_proof(proof_path: Path, config_path: Path, validator_path: Path,
 
 
 def attested_proof_key(attestation: dict) -> str:
-    """A six-host update keeps its original key; only a declared-offline update uses the live-host key."""
     keys = [key for key in (SIX_HOST_PROOF_KEY, LIVE_HOST_PROOF_KEY) if key in attestation]
     need(len(keys) == 1 and isinstance(attestation[keys[0]], dict),
          "attestation must carry exactly one fresh proof summary")
@@ -237,8 +230,6 @@ def norm_hash(value: object, label: str) -> str:
 
 def verify_checkpoint(binary: Path, checkpoint: Path, genesis: Path, manifest_hash: str,
                       epoch: int, set_id: int, expected_domain: str) -> dict:
-    # The verifier runs with cwd="/". Normalize lexically before that chdir;
-    # abspath preserves a symlink at the final component for `regular()` to reject.
     binary = Path(os.path.abspath(binary))
     checkpoint = Path(os.path.abspath(checkpoint))
     genesis = Path(os.path.abspath(genesis))
@@ -320,8 +311,6 @@ def validate_certificate_authority(checkpoint: dict, hosts: dict[str, dict], con
     declared_authority = declared_offline_authority(config)
     need(len(live_authority) == len(hosts) and not set(live_authority) & set(declared_authority),
          "a validator identity is pinned twice, or both live and declared offline")
-    # Every signed validator is pinned exactly once: as a live host, or as a
-    # validator the owner input declares offline. Nothing is dropped or added.
     need(certificate_authority == {**live_authority, **declared_authority},
          "verified checkpoint certificate authority differs from the live and declared-offline validator pins")
 
@@ -345,7 +334,6 @@ def public_artifact(platform: str, value: dict) -> dict:
 
 
 def verify_owner_verifier(args: argparse.Namespace, owner_verifier: dict) -> None:
-    """Re-materialize even a foreign-platform verifier; it need not be executed."""
     owner_args = argparse.Namespace(**vars(args))
     owner_args.verifier_platform = owner_verifier["platform"]
     with tempfile.TemporaryDirectory(prefix="arc-owner-verifier-") as td:
@@ -392,7 +380,6 @@ def assemble(args: argparse.Namespace) -> dict:
         need(selected["genesis_sha256"] == verifier["genesis_sha256"],
              "production and verifier platform artifacts carry different genesis bytes")
         config = read_json(args.host_config)
-        # Refuse an unconfirmed or unrequested offline declaration before the slow checkpoint check.
         confirm_declared_offline([row["site"] for row in declared_offline_rows(config)],
                                  getattr(args, "declared_offline", None))
         checkpoint = verify_checkpoint(verifier["binary_path"], args.checkpoint, verifier["genesis_path"],
@@ -404,21 +391,15 @@ def assemble(args: argparse.Namespace) -> dict:
         need(SHA.fullmatch(approved_genesis_hash) is not None,
              "approved genesis.network-hash must be one bare SHA-256")
         proof = read_json(args.quorum_proof)
-        # CLI genesis_hash is computed from the signed genesis; RPC's legacy
-        # genesis_network_hash is a distinct pin and is retained separately.
         validate_crossbindings(checkpoint, {h["site"]: h for h in config["hosts"]}, config,
                                selected["genesis_sha256"], validator_binary_sha256, proof,
                                approved_genesis_hash)
-        # Run the strict freshness/liveness validator last: full checkpoint
-        # verification is allowed to take several minutes.
         proof_now = getattr(args, "proof_validation_time", None)
         proof_summary, checked_config = strict_proof(args.quorum_proof, args.host_config,
             args.rollout_validator, validator_binary_sha256, now=proof_now,
             declared_offline_sites=getattr(args, "declared_offline", None) or (), profile=profile)
         need(checked_config == config, "host config changed during qualification")
     proof_summary["rpc_genesis_network_hash"] = config["genesis_network_hash"]
-    # Only an update with explicit declarations names the offline validators and
-    # labels its proof as live-host. Rows use the same site order as the host config.
     declared = declared_offline_rows(config)
     observation = ({"declared_offline_validators": declared, LIVE_HOST_PROOF_KEY: proof_summary}
                    if declared else {SIX_HOST_PROOF_KEY: proof_summary})
@@ -451,7 +432,6 @@ def assemble(args: argparse.Namespace) -> dict:
 
 
 def validate_owner_attestation(args: argparse.Namespace, owner_path: Path, now: float | None = None) -> dict:
-    """Recompute the owner's public evidence and preserve its real observation time."""
     now = time.time() if now is None else now
     owner = read_json(owner_path)
     generated_at = owner.get("generated_at_unix")
@@ -482,8 +462,6 @@ def validate_owner_attestation(args: argparse.Namespace, owner_path: Path, now: 
     owner_projection = json.loads(json.dumps(owner))
     producer_projection = json.loads(json.dumps(recomputed))
     if recomputed.get("profile") == DESKTOP_PROFILE:
-        # Legacy newest-only owner evidence can omit the empty skip list. A
-        # nonempty recomputed list still fails the full projection comparison.
         owner_projection.setdefault("validators_release_skipped_desktop_updates", [])
     owner_projection["release"].pop("checkpoint_verifier_artifact", None)
     producer_projection["release"].pop("checkpoint_verifier_artifact", None)

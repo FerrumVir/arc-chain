@@ -1,26 +1,14 @@
-//! Exact integer tables of the dyadic profile (spec §4.5, §4.7, §5.1).
-//!
-//! Both tables are defined as correctly rounded real values. They are built
-//! here with signed 128-bit Q62 fixed point (`ONE = 2^62`), which reproduces
-//! the correctly rounded values exactly; the unit tests pin the BLAKE3 digests
-//! computed independently at 200-bit and 60-digit precision. No floating point
-//! and no libm are involved, so every platform builds identical tables.
-
 use super::ModernError;
 
 const Q: u32 = 62;
 const QONE: i128 = 1 << Q;
 const QHALF: i128 = 1 << (Q - 1);
 
-/// Number of intervals of the exp table: steps of 1/256 over [-16, 0].
 pub const EXP_STEPS: usize = 4096;
 
-/// `T[i] = round_half_away(e^(-(4096 - i)/256) * 2^16)` for `i` in `0..=4096`.
 pub static EXP_TABLE: [i64; EXP_STEPS + 1] = build_exp_table();
 
 const fn build_exp_table() -> [i64; EXP_STEPS + 1] {
-    // e^(-1/256) in Q62 from its Taylor series (every term is non-negative
-    // before its sign is applied, so `/` is a floor).
     let mut term: i128 = QONE;
     let mut decay: i128 = QONE;
     let mut n: i128 = 1;
@@ -45,14 +33,11 @@ const fn build_exp_table() -> [i64; EXP_STEPS + 1] {
     table
 }
 
-/// Exact integer square root `floor(sqrt(n))`.
 pub fn isqrt_u128(n: u128) -> u128 {
     if n < 2 {
         return n;
     }
     let bits = 128 - n.leading_zeros();
-    // 2^ceil(bits/2) >= sqrt(n), and Newton's iteration decreases
-    // monotonically from any start at or above floor(sqrt(n)).
     let mut x: u128 = 1u128 << bits.div_ceil(2);
     loop {
         let y = (x + n / x) >> 1;
@@ -67,7 +52,6 @@ fn mulq(a: i128, b: i128) -> i128 {
     (a * b + QHALF) >> Q
 }
 
-/// `atanh(z)` for `0 <= z <= ONE/3`, Q62.
 fn atanh_q62(z: i128) -> i128 {
     let zz = mulq(z, z);
     let mut total = z;
@@ -84,7 +68,6 @@ fn atanh_q62(z: i128) -> i128 {
     }
 }
 
-/// `ln(theta)` for an integer `2 <= theta <= 2^53`, Q62.
 fn ln_q62(theta: u64) -> i128 {
     let ln2 = 2 * atanh_q62(QONE / 3);
     let b = 63 - theta.leading_zeros();
@@ -93,7 +76,6 @@ fn ln_q62(theta: u64) -> i128 {
     i128::from(b) * ln2 + 2 * atanh_q62(z)
 }
 
-/// Taylor series of `e^(-x)` for `0 <= x <= ONE`, Q62.
 fn exp_neg_taylor_q62(x: i128) -> i128 {
     let mut term = QONE;
     let mut total = QONE;
@@ -112,8 +94,6 @@ fn exp_neg_taylor_q62(x: i128) -> i128 {
     }
 }
 
-/// `e^(-x)` for `0 <= x < 64 * ONE`, Q62: `e^(-f) * (e^(-1))^n` with
-/// `x = n + f`, `0 <= f < 1`.
 fn exp_neg_q62(x: i128) -> i128 {
     let whole = x >> Q;
     let mut result = exp_neg_taylor_q62(x - (whole << Q));
@@ -126,7 +106,6 @@ fn exp_neg_q62(x: i128) -> i128 {
     result
 }
 
-/// `(cos w, sin w)` for `0 <= w <= ONE`, Q62.
 fn cos_sin_q62(w: i128) -> (i128, i128) {
     let mut c = QONE;
     let mut s: i128 = 0;
@@ -156,14 +135,10 @@ fn cos_sin_q62(w: i128) -> (i128, i128) {
 fn round_q62_to_q16(v: i128) -> i32 {
     let shift = Q - 16;
     let magnitude = (v.unsigned_abs() + (1u128 << (shift - 1))) >> shift;
-    // |v| <= ~2^62, so the magnitude is at most 65537.
     let m = magnitude as i32;
     if v < 0 { -m } else { m }
 }
 
-/// RoPE tables `(cos, sin)`, each `max_seq * d_head/2` Q16 values, row-major
-/// by position: `cos[p * (d_head/2) + i] = round_half_away(cos(p * w_i) * 2^16)`
-/// with `w_i = theta^(-2i/d_head)`.
 pub fn rope_tables(
     theta: u64,
     d_head: usize,
@@ -211,7 +186,6 @@ pub fn rope_tables(
     Ok((cos, sin))
 }
 
-/// Attention scale `floor(2^30 / sqrt(d_head))`, exactly.
 pub fn attention_lambda(d_head: usize) -> i64 {
     let n = (1u128 << 60) / d_head.max(1) as u128;
     isqrt_u128(n) as i64

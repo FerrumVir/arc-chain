@@ -1,117 +1,52 @@
-//! Light client proofs - allow verification of state without downloading the full chain.
-//!
-//! Provides:
-//! - `StateProof` - prove an account's state against a Merkle state root
-//! - `HeaderProof` - verify a chain of block headers by parent-hash linkage
-//! - `TxInclusionProof` - prove a transaction was included in a specific block
-//! - `LightSnapshot` - compact aggregate view for light client bootstrapping
-//! - `FinalityProof` - prove a block was finalized by a consensus quorum
-//! - `LightClientBundle` - complete verification bundle (finality + state + header)
-//!
-//! All verification functions are pure (no StateDB required), so light clients
-//! can run them with only the proof data and a trusted state root.
-
 use arc_crypto::{Hash256, MerkleProof, MerkleTree, Signature as CryptoSignature, hash_bytes};
 use arc_types::{Account, Address, BlockHeader, strict_supermajority_threshold};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-// ---------------------------------------------------------------------------
-// Proof types
-// ---------------------------------------------------------------------------
-
-/// Proof that a specific account exists with a given state at a particular block height.
-///
-/// A light client can verify this against a trusted `state_root` without
-/// downloading the full account set.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StateProof {
-    /// Address of the account being proved.
     pub account_address: Hash256,
-    /// The full account state (balance, nonce, code_hash, etc.).
     pub account: Account,
-    /// Merkle inclusion proof from the account leaf to the state root.
     pub merkle_proof: MerkleProof,
-    /// Block height at which this proof was generated.
     pub block_height: u64,
-    /// State root that the Merkle proof resolves to.
     pub state_root: Hash256,
-    /// Timestamp of the block (unix millis).
     pub timestamp: u64,
 }
 
-/// A block header annotated with optional validator signature and explicit
-/// parent hash - used by light clients to verify header-chain continuity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HeaderProof {
-    /// The block header.
     pub header: BlockHeader,
-    /// Unverified signature metadata retained for wire compatibility. Header
-    /// verification does not consult this field; authenticity comes from a
-    /// separately verified finality proof over the computed block hash.
     pub validator_signature: Option<Vec<u8>>,
-    /// Hash of the parent block header (convenience duplicate of `header.parent_hash`).
     pub parent_hash: Hash256,
 }
 
-/// Proof that a transaction was included in a specific block's transaction tree.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TxInclusionProof {
-    /// Hash of the transaction being proved.
     pub tx_hash: Hash256,
-    /// Block height the transaction was included in.
     pub block_height: u64,
-    /// Merkle inclusion proof within the block's transaction tree.
     pub merkle_proof: MerkleProof,
-    /// Transaction Merkle root stored in the block header.
     pub block_tx_root: Hash256,
 }
 
-/// Check the structural voting-power condition for finality.
-///
-/// This does not verify validator identities or signatures. Call
-/// [`FinalityProof::verify_against_trusted_set`] for cryptographic finality.
-/// This is a pure function - light clients can call it with raw values
-/// obtained from a FinalityProof (defined in arc-consensus).
 pub fn verify_finality_stake(signing_stake: u64, total_stake: u64) -> bool {
     total_stake > 0
         && signing_stake <= total_stake
         && signing_stake >= strict_supermajority_threshold(total_stake)
 }
 
-/// Compact aggregate snapshot for light client bootstrapping.
-///
-/// Gives a light client enough context to know the chain tip without
-/// downloading blocks or accounts.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LightSnapshot {
-    /// Current chain height.
     pub height: u64,
-    /// Merkle root of the current account state.
     pub state_root: Hash256,
-    /// Total number of accounts.
     pub account_count: u64,
-    /// Sum of all account balances (total supply in circulation).
     pub total_supply: u64,
-    /// Hash of the latest committed block.
     pub latest_block_hash: Hash256,
 }
 
-// ---------------------------------------------------------------------------
-// Pure verification functions (no StateDB dependency)
-// ---------------------------------------------------------------------------
-
-/// Verify that a `StateProof`'s Merkle path resolves to the embedded state root.
-///
-/// This confirms the account leaf is a member of the state tree that produced
-/// `proof.state_root`. It does NOT verify that `state_root` itself is trusted -
-/// that responsibility falls on the light client (e.g. via header chain).
 pub fn verify_state_proof(proof: &StateProof) -> bool {
-    // The proof's root must match the declared state root.
     if proof.merkle_proof.root != proof.state_root {
         return false;
     }
-    // The leaf in the proof must be the hash of the serialised account.
     let Ok(account_bytes) = bincode::serialize(&proof.account) else {
         return false;
     };
@@ -122,7 +57,6 @@ pub fn verify_state_proof(proof: &StateProof) -> bool {
     MerkleTree::verify_proof(&proof.merkle_proof)
 }
 
-/// Verify a state proof AND check that the account's balance matches `expected_balance`.
 pub fn verify_account_balance(proof: &StateProof, expected_balance: u64) -> bool {
     if !verify_state_proof(proof) {
         return false;
@@ -130,17 +64,10 @@ pub fn verify_account_balance(proof: &StateProof, expected_balance: u64) -> bool
     proof.account.balance == expected_balance
 }
 
-/// Verify a state proof - returns `true` if the Merkle proof is valid, which
-/// inherently proves the account exists in the state tree.
 pub fn verify_account_exists(proof: &StateProof) -> bool {
     verify_state_proof(proof)
 }
 
-/// Verify only that a sequence of `HeaderProof`s forms a consistent parent-hash
-/// chain. This does not authenticate a producer or establish finality.
-///
-/// Each header (except the first) must reference the previous header's computed
-/// block hash as its `parent_hash`.
 pub fn verify_header_chain(headers: &[HeaderProof]) -> bool {
     if headers.is_empty() {
         return true;
@@ -152,7 +79,6 @@ pub fn verify_header_chain(headers: &[HeaderProof]) -> bool {
         if child.parent_hash != parent_block_hash {
             return false;
         }
-        // Also verify the child header's own parent_hash field is consistent.
         if child.header.parent_hash != parent_block_hash {
             return false;
         }
@@ -160,8 +86,6 @@ pub fn verify_header_chain(headers: &[HeaderProof]) -> bool {
     true
 }
 
-/// Verify that a transaction was included in a block by checking its Merkle
-/// inclusion proof against the declared `block_tx_root`.
 pub fn verify_tx_inclusion(proof: &TxInclusionProof) -> bool {
     if proof.merkle_proof.root != proof.block_tx_root {
         return false;
@@ -172,77 +96,36 @@ pub fn verify_tx_inclusion(proof: &TxInclusionProof) -> bool {
     MerkleTree::verify_proof(&proof.merkle_proof)
 }
 
-// ---------------------------------------------------------------------------
-// Finality proof types
-// ---------------------------------------------------------------------------
-
-/// A single validator's attestation to a finalized block.
-///
-/// Each attestation records the validator's address, their stake weight,
-/// and a serialized signature over the block hash.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ValidatorAttestation {
-    /// Address (public key hash) of the attesting validator.
     pub validator_address: Address,
-    /// Stake weight of this validator at the time of attestation.
     pub stake: u64,
-    /// Bincode-serialized [`arc_crypto::Signature`] over the canonical
-    /// domain-separated finality transcript.
     pub signature_bytes: Vec<u8>,
 }
 
-/// Validator identity and voting power obtained from a trusted checkpoint or
-/// genesis configuration, never from the finality proof being verified.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrustedValidator {
     pub validator_address: Address,
     pub stake: u64,
 }
 
-/// Proof that a block was finalized by a consensus quorum.
-///
-/// Contains the block metadata plus a set of validator attestations whose
-/// aggregate stake must be strictly greater than two thirds of total stake.
-/// Cryptographic verification additionally requires an external trusted
-/// validator set.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FinalityProof {
-    /// Hash of the finalized block.
     pub block_hash: Hash256,
-    /// Consensus round in which finality was reached.
     pub round: u64,
-    /// Height of the finalized block.
     pub block_height: u64,
-    /// State root committed by this block.
     pub state_root: Hash256,
-    /// Individual validator attestations forming the quorum.
     pub quorum_signatures: Vec<ValidatorAttestation>,
-    /// Total stake across all validators in the active set.
     pub total_stake: u64,
-    /// Sum of stake from validators that signed (cached from attestations).
     pub signing_stake: u64,
 }
 
-/// Complete light client verification bundle.
-///
-/// Combines a finality proof (consensus quorum), a state proof (Merkle
-/// inclusion of an account), and a header proof (block header chain) into
-/// a single verifiable unit. A light client calls `verify_complete()` with a
-/// validator set obtained from a trusted checkpoint or genesis configuration
-/// to check all three layers plus cross-layer consistency.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LightClientBundle {
-    /// Proof that the block was finalized by consensus.
     pub finality_proof: FinalityProof,
-    /// Merkle proof of an account's state at the finalized block.
     pub state_proof: StateProof,
-    /// Block header proof for chain continuity.
     pub header_proof: HeaderProof,
 }
-
-// ---------------------------------------------------------------------------
-// FinalityProof implementation
-// ---------------------------------------------------------------------------
 
 fn checked_attestation_stake(attestations: &[ValidatorAttestation]) -> Option<u64> {
     let mut seen = HashSet::with_capacity(attestations.len());
@@ -257,7 +140,6 @@ fn checked_attestation_stake(attestations: &[ValidatorAttestation]) -> Option<u6
 }
 
 impl FinalityProof {
-    /// Canonical transcript validators sign when attesting to finality.
     pub fn signing_commitment(
         block_hash: &Hash256,
         round: u64,
@@ -274,7 +156,6 @@ impl FinalityProof {
         Hash256(*hasher.finalize().as_bytes())
     }
 
-    /// Return this proof's canonical finality-signing transcript.
     pub fn signing_hash(&self) -> Hash256 {
         Self::signing_commitment(
             &self.block_hash,
@@ -285,9 +166,6 @@ impl FinalityProof {
         )
     }
 
-    /// Create a new finality proof from validator attestations.
-    ///
-    /// `signing_stake` is computed automatically from the attestation set.
     pub fn new(
         block_hash: Hash256,
         round: u64,
@@ -309,22 +187,14 @@ impl FinalityProof {
         }
     }
 
-    /// Compute the supermajority threshold for a given total stake.
-    ///
-    /// The threshold is `floor(2 * total_stake / 3) + 1`.
     pub fn supermajority_threshold(total_stake: u64) -> u64 {
         strict_supermajority_threshold(total_stake)
     }
 
-    /// Check internal stake accounting and the strict quorum threshold.
-    ///
-    /// This is not cryptographic verification: attestation stakes are
-    /// self-declared until checked against a trusted validator set.
     pub fn has_structural_quorum(&self) -> bool {
         verify_finality_stake(self.signing_stake, self.total_stake)
     }
 
-    /// Get the fraction of total stake that signed, as a percentage (0.0–100.0).
     pub fn stake_percentage(&self) -> f64 {
         if self.total_stake == 0 {
             return 0.0;
@@ -332,14 +202,6 @@ impl FinalityProof {
         (self.signing_stake as f64 / self.total_stake as f64) * 100.0
     }
 
-    /// Verify that the proof is internally consistent, without trusting it as
-    /// evidence of finality.
-    ///
-    /// Checks:
-    /// 1. At least one attestation exists.
-    /// 2. The `signing_stake` field matches the sum of attestation stakes.
-    /// 3. The `signing_stake` does not exceed `total_stake`.
-    /// 4. The quorum threshold is met.
     pub fn is_structurally_valid(&self) -> bool {
         if self.quorum_signatures.is_empty() {
             return false;
@@ -353,8 +215,6 @@ impl FinalityProof {
         self.has_structural_quorum()
     }
 
-    /// Cryptographically verify this proof against validator identities and
-    /// stakes from a trusted checkpoint or genesis configuration.
     pub fn verify_against_trusted_set(&self, trusted_validators: &[TrustedValidator]) -> bool {
         if !self.is_structurally_valid() || trusted_validators.is_empty() {
             return false;
@@ -403,12 +263,7 @@ impl FinalityProof {
     }
 }
 
-// ---------------------------------------------------------------------------
-// LightClientBundle implementation
-// ---------------------------------------------------------------------------
-
 impl LightClientBundle {
-    /// Create a complete verification bundle.
     pub fn new(finality: FinalityProof, state: StateProof, header: HeaderProof) -> Self {
         Self {
             finality_proof: finality,
@@ -417,17 +272,7 @@ impl LightClientBundle {
         }
     }
 
-    /// Verify the entire bundle against a validator set obtained independently
-    /// from a trusted checkpoint or genesis configuration.
-    ///
-    /// Checks:
-    /// 1. The finality proof has valid signatures from a trusted quorum.
-    /// 2. The state proof Merkle path is valid.
-    /// 3. The finality proof's state root matches the state proof's state root.
-    /// 4. The header proof's block state root matches the finality proof's state root.
-    /// 5. The finality proof's block hash and height match the header and state proof.
     pub fn verify_complete(&self, trusted_validators: &[TrustedValidator]) -> bool {
-        // 1. Verify finality signatures, identities, and trusted voting power.
         if !self
             .finality_proof
             .verify_against_trusted_set(trusted_validators)
@@ -435,22 +280,18 @@ impl LightClientBundle {
             return false;
         }
 
-        // 2. Verify the state proof's Merkle path.
         if !verify_state_proof(&self.state_proof) {
             return false;
         }
 
-        // 3. Cross-check: finality state root == state proof state root.
         if self.finality_proof.state_root != self.state_proof.state_root {
             return false;
         }
 
-        // 4. Cross-check: header state root == finality state root.
         if self.header_proof.header.state_root != self.finality_proof.state_root {
             return false;
         }
 
-        // 5. Cross-check the finality commitment against the exact header.
         let header_hash = arc_types::Block::compute_hash(&self.header_proof.header);
         if self.finality_proof.block_hash != header_hash
             || self.header_proof.parent_hash != self.header_proof.header.parent_hash
@@ -465,10 +306,6 @@ impl LightClientBundle {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,12 +317,9 @@ mod tests {
         hash_bytes(&[n])
     }
 
-    // -- StateProof ----------------------------------------------------------
-
     #[test]
     fn test_state_proof_valid() {
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 500)]);
-        // Execute a block so we have height > 0 with a committed block.
         let tx = Transaction::new_transfer(addr(1), addr(2), 100, 0);
         state.execute_block(&[tx], addr(99)).unwrap();
 
@@ -502,9 +336,7 @@ mod tests {
         state.execute_block(&[tx], addr(99)).unwrap();
 
         let proof = state.generate_state_proof(&addr(1)).unwrap();
-        // Proof itself is valid…
         assert!(verify_state_proof(&proof));
-        // …but balance check fails for the wrong value.
         assert!(!verify_account_balance(&proof, 42));
     }
 
@@ -514,18 +346,13 @@ mod tests {
         let tx = Transaction::new_transfer(addr(1), addr(2), 100, 0);
         state.execute_block(&[tx], addr(99)).unwrap();
 
-        // addr(99) was never funded (it's only the block producer, not an account).
-        // Actually addr(99) may or may not exist. Use addr(50) which is definitely absent.
         let result = state.generate_state_proof(&addr(50));
         assert!(result.is_err());
     }
 
-    // -- HeaderProof ---------------------------------------------------------
-
     #[test]
     fn test_header_chain_valid() {
         let state = StateDB::with_genesis(&[(addr(1), u64::MAX)]);
-        // Produce 3 blocks.
         for i in 0..3u64 {
             let tx = Transaction::new_transfer(addr(1), addr(2), 1, i);
             state.execute_block(&[tx], addr(99)).unwrap();
@@ -549,13 +376,10 @@ mod tests {
             .map(|h| state.generate_header_proof(h).unwrap())
             .collect();
 
-        // Corrupt the middle header's parent hash.
         proofs[1].parent_hash = Hash256::ZERO;
         proofs[1].header.parent_hash = Hash256::ZERO;
         assert!(!verify_header_chain(&proofs));
     }
-
-    // -- TxInclusionProof ----------------------------------------------------
 
     #[test]
     fn test_tx_inclusion_proof() {
@@ -568,8 +392,6 @@ mod tests {
         assert!(verify_tx_inclusion(&proof));
     }
 
-    // -- LightSnapshot -------------------------------------------------------
-
     #[test]
     fn test_light_snapshot() {
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 500_000)]);
@@ -579,13 +401,10 @@ mod tests {
         let snap = state.generate_light_snapshot();
         assert_eq!(snap.height, 1);
         assert_eq!(snap.account_count, 2);
-        // Total supply is conserved: 1_000_000 + 500_000 = 1_500_000
         assert_eq!(snap.total_supply, 1_500_000);
         assert_ne!(snap.state_root, Hash256::ZERO);
         assert_ne!(snap.latest_block_hash, Hash256::ZERO);
     }
-
-    // -- State root changes --------------------------------------------------
 
     #[test]
     fn test_state_root_changes() {
@@ -601,8 +420,6 @@ mod tests {
             "state root must change after executing transactions"
         );
     }
-
-    // -- FinalityProof -------------------------------------------------------
 
     struct TestCommittee {
         keys: Vec<KeyPair>,
@@ -857,12 +674,8 @@ mod tests {
         );
     }
 
-    // -- LightClientBundle ---------------------------------------------------
-
     #[test]
     fn test_light_client_bundle_consistent() {
-        // Build a real state + header proof from StateDB, then wrap in a bundle
-        // with a matching finality proof.
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 500)]);
         let tx = Transaction::new_transfer(addr(1), addr(2), 100, 0);
         state.execute_block(&[tx], addr(99)).unwrap();
@@ -871,7 +684,6 @@ mod tests {
         let header_proof = state.generate_header_proof(1).unwrap();
         let block_hash = arc_types::Block::compute_hash(&header_proof.header);
 
-        // Build a finality proof that matches the state root from the proofs.
         let committee = make_committee(&[40, 40, 20]);
         let attestations = make_attestations(
             &block_hash,
@@ -900,7 +712,6 @@ mod tests {
 
     #[test]
     fn test_light_client_bundle_mismatched() {
-        // Build valid proofs but give the finality proof a different state root.
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 500)]);
         let tx = Transaction::new_transfer(addr(1), addr(2), 100, 0);
         state.execute_block(&[tx], addr(99)).unwrap();
@@ -909,7 +720,6 @@ mod tests {
         let header_proof = state.generate_header_proof(1).unwrap();
         let block_hash = arc_types::Block::compute_hash(&header_proof.header);
 
-        // Use a WRONG state root in the finality proof.
         let wrong_state_root = hash_bytes(b"wrong-state-root");
         let committee = make_committee(&[40, 40, 20]);
         let attestations = make_attestations(

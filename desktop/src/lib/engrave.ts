@@ -1,13 +1,3 @@
-// The website's engraving engine (arc-ai-website/js/engrave/engine.js), copied
-// into the app and typed. A plate is an ordered list of strokes (polylines with
-// a width at every point) and masks (polygons filled with the ground colour, for
-// occlusion). Hatching follows each form, swells in shadow and tapers into
-// light, and crosses in up to four layers where it is darkest. White on Arc blue
-// reads as a negative print: the more shadow, the more white.
-//
-// Kept deliberately close to the original so both stay recognisably one hand;
-// the site's text items and slice-at-a-time drawing are left out.
-
 export type Pt = [number, number];
 export type Dark = (u: number, v: number) => number;
 export type Map2 = (u: number, v: number) => Pt;
@@ -65,12 +55,10 @@ export function norm(v: [number, number, number]): [number, number, number] {
   const l = Math.hypot(v[0], v[1], v[2]) || 1;
   return [v[0] / l, v[1] / l, v[2] / l];
 }
-/** Light from the upper left and a little in front, in plate space (x right, y down, z toward the viewer). */
 const LS = norm([-0.62, -0.58, 0.52]);
 export function lit(nx: number, ny: number, nz: number) {
   return Math.max(0, nx * LS[0] + ny * LS[1] + nz * LS[2]);
 }
-/** A face of dressed stone, pillowed: bright bevels to the upper left, dark ones to the lower right. */
 export function pillow(u: number, v: number, e = 0.15) {
   const du = u < e ? (u - e) / e : u > 1 - e ? (u - 1 + e) / e : 0;
   const dv = v < e ? (v - e) / e : v > 1 - e ? (v - 1 + e) / e : 0;
@@ -110,12 +98,9 @@ export class Plate {
     for (let i = 0; i <= k; i++) { const a = a0 + ((a1 - a0) * i) / k; pts.push([cx + Math.cos(a) * r, cy - Math.sin(a) * r]); }
     this.add(pts, w, layer);
   }
-  /** A contour whose weight follows the shadow: heavier where the form turns away from the light. */
   contour(pts: Pt[], darkAt: (p: Pt) => number, w0: number, w1: number, layer = 1) {
     this.add(pts, pts.map((p) => mix(w0, w1, clamp(darkAt(p), 0, 1))), layer);
   }
-  /** Hatch a patch. pt(u, v) maps the unit square onto the drawing; dark(u, v) is 0 (light) .. 1 (black).
-   *  Family one runs along v, spaced along u; three crossing families enter at rising darkness. */
   hatch(pt: Map2, dark: Dark, o: HatchOptions) {
     const sp = o.sp || 1.5, nu = Math.max(2, Math.round(o.lenU / sp)), nv = Math.max(2, Math.round(o.lenV / (o.step || 1.4)));
     const T = o.t || [0.14, 0.42, 0.64, 0.84], w0 = o.w0 ?? 0.16, w1 = o.w1 ?? 0.72, layer = o.layer ?? 3;
@@ -148,7 +133,6 @@ export class Plate {
       }
     });
   }
-  /** Short strokes and dots scattered where dark(x, y) says, for grain and spray. */
   stipple(x0: number, y0: number, x1: number, y1: number, dark: (x: number, y: number) => number, count: number, seed = 1, w = 0.35, layer = 4) {
     const r = rng(seed);
     for (let i = 0; i < count; i++) {
@@ -162,7 +146,6 @@ export class Plate {
 
 const BINS = [0.26, 0.38, 0.52, 0.7, 0.95, 1.3, 1.8, 2.6];
 
-/** Draw a plate. T maps plate units to CSS px; the canvas is in device px (dpr). */
 export function drawPlate(
   g: CanvasRenderingContext2D,
   plate: Plate,

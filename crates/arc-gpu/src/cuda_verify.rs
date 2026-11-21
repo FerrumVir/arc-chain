@@ -1,28 +1,7 @@
-//! CUDA-accelerated Ed25519 batch signature verification.
-//!
-//! Feature-gated behind `cuda`. When the feature is not enabled, provides
-//! a stub `CudaVerifier` that always falls back to CPU verification.
-//!
-//! When enabled, uses embedded PTX for a 5-limb radix-2^51 Ed25519
-//! verification kernel. One thread per signature, block size 256.
-//! Pre-allocated device buffers mirror the Metal verifier pattern.
-//!
-//! Input format per signature (128 bytes, same as Metal):
-//! ```text
-//!   [  0.. 32]  R   (compressed signature point)
-//!   [ 32.. 64]  S   (signature scalar)
-//!   [ 64.. 96]  k   (pre-computed SHA-512 scalar, reduced mod l)
-//!   [ 96..128]  A   (compressed public key)
-//! ```
-
 use crate::metal_verify::{GpuVerifyResult, VerifyTask};
 use std::time::Instant;
 use tracing::{debug, warn};
 
-/// CUDA batch Ed25519 verifier.
-///
-/// When built with `--features cuda`, dispatches to NVIDIA GPU via cudarc.
-/// Otherwise, falls back to CPU rayon-parallel verification.
 pub struct CudaVerifier {
     available: bool,
     total_verified: u64,
@@ -36,7 +15,6 @@ impl Default for CudaVerifier {
 }
 
 impl CudaVerifier {
-    /// Create a new CUDA verifier. Probes for NVIDIA GPU availability.
     pub fn new() -> Self {
         let available = Self::probe_cuda();
         if available {
@@ -51,21 +29,14 @@ impl CudaVerifier {
         }
     }
 
-    /// Check if CUDA runtime is available.
     fn probe_cuda() -> bool {
-        // Without the `cuda` feature, CUDA is never available.
-        // With the feature, we'd check cudarc::driver::result::init() here.
         false
     }
 
-    /// Whether this verifier has a real CUDA backend.
     pub fn is_available(&self) -> bool {
         self.available
     }
 
-    /// Batch verify Ed25519 signatures.
-    ///
-    /// If CUDA is available, dispatches to GPU. Otherwise uses CPU fallback.
     pub fn batch_verify(&mut self, tasks: &[VerifyTask]) -> GpuVerifyResult {
         if tasks.is_empty() {
             return GpuVerifyResult {
@@ -80,7 +51,6 @@ impl CudaVerifier {
         let start = Instant::now();
 
         let (results, used_gpu) = if self.available {
-            // CUDA GPU path (when `cuda` feature is enabled and GPU is present)
             match self.gpu_verify(tasks) {
                 Ok(r) => (r, true),
                 Err(e) => {
@@ -124,29 +94,11 @@ impl CudaVerifier {
         }
     }
 
-    /// GPU dispatch path. Returns per-signature validity.
     fn gpu_verify(&self, _tasks: &[VerifyTask]) -> Result<Vec<bool>, String> {
-        // This is the cudarc dispatch path. When compiled with `cuda` feature:
-        //
-        // 1. Pack signatures into 128-byte input format (R, S, k, A)
-        //    - Pre-compute k = SHA-512(R || A || msg) reduced mod l on CPU
-        // 2. Copy packed input to device buffer
-        // 3. Launch ed25519_verify_kernel<<<blocks, 256>>>
-        // 4. Copy u32 results back (1=valid, 0=invalid)
-        // 5. Convert to Vec<bool>
-        //
-        // The PTX kernel implements:
-        //   - 5-limb radix-2^51 field arithmetic for GF(2^255-19)
-        //   - Extended twisted Edwards point operations
-        //   - Double scalar multiplication: [s]B - [k]A
-        //   - Point comparison with R
-        //
-        // See ED25519_VERIFY_PTX below for the kernel source.
         Err("CUDA feature not enabled at compile time".to_string())
     }
 }
 
-/// CPU rayon-parallel fallback.
 fn cpu_fallback(tasks: &[VerifyTask]) -> Vec<bool> {
     use ed25519_dalek::{Signature, VerifyingKey};
     use rayon::prelude::*;
@@ -167,15 +119,6 @@ fn cpu_fallback(tasks: &[VerifyTask]) -> Vec<bool> {
     }
 }
 
-/// Embedded PTX source for the Ed25519 verification kernel.
-///
-/// This kernel verifies one Ed25519 signature per CUDA thread using 5-limb
-/// radix-2^51 arithmetic in GF(2^255-19). Input is 128 bytes per signature:
-/// [R(32), S(32), k(32), A(32)]. Output is one u32 per signature (1=valid).
-///
-/// The kernel will be compiled to PTX via nvcc or loaded as pre-compiled PTX.
-/// For now, this serves as the reference implementation that will be compiled
-/// when the CUDA toolchain is available.
 #[allow(dead_code)]
 const ED25519_VERIFY_PTX_SOURCE: &str = r#"
 // Ed25519 signature verification CUDA kernel
@@ -222,7 +165,6 @@ mod tests {
     #[test]
     fn test_cuda_verifier_creation() {
         let v = CudaVerifier::new();
-        // Without CUDA feature, should not be available
         assert!(!v.is_available());
     }
 

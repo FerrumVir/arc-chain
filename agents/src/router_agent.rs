@@ -1,27 +1,3 @@
-//! Router Agent - On-chain AI agent that routes inference requests.
-//!
-//! Demonstrates:
-//! - Receiving inference requests and routing to available agents
-//! - Selecting the cheapest/fastest inference provider
-//! - Collecting a routing fee via Settle TXs
-//! - Agent-to-agent communication patterns
-//!
-//! # Architecture
-//!
-//! ```text
-//!                          ┌───────────────┐
-//!                          │  Router Agent  │
-//!                 request  │  ┌──────────┐ │  route
-//! ┌──────────┐ ─────────> │  │ Routing  │ │ ──────> ┌──────────────┐
-//! │  Client   │            │  │  Table   │ │         │ Sentiment    │
-//! │           │ <───────── │  └──────────┘ │ <────── │ Agent        │
-//! └──────────┘   result   │               │  result └──────────────┘
-//!                         │  Settle TXs   │
-//!                         │  (routing fee) │ ──────> ┌──────────────┐
-//!                         └───────────────┘         │ Oracle Agent │
-//!                                                   └──────────────┘
-//! ```
-
 use arc_crypto::signature::Signature;
 use arc_crypto::{Hash256, hash_bytes};
 use arc_types::transaction::{RegisterBody, SettleBody, Transaction, TxBody, TxType};
@@ -29,25 +5,12 @@ use arc_vm::agent::{
     ActionResult, ActionType, Agent, AgentAction, AgentConfig, AgentId, AgentRegistry, AgentState,
 };
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 const AGENT_NAME: &str = "inference-router-v1";
 
-/// Routing fee in ARC (charged per routed request).
 const ROUTING_FEE: u64 = 10;
 
-// ---------------------------------------------------------------------------
-// Routing table
-// ---------------------------------------------------------------------------
-
-/// Seed data for one demo provider, in the order the demo table lists them:
-/// (routing key, display name, cost per request, average latency in ms,
-/// capabilities, reputation).
 type ProviderSeed = (&'static str, &'static str, u64, u64, Vec<&'static str>, f64);
 
-/// An entry in the routing table representing an available inference provider.
 #[derive(Debug, Clone)]
 struct ProviderEntry {
     agent_id: AgentId,
@@ -60,7 +23,6 @@ struct ProviderEntry {
     reputation: f64,
 }
 
-/// Strategy for selecting an inference provider.
 #[derive(Debug, Clone, Copy)]
 enum RoutingStrategy {
     Cheapest,
@@ -68,7 +30,6 @@ enum RoutingStrategy {
     Balanced,
 }
 
-/// Routing table managing available inference providers.
 struct RoutingTable {
     providers: Vec<ProviderEntry>,
 }
@@ -121,7 +82,6 @@ impl RoutingTable {
     }
 }
 
-/// An inference request to be routed.
 #[derive(Debug)]
 struct InferenceRoutingRequest {
     capability: String,
@@ -129,10 +89,6 @@ struct InferenceRoutingRequest {
     max_cost: u64,
     strategy: RoutingStrategy,
 }
-
-// ---------------------------------------------------------------------------
-// Transaction helpers
-// ---------------------------------------------------------------------------
 
 fn build_register_tx(owner: Hash256, nonce: u64) -> Transaction {
     let body = TxBody::RegisterAgent(RegisterBody {
@@ -223,16 +179,11 @@ fn build_provider_settle_tx(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
-
 fn main() {
     println!("=== ARC Chain Router Agent ===\n");
 
     let owner = hash_bytes(b"router-agent-owner");
 
-    // 1. Register the router agent.
     println!("[1/5] Registering router agent on-chain");
     let register_tx = build_register_tx(owner, 0);
     println!("      RegisterAgent TX: hash={}", register_tx.hash);
@@ -268,7 +219,6 @@ fn main() {
         .expect("activation failed");
     println!("      Router agent registered: {:?}", router_id);
 
-    // 2. Populate the routing table with inference providers.
     println!("[2/5] Populating routing table with inference providers\n");
     let mut routing_table = RoutingTable::new();
 
@@ -337,7 +287,6 @@ fn main() {
         routing_table.available_count()
     );
 
-    // 3. Register provider agents on-chain.
     println!("\n[3/5] Registering provider agents on-chain");
     for (i, (key, _name, _cost, _latency, _caps, _rep)) in providers_data.iter().enumerate() {
         let id_bytes = hash_bytes(key.as_bytes()).0;
@@ -363,7 +312,6 @@ fn main() {
         println!("      Provider {} registered: {:?}", i + 1, id);
     }
 
-    // 4. Process sample routing requests.
     println!("\n[4/5] Processing inference routing requests\n");
 
     let requests = [
@@ -491,7 +439,6 @@ fn main() {
         println!();
     }
 
-    // 5. Summary.
     println!("[5/5] Router agent summary\n");
     let final_router = registry.get(&router_id).expect("router not found");
     println!("  Name:               {}", final_router.name);

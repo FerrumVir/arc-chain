@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Adversarial tests for isolated release-manifest signing handoffs."""
 
 from __future__ import annotations
 

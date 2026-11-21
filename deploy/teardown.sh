@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# ARC_RETIRED_LIVE_TOOL_V3_REQUIRED
 set -euo pipefail
 printf '%s\n' \
     'RETIRED: deploy/teardown.sh cannot safely select or delete cloud servers.' \

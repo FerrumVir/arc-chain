@@ -1,10 +1,3 @@
-//! BF16 safetensors to the integer package (spec §4), on the device.
-//!
-//! Every step reads BF16 bit patterns as exact rationals and uses integer
-//! arithmetic only, so identical source bytes give identical package bytes on
-//! every OS and CPU. Rows are quantised in parallel; each row is independent,
-//! so the thread count cannot change a byte.
-
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
@@ -20,10 +13,8 @@ use super::package::{self, PackageDigest, PackageWriter};
 use super::safetensors::SafetensorsFile;
 use super::{ModernError, hex_lower, tables};
 
-/// Source manifest schema (`docs/protocol/packages/*.source.json`).
 pub const SOURCE_SCHEMA: &str = "arc.hf-source.v1";
 
-/// One pinned source file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceFile {
     pub name: String,
@@ -31,13 +22,11 @@ pub struct SourceFile {
     pub sha256: String,
 }
 
-/// A pinned Hugging Face source: repository, revision and file digests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceManifest {
     pub repo: String,
     pub revision: String,
     pub max_seq: usize,
-    /// `config.json` and the safetensors shards, in conversion order.
     pub files: Vec<SourceFile>,
     pub tokenizer: Option<SourceFile>,
     pub chat_template: Option<SourceFile>,
@@ -71,7 +60,6 @@ fn source_file(value: &Value, what: &str) -> Result<SourceFile, ModernError> {
 }
 
 impl SourceManifest {
-    /// Parse a source manifest.
     pub fn parse(bytes: &[u8]) -> Result<Self, ModernError> {
         let value: Value = serde_json::from_slice(bytes)
             .map_err(|e| ModernError::Invalid(format!("source manifest JSON: {e}")))?;
@@ -110,14 +98,12 @@ impl SourceManifest {
         })
     }
 
-    /// Read and parse a source manifest file.
     pub fn read(path: &Path) -> Result<Self, ModernError> {
         let bytes =
             std::fs::read(path).map_err(|e| ModernError::io(&path.display().to_string(), e))?;
         Self::parse(&bytes)
     }
 
-    /// The `source` object recorded in the package header (spec §4.9).
     pub fn header_json(&self) -> Value {
         let files: Vec<Value> = self
             .files
@@ -128,7 +114,6 @@ impl SourceManifest {
     }
 }
 
-/// Stream `path` through SHA-256, returning `(bytes, hex digest)`.
 pub fn sha256_file(path: &Path) -> Result<(u64, String), ModernError> {
     let context = path.display().to_string();
     let mut file = File::open(path).map_err(|e| ModernError::io(&context, e))?;
@@ -148,7 +133,6 @@ pub fn sha256_file(path: &Path) -> Result<(u64, String), ModernError> {
     Ok((total, hex_lower(&hasher.finalize())))
 }
 
-/// Refuse unless `dir/name` has exactly the pinned length and SHA-256.
 pub fn verify_source_file(dir: &Path, file: &SourceFile) -> Result<PathBuf, ModernError> {
     let path = dir.join(&file.name);
     let (bytes, sha256) = sha256_file(&path)?;
@@ -163,7 +147,6 @@ pub fn verify_source_file(dir: &Path, file: &SourceFile) -> Result<PathBuf, Mode
     Ok(path)
 }
 
-/// Exact parts of a BF16 value: `(negative, M, e)` with value `(-1)^s * M * 2^e`.
 pub fn bf16_parts(bits: u16) -> Result<(bool, u32, i32), ModernError> {
     let negative = bits >> 15 == 1;
     let exponent = (bits >> 7) & 0xFF;
@@ -175,7 +158,6 @@ pub fn bf16_parts(bits: u16) -> Result<(bool, u32, i32), ModernError> {
     }
 }
 
-/// Quantise one row to INT8 with a dyadic scale (spec §4.2).
 pub fn quantize_row(bits: &[u16], q: &mut [i8]) -> Result<(i32, u8), ModernError> {
     if bits.len() != q.len() {
         return Err(ModernError::Invalid("quantize_row length mismatch".into()));
@@ -235,7 +217,6 @@ pub fn quantize_row(bits: &[u16], q: &mut [i8]) -> Result<(i32, u8), ModernError
     Ok((mu as i32, k as u8))
 }
 
-/// Quantise a `[rows, cols]` BF16 matrix (spec §4.2).
 pub fn quantize_matrix(
     bits: &[u16],
     rows: usize,
@@ -265,7 +246,6 @@ pub fn quantize_matrix(
     })
 }
 
-/// `round_half_away(v * 2^16)` of a BF16 value, exactly (spec §4.3).
 pub fn bf16_to_q16(bits: u16) -> Result<i64, ModernError> {
     let (negative, m, e) = bf16_parts(bits)?;
     let m = i128::from(m);
@@ -282,7 +262,6 @@ pub fn bf16_to_q16(bits: u16) -> Result<i64, ModernError> {
     Ok((if negative { -magnitude } else { magnitude }) as i64)
 }
 
-/// `round_half_away(eps * 2^32)` (spec §4.4).
 pub fn eps_q32(eps: f64) -> Result<i64, ModernError> {
     let scaled = (eps * 4_294_967_296.0).round();
     if !(1.0..1.0e12).contains(&scaled) {
@@ -293,7 +272,6 @@ pub fn eps_q32(eps: f64) -> Result<i64, ModernError> {
     Ok(scaled as i64)
 }
 
-/// Parsed `config.json`: the model shape and the EOS ids.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HfConfig {
     pub config: ModernConfig,
@@ -307,7 +285,6 @@ fn config_flag_absent_or(value: &Value, key: &str, allowed: &Value) -> bool {
     }
 }
 
-/// Parse and check a Hugging Face `config.json` (spec §4.6).
 pub fn parse_hf_config(bytes: &[u8], max_seq: usize) -> Result<HfConfig, ModernError> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|e| ModernError::Invalid(format!("config.json: {e}")))?;
@@ -411,7 +388,6 @@ pub fn parse_hf_config(bytes: &[u8], max_seq: usize) -> Result<HfConfig, ModernE
     Ok(HfConfig { config, eos })
 }
 
-/// Hugging Face tensor name for each package matrix of layer `l`.
 fn layer_sources(l: usize) -> [(&'static str, String); 7] {
     let p = format!("model.layers.{l}");
     [
@@ -425,7 +401,6 @@ fn layer_sources(l: usize) -> [(&'static str, String); 7] {
     ]
 }
 
-/// Every source tensor with its required shape, in package order.
 fn expected_tensors(c: &ModernConfig) -> Vec<(String, Vec<usize>)> {
     let mut out = vec![
         (
@@ -455,7 +430,6 @@ fn expected_tensors(c: &ModernConfig) -> Vec<(String, Vec<usize>)> {
     out
 }
 
-/// All tensors of all shards, by name.
 struct SourceTensors {
     shards: Vec<SafetensorsFile>,
     index: BTreeMap<String, usize>,
@@ -512,7 +486,6 @@ impl SourceTensors {
     }
 }
 
-/// What a conversion produced.
 #[derive(Debug, Clone)]
 pub struct ConversionReport {
     pub digest: PackageDigest,
@@ -520,14 +493,9 @@ pub struct ConversionReport {
     pub manifest: Value,
     pub config: ModernConfig,
     pub seconds: f64,
-    /// What Q16 row scales would have cost on these rows (measurement only).
     pub scale_stats: ScaleStats,
 }
 
-/// Measured gain error a v1 Q16 row scale `round(absmax * 2^16 / 127)` would
-/// carry on each converted row, next to the dyadic scale actually used
-/// (relative error at most 2^-31 by construction). Measurement only: nothing
-/// here feeds the package bytes.
 #[derive(Debug, Clone, Default)]
 pub struct ScaleStats {
     pub rows: u64,
@@ -537,13 +505,11 @@ pub struct ScaleStats {
 }
 
 impl ScaleStats {
-    /// Add every nonzero row of `matrix`.
     pub fn add(&mut self, matrix: &DyadicMatrix) {
         for (&mu, &k) in matrix.mu.iter().zip(&matrix.k) {
             if mu == 0 {
                 continue;
             }
-            // mu * 2^(16 - k) is the exact Q16 scale to within 2^-31.
             let exact = f64::from(mu) * 2f64.powi(16 - i32::from(k));
             let q16 = exact.round().max(1.0);
             let error = (q16 - exact).abs() / exact;
@@ -574,10 +540,6 @@ impl ScaleStats {
     }
 }
 
-/// Convert the pinned BF16 source in `dir` to the package at `out`.
-///
-/// Every file named in the source manifest is checked for its exact length
-/// and SHA-256 first; nothing is converted from an unverified byte.
 pub fn convert(
     dir: &Path,
     source: &SourceManifest,
@@ -690,7 +652,7 @@ mod tests {
 
     #[test]
     fn bf16_parts_decode_normals_subnormals_and_refuse_nan() {
-        assert_eq!(bf16_parts(0x3F80).unwrap(), (false, 128, -7)); // 1.0 = 128 * 2^-7
+        assert_eq!(bf16_parts(0x3F80).unwrap(), (false, 128, -7));
         assert_eq!(bf16_parts(0xBF80).unwrap(), (true, 128, -7));
         assert_eq!(bf16_parts(0x0001).unwrap(), (false, 1, -133));
         assert_eq!(bf16_parts(0x8000).unwrap(), (true, 0, -133));
@@ -700,23 +662,18 @@ mod tests {
 
     #[test]
     fn rows_quantise_exactly_with_dyadic_scales() {
-        // Row [1.0, -0.5, 0.25, 0]: A = 1, q = rha(127 v).
         let bits = [bf16(1.0), bf16(-0.5), bf16(0.25), 0];
         let mut q = [0i8; 4];
         let (mu, k) = quantize_row(&bits, &mut q).unwrap();
-        // 127 * 0.5 = 63.5 -> 64 (half away), 127 * 0.25 = 31.75 -> 32.
         assert_eq!(q, [127, -64, 32, 0]);
-        // 1/127 = mu * 2^-k with mu in [2^30, 2^31).
         assert!((1 << 30..1i64 << 31).contains(&i64::from(mu)));
         let exact = 1.0 / 127.0;
         let got = f64::from(mu) / 2f64.powi(i32::from(k));
         assert!(((got - exact) / exact).abs() < 1e-9);
         assert_eq!((mu, k), (1_082_196_484, 37));
-        // All-zero rows have the zero scale.
         let mut q = [5i8; 3];
         assert_eq!(quantize_row(&[0, 0x8000, 0], &mut q).unwrap(), (0, 16));
         assert_eq!(q, [0, 0, 0]);
-        // NaN anywhere in a row is refused.
         assert!(quantize_row(&[bf16(1.0), 0x7FC0], &mut [0i8; 2]).is_err());
     }
 
@@ -724,7 +681,6 @@ mod tests {
     fn norm_gains_round_half_away_from_zero() {
         assert_eq!(bf16_to_q16(bf16(1.0)).unwrap(), 65_536);
         assert_eq!(bf16_to_q16(bf16(-2.5)).unwrap(), -163_840);
-        // 2^-17 = 0.5 Q16 units -> 1 (away from zero); -2^-17 -> -1.
         assert_eq!(bf16_to_q16(bf16(2f32.powi(-17))).unwrap(), 1);
         assert_eq!(bf16_to_q16(bf16(-(2f32.powi(-17)))).unwrap(), -1);
         assert_eq!(bf16_to_q16(bf16(2f32.powi(-18))).unwrap(), 0);

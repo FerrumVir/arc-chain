@@ -1,26 +1,3 @@
-//! ARC Chain - Production Pipeline Benchmark (HONEST)
-//!
-//! This benchmark measures REAL production throughput through the actual
-//! 4-stage pipeline: Receive → Verify → Execute → Commit.
-//!
-//! Unlike other benchmarks that skip signature verification or measure
-//! components in isolation, this runs the COMPLETE production path:
-//!   1. Pre-sign transactions with real Ed25519 keypairs
-//!   2. Push signed batches through the Pipeline
-//!   3. Pipeline verifies hash integrity
-//!   4. Pipeline batch-verifies Ed25519 signatures (CPU-parallel, NOT GPU)
-//!   5. Pipeline executes state transitions (balance transfers)
-//!   6. Pipeline commits blocks (Merkle tree, WAL)
-//!   7. Measure end-to-end throughput
-//!
-//! Multi-proposer mode simulates N independent proposer nodes, each with
-//! its own state and pipeline, processing non-overlapping transaction sets.
-//! This is the propose-verify architecture: each proposer executes its own
-//! partition; in production, verifiers would check state diffs.
-//!
-//! Usage:
-//!   arc-bench-production [--txs 100000] [--batch 10000] [--proposers 1]
-
 mod ephemeral_keys;
 
 use arc_crypto::Hash256;
@@ -66,8 +43,6 @@ fn format_tps(tps: f64) -> String {
     }
 }
 
-/// Pre-sign a batch of transactions for a given proposer's sender partition.
-/// Each proposer gets senders [start..start+count), receivers from a separate range.
 fn presign_transactions(
     _sender_start: u8,
     sender_count: u8,
@@ -75,10 +50,8 @@ fn presign_transactions(
 ) -> (Vec<Transaction>, Vec<(Hash256, u64)>) {
     let keypairs = ephemeral_keys::signing_keypairs(sender_count as usize);
 
-    // Receiver addresses (don't overlap with senders)
     let receivers = ephemeral_keys::addresses(56);
 
-    // Genesis accounts: fund all senders and receivers
     let mut genesis: Vec<(Hash256, u64)> = keypairs
         .iter()
         .map(|(_, addr)| (*addr, u64::MAX / 4))
@@ -108,18 +81,14 @@ fn presign_transactions(
     (transactions, genesis)
 }
 
-/// Run a single proposer's pipeline benchmark.
-/// Returns (total_txs_processed, total_success, elapsed).
 fn run_single_proposer(
     proposer_id: usize,
     total_txs: usize,
     batch_size: usize,
 ) -> (usize, usize, Duration) {
-    // Each proposer gets its own sender partition (non-overlapping)
     let senders_per_proposer = 10u8;
     let sender_start = (proposer_id as u8) * senders_per_proposer;
 
-    // Pre-sign all transactions
     let sign_start = Instant::now();
     let (transactions, genesis) =
         presign_transactions(sender_start, senders_per_proposer, total_txs);
@@ -133,20 +102,16 @@ fn run_single_proposer(
         format_tps(transactions.len() as f64 / sign_elapsed.as_secs_f64()),
     );
 
-    // Create state with genesis accounts
     let state = Arc::new(StateDB::with_genesis(&genesis));
 
-    // Create the actual production pipeline
     let pipeline = Pipeline::new(Arc::clone(&state));
     let producer = genesis[0].0;
 
-    // Feed batches into the pipeline and collect results
     let pipeline_start = Instant::now();
     let mut batches_submitted = 0usize;
     let mut total_processed = 0usize;
     let mut total_success = 0usize;
 
-    // Submit all batches
     let num_batches = transactions.len().div_ceil(batch_size);
     let mut tx_iter = transactions.into_iter();
 
@@ -164,7 +129,6 @@ fn run_single_proposer(
         batches_submitted += 1;
     }
 
-    // Collect all results (blocking with timeout)
     let timeout = Duration::from_secs(120);
     let deadline = Instant::now() + timeout;
     let mut results_received = 0usize;
@@ -179,7 +143,6 @@ fn run_single_proposer(
             break;
         }
 
-        // Poll with short sleep to avoid busy-waiting
         if let Some(result) = pipeline.try_recv() {
             total_processed += result.tx_count;
             total_success += result.success_count;
@@ -235,7 +198,6 @@ fn main() {
     println!();
 
     if args.proposers == 1 {
-        // ── Single Proposer ────────────────────────────────────────────
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         println!("  SINGLE PROPOSER (Full Pipeline)");
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -253,7 +215,6 @@ fn main() {
         println!("    Throughput:    {} TPS", format_tps(tps));
         println!();
 
-        // ── Honest projections ─────────────────────────────────────────
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         println!("  PROJECTIONS (based on measured single-proposer TPS)");
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -263,9 +224,8 @@ fn main() {
         println!("  Verifiers only check state diffs (O(k), nearly free).");
         println!();
 
-        // Conservative: same TPS per machine (reality varies by hardware)
         let per_machine = tps;
-        let three_machine = per_machine * 3.0 * 0.90; // 90% efficiency for network overhead
+        let three_machine = per_machine * 3.0 * 0.90;
         println!(
             "    1 machine (this):    {:>12} TPS (measured)",
             format_tps(per_machine)
@@ -315,7 +275,6 @@ fn main() {
             }
         }
     } else {
-        // ── Multi-Proposer Simulation ──────────────────────────────────
         println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         println!("  MULTI-PROPOSER SIMULATION ({} proposers)", args.proposers);
         println!("  Each proposer has its own state + pipeline + tx partition.");
@@ -325,7 +284,6 @@ fn main() {
 
         let overall_start = Instant::now();
 
-        // Run proposers in parallel threads
         let handles: Vec<_> = (0..args.proposers)
             .map(|id| {
                 let txs = args.txs;
@@ -364,7 +322,6 @@ fn main() {
             );
         }
 
-        // Aggregate TPS = total txs processed / wall-clock time
         let aggregate_tps = total_processed as f64 / overall_elapsed.as_secs_f64();
         let sum_individual_tps: f64 = per_proposer_tps.iter().sum();
         let avg_individual_tps = sum_individual_tps / args.proposers as f64;

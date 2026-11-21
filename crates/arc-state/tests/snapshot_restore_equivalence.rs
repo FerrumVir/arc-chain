@@ -1,12 +1,3 @@
-//! A snapshot plus the WAL tail after it must reach exactly the state that
-//! replaying the whole WAL reaches.
-//!
-//! That equivalence is the entire justification for skipping records at open.
-//! It is asserted here against real `StateDB` instances over real files rather
-//! than argued for, and the failure modes a snapshot introduces - a corrupt
-//! payload, a lost manifest, an interrupted write, a snapshot that does not
-//! reproduce its own state root - each get a test that the node still recovers.
-
 use arc_crypto::{Hash256, hash_bytes};
 use arc_state::StateDB;
 use arc_state::snapshot::{self, SnapshotError};
@@ -24,7 +15,6 @@ fn open(dir: &std::path::Path) -> StateDB {
     StateDB::with_genesis_persistent(&prefunded(), dir, Hash256::ZERO).expect("persistent state")
 }
 
-/// Produce `count` canonical blocks, so the WAL has a tail worth skipping.
 fn advance(state: &StateDB, count: u64) {
     for i in 0..count {
         state
@@ -41,7 +31,6 @@ fn advance(state: &StateDB, count: u64) {
 type ObservedChain = Vec<(u64, Hash256, Hash256)>;
 type ObservableState = (u64, Hash256, ObservedChain, Vec<u64>);
 
-/// Everything an observer can read back, used to compare two recovered states.
 fn observable(state: &StateDB) -> ObservableState {
     let height = state.height();
     let chain = (0..=height)
@@ -63,7 +52,6 @@ fn a_snapshot_plus_the_tail_equals_a_full_replay() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state");
 
-    // Build a chain, snapshot partway, then keep going.
     let state = open(&path);
     advance(&state, 12);
     let manifest = state
@@ -74,12 +62,10 @@ fn a_snapshot_plus_the_tail_equals_a_full_replay() {
     let expected = observable(&state);
     drop(state);
 
-    // Reopen WITH the snapshot: only the tail is applied.
     let with_snapshot = open(&path);
     let from_snapshot = observable(&with_snapshot);
     drop(with_snapshot);
 
-    // Reopen WITHOUT it: the whole WAL is applied.
     snapshot::remove(&path).expect("snapshot removed");
     let full_replay = open(&path);
     let from_replay = observable(&full_replay);
@@ -100,7 +86,6 @@ fn transfer(from: Address, to: Address, amount: u64, nonce: u64) -> arc_types::T
     tx
 }
 
-/// Every transaction's receipt outcome and whether its body is held.
 fn history(state: &StateDB, hashes: &[Hash256]) -> Vec<(Hash256, Option<bool>, bool)> {
     hashes
         .iter()
@@ -116,10 +101,6 @@ fn history(state: &StateDB, hashes: &[Hash256]) -> Vec<(Hash256, Option<bool>, b
 
 #[test]
 fn a_snapshot_carries_only_a_recent_history_window_and_open_rebuilds_the_rest() {
-    // A snapshot used to capture every block, receipt and body, so each one
-    // grew with the chain. It now carries a recent window; the rest must come
-    // back from the WAL records below it - with every receipt and body, not
-    // just the block headers.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state");
     let state = open(&path);
@@ -242,7 +223,6 @@ fn a_corrupt_snapshot_is_refused_and_the_node_still_recovers() {
     let expected = observable(&state);
     drop(state);
 
-    // Flip a byte in the payload. The digest no longer matches.
     let payload = path.join(snapshot::PAYLOAD_FILE);
     let mut bytes = std::fs::read(&payload).unwrap();
     let middle = bytes.len() / 2;
@@ -253,7 +233,6 @@ fn a_corrupt_snapshot_is_refused_and_the_node_still_recovers() {
         Err(SnapshotError::DigestMismatch { .. })
     ));
 
-    // The node opens anyway, by replaying everything.
     let recovered = open(&path);
     assert_eq!(
         observable(&recovered),
@@ -264,8 +243,6 @@ fn a_corrupt_snapshot_is_refused_and_the_node_still_recovers() {
 
 #[test]
 fn an_interrupted_snapshot_write_leaves_the_previous_state_recoverable() {
-    // The shape a crash between the payload write and the manifest write
-    // leaves: a payload with no manifest naming it.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state");
     let state = open(&path);
@@ -284,10 +261,6 @@ fn an_interrupted_snapshot_write_leaves_the_previous_state_recoverable() {
 
 #[test]
 fn a_snapshot_that_does_not_reproduce_its_state_root_is_backed_out() {
-    // A digest proves the bytes are the ones written. It does not prove they
-    // describe the state they claim to - so the root is recomputed after
-    // installing, and a mismatch must discard the install rather than build
-    // the tail on top of it.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state");
     let state = open(&path);
@@ -297,8 +270,6 @@ fn a_snapshot_that_does_not_reproduce_its_state_root_is_backed_out() {
     let expected = observable(&state);
     drop(state);
 
-    // Rewrite the manifest with a state root that is not the payload's, and
-    // re-point its digest at the untouched payload so only the ROOT is wrong.
     let loaded = snapshot::load(&path).expect("snapshot loads");
     snapshot::publish(
         &path,
@@ -330,7 +301,6 @@ fn a_snapshot_from_an_unknown_version_is_ignored_not_guessed_at() {
 
     let manifest_path = path.join(snapshot::MANIFEST_FILE);
     let mut bytes = std::fs::read(&manifest_path).unwrap();
-    // The version byte sits immediately after the magic.
     bytes[b"ARC-SNAPSHOT".len()] = 99;
     std::fs::write(&manifest_path, &bytes).unwrap();
     assert!(matches!(
@@ -344,10 +314,6 @@ fn a_snapshot_from_an_unknown_version_is_ignored_not_guessed_at() {
 
 #[test]
 fn a_torn_wal_tail_after_a_snapshot_still_recovers_to_the_repaired_state() {
-    // A snapshot bounds what replay applies; it must not change what replay
-    // DECIDES. If the tail beyond the snapshot is torn, recovery has to reach
-    // the same state a full replay of the repaired log reaches - not the
-    // snapshot's own height, and not a mixture.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state");
 
@@ -359,7 +325,6 @@ fn a_torn_wal_tail_after_a_snapshot_still_recovers_to_the_repaired_state() {
     advance(&state, 6);
     drop(state);
 
-    // Tear the final frame, the way a crash mid-append leaves it.
     let wal = path.join("state.wal");
     let bytes = std::fs::read(&wal).unwrap();
     assert!(bytes.len() > 64);
@@ -374,7 +339,6 @@ fn a_torn_wal_tail_after_a_snapshot_still_recovers_to_the_repaired_state() {
     );
     drop(with_snapshot);
 
-    // The same torn log, replayed in full, must agree.
     snapshot::remove(&path).expect("snapshot removed");
     let full_replay = open(&path);
     assert_eq!(
@@ -386,9 +350,6 @@ fn a_torn_wal_tail_after_a_snapshot_still_recovers_to_the_repaired_state() {
 
 #[test]
 fn a_snapshot_ahead_of_the_wal_is_refused() {
-    // A snapshot naming a resume point beyond anything in the log would skip
-    // every remaining record. The state root check is what catches it: the
-    // installed payload describes a height the log never reached.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state");
     let state = open(&path);

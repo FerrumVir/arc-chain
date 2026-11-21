@@ -1,35 +1,3 @@
-//! Canonical INT8 worker benchmark on a 7B-shaped synthetic model.
-//!
-//! CI evidence for Stage 0 of the kernel plan: positions per second of the
-//! forward pass a community worker runs, with the process's default projection
-//! kernel and with the other kernel, in one process on the same machine. The
-//! model has Llama-2-7B shapes (32 layers, d_model 4096, 32 heads, d_ff 11008,
-//! a 32,000-row LM head) in the canonical per-row INT8 profile and the legacy
-//! split-half layout workers run. Its weights come from a fixed SplitMix64
-//! stream, so nothing is downloaded and every run computes the same integers.
-//! Only the first 512 embedding rows are materialised; an embedding is one row
-//! lookup per position, so this changes no per-position work.
-//!
-//! Each leg decodes the same tokens with `forward_one_token`, the call a worker
-//! makes once per position, starting from an empty KV cache. The run fails if
-//! the legs' logits or KV caches differ, or if a vectorised leg refused any
-//! projection, which would otherwise report a scalar fallback as a vectorised
-//! timing.
-//!
-//! Timings are wall clock on whatever machine runs this. On GitHub-hosted
-//! runners they are CI-runner measurements, not product benchmarks.
-//!
-//! ```text
-//! cargo run --release --locked -p arc-inference --example canonical_worker_bench -- \
-//!     [--layers 32] [--positions 8] [--warmup 1] [--threads N] [--summary FILE] \
-//!     [--expect-default KERNEL]
-//! ```
-//!
-//! `--summary` appends a Markdown table to an existing file, such as
-//! `$GITHUB_STEP_SUMMARY`. `--expect-default` fails the run unless the
-//! process default kernel has that name (`avx2-limb`, `neon-sdot-limb` or
-//! `scalar-i8xi64`), which lets CI check the default and the overrides.
-
 use arc_inference::cached_integer_model::{
     ArithmeticProfile, CachedIntegerModel, CachedLayer, I8Weights, KVCache, ModelConfig,
 };
@@ -43,15 +11,11 @@ const D_MODEL: usize = 4096;
 const N_HEADS: usize = 32;
 const D_FF: usize = 11_008;
 const VOCAB: usize = 32_000;
-/// Embedding rows materialised. Every id in `TOKENS` is below this.
 const EMBEDDED_TOKENS: usize = 512;
 const MAX_SEQ: usize = 64;
-/// Decoded in order, one forward per position, starting with Llama's BOS id.
 const TOKENS: [u32; 16] = [
     1, 13, 29, 37, 101, 211, 307, 409, 503, 3, 7, 11, 17, 19, 23, 31,
 ];
-/// Q16 samples of the unit circle at multiples of pi/8, as in the golden
-/// fixture, so the RoPE tables need no platform math library.
 const COS: [i64; 16] = [
     65_536, 60_547, 46_341, 25_080, 0, -25_080, -46_341, -60_547, -65_536, -60_547, -46_341,
     -25_080, 0, 25_080, 46_341, 60_547,
@@ -60,10 +24,7 @@ const SIN: [i64; 16] = [
     0, 25_080, 46_341, 60_547, 65_536, 60_547, 46_341, 25_080, 0, -25_080, -46_341, -60_547,
     -65_536, -60_547, -46_341, -25_080,
 ];
-/// The kernel plan's Stage 0 target for a 4-vCPU runner (baseline 0.77).
 const TARGET_POSITIONS_PER_SECOND: f64 = 1.4;
-/// Bytes filled from one independently seeded stream, so weight generation
-/// runs in parallel and still does not depend on the thread count.
 const FILL_CHUNK: usize = 1 << 20;
 
 struct Args {
@@ -120,7 +81,6 @@ fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
-/// SplitMix64: a fixed, platform-independent stream for the synthetic weights.
 fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = *state;
@@ -129,10 +89,6 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// A row-major INT8 matrix with weights in [-127, 127], the range per-row
-/// quantization produces, and per-row Q16 scales in [12, 35]. These scales
-/// keep activations at the magnitudes the real 7B model shows, so the limb
-/// kernel works on three digit planes, as it does there.
 fn matrix(rows: usize, cols: usize, seed: u64) -> I8Weights {
     let mut data = vec![0i8; rows * cols];
     data.par_chunks_mut(FILL_CHUNK)
@@ -158,7 +114,6 @@ fn matrix(rows: usize, cols: usize, seed: u64) -> I8Weights {
     }
 }
 
-/// RMSNorm gains near 1.0 in Q16, as in the golden fixture.
 fn norm(len: usize, seed: u64) -> Vec<i64> {
     let mut state = seed;
     (0..len)
@@ -211,7 +166,6 @@ fn build_model(n_layers: usize) -> CachedIntegerModel {
             d_head,
             d_kv: D_MODEL,
             vocab_size: VOCAB,
-            // round(2^16 / sqrt(128))
             attn_scale: 5_793,
             rope_cos,
             rope_sin,
@@ -262,8 +216,6 @@ fn weight_bytes(model: &CachedIntegerModel) -> usize {
     layers + model.output_weight.data.len()
 }
 
-/// The projection kernel I8 matmuls use right now, named as the determinism
-/// proof (PR #136) names them.
 fn kernel_name() -> &'static str {
     if !canonical_simd::fast_canonical_kernel_enabled() {
         "scalar-i8xi64"
@@ -308,8 +260,6 @@ impl Leg {
     }
 }
 
-/// Decode `TOKENS[..warmup + positions]` on a `threads`-wide pool with the
-/// current process-wide kernel, timing every position after the warm-up.
 fn run_leg(model: &CachedIntegerModel, label: &'static str, args: &Args) -> Result<Leg, String> {
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(args.threads)
@@ -357,8 +307,6 @@ fn run_leg(model: &CachedIntegerModel, label: &'static str, args: &Args) -> Resu
 
 fn main() -> Result<(), String> {
     let args = parse_args()?;
-    // Read the process default before anything chooses a kernel, so the first
-    // leg runs what a worker started without an override runs.
     let default_is_vectorised = canonical_simd::fast_canonical_kernel_enabled();
     let simd_available = canonical_simd::dotprod_available();
     println!(
@@ -398,8 +346,6 @@ fn main() -> Result<(), String> {
         legs.push(run_leg(&model, "vectorised (forced)", &args)?);
     }
 
-    // Every I8 projection of a forward reaches the kernel switch: seven per
-    // layer plus the LM head.
     let forwards = (args.warmup + args.positions) as u64;
     let expected_attempts = forwards * (7 * args.layers as u64 + 1);
     let mut failures = Vec::new();

@@ -2,8 +2,6 @@ import { expect, test } from "@playwright/test";
 import { modelDownloadStatus } from "../src/lib/format";
 import type { ModelDownloadProgress } from "../src/lib/types";
 
-// Pure logic: no page. The copy the onboarding screen and the observer
-// upgrade dialog show for each stage of a resumable model download.
 const GIB = 1024 ** 3;
 const base: ModelDownloadProgress = {
   tier: "standard",
@@ -17,7 +15,6 @@ test.describe("model download status copy", () => {
     expect(modelDownloadStatus({ ...base, stage: "downloading" })).toBe(
       "1.00 GB of 3.80 GB (26%)",
     );
-    // Events from a backend that predates stages read the same way.
     expect(modelDownloadStatus(base)).toBe("1.00 GB of 3.80 GB (26%)");
   });
 

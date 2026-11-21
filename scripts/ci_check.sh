@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# ARC Chain local quality gate.
-#
-# Default (`--full`) mirrors every blocking Linux CI check. `--quick` keeps the
-# cheap contracts, linters, compile check, and unit tests for a shorter edit
-# loop. Every check is isolated and summarized so one failure does not hide the
-# rest of the evidence.
 set -uo pipefail
 
 REPO_ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -33,10 +27,6 @@ CHECK_INDEX=0
 RESULTS=()
 LOG_DIR="${ARC_CI_LOG_DIR:-$REPO_ROOT/target/ci-check}"
 mkdir -p "$LOG_DIR"
-# Ordinary imports must never write beside reviewed source. `python -m
-# py_compile` deliberately writes bytecode even when PYTHONDONTWRITEBYTECODE is
-# set, so route those explicit compilation outputs into the already ignored gate
-# output root as a second boundary.
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPYCACHEPREFIX="$LOG_DIR/python-pycache"
 
@@ -53,8 +43,6 @@ run_check() {
         PASS=$((PASS + 1))
         RESULTS+=("[PASS] $name")
     else
-        # A suite can fail early and finish with many successful subtests.
-        # Retain the actual failure in the Actions log as well as on disk.
         cat "$log_file"
         FAIL=$((FAIL + 1))
         RESULTS+=("[FAIL] $name ($log_file)")
@@ -135,9 +123,6 @@ desktop_e2e() {
 }
 
 desktop_tauri_tests() {
-    # `tauri::generate_context!()` validates frontendDist at compile time.
-    # Build it here just as CI does so this gate also works from a pristine
-    # checkout instead of succeeding only when a developer has stale dist/.
     (
         cd desktop &&
             npm run build
@@ -222,6 +207,7 @@ run_check "Release + installer contracts" bash tests/release/run.sh
 run_check "Shell syntax" check_shell_syntax
 run_check "ShellCheck" check_shell_lint
 run_check "GitHub Actions syntax" check_workflows
+run_check "No code comments" python3 scripts/ci/no_comments.py
 run_check "Dashboard build + contract" dashboard_contract
 run_check "Explorer contract" node explorer/test-contract.mjs
 run_check "Rust formatting" ./scripts/rustfmt-workspace.sh --check

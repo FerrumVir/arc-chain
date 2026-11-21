@@ -109,10 +109,6 @@ APPROVED_ACME_EMAIL = "tj@arc.ai"
 MAX_OFFLINE_STOP_VERIFICATION_AGE_SECONDS = 300
 MAX_OFFLINE_STOP_VERIFICATION_DURATION_MS = 120_000
 MAX_MACOS_CANARY_ACCEPTANCE_AGE_SECONDS = 6 * 60 * 60
-# The live capture path enforces this wall-clock bound immediately before the
-# authenticated all-writer cross-proof. The post-stop builder re-proves the
-# same bound from the immutable receipt/cross-proof timeline; the six official
-# HTTP origins no longer exist to resample at that point.
 MAX_LEGACY_HEIGHT_TO_AUTHENTICATED_CROSS_SECONDS = 300
 TRUSTED_CHECKPOINT_MIN_HEIGHT = 137_145
 TRUSTED_CHECKPOINT_ANCHOR_BLOCK_HASH = (
@@ -170,7 +166,7 @@ PROTECTED_MAIN_EXECUTION_FILES = (
 
 
 class BuilderError(RuntimeError):
-    """An input or archive root failed closed before publication."""
+    pass
 
 
 def fail(message: str) -> NoReturn:
@@ -217,8 +213,6 @@ def require_uint(value: Any, field: str, *, positive: bool = False) -> int:
 
 
 def validate_protected_main_commit(source_main_sha: str) -> None:
-    """Prove the executing recovery implementation is the selected Git commit."""
-
     environment = {
         "HOME": "/var/empty",
         "PATH": "/usr/bin:/bin",
@@ -319,8 +313,6 @@ def _lexical_absolute(path: Path, label: str) -> None:
 
 
 def open_parent_directory(path: Path, label: str) -> tuple[int, str]:
-    """Open every parent component without following symlinks."""
-
     _lexical_absolute(path, label)
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open("/", flags)
@@ -362,8 +354,6 @@ def _require_stable_secure_read_identity(
     label: str,
     operation: str,
 ) -> bool:
-    """Validate a held file descriptor and report ctime-only publication noise."""
-
     before_identity = _secure_file_identity(before)
     after_identity = _secure_file_identity(after)
     if observed_size != before.st_size or before_identity != after_identity:
@@ -418,11 +408,6 @@ def read_secure(
             label=label,
             operation="read",
         ):
-            # APFS can publish a delayed ctime after create/chmod or an
-            # xattr-only metadata update.  Re-read the same held no-follow FD
-            # exactly once and require byte-for-byte equality plus a stable
-            # security identity.  This is an independent content reproof, not
-            # a retry that can mask a moving source.
             os.lseek(descriptor, 0, os.SEEK_SET)
             verification_chunks: list[bytes] = []
             remaining = maximum_bytes + 1
@@ -516,8 +501,6 @@ def _stage_copy(
     mode: int,
     executable: bool = False,
 ) -> dict[str, Any]:
-    """Create one immutable private copy from a stable no-follow source FD."""
-
     source_parent_fd, source_name = open_parent_directory(source, label)
     source_fd = -1
     destination_fd = -1
@@ -561,11 +544,6 @@ def _stage_copy(
                 offset += written
             copied += len(chunk)
         after = os.fstat(source_fd)
-        # APFS may publish a delayed ctime after create/chmod or an xattr-only
-        # metadata update.  Compare every security-relevant field directly;
-        # if ctime alone advanced, re-read the held source FD and require its
-        # full digest to equal the bytes just copied.  This accepts harmless
-        # metadata publication without losing the content-mutation guard.
         identity_fields = (
             ("device", "st_dev"),
             ("inode", "st_ino"),
@@ -699,14 +677,6 @@ def _stage_bytes(
 
 
 def stage_prearchive_inputs(args: argparse.Namespace) -> tuple[argparse.Namespace, str]:
-    """Freeze every semantic prearchive input into one create-only private tree.
-
-    Subsequent validators, checkpoint reproduction, binary execution, archive
-    capture, and rollout consume only these staged paths.  This removes the
-    caller-path hash/open gap; the documented same-operator account remains the
-    outer trust boundary.
-    """
-
     stage_root = args.stage_root
     _lexical_absolute(stage_root, "production input stage root")
     if args.reward_probe != SCRIPT_DIR / "community-reward-probe.py":
@@ -1198,13 +1168,6 @@ def artifact(path: Path, label: str, *, executable: bool = False) -> dict[str, s
 def stable_artifact_identity_window(
     manifest: Mapping[str, Any],
 ) -> Any:
-    """Hold every staged artifact open across the final public API reproof.
-
-    Rehashing all nine release ZIPs after the branch-last query could make that
-    proof stale.  This window hashes first, retains no-follow descriptors, and
-    then proves full descriptor/path identity immediately before publication.
-    """
-
     opened: list[tuple[str, Path, int, tuple[int, ...]]] = []
     opened_directories: list[tuple[str, Path, int, tuple[int, ...]]] = []
     identity_fields = (
@@ -1231,9 +1194,6 @@ def stable_artifact_identity_window(
         )
 
     def immediate_identity(details: os.stat_result) -> tuple[int, ...]:
-        # ctime can advance asynchronously after create/chmod on APFS.  It is
-        # useful for an instantaneous descriptor/path equality check, but is
-        # not a deterministic cross-network-window identity field.
         return (*identity(details), details.st_ctime_ns)
 
     def changed_fields(actual: tuple[int, ...], expected: tuple[int, ...]) -> str:
@@ -1411,8 +1371,6 @@ def load_pretag_input_set(
     run_id: int,
     run_attempt: int,
 ) -> tuple[list[dict[str, Any]], bytes, str]:
-    """Load only transport coordinates; every tuple is authorized live later."""
-
     value, payload, digest = load_canonical_json(
         path,
         label="protected pre-tag artifact input set",
@@ -1490,8 +1448,6 @@ def validate_macos_canary_acceptance(
     run_attempt: int,
     verified_pretag_artifacts: Sequence[Mapping[str, Any]],
 ) -> tuple[dict[str, Any], bytes, str]:
-    """Authenticate the dedicated pre-tag Mac worker accepted for reward probes."""
-
     value, payload, digest = load_canonical_json(
         path,
         label="macOS pre-tag community canary acceptance",
@@ -1950,8 +1906,6 @@ def validate_legacy_maintenance_evidence_bundle(
     height_receipt: Mapping[str, Any],
     height_receipt_sha: str,
 ) -> tuple[str, int, dict[str, Any], bytes, bytes]:
-    """Authenticate the complete create-only pre-boundary maintenance evidence set."""
-
     payload, details = read_secure(
         args.legacy_maintenance_evidence_bundle,
         label="legacy maintenance evidence bundle",
@@ -2195,13 +2149,6 @@ def validate_legacy_maintenance_evidence_bundle(
     ]
     if len(active_fleet) + len(stopped_fleet) != len(FLEET):
         fail("maintenance quarantine generation contains an unsupported transition kind")
-    # The six-origin receipt is a live, pre-mutation diagnostic boundary.  It
-    # cannot safely be reused as a quarantine lease after a crash: every
-    # successful mixed-state round takes its own fresh target-only sample.
-    # Bind the first transition to the same source/capture/freeze here; the
-    # sealed timeline below proves that its fresh sample starts after the
-    # diagnostic fleet bracket completes.  Requiring byte equality would force
-    # all six nodes into one non-atomic remote transaction again.
     first_round_public = generation_ledger["rounds"][0]["authorization"]["value"][
         "public_height_receipt"
     ]["value"]
@@ -3748,8 +3695,6 @@ def validate_legacy_maintenance_boundary(
     evidence_bundle: Mapping[str, Any],
     evidence_bundle_sha: str,
 ) -> tuple[str, int, dict[str, Any], bytes, bytes]:
-    """Validate the create-only ceiling that separates preserved legacy forks from v3."""
-
     payload, details = read_secure(
         args.legacy_maintenance_boundary,
         label="legacy maintenance boundary",
@@ -4275,8 +4220,6 @@ def validate_legacy_late_fork_source_set(
     boundary: Mapping[str, Any],
     boundary_sha: str,
 ) -> tuple[dict[str, Any], str, bytes, bytes, str]:
-    """Bind the online fail-closed monitor to the exact legacy cutoff and tool."""
-
     tool_sha, _tool_size = hash_secure(
         args.legacy_late_fork_interlock_tool,
         "legacy late-fork interlock tool",
@@ -4730,8 +4673,6 @@ def validate_offline_stop_evidence(
 
 
 def validate_known_hosts(path: Path) -> tuple[str, int, bytes]:
-    """Validate the complete, public trust anchor for the fixed production fleet."""
-
     payload, details = read_secure(
         path,
         label="production SSH known-hosts trust anchor",
@@ -4787,8 +4728,6 @@ def validate_private_ssh_identity(path: Path) -> bytes:
 
 
 def _validate_protected_system_ancestry(path: Path, label: str) -> None:
-    """Require a root-owned, non-writable, symlink-free system parent chain."""
-
     _lexical_absolute(path, label)
     current = Path("/")
     ancestors = [current]
@@ -4826,8 +4765,6 @@ def _resolve_system_python_entrypoint(
     lstat_fn: Any = os.lstat,
     readlink_fn: Any = os.readlink,
 ) -> Path:
-    """Resolve the reviewed direct/macOS or same-directory/Linux shape."""
-
     candidate = SYSTEM_PYTHON_ENTRYPOINT
     seen: set[Path] = set()
     for _ in range(8):
@@ -4855,14 +4792,6 @@ def _resolve_system_python_entrypoint(
 
 
 def _system_python() -> tuple[Path, str]:
-    """Resolve only the protected /usr/bin Python entry point.
-
-    macOS legitimately ships ``/usr/bin/python3`` as one of many hard links,
-    while Debian-family Linux commonly ships it as a root-owned symlink to a
-    versioned binary in the same protected directory.  Both shapes are safe
-    here; arbitrary alternative/PATH resolution is not.
-    """
-
     _validate_protected_system_ancestry(
         SYSTEM_PYTHON_ENTRYPOINT, "production Python entry point"
     )
@@ -4901,8 +4830,6 @@ def execute_remote_stop_verifier(
     known_hosts_payload: bytes,
     identity_payload: bytes,
 ) -> dict[str, Any]:
-    """Run the protected orchestrator with a non-inheriting execution boundary."""
-
     bash, _bash_sha = _system_bash()
     environment = {
         "PATH": "/usr/bin:/bin",
@@ -5007,16 +4934,6 @@ def load_intrinsic_legacy_public_height_receipt(
     *,
     freeze_sha: str,
 ) -> tuple[dict[str, Any], int, str, bytes]:
-    """Load a historical stopped-fleet receipt without using the current clock.
-
-    ``archive-fleet-to-drive.sh capture`` performs the live <=300-second check
-    immediately before it seals the authenticated all-writer cross-proof.
-    Actual writer mutations are separately authorized by fresh, bounded
-    per-round target receipts.  After the writers retire, this builder validates
-    intrinsic receipt semantics and the exact sealed capture timeline instead
-    of comparing historical evidence against ``now()``.
-    """
-
     payload, _details = read_secure(
         args.legacy_public_height_receipt,
         label="legacy public-height receipt",
@@ -5052,8 +4969,6 @@ def validate_sealed_legacy_height_capture_timeline(
     boundary: Mapping[str, Any],
     offline_stop: Mapping[str, Any],
 ) -> None:
-    """Authenticate the historical freshness decision without using ``now()``."""
-
     capture_id = rollout.capture_id_for_freeze_plan_hash(freeze_sha)
     expected_identity = {
         "source_main_commit": args.source_main_sha,
@@ -5185,9 +5100,6 @@ def validate_sealed_legacy_height_capture_timeline(
     if (fleet_started - height_completed).total_seconds() \
             > MAX_LEGACY_HEIGHT_TO_AUTHENTICATED_CROSS_SECONDS:
         fail("sealed legacy public-height receipt exceeded the 300-second authenticated cross-proof boundary")
-    # Remote transition/stop UTC values and operator UTC are audit-only.  The
-    # exact selection -> authorization -> readiness -> dispatch -> transition
-    # -> ledger roots (plus each node's BOOTTIME lease) establish causality.
     if boundary.get("observed_cutoff_height") < ledger_state["legacy_cutoff_height"]:
         fail("sealed maintenance cutoff precedes a quarantine generation")
 
@@ -5332,9 +5244,6 @@ def validate_remote_stop_verification(
                 or (normalized.get("node"), normalized.get("host")) != (node, host)
             ):
                 fail(f"fresh offline-stop {node} stopped transition topology differs")
-            # The historical current-status root remains bound by the sealed
-            # offline receipt.  A fresh status may have a later observed_at and
-            # therefore must re-prove, rather than byte-match, that transition.
             continue
         expected_status = {
             "schema": "arc.recovery.offline-stop-challenged-status.v1",
@@ -5372,14 +5281,6 @@ def parse_command_json(result: subprocess.CompletedProcess[str], label: str) -> 
 def execute_installed_key_verifier(
     args: argparse.Namespace, manifest: Mapping[str, Any]
 ) -> dict[str, Any]:
-    """Obtain one fresh, challenged proof of the six installed validator keys.
-
-    The verifier consumes a temporary, create-only provisional manifest. Its
-    result binds immutable stage and receipt roots rather than that provisional
-    manifest digest, avoiding a hash cycle when the proof is added to final
-    provenance.
-    """
-
     try:
         rollout.validate_manifest(
             manifest, allow_provisional_installed_key_proof=True
@@ -5698,8 +5599,6 @@ def validate_embedded_legacy_dag_round(raw: Any, label: str) -> dict[str, Any]:
 
 
 def persisted_source_pair(value: Mapping[str, Any], label: str) -> dict[str, Any]:
-    """Project the replay pair identically from active v3/v4/v5 or stopped v2 receipts."""
-
     if value.get("schema") in {
         "arc.recovery.persisted-legacy-head.v3",
         "arc.recovery.persisted-legacy-head.v4",
@@ -5752,8 +5651,6 @@ def select_canonical_source(
     evidence_bundle: Mapping[str, Any],
     inspected: Mapping[str, Any] | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Select the unique highest captured descendant and bind its replay pair."""
-
     snapshot_sha: str | None = None
     snapshot_size: int | None = None
     wal_sha: str | None = None
@@ -6082,8 +5979,6 @@ def select_canonical_source(
 
 
 def select_source(args: argparse.Namespace) -> str:
-    """Seal the pre-sign canonical source decision from full maintenance evidence."""
-
     validate_protected_main_commit(args.source_main_sha)
     freeze, _freeze_payload, freeze_sha, _freeze_sidecar_sha, _freeze_sidecar = (
         validate_freeze_inputs(args)
@@ -6280,8 +6175,6 @@ def inspect_trusted_anchor(
     args: argparse.Namespace,
     canonical_source: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Replay and seal the historical anchor independently of selected H."""
-
     binary_sha, _binary_size = hash_secure(
         args.binary, "trusted-anchor inspector binary", executable=True
     )
@@ -6992,9 +6885,6 @@ def prearchive(args: argparse.Namespace) -> str:
         )
     except rollout.RolloutError as error:
         fail(f"validator restore/install receipt chain failed closed: {error}")
-    # The manifest is not trusted merely because this builder assembled it.
-    # Exercise the same validator and exact checkpoint verifier used at rollout
-    # before asking the stopped fleet to prove its installed key bytes.
     try:
         rollout.validate_manifest(
             manifest, allow_provisional_installed_key_proof=True
@@ -7013,7 +6903,6 @@ def prearchive(args: argparse.Namespace) -> str:
         rollout.require_prearchive_manifest(manifest)
     except rollout.RolloutError as error:
         fail(f"installed-key-bound prearchive rollout failed validation: {error}")
-    # Recheck source seals and freshness immediately before create-only write.
     current_freeze, _ = read_secure(
         args.freeze_plan,
         label="sealed freeze plan final recheck",
@@ -8135,8 +8024,6 @@ def finalize(args: argparse.Namespace) -> str:
         rollout.validate_manifest(final_manifest)
         if rollout.prearchive_projection_digest(final_manifest) != prearchive_sha:
             fail("final rollout does not project to the exact sealed prearchive digest")
-        # Reuse the rollout's local archive identity/classification validator in
-        # addition to the stricter roots/SHA256SUMS checks above.
         digest = rollout.sha256_bytes(rollout.canonical_bytes(final_manifest))
         checked = rollout.RecoveryRollout(final_manifest, digest)
         rollout.load_legacy_archive_fork_nodes(

@@ -1,9 +1,5 @@
 name: Published artifact acceptance
 
-# This workflow has no publication, deployment, environment, OIDC, or package
-# authority.  It is dispatched only after the exact v0.8.23 release attempt and
-# recovered validator rollout have succeeded.  Every job reuses a sealed API
-# binding and downloads public assets by immutable GitHub release asset ID.
 on:
   workflow_dispatch:
     inputs:
@@ -46,7 +42,7 @@ jobs:
       artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
       release_id: ${{ steps.selection.outputs.release_id }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.release_source_sha }}
           fetch-depth: 1
@@ -112,7 +108,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Download exact publication evidence by immutable artifact ID
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ steps.selection.outputs.artifact_id }}
           path: release-published-download
@@ -163,7 +159,7 @@ jobs:
 
       - id: upload
         name: Upload immutable release binding
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: arc-published-release-binding-${{ inputs.release_run_id }}-attempt-${{ inputs.release_run_attempt }}
           path: |
@@ -185,14 +181,14 @@ jobs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
       artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.release_source_sha }}
           fetch-depth: 1
           persist-credentials: false
 
       - name: Download exact release binding by artifact ID
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ needs.bind-release.outputs.artifact_id }}
           path: binding
@@ -270,8 +266,6 @@ jobs:
           )
           test -x "$runtime/squashfs-root/AppRun"
 
-          # The single-quoted program is intentionally evaluated by the inner
-          # xvfb shell, which receives APP_ROOT and EVIDENCE in its environment.
           # shellcheck disable=SC2016
           APP_ROOT="$runtime" EVIDENCE="$evidence" \
           dbus-run-session -- xvfb-run -a -s '-screen 0 1280x900x24' bash -ceu '
@@ -402,8 +396,6 @@ jobs:
             | tee evidence-linux/legacy-version.txt \
             | grep -F ' 0.7.7'
 
-          # Generate genuine v0.7.7 WAL/genesis history with the released
-          # binary inside a network namespace that has no interface or route.
           legacy_runtime_image='ubuntu@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316'
           docker pull "$legacy_runtime_image"
           docker run --rm --network none \
@@ -551,9 +543,6 @@ jobs:
           fi
 
           update_status=0
-          # Same user as the migration attempt above: without its HOME the installer
-          # does not recognize $HOME/.arc as the legacy root and refuses earlier as an
-          # unmarked directory (v0.8.10 acceptance run 36801683529).
           HOME="$legacy_home" bash published/install.sh --update-only \
             --install-dir "$legacy_root" --no-service --no-auto-update \
             > evidence-linux/legacy-update.stdout \
@@ -614,8 +603,6 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          # Every installer invocation above redirects stdout/stderr into
-          # evidence-linux/, so a failing step otherwise shows no reason.
           for f in evidence-linux/*.stdout evidence-linux/*.stderr; do
             [ -f "$f" ] || continue
             printf '===== %s (last 80 lines)\n' "$f"
@@ -624,7 +611,7 @@ jobs:
 
       - name: Upload Linux failure evidence
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: arc-published-acceptance-linux-x86_64-failure-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: evidence-linux
@@ -685,7 +672,7 @@ jobs:
 
       - id: upload
         name: Upload Linux acceptance and evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: arc-published-acceptance-linux-x86_64-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: artifact
@@ -709,14 +696,14 @@ jobs:
             runner: macos-15-intel
             architecture: x86_64
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.release_source_sha }}
           fetch-depth: 1
           persist-credentials: false
 
       - name: Download exact release binding by artifact ID
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ needs.bind-release.outputs.artifact_id }}
           path: binding
@@ -968,7 +955,7 @@ jobs:
 
       - id: upload
         name: Upload macOS component receipt
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: arc-published-acceptance-${{ matrix.platform }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: artifact
@@ -985,14 +972,14 @@ jobs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
       artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.release_source_sha }}
           fetch-depth: 1
           persist-credentials: false
 
       - name: Download exact release binding by artifact ID
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ needs.bind-release.outputs.artifact_id }}
           path: binding
@@ -1077,8 +1064,6 @@ jobs:
           }
 
           $setup = 'published/arc-desktop-windows-x86_64-setup.exe'
-          # The NSIS installer stub is a 32-bit PE even for this x64-only
-          # package; the installed arc-desktop.exe below must be AMD64.
           if ((Get-PeMachine $setup) -notin @('I386', 'AMD64')) { throw 'setup is not a Windows installer PE' }
           $msiPath = (Resolve-Path 'published/arc-desktop-windows-x86_64.msi').Path
           $installer = $null
@@ -1248,7 +1233,7 @@ jobs:
 
       - id: upload
         name: Upload Windows component receipt
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: arc-published-acceptance-windows-x86_64-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: artifact
@@ -1262,14 +1247,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ inputs.release_source_sha }}
           fetch-depth: 1
           persist-credentials: false
 
       - name: Download exact binding
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ needs.bind-release.outputs.artifact_id }}
           path: binding
@@ -1365,7 +1350,7 @@ jobs:
             ' > component-artifacts.json
 
       - name: Download exact Linux component artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ steps.components.outputs.linux_id }}
           path: components/linux
@@ -1375,7 +1360,7 @@ jobs:
           digest-mismatch: error
 
       - name: Download exact macOS arm64 component artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ steps.components.outputs.macos_arm64_id }}
           path: components/macos-arm64
@@ -1385,7 +1370,7 @@ jobs:
           digest-mismatch: error
 
       - name: Download exact macOS x86_64 component artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ steps.components.outputs.macos_x86_64_id }}
           path: components/macos-x86_64
@@ -1395,7 +1380,7 @@ jobs:
           digest-mismatch: error
 
       - name: Download exact Windows component artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           artifact-ids: ${{ steps.components.outputs.windows_id }}
           path: components/windows
@@ -1458,7 +1443,7 @@ jobs:
 
       - id: upload
         name: Upload canonical published-artifact acceptance receipt
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: arc-published-artifact-acceptance-v0.8.23-${{ inputs.release_source_sha }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: canonical
@@ -1474,8 +1459,5 @@ jobs:
         run: |
           set -Eeuo pipefail
           [[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
-          # upload-artifact exposes its output as the bare SHA-256; the Actions
-          # artifacts API used by the operator later returns the same value with
-          # a `sha256:` prefix.
           [[ "$ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
           echo "::notice::Canonical post-release acceptance: run $GITHUB_RUN_ID attempt $GITHUB_RUN_ATTEMPT, artifact $ARTIFACT_ID, digest sha256:$ARTIFACT_DIGEST"

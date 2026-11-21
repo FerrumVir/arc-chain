@@ -27,11 +27,11 @@ SCHEMA = "arc.model-package.v1"
 PROFILE = "arc.gguf-llama.i8-per-row.rope-interleaved.v1"
 GENERATION = "ARC-native-inference/gguf-llama-i8-interleaved-rope/generation-v2/bos-once/le-u32/v1"
 TOKENIZER = "arc.gguf-llama.spm-score-merge.v1"
-MAX_SEQ = 4096          # loader constant (contract §8)
-NATIVE_INPUT_MAX_BYTES = 32 * 1024   # arc_types::transaction::TIER1_INPUT_BLOB_MAX
-NATIVE_MAX_TOKENS = 2048             # arc_types::transaction::TIER1_MAX_TOKENS
+MAX_SEQ = 4096
+NATIVE_INPUT_MAX_BYTES = 32 * 1024
+NATIVE_MAX_TOKENS = 2048
 DEFAULT_ROPE_BASE = 10000.0
-RMS_EPSILON_Q16 = 1     # contract §3.3
+RMS_EPSILON_Q16 = 1
 LAYER_MATRICES = ("attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down")
 LAYER_NORMS = ("attn_norm", "ffn_norm")
 
@@ -160,7 +160,7 @@ def derive(path: Path, *, hash_bytes: bool = True) -> dict:
         type_counts[t.type_name] = type_counts.get(t.type_name, 0) + 1
 
     def matrix_bytes(rows, cols):
-        return rows * cols + rows * 8          # INT8 data + i64 scale per row
+        return rows * cols + rows * 8
 
     layer_bytes = sum(matrix_bytes(*shapes[k]) for k in LAYER_MATRICES) + 2 * d_model * 8
     memory = {
@@ -175,9 +175,6 @@ def derive(path: Path, *, hash_bytes: bool = True) -> dict:
     memory["prepared_total_bytes"] = sum(memory[k] for k in (
         "prepared_layer_bytes", "embedding_q16_bytes", "embedding_i8_bytes",
         "output_i8_bytes", "rope_table_bytes")) + d_model * 8
-    # The largest request the native protocol admits: its prompt and output
-    # limits, capped by the context window. A host must hold this KV cache
-    # next to the prepared model to serve every admissible request.
     max_native_positions = min(MAX_SEQ, 1 + NATIVE_INPUT_MAX_BYTES // 4 + NATIVE_MAX_TOKENS)
     memory["max_native_request_positions"] = max_native_positions
     memory["kv_bytes_at_max_native_request"] = memory["kv_bytes_per_position"] * max_native_positions

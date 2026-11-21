@@ -1,11 +1,3 @@
-//! Exact, content-addressed identity for inference model artifacts.
-//!
-//! Model dimensions are metadata, not identity: two artifacts can have the
-//! same layer/width/vocabulary shape and completely different weights.  ARC
-//! therefore identifies a model by streaming every byte of its source
-//! artifact through BLAKE3.  The bounded buffer keeps memory usage constant
-//! even for multi-gigabyte GGUF files.
-
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -16,7 +8,6 @@ use crate::InferenceError;
 
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
-/// A BLAKE3 commitment to the exact bytes of one source model artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelArtifactCommitment {
     path: PathBuf,
@@ -25,7 +16,6 @@ pub struct ModelArtifactCommitment {
 }
 
 impl ModelArtifactCommitment {
-    /// Stream the complete artifact at `path` into BLAKE3.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, InferenceError> {
         let path = path.as_ref();
         let file = File::open(path).map_err(|error| {
@@ -59,9 +49,6 @@ impl ModelArtifactCommitment {
         self.size_bytes
     }
 
-    /// Re-read the artifact and fail if its bytes changed after commitment.
-    /// Model loading is a startup-only operation, so correctness is worth the
-    /// additional bounded-memory pass over the file.
     pub fn verify_unchanged(&self) -> Result<(), InferenceError> {
         let current = Self::from_path(&self.path)?;
         if current.model_id != self.model_id || current.size_bytes != self.size_bytes {
@@ -101,9 +88,6 @@ mod tests {
     fn same_shape_with_mutated_weight_bytes_has_a_different_model_id() {
         let shape_header = b"GGUF:layers=32,width=4096,heads=32,vocab=32000;weights=";
         let mut model_a = shape_header.to_vec();
-        // Larger than the legacy first-1MiB + last-1MiB sampler. Mutate only
-        // the unsampled middle so this test fails if full streaming ever
-        // regresses back to endpoint sampling.
         model_a.resize(shape_header.len() + 3 * HASH_BUFFER_BYTES, 7u8);
         let mut model_b = model_a.clone();
         model_b[shape_header.len() + HASH_BUFFER_BYTES + 17] ^= 1;

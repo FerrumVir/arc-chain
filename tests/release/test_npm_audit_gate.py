@@ -1,5 +1,3 @@
-"""Offline audit-policy tests using saved npm audit --json reports."""
-
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 import importlib.util
@@ -245,8 +243,6 @@ class AuditGateTests(unittest.TestCase):
         script = self.root / "scripts/release/npm-audit-gate.py"
         script.parent.mkdir(parents=True)
         shutil.copyfile(SCRIPT, script)
-        # Policy dates follow today for this real subprocess; unit tests freeze
-        # the clock to keep expiry cases deterministic after the policy expires.
         today = datetime.now(timezone.utc).date().isoformat()
         self.policy["exceptions"][0].update(added=today, expires=today)
         self.write_policy()

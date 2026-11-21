@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Legacy system-service name retained as a safe wrapper around install.sh.
 set -Eeuo pipefail
 
 REPO_ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"

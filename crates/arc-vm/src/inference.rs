@@ -1,45 +1,23 @@
-//! AI Model Inference Execution Engine
-//! Manages model lifecycle and executes inference requests within the ARC VM.
-//!
-//! Supports two modes:
-//! 1. **Real compute** - loads serialized `NeuralNet` weights and runs actual
-//!    matrix-multiply forward passes (Dense, ReLU, Softmax, LayerNorm, Embedding).
-//! 2. **Mock fallback** - when no model weights are provided, uses the legacy
-//!    mock behaviour (reversed text, normalized embeddings, etc.).
-//!
-//! All floating-point arithmetic is designed for deterministic, platform-identical
-//! results so that inference outputs can be verified inside ZK proof circuits.
-
 use std::collections::HashMap;
 
-// ---------------------------------------------------------------------------
-// Neural network types
-// ---------------------------------------------------------------------------
-
-/// A single layer in a neural network.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Layer {
-    /// Fully-connected (dense / linear) layer.
-    /// `output[i] = sum_j(weights[i][j] * input[j]) + bias[i]`
     Dense {
         weights: Vec<Vec<f32>>,
         bias: Vec<f32>,
     },
-    /// Rectified Linear Unit - `max(0, x)`.
     ReLU,
-    /// Softmax - `exp(x_i) / sum_j(exp(x_j))`.
     Softmax,
-    /// Layer normalization with learnable affine parameters.
     LayerNorm {
         gamma: Vec<f32>,
         beta: Vec<f32>,
         eps: f32,
     },
-    /// Embedding lookup table.  Input value is cast to `usize` index.
-    Embedding { table: Vec<Vec<f32>> },
+    Embedding {
+        table: Vec<Vec<f32>>,
+    },
 }
 
-/// A feedforward neural network composed of an ordered list of layers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NeuralNet {
     pub layers: Vec<Layer>,
@@ -47,14 +25,12 @@ pub struct NeuralNet {
     pub output_size: usize,
 }
 
-// Layer type tags for the binary format.
 const TAG_DENSE: u8 = 0;
 const TAG_RELU: u8 = 1;
 const TAG_SOFTMAX: u8 = 2;
 const TAG_LAYER_NORM: u8 = 3;
 const TAG_EMBEDDING: u8 = 4;
 
-/// Read a little-endian `u32` from `data` at `offset`, advancing `offset`.
 fn read_u32(data: &[u8], offset: &mut usize) -> Result<u32, String> {
     if *offset + 4 > data.len() {
         return Err(format!(
@@ -73,7 +49,6 @@ fn read_u32(data: &[u8], offset: &mut usize) -> Result<u32, String> {
     Ok(val)
 }
 
-/// Read a little-endian `f32` from `data` at `offset`, advancing `offset`.
 fn read_f32(data: &[u8], offset: &mut usize) -> Result<f32, String> {
     if *offset + 4 > data.len() {
         return Err(format!(
@@ -91,44 +66,15 @@ fn read_f32(data: &[u8], offset: &mut usize) -> Result<f32, String> {
     Ok(val)
 }
 
-/// Write a little-endian `u32` to `buf`.
 fn write_u32(buf: &mut Vec<u8>, val: u32) {
     buf.extend_from_slice(&val.to_le_bytes());
 }
 
-/// Write a little-endian `f32` to `buf`.
 fn write_f32(buf: &mut Vec<u8>, val: f32) {
     buf.extend_from_slice(&val.to_le_bytes());
 }
 
 impl NeuralNet {
-    // ------------------------------------------------------------------
-    // Serialization - simple binary format
-    // ------------------------------------------------------------------
-    //
-    //  [4 bytes] num_layers  (u32 LE)
-    //  For each layer:
-    //    [1 byte]  layer_type tag
-    //    [layer-specific payload …]
-    //
-    //  Dense payload:
-    //    [4] out_rows  [4] in_cols
-    //    [out_rows * in_cols * 4] weights row-major f32 LE
-    //    [out_rows * 4]           bias f32 LE
-    //
-    //  ReLU / Softmax: no additional payload.
-    //
-    //  LayerNorm payload:
-    //    [4] size
-    //    [size * 4] gamma
-    //    [size * 4] beta
-    //    [4] eps (f32 LE)
-    //
-    //  Embedding payload:
-    //    [4] vocab_size  [4] embed_dim
-    //    [vocab_size * embed_dim * 4] table row-major f32 LE
-
-    /// Deserialize a `NeuralNet` from the binary model format.
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
         if data.len() < 4 {
             return Err("model data too short (need at least 4 bytes for header)".to_string());
@@ -199,7 +145,6 @@ impl NeuralNet {
             layers.push(layer);
         }
 
-        // Derive input_size and output_size from the first and last layers.
         let input_size = Self::infer_input_size(&layers)?;
         let output_size = Self::infer_output_size(&layers)?;
 
@@ -210,7 +155,6 @@ impl NeuralNet {
         })
     }
 
-    /// Serialize the `NeuralNet` to the binary model format.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         write_u32(&mut buf, self.layers.len() as u32);
@@ -270,15 +214,6 @@ impl NeuralNet {
         buf
     }
 
-    // ------------------------------------------------------------------
-    // Forward pass
-    // ------------------------------------------------------------------
-
-    /// Execute a forward pass through all layers.
-    ///
-    /// For determinism the implementation avoids non-associative reductions
-    /// and uses a strictly sequential (left-to-right) accumulation order so
-    /// that results are bitwise identical on all IEEE-754 platforms.
     pub fn forward(&self, input: &[f32]) -> Vec<f32> {
         let mut activations = input.to_vec();
 
@@ -297,13 +232,10 @@ impl NeuralNet {
         activations
     }
 
-    // --- individual layer implementations ---
-
     fn forward_dense(weights: &[Vec<f32>], bias: &[f32], input: &[f32]) -> Vec<f32> {
         let out_size = weights.len();
         let mut output = Vec::with_capacity(out_size);
         for i in 0..out_size {
-            // Strictly left-to-right sum for determinism.
             let mut acc: f32 = bias[i];
             for (j, &x) in input.iter().enumerate() {
                 if j < weights[i].len() {
@@ -326,12 +258,10 @@ impl NeuralNet {
         if input.is_empty() {
             return Vec::new();
         }
-        // Numerically stable softmax: subtract max before exp.
         let max_val = input.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let exps: Vec<f32> = input.iter().map(|&x| (x - max_val).exp()).collect();
         let sum: f32 = exps.iter().sum();
         if sum == 0.0 {
-            // Degenerate case - return uniform.
             let n = input.len() as f32;
             return vec![1.0 / n; input.len()];
         }
@@ -340,9 +270,7 @@ impl NeuralNet {
 
     fn forward_layer_norm(gamma: &[f32], beta: &[f32], eps: f32, input: &[f32]) -> Vec<f32> {
         let n = input.len() as f32;
-        // Mean
         let mean: f32 = input.iter().sum::<f32>() / n;
-        // Variance
         let var: f32 = input.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / n;
         let inv_std = 1.0 / (var + eps).sqrt();
 
@@ -359,25 +287,18 @@ impl NeuralNet {
     }
 
     fn forward_embedding(table: &[Vec<f32>], input: &[f32]) -> Vec<f32> {
-        // Each element in `input` is treated as a token index.
-        // We concatenate the embedding vectors for each token.
         let mut output = Vec::new();
         for &idx_f in input {
             let idx = idx_f as usize;
             if idx < table.len() {
                 output.extend_from_slice(&table[idx]);
             } else {
-                // Out-of-vocabulary - emit zeros matching embed_dim.
                 let dim = if table.is_empty() { 0 } else { table[0].len() };
                 output.extend(std::iter::repeat_n(0.0f32, dim));
             }
         }
         output
     }
-
-    // ------------------------------------------------------------------
-    // Helpers
-    // ------------------------------------------------------------------
 
     fn infer_input_size(layers: &[Layer]) -> Result<usize, String> {
         for layer in layers {
@@ -390,15 +311,12 @@ impl NeuralNet {
                     });
                 }
                 Layer::Embedding { table } => {
-                    // For embeddings, the "input size" is the vocab dimension.
                     return Ok(table.len());
                 }
                 Layer::LayerNorm { gamma, .. } => return Ok(gamma.len()),
-                // ReLU / Softmax are element-wise - skip to find a sized layer.
                 _ => continue,
             }
         }
-        // No sized layer found - accept any size.
         Ok(0)
     }
 
@@ -417,11 +335,6 @@ impl NeuralNet {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Existing public types (unchanged)
-// ---------------------------------------------------------------------------
-
-/// Status of a loaded model in the inference engine.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelStatus {
     Loading,
@@ -431,7 +344,6 @@ pub enum ModelStatus {
     Error(String),
 }
 
-/// Metadata about an AI model.
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
     pub name: String,
@@ -441,18 +353,15 @@ pub struct ModelInfo {
     pub max_context: u32,
 }
 
-/// A model loaded into the inference engine.
 #[derive(Debug, Clone)]
 pub struct LoadedModel {
     pub id: [u8; 32],
     pub metadata: ModelInfo,
     pub status: ModelStatus,
     pub last_used: u64,
-    /// Optional real neural-net weights.  `None` ⇒ mock mode.
     neural_net: Option<NeuralNet>,
 }
 
-/// Configuration for the inference engine.
 #[derive(Debug, Clone)]
 pub struct InferenceConfig {
     pub max_loaded_models: usize,
@@ -461,7 +370,6 @@ pub struct InferenceConfig {
     pub temperature: f32,
 }
 
-/// Input types for inference requests.
 #[derive(Debug, Clone)]
 pub enum InferenceInput {
     Text(String),
@@ -470,7 +378,6 @@ pub enum InferenceInput {
     Image(Vec<u8>),
 }
 
-/// Parameters controlling inference behavior.
 #[derive(Debug, Clone)]
 pub struct InferenceParams {
     pub max_tokens: u32,
@@ -479,7 +386,6 @@ pub struct InferenceParams {
     pub stop_sequences: Vec<String>,
 }
 
-/// A request for model inference.
 #[derive(Debug, Clone)]
 pub struct InferenceRequest {
     pub model_id: [u8; 32],
@@ -487,7 +393,6 @@ pub struct InferenceRequest {
     pub params: InferenceParams,
 }
 
-/// Output types from inference.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InferenceOutput {
     Text(String),
@@ -496,7 +401,6 @@ pub enum InferenceOutput {
     Classification(Vec<(String, f64)>),
 }
 
-/// Response from an inference execution.
 #[derive(Debug, Clone)]
 pub struct InferenceResponse {
     pub model_id: [u8; 32],
@@ -506,7 +410,6 @@ pub struct InferenceResponse {
     pub cost: u64,
 }
 
-/// Cumulative statistics for the inference engine.
 #[derive(Debug, Clone, Default)]
 pub struct InferenceStats {
     pub total_inferences: u64,
@@ -515,21 +418,14 @@ pub struct InferenceStats {
     pub cache_hits: u64,
 }
 
-// ---------------------------------------------------------------------------
-// Inference engine
-// ---------------------------------------------------------------------------
-
-/// The inference engine manages model loading/unloading and executes inference.
 pub struct InferenceEngine {
     models: HashMap<[u8; 32], LoadedModel>,
     config: InferenceConfig,
     stats: InferenceStats,
-    /// Running sum of latencies for computing average
     total_latency_ms: u64,
 }
 
 impl InferenceEngine {
-    /// Create a new inference engine with the given configuration.
     pub fn new(config: InferenceConfig) -> Self {
         Self {
             models: HashMap::new(),
@@ -539,19 +435,10 @@ impl InferenceEngine {
         }
     }
 
-    /// Load a model into the engine **without** real weights (mock mode).
-    ///
-    /// Returns an error if the model is already loaded or the engine has reached
-    /// its maximum capacity.
     pub fn load_model(&mut self, id: [u8; 32], info: ModelInfo) -> Result<(), String> {
         self.load_model_inner(id, info, None)
     }
 
-    /// Load a model with serialized neural-net weights.
-    ///
-    /// `model_data` is parsed via [`NeuralNet::from_bytes`].  If the data is
-    /// empty or fails to parse the model is loaded in mock mode and the parse
-    /// error is silently ignored (backward compat).
     pub fn load_model_with_weights(
         &mut self,
         id: [u8; 32],
@@ -561,7 +448,6 @@ impl InferenceEngine {
         let net = if model_data.is_empty() {
             None
         } else {
-            // A parse failure falls back to mock mode (see doc comment above).
             NeuralNet::from_bytes(model_data).ok()
         };
         self.load_model_inner(id, info, net)
@@ -594,9 +480,6 @@ impl InferenceEngine {
         Ok(())
     }
 
-    /// Unload a model from the engine.
-    ///
-    /// Returns true if the model was found and unloaded, false if not found.
     pub fn unload_model(&mut self, id: &[u8; 32]) -> bool {
         if let Some(model) = self.models.get_mut(id) {
             model.status = ModelStatus::Unloaded;
@@ -607,14 +490,6 @@ impl InferenceEngine {
         }
     }
 
-    /// Execute an inference request.
-    ///
-    /// If the model was loaded with real weights the request goes through the
-    /// neural-net forward pass.  Otherwise the legacy mock path is used:
-    /// - Text input: returns the reversed text plus model name
-    /// - Tokens input: returns the same tokens
-    /// - Embedding input: returns normalized embedding
-    /// - Image input: returns classification labels
     pub fn run_inference(
         &mut self,
         request: &InferenceRequest,
@@ -632,30 +507,23 @@ impl InferenceEngine {
             ModelStatus::Error(e) => return Err(format!("Model error: {}", e)),
         }
 
-        // Mark busy during execution
         model.status = ModelStatus::Busy;
         let model_name = model.metadata.name.clone();
-        // Clone the neural net reference out so we don't hold the mutable borrow on `self.models`.
         let neural_net_clone = model.neural_net.clone();
 
         let (output, tokens_used) = if let Some(ref net) = neural_net_clone {
-            // ---- REAL COMPUTE PATH ----
             Self::run_real_inference(net, &request.input, &model_name)
         } else {
-            // ---- MOCK FALLBACK PATH ----
             Self::run_mock_inference(&request.input, &model_name)
         };
 
-        // Compute latency based on tokens
         let compute_time_ms = tokens_used * 2 + 10;
         let cost = tokens_used * 5;
 
-        // Update model state
         let model = self.models.get_mut(&request.model_id).unwrap();
         model.status = ModelStatus::Ready;
         model.last_used += 1;
 
-        // Update stats
         self.stats.total_inferences += 1;
         self.stats.total_tokens += tokens_used;
         self.total_latency_ms += compute_time_ms;
@@ -670,10 +538,6 @@ impl InferenceEngine {
         })
     }
 
-    // ------------------------------------------------------------------
-    // Real compute path
-    // ------------------------------------------------------------------
-
     fn run_real_inference(
         net: &NeuralNet,
         input: &InferenceInput,
@@ -681,14 +545,9 @@ impl InferenceEngine {
     ) -> (InferenceOutput, u64) {
         match input {
             InferenceInput::Text(text) => {
-                // Simple char-level tokenization → embedding indices → forward → decode.
-                // Use full Unicode codepoint (clamped to embedding table size) to
-                // preserve character identity for non-ASCII input (Cyrillic, CJK, etc.).
                 let char_indices: Vec<f32> =
                     text.chars().map(|c| (c as u32).min(65535) as f32).collect();
                 let raw_output = net.forward(&char_indices);
-                // Interpret output as per-character logits and decode via argmax
-                // If output is small, just return it as-is as a text representation.
                 let decoded = Self::decode_output(&raw_output);
                 let tokens = char_indices.len() as u64;
                 (InferenceOutput::Text(decoded), tokens)
@@ -706,19 +565,14 @@ impl InferenceEngine {
                 (InferenceOutput::Embedding(raw_output), tok_count)
             }
             InferenceInput::Image(data) => {
-                // Treat image bytes as f32 input (normalize to [0,1]).
                 let float_data: Vec<f32> = data.iter().map(|&b| b as f32 / 255.0).collect();
                 let raw_output = net.forward(&float_data);
-                // Interpret as classification scores.
                 let classes = Self::output_to_classification(&raw_output);
                 (InferenceOutput::Classification(classes), 10)
             }
         }
     }
 
-    /// Decode a raw float vector into a string.
-    /// Each value is mapped to a Unicode codepoint. Supports full BMP
-    /// (Basic Multilingual Plane) output including Cyrillic, CJK, etc.
     fn decode_output(output: &[f32]) -> String {
         if output.is_empty() {
             return String::new();
@@ -727,19 +581,16 @@ impl InferenceEngine {
             .iter()
             .filter_map(|&v| {
                 let idx = ((v.abs() * 100.0) as u32) % 65536;
-                // Clamp to printable range: skip control chars, use space as floor
                 let cp = if idx < 32 { idx + 32 } else { idx };
                 char::from_u32(cp)
             })
             .collect()
     }
 
-    /// Convert raw output vector into classification labels.
     fn output_to_classification(output: &[f32]) -> Vec<(String, f64)> {
         if output.is_empty() {
             return vec![("unknown".to_string(), 1.0)];
         }
-        // Apply softmax to get probabilities.
         let probs = NeuralNet::forward_softmax(output);
         probs
             .iter()
@@ -747,10 +598,6 @@ impl InferenceEngine {
             .map(|(i, &p)| (format!("class_{}", i), p as f64))
             .collect()
     }
-
-    // ------------------------------------------------------------------
-    // Mock fallback path (original behaviour)
-    // ------------------------------------------------------------------
 
     fn run_mock_inference(input: &InferenceInput, model_name: &str) -> (InferenceOutput, u64) {
         match input {
@@ -783,25 +630,18 @@ impl InferenceEngine {
         }
     }
 
-    /// Get the status of a model by ID.
     pub fn get_model_status(&self, id: &[u8; 32]) -> Option<ModelStatus> {
         self.models.get(id).map(|m| m.status.clone())
     }
 
-    /// Return the IDs of all currently loaded models.
     pub fn loaded_models(&self) -> Vec<[u8; 32]> {
         self.models.keys().copied().collect()
     }
 
-    /// Return a reference to the engine's cumulative statistics.
     pub fn stats(&self) -> &InferenceStats {
         &self.stats
     }
 }
-
-// ===========================================================================
-// Tests
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -840,10 +680,6 @@ mod tests {
             stop_sequences: vec![],
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Original tests (must still pass - backward compat)
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_load_model() {
@@ -892,7 +728,6 @@ mod tests {
         engine.load_model(id, sample_model_info("m")).unwrap();
         assert!(engine.unload_model(&id));
         assert!(engine.get_model_status(&id).is_none());
-        // Unload again returns false
         assert!(!engine.unload_model(&id));
     }
 
@@ -959,7 +794,6 @@ mod tests {
 
         let response = engine.run_inference(&request).unwrap();
         if let InferenceOutput::Embedding(norm) = &response.output {
-            // 3/5 = 0.6, 4/5 = 0.8
             assert!((norm[0] - 0.6).abs() < 0.001);
             assert!((norm[1] - 0.8).abs() < 0.001);
         } else {
@@ -1043,23 +877,11 @@ mod tests {
         };
 
         engine.run_inference(&request).unwrap();
-        // Model should be back to Ready after inference completes
         assert_eq!(engine.get_model_status(&id), Some(ModelStatus::Ready));
     }
 
-    // -----------------------------------------------------------------------
-    // NEW: NeuralNet layer tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_dense_layer_forward() {
-        // 2x3 Dense: output_size=2, input_size=3
-        //   W = [[1, 0, -1],
-        //        [0, 1,  2]]
-        //   b = [0.5, -0.5]
-        // input = [1.0, 2.0, 3.0]
-        // output[0] = 1*1 + 0*2 + (-1)*3 + 0.5 = 1 - 3 + 0.5 = -1.5
-        // output[1] = 0*1 + 1*2 + 2*3 + (-0.5) = 2 + 6 - 0.5 = 7.5
         let net = NeuralNet {
             layers: vec![Layer::Dense {
                 weights: vec![vec![1.0, 0.0, -1.0], vec![0.0, 1.0, 2.0]],
@@ -1095,7 +917,6 @@ mod tests {
         };
         let output = net.forward(&[1.0, 2.0, 3.0, 4.0]);
 
-        // Sum must equal 1.0
         let sum: f32 = output.iter().sum();
         assert!(
             (sum - 1.0).abs() < 1e-6,
@@ -1103,12 +924,10 @@ mod tests {
             sum
         );
 
-        // Each element must be positive
         for &v in &output {
             assert!(v > 0.0, "softmax outputs must be positive");
         }
 
-        // Values must be in ascending order (since inputs are ascending)
         for i in 1..output.len() {
             assert!(
                 output[i] >= output[i - 1],
@@ -1121,7 +940,6 @@ mod tests {
 
     #[test]
     fn test_layernorm() {
-        // LayerNorm with gamma=1, beta=0 should produce zero-mean, unit-variance output.
         let net = NeuralNet {
             layers: vec![Layer::LayerNorm {
                 gamma: vec![1.0, 1.0, 1.0, 1.0],
@@ -1135,7 +953,6 @@ mod tests {
         let output = net.forward(&[2.0, 4.0, 6.0, 8.0]);
         assert_eq!(output.len(), 4);
 
-        // Mean of output should be ~0
         let mean: f32 = output.iter().sum::<f32>() / output.len() as f32;
         assert!(
             mean.abs() < 1e-5,
@@ -1143,7 +960,6 @@ mod tests {
             mean
         );
 
-        // Variance of output should be ~1
         let var: f32 =
             output.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / output.len() as f32;
         assert!(
@@ -1152,7 +968,6 @@ mod tests {
             var
         );
 
-        // Test with non-trivial gamma/beta
         let net2 = NeuralNet {
             layers: vec![Layer::LayerNorm {
                 gamma: vec![2.0, 2.0, 2.0, 2.0],
@@ -1164,7 +979,6 @@ mod tests {
         };
         let output2 = net2.forward(&[2.0, 4.0, 6.0, 8.0]);
         let mean2: f32 = output2.iter().sum::<f32>() / output2.len() as f32;
-        // Mean should be ~beta (1.0), since normalized mean is 0
         assert!(
             (mean2 - 1.0).abs() < 1e-4,
             "layernorm with beta=1 output mean should be ~1, got {}",
@@ -1174,15 +988,6 @@ mod tests {
 
     #[test]
     fn test_small_network_forward() {
-        // 2-layer MLP: Dense(3→2) → ReLU → Dense(2→1)
-        //
-        // Layer 1: W1=[[1, -1, 0], [0, 1, 1]], b1=[0, 0]
-        // Layer 2: W2=[[1, 1]], b2=[0.1]
-        //
-        // input = [1.0, 2.0, 3.0]
-        //   after Dense1: [1*1 + (-1)*2 + 0*3 + 0, 0*1 + 1*2 + 1*3 + 0] = [-1, 5]
-        //   after ReLU:   [0, 5]
-        //   after Dense2: [1*0 + 1*5 + 0.1] = [5.1]
         let net = NeuralNet {
             layers: vec![
                 Layer::Dense {
@@ -1210,7 +1015,6 @@ mod tests {
 
     #[test]
     fn test_model_serialization_roundtrip() {
-        // Build a non-trivial network with every layer type.
         let original = NeuralNet {
             layers: vec![
                 Layer::Embedding {
@@ -1245,8 +1049,7 @@ mod tests {
         assert_eq!(original.input_size, restored.input_size);
         assert_eq!(original.output_size, restored.output_size);
 
-        // Run the same input through both and compare.
-        let test_input = vec![0.0, 1.0, 2.0]; // token indices for embedding
+        let test_input = vec![0.0, 1.0, 2.0];
         let out_orig = original.forward(&test_input);
         let out_restored = restored.forward(&test_input);
         assert_eq!(out_orig.len(), out_restored.len());
@@ -1257,8 +1060,6 @@ mod tests {
 
     #[test]
     fn test_inference_engine_with_real_model() {
-        // Build a small classification model:
-        //   Dense(4→3) → ReLU → Dense(3→2) → Softmax
         let net = NeuralNet {
             layers: vec![
                 Layer::Dense {
@@ -1288,7 +1089,6 @@ mod tests {
             .load_model_with_weights(id, sample_model_info("real-clf"), &model_bytes)
             .unwrap();
 
-        // Run with Embedding input (4 floats).
         let request = InferenceRequest {
             model_id: id,
             input: InferenceInput::Embedding(vec![1.0, 0.5, -0.5, 0.2]),
@@ -1297,7 +1097,6 @@ mod tests {
 
         let response = engine.run_inference(&request).unwrap();
         if let InferenceOutput::Embedding(out) = &response.output {
-            // Softmax output: should sum to 1.0
             let sum: f32 = out.iter().sum();
             assert!(
                 (sum - 1.0).abs() < 1e-5,
@@ -1309,7 +1108,6 @@ mod tests {
             panic!("Expected Embedding output from real model");
         }
 
-        // The model should be back to Ready.
         assert_eq!(engine.get_model_status(&id), Some(ModelStatus::Ready));
         assert_eq!(engine.stats().total_inferences, 1);
     }
@@ -1318,7 +1116,6 @@ mod tests {
     fn test_load_model_with_empty_weights_falls_back_to_mock() {
         let mut engine = InferenceEngine::new(default_config());
         let id = model_id(21);
-        // Empty weights → mock mode.
         engine
             .load_model_with_weights(id, sample_model_info("mock-fallback"), &[])
             .unwrap();
@@ -1331,7 +1128,6 @@ mod tests {
 
         let response = engine.run_inference(&request).unwrap();
         if let InferenceOutput::Text(text) = &response.output {
-            // Mock mode reverses text and prepends model name.
             assert!(text.contains("cba"), "mock fallback should reverse text");
             assert!(
                 text.contains("[mock-fallback]"),
@@ -1346,7 +1142,6 @@ mod tests {
     fn test_load_model_with_corrupt_weights_falls_back_to_mock() {
         let mut engine = InferenceEngine::new(default_config());
         let id = model_id(22);
-        // Corrupt/garbage bytes → should silently fall back to mock.
         let garbage = vec![0xFF, 0xFE, 0xAB];
         engine
             .load_model_with_weights(id, sample_model_info("corrupt"), &garbage)
@@ -1371,7 +1166,6 @@ mod tests {
 
     #[test]
     fn test_embedding_layer_forward() {
-        // Embedding table with 3 tokens of dim 2.
         let net = NeuralNet {
             layers: vec![Layer::Embedding {
                 table: vec![vec![10.0, 20.0], vec![30.0, 40.0], vec![50.0, 60.0]],
@@ -1380,7 +1174,6 @@ mod tests {
             output_size: 2,
         };
 
-        // Look up tokens 2, 0, 1 → concatenation of embeddings.
         let output = net.forward(&[2.0, 0.0, 1.0]);
         assert_eq!(
             output,
@@ -1391,7 +1184,6 @@ mod tests {
 
     #[test]
     fn test_forward_determinism() {
-        // Run the same network/input 100 times and confirm bitwise identical output.
         let net = NeuralNet {
             layers: vec![
                 Layer::Dense {
@@ -1419,20 +1211,16 @@ mod tests {
 
     #[test]
     fn test_from_bytes_errors_on_truncated_data() {
-        // Too short to contain the header.
         assert!(NeuralNet::from_bytes(&[]).is_err());
         assert!(NeuralNet::from_bytes(&[0, 0]).is_err());
 
-        // Header says 1 layer but no layer data follows.
         let mut buf = Vec::new();
         write_u32(&mut buf, 1);
         assert!(NeuralNet::from_bytes(&buf).is_err());
 
-        // Header says 1 Dense layer but weights are truncated.
         buf.push(TAG_DENSE);
-        write_u32(&mut buf, 2); // out_rows
-        write_u32(&mut buf, 2); // in_cols
-        // Missing actual weight data.
+        write_u32(&mut buf, 2);
+        write_u32(&mut buf, 2);
         assert!(NeuralNet::from_bytes(&buf).is_err());
     }
 }

@@ -1,18 +1,4 @@
 #!/usr/bin/env bash
-# Start (or stop) a disposable local network for local-development UI work.
-#
-# The multi-node fixture tears its network down when it finishes, which is right
-# for a gate but useless for driving a browser against it. This starts the same
-# shape of network and leaves it running, then prints the RPC URL the
-# local-development Playwright project expects in ARC_LOCALDEV_RPC.
-#
-# It is disposable and loopback-only, and it is NOT a production or recovered
-# network. Start order is staggered because simultaneous mutual dialling between
-# arc-node processes deadlocks until timeout (packet defect D1), and node N must
-# start before the chain advances or it can never join (D5).
-#
-# usage: arc-localdev-network.sh [--nodes N] [--binary PATH]
-#        arc-localdev-network.sh --stop
 set -uo pipefail
 
 NODES=${NODES:-3}
@@ -75,8 +61,6 @@ GEN="$STATE_DIR/genesis.toml"
 {
   echo '[chain]'; echo 'name = "arc-localdev"'; echo 'chain_id = "0x415243"'
   echo 'validator_set_complete = false'
-  # A fresh chain-run identity: the certificate domain commits to it, so a
-  # certificate or checkpoint from a previous localdev chain cannot verify here.
   echo "instance_id = \"localdev-$$-$(date -u +%s)\""; echo ''
   echo '[[accounts]]'; echo "address = \"$FAUCET_POOL\""; echo 'balance = 1_000_000_000_000'; echo ''
   for a in "${ADDRS[@]}"; do
@@ -118,10 +102,6 @@ for _ in $(seq 1 40); do
   sleep 3
 done
 echo "  height=${h:-0}"
-# Put at least one real transaction on the chain. An all-empty chain is still a
-# working chain, but "transaction details" is part of what the local-development
-# explorer view is supposed to demonstrate, and the faucet is the only signed
-# transaction this script can produce without holding a user key.
 DEV_RECIPIENT="1111111111111111111111111111111111111111111111111111111111111111"
 echo "submitting one faucet transaction so a block carries transaction detail..."
 claim=$(curl -s --max-time 10 -X POST "http://127.0.0.1:$BASE_RPC/faucet/claim" \

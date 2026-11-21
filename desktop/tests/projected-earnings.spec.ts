@@ -1,12 +1,3 @@
-// Projected earnings — the app's only forward-looking number.
-//
-// Every assertion here checks FORMAT, PRESENCE or COPY. None checks a
-// magnitude. A spec that required earnings to be non-zero could never pass
-// against a real network where a node has served nothing, and a spec that
-// pinned an exact figure would break the first time the mock's fixtures moved.
-// What must never drift is the honesty of the degraded states, so those get the
-// most coverage.
-
 import { expect, test } from "@playwright/test";
 import {
   ECONOMICS_404,
@@ -17,7 +8,6 @@ import {
   seedOnboarded,
 } from "./helpers";
 
-/** An ARC amount: thousands separators optional, exactly two decimals. */
 const ARC_AMOUNT = /^[\d,]+\.\d{2}$/;
 
 async function gotoEarnings(page: import("@playwright/test").Page) {
@@ -56,8 +46,6 @@ test.describe("Projected earnings - populated", () => {
     );
     await expect(projection).toHaveAttribute("data-community-rewards-enabled", "true");
     await expect(projection).toHaveAttribute("data-issuance-ready-for-worker", "true");
-    // Format only. Whether the number is large, small or zero is the
-    // network's business, not this spec's.
     await expect(page.getByTestId("projection-per-day")).toHaveText(ARC_AMOUNT);
     await expect(page.getByTestId("projection-per-week")).toHaveText(
       ARC_AMOUNT,
@@ -70,14 +58,11 @@ test.describe("Projected earnings - populated", () => {
     await gotoEarnings(page);
     const assumptions = page.getByTestId("projection-assumptions");
     await expect(assumptions).toBeVisible();
-    // The three things a reader needs in order to judge the projection.
     await expect(assumptions).toContainText("mined reward receipts/day");
     await expect(assumptions).toContainText("measured on");
     await expect(assumptions).toContainText("successful mined 0x25");
     await expect(assumptions).toContainText("approval collection");
     await expect(assumptions).toContainText("no worker bond");
-    // The rate must be attributed to a host. Cross-source aggregation requires
-    // independently verified canonical agreement.
     await expect(assumptions).toContainText(/LAX|\d+\.\d+\.\d+\.\d+/);
   });
 
@@ -99,7 +84,6 @@ test.describe("Projected earnings - populated", () => {
     await expect(treasury).toContainText("finite");
     await expect(treasury).toContainText("host-scoped");
     await expect(treasury).toContainText("ARC");
-    // The anti-"unlimited payout" sentence.
     await expect(treasury).toContainText("Rewards stop when it is empty");
     await expect(treasury).toContainText(
       "unless canonical agreement is independently verified",
@@ -124,10 +108,6 @@ test.describe("Projected earnings - populated", () => {
   }) => {
     await gotoEarnings(page);
     const treasury = page.getByTestId("treasury-remaining");
-    // `rewards_remaining` on the wire is a COUNT of reward receipts the treasury
-    // can still pay for, NOT an ARC amount. Rendering it as currency would be
-    // wrong by nine orders of magnitude and wrong in kind, so the copy has to
-    // name the unit it actually is.
     await expect(treasury).toContainText("more");
     await expect(treasury).toContainText("successful mined");
     await expect(treasury).toContainText("0x25");
@@ -210,7 +190,6 @@ test.describe("Projected earnings - populated", () => {
     page,
   }) => {
     await gotoEarnings(page);
-    // Verbatim from the host - it knows its method, this build does not.
     await expect(page.getByTestId("projection-rate-caveat")).toContainText(
       "offline for part of that window",
     );
@@ -231,7 +210,6 @@ test.describe("Projected earnings - populated", () => {
     const tile = page.getByTestId("dashboard-projection");
     await expect(tile).toBeVisible();
     await expect(tile.getByTestId("projection-per-day")).toHaveText(ARC_AMOUNT);
-    // Compact variant: one figure, not two.
     await expect(tile.getByTestId("projection-per-week")).toHaveCount(0);
     await expect(
       tile.getByTestId("projection-funding-label"),
@@ -273,8 +251,6 @@ test.describe("Projected earnings - no measured rate", () => {
       "No per-day figure is shown unless the coordinator explicitly supplies one",
     );
     await expect(card).toContainText("No successful mined reward receipts are retained");
-    // The whole point: zero attestations must not become a zero rate and a
-    // zero projection. No per-day figure may be rendered at all.
     await expect(page.getByTestId("projection-per-day")).toHaveCount(0);
     await expect(page.getByTestId("projection-per-week")).toHaveCount(0);
   });
@@ -306,11 +282,9 @@ test.describe("Projected earnings - endpoint 404s", () => {
     await gotoEarnings(page);
     const reason = page.getByTestId("projection-unavailable");
     await expect(reason).toBeVisible();
-    // Names the host and what was observed - never speculates why.
     await expect(reason).toContainText("HTTP 404");
     await expect(reason).toContainText("140.82.16.112");
     await expect(reason).toContainText("Not available from this host");
-    // No figure is invented to fill the gap.
     await expect(page.getByTestId("projection-per-day")).toHaveCount(0);
     await expect(page.getByTestId("projection-per-attestation")).toHaveCount(0);
     const projection = page.getByTestId("projection-card");
@@ -327,8 +301,6 @@ test.describe("Projected earnings - endpoint 404s", () => {
   }) => {
     await seedMockOverrides(page, { fetch_reward_economics: ECONOMICS_404 });
     await gotoEarnings(page);
-    // The two reads are independent: losing the treasury figure must not take
-    // down a projection whose own inputs are intact.
     await expect(page.getByTestId("projection-per-day")).toHaveText(ARC_AMOUNT);
     const treasury = page.getByTestId("treasury-unavailable");
     await expect(treasury).toBeVisible();
@@ -359,13 +331,10 @@ test.describe("Projected earnings - endpoint 404s", () => {
       fetch_reward_economics: ECONOMICS_NO_BALANCE,
     });
     await gotoEarnings(page);
-    // The endpoint exists and answered - it just could not read the account.
-    // That is a different state from a 404 and carries its own reason.
     const treasury = page.getByTestId("treasury-unavailable");
     await expect(treasury).toBeVisible();
     await expect(treasury).toContainText("not present in this host's state");
     await expect(page.getByTestId("treasury-remaining")).toHaveCount(0);
-    // Certificate terms are still known even though the balance is not.
     await expect(page.getByTestId("projection-assumptions")).toContainText(
       "no worker bond",
     );
@@ -376,8 +345,6 @@ test.describe("Projected earnings - endpoint 404s", () => {
   }) => {
     await seedMockOverrides(page, { fetch_reward_economics: ECONOMICS_404 });
     await gotoEarnings(page);
-    // Certificate terms come from that endpoint, so the gross-reward
-    // assumption must be explicit.
     await expect(page.getByTestId("projection-assumptions")).toContainText(
       "worker certificate bond terms could not be read",
     );

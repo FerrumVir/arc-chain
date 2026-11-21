@@ -1,11 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::net::IpAddr;
 
-/// Normalize an RPC base URL and reject every non-loopback destination.
-///
-/// Mutation examples must never grow an "unsafe" override: a caller that
-/// needs a real-network transaction must use the reviewed release tooling and
-/// an explicitly provisioned key, not an example binary.
 pub fn require_loopback_rpc(raw: &str) -> Result<String> {
     let url = reqwest::Url::parse(raw).context("RPC URL is invalid")?;
     if !matches!(url.scheme(), "http" | "https") {

@@ -2,9 +2,6 @@ import { expect, test } from "@playwright/test";
 import { PLAIN_COPY } from "../src/lib/plain-copy";
 import { openOn, seedMockOverrides, seedOnboarded } from "./helpers";
 
-// Home is "Ask ARC": the chat answers from the network whatever the node is
-// doing, and a one-line strip says what the node needs and offers its one fix.
-
 const REFUSAL =
   "ARC refused to start the node because chain-data migration is not safely resolved: managed-node durability recovery failed: recovery node exited before its WAL barrier. Restart ARC after repairing the reported path or permissions; do not point v0.8 at the preserved legacy directory.";
 const RECONCILING =
@@ -15,7 +12,6 @@ test.describe("Home: Ask ARC", () => {
     page,
   }) => {
     await seedOnboarded(page);
-    // Not a screen name: the app falls back to its own default, Home.
     await openOn(page, "default");
     await page.goto("/");
 
@@ -29,13 +25,9 @@ test.describe("Home: Ask ARC", () => {
     await expect(strip.getByTestId("node-strip-action")).toHaveText(
       PLAIN_COPY.actions.startNode,
     );
-    // A node that is off by choice is not a problem, so the strip is not red.
     await expect(strip).toHaveAttribute("data-tone", "idle");
-    // ARC can update itself from where it runs, so there is nothing to say about that.
     await expect(page.getByTestId("update-location-notice")).toHaveCount(0);
 
-    // Where a prompt goes, as the native route does it: to the coordinator
-    // this session reads the chain from, not to this computer's node first.
     const home = page.getByTestId("inference-screen");
     await expect(home).toContainText(PLAIN_COPY.home.proofBody);
     await expect(home).not.toContainText("Your own node first");
@@ -49,12 +41,8 @@ test.describe("Home: Ask ARC", () => {
 
     await page.getByTestId("inference-prompt").fill("The largest planet is");
     await page.getByTestId("btn-run-inference").click();
-    // While the question is out the thread says so, with the time elapsed.
     await expect(page.getByTestId("inference-output")).toContainText("mock response");
 
-    // The strip's one button starts the node, and the sentence follows:
-    // connecting first, then connected once the network answers (the mock
-    // reports that after 8 s). Neither is red.
     await strip.getByTestId("node-strip-action").click();
     await expect(strip.getByTestId("node-strip-sentence")).toHaveText(
       PLAIN_COPY.nodeStrip.runningConnecting,
@@ -89,8 +77,6 @@ test.describe("Home: Ask ARC", () => {
       "recovery node exited before its WAL barrier",
     );
 
-    // People share these errors: the sentence and the native text can be
-    // selected, the buttons cannot, and "Copy details" copies the text as is.
     const userSelect = (testId: string) =>
       strip
         .getByTestId(testId)
@@ -110,9 +96,6 @@ test.describe("Home: Ask ARC", () => {
     await expect(page.getByTestId("inference-output")).toContainText("mock response");
   });
 
-  // macOS: run from the mounted .dmg, a translocated download or another
-  // volume, the updater can't replace ARC. Launch says so once, calmly; the
-  // node, the strip and the chat work as they always do.
   test("a copy ARC can't update in place says so in one calm line, and ARC stays usable", async ({
     page,
   }) => {
@@ -126,9 +109,7 @@ test.describe("Home: Ask ARC", () => {
 
     const notice = page.getByTestId("update-location-notice");
     await expect(notice).toHaveText(PLAIN_COPY.updates.wrongLocation);
-    // A status, not an alert.
     await expect(notice).toHaveAttribute("role", "status");
-    // Not red: neither its text, its icon nor its border takes the danger colour.
     const colours = await notice.evaluate((element) => {
       const probe = document.createElement("span");
       probe.style.color = "var(--danger)";

@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Generate ARC desktop icons from a solid gradient square.
-Uses only the standard library (zlib + struct) so no PIL dep."""
 import os
 import struct
 import zlib
@@ -8,18 +6,15 @@ import zlib
 OUT = os.path.dirname(os.path.abspath(__file__))
 
 
-ARC_BLUE = (59, 99, 245)  # #3B63F5 — primary brand (swap with brandpad hex once available)
+ARC_BLUE = (59, 99, 245)
 WHITE = (255, 255, 255)
 
 
 def make_png(width: int, height: int) -> bytes:
-    """Solid-blue app icon with a white lowercase 'arc' wordmark.
-    Per brandpad.io/arc spec: white logotype inside a solid colour container.
-    Wordmark drawn with a 5x7 monospace glyph bitmap — no font dependency."""
     raw = bytearray()
     glyph_pixels = _wordmark_mask(width, height)
     for y in range(height):
-        raw.append(0)  # filter byte
+        raw.append(0)
         for x in range(width):
             if glyph_pixels[y * width + x]:
                 raw += bytes([*WHITE, 255])
@@ -29,8 +24,6 @@ def make_png(width: int, height: int) -> bytes:
     return _encode_png(raw, width, height)
 
 
-# Compact 5x7 glyph bitmaps for a–z (only a, r, c used but we'll include more
-# for completeness in case we ever render another word).
 GLYPHS_5x7 = {
     "a": [
         "01110",
@@ -63,12 +56,9 @@ GLYPHS_5x7 = {
 
 
 def _wordmark_mask(w: int, h: int) -> list[bool]:
-    """Render `arc` centred in a w×h buffer. Returns a flat list of booleans."""
     word = "arc"
     g_w, g_h = 5, 7
-    # Space the glyphs with one pixel gap, same scale throughout.
     total_glyph_w = len(word) * g_w + (len(word) - 1)
-    # Scale so the wordmark fills ~52% of the icon width.
     scale = max(1, int(min(w * 0.52 / total_glyph_w, h * 0.48 / g_h)))
     pixel_w = total_glyph_w * scale
     pixel_h = g_h * scale
@@ -125,7 +115,6 @@ for name, size in sizes.items():
         f.write(data)
     print(f"wrote {path} ({size}x{size}, {len(data)} bytes)")
 
-# .ico: bundle 32x32, 64x64, 128x128 png-in-ico
 def make_ico() -> bytes:
     entries = []
     for size in (32, 64, 128):
@@ -133,7 +122,6 @@ def make_ico() -> bytes:
         entries.append((size, png))
 
     header = struct.pack("!HHH", 0, 1, len(entries))
-    # little-endian for Windows
     header = struct.pack("<HHH", 0, 1, len(entries))
     offset = 6 + 16 * len(entries)
     dir_entries = bytearray()
@@ -153,11 +141,8 @@ with open(os.path.join(OUT, "icon.ico"), "wb") as f:
     f.write(make_ico())
 print("wrote icon.ico")
 
-# .icns: minimal — Tauri's macOS bundler prefers icns. We'll just reuse the 512 PNG.
-# macOS iconutil would normally do this; we approximate by writing a fake icns header
-# that embeds one PNG. If Tauri rejects it, run `iconutil -c icns` on an .iconset dir.
 def make_icns_from_png(png_512: bytes) -> bytes:
-    body = b"ic09" + struct.pack(">I", 8 + len(png_512)) + png_512  # 512x512 PNG slot
+    body = b"ic09" + struct.pack(">I", 8 + len(png_512)) + png_512
     return b"icns" + struct.pack(">I", 8 + len(body)) + body
 
 

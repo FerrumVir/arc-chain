@@ -1,17 +1,3 @@
-//! Prepare <=1 GiB row bundles without loading the full model. Existing
-//! tensor_row_stdio_worker consumes the identical ARCROW01 files. Source
-//! reads retain the pinned artifact/profile and check verified chunk hashes.
-//!
-//! --model GGUF --artifact HASH --worker-id ID --layers 0,1,2,3
-//! --output-dir NEW_ABSOLUTE_DIRECTORY [--include-output] [--row-partition RANK/COUNT]
-//! Partial bundles are for the offline proof; production layer residency
-//! configuration cannot describe them yet. Ranks are zero-based.
-//!
-//! Peak preparation is bounded by two copies of the largest selected matrix
-//! plus norms/metadata/verified-read scratch. Worker startup retains <=1 GiB
-//! total rows and can transiently use one additional file-sized conversion
-//! buffer. Neither preparation nor serving first constructs a full model.
-
 use arc_crypto::Hash256;
 use arc_inference::low_residency::{CanonicalRowSource, load_low_residency_model};
 use arc_inference::tensor_parallel::{MAX_CANONICAL_ROW_FILE_BYTES, RowAssignment, TensorKey};
@@ -168,7 +154,6 @@ fn run(args: &[String]) -> Result<(), String> {
             if path.metadata().map_err(|e| e.to_string())?.len() != *size as u64 {
                 return Err("exported file size disagrees with preflight".into());
             }
-            // Hash in bounded chunks, never read a whole row file for its digest.
             let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
             let mut hasher = blake3::Hasher::new();
             let mut buffer = vec![0; 65536];
@@ -192,7 +177,6 @@ fn run(args: &[String]) -> Result<(), String> {
             "capacity_note": "Payload bounds exclude process/allocator/OS/node memory. Measure aggregate host peak and latency before activation."
         });
         if let Some(partition) = partition {
-            // Never advertise partial rows as complete production layers.
             manifest["format"] = serde_json::json!("arc.tensor-row-offline-partition-bundle.v1");
             manifest["row_partition"] =
                 serde_json::json!({"rank": partition.rank, "count": partition.count});
@@ -256,8 +240,6 @@ mod tests {
         }
     }
 
-    // A generated, sub-megabyte GGUF with GQA and Q/K permutation. No model
-    // download or production artifact is involved in these exporter tests.
     fn tiny_gguf(path: &std::path::Path) {
         use gguf_file::Value;
         let metadata = [

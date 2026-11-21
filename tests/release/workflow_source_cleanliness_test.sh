@@ -150,9 +150,6 @@ for exclusion in (
 ):
     require(assembler, exclusion, "release assembler")
 
-# Run the real staging cleanliness block against the exact files that
-# assemble-release.sh leaves beside release-files/. Release run 36569256300
-# failed because the sibling ownership receipt was not excluded.
 assemble_script = (Path(sys.argv[2]).parents[2] / "scripts/release/assemble-release.sh").read_text(
     encoding="utf-8"
 )

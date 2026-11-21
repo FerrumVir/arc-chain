@@ -1,10 +1,3 @@
-//! Race-resistant private-file creation and loading.
-//!
-//! Validator keyfiles must be born private, must never follow a symbolic link
-//! or Windows reparse point, and must be validated through the already-open
-//! handle. Keeping this boundary in one module lets the CLI, node, installer,
-//! and desktop agree on the same filesystem contract.
-
 use sha2::{Digest as _, Sha256};
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
@@ -41,8 +34,6 @@ pub struct DesktopWorkerQuiescenceRequest {
     pub request_id: [u8; 32],
     pub action: DesktopWorkerQuiescenceAction,
     pub timeout_ms: u32,
-    /// Absolute Unix-millisecond expiry for the quiesced state. If shutdown
-    /// does not begin by this time, the worker automatically resumes.
     pub lease_deadline_unix_ms: u64,
 }
 
@@ -68,12 +59,6 @@ fn permission_error(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message.into())
 }
 
-/// Convert a filesystem path to an absolute Win32 extended-length path.
-///
-/// Raw `*W` APIs do not receive Rust std's automatic long-path normalization.
-/// Prefixing drive paths with `\\?\` and UNC paths with `\\?\UNC\` keeps ARC
-/// data directories working beyond legacy `MAX_PATH` without depending on a
-/// process manifest or machine-wide registry setting.
 #[cfg(windows)]
 pub fn windows_extended_path(path: &Path) -> io::Result<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt as _;
@@ -86,12 +71,6 @@ pub fn windows_extended_path(path: &Path) -> io::Result<Vec<u16>> {
         ));
     }
 
-    // `std::path::absolute` delegates to GetFullPathNameW on Windows. Calling
-    // it before adding the extended-length prefix reintroduces the very
-    // MAX_PATH dependency this helper exists to avoid. Resolve ordinary
-    // relative paths by joining the already-absolute process directory and
-    // reject partially-qualified drive/root paths whose interpretation would
-    // otherwise require Win32 normalization.
     let first = path.components().next();
     if let Some(Component::Prefix(prefix)) = first {
         match prefix.kind() {
@@ -163,9 +142,6 @@ pub fn windows_extended_path(path: &Path) -> io::Result<Vec<u16>> {
             }
             Component::RootDir => normalized.push(component.as_os_str()),
             Component::Normal(value) => {
-                // Verbatim paths intentionally disable Win32 dot-segment
-                // normalization. Canonicalized paths never contain these;
-                // reject caller-supplied ambiguous verbatim components.
                 if value == std::ffi::OsStr::new(".") || value == std::ffi::OsStr::new("..") {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -219,8 +195,6 @@ pub fn windows_extended_path(path: &Path) -> io::Result<Vec<u16>> {
     Ok(extended)
 }
 
-/// Move a file or directory through the documented Windows write-through
-/// namespace primitive, using extended-length absolute paths on both sides.
 #[cfg(windows)]
 pub fn windows_move_path_write_through(
     source: &Path,
@@ -246,132 +220,60 @@ pub fn windows_move_path_write_through(
     }
 }
 
-/// Create a brand-new private regular file without following links.
-///
-/// The target must not already exist. Unix files are born and revalidated at
-/// mode 0600. Windows files are born owned by the current user with a protected
-/// DACL granting full control only to that user, LocalSystem, and
-/// Administrators, then owner and DACL are revalidated through the returned
-/// handle.
 pub fn create_new_private(path: &Path) -> io::Result<File> {
     platform::create_new_private(path)
 }
 
-/// Open an existing private regular file without following links and validate
-/// its permissions through the open handle.
 pub fn open_private(path: &Path) -> io::Result<File> {
     platform::open_private(path)
 }
 
-/// Open an existing private file read/write without following links. This is
-/// reserved for OS-backed advisory lock files whose handle must remain open;
-/// secret payload readers should keep using the read-only `open_private`.
 pub fn open_private_read_write(path: &Path) -> io::Result<File> {
     platform::open_private_read_write(path)
 }
 
-/// Open an existing owner-controlled private regular file for append without
-/// following links, tightening pre-hardening permissions through that exact
-/// handle before returning it. The returned handle uses kernel append
-/// semantics so a WAL writer cannot accidentally overwrite an existing tail.
 pub fn open_private_append_owned_migration(path: &Path) -> io::Result<File> {
     platform::open_private_append_owned_migration(path)
 }
 
-/// Open an owner-controlled regular file for bounded comparison without
-/// following links or changing its existing permission boundary. Callers may
-/// subsequently tighten that exact handle only after proving idempotence.
 pub fn open_owned_nofollow_read(path: &Path) -> io::Result<File> {
     platform::open_owned_nofollow_read(path)
 }
 
-/// Open an existing owner-controlled directory without following its final
-/// link and without changing its permission boundary.
-///
-/// The returned handle is an identity pin only. On Windows it uses directory
-/// backup semantics and shares reads, writes, and deletes so holding the pin
-/// does not create an OS-specific namespace lock that Unix callers would not
-/// receive. Callers that require a quiescent namespace must enforce that
-/// separately.
 pub fn open_owned_nofollow_directory(path: &Path) -> io::Result<File> {
     platform::open_owned_nofollow_directory(path)
 }
 
-/// Open an owner-validated, non-reparse Windows file for a read-only inspection
-/// while an independently synchronized writer handle remains live.
-///
-/// The caller must exclude content mutation for the complete inspection. This
-/// opener requests no write access and its share flags grant no access; the
-/// already-open writer's own share mode continues to exclude a second writer.
 #[cfg(windows)]
 pub fn open_owned_nofollow_shared_read(path: &Path) -> io::Result<File> {
     platform::open_owned_nofollow_shared_read(path)
 }
 
-/// Open an owner-validated, non-reparse Windows file only to compare its
-/// kernel identity with an already-open writer handle.
-///
-/// The identity probe requests no write access but must share reads, writes,
-/// and deletes: the WAL append handle is intentionally live while its final
-/// pathname is rebound to the same file ID. This narrowly scoped opener does
-/// not weaken the append handle's own share mode, so a second writer remains
-/// excluded.
 #[cfg(windows)]
 pub fn open_owned_nofollow_identity_probe(path: &Path) -> io::Result<File> {
     platform::open_owned_nofollow_identity_probe(path)
 }
 
-/// Tighten an already-open, owner-verified regular file to ARC's private
-/// permission boundary. The handle is revalidated before any mutation.
 pub fn tighten_open_owned_private(file: &File, path: &Path) -> io::Result<()> {
     platform::tighten_open_owned_private(file, path)
 }
 
-/// Open an existing private file that ARC itself wrote for reading and
-/// writing, repairing only its permission boundary.
-///
-/// Released arc-node binaries create `.arc-node.lock` with a plain open. On
-/// Windows that file inherits the private data directory's ACEs instead of
-/// carrying its own protected DACL, so the strict `open_private_read_write`
-/// rejected it ("Windows DACL inherits from its parent") on every later
-/// launch, and nothing repaired it. This opener keeps every refusal that
-/// matters (a link or reparse point, a non-regular file, a file owned by
-/// anyone other than the current user or, on Windows, the Administrators
-/// group) and, when the only fault is an inherited or over-broad boundary,
-/// tightens that exact open handle to ARC's private policy (Unix: mode 0600
-/// with no extended ACL; Windows: a protected DACL granting full control to
-/// the current user, LocalSystem and Administrators only) before
-/// revalidating it. A file that already passes is not touched, so this only
-/// ever narrows access.
 pub fn open_owned_private_read_write_repairing(path: &Path) -> io::Result<File> {
     platform::open_owned_private_read_write_repairing(path)
 }
 
-/// Revalidate the private-file contract through an already-open handle.
 pub fn validate_private(file: &File, path: &Path) -> io::Result<()> {
     platform::validate_private(file, path)
 }
 
-/// Remove the path naming an already-open validated private file while the
-/// caller still retains that exact handle. This closes the consume/publish
-/// gap in one-shot capability protocols: a replacement cannot be published
-/// between dropping the read handle and unlinking the name.
 pub fn remove_private_while_open(file: &File, path: &Path) -> io::Result<()> {
     platform::remove_private_while_open(file, path)
 }
 
-/// Durably remove a validated private lifecycle marker. Unix unlinks and
-/// fsyncs the parent directory. Windows performs a same-directory
-/// write-through rename to a unique tombstone before best-effort deletion, so
-/// a reboot can resurrect only the harmless tombstone, never the live marker.
 pub fn durably_remove_private_while_open(file: &File, path: &Path) -> io::Result<()> {
     platform::durably_remove_private_while_open(file, path)
 }
 
-/// Create a brand-new private directory without following a final link.
-///
-/// Unix directories are owned by the effective UID and mode 0700. Windows
-/// directories use the same protected owner/DACL policy as private files.
 pub fn create_new_private_directory(path: &Path) -> io::Result<()> {
     platform::create_new_private_directory(path)
 }
@@ -396,18 +298,6 @@ fn private_directory_namespace_rebarrier_path(path: &Path) -> io::Result<PathBuf
     )))
 }
 
-/// Stable sidecar identity for a target within its already-existing parent.
-/// The parent directory itself scopes every lock/staging path, so hashing it
-/// again would be harmful: two drive/mount spellings of the same Windows
-/// parent could derive different sibling locks. Windows leaf names are folded
-/// by the platform's non-linguistic filesystem casing rules. On macOS the
-/// containing volume is queried with `_PC_CASE_SENSITIVE`; ASCII leaves are
-/// folded on case-insensitive volumes and retained exactly on case-sensitive
-/// volumes. Non-ASCII absent leaves are rejected on case-insensitive macOS
-/// volumes because guessing APFS Unicode equivalence would permit two locks
-/// for one future directory name. Case-sensitive Windows parents are rejected
-/// because two distinct names could otherwise collide in this deterministic
-/// sidecar namespace.
 pub fn namespace_path_digest(path: &Path) -> io::Result<String> {
     let leaf = path.file_name().ok_or_else(|| {
         io::Error::new(
@@ -420,11 +310,6 @@ pub fn namespace_path_digest(path: &Path) -> io::Result<String> {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
         .canonicalize()?;
-    // The deterministic sibling names below deliberately case-fold their
-    // target leaf. A Windows directory with the per-directory POSIX
-    // case-sensitive flag could contain two distinct names that fold to the
-    // same lock/staging path, so reject that unsupported namespace before
-    // deriving or mutating either sidecar.
     #[cfg(windows)]
     platform::validate_case_insensitive_namespace_parent(&parent)?;
     #[cfg(not(windows))]
@@ -444,9 +329,6 @@ pub fn namespace_path_digest(path: &Path) -> io::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Compare two target paths by their actual parent directory plus the exact
-/// per-platform leaf namespace rules. This is intentionally separate from the
-/// parent-scoped sidecar digest above.
 pub fn same_private_directory_namespace(left: &Path, right: &Path) -> io::Result<bool> {
     let split = |path: &Path| -> io::Result<(PathBuf, std::ffi::OsString)> {
         let leaf = path.file_name().ok_or_else(|| {
@@ -504,9 +386,6 @@ fn macos_namespace_parent_is_case_sensitive(parent: &Path) -> io::Result<bool> {
             ),
         )
     })?;
-    // SAFETY: `path` is NUL terminated and live for the synchronous call.
-    // Clearing errno distinguishes an unsupported/indeterminate -1 from an
-    // actual pathconf error. `_PC_CASE_SENSITIVE` is a boolean on Darwin.
     let result = unsafe {
         *libc::__error() = 0;
         libc::pathconf(path.as_ptr(), libc::_PC_CASE_SENSITIVE)
@@ -585,8 +464,6 @@ fn windows_casefold_namespace_leaf(leaf: &std::ffi::OsStr) -> io::Result<Vec<u16
             "Windows namespace leaf must not be empty",
         ));
     }
-    // SAFETY: `source` remains live for its explicit length. A null output
-    // buffer asks the API for the exact number of UTF-16 code units required.
     let required = unsafe {
         LCMapStringEx(
             LOCALE_NAME_INVARIANT,
@@ -604,8 +481,6 @@ fn windows_casefold_namespace_leaf(leaf: &std::ffi::OsStr) -> io::Result<Vec<u16
         return Err(io::Error::last_os_error());
     }
     let mut mapped = vec![0u16; required as usize];
-    // SAFETY: input and output buffers are disjoint, live for their explicit
-    // lengths, and neither pointer is retained by the synchronous API.
     let written = unsafe {
         LCMapStringEx(
             LOCALE_NAME_INVARIANT,
@@ -648,8 +523,6 @@ fn windows_namespace_leaves_equal(
             "Windows namespace leaf exceeds the Win32 comparison limit",
         )
     })?;
-    // SAFETY: both slices remain live for their explicit lengths and the API
-    // does not retain either pointer.
     let comparison =
         unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) };
     if comparison == 0 {
@@ -658,10 +531,6 @@ fn windows_namespace_leaves_equal(
     Ok(comparison == CSTR_EQUAL)
 }
 
-/// Return the existing final component's canonical long name, rejecting an
-/// NTFS 8.3 or other alternate spelling. Case-only variants are accepted and
-/// hash to the same namespace, but a second non-case spelling must never
-/// derive a different lock or staging name for the same live directory.
 #[cfg(windows)]
 fn windows_canonical_namespace_leaf(target: &Path) -> io::Result<std::ffi::OsString> {
     use std::ffi::OsString;
@@ -692,9 +561,6 @@ fn windows_canonical_namespace_leaf(target: &Path) -> io::Result<std::ffi::OsStr
     let target_wide = windows_extended_path(target)?;
     let mut long_wide = vec![0u16; 32_768];
     let long_len = loop {
-        // SAFETY: input is NUL terminated and the output buffer is valid for
-        // its advertised length. A too-small result reports the required
-        // capacity, so an unusually long path is retried without truncation.
         let written = unsafe {
             GetLongPathNameW(
                 target_wide.as_ptr(),
@@ -731,18 +597,11 @@ fn windows_canonical_namespace_leaf(target: &Path) -> io::Result<std::ffi::OsStr
     Ok(long_leaf.to_os_string())
 }
 
-/// Cross-process guard for publishing or rebarriering one private directory
-/// name. The lock lives beside the target, so it remains continuously
-/// addressable while the target itself moves through its deterministic
-/// Windows write-through intermediate.
 pub struct PrivateDirectoryNamespaceLock {
     target: PathBuf,
     _file: File,
 }
 
-/// Capability proving that one private directory name was restored and then
-/// either rebarriered directly or authenticated by the desktop's exact durable
-/// namespace marker while its stable sibling lock remained held.
 pub struct PreparedPrivateDirectoryNamespaceLock {
     inner: PrivateDirectoryNamespaceLock,
 }
@@ -754,33 +613,19 @@ impl PreparedPrivateDirectoryNamespaceLock {
 }
 
 impl PrivateDirectoryNamespaceLock {
-    /// Restore a staged-only directory before an absent-name creation check.
-    /// Callers must retain this guard through the following create/open step.
     pub fn restore_interrupted(&self) -> io::Result<()> {
         restore_private_directory_namespace_rebarrier(&self.target)
     }
 
-    /// Re-prove an existing directory name while retaining this stable sibling
-    /// lock. On Windows the caller must not retain any open descendant handle:
-    /// MS-FSA 2.1.5.15.12 requires a directory rename to fail with access
-    /// denied while a file beneath that directory is open. Callers that also
-    /// use an inner semantic lock must close it for the rename and reacquire it
-    /// before mutating the restored live namespace.
     pub fn rebarrier_existing(&self) -> io::Result<()> {
         rebarrier_private_directory_namespace(&self.target)
     }
 
-    /// Consume the live sibling guard only after its target has crossed the
-    /// platform durability barrier successfully.
     pub fn rebarrier_into_prepared(self) -> io::Result<PreparedPrivateDirectoryNamespaceLock> {
         rebarrier_private_directory_namespace(&self.target)?;
         Ok(PreparedPrivateDirectoryNamespaceLock { inner: self })
     }
 
-    /// Consume the live sibling guard after authenticating the desktop's exact
-    /// proof and its actively held in-directory lifecycle handle. This avoids
-    /// an impossible parent rename on Windows while keeping the skip bound to
-    /// one continuous desktop-to-node namespace handoff.
     pub fn into_desktop_lifecycle_proven(
         self,
         session_nonce: &[u8; 32],
@@ -805,17 +650,12 @@ impl PrivateDirectoryNamespaceLock {
     }
 }
 
-/// Acquire the deterministic parent-sibling lock for one directory target.
-/// The target may be absent, but its parent must already be a real directory.
 pub fn acquire_private_directory_namespace_lock(
     target: &Path,
 ) -> io::Result<PrivateDirectoryNamespaceLock> {
     acquire_private_directory_namespace_lock_with_mode(target, false)
 }
 
-/// Try to acquire the deterministic parent-sibling namespace lock without
-/// waiting. This is reserved for process-lifetime ownership protocols whose
-/// public contract must report an already-running owner instead of blocking.
 pub fn try_acquire_private_directory_namespace_lock(
     target: &Path,
 ) -> io::Result<PrivateDirectoryNamespaceLock> {
@@ -848,10 +688,6 @@ fn acquire_private_directory_namespace_lock_with_mode(
             created.write_all(b"arc.private-directory.namespace-lock.v1\n")?;
             created.sync_all()?;
             drop(created);
-            // Reopen with share-write before taking the advisory lock. A
-            // CREATE_NEW handle is intentionally born exclusive on Windows;
-            // retaining it would make contenders fail at open instead of wait
-            // on the common kernel lock.
             open_private_namespace_lock_after_create(&lock_path, nonblocking)?
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -859,9 +695,6 @@ fn acquire_private_directory_namespace_lock_with_mode(
         }
         Err(error) => return Err(error),
     };
-    // Namespace preparation is bounded to two same-parent moves. Waiting for
-    // an in-flight cooperating creator avoids surfacing spurious request
-    // failures when several settlement publishers initialize one directory.
     if nonblocking {
         match file.try_lock() {
             Ok(()) => {}
@@ -879,8 +712,6 @@ fn acquire_private_directory_namespace_lock_with_mode(
     } else {
         file.lock()?;
     }
-    // Close the absent-name race: an uncooperating creator may have made an
-    // alternate Windows spelling resolve after the digest was first derived.
     #[cfg(windows)]
     windows_canonical_namespace_leaf(&target)?;
     Ok(PrivateDirectoryNamespaceLock {
@@ -899,10 +730,6 @@ fn open_private_namespace_lock_after_create(path: &Path, nonblocking: bool) -> i
     {
         use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 
-        // `create_new_private` intentionally uses a share-mode-zero handle.
-        // A simultaneous first acquirer can observe the name before that
-        // creator finishes its fixed write/fsync/drop. Retry only this exact
-        // transient; every other validation/open failure remains fail-closed.
         const ATTEMPTS: usize = 400;
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
         let mut last_sharing_violation = None;
@@ -954,10 +781,6 @@ fn desktop_lifecycle_namespace_identity(data_dir: &Path) -> io::Result<(String, 
     ))
 }
 
-/// Return the only v3 proof pathname valid for this exact canonical data path
-/// and filesystem directory identity. A moved or restored tree carries a
-/// differently named, inert proof and can therefore be rebarriered and
-/// migrated without trusting or overwriting prior evidence.
 pub fn desktop_lifecycle_namespace_proof_path(data_dir: &Path) -> io::Result<PathBuf> {
     let (canonical_path_sha256, data_directory_identity, control_directory_identity) =
         desktop_lifecycle_namespace_identity(data_dir)?;
@@ -976,11 +799,6 @@ pub fn desktop_lifecycle_namespace_proof_path(data_dir: &Path) -> io::Result<Pat
         )))
 }
 
-/// Build the desktop's exact path-and-directory-identity proof after its
-/// managed data directory and shutdown-control child have both crossed their
-/// write-through barriers. A copied/restored directory receives a different
-/// filesystem identity even at the same lexical path, while a moved tree also
-/// changes the canonical-path digest and expected proof filename.
 pub fn desktop_lifecycle_namespace_proof(
     data_dir: &Path,
     session_nonce: &[u8; 32],
@@ -1030,12 +848,6 @@ fn valid_desktop_lifecycle_directory_identity(value: &str) -> bool {
     false
 }
 
-/// Validate the desktop's exact path-bound proof that both its managed data
-/// directory and shutdown-control child were durably published
-/// before any lifecycle handle was retained beneath them. A well-formed proof
-/// copied with a replacement directory is stale (Ok(false)) and must be
-/// refreshed only after a real rebarrier. Malformed/truncated contents remain
-/// hard failures. The retired v1 static marker is never accepted as proof.
 pub fn has_exact_desktop_lifecycle_namespace_proof(
     data_dir: &Path,
     session_nonce: &[u8; 32],
@@ -1154,11 +966,6 @@ pub fn has_exact_desktop_lifecycle_namespace_proof(
     )
 }
 
-/// The node may consume the desktop proof only while the desktop still owns
-/// the in-directory lifecycle lock. The stable sibling namespace lock held by
-/// the caller closes the small interval between this probe and node startup:
-/// proof publication happens under that same sibling lock, and the desktop
-/// does not release it until after acquiring the lifecycle lock.
 pub fn has_active_exact_desktop_lifecycle_namespace_proof(
     data_dir: &Path,
     session_nonce: &[u8; 32],
@@ -1177,10 +984,6 @@ pub fn has_active_exact_desktop_lifecycle_namespace_proof(
             Ok(false)
         }
         Err(std::fs::TryLockError::WouldBlock) => {
-            // LockFileEx byte-range locks are mandatory on Windows, so a
-            // second handle cannot read a payload while the lease is live.
-            // The immutable session binding therefore lives in a separate
-            // private file; this owner file carries liveness only.
             let expected = desktop_lifecycle_lock_payload(session_nonce);
             let mut lifecycle = open_private(&lifecycle_path)?;
             if lifecycle.metadata()?.len() != expected.len() as u64 {
@@ -1288,18 +1091,6 @@ fn rebarrier_private_directory_namespace(path: &Path) -> io::Result<()> {
     sync_parent_directory(path)
 }
 
-/// Create every missing component of a user-selected private directory tree.
-///
-/// The deepest existing ancestor is canonicalized first so platform aliases
-/// such as macOS `/var -> /private/var` do not make otherwise valid data paths
-/// unusable. Every newly-created component is then born private and its parent
-/// namespace is made durable by the platform primitive. The final component is
-/// always revalidated/tightened as an ARC-private directory.
-///
-/// Unlike [`secure_private_directory_tree`], this helper intentionally accepts
-/// links in the already-existing ancestor prefix. It is therefore appropriate
-/// for an operator-selected storage path, but not for a capability directory
-/// whose complete ancestor chain must be link-free.
 pub fn create_private_directory_tree(path: &Path) -> io::Result<()> {
     let mut normalized = std::path::PathBuf::new();
     for component in path.components() {
@@ -1382,58 +1173,24 @@ pub fn create_private_directory_tree(path: &Path) -> io::Result<()> {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 secure_private_directory(&resolved)?;
-                // A prior attempt (or a racing creator) may have made this
-                // name visible but failed before its parent-directory barrier.
-                // Repeating that barrier makes retry success meaningful.
                 sync_parent_directory(&resolved)?;
             }
             Err(error) => return Err(error),
         }
     }
     secure_private_directory(&resolved)?;
-    // This also covers the retry case where the requested leaf already
-    // existed when the walk began. On Windows the create/move and subsequent
-    // child publications use write-through namespace operations; the portable
-    // parent-sync abstraction is intentionally a no-op there.
     sync_parent_directory(&resolved)
 }
 
-/// Open and validate an existing private directory through an OS handle.
 pub fn validate_private_directory(path: &Path) -> io::Result<()> {
     platform::validate_private_directory(path)
 }
 
-/// Ensure an app-owned secret directory exists at the platform's private
-/// owner boundary. An existing owner-controlled directory may have its Unix
-/// mode or Windows inherited DACL tightened through the already-open handle,
-/// which safely migrates pre-hardening per-user app directories.
 pub fn secure_private_directory(path: &Path) -> io::Result<()> {
     platform::secure_private_directory(path)
 }
 
-/// Ensure every missing component of an application-private directory tree is
-/// created through the platform's protected, durable directory publication
-/// primitive. Existing final directories are owner-verified and tightened.
-///
-/// This is used before publishing durable lifecycle capabilities: persisting a
-/// token or receipt *inside* a directory is not enough if a power loss can
-/// still discard the directory entry that contains them.
-///
-/// Threat boundary: this pathname walk rejects links/reparse points that are
-/// present while each component is inspected and then tightens app-owned
-/// directories to mode 0700/a protected owner DACL. It is not a handle-relative
-/// walk: a malicious process already running as the same OS user could swap a
-/// component between validation and `canonicalize`. Such a process is outside
-/// this primitive's isolation boundary because it can already read or replace
-/// the same user's secret files directly. Callers still use their lifecycle
-/// lock to serialize cooperating ARC processes.
 pub fn secure_private_directory_tree(path: &Path) -> io::Result<()> {
-    // Validate each existing pathname component at the component's own name.
-    // Inspecting only the deepest existing path is insufficient: lstat/Windows
-    // metadata for `root/link/child` describes `child` after an intermediate
-    // symlink or junction has already been followed. Walking root-to-leaf makes
-    // the link/reparse component itself the final object inspected, before the
-    // existing prefix is canonicalized below.
     let mut ancestors = path.ancestors().collect::<Vec<_>>();
     ancestors.reverse();
     for ancestor in ancestors {
@@ -1484,10 +1241,6 @@ pub fn secure_private_directory_tree(path: &Path) -> io::Result<()> {
             Err(error) => return Err(error),
         }
     }
-    // Resolve the checked existing prefix once, then create beneath that
-    // canonical location. This rejects stable pre-existing intermediate links;
-    // it does not claim handle-relative protection from a concurrent same-user
-    // namespace swap (see the explicit threat boundary above).
     let mut resolved = cursor.canonicalize()?;
     for name in missing_names.iter().rev() {
         resolved.push(name);
@@ -1504,15 +1257,10 @@ pub fn secure_private_directory_tree(path: &Path) -> io::Result<()> {
     sync_parent_directory(&resolved)
 }
 
-/// Open a pre-hardening app secret file and migrate only an owner-controlled
-/// permission boundary through the already-open handle. Unix tightens the mode
-/// to 0600 and strips a macOS ACL; Windows applies the protected private DACL.
 pub fn open_private_owned_migration(path: &Path) -> io::Result<File> {
     platform::open_private_owned_migration(path)
 }
 
-/// Durably publish a same-directory file creation on platforms that support
-/// directory fsync.
 pub fn sync_parent_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -1525,9 +1273,6 @@ pub fn sync_parent_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Atomically publish one already-complete private file at an absent sibling
-/// name. The staging file is revalidated and fsynced through a writable handle
-/// before Unix hard-link/parent-fsync or Windows write-through move.
 pub fn durably_publish_existing_private_no_replace(
     staging: &Path,
     final_path: &Path,
@@ -1558,10 +1303,6 @@ fn publish_private_no_replace(staging: &Path, final_path: &Path) -> io::Result<(
 
 #[cfg(windows)]
 fn publish_private_no_replace(staging: &Path, final_path: &Path) -> io::Result<()> {
-    // No REPLACE_EXISTING flag: publication is atomic create-only. The
-    // write-through flag asks NTFS to flush the directory-entry mutation
-    // before success is reported, closing the power-loss gap left by the
-    // otherwise no-op Windows parent-directory fsync abstraction.
     windows_move_path_write_through(staging, final_path, false)?;
     let final_handle = open_private(final_path)?;
     validate_private(&final_handle, final_path)
@@ -1746,10 +1487,6 @@ fn read_private_receipt(file: &mut File) -> io::Result<String> {
     Ok(text)
 }
 
-/// Durably arm the desktop-managed shutdown boundary before the supervisor
-/// signals or spawns the node. The receipt binds the exact canonical data
-/// directory, private capability, executable bytes, and genesis bytes. An
-/// existing receipt is accepted only when every binding is identical.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DesktopShutdownReceiptArm {
     pub nonce: [u8; 32],
@@ -1763,9 +1500,6 @@ fn publish_bound_private_file(
 ) -> io::Result<bool> {
     use rand::RngCore as _;
 
-    // A crash can leave staging behind and a reboot can reuse both the PID and
-    // inherited lifecycle nonce. Give every publication a fresh suffix so an
-    // orphan staging inode never permanently fences a recovery ACK.
     let mut publication_nonce = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut publication_nonce);
     let staging = path.with_file_name(format!(
@@ -1799,13 +1533,6 @@ fn publish_bound_private_file(
     }
 }
 
-/// Durably publish a complete private file at a previously absent name.
-///
-/// The complete contents are written and fsynced in a same-directory staging
-/// file before an atomic no-replace publication. Windows uses a write-through
-/// rename so the directory entry is durable before success; Unix fsyncs the
-/// parent directory. `Ok(false)` means another complete file already owns the
-/// final name and this call did not modify it.
 pub fn durably_publish_new_private(path: &Path, contents: &[u8]) -> io::Result<bool> {
     use rand::RngCore as _;
 
@@ -1842,8 +1569,6 @@ pub fn durably_publish_new_private(path: &Path, contents: &[u8]) -> io::Result<b
     }
 }
 
-/// Atomically and durably replace a private regular file with complete bytes.
-/// The caller must place the file in an already validated private directory.
 pub fn durably_replace_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     use rand::RngCore as _;
 
@@ -1933,8 +1658,6 @@ fn worker_quiescence_paths(data_dir: &Path) -> io::Result<(PathBuf, PathBuf)> {
     ))
 }
 
-/// Publish one request on a separate filename from the legacy shutdown
-/// protocol. An old node therefore cannot misread drain as permission to stop.
 pub fn publish_desktop_worker_quiescence_request(
     data_dir: &Path,
     token: &[u8; 32],
@@ -1967,8 +1690,6 @@ pub fn publish_desktop_worker_quiescence_request(
     durably_publish_new_private(&path, contents.as_bytes())
 }
 
-/// Consume and authenticate one request using the existing private desktop
-/// capability and armed-receipt nonce. The request is one-shot even if invalid.
 pub fn take_desktop_worker_quiescence_request(
     data_dir: &Path,
     expected_pid: u32,
@@ -1983,17 +1704,9 @@ pub fn take_desktop_worker_quiescence_request(
     let control_dir = path
         .parent()
         .expect("worker quiescence request path always has its control directory");
-    // Keep competing consumers in this private request namespace serialized
-    // through the complete claim and removal lifecycle. The Windows concurrency
-    // regression test observed a second successful rename followed by a missing
-    // claim at open; serializing consumers prevents that race.
     let _namespace = acquire_private_directory_namespace_lock(control_dir).map_err(|error| {
         worker_quiescence_io_context(error, "lock worker quiescence request namespace")
     })?;
-    // Atomic rename claims the one-shot request before either side parses it.
-    // This prevents the desktop timeout path and node watcher from both
-    // believing they own the same request. The random same-directory name
-    // also works on Windows without replacing another claim.
     let mut claim_nonce = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut claim_nonce);
     let claim = path.with_file_name(format!(
@@ -2119,7 +1832,6 @@ pub fn take_desktop_worker_quiescence_request(
     })
 }
 
-/// Durably publish the response associated with one authenticated request.
 pub fn publish_desktop_worker_quiescence_response(
     data_dir: &Path,
     response: DesktopWorkerQuiescenceResponse,
@@ -2142,7 +1854,6 @@ pub fn publish_desktop_worker_quiescence_response(
     durably_replace_private(&path, contents.as_bytes())
 }
 
-/// Read only a response bound to the caller's exact process, nonce and request.
 pub fn read_desktop_worker_quiescence_response(
     data_dir: &Path,
     expected_pid: u32,
@@ -2251,11 +1962,6 @@ pub fn arm_desktop_shutdown_receipt(
                 ));
             }
             drop(file);
-            // The preceding publication may have made this exact receipt
-            // visible while reporting a late parent-directory/write-through
-            // failure. The managed lifecycle lock serializes this bounded
-            // replacement, so retry success proves the unproven marker before
-            // the supervisor is allowed to spawn a node beneath it.
             durably_replace_private(&receipt, expected.as_bytes())?;
             return Ok(DesktopShutdownReceiptArm {
                 nonce,
@@ -2266,9 +1972,6 @@ pub fn arm_desktop_shutdown_receipt(
         Err(error) => return Err(error),
     }
 
-    // An ACK without a marker can only be the fail-safe residue of a prior
-    // supervisor crash after it consumed the marker. Remove that private
-    // complete record before selecting the next unique lifecycle nonce.
     let ack = control_dir.join(DESKTOP_SHUTDOWN_ACK_FILE_NAME);
     match open_private(&ack) {
         Ok(mut file) => {
@@ -2314,9 +2017,6 @@ pub fn arm_desktop_shutdown_receipt(
                 ));
             }
             drop(file);
-            // `Ok(false)` proves only that an identical publisher won the
-            // create-only race. Repeat the namespace barrier before treating
-            // that visible receipt as a durable launch fence.
             durably_replace_private(&receipt, expected.as_bytes())?;
             Ok(DesktopShutdownReceiptArm {
                 nonce,
@@ -2327,7 +2027,6 @@ pub fn arm_desktop_shutdown_receipt(
     }
 }
 
-/// Validate that an armed receipt still binds this exact managed node.
 pub fn validate_desktop_shutdown_receipt(
     data_dir: &Path,
     token: &[u8; 32],
@@ -2351,8 +2050,6 @@ pub fn validate_desktop_shutdown_receipt(
     Ok(true)
 }
 
-/// Load and validate an inherited receipt for an exact recovery launch.
-/// Absence is the normal state for a newly started managed node.
 pub fn load_desktop_shutdown_receipt_nonce(
     data_dir: &Path,
     token: &[u8; 32],
@@ -2380,10 +2077,6 @@ pub fn load_desktop_shutdown_receipt_nonce(
     Ok(Some(nonce))
 }
 
-/// Publish the node's positive clean-shutdown ACK while leaving the unproven
-/// marker in place. The node calls this as its final fallible operation only
-/// after all writers join and the final WAL fsync succeeds. The supervisor
-/// validates both files after exact process death, then consumes them.
 pub fn acknowledge_desktop_shutdown_receipt(
     data_dir: &Path,
     token: &[u8; 32],
@@ -2436,11 +2129,6 @@ pub fn validate_desktop_shutdown_ack(
     Ok(true)
 }
 
-/// Consume a positive ACK and its unproven marker after the supervisor has
-/// independently proved exact process death (and exit status where the OS
-/// exposes it). ACK-first removal is fail-safe: a supervisor crash can leave
-/// the unproven marker armed, but can never leave an ACK-only residue whose old
-/// identity an updater might invalidate before cleanup.
 pub fn consume_desktop_shutdown_ack(
     data_dir: &Path,
     token: &[u8; 32],
@@ -2468,10 +2156,6 @@ pub fn consume_desktop_shutdown_ack(
     Ok(())
 }
 
-/// Cancel the exact just-armed receipt only when the supervisor has proof
-/// that process creation itself failed and therefore no node ever owned the
-/// data directory. This is intentionally the sole supervisor-side removal
-/// path; once spawn succeeds, only the node's clean WAL barrier may ack it.
 pub fn cancel_desktop_shutdown_receipt_before_spawn(
     data_dir: &Path,
     token: &[u8; 32],
@@ -2506,11 +2190,6 @@ impl DesktopShutdownLifecycleState {
     }
 }
 
-/// Inspect the durable managed-node lifecycle boundary without weakening its
-/// private directory/file policy. Both marker and ACK names are mutation
-/// fences: an ACK-only residue from an interrupted older cleanup must not let
-/// an updater replace the executable or stable network identity before exact
-/// validation can finish cleanup.
 pub fn desktop_shutdown_lifecycle_state(
     data_dir: &Path,
 ) -> io::Result<DesktopShutdownLifecycleState> {
@@ -2545,8 +2224,6 @@ pub fn desktop_shutdown_lifecycle_state(
     })
 }
 
-/// Backward-compatible marker predicate. Mutation/update guards should prefer
-/// `desktop_shutdown_lifecycle_state` so ACK-only residues remain fail-closed.
 pub fn desktop_shutdown_receipt_exists(data_dir: &Path) -> io::Result<bool> {
     Ok(matches!(
         desktop_shutdown_lifecycle_state(data_dir)?,
@@ -2592,7 +2269,6 @@ mod platform {
         impl Drop for Acl {
             fn drop(&mut self) {
                 if !self.0.is_null() {
-                    // SAFETY: this pointer was returned by a successful ACL API.
                     unsafe {
                         acl_free(self.0);
                     }
@@ -2601,8 +2277,6 @@ mod platform {
         }
 
         pub(super) fn strip(file: &File) -> io::Result<()> {
-            // An empty extended ACL is the mode-only private policy. Applying
-            // it through the already-open handle avoids a pathname race.
             let empty = Acl(unsafe { acl_init(0) });
             if empty.0.is_null() {
                 return Err(io::Error::last_os_error());
@@ -2611,8 +2285,6 @@ mod platform {
                 && unsafe { acl_set_fd_np(file.as_raw_fd(), empty.0, ACL_TYPE_EXTENDED) } != 0
             {
                 let error = io::Error::last_os_error();
-                // macOS reports ENOENT when the object already has no extended
-                // ACL to delete; that is precisely the required state.
                 if error.kind() != io::ErrorKind::NotFound {
                     return Err(error);
                 }
@@ -2641,8 +2313,6 @@ mod platform {
                 ))),
                 _ => {
                     let error = io::Error::last_os_error();
-                    // Darwin reports EINVAL when ACL_FIRST_ENTRY is requested
-                    // from a valid empty ACL.
                     if error.raw_os_error() == Some(libc::EINVAL) {
                         Ok(())
                     } else {
@@ -2683,7 +2353,6 @@ mod platform {
     }
 
     fn validate_owner(metadata: &fs::Metadata, path: &Path, object: &str) -> io::Result<()> {
-        // SAFETY: geteuid has no preconditions and does not retain pointers.
         let effective_uid = unsafe { libc::geteuid() };
         validate_owner_as(metadata, path, object, effective_uid)
     }
@@ -2749,8 +2418,6 @@ mod platform {
             .read(true)
             .write(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
-        // O_NOFOLLOW refuses a final symlink; tightening re-checks the
-        // regular-file type and the effective-uid owner on this exact handle.
         let file = options.open(path)?;
         if validate_private(&file, path).is_err() {
             tighten_open_owned_private(&file, path)?;
@@ -2845,8 +2512,6 @@ mod platform {
 
     pub(super) fn remove_private_while_open(file: &File, path: &Path) -> io::Result<()> {
         validate_private(file, path)?;
-        // Unix unlink operates on the directory entry while `file` keeps the
-        // exact opened inode alive through completion.
         fs::remove_file(path)
     }
 
@@ -2945,9 +2610,6 @@ mod platform {
             )));
         }
         validate_owner(&metadata, path, "file")?;
-        // Public v0.7 desktop tags wrote store.json with std::fs::write, which
-        // commonly inherited mode 0644. Tighten only the already-open,
-        // nofollow, owner-verified regular file; never chmod by pathname.
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         macos_acl::strip(&file)?;
         validate_private(&file, path)?;
@@ -3098,8 +2760,6 @@ mod tests {
                     )
                 });
                 barrier.wait();
-                // Join both workers before assessing either result so a failure
-                // reports both consumers instead of stopping at the first panic.
                 (first.join(), second.join())
             });
 
@@ -3318,8 +2978,6 @@ mod tests {
         let control = first_data.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME);
         create_private_directory_tree(&control).unwrap();
 
-        // A v1 marker may exist on a candidate installation, but it is never
-        // silently promoted to the path-bound capability.
         durably_publish_new_private(
             &control.join("lifecycle.namespace-proof"),
             b"arc.desktop.lifecycle-namespace.v1\n",
@@ -3346,9 +3004,6 @@ mod tests {
         durably_replace_private(&moved_proof_path, &moved_proof).unwrap();
         assert!(has_exact_desktop_lifecycle_namespace_proof(&moved_data, &session_nonce).unwrap());
 
-        // Replacing the data directory at the identical lexical path changes
-        // its filesystem identity. Even copying valid old bytes into the new
-        // identity-keyed proof name cannot authenticate the replacement.
         let archived_data = second_parent.join("archived-data-v3");
         std::fs::rename(&moved_data, &archived_data).unwrap();
         create_private_directory_tree(&moved_control).unwrap();
@@ -3359,7 +3014,6 @@ mod tests {
             "same-path restore must not inherit the old data-directory identity"
         );
 
-        // Replacing only the shutdown-control child is equally visible.
         let refreshed_proof =
             desktop_lifecycle_namespace_proof(&moved_data, &session_nonce).unwrap();
         durably_replace_private(&restored_proof_path, &refreshed_proof).unwrap();
@@ -3435,9 +3089,6 @@ mod tests {
         created.sync_all().unwrap();
         drop(created);
 
-        // Even a descendant reopened with FILE_SHARE_DELETE pins its ancestor
-        // against rename on NTFS. This is the exact constraint the recovery
-        // store's two-phase inner-lock handshake must respect.
         let opened = open_private_read_write(&payload).unwrap();
         opened.try_lock().unwrap();
         let error = guard
@@ -3476,9 +3127,6 @@ mod tests {
         let long_path = root.0.join("CanonicalNamespaceHistoryDirectory");
         create_private_directory_tree(&long_path).unwrap();
         let wide = windows_extended_path(&long_path).unwrap();
-        // SAFETY: the path is NUL terminated and every flag is valid for an
-        // existing directory handle. The successful handle is transferred to
-        // `File` immediately below.
         let handle = unsafe {
             CreateFileW(
                 wide.as_ptr(),
@@ -3491,15 +3139,11 @@ mod tests {
             )
         };
         assert_ne!(handle, INVALID_HANDLE_VALUE, "cannot open alias fixture");
-        // SAFETY: the successful handle is uniquely owned here.
         let directory = unsafe { File::from_raw_handle(handle.cast::<c_void>()) };
         let mut alias_wide = std::ffi::OsStr::new("ARCALT01")
             .encode_wide()
             .collect::<Vec<_>>();
         alias_wide.push(0);
-        // SAFETY: the directory handle has DELETE access and the requested
-        // DOS 8.3 name is NUL terminated. Hosted Windows CI must exercise the
-        // real alternate-name path rather than silently skipping it.
         assert_ne!(
             unsafe { SetFileShortNameW(directory.as_raw_handle().cast(), alias_wide.as_ptr()) },
             0,
@@ -3585,12 +3229,6 @@ mod tests {
     #[test]
     fn operator_private_directory_tree_rejects_parent_traversal_before_mutation() {
         let root = TestDir::new("operator-private-tree-parent");
-        // Append the lexical components without `PathBuf::push`/`join`.
-        // Windows normalizes dot segments while pushing onto a verbatim
-        // (`\\?\`) path, which would silently turn this negative fixture into
-        // the harmless sibling `root/target` before the function saw it.
-        // Operator input arrives as one raw OS string, so preserve that exact
-        // representation here and exercise the real parser boundary.
         let mut requested = root.0.as_os_str().to_os_string();
         requested.push(std::path::MAIN_SEPARATOR_STR);
         requested.push("missing");
@@ -3753,13 +3391,6 @@ mod tests {
         assert_eq!(std::fs::read(outside).unwrap(), b"must remain untouched");
     }
 
-    /// Field failure: released arc-node binaries create `.arc-node.lock` with
-    /// a plain open. On Windows it inherits the private data directory's ACEs
-    /// instead of carrying a protected DACL; on Unix it can carry a wider
-    /// umask mode. The strict opener refused it on every launch ("private
-    /// file Windows DACL inherits from its parent") and nothing repaired it.
-    /// The repairing opener tightens that exact file once, keeps its bytes,
-    /// and leaves an already-private file untouched.
     #[test]
     fn owned_private_read_write_repairing_tightens_a_plainly_created_node_lock() {
         let dir = TestDir::new("repair-plain-node-lock");
@@ -3794,15 +3425,11 @@ mod tests {
                 0o600
             );
         }
-        // Repaired for good: the strict opener accepts it now, a second
-        // repair is a no-op, and the lock's bytes are unchanged.
         drop(open_private_read_write(&path).unwrap());
         drop(open_owned_private_read_write_repairing(&path).unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), contents);
     }
 
-    /// The repair never creates a file: a missing lock still reports
-    /// NotFound, which callers read as "no node has run here".
     #[test]
     fn owned_private_read_write_repairing_reports_a_missing_file_as_not_found() {
         let dir = TestDir::new("repair-missing");
@@ -3812,7 +3439,6 @@ mod tests {
         assert!(!dir.0.join(".arc-node.lock").exists());
     }
 
-    /// Repair never follows a link and never touches the link's target.
     #[cfg(unix)]
     #[test]
     fn owned_private_read_write_repairing_refuses_a_symlink_without_touching_its_target() {
@@ -3872,14 +3498,9 @@ mod tests {
         let error = platform::validate_owner_for_test(&path, foreign_uid).unwrap_err();
         assert!(error.to_string().contains("must be owned by effective uid"));
 
-        // Exercise the full open boundary when the test runner has authority
-        // to create a genuinely foreign-owned fixture.
-        // SAFETY: geteuid has no preconditions.
         if unsafe { libc::geteuid() } == 0 {
             use std::os::unix::ffi::OsStrExt as _;
             let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-            // SAFETY: encoded is a live NUL-terminated path; uid 1 is foreign
-            // to the root test process and the group is left unchanged.
             assert_eq!(unsafe { libc::chown(encoded.as_ptr(), 1, !0) }, 0);
             assert!(open_private(&path).is_err());
         }
@@ -4143,8 +3764,6 @@ mod tests {
             "fixture must exceed legacy MAX_PATH"
         );
 
-        // Directory and file creation exercise the SDDL/SID conversion too;
-        // those strings must remain raw UTF-16 rather than path-normalized.
         create_private_directory_tree(&deep).unwrap();
         validate_private_directory(&deep).unwrap();
         let path = deep.join("state.wal");
@@ -4184,10 +3803,6 @@ mod tests {
         let private_directory = root.0.join("private-app-data");
         create_new_private_directory(&private_directory).unwrap();
 
-        // Chain directories are intentionally ordinary filesystem objects,
-        // not secret-file primitives. They must inherit the same narrow trust
-        // set so a hardened app-data parent cannot strand preserved WAL bytes
-        // behind an empty/non-inheritable DACL.
         let chain_directory = private_directory.join("data-v3");
         std::fs::create_dir(&chain_directory).unwrap();
         let wal = chain_directory.join("state.wal");
@@ -4257,7 +3872,6 @@ mod platform {
     impl Drop for Handle {
         fn drop(&mut self) {
             if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
-                // SAFETY: this RAII value owns the successful Win32 handle.
                 unsafe {
                     CloseHandle(self.0);
                 }
@@ -4270,7 +3884,6 @@ mod platform {
     impl Drop for LocalAllocation {
         fn drop(&mut self) {
             if !self.0.is_null() {
-                // SAFETY: the pointer came from a LocalAlloc-returning Win32 API.
                 unsafe {
                     LocalFree(self.0);
                 }
@@ -4287,15 +3900,12 @@ mod platform {
             if sid.is_null() {
                 return Err(permission_error("Windows account SID is null"));
             }
-            // SAFETY: caller supplies a SID returned by a successful Win32 API.
             let length = unsafe { GetLengthSid(sid) } as usize;
             if length == 0 {
                 return Err(io::Error::last_os_error());
             }
             let words = length.div_ceil(size_of::<usize>());
             let mut storage = vec![0usize; words];
-            // SAFETY: destination owns at least `length` bytes; SID length was
-            // obtained from the same validated SID pointer.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     sid.cast::<u8>(),
@@ -4329,14 +3939,11 @@ mod platform {
 
     fn current_user_sid() -> io::Result<OwnedSid> {
         let mut token = null_mut();
-        // SAFETY: output pointer is valid and initialized; pseudo-process
-        // handle is provided by the OS.
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
             return Err(io::Error::last_os_error());
         }
         let token = Handle(token);
         let mut length = 0u32;
-        // SAFETY: the documented sizing call accepts a null buffer.
         unsafe {
             GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut length);
         }
@@ -4345,7 +3952,6 @@ mod platform {
         }
         let words = (length as usize).div_ceil(size_of::<usize>());
         let mut buffer = vec![0usize; words];
-        // SAFETY: the aligned buffer has the exact requested byte capacity.
         if unsafe {
             GetTokenInformation(
                 token.0,
@@ -4358,26 +3964,22 @@ mod platform {
         {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: successful TokenUser output begins with TOKEN_USER.
         let user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
         OwnedSid::copy_from(user.User.Sid)
     }
 
     fn sid_string(sid: PSID) -> io::Result<String> {
         let mut value = null_mut();
-        // SAFETY: SID is valid and the API initializes the LocalAlloc pointer.
         if unsafe { ConvertSidToStringSidW(sid, &mut value) } == 0 {
             return Err(io::Error::last_os_error());
         }
         let allocation = LocalAllocation(value.cast::<c_void>());
         let mut length = 0usize;
-        // SAFETY: the API returned a NUL-terminated UTF-16 string.
         unsafe {
             while *value.add(length) != 0 {
                 length += 1;
             }
         }
-        // SAFETY: `length` was bounded by the first NUL in the API allocation.
         let text = String::from_utf16(unsafe { std::slice::from_raw_parts(value, length) })
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Windows SID is not UTF-16"))?;
         drop(allocation);
@@ -4387,7 +3989,6 @@ mod platform {
     fn parse_sid(value: &str) -> io::Result<LocalAllocation> {
         let wide = wide(std::ffi::OsStr::new(value))?;
         let mut sid = null_mut();
-        // SAFETY: input is NUL-terminated and output receives a LocalAlloc SID.
         if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) } == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -4397,25 +3998,10 @@ mod platform {
     fn private_security_attributes() -> io::Result<(LocalAllocation, SECURITY_ATTRIBUTES)> {
         let user = current_user_sid()?;
         let user_text = sid_string(user.as_ptr())?;
-        // An administrator token's Windows default-owner SID is normally the
-        // built-in Administrators group, not its TOKEN_USER SID. Pin the owner
-        // explicitly so every newly created ARC secret remains owned by the
-        // exact account even when the process is elevated.
-        // Keep the private trust boundary inheritable inside app-owned
-        // directories. Without OI/CI, tightening an existing Windows app
-        // data directory leaves subsequently created ordinary descendants
-        // (for example `data-v3` and its WAL) with no usable inherited ACEs;
-        // the creating account can then receive ERROR_ACCESS_DENIED when it
-        // reopens its own chain history. Inheritance does not widen trust:
-        // only the exact user, LocalSystem, and Administrators receive the
-        // full-control ACEs, and every secret file/directory created by this
-        // module is still born with its own protected DACL and revalidated.
         let sddl =
             format!("O:{user_text}D:P(A;OICI;FA;;;{user_text})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
         let sddl = wide(std::ffi::OsStr::new(&sddl))?;
         let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
-        // SAFETY: input is NUL-terminated and output receives a LocalAlloc
-        // security descriptor.
         if unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl.as_ptr(),
@@ -4439,8 +4025,6 @@ mod platform {
     pub(super) fn create_new_private(path: &Path) -> io::Result<File> {
         let (descriptor_guard, attributes) = private_security_attributes()?;
         let path_wide = wide_path(path)?;
-        // SAFETY: all pointers remain alive for the call; CREATE_NEW prevents
-        // overwrite and OPEN_REPARSE_POINT prevents traversal of a final link.
         let handle = unsafe {
             CreateFileW(
                 path_wide.as_ptr(),
@@ -4456,7 +4040,6 @@ mod platform {
         if handle == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: the successful handle is uniquely transferred to File.
         let file = unsafe { File::from_raw_handle(handle.cast::<c_void>()) };
         validate_private(&file, path)?;
         Ok(file)
@@ -4464,19 +4047,12 @@ mod platform {
 
     pub(super) fn create_new_private_directory(path: &Path) -> io::Result<()> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        // A deterministic destination-bound staging name makes directory
-        // creation resumable and bounds crash residue to one empty directory.
-        // Callers that need to rebarrier an already-live semantic directory
-        // additionally hold `PrivateDirectoryNamespaceLock`.
         let staging = parent.join(format!(
             ".arc-private-directory-create-{}.staging",
             super::namespace_path_digest(path)?
         ));
         let (descriptor_guard, attributes) = private_security_attributes()?;
         let staging_wide = wide_path(&staging)?;
-        // SAFETY: path and descriptor remain live for the call. CreateDirectoryW
-        // fails if the staging path already exists and applies the protected
-        // DACL before another process can open the directory.
         let created = unsafe { CreateDirectoryW(staging_wide.as_ptr(), &attributes) };
         drop(descriptor_guard);
         if created == 0 {
@@ -4523,18 +4099,12 @@ mod platform {
     }
 
     pub(super) fn open_owned_private_read_write_repairing(path: &Path) -> io::Result<File> {
-        // FILE_FLAG_OPEN_REPARSE_POINT opens a link itself, and
-        // `tighten_open_owned_private` refuses it, refuses a non-regular file,
-        // and refuses an owner other than the current user or Administrators
-        // before it changes anything.
         let file = match open_private_raw_with_access_and_share(
             path,
             GENERIC_READ | GENERIC_WRITE | READ_CONTROL | WRITE_DAC,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         ) {
             Ok(file) => file,
-            // No right to change this DACL: it cannot be repaired here, so
-            // keep the strict contract and its precise refusal.
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 return open_private_read_write(path);
             }
@@ -4644,8 +4214,6 @@ mod platform {
         share_mode: u32,
     ) -> io::Result<File> {
         let path_wide = wide_path(path)?;
-        // SAFETY: input is a live NUL-terminated path. OPEN_REPARSE_POINT
-        // opens the link itself so validation can reject it.
         let handle = unsafe {
             CreateFileW(
                 path_wide.as_ptr(),
@@ -4660,12 +4228,10 @@ mod platform {
         if handle == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: the successful handle is uniquely transferred to File.
         Ok(unsafe { File::from_raw_handle(handle.cast::<c_void>()) })
     }
 
     fn equal_sid(left: PSID, right: PSID) -> bool {
-        // SAFETY: both pointers refer to validated SID allocations.
         unsafe { EqualSid(left, right) != 0 }
     }
 
@@ -4687,10 +4253,6 @@ mod platform {
     pub(super) fn remove_private_while_open(file: &File, path: &Path) -> io::Result<()> {
         validate_private(file, path)?;
         let path_wide = wide_path(path)?;
-        // The retained validated handle was opened with FILE_SHARE_DELETE.
-        // DeleteFileW marks this exact still-existing name for deletion; a
-        // CREATE_NEW publisher cannot install a replacement until the handle
-        // closes and the old name is gone.
         if unsafe { windows_sys::Win32::Storage::FileSystem::DeleteFileW(path_wide.as_ptr()) } == 0
         {
             Err(io::Error::last_os_error())
@@ -4718,9 +4280,6 @@ mod platform {
         ));
         super::windows_move_path_write_through(path, &tombstone, false)?;
 
-        // Re-open the tombstone and compare stable volume/file indices with
-        // the retained validated source handle before treating disappearance
-        // of the final name as durable.
         let tombstone_file = open_private(&tombstone)?;
         let identity = |candidate: &File| -> io::Result<(u32, u64)> {
             let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -4742,9 +4301,6 @@ mod platform {
             ));
         }
         drop(tombstone_file);
-        // Deletion is cleanup only. If it is interrupted, the uniquely named
-        // private tombstone is fail-safe and cannot be mistaken for an armed
-        // receipt or a clean ACK.
         let _ = std::fs::remove_file(&tombstone);
         Ok(())
     }
@@ -4762,8 +4318,6 @@ mod platform {
         let directory = open_private_directory_raw(path)?;
         validate_private_directory_handle(&directory, path)?;
         let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: `directory` owns a live validated handle and `information`
-        // is a writable output buffer for this synchronous call.
         if unsafe { GetFileInformationByHandle(directory.as_raw_handle().cast(), &mut information) }
             == 0
         {
@@ -4787,10 +4341,6 @@ mod platform {
             )));
         }
         let mut information = FILE_CASE_SENSITIVE_INFO::default();
-        // SAFETY: `directory` owns a live directory handle and `information`
-        // is a correctly sized writable output buffer for this synchronous
-        // query. Failing the query is itself fail-closed: ARC cannot safely
-        // assume that case-folded deterministic sidecars are unique.
         if unsafe {
             GetFileInformationByHandleEx(
                 directory.as_raw_handle().cast(),
@@ -4825,8 +4375,6 @@ mod platform {
             )));
         }
         let mut information = BY_HANDLE_FILE_INFORMATION::default();
-        // SAFETY: `directory` owns a live handle and `information` is a valid
-        // output buffer for this synchronous identity query.
         if unsafe { GetFileInformationByHandle(directory.as_raw_handle().cast(), &mut information) }
             == 0
         {
@@ -4846,8 +4394,6 @@ mod platform {
         desired_access: u32,
     ) -> io::Result<File> {
         let path_wide = wide_path(path)?;
-        // SAFETY: OPEN_REPARSE_POINT opens a final directory reparse point
-        // itself; BACKUP_SEMANTICS permits opening a real directory handle.
         let handle = unsafe {
             CreateFileW(
                 path_wide.as_ptr(),
@@ -4862,14 +4408,10 @@ mod platform {
         if handle == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: the successful directory handle is uniquely transferred.
         Ok(unsafe { File::from_raw_handle(handle.cast::<c_void>()) })
     }
 
     pub(super) fn validate_directory_component_no_link(path: &Path) -> io::Result<()> {
-        // Open this component as the final path with OPEN_REPARSE_POINT, then
-        // reject every reparse tag (junctions included), not only Rust's
-        // `is_symlink` subset.
         let directory = open_private_directory_raw_with_access(path, 0)?;
         let metadata = directory.metadata()?;
         if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -4897,8 +4439,6 @@ mod platform {
         let administrators = parse_sid("S-1-5-32-544")?;
         let mut owner: PSID = null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
-        // SAFETY: the handle remains owned by `file`; GetSecurityInfo returns
-        // one LocalAlloc descriptor containing the owner SID.
         let status = unsafe {
             GetSecurityInfo(
                 file.as_raw_handle().cast::<c_void>(),
@@ -4915,11 +4455,6 @@ mod platform {
             return Err(io::Error::from_raw_os_error(status as i32));
         }
         let _descriptor_guard = LocalAllocation(descriptor);
-        // Windows deliberately uses BUILTIN\Administrators as the default
-        // owner for administrator tokens. Accepting that one group does not
-        // expand this module's trust boundary: the protected DACL below
-        // already grants that exact SID full control. Every other group or
-        // account owner remains rejected.
         if !owner_matches_private_policy(owner, current_user.as_ptr(), administrators.0) {
             return Err(permission_error(format!(
                 "private {object} is not owned by the current Windows user or trusted Administrators group: {}",
@@ -4934,7 +4469,6 @@ mod platform {
         let mut dacl_present = 0;
         let mut dacl_defaulted = 0;
         let mut dacl: *mut ACL = null_mut();
-        // SAFETY: the protected descriptor remains live through SetSecurityInfo.
         if unsafe {
             GetSecurityDescriptorDacl(
                 attributes.lpSecurityDescriptor,
@@ -4948,8 +4482,6 @@ mod platform {
         {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: the caller owns the object, the handle remains live, and
-        // `dacl` is backed by descriptor_guard until this call returns.
         let status = unsafe {
             SetSecurityInfo(
                 file.as_raw_handle().cast::<c_void>(),
@@ -5015,8 +4547,6 @@ mod platform {
         let mut owner: PSID = null_mut();
         let mut dacl: *mut ACL = null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
-        // SAFETY: the raw handle remains owned by `file`; output pointers are
-        // valid and the returned descriptor is freed below.
         let status = unsafe {
             GetSecurityInfo(
                 file.as_raw_handle().cast::<c_void>(),
@@ -5047,7 +4577,6 @@ mod platform {
         }
         let mut control = 0u16;
         let mut revision = 0u32;
-        // SAFETY: descriptor came from successful GetSecurityInfo.
         if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -5059,15 +4588,12 @@ mod platform {
         }
 
         let mut current_user_full_control = false;
-        // SAFETY: non-null ACL came from the security descriptor.
         let ace_count = unsafe { (*dacl).AceCount } as u32;
         for index in 0..ace_count {
             let mut raw_ace = null_mut();
-            // SAFETY: index is bounded by the ACL's AceCount.
             if unsafe { GetAce(dacl, index, &mut raw_ace) } == 0 {
                 return Err(io::Error::last_os_error());
             }
-            // SAFETY: successful GetAce returns at least ACE_HEADER.
             let header = unsafe { &*(raw_ace.cast::<ACE_HEADER>()) };
             if header.AceType as u32 == ACCESS_DENIED_ACE_TYPE {
                 continue;
@@ -5080,7 +4606,6 @@ mod platform {
                     path.display()
                 )));
             }
-            // SAFETY: type and minimum size were checked above.
             let ace = unsafe { &*(raw_ace.cast::<ACCESS_ALLOWED_ACE>()) };
             let sid = (&ace.SidStart as *const u32).cast_mut().cast::<c_void>();
             let is_current = equal_sid(sid, current_user.as_ptr());
@@ -5126,8 +4651,6 @@ mod platform {
         let current_user = current_user_sid()?;
         let mut owner: PSID = null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
-        // SAFETY: the object handle remains live and GetSecurityInfo owns
-        // the returned LocalAlloc descriptor until the guard below is dropped.
         let status = unsafe {
             GetSecurityInfo(
                 handle.as_raw_handle().cast::<c_void>(),

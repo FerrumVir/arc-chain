@@ -1,11 +1,3 @@
-// ARC LOCAL DEVELOPMENT explorer view.
-//
-// Scope: one disposable local node, read directly over its RPC. This file is
-// intentionally standalone - it never imports the canonical network resolver,
-// never reads arc-network.json, and never writes a configuration document that
-// the canonical explorer could consume. The canonical publication rules
-// (approved recovery checkpoint + maintenance interlock) live in
-// shared/frontend/arc-network.js and are untouched by this page.
 (() => {
   "use strict";
 
@@ -22,15 +14,11 @@
   }
 
   const BASE = rpcBase();
-  // Other replicas to cross-check a native receipt against: ?replicas=a,b
   const REPLICAS = (new URLSearchParams(window.location.search).get("replicas") || "")
     .split(",")
     .map((s) => s.trim().replace(/\/+$/, ""))
     .filter(Boolean);
   const NATIVE = window.ArcLocalDevNative;
-  // Tracked so a native-request lookup - triggered independently of the
-  // periodic refresh, e.g. from the deep link on page load - can still judge
-  // Pending expiry against this node's own most recently observed height.
   let lastKnownHeight = null;
 
   async function rpc(path) {
@@ -99,8 +87,6 @@
     return blocks;
   }
 
-  /// Normalise a raw /block/{h} response (header-nested) to the flat shape the
-  /// /blocks listing uses, so one renderer serves both.
   function flattenBlock(raw) {
     const header = raw?.header ?? {};
     return {
@@ -163,8 +149,6 @@
       item.dataset.hash = tx.hash;
       item.innerHTML = `<span class="localdev-tx-index">#${tx.index}</span> <code>${SHORT(tx.hash, 16, 8)}</code> <span class="localdev-tx-type"></span>`;
       list.appendChild(item);
-      // The type and outcome come from the transaction itself; a native one
-      // links to its request's receipt.
       rpc(`/tx/${tx.hash}/full`)
         .then((full) => {
           const d = NATIVE.describeTransaction(full);
@@ -232,8 +216,6 @@
     $("localdev-native-output-hex").textContent = own.outputCertified ? SHORT(own.outputHex, 16, 8) : "empty - not finalized yet";
     $("localdev-native-output-text").textContent = own.outputText !== null ? own.outputText : "unavailable (display-only, never certified)";
     $("localdev-native-votes").textContent = own.votes ?? "-";
-    // Read this node's OWN reported height, not another replica's, so the
-    // expiry judgment matches whichever chain view is on screen.
     const expiry = NATIVE.classifyExpiry(own, lastKnownHeight);
     if (expiry.applicable && expiry.expired === true) {
       expiryNote.hidden = false;
@@ -280,8 +262,6 @@
     }
   }
 
-  // A pinned ?height= keeps the periodic refresh from pulling the detail pane
-  // back to the newest block while someone is looking at an older one.
   const PINNED_HEIGHT = new URLSearchParams(window.location.search).get("height");
 
   async function refresh() {
@@ -292,9 +272,6 @@
       if (PINNED_HEIGHT) {
         await openBlockByHeight(PINNED_HEIGHT);
       } else if (blocks.length > 0) {
-        // Show the newest block that actually carries transactions when there
-        // is one; otherwise the newest block. Either way it is a real block
-        // this node committed.
         await showBlock(blocks.find((b) => (b.tx_count ?? 0) > 0) ?? blocks[0]);
       }
       const input = $("localdev-account-input");

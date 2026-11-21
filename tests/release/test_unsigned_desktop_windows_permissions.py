@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Native-Windows and hostile tests for the desktop signer permission gate."""
 
 from __future__ import annotations
 
@@ -173,8 +172,6 @@ class NativeWindowsPermissionTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
 
     def tearDown(self) -> None:
-        # A rejected workspace intentionally retains read-only files. Clear the
-        # attribute so TemporaryDirectory can remove them on every CPython.
         for path in self.root.rglob("*"):
             if path.is_file():
                 try:
@@ -247,8 +244,6 @@ class NativeWindowsPermissionTests(unittest.TestCase):
             github_output=github_output,
         )
 
-        # Python 3.12 on the hosted Windows image has no os.fchmod. Keep this
-        # exact fallback exercised even after the runner eventually advances.
         with mock.patch.object(HANDOFF.os, "fchmod", None, create=True):
             HANDOFF.package(args)
 

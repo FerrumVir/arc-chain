@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Tracked pure validators for authenticated host config and fresh quorum proof."""
 from __future__ import annotations
 
 import re
@@ -26,13 +25,9 @@ MIN_SAMPLE_INTERVAL = 10
 SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
 IP_RE = re.compile(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}\Z")
 SITE_RE = re.compile(r"[a-z]{3}\Z")
-# An update may leave at most two validators unobserved, and only when the owner
-# input names them. Nothing here ever derives that set from a host that fails to answer.
 MAX_DECLARED_OFFLINE = 2
 DECLARED_OFFLINE_FIELDS = frozenset({"site", "ip", "validator", "stake"})
 OFFLINE_PROBE_FIELDS = frozenset({"site", "ip", "validator", "health_url", "http_status", "binary_sha256"})
-# The public front answers 502, 503 or 504 when the node behind it does not
-# answer; no HTTP response at all is recorded as null. Every other result is an answer.
 NOT_ANSWERING_HTTP_STATUSES = frozenset({502, 503, 504})
 
 
@@ -65,11 +60,6 @@ def validate_argv_suffix(pin: dict, site: str, profile: str) -> list[str]:
 
 
 def validate_native_pin(native: object, site: str) -> dict:
-    """An owner-pinned native inference tail, its file hashes and context commitment.
-
-    Native inference is irreversibly activated on the live chain, so an update proof
-    must accept exactly the pinned production tail on every host and nothing else.
-    """
     require(isinstance(native, dict) and set(native) == {"argv_tail", "files_sha256", "context_commitment"},
             "native pin schema differs at " + site)
     tail = native["argv_tail"]
@@ -88,11 +78,6 @@ def validate_native_pin(native: object, site: str) -> dict:
 
 
 def validate_declared_offline_rows(config: dict, live: dict[str, dict]) -> dict[str, dict]:
-    """The owner-named validators that this update deliberately does not observe.
-
-    Each row names one validator by site, IP, identity and stake. A declared row can
-    never also be a live host, and at most two validators may be declared.
-    """
     rows = config.get("declared_offline", [])
     require(isinstance(rows, list), "declared-offline validators must be a list")
     require(len(rows) <= MAX_DECLARED_OFFLINE, "at most two validators may be declared offline")
@@ -119,7 +104,6 @@ def validate_declared_offline_rows(config: dict, live: dict[str, dict]) -> dict[
 
 
 def strict_supermajority_threshold(total_stake: int) -> int:
-    """Match arc_types::strict_supermajority_threshold, including zero power."""
     return 1 if total_stake == 0 else total_stake - (total_stake - 1) // 3
 
 
@@ -194,17 +178,11 @@ def validate_host_config(config: dict, *, profile: str = UPDATE_PROFILE) -> tupl
 
 
 def declared_offline_hosts(config: dict, *, profile: str = UPDATE_PROFILE) -> dict[str, dict]:
-    """Validate the whole host config and return its declared-offline validators by site."""
     hosts, _, _ = validate_host_config(config, profile=profile)
     return validate_declared_offline_rows(config, hosts)
 
 
 def validate_declared_offline_probes(sample: dict, declared: dict[str, dict]) -> None:
-    """Each sample must show every declared-offline validator not answering its public health read.
-
-    A declared validator that answers at all, on any binary, refutes the declaration: it
-    must be configured as a live host and run the candidate instead.
-    """
     if not declared:
         require("declared_offline" not in sample,
                 "a sample without declared-offline validators must not carry offline probes")
@@ -238,7 +216,6 @@ def validate_declared_offline_probes(sample: dict, declared: dict[str, dict]) ->
 
 
 def require_no_declared_rows(rows: object, declared: dict[str, dict], where: str) -> None:
-    """A declared-offline validator that shows up as a captured host refutes its declaration."""
     for row in rows if isinstance(rows, list) else ():
         if not isinstance(row, dict):
             continue
@@ -336,8 +313,6 @@ def validate_quorum_proof(proof: dict, hosts: dict[str, dict], total_stake: int,
             health = row.get("health") or {}
             require(type(row.get("height")) is int and type(row.get("last_block_height")) is int,
                     "host height fields are malformed at " + site)
-            # Each live host must see every other live host, up to the six-host floor of four:
-            # four live hosts (two declared offline) can only ever report three peers.
             require(health.get("status") == "ok" and health.get("chain_advancing") is True and
                     type(health.get("peers")) is int and health["peers"] >= min(4, len(hosts) - 1) and
                     health.get("validators") == 6 and

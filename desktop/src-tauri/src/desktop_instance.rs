@@ -1,7 +1,3 @@
-//! Per-user desktop lease and bounded, authenticated argument handoff.
-//! Registered first, before any plugin or application setup can mutate state.
-//! The lease is a Tauri resource: cleanup_before_exit releases it even when
-//! restart skips RunEvent::Exit. No persistent socket pathname is unlinked.
 use fs2::FileExt;
 use std::{
     fs::File,
@@ -34,8 +30,6 @@ pub fn should_show(args: &[String]) -> bool {
     !args.iter().any(|arg| arg == "--minimized")
 }
 
-/// The same lock covers readiness and pending intent: a handoff racing with
-/// startup either queues once or dispatches after readiness, never falls between.
 #[derive(Default)]
 struct StartupGate(Mutex<StartupState>);
 
@@ -56,7 +50,6 @@ impl StartupGate {
         }
     }
 
-    // None means readiness was already published; Some carries queued intent.
     fn finish(&self) -> Option<bool> {
         let mut state = self.0.lock().unwrap();
         if state.ready {
@@ -67,9 +60,6 @@ impl StartupGate {
     }
 }
 
-/// Called on RunEvent::Ready, after application setup has returned. A managed
-/// WebviewWindow alone can survive failed native creation; querying its URL
-/// also requires the runtime's live webview. Do not log the URL itself.
 pub fn finish_startup(app: &tauri::AppHandle) {
     if app.try_state::<StartupFailure>().is_some() {
         return;
@@ -90,14 +80,10 @@ pub fn finish_startup(app: &tauri::AppHandle) {
     }
 }
 
-/// Restore the native state even when an external ShowWindow call has left
-/// Tao's cached visibility out of sync. All callers run on the UI thread.
 #[cfg(windows)]
 fn restore_windows_main(window: &tauri::WebviewWindow) -> tauri::Result<()> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, ShowWindow, SW_RESTORE, SW_SHOW};
     let hwnd = window.hwnd()?.0;
-    // SAFETY: this is the live Tauri window's HWND, on its owning thread.
-    // ShowWindow returns the previous visibility, not success/failure.
     unsafe {
         ShowWindow(
             hwnd,
@@ -111,7 +97,6 @@ fn restore_windows_main(window: &tauri::WebviewWindow) -> tauri::Result<()> {
     Ok(())
 }
 
-/// All explicit reopen routes use this order and the same wake signal.
 pub fn show_main(app: &tauri::AppHandle) {
     tracing::debug!("desktop show_main entered on main thread");
     if app.try_state::<StartupFailure>().is_some() {
@@ -168,11 +153,6 @@ enum Entry {
 
 fn enter(app_data_dir: &Path, args: &[String]) -> anyhow::Result<Entry> {
     use arc_crypto::secret_file as private;
-    // Tauri's per-user app-data ancestry can legitimately contain symlinks
-    // (e.g. /var on macOS or a relocated home). Resolve only that ancestry,
-    // including on first launch when the app-data directory does not exist.
-    // Never canonicalize desktop-session itself: its no-link, owner and
-    // private-permission checks must run before any capability is published.
     std::fs::create_dir_all(app_data_dir)?;
     let dir = app_data_dir.canonicalize()?.join("desktop-session");
     private::secure_private_directory_tree(&dir)?;
@@ -191,8 +171,6 @@ fn enter(app_data_dir: &Path, args: &[String]) -> anyhow::Result<Entry> {
                     port: listener.local_addr()?.port(),
                     token: token.clone(),
                 };
-                // Windows mandatory byte locks also deny reads: publish the
-                // handoff endpoint separately from the locked lease file.
                 private::durably_replace_private(&endpoint_path, &serde_json::to_vec(&endpoint)?)?;
                 return Ok(Entry::Owner(
                     Lease {
@@ -204,8 +182,6 @@ fn enter(app_data_dir: &Path, args: &[String]) -> anyhow::Result<Entry> {
                 ));
             }
             Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
-                // The owner may still be publishing its endpoint, or exiting.
-                // Only an authenticated acknowledgement permits this copy to exit 0.
                 let mut bytes = Vec::new();
                 if let Ok(endpoint_file) = private::open_private(&endpoint_path) {
                     let _ = endpoint_file.take(MAX_MESSAGE).read_to_end(&mut bytes);
@@ -251,7 +227,6 @@ fn receive(
     token: &str,
     mut callback: impl FnMut(Vec<String>),
 ) -> anyhow::Result<()> {
-    // Accepted sockets can inherit the listener's nonblocking flag.
     stream.set_nonblocking(false)?;
     let deadline = Instant::now() + CONNECTION_TIMEOUT;
     let mut bytes = Vec::new();
@@ -276,8 +251,6 @@ fn receive(
         "desktop handoff deadline exceeded"
     );
     let message: Handoff = serde_json::from_slice(&bytes)?;
-    // BLAKE3 Hash equality uses constant_time_eq_32. The protocol token is
-    // fixed-size ASCII hex; reject other lengths before hashing/comparing.
     anyhow::ensure!(
         message.token.len() == 64 && token.len() == 64,
         "invalid desktop handoff"
@@ -295,8 +268,6 @@ fn receive(
     Ok(())
 }
 
-/// A slow unauthenticated peer cannot monopolize the accept loop. Both the
-/// number of workers and each worker's total connection lifetime are bounded.
 fn serve(
     listener: TcpListener,
     token: String,
@@ -336,9 +307,6 @@ fn serve(
 
 struct StartupFailure(String);
 
-/// Called by application setup only after the dialog plugin is initialized.
-/// Return before loading the store, installing a tray or reconciling a node.
-/// Use an asynchronous native dialog so the main event loop remains available.
 pub fn show_startup_failure(app: &tauri::AppHandle) -> bool {
     use tauri_plugin_dialog::DialogExt;
     let Some(failure) = app.try_state::<StartupFailure>() else {
@@ -392,8 +360,6 @@ pub fn init() -> tauri::plugin::TauriPlugin<tauri::Wry> {
                     });
                 }
                 Err(error) => {
-                    // Propagating this through plugin setup would panic in
-                    // Builder::build, silently in Windows GUI builds.
                     app.manage(StartupFailure(crate::paths::redact_home_text(
                         &error.to_string(),
                     )));
@@ -465,7 +431,6 @@ mod tests {
             ));
             assert!(!received.recv_timeout(TIMEOUT).unwrap());
         }
-        // A login handoff must not cancel the earlier explicit click.
         assert_eq!(gate.finish(), Some(true));
         assert_eq!(gate.finish(), None);
         drop(lease);
@@ -500,8 +465,6 @@ mod tests {
             Entry::Forwarded
         ));
         assert_eq!(received.recv_timeout(TIMEOUT).unwrap(), args);
-        // A lease has no owner outside Tauri's resource table. Dropping
-        // that table exercises the same resource drop as its exit cleanup.
         let mut resources = tauri::ResourceTable::default();
         resources.add(lease);
         drop(resources);
@@ -595,8 +558,6 @@ mod tests {
             let started = Instant::now();
             slow.set_write_timeout(Some(CONNECTION_TIMEOUT)).unwrap();
             slow.set_read_timeout(Some(TIMEOUT)).unwrap();
-            // All gaps are below the old per-read timeout. The overall
-            // deadline must close the connection despite continued input.
             for _ in 0..8 {
                 std::thread::sleep(Duration::from_millis(100));
                 if slow.write_all(b" ").is_err() {
@@ -633,8 +594,6 @@ mod tests {
         let session = app_data.join("desktop-session");
         arc_crypto::secret_file::validate_private_directory(&session).unwrap();
         for name in ["desktop-instance.lock", "desktop-instance.json"] {
-            // Windows denies reads of the held lock; its creation/open path
-            // already validates it. Inspect the endpoint on every platform.
             if cfg!(windows) && name.ends_with(".lock") {
                 continue;
             }
@@ -652,7 +611,6 @@ mod tests {
         let linked_home = root.path().join("home");
         symlink(&home, &linked_home).unwrap();
         let app_data = home.join("app-data/ARC");
-        // First launch through a symlinked home, with missing app-data dirs.
         let Entry::Owner(lease, listener, token) =
             enter(&linked_home.join("app-data/ARC"), &[]).unwrap()
         else {

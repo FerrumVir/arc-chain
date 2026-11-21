@@ -36,7 +36,6 @@ def llama_ppl(log_text: str) -> tuple[float, float]:
 
 
 def read_tokens(text: str) -> list[int]:
-    """Token ids from `llama-tokenize --ids` ([1, 2, ...]) or one id per line."""
     return [int(t) for t in TOKEN.findall(text)]
 
 

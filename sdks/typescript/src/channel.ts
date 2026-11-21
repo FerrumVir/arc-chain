@@ -1,18 +1,3 @@
-/**
- * Off-chain bilateral payment channel for ARC Chain.
- *
- * Provides a Channel class with pay(), receive(), close(), and dispute()
- * methods for high-throughput off-chain transactions between two agents.
- *
- * @example
- * ```typescript
- * const channel = new Channel(channelId, myKeypair, counterpartyPubkey, deposit);
- * await channel.open(client);
- * const commitment = channel.pay(100);
- * // Send commitment to counterparty...
- * ```
- */
-
 import { Hash256, Address, TransactionBody } from './types';
 
 function assertSafeU64Number(value: number, fieldName: string): void {
@@ -21,7 +6,6 @@ function assertSafeU64Number(value: number, fieldName: string): void {
   }
 }
 
-/** Channel lifecycle states. */
 export enum ChannelState {
   Opening = 'Opening',
   Open = 'Open',
@@ -30,27 +14,17 @@ export enum ChannelState {
   Closed = 'Closed',
 }
 
-/** A signed state commitment for the channel. */
 export interface StateCommitment {
   channelId: Hash256;
   nonce: number;
   openerBalance: number;
   counterpartyBalance: number;
-  /** Signature from the party that proposed this state. */
   proposerSig: Uint8Array;
-  /** Signature from the party that accepted this state (null if pending). */
   acceptorSig: Uint8Array | null;
 }
 
-/** Role of a party in the channel. */
 export type Role = 'opener' | 'counterparty';
 
-/**
- * Off-chain bilateral payment channel.
- *
- * Manages state transitions, signature verification, and balance conservation
- * for a two-party payment channel on ARC Chain.
- */
 export class Channel {
   readonly channelId: Hash256;
   readonly role: Role;
@@ -82,7 +56,6 @@ export class Channel {
     }
   }
 
-  /** Mark channel as open after on-chain ChannelOpen confirms. */
   confirmOpen(): void {
     if (this.state !== ChannelState.Opening) {
       throw new Error(`Cannot open: channel is ${this.state}`);
@@ -90,20 +63,14 @@ export class Channel {
     this.state = ChannelState.Open;
   }
 
-  /** Get this party's current balance. */
   myBalance(): number {
     return this.role === 'opener' ? this.openerBalance : this.counterpartyBalance;
   }
 
-  /** Get counterparty's current balance. */
   theirBalance(): number {
     return this.role === 'opener' ? this.counterpartyBalance : this.openerBalance;
   }
 
-  /**
-   * Transfer `amount` from this party to the counterparty.
-   * Returns a half-signed state commitment to send to the counterparty.
-   */
   pay(amount: number): StateCommitment {
     if (this.state !== ChannelState.Open) {
       throw new Error(`Cannot pay: channel is ${this.state}`);
@@ -129,7 +96,6 @@ export class Channel {
     return this.proposeState(newOpener, newCounter);
   }
 
-  /** Propose a new state with arbitrary balances. */
   proposeState(openerBalance: number, counterpartyBalance: number): StateCommitment {
     if (this.state !== ChannelState.Open) {
       throw new Error(`Cannot propose: channel is ${this.state}`);
@@ -154,17 +120,13 @@ export class Channel {
       nonce: newNonce,
       openerBalance,
       counterpartyBalance,
-      proposerSig: new Uint8Array(64), // Caller signs externally
+      proposerSig: new Uint8Array(64),
       acceptorSig: null,
     };
 
     return commitment;
   }
 
-  /**
-   * Receive and validate a state commitment from the counterparty.
-   * Updates local state if valid.
-   */
   receiveState(commitment: StateCommitment): StateCommitment {
     if (this.state !== ChannelState.Open) {
       throw new Error(`Cannot receive: channel is ${this.state}`);
@@ -188,12 +150,9 @@ export class Channel {
       throw new Error('Conservation violated');
     }
 
-    // In a full implementation, verify proposer's Ed25519 signature here.
-    // For now, accept the commitment and co-sign.
-
     const signed: StateCommitment = {
       ...commitment,
-      acceptorSig: new Uint8Array(64), // Caller signs externally
+      acceptorSig: new Uint8Array(64),
     };
 
     this.nonce = commitment.nonce;
@@ -204,7 +163,6 @@ export class Channel {
     return signed;
   }
 
-  /** Finalize a state after receiving counterparty's co-signature. */
   finalizeState(commitment: StateCommitment): void {
     if (!commitment.acceptorSig) {
       throw new Error('Commitment not fully signed');
@@ -226,7 +184,6 @@ export class Channel {
     this.history.push(commitment);
   }
 
-  /** Initiate cooperative close. */
   close(): StateCommitment {
     if (this.state !== ChannelState.Open) {
       throw new Error(`Cannot close: channel is ${this.state}`);
@@ -244,7 +201,6 @@ export class Channel {
     };
   }
 
-  /** Get the latest fully-signed state for on-chain dispute submission. */
   dispute(): StateCommitment {
     const latest = [...this.history].reverse().find((c) => c.acceptorSig !== null);
     if (!latest) {
@@ -253,12 +209,10 @@ export class Channel {
     return latest;
   }
 
-  /** Mark channel as closed after on-chain resolution. */
   confirmClosed(): void {
     this.state = ChannelState.Closed;
   }
 
-  /** Build a ChannelOpen transaction body. */
   static buildOpenBody(
     channelId: Hash256,
     counterparty: Address,
@@ -276,7 +230,6 @@ export class Channel {
     };
   }
 
-  /** Build a ChannelClose transaction body. */
   static buildCloseBody(
     channelId: Hash256,
     openerBalance: number,
@@ -297,7 +250,6 @@ export class Channel {
     };
   }
 
-  /** Build a ChannelDispute transaction body. */
   static buildDisputeBody(
     channelId: Hash256,
     openerBalance: number,

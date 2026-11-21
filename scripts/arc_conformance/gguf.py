@@ -1,10 +1,3 @@
-"""Minimal GGUF (v2/v3) header reader and writer. Never reads tensor data.
-
-The reader stops at the end of the tensor-info table, so inspecting a
-multi-gigabyte artifact costs a few megabytes of I/O. The writer exists for
-tests: it produces small, valid files for the manifest and loader tests.
-"""
-
 from __future__ import annotations
 
 import struct
@@ -12,19 +5,17 @@ from dataclasses import dataclass, field
 
 MAGIC = b"GGUF"
 
-# Metadata value types.
 U8, I8, U16, I16, U32, I32, F32, BOOL, STRING, ARRAY, U64, I64, F64 = range(13)
 _SCALAR = {U8: "<B", I8: "<b", U16: "<H", I16: "<h", U32: "<I", I32: "<i",
            F32: "<f", BOOL: "<?", U64: "<Q", I64: "<q", F64: "<d"}
 
-# ggml tensor types (the ones a manifest names; unknown ids are kept numeric).
 GGML_TYPES = {0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1",
               8: "Q8_0", 9: "Q8_1", 10: "Q2_K", 11: "Q3_K", 12: "Q4_K",
               13: "Q5_K", 14: "Q6_K", 15: "Q8_K", 24: "I8", 25: "I16",
               26: "I32", 27: "I64", 28: "F64", 30: "BF16"}
 
-MAX_STRING = 1 << 24      # 16 MiB: no legitimate key or token is larger
-MAX_ARRAY = 1 << 24       # 16 Mi entries
+MAX_STRING = 1 << 24
+MAX_ARRAY = 1 << 24
 MAX_TENSORS = 1 << 16
 MAX_DIMS = 4
 
@@ -36,7 +27,7 @@ class GgufError(ValueError):
 @dataclass
 class TensorInfo:
     name: str
-    dims: list[int]           # GGUF order: innermost (ne0) first
+    dims: list[int]
     ggml_type: int
     offset: int
 
@@ -46,7 +37,6 @@ class TensorInfo:
 
     @property
     def shape(self) -> list[int]:
-        """Row-major shape, outermost first (how candle and ARC see it)."""
         return list(reversed(self.dims))
 
 
@@ -134,8 +124,6 @@ def read_header(path) -> Header:
     return header
 
 
-# --- writer (tests only) --------------------------------------------------------
-
 def _pack_string(text: str) -> bytes:
     data = text.encode("utf-8")
     return struct.pack("<Q", len(data)) + data
@@ -153,7 +141,6 @@ def _pack_value(vtype: int, value, etype=None) -> bytes:
 
 
 def write(path, metadata: list[tuple], tensors: list[tuple], alignment: int = 32) -> None:
-    """metadata: (key, vtype, value[, etype]); tensors: (name, shape, f32 values)."""
     out = bytearray(MAGIC + struct.pack("<IQQ", 3, len(tensors), len(metadata)))
     for item in metadata:
         key, vtype, value = item[:3]
@@ -164,7 +151,7 @@ def write(path, metadata: list[tuple], tensors: list[tuple], alignment: int = 32
         dims = list(reversed(shape))
         out += _pack_string(name) + struct.pack("<I", len(dims))
         out += b"".join(struct.pack("<Q", d) for d in dims)
-        out += struct.pack("<IQ", 0, offset)  # F32
+        out += struct.pack("<IQ", 0, offset)
         blob = struct.pack(f"<{len(values)}f", *values)
         blobs.append(blob)
         offset += len(blob) + (-len(blob)) % alignment

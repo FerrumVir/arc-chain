@@ -1,19 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// ─── Fused LayerNorm + Quantize ─────────────────────────────────────────────
-//
-// Combines two dispatches into one:
-//   layernorm(i32 input → i32 normed) + quantize(i32 normed → packed u32 i8)
-//
-// Saves: 1 dispatch per fusion point, 1 intermediate buffer write+read.
-// Uses 16KB threadgroup memory to cache normalized values (d_model ≤ 8192).
-//
-// 256 threads per threadgroup, 1 threadgroup per dispatch.
-// 5 phases: mean → variance → normalize+absmax → reduce absmax → pack
-
 struct LNQParams {
-    uint size;   // d_model
+    uint size;
     uint _p1;
     uint _p2;
     uint _p3;
@@ -21,19 +10,17 @@ struct LNQParams {
 
 kernel void layernorm_quantize(
     device const int* input [[buffer(0)]],
-    device uint* output [[buffer(1)]],        // packed u32 (i8×4)
+    device uint* output [[buffer(1)]],
     device const int* gamma [[buffer(2)]],
     constant LNQParams& params [[buffer(3)]],
-    device int* out_scale [[buffer(4)]],      // single i32 scale factor
+    device int* out_scale [[buffer(4)]],
     uint tid [[thread_index_in_threadgroup]]
 ) {
     const uint size = params.size;
 
-    // Shared memory: reduction scratch + normalized value cache
     threadgroup int shared[256];
-    threadgroup int norm_cache[8192]; // supports d_model up to 8192
+    threadgroup int norm_cache[8192];
 
-    // ── Phase 1: mean ────────────────────────────────────────────────
     int local_sum = 0;
     for (uint i = tid; i < size; i += 256u) {
         local_sum += input[i];
@@ -48,7 +35,6 @@ kernel void layernorm_quantize(
     const int mean = shared[0] / int(size);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ── Phase 2: variance ────────────────────────────────────────────
     int local_var = 0;
     for (uint i = tid; i < size; i += 256u) {
         int d = input[i] - mean;
@@ -65,7 +51,6 @@ kernel void layernorm_quantize(
     const int inv_std = 65536 / max(1, int(sqrt(float(max(1, variance + 1)))));
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ── Phase 3: normalize + gamma → cache + find abs_max ────────────
     int local_max = 0;
     for (uint i = tid; i < size; i += 256u) {
         int norm = ((input[i] - mean) * inv_std) >> 16;
@@ -77,7 +62,6 @@ kernel void layernorm_quantize(
     shared[tid] = local_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ── Phase 4: reduce abs_max ──────────────────────────────────────
     for (uint stride = 128u; stride > 0u; stride >>= 1u) {
         if (tid < stride) shared[tid] = max(shared[tid], shared[tid + stride]);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -90,7 +74,6 @@ kernel void layernorm_quantize(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ── Phase 5: quantize from cache + pack u32 ─────────────────────
     const uint packed_size = (size + 3u) / 4u;
     for (uint i = tid; i < packed_size; i += 256u) {
         uint base = i * 4u;
@@ -105,14 +88,6 @@ kernel void layernorm_quantize(
     }
 }
 
-// ─── Q4 Matmul: 4-bit weights × 8-bit input ────────────────────────────────
-//
-// Weights stored as 4-bit signed (2's complement), 2 values per byte.
-// Byte layout: [high_nibble | low_nibble] where each nibble is signed [-8, 7].
-// Weight buffer is HALF the size of Q8 → halves memory bandwidth.
-//
-// Same simdgroup tiling as matmul_i8: 4 simdgroups × 32 threads per threadgroup.
-
 struct MatmulParams {
     uint in_size;
     uint out_size;
@@ -121,8 +96,8 @@ struct MatmulParams {
 };
 
 kernel void matmul_i4(
-    device const uchar* weights [[buffer(0)]],  // Q4 packed: 2 weights per byte
-    device const char* input [[buffer(1)]],      // Q8 input
+    device const uchar* weights [[buffer(0)]],
+    device const char* input [[buffer(1)]],
     device int* output [[buffer(2)]],
     constant MatmulParams& params [[buffer(3)]],
     device const int* scales [[buffer(4)]],
@@ -134,7 +109,7 @@ kernel void matmul_i4(
     if (row >= (int)params.out_size) return;
 
     const uint in_sz = params.in_size;
-    const uint byte_cols = in_sz / 2u; // 2 values per byte
+    const uint byte_cols = in_sz / 2u;
     device const uchar* w = weights + row * byte_cols;
 
     const uint chunk = (byte_cols + 31u) / 32u;
@@ -143,11 +118,9 @@ kernel void matmul_i4(
 
     int acc = 0;
 
-    // Each byte produces 2 multiply-adds
     for (uint j = start; j < end; j++) {
         uchar packed = w[j];
 
-        // Bias-8 encoding: nibble [0,15] → signed [-8, 7] by subtracting 8
         int w_lo = int(packed & 0xFu) - 8;
         int w_hi = int((packed >> 4u) & 0xFu) - 8;
 

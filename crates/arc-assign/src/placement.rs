@@ -1,17 +1,7 @@
-//! Deterministic, cost-aware placement (S3).
-//!
-//! Given the per-token projection stages of a model, the coordinator's own
-//! rate, and validated workers with MEASURED rates and fresh link
-//! measurements, choose who computes which rows - or nobody but the
-//! coordinator, when distributing would be slower. The same inputs always
-//! give the same placement, whatever order they arrive in, so any validator
-//! can recompute it from a certificate (S4).
-
 use crate::Address;
 use crate::link::LinkMeasurement;
 use serde::{Deserialize, Serialize};
 
-/// One projection a token needs: `rows` outputs of `cols` inputs each.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stage {
     pub layer: Option<u32>,
@@ -20,26 +10,16 @@ pub struct Stage {
     pub cols: u64,
 }
 
-/// A worker eligible for placement: its lease validated, its capacity
-/// measured by challenge, its link measured.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Candidate {
     pub worker: Address,
     pub transport_id: String,
-    /// Measured multiply-accumulates per second (never the claim).
     pub macs_per_s: u64,
     pub ram_headroom_bytes: u64,
     pub max_concurrency: u32,
     pub link: LinkMeasurement,
-    /// Layers whose weights this worker actually holds, as half-open
-    /// `[start, end)` ranges - exactly what `--shard-range` configures and a
-    /// shard announcement carries. Empty means the whole model. A worker is
-    /// never given rows of a layer it does not hold, and a layerless stage
-    /// (embedding, output) belongs to full-model participants only.
     #[serde(default)]
     pub resident_layers: Vec<(u32, u32)>,
-    /// Explicit output-head rows on a ranged private worker. Does not imply
-    /// any other layerless tensor or a complete local model.
     #[serde(default)]
     pub resident_output: bool,
 }
@@ -47,23 +27,16 @@ pub struct Candidate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
     pub max_workers: usize,
-    /// Links measured more than this long ago (same units as
-    /// `LinkMeasurement::measured_at`) are not used.
     pub max_link_age: u64,
     pub now: u64,
     pub max_failure_per_mille: u32,
-    /// Whether measurements taken under injected conditions may be used.
     pub allow_simulated_links: bool,
-    /// Bytes per input element sent and per output element returned.
     pub input_element_bytes: u64,
     pub output_element_bytes: u64,
-    /// Bytes a resident row costs per input column (1 for canonical I8).
     pub weight_bytes_per_element: u64,
-    /// Whether the coordinator computes a share itself.
     pub include_coordinator: bool,
 }
 
-/// Who computes a slice: the coordinator itself, or a worker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Participant {
     Coordinator,
@@ -71,7 +44,6 @@ pub enum Participant {
 }
 
 impl Participant {
-    /// Canonical order: the coordinator first, then workers by address.
     fn order_key(&self) -> (u8, [u8; 32]) {
         match self {
             Participant::Coordinator => (0, [0; 32]),
@@ -95,11 +67,8 @@ pub struct StagePlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Placement {
-    /// Workers used, in address order (the coordinator is implicit).
     pub workers: Vec<Address>,
     pub stages: Vec<StagePlan>,
-    /// Predicted per-token time of this placement, and of the coordinator
-    /// alone - so the decision to distribute is visible in the record.
     pub predicted_token_us: u64,
     pub coordinator_only_token_us: u64,
 }
@@ -123,8 +92,6 @@ fn usable(c: &Candidate, p: &Policy) -> bool {
         && (p.allow_simulated_links || !c.link.simulated)
 }
 
-/// Split `rows` in proportion to `weights` (parts per million), exactly:
-/// floor shares, then the remainder one row each in participant order.
 fn split_rows(rows: u64, weights: &[u64]) -> Vec<u64> {
     let total: u128 = weights.iter().map(|w| *w as u128).sum();
     if total == 0 {
@@ -146,7 +113,6 @@ fn split_rows(rows: u64, weights: &[u64]) -> Vec<u64> {
     out
 }
 
-/// Per-token time of one participant set with the given row counts per stage.
 fn predict(
     stages: &[Stage],
     rates: &[u64],
@@ -179,8 +145,6 @@ fn predict(
     total.min(u64::MAX as u128) as u64
 }
 
-/// Whether a participant holding `resident` layers can serve this stage.
-/// Empty residency is a full-model participant: it holds everything.
 fn holds_stage(resident: &[(u32, u32)], resident_output: bool, stage: &Stage) -> bool {
     if resident.is_empty() {
         return true;
@@ -191,9 +155,6 @@ fn holds_stage(resident: &[(u32, u32)], resident_output: bool, stage: &Stage) ->
     }
 }
 
-/// Weights for one stage, in ppm: proportional to rate among the
-/// participants that hold it, each capped by what its memory allows, the
-/// excess redistributed to those with room left (bounded passes).
 fn capped_weights(rates: &[u64], caps: &[u128], eligible: &[bool]) -> Vec<u128> {
     let rate_total: u128 = rates
         .iter()
@@ -238,7 +199,6 @@ fn capped_weights(rates: &[u64], caps: &[u128], eligible: &[bool]) -> Vec<u128> 
     weights
 }
 
-/// Choose a placement. See the module documentation.
 pub fn place(
     stages: &[Stage],
     coordinator_macs_per_s: u64,
@@ -251,16 +211,12 @@ pub fn place(
     if policy.include_coordinator && coordinator_macs_per_s == 0 {
         return Err(PlacementError::NoCoordinatorRate);
     }
-    // Deterministic candidate order: fastest measured first, address breaks
-    // ties. Input order never matters.
     let mut pool: Vec<&Candidate> = candidates.iter().filter(|c| usable(c, policy)).collect();
     pool.sort_by(|a, b| {
         b.macs_per_s
             .cmp(&a.macs_per_s)
             .then(a.worker.0.cmp(&b.worker.0))
     });
-    // One entry per validator identity - its fastest offer - however many
-    // leases or transports it presented.
     let mut seen = std::collections::BTreeSet::new();
     pool.retain(|c| seen.insert(c.worker.0));
 
@@ -277,11 +233,10 @@ pub fn place(
         if k == 0 && !policy.include_coordinator {
             continue;
         }
-        // Participants: coordinator (if included) then the k fastest workers.
         let chosen = &pool[..k];
         let mut rates: Vec<u64> = Vec::new();
         let mut links: Vec<Option<&LinkMeasurement>> = Vec::new();
-        let mut caps: Vec<u128> = Vec::new(); // max share of ANY held stage, in ppm
+        let mut caps: Vec<u128> = Vec::new();
         let mut resident: Vec<(&[(u32, u32)], bool)> = Vec::new();
         if policy.include_coordinator {
             rates.push(coordinator_macs_per_s);
@@ -292,26 +247,17 @@ pub fn place(
         for c in chosen {
             rates.push(c.macs_per_s);
             links.push(Some(&c.link));
-            // Bytes this machine would hold if it took every row of every
-            // stage it is resident for - the denominator its headroom is
-            // measured against.
             let held_bytes: u128 = stages
                 .iter()
                 .filter(|s| holds_stage(&c.resident_layers, c.resident_output, s))
                 .map(|s| s.rows as u128 * s.cols as u128 * policy.weight_bytes_per_element as u128)
                 .sum();
-            // The same fraction cap on every held stage bounds total
-            // residency: sum over held stages of cap * stage_bytes is
-            // cap * held_bytes, which is the headroom itself.
             let cap = (c.ram_headroom_bytes as u128 * 1_000_000)
                 .checked_div(held_bytes)
                 .map_or(1_000_000, |share| share.min(1_000_000));
             caps.push(cap);
             resident.push((&c.resident_layers, c.resident_output));
         }
-        // Each stage is shared out among the participants resident for it,
-        // so nobody is ever handed rows it does not hold. A set that cannot
-        // cover some stage is not a placement at all.
         let mut rows_per_stage: Vec<Vec<u64>> = Vec::with_capacity(stages.len());
         let mut coverable = true;
         for stage in stages {
@@ -322,8 +268,6 @@ pub fn place(
             let weights = capped_weights(&rates, &caps, &eligible);
             let placed: u128 = weights.iter().sum();
             if placed + (weights.len() as u128) < 1_000_000 {
-                // Nobody resident for this stage, or not enough memory
-                // among those who are, to hold every one of its rows.
                 coverable = false;
                 break;
             }
@@ -353,8 +297,6 @@ pub fn place(
     for c in &pool[..k] {
         participants.push(Participant::Worker(c.worker));
     }
-    // Slices in a canonical participant order: coordinator, then workers by
-    // address - independent of how fast each was.
     let mut order: Vec<usize> = (0..participants.len()).collect();
     order.sort_by_key(|i| participants[*i].order_key());
     let stage_plans = stages
@@ -388,8 +330,6 @@ pub fn place(
     })
 }
 
-/// Every stage covered exactly once, in order: the invariant a certificate
-/// and the executor both check before any row is computed.
 pub fn covers_exactly(placement: &Placement, stages: &[Stage]) -> bool {
     placement.stages.len() == stages.len()
         && placement.stages.iter().zip(stages).all(|(plan, stage)| {

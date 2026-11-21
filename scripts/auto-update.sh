@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# Supported local-only compatibility wrapper for stake-zero community installs.
-# It accepts no remote host, release URL, or executable payload. The installed
-# canonical updater resolves one release, verifies SHA-256 before replacement,
-# and applies its own downgrade/service safety checks.
 set -Eeuo pipefail
 
 ARC_DIR="${ARC_DIR:-$HOME/.arc}"

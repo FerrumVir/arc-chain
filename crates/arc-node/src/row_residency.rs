@@ -1,12 +1,3 @@
-//! Operator-pinned manifests for private fixed-residency row workers.
-//!
-//! This validates bounded manifest metadata and file sizes only. It does not
-//! read model weights or authenticate row-file contents. Partial connections
-//! require the shared daemon's exact-stream manifest pin handshake over trusted
-//! private SSH; canonical numerical and package qualification remain required. Offline
-//! exporter/conformance manifests are inputs to configuration validation,
-//! not evidence of production qualification.
-
 use crate::row_cohort::{RowWorkerEntry, machine_address, projection_stages};
 use arc_assign::resident::{ResidentRange, WorkerResidency, validate_layout};
 use arc_crypto::Hash256;
@@ -42,7 +33,6 @@ pub struct ManifestPin {
 }
 
 impl PartialRowConfig {
-    /// Check operator intent against the exact worker set before opening files.
     pub fn validate(&self, workers: &[RowWorkerEntry]) -> Result<(), String> {
         if self.format != CONFIG_FORMAT {
             return Err("unsupported private row-residency config format".into());
@@ -90,7 +80,6 @@ impl PartialRowConfig {
         Ok(())
     }
 
-    /// Load only bounded metadata; row payloads are neither read nor trusted here.
     pub fn load(
         &self,
         workers: &[RowWorkerEntry],

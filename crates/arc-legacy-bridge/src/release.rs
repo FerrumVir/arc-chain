@@ -1,5 +1,3 @@
-//! The pinned v0.8 release on disk: fetched, signature-checked, and probed.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,11 +23,6 @@ pub struct VerifiedRelease {
     pub seeds: PathBuf,
 }
 
-/// Fetch (or re-verify the cached copy of) every file the bridged node needs.
-///
-/// Order matches `install.sh`: the signed manifest is fetched and verified
-/// with the pinned release key before any executable is downloaded, and every
-/// asset must match both the signed manifest and the compiled-in pin.
 pub fn ensure(
     layout: &Layout,
     pins: &Pins,
@@ -137,7 +130,6 @@ fn make_executable(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A command for a helper binary that never flashes a console on Windows.
 pub fn quiet_command(program: &Path) -> Command {
     #[allow(unused_mut)]
     let mut command = Command::new(program);
@@ -150,8 +142,6 @@ pub fn quiet_command(program: &Path) -> Command {
     command
 }
 
-/// Prove the pinned binary runs on this machine (architecture, C library,
-/// OS version) before the bridge commits to starting it.
 pub fn probe_version(binary: &Path, expected_version: &str) -> Result<()> {
     let output = quiet_command(binary)
         .arg("--version")
@@ -178,14 +168,6 @@ pub fn probe_version(binary: &Path, expected_version: &str) -> Result<()> {
     Ok(())
 }
 
-/// Create (once) and self-check the bridged node's Ed25519 keyfile.
-///
-/// The identity is new: the v0.7 seed is never read. A v0.7 headless seed
-/// was `community-<hostname>-<8 hex>`, about 32 bits of secret, so preserving
-/// it would keep a key that can be brute-forced from its public address. The
-/// keyfile is created by the pinned `arc-cli`, which writes it owner-only
-/// (mode 0600 on Unix, a protected owner DACL on Windows) and never replaces
-/// an existing file.
 pub fn ensure_identity(layout: &Layout, cli: &Path, log: &mut Log) -> Result<String> {
     let keyfile = layout.keyfile();
     if fs::symlink_metadata(&keyfile).is_err() {
@@ -234,9 +216,6 @@ mod tests {
     const MANIFEST: &[u8] = include_bytes!("../fixtures/v0.8.13/SHA256SUMS");
     const SIGNATURE: &[u8] = include_bytes!("../fixtures/v0.8.13/SHA256SUMS.sig");
 
-    /// Pins whose asset digests describe small local stand-ins, while the
-    /// manifest and its signature stay the real v0.8.13 bytes. This drives
-    /// the full ordering and refusal logic without downloading 30 MB.
     fn stand_in_pins(platform: Platform) -> (Pins, BTreeMap<String, Vec<u8>>) {
         let mut pins = Pins::embedded().unwrap();
         let mut files = BTreeMap::new();
@@ -269,7 +248,6 @@ mod tests {
             ensure_release_with(&fetcher, temp.path(), &pins, platform, &mut log).unwrap_err();
         assert_eq!(exit::code_for(&error), exit::EX_CONFIG);
         assert!(format!("{error:#}").contains("differs from the bridge pins"));
-        // Nothing executable was fetched before the manifest check failed.
         assert!(!temp.path().join(platform.node_asset()).exists());
     }
 

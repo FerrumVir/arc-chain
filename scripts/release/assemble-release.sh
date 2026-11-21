@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Assemble and validate the complete ARC release in one flat directory.
-#
-# This script is deliberately usable outside GitHub Actions.  The release
-# workflow calls it after downloading every build artifact, while the release
-# contract tests feed it fixtures.  A missing platform, updater signature, or
-# checksum is therefore a hard failure before a GitHub release can be created.
 set -Eeuo pipefail
 
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-artifacts}"
@@ -51,10 +45,6 @@ case "$RELEASE_PROFILE" in
 esac
 command -v python3 >/dev/null 2>&1 || die "python3 is required to generate latest.json"
 
-# Validate before clearing or writing OUTPUT_DIR. A release may ship either a
-# complete public-address-only validator set or the explicit empty migration
-# placeholder used by stake-zero community observers. It must never package a
-# deterministic seed, private key, partial validator set, or implicit mode.
 python3 "$GENESIS_VALIDATOR" "$GENESIS_FILE" \
     || die "refusing to package unsafe genesis: $GENESIS_FILE"
 
@@ -65,11 +55,6 @@ case "/$OUTPUT_DIR/" in
     *'/../'*|*'/./'*) die "refusing non-canonical OUTPUT_DIR: $OUTPUT_DIR" ;;
 esac
 
-# Build beside the requested destination, then publish by directory rename. A
-# non-empty destination may only be replaced when this script left an exact
-# sidecar ownership receipt on a previous successful run. This prevents a typo
-# such as OUTPUT_DIR=/home/alice from recursively deleting unrelated data and
-# keeps the last known-good release intact when assembly fails halfway through.
 OUTPUT_BASENAME="$(basename -- "${OUTPUT_DIR%/}")"
 case "$OUTPUT_BASENAME" in
     ''|.|..|*[!A-Za-z0-9._-]*) die "unsafe OUTPUT_DIR basename: $OUTPUT_BASENAME" ;;
@@ -148,8 +133,6 @@ copy_as() {
     cp -- "$source" "$OUTPUT_DIR/$destination"
 }
 
-# Headless assets have a stable, version-independent naming contract.  The
-# installer and README use these names literally.
 HEADLESS_ASSETS=(
     arc-node-linux-x86_64
     arc-cli-linux-x86_64
@@ -167,9 +150,6 @@ for asset in "${HEADLESS_ASSETS[@]}"; do
     copy_as "$(find_one "$ARTIFACTS_DIR" "$asset")" "$asset"
 done
 
-# Normalize Tauri's versioned/space-bearing bundle names into stable release
-# names.  Renaming does not alter the updater payload bytes or their Tauri
-# signatures, and gives README links that never need a version edit.
 copy_as "$(find_one "$ARTIFACTS_DIR/arc-desktop-macos-arm64" '*.app.tar.gz')" \
     arc-desktop-macos-arm64.app.tar.gz
 copy_as "$(find_one "$ARTIFACTS_DIR/arc-desktop-macos-arm64" '*.app.tar.gz.sig')" \
@@ -200,15 +180,11 @@ copy_as "$(find_one "$ARTIFACTS_DIR/arc-desktop-linux-x86_64" '*.deb')" \
 copy_as "$(find_one "$ARTIFACTS_DIR/arc-desktop-linux-x86_64" '*.rpm')" \
     arc-desktop-linux-x86_64.rpm
 
-# Ship the exact installer and network configuration from the validated tag
-# commit; repository tag protection is a separate owner-controlled prerequisite.
-# Auto-update installs this checksummed copy, not a moving main-branch script.
 copy_as install.sh install.sh
 copy_as testnet-seeds.txt testnet-seeds.txt
 copy_as "$GENESIS_FILE" genesis.toml
 
 if [ "$RELEASE_PROFILE" = "cutover-v1" ]; then
-    # The v1 first-cutover ceremony retains its existing strict validator.
     python3 "$CUTOVER_ASSET_VALIDATOR" \
         --input-dir "$CUTOVER_HANDOFF_DIR" \
         --output-dir "$OUTPUT_DIR" \
@@ -220,8 +196,6 @@ if [ "$RELEASE_PROFILE" = "cutover-v1" ]; then
         --commit "$RELEASE_COMMIT" \
         || die "protected cutover assets failed recovery validation"
 else
-    # Existing-chain updates carry only their truthful readiness attestation;
-    # they do not manufacture or imply first-cutover/retirement evidence.
     UPDATE_ATTESTATION="$EXISTING_UPDATE_HANDOFF_DIR/arc-existing-chain-update-attestation.json"
     [ -s "$UPDATE_ATTESTATION" ] && [ ! -L "$UPDATE_ATTESTATION" ] \
         || die "existing-chain update attestation is missing or unsafe"
@@ -242,8 +216,6 @@ if sys.argv[6] == "desktop-update-existing-validators-v1":
     spec = importlib.util.spec_from_file_location("previous_release", Path(sys.argv[7]) / "previous-validator-release.py")
     previous = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(previous)
-    # Re-authenticate the actual validator baseline and every skipped desktop
-    # update against the current listing, including the exact recorded skip list.
     previous.verify_attestation(v, sys.argv[3], time.time())
     previous.verify_preflight_binding(v, int(os.environ["PRETAG_RUN_ID"]),
         int(os.environ["PRETAG_RUN_ATTEMPT"]), json.loads(os.environ["PRETAG_SELECTION"]))
@@ -314,10 +286,6 @@ manifest = {
 )
 PY
 
-# Hash every published file (including Tauri signatures and latest.json).
-# The signed header binds the manifest against cross-repository, cross-tag, and
-# cross-commit replay. SHA256SUMS and its detached signature are intentionally
-# not listed in the manifest, avoiding a circular digest.
 # shellcheck disable=SC2094 # find explicitly excludes the redirection target.
 (
     cd "$OUTPUT_DIR"

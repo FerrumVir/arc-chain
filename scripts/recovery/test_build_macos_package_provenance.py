@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Focused fail-closed tests for the macOS package provenance controller."""
 
 from __future__ import annotations
 
@@ -195,9 +194,6 @@ class BindingTests(unittest.TestCase):
 
 class ExtractionTests(unittest.TestCase):
     def setUp(self) -> None:
-        # macOS maps /var through a root symlink.  The production controller
-        # deliberately rejects symlinked input ancestry, so keep extraction
-        # fixtures under the real checked-out source directory too.
         self.temporary = tempfile.TemporaryDirectory(dir=HELPER.parent)
         self.root = Path(self.temporary.name)
         self.root.chmod(0o700)

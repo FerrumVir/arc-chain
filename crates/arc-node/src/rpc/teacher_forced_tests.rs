@@ -1,52 +1,30 @@
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TfLegacyWorkResult {
-    /// Must match the WorkItem.job_id.
     pub job_id: String,
-    /// Worker's self-chosen identifier (hex of validator pubkey).
     pub worker_id: String,
-    /// True if the worker produced output; false on inference error.
     #[serde(default = "default_true")]
     pub success: bool,
-    /// True when the worker is deliberately returning an extra concurrent
-    /// assignment without attempting inference. This unblocks the coordinator
-    /// without counting a capacity race as a model failure.
     #[serde(default)]
     pub declined: bool,
-    /// Generated text (decoded from the worker's tokens).
     #[serde(default)]
     pub output: String,
-    /// BLAKE3 of the output token sequence (hex, 0x-prefixed). The chain
-    /// uses this for cross-worker hash-majority verification.
     #[serde(default)]
     pub output_hash: String,
-    /// Number of tokens generated.
     #[serde(default)]
     pub tokens_generated: u64,
-    /// Total wall time on the worker, in milliseconds (encode + generate + decode).
     #[serde(default)]
     pub total_ms: u64,
-    /// Average ms per generated token.
     #[serde(default)]
     pub ms_per_token: u64,
-    /// Engine identifier ("INT8 integer (community worker)", etc.) for analytics.
     #[serde(default)]
     pub engine: String,
-    /// Optional error message when success=false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Hex-encoded `bincode(arc_types::Transaction)` of the worker-signed
-    /// InferenceAttestation (tx 0x16) for this completion. Lets the seed
-    /// post the attestation on-chain with `from = worker_address`, so
-    /// rewards accrue to the worker who actually did the work — not the
-    /// seed that routed the request. Optional during the v0.7.0
-    /// transition; pre-v0.7 workers don't send it, and the seed accepts
-    /// the submit anyway (just no on-chain record).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_attestation_hex: Option<String>,
 }
 
-// Included inside rpc::tests to reuse its authenticated validator fixtures.
 #[derive(Clone)]
 struct TfHolder {
     node: NodeState,
@@ -68,8 +46,6 @@ async fn tf_forward(
     if holder.refuse.load(Ordering::SeqCst) {
         return Err((StatusCode::TOO_MANY_REQUESTS, "test queue full".into()));
     }
-    // Simulate transit outside the per-request cache lock, then computation
-    // inside it. The real authenticated forward and its real KV lock still run.
     tokio::time::sleep(std::time::Duration::from_millis(holder.network_ms)).await;
     let lock = holder
         .locks
@@ -123,7 +99,6 @@ impl TfFixture {
         let mut servers = tokio::task::JoinSet::new();
         for h in 0..holders {
             let mut holder_node = node.clone();
-            // Independent holders need independent KV maps and admission gates.
             let fresh = fake_node_with_workers(Vec::new());
             holder_node.shard_kv_caches = fresh.shard_kv_caches;
             holder_node.shard_kv_cache_metadata = fresh.shard_kv_cache_metadata;
@@ -447,8 +422,6 @@ async fn teacher_forced_timing_three_topologies() {
         let fast_ms = start.elapsed().as_millis();
         assert_eq!(fast.generated, sequential.generated);
         println!("TIMING {label}: sequential={sequential_ms}ms teacher_forced={fast_ms}ms");
-        // Wall time is diagnostic: shared CI runners cannot guarantee a
-        // scheduling margin. Token equivalence above remains the test gate.
         f.servers.shutdown().await;
     }
 }
@@ -496,7 +469,6 @@ fn teacher_forced_optional_fields_preserve_old_bytes_and_journal_hash() {
     let old: TfLegacyJournal = serde_json::from_slice(&journal).unwrap();
     assert_eq!(old.payload_hash, hash);
     assert_eq!(serde_json::to_vec(&old.payload).unwrap(), bytes);
-    // Serialize and deserialize the legacy worker shape, retaining field order.
     let result = successful_test_result("job".into(), "worker");
     let json = serde_json::to_string(&result).unwrap();
     assert!(!json.contains("output_tokens"));
@@ -634,7 +606,6 @@ async fn teacher_forced_skip_counts_distinct_active_validators_and_pending_retri
     }
     assert_eq!(fixture.approval_request_count(), 0);
     assert!(received.lock().unwrap().is_empty());
-    // A second origin reporting the same address contributes no extra vote.
     let mut duplicate = fixture.coordinator.community_rpc_bases.as_ref().clone();
     duplicate.push(original[0].clone());
     fixture.coordinator.community_rpc_bases = Arc::new(duplicate);
@@ -645,7 +616,6 @@ async fn teacher_forced_skip_counts_distinct_active_validators_and_pending_retri
             .contains("4 distinct active")
     );
     assert_eq!(fixture.approval_request_count(), 0);
-    // A fourth remote, with a delayed but successful probe, starts the round.
     let mut remote_info: Value = fixture
         .coordinator
         .inference_http
@@ -678,7 +648,7 @@ async fn teacher_forced_skip_counts_distinct_active_validators_and_pending_retri
         received.lock().unwrap()[0]["payload"]
             .get("output_tokens")
             .is_none()
-    ); // old capability
+    );
     servers.shutdown().await;
 }
 
@@ -728,8 +698,6 @@ async fn teacher_forced_released_settlement_retains_tokens_and_bad_approval_hint
     }
     let mut coordinator = fixture.coordinator.clone();
     coordinator.community_rpc_bases = Arc::new(origins);
-    // Four remote identities plus the local vote can form quorum, but the
-    // existing configuration prerequisite requires at least five origins.
     let error = attempt_verified_community_reward(&coordinator, job.job_hash)
         .await
         .unwrap_err();
@@ -739,8 +707,6 @@ async fn teacher_forced_released_settlement_retains_tokens_and_bad_approval_hint
     );
     assert!(received.lock().unwrap().is_empty());
 
-    // Include the coordinator's origin, as a real committee configuration
-    // does. Its probe must count only the existing local vote and send no POST.
     let local_origin = tf_wire_server(
         TfApprovalWire {
             info: json!({
@@ -760,8 +726,6 @@ async fn teacher_forced_released_settlement_retains_tokens_and_bad_approval_hint
     let error = attempt_verified_community_reward(&coordinator, job.job_hash)
         .await
         .unwrap_err();
-    // The wire-capture servers return 503 after recording each POST, so only
-    // the real local approval is available; this must be a collection error.
     assert_eq!(
         error,
         "collected 1 valid independent approvals; 5 of 6 required"

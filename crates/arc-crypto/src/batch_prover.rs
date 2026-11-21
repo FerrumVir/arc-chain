@@ -1,42 +1,11 @@
-//! Batch proving pipeline for ARC Chain.
-//!
-//! Queues proving tasks, executes them in priority order, and collects results
-//! with timing statistics. Proofs are BLAKE3-based mock proofs suitable for
-//! integration testing and pipeline validation. For real STARK proofs, use
-//! the `stwo-prover` feature which routes through `stwo_air.rs`.
-//!
-//! ## Pipeline flow
-//!
-//! ```text
-//! submit(task) ──> priority queue ──> prove_next() ──> ProveResult
-//!                                 ──> prove_batch(n) ──> Vec<ProveResult>
-//!                                                        │
-//!                                                        v
-//!                                                    drain_completed()
-//! ```
-//!
-//! ## Mock proof construction
-//!
-//! ```text
-//! proof = BLAKE3("arc-batch-proof" || circuit_id || public_inputs || private_inputs)
-//! verification = BLAKE3("arc-batch-verify" || circuit_id || public_inputs) == proof_tag
-//! ```
-
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
-// ── Core types ────────────────────────────────────────────────────────────────
-
-/// Configuration for the batch prover.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchConfig {
-    /// Maximum number of tasks in a single batch.
     pub max_batch_size: usize,
-    /// Maximum number of proofs that can be generated in parallel.
     pub max_parallel_proofs: usize,
-    /// Timeout per proof in milliseconds.
     pub timeout_ms: u64,
-    /// Proof system identifier (e.g., "stark", "plonk", "groth16").
     pub proof_type: String,
 }
 
@@ -51,41 +20,26 @@ impl Default for BatchConfig {
     }
 }
 
-/// A task submitted to the batch prover.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProveTask {
-    /// Unique task identifier.
     pub id: [u8; 32],
-    /// Identifier of the circuit to prove.
     pub circuit_id: [u8; 32],
-    /// Public inputs to the circuit.
     pub public_inputs: Vec<u64>,
-    /// Private (witness) inputs to the circuit.
     pub private_inputs: Vec<u64>,
-    /// Priority (0 = lowest, 255 = highest). Higher priority tasks are proved first.
     pub priority: u8,
-    /// Submission timestamp (unix millis).
     pub submitted_at: u64,
 }
 
-/// Result of proving a task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProveResult {
-    /// The task that was proved.
     pub task_id: [u8; 32],
-    /// The generated proof bytes.
     pub proof: Vec<u8>,
-    /// Public output values (derived from the proof).
     pub public_outputs: Vec<u64>,
-    /// Time spent generating the proof in milliseconds.
     pub prove_time_ms: u64,
-    /// Time spent verifying the proof in milliseconds.
     pub verify_time_ms: u64,
-    /// Outcome status.
     pub status: ProveStatus,
 }
 
-/// Status of a prove operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProveStatus {
     Success,
@@ -94,7 +48,6 @@ pub enum ProveStatus {
     Cancelled,
 }
 
-/// Cumulative statistics for a batch prover instance.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProverStats {
     pub total_proved: u64,
@@ -104,11 +57,6 @@ pub struct ProverStats {
     pub total_verified: u64,
 }
 
-// ── Mock proof helpers ────────────────────────────────────────────────────────
-
-/// Generate a mock STARK proof from a task.
-///
-/// proof = BLAKE3("arc-batch-proof" || circuit_id || public_inputs || private_inputs)
 fn generate_mock_proof(task: &ProveTask) -> Vec<u8> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"arc-batch-proof");
@@ -122,9 +70,6 @@ fn generate_mock_proof(task: &ProveTask) -> Vec<u8> {
     hasher.finalize().as_bytes().to_vec()
 }
 
-/// Compute the verification tag for a proof.
-///
-/// tag = BLAKE3("arc-batch-verify" || circuit_id || public_inputs || proof)
 fn compute_verify_tag(circuit_id: &[u8; 32], public_inputs: &[u64], proof: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"arc-batch-verify");
@@ -136,7 +81,6 @@ fn compute_verify_tag(circuit_id: &[u8; 32], public_inputs: &[u64], proof: &[u8]
     *hasher.finalize().as_bytes()
 }
 
-/// Verify a mock proof.
 pub fn verify_mock_proof(
     circuit_id: &[u8; 32],
     public_inputs: &[u64],
@@ -147,9 +91,6 @@ pub fn verify_mock_proof(
     tag == *expected_tag
 }
 
-// ── Batch Prover ──────────────────────────────────────────────────────────────
-
-/// The batch prover: queues tasks, generates proofs, and tracks statistics.
 pub struct BatchProver {
     pub config: BatchConfig,
     queue: Vec<ProveTask>,
@@ -158,7 +99,6 @@ pub struct BatchProver {
 }
 
 impl BatchProver {
-    /// Create a new batch prover with the given configuration.
     pub fn new(config: BatchConfig) -> Self {
         Self {
             config,
@@ -168,22 +108,17 @@ impl BatchProver {
         }
     }
 
-    /// Submit a task to the proving queue. Returns the task ID.
     pub fn submit(&mut self, task: ProveTask) -> [u8; 32] {
         let id = task.id;
         self.queue.push(task);
         id
     }
 
-    /// Prove the highest-priority pending task.
-    ///
-    /// Returns `None` if the queue is empty.
     pub fn prove_next(&mut self) -> Option<ProveResult> {
         if self.queue.is_empty() {
             return None;
         }
 
-        // Find highest priority task (stable: first submitted among equal priority).
         let best_idx = self
             .queue
             .iter()
@@ -198,7 +133,6 @@ impl BatchProver {
         Some(result)
     }
 
-    /// Prove up to `max` tasks from the queue in priority order.
     pub fn prove_batch(&mut self, max: usize) -> Vec<ProveResult> {
         let count = max.min(self.queue.len());
         let mut results = Vec::with_capacity(count);
@@ -214,30 +148,24 @@ impl BatchProver {
         results
     }
 
-    /// Drain all completed results from the prover.
     pub fn drain_completed(&mut self) -> Vec<ProveResult> {
         std::mem::take(&mut self.completed)
     }
 
-    /// Number of tasks waiting in the queue.
     pub fn pending_count(&self) -> usize {
         self.queue.len()
     }
 
-    /// Reference to cumulative prover statistics.
     pub fn stats(&self) -> &ProverStats {
         &self.stats
     }
 
-    /// Internal: prove a single task and update stats.
     fn prove_task(&mut self, task: &ProveTask) -> ProveResult {
         let start = Instant::now();
 
-        // Generate the mock proof.
         let proof = generate_mock_proof(task);
         let prove_elapsed = start.elapsed().as_millis() as u64;
 
-        // Compute a verification tag and verify.
         let verify_start = Instant::now();
         let verify_tag = compute_verify_tag(&task.circuit_id, &task.public_inputs, &proof);
         let verified =
@@ -250,7 +178,6 @@ impl BatchProver {
             ProveStatus::Failed("verification mismatch".to_string())
         };
 
-        // Update stats.
         match &status {
             ProveStatus::Success => {
                 self.stats.total_proved += 1;
@@ -262,13 +189,10 @@ impl BatchProver {
             _ => {}
         }
 
-        // Update timing stats.
         if prove_elapsed > self.stats.peak_prove_time_ms {
             self.stats.peak_prove_time_ms = prove_elapsed;
         }
         let total_proofs = self.stats.total_proved + self.stats.total_failed;
-        // Rolling average. checked_div carries the "total_proofs > 0" guard,
-        // so the divisor cannot be zero here by construction.
         if let Some(avg) = ((self.stats.avg_prove_time_ms * total_proofs.saturating_sub(1))
             + prove_elapsed)
             .checked_div(total_proofs)
@@ -276,7 +200,6 @@ impl BatchProver {
             self.stats.avg_prove_time_ms = avg;
         }
 
-        // Public outputs: the first 32 bytes of the proof re-hashed.
         let mut output_hasher = blake3::Hasher::new();
         output_hasher.update(b"arc-batch-output");
         output_hasher.update(&proof);
@@ -302,7 +225,6 @@ impl BatchProver {
     }
 }
 
-/// Create a task ID from a seed string (convenience for tests).
 pub fn task_id_from_seed(seed: &str) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"arc-task-id");
@@ -310,15 +232,12 @@ pub fn task_id_from_seed(seed: &str) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// Create a circuit ID from a name (convenience for tests).
 pub fn circuit_id_from_name(name: &str) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"arc-circuit-id");
     hasher.update(name.as_bytes());
     *hasher.finalize().as_bytes()
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -376,7 +295,6 @@ mod tests {
         prover.submit(make_task("high", 10));
         prover.submit(make_task("medium", 5));
 
-        // Highest priority first.
         let r1 = prover.prove_next().unwrap();
         assert_eq!(r1.task_id, task_id_from_seed("high"));
 
@@ -398,7 +316,6 @@ mod tests {
         assert_eq!(results.len(), 3);
         assert_eq!(prover.pending_count(), 2);
 
-        // All should succeed.
         for r in &results {
             assert_eq!(r.status, ProveStatus::Success);
         }
@@ -424,7 +341,6 @@ mod tests {
         let completed = prover.drain_completed();
         assert_eq!(completed.len(), 2);
 
-        // Drain again should be empty.
         let again = prover.drain_completed();
         assert!(again.is_empty());
     }
@@ -487,7 +403,6 @@ mod tests {
         let mut proof = generate_mock_proof(&task);
         let tag = compute_verify_tag(&task.circuit_id, &task.public_inputs, &proof);
 
-        // Tamper with the proof.
         proof[0] ^= 0xFF;
         assert!(!verify_mock_proof(
             &task.circuit_id,
@@ -503,7 +418,6 @@ mod tests {
         prover.submit(make_task("outputs", 5));
 
         let result = prover.prove_next().unwrap();
-        // Public outputs should be 4 u64 values (32 bytes / 8).
         assert_eq!(result.public_outputs.len(), 4);
     }
 

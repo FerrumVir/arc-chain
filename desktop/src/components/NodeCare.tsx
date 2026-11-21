@@ -6,7 +6,6 @@ import { useAppStore } from "../lib/store";
 const NOTICE_BODY =
   "When your node won't start, crashes, gets stuck or an update fails, ARC sends a short anonymous report so the problem can be fixed. Once a day it also says whether the node is running. Reports never include your wallet, keys, recovery phrase, IP address or files. You can turn this off or see exactly what's sent in Settings.";
 
-/** The one-time first-run notice. Reports wait until it has been shown. */
 export function NodeCareNotice() {
   const snapshot = useNodeCareSnapshot();
   const setRoute = useAppStore((s) => s.setRoute);
@@ -85,7 +84,6 @@ const DELIVERY_LABEL = {
   "not-configured": "Not sent: this build has no report address",
 } as const;
 
-/** Settings: the switch, the install ID and the exact last payloads. */
 export function NodeCareSettings() {
   const snapshot = useNodeCareSnapshot();
   const [showPayloads, setShowPayloads] = useState(false);

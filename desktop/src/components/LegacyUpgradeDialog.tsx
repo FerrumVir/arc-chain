@@ -4,12 +4,6 @@ import { api } from "../lib/tauri";
 import { useAppStore } from "../lib/store";
 import type { LegacyComputeQuestion } from "../lib/types";
 
-/**
- * Asked once, on the first launch after a v0.7 install reached this app. The
- * node stays an observer without a model until the user answers; the answer
- * is recorded exactly like the Settings "Let ARC run inference jobs on this
- * computer" switch, so it can be changed there at any time.
- */
 export function LegacyUpgradeDialog({
   question,
   onAnswered,

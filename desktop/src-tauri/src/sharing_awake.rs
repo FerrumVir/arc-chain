@@ -1,5 +1,3 @@
-//! Desktop-owned opt-in hold. All OS guards are created and dropped on one
-//! native thread (required by Windows), independently of per-job holds.
 use crate::background_promotion::{DownloadConditions, PowerSource, SystemConditions};
 use crate::keep_awake::KeepAwake;
 use std::sync::{mpsc, OnceLock};
@@ -20,8 +18,6 @@ impl<G> Hold<G> {
     ) {
         let wanted = worker.filter(|_| opted_in && power == PowerSource::Mains);
         if self.guard.as_ref().map(|(pid, _)| *pid) != wanted {
-            // Drop before acquiring: Windows requests belong to this thread,
-            // and dropping the old guard after acquisition would clear the new one.
             self.guard = None;
             self.guard = wanted.map(|pid| (pid, acquire(pid)));
         }
@@ -38,8 +34,6 @@ struct Request {
     done: Option<mpsc::Sender<()>>,
 }
 
-// macOS notifies immediately; the slow sample recovers lost notifications and
-// detects a dead worker. Other platforms have no notification source here.
 const POWER_CHECK_INTERVAL: Duration = if cfg!(target_os = "macos") {
     Duration::from_secs(3)
 } else {
@@ -64,7 +58,6 @@ fn run_controller<G>(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         } else {
-            // No periodic wakeups or power/process queries on inactive installs.
             match rx.recv() {
                 Ok(request) => Some(request),
                 Err(_) => break,
@@ -81,7 +74,6 @@ fn run_controller<G>(
             if worker.is_some_and(&mut process_running) {
                 power_source()
             } else {
-                // Wait for the next worker lifecycle event after an exit.
                 worker = None;
                 PowerSource::Unknown
             }
@@ -117,7 +109,6 @@ fn sender() -> &'static mpsc::Sender<Request> {
     })
 }
 
-// A settings/lifecycle command returns only after its hold has been released.
 fn change(change: Change) {
     #[cfg(not(test))]
     {
@@ -133,7 +124,7 @@ fn change(change: Change) {
         }
     }
     #[cfg(test)]
-    let _ = change; // Unit tests must never hold the developer's computer awake.
+    let _ = change;
 }
 
 pub(crate) fn set_enabled(enabled: bool) {
@@ -145,7 +136,6 @@ pub(crate) fn set_worker(pid: Option<u32>) {
 
 #[cfg(unix)]
 fn process_running(pid: u32) -> bool {
-    // SAFETY: signal 0 tests existence/permission without sending a signal.
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 #[cfg(windows)]
@@ -154,13 +144,12 @@ fn process_running(pid: u32) -> bool {
         Foundation::CloseHandle,
         System::Threading::{OpenProcess, WaitForSingleObject},
     };
-    // SAFETY: handle is used only while owned here, then closed exactly once.
     unsafe {
-        let handle = OpenProcess(0x0010_0000, 0, pid); // SYNCHRONIZE
+        let handle = OpenProcess(0x0010_0000, 0, pid);
         if handle.is_null() {
             return false;
         }
-        let running = WaitForSingleObject(handle, 0) == 258; // WAIT_TIMEOUT
+        let running = WaitForSingleObject(handle, 0) == 258;
         CloseHandle(handle);
         running
     }
@@ -190,8 +179,6 @@ fn power_notifications(tx: mpsc::Sender<Request>) {
         static kCFRunLoopDefaultMode: Ref;
     }
     extern "C" fn changed(context: *mut c_void) {
-        // SAFETY: the sender lives on the notification thread's stack until
-        // its run loop exits and its source is released.
         let tx = unsafe { &*(context as *const mpsc::Sender<Request>) };
         let _ = tx.send(Request {
             change: Change::Power,
@@ -201,8 +188,6 @@ fn power_notifications(tx: mpsc::Sender<Request>) {
     let _ = std::thread::Builder::new()
         .name("arc-power-source".into())
         .spawn(move || {
-            // SAFETY: source and loop are created/used on this thread; callback
-            // context remains alive throughout CFRunLoopRun.
             unsafe {
                 let source =
                     IOPSNotificationCreateRunLoopSource(changed, &tx as *const _ as *mut c_void);
@@ -259,8 +244,6 @@ mod tests {
         assert_eq!(active.load(Ordering::SeqCst), 0, "quit drops the hold");
     }
 
-    // Exercise the production receive loop with injected OS operations. No test
-    // creates a real sleep assertion or requires a power-source change.
     struct Controller {
         tx: Option<mpsc::Sender<Request>>,
         thread: Option<std::thread::JoinHandle<()>>,
@@ -341,8 +324,6 @@ mod tests {
         fn assert_quiet(&self) {
             let queries = self.queries.load(Ordering::SeqCst);
             let checks = self.process_checks.load(Ordering::SeqCst);
-            // Several periods of the injected 10 ms timer must pass without a
-            // query, including when a power notification reaches an idle loop.
             self.send(Change::Power);
             std::thread::sleep(Duration::from_millis(80));
             assert_eq!(self.queries.load(Ordering::SeqCst), queries);
@@ -363,11 +344,11 @@ mod tests {
     fn no_periodic_power_queries_while_opted_out() {
         let c = Controller::new(Duration::from_millis(10));
         c.send(Change::Worker(Some(11)));
-        c.assert_quiet(); // includes default off
+        c.assert_quiet();
         c.send(Change::Enabled(true));
         assert_eq!(c.active.load(Ordering::SeqCst), 1);
         c.send(Change::Enabled(false));
-        c.assert_quiet(); // includes untick / sharing off / quit
+        c.assert_quiet();
     }
 
     #[test]
@@ -381,7 +362,7 @@ mod tests {
         c.assert_quiet();
         c.send(Change::Worker(Some(12)));
         c.alive.store(false, Ordering::SeqCst);
-        c.send(Change::Power); // also clears a stale PID after process death
+        c.send(Change::Power);
         c.assert_quiet();
     }
 
@@ -420,7 +401,6 @@ mod tests {
         assert_eq!(c.active.load(Ordering::SeqCst), 0);
         c.send(Change::Worker(Some(22)));
         assert_eq!(c.active.load(Ordering::SeqCst), 1);
-        // Disconnect/quit drops the final guard on its owning thread.
     }
 
     #[test]

@@ -1,20 +1,4 @@
 #!/usr/bin/env bash
-# ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain - Factual Benchmark
-#
-# Runs 10 factual prompts through the sharded inference pipeline and
-# checks each output for an expected keyword. Captures latency, tx_hash,
-# and pass/fail. Emits a markdown report that can be saved or piped to
-# a file for sharing.
-#
-# Usage:
-#   ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-bench.sh
-#   ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-bench.sh > BENCHMARK.md
-#
-# Run this only against an explicitly selected coordinator or from a reviewed
-# checkout with the local coordinator picker. Output describes that coordinator;
-# it is not proof that the public fleet shares one canonical chain.
-# ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
 if [ -z "${ARC_COORDINATOR:-}" ]; then
@@ -25,8 +9,6 @@ fi
 COORDINATOR="$ARC_COORDINATOR"
 MAX_TOKENS="${ARC_MAX_TOKENS:-12}"
 
-# Each entry: prompt|expected_keyword (case-insensitive substring match)
-# Default 5 prompts. Set ARC_BENCH_FULL=1 for the 10-prompt version.
 if [ "${ARC_BENCH_FULL:-0}" = "1" ]; then
     PROMPTS=(
         "The capital of France is|paris"
@@ -55,7 +37,6 @@ if ! command -v curl >/dev/null || ! command -v python3 >/dev/null; then
     exit 1
 fi
 
-# Markdown header
 cat <<HEADER
 # ARC Chain - Factual Benchmark Report
 
@@ -82,16 +63,10 @@ for entry in "${PROMPTS[@]}"; do
     EXPECTED="${entry##*|}"
     TOTAL=$((TOTAL + 1))
 
-    # Pause between requests so the 7-shard pipeline has time to drain.
-    # Without this the coordinator's HTTP server backs up under sequential
-    # load and the watchdog eventually restarts it. 60s gives the pipeline
-    # time to fully drain (each request takes ~150s wall time through the
-    # 7-hop chain, so requests overlap if the sleep is too short).
     if [ $TOTAL -gt 1 ]; then
         sleep 60
     fi
 
-    # POST to /inference/run_sharded with a generous timeout
     BODY=$(python3 -c "import json; print(json.dumps({'input': '$PROMPT', 'max_tokens': $MAX_TOKENS}))")
     RESP=$(curl -sf -m 600 -X POST "${COORDINATOR}/inference/run_sharded" \
         -H 'Content-Type: application/json' \
@@ -107,7 +82,6 @@ for entry in "${PROMPTS[@]}"; do
     MS_PER_TOK=$(echo "$RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('ms_per_token',0))" 2>/dev/null)
     TX_HASH=$(echo "$RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('attestation',{}).get('tx_hash',''))" 2>/dev/null)
 
-    # Case-insensitive substring match
     OUTPUT_LOWER=$(echo "$OUTPUT" | tr '[:upper:]' '[:lower:]')
     EXPECTED_LOWER=$(echo "$EXPECTED" | tr '[:upper:]' '[:lower:]')
     if echo "$OUTPUT_LOWER" | grep -q "$EXPECTED_LOWER"; then
@@ -119,7 +93,6 @@ for entry in "${PROMPTS[@]}"; do
     fi
 
     TOTAL_MS_PER_TOK=$((TOTAL_MS_PER_TOK + MS_PER_TOK))
-    # Escape pipes in output for markdown table
     OUTPUT_ESC=$(echo "$OUTPUT" | sed 's/|/\\|/g')
     TX_SHORT="${TX_HASH:0:14}…"
     printf "| %d | %s | %s | %s | %s | %s | \`%s\` |\n" "$TOTAL" "$PROMPT" "$EXPECTED" "$OUTPUT_ESC" "$STATUS" "$MS_PER_TOK" "$TX_SHORT"

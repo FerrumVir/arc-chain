@@ -16,11 +16,6 @@ use tokio::sync::Mutex;
 use zeroize::{Zeroize as _, Zeroizing};
 
 const LOG_RING_SIZE: usize = 2000;
-// Keep this synchronized with arc-node's managed shutdown contract and the
-// systemd/launchd services emitted by install.sh. A public inference handler
-// may validly run for 4,000 seconds and an already-claimed community job keeps
-// a 300-second late-submit window; the remaining two minutes cover task joins
-// and the final WAL durability barrier. Idle nodes still exit immediately.
 const GRACEFUL_STOP_TIMEOUT_SECS: u64 = 4_420;
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(GRACEFUL_STOP_TIMEOUT_SECS);
 const FORCE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -79,11 +74,6 @@ struct DesktopShutdownControl {
     receipt_nonce: Option<[u8; 32]>,
 }
 
-/// Cross-process ownership of one canonical managed data directory. The lock
-/// is acquired before the final lifecycle-state check and is held across any
-/// executable/stable-resource mutation plus receipt arm→spawn. A running
-/// NodeManager retains it for the child's full lifetime; the OS releases it if
-/// the GUI crashes, allowing a new GUI to reconcile the still-fenced child.
 pub struct ManagedLifecycleLock {
     data_dir: PathBuf,
     _file: std::fs::File,
@@ -148,10 +138,6 @@ struct ManagedLaunchPlan {
     binary: ExactLaunchFile,
     seeds: ExactLaunchFile,
     genesis: ExactLaunchFile,
-    /// The configured model this launch left out because the pre-start check
-    /// found it missing or unreadable. A crash retry or updater resume of the
-    /// plan checks it again, so the status stays accurate and a model that is
-    /// back is used again without a manual Stop and Start.
     dropped_model: Option<String>,
 }
 
@@ -269,9 +255,6 @@ pub(crate) fn validate_configured_directory_ancestry_no_link(path: &Path) -> any
                     ancestor.display()
                 );
             }
-            // The configured leaf may validly be absent. The existing parent
-            // requirement below still rejects a missing custom ancestor, while
-            // the managed-default helper may create exactly ~/.arc.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(error).with_context(|| {
@@ -307,10 +290,6 @@ fn is_managed_default_data_namespace(data_dir: &Path, managed_root: &Path) -> bo
     else {
         return false;
     };
-    // Compare the parent directory entries by the same stable identity used
-    // for their namespace locks. This catches Windows case variants without
-    // following a different custom leaf target. A missing custom ancestor is
-    // intentionally left to the existing custom-parent validation below.
     arc_crypto::secret_file::same_private_directory_namespace(data_parent, managed_root)
         .unwrap_or(false)
 }
@@ -330,10 +309,6 @@ fn prepare_first_launch_managed_root_at(
                 managed_root.display()
             );
             match std::fs::symlink_metadata(data_dir) {
-                // Once the managed child exists, its own namespace/lifecycle
-                // protocol proves every subsequent startup. Before then, a
-                // visible root may be the late-visible result of a failed
-                // first publication and must be rebarriered below.
                 Ok(_) => return Ok(None),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -343,11 +318,6 @@ fn prepare_first_launch_managed_root_at(
         Err(error) => return Err(error.into()),
     }
 
-    // The packaged desktop owns exactly ~/.arc, whose immediate parent is the
-    // already-existing OS user home. Reserve and restore that one namespace
-    // before its first creation so a crash cannot strand the whole managed
-    // binary/data tree under a hidden Windows rebarrier name. Arbitrary custom
-    // data parents remain operator-owned and must already exist.
     let namespace_lock =
         arc_crypto::secret_file::acquire_private_directory_namespace_lock(managed_root)
             .with_context(|| {
@@ -377,12 +347,6 @@ fn prepare_first_launch_managed_root_at(
         }
         Err(error) => return Err(error.into()),
     }
-    // Re-check after acquiring the root guard. Another first-launch process
-    // may have completed the child while this one waited. In that case its
-    // successful child creation depended on an already-proven root. When the
-    // child is still absent, repeat the root barrier now, including the retry
-    // where an earlier write-through move made the root visible but reported
-    // a late failure.
     match std::fs::symlink_metadata(data_dir) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -395,14 +359,9 @@ fn prepare_first_launch_managed_root_at(
         }
         Err(error) => return Err(error.into()),
     }
-    // Retain this guard through the data child and internal lifecycle-lock
-    // publication. Dropping it here would reopen a window in which another
-    // first-launch process could move the parent while this caller creates
-    // the child beneath it.
     Ok(Some(namespace_lock))
 }
 
-/// Only an OS lock conflict is another owner; access and I/O errors stay errors.
 #[derive(Debug, thiserror::Error)]
 #[error("ARC is already open on this computer.")]
 pub struct ManagedLifecycleContention;
@@ -415,9 +374,6 @@ fn lifecycle_lock_error(error: std::io::Error) -> anyhow::Error {
     }
 }
 
-/// Advisory, non-mutating old-copy probe. Absence is not ownership: the real
-/// reconciliation path must still acquire its lease before it writes anything.
-/// Do not secure directories, create files or restore/refresh namespaces here.
 pub fn probe_existing_managed_lifecycle_owner(configured_data_dir: &str) -> anyhow::Result<()> {
     let data_dir = resolve_data_dir(configured_data_dir);
     validate_configured_directory_ancestry_no_link(&data_dir)?;
@@ -441,20 +397,10 @@ pub fn acquire_managed_lifecycle_lock(
     )?)
 }
 
-/// Acquire a provisional desktop-only lease while retaining the stable outer
-/// namespace guard. Startup reconciliation uses this form to drain an exact
-/// orphaned child before Windows can rename the data directory. The lease is
-/// deliberately not accepted by launch/mutation entrypoints and must be
-/// converted by `refresh_managed_lifecycle_namespace` after every writer is
-/// gone.
 fn acquire_managed_lifecycle_lock_for_reconciliation(
     configured_data_dir: &str,
 ) -> anyhow::Result<ManagedLifecycleLock> {
     let data_dir = resolve_data_dir(configured_data_dir);
-    // Validate the pathname exactly as configured before canonicalization or
-    // namespace-lock acquisition. Otherwise a custom symlinked parent is
-    // followed first and the lock sidecar mutates its external target before
-    // the later private-tree walk rejects the link.
     validate_configured_directory_ancestry_no_link(&data_dir)?;
     let _managed_root_namespace_lock =
         prepare_first_launch_managed_root_at(&data_dir, &paths::arc_home())?;
@@ -521,9 +467,6 @@ fn acquire_managed_lifecycle_lock_for_reconciliation(
             )
         })?;
     arc_crypto::secret_file::secure_private_directory_tree(&control_dir)?;
-    // A malformed current proof is never migration input. Missing, moved, or
-    // retired proofs are safe here because this provisional lease authorizes
-    // only exact detached-process reconciliation, not a new launch.
     let _ = has_exact_lifecycle_namespace_proof(&data_dir, &[0u8; 32])?;
     drop(control_namespace_lock);
 
@@ -549,9 +492,6 @@ fn acquire_managed_lifecycle_lock_for_reconciliation(
 }
 
 fn retire_legacy_lifecycle_namespace_proofs(control_dir: &Path) -> anyhow::Result<()> {
-    // v1 was path-independent. The fixed-name v2 entry was used only by a
-    // pre-release candidate, but removing both after current-v3 publication
-    // prevents an older build from reopening either downgrade path.
     for file_name in ["lifecycle.namespace-proof", "lifecycle.namespace-proof.v2"] {
         let path = control_dir.join(file_name);
         arc_crypto::secret_file::durably_replace_private(
@@ -568,11 +508,6 @@ fn retire_legacy_lifecycle_namespace_proofs(control_dir: &Path) -> anyhow::Resul
     Ok(())
 }
 
-/// Convert a provisional/reused lifecycle lease into a fresh launch-capable
-/// namespace. The outer sibling guard stays held while the descendant lock is
-/// released, both directory names cross their durability barriers, the exact
-/// proof is replaced, and the lifecycle lock is reacquired. This is the only
-/// transition that sets `namespace_prepared`.
 fn refresh_managed_lifecycle_namespace(
     mut lifecycle_lock: ManagedLifecycleLock,
 ) -> anyhow::Result<ManagedLifecycleLock> {
@@ -612,15 +547,9 @@ fn refresh_managed_lifecycle_namespace(
             })?;
     control_namespace_lock.restore_interrupted()?;
     arc_crypto::secret_file::secure_private_directory_tree(&control_dir)?;
-    // Validate any proof at the one currently expected identity-bound name.
-    // Well-formed stale identities are refreshable; malformed bytes fail
-    // before the lifecycle lease or any live namespace name is released.
     let _ = has_exact_lifecycle_namespace_proof(&data_dir, &[0u8; 32])?;
 
     let node_lock_path = data_dir.join(".arc-node.lock");
-    // arc-node creates this lock with a plain open, so an existing one may
-    // carry an inherited Windows DACL (or a wider Unix mode). Repair only that
-    // boundary on ARC's own file; links and foreign owners are still refused.
     match arc_crypto::secret_file::open_owned_private_read_write_repairing(&node_lock_path) {
         Ok(node_lock) => {
             node_lock.try_lock_exclusive().map_err(|error| {
@@ -966,10 +895,6 @@ fn prepare_desktop_shutdown_control(data_dir: &Path) -> anyhow::Result<DesktopSh
             )
         })?;
     }
-    // Never delete an existing request here. A second desktop can reach this
-    // pre-spawn path while the first desktop's node owns the data-directory
-    // lock and is draining that exact request. Requests carry a target PID;
-    // only arc-node, after taking the exclusive lock, may consume a stale one.
     read_desktop_shutdown_control(&token_file)
 }
 
@@ -1103,11 +1028,6 @@ fn write_desktop_shutdown_request(
         }
         drop(file);
 
-        // A hard-link publication is a same-filesystem, atomic no-replace
-        // operation on Unix and Windows. The watcher can therefore observe
-        // either no request or the complete fsynced payload, never a torn
-        // final file. Concurrent desktop instances converge on one final
-        // request without deleting each other's request.
         match std::fs::hard_link(&temporary_file, &control.request_file) {
             Ok(()) => {
                 arc_crypto::secret_file::sync_parent_directory(&control.request_file)?;
@@ -1128,10 +1048,6 @@ fn write_desktop_shutdown_request(
                                 "existing private desktop shutdown request is not authenticated by this control capability"
                             );
                         }
-                        // A valid request for a prior PID may still be in the
-                        // new node's early watcher or in the old node's drain.
-                        // Wait for node-side consumption; never replace it or
-                        // downgrade this race to force-kill.
                     }
                     Err(error)
                         if !matches!(
@@ -1147,8 +1063,6 @@ fn write_desktop_shutdown_request(
                         ));
                     }
                     Err(_) => {
-                        // Node-side consumption removes a bounded malformed or
-                        // stale private request after reading a stable handle.
                     }
                 }
             }
@@ -1171,8 +1085,6 @@ fn write_desktop_shutdown_request(
 struct StopSummary {
     stopped: usize,
     forced: usize,
-    /// Recorded nodes that were already gone without proving their final
-    /// WAL barrier. Nothing was stopped; their receipts stay armed.
     gone_unproven: usize,
 }
 
@@ -1223,29 +1135,11 @@ pub fn is_managed_durability_recovery_required(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<ManagedDurabilityRecoveryRequired>())
 }
 
-/// What Start and Restart are told while a signed app update holds the node
-/// (`NodeManager::refuse_start_during_update`). Home's node strip says the
-/// same for that state, and `start-failure.ts` recognises it.
 pub const UPDATE_HOLDS_NODE: &str = "ARC couldn't finish an update. Quit ARC and open it again.";
 
-// ── Priority of the managed node ───────────────────────────────────────────
-//
-// The node runs on the person's own computer while they use it, so it starts
-// at low operating-system priority: their apps get the processor first when it
-// is busy, and the node takes what they leave. This changes scheduling only.
-// It does not limit how much of the processor the node may use (the core
-// count does that, `NodeConfig::worker_threads`), and it does not pause the
-// node for anything.
-
-/// The nice value the managed node starts with on macOS and Linux. 0 is
-/// normal and 19 is the lowest priority.
 #[cfg(unix)]
 const NODE_NICE: libc::c_int = 10;
 
-/// CreateProcess flags for the managed node on Windows. CREATE_NO_WINDOW and
-/// CREATE_NEW_PROCESS_GROUP detach it from the GUI's console (the note at the
-/// call in `start_while_lifecycle_locked` says why), and
-/// BELOW_NORMAL_PRIORITY_CLASS is the Windows counterpart of `NODE_NICE`.
 #[cfg(windows)]
 fn node_creation_flags() -> u32 {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -1254,17 +1148,8 @@ fn node_creation_flags() -> u32 {
     CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | BELOW_NORMAL_PRIORITY_CLASS
 }
 
-/// Start `cmd`'s process with the nice value `nice`. A refused change is not
-/// an error: the process starts anyway, at the priority it inherited, and
-/// `unlowered_priority_warning` reports what it got.
 #[cfg(unix)]
 fn set_child_nice(cmd: &mut Command, nice: libc::c_int) {
-    // SAFETY: the closure runs in the forked child, between fork and exec,
-    // where only async-signal-safe calls are allowed. `setpriority` is a
-    // plain system call: it allocates nothing, takes no lock and logs
-    // nothing, and its result is ignored on purpose so that a node whose
-    // priority cannot be lowered still starts. The nice value is set before
-    // exec, so every thread the node creates later inherits it.
     unsafe {
         cmd.pre_exec(move || {
             libc::setpriority(libc::PRIO_PROCESS as _, 0, nice);
@@ -1273,19 +1158,11 @@ fn set_child_nice(cmd: &mut Command, nice: libc::c_int) {
     }
 }
 
-/// The nice value of process `pid` as the system reports it. `getpriority`
-/// answers -1 both for a real value of -1 and for an error, so a caller that
-/// wants "at least this low" treats -1 as not lowered.
 #[cfg(unix)]
 fn process_nice(pid: u32) -> libc::c_int {
-    // SAFETY: getpriority only reads a scheduling field of the process.
     unsafe { libc::getpriority(libc::PRIO_PROCESS as _, pid as libc::id_t) }
 }
 
-/// The log line for a node that did not get its low priority, or None when
-/// `nice` (read back from the running node) is `NODE_NICE` or lower priority.
-/// If ARC itself already runs at a higher nice value than `NODE_NICE`, the
-/// node inherits that: lower priority than asked for, and no failure.
 #[cfg(unix)]
 fn low_priority_warning(nice: libc::c_int) -> Option<String> {
     (nice < NODE_NICE).then(|| {
@@ -1301,11 +1178,6 @@ fn unlowered_priority_warning(pid: u32) -> Option<String> {
     low_priority_warning(process_nice(pid))
 }
 
-/// After a spawn: put a line in the logs if the node did not get low
-/// priority. The change itself runs in the forked child, where nothing can be
-/// logged, so it is read back here. The write goes through a spawned task
-/// because `start_while_lifecycle_locked` may not suspend between the spawn
-/// and installing the child.
 #[cfg(unix)]
 fn report_unlowered_priority(logs: &Arc<Mutex<VecDeque<LogEntry>>>, pid: Option<u32>) {
     let Some(message) = pid.and_then(unlowered_priority_warning) else {
@@ -1317,16 +1189,9 @@ fn report_unlowered_priority(logs: &Arc<Mutex<VecDeque<LogEntry>>>, pid: Option<
     });
 }
 
-/// The operating-system settings every managed node process starts with:
-/// detached from the GUI's console and below normal priority on Windows, a
-/// nice value of `NODE_NICE` on macOS and Linux. Called once, where the node
-/// is spawned.
 fn configure_node_process(cmd: &mut Command) {
     #[cfg(windows)]
     {
-        // `tokio::process::Command::creation_flags` is a Windows-only
-        // inherent method (it forwards to CreateProcessW). No std trait
-        // import needed.
         cmd.creation_flags(node_creation_flags());
     }
     #[cfg(unix)]
@@ -1340,74 +1205,30 @@ pub struct NodeManager {
     started_at: Option<Instant>,
     pub rpc_port: u16,
     pub logs: Arc<Mutex<VecDeque<LogEntry>>>,
-    /// Set by the reaper when the child exits unexpectedly (we didn't call stop()).
-    /// Surfaced through node_status.last_error so the UI can show a crash banner.
     pub crash_info: Arc<Mutex<Option<CrashInfo>>>,
-    /// Intentional-stop flag - `stop()` sets this before killing, so the reaper
-    /// doesn't misreport a clean shutdown as a crash.
     stopping: Arc<std::sync::atomic::AtomicBool>,
-    /// Private file-capability used by packaged Windows nodes, which have no
-    /// console signal channel under CREATE_NO_WINDOW. The token is persisted
-    /// mode-0600 beside chain data so a restarted desktop can also drain a
-    /// detached managed node without exposing a remote shutdown endpoint.
     shutdown_control: Option<DesktopShutdownControl>,
     lifecycle_lock: Option<ManagedLifecycleLock>,
-    /// Cross-process fence retained after a successful updater preflight and
-    /// through signed bundle installation/relaunch. Unlike `lifecycle_lock`,
-    /// this guard intentionally exists while no child is running: it prevents
-    /// a second GUI from starting a new writer after Stop has returned to the
-    /// WebView but before the updater has replaced and relaunched the app.
     update_lifecycle_lock: Option<ManagedLifecycleLock>,
-    /// Exact launch identity captured only after a managed child successfully
-    /// spawns. A pre-handoff updater abort may consume this plan to restore
-    /// the node that was running before Prepare, without consulting mutable
-    /// WebView settings or re-resolving a different executable.
     active_launch_plan: Option<ManagedLaunchPlan>,
-    /// Present only while Prepare has stopped a previously running owned node.
-    /// It is consumed by the atomic abort-and-resume transaction, or retained
-    /// with the update lock when a safe resume cannot be proven.
     update_restart_plan: Option<ManagedLaunchPlan>,
-    /// One-way native boundary set immediately before the updater installer is
-    /// invoked. Once set, abort is forbidden even if install() rejects.
     update_handoff_started: bool,
-    /// Set while the updater boundary was taken with no node running behind a
-    /// start refusal or an unresolved shutdown receipt. Nothing was stopped,
-    /// so an abort resumes nothing and leaves the refusal and receipt as they
-    /// were.
     update_fenced: bool,
-    /// Exact compute-drain request retained across IPC cancellation. Abort
-    /// must resume it before releasing app-side request ownership.
     auto_quiescence: Option<arc_crypto::secret_file::DesktopWorkerQuiescenceRequest>,
     managed_data_dir: Option<PathBuf>,
     durability_failure: Option<String>,
     legacy_windows_stop_context: Option<LegacyWindowsStopContext>,
     legacy_windows_stop_error: Option<String>,
-    /// Core count the *running* child was actually launched with. Read back
-    /// by `node_status` so the Dashboard reports the node's real compute
-    /// width rather than whatever the config currently says — those diverge
-    /// the moment the user moves the slider without applying it.
     pub active_worker_threads: Option<u32>,
-    /// Set when the *running* child was started without its configured model
-    /// because the pre-start check found the file missing or unreadable.
-    /// Read back by `node_status` so the app can say local compute is off,
-    /// and cleared with the rest of the per-launch state.
     pub active_model_unavailable: Option<ModelUnavailableReason>,
-    /// Native run intent for crash supervision. It becomes true only after a
-    /// successful Start and is cleared before every intentional drain.
     desired_running: bool,
     crash_restart_policy: CrashRestartPolicy,
     update_restart_was_desired: bool,
-    /// A slow crash wait the update boundary took over. While the boundary is
-    /// held it can't fire; Abort puts it back under the same lifecycle lease,
-    /// and the one-way handoff discards it.
     update_suspended_crash_retry: Option<SuspendedCrashRetry>,
-    /// Instance-local fixture capacity; absent from production builds.
     #[cfg(test)]
     test_ram_gb: Option<u64>,
 }
 
-/// The exact recovery a slow crash wait would have run, set aside while a
-/// signed update holds the lifecycle fence.
 struct SuspendedCrashRetry {
     plan: Option<ManagedLaunchPlan>,
     policy: CrashRestartPolicy,
@@ -1439,7 +1260,6 @@ impl CrashRestartPolicy {
                 self.retry_at = None;
                 return None;
             }
-            // One attempt per slow interval, never another burst of five.
             let delay = Duration::from_secs(10 * 60)
                 .saturating_mul(1u32 << self.slow_restarts_attempted.min(3))
                 .min(Duration::from_secs(60 * 60));
@@ -1487,9 +1307,6 @@ pub struct CrashInfo {
     pub at_millis: i64,
 }
 
-/// Paths to the testnet bootstrap config bundled with the app.
-/// Callers resolve these from the Tauri resource dir via AppHandle, then
-/// hand them to `start()` so we don't carry Tauri types deep in NodeManager.
 #[derive(Clone, Debug, Default)]
 pub struct TestnetResources {
     pub seeds_file: Option<PathBuf>,
@@ -1526,10 +1343,6 @@ fn stable_network_replacement_staging(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Replace one stable network resource through a deterministic, destination-
-/// bound staging file. The lifecycle and network namespace guards serialize
-/// this helper, so a crash can leave at most one bounded staging file per
-/// resource; a retry truncates and reuses it without touching unrelated files.
 fn durably_replace_stable_network_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     if contents.is_empty() || contents.len() as u64 > DESKTOP_NETWORK_RESOURCE_MAX_BYTES {
         return Err(std::io::Error::new(
@@ -1564,10 +1377,6 @@ fn durably_replace_stable_network_file(path: &Path, contents: &[u8]) -> std::io:
     Ok(())
 }
 
-/// Copy the signed bundle network identity into stable private app data before
-/// the lifecycle receipt is armed. AppImage mount paths change every launch
-/// and package/manual updates can replace bundle resources; a crash-recovery
-/// receipt must therefore bind files whose path and bytes survive GUI updates.
 fn materialize_stable_testnet_resources(
     data_dir: &Path,
     bundle: &TestnetResources,
@@ -1629,9 +1438,6 @@ fn materialize_stable_testnet_resources(
                 )
             })?;
     } else {
-        // Never derive recovery identity from a new AppImage mount or replaced
-        // application bundle. The old stable copy is immutable until the node
-        // publishes a clean ACK and the supervisor consumes the marker.
         arc_crypto::secret_file::validate_private_directory(&network_dir).with_context(|| {
             format!(
                 "managed-node recovery fence exists but stable network directory {} is unavailable",
@@ -1689,9 +1495,6 @@ fn build_legacy_windows_stop_context(
                 )
             })
             .collect(),
-        // v0.7 resolved relative model arguments in the child process cwd.
-        // Preserve the raw config form and resolve it against that exact cwd
-        // during process matching.
         model_path: config.model_path.as_deref().map(PathBuf::from),
         worker_mode: config.role == "worker" && config.model_path.is_some(),
     })
@@ -1702,9 +1505,6 @@ impl NodeManager {
         Self {
             child: None,
             started_at: None,
-            // Defaults to 9090 (community installer convention). Startup
-            // replaces this with the saved config while stopped; a launch
-            // may then select a fallback port if the configured pair is busy.
             rpc_port: 9090,
             logs: Arc::new(Mutex::new(VecDeque::with_capacity(LOG_RING_SIZE))),
             crash_info: Arc::new(Mutex::new(None)),
@@ -1732,8 +1532,6 @@ impl NodeManager {
         }
     }
 
-    /// Initialize status polling from the saved configuration while this
-    /// manager is stopped. A live child's RPC port remains authoritative.
     pub fn configure_rpc_port_if_stopped(&mut self, rpc_port: u16) -> bool {
         if self.is_running() {
             return false;
@@ -1746,15 +1544,11 @@ impl NodeManager {
         *self.crash_info.lock().await = None;
     }
 
-    /// Clear runtime run intent before an intentional stop or update drain.
-    /// A later successful Start establishes fresh intent and retry budget.
     pub fn clear_desired_running(&mut self) {
         self.desired_running = false;
         self.crash_restart_policy.retry_at = None;
     }
 
-    /// Slow recovery follows the current saved auto-start preference. Explicit
-    /// Stop still clears desired_running, so enabling this cannot restart it.
     pub fn set_crash_autostart_enabled(&mut self, enabled: bool) {
         self.crash_restart_policy.auto_start_enabled = enabled;
         if !enabled {
@@ -1762,8 +1556,6 @@ impl NodeManager {
         }
     }
 
-    /// Release our own pending slow retry before a manual Start takes the
-    /// normal lifecycle lock and reconciles the durable receipt itself.
     pub fn cancel_slow_crash_retry(&mut self) {
         if self.child.is_none() && self.crash_restart_policy.slow_retry_pending() {
             self.clear_desired_running();
@@ -1772,20 +1564,12 @@ impl NodeManager {
         }
     }
 
-    /// No node runs, and the only thing that would start one is a slow
-    /// crash retry after the fast budget ran out. Nothing is left to drain,
-    /// so a signed update may take this over instead of waiting behind it
-    /// (fast retries keep their own deferral).
     pub fn slow_crash_wait_pending(&self) -> bool {
         self.child.is_none()
             && self.desired_running
             && self.crash_restart_policy.slow_retry_pending()
     }
 
-    /// Take a pending slow crash wait out of the supervisor's reach for an
-    /// update boundary, keeping the lifecycle lease where it is so the
-    /// boundary inherits it with no release/reacquire gap. Returns whether a
-    /// wait was taken over.
     fn suspend_slow_crash_retry_for_update(&mut self) -> bool {
         if !self.slow_crash_wait_pending() {
             return false;
@@ -1798,11 +1582,6 @@ impl NodeManager {
         true
     }
 
-    /// Put a suspended slow crash wait back after the update did not happen.
-    /// The retry runs only through the supervisor's exact-plan path, so the
-    /// lifecycle lease, launch identities and authenticated recovery receipt
-    /// are all re-checked when it is due. Without the lease it fails closed
-    /// at once, and Home says the node stopped instead of promising a retry.
     async fn restore_suspended_crash_retry(&mut self) {
         let Some(suspended) = self.update_suspended_crash_retry.take() else {
             return;
@@ -1834,8 +1613,6 @@ impl NodeManager {
         })
     }
 
-    /// Reap an exited child and run one due exact-plan retry. Called only by
-    /// the app-lifetime watcher, so recovery is independent of window polling.
     pub async fn supervise_managed_node(&mut self) {
         self.try_reap_if_crashed().await;
         if self.child.is_some() {
@@ -1879,8 +1656,6 @@ impl NodeManager {
             ),
         )
         .await;
-        // The native watcher is the only caller. Preserve the retry deadline
-        // across awaits so cancellation cannot consume recovery authority.
         let recovery_launch = self
             .managed_data_dir
             .as_deref()
@@ -1899,9 +1674,6 @@ impl NodeManager {
         match result {
             Ok(()) => {
                 self.lifecycle_lock = Some(lifecycle_lock);
-                // Install the exact plan and guard before any post-spawn
-                // suspension. Recovery launches remain quarantined until the
-                // authenticated stop path consumes their ACK.
                 if recovery_launch {
                     self.desired_running = true;
                     let stop = self.stop_and_retain_lifecycle_lock().await;
@@ -1973,8 +1745,6 @@ impl NodeManager {
     async fn fail_crash_restart(&mut self, reason: &str) {
         self.desired_running = false;
         self.crash_restart_policy.retry_at = None;
-        // A failed stop may have restored a still-live child. Never release
-        // its sole-writer fence merely because recovery itself failed.
         if self.child.is_none() {
             self.lifecycle_lock = None;
             self.active_launch_plan = None;
@@ -2038,8 +1808,6 @@ impl NodeManager {
     pub fn configure_managed_data_dir(&mut self, configured: &str) -> anyhow::Result<()> {
         let data_dir = resolve_data_dir(configured);
         if !data_dir.exists() {
-            // Nothing has run there, so no receipt is armed. Launch re-points
-            // here after setting an earlier install's directory aside.
             self.durability_failure = None;
             self.managed_data_dir = Some(data_dir);
             return Ok(());
@@ -2104,7 +1872,6 @@ impl NodeManager {
         self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0)
     }
 
-    /// Do not reacquire our own lease during crash backoff or rerun setup.
     pub fn require_idle_for_binary_check(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.lifecycle_lock.is_none() && self.child.is_none() && !self.desired_running,
@@ -2120,30 +1887,9 @@ impl NodeManager {
     }
 
     pub fn is_running(&mut self) -> bool {
-        // tokio::process::Child::try_wait doesn't exist on async Child;
-        // checking id() is enough - if we haven't called wait() it's still alive.
         self.child.is_some()
     }
 
-    /// Spawn arc-node with the CLI flags the chain actually accepts
-    /// (verified against crates/arc-node/src/main.rs). Pass:
-    ///   --rpc <ip>:<port>            bind the HTTP RPC server
-    ///   --p2p-port <port>            QUIC P2P listener
-    ///   --data-dir <dir>             where WAL + state live
-    ///   --validator-key-file <path>  persistent app-owned Ed25519 identity
-    ///   --seeds-file <path>          testnet peer bootstrap list
-    ///   --genesis <path>             testnet genesis.toml
-    ///   --eth-rpc-port 0             disable the extra EVM RPC port
-    ///   --community-mode             (worker role only) register with seed
-    ///                                gateways as a volunteer inference worker
-    ///   --full-integer-worker        load full deterministic integer weights
-    ///                                without announcing a validator shard
-    ///   --model <path>               (optional) GGUF weights for local inference
-    ///
-    /// Any of these missing would leave the node either bound to wrong
-    /// ports, isolated from the testnet, identity-mismatched, or silent
-    /// as a worker. All are required for the "download → run → earn"
-    /// operator flow.
     pub async fn start(
         &mut self,
         config: &NodeConfig,
@@ -2177,10 +1923,6 @@ impl NodeManager {
         .await;
     }
 
-    /// Spawn while borrowing the caller's already-held lifecycle lock. The
-    /// updater abort path uses this form so a failed resume can put the exact
-    /// same guard back into `update_lifecycle_lock` without ever opening a
-    /// cross-GUI writer race.
     async fn start_while_lifecycle_locked(
         &mut self,
         config: &NodeConfig,
@@ -2198,10 +1940,6 @@ impl NodeManager {
             anyhow::bail!("managed arc-node is already running");
         }
 
-        // A crash retry or updater resume relaunches the config its plan
-        // recorded. When that launch left out an unavailable model, start again
-        // from the configured model: the consent rule and the pre-start check
-        // below then keep the status accurate, and use the model if it is back.
         let config_with_dropped_model;
         let config = match resume_plan.and_then(|plan| plan.dropped_model.as_deref()) {
             Some(model) if config.model_path.is_none() => {
@@ -2214,14 +1952,6 @@ impl NodeManager {
             _ => config,
         };
 
-        // Defense in depth for the consent switch (PR #138, ARC-48 F1): the
-        // worker flags, `--model`, the keep-awake flag, the recorded launch
-        // plan and the spawn log all follow one effective config. A stored
-        // config that still says worker + model while consent is recorded
-        // as withdrawn launches as an observer without the model, which is
-        // what `withdraw_compute_consent` persists. Consent `None` keeps the
-        // existing rule (a worker with a model from before the question
-        // counts as opted in), so v0.8.10 workers start unchanged.
         #[cfg(not(test))]
         let mut effective = effective_launch_config(config);
         #[cfg(test)]
@@ -2238,13 +1968,6 @@ impl NodeManager {
             )
             .await;
         }
-        // Pre-start model check (community PR #132). arc-node exits before it
-        // can prove WAL durability when `--model` names a file it cannot
-        // open, and every recovery launch would repeat that exit. Drop the
-        // model here, before the worker decision, so the worker flags,
-        // `--model`, the keep-awake flag, the spawn log and the recorded
-        // launch plan all follow the same observer config. Only this launch
-        // changes: the saved config (store.json) is left as it is.
         let configured_model = effective.model_path.clone();
         let model_preflight = drop_unavailable_model(&mut effective);
         let dropped_model = model_preflight.as_ref().and(configured_model);
@@ -2253,11 +1976,6 @@ impl NodeManager {
         }
         let config: &NodeConfig = &effective;
 
-        // Network identity is application-owned, never WebView/config-owned.
-        // Both files must resolve from the signed Tauri resource bundle and
-        // must remain regular files. Falling back to arc-node defaults (or to
-        // a same-named file in the process working directory) can silently
-        // place a user's preserved history on a different network.
         let data_dir = resolve_data_dir(&config.data_dir);
         arc_crypto::secret_file::secure_private_directory_tree(&data_dir).map_err(|error| {
             anyhow::anyhow!(
@@ -2265,10 +1983,6 @@ impl NodeManager {
                 data_dir.display()
             )
         })?;
-        // Use one canonical path for both argv and the private shutdown
-        // control. In particular, Windows canonicalize may add a verbatim
-        // `\\?\` prefix; mixing normal data argv with a verbatim token argv
-        // makes later detached ownership recovery ambiguous.
         let data_dir = data_dir.canonicalize().with_context(|| {
             format!(
                 "cannot canonicalize desktop node data directory {}",
@@ -2291,10 +2005,6 @@ impl NodeManager {
             );
             persist_managed_executable_identity(&data_dir, binary)?
         } else if recovery_launch {
-            // The new GUI environment may not retain the ARC_NODE_BIN/PATH/dev
-            // resolution that launched the fenced process. Recover from the
-            // private durable exact path selected before that process spawned;
-            // the receipt below still authenticates both path and bytes.
             load_managed_executable_identity(&data_dir)?
         } else {
             persist_managed_executable_identity(&data_dir, &resolve_binary()?)?
@@ -2336,10 +2046,6 @@ impl NodeManager {
         }
         let mut shutdown_control = if supports_desktop_shutdown {
             let mut control = prepare_desktop_shutdown_control(&data_dir)?;
-            // A stale receipt is a recovery fence, not a file to overwrite.
-            // Only the same executable/genesis/data/token identity may start
-            // against it, and the node will clear it only after full replay
-            // plus a later authenticated clean shutdown.
             control.bind_receipt_identity(&binary, genesis_file)?;
             if control.receipt_nonce.is_some() {
                 self.durability_failure = Some(
@@ -2356,9 +2062,6 @@ impl NodeManager {
             None
         };
 
-        // Probe for an available port pair. First preference is the configured
-        // port; fall back in 10-port increments up to 5 tries. This catches the
-        // common case of an old node process still bound or Jupyter stealing 9090.
         let (rpc_port, p2p_port) = choose_port_pair(config.rpc_port, config.p2p_port)?;
         if rpc_port != config.rpc_port {
             push_log(
@@ -2381,38 +2084,8 @@ impl NodeManager {
             .arg(&data_dir)
             .arg("--eth-rpc-port")
             .arg("0")
-            // ── LIVE-NETWORK SAFETY: join as an observer, never a validator ──
-            //
-            // Current arc-node builds default `--stake` to 0, but every
-            // released binary through v0.7.11 defaults to 5,000,000 ARC — and
-            // this manager may spawn any of them. Passing the flag explicitly
-            // keeps the desktop safe regardless of binary vintage: without it,
-            // an old binary announces itself to the public seeds as a 5M-stake
-            // validator and tries to shard-join the testnet — welding a
-            // phantom validator into validator sets
-            // that are currently frozen, on a network where four of six
-            // seeds have not produced a block in ~6 days. Recovering from
-            // that means hand-editing state on six VPSes.
-            //
-            // `--stake 0` is the observer path: full consensus participation
-            // and DAG validation, zero claim on the validator set. It exists
-            // in every arc-node version the desktop can encounter, which is
-            // why it is passed unconditionally rather than probed for.
-            //
-            // TODO(chain-core): arc-node v0.7.11 gained `--community`, which
-            // is exactly `--stake 0 --community-mode` plus GGUF
-            // auto-discovery. Prefer it once the minimum supported node
-            // version is >= 0.7.11 — passing an unknown flag to an older
-            // binary makes clap abort before the node ever starts, so it
-            // cannot simply be swapped in while 0.7.9 nodes are still in the
-            // field. Gate it on `binary_supports_flag(&binary, "--community")`.
             .arg("--stake")
             .arg("0")
-            // The wallet phrase never enters argv, the child environment, or
-            // logs. identity.rs derives the exact historical Ed25519 key and
-            // atomically materializes this private, app-owned JSON keyfile.
-            // Keeping it persistent preserves the node/reward address across
-            // desktop and machine restarts.
             .arg("--validator-key-file")
             .arg(&validator_keyfile)
             .stdout(Stdio::piped())
@@ -2424,18 +2097,6 @@ impl NodeManager {
                 .arg(hex::encode(lifecycle_lock.session_nonce()?));
         }
 
-        // ── Compute contribution ────────────────────────────────────────
-        // rayon sizes its global pool from RAYON_NUM_THREADS the first time
-        // that pool is built, and arc-node only ever calls ThreadPoolBuilder
-        // explicitly under `--benchmark`. Setting the env var is therefore
-        // the one control that works on every shipped node version, with no
-        // chain-side change required.
-        //
-        // `--threads` is the explicit flag the chain-core agent is adding.
-        // It is probed rather than assumed for the same reason as
-        // `--community` above: an unknown flag is a hard clap failure, and a
-        // node that will not start is a worse outcome than a node running at
-        // its default width.
         if let Some(n) = config.worker_threads.filter(|n| *n > 0) {
             cmd.env("RAYON_NUM_THREADS", n.to_string());
             if binary_supports_flag(&binary, "--threads") {
@@ -2453,55 +2114,13 @@ impl NodeManager {
             }
         }
 
-        // Windows: detach from the GUI parent's console.
-        //
-        // arc-node is a console executable. When a Tauri GUI app spawns
-        // it without these flags, Windows allocates a fresh console
-        // window for the child and ties it to the parent's console
-        // group. Two failure modes follow:
-        //
-        //   1. The black console pops up alongside the desktop window.
-        //      Users (reasonably) close it. Closing a console sends
-        //      CTRL_CLOSE_EVENT to every process attached to it; the
-        //      C runtime's default handler exits with NTSTATUS
-        //      0xC000013A (STATUS_CONTROL_C_EXIT, decimal -1073741510).
-        //      That is exactly the exit code we see in field crash
-        //      reports.
-        //   2. Any Ctrl+C delivered to the parent console is also
-        //      delivered to the child via the shared process group,
-        //      same -1073741510 exit.
-        //
-        // CREATE_NO_WINDOW (0x08000000) tells Windows not to allocate
-        // a console for the child. CREATE_NEW_PROCESS_GROUP (0x00000200)
-        // additionally isolates it from any console signals the parent
-        // does receive. Together they make the child immune to the
-        // console-event class of crashes. Stdio::piped() above still
-        // gives us the child's stdout/stderr, so log capture is
-        // unaffected.
-        //
-        // Priority. The node shares this computer with the person using it,
-        // so it also starts below normal priority: BELOW_NORMAL_PRIORITY_CLASS
-        // on Windows, a nice value of 10 on macOS and Linux. Their own apps
-        // get the processor first when it is busy. This is scheduling only:
-        // `worker_threads` limits how much the node may use, and nothing
-        // pauses it. If the change is refused the node still starts, and
-        // the check after the spawn below logs it.
         configure_node_process(&mut cmd);
 
-        // Required signed-bundle network bootstrap files. Their selection is
-        // deliberately absent from NodeConfig, so stale or malicious WebView
-        // IPC cannot redirect either one.
         cmd.arg("--seeds-file")
             .arg(seeds_file)
             .arg("--genesis")
             .arg(genesis_file);
 
-        // Only register as a community inference worker if we actually
-        // have a model to serve. role="worker" without model_path is
-        // nonsense - the gateway would forward requests the node can't
-        // answer. Default role is "observer" which just joins consensus,
-        // validates blocks, and helps the network without requiring a
-        // 4 GB model download.
         if config.role == "worker" && config.model_path.is_some() {
             if !binary_supports_flag(&binary, "--community-rpc-url") {
                 anyhow::bail!(
@@ -2515,8 +2134,6 @@ impl NodeManager {
             }
         }
         if keep_awake_during_jobs_requested(config) {
-            // Probed like --threads: an unknown flag is a hard clap failure,
-            // and a node that will not start is worse than one that may sleep.
             if binary_supports_flag(&binary, "--prevent-sleep-during-jobs") {
                 cmd.arg("--prevent-sleep-during-jobs");
             } else {
@@ -2532,9 +2149,6 @@ impl NodeManager {
 
         append_compute_launch_args(&mut cmd, config);
 
-        // Capture every launch identity before arming the shutdown receipt or
-        // spawning. Nothing after a successful spawn may fail before the
-        // Child handle and its exact restart plan are installed in `self`.
         let mut launch_plan =
             ManagedLaunchPlan::capture(config, &validator_keyfile, &binary, &stable_resources)?;
         launch_plan.dropped_model = dropped_model;
@@ -2567,29 +2181,17 @@ impl NodeManager {
         .await;
 
         if let Some(control) = shutdown_control.as_mut() {
-            // All fallible identity/port/flag/resource preflight is complete.
-            // Arm immediately before spawn so any later desktop/node/OS crash
-            // leaves a durable recovery fence for the full process lifetime.
             control.ensure_receipt_armed()?;
             self.durability_failure = Some(
                 "the running managed node has not yet acknowledged its final WAL durability barrier"
                     .into(),
             );
         }
-        // After spawn returns, this async method must run to completion
-        // without another suspension point. Each caller installs its owned
-        // lifecycle lock before awaiting post-start status/log bookkeeping.
         self.stopping
             .store(false, std::sync::atomic::Ordering::SeqCst);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(error) => {
-                // Leave the published receipt fail-closed even when spawn
-                // fails. Another desktop may have accepted the identical
-                // marker and successfully spawned between our arm and this
-                // error; cancelling it would leave that live writer unfenced.
-                // An exact recovery start can reuse the marker and clear it
-                // only through a later full replay + clean WAL ACK.
                 self.refresh_durability_failure()?;
                 return Err(anyhow::anyhow!(
                     "Failed to start arc-node at {}: {}. If this is your first launch, the binary should have been auto-downloaded. Check ~/.arc/bin/arc-node exists and is executable.",
@@ -2606,7 +2208,6 @@ impl NodeManager {
         self.active_model_unavailable = model_preflight.as_ref().map(|preflight| preflight.reason);
         self.active_launch_plan = Some(launch_plan);
 
-        // Drain stdout/stderr into the log ring.
         if let Some(stdout) = child.stdout.take() {
             let logs = self.logs.clone();
             tokio::spawn(async move {
@@ -2627,9 +2228,6 @@ impl NodeManager {
             });
         }
 
-        // Read back whether the low priority took (see `configure_node_process`).
-        // A spawned task, not an await: nothing here may suspend before the
-        // child is installed.
         #[cfg(unix)]
         {
             report_unlowered_priority(&self.logs, child.id());
@@ -2649,8 +2247,6 @@ impl NodeManager {
         Ok(())
     }
 
-    /// Called on every node_status poll. If our child has exited and we didn't
-    /// ask it to, record a CrashInfo. Non-blocking; safe to call frequently.
     pub async fn try_reap_if_crashed(&mut self) {
         if self.child.is_none() {
             return;
@@ -2675,9 +2271,6 @@ impl NodeManager {
                         "arc-node exited unexpectedly{}",
                         code.map(|c| format!(" (code {})", c)).unwrap_or_default()
                     );
-                    // Publish the next lifecycle state before any IPC/log
-                    // mutex await. Cancellation of a status reader must not
-                    // leave a desired app with no retry deadline.
                     let was_desired = self.desired_running;
                     let retry_schedule = if was_desired && self.active_launch_plan.is_some() {
                         self.crash_restart_policy
@@ -2736,8 +2329,8 @@ impl NodeManager {
                     self.active_launch_plan = None;
                 }
             }
-            Ok(None) => { /* still running */ }
-            Err(_) => { /* treat as still running; will re-check next tick */ }
+            Ok(None) => { }
+            Err(_) => { }
         }
     }
 
@@ -2745,7 +2338,6 @@ impl NodeManager {
         let mut stopped = 0usize;
         if let Some(mut child) = self.child.take() {
             let mut shutdown_control = self.shutdown_control.take();
-            // Tell the crash reaper this is intentional so it doesn't fire.
             self.stopping
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             let outcome =
@@ -2756,18 +2348,11 @@ impl NodeManager {
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    // A request, termination, or reap error is not proof that
-                    // the WAL writer is gone. Preserve the exact owned Child
-                    // handle and its capability whenever it may still be live,
-                    // so the UI cannot launch another writer against the same
-                    // data directory and a later Stop can safely retry.
                     let receipt_error = self.refresh_durability_failure().err();
                     let exited_before_stop = error
                         .downcast_ref::<OwnedNodeExitedBeforeStop>()
                         .map(ToString::to_string);
                     self.restore_child_after_failed_stop(child, shutdown_control);
-                    // Logged only after the synchronous restore, so no await
-                    // sits between taking the child and putting it back.
                     if let Some(note) = exited_before_stop {
                         push_log(&self.logs, "warn", note).await;
                     }
@@ -2824,8 +2409,6 @@ impl NodeManager {
 
     async fn stop_and_retain_lifecycle_lock(&mut self) -> anyhow::Result<StopLifecycleOutcome> {
         crate::sharing_awake::set_worker(None);
-        // Suppress crash restarts before any intentional process drain starts,
-        // including Stop, Quit, local mutations, and updater preparation.
         self.clear_desired_running();
         anyhow::ensure!(
             self.update_lifecycle_lock.is_none(),
@@ -2836,13 +2419,6 @@ impl NodeManager {
                 "legacy desktop node reconciliation is unresolved; refusing Stop/update boundary: {error}"
             );
         }
-        // Transfer the owned-child guard into this stop transaction. Keeping
-        // it in `self` is insufficient: `stop_owned_child` consumes the ACK
-        // and clears `self.lifecycle_lock`, which used to leave a cross-GUI
-        // race before the detached scan and final lifecycle-state check. A
-        // second desktop could start a new writer in that gap and this caller
-        // could still report an update-safe boundary. A restarted GUI instead
-        // acquires the same guard here before inspecting detached processes.
         let mut lifecycle_lock = match self.lifecycle_lock.take() {
             Some(lock) => Some(lock),
             None => self
@@ -2856,30 +2432,12 @@ impl NodeManager {
         let mut stopped = match self.stop_owned_child().await {
             Ok(stopped) => stopped,
             Err(error) => {
-                // A failed owned-child stop may restore the live Child and its
-                // shutdown capability. Reassociate the same OS-held guard so
-                // no other desktop can enter the lifecycle while it remains
-                // live. If the child is already gone, the durable receipt is
-                // the fail-closed recovery fence and the local guard may drop.
                 if self.child.is_some() {
                     self.lifecycle_lock = lifecycle_lock.take();
                 }
                 return Err(error);
             }
         };
-        // No managed child handle. This happens when the Tauri process
-        // restarted (e.g. cargo rebuild in dev) while arc-node — spawned
-        // with CREATE_NEW_PROCESS_GROUP — kept running detached. Locate
-        // it by the managed binary path and kill it so the UI's Stop
-        // button is not a no-op.
-        //
-        // Run this even after stopping an owned child. Multiple app instances
-        // or an interrupted updater can leave more than one matching detached
-        // process, and a release boundary must drain all of them.
-        // The tokenless v0.7 proof is a one-time upgrade capability. Move it
-        // out before reconciliation so its Zeroizing seed is dropped after a
-        // successful scan (including zero matches). Restore it only when the
-        // exact proof/termination operation errors and a safe retry is needed.
         let legacy_context = self.legacy_windows_stop_context.take();
         let reconciliation =
             stop_detached_arc_node(legacy_context.as_ref(), self.managed_data_dir.as_deref()).await;
@@ -2933,9 +2491,6 @@ impl NodeManager {
         lifecycle_lock = lifecycle_lock
             .map(refresh_managed_lifecycle_namespace)
             .transpose()?;
-        // Return the freshly prepared, still-live guard so callers performing a local mutation
-        // or update can extend the same transaction without a release/reopen
-        // gap. Plain Stop drops it immediately after this function returns.
         Ok(StopLifecycleOutcome {
             lifecycle_lock,
             stopped,
@@ -2947,8 +2502,6 @@ impl NodeManager {
         Ok(())
     }
 
-    /// Stop every proven managed writer and retain the exact data-directory
-    /// lifecycle lock for the caller's following mutation/start transaction.
     pub async fn stop_for_local_mutation(&mut self) -> anyhow::Result<ManagedLifecycleLock> {
         self.stop_and_retain_lifecycle_lock()
             .await?
@@ -2956,18 +2509,8 @@ impl NodeManager {
             .ok_or_else(|| anyhow::anyhow!("managed node data directory is not configured"))
     }
 
-    /// Establish the native half of the updater boundary. The guard remains
-    /// owned by this NodeManager after IPC returns and is released only by
-    /// process exit/relaunch or an explicit failed-install abort transaction.
     pub async fn prepare_update_relaunch(&mut self) -> anyhow::Result<()> {
         if self.update_lifecycle_lock.is_some() {
-            // A second prepare is never a harmless idempotent success. The
-            // previous pre-install abort may have retained this fence because
-            // detached-process reconciliation failed even though no receipt
-            // was visible. Reporting success here would let a UI retry enter
-            // install() without re-proving that boundary. The controller
-            // coalesces legitimate concurrent clicks, so fail closed until a
-            // successful abort releases the existing fence or this GUI exits.
             anyhow::bail!("a signed desktop update already owns the managed-node lifecycle fence");
         }
         anyhow::ensure!(
@@ -2975,13 +2518,7 @@ impl NodeManager {
             "a prior desktop update lifecycle transaction is unresolved"
         );
 
-        // Capture the exact launch before Stop consumes the child state. If a
-        // running owned node somehow lacks this post-spawn identity, do not
-        // stop it: an updater failure could not restore what was running.
         let owned_was_running = self.child.is_some();
-        // An exhausted budget's slow wait is set aside like an explicit Stop
-        // (the update that may fix the crash must not wait behind it); a
-        // failed Prepare puts it back. A fast retry still defers the update.
         let suspended = self.suspend_slow_crash_retry_for_update();
         let restart_was_desired = self.desired_running;
         anyhow::ensure!(
@@ -3016,10 +2553,6 @@ impl NodeManager {
             .lifecycle_lock
             .ok_or_else(|| anyhow::anyhow!("managed node data directory is not configured"))?;
 
-        // A restarted GUI normally reconciles detached children during app
-        // startup, before the updater can run. If one appears here, or if
-        // duplicate managed writers were drained, retain the fence and fail
-        // closed: there is no single exact owned launch to restore.
         if outcome.stopped > 0 && (restart_plan.is_none() || outcome.stopped != 1) {
             self.update_lifecycle_lock = Some(lifecycle_lock);
             anyhow::bail!(
@@ -3034,15 +2567,6 @@ impl NodeManager {
         Ok(())
     }
 
-    /// Whether the ordinary updater boundary is closed only by an unresolved
-    /// shutdown receipt while no node runs (none owned here, none holding the
-    /// data directory) and no crash retry is pending: a crash whose recovery
-    /// could not finish. Stop refuses that receipt by design, so the signed
-    /// app update that may carry the fix takes the fenced boundary instead.
-    ///
-    /// An exhausted crash budget's slow wait also takes it: no node runs, and
-    /// the update owns the lease the retry would have used until it finishes
-    /// or aborts. A fast retry keeps the ordinary deferral.
     pub fn ordinary_update_boundary_is_fenced(&self) -> bool {
         if self.child.is_some() || (self.desired_running && !self.slow_crash_wait_pending()) {
             return false;
@@ -3053,35 +2577,16 @@ impl NodeManager {
         if !data_dir.exists() {
             return false;
         }
-        // A node left running by another desktop process that has since
-        // exited also shows an armed receipt and no child here, but it is a
-        // live writer with jobs to drain: the ordinary path stops it, and an
-        // unattended update defers. The probe never waits.
         if matches!(node_data_directory_held(data_dir), Ok(true)) {
             return false;
         }
         if self.slow_crash_wait_pending() {
             return true;
         }
-        // An unreadable receipt closes the node as firmly as an armed one.
         arc_crypto::secret_file::desktop_shutdown_lifecycle_state(data_dir)
             .map_or(true, |state| !state.is_clear())
     }
 
-    /// The updater boundary when no node runs and none may start: behind a
-    /// start refusal, or an unresolved shutdown receipt. There is nothing to
-    /// drain and nothing to resume, so this takes only the lifecycle owner
-    /// lease that keeps another desktop from starting a writer while the
-    /// signed bundle is replaced. It never stops, starts or replaces arc-node,
-    /// and never reads or clears the receipt: the new version's launch-time
-    /// reconciliation recovers with the receipt-bound executable and genesis
-    /// before it starts or replaces anything, exactly as after a manual
-    /// install.
-    ///
-    /// It still fails closed where the lease itself can't be taken: an
-    /// unresolved legacy v0.7 reconciliation, a data directory that was never
-    /// configured, a linked path, or another desktop holding the lease. Those
-    /// stay on the manual-install path, as in v0.8.13.
     pub fn prepare_fenced_update_relaunch(&mut self) -> anyhow::Result<()> {
         if self.update_lifecycle_lock.is_some() {
             anyhow::bail!("a signed desktop update already owns the managed-node lifecycle fence");
@@ -3102,16 +2607,11 @@ impl NodeManager {
             !self.desired_running || self.slow_crash_wait_pending(),
             "cannot prepare an update while exact-plan crash recovery is pending; let recovery run or explicitly stop the node first"
         );
-        // The Stop path's v0.8.13 guard. A refused v0.7 migration can leave
-        // the config pointing at the preserved directory, and taking a lease
-        // there would create lock files in it and tighten its mode.
         if let Some(error) = self.legacy_windows_stop_error.as_deref() {
             anyhow::bail!(
                 "legacy desktop node reconciliation is unresolved; refusing the update boundary: {error}"
             );
         }
-        // Nothing below can fail once a slow crash wait's own lease exists,
-        // so the wait is set aside only when this boundary is certain to hold.
         if self.lifecycle_lock.is_some() {
             self.suspend_slow_crash_retry_for_update();
         }
@@ -3128,12 +2628,6 @@ impl NodeManager {
                 acquire_managed_lifecycle_lock_for_reconciliation(&data_dir.to_string_lossy())?
             }
         };
-        // Keep only the owner lease, as the ordinary boundary's refreshed lock
-        // does. The provisional lease also holds the blocking namespace lock,
-        // which is meant for short holds: kept for the whole install, every
-        // other acquirer (an in-process Start, another desktop's launch
-        // reconciliation) would wait on it instead of failing at the owner
-        // lock.
         lifecycle_lock.namespace_guard = None;
         self.update_restart_was_desired = false;
         self.update_fenced = true;
@@ -3141,9 +2635,6 @@ impl NodeManager {
         Ok(())
     }
 
-    /// Pause actual worker execution before an unattended lifecycle stop.
-    /// Older nodes ignore the separate control file and are deferred, never
-    /// mistaken for idle by looking at a public health response.
     pub async fn prepare_auto_update_relaunch(
         &mut self,
     ) -> anyhow::Result<crate::auto_update::PrepareResult> {
@@ -3163,8 +2654,6 @@ impl NodeManager {
             ));
         }
         let Some(pid) = self.pid() else {
-            // A detached/recovering child has no proven execution gate. The
-            // explicit manual update can reconcile it; unattended work waits.
             return Ok(PrepareResult::busy(
                 "The managed node must be running before an unattended update can prove it is idle",
                 0,
@@ -3188,7 +2677,6 @@ impl NodeManager {
             timeout_ms: 15_000,
             lease_deadline_unix_ms: worker_control_now_ms()?.saturating_add(120_000),
         };
-        // No await between recording ownership and publishing the capability.
         self.auto_quiescence = Some(request);
         if !self.publish_worker_control(request)? {
             self.auto_quiescence = None;
@@ -3202,8 +2690,6 @@ impl NodeManager {
             .await?;
         match response {
             Some(response) if response.status == Status::Quiesced && response.active_jobs == 0 => {
-                // Leave enough of the bounded lease for the graceful stop.
-                // If scheduling consumed it, resume and retry another time.
                 if request
                     .lease_deadline_unix_ms
                     .saturating_sub(worker_control_now_ms()?)
@@ -3297,7 +2783,6 @@ impl NodeManager {
             return Ok(());
         };
         if self.pid() != Some(request.pid) {
-            // The exact child is gone; its gate cannot affect a new process.
             self.auto_quiescence = None;
             return Ok(());
         }
@@ -3318,8 +2803,6 @@ impl NodeManager {
                 "another worker control request occupies the owned channel"
             );
             if pending.action == Action::Quiesce {
-                // Atomically removed before the child consumed it. This also
-                // makes an older node's unsupported channel a safe deferral.
                 self.auto_quiescence = None;
                 return Ok(());
             }
@@ -3341,9 +2824,6 @@ impl NodeManager {
         Ok(())
     }
 
-    /// Commit the irreversible updater handoff immediately before the signed
-    /// installer is invoked. A frontend or IPC failure after this call must
-    /// never route through the pre-install abort-and-resume path.
     pub fn begin_update_handoff(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.update_lifecycle_lock.is_some(),
@@ -3358,20 +2838,10 @@ impl NodeManager {
             "updater handoff has already begun"
         );
         self.update_handoff_started = true;
-        // Past this point the old node never resumes, so neither does a
-        // slow crash wait the boundary took over.
         self.update_suspended_crash_retry = None;
         Ok(())
     }
 
-    /// Refuse a Start or Restart while a signed app update holds the node:
-    /// its lifecycle fence is held, or its one-way handoff has begun. After
-    /// an install that failed past the handoff, only exiting ARC releases
-    /// either. Start takes the lifecycle owner lock next, which this process
-    /// already holds as that fence. Locking a second open of the same file
-    /// fails against it (EWOULDBLOCK, os error 35 on macOS), and that used to
-    /// reach the user as "another ARC desktop currently owns the managed node
-    /// lifecycle". Restart's stop refused the fence in internal wording.
     pub fn refuse_start_during_update(&self) -> Result<(), String> {
         if self.update_lifecycle_lock.is_some() || self.update_handoff_started {
             return Err(UPDATE_HOLDS_NODE.to_owned());
@@ -3379,10 +2849,6 @@ impl NodeManager {
         Ok(())
     }
 
-    /// Abort only after download/signature/preparation rejects before native
-    /// handoff, and only after re-proving that no owned or detached writer
-    /// exists and the authenticated lifecycle receipt is clear. If Prepare
-    /// stopped an owned node, restore its exact launch under the same guard.
     pub async fn abort_update_relaunch(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.update_handoff_started,
@@ -3393,15 +2859,10 @@ impl NodeManager {
             return Ok(());
         }
         if self.update_fenced {
-            // The fenced boundary stopped nothing, so there is nothing to
-            // resume or re-prove. Releasing the lease restores the exact
-            // prior state, its refusal and unresolved receipt included.
-            // The handoff check at the top of this function must stay first.
             debug_assert!(!self.update_handoff_started);
             let lease = self.update_lifecycle_lock.take();
             self.update_fenced = false;
             if self.update_suspended_crash_retry.is_some() {
-                // The same lease the slow wait held goes back to it.
                 self.lifecycle_lock = lease;
                 self.restore_suspended_crash_retry().await;
             }
@@ -3437,9 +2898,6 @@ impl NodeManager {
         }
 
         let Some(restart_plan) = self.update_restart_plan.take() else {
-            // The node was already stopped before Prepare. Release only the
-            // updater fence and preserve that stopped state, or hand the
-            // lease back to the slow crash wait Prepare set aside.
             let lease = self.update_lifecycle_lock.take();
             self.update_handoff_started = false;
             self.update_restart_was_desired = false;
@@ -3469,8 +2927,6 @@ impl NodeManager {
             .await;
         match result {
             Ok(()) => {
-                // Convert the same continuously-held OS lock from updater
-                // ownership back into ordinary child-lifecycle ownership.
                 self.lifecycle_lock = Some(lifecycle_lock);
                 self.desired_running = self.update_restart_was_desired;
                 self.update_restart_was_desired = false;
@@ -3479,9 +2935,6 @@ impl NodeManager {
                 Ok(())
             }
             Err(error) => {
-                // Keep both the exact plan and the same lock so a failed
-                // identity/preflight/spawn cannot open a cross-GUI writer
-                // window or be mistaken for a harmless download error.
                 self.update_lifecycle_lock = Some(lifecycle_lock);
                 self.update_restart_plan = Some(restart_plan);
                 Err(error.context(
@@ -3518,10 +2971,6 @@ impl NodeManager {
     }
 }
 
-/// Ask the node to run its signal-driven shutdown path first so it can drain
-/// RPC work and sync the WAL. A force-kill is a bounded, explicitly reported
-/// fallback only; merely accepting a termination request is never treated as
-/// a completed updater boundary.
 async fn terminate_owned_child(
     child: &mut Child,
     shutdown_control: Option<&mut DesktopShutdownControl>,
@@ -3583,8 +3032,6 @@ async fn terminate_owned_child(
         ),
     };
 
-    // Avoid a force-kill if the process exited in the narrow interval between
-    // the timeout/request error and this fallback decision.
     if let Some(status) = child.try_wait().map_err(|error| {
         anyhow::anyhow!("failed to re-inspect managed arc-node process: {error}")
     })? {
@@ -3622,10 +3069,6 @@ async fn terminate_owned_child(
     )
 }
 
-/// The owned child exited before its authenticated stop request could be
-/// delivered (community PR #132: an early exit, such as a missing model,
-/// before the WAL proof). Nothing is left to stop. Final WAL durability was
-/// not proven, so the receipt stays armed for the next recovery launch.
 #[derive(Debug)]
 struct OwnedNodeExitedBeforeStop {
     status: String,
@@ -3643,11 +3086,6 @@ impl std::fmt::Display for OwnedNodeExitedBeforeStop {
 
 impl std::error::Error for OwnedNodeExitedBeforeStop {}
 
-/// Turn an undelivered stop request into the right error. A force-stop is
-/// never attempted without that request. The one case that is not a refusal
-/// is an owned child that has already exited: until it is reaped, the OS
-/// cannot give its PID to another process, so its exit status is proof that
-/// nothing of ours is left to stop.
 fn undelivered_stop_error(child: &mut Child, error: anyhow::Error) -> anyhow::Error {
     match child.try_wait() {
         Ok(Some(status)) => anyhow::Error::new(OwnedNodeExitedBeforeStop {
@@ -3680,9 +3118,6 @@ fn request_graceful_stop(
     child: &Child,
     shutdown_control: Option<&DesktopShutdownControl>,
 ) -> anyhow::Result<()> {
-    // CREATE_NO_WINDOW deliberately removes the console-control channel.
-    // Use the private local file capability shared with arc-node instead;
-    // there is no remotely reachable shutdown route or bearer token in argv.
     let target_pid = child
         .id()
         .ok_or_else(|| anyhow::anyhow!("managed process has no live PID"))?;
@@ -3702,15 +3137,6 @@ fn request_graceful_stop(
     anyhow::bail!("this platform exposes no supported graceful process signal")
 }
 
-/// The config a launch follows. Defense in depth for the consent switch
-/// (PR #138, ARC-48 F1): a stored config that still says worker + model while
-/// `compute_consent` is recorded as withdrawn launches as an observer without
-/// the model, exactly what `withdraw_compute_consent` persists, so the worker
-/// flags, `--model`, the keep-awake flag and the recorded launch plan agree
-/// with each other. Consent `None` keeps the existing rule: a worker with a
-/// model from before the question counts as opted in. Below the RAM floor,
-/// omit even an observer's saved model: arc-node loads `--model` without
-/// worker flags too. This projection must never be saved to the store.
 pub(crate) fn effective_launch_config(config: &NodeConfig) -> std::borrow::Cow<'_, NodeConfig> {
     effective_launch_config_for_ram(config, crate::hardware::compute_capacity().0)
 }
@@ -3744,8 +3170,6 @@ pub(crate) fn effective_launch_config_for_ram(
     }
 }
 
-/// Append compute arguments after the caller checks binary compatibility.
-/// Kept separate so launch projections can be tested without spawning a node.
 fn append_compute_launch_args(cmd: &mut Command, config: &NodeConfig) {
     if config.role == "worker" && config.model_path.is_some() {
         cmd.arg("--community-mode").arg("--full-integer-worker");
@@ -3758,32 +3182,20 @@ fn append_compute_launch_args(cmd: &mut Command, config: &NodeConfig) {
     }
 }
 
-/// Whether to start the node with `--prevent-sleep-during-jobs`: only a
-/// worker computes jobs, and only a user who turned the setting on.
 fn keep_awake_during_jobs_requested(config: &NodeConfig) -> bool {
     config.role == "worker"
         && config.model_path.is_some()
         && config.prevent_sleep_during_jobs == Some(true)
 }
 
-/// The pre-start check found that the configured model file cannot be used
-/// for this launch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ModelPreflight {
     reason: ModelUnavailableReason,
-    /// The configured path with the home directory shortened to `~`.
     shown_path: String,
-    /// The operating system's reason, for a file that cannot be read. An
-    /// `io::Error` message never includes the path itself.
     detail: Option<String>,
 }
 
 impl ModelPreflight {
-    /// Check the file arc-node would open for `--model`. `Path::try_exists`
-    /// tells "nothing is there" apart from "cannot tell" (for example a
-    /// permissions error on a parent directory), which `Path::exists` would
-    /// report as missing. Opening the file then proves arc-node could read
-    /// it. Returns `None` when the file is usable.
     fn check(path: &Path) -> Option<Self> {
         let unavailable = |reason: ModelUnavailableReason, detail: Option<String>| {
             Some(Self {
@@ -3805,7 +3217,6 @@ impl ModelPreflight {
                 ModelUnavailableReason::Unreadable,
                 Some("it is not a regular file".into()),
             ),
-            // Removed between the two checks.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 unavailable(ModelUnavailableReason::NotFound, None)
             }
@@ -3813,8 +3224,6 @@ impl ModelPreflight {
         }
     }
 
-    /// The warning for the Logs screen. People paste that screen into bug
-    /// reports, so the path is shown with `~` for the home directory.
     fn log_message(&self) -> String {
         match self.reason {
             ModelUnavailableReason::NotFound => format!(
@@ -3830,17 +3239,12 @@ impl ModelPreflight {
     }
 }
 
-/// Drop a configured model that cannot be used for this launch, which leaves
-/// an observer launch. Returns what the check found, or `None` when the model
-/// is usable or no model is configured. Only the launch copy changes.
 fn drop_unavailable_model(config: &mut std::borrow::Cow<'_, NodeConfig>) -> Option<ModelPreflight> {
     let preflight = ModelPreflight::check(Path::new(config.model_path.as_deref()?))?;
     config.to_mut().model_path = None;
     Some(preflight)
 }
 
-/// Whether the configured model file cannot be used right now. The explicit
-/// "re-download" path uses this; startup never downloads on its own.
 pub(crate) fn configured_model_unavailable(config: &NodeConfig) -> Option<ModelUnavailableReason> {
     let path = config.model_path.as_deref()?;
     ModelPreflight::check(Path::new(path)).map(|preflight| preflight.reason)
@@ -3880,12 +3284,6 @@ fn classify_level(line: &str) -> &'static str {
     }
 }
 
-/// An explicitly configured binary path, if the operator set one.
-///
-/// `ARC_NODE_BIN` is the documented name; `ARC_NODE_BINARY` is kept because
-/// existing test fixtures and dev scripts already export it. Both win over
-/// every other resolution step — if someone names a binary, that is the
-/// binary, and `ensure_binary` must not second-guess it with a download.
 pub fn env_binary_override() -> Option<PathBuf> {
     for key in ["ARC_NODE_BIN", "ARC_NODE_BINARY"] {
         if let Some(v) = std::env::var_os(key) {
@@ -3897,18 +3295,6 @@ pub fn env_binary_override() -> Option<PathBuf> {
     None
 }
 
-/// A locally built `target/release/arc-node`, if this app is running from a
-/// repo checkout.
-///
-/// This is the path the demo machine takes: the repo has a freshly built
-/// arc-node that matches the desktop version, while the published GitHub
-/// release ships no arc-node assets at all. Without this, a dev-mode run has
-/// nothing to launch even with the binary sitting two directories away.
-///
-/// Searched relative to both the working directory (`cargo tauri dev` runs
-/// from `desktop/src-tauri`, some tooling from `desktop/`) and the running
-/// executable's ancestors (`target/debug/arc-desktop` lives inside the same
-/// checkout), so it resolves whichever way the app was launched.
 pub fn dev_build_binary() -> Option<PathBuf> {
     let exe_name = if cfg!(windows) {
         "arc-node.exe"
@@ -3918,22 +3304,17 @@ pub fn dev_build_binary() -> Option<PathBuf> {
 
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
-        // desktop/src-tauri → ../.. = repo root; desktop → .. = repo root.
         roots.push(cwd.join("..").join(".."));
         roots.push(cwd.join(".."));
         roots.push(cwd.clone());
     }
     if let Ok(exe) = std::env::current_exe() {
-        // Walk up from the executable; one of these ancestors is the repo
-        // root when running a dev build out of target/.
         roots.extend(exe.ancestors().take(8).map(PathBuf::from));
     }
 
     for root in roots {
         let cand = root.join("target").join("release").join(exe_name);
         if cand.is_file() {
-            // Canonicalize so the `../..` forms turn into a clean absolute
-            // path in logs and in the "detached process" comparison.
             return Some(cand.canonicalize().unwrap_or(cand));
         }
     }
@@ -3941,24 +3322,19 @@ pub fn dev_build_binary() -> Option<PathBuf> {
 }
 
 fn resolve_binary() -> anyhow::Result<PathBuf> {
-    // 1. Explicit override (env). Highest precedence, no questions asked.
     if let Some(p) = env_binary_override() {
         return Ok(p);
     }
 
-    // 2. Canonical app-managed path. Auto-download (commands::ensure_binary)
-    //    writes here on first launch.
     let managed = managed_binary_path();
     if managed.exists() {
         return Ok(managed);
     }
 
-    // 3. A release build sitting in this repo checkout (dev + demo machines).
     if let Some(p) = dev_build_binary() {
         return Ok(p);
     }
 
-    // 4. PATH lookup, for devs who installed arc-node system-wide.
     if let Ok(p) = which_on_path("arc-node") {
         return Ok(p);
     }
@@ -4003,15 +3379,6 @@ fn require_regular_bundle_resource(path: &Path, name: &str) -> anyhow::Result<()
     Ok(())
 }
 
-/// Does this arc-node accept `flag`?
-///
-/// clap aborts the process on an unrecognized argument, so every optional
-/// flag must be probed before use or a node that would have started fine at
-/// default settings refuses to start at all. `--help` output is the only
-/// version-independent way to ask.
-///
-/// Cached per (binary, flag): `--help` costs a process spawn, and `start()`
-/// runs on every user-visible Start click.
 #[cfg(windows)]
 fn windows_binary_file_identity(path: &Path) -> Option<String> {
     use std::os::windows::io::AsRawHandle as _;
@@ -4020,10 +3387,7 @@ fn windows_binary_file_identity(path: &Path) -> Option<String> {
     };
 
     let file = std::fs::File::open(path).ok()?;
-    // SAFETY: the all-zero value is a valid output buffer for the Win32 API.
     let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: the File owns a live handle and `information` is writable for
-    // the duration of this synchronous call.
     if unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) } == 0 {
         return None;
     }
@@ -4066,9 +3430,6 @@ pub fn binary_supports_flag(binary: &Path, flag: &str) -> bool {
             format!("{stable_identity}:{}:{modified}:{created}", metadata.len())
         })
         .unwrap_or_else(|_| "missing".into());
-    // The updater replaces the executable at the same managed path. Include
-    // file freshness so a v0.7 negative probe cannot poison the subsequent
-    // v0.8 capability check in the same desktop process.
     let key = format!("{}\u{0}{freshness}\u{0}{flag}", canonical.display());
     if let Ok(guard) = cache.lock() {
         if let Some(hit) = guard.get(&key) {
@@ -4091,8 +3452,6 @@ pub fn binary_supports_flag(binary: &Path, flag: &str) -> bool {
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
-            // Match the flag followed by a boundary so `--threads` does not
-            // report true because `--bench-rayon-threads` is present.
             text.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
                 .any(|tok| tok == flag)
         }
@@ -4104,9 +3463,6 @@ pub fn binary_supports_flag(binary: &Path, flag: &str) -> bool {
     supported
 }
 
-/// Canonical location for the auto-downloaded arc-node binary.
-/// `~/.arc/bin/arc-node` (or `.exe` on Windows). Public so commands.rs can
-/// write to the same path during auto-download.
 fn unique_command_flag_value<'a>(
     command: &'a [std::ffi::OsString],
     flag: &str,
@@ -4120,11 +3476,6 @@ fn unique_command_flag_value<'a>(
     values.next().is_none().then_some(value)
 }
 
-/// Recover a capability only from the exact argv shape emitted by the
-/// desktop: one canonical data directory and the exact token beneath that
-/// directory's named private control boundary. Merely executing the same
-/// arc-node binary is never evidence that a manual/headless node belongs to
-/// the desktop.
 #[cfg(any(unix, windows, test))]
 fn desktop_shutdown_control_from_command(
     command: &[std::ffi::OsString],
@@ -4158,9 +3509,6 @@ fn desktop_shutdown_control_from_command(
     {
         anyhow::bail!("managed desktop shutdown capability has an unexpected path shape");
     }
-    // Once argv has the exact desktop-emitted path binding, recovery is
-    // fail-closed: a deleted token, corrupt private directory, or access/DACL
-    // failure means the updater cannot prove a safe stop boundary.
     let data_dir = raw_data_dir.canonicalize().with_context(|| {
         format!(
             "cannot recover exact managed desktop data directory {}",
@@ -4209,10 +3557,6 @@ fn constant_time_legacy_seed_eq(candidate: &std::ffi::OsStr, expected: &Zeroizin
     {
         return false;
     }
-    // Both identities are compared across the same public upper bound. This
-    // avoids a secret-dependent early mismatch while retaining exact equality
-    // (including length) for the recovery phrase that old desktop builds put
-    // in argv. The expected copy remains Zeroizing and is never formatted.
     let mut difference = candidate.len() ^ expected.len();
     for index in 0..LEGACY_VALIDATOR_SEED_MAX_BYTES {
         let left = candidate.get(index).copied().unwrap_or(0);
@@ -4244,14 +3588,6 @@ fn legacy_packaged_resource_matches(
     if let Some(canonical) = canonical_process_path(value, process_cwd) {
         return canonical == current_signed_resource;
     }
-    // Linux AppImage resources live beneath an ephemeral /tmp/.mount_* tree
-    // that disappears when the old GUI relaunches even though its detached
-    // node survives. The real public tags always emitted both resources from
-    // the signed bundle's `resources/` directory. When that mount is gone, the
-    // remaining exact evidence is the immutable tag argv shape plus managed
-    // executable, persisted secret seed, data dir, ports, role and model. Only
-    // accept that exact packaged lexical suffix; arbitrary missing paths do
-    // not qualify.
     let path = Path::new(value);
     path.file_name() == Some(std::ffi::OsStr::new(expected_name))
         && path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("resources"))
@@ -4434,12 +3770,8 @@ struct WindowsProcessHandle {
 }
 
 #[cfg(windows)]
-// Windows process handles are kernel object references and may be waited or
-// terminated from any thread. Ownership remains unique in this RAII wrapper.
 unsafe impl Send for WindowsProcessHandle {}
 #[cfg(windows)]
-// Waiting/querying a process kernel object through shared references is safe;
-// termination remains serialized by the owning NodeManager stop operation.
 unsafe impl Sync for WindowsProcessHandle {}
 
 #[cfg(windows)]
@@ -4450,8 +3782,6 @@ impl WindowsProcessHandle {
             GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
             PROCESS_TERMINATE,
         };
-        // SAFETY: OpenProcess receives a numeric PID and returns an owned
-        // kernel handle; handle inheritance is explicitly disabled.
         let handle = unsafe {
             OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
@@ -4466,8 +3796,6 @@ impl WindowsProcessHandle {
         let mut exit = FILETIME::default();
         let mut kernel = FILETIME::default();
         let mut user = FILETIME::default();
-        // SAFETY: outputs point to initialized FILETIME storage and the
-        // retained handle has query access.
         if unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) } == 0
         {
             unsafe {
@@ -4502,7 +3830,6 @@ impl WindowsProcessHandle {
     fn is_live(&self) -> std::io::Result<bool> {
         use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
         use windows_sys::Win32::System::Threading::WaitForSingleObject;
-        // SAFETY: this wrapper owns a valid process handle for its lifetime.
         match unsafe { WaitForSingleObject(self.handle, 0) } {
             WAIT_TIMEOUT => Ok(true),
             WAIT_OBJECT_0 => Ok(false),
@@ -4514,8 +3841,6 @@ impl WindowsProcessHandle {
         use windows_sys::Win32::Foundation::STILL_ACTIVE;
         use windows_sys::Win32::System::Threading::GetExitCodeProcess;
         let mut code = 0u32;
-        // SAFETY: this wrapper owns a query-capable process handle and `code`
-        // is a live writable output for the duration of the call.
         if unsafe { GetExitCodeProcess(self.handle, &mut code) } == 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -4528,8 +3853,6 @@ impl WindowsProcessHandle {
 
         let mut buffer = vec![0u16; 32_768];
         let mut length = buffer.len() as u32;
-        // SAFETY: the buffer is writable for `length` UTF-16 units and this
-        // wrapper owns a query-capable process handle.
         if unsafe { QueryFullProcessImageNameW(self.handle, 0, buffer.as_mut_ptr(), &mut length) }
             == 0
         {
@@ -4541,8 +3864,6 @@ impl WindowsProcessHandle {
 
     fn terminate(&self) -> std::io::Result<()> {
         use windows_sys::Win32::System::Threading::TerminateProcess;
-        // SAFETY: this is the retained handle opened for the exact managed
-        // process before the graceful wait; PID reuse cannot retarget it.
         if unsafe { TerminateProcess(self.handle, 1) } == 0 {
             Err(std::io::Error::last_os_error())
         } else {
@@ -4554,7 +3875,6 @@ impl WindowsProcessHandle {
 #[cfg(windows)]
 impl Drop for WindowsProcessHandle {
     fn drop(&mut self) {
-        // SAFETY: this wrapper uniquely owns the successful OpenProcess handle.
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(self.handle);
         }
@@ -4571,14 +3891,11 @@ impl UnixLegacyProcessHandle {
     fn open(pid: u32, _expected_executable: &Path) -> anyhow::Result<Self> {
         use std::os::fd::FromRawFd as _;
 
-        // SAFETY: pidfd_open takes a numeric pid and zero flags, retains no
-        // caller pointers, and returns a new owned descriptor on success.
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as i32;
         if fd < 0 {
             return Err(std::io::Error::last_os_error())
                 .context("Linux pidfd_open is unavailable for legacy reconciliation");
         }
-        // SAFETY: the successful syscall returned a uniquely owned descriptor.
         Ok(Self {
             pidfd: unsafe { std::fs::File::from_raw_fd(fd) },
         })
@@ -4587,8 +3904,6 @@ impl UnixLegacyProcessHandle {
     fn signal_term(&self) -> anyhow::Result<()> {
         use std::os::fd::AsRawFd as _;
 
-        // SAFETY: pidfd_send_signal targets the retained process object, not a
-        // reusable numeric PID. siginfo is null and flags are zero.
         let result = unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
@@ -4614,7 +3929,6 @@ impl UnixLegacyProcessHandle {
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: descriptor points to one initialized pollfd for this call.
         let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
         if result < 0 {
             return Err(std::io::Error::last_os_error()).context("polling legacy pidfd failed");
@@ -4644,15 +3958,12 @@ impl UnixLegacyProcessHandle {
             name.last() == Some(&0),
             "dynamic symbol name is not terminated"
         );
-        // SAFETY: RTLD_DEFAULT asks dyld for a process-global symbol. The
-        // caller supplies the exact public SDK function signature.
         let pointer =
             unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr().cast::<libc::c_char>()) };
         anyhow::ensure!(
             !pointer.is_null(),
             "required macOS audit-token process API is unavailable"
         );
-        // SAFETY: dlsym returned the named function; T is the matching ABI.
         Ok(unsafe { std::mem::transmute_copy::<*mut std::ffi::c_void, T>(&pointer) })
     }
 
@@ -4696,8 +4007,6 @@ impl UnixLegacyProcessHandle {
                 &mut count,
             )
         };
-        // The audit token remains stable after releasing the temporary task
-        // port and includes the kernel pidversion that rejects PID reuse.
         let _ = unsafe { mach_port_deallocate(self_task, name) };
         anyhow::ensure!(
             status == KERN_SUCCESS && count == TASK_AUDIT_TOKEN_COUNT,
@@ -4797,11 +4106,6 @@ impl UnixLegacyProcessHandle {
     }
 }
 
-/// Find and stop only detached arc-node processes that prove desktop ownership
-/// through an exact data-dir-bound private capability in argv. Same-binary
-/// manual/headless nodes are deliberately ignored. Unix nodes receive SIGTERM;
-/// Windows nodes use the private request and a retained process handle so PID
-/// reuse can never redirect the force fallback.
 async fn stop_detached_arc_node(
     legacy_context: Option<&LegacyWindowsStopContext>,
     expected_data_dir: Option<&Path>,
@@ -4891,10 +4195,6 @@ async fn stop_detached_arc_node(
         ensure_windows_process_image(&handle, &identity)?;
         #[cfg(windows)]
         {
-            // sysinfo timestamps have one-second resolution. After retaining
-            // the kernel handle, refresh argv/cwd and repeat the full private
-            // capability + receipt proof for this PID so same-exe PID reuse
-            // within that second cannot inherit the stale initial proof.
             let mut refreshed = sysinfo::System::new();
             refresh_process_command_metadata(&mut refreshed);
             let process = refreshed
@@ -4949,9 +4249,6 @@ async fn stop_detached_arc_node(
         return Ok(StopSummary::default());
     }
 
-    // Arm every exact-bound receipt before publishing any request. This
-    // avoids partially draining a multi-process set when another target's
-    // durable receipt cannot be established.
     for target in &mut targeted {
         target
             .shutdown_control
@@ -4963,12 +4260,6 @@ async fn stop_detached_arc_node(
                 )
             })?;
     }
-    // A recorded node that is provably gone (community PR #132) has nothing
-    // left to stop. It is skipped rather than reported as a failed stop: its
-    // receipt stays armed, so the caller's durability check returns
-    // `ManagedDurabilityRecoveryRequired` and startup continues with the
-    // normal recovery launch. A node that is live, or whose identity cannot
-    // be proven either way, keeps every refusal below.
     let mut gone_unproven = Vec::<usize>::new();
     for (index, target) in targeted.iter().enumerate() {
         if let Err(error) =
@@ -4999,9 +4290,6 @@ async fn stop_detached_arc_node(
         if still_targeted.contains(&index) || gone_unproven.contains(&index) {
             continue;
         }
-        // Windows keeps the exact exit code behind the retained handle; Unix
-        // exposes no exit status for a detached process, so the ACK alone is
-        // the proof there.
         #[cfg(windows)]
         let exit_code = target.handle.exit_code()?.ok_or_else(|| {
             anyhow::anyhow!(
@@ -5017,9 +4305,6 @@ async fn stop_detached_arc_node(
             target.shutdown_control.consume_clean_ack()?;
             continue;
         }
-        // The node exited without proving its final WAL barrier. That is not
-        // a stop failure when the recorded process is provably gone: leave
-        // its receipt armed for the recovery launch instead.
         match recorded_node_state(target) {
             RecordedNodeState::Gone => {}
             RecordedNodeState::DataDirectoryHeld => {
@@ -5097,36 +4382,20 @@ async fn stop_detached_arc_node(
     Ok(summary)
 }
 
-/// What a fresh look at a recorded detached node proves (community PR #132).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecordedNodeState {
-    /// A process with the recorded PID, start time and executable is live.
-    /// It is ours, and it is stopped only through its authenticated request.
     LiveAndOurs,
-    /// No process has the PID, or the process holding it has a different
-    /// start time or executable. Nothing of ours is left to stop.
     Gone,
-    /// The PID belongs to a process with the recorded start time whose
-    /// executable cannot be read. That proves nothing either way, so it is
-    /// treated like a live process: never skipped and never signalled.
     Unproven,
-    /// The recorded process no longer answers, but a node still holds the
-    /// data directory's lock. Never treated as gone: no recovery node could
-    /// start beside it, and the second look may have misjudged a live node.
     DataDirectoryHeld,
 }
 
-/// One process-table lookup of a recorded PID.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ObservedProcess {
     start_time: u64,
-    /// Canonical executable path, when the operating system shows it.
     executable: Option<PathBuf>,
 }
 
-/// Decide from the recorded launch identity alone. PID reuse is the hazard
-/// here: a different process can hold the PID later, so the PID never counts
-/// as ours without the matching start time and executable.
 fn classify_recorded_node(
     identity: &DetachedProcessIdentity,
     observed: Option<&ObservedProcess>,
@@ -5144,7 +4413,6 @@ fn classify_recorded_node(
     }
 }
 
-/// Look the recorded PID up again and classify what holds it now.
 #[cfg_attr(windows, allow(dead_code))]
 fn observe_recorded_node(identity: &DetachedProcessIdentity) -> RecordedNodeState {
     let mut system = sysinfo::System::new();
@@ -5162,12 +4430,6 @@ fn observe_recorded_node(identity: &DetachedProcessIdentity) -> RecordedNodeStat
     classify_recorded_node(identity, observed.as_ref())
 }
 
-/// What a fresh look proves about a recorded detached node. "Gone" is
-/// trusted only while no node holds the data directory (review of #200, C1).
-/// On Unix the second look can misjudge a live node: its binary replaced or
-/// removed between the looks, a wall-clock step, or a transient `/proc`
-/// read. arc-node's exclusive data-directory lock is the backstop, so it is
-/// checked before the verdict, with a precise refusal while it is held.
 fn recorded_node_state(target: &ManagedDetachedProcess) -> RecordedNodeState {
     match recorded_process_state(target) {
         RecordedNodeState::Gone => {
@@ -5181,8 +4443,6 @@ fn recorded_node_state(target: &ManagedDetachedProcess) -> RecordedNodeState {
     }
 }
 
-/// Windows asks the retained process handle. It pins the exact process
-/// object, so a reused PID can never answer for the recorded node.
 #[cfg(windows)]
 fn recorded_process_state(target: &ManagedDetachedProcess) -> RecordedNodeState {
     match target.handle.is_live() {
@@ -5197,19 +4457,6 @@ fn recorded_process_state(target: &ManagedDetachedProcess) -> RecordedNodeState 
     observe_recorded_node(&target.identity)
 }
 
-/// Whether a node still holds `data_dir`. arc-node takes an exclusive lock
-/// on `<data_dir>/.arc-node.lock` before it touches any state and keeps it
-/// until it exits, so a held lock means a node is running there, whatever a
-/// process-table lookup says. Like the check after detached-process
-/// reconciliation, this opens only an existing lock file (a missing one
-/// means no node has run there) and releases the lock at once.
-///
-/// arc-node creates the lock with a plain open, so on Windows an existing
-/// lock inherits the data directory's ACEs rather than carrying a protected
-/// DACL. Through v0.8.14 the strict private opener refused it, and startup
-/// reconciliation failed on every launch with "private file Windows DACL
-/// inherits from its parent". The probe now repairs that boundary on ARC's
-/// own, owner-verified, non-link lock file before it looks at the lock.
 pub(crate) fn node_data_directory_held(data_dir: &Path) -> std::io::Result<bool> {
     let node_lock_path = data_dir.join(".arc-node.lock");
     let node_lock =
@@ -5230,7 +4477,6 @@ pub(crate) fn node_data_directory_held(data_dir: &Path) -> std::io::Result<bool>
     }
 }
 
-/// The refusal for a recorded node whose data directory is still held.
 fn data_directory_still_held(target: &ManagedDetachedProcess) -> String {
     format!(
         "a node still holds the data directory {}, although managed detached arc-node pid {} no longer matches its recorded launch identity; refusing to treat it as exited or to start a recovery node beside it",
@@ -5255,9 +4501,6 @@ async fn stop_one_proven_legacy_node(
         }
     };
     if binary_supports_flag(&managed, "--desktop-shutdown-token-file") {
-        // The running-image lock prevents replacing a live legacy executable
-        // at this exact managed path on Windows. A capability-aware image is
-        // therefore proof that the one-time tokenless upgrade edge is over.
         return Ok(StopSummary::default());
     }
     let mut system = sysinfo::System::new();
@@ -5428,10 +4671,6 @@ async fn stop_one_proven_legacy_node(
     let handle = UnixLegacyProcessHandle::open(identity.pid.as_u32(), &identity.executable)
         .context("failed to retain kernel-bound identity for the legacy desktop node")?;
 
-    // Reprove the full argv/cwd/executable grammar after retaining the kernel
-    // identity. If PID reuse happened before handle acquisition, this catches
-    // it; if it happens later, pidfd/audit-token signaling remains bound to the
-    // old process object and cannot target the replacement.
     let mut refreshed = sysinfo::System::new();
     refresh_process_command_metadata(&mut refreshed);
     refreshed
@@ -5568,17 +4807,10 @@ fn which_on_path(name: &str) -> anyhow::Result<PathBuf> {
     Err(anyhow::anyhow!("{} not found on PATH", name))
 }
 
-/// Resolve the configured data dir. Goes through [`paths::expand_tilde`] so
-/// the default `~/.arc` lands in the user's profile on Windows instead of
-/// `./.arc` relative to the GUI's CWD.
 pub fn resolve_data_dir(s: &str) -> PathBuf {
     paths::expand_tilde(s)
 }
 
-/// Inspect a stale durability receipt before any updater/download is allowed
-/// to replace the exact executable or signed genesis bytes it binds. A true
-/// result means Start is a recovery launch and must use the installed bytes
-/// already on disk; NodeManager::start performs the full binding check.
 pub fn managed_shutdown_recovery_required(configured_data_dir: &str) -> anyhow::Result<bool> {
     let data_dir = resolve_data_dir(configured_data_dir);
     if !data_dir.exists() {
@@ -5594,22 +4826,11 @@ pub fn managed_shutdown_recovery_required(configured_data_dir: &str) -> anyhow::
         })
 }
 
-/// Can we bind TCP on this port? Correct probe for the RPC listener.
 fn tcp_available(port: u16) -> bool {
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     TcpListener::bind(addr).is_ok()
 }
 
-/// Can we bind UDP on this port? Correct probe for the P2P listener, which
-/// is QUIC and therefore UDP.
-///
-/// The previous code TCP-probed the P2P port, which made the probe blind to
-/// the exact failure it was written to survive: with WSL2 or Docker Desktop
-/// installed, Hyper-V reserves dynamic UDP exclusion ranges that frequently
-/// cover 9000-9100. UDP 9091 is then un-bindable by any user-mode process
-/// while TCP 9091 binds fine — so the probe passed, arc-node got a port it
-/// could not use, and the only sign was a silent fall back to an ephemeral
-/// port with no inbound reachability.
 fn udp_available(port: u16) -> bool {
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     UdpSocket::bind(addr).is_ok()
@@ -5621,8 +4842,6 @@ fn choose_port_pair_with_probes(
     mut rpc_available: impl FnMut(u16) -> bool,
     mut p2p_available: impl FnMut(u16) -> bool,
 ) -> anyhow::Result<(u16, u16)> {
-    // Try up to 5 offsets in +10 increments. RPC must be TCP-bindable and
-    // P2P must be UDP-bindable.
     for i in 0..5 {
         let rpc = preferred_rpc.saturating_add(i * 10);
         let p2p = preferred_p2p.saturating_add(i * 10);
@@ -5754,10 +4973,6 @@ mod tests {
     }
 
     fn resource_test_dir(label: &str) -> PathBuf {
-        // macOS exposes its temporary directory through `/var`, which is a
-        // compatibility symlink to `/private/var`. Production lifecycle paths
-        // deliberately reject linked ancestors, so build test paths beneath
-        // the already-resolved temporary-directory prefix.
         std::env::temp_dir().canonicalize().unwrap().join(format!(
             "arc-desktop-network-resource-{label}-{}-{}",
             std::process::id(),
@@ -5790,10 +5005,6 @@ mod tests {
         let persisted = persist_managed_executable_identity(&dir, &original).unwrap();
         assert_eq!(persisted, original);
 
-        // Recovery must not recompute ARC_NODE_BIN/PATH/dev candidates from a
-        // new desktop process. The private exact path selected before spawn is
-        // independent of that ephemeral environment and is re-authenticated
-        // against the receipt's executable path+content digests at Start.
         let recovered = load_managed_executable_identity(&dir).unwrap();
         assert_eq!(recovered, original);
 
@@ -5933,24 +5144,21 @@ mod tests {
             out
         }
         let root = tempfile::tempdir().unwrap();
-        // The managed data namespace deliberately rejects linked ancestry.
-        // Resolve the test's OS temp root (e.g. macOS /var -> /private/var)
-        // without relaxing that production boundary.
         let data = root.path().canonicalize().unwrap().join("data-v3");
         let configured = data.to_string_lossy();
         let before = snapshot(root.path());
         probe_existing_managed_lifecycle_owner(&configured).unwrap();
-        assert_eq!(snapshot(root.path()), before); // Absent directory/lock.
+        assert_eq!(snapshot(root.path()), before);
         std::fs::create_dir(&data).unwrap();
         std::fs::write(data.join("sentinel"), b"unchanged").unwrap();
         let before = snapshot(root.path());
         probe_existing_managed_lifecycle_owner(&configured).unwrap();
-        assert_eq!(snapshot(root.path()), before); // Existing directory, absent lock.
+        assert_eq!(snapshot(root.path()), before);
         let owner = acquire_managed_lifecycle_lock(&configured).unwrap();
         drop(owner);
         let before = snapshot(root.path());
         probe_existing_managed_lifecycle_owner(&configured).unwrap();
-        assert_eq!(snapshot(root.path()), before); // Existing unlocked lock.
+        assert_eq!(snapshot(root.path()), before);
         let owner_path = data.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME)
             .join(DESKTOP_LIFECYCLE_OWNER_LOCK_FILE_NAME);
         let owner_bytes = std::fs::read(&owner_path).unwrap();
@@ -5958,7 +5166,7 @@ mod tests {
         owner.try_lock_exclusive().unwrap();
         let error = probe_existing_managed_lifecycle_owner(&configured).unwrap_err();
         assert!(error.downcast_ref::<ManagedLifecycleContention>().is_some());
-        fs2::FileExt::unlock(&owner).unwrap(); // Windows forbids reading locked bytes.
+        fs2::FileExt::unlock(&owner).unwrap();
         assert_eq!(std::fs::read(owner_path).unwrap(), owner_bytes);
         assert_eq!(snapshot(root.path()), before);
     }
@@ -6115,15 +5323,8 @@ mod tests {
         let home = resource_test_dir("first-launch-visible-root-retry");
         arc_crypto::secret_file::secure_private_directory_tree(&home).unwrap();
         let managed_root = home.join(".arc");
-        // A configured case variant still names the exact managed namespaces
-        // on Windows and therefore must participate in the outer-root fence.
         let data = home.join(".ARC").join("DATA-V3");
 
-        // Model the observable state after MoveFileExW made the first root
-        // publication visible but reported a late write-through failure. A
-        // retry must not treat mere visibility as proof that the parent name
-        // is durable, and must retain its namespace guard through child
-        // creation.
         arc_crypto::secret_file::secure_private_directory(&managed_root).unwrap();
         let root_guard = prepare_first_launch_managed_root_at(&data, &managed_root)
             .unwrap()
@@ -6375,9 +5576,6 @@ mod tests {
             "ordinary lifecycle commands must not accidentally release the updater fence"
         );
 
-        // A rejected installer calls the explicit native abort. Native code
-        // re-scans for detached writers and revalidates the receipt before it
-        // releases the guard, after which a second GUI may own the lifecycle.
         installer_gui.abort_update_relaunch().await.unwrap();
         assert!(installer_gui.update_lifecycle_lock.is_none());
         assert!(installer_gui.child.is_none());
@@ -6409,17 +5607,11 @@ mod tests {
         assert!(manager.update_lifecycle_lock.is_some());
         assert!(manager.child.is_none());
 
-        // Process exit is the only release after handoff.
         drop(manager);
         drop(acquire_managed_lifecycle_lock(&configured).unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// The trap behind "another ARC desktop currently owns the managed node
-    /// lifecycle": an install that failed after the handoff keeps the update
-    /// fence until ARC exits, and a Start in the same desktop took the owner
-    /// lock again and failed against it. Start and Restart refuse first now,
-    /// in the sentence Home shows for that state.
     #[tokio::test]
     async fn start_and_restart_refuse_plainly_while_an_update_holds_the_node() {
         let root = resource_test_dir("update-holds-node");
@@ -6434,18 +5626,15 @@ mod tests {
             manager.refuse_start_during_update(),
             Err(UPDATE_HOLDS_NODE.to_owned())
         );
-        // What the owner lock told such a Start before the refusal existed.
         let contender = contend_for_lifecycle_lock(&configured);
         assert!(
             contender.contains(crate::start_fence::ALREADY_OPEN),
             "{contender}"
         );
 
-        // A rejected install before the handoff releases the fence.
         manager.abort_update_relaunch().await.unwrap();
         assert_eq!(manager.refuse_start_during_update(), Ok(()));
 
-        // After the handoff nothing in this process releases it.
         manager.prepare_update_relaunch().await.unwrap();
         manager.begin_update_handoff().unwrap();
         assert!(manager.abort_update_relaunch().await.is_err());
@@ -6464,11 +5653,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// The state behind the stuck reports: the previous node never
-    /// acknowledged its final WAL barrier, and no node runs. Stop and the
-    /// ordinary update boundary refuse that receipt by design. The fenced
-    /// boundary lets the signed app update through without stopping,
-    /// starting or clearing anything.
     #[tokio::test]
     async fn fenced_update_boundary_passes_an_unresolved_receipt_and_leaves_it_armed() {
         let root = resource_test_dir("fenced-update-boundary");
@@ -6489,14 +5673,10 @@ mod tests {
         assert!(manager.ordinary_update_boundary_is_fenced());
 
         manager.prepare_fenced_update_relaunch().unwrap();
-        // Only the owner lease is held for the install, never the blocking
-        // namespace lock: a second desktop, or a Start in this one, fails at
-        // the owner lock instead of waiting for the install to finish.
         assert!(manager
             .update_lifecycle_lock
             .as_ref()
             .is_some_and(|lock| lock.namespace_guard.is_none()));
-        // Non-blocking: the namespace lock is free for the whole install.
         drop(arc_crypto::secret_file::try_acquire_private_directory_namespace_lock(&data).unwrap());
         let contender = contend_for_lifecycle_lock(&configured);
         assert!(
@@ -6508,14 +5688,11 @@ mod tests {
         assert!(manager.child.is_none());
         assert!(managed_shutdown_recovery_required(&configured).unwrap());
 
-        // A rejected install releases only the lease. The receipt stays armed
-        // for the new version's own recovery launch.
         manager.abort_update_relaunch().await.unwrap();
         assert!(manager.update_lifecycle_lock.is_none());
         assert!(manager.child.is_none());
         assert!(managed_shutdown_recovery_required(&configured).unwrap());
 
-        // A lease this manager already holds becomes the update lease.
         manager.lifecycle_lock = Some(acquire_managed_lifecycle_lock(&configured).unwrap());
         manager.prepare_fenced_update_relaunch().unwrap();
         assert!(manager.lifecycle_lock.is_none());
@@ -6527,7 +5704,6 @@ mod tests {
         manager.abort_update_relaunch().await.unwrap();
         assert!(manager.update_lifecycle_lock.is_none());
 
-        // An accepted install is one-way, as on the ordinary boundary.
         manager.prepare_fenced_update_relaunch().unwrap();
         manager.begin_update_handoff().unwrap();
         assert!(manager.abort_update_relaunch().await.is_err());
@@ -6550,9 +5726,6 @@ mod tests {
             receipt_control_for_executable(&data, &std::env::current_exe().unwrap());
         assert!(manager.ordinary_update_boundary_is_fenced());
 
-        // A healthy node orphaned by another desktop process: its receipt is
-        // armed while it runs, and it holds the data lock. It has jobs to
-        // drain, so the update must not take the fenced boundary past it.
         let node_lock_path = data.join(".arc-node.lock");
         arc_crypto::secret_file::durably_publish_new_private(
             &node_lock_path,
@@ -6576,10 +5749,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// v0.8.13's legacy guard stays. A refused v0.7 migration can leave the
-    /// config pointing at the preserved directory; the fenced boundary must
-    /// not create lock files in it or tighten its mode. That refusal stays on
-    /// the manual-install path.
     #[test]
     fn fenced_update_boundary_keeps_the_legacy_reconciliation_refusal() {
         let root = resource_test_dir("fenced-update-legacy");
@@ -6609,9 +5778,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A contender's whole acquisition, bounded so a regression fails here
-    /// instead of hanging the suite: it must fail at the owner lock, never
-    /// wait on a lock the update holds for the whole install.
     fn contend_for_lifecycle_lock(configured: &str) -> String {
         let configured = configured.to_owned();
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -6734,8 +5900,6 @@ mod tests {
         let nonce = control.receipt_nonce.unwrap();
         let executable = control.receipt_executable.clone().unwrap();
         let genesis = control.receipt_genesis.clone().unwrap();
-        // This process fixture exercises the desktop control/lifecycle
-        // boundary. Real node WAL durability is tested in the node suite.
         let responder = tokio::spawn(async move {
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
@@ -6851,16 +6015,12 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// The node shares the computer with the person using it, so it starts at
-    /// low priority. This starts a node through the real launch path and reads
-    /// back the nice value the system reports for it.
     #[cfg(unix)]
     #[tokio::test]
     async fn the_managed_node_starts_at_low_priority() {
         let (root, _configured, mut manager, _plan) = updater_resume_fixture("low-priority-start");
         manager.abort_update_relaunch().await.unwrap();
         let pid = manager.pid().unwrap();
-        // The fixture execs `sleep`, which keeps the nice value set before exec.
         let nice = process_nice(pid);
         assert!(
             nice >= NODE_NICE,
@@ -6875,15 +6035,10 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A node whose priority could not be lowered still starts, and the log
-    /// says so. Asking an unprivileged process for a negative nice value is
-    /// refused (a privileged one is granted it): either way the child is
-    /// above low priority, which is the state this reports.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_node_that_could_not_be_lowered_still_starts_and_is_logged() {
         if process_nice(std::process::id()) >= NODE_NICE {
-            // This test run is itself at low priority: nothing to refuse.
             return;
         }
         let mut cmd = Command::new("sleep");
@@ -6917,7 +6072,6 @@ mod tests {
         logged.expect("the unlowered node is logged as a warning");
     }
 
-    /// A node at or below the priority it asked for is not reported.
     #[cfg(unix)]
     #[test]
     fn only_a_node_above_low_priority_is_reported() {
@@ -6930,8 +6084,6 @@ mod tests {
         }
     }
 
-    /// Windows: the node's process is created below normal priority, in
-    /// addition to the console detachment it always had.
     #[cfg(windows)]
     #[tokio::test]
     async fn the_managed_node_starts_below_normal_priority() {
@@ -6945,19 +6097,14 @@ mod tests {
         configure_node_process(&mut cmd);
         let mut child = cmd.spawn().expect("spawn a disposable Windows process");
         let pid = child.id().expect("the child is running");
-        // SAFETY: OpenProcess takes a numeric PID of a process this test
-        // just spawned and returns an owned handle, closed below.
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         assert!(!handle.is_null(), "{}", std::io::Error::last_os_error());
-        // SAFETY: the handle is valid and has query access.
         let class = unsafe { GetPriorityClass(handle) };
-        // SAFETY: the handle was opened above and is closed once.
         unsafe {
             CloseHandle(handle);
         }
         child.start_kill().unwrap();
         child.wait().await.unwrap();
-        // BELOW_NORMAL_PRIORITY_CLASS
         assert_eq!(class, 0x0000_4000);
     }
 
@@ -6967,8 +6114,6 @@ mod tests {
         let (root, _configured, mut manager, _plan) = updater_resume_fixture("auto-update-cancel");
         manager.abort_update_relaunch().await.unwrap();
         let pid = manager.pid().unwrap();
-        // The fixture represents an older child which ignores the new file.
-        // Cancellation must retain ownership until Abort withdraws that file.
         assert!(tokio::time::timeout(
             Duration::from_millis(100),
             manager.prepare_auto_update_relaunch()
@@ -7022,8 +6167,6 @@ mod tests {
             "post-start status update must be blocked"
         );
 
-        // Cancelling the caller while it waits for the contended crash-info
-        // lock must not orphan a child or drop the OS lifecycle fence.
         task.abort();
         let _ = task.await;
         drop(held_crash_info);
@@ -7108,8 +6251,6 @@ mod tests {
         manager.abort_update_relaunch().await.unwrap();
         assert!(manager.desired_running);
         let first_pid = manager.pid().unwrap();
-        // Do not kill the shell before it records launch 1: otherwise its
-        // recovery can masquerade as the first launch and sleep for a minute.
         wait_for_crash_fixture_start(&configured, 1).await;
         let expected_attempts = if slow { MAX_CRASH_RESTARTS } else { 1 };
         if slow {
@@ -7129,13 +6270,8 @@ mod tests {
         );
         assert_eq!(manager.crash_retry_in_secs().is_some(), slow);
 
-        // The real schedule is exponential; make this integration test prompt
-        // while preserving the same due-retry transition.
         manager.crash_restart_policy.retry_at = Some(Instant::now());
 
-        // The fixture recovery process exits only after the exact request is
-        // published. Simulate arc-node's final authenticated WAL ACK using
-        // the real receipt API, so retry cannot skip the quarantine boundary.
         let mut control = prepare_desktop_shutdown_control(Path::new(&configured)).unwrap();
         control
             .bind_receipt_identity(&_plan.binary.path, &_plan.genesis.path)
@@ -7217,7 +6353,6 @@ mod tests {
             .await
             .expect_err("update must defer while exact-plan automatic recovery is pending");
         assert!(error.to_string().contains("crash recovery is pending"));
-        // A fast retry is seconds away: neither boundary takes it over.
         assert!(!manager.slow_crash_wait_pending());
         assert!(!manager.ordinary_update_boundary_is_fenced());
         assert!(manager.prepare_fenced_update_relaunch().is_err());
@@ -7235,8 +6370,6 @@ mod tests {
     }
 
     impl NodeManager {
-        /// A slow crash wait with no launch plan, for the update entrypoint
-        /// tests in `commands`: if it ever fired, it would fail closed.
         pub(crate) fn enter_slow_crash_wait_for_test(&mut self, configured: &str) {
             self.configure_managed_data_dir(configured).unwrap();
             self.lifecycle_lock = Some(acquire_managed_lifecycle_lock(configured).unwrap());
@@ -7248,9 +6381,6 @@ mod tests {
         }
     }
 
-    /// A real crash loop on its slow schedule: the fixture's first launch is
-    /// killed after the fast budget is spent, so no node runs, the durable
-    /// receipt is armed, and the next retry is minutes away.
     #[cfg(unix)]
     async fn slow_crash_wait_fixture(
         label: &str,
@@ -7276,11 +6406,6 @@ mod tests {
         std::fs::read_to_string(Path::new(configured).join("crash-retry-fixture-starts")).unwrap()
     }
 
-    /// Review finding 1: the update that may fix a crash loop must not wait
-    /// behind the loop's slow retry. Home's Update and the unattended updater
-    /// both route this state to the fenced boundary
-    /// (`ordinary_update_boundary_is_fenced`), which takes over the wait's own
-    /// lease. The set-aside retry never launches a node, even once it is due.
     #[cfg(unix)]
     #[tokio::test]
     async fn slow_crash_wait_yields_to_the_update_and_never_relaunches() {
@@ -7299,7 +6424,6 @@ mod tests {
         let contender = contend_for_lifecycle_lock(&configured);
         assert_eq!(contender, crate::start_fence::ALREADY_OPEN);
 
-        // Even with the set-aside deadline long past, the supervisor launches nothing.
         manager
             .update_suspended_crash_retry
             .as_mut()
@@ -7318,16 +6442,12 @@ mod tests {
         assert!(manager.child.is_none());
         assert!(!manager.desired_running);
         assert_eq!(fixture_launches(&configured), "1");
-        // The receipt stays armed for the new version's own recovery launch.
         assert!(managed_shutdown_recovery_required(&configured).unwrap());
 
         drop(manager);
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// An update rejected before its handoff gives the slow wait back exactly:
-    /// the same lease (never released, so no other desktop got in), the same
-    /// launch plan and the same deadline.
     #[cfg(unix)]
     #[tokio::test]
     async fn aborted_update_returns_the_slow_crash_wait_under_the_same_lease() {
@@ -7357,8 +6477,6 @@ mod tests {
         assert_eq!(contender, crate::start_fence::ALREADY_OPEN);
         assert_eq!(fixture_launches(&configured), "1");
 
-        // Auto-start turned off during the update cancels the returned wait,
-        // as it does any slow wait.
         manager.prepare_fenced_update_relaunch().unwrap();
         manager.set_crash_autostart_enabled(false);
         manager.abort_update_relaunch().await.unwrap();
@@ -7373,9 +6491,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// The ordinary boundary (Update when a writer holds the data directory,
-    /// or a direct call) sets the slow wait aside too, instead of refusing.
-    /// With a clear receipt nothing needs recovery, so Prepare succeeds.
     #[tokio::test]
     async fn ordinary_update_prepare_sets_aside_a_slow_crash_wait() {
         let root = resource_test_dir("ordinary-update-slow-crash-wait");
@@ -7386,7 +6501,6 @@ mod tests {
         manager.enter_slow_crash_wait_for_test(&configured);
         assert!(manager.slow_crash_wait_pending());
         assert!(!managed_shutdown_recovery_required(&configured).unwrap());
-        // Clear receipt: only the slow wait routes this to the fenced boundary.
         assert!(manager.ordinary_update_boundary_is_fenced());
 
         manager.prepare_update_relaunch().await.unwrap();
@@ -7398,8 +6512,6 @@ mod tests {
         manager.supervise_managed_node().await;
         assert!(manager.child.is_none());
 
-        // This synthetic wait has no exact launch plan, so the returned wait
-        // fails closed at once and Home shows a stopped node, not a promise.
         manager.abort_update_relaunch().await.unwrap();
         assert!(!manager.desired_running);
         assert!(manager.crash_retry_in_secs().is_none());
@@ -7535,9 +6647,6 @@ mod tests {
 
         let mut updating = NodeManager::new();
         updating.configure_managed_data_dir(&configured).unwrap();
-        // No owned child means this is not an intentional updater drain of a
-        // previously running app; the pending-retry case is covered by the
-        // explicit defer test above.
         updating.desired_running = false;
         updating
             .crash_restart_policy
@@ -7677,11 +6786,6 @@ mod tests {
 
     #[test]
     fn port_pair_probes_fallback() {
-        // Exercise selection independently of the host ephemeral-port range
-        // and other parallel tests. Binding port 0 and then releasing one of
-        // the results left this regression racing every socket user on the
-        // machine, and high ephemeral allocations could also collapse several
-        // saturating +10 candidates onto 65535.
         let preferred_rpc = 31_000;
         let preferred_p2p = 31_001;
         let mut rpc_probes = Vec::new();
@@ -7701,20 +6805,11 @@ mod tests {
         .expect("the deterministic fallback probe should find its second pair");
         assert_eq!(result, (preferred_rpc + 10, preferred_p2p + 10));
         assert_eq!(rpc_probes, [preferred_rpc, preferred_rpc + 10]);
-        // Short-circuiting must not probe UDP for a pair whose RPC port is
-        // already unavailable.
         assert_eq!(p2p_probes, [preferred_p2p + 10]);
     }
 
-    /// The P2P listener is QUIC/UDP. A TCP bind on the same number proves
-    /// nothing about it, which is what made the old probe blind to Hyper-V's
-    /// UDP exclusion ranges.
     #[test]
     fn p2p_probe_is_udp_not_tcp() {
-        // Windows may allocate an ephemeral UDP port from a range that is
-        // excluded for TCP. Select the port through TCP first, then hold UDP
-        // on the same number so the fixture does not depend on the two
-        // protocols sharing an ephemeral-port allocation policy.
         let (udp, busy_udp) = (0..128)
             .find_map(|_| {
                 let tcp = TcpListener::bind("127.0.0.1:0").ok()?;
@@ -7726,9 +6821,6 @@ mod tests {
             .expect("should find a UDP-held port that remains TCP-available");
         assert_eq!(udp.local_addr().unwrap().port(), busy_udp);
         assert!(!udp_available(busy_udp), "held UDP port must read as busy");
-        // The successful selection above observed tcp_available(port) while
-        // UDP held the same number, independently proving the exact blind spot
-        // in the old TCP-based P2P probe.
     }
 
     #[test]
@@ -7758,12 +6850,8 @@ mod tests {
         assert_eq!(p2p_probes, [preferred_p2p, preferred_p2p + 10]);
     }
 
-    /// `--threads` must not report as supported just because
-    /// `--bench-rayon-threads` appears in the same help text.
     #[test]
     fn flag_probe_requires_whole_token_match() {
-        // `/bin/echo` is not arc-node, so the probe returns false rather
-        // than panicking - the safe default for an unknown binary.
         assert!(!binary_supports_flag(
             Path::new("/nonexistent/arc-node"),
             "--threads"
@@ -7825,8 +6913,6 @@ mod tests {
 
     #[test]
     fn data_dir_lands_under_home_not_cwd() {
-        // The Windows bug in miniature: `~/.arc` must never resolve to a
-        // relative `./.arc`.
         let p = resolve_data_dir("~/.arc");
         assert!(p.is_absolute() || p.starts_with(paths::home_dir()));
         assert!(!p.starts_with("./"));
@@ -7863,8 +6949,6 @@ mod tests {
         }
 
         write_desktop_shutdown_request(&control, 4_242).unwrap();
-        // Idempotent concurrent/repeated publication must converge on the
-        // exact complete payload and never replace it.
         write_desktop_shutdown_request(&control, 4_242).unwrap();
         let request = read_private_shutdown_request(&control.request_file).unwrap();
         assert_eq!(
@@ -7889,8 +6973,6 @@ mod tests {
         assert_eq!(recovered.request_file, control.request_file);
         assert_eq!(recovered.token.as_str(), control.token.as_str());
 
-        // A second desktop reaching pre-spawn preparation must not erase the
-        // first node's live request while that node owns the data-dir lock.
         let _ = prepare_desktop_shutdown_control(&dir).unwrap();
         assert!(control.request_file.exists());
         std::fs::remove_dir_all(dir).unwrap();
@@ -8024,9 +7106,6 @@ mod tests {
         assert!(!dir.join("identity/validator-key.json").exists());
         let context = manager.legacy_windows_stop_context.as_ref().unwrap();
 
-        // Exact argv emitted by the v0.7.7/v0.7.10/v0.7.11 release launcher.
-        // The newly configured data-v3 path did not exist in this already-
-        // running process, and those tags had no stake/current-worker flags.
         let exact = vec![
             "arc-node.exe".into(),
             "--rpc".into(),
@@ -8146,9 +7225,6 @@ mod tests {
             worker_context
         ));
 
-        // Successful first-upgrade reconciliation consumes and zeroizes the
-        // legacy proof. A later stop of the capability-aware v0.8 child sees
-        // no tokenless context and therefore cannot re-enter force migration.
         let attempted = worker_manager.legacy_windows_stop_context.take();
         assert!(attempted.is_some());
         let first = finish_legacy_reconciliation(
@@ -8173,10 +7249,6 @@ mod tests {
         assert_eq!(second.stopped, 0);
         assert!(worker_manager.legacy_windows_stop_context.is_none());
 
-        // Public Windows tags used HOME only for `~/.arc`; with HOME absent
-        // they emitted relative `.arc` even though the managed executable was
-        // under USERPROFILE. Resolve that argv against the target process cwd,
-        // never the new v0.8 GUI cwd, and fence the exact resulting history.
         let old_cwd = dir.join("v07-old-cwd");
         let new_cwd = dir.join("v08-new-cwd");
         let relative_data = old_cwd.join(".arc");
@@ -8321,9 +7393,6 @@ mod tests {
         manager.shutdown_control = Some(control);
         manager.started_at = Some(Instant::now());
 
-        // Exercise only the child handle created by this test. Calling the
-        // public `stop()` here would also scan production managed paths and
-        // could terminate a real ARC node running on the developer's machine.
         assert_eq!(manager.stop_owned_child().await.expect("verified stop"), 1);
         ack_task.await.unwrap();
         assert!(manager.child.is_none());
@@ -8374,10 +7443,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Leave an authenticated stop request addressed to a PID that no live
-    /// node holds: the residue of a node that exited before reading it. The
-    /// desktop never replaces such a request, so a later request cannot be
-    /// delivered unless a live node clears it (community PR #132).
     #[cfg(unix)]
     fn leave_undeliverable_stop_request(control: &DesktopShutdownControl) {
         write_desktop_shutdown_request(control, u32::MAX - 7).unwrap();
@@ -8390,7 +7455,6 @@ mod tests {
         let shell = PathBuf::from("/bin/sh").canonicalize().unwrap();
         let (mut control, _genesis) = receipt_control_for_executable(&dir, &shell);
         leave_undeliverable_stop_request(&control);
-        // An early exit before the WAL proof, as with a missing model.
         let mut child = Command::new("sh")
             .args(["-c", "sleep 1; exit 3"])
             .spawn()
@@ -8406,7 +7470,6 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("nothing to stop"), "{message}");
         assert!(!message.contains("refusing"), "{message}");
-        // It exited on its own; nothing signalled it.
         let status = child.try_wait().unwrap().expect("child has exited");
         assert_eq!(status.code(), Some(3));
         assert!(
@@ -8449,12 +7512,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Stage a stand-in for a detached desktop node bound to `dir`: the exact
-    /// desktop argv shape, a receipt armed for the image the scan will see,
-    /// an undeliverable stop request, and an early exit (code 1) that never
-    /// reads a request. bash runs the script in place, so the process keeps
-    /// this argv and image. A reaper thread collects the exit, as the OS does
-    /// for a detached process whose desktop has gone.
     #[cfg(unix)]
     fn spawn_gone_detached_stand_in(
         dir: &Path,
@@ -8492,10 +7549,6 @@ mod tests {
         std::thread::spawn(move || node.wait())
     }
 
-    /// End to end through the detached reconciliation run at startup. A
-    /// recorded node exits before its stop request can be delivered. It must
-    /// be skipped (nothing is left to stop), never signalled, and its receipt
-    /// must stay armed so the caller continues with durability recovery.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_recorded_detached_node_that_is_already_gone_is_skipped_for_recovery() {
@@ -8521,16 +7574,11 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Review of #200, C1. A second look can call a live node gone on Unix
-    /// (its binary replaced, a clock step, a transient read). While a node
-    /// still holds the data directory's lock, the verdict is a precise
-    /// refusal, never "already exited" and never a recovery beside it.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_gone_verdict_is_refused_while_a_node_still_holds_the_data_directory() {
         let dir = resource_test_dir("detached-gone-lock-held");
         let reaper = spawn_gone_detached_stand_in(&dir);
-        // The lock a live arc-node holds for its whole life.
         let node_lock_path = dir.join(".arc-node.lock");
         arc_crypto::secret_file::durably_publish_new_private(
             &node_lock_path,
@@ -8563,7 +7611,6 @@ mod tests {
         let dir = resource_test_dir("node-lock-probe");
         arc_crypto::secret_file::secure_private_directory_tree(&dir).unwrap();
         let node_lock_path = dir.join(".arc-node.lock");
-        // No node has run here: nothing holds it, and the probe creates nothing.
         assert!(!node_data_directory_held(&dir).unwrap());
         assert!(!node_lock_path.exists());
 
@@ -8582,17 +7629,11 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Field failure on Windows: arc-node creates `.arc-node.lock` with a
-    /// plain open, so it inherits the data directory's ACEs (on Unix it can
-    /// carry a wider umask mode). The probe refused it on every launch and
-    /// startup reconciliation never finished. It now repairs the lock's
-    /// boundary and still reports only whether a node holds it.
     #[test]
     fn the_data_directory_lock_probe_repairs_a_lock_created_the_way_arc_node_creates_it() {
         let dir = resource_test_dir("node-lock-probe-plain");
         arc_crypto::secret_file::secure_private_directory_tree(&dir).unwrap();
         let node_lock_path = dir.join(".arc-node.lock");
-        // arc-node's `open_and_try_lock_node_data_file` open (it never truncates).
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         let node_lock = options.open(&node_lock_path).unwrap();
@@ -8610,14 +7651,10 @@ mod tests {
         fs2::FileExt::unlock(&node_lock).unwrap();
         drop(node_lock);
         assert!(!node_data_directory_held(&dir).unwrap());
-        // Repaired for good: the strict private contract holds now.
         drop(arc_crypto::secret_file::open_private_read_write(&node_lock_path).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Review of #200, C3. On Windows the "gone" check asks the retained
-    /// process handle, which pins the exact process object, and a held data
-    /// directory still blocks the verdict.
     #[cfg(windows)]
     #[test]
     fn a_recorded_windows_node_is_gone_only_when_its_retained_handle_says_so() {
@@ -8683,9 +7720,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The argv the fixture recorded for its `start`-th launch. A launch
-    /// returns once the child is spawned, so wait for the fixture to finish
-    /// writing the line.
     #[cfg(unix)]
     async fn fixture_argv(data: &Path, start: u32) -> String {
         let path = data.join(format!("fixture-argv-{start}"));
@@ -8703,10 +7737,6 @@ mod tests {
         .expect("the fixture records each launch's argv")
     }
 
-    /// Review of #200, F2. A crash retry or updater resume relaunches its
-    /// saved plan. When that launch left out an unavailable model, the status
-    /// survives the relaunch, and a model that is back is picked up without a
-    /// manual Stop and Start.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_dropped_model_is_checked_again_by_every_relaunch_of_its_plan() {
@@ -8722,9 +7752,6 @@ mod tests {
         let genesis = root.join("genesis.toml");
         let model = root.join("standard.gguf");
         let model_path = model.to_string_lossy().into_owned();
-        // Like `updater_resume_fixture`, plus the worker flags. Each start's
-        // argv is recorded. Start 2, the quarantined recovery launch, exits
-        // after its stop request is published.
         std::fs::write(
             &binary,
             b"#!/bin/sh\nif [ \"${1-}\" = --help ]; then\n  printf '%s\\n' '--validator-key-file --desktop-shutdown-token-file --desktop-lifecycle-nonce --community-rpc-url --full-integer-worker'\n  exit 0\nfi\nall=\"$*\"\ndata_dir=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --data-dir ]; then data_dir=\"$2\"; shift 2; else shift; fi\ndone\nstarts=0\nif [ -f \"$data_dir/fixture-starts\" ]; then starts=$(cat \"$data_dir/fixture-starts\"); fi\nstarts=$((starts + 1))\nprintf '%s' \"$starts\" > \"$data_dir/fixture-starts\"\nprintf '%s\\n' \"$all\" > \"$data_dir/fixture-argv-$starts\"\nif [ \"$starts\" -eq 2 ]; then while [ ! -f \"$data_dir/.arc-desktop-control/request\" ]; do sleep 0.01; done; sleep 0.1; exit 0; fi\nexec sleep 60\n",
@@ -8744,7 +7771,6 @@ mod tests {
             worker_threads: None,
             ..NodeConfig::default()
         };
-        // The launch that found the model missing recorded an observer plan.
         let mut plan = ManagedLaunchPlan::capture(
             &NodeConfig {
                 model_path: None,
@@ -8762,17 +7788,12 @@ mod tests {
         let receipt_binary = plan.binary.path.clone();
         let receipt_genesis = plan.genesis.path.clone();
         let mut manager = NodeManager::new();
-        // This fixture exercises model availability across real start/relaunch
-        // paths, so deliberately supply eligible RAM even on small CI hosts.
-        // Keep it on this manager: parallel tests retain their own capacity.
         manager.test_ram_gb = Some(16);
         manager.configure_managed_data_dir(&configured).unwrap();
         manager.update_lifecycle_lock = Some(acquire_managed_lifecycle_lock(&configured).unwrap());
         manager.update_restart_plan = Some(plan);
         manager.update_restart_was_desired = true;
 
-        // An updater resume while the model is still missing: still an
-        // observer, and still reported.
         manager.abort_update_relaunch().await.unwrap();
         assert_eq!(
             manager.active_model_unavailable,
@@ -8791,8 +7812,6 @@ mod tests {
             Some(model_path.as_str())
         );
 
-        // The model is back, then the node crashes. The automatic retry
-        // relaunches the same plan and uses the model again.
         std::fs::write(&model, b"GGUF").unwrap();
         let child = manager.child.as_mut().unwrap();
         child.start_kill().unwrap();
@@ -8801,9 +7820,6 @@ mod tests {
         assert!(manager.child.is_none());
         assert_eq!(manager.active_model_unavailable, None);
         manager.crash_restart_policy.retry_at = Some(Instant::now());
-        // The killed launch left its receipt armed, so the retry first runs
-        // the quarantined recovery launch. Simulate arc-node's authenticated
-        // WAL ACK for it, as the exact-plan crash retry test does.
         let mut control = prepare_desktop_shutdown_control(Path::new(&configured)).unwrap();
         control
             .bind_receipt_identity(&receipt_binary, &receipt_genesis)
@@ -8874,12 +7890,10 @@ mod tests {
             executable: executable.map(PathBuf::from),
         };
 
-        // No process has the PID.
         assert_eq!(
             classify_recorded_node(&identity, None),
             RecordedNodeState::Gone
         );
-        // The PID was reused by a process that started later.
         assert_eq!(
             classify_recorded_node(
                 &identity,
@@ -8887,12 +7901,10 @@ mod tests {
             ),
             RecordedNodeState::Gone
         );
-        // The PID now runs a different executable.
         assert_eq!(
             classify_recorded_node(&identity, Some(&observed(1_000, Some("/usr/bin/other")))),
             RecordedNodeState::Gone
         );
-        // Live and ours: the existing authenticated stop and its refusals apply.
         assert_eq!(
             classify_recorded_node(
                 &identity,
@@ -8900,8 +7912,6 @@ mod tests {
             ),
             RecordedNodeState::LiveAndOurs
         );
-        // Same start time but the executable cannot be read: not proof of
-        // anything, so it is never treated as gone.
         assert_eq!(
             classify_recorded_node(&identity, Some(&observed(1_000, None))),
             RecordedNodeState::Unproven
@@ -8918,7 +7928,6 @@ mod tests {
             .unwrap();
         let pid = sysinfo::Pid::from_u32(target.id());
         let result = (|| -> anyhow::Result<()> {
-            // Record the launch identity the same way the detached scan does.
             let mut system = sysinfo::System::new();
             refresh_process_command_metadata(&mut system);
             let process = system
@@ -8936,8 +7945,6 @@ mod tests {
                 observe_recorded_node(&identity) == RecordedNodeState::LiveAndOurs,
                 "a live recorded process with its exact identity is ours"
             );
-            // Stand-ins for a reused PID: same PID, different start time or
-            // executable. Neither may ever be treated as our node.
             let later = DetachedProcessIdentity {
                 start_time: identity.start_time + 1,
                 ..identity.clone()
@@ -9056,11 +8063,8 @@ mod effective_launch_config_tests {
         assert!(matches!(launched, std::borrow::Cow::Owned(_)));
         assert_eq!(launched.role, "observer");
         assert_eq!(launched.model_path, None);
-        // No worker flags, no `--model`, no keep-awake, and the plan the
-        // launch records says the same.
         assert!(!keep_awake_during_jobs_requested(&launched));
         assert!(!(launched.role == "worker" && launched.model_path.is_some()));
-        // Everything else is the stored config.
         assert_eq!(launched.rpc_port, stored.rpc_port);
         assert_eq!(launched.p2p_port, stored.p2p_port);
         assert_eq!(launched.data_dir, stored.data_dir);
@@ -9083,7 +8087,6 @@ mod effective_launch_config_tests {
     }
 
     fn compute_args(config: &NodeConfig) -> Vec<String> {
-        // Build argv only. Never execute this command or contact a node.
         let mut command = Command::new("arc-node-not-executed");
         append_compute_launch_args(&mut command, config);
         command
@@ -9210,13 +8213,9 @@ mod model_preflight_tests {
         let mut launched = effective_launch_config_for_ram(&stored, 16);
         let preflight = drop_unavailable_model(&mut launched).expect("missing model is reported");
         assert_eq!(preflight.reason, ModelUnavailableReason::NotFound);
-        // No `--model`, no `--community-mode --full-integer-worker`, no
-        // keep-awake flag. The spawn log and the recorded launch plan read
-        // this same config, so they say the same.
         assert_eq!(launched.model_path, None);
         assert!(!(launched.role == "worker" && launched.model_path.is_some()));
         assert!(!keep_awake_during_jobs_requested(&launched));
-        // Only the launch copy changes; the saved config keeps the path.
         assert_eq!(
             stored.model_path.as_deref(),
             Some(missing.to_string_lossy().as_ref())
@@ -9235,8 +8234,6 @@ mod model_preflight_tests {
     #[test]
     fn a_model_path_that_is_not_a_readable_file_is_unreadable_not_missing() {
         let dir = test_dir("not-a-file");
-        // A directory where the model file should be. arc-node cannot open
-        // it as a model on any platform.
         let not_a_file = dir.join("standard.gguf");
         std::fs::create_dir(&not_a_file).unwrap();
         let stored = consenting_worker(&not_a_file);
@@ -9256,7 +8253,6 @@ mod model_preflight_tests {
     #[test]
     fn a_permission_error_is_unreadable_where_exists_would_say_missing() {
         use std::os::unix::fs::PermissionsExt as _;
-        // Permissions do not bind root, so this case cannot be staged there.
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
@@ -9267,8 +8263,6 @@ mod model_preflight_tests {
         std::fs::write(&model, b"GGUF").unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        // `Path::exists` folds the permission error into "missing";
-        // `try_exists` does not, so the warning can say what is wrong.
         let exists = model.exists();
         let preflight = ModelPreflight::check(&model);
 
@@ -9307,8 +8301,6 @@ mod model_preflight_tests {
         assert!(drop_unavailable_model(&mut launched).is_none());
         assert!(matches!(launched, std::borrow::Cow::Borrowed(_)));
 
-        // Compute switched off already launches without the model, so a
-        // stale path left in the saved config is not reported as missing.
         let dir = test_dir("withdrawn");
         let withdrawn = NodeConfig {
             compute_consent: Some(false),
@@ -9323,12 +8315,9 @@ mod model_preflight_tests {
     #[test]
     fn the_model_warning_shortens_the_home_directory() {
         let home = paths::home_dir();
-        // Meaningful only for a real home below the filesystem root.
         if !home.is_absolute() || home.parent().is_none() {
             return;
         }
-        // A path under the home directory that does not exist. Nothing is
-        // created there.
         let missing = home.join(format!(
             ".arc-model-preflight-{}-{}.gguf",
             std::process::id(),

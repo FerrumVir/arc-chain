@@ -1,23 +1,4 @@
 #!/usr/bin/env python3
-"""
-Submit real LLM inference to ARC Chain as an on-chain attestation.
-
-Runs inference via ollama (local) or any OpenAI-compatible API,
-hashes the model+input+output with BLAKE3, and submits an
-InferenceAttestation transaction to the chain.
-
-The attestation is permanently recorded on-chain and visible in the explorer.
-
-Prerequisites:
-  - ollama installed and running: brew install ollama && ollama serve
-  - A model pulled: ollama pull llama3:8b
-  - ARC node running: cargo run --release --bin arc-node
-
-Usage:
-  python3 scripts/submit-real-inference.py --model llama3:8b --prompt "What is 2+2?"
-  python3 scripts/submit-real-inference.py --model mistral --prompt "Is this fraudulent?" --rpc http://your-vps:9090
-  python3 scripts/submit-real-inference.py --batch prompts.txt --model llama3:8b
-"""
 
 import argparse
 import hashlib
@@ -28,7 +9,6 @@ import time
 import urllib.request
 
 def blake3_hash(data: bytes) -> bytes:
-    """BLAKE3 hash, falls back to SHA-256 if blake3 not installed."""
     try:
         import blake3
         return blake3.blake3(data).digest()
@@ -48,12 +28,7 @@ def http_get(url, timeout=10):
     with urllib.request.urlopen(url, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Ollama inference
-# ──────────────────────────────────────────────────────────────────────────────
-
 def run_ollama_inference(model: str, prompt: str, ollama_url: str = "http://localhost:11434"):
-    """Run inference via ollama API and return the response."""
     print(f"  Running {model} inference via ollama...")
     start = time.time()
 
@@ -62,9 +37,9 @@ def run_ollama_inference(model: str, prompt: str, ollama_url: str = "http://loca
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0,      # deterministic
-            "seed": 42,            # fixed seed for reproducibility
-            "num_predict": 256,    # max tokens
+            "temperature": 0,
+            "seed": 42,
+            "num_predict": 256,
         }
     }, timeout=120)
 
@@ -72,7 +47,6 @@ def run_ollama_inference(model: str, prompt: str, ollama_url: str = "http://loca
     output = response.get("response", "")
     model_name = response.get("model", model)
 
-    # Get model info for the model_id hash
     try:
         model_info = http_post(f"{ollama_url}/api/show", {"name": model})
         model_digest = model_info.get("digest", "")
@@ -95,14 +69,8 @@ def run_ollama_inference(model: str, prompt: str, ollama_url: str = "http://loca
         "tokens_per_sec": response.get("eval_count", 0) / max(response.get("eval_duration", 1) / 1e9, 0.001),
     }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Submit attestation to ARC Chain
-# ──────────────────────────────────────────────────────────────────────────────
-
 def submit_attestation(rpc_url: str, model_id: bytes, input_hash: bytes,
                        output_hash: bytes, bond: int = 1000, challenge_period: int = 100):
-    """Submit InferenceAttestation TX to ARC Chain."""
-
     payload = {
         "type": "InferenceAttestation",
         "model_id": model_id.hex(),
@@ -112,29 +80,19 @@ def submit_attestation(rpc_url: str, model_id: bytes, input_hash: bytes,
         "challenge_period": challenge_period,
     }
 
-    # Try the /inference/run endpoint first (does inference + attestation)
-    # Fall back to /tx/submit for raw attestation
     try:
         response = http_post(f"{rpc_url}/tx/submit", payload)
         return response
     except Exception as e:
         return {"error": str(e)}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────────────────────────────────────
-
 def process_single(model: str, prompt: str, rpc_url: str, ollama_url: str, bond: int):
-    """Run inference on one prompt and submit attestation."""
-
-    # Run inference
     result = run_ollama_inference(model, prompt, ollama_url)
 
     print(f"  Model: {result['model_name']} ({result['model_params']})")
     print(f"  Inference: {result['elapsed_ms']}ms, {result['tokens_generated']} tokens")
     print(f"  Output: {result['output'][:200]}{'...' if len(result['output']) > 200 else ''}")
 
-    # Compute BLAKE3 hashes
     model_id = blake3_hash(result['model_digest'].encode())
     input_hash = blake3_hash(prompt.encode())
     output_hash = blake3_hash(result['output'].encode())
@@ -144,7 +102,6 @@ def process_single(model: str, prompt: str, rpc_url: str, ollama_url: str, bond:
     print(f"    input_hash:  0x{input_hash.hex()[:16]}...")
     print(f"    output_hash: 0x{output_hash.hex()[:16]}...")
 
-    # Submit to chain
     print(f"\n  Submitting InferenceAttestation to {rpc_url}...")
     tx_result = submit_attestation(rpc_url, model_id, input_hash, output_hash, bond)
 
@@ -184,7 +141,6 @@ def main():
     print(f"RPC: {args.rpc}")
     print(f"Ollama: {args.ollama}")
 
-    # Check ollama is running
     try:
         http_get(f"{args.ollama}/api/tags")
         print(f"Ollama: connected")
@@ -197,7 +153,6 @@ def main():
     results = []
 
     if args.batch:
-        # Batch mode: one prompt per line
         with open(args.batch) as f:
             prompts = [line.strip() for line in f if line.strip()]
         print(f"\nBatch mode: {len(prompts)} prompts")
@@ -207,18 +162,15 @@ def main():
             r = process_single(args.model, prompt, args.rpc, args.ollama, args.bond)
             results.append(r)
     else:
-        # Single prompt
         prompt = args.prompt or "Explain the significance of zero-knowledge proofs for AI verification in one paragraph."
         print(f"\nPrompt: \"{prompt}\"")
         r = process_single(args.model, prompt, args.rpc, args.ollama, args.bond)
         results.append(r)
 
-    # Save results
     with open(args.output, 'w') as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to: {args.output}")
 
-    # Summary table for paper
     print(f"\n{'=' * 60}")
     print("PAPER-READY SUMMARY")
     print(f"{'=' * 60}")

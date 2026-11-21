@@ -1,10 +1,3 @@
-//! Memory-mapped state pages for ARC Chain.
-//!
-//! Provides a page-oriented storage backend backed by a simulated memory-mapped
-//! region (a `Vec<u8>` that can be swapped for a real `mmap` later via the
-//! [`MmapBackend`] trait).  Every 4 KiB page carries a [`PageHeader`] with a
-//! BLAKE3 checksum so corruption is caught on read.
-
 use blake3;
 use dashmap::DashMap;
 use parking_lot::RwLock;
@@ -12,25 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Logical page payload size (4 KiB).
 pub const PAGE_SIZE: usize = 4096;
 
-/// Size of the on-disk page header that prefixes every page.
 pub const PAGE_HEADER_SIZE: usize = 48;
 
-/// Total bytes per slot: header + payload.
 pub const PAGE_SLOT_SIZE: usize = PAGE_HEADER_SIZE + PAGE_SIZE;
 
-/// Magic number written at the start of every page header.
-const PAGE_MAGIC: u32 = 0x4152_4350; // "ARCP"
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
+const PAGE_MAGIC: u32 = 0x4152_4350;
 
 #[derive(Error, Debug)]
 pub enum MmapError {
@@ -56,16 +37,6 @@ pub enum MmapError {
 
 pub type MmapResult<T> = Result<T, MmapError>;
 
-// ---------------------------------------------------------------------------
-// Page header (48 bytes)
-// ---------------------------------------------------------------------------
-
-/// Fixed-size header prepended to every page slot.
-///
-/// Layout (48 bytes):
-/// ```text
-/// [ magic: 4 ][ page_id: 8 ][ data_len: 4 ][ checksum: 32 ]
-/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageHeader {
     pub magic: u32,
@@ -77,7 +48,6 @@ pub struct PageHeader {
 impl PageHeader {
     pub const SIZE: usize = PAGE_HEADER_SIZE;
 
-    /// Serialize the header into a 48-byte buffer.
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut buf = [0u8; Self::SIZE];
         buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
@@ -87,7 +57,6 @@ impl PageHeader {
         buf
     }
 
-    /// Deserialize a header from a 48-byte slice.
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
         if buf.len() < Self::SIZE {
             return None;
@@ -106,34 +75,18 @@ impl PageHeader {
     }
 }
 
-// ---------------------------------------------------------------------------
-// MmapBackend trait
-// ---------------------------------------------------------------------------
-
-/// Abstraction over the backing storage so we can swap `Vec<u8>` for a real
-/// `mmap` (e.g. via `memmap2`) later without changing consumer code.
 pub trait MmapBackend: Send + Sync {
-    /// Total capacity of the backing store in bytes.
     fn capacity(&self) -> usize;
 
-    /// Read `len` bytes starting at `offset`.
     fn read(&self, offset: usize, len: usize) -> MmapResult<Vec<u8>>;
 
-    /// Write `data` starting at `offset`.
     fn write(&self, offset: usize, data: &[u8]) -> MmapResult<()>;
 
-    /// Ensure all pending writes are durable.
     fn flush(&self) -> MmapResult<()>;
 
-    /// Grow the backing store to `new_capacity` bytes.
     fn resize(&self, new_capacity: usize) -> MmapResult<()>;
 }
 
-// ---------------------------------------------------------------------------
-// VecBackend - in-process simulation
-// ---------------------------------------------------------------------------
-
-/// A `Vec<u8>` that implements [`MmapBackend`].
 pub struct VecBackend {
     buf: RwLock<Vec<u8>>,
 }
@@ -175,7 +128,6 @@ impl MmapBackend for VecBackend {
     }
 
     fn flush(&self) -> MmapResult<()> {
-        // Vec is already in memory - nothing to flush.
         Ok(())
     }
 
@@ -186,68 +138,39 @@ impl MmapBackend for VecBackend {
     }
 }
 
-// ---------------------------------------------------------------------------
-// MmapConfig
-// ---------------------------------------------------------------------------
-
-/// Tuning knobs for the mmap state store.
 #[derive(Debug, Clone)]
 pub struct MmapConfig {
-    /// Size of the backing store on first open (bytes).
     pub initial_size: usize,
-    /// Hard upper limit the store may grow to (bytes).
     pub max_size: usize,
-    /// Multiplicative factor when auto-growing (e.g. 2.0 = double).
     pub growth_factor: f64,
 }
 
 impl Default for MmapConfig {
     fn default() -> Self {
         Self {
-            initial_size: PAGE_SLOT_SIZE * 256,   // ~1 MiB
-            max_size: PAGE_SLOT_SIZE * 1_048_576, // ~4 GiB
+            initial_size: PAGE_SLOT_SIZE * 256,
+            max_size: PAGE_SLOT_SIZE * 1_048_576,
             growth_factor: 2.0,
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// MmapRegion
-// ---------------------------------------------------------------------------
-
-/// One contiguous mapped region inside the backing store.
 #[derive(Debug, Clone)]
 pub struct MmapRegion {
-    /// Byte offset into the backing store where this region starts.
     pub offset: usize,
-    /// Length of the region in bytes.
     pub length: usize,
-    /// Logical path associated with this region (for bookkeeping / debugging).
     pub path: PathBuf,
 }
 
-// ---------------------------------------------------------------------------
-// MmapStateStore
-// ---------------------------------------------------------------------------
-
-/// Page-oriented state store backed by an [`MmapBackend`].
-///
-/// Pages are 4 KiB payloads, each prefixed by a 48-byte [`PageHeader`] that
-/// carries a BLAKE3 checksum.  An internal `DashMap` tracks where each
-/// `page_id` lives inside the backing store so lookups are O(1).
 pub struct MmapStateStore<B: MmapBackend = VecBackend> {
     backend: Arc<B>,
-    /// Maps page_id → MmapRegion describing where the page lives.
     index: DashMap<u64, MmapRegion>,
-    /// Next free byte offset in the backing store.
     next_offset: RwLock<usize>,
     config: MmapConfig,
-    /// Optional filesystem path (used when backed by a real file).
     path: Option<PathBuf>,
 }
 
 impl MmapStateStore<VecBackend> {
-    /// Open (or create) an in-memory state store at a logical `path`.
     pub fn open<P: AsRef<Path>>(path: P, config: MmapConfig) -> MmapResult<Self> {
         let backend = Arc::new(VecBackend::new(config.initial_size));
         Ok(Self {
@@ -259,14 +182,12 @@ impl MmapStateStore<VecBackend> {
         })
     }
 
-    /// Convenience: open with default config.
     pub fn open_default<P: AsRef<Path>>(path: P) -> MmapResult<Self> {
         Self::open(path, MmapConfig::default())
     }
 }
 
 impl<B: MmapBackend> MmapStateStore<B> {
-    /// Create a store around an existing backend.
     pub fn with_backend(backend: Arc<B>, config: MmapConfig) -> Self {
         Self {
             backend,
@@ -277,17 +198,14 @@ impl<B: MmapBackend> MmapStateStore<B> {
         }
     }
 
-    /// Read the page payload for `page_id`, verifying its checksum.
     pub fn get_page(&self, page_id: u64) -> MmapResult<Vec<u8>> {
         let region = self
             .index
             .get(&page_id)
             .ok_or(MmapError::PageNotFound(page_id))?;
 
-        // Read the full slot (header + payload).
         let raw = self.backend.read(region.offset, PAGE_SLOT_SIZE)?;
 
-        // Decode header.
         let header = PageHeader::from_bytes(&raw[..PAGE_HEADER_SIZE])
             .ok_or(MmapError::InvalidMagic { page_id })?;
 
@@ -298,7 +216,6 @@ impl<B: MmapBackend> MmapStateStore<B> {
         let data_len = header.data_len as usize;
         let payload = &raw[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + data_len];
 
-        // Verify checksum.
         let actual_hash = blake3::hash(payload);
         if actual_hash.as_bytes() != &header.checksum {
             return Err(MmapError::ChecksumMismatch {
@@ -311,10 +228,6 @@ impl<B: MmapBackend> MmapStateStore<B> {
         Ok(payload.to_vec())
     }
 
-    /// Write `data` into the page for `page_id`.
-    ///
-    /// If the page already exists its slot is reused; otherwise a new slot is
-    /// allocated (auto-growing the backing store if necessary).
     pub fn put_page(&self, page_id: u64, data: &[u8]) -> MmapResult<()> {
         if data.len() > PAGE_SIZE {
             return Err(MmapError::DataTooLarge {
@@ -338,15 +251,12 @@ impl<B: MmapBackend> MmapStateStore<B> {
             self.allocate_slot()?
         };
 
-        // Write header.
         self.backend.write(offset, &header.to_bytes())?;
 
-        // Write payload (zero-pad to full PAGE_SIZE to keep slots uniform).
         let mut padded = vec![0u8; PAGE_SIZE];
         padded[..data.len()].copy_from_slice(data);
         self.backend.write(offset + PAGE_HEADER_SIZE, &padded)?;
 
-        // Update index.
         self.index.insert(
             page_id,
             MmapRegion {
@@ -359,12 +269,10 @@ impl<B: MmapBackend> MmapStateStore<B> {
         Ok(())
     }
 
-    /// Flush all pending writes to the underlying backend.
     pub fn flush(&self) -> MmapResult<()> {
         self.backend.flush()
     }
 
-    /// Grow the backing store to `new_size` bytes.
     pub fn resize(&self, new_size: usize) -> MmapResult<()> {
         if new_size > self.config.max_size {
             return Err(MmapError::ResizeExceedsMax {
@@ -374,18 +282,14 @@ impl<B: MmapBackend> MmapStateStore<B> {
         self.backend.resize(new_size)
     }
 
-    /// Number of pages currently stored.
     pub fn page_count(&self) -> usize {
         self.index.len()
     }
 
-    /// Returns `true` if `page_id` is in the index.
     pub fn contains_page(&self, page_id: u64) -> bool {
         self.index.contains_key(&page_id)
     }
 
-    /// Remove a page from the store (marks the slot as freed but does not
-    /// compact - compaction is a future optimisation).
     pub fn remove_page(&self, page_id: u64) -> MmapResult<()> {
         self.index
             .remove(&page_id)
@@ -393,14 +297,10 @@ impl<B: MmapBackend> MmapStateStore<B> {
         Ok(())
     }
 
-    /// Iterate over all stored page IDs.
     pub fn page_ids(&self) -> Vec<u64> {
         self.index.iter().map(|entry| *entry.key()).collect()
     }
 
-    // -- private helpers ---------------------------------------------------
-
-    /// Allocate the next free slot, auto-growing if necessary.
     fn allocate_slot(&self) -> MmapResult<usize> {
         let mut next = self.next_offset.write();
         let offset = *next;
@@ -424,17 +324,9 @@ impl<B: MmapBackend> MmapStateStore<B> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -444,7 +336,6 @@ mod tests {
         MmapStateStore::open_default("/tmp/test_mmap").unwrap()
     }
 
-    // 1. Basic put / get round-trip.
     #[test]
     fn test_put_get_roundtrip() {
         let store = make_store();
@@ -454,7 +345,6 @@ mod tests {
         assert_eq!(got, data);
     }
 
-    // 2. Page not found.
     #[test]
     fn test_page_not_found() {
         let store = make_store();
@@ -462,7 +352,6 @@ mod tests {
         assert!(matches!(err, MmapError::PageNotFound(999)));
     }
 
-    // 3. Overwrite an existing page.
     #[test]
     fn test_overwrite_page() {
         let store = make_store();
@@ -472,7 +361,6 @@ mod tests {
         assert_eq!(got, b"version_2");
     }
 
-    // 4. Data too large for page.
     #[test]
     fn test_data_too_large() {
         let store = make_store();
@@ -481,7 +369,6 @@ mod tests {
         assert!(matches!(err, MmapError::DataTooLarge { .. }));
     }
 
-    // 5. Multiple pages.
     #[test]
     fn test_multiple_pages() {
         let store = make_store();
@@ -497,14 +384,12 @@ mod tests {
         }
     }
 
-    // 6. Checksum corruption detection.
     #[test]
     fn test_checksum_corruption() {
         let backend = Arc::new(VecBackend::new(PAGE_SLOT_SIZE * 4));
         let store = MmapStateStore::with_backend(backend.clone(), MmapConfig::default());
         store.put_page(1, b"important data").unwrap();
 
-        // Corrupt one byte in the payload area.
         let region = store.index.get(&1).unwrap();
         let corrupt_offset = region.offset + PAGE_HEADER_SIZE + 2;
         backend.write(corrupt_offset, &[0xFF]).unwrap();
@@ -513,7 +398,6 @@ mod tests {
         assert!(matches!(err, MmapError::ChecksumMismatch { .. }));
     }
 
-    // 7. Flush succeeds.
     #[test]
     fn test_flush() {
         let store = make_store();
@@ -521,7 +405,6 @@ mod tests {
         store.flush().unwrap();
     }
 
-    // 8. Resize within bounds succeeds.
     #[test]
     fn test_resize_within_bounds() {
         let config = MmapConfig {
@@ -533,7 +416,6 @@ mod tests {
         store.resize(PAGE_SLOT_SIZE * 50).unwrap();
     }
 
-    // 9. Resize beyond max_size fails.
     #[test]
     fn test_resize_exceeds_max() {
         let config = MmapConfig {
@@ -546,7 +428,6 @@ mod tests {
         assert!(matches!(err, MmapError::ResizeExceedsMax { .. }));
     }
 
-    // 10. Remove page.
     #[test]
     fn test_remove_page() {
         let store = make_store();
@@ -557,7 +438,6 @@ mod tests {
         assert!(store.get_page(42).is_err());
     }
 
-    // 11. Remove nonexistent page is an error.
     #[test]
     fn test_remove_nonexistent() {
         let store = make_store();
@@ -565,7 +445,6 @@ mod tests {
         assert!(matches!(err, MmapError::PageNotFound(7)));
     }
 
-    // 12. Auto-grow on allocation.
     #[test]
     fn test_auto_grow() {
         let config = MmapConfig {
@@ -574,7 +453,6 @@ mod tests {
             growth_factor: 2.0,
         };
         let store = MmapStateStore::open("/tmp/auto_grow_test", config).unwrap();
-        // Write more pages than initial capacity allows.
         for i in 0..10 {
             store.put_page(i, b"grow me").unwrap();
         }
@@ -584,7 +462,6 @@ mod tests {
         }
     }
 
-    // 13. page_ids returns all stored IDs.
     #[test]
     fn test_page_ids() {
         let store = make_store();
@@ -596,7 +473,6 @@ mod tests {
         assert_eq!(ids, vec![10, 20, 30]);
     }
 
-    // 14. PageHeader round-trip serialization.
     #[test]
     fn test_page_header_serde() {
         let hdr = PageHeader {
@@ -610,7 +486,6 @@ mod tests {
         assert_eq!(hdr, decoded);
     }
 
-    // 15. Full page (exactly PAGE_SIZE bytes) round-trip.
     #[test]
     fn test_full_page_data() {
         let store = make_store();

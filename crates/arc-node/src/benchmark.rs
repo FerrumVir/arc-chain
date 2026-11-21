@@ -1,9 +1,3 @@
-//! Pre-signing pool for benchmark mode.
-//!
-//! Background threads continuously generate and sign Transfer transactions
-//! using deterministic Ed25519 keypairs. The consensus loop drains signed txs
-//! from a bounded channel and feeds them to `execute_block_signed_benchmark()`.
-
 #[cfg(feature = "benchmark-tools")]
 use arc_crypto::Hash256;
 #[cfg(feature = "benchmark-tools")]
@@ -20,7 +14,6 @@ use std::thread::JoinHandle;
 #[cfg(feature = "benchmark-tools")]
 use tracing::info;
 
-/// Pre-signing pool that feeds signed transactions to the consensus loop.
 #[cfg(feature = "benchmark-tools")]
 pub struct BenchmarkPool {
     rx: Receiver<Vec<Transaction>>,
@@ -36,31 +29,17 @@ pub struct BenchmarkPool {
 
 #[cfg(feature = "benchmark-tools")]
 impl BenchmarkPool {
-    /// Start the pre-signing pool.
-    ///
-    /// Spawns `num_threads` background threads that continuously generate and sign
-    /// Transfer transactions. Each thread owns a partition of senders to avoid
-    /// nonce conflicts.
-    ///
-    /// # Arguments
-    /// * `sender_start` - first sender index (0-based)
-    /// * `sender_count` - number of senders this node owns
-    /// * `num_threads` - signing threads (default 4)
-    /// * `batch_size` - txs per batch sent through channel
     pub fn start(
         sender_start: u8,
         sender_count: u8,
         num_threads: usize,
         batch_size: usize,
     ) -> Self {
-        // Bounded channel - prevents OOM if execution can't keep up
         let (tx, rx) = channel::bounded::<Vec<Transaction>>(64);
         let stop = Arc::new(AtomicBool::new(false));
 
-        // Pre-compute receiver addresses (senders 50..100 map to receivers)
         let receivers: Vec<Hash256> = (50u8..100u8).map(benchmark_address).collect();
 
-        // Partition senders across threads
         let senders_per_thread = (sender_count as usize).div_ceil(num_threads);
 
         let mut handles = Vec::with_capacity(num_threads);
@@ -79,7 +58,6 @@ impl BenchmarkPool {
             let handle = std::thread::Builder::new()
                 .name(format!("bench-sign-{}", thread_id))
                 .spawn(move || {
-                    // Each thread creates its own keypairs (deterministic, same across nodes)
                     let keypairs: Vec<_> = (start_idx..end_idx)
                         .map(|i| {
                             let sk = benchmark_keypair(i as u8);
@@ -88,13 +66,11 @@ impl BenchmarkPool {
                         })
                         .collect();
 
-                    // Track nonces per sender
                     let mut nonces: Vec<u64> = vec![0; keypairs.len()];
 
                     while !stop.load(Ordering::Relaxed) {
                         let mut batch = Vec::with_capacity(batch_size);
 
-                        // Round-robin across this thread's senders
                         for _ in 0..batch_size {
                             for (kp_idx, (sk, sender, sender_global_idx)) in
                                 keypairs.iter().enumerate()
@@ -107,7 +83,6 @@ impl BenchmarkPool {
 
                                 let mut tx = Transaction::new_transfer(*sender, receiver, 1, nonce);
 
-                                // Sign with ed25519 keypair
                                 use ed25519_dalek::Signer;
                                 let sig = sk.sign(tx.hash.as_bytes());
                                 let vk = sk.verifying_key();
@@ -125,7 +100,7 @@ impl BenchmarkPool {
                         }
 
                         if !batch.is_empty() && tx.send(batch).is_err() {
-                            break; // Channel closed
+                            break;
                         }
                     }
                 })
@@ -144,8 +119,6 @@ impl BenchmarkPool {
         Self { rx, stop, handles }
     }
 
-    /// Drain up to `max` signed transactions from the pool.
-    /// Non-blocking - returns whatever is available.
     pub fn drain(&self, max: usize) -> Vec<Transaction> {
         let mut result = Vec::with_capacity(max);
         while result.len() < max {
@@ -164,7 +137,6 @@ impl BenchmarkPool {
         result
     }
 
-    /// Stop all signing threads.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
@@ -172,8 +144,6 @@ impl BenchmarkPool {
 
 #[cfg(not(feature = "benchmark-tools"))]
 impl BenchmarkPool {
-    /// Default/release builds retain only an inert consensus API shape; they
-    /// cannot construct a signing pool or generate benchmark transactions.
     pub fn drain(&self, _max: usize) -> Vec<Transaction> {
         Vec::new()
     }

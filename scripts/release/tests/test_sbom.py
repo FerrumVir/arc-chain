@@ -80,7 +80,6 @@ class Sbom(unittest.TestCase):
         self.assertEqual(scoped["hashes"][0]["content"], hashlib.sha512(b"x").hexdigest())
         self.assertIn({"name": "arc:scope", "value": "dev"}, scoped["properties"])
         deps = {d["ref"]: d["dependsOn"] for d in doc["dependencies"]}
-        # "rand 0.8.5" resolves to the exact version, not the other rand.
         self.assertIn("pkg:cargo/rand@0.8.5", deps["pkg:cargo/arc-node@0.8.23"])
         self.assertNotIn("pkg:cargo/rand@0.9.0", deps["pkg:cargo/arc-node@0.8.23"])
         self.assertEqual(doc["bomFormat"], "CycloneDX")

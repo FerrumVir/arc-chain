@@ -1,10 +1,3 @@
-//! The dyadic-profile model: configuration, forward pass and generation.
-//!
-//! Grouped-query attention, per-layer NoPE, a tied INT8 embedding that is also
-//! the LM head, and an i32 KV cache (spec §5.8, §6). Every value is computed by
-//! [`super::arith`], so the output is a pure function of the package bytes, the
-//! token ids and the generation rule.
-
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -16,7 +9,6 @@ use super::arith::{
 };
 use super::tables::attention_lambda;
 
-/// Model shape and the profile constants read from the package header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModernConfig {
     pub architecture: String,
@@ -28,30 +20,24 @@ pub struct ModernConfig {
     pub d_ff: usize,
     pub vocab_size: usize,
     pub max_seq: usize,
-    /// `round_half_away(rms_norm_eps * 2^32)`.
     pub rms_eps_q32: i64,
     pub rope_theta: u64,
-    /// `true` where the layer applies RoPE; `false` for NoPE layers.
     pub rope_layers: Vec<bool>,
 }
 
 impl ModernConfig {
-    /// Width of the concatenated query heads.
     pub fn d_q(&self) -> usize {
         self.n_heads * self.d_head
     }
 
-    /// Width of the concatenated KV heads.
     pub fn d_kv(&self) -> usize {
         self.n_kv_heads * self.d_head
     }
 
-    /// KV cache bytes per position (i32 keys and values, every layer).
     pub fn kv_bytes_per_position(&self) -> usize {
         self.n_layers * 2 * self.d_kv() * 4
     }
 
-    /// Reject shapes the profile does not define.
     pub fn validate(&self) -> Result<(), ModernError> {
         let positive = [
             self.n_layers,
@@ -81,7 +67,6 @@ impl ModernConfig {
     }
 }
 
-/// One transformer layer.
 #[derive(Debug, Clone)]
 pub struct ModernLayer {
     pub attn_norm: Vec<i64>,
@@ -95,21 +80,17 @@ pub struct ModernLayer {
     pub w_down: DyadicMatrix,
 }
 
-/// A loaded dyadic-profile model.
 #[derive(Debug, Clone)]
 pub struct ModernModel {
     pub config: ModernConfig,
-    /// Tied embedding: token lookup and LM head.
     pub embed: DyadicMatrix,
     pub final_norm: Vec<i64>,
-    /// `max_seq * d_head/2` Q16 values, row-major by position.
     pub rope_cos: Vec<i32>,
     pub rope_sin: Vec<i32>,
     pub layers: Vec<ModernLayer>,
 }
 
 impl ModernModel {
-    /// Check every tensor's shape against the configuration.
     pub fn validate(&self) -> Result<(), ModernError> {
         let c = &self.config;
         c.validate()?;
@@ -148,7 +129,6 @@ impl ModernModel {
         Ok(())
     }
 
-    /// INT8 weight count (every matrix including the tied embedding once).
     pub fn weight_count(&self) -> usize {
         let mut total = self.embed.q.len();
         for layer in &self.layers {
@@ -167,7 +147,6 @@ impl ModernModel {
         total
     }
 
-    /// A fresh KV cache for this model.
     pub fn new_cache(&self) -> KvCache {
         KvCache {
             keys: vec![Vec::new(); self.config.n_layers],
@@ -176,9 +155,6 @@ impl ModernModel {
         }
     }
 
-    /// One token through the model at the cache's next position (spec §5.8).
-    ///
-    /// On error the cache may hold a partial position and must be discarded.
     pub fn forward(&self, token: u32, cache: &mut KvCache) -> Result<Vec<i64>, ModernError> {
         let c = &self.config;
         let position = cache.positions;
@@ -254,7 +230,6 @@ impl ModernModel {
         Ok(logits)
     }
 
-    /// Generation `arc.hf-chat.no-bos.*.le-u32.v1` (spec §6.2).
     pub fn generate(
         &self,
         request: &GenerationRequest<'_>,
@@ -311,7 +286,6 @@ impl ModernModel {
     }
 }
 
-/// i32 KV cache: post-RoPE keys and raw values per layer.
 #[derive(Debug, Clone)]
 pub struct KvCache {
     keys: Vec<Vec<i32>>,
@@ -320,7 +294,6 @@ pub struct KvCache {
 }
 
 impl KvCache {
-    /// Number of cached positions.
     pub fn positions(&self) -> usize {
         self.positions
     }
@@ -337,7 +310,6 @@ impl KvCache {
         Ok(())
     }
 
-    /// BLAKE3 over every cached key then value, layer by layer, as LE i32.
     pub fn digest(&self) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         for (keys, values) in self.keys.iter().zip(&self.values) {
@@ -349,7 +321,6 @@ impl KvCache {
     }
 }
 
-/// A generation request in token ids.
 #[derive(Debug, Clone)]
 pub struct GenerationRequest<'a> {
     pub prompt: &'a [u32],
@@ -358,17 +329,14 @@ pub struct GenerationRequest<'a> {
     pub selection: Selection,
 }
 
-/// Tokens, digests and timings of one generation.
 #[derive(Debug, Clone)]
 pub struct GenerationOutput {
     pub tokens: Vec<u32>,
     pub output_hash: [u8; 32],
-    /// One hash per forward call, in order.
     pub logits_hashes: Vec<[u8; 32]>,
     pub logits_digest: [u8; 32],
     pub prefill_seconds: f64,
     pub decode_seconds: f64,
-    /// Forward calls made after the prompt.
     pub decode_forwards: usize,
 }
 
@@ -376,7 +344,6 @@ pub struct GenerationOutput {
 pub(crate) mod tests {
     use super::*;
 
-    /// Deterministic pseudo-random dyadic matrix with realistic scales.
     pub(crate) fn lcg_matrix(seed: &mut u64, rows: usize, cols: usize) -> DyadicMatrix {
         let mut next = || {
             *seed = seed
@@ -462,8 +429,6 @@ pub(crate) mod tests {
                 (hashes, cache.digest())
             })
         };
-        // Scalar explicitly: the vectorised kernel is the default on x86-64
-        // and arm64, so relying on the default would compare it with itself.
         let _guard = crate::canonical_simd::kernel_switch_guard();
         let previous = crate::canonical_simd::fast_canonical_kernel_enabled();
         crate::canonical_simd::set_fast_canonical_kernel(false);
@@ -487,16 +452,13 @@ pub(crate) mod tests {
         };
         let out = model.generate(&request).unwrap();
         assert_eq!(out.tokens.len(), 6);
-        // P + len(out) - 1 forward calls, the last token never forwarded.
         assert_eq!(out.logits_hashes.len(), 3 + 6 - 1);
-        // Replaying prompt + tokens[..-1] reproduces every logits hash.
         let mut cache = model.new_cache();
         let mut replay = Vec::new();
         for &t in prompt.iter().chain(&out.tokens[..5]) {
             replay.push(arith::logits_hash(&model.forward(t, &mut cache).unwrap()));
         }
         assert_eq!(replay, out.logits_hashes);
-        // Stopping on the first generated token as EOS forwards nothing more.
         let eos = [out.tokens[0]];
         let stopped = model
             .generate(&GenerationRequest {
@@ -548,21 +510,16 @@ pub(crate) mod tests {
             }
             logits
         };
-        // One NoPE layer: keys and values depend only on their token and the
-        // sums are exact, so the order of the context cannot change the
-        // logits of the last position.
         model.config.rope_layers = vec![false];
         assert_eq!(
             last_logits(&model, &[3, 9, 7]),
             last_logits(&model, &[9, 3, 7])
         );
-        // With RoPE the keys are rotated by position, so the order matters.
         model.config.rope_layers = vec![true];
         assert_ne!(
             last_logits(&model, &[3, 9, 7]),
             last_logits(&model, &[9, 3, 7])
         );
-        // At position 0 the rotation is the identity.
         let first_rope = last_logits(&model, &[5]);
         model.config.rope_layers = vec![false];
         assert_eq!(first_rope, last_logits(&model, &[5]));

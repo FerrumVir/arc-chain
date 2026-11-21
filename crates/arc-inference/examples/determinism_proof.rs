@@ -1,42 +1,3 @@
-//! Cross-platform determinism proof for the canonical per-row INT8 engine.
-//!
-//! Loads the pinned Llama-2-7B-Chat Q4_K_M GGUF through the canonical
-//! interleaved-RoPE INT8 profile, greedily decodes a fixed public prompt set
-//! and writes a platform-independent transcript. For every forward position
-//! the transcript records the BLAKE3 digest of the exact i64 logits and of the
-//! KV rows appended at that position, then the generated token IDs. Two
-//! machines agree byte-for-byte exactly when their transcripts have the same
-//! SHA-256, which the caller computes with an independent tool.
-//!
-//! Nothing machine-specific (OS, CPU, kernel choice, timing) is written to the
-//! transcript. That goes to the separate run JSON, so the scalar kernel and the
-//! SIMD kernel must also produce the identical transcript.
-//!
-//! `--kernel simd` pins the architecture's base limb kernel: NEON dotprod on
-//! arm64, AVX2 on x86_64. Since v0.8.12 the engine otherwise runs one-token
-//! projections on the widest exact kernel the CPU has (SMMLA on arm64, VNNI on
-//! x86_64), so the pin keeps `simd` meaning the kernel the published results
-//! measured.
-//!
-//! The generation loop is the engine's own greedy v2 loop
-//! (`try_generate_v2_greedy`): one internal BOS forward, token-at-a-time
-//! prefill, raw argmax with ties to the lowest index, EOS included in the
-//! output, and the final non-EOS forward. The first prompt is replayed through
-//! that public API as a cross-check unless `--no-engine-crosscheck` is given.
-//!
-//! ```text
-//! determinism_proof --model GGUF --prompts PROMPTS.json --kernel scalar|simd
-//!     --max-new-tokens N --transcript OUT.txt --run-json OUT.json
-//!     [--prompt-limit N] [--shard K/COUNT] [--deadline-seconds S]
-//!     [--no-engine-crosscheck]
-//! ```
-//!
-//! `--shard K/COUNT` runs only the K-th of COUNT contiguous slices of the
-//! prompt set (K counts from 0). Each prompt starts from an empty KV cache, so
-//! a shard's blocks are exactly the blocks a single run writes for those
-//! prompts; joining shard transcripts in order and ending with `end`
-//! reproduces the single-run transcript byte for byte.
-
 use arc_inference::cached_integer_model::{
     CachedIntegerModel, GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE,
     GGUF_LLAMA_GREEDY_GENERATION_SEMANTICS_V1, KVCache,
@@ -72,9 +33,6 @@ impl Kernel {
         }
     }
 
-    /// The kernel this request pins for the engine's vector projections: none
-    /// for `scalar`, and the architecture's base limb kernel for `simd`, so a
-    /// CPU with SMMLA or VNNI still runs NEON dotprod or AVX2.
     fn pinned(self) -> Option<BatchedKernel> {
         match self {
             Kernel::Scalar => None,
@@ -84,7 +42,6 @@ impl Kernel {
         }
     }
 
-    /// The projection kernel this build actually dispatches for the request.
     fn effective_label(self) -> &'static str {
         match self {
             Kernel::Scalar => "scalar-i8xi64",
@@ -237,8 +194,6 @@ fn load_prompts(path: &str) -> Result<Vec<Prompt>, String> {
     Ok(prompts)
 }
 
-/// Digest of the selected prompts' content, independent of the file's line
-/// endings or JSON formatting (Windows checkouts may convert newlines).
 fn prompt_set_digest(prompts: &[Prompt]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(PROMPT_SCHEMA.as_bytes());
@@ -270,8 +225,6 @@ fn file_blake3(path: &str) -> Result<(String, u64), String> {
     Ok((hasher.finalize().to_hex().to_string(), total))
 }
 
-/// Feed little-endian i64 bytes to `hasher` in bounded chunks. Equivalent to
-/// hashing the whole little-endian byte string, without copying it whole.
 fn update_i64(hasher: &mut blake3::Hasher, values: &[i64]) {
     let mut buffer = [0u8; 8 * 1024];
     for chunk in values.chunks(1024) {
@@ -282,9 +235,6 @@ fn update_i64(hasher: &mut blake3::Hasher, values: &[i64]) {
     }
 }
 
-/// Embedding table and norm vectors: every resident Q16 value the forward pass
-/// reads besides the I8 matrices (covered by the engine's `weight_hash`) and
-/// the RoPE tables (digested separately because they come from libm).
 fn resident_q16_digest(model: &CachedIntegerModel) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"arc-determinism-proof-resident-q16-v1");
@@ -313,7 +263,6 @@ fn rope_digest(model: &CachedIntegerModel) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// K and V rows appended at `position`, for every layer, in layer order.
 fn kv_append_digest(cache: &KVCache, position: usize, d_kv: usize) -> Result<String, String> {
     let start = position * d_kv;
     let end = start + d_kv;
@@ -330,8 +279,6 @@ fn kv_append_digest(cache: &KVCache, position: usize, d_kv: usize) -> Result<Str
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Whole-cache digest with the same definition and domain string as
-/// `low_residency_conformance`'s `kv_hash`.
 fn kv_full_digest(cache: &KVCache) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"ARC-low-residency-conformance-kv-v1");
@@ -359,7 +306,6 @@ struct PromptTrace {
 }
 
 impl PromptTrace {
-    /// One canonical forward, recorded exactly as the engine produced it.
     fn forward(
         &mut self,
         model: &CachedIntegerModel,
@@ -401,8 +347,6 @@ struct PromptOutcome {
     decode_forwards: usize,
 }
 
-/// The engine's greedy v2 loop (`generate_preflighted_v2_with_sampling` with
-/// sampling disabled), with every forward recorded.
 fn run_prompt(
     model: &CachedIntegerModel,
     prompt_ids: &[u32],
@@ -437,7 +381,6 @@ fn run_prompt(
         logits = trace.forward(model, next, &mut cache)?;
         decode_forwards += 1;
     }
-    // Forward-pass time only: digesting and token selection are excluded.
     let (prefill_ms, decode_ms) = trace.forward_ms.split_at(prefill_forwards);
     let prefill_seconds = prefill_ms.iter().sum::<f64>() / 1000.0;
     let decode_seconds = decode_ms.iter().sum::<f64>() / 1000.0;
@@ -507,7 +450,6 @@ impl TranscriptWriter {
         })
     }
 
-    /// Append and flush, so a run stopped early still leaves its evidence.
     fn append(&mut self, text: &str) -> Result<(), String> {
         self.file
             .write_all(text.as_bytes())
@@ -521,7 +463,6 @@ impl TranscriptWriter {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn max_rss_bytes() -> Option<u64> {
-    // SAFETY: getrusage receives a zeroed, correctly sized out-parameter.
     unsafe {
         let mut u: libc::rusage = std::mem::zeroed();
         if libc::getrusage(libc::RUSAGE_SELF, &mut u) != 0 {
@@ -587,10 +528,6 @@ fn main() -> Result<(), String> {
         ));
     }
 
-    // Force each switch's one-time environment initialisation before setting
-    // it, so an inherited ARC_CANONICAL_KERNEL, ARC_FAST_CANONICAL_KERNEL,
-    // ARC_CANONICAL_BATCHED_KERNEL or ARC_BATCHED_PREFILL cannot change the
-    // path after this point.
     let want_simd = args.kernel == Kernel::Simd;
     let _ = canonical_simd::fast_canonical_kernel_enabled();
     let _ = canonical_simd::batched_kernel_preference();
@@ -673,7 +610,6 @@ fn main() -> Result<(), String> {
         let ids = tokenizer
             .encode_prompt(&prompt.text)
             .map_err(|error| format!("tokenize {}: {error}", prompt.id))?;
-        // The tokenizer prepends BOS; generation owns the one BOS forward.
         if ids.len() < 2
             || ids[0] != config.bos_token
             || ids[1..]
@@ -784,8 +720,6 @@ fn main() -> Result<(), String> {
     transcript.append(&(terminator + "\n"))?;
     let census = canonical_simd::projection_census();
 
-    // Replay the first prompt through the engine's public greedy API. Its
-    // tokens and output hash must equal the recorded loop exactly.
     let mut crosscheck_ok = true;
     let crosscheck = match outcomes.first() {
         Some(first) if args.engine_crosscheck && shard_start == 0 => {

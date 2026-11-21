@@ -1,18 +1,3 @@
-// Adapter between the ARC node's real HTTP RPC and the shapes our UI expects.
-// Real endpoints (verified live at 127.0.0.1:9090):
-//   GET  /health                         { status, version, height, peers,
-//                                          uptime_secs, dag_round, dag_committed,
-//                                          validators }
-//   GET  /inference/attestations?limit=N { attestations: [{inference: {input,
-//                                          output, output_hash, model_hash,
-//                                          tokens_generated, ms_per_token},
-//                                          tx_hash, success}], count, chain_height }
-//   GET  /inference/results?limit=N      { results: [{input, output, output_hash,
-//                                          ms_per_token, tokens_generated,
-//                                          tx_hash}], count }
-//   GET  /worker/earnings/:address       (candidate: successful mined 0x25
-//                                          receipt index + readiness fields)
-
 use crate::types::{
     AccountBalance, Attestation, BlockSummary, ConfirmedRewardReceipt, Earnings,
     EarningsProjection, FaucetResult, InferenceConsensus, InferenceHop, InferenceResult,
@@ -24,29 +9,16 @@ use arc_types::Transaction;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
-/// Public seed coordinators that mirror `commands.rs::COORDINATOR_HOSTS`.
-/// Probed when local P2P can't get peers, so the UI can flip to "lite mode"
-/// (HTTPS RPC fallback) instead of showing a hard "offline" — most consumer
-/// ISPs silently drop outbound UDP on non-standard ports, which kills our
-/// QUIC handshake to seed UDP 9091. Order biases North America first.
 pub(crate) const PRODUCTION_RPC_ORIGINS: [&str; 6] = [
-    "https://149.28.32.76",   // NYC
-    "https://140.82.16.112",  // LAX
-    "https://136.244.109.1",  // AMS
-    "https://104.238.171.11", // LHR
-    "https://202.182.107.41", // NRT
-    "https://149.28.153.31",  // SGP
+    "https://149.28.32.76",
+    "https://140.82.16.112",
+    "https://136.244.109.1",
+    "https://104.238.171.11",
+    "https://202.182.107.41",
+    "https://149.28.153.31",
 ];
 const STATUS_COORDINATORS: [&str; 6] = PRODUCTION_RPC_ORIGINS;
 
-/// Return the first coordinator to answer 200 on `/health`, or `None` if
-/// every public seed is unreachable (genuine offline — total network failure
-/// or a captive portal).
-///
-/// Probed concurrently. Sequentially, with a 2s timeout per host, the
-/// worst case was 12s — inside a poll that repeats every 1.5s, so the polls
-/// stacked up on exactly the broken-network path this is meant to detect.
-/// Here the whole probe is bounded by the single slowest host.
 pub async fn probe_coordinator(http: &reqwest::Client) -> Option<String> {
     let mut set = tokio::task::JoinSet::new();
     for origin in STATUS_COORDINATORS.iter() {
@@ -62,7 +34,6 @@ pub async fn probe_coordinator(http: &reqwest::Client) -> Option<String> {
             }
         });
     }
-    // First success wins; the rest are dropped (and cancelled) with the set.
     while let Some(joined) = set.join_next().await {
         if let Ok(Some(origin)) = joined {
             return Some(origin);
@@ -78,13 +49,6 @@ async fn get_json(http: &reqwest::Client, url: String) -> Option<Value> {
     }
 }
 
-/// Build the node status.
-///
-/// `local_url` is the arc-node on this machine; `chain_url` is the elected
-/// public seed. Keeping both is the point: everything describing "your node"
-/// comes from `local_url`, and the chain-wide numbers are carried separately
-/// so the UI can show network context without dressing it up as the user's
-/// own machine.
 pub async fn fetch_status(
     http: &reqwest::Client,
     local_url: &str,
@@ -94,16 +58,11 @@ pub async fn fetch_status(
     address: Option<String>,
     crash_message: Option<String>,
 ) -> NodeStatus {
-    // Independent requests - issue them together.
     let (local, chain) = tokio::join!(
         get_json(http, format!("{}/health", local_url)),
         get_json(http, format!("{}/health", chain_url)),
     );
 
-    // Running if the LOCAL /health responds - whether or not we spawned it.
-    // This still recognizes externally-managed nodes (a community installer
-    // launchd daemon, or our own child surviving a dev rebuild), which is
-    // why `running` is not simply `pid.is_some()`.
     let running = local.is_some();
 
     let (peers, round, committed, height, uptime, version) = match local {
@@ -126,20 +85,12 @@ pub async fn fetch_status(
         .and_then(|h| h.get("dag_round"))
         .and_then(|v| v.as_u64());
 
-    // Probe the public seeds only when the local node can't carry the user
-    // on its own. This gates the "lite" health level and the onboarding
-    // online-check, so residential ISPs that drop outbound UDP on 9091 don't
-    // strand the user at a hard "offline".
     let coordinator_url = if !running || peers == 0 {
         probe_coordinator(http).await
     } else {
         None
     };
 
-    // These branches are reachable again now that the inputs are local.
-    // Previously `running` was true and `peers` was 8 on every poll (they
-    // were a datacenter's), so "lite" and "syncing" were dead code and the
-    // recovery UI behind them could never render.
     let health_level = if running && peers >= 1 && uptime >= 8 {
         "live"
     } else if coordinator_url.is_some() {
@@ -178,28 +129,18 @@ pub async fn fetch_status(
             }
         }),
         coordinator_url,
-        // Filled in by the command layer, which owns the host election.
         chain_host: None,
         chain_height: None,
         chain_round,
         chain_block_age_seconds: None,
         worker_threads: None,
         cpu_cores: None,
-        // Filled in by the command layer from the running launch.
         model_unavailable: None,
         crash_retry_in_secs: None,
         model_download_wait: None,
     }
 }
 
-/// Parse only the v0.8.0 mined-community-reward receipt contract.
-///
-/// Public v2 also answers `/worker/earnings/:address` with HTTP 200, but that
-/// older body is raw-0x16 count × constant display arithmetic. HTTP success is
-/// therefore not a semantics/version signal. The candidate contract is
-/// identified by its explicit receipt count, retained-window note, last-reward
-/// evidence fields, and all three rollout/readiness booleans. Any missing,
-/// ambiguous, or internally inconsistent field fails closed.
 const RETAINED_EARNINGS_SOURCE: &str = "scan of this node's in-memory full_transactions map";
 const ARCHIVE_EARNINGS_SCOPE: &str =
     "complete canonical reward history since the v3 recovery boundary";
@@ -221,9 +162,6 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
     if total_arc < 0.0 {
         return None;
     }
-    // The backend cannot yet join every retained reward receipt to a wall
-    // clock day. Accepting a numeric `today_arc` would reintroduce an
-    // estimate that is not mined-receipt evidence.
     if !v.get("today_arc")?.is_null() {
         return None;
     }
@@ -242,10 +180,6 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
     if history_domain != EARNINGS_HISTORY_DOMAIN {
         return None;
     }
-    // `archive_mode` describes the host's configured retention mode, not
-    // whether it has proved a complete index from the v3 recovery boundary.
-    // An archive host without that proof still returns a valid retained
-    // window. Only a complete-history claim requires archive mode.
     if (history_complete_since_recovery
         && (!archive_mode || history_scope != ARCHIVE_EARNINGS_SCOPE))
         || (!history_complete_since_recovery && history_scope != RETAINED_EARNINGS_SCOPE)
@@ -339,14 +273,9 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
         Value::Null => None,
         value => Some(value.as_str()?.trim().to_string()).filter(|reason| !reason.is_empty()),
     };
-    // Exactly one side of the projection contract is populated: either a
-    // receipt-derived forecast or a concrete explanation for its absence.
     if host_projected_daily_arc.is_some() == host_projection_reason.is_some() {
         return None;
     }
-    // The host's numeric field is only a candidate. Exact, unique successful
-    // mined 0x25 rows above establish the observation count used by the local
-    // minimum-history gate; a raw count alone never unlocks a projection.
     let observation_gate =
         projection_observation_gate(v, u64::try_from(confirmed_receipts.len()).ok()?);
     let projected_daily_arc = observation_gate
@@ -355,8 +284,6 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
         .flatten();
     let projected_daily_unavailable_reason = observation_gate.or(host_projection_reason);
 
-    // Both keys are part of the candidate contract even when their value is
-    // null because no successful receipt exists yet.
     let last_reward_block_value = v.get("last_reward_block")?;
     let last_reward_hash_value = v.get("last_reward_tx_hash")?;
     let last_reward_block = last_reward_block_value.as_u64();
@@ -375,8 +302,6 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
 
     Some(Earnings {
         total_arc,
-        // Null means unavailable, not zero. The candidate intentionally does
-        // not invent a daily split from a lifetime receipt count.
         today_arc: None,
         pending_arc: None,
         rank: None,
@@ -397,13 +322,6 @@ fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
     })
 }
 
-/// Fetch this worker's confirmed community rewards.
-///
-/// Only the v0.8.0 receipt/readiness response above can produce numeric
-/// earnings. Older endpoints and inference caches are deliberately unavailable
-/// rather than converted into ARC.
-///
-/// `address` is the user's hex address (with or without `0x` prefix).
 fn earnings_response_matches_worker(value: &Value, requested_address: &str) -> bool {
     let requested = strip_0x(requested_address);
     let response = value.get("address").and_then(Value::as_str).map(strip_0x);
@@ -433,27 +351,6 @@ pub async fn fetch_earnings(
     earnings_from_fetched(base_url, &path, fetched)
 }
 
-/// Recent attestations, parsed shape-tolerantly and attributed honestly.
-///
-/// Three separate problems lived here.
-///
-/// **Shape.** Every field was read out of a nested `inference` object. The
-/// deployed seeds return a flat transaction record —
-/// `{block_height, from, gas_used, success, tx_hash, tx_type}` — with no such
-/// key, so every field collapsed to `""` or `0` while the old adapter still
-/// attached a hardcoded +2.5. The Dashboard rendered rows with a blank prompt,
-/// "0 tokens", "0ms" and a confident "+2.50". Both shapes are accepted now,
-/// and absent values stay absent instead of becoming zero.
-///
-/// **Payment.** Protocol-v3 activity rows distinguish a mined computation-only
-/// `0x16` claim from the authoritative `0x25` community reward receipt. Worker
-/// ownership comes from the reward body's `worker`, never its coordinator
-/// `from`; failed, pending, local-only, or unreceipted rows are excluded.
-///
-/// **Time.** Timestamps were fabricated as `now - i * 30s`, producing a
-/// plausible-looking "34s ago / 1m ago / 2m ago" ladder that was pure
-/// invention. Real timestamps are used when present; otherwise `None`, and
-/// the UI says "recent".
 pub async fn fetch_attestations(
     http: &reqwest::Client,
     base_url: &str,
@@ -478,8 +375,6 @@ fn attestations_from_value(root: &Value, address: Option<&str>) -> Vec<Attestati
         .cloned()
         .unwrap_or_default();
 
-    // Compare addresses without the `0x` prefix and case-insensitively; the
-    // chain returns bare lowercase hex while identities are shown prefixed.
     let want = address.map(|a| a.trim_start_matches("0x").to_ascii_lowercase());
 
     let mut out: Vec<Attestation> = arr
@@ -524,8 +419,6 @@ fn attestations_from_value(root: &Value, address: Option<&str>) -> Vec<Attestati
                     return None;
                 }
             }
-            // Flat records fall through to the record itself, so the same
-            // field lookups work against either shape.
             let inf = v.get("inference").cloned().unwrap_or_else(|| v.clone());
 
             let tx_hash = v
@@ -533,8 +426,6 @@ fn attestations_from_value(root: &Value, address: Option<&str>) -> Vec<Attestati
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
-            // A record with no transaction hash is not something we can show
-            // or link to - drop it rather than rendering an empty row.
             if tx_hash.is_empty() {
                 return None;
             }
@@ -547,7 +438,6 @@ fn attestations_from_value(root: &Value, address: Option<&str>) -> Vec<Attestati
             };
             let tokens = opt_u32(&inf, "tokens_generated");
             let ms_per_tok = opt_u32(&inf, "ms_per_token");
-            // Only a real product, never 0 × 0.
             let latency_ms = match (tokens, ms_per_tok) {
                 (Some(t), Some(ms)) => Some(t.saturating_mul(ms)),
                 _ => opt_u32(&inf, "inference_ms").or_else(|| opt_u32(&inf, "total_ms")),
@@ -557,9 +447,6 @@ fn attestations_from_value(root: &Value, address: Option<&str>) -> Vec<Attestati
                 .get("input")
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
-                // Strip Llama chat tags that clutter the preview. Kept for
-                // records produced before the client-side wrapping was
-                // removed - they are still on-chain.
                 .replace("[INST] ", "")
                 .replace(" [/INST]", "")
                 .chars()
@@ -624,8 +511,6 @@ fn attestations_from_value(root: &Value, address: Option<&str>) -> Vec<Attestati
         })
         .collect();
 
-    // Newest first. Block height is the reliable ordering key on this data -
-    // it is present on the flat records where timestamps are not.
     out.sort_by(|a, b| {
         b.block_height
             .unwrap_or(0)
@@ -636,11 +521,6 @@ fn attestations_from_value(root: &Value, address: Option<&str>) -> Vec<Attestati
 }
 
 pub async fn fetch_network_stats(http: &reqwest::Client, base_url: &str) -> NetworkStats {
-    // No dedicated /network/stats endpoint - synthesize:
-    //   total_nodes  ← /health.validators (rough: treat each validator as a node)
-    //   total_inferences ← /inference/results.count
-    //   avg_tps      ← /health.dag_round / uptime_secs * factor
-    //   latest_block ← /health.height (canonical sealed block height)
     let base = base_url.to_string();
     let (health_val, results_val) = tokio::join!(
         async {
@@ -693,12 +573,9 @@ pub async fn fetch_network_stats(http: &reqwest::Client, base_url: &str) -> Netw
         .unwrap_or(1)
         .max(1);
 
-    // Rough: ~4 tx per round on testnet
     let avg_tps = (dag_round.saturating_mul(4)) / uptime_secs;
 
     NetworkStats {
-        // Show community estimate: validators × a fanout factor, floored to the
-        // real number. On production this would come from a real peer-set API.
         total_nodes: validators.max(1),
         total_inferences: total_inf,
         avg_tps,
@@ -742,7 +619,6 @@ pub async fn fetch_balance(
         .await
         .map_err(|e| e.to_string())?;
     if resp.status().as_u16() == 404 {
-        // Account not yet seen on-chain = zero balance, zero nonce.
         return Ok(AccountBalance {
             address: address_hex.to_string(),
             balance_base: "0".to_string(),
@@ -785,9 +661,6 @@ pub async fn fetch_balance(
     })
 }
 
-/// Fetch the transaction-signing domain from the same pinned host that will
-/// receive the signed transaction. Missing or inconsistent recovery metadata
-/// fails closed: signing for the wrong domain weakens replay protection.
 pub async fn transaction_signing_domain(
     http: &reqwest::Client,
     base_url: &str,
@@ -1014,8 +887,6 @@ pub async fn faucet_claim(
     ))
 }
 
-/// Parse the `shard_trace` array a coordinator returns alongside a sharded
-/// run, so the UI can show which machines actually ran which layers.
 fn parse_trace(v: &Value) -> Option<Vec<InferenceHop>> {
     let arr = v.get("shard_trace")?.as_array()?;
     if arr.is_empty() {
@@ -1183,11 +1054,6 @@ pub(crate) fn validate_community_receipt_expectation(
     Ok(())
 }
 
-/// Parse only the canonical community reward receipt contract, bound to the
-/// exact identity tuple returned by the inference coordinator. This parser is
-/// intentionally stricter than the provisional `/inference/run` adapter: a
-/// missing field, cross-job/cross-worker response, or impossible state matrix
-/// is an unavailable receipt, never evidence of earnings.
 fn parse_community_reward_receipt_value(
     value: &Value,
     expected_tx_hash: &str,
@@ -1448,10 +1314,6 @@ fn parse_community_reward_receipt_value(
     })
 }
 
-/// Fetch one exact receipt from the coordinator that accepted/served the
-/// inference. The command layer allowlists and pins `source_host`; this layer
-/// performs one GET with no coordinator fallback and proves the response's
-/// complete identity and state matrix before returning it to the WebView.
 pub async fn fetch_community_reward_receipt(
     http: &reqwest::Client,
     source_host: &str,
@@ -1487,11 +1349,6 @@ pub async fn fetch_community_reward_receipt(
     parse_community_reward_receipt_value(&value, tx_hash, job_id, worker, receipt_url)
 }
 
-/// Parse the common `/inference/run` envelope. Community verification and
-/// reward settlement live at the top level, while local inference evidence
-/// lives under `inference`; preserving that distinction prevents a verified
-/// community result from being displayed as unverified and prevents a pending
-/// 0x25 reward from being mislabeled as an unpaid 0x16 claim.
 fn parse_inference_run_value(
     v: &Value,
     coordinator: Option<&str>,
@@ -1507,8 +1364,6 @@ fn parse_inference_run_value(
     let inf = v
         .get("inference")
         .and_then(Value::as_object)
-        // `/inference/run` delegates partial-model seeds to run_sharded,
-        // whose successful response is flat rather than nested.
         .or_else(|| {
             v.get("output")
                 .and_then(Value::as_str)
@@ -1612,15 +1467,6 @@ fn parse_inference_run_value(
     })
 }
 
-/// Prompts are sent RAW, with `chat_template` as a flag.
-///
-/// The client used to wrap every prompt in `[INST] ... [/INST]` unless the
-/// user had typed those tags themselves. That is Llama-2's instruction
-/// format specifically — wrong for every other architecture, and wrong even
-/// for Llama-2 when the node applies its own template from the GGUF metadata
-/// (the tags then appear twice in the tokenized input). arc-node accepts
-/// `"chat_template": true` and applies the loaded model's own template,
-/// which is correct for whatever is actually loaded.
 pub async fn inference_readiness(http: &reqwest::Client, base_url: &str) -> Result<bool, String> {
     const SCHEMA: &str = "arc.inference.readiness.v1";
     const PROFILE: &str = arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE;
@@ -1758,18 +1604,9 @@ pub async fn run_inference(
         "[inference/run] ✓ response: {}",
         serde_json::to_string(&v).unwrap_or_default()
     );
-    // Keep the exact local origin that answered this request. If it returned a
-    // provisional community settlement, receipt polling must stay pinned to
-    // this host just as remote coordinator polling does.
     parse_inference_run_value(&v, Some(base_url), false)
 }
 
-/// Milestone A: fall back to a seed coordinator's `/inference/run_consensus`
-/// when the local node cannot serve inference (observer role, no model
-/// loaded). `coord_base` is a full origin like `https://149.28.32.76`.
-///
-/// Caller must pass an http client with a long timeout - consensus
-/// inference on the 6-seed pipeline takes 30–60 s for a short prompt.
 pub async fn run_inference_consensus(
     http: &reqwest::Client,
     coord_base: &str,
@@ -1860,9 +1697,6 @@ pub async fn run_inference_consensus(
             .get("tokens_generated")
             .and_then(|x| x.as_u64())
             .unwrap_or(0) as u32,
-        // run_consensus reports `total_ms` (wall time across the whole
-        // pipeline × every token). Use it as `inference_ms` so the UI's
-        // "Xms" label still works.
         inference_ms: v.get("total_ms").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
         attestation_status: None,
         attestation_hash: String::new(),
@@ -1899,12 +1733,6 @@ pub async fn run_inference_consensus(
     })
 }
 
-/// Single-node inference on a remote coordinator. Same `/inference/run` route
-/// as the local node but at an arbitrary base URL. Used as a fallback when
-/// `/inference/run_consensus` fails with `Pipeline gap` because the shard
-/// registry still references retired or overlapping shards. Loses k-of-n
-/// consensus, but still produces a deterministic output and an on-chain
-/// attestation from the coordinator that served it.
 pub async fn run_inference_remote(
     http: &reqwest::Client,
     coord_base: &str,
@@ -1934,16 +1762,6 @@ pub async fn run_inference_remote(
     parse_inference_run_value(&v, Some(coord_base), false)
 }
 
-// ── Historical Tier 1 reads ───────────────────────────────────────────────
-// New Tier 1 request writes are disabled by commands.rs. The former
-// seed-signed convenience submitter was removed as well: server-selected
-// replica names and VRF membership are not validator authorization. Keep only
-// the read path so an operator can inspect a request ID created by an older
-// build without creating a new request.
-
-/// Poll the on-chain state of a Tier 1 request. Returns the current
-/// status, the votes seen so far, and (once finalized) the agreed
-/// `output_hash` + `output_blob`.
 pub async fn tier1_result(
     http: &reqwest::Client,
     base_url: &str,
@@ -2056,30 +1874,14 @@ pub struct Tier1Result {
     pub max_reward: u64,
 }
 
-// ═════════════════════════════════════════════════════════════════════════
-// Chain visibility + projection reads (v0.8.0)
-// ═════════════════════════════════════════════════════════════════════════
-
-/// ARC base units per whole ARC. Balances and stakes cross the wire as
-/// integers in these units.
 const ARC_BASE_UNITS: f64 = 1_000_000_000.0;
 
-/// Outcome of a GET, keeping distinctions the UI has to phrase differently.
-///
-/// A collapsed `Option<Value>` cannot tell "this seed is running a build
-/// without that endpoint" from "this seed is unreachable" — and those degrade
-/// to two different sentences. Several of the endpoints below only exist on
-/// builds newer than what is deployed, so 404 is the *expected* path and has
-/// to read as a statement about the host, not as an error.
 enum Fetched {
     Ok(Value),
-    /// HTTP 404 — the host does not serve this path.
     NotFound,
-    /// HTTP 400 — the host rejected the request as malformed.
     BadRequest,
     Status(u16),
     Unreachable(String),
-    /// 200, but the body was not JSON we could parse.
     Unparseable,
 }
 
@@ -2104,12 +1906,6 @@ async fn get_detailed(http: &reqwest::Client, url: &str) -> Fetched {
     }
 }
 
-/// Phrase a failed read as a sentence naming the host and the path.
-///
-/// Deliberately states only what was observed. It does not guess *why* a host
-/// lacks an endpoint (an old build? a proxy? a feature flag?) because the
-/// desktop cannot know, and a confident wrong explanation is worse than the
-/// bare fact.
 fn unavailable_reason(host: &str, path: &str, f: &Fetched) -> String {
     match f {
         Fetched::Ok(_) => String::new(),
@@ -2136,7 +1932,6 @@ fn earnings_from_fetched(host: &str, path: &str, fetched: Fetched) -> Earnings {
     }
 }
 
-/// First present key out of `keys`, as f64. Accepts ints and floats.
 fn pick_f64(v: &Value, keys: &[&str]) -> Option<f64> {
     keys.iter().find_map(|k| v.get(*k).and_then(|x| x.as_f64()))
 }
@@ -2145,12 +1940,6 @@ fn pick_u64(v: &Value, keys: &[&str]) -> Option<u64> {
     keys.iter().find_map(|k| v.get(*k).and_then(|x| x.as_u64()))
 }
 
-/// Follow a dotted path, e.g. `threads.in_use`.
-///
-/// `/node/contribution` groups its figures into `threads`, `shards` and
-/// `own_compute_ms` objects rather than emitting them flat. A flat lookup for
-/// `threads` returns the OBJECT, which silently yields `None` from `pick_u64`
-/// and made the whole panel look unreported.
 fn at<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
     let mut cur = v;
     for seg in path.split('.') {
@@ -2187,10 +1976,6 @@ fn pick_str(v: &Value, keys: &[&str]) -> Option<String> {
     })
 }
 
-/// Strip an optional `0x` and lowercase. The node's own handlers are
-/// inconsistent about the prefix — `/worker/earnings` and
-/// `/inference/attestations` emit it, `/blocks`, `/validators` and `/tx/{hash}`
-/// do not — so everything is normalised on ingest.
 pub fn strip_0x(s: &str) -> String {
     s.trim()
         .trim_start_matches("0x")
@@ -2198,20 +1983,10 @@ pub fn strip_0x(s: &str) -> String {
         .to_lowercase()
 }
 
-/// Whether `s` (already `strip_0x`ed) is a 32-byte hash.
-///
-/// Separate from the lookup so the "that is not a hash" answer can be tested
-/// without a network, and so the check is stated once. Being able to reject a
-/// bad paste locally is what keeps a typo from being reported as a pending
-/// transaction.
 pub fn is_tx_hash(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// `GET /economics/rewards` — the finite reward treasury.
-///
-/// Not present on the deployed seeds, so the 404 path is the one that runs
-/// today and is the one that has to read well.
 pub async fn fetch_reward_economics(http: &reqwest::Client, base_url: &str) -> RewardEconomics {
     let path = "/economics/rewards";
     let f = get_detailed(http, &format!("{}{}", base_url, path)).await;
@@ -2235,9 +2010,6 @@ pub async fn fetch_reward_economics(http: &reqwest::Client, base_url: &str) -> R
         }
     };
 
-    // Prefer the exact `_base` integer and divide, falling back to the
-    // host's own `_arc` float. The floats are produced by dividing by 1e9 and
-    // carry rounding; the integers do not.
     let base_or_arc = |base_key: &str, arc_key: &str| -> Option<f64> {
         pick_u64(v, &[base_key])
             .map(|b| b as f64 / ARC_BASE_UNITS)
@@ -2253,18 +2025,12 @@ pub async fn fetch_reward_economics(http: &reqwest::Client, base_url: &str) -> R
         ),
         treasury_balance_arc: base_or_arc("treasury_balance_base", "treasury_balance_arc"),
         treasury_balance_unavailable_reason: pick_str(v, &["treasury_balance_unavailable_reason"]),
-        // `rewards_remaining` is a COUNT of fundable reward receipts — NOT an
-        // ARC amount. Renamed on the way in so no call site can mistake it for
-        // currency.
         attestations_remaining: pick_u64(v, &["rewards_remaining"]),
         attestations_remaining_unavailable_reason: pick_str(
             v,
             &["rewards_remaining_unavailable_reason"],
         ),
         treasury_is_finite: v.get("treasury_is_finite").and_then(|x| x.as_bool()),
-        // Community reward certificates are a separate transaction shape
-        // from the local coordinator attestation. Never subtract the latter's
-        // bond from a worker's projected reward.
         bond_per_attestation: base_or_arc(
             "community_worker_certificate_bond_base",
             "community_worker_certificate_bond_arc",
@@ -2275,13 +2041,6 @@ pub async fn fetch_reward_economics(http: &reqwest::Client, base_url: &str) -> R
     }
 }
 
-/// `GET /worker/earnings/{addr}` — projection inputs for one address.
-///
-/// The rate is the delicate part. `attestations_per_day` is populated ONLY if
-/// the host measured it. This function never derives a rate itself: doing so
-/// would mean assuming a block time, and on this network block production has
-/// been stalled on four of six seeds for days, so any block-time assumption is
-/// wrong by an unknown factor.
 const MIN_PROJECTION_RECEIPTS: u64 = 3;
 const MIN_PROJECTION_WINDOW_MS: u64 = 86_400_000;
 const PROJECTION_COLLECTING_REASON: &str = "collecting data: a projection needs at least 3 successful mined reward receipts spanning at least 24 hours, not the initial one or two rollout canaries";
@@ -2418,21 +2177,15 @@ pub async fn fetch_earnings_projection(
         .filter(|rate| *rate >= 0.0);
     let (reward_per_attestation, reward_rate_source) = match chain_rate {
         Some(r) => (Some(r), "chain"),
-        // A payable amount must come from the selected coordinator. A local
-        // constant cannot prove that the remote rollout is active or aligned.
         None => (None, "unknown"),
     };
     let community_rewards_enabled = v
         .get("community_rewards_v1_enabled")
         .and_then(|value| value.as_bool());
 
-    // The parser above has already reconciled this count against every exact
-    // successful mined 0x25 receipt row. Do not re-trust a parallel host count
-    // when receipt identities are available.
     let attestations_total = confirmed.attestations;
     let observation_gate = projection_observation_gate(v, attestations_total);
     let first_attestation_block = pick_u64(v, &["first_attestation_block"]);
-    // `blocks_observed` on the wire — the inclusive span the rate covers.
     let observed_over_blocks = pick_u64(v, &["blocks_observed"]);
     let attestations_per_day = if observation_gate.is_none() {
         pick_f64(v, &["attestations_per_day_observed"]).filter(|rate| *rate >= 0.0)
@@ -2440,8 +2193,6 @@ pub async fn fetch_earnings_projection(
         None
     };
 
-    // A rate the host explicitly declined to give carries its own reason;
-    // otherwise say precisely which input is missing.
     let rate_unavailable_reason = if attestations_per_day.is_some() {
         None
     } else {
@@ -2469,8 +2220,6 @@ pub async fn fetch_earnings_projection(
         })
     };
 
-    // The host's own caveat about how it derived the rate. Shown verbatim
-    // rather than paraphrased — it knows its method and this build does not.
     let rate_caveat = pick_str(v, &["attestations_per_day_caveat"]);
     let budget = v.get("reward_budget").and_then(Value::as_object);
 
@@ -2508,20 +2257,12 @@ pub async fn fetch_earnings_projection(
         attestations_per_day,
         rate_unavailable_reason,
         observed_over_blocks,
-        // The bond is NOT on this endpoint. It comes from /economics/rewards,
-        // which is fetched separately and joined in the UI.
         rate_caveat,
     }
 }
 
-/// Local path of the community worker status served by arc-node.
 pub(crate) const WORKER_STATUS_PATH: &str = "/community/worker/status";
 
-/// This machine's community worker, read from the LOCAL node only.
-///
-/// A 404 means the node runs no worker (observer mode, no model loaded, or an
-/// arc-node older than this endpoint); any other failure is reported as the
-/// observed fact rather than shown as zero jobs.
 pub async fn fetch_worker_status(
     http: &reqwest::Client,
     local_url: &str,
@@ -2566,12 +2307,6 @@ pub(crate) fn worker_status_from_json(value: &Value) -> crate::types::WorkerStat
     }
 }
 
-/// What the LOCAL node is contributing.
-///
-/// Prefers `GET /node/contribution`. Where that is absent it composes the same
-/// picture from `GET /node/threads` and `GET /stats`, both of which the shipped
-/// binary serves — so "not available" is reserved for a node that genuinely
-/// isn't answering, rather than shown next to numbers we could have read.
 pub async fn fetch_node_contribution(
     http: &reqwest::Client,
     local_url: &str,
@@ -2579,9 +2314,6 @@ pub async fn fetch_node_contribution(
 ) -> NodeContribution {
     let path = "/node/contribution";
     if let Fetched::Ok(v) = get_detailed(http, &format!("{}{}", local_url, path)).await {
-        // This endpoint is NESTED: `threads`, `shards` and `own_compute_ms` are
-        // objects. A flat lookup for "threads" returns the object itself, which
-        // reads as absent and made the whole panel look unreported.
         let ranges = at(&v, "shards.ranges")
             .and_then(|x| x.as_array())
             .map(|arr| {
@@ -2601,8 +2333,6 @@ pub async fn fetch_node_contribution(
             source: "contribution".to_string(),
             threads_in_use: nested_u64(&v, "threads.in_use").map(|x| x as u32),
             threads_available: nested_u64(&v, "threads.available_parallelism")
-                // The host reports 0 when it could not read the core count.
-                // Zero cores is not a measurement, so fall back to ours.
                 .filter(|x| *x > 0)
                 .map(|x| x as u32)
                 .or(cpu_cores),
@@ -2611,13 +2341,9 @@ pub async fn fetch_node_contribution(
             } else {
                 Some(ranges.join(", "))
             },
-            // A UNION of the layers held, which the host computes. Summing the
-            // ranges would double-count replicated layers.
             layer_count: nested_u64(&v, "shards.layers_held").map(|x| x as u32),
             total_layers: nested_u64(&v, "shards.total_layers").map(|x| x as u32),
             runs_served: pick_u64(&v, &["sharded_runs_total"]),
-            // `sharded_cache_hits` — no `_total` suffix here, unlike
-            // `sharded_runs_total` and `sharded_bytes_total`.
             cache_hits: pick_u64(&v, &["sharded_cache_hits"]),
             hop_ms_mean: nested_f64(&v, "own_compute_ms.mean_ms"),
             hop_samples: nested_u64(&v, "own_compute_ms.samples"),
@@ -2625,8 +2351,6 @@ pub async fn fetch_node_contribution(
         };
     }
 
-    // Composed fallback. Both reads are against 127.0.0.1 — this describes the
-    // user's own machine, never a seed's.
     let threads = get_detailed(http, &format!("{}/node/threads", local_url)).await;
     let stats = get_detailed(http, &format!("{}/stats", local_url)).await;
 
@@ -2643,13 +2367,11 @@ pub async fn fetch_node_contribution(
     let (runs_served, cache_hits) = match &stats {
         Fetched::Ok(v) => (
             pick_u64(v, &["sharded_runs_total"]),
-            // /stats spells it with `_total`; /node/contribution does not.
             pick_u64(v, &["sharded_cache_hits_total", "sharded_cache_hits"]),
         ),
         _ => (None, None),
     };
 
-    // Nothing answered at all — say so once, naming the local node.
     if threads_in_use.is_none() && runs_served.is_none() {
         return NodeContribution {
             source_host: local_url.to_string(),
@@ -2677,29 +2399,17 @@ pub async fn fetch_node_contribution(
         source: "composed".to_string(),
         threads_in_use,
         threads_available,
-        // Neither /node/threads nor /stats reports the layer range. Absent,
-        // not guessed — /shards would answer it but describes the whole
-        // network's tiling, not specifically this node's slice.
         layers_held: None,
         layer_count: None,
         total_layers: None,
         runs_served,
         cache_hits,
-        // No endpoint on the older binary measures a per-hop mean for this
-        // node. /inference/latency_stats is the network's EWMA, which is
-        // known-poisoned and 9-11h stale, so it is deliberately not used.
         hop_ms_mean: None,
         hop_samples: None,
         hop_unavailable_reason: None,
     }
 }
 
-/// The Network screen's chain view, from the ONE pinned host.
-///
-/// Four independent reads against the same host. `/network/info` is allowed to
-/// be missing without taking the rest down: a host that cannot name its
-/// network can still report a height and a block age, and those are the
-/// numbers a user needs to see that a chain has stopped.
 pub async fn fetch_network_overview(http: &reqwest::Client, base_url: &str) -> NetworkOverview {
     let (info_url, health_url, latest_url, validators_url) = (
         format!("{}/network/info", base_url),
@@ -2714,10 +2424,6 @@ pub async fn fetch_network_overview(http: &reqwest::Client, base_url: &str) -> N
         get_detailed(http, &validators_url),
     );
 
-    // Only /network/info may name the network. `/info` is NOT consulted: its
-    // `chain` field is the constant string "ARC Chain" on every deployment, so
-    // it distinguishes nothing and would be an invented answer to "which
-    // network am I on".
     let info_body = match &info {
         Fetched::Ok(v) => Some(v),
         _ => None,
@@ -2730,7 +2436,6 @@ pub async fn fetch_network_overview(http: &reqwest::Client, base_url: &str) -> N
             Fetched::Ok(_) => None,
             other => Some(unavailable_reason(base_url, "/network/info", other)),
         });
-    // The ONLY input allowed to make this app describe a network as mainnet.
     let declares_mainnet = info_body.and_then(|v| nested_bool(v, "declares_mainnet"));
     let is_block_producing = info_body.and_then(|v| nested_bool(v, "is_block_producing"));
     let is_block_producing_basis =
@@ -2747,9 +2452,6 @@ pub async fn fetch_network_overview(http: &reqwest::Client, base_url: &str) -> N
         _ => (None, None, None, None, None),
     };
 
-    // Block age comes from the block header's own timestamp, not from
-    // /health. A stalled seed still reports status "ok" with a healthy peer
-    // count, because its DAG round keeps advancing while height stands still.
     let last_block_age_secs = info_body
         .and_then(|v| pick_u64(v, &["last_block_age_secs"]))
         .or_else(|| match &latest {
@@ -2765,9 +2467,6 @@ pub async fn fetch_network_overview(http: &reqwest::Client, base_url: &str) -> N
             _ => None,
         });
 
-    // Active vs registered is DERIVED here by counting stake > 0, because
-    // /validators exposes no such distinction. Zero-stake entries are counted
-    // by /health and by `count`, which is what inflates the reported set.
     let reported_active = info_body.and_then(|v| pick_u64(v, &["validators_active"]));
     let reported_registered = info_body.and_then(|v| pick_u64(v, &["validators_registered"]));
     let min_active_stake = info_body.and_then(|v| pick_u64(v, &["min_active_stake"]));
@@ -2800,17 +2499,10 @@ pub async fn fetch_network_overview(http: &reqwest::Client, base_url: &str) -> N
         _ => (Vec::new(), None, None),
     };
 
-    // `/network/info` applies the real `min_active_stake` threshold; counting
-    // stake > 0 from `/validators` only approximates it. Prefer the reported
-    // figures and record which was used, so an approximation is never shown as
-    // the host's own number.
     let validator_split_derived = reported_active.is_none();
     let validators_active = reported_active.map(|x| x as u32).or(derived_active);
     let validators_registered = reported_registered.map(|x| x as u32).or(derived_registered);
 
-    // Only a total blackout is "unavailable". A missing network name is
-    // reported by `network_name: None` and phrased by the UI, which names the
-    // host it is reading.
     let unavailable =
         if height.is_none() && last_block_age_secs.is_none() && validator_list.is_empty() {
             Some(unavailable_reason(base_url, "/health", &health))
@@ -2841,8 +2533,6 @@ pub async fn fetch_network_overview(http: &reqwest::Client, base_url: &str) -> N
     }
 }
 
-/// Verify the exact model/profile advertised by one already selected
-/// production coordinator before acceptance performs its single paid POST.
 pub async fn fetch_production_model_identity(
     http: &reqwest::Client,
     base_url: &str,
@@ -2978,34 +2668,18 @@ fn parse_production_model_identity(
     Ok(expected_model_id.to_string())
 }
 
-/// The `from`/`to` window covering the newest `limit` blocks at `tip`.
-///
-/// Extracted so the off-by-one is testable. Getting it wrong is not a cosmetic
-/// error: asking `/blocks` for a limit with no `from` returns genesis, whose
-/// timestamp is 0, which the UI's relative-time formatter renders as
-/// "20770d ago".
 fn recent_block_range(tip: u64, limit: u32) -> (u64, u64) {
     let span = (limit.max(1) as u64).saturating_sub(1);
     (tip.saturating_sub(span), tip)
 }
 
-/// `GET /blocks` — the most recent blocks on the pinned host.
-///
-/// The range has to be computed, not defaulted. `/blocks` takes `from`, `to`
-/// and `limit`, and `from` defaults to **0** — so `?limit=10` returns the ten
-/// OLDEST blocks, starting at genesis, not the newest ten. Verified against the
-/// live NYC seed, which answered `?limit=2` with height 0. The height is read
-/// first so the window can be anchored to the tip.
 pub async fn fetch_recent_blocks(
     http: &reqwest::Client,
     base_url: &str,
     limit: u32,
 ) -> RecentBlocks {
-    // The handler caps limit at 100; ask for no more than it will give.
     let limit = limit.clamp(1, 100);
 
-    // Anchor to the tip. Without a height we cannot ask for "recent", so say
-    // so rather than silently returning genesis blocks.
     let health = get_detailed(http, &format!("{}/health", base_url)).await;
     let tip = match &health {
         Fetched::Ok(v) => pick_u64(v, &["height", "block_height"]),
@@ -3051,13 +2725,8 @@ pub async fn fetch_recent_blocks(
                         hash: pick_str(b, &["hash"])
                             .map(|h| strip_0x(&h))
                             .unwrap_or_default(),
-                        // A zero timestamp is not a time. Genesis carries
-                        // `timestamp: 0`, and feeding that to the UI's
-                        // relative-time formatter renders "20770d ago" — the
-                        // same class of bug as passing a block height to it.
                         timestamp_ms: pick_u64(b, &["timestamp"]).filter(|t| *t > 0),
                         tx_count: pick_u64(b, &["tx_count"]).map(|x| x as u32),
-                        // An all-zero producer is a placeholder, not an address.
                         proposer: pick_str(b, &["producer", "proposer"])
                             .map(|p| strip_0x(&p))
                             .filter(|p| p.chars().any(|c| c != '0')),
@@ -3066,7 +2735,6 @@ pub async fn fetch_recent_blocks(
                 .collect()
         })
         .unwrap_or_default();
-    // Newest first. The handler returns ascending by height.
     blocks.sort_by_key(|block| std::cmp::Reverse(block.height));
 
     RecentBlocks {
@@ -3076,12 +2744,6 @@ pub async fn fetch_recent_blocks(
     }
 }
 
-/// `GET /tx/{hash}` on the pinned host.
-///
-/// The three outcomes are kept apart deliberately. A 404 here does NOT mean
-/// the hash is bogus: `/tx/{hash}` returns a *receipt*, and a transaction
-/// still in the mempool has none. Calling that "invalid" would tell a user who
-/// just submitted an attestation that their hash was fake.
 pub async fn lookup_tx(http: &reqwest::Client, base_url: &str, hash: &str) -> TxLookup {
     let normalised = strip_0x(hash);
     let base = TxLookup {
@@ -3096,8 +2758,6 @@ pub async fn lookup_tx(http: &reqwest::Client, base_url: &str, hash: &str) -> Tx
         gas_used: None,
     };
 
-    // Reject a malformed paste locally rather than spending a round trip to
-    // be told the same thing.
     if !is_tx_hash(&normalised) {
         return TxLookup {
             status: "invalid_hash".to_string(),
@@ -3137,11 +2797,6 @@ pub async fn lookup_tx(http: &reqwest::Client, base_url: &str, hash: &str) -> Tx
     }
 }
 
-/// `GET /block/{height}/txs` — the transactions in one block.
-///
-/// Fetched on demand (when the user expands a block), never on the polling
-/// path. Expanding every visible block on each poll would mean ten extra
-/// requests per interval against the single pinned host.
 pub async fn fetch_block_txs(
     http: &reqwest::Client,
     base_url: &str,
@@ -3657,11 +3312,6 @@ mod chain_read_tests {
         assert_eq!(parsed.trace.as_ref().map(Vec::len), Some(1));
     }
 
-    // ── Hash normalisation ──────────────────────────────────────────────
-    // The node's handlers disagree about the `0x` prefix, so every hash is
-    // normalised on ingest. Getting this wrong makes a lookup miss a tx that
-    // is genuinely in a block.
-
     #[test]
     fn strip_0x_removes_either_prefix_case_and_lowercases() {
         assert_eq!(strip_0x("0xABCD"), "abcd");
@@ -3672,7 +3322,6 @@ mod chain_read_tests {
 
     #[test]
     fn strip_0x_leaves_an_embedded_0x_alone() {
-        // Only a LEADING prefix is a prefix.
         assert_eq!(strip_0x("ab0xcd"), "ab0xcd");
     }
 
@@ -3688,16 +3337,9 @@ mod chain_read_tests {
         assert!(!is_tx_hash(""));
         assert!(!is_tx_hash(&"a".repeat(63)));
         assert!(!is_tx_hash(&"a".repeat(65)));
-        // 'g' is not hex. A 64-char non-hex string is the paste most likely to
-        // be mistaken for a valid hash.
         assert!(!is_tx_hash(&"g".repeat(64)));
         assert!(!is_tx_hash("not-a-hash"));
     }
-
-    // ── Degradation copy ────────────────────────────────────────────────
-    // These sentences are the product when an endpoint is missing, which on
-    // the deployed seeds is most of the time. They must name the host and the
-    // path, and must not speculate about the cause.
 
     #[test]
     fn not_found_names_the_host_the_path_and_the_status() {
@@ -3713,8 +3355,6 @@ mod chain_read_tests {
 
     #[test]
     fn degradation_copy_never_speculates_about_the_cause() {
-        // A confident wrong explanation ("your node is out of date") is worse
-        // than the bare observed fact, because the desktop cannot know.
         let forbidden = [
             "old build",
             "out of date",
@@ -3751,8 +3391,6 @@ mod chain_read_tests {
 
     #[test]
     fn every_failure_mode_produces_a_non_empty_sentence() {
-        // A blank reason would render as an empty box where an explanation
-        // should be.
         for f in [
             Fetched::NotFound,
             Fetched::BadRequest,
@@ -3764,11 +3402,6 @@ mod chain_read_tests {
             assert!(!r.trim().is_empty());
         }
     }
-
-    // ── Field picking ───────────────────────────────────────────────────
-    // Endpoints spell the same quantity differently (`height` vs
-    // `block_height`), and the projection fields may land under either an
-    // `_arc` or a `_base` name. Absent must stay absent rather than becoming 0.
 
     #[test]
     fn pick_takes_the_first_present_key_in_order() {
@@ -3787,23 +3420,18 @@ mod chain_read_tests {
 
     #[test]
     fn pick_f64_accepts_an_integer_encoding() {
-        // Reward figures arrive as either 2.5 or 2, depending on the handler.
         let v = json!({ "reward": 2 });
         assert_eq!(pick_f64(&v, &["reward"]), Some(2.0));
     }
 
     #[test]
     fn pick_str_treats_an_empty_string_as_absent() {
-        // An empty network name must fall through to "unknown", not render as
-        // a blank network label.
         let v = json!({ "network_name": "", "name": "arc-testnet-1" });
         assert_eq!(
             pick_str(&v, &["network_name", "name"]),
             Some("arc-testnet-1".to_string())
         );
     }
-
-    // ── Recent-block window ─────────────────────────────────────────────
 
     fn candidate_earnings_value() -> Value {
         json!({
@@ -4267,8 +3895,6 @@ mod chain_read_tests {
         assert_eq!(parsed.archive_mode, Some(true));
         assert_eq!(parsed.history_complete_since_recovery, Some(true));
 
-        // Mirrors the live LAX and SGP response: archive retention is enabled,
-        // but the host cannot prove completeness from the v3 recovery boundary.
         let mut incomplete_archive = candidate_earnings_value();
         incomplete_archive["archive_mode"] = json!(true);
         incomplete_archive["history_complete_since_recovery"] = json!(false);
@@ -4436,15 +4062,12 @@ mod chain_read_tests {
 
     #[test]
     fn recent_block_range_anchors_to_the_tip_not_to_genesis() {
-        // The bug this guards: `/blocks?limit=10` with no `from` returns
-        // heights 0..9, whose timestamps are 0.
         assert_eq!(recent_block_range(123_469, 10), (123_460, 123_469));
         assert_eq!(recent_block_range(123_469, 1), (123_469, 123_469));
     }
 
     #[test]
     fn recent_block_range_clamps_at_genesis_on_a_short_chain() {
-        // A chain shorter than the window must not underflow to u64::MAX.
         assert_eq!(recent_block_range(3, 10), (0, 3));
         assert_eq!(recent_block_range(0, 10), (0, 0));
     }
@@ -4456,7 +4079,6 @@ mod chain_read_tests {
 
     #[test]
     fn pick_ignores_an_explicit_json_null() {
-        // `/worker/earnings` sends `today_arc: null` deliberately.
         let v = json!({ "today_arc": Value::Null });
         assert_eq!(pick_f64(&v, &["today_arc"]), None);
     }

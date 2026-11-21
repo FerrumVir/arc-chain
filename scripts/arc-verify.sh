@@ -1,34 +1,4 @@
 #!/usr/bin/env bash
-# ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain - Inference Verifier
-#
-# Take an inference attestation tx_hash, fetch its recorded details
-# (input, output, model_id, output_hash), re-run the SAME input through
-# the SAME coordinator, and verify the new output_hash matches the
-# original. This is a reported-commitment comparison, not payment proof or
-# exact-artifact verification unless the selected candidate exposes those fields.
-#
-# Usage from a reviewed checkout:
-#   ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-verify.sh --latest
-#
-#   # Or with a specific tx_hash:
-#   ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-verify.sh 0x933b8616d6712baff21bc9083705f7715da4a9fd20d1815c6412426d8f071c24
-#
-#   # Or with a custom coordinator:
-#   ARC_COORDINATOR=http://your-node:9090 bash arc-verify.sh <tx_hash>
-#
-# WHERE THE DATA COMES FROM (2026-08-17)
-#   Attestation records live in TWO places and neither is guaranteed populated:
-#     /inference/results       node-local, in-memory, lost on restart
-#     /inference/attestations  same records, plus on-chain rows, plus - past
-#                              the end of the real list - a fallthrough that
-#                              emits unrelated transactions tagged tx_type
-#                              "Other". Those are filtered out here.
-#   On the live network /inference/results is EMPTY on most seeds. This script
-#   therefore sweeps every seed and both endpoints rather than trusting one.
-#
-# Requires curl + python3.
-# ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
 if [ -z "${ARC_COORDINATOR:-}" ]; then
@@ -39,11 +9,8 @@ fi
 COORDINATOR="$ARC_COORDINATOR"
 TX_HASH="${1:-}"
 
-# Seeds to sweep when the chosen coordinator has no record. The coordinator is
-# always tried first; the rest follow in order.
 ARC_SEEDS_SWEEP="${ARC_SEEDS_SWEEP:-$COORDINATOR}"
 
-# Colors
 if [ -t 1 ]; then
     BOLD=$'\033[1m' DIM=$'\033[2m' RESET=$'\033[0m'
     GREEN=$'\033[32m' CYAN=$'\033[36m' YELLOW=$'\033[33m' RED=$'\033[31m'
@@ -95,11 +62,6 @@ fi
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-# ── Normalizer: read both endpoint shapes, emit flat records ────────────────
-# /inference/results     -> {"results":[{tx_hash, input, output_hash, ...}]}
-# /inference/attestations-> {"attestations":[{tx_hash, tx_type, inference:{...}}]}
-# Rows with tx_type != "Inference" (the generic-transaction fallthrough) and
-# rows with no output_hash are dropped - they are not attestations.
 read -r -d '' ARC_NORMALIZE_PY <<'PYEOF' || true
 import json, sys
 
@@ -143,7 +105,6 @@ for r in records:
 print(json.dumps(uniq))
 PYEOF
 
-# fetch_records <url> -> writes normalized JSON array to stdout
 fetch_records() {
     local url="$1"
     local f_res="$WORK_DIR/res.json" f_att="$WORK_DIR/att.json"
@@ -153,7 +114,6 @@ fetch_records() {
                                    "$f_att" "${url}/inference/attestations" 2>/dev/null || echo "[]"
 }
 
-# ── Locate the attestation across every seed ────────────────────────────────
 WANT="${TX_HASH#0x}"
 WANT="$(printf '%s' "$WANT" | tr 'A-Z' 'a-z')"
 LATEST_MODE=0
@@ -227,7 +187,6 @@ ORIG_SOURCE=$(jget _source)
 ORIG_BLOCK=$(jget block_height)
 ORIG_TOKENS=$(jget tokens_generated)
 
-# The re-run has to hit the seed that actually holds the record.
 COORDINATOR="$FOUND_SEED"
 
 cat <<HEADER
@@ -257,7 +216,6 @@ else
 fi
 echo ""
 
-# ── Step 2: Re-run the inference ────────────────────────────────────────────
 printf "${CYAN}[2/3]${RESET} Re-running the same input through %s...\n" "${COORDINATOR#http://}"
 
 if [ "$ORIG_SHARDED" = "True" ] || [ "$ORIG_SHARDED" = "true" ]; then
@@ -269,9 +227,6 @@ RERUN_TOKENS="${ORIG_TOKENS:-15}"
 case "$RERUN_TOKENS" in ''|*[!0-9]*) RERUN_TOKENS=15 ;; esac
 printf "       endpoint:     %s  (max_tokens %s)\n" "$ENDPOINT" "$RERUN_TOKENS"
 
-# Ask for a genuine recomputation. Coordinators that predate the flag ignore
-# unknown JSON fields, so this is safe to send everywhere - we detect what we
-# actually got by reading cache.hit off the response, not by trusting the flag.
 ARC_INPUT="$ORIG_INPUT" ARC_TOK="$RERUN_TOKENS" python3 -c "
 import json, os
 print(json.dumps({'input': os.environ['ARC_INPUT'],
@@ -283,7 +238,6 @@ NEW_RESPONSE=$(curl -sf -m 300 -X POST "${COORDINATOR}${ENDPOINT}" \
     -H 'Content-Type: application/json' \
     --data @"$WORK_DIR/body.json" 2>/dev/null || echo "")
 
-# If the coordinator rejected the extra field outright, retry without it.
 FORCED_SUPPORTED=1
 if [ -z "$NEW_RESPONSE" ]; then
     FORCED_SUPPORTED=0
@@ -332,14 +286,9 @@ printf "       wall time:       %s ms across %s traced hops\n" "${NEW_TOTAL_MS:-
 printf "       served from cache: %s\n" "$CACHE_HIT"
 echo ""
 
-# ── Step 3: Compare ────────────────────────────────────────────────────────
 printf "${CYAN}[3/3]${RESET} Comparing hashes...\n"
 echo ""
 
-# cache.hit is the ONLY reliable signal. Do not also require a non-empty
-# shard_trace: on older builds a cache hit returns an empty trace, but the
-# newer build carries the ORIGINAL run's trace through the cache, so a
-# populated trace no longer implies the pipeline actually ran.
 RECOMPUTED=0
 if [ "$CACHE_HIT" = "no" ]; then
     RECOMPUTED=1

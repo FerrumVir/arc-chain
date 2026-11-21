@@ -1,5 +1,3 @@
-//! S9: synthetic assignment scenarios - no network, no model.
-
 use arc_assign::certificate::{
     AssignmentCertificate, CertificateError, policy_hash, policy_hash_v2,
 };
@@ -59,14 +57,11 @@ fn a_lease_is_used_only_when_signed_current_and_for_this_model() {
     let good = CapabilityLease::sign(body(&k), &k).unwrap();
     lease::validate(&good, &req).unwrap();
 
-    // Signed by someone else for this worker.
     let forged = CapabilityLease::sign(body(&k), &key(2)).unwrap();
     assert_eq!(lease::validate(&forged, &req), Err(LeaseError::Signature));
-    // Not a committee member.
     let outsider = key(3);
     let foreign = CapabilityLease::sign(body(&outsider), &outsider).unwrap();
     assert_eq!(lease::validate(&foreign, &req), Err(LeaseError::NotMember));
-    // Another model; a missing operator; expired.
     let mut b = body(&k);
     b.artifact_id = hash_bytes(b"other");
     assert_eq!(
@@ -91,8 +86,6 @@ fn a_lease_is_used_only_when_signed_current_and_for_this_model() {
 fn claimed_capacity_is_replaced_by_the_measured_one_or_refused() {
     let k = key(1);
     let lease = CapabilityLease::sign(body(&k), &k).unwrap();
-    // Answered correctly at 1.8e9 MAC/s against a 2e9 claim: accepted at the
-    // measured rate.
     let honest = ChallengeResult {
         macs: 1_800_000_000,
         elapsed_us: 1_000_000,
@@ -102,7 +95,6 @@ fn claimed_capacity_is_replaced_by_the_measured_one_or_refused() {
         lease::check_challenge(&lease, &honest, 80),
         Ok(1_800_000_000)
     );
-    // Half the claim: dishonest capacity.
     let slow = ChallengeResult {
         macs: 1_000_000_000,
         elapsed_us: 1_000_000,
@@ -112,7 +104,6 @@ fn claimed_capacity_is_replaced_by_the_measured_one_or_refused() {
         lease::check_challenge(&lease, &slow, 80),
         Err(LeaseError::DishonestCapacity { .. })
     ));
-    // Fast but wrong is refused outright.
     let wrong = ChallengeResult {
         macs: 4_000_000_000,
         elapsed_us: 1_000_000,
@@ -197,7 +188,6 @@ fn policy() -> Policy {
     }
 }
 
-/// A 7B-like layer's projections: rows x cols per token.
 fn stages() -> Vec<Stage> {
     let mut s = Vec::new();
     for layer in 0..4u32 {
@@ -251,8 +241,6 @@ fn unequal_workers_get_unequal_slices_on_a_fast_network() {
 
 #[test]
 fn a_slow_network_means_the_coordinator_works_alone() {
-    // Stage A's measured WAN: 161 ms round trips. No worker can pay that 28
-    // times per token and win.
     let wan = link(161_000, 12_500_000);
     let cands = vec![
         candidate(1, 8_000_000_000, wan),
@@ -269,7 +257,7 @@ fn memory_caps_a_workers_share_and_the_rest_goes_elsewhere() {
     let fast = link(50, 10_000_000_000);
     let mut small = candidate(1, 8_000_000_000, fast);
     let total: u64 = stages().iter().map(|s| s.rows * s.cols).sum();
-    small.ram_headroom_bytes = total / 10; // holds a tenth of the rows at most
+    small.ram_headroom_bytes = total / 10;
     let p = place(&stages(), 1_000_000_000, &[small], &policy()).unwrap();
     let rows = rows_of(&p, &Participant::Worker(key(1).address()));
     let all_rows: u64 = stages().iter().map(|s| s.rows).sum();
@@ -316,7 +304,6 @@ fn placement_is_the_same_whatever_order_the_inputs_arrive_in() {
     cands.swap(0, 2);
     let b = place(&stages(), 1_000_000_000, &cands, &policy()).unwrap();
     assert_eq!(a, b);
-    // One validator presenting two offers counts once.
     let mut doubled = cands.clone();
     let mut again = candidate(5, 5_000_000_000, fast);
     again.transport_id = "second transport".into();
@@ -341,14 +328,12 @@ fn without_the_coordinator_the_workers_must_hold_every_row() {
     assert!(covers_exactly(&placed, &stages()));
 }
 
-/// A worker that holds only some layers, as `--shard-range` configures.
 fn sharded(i: u8, rate: u64, link: LinkMeasurement, layers: &[(u32, u32)]) -> Candidate {
     let mut c = candidate(i, rate, link);
     c.resident_layers = layers.to_vec();
     c
 }
 
-/// Rows a participant was given on one stage.
 fn rows_on(p: &Placement, si: usize, who: &Participant) -> u64 {
     p.stages[si]
         .slices
@@ -393,7 +378,6 @@ fn each_half_of_the_model_is_served_by_the_worker_holding_it() {
     let p = place(&stages(), 1_000_000_000, &[lower, upper], &policy()).unwrap();
     let a = Participant::Worker(key(1).address());
     let b = Participant::Worker(key(2).address());
-    // Stage 0 is layer 0; stage 21 is layer 3 (7 tensors per layer).
     assert!(rows_on(&p, 0, &a) > 0, "the lower half must serve layer 0");
     assert_eq!(rows_on(&p, 0, &b), 0, "the upper half holds no layer 0");
     assert!(rows_on(&p, 21, &b) > 0, "the upper half must serve layer 3");
@@ -449,7 +433,6 @@ fn a_layerless_stage_belongs_to_full_model_participants_only() {
     );
     assert!(rows_on(&p, 1, &w) > 0, "but it does hold layer 0");
     assert!(covers_exactly(&p, &mixed));
-    // With no coordinator to hold it, that stage cannot be placed at all.
     let mut solo = policy();
     solo.include_coordinator = false;
     assert_eq!(
@@ -462,9 +445,6 @@ fn a_layerless_stage_belongs_to_full_model_participants_only() {
 fn memory_is_measured_against_the_layers_a_worker_actually_holds() {
     let fast = link(50, 10_000_000_000);
     let total: u64 = stages().iter().map(|s| s.rows * s.cols).sum();
-    // Room for its own quarter of the model and no more. Measured against
-    // the whole model this would cap it near a quarter of every stage;
-    // measured against what it holds, it can serve its own layer fully.
     let mut shard = sharded(1, 8_000_000_000, fast, &[(0, 1)]);
     shard.ram_headroom_bytes = total / 4;
     let p = place(&stages(), 1_000_000_000, &[shard], &policy()).unwrap();
@@ -484,7 +464,6 @@ fn a_worker_too_small_for_its_own_layers_is_still_capped() {
     let fast = link(50, 10_000_000_000);
     let total: u64 = stages().iter().map(|s| s.rows * s.cols).sum();
     let mut shard = sharded(1, 8_000_000_000, fast, &[(0, 1)]);
-    // A tenth of the one layer it holds (a quarter of the model).
     shard.ram_headroom_bytes = total / 40;
     let p = place(&stages(), 1_000_000_000, &[shard], &policy()).unwrap();
     let w = Participant::Worker(key(1).address());
@@ -597,8 +576,6 @@ fn v2_certificate_verifies_authorization_and_recomputes_the_recorded_placement()
         forged.verify(&authorized),
         Err(CertificateError::WrongPolicy)
     );
-    // A stable policy cannot make expired observations usable: the recorded
-    // actual height still changes the recomputed placement.
     forged = cert;
     forged.policy.now += 10_000;
     assert_eq!(
@@ -673,7 +650,7 @@ fn any_validator_can_recompute_a_certificate_and_refuse_a_forged_one() {
         Err(CertificateError::PlacementMismatch)
     );
     let mut inflated = cert.clone();
-    inflated.candidates[0].macs_per_s *= 10; // claims its worker is faster
+    inflated.candidates[0].macs_per_s *= 10;
     assert_eq!(
         inflated.verify(&authorised),
         Err(CertificateError::PlacementMismatch)
@@ -757,13 +734,10 @@ fn the_queue_is_fair_bounded_and_honours_deadlines_and_cancellation() {
     q.push(call(3, 0, 5)).unwrap();
     assert_eq!(q.push(call(4, 0, 100)), Err(QueueError::Full(5)));
 
-    // Past request 3's deadline: its call is expired, not run.
     match q.next(10) {
         Next::Expired(calls) => assert_eq!(calls, vec![call(3, 0, 5)]),
         other => panic!("{other:?}"),
     }
-    // Requests alternate: 1, 2, then 1 again - request 1's three calls do
-    // not all go first.
     let order: Vec<Hash256> = (0..3)
         .map(|_| match q.next(10) {
             Next::Run(c) => c.request,
@@ -811,7 +785,6 @@ fn ranged_workers_need_explicit_output_head_coverage_without_a_coordinator() {
             .iter()
             .all(|s| s.participant == Participant::Worker(upper.worker))
     );
-    // The explicit output capability cannot invent embedding residency.
     stages.last_mut().unwrap().tensor = "embedding".into();
     assert_eq!(
         place(&stages, 0, &[lower, upper], &p),

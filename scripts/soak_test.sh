@@ -1,47 +1,6 @@
 #!/usr/bin/env bash
-# ARC Chain - Soak Test
-#
-# Runs N validator nodes locally and records liveness, height progression,
-# state-root agreement, memory and errors.
-#
-# usage: ./scripts/soak_test.sh [--nodes N] [--duration SECONDS] [--batch-size N]
-#                              [--binary PATH] [--max-rss-mb N]
-#        ./scripts/soak_test.sh --self-test     prove status propagation
-#
-# ---------------------------------------------------------------------------
-# This file has been rewritten twice, and the second rewrite was needed because
-# the first one still could not be trusted:
-#
-#   v0 could not fail at all. It passed --validator-id/--rpc-port/--batch-size
-#   (none of which exist on arc-node), passed --benchmark to a binary its own
-#   build step built WITHOUT the benchmark-tools feature that defines it, gave
-#   every node the same implicit --data-dir, and never checked that a node
-#   started. A 24-hour run would have slept over five dead processes and
-#   printed a completed report.
-#
-#   v1 fixed the flags and added a startup gate, then reported a verdict its own
-#   exit status contradicted: `rc` was mutated inside a brace group piped to
-#   `tee`, which runs in a SUBSHELL, so every `rc=1` was discarded. Both saved
-#   reports said FAIL while their exitcode.txt said 0. It also left the liveness
-#   snapshot stale when the monitor loop broke on a dead node, and accepted any
-#   HTTP body - including an error page - as a health sample.
-#
-# Rules now enforced:
-#   - status is accumulated in plain variables, never inside a pipeline; the
-#     report is written to a file and then printed, so nothing runs in a subshell
-#   - the first failure reason is preserved and reported even if later checks
-#     also fail, and cleanup cannot discard it
-#   - process exit status, report verdict, and exitcode.txt always agree, for
-#     startup failure, node death, workload failure, interruption and success
-#   - liveness is snapshotted immediately before the loop exits by ANY path
-#   - health/snapshot samples must be HTTP 200 AND parse as JSON AND carry the
-#     fields being read; anything else is a missing sample, not a zero
-#   - state roots are compared at a COMMON HEIGHT, so a node that is merely
-#     behind is reported as lag, not as divergence
-#   - peak RSS is bounded and exceeding the bound fails the run
-# ---------------------------------------------------------------------------
 
-set -uo pipefail   # deliberately NOT -e: status is handled explicitly
+set -uo pipefail
 
 NODES=${NODES:-5}
 DURATION=${DURATION:-86400}
@@ -64,10 +23,7 @@ fail() {
     EXIT_STATUS=1
 }
 
-# ── validated sampling ──────────────────────────────────────────────────────
-# A sample is only a sample if it is HTTP 200, parses as JSON, and contains the
-# fields being read. Anything else is recorded as missing.
-http_json_fields() { # port path field...
+http_json_fields() {
     local port="$1" path="$2"; shift 2
     local raw code body
     raw=$(curl -s -w '\n%{http_code}' --max-time 4 "http://127.0.0.1:${port}${path}" 2>/dev/null) || return 1
@@ -103,7 +59,6 @@ snapshot_liveness() {
     done
 }
 
-# ── acceptance evaluation (runs BEFORE the report, mutates status directly) ──
 evaluate_acceptance() {
     local i errs alive maxrss
 
@@ -114,8 +69,6 @@ evaluate_acceptance() {
     for i in $(seq 0 $((NODES - 1))); do
         alive=$(cat "$LOG_DIR/node-${i}.alive" 2>/dev/null || echo unknown)
         [[ "$alive" != yes ]] && fail "node $i not alive at end of run (state=$alive)"
-        # grep -c already prints 0 when nothing matches; it just exits 1. An
-        # `|| echo 0` here appended a second line and broke every [[ -gt ]].
         errs=$(grep -c -i -E "error|panic|fatal" "$LOG_DIR/node-${i}.log" 2>/dev/null)
         errs=${errs:-0}
         [[ "$errs" -gt 0 ]] && fail "node $i logged ${errs} error/panic/fatal lines"
@@ -129,16 +82,6 @@ evaluate_acceptance() {
     missing=$(awk -F, 'NR>1 && ($3=="" || $4=="") {n++} END{print n+0}' "$LOG_DIR/roots.csv" 2>/dev/null)
     [[ "${missing:-0}" -gt 0 ]] && fail "${missing} height/state-root samples were missing or invalid"
 
-    # Root agreement is only meaningful between nodes that share a chain.
-    #
-    # Comparing roots across UNPEERED nodes is meaningless in both directions,
-    # and this harness got it wrong once in each: equal roots at different
-    # heights were nearly reported as "agreement" (they are determinism - the
-    # same transaction sequence from the same genesis), and then different roots
-    # at the SAME height were reported as divergence (they are simply two
-    # different chains that happen to be the same length). Neither says anything
-    # about consensus. So the check runs only when peering was requested, which
-    # is the only configuration where a common chain identity exists.
     local diverged=0
     if [[ -n "$PEER_LIST" ]]; then
         diverged=$(awk -F, 'NR>1 && $3!="" && $4!="" {
@@ -151,7 +94,6 @@ evaluate_acceptance() {
     fi
     echo "$diverged" > "$LOG_DIR/diverged_heights.txt"
 
-    # Workload actually exercised the block path.
     local maxh
     maxh=$(awk -F, 'NR>1 && $3!="" {if ($3+0>m) m=$3+0} END{print m+0}' "$LOG_DIR/roots.csv" 2>/dev/null)
     echo "${maxh:-0}" > "$LOG_DIR/max_height.txt"
@@ -235,8 +177,6 @@ cleanup() {
     [[ "$CLEANED" = 1 ]] && return
     CLEANED=1
     trap - EXIT INT TERM
-    # Snapshot the real state BEFORE killing anything, so the report describes
-    # the run rather than the shutdown.
     snapshot_liveness
     echo ""; echo "Shutting down nodes..."
     local pid
@@ -250,7 +190,6 @@ cleanup() {
     exit "$EXIT_STATUS"
 }
 
-# ── self-test ───────────────────────────────────────────────────────────────
 if [[ "${1:-}" == "--self-test" ]]; then
     echo "self-test: status propagation out of the report writer"
     LOG_DIR=$(mktemp -d); NODES=1; START_TIME=$(date +%s); STARTUP_OK=1
@@ -349,10 +288,6 @@ if ! "$BINARY" --help 2>&1 | grep -q -- "--benchmark"; then
     if [[ "${ALLOW_IDLE_SOAK:-0}" != "1" ]]; then fail "binary lacks benchmark-tools"; exit 1; fi
     echo "       ALLOW_IDLE_SOAK=1 - continuing WITHOUT a workload."
 else
-    # arc-node gates --benchmark behind its own isolation contract
-    # (main.rs:5566): positive stake, explicit dev seed, and NO --genesis; it
-    # separately refuses any non-loopback benchmark peer. That combination IS a
-    # disposable local devnet, which is why a positive stake is safe here.
     BENCH_ARGS=(--benchmark --bench-batch "$BATCH_SIZE"
                 --insecure-dev-validator-seed --stake "${SOAK_STAKE:-5000000}")
     NEEDS_SEED=1

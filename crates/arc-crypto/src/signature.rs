@@ -1,42 +1,15 @@
-//! Digital signature primitives for ARC Chain.
-//!
-//! Four signature schemes:
-//! - **Ed25519**: Fast agent/native transactions (~4-9M batch verifications/sec)
-//! - **Secp256k1**: ETH-compatible operations (MetaMask, bridge verification)
-//! - **ML-DSA-65**: Post-quantum signatures (NIST FIPS 204, lattice-based)
-//! - **Falcon-512**: Post-quantum signatures (NIST round-3, hash-based lattice)
-//!
-//! Address derivation:
-//! - Ed25519: `address = BLAKE3(public_key)[0..32]`
-//! - Secp256k1: `address = BLAKE3(uncompressed_pubkey[1..65])[0..32]`
-//! - ML-DSA-65: `address = BLAKE3(public_key)[0..32]`
-//! - Falcon-512: `address = BLAKE3(public_key)[0..32]`
-
 use crate::hash::{Hash256, hash_bytes};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroize;
 
-// ── ML-DSA-65 constants (FIPS 204) ──────────────────────────────────────────
-
-/// ML-DSA-65 public key length in bytes.
 pub const ML_DSA_PK_LEN: usize = fips204::ml_dsa_65::PK_LEN;
-/// ML-DSA-65 secret key length in bytes.
 pub const ML_DSA_SK_LEN: usize = fips204::ml_dsa_65::SK_LEN;
-/// ML-DSA-65 signature length in bytes.
 pub const ML_DSA_SIG_LEN: usize = fips204::ml_dsa_65::SIG_LEN;
 
-// ── Falcon-512 constants ────────────────────────────────────────────────────
-
-/// Falcon-512 public key length in bytes.
 pub const FALCON_PK_LEN: usize = 897;
-/// Falcon-512 secret key length in bytes.
 pub const FALCON_SK_LEN: usize = 1281;
-/// Falcon-512 maximum signature length in bytes.
-/// Falcon signatures are variable-length (up to 752 bytes).
 pub const FALCON_SIG_MAX_LEN: usize = 752;
-
-// ── Errors ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
 pub enum SignatureError {
@@ -65,55 +38,26 @@ pub enum SignatureError {
     InvalidLength { expected: usize, got: usize },
 }
 
-// ── Signature ───────────────────────────────────────────────────────────────
-
-/// Cryptographic signature proving transaction authorization.
-///
-/// Ed25519 signatures carry the public key (96 bytes total).
-/// Secp256k1 signatures are recoverable (65 bytes total: r‖s‖v).
-/// ML-DSA-65 signatures carry the public key (1952 + 3309 = 5261 bytes total).
-/// Falcon-512 signatures carry the public key (897 + up to 752 = up to 1649 bytes total).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Signature {
-    /// Ed25519 signature (fast, for native/agent transactions).
     Ed25519 {
-        /// 32-byte compressed public key.
         public_key: [u8; 32],
-        /// 64-byte Ed25519 signature (stored as Vec for serde compat).
         signature: Vec<u8>,
     },
-    /// Secp256k1 recoverable signature (ETH-compatible).
     Secp256k1 {
-        /// 65-byte recoverable signature: r[32] ‖ s[32] ‖ v[1].
         signature: Vec<u8>,
     },
-    /// ML-DSA-65 post-quantum signature (NIST FIPS 204).
     MlDsa65 {
-        /// 1952-byte ML-DSA-65 public key.
         public_key: Vec<u8>,
-        /// 3309-byte ML-DSA-65 signature.
         signature: Vec<u8>,
     },
-    /// Falcon-512 post-quantum signature (NTRU lattice-based).
     Falcon512 {
-        /// 897-byte Falcon-512 public key.
         public_key: Vec<u8>,
-        /// Variable-length Falcon-512 signature (up to 752 bytes).
         signature: Vec<u8>,
     },
 }
 
 impl Signature {
-    /// Verify this signature against a message hash and expected sender address.
-    ///
-    /// For Ed25519: checks that `public_key` hashes to `expected_address`,
-    /// then verifies the signature over `message_hash`.
-    ///
-    /// For Secp256k1: recovers the public key from `(signature, recovery_id)`,
-    /// then checks it hashes to `expected_address`.
-    ///
-    /// For ML-DSA-65: checks that `public_key` hashes to `expected_address`,
-    /// then verifies the lattice-based signature over `message_hash`.
     pub fn verify(
         &self,
         message_hash: &Hash256,
@@ -124,7 +68,6 @@ impl Signature {
                 public_key,
                 signature,
             } => {
-                // Length check
                 if signature.len() != 64 {
                     return Err(SignatureError::InvalidLength {
                         expected: 64,
@@ -132,7 +75,6 @@ impl Signature {
                     });
                 }
 
-                // 1. Public key must hash to the expected address
                 let derived = address_from_ed25519_pubkey(public_key);
                 if derived != *expected_address {
                     return Err(SignatureError::AddressMismatch {
@@ -141,7 +83,6 @@ impl Signature {
                     });
                 }
 
-                // 2. Verify the Ed25519 signature
                 let vk = ed25519_dalek::VerifyingKey::from_bytes(public_key)
                     .map_err(|_| SignatureError::InvalidPublicKey)?;
                 let sig_bytes: [u8; 64] = signature
@@ -155,7 +96,6 @@ impl Signature {
             }
 
             Signature::Secp256k1 { signature } => {
-                // Length check
                 if signature.len() != 65 {
                     return Err(SignatureError::InvalidLength {
                         expected: 65,
@@ -163,14 +103,12 @@ impl Signature {
                     });
                 }
 
-                // 1. Split 65-byte blob into (r‖s, v)
                 let (rs, v_slice) = signature.split_at(64);
                 let recovery_id = k256::ecdsa::RecoveryId::try_from(v_slice[0])
                     .map_err(|_| SignatureError::InvalidSignature)?;
                 let sig = k256::ecdsa::Signature::from_slice(rs)
                     .map_err(|_| SignatureError::InvalidSignature)?;
 
-                // 2. Recover public key from the signature + hash
                 let recovered_vk = k256::ecdsa::VerifyingKey::recover_from_prehash(
                     message_hash.as_bytes(),
                     &sig,
@@ -178,10 +116,8 @@ impl Signature {
                 )
                 .map_err(|_| SignatureError::InvalidSignature)?;
 
-                // 3. Check the recovered key hashes to the expected address
                 let uncompressed = recovered_vk.to_encoded_point(false);
                 let point_bytes = uncompressed.as_bytes();
-                // Skip the 0x04 uncompressed prefix → 64 raw bytes
                 if point_bytes.len() < 65 {
                     return Err(SignatureError::InvalidPublicKey);
                 }
@@ -202,7 +138,6 @@ impl Signature {
             } => {
                 use fips204::traits::{SerDes, Verifier};
 
-                // Length checks
                 if signature.len() != ML_DSA_SIG_LEN {
                     return Err(SignatureError::InvalidLength {
                         expected: ML_DSA_SIG_LEN,
@@ -213,7 +148,6 @@ impl Signature {
                     return Err(SignatureError::InvalidPublicKey);
                 }
 
-                // 1. Public key must hash to the expected address
                 let derived = address_from_ml_dsa_pubkey(public_key);
                 if derived != *expected_address {
                     return Err(SignatureError::AddressMismatch {
@@ -222,7 +156,6 @@ impl Signature {
                     });
                 }
 
-                // 2. Reconstruct public key and verify signature
                 let pk_arr: [u8; ML_DSA_PK_LEN] = public_key
                     .as_slice()
                     .try_into()
@@ -249,7 +182,6 @@ impl Signature {
                     DetachedSignature as PqDetachedSignature, PublicKey as PqPublicKey,
                 };
 
-                // Length checks
                 if signature.is_empty() || signature.len() > FALCON_SIG_MAX_LEN {
                     return Err(SignatureError::InvalidLength {
                         expected: FALCON_SIG_MAX_LEN,
@@ -260,7 +192,6 @@ impl Signature {
                     return Err(SignatureError::InvalidPublicKey);
                 }
 
-                // 1. Public key must hash to the expected address
                 let derived = address_from_falcon_pubkey(public_key);
                 if derived != *expected_address {
                     return Err(SignatureError::AddressMismatch {
@@ -269,7 +200,6 @@ impl Signature {
                     });
                 }
 
-                // 2. Reconstruct public key and detached signature, then verify
                 let pk = pqcrypto_falcon::falcon512::PublicKey::from_bytes(public_key)
                     .map_err(|_| SignatureError::InvalidPublicKey)?;
                 let sig = pqcrypto_falcon::falcon512::DetachedSignature::from_bytes(signature)
@@ -285,7 +215,6 @@ impl Signature {
         }
     }
 
-    /// Returns a null/empty signature (for unsigned benchmark transactions).
     pub fn null() -> Self {
         Signature::Ed25519 {
             public_key: [0u8; 32],
@@ -293,7 +222,6 @@ impl Signature {
         }
     }
 
-    /// Returns true if this is the null (unsigned) signature.
     pub fn is_null(&self) -> bool {
         match self {
             Signature::Ed25519 {
@@ -311,29 +239,16 @@ impl Default for Signature {
     }
 }
 
-// ── KeyPair ─────────────────────────────────────────────────────────────────
-
-/// Key pair for signing ARC chain transactions.
 #[derive(Clone)]
 pub enum KeyPair {
-    /// Ed25519 key pair - fast, native operations.
     Ed25519(ed25519_dalek::SigningKey),
-    /// Secp256k1 key pair - ETH-compatible operations.
     Secp256k1(k256::ecdsa::SigningKey),
-    /// ML-DSA-65 key pair - quantum-resistant operations (NIST FIPS 204).
-    /// Stored as serialized bytes because fips204 types don't implement Debug/Serialize.
     MlDsa65 {
-        /// 4032-byte serialized private key.
         sk_bytes: Vec<u8>,
-        /// 1952-byte serialized public key.
         pk_bytes: Vec<u8>,
     },
-    /// Falcon-512 key pair - post-quantum NTRU lattice signatures.
-    /// Stored as serialized bytes (pqcrypto types don't implement Debug/Serialize by default).
     Falcon512 {
-        /// 1281-byte serialized secret key.
         sk_bytes: Vec<u8>,
-        /// 897-byte serialized public key.
         pk_bytes: Vec<u8>,
     },
 }
@@ -342,15 +257,11 @@ impl Drop for KeyPair {
     fn drop(&mut self) {
         match self {
             KeyPair::Ed25519(signing_key) => {
-                // ed25519_dalek::SigningKey implements Zeroize internally
-                // but we explicitly zeroize for defense in depth
                 let bytes = signing_key.to_bytes();
                 let mut zeroed = bytes;
                 zeroed.zeroize();
             }
-            KeyPair::Secp256k1(_) => {
-                // k256 SigningKey implements ZeroizeOnDrop
-            }
+            KeyPair::Secp256k1(_) => {}
             KeyPair::MlDsa65 {
                 sk_bytes,
                 pk_bytes: _,
@@ -368,30 +279,20 @@ impl Drop for KeyPair {
 }
 
 impl KeyPair {
-    /// Generate a new random Ed25519 key pair.
     pub fn generate_ed25519() -> Self {
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         KeyPair::Ed25519(signing_key)
     }
 
-    /// Rebuild an Ed25519 key pair from 32 secret bytes.
-    ///
-    /// The caller owns the secret's provenance entirely: this performs no key
-    /// derivation, stretching or entropy check. It exists so deterministic
-    /// simulations and fixtures can replay the same committee, and for callers
-    /// that already hold a securely generated secret. Never derive one of these
-    /// from a guessable value for anything that holds funds.
     pub fn from_ed25519_secret_bytes(secret: &[u8; 32]) -> Self {
         KeyPair::Ed25519(ed25519_dalek::SigningKey::from_bytes(secret))
     }
 
-    /// Generate a new random Secp256k1 key pair.
     pub fn generate_secp256k1() -> Self {
         let signing_key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
         KeyPair::Secp256k1(signing_key)
     }
 
-    /// Generate a new random ML-DSA-65 key pair (post-quantum).
     pub fn generate_ml_dsa() -> Self {
         use fips204::traits::SerDes;
         let (pk, sk) =
@@ -402,7 +303,6 @@ impl KeyPair {
         }
     }
 
-    /// Generate a new random Falcon-512 key pair (post-quantum).
     pub fn generate_falcon512() -> Self {
         use pqcrypto_traits::sign::{PublicKey as PqPk, SecretKey as PqSk};
         let (pk, sk) = pqcrypto_falcon::falcon512::keypair();
@@ -412,11 +312,6 @@ impl KeyPair {
         }
     }
 
-    /// Derive the ARC chain address from this key pair.
-    ///
-    /// Ed25519: `BLAKE3(public_key)`
-    /// Secp256k1: `BLAKE3(uncompressed_point[1..65])`
-    /// ML-DSA-65: `BLAKE3(public_key)`
     pub fn address(&self) -> Hash256 {
         match self {
             KeyPair::Ed25519(sk) => {
@@ -427,7 +322,6 @@ impl KeyPair {
                 let vk = sk.verifying_key();
                 let uncompressed = vk.to_encoded_point(false);
                 let point_bytes = uncompressed.as_bytes();
-                // Uncompressed secp256k1 point: 0x04 || x (32 bytes) || y (32 bytes) = 65 bytes
                 debug_assert!(
                     point_bytes.len() >= 65,
                     "secp256k1 uncompressed point too short"
@@ -439,7 +333,6 @@ impl KeyPair {
         }
     }
 
-    /// Sign a message hash, returning a `Signature`.
     pub fn sign(&self, message_hash: &Hash256) -> Result<Signature, SignatureError> {
         match self {
             KeyPair::Ed25519(sk) => {
@@ -503,7 +396,6 @@ impl KeyPair {
         }
     }
 
-    /// Get the raw public key bytes.
     pub fn public_key_bytes(&self) -> Vec<u8> {
         match self {
             KeyPair::Ed25519(sk) => sk.verifying_key().as_bytes().to_vec(),
@@ -528,17 +420,11 @@ impl std::fmt::Debug for KeyPair {
     }
 }
 
-// ── Address derivation ──────────────────────────────────────────────────────
-
-/// Derive an ARC address from an Ed25519 public key.
-/// `address = BLAKE3(public_key)[0..32]`
 #[inline]
 pub fn address_from_ed25519_pubkey(public_key: &[u8; 32]) -> Hash256 {
     hash_bytes(public_key)
 }
 
-/// Derive an ARC address from a raw (uncompressed, no prefix) Secp256k1 public key.
-/// `address = BLAKE3(raw_64_bytes)[0..32]`
 #[inline]
 pub fn address_from_secp256k1_pubkey(raw_pubkey_64: &[u8]) -> Hash256 {
     debug_assert_eq!(
@@ -549,8 +435,6 @@ pub fn address_from_secp256k1_pubkey(raw_pubkey_64: &[u8]) -> Hash256 {
     hash_bytes(raw_pubkey_64)
 }
 
-/// Derive an ARC address from an ML-DSA-65 public key.
-/// `address = BLAKE3(public_key)[0..32]`
 #[inline]
 pub fn address_from_ml_dsa_pubkey(public_key: &[u8]) -> Hash256 {
     debug_assert_eq!(
@@ -562,8 +446,6 @@ pub fn address_from_ml_dsa_pubkey(public_key: &[u8]) -> Hash256 {
     hash_bytes(public_key)
 }
 
-/// Derive an ARC address from a Falcon-512 public key.
-/// `address = BLAKE3(public_key)[0..32]`
 #[inline]
 pub fn address_from_falcon_pubkey(public_key: &[u8]) -> Hash256 {
     debug_assert_eq!(
@@ -575,12 +457,6 @@ pub fn address_from_falcon_pubkey(public_key: &[u8]) -> Hash256 {
     hash_bytes(public_key)
 }
 
-// ── Batch verification ──────────────────────────────────────────────────────
-
-/// Batch verify N Ed25519 signatures using multi-scalar multiplication.
-/// Approximately 2× faster than individual verification.
-///
-/// All three slices must have the same length.
 pub fn batch_verify_ed25519(
     messages: &[&[u8]],
     signatures: &[ed25519_dalek::Signature],
@@ -590,12 +466,6 @@ pub fn batch_verify_ed25519(
         .map_err(|_| SignatureError::BatchVerifyFailed)
 }
 
-/// Batch verify N ML-DSA-65 signatures using parallel individual verification.
-///
-/// ML-DSA doesn't have native batch verification like Ed25519, but the NTT-based
-/// verification is CPU-bound and parallelizes well across cores with Rayon.
-///
-/// All three slices must have the same length.
 pub fn batch_verify_ml_dsa(
     messages: &[&[u8]],
     signatures: &[[u8; ML_DSA_SIG_LEN]],
@@ -623,13 +493,6 @@ pub fn batch_verify_ml_dsa(
     }
 }
 
-/// Batch verify N Falcon-512 signatures using parallel individual verification.
-///
-/// Falcon doesn't have native batch verification, but each verification is
-/// CPU-bound and parallelizes well across cores with Rayon.
-///
-/// All three slices must have the same length.
-/// Signatures are variable-length, so they are passed as `Vec<u8>` slices.
 pub fn batch_verify_falcon512(
     messages: &[&[u8]],
     signatures: &[&[u8]],
@@ -663,38 +526,23 @@ pub fn batch_verify_falcon512(
     }
 }
 
-// ── Isolated benchmark keypair derivation ────────────────────────────────────
-
-/// Derive a deterministic Ed25519 keypair from a benchmark index.
-/// All nodes derive the same keypairs → same genesis → compatible P2P.
-///
-/// This deliberately predictable signer is unavailable in production/default
-/// builds. Callers must opt into the nondefault `benchmark-tools` feature and
-/// enforce an isolated numeric-loopback runtime boundary before using it.
 #[cfg(feature = "benchmark-tools")]
 pub fn benchmark_keypair(index: u8) -> ed25519_dalek::SigningKey {
     let seed = blake3::derive_key("ARC-chain-benchmark-keypair-v1", &[index]);
     ed25519_dalek::SigningKey::from_bytes(&seed)
 }
 
-/// ARC address for benchmark keypair at the given index.
-/// `address = BLAKE3(ed25519_public_key)`
 #[cfg(feature = "benchmark-tools")]
 pub fn benchmark_address(index: u8) -> Hash256 {
     address_from_ed25519_pubkey(benchmark_keypair(index).verifying_key().as_bytes())
 }
 
-// ── Falcon-512 standalone helpers ────────────────────────────────────────────
-
-/// Generate a new Falcon-512 key pair, returning raw bytes.
-/// Public key: 897 bytes, Secret key: 1281 bytes.
 pub fn falcon_keygen() -> (Vec<u8>, Vec<u8>) {
     use pqcrypto_traits::sign::{PublicKey as PqPk, SecretKey as PqSk};
     let (pk, sk) = pqcrypto_falcon::falcon512::keypair();
     (pk.as_bytes().to_vec(), sk.as_bytes().to_vec())
 }
 
-/// Sign a message with a Falcon-512 secret key, returning the detached signature bytes.
 pub fn falcon_sign(secret_key: &[u8], message: &[u8]) -> Result<Vec<u8>, SignatureError> {
     use pqcrypto_traits::sign::{DetachedSignature as PqDetachedSig, SecretKey as PqSk};
     let sk = pqcrypto_falcon::falcon512::SecretKey::from_bytes(secret_key)
@@ -703,7 +551,6 @@ pub fn falcon_sign(secret_key: &[u8], message: &[u8]) -> Result<Vec<u8>, Signatu
     Ok(sig.as_bytes().to_vec())
 }
 
-/// Verify a Falcon-512 detached signature against a message and public key.
 pub fn falcon_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
     use pqcrypto_traits::sign::{
         DetachedSignature as PqDetachedSignature, PublicKey as PqPublicKey,
@@ -719,10 +566,6 @@ pub fn falcon_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> boo
     pqcrypto_falcon::falcon512::verify_detached_signature(&sig, message, &pk).is_ok()
 }
 
-/// Batch verify N Falcon-512 signatures, returning per-element results.
-///
-/// Unlike `batch_verify_falcon512` which returns a single pass/fail,
-/// this returns a `Vec<bool>` indicating which individual signatures are valid.
 pub fn falcon_batch_verify(keys: &[&[u8]], messages: &[&[u8]], signatures: &[&[u8]]) -> Vec<bool> {
     use pqcrypto_traits::sign::{
         DetachedSignature as PqDetachedSignature, PublicKey as PqPublicKey,
@@ -746,13 +589,9 @@ pub fn falcon_batch_verify(keys: &[&[u8]], messages: &[&[u8]], signatures: &[&[u
         .collect()
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── Ed25519 ──
 
     #[test]
     fn ed25519_sign_and_verify() {
@@ -791,8 +630,6 @@ mod tests {
         assert_eq!(kp.address(), kp.address());
     }
 
-    // ── Secp256k1 ──
-
     #[test]
     fn secp256k1_sign_and_verify() {
         let kp = KeyPair::generate_secp256k1();
@@ -823,8 +660,6 @@ mod tests {
         let sig = kp.sign(&msg).expect("sign ok");
         assert!(sig.verify(&wrong, &address).is_err());
     }
-
-    // ── ML-DSA-65 (Post-Quantum) ──
 
     #[test]
     fn ml_dsa_sign_and_verify() {
@@ -886,8 +721,6 @@ mod tests {
         }
     }
 
-    // ── Batch verification ──
-
     #[test]
     fn batch_verify_10_ed25519() {
         let keys: Vec<_> = (0..10)
@@ -932,7 +765,6 @@ mod tests {
             })
             .collect();
 
-        // Corrupt one signature by signing a different message
         {
             use ed25519_dalek::Signer;
             signatures[2] = keys[2].sign(b"tampered");
@@ -1000,14 +832,11 @@ mod tests {
             }
         }
 
-        // Corrupt: use a different message for verification of entry 1
         messages[1] = hash_bytes(b"tampered").as_bytes().to_vec();
 
         let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
         assert!(batch_verify_ml_dsa(&msg_refs, &signatures, &public_keys).is_err());
     }
-
-    // ── Falcon-512 (Post-Quantum) ──
 
     #[test]
     fn falcon512_sign_and_verify() {
@@ -1086,8 +915,6 @@ mod tests {
         assert!(!sig.is_null());
     }
 
-    // ── Falcon-512 standalone helpers ──
-
     #[test]
     fn falcon_keygen_produces_valid_keys() {
         let (pk, sk) = falcon_keygen();
@@ -1150,7 +977,6 @@ mod tests {
             sigs.push(sig);
         }
 
-        // Corrupt message at index 1
         msgs[1] = b"tampered".to_vec();
 
         let pk_refs: Vec<&[u8]> = pks.iter().map(|p| p.as_slice()).collect();
@@ -1162,8 +988,6 @@ mod tests {
         assert!(!results[1], "second should be invalid (tampered)");
         assert!(results[2], "third should be valid");
     }
-
-    // ── Batch verification (Falcon-512 aggregate) ──
 
     #[test]
     fn batch_verify_falcon512_5_signatures() {
@@ -1224,7 +1048,6 @@ mod tests {
             }
         }
 
-        // Corrupt: tamper with a message
         messages[1] = hash_bytes(b"tampered").as_bytes().to_vec();
 
         let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
@@ -1233,8 +1056,6 @@ mod tests {
 
         assert!(batch_verify_falcon512(&msg_refs, &sig_refs, &pk_refs).is_err());
     }
-
-    // ── Null / Default ──
 
     #[test]
     fn null_signature() {
@@ -1257,13 +1078,10 @@ mod tests {
         assert!(!sig.is_null());
     }
 
-    // ── Cross-scheme ──
-
     #[test]
     fn ed25519_and_secp256k1_addresses_differ() {
         let ed = KeyPair::generate_ed25519();
         let secp = KeyPair::generate_secp256k1();
-        // Different schemes → different addresses (collision probability ~2^-256)
         assert_ne!(ed.address(), secp.address());
     }
 

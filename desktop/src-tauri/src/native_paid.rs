@@ -1,19 +1,3 @@
-//! Native paid inference on recovered chains, signed by the desktop wallet.
-//!
-//! The WebView sends a prompt and the price it accepts. This module reads the
-//! chain's native context from the pinned chain host, builds the exact job the
-//! chain admits, signs it with the Rust-only wallet key, journals the signed
-//! transaction durably, and only then submits it. Everything after submission
-//! is read from the chain: the request's receipt at
-//! `/native-inference/receipt/{request_id}` is the only thing that moves it.
-//!
-//! Cancellation follows finality. A request the WebView has not asked this
-//! module to sign exists nowhere and is withdrawn there. A signed request
-//! cannot be recalled: if no block admits it before its expiry height it is
-//! dropped and nothing is reserved; once admitted it either finalizes, or
-//! after its expiry its reservation comes back through a refund transaction
-//! signed here. Nothing in this module hides a request instead.
-
 use crate::rpc_client::strip_0x;
 use crate::{rpc_client, wallet, AppState};
 use arc_crypto::{hash_bytes, Hash256, KeyPair, Signature};
@@ -32,20 +16,10 @@ use tauri::State;
 
 type CmdResult<T> = Result<T, String>;
 
-/// Shortest and longest expiry the app offers, in blocks past the current
-/// height. The chain itself only requires the expiry to be in the future.
 pub const MIN_EXPIRY_BLOCKS: u64 = 30;
 pub const MAX_EXPIRY_BLOCKS: u64 = 20_000;
-/// How long a signed refund holds its account nonce in the journal if it is
-/// never mined. After that the refund can be claimed again. Known limit: a
-/// refund has no chain expiry, so a copy still pending somewhere past this
-/// point competes with whatever is signed next at the same nonce, and one of
-/// the two fails. No funds are at risk: a nonce admits one transaction.
 const REFUND_RESERVATION_BLOCKS: u64 = 600;
 const JOURNAL_FILE: &str = "native-requests.json";
-/// Held (fs2, exclusive) from a journal load through its save and the
-/// submission, so a second app instance on the same data directory cannot
-/// sign the same nonce or overwrite this one's journal.
 const JOURNAL_LOCK_FILE: &str = "native-requests.lock";
 const JOURNAL_MAX_RECORDS: usize = 256;
 const JOURNAL_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -53,13 +27,8 @@ const PROMPT_PREVIEW_CHARS: usize = 120;
 
 pub const INPUT_CANONICAL_TOKENS: &str = "canonical_tokens";
 pub const INPUT_TEST_EXECUTOR_BYTES: &str = "test_executor_bytes";
-/// The input encodings the node's executors read, exactly as its
-/// `/native-inference/context` states them (`NativeExecutorKind::input_format`).
-/// This app encodes these and nothing else.
 const CANONICAL_INPUT_FORMAT: &str = "le_u32_token_ids_without_bos";
 const TEST_EXECUTOR_INPUT_FORMAT: &str = "opaque_bytes";
-
-// ── The chain's native context ────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Execution {
@@ -76,8 +45,6 @@ pub struct NativeServingView {
     pub input_format: String,
     pub tokenize_endpoint: bool,
     pub tokenizer_profile: Option<String>,
-    /// The most positions (1 + prompt + max tokens) the host's executor holds
-    /// for one job; it never votes on a job that needs more.
     pub max_positions: Option<u64>,
 }
 
@@ -123,8 +90,6 @@ fn u64_field(value: &Value, field: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("native context is missing an exact {field}"))
 }
 
-/// Parse and check `/native-inference/context`. An `Err` says why this app
-/// cannot build requests the chain would admit, in words for the user.
 fn parse_context(value: &Value) -> Result<ChainContext, String> {
     if value.get("candidate_protocol").and_then(Value::as_u64) != Some(4) {
         return Err("the host does not describe a protocol-4 native context".into());
@@ -199,8 +164,6 @@ fn parse_context(value: &Value) -> Result<ChainContext, String> {
         recovery_epoch: u64_field(value, "recovery_epoch")?,
         validator_set_hash: hash_field(value, "validator_set_hash")?,
     };
-    // The member list is the preimage of the signed validator-set hash. A
-    // host whose two disagree is describing a chain nobody could admit to.
     let recomputed = validator_set_commitment(&members)
         .map_err(|error| format!("the host's validator set is invalid: {error}"))?;
     if recomputed != domain.validator_set_hash {
@@ -263,7 +226,6 @@ fn parse_context(value: &Value) -> Result<ChainContext, String> {
     })
 }
 
-/// How a prompt becomes signed input on this host, or why it cannot.
 fn input_kind(serving: Option<&NativeServingView>) -> Result<&'static str, String> {
     if let Some(serving) = serving {
         let expected = match serving.executor.as_str() {
@@ -325,10 +287,6 @@ async fn fetch_context_value(http: &reqwest::Client, host: &str) -> Result<Optio
         .map_err(|error| format!("invalid native context from {host}: {error}"))
 }
 
-/// Whether `host` serves a protocol-4 chain, whose blocks carry only native
-/// paid-inference transactions (its nodes refuse any other at submission).
-/// `false` when it says it does not, and when it cannot say: the node then
-/// still refuses what it could never include.
 pub(crate) async fn host_carries_only_native_transactions(state: &AppState, host: &str) -> bool {
     matches!(fetch_context_value(&state.http, host).await, Ok(Some(value)) if context_is_native_only(&value))
 }
@@ -349,7 +307,6 @@ async fn load_context(http: &reqwest::Client, host: &str) -> Result<ChainContext
 #[serde(rename_all = "camelCase")]
 pub struct NativeContextView {
     pub host: String,
-    /// False when this app cannot build requests this host's chain admits.
     pub compatible: bool,
     pub reason: Option<String>,
     pub height: Option<u64>,
@@ -363,7 +320,6 @@ pub struct NativeContextView {
     pub chain_protocol: Option<u64>,
     pub native_only_chain: Option<bool>,
     pub request_admission_open: bool,
-    /// A parseable native contract context lets the app track existing requests.
     pub tracking_available: bool,
 }
 
@@ -414,8 +370,6 @@ fn context_view(host: String, parsed: Result<ChainContext, String>) -> NativeCon
     view
 }
 
-/// The native context of the pinned chain host. `None` when the host does not
-/// expose the native-inference context endpoint (the panel stays hidden).
 #[tauri::command]
 pub async fn native_context(state: State<'_, AppState>) -> CmdResult<Option<NativeContextView>> {
     native_context_inner(&state).await
@@ -429,8 +383,6 @@ pub(crate) async fn native_context_inner(state: &AppState) -> CmdResult<Option<N
     Ok(Some(context_view(host, parse_context(&value))))
 }
 
-// ── Preparing the signed input ────────────────────────────────────────────
-
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreparedInput {
@@ -439,13 +391,9 @@ pub struct PreparedInput {
     pub input_kind: String,
     pub token_count: Option<usize>,
     pub byte_len: usize,
-    /// What this chain's executor does with the input, in words.
     pub note: String,
 }
 
-/// Check that a node's tokenize answer is internally consistent and within
-/// the chain's input limit: `input_hex` must be exactly the little-endian
-/// encoding of `tokens`.
 fn checked_token_input(value: &Value, max_input_bytes: usize) -> Result<Vec<u8>, String> {
     let tokens = value
         .get("tokens")
@@ -497,8 +445,6 @@ async fn prepare_input(
         let response = http
             .post(format!("{host}/native-inference/tokenize"))
             .json(&json!({ "text": prompt }))
-            // Tokenizing a long prompt can take seconds on the node; the
-            // client's default timeout is for quick reads.
             .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
@@ -549,7 +495,6 @@ async fn prepare_input(
     })
 }
 
-/// Turn a prompt into the exact input bytes a request would sign.
 #[tauri::command]
 pub async fn native_prepare(
     state: State<'_, AppState>,
@@ -571,9 +516,6 @@ pub(crate) async fn native_prepare_inner(
     prepare_input(&state.http, &host, &context, &prompt).await
 }
 
-// ── Building and signing ──────────────────────────────────────────────────
-
-/// Choices the user made for one request, in base units and blocks.
 #[derive(Clone, Copy, Debug)]
 struct RequestTerms {
     max_tokens: u32,
@@ -589,8 +531,6 @@ fn check_terms(terms: &RequestTerms, context: &ChainContext, kind: &str) -> Resu
             context.max_tokens
         ));
     }
-    // The test executor always returns two tokens; a smaller bound could
-    // never be certified and would only end in a refund.
     if kind == INPUT_TEST_EXECUTOR_BYTES && terms.max_tokens < 2 {
         return Err("the test executor returns two tokens; allow at least 2".into());
     }
@@ -608,9 +548,6 @@ fn check_terms(terms: &RequestTerms, context: &ChainContext, kind: &str) -> Resu
     Ok(())
 }
 
-/// A canonical request must fit the host executor's KV budget: 1 BOS +
-/// prompt tokens + `max_tokens` positions. Otherwise that executor refuses it
-/// and never votes, and the request can only expire and refund.
 fn check_positions(prompt_tokens: u64, max_tokens: u32, limit: Option<u64>) -> Result<(), String> {
     let Some(limit) = limit else {
         return Ok(());
@@ -626,7 +563,6 @@ fn check_positions(prompt_tokens: u64, max_tokens: u32, limit: Option<u64>) -> R
     Ok(())
 }
 
-/// Build and sign one native request transaction. Pure: no I/O.
 #[allow(clippy::too_many_arguments)]
 fn build_request_tx(
     keypair: &KeyPair,
@@ -680,7 +616,6 @@ fn native_tx(from: Hash256, nonce: u64, body: TxBody, gas_limit: u64) -> Transac
         from,
         nonce,
         body,
-        // Native transactions carry no fee: the price is signed in the job.
         fee: 0,
         gas_limit,
         hash: Hash256::ZERO,
@@ -688,8 +623,6 @@ fn native_tx(from: Hash256, nonce: u64, body: TxBody, gas_limit: u64) -> Transac
         sig_verified: false,
     }
 }
-
-// ── The journal: signed transactions survive a restart ───────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -704,15 +637,10 @@ struct JournalRecord {
     request_id: String,
     tx_hash: String,
     account: String,
-    /// The chain (its genesis hash): records are matched by chain, not by
-    /// which host served them, so a change of host never hides an open
-    /// record or lets a second transaction take its nonce.
     #[serde(default)]
     chain: String,
     host: String,
     nonce: u64,
-    /// For a request, its signed expiry. For a refund, how long it holds the
-    /// account nonce if it is never mined.
     expires_at: u64,
     created_at_ms: i64,
     #[serde(default)]
@@ -723,11 +651,8 @@ struct JournalRecord {
     execution_price: u64,
     #[serde(default)]
     reserved_max_payment: u64,
-    /// A definitive refusal at submission: these bytes will never be admitted.
     #[serde(default)]
     refused: Option<String>,
-    /// Kept only while the transaction can still be admitted, so a restart
-    /// resubmits the identical signed bytes instead of signing again.
     #[serde(default)]
     signed_tx: Option<Value>,
 }
@@ -742,10 +667,6 @@ impl Journal {
         dir.join(JOURNAL_FILE)
     }
 
-    /// The journal, or why it cannot be trusted. An unreadable or oversized
-    /// journal is moved aside and signing stays paused while it is there:
-    /// starting from an empty one would forget signed transactions that may
-    /// still be admitted, and let a second one take their nonce.
     fn load(dir: &Path) -> Result<Journal, String> {
         let path = Self::path(dir);
         let aside = path.with_extension("json.unreadable");
@@ -756,9 +677,6 @@ impl Journal {
                 aside.display()
             ));
         }
-        // Only a journal that is verifiably absent starts empty. Any other
-        // error (permissions, I/O, a data path that is not a directory) would
-        // forget signed transactions that may still be admitted.
         let metadata = match std::fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -780,7 +698,6 @@ impl Journal {
                 .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
         };
         parsed.map_err(|error| {
-            // Keep the bytes for inspection; never overwrite them.
             let _ = std::fs::rename(&path, &aside);
             tracing::error!(%error, aside = %aside.display(), "native request journal unreadable");
             format!(
@@ -795,9 +712,6 @@ impl Journal {
         let path = Self::path(dir);
         let temporary = path.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(self).map_err(|error| error.to_string())?;
-        // Owner-only: the journal holds prompt previews. A temporary left by a
-        // crash is replaced, never reused, so it cannot carry wider
-        // permissions into the journal.
         match std::fs::remove_file(&temporary) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -817,15 +731,9 @@ impl Journal {
         file.sync_all().map_err(|error| error.to_string())?;
         drop(file);
         std::fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
-        // The rename itself must survive a crash: a signed request that was
-        // submitted but fell out of the journal could never be refunded from
-        // this app.
         arc_crypto::secret_file::sync_parent_directory(&path).map_err(|error| error.to_string())
     }
 
-    /// Drop signed bytes that can no longer be admitted on `chain`: the
-    /// account has used the nonce (by this transaction or another), or the
-    /// transaction's horizon has passed. Returns whether anything changed.
     fn settle(&mut self, chain: &str, account: &str, account_nonce: u64, height: u64) -> bool {
         let mut changed = false;
         for record in &mut self.records {
@@ -841,11 +749,6 @@ impl Journal {
         changed
     }
 
-    /// A signed transaction of `account` on `chain` that can still take the
-    /// account's next nonce, whichever host it went through. Signing another
-    /// would compete for it. A record written before records named their
-    /// chain (`chain` empty) could belong to any chain, so it holds the nonce
-    /// on every chain; no chain's nonce or height can settle it.
     fn open_for(&self, chain: &str, account: &str) -> Option<&JournalRecord> {
         self.records.iter().find(|record| {
             (record.chain == chain || record.chain.is_empty())
@@ -878,8 +781,6 @@ impl Journal {
     }
 }
 
-/// Why a record from before records named their chain blocks signing, and
-/// what the user can do about it.
 fn unattributed_hold(open: &JournalRecord, dir: &Path) -> String {
     format!(
         "a transaction this wallet signed before the journal recorded chains (nonce {}, via {}) \
@@ -891,9 +792,6 @@ fn unattributed_hold(open: &JournalRecord, dir: &Path) -> String {
     )
 }
 
-// ── Submitting ────────────────────────────────────────────────────────────
-
-/// What happened to one signed native transaction at `/tx/submit_signed`.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeSubmitResult {
@@ -902,13 +800,9 @@ pub struct NativeSubmitResult {
     pub tx_hash: String,
     pub nonce: u64,
     pub expires_at: u64,
-    /// The node acknowledged exactly this transaction as pending.
     pub accepted: bool,
-    /// The node's refusal, verbatim, when it refused.
     pub http_status: Option<u16>,
     pub body: Option<String>,
-    /// Set when the node could not be reached: delivery is unknown, and the
-    /// signed bytes stay journaled for resubmission.
     pub network_error: Option<String>,
 }
 
@@ -919,14 +813,6 @@ enum SubmitOutcome {
 }
 
 impl SubmitOutcome {
-    /// A refusal after which these signed bytes can never be admitted: the
-    /// node's own validation refusal (400, 413, 422) of a first delivery.
-    /// Anything else - busy, rate-limited, "already have it", a proxy's 5xx,
-    /// a 404 from something in between - leaves them resubmittable, and so
-    /// does a nonce the account already used: that may have been this very
-    /// transaction, and its receipt says. Callers apply this only to the
-    /// first delivery; a later copy's refusal says nothing about an earlier
-    /// copy that may already be in a mempool.
     fn is_definitive_refusal(&self) -> bool {
         match self {
             SubmitOutcome::Refused { status, body } => {
@@ -943,7 +829,6 @@ impl SubmitOutcome {
     }
 }
 
-/// `(expected, got)` from the node's "invalid nonce: expected E, got G".
 fn nonce_refusal(body: &str) -> Option<(u64, u64)> {
     let rest = &body[body.find("invalid nonce: expected ")? + "invalid nonce: expected ".len()..];
     let (expected, rest) = rest.split_once(", got ")?;
@@ -981,8 +866,6 @@ async fn post_signed(http: &reqwest::Client, host: &str, tx: &Transaction) -> Su
     if acknowledged {
         SubmitOutcome::Accepted
     } else {
-        // A 2xx that does not name this transaction as pending proves
-        // nothing either way: it may have been accepted. Delivery unknown.
         SubmitOutcome::Unreachable(format!(
             "{host} answered without acknowledging this exact transaction as pending"
         ))
@@ -1023,9 +906,6 @@ async fn chain_height(http: &reqwest::Client, host: &str) -> Result<u64, String>
         .ok_or_else(|| format!("{host} did not report an exact height"))
 }
 
-/// The chain `host` serves, as its genesis hash: the key journal records are
-/// matched by. Read without the full compatibility check, so a refund stays
-/// possible even when app and node disagree about building new requests.
 async fn chain_identity(http: &reqwest::Client, host: &str) -> Result<String, String> {
     let value = fetch_context_value(http, host)
         .await?
@@ -1037,10 +917,6 @@ async fn data_dir(state: &AppState) -> PathBuf {
     state.data_dir.lock().await.clone()
 }
 
-/// Take the cross-process journal lock (`JOURNAL_LOCK_FILE`). `wallet_write`
-/// serializes signing inside this process only. The returned file holds the
-/// lock until it is dropped; callers keep it from the journal load through the
-/// save and the submission.
 async fn lock_journal(dir: &Path) -> Result<std::fs::File, String> {
     let lock_path = dir.join(JOURNAL_LOCK_FILE);
     tokio::task::spawn_blocking(move || {
@@ -1075,7 +951,6 @@ async fn lock_journal(dir: &Path) -> Result<std::fs::File, String> {
     .map_err(|error| format!("the native request journal lock could not be taken: {error}"))?
 }
 
-/// The wallet's address, then (only when signing) its key.
 async fn wallet_address(state: &AppState) -> Result<String, String> {
     let store = state.store.lock().await;
     store
@@ -1102,8 +977,6 @@ fn preview(prompt: &str) -> String {
     prompt.chars().take(PROMPT_PREVIEW_CHARS).collect()
 }
 
-/// Record `record` durably, submit its transaction, and record the outcome.
-/// Nothing is submitted unless the signed bytes were journaled first.
 async fn journal_and_submit(
     state: &AppState,
     host: &str,
@@ -1129,14 +1002,11 @@ async fn journal_and_submit(
     }
     let result = result_for(record, &outcome);
     if let Err(error) = journal.save(&dir) {
-        // The submission already happened; a stale journal only means a
-        // restart may resubmit bytes the node will refuse again.
         tracing::error!(%error, "could not record a native submission outcome");
     }
     Ok(result)
 }
 
-/// Sign and submit one native paid request.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn native_submit(
@@ -1164,7 +1034,6 @@ pub async fn native_submit(
     .await
 }
 
-/// The WebView's request, as `native_submit` receives it.
 #[derive(Clone, Debug)]
 pub(crate) struct NativeSubmitRequest {
     pub input_hex: String,
@@ -1198,8 +1067,6 @@ pub(crate) async fn native_submit_inner(
     let input = hex::decode(input_hex.trim())
         .map_err(|_| "the prepared input is not hexadecimal".to_string())?;
 
-    // One signer at a time, shared with transfers: two clicks must never
-    // sign the same account nonce.
     let _write_guard = state.wallet_write.lock().await;
     let address = wallet_address(state).await?;
     let host = wallet::validate_rpc_origin(&crate::commands::chain_host(state).await)?;
@@ -1223,8 +1090,6 @@ pub(crate) async fn native_submit_inner(
 
     let dir = data_dir(state).await;
     let _journal_lock = lock_journal(&dir).await?;
-    // Read the account under the lock: a nonce read before it could already
-    // have been used by another app instance on this data directory.
     let account = rpc_client::fetch_balance(&state.http, &host, &address).await?;
     let balance = account
         .balance_base
@@ -1286,8 +1151,6 @@ pub(crate) async fn native_submit_inner(
     journal_and_submit(state, &host, journal, record, &tx).await
 }
 
-/// The input kind the WebView prepared must still be what this host's
-/// executor reads, and the bytes must fit it.
 fn input_kind_checked(
     context: &ChainContext,
     prepared_kind: &str,
@@ -1308,18 +1171,14 @@ fn input_kind_checked(
     Ok(kind)
 }
 
-// ── Following a request ───────────────────────────────────────────────────
-
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeReceiptView {
     pub found: bool,
     pub height: u64,
-    /// The node's receipt, verbatim, when it has one.
     pub receipt: Option<Value>,
 }
 
-/// The chain's receipt for one request, with the height it was read at.
 #[tauri::command]
 pub async fn native_receipt(
     state: State<'_, AppState>,
@@ -1375,8 +1234,6 @@ pub(crate) async fn native_receipt_inner(
     })
 }
 
-/// Claim back the reservation of an admitted request that expired without a
-/// certificate. Anyone may; the chain returns it to the requester.
 #[tauri::command]
 pub async fn native_refund(
     state: State<'_, AppState>,
@@ -1429,8 +1286,6 @@ pub(crate) async fn native_refund_inner(
         .get("expires_at")
         .and_then(Value::as_u64)
         .ok_or_else(|| "the receipt does not state its expiry; update the node".to_string())?;
-    // The chain refunds at the first block whose height is at or past the
-    // expiry; the next block is `height + 1`.
     if height.saturating_add(1) < expires_at {
         return Err(format!(
             "not refundable yet: the request expires at block {expires_at} (now {height})"
@@ -1438,7 +1293,6 @@ pub(crate) async fn native_refund_inner(
     }
     let dir = data_dir(state).await;
     let _journal_lock = lock_journal(&dir).await?;
-    // Under the lock, as in native_submit_inner.
     let account = rpc_client::fetch_balance(&state.http, &host, &address).await?;
     let mut journal = Journal::load(&dir)?;
     if journal.settle(&chain, &address, account.nonce, height) {
@@ -1487,8 +1341,6 @@ pub(crate) async fn native_refund_inner(
     journal_and_submit(state, &host, journal, record, &tx).await
 }
 
-/// Resubmit the identical signed bytes of a journaled transaction, e.g.
-/// after a restart or a transient refusal. Never signs anything new.
 #[tauri::command]
 pub async fn native_resubmit(
     state: State<'_, AppState>,
@@ -1509,7 +1361,6 @@ pub(crate) async fn native_resubmit_inner(
     let height = chain_height(&state.http, &host).await?;
     let dir = data_dir(state).await;
     let _journal_lock = lock_journal(&dir).await?;
-    // Under the lock, as in native_submit_inner.
     let account = rpc_client::fetch_balance(&state.http, &host, &address).await?;
     let mut journal = Journal::load(&dir)?;
     if journal.settle(&chain, &address, account.nonce, height) {
@@ -1534,9 +1385,6 @@ pub(crate) async fn native_resubmit_inner(
     if tx.hash.to_hex() != record.tx_hash {
         return Err("journaled transaction does not match its recorded hash".into());
     }
-    // A resubmission's refusal never releases the signed bytes: the first
-    // copy may already be in a mempool. The nonce or the expiry decides
-    // (`Journal::settle`).
     let outcome = post_signed(&state.http, &host, &tx).await;
     Ok(result_for(&record, &outcome))
 }
@@ -1555,12 +1403,9 @@ pub struct NativeJournalEntry {
     pub execution_price: u64,
     pub reserved_max_payment: u64,
     pub refused: Option<String>,
-    /// The signed bytes are still held and can be resubmitted.
     pub resubmittable: bool,
 }
 
-/// This wallet's journaled native transactions on the pinned host, oldest
-/// first, so the WebView can resume following them after a restart.
 #[tauri::command]
 pub async fn native_journal(state: State<'_, AppState>) -> CmdResult<Vec<NativeJournalEntry>> {
     native_journal_inner(&state).await
@@ -1572,11 +1417,6 @@ pub(crate) async fn native_journal_inner(state: &AppState) -> CmdResult<Vec<Nati
     let chain = chain_identity(&state.http, &host).await?;
     let dir = data_dir(state).await;
     let mut journal = Journal::load(&dir)?;
-    // Best effort, in memory only: say truthfully what can still be
-    // resubmitted without writing anything. Only the signing paths, which
-    // hold the wallet lock and the journal lock, rewrite the journal; a
-    // listing that saved could drop a record one of them had just written.
-    // Offline, list what is recorded.
     if let (Ok(height), Ok(account)) = (
         chain_height(&state.http, &host).await,
         rpc_client::fetch_balance(&state.http, &host, &address).await,
@@ -1703,7 +1543,6 @@ mod tests {
             .request_admission_error()
             .unwrap()
             .contains("update the node"));
-        // Receipt/refund paths parse the context without requiring request admission.
         assert_eq!(parsed.height, 100);
     }
 
@@ -1803,12 +1642,10 @@ mod tests {
         let TxBody::NativeInferenceRequest(body) = &tx.body else {
             panic!("not a native request");
         };
-        // The same request-signature check the chain runs at admission.
         assert!(body.request.verify_signature().is_ok());
         assert_eq!(body.request.job.request_id(), job.request_id());
         assert_eq!(body.input_blob, b"hi");
 
-        // Signed in the recovery domain when one is active.
         let domain = hash_bytes(b"recovery-domain");
         let (in_domain, _) = build_request_tx(
             &requester_key,
@@ -1868,7 +1705,6 @@ mod tests {
                 "{bad:?}"
             );
         }
-        // One token is fine for the canonical executor.
         assert!(check_terms(
             &RequestTerms {
                 max_tokens: 1,
@@ -1900,7 +1736,6 @@ mod tests {
             request_id: format!("{nonce:064x}"),
             tx_hash: format!("{:064x}", nonce + 1_000),
             account: "aa".into(),
-            // Records are matched by chain; the host is informational.
             chain: "h".into(),
             host: "some-host".into(),
             nonce,
@@ -1919,14 +1754,11 @@ mod tests {
     fn signed_bytes_are_held_only_while_they_can_still_be_admitted() {
         let mut journal = Journal::default();
         journal.push(record(5, 700, true));
-        // Same nonce, before expiry: it blocks signing another.
         assert!(!journal.settle("h", "aa", 5, 100));
         assert_eq!(journal.open_for("h", "aa").map(|r| r.nonce), Some(5));
-        // Another chain or account is someone else's nonce.
         assert!(journal.open_for("other", "aa").is_none());
         assert!(journal.open_for("h", "bb").is_none());
         assert!(!journal.settle("other", "aa", 9, 100));
-        // The account moved past the nonce: admitted or superseded.
         assert!(journal.settle("h", "aa", 6, 100));
         assert!(journal.open_for("h", "aa").is_none());
 
@@ -1958,9 +1790,6 @@ mod tests {
         journal.save(dir.path()).unwrap();
         assert_eq!(Journal::load(dir.path()).unwrap().records, journal.records);
 
-        // Unreadable: moved aside, and signing stays paused (every load
-        // refuses) until someone inspects and removes it. Starting empty
-        // would forget signed requests that may still be admitted.
         std::fs::write(dir.path().join(JOURNAL_FILE), b"{not json").unwrap();
         let aside = dir.path().join("native-requests.json.unreadable");
         assert!(Journal::load(dir.path()).unwrap_err().contains("inspect"));
@@ -1973,7 +1802,6 @@ mod tests {
         std::fs::remove_file(&aside).unwrap();
         assert!(Journal::load(dir.path()).unwrap().records.is_empty());
 
-        // Oversized: the same, never overwritten.
         std::fs::write(
             dir.path().join(JOURNAL_FILE),
             vec![b' '; JOURNAL_MAX_BYTES as usize + 1],
@@ -2003,9 +1831,7 @@ mod tests {
             refused(400, "native request input does not match its signed hash")
                 .is_definitive_refusal()
         );
-        // A used nonce may be this very transaction: keep it for the receipt.
         assert!(!refused(400, "invalid nonce: expected 5, got 4").is_definitive_refusal());
-        // A nonce ahead of the account was refused and never entered a mempool.
         assert!(
             refused(400, "execution error: invalid nonce: expected 4, got 5")
                 .is_definitive_refusal()
@@ -2018,8 +1844,6 @@ mod tests {
         assert!(!refused(409, "").is_definitive_refusal());
         assert!(!refused(429, "").is_definitive_refusal());
         assert!(!refused(503, "rebuilding its DAG").is_definitive_refusal());
-        // Only the node's own validation refusals are final: a proxy's 5xx
-        // or a 404 from something in between may follow a delivery.
         for status in [500, 502, 504, 404, 401] {
             assert!(
                 !refused(status, "gateway").is_definitive_refusal(),
@@ -2049,7 +1873,6 @@ mod tests {
         assert!(!view.compatible);
         assert!(view.reason.unwrap().contains("different releases"));
 
-        // The formats the node's executors state are accepted.
         canonical["serving"]["input_format"] = json!(CANONICAL_INPUT_FORMAT);
         let view = context_view("h".into(), parse_context(&canonical));
         assert!(view.compatible, "{:?}", view.reason);
@@ -2064,9 +1887,7 @@ mod tests {
         journal.push(legacy);
         assert!(journal.open_for("h", "aa").is_some());
         assert!(journal.open_for("other", "aa").is_some());
-        // Another account's nonce is still its own.
         assert!(journal.open_for("h", "bb").is_none());
-        // No chain's nonce or height can say it settled.
         assert!(!journal.settle("h", "aa", 99, 99_999));
         let open = journal.open_for("other", "aa").unwrap();
         let message = unattributed_hold(open, Path::new("/data"));
@@ -2080,9 +1901,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_journal_that_cannot_be_inspected_pauses_signing() {
-        // Not a missing journal: the data path is a file, so inspecting the
-        // journal fails with NotADirectory. Starting empty would forget signed
-        // transactions that may still be admitted.
         let dir = tempfile::tempdir().unwrap();
         let not_a_directory = dir.path().join("data");
         std::fs::write(
@@ -2092,7 +1910,6 @@ mod tests {
         .unwrap();
         let error = Journal::load(&not_a_directory).unwrap_err();
         assert!(error.contains("could not be inspected"), "{error}");
-        // A journal that is simply absent still starts empty.
         assert!(Journal::load(dir.path()).unwrap().records.is_empty());
     }
 
@@ -2121,29 +1938,17 @@ mod tests {
         use fs2::FileExt as _;
         let dir = tempfile::tempdir().unwrap();
         let held = lock_journal(dir.path()).await.unwrap();
-        // A second holder (another app instance on this data directory)
-        // cannot take it while it is held...
         let other = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(dir.path().join(JOURNAL_LOCK_FILE))
             .unwrap();
         assert!(other.try_lock_exclusive().is_err());
-        // ...and can once it is released.
         drop(held);
         assert!(other.try_lock_exclusive().is_ok());
     }
 }
 
-/// The real command cores against a real protocol-4 chain. Ignored by
-/// default: it needs a running chain whose genesis funds the phrase's wallet
-/// (harness `--fund`). Settle path:
-///
-///   ARC_WALLET_HOST=http://127.0.0.1:9960 ARC_LIVE_PHRASE="<funded test phrase>" \
-///     cargo test --lib native_paid::live_journey -- --ignored --nocapture
-///
-/// Refund path, on a chain whose voting committee is below quorum (harness
-/// `--native-workers 2`): add `ARC_LIVE_EXPECT=refund`.
 #[cfg(test)]
 mod live_journey {
     use super::*;
@@ -2179,7 +1984,6 @@ mod live_journey {
         }
     }
 
-    /// Poll the receipt until `done` holds, at most `polls` seconds.
     async fn wait(
         state: &AppState,
         request_id: &str,
@@ -2239,8 +2043,6 @@ mod live_journey {
         .await
         .unwrap();
         assert!(submitted.accepted, "{submitted:?}");
-        // A second request before the first is in a block would compete for
-        // the nonce: the core refuses it before signing.
         let queued = native_submit_inner(
             &app,
             NativeSubmitRequest {
@@ -2259,12 +2061,6 @@ mod live_journey {
         }
 
         let id = submitted.request_id.clone();
-        // Printed so the documented cross-surface check (runbook section 6.6)
-        // can be pointed at this request: the journal this test writes lives in
-        // a temporary directory that is deleted when the test ends, and the
-        // node exposes no endpoint that enumerates request ids, so without this
-        // line a refunded request cannot be handed to `arc_ops.receipts` or
-        // `explorer/test-live-native.mjs`. Visible with `-- --nocapture`.
         println!("live_journey request_id={id}");
         let price = 10_000_000u64;
         let reserve = 20_000_000u64;
@@ -2295,9 +2091,6 @@ mod live_journey {
             .sum();
         assert_eq!(credits, reserve, "credits add up to the reservation");
 
-        // The wallet pays exactly the price on a finalized request, nothing on
-        // a refunded one (native transactions carry no fee). If the second
-        // request was admitted meanwhile, its reservation is also held.
         let after = rpc_client::fetch_balance(&app.http, &host, &address)
             .await
             .unwrap();
@@ -2306,8 +2099,6 @@ mod live_journey {
         let expected = if refund { before } else { before - price };
         let mut acceptable = vec![expected];
         if queued.is_ok() {
-            // The second request was signed once the first was in a block:
-            // its reservation may be held, or (settle path) it finalized too.
             acceptable.push(expected - reserve);
             if !refund {
                 acceptable.push(expected - price);
@@ -2318,8 +2109,6 @@ mod live_journey {
             "balance {after}, expected one of {acceptable:?}"
         );
 
-        // A restart finds the signed request in the journal, no longer
-        // resubmittable once its nonce is used.
         let restarted = state(dir.path(), identity);
         let journal = native_journal_inner(&restarted).await.unwrap();
         let entry = journal
@@ -2333,9 +2122,6 @@ mod live_journey {
                 .any(|e| e.kind == RecordKind::Refund && e.request_id == id));
         }
 
-        // A protocol-4 block carries only native transactions, so the wallet
-        // refuses a transfer before signing anything, and the journal (which
-        // holds the account's nonce for native transactions) is untouched.
         let before = Journal::load(dir.path()).unwrap().records.len();
         let recipient = hash_bytes(b"live-journey-transfer-recipient").to_hex();
         let refused = crate::commands::send_arc_inner(&restarted, recipient, "0.001".into())

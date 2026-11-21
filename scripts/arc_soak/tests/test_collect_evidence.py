@@ -1,5 +1,3 @@
-"""Tests for the post-soak evidence collector. Synthetic run directories, no nodes."""
-
 import gzip
 import hashlib
 import io
@@ -55,7 +53,6 @@ def make_run(root):
                 + [{"request_id": "r3", "final_status": "refunded"},
                    {"request_id": "r4", "final_status": "pending"}],
                 extra=("not json", ""))
-    # 60 samples 30 s apart, so a 700 s warm-up still leaves a steady window.
     diag, samples = [], []
     for i in range(60):
         t, h = 1000.0 + 30 * i, 100 * i
@@ -82,7 +79,6 @@ def make_run(root):
 
 
 def snapshot(root):
-    """Every path under root with its bytes' digest (files) and mtime (files and directories)."""
     out = {}
     for base, dirs, files in os.walk(root):
         rel = os.path.relpath(base, root)
@@ -122,7 +118,7 @@ class Collect(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         expected = set(ce.RECORDS) | {"ident-0.txt", "ident-1.txt", "growth.txt",
                                       "summary.json", "MANIFEST.sha256"}
-        self.assertEqual(set(os.listdir(self.out)), expected)  # no node dirs, logs, backups
+        self.assertEqual(set(os.listdir(self.out)), expected)
         for name in list(ce.RECORDS) + ["ident-0.txt", "ident-1.txt"]:
             with open(os.path.join(self.run_dir, name), "rb") as a, open(os.path.join(self.out, name), "rb") as b:
                 self.assertEqual(a.read(), b.read(), name)
@@ -160,7 +156,7 @@ class Collect(unittest.TestCase):
         self.assertEqual(run_main("--run", self.run_dir, "--out", self.out)[0], 0)
         with open(os.path.join(self.out, "summary.json")) as fh:
             s = json.load(fh)
-        self.assertEqual(s["verdict"], {"status": "INCOMPLETE"})  # no exit code synthesized
+        self.assertEqual(s["verdict"], {"status": "INCOMPLETE"})
 
     def test_an_unreadable_verdict_is_reported_not_judged(self):
         write(os.path.join(self.run_dir, "verdict.json"), "{truncated")
@@ -240,7 +236,7 @@ class Collect(unittest.TestCase):
             with open(os.path.join(self.run_dir, name), "rb") as a, \
                     gzip.open(os.path.join(self.out, name + ".gz"), "rb") as b:
                 self.assertEqual(a.read(), b.read(), name)
-        self.assertTrue(logs.isdisjoint(os.listdir(self.out)))  # never uncompressed
+        self.assertTrue(logs.isdisjoint(os.listdir(self.out)))
         self.assertFalse(any(n.startswith("node-") and not n.endswith(".log.gz")
                              for n in os.listdir(self.out)))
         self.assertTrue({n + ".gz" for n in logs} <= {p for _, p in read_manifest(self.out)})

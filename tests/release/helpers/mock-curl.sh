@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -u
 
-# Offline curl stand-in for install-community-node.sh contract tests.
-# It intentionally understands only the GitHub and localhost requests the
-# installer is allowed to make. An unknown URL fails closed.
-
 original_args="$*"
 output_path=""
 url=""
@@ -100,10 +96,6 @@ render_fake_binary() {
             printf 'fi\n'
         fi
         if [ "$program" = arc-cli ]; then
-            # Offline identity behavior used by installer migration tests.
-            # The mock never needs the secret; it preserves a deterministic
-            # public address for a protected legacy seed and emits the exact
-            # JSON shape consumed by the installer contract.
             printf 'if [ "${1:-}" = "keygen" ]; then\n'
             printf '    shift; output=""; legacy=""; verify=""\n'
             printf '    while [ "$#" -gt 0 ]; do case "$1" in --output) output="$2"; shift 2 ;; --legacy-seed-file) legacy="$2"; shift 2 ;; --verify-keyfile) verify="$2"; shift 2 ;; --scheme) shift 2 ;; *) shift ;; esac; done\n'

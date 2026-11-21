@@ -1,9 +1,3 @@
-//! Private milestone-2 native inference worker seam.
-//!
-//! The worker accepts request IDs only. It fetches the canonical pending job
-//! through `PendingSource`, computes once through an injected executor, and
-//! persists a signed output decision before a vote sink can observe it.
-
 use arc_crypto::signature::{KeyPair, Signature};
 use arc_crypto::{Hash256, hash_bytes};
 use arc_mempool::Mempool;
@@ -38,9 +32,6 @@ const MAX_CERTIFICATE_CANDIDATES: usize = 1024;
 const CANONICAL_I8_V2_GENERATION_SEMANTICS: &[u8] =
     b"ARC-native-inference/gguf-llama-i8-interleaved-rope/generation-v2/bos-once/le-u32/v1";
 
-/// Commitments required in the activated execution tuple for the corrected
-/// per-row-I8 worker.  They are deliberately derived from versioned shared
-/// strings rather than accepted as caller-selected labels.
 pub fn canonical_i8_profile_commitment() -> Hash256 {
     hash_bytes(
         arc_inference::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE.as_bytes(),
@@ -75,9 +66,6 @@ pub struct ExecutionOutput {
     pub output_hash: Hash256,
 }
 
-/// The complete domain-bound payload presented to the signer.  Signing only
-/// the output would allow the same signature to be replayed for another
-/// request, artifact, or execution context.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecisionMaterial {
     pub request_id: Hash256,
@@ -151,13 +139,6 @@ pub enum NativeInferenceError {
 }
 
 impl NativeInferenceError {
-    /// A refusal of one request that running it again would repeat: it is
-    /// expired, no longer pending (the rest of the committee settled it
-    /// first), outside the worker's bounds, or refused by the executor (for
-    /// example over this node's KV budget, or for a model this node does not
-    /// run). Not a failure of the worker, so it never counts toward the
-    /// runtime's consecutive-error limit. `ContextMismatch` is not one: it
-    /// means the node's own context or store disagrees with the chain.
     pub fn is_request_refusal(&self) -> bool {
         matches!(
             self,
@@ -173,8 +154,6 @@ impl NativeInferenceError {
 pub trait PendingSource: Send + Sync {
     fn load_pending(&self, request_id: Hash256) -> Result<PendingJob, NativeInferenceError>;
 
-    /// Re-read the canonical source immediately before a durable decision is
-    /// exposed. The default preserves the labelled test-source seam.
     fn ensure_live(&self, job: &PendingJob, now: u64) -> Result<(), NativeInferenceError> {
         if now >= job.expires_at || self.load_pending(job.request_id)? != *job {
             return Err(NativeInferenceError::Expired);
@@ -183,8 +162,6 @@ pub trait PendingSource: Send + Sync {
     }
 }
 
-/// Canonical pending source backed by the bounded StateDB index. It never
-/// accepts a caller-supplied request body and rejects a context mismatch.
 pub struct StatePendingSource {
     state: Arc<arc_state::StateDB>,
     context_commitment: Hash256,
@@ -198,8 +175,6 @@ impl StatePendingSource {
         }
     }
 
-    /// Bind to the only context StateDB currently considers live. A caller
-    /// cannot manufacture a context commitment for a different frozen set.
     pub fn from_active(state: Arc<arc_state::StateDB>) -> Result<Self, NativeInferenceError> {
         let context = state
             .try_native_inference_context()
@@ -215,13 +190,6 @@ impl StatePendingSource {
 }
 
 impl StatePendingSource {
-    /// The binding in force RIGHT NOW, not the one this source was built
-    /// with. A binding update replaces it, and a source pinned to the
-    /// commitment it started with stops being able to load any work the
-    /// moment that happens - which on a live chain means the worker fails
-    /// every poll and the chain serves nothing. Reading it from the state
-    /// keeps the original property: the commitment is the state's own, never
-    /// one a caller supplied.
     fn live_commitment(&self) -> Hash256 {
         self.state
             .try_native_inference_context()
@@ -240,8 +208,6 @@ impl PendingSource for StatePendingSource {
             .map_err(|error| NativeInferenceError::Source(error.to_string()))?
             .into_iter()
             .find(|snapshot| snapshot.request_id == request_id)
-            // Settled meanwhile (finalized or refunded without this member),
-            // or never admitted: over for this member too, not a failure.
             .ok_or(NativeInferenceError::NotPending)?;
         let job = pending.request.job;
         Ok(PendingJob {
@@ -274,17 +240,9 @@ impl PendingSource for StatePendingSource {
         let commitment = context
             .commitment()
             .map_err(|error| NativeInferenceError::Source(error.to_string()))?;
-        // Against the binding in force, not the one this source was built
-        // with: after an update they differ, and comparing to the startup
-        // value refuses every job on the chain. A job admitted under a
-        // superseded binding is still refused here - it settles or refunds
-        // on its own terms rather than being executed under semantics it was
-        // not accepted under.
         if job.context != commitment {
             return Err(NativeInferenceError::ContextMismatch);
         }
-        // Expiry is evaluated at the next canonical block, not wall clock.
-        // A terminal receipt has no entry in this bounded pending view.
         let next_height = self.state.height().saturating_add(1);
         if next_height >= job.expires_at || self.load_pending(job.request_id)? != *job {
             return Err(NativeInferenceError::Expired);
@@ -294,31 +252,20 @@ impl PendingSource for StatePendingSource {
 }
 
 pub trait NativeExecutor: Send + Sync {
-    /// Local readiness only, never consensus validity. Unknown executors are
-    /// closed by default; construction/identity checks alone are not liveness.
     fn ready_for_requests(&self, _context: &InferenceAdmissionContext, _now: u64) -> bool {
         false
     }
 
-    /// Checked by admission even during execution. The default requires full
-    /// readiness; separating policy permits grace for compute availability.
     fn policy_allows_requests(&self, context: &InferenceAdmissionContext, now: u64) -> bool {
         self.ready_for_requests(context, now)
     }
 
-    /// Identity/policy authorization, independent of live compute readiness.
-    /// Called before durable replay as well as new execution. Explicit
-    /// synthetic executors retain their own fixture contract; the canonical
-    /// production executor binds every job to its actual assignment policy.
     fn validate_job(&self, _job: &PendingJob) -> Result<(), NativeInferenceError> {
         Ok(())
     }
 
     fn execute(&self, job: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError>;
 
-    /// [`Self::execute`] at chain height `now`, which is what the worker
-    /// calls. An executor that places work on other machines uses the height
-    /// to age link measurements and sweep reservations; the rest ignore it.
     fn execute_at(
         &self,
         job: &PendingJob,
@@ -328,12 +275,6 @@ pub trait NativeExecutor: Send + Sync {
     }
 }
 
-/// A reviewed binding for the private canonical-I8 worker.  The three hashes
-/// are the activation's immutable model/profile/generation tuple; the
-/// generation commitment must include the independently qualified tokenizer
-/// and prompt-template contract.  Setting `reference_generation_qualified`
-/// is an explicit release decision made only after reference-output evidence,
-/// never an optimistic default at node startup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CanonicalI8Qualification {
     pub artifact_hash: Hash256,
@@ -342,14 +283,10 @@ pub struct CanonicalI8Qualification {
     pub reference_generation_qualified: bool,
 }
 
-/// Local-only execution has its own policy identity and cannot satisfy a
-/// request authorizing private row machines (or vice versa).
 pub fn local_canonical_assignment_hash() -> Hash256 {
     hash_bytes(b"ARC-native-local-canonical-i8-assignment-v1")
 }
 
-/// Derive the policy from actual startup configuration before loading a model.
-/// No caller-supplied assignment label is accepted as evidence of its policy.
 pub fn runtime_assignment_hash(
     cohort: Option<&crate::row_cohort::RowCohortConfig>,
     low_residency: bool,
@@ -368,17 +305,8 @@ pub fn runtime_assignment_hash(
     }
 }
 
-/// Default KV-cache budget for one native job: 4 GiB, which is 2,048
-/// positions of the canonical 7B package (2 MiB each) beside its 7.8 GB of
-/// prepared weights. The protocol admits requests up to the 4,096-position
-/// context (8 GiB of KV, 16.4 GB resident: more than a 16 GB host), so a node
-/// refuses what it cannot hold instead of swapping or being killed mid-job.
-/// Refusing means not voting: the request expires and refunds. Operators
-/// with more memory raise it with `--native-kv-budget-bytes`.
 pub const DEFAULT_NATIVE_KV_BUDGET_BYTES: u64 = 4 << 30;
 
-/// KV-cache bytes for `positions` positions: every position holds one K and
-/// one V row of `d_kv` i64 values per layer. `None` on overflow.
 pub fn native_kv_bytes(positions: u64, n_layers: u64, d_kv: u64) -> Option<u64> {
     positions
         .checked_mul(n_layers)?
@@ -386,16 +314,8 @@ pub fn native_kv_bytes(positions: u64, n_layers: u64, d_kv: u64) -> Option<u64> 
         .checked_mul(2 * std::mem::size_of::<i64>() as u64)
 }
 
-/// The fewest positions a node's KV budget must hold: the smallest native
-/// job (1 BOS + 1 prompt token + 1 generated token) allocated as the next
-/// power of two. A smaller budget refuses every job, so startup refuses it.
 pub const MIN_NATIVE_KV_POSITIONS: u64 = 4;
 
-/// The most positions one job may use under `budget`. The KV cache grows by
-/// doubling (`KVCache` extends each layer's buffer), so a job of `p`
-/// positions holds `p.next_power_of_two()` of them: the most that fit is the
-/// largest power of two at or below what the budget holds, capped at the
-/// model's context.
 pub fn allocatable_kv_positions(budget: u64, per_position: u64, max_seq: u64) -> u64 {
     (budget / per_position.max(1))
         .checked_ilog2()
@@ -403,8 +323,6 @@ pub fn allocatable_kv_positions(budget: u64, per_position: u64, max_seq: u64) ->
         .min(max_seq)
 }
 
-/// Refuse a job whose KV cache would exceed `budget` bytes: 1 BOS + prompt +
-/// `max_tokens` positions, allocated as the next power of two.
 pub fn check_native_kv_budget(
     prompt_tokens: usize,
     max_tokens: usize,
@@ -433,16 +351,10 @@ pub fn check_native_kv_budget(
     }
 }
 
-/// Concrete adapter for the corrected GGUF Llama per-row-I8 execution path.
-/// It intentionally accepts pre-qualified LE-u32 prompt IDs only.  The legacy
-/// greedy `CachedIntegerModel::encode` tokenizer is never called here, so raw
-/// UTF-8 cannot become a paid output before tokenizer/template qualification.
 pub struct CanonicalI8NativeExecutor {
     model: crate::row_cohort::CoordinatorModel,
     qualification: CanonicalI8Qualification,
     kv_budget_bytes: u64,
-    /// This operator's own row machines, when configured (option (a) of the
-    /// assignment trust model; `crate::row_cohort`).
     row_cohort: Option<Arc<crate::row_cohort::RowCohort>>,
 }
 
@@ -454,9 +366,6 @@ impl CanonicalI8NativeExecutor {
         }
     }
 
-    /// Load the artifact and prove its byte commitment before model loading.
-    /// This is the production-facing constructor; it cannot be pointed at an
-    /// already-resident arbitrary model with a claimed source hash.
     pub fn load_qualified(
         path: impl AsRef<Path>,
         qualification: CanonicalI8Qualification,
@@ -480,8 +389,6 @@ impl CanonicalI8NativeExecutor {
         Self::from_model(model, qualification)
     }
 
-    // Kept private for module-level fixtures. Production construction must go
-    // through `load_qualified`, which hashes the actual source artifact.
     fn from_model(
         model: Arc<arc_inference::cached_integer_model::CachedIntegerModel>,
         qualification: CanonicalI8Qualification,
@@ -522,9 +429,6 @@ impl CanonicalI8NativeExecutor {
         Ok(())
     }
 
-    /// Explicit remote-only coordinator. Verifies the same artifact and
-    /// qualification without ever constructing a full CachedIntegerModel.
-    /// Until a complete measured cohort is attached, every job is refused.
     pub fn load_qualified_low_residency(
         path: impl AsRef<Path>,
         qualification: CanonicalI8Qualification,
@@ -547,15 +451,11 @@ impl CanonicalI8NativeExecutor {
         })
     }
 
-    /// Replace the default KV-cache budget ([`DEFAULT_NATIVE_KV_BUDGET_BYTES`]).
     pub fn with_kv_budget(mut self, bytes: u64) -> Self {
         self.kv_budget_bytes = bytes;
         self
     }
 
-    /// Connect this operator's own row machines (`crate::row_cohort`). Paid
-    /// requests are then placed on them whenever placement predicts that is
-    /// faster; the tokens are local execution's either way.
     pub fn connect_row_cohort(
         mut self,
         config: crate::row_cohort::RowCohortConfig,
@@ -574,15 +474,10 @@ impl CanonicalI8NativeExecutor {
         Ok(self)
     }
 
-    /// The connected row cohort, for the read-only view.
     pub fn row_cohort(&self) -> Option<Arc<crate::row_cohort::RowCohort>> {
         self.row_cohort.clone()
     }
 
-    /// The most positions (1 BOS + prompt + generated tokens) one job may
-    /// use on this node: its KV budget, capped at the model's context. A
-    /// client checks a request against it before signing; the node refuses
-    /// (never votes on) a job that needs more.
     pub fn max_positions(&self) -> u64 {
         let config = self.model.config();
         let per_position =
@@ -590,11 +485,6 @@ impl CanonicalI8NativeExecutor {
         allocatable_kv_positions(self.kv_budget_bytes, per_position, config.max_seq as u64)
     }
 
-    /// Check that the package manifest pinned by `package_manifest_hash`
-    /// describes exactly what this executor loaded from `artifact`: the
-    /// artifact bytes, profile and generation commitments, graph, tokenizer
-    /// vocabulary, tensor inventory and KV cost. Startup refuses on any
-    /// difference, naming the field (model package contract v1).
     pub fn verify_package(
         &self,
         artifact: &Path,
@@ -616,9 +506,6 @@ impl CanonicalI8NativeExecutor {
         bos_token: u32,
         vocab_size: usize,
     ) -> Result<Vec<u32>, NativeInferenceError> {
-        // The signed input hash was checked by StatePendingSource and again by
-        // NativeWorker. This wire form prevents a hidden text tokenizer from
-        // changing a request after its generation commitment was signed.
         if job.input.is_empty() || !job.input.len().is_multiple_of(std::mem::size_of::<u32>()) {
             return Err(NativeInferenceError::Executor(
                 "native canonical I8 input must be non-empty little-endian u32 token IDs".into(),
@@ -635,10 +522,6 @@ impl CanonicalI8NativeExecutor {
                     .into(),
             ));
         }
-        // The engine returns empty logits for an id outside the vocabulary and
-        // silently skips that position, so such a prompt would be paid for a
-        // corrupted sequence. Refuse it; the request then expires and refunds
-        // (integer profile contract v1, deviation D2).
         if tokens.iter().any(|&token| token as usize >= vocab_size) {
             return Err(NativeInferenceError::Executor(
                 "native canonical I8 prompt contains a token id outside the model vocabulary"
@@ -649,9 +532,6 @@ impl CanonicalI8NativeExecutor {
     }
 }
 
-/// What a node measured of the package it loaded: the facts a package
-/// manifest must match (model package contract v1, section 7).
-/// `artifact_hash` is the BLAKE3 the loader verified for `artifact`.
 pub fn package_facts(
     model: &arc_inference::cached_integer_model::CachedIntegerModel,
     artifact_hash: Hash256,
@@ -670,8 +550,6 @@ fn package_facts_from_config(
     let refuse = |message: String| NativeInferenceError::Executor(message);
     let (_, tensors) = arc_inference::gguf_meta::read_header_from_path(artifact)
         .map_err(|error| refuse(format!("reading the artifact's tensor inventory: {error}")))?;
-    // The tokenizer serving /native-inference/tokenize must agree with the
-    // loaded model before either is compared with the manifest.
     if tokenizer.bos_token() != config.bos_token
         || tokenizer.eos_tokens() != config.eos_tokens.as_slice()
     {
@@ -705,8 +583,6 @@ fn package_facts_from_config(
     })
 }
 
-/// Read the manifest at `manifest` (bounded) and require it to be the one
-/// `package_manifest_hash` pins and to describe `loaded` exactly.
 pub fn verify_package_manifest(
     manifest: &Path,
     package_manifest_hash: Hash256,
@@ -750,8 +626,6 @@ fn artifact_hash(path: &Path) -> Result<Hash256, NativeInferenceError> {
 }
 
 impl CanonicalI8NativeExecutor {
-    /// One job. With a row cohort and the chain height, the generation may
-    /// be placed on this operator's machines; without either, it runs here.
     fn run(
         &self,
         job: &PendingJob,
@@ -859,16 +733,9 @@ impl NativeExecutor for CanonicalI8NativeExecutor {
     }
 }
 
-/// Which executor this node's native worker runs. Published on
-/// `/native-inference/context` so a client can build input the executor
-/// accepts. Client convenience only: admission never consults it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeExecutorKind {
-    /// The qualified canonical-I8 artifact. It reads little-endian u32 token
-    /// ids from the generation contract's tokenizer, without BOS.
     CanonicalI8,
-    /// The integration-only deterministic executor. It loads no model and
-    /// ignores its input; its output is protocol coverage, not an answer.
     DeterministicTest,
 }
 
@@ -880,7 +747,6 @@ impl NativeExecutorKind {
         }
     }
 
-    /// The input encoding this executor reads.
     pub fn input_format(self) -> &'static str {
         match self {
             Self::CanonicalI8 => "le_u32_token_ids_without_bos",
@@ -889,16 +755,10 @@ impl NativeExecutorKind {
     }
 }
 
-/// What this node serves for native requests: its executor, and for the
-/// canonical executor the tokenizer read from the same artifact.
 pub struct NativeServing {
     pub executor: NativeExecutorKind,
     pub tokenizer: Option<arc_inference::llama_spm_tokenizer::LlamaGgufSpmTokenizer>,
-    /// The most positions one job may use here (the executor's KV budget,
-    /// capped at the model's context); `None` when the executor has no such
-    /// limit.
     pub max_positions: Option<u64>,
-    /// The executor's row cohort, for the read-only `/assignment/cohort`.
     pub row_cohort: Option<Arc<crate::row_cohort::RowCohort>>,
 }
 
@@ -924,16 +784,11 @@ impl NativeServing {
         }
     }
 
-    /// Attach the executor's row cohort for the read-only view.
     pub fn with_row_cohort(mut self, cohort: Option<Arc<crate::row_cohort::RowCohort>>) -> Self {
         self.row_cohort = cohort;
         self
     }
 
-    /// Tokenize a prompt into exactly the input the canonical executor
-    /// accepts: the tokenizer's ids without the BOS that generation v2 adds
-    /// itself. The same refusals as the executor apply, so a client learns
-    /// before signing, not after paying for an expiry.
     pub fn tokenize_prompt(&self, text: &str) -> Result<Vec<u32>, NativeInferenceError> {
         let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
             NativeInferenceError::Executor("this node holds no canonical tokenizer".into())
@@ -976,9 +831,6 @@ impl NativeServing {
         Ok(tokens)
     }
 
-    /// Display text for a certified output, when this node holds the
-    /// tokenizer and the output is whole little-endian u32 ids. Display
-    /// only: the certificate commits to the bytes, not to this text.
     pub fn decode_output(&self, output: &[u8]) -> Option<String> {
         let tokenizer = self.tokenizer.as_ref()?;
         if output.is_empty() || !output.len().is_multiple_of(4) {
@@ -1029,48 +881,28 @@ pub struct StoredVote {
     pub vote: InferenceVote,
 }
 
-/// Collects independently signed native votes and submits exactly one ordinary
-/// signed `NativeInferenceFinalize` transaction once the frozen membership has
-/// a strict >2/3 stake certificate. This is intentionally a local relay, not
-/// a consensus shortcut: the StateDB preflight and later block execution both
-/// verify every vote and the canonical pending request again.
 pub struct NativeFinalizeSink {
     state: Arc<arc_state::StateDB>,
     mempool: Arc<Mempool>,
     submitter: Arc<KeyPair>,
     candidates: Mutex<BTreeMap<[u8; 32], CandidateVotes>>,
-    /// This validator's one finalize transaction in flight, if any. See
-    /// `accept`.
     in_flight: Mutex<Option<InFlightFinalize>>,
     emission_gate: Mutex<()>,
-    /// This validator's OWN votes, waiting for the consensus loop to gossip
-    /// them. Bounded: a vote that cannot be sent is not a correctness problem
-    /// (other members' votes can still reach threshold), only a delay.
     outbound: Mutex<std::collections::VecDeque<StoredVote>>,
 }
 
-/// Votes queued for gossip at once.
 const MAX_OUTBOUND_NATIVE_VOTES: usize = 1_024;
 
 type ValidatorVotes = BTreeMap<[u8; 32], InferenceVote>;
 type OutputVotes = BTreeMap<[u8; 32], (Vec<u8>, ValidatorVotes)>;
 
-/// Votes for one request, kept per output. A single "the output" per request
-/// let the first vote to arrive decide what every later vote was compared
-/// against: one byzantine member voting first for invented tokens made every
-/// honest vote an "equivocation", no certificate could ever form, and each
-/// refused local vote counted as a worker failure until the worker stopped.
 #[derive(Default)]
 struct CandidateVotes {
-    /// output hash -> (output bytes, validator -> vote)
     outputs: OutputVotes,
-    /// validator -> the output hash it voted for (a second, different output
-    /// from the same validator is its equivocation, never counted).
     voted: BTreeMap<[u8; 32], [u8; 32]>,
     submitted: Option<InFlightFinalize>,
 }
 
-/// A finalize this validator signed and handed to its mempool.
 #[derive(Clone, Copy, Debug)]
 struct InFlightFinalize {
     request_id: [u8; 32],
@@ -1079,8 +911,6 @@ struct InFlightFinalize {
     at: std::time::Instant,
 }
 
-/// How long a finalize may sit neither executed nor visibly dead before this
-/// validator stops waiting on it (it was omitted from a block, or dropped).
 const FINALIZE_IN_FLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl NativeFinalizeSink {
@@ -1100,17 +930,12 @@ impl NativeFinalizeSink {
         }
     }
 
-    /// This validator's own votes, for the consensus loop to gossip.
     pub fn take_outbound_votes(&self, max: usize) -> Vec<StoredVote> {
         let mut queue = self.outbound.lock();
         let n = max.min(queue.len());
         queue.drain(..n).collect()
     }
 
-    /// A vote another validator gossiped. Verified exactly as a local one -
-    /// signature, output binding, frozen membership, pending request - by the
-    /// same `accept`, and never re-broadcast: gossip carries each vote from its
-    /// signer, not in an echo loop.
     pub fn accept_peer_vote(&self, decision: &StoredVote) -> Result<(), NativeInferenceError> {
         self.accept(decision)
     }
@@ -1173,7 +998,6 @@ impl NativeFinalizeSink {
 }
 
 impl VoteSink for NativeFinalizeSink {
-    /// This validator's own vote: queue it for gossip, then count it.
     fn emit(&self, decision: &StoredVote) -> Result<(), NativeInferenceError> {
         {
             let mut queue = self.outbound.lock();
@@ -1183,10 +1007,6 @@ impl VoteSink for NativeFinalizeSink {
             queue.push_back(decision.clone());
         }
         match self.accept(decision) {
-            // The request settled or expired while this vote was being made -
-            // another validator's finalize won, which is the system working.
-            // Counting it as a worker failure stopped the worker for good
-            // after enough of them in a row.
             Err(NativeInferenceError::Expired) => Ok(()),
             Err(NativeInferenceError::Source(message)) if message.contains("no longer pending") => {
                 Ok(())
@@ -1197,9 +1017,6 @@ impl VoteSink for NativeFinalizeSink {
 }
 
 impl NativeFinalizeSink {
-    /// Whether `flight` can still execute: not yet executed, its nonce not yet
-    /// consumed by another of this validator's transactions, its request
-    /// still pending, and not older than `FINALIZE_IN_FLIGHT_TIMEOUT`.
     fn still_in_flight(&self, flight: &InFlightFinalize) -> bool {
         if self.state.receipts.contains_key(&flight.tx_hash.0) {
             return false;
@@ -1228,23 +1045,8 @@ impl NativeFinalizeSink {
         pending && flight.at.elapsed() < FINALIZE_IN_FLIGHT_TIMEOUT
     }
 
-    /// Count a verified vote toward its request's certificate and, at a strict
-    /// supermajority for one output, submit the finalize transaction.
-    ///
-    /// Votes are counted per output: a vote for a different output is not an
-    /// error for anyone else's vote, only a different candidate certificate.
-    /// A validator voting for two outputs is refused on its second.
-    ///
-    /// This validator keeps ONE finalize in flight. Each is signed at the
-    /// account's current nonce, so two signed together collided on it: one
-    /// executed, the other was dropped, and its request - marked submitted -
-    /// was never re-signed. Later certificates wait for the one in flight to
-    /// execute or die, and a submitted finalize that died is re-signed.
     fn accept(&self, decision: &StoredVote) -> Result<(), NativeInferenceError> {
         let _emission = self.emission_gate.lock();
-        // A vote already counted costs nothing more: no state read, no
-        // signature check. (Each validator re-sends its vote every few
-        // seconds while a request is pending.)
         let already_counted = self
             .candidates
             .lock()
@@ -1277,8 +1079,6 @@ impl NativeFinalizeSink {
             if !candidates.contains_key(&decision.request_id.0)
                 && candidates.len() >= MAX_CERTIFICATE_CANDIDATES
             {
-                // Only now pay for a sweep: drop requests that are no longer
-                // pending. Bounded by the state's own bounded pending index.
                 let commitment = context
                     .commitment()
                     .map_err(|error| NativeInferenceError::Source(error.to_string()))?;
@@ -1296,7 +1096,6 @@ impl NativeFinalizeSink {
             let candidate = candidates.entry(decision.request_id.0).or_default();
             match candidate.voted.get(&decision.vote.validator.0) {
                 Some(voted) if *voted != decision.output_hash.0 => {
-                    // This member already voted for a different output.
                     return Err(NativeInferenceError::Equivocation);
                 }
                 Some(_) => {}
@@ -1323,7 +1122,6 @@ impl NativeFinalizeSink {
             }
         }
 
-        // Is there a certificate, and is there a finalize to send for it?
         let certificate = {
             let mut candidates = self.candidates.lock();
             let Some(candidate) = candidates.get_mut(&decision.request_id.0) else {
@@ -1335,8 +1133,6 @@ impl NativeFinalizeSink {
                 {
                     return Ok(());
                 }
-                // It died without executing (omitted, dropped, or its nonce
-                // was taken): sign again.
                 candidate.submitted = None;
             }
             let mut found = None;
@@ -1356,8 +1152,6 @@ impl NativeFinalizeSink {
             }
         };
 
-        // One finalize in flight per validator; a later one waits (the vote
-        // re-emission calls back here every few seconds).
         {
             let mut flight = self.in_flight.lock();
             if let Some(current) = *flight {
@@ -1368,8 +1162,6 @@ impl NativeFinalizeSink {
             }
         }
 
-        // Re-read immediately before signing/admitting. The state preflight
-        // supplies the same check under its canonical native execution lock.
         let (current_context, current_pending) = self.pending_and_context(decision.request_id)?;
         if current_context != context || current_pending != pending {
             return Err(NativeInferenceError::ContextMismatch);
@@ -1444,11 +1236,6 @@ impl DecisionStore {
         })
     }
 
-    /// Decisions are namespaced by the binding they were made under, so one
-    /// made under a superseded binding can never be mistaken for one made
-    /// under the binding now in force. That binding is the JOB's, not the one
-    /// this store was opened with: after an update the two differ, and a
-    /// store pinned to the opening value refuses every job on the chain.
     fn path(&self, context: Hash256, request_id: Hash256) -> PathBuf {
         let mut bytes = Vec::with_capacity(128);
         bytes.extend_from_slice(&self.validator.0);
@@ -1479,9 +1266,6 @@ impl DecisionStore {
         if file.metadata()?.len() > MAX_DECISION_BYTES as u64 {
             return Err(NativeInferenceError::CorruptStore);
         }
-        // A file can grow after metadata is checked. Read through Take so the
-        // store never turns a corrupted decision file into an unbounded heap
-        // allocation.
         let mut bytes = Vec::with_capacity(MAX_DECISION_BYTES.min(8192));
         file.take(MAX_DECISION_BYTES as u64 + 1)
             .read_to_end(&mut bytes)?;
@@ -1502,10 +1286,6 @@ impl DecisionStore {
         let path = self.path(context, request_id);
         #[cfg(windows)]
         {
-            // A read-only File::sync_all and opening a directory do not work
-            // on Windows. Confirm the exact winner bytes before a durable
-            // write-through replacement; never publish this caller's proposed
-            // decision over a conflicting concurrent winner.
             const MAX_DECISION_BYTES: u64 = 256 * 1024;
             let file = File::open(&path)?;
             if file.metadata()?.len() > MAX_DECISION_BYTES {
@@ -1526,9 +1306,6 @@ impl DecisionStore {
         }
         #[cfg(not(windows))]
         {
-            // The record's writable staging handle was flushed before
-            // publication. Preserve the historical file barrier and sync the
-            // parent namespace through the platform abstraction.
             let file = File::open(&path)?;
             file.sync_all()?;
             arc_crypto::secret_file::sync_parent_directory(&path)?;
@@ -1569,16 +1346,11 @@ impl DecisionStore {
         let vote = InferenceVote {
             validator: stored.validator,
             output_hash: stored.output_hash,
-            // Keep the stored record available for the Windows durability
-            // barrier below before re-emitting its validated vote.
             signature: stored.signature.clone(),
         };
         if !verify_vote(&vote, job.request_id, &stored.tokens) {
             return Err(NativeInferenceError::CorruptStore);
         }
-        // A record may have become visible immediately before a publisher
-        // lost power or received a late write-through error. Reprove its
-        // namespace durability before the worker reemits the persisted vote.
         #[cfg(windows)]
         self.sync_published(job.context, job.request_id, &stored)?;
         Ok(Some(StoredVote {
@@ -1589,22 +1361,6 @@ impl DecisionStore {
         }))
     }
 
-    /// Delete this validator's decisions for requests that are terminal.
-    ///
-    /// A decision file is the validator's anti-equivocation record for one
-    /// request: it must never sign a second output for it, even across a
-    /// restart. That matters only while the request can still be finalized.
-    /// Once the chain has settled it - finalized or refunded - no vote for it
-    /// is admissible ever again, so the file protects nothing, and it was the
-    /// one per-request artefact that grew for the life of the node (one file,
-    /// about 4 KB of disk, per request).
-    ///
-    /// `is_terminal` must answer from canonical state. A request that is
-    /// merely absent from the pending index is NOT terminal - it may have been
-    /// admitted a moment ago - so the caller asks for an explicit settled
-    /// receipt. Files that cannot be read, or that belong to another
-    /// validator, chain or activation, are kept: an unreadable record is not
-    /// evidence that it is safe to forget.
     pub fn prune_terminal(
         &self,
         is_terminal: impl Fn(Hash256) -> bool,
@@ -1626,10 +1382,6 @@ impl DecisionStore {
             else {
                 continue;
             };
-            // Any binding's decisions are swept, not just the one in force:
-            // the path check below already proves the file is namespaced by
-            // the binding the decision itself names, so a superseded
-            // binding's settled work is collected too rather than left behind.
             if stored.validator != self.validator
                 || stored.genesis != self.genesis
                 || path != self.path(stored.context, stored.request_id)
@@ -1645,11 +1397,7 @@ impl DecisionStore {
             #[cfg(unix)]
             File::open(&self.root)?.sync_all()?;
             #[cfg(windows)]
-            {
-                // Windows has no directory-fsync primitive in the shared
-                // platform abstraction. These entries are already canonical-
-                // terminal, so a resurrected record cannot enable a vote.
-            }
+            {}
         }
         Ok(removed)
     }
@@ -1662,10 +1410,6 @@ impl DecisionStore {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(NativeInferenceError::StorePoisoned);
         }
-        // The job's binding is whichever one the chain admitted it under -
-        // the current one, or a superseded one still settling. What this
-        // store insists on is its own chain and its own validator identity;
-        // the binding is a namespace, not a filter.
         if job.genesis != self.genesis {
             return Err(NativeInferenceError::ContextMismatch);
         }
@@ -1791,9 +1535,6 @@ pub struct NativeWorker<S, E, G, V> {
     signer: Arc<G>,
     sink: Arc<V>,
     store: DecisionStore,
-    /// Round-robin across requesters, each request's expiry as its deadline
-    /// (S6): one requester with many admitted requests cannot hold every
-    /// execution slot, and an expired request is dropped before it runs.
     queue: Mutex<arc_assign::queue::FairQueue>,
     queued: DashSet<[u8; 32]>,
     cancelled: Arc<AtomicBool>,
@@ -1821,15 +1562,10 @@ impl<S: PendingSource, E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWork
         }
     }
 
-    /// Queue a request with no requester or deadline known: it takes its
-    /// turn in one shared group and never expires in the queue (the source
-    /// still refuses an expired job when it runs).
     pub fn submit(&self, request_id: Hash256) -> Result<(), NativeInferenceError> {
         self.submit_for(request_id, Hash256::ZERO, u64::MAX)
     }
 
-    /// Queue a request in its requester's turn, dropped unrun once the next
-    /// block height reaches `expires_at`.
     pub fn submit_for(
         &self,
         request_id: Hash256,
@@ -1839,9 +1575,6 @@ impl<S: PendingSource, E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWork
         if self.cancelled.load(Ordering::Acquire) {
             return Err(NativeInferenceError::Cancelled);
         }
-        // Pollers may observe the same persisted request many times while a
-        // model run is in flight. Keep one queue slot per request so a slow
-        // job cannot fill the bounded queue with duplicates.
         if !self.queued.insert(request_id.0) {
             return Ok(());
         }
@@ -1856,7 +1589,6 @@ impl<S: PendingSource, E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWork
         })
     }
 
-    /// Nothing is queued.
     pub fn is_idle(&self) -> bool {
         self.queue.lock().is_empty()
     }
@@ -1865,9 +1597,6 @@ impl<S: PendingSource, E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWork
         self.cancelled.store(true, Ordering::Release);
     }
 
-    /// Run the next queued request. See [`Self::next_request`] and
-    /// [`Self::run_request`], which the runtime uses separately so it knows
-    /// which request a refusal belongs to.
     pub fn run_one(&self, now: u64) -> Result<StoredVote, NativeInferenceError> {
         if self.cancelled.load(Ordering::Acquire) {
             return Err(NativeInferenceError::Cancelled);
@@ -1878,9 +1607,6 @@ impl<S: PendingSource, E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWork
         self.run_request(request_id, now)
     }
 
-    /// The next queued request whose expiry is above `now` (the next block
-    /// height), taking one requester's turn. Expired calls are dropped on the
-    /// way, and `None` means nothing live is queued - idle, not an error.
     pub fn next_request(&self, now: u64) -> Option<Hash256> {
         loop {
             let next = self.queue.lock().next(now);
@@ -1899,8 +1625,6 @@ impl<S: PendingSource, E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWork
         }
     }
 
-    /// Execute (or re-emit the durable vote for) one request taken from the
-    /// queue by [`Self::next_request`].
     pub fn run_request(
         &self,
         request_id: Hash256,
@@ -1926,9 +1650,6 @@ impl<S: PendingSource, E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWork
         if arc_crypto::hash_bytes(&job.input) != job.input_hash {
             return Err(NativeInferenceError::ContextMismatch);
         }
-        // Policy mismatch must not re-emit a vote made under another runtime
-        // policy. The original durable decision remains intact; it is never
-        // deleted, overwritten or replaced by a second output.
         self.executor.validate_job(&job)?;
         if let Some(vote) = self.store.load_existing_valid(&job)? {
             self.source.ensure_live(&job, now)?;
@@ -1981,8 +1702,6 @@ impl<S: PendingSource, E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWork
             vote: signature,
         };
         let vote = self.store.persist_signed(vote, &job)?;
-        // Persist before emission, then re-read canonical terminal state so a
-        // concurrent finalize/refund never receives a newly emitted vote.
         self.source.ensure_live(&job, now)?;
         if self.cancelled.load(Ordering::Acquire) {
             return Err(NativeInferenceError::Cancelled);
@@ -1992,38 +1711,17 @@ impl<S: PendingSource, E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWork
     }
 }
 
-/// Polling bridge for the real StateDB bounded pending index.  It is suitable
-/// for the node's background task and deliberately does not accept a request
-/// body or arbitrary trait-source job.  A restart simply re-enqueues the
-/// still-pending canonical entries; DecisionStore makes the second pass reuse
-/// its exact durable signed vote instead of re-signing it.
 pub struct NativeWorkerRuntime<E, G, V> {
     state: Arc<arc_state::StateDB>,
     source: Arc<StatePendingSource>,
     worker: NativeWorker<StatePendingSource, E, G, V>,
-    /// When this validator last emitted its vote for each still-pending request.
     last_emitted: Mutex<BTreeMap<[u8; 32], std::time::Instant>>,
-    /// Still-pending requests this node refused for good (expired, out of
-    /// bounds, refused by the executor), with the reason. Never offered to
-    /// the worker again while pending: re-running them would only repeat the
-    /// refusal, and counting it as a worker failure used to stop the worker.
     refused: Mutex<BTreeMap<[u8; 32], String>>,
-    /// When settled requests' decision files were last pruned.
     pruned_at: Mutex<Option<std::time::Instant>>,
 }
 
-/// How often the runtime deletes decision files of settled requests.
 pub const NATIVE_DECISION_PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How often an already-cast vote for a still-pending request is emitted again.
-///
-/// The runtime was built around a single validator, whose own vote finalizes a
-/// request at once. On a committee the request stays pending until a
-/// supermajority of votes arrives, and `poll_once` - which re-submits every
-/// pending request - re-emitted the stored vote in a tight loop: the four-node
-/// paid-flow test logged 59,000-80,000 identical decisions per validator for a
-/// single request. Re-emitting occasionally is still useful (a peer that missed
-/// the gossip gets it again); continuously is not.
 pub const NATIVE_VOTE_REEMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl<E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWorkerRuntime<E, G, V> {
@@ -2058,9 +1756,6 @@ impl<E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWorkerRuntime<E, G, V>
             })
     }
 
-    /// Enqueue every bounded canonical pending request and execute at most one.
-    /// The caller supplies no height: StateDB determines the canonical next
-    /// block height at each validation point.
     pub fn poll_once(&self) -> Result<Option<StoredVote>, NativeInferenceError> {
         let context = self
             .state
@@ -2079,14 +1774,9 @@ impl<E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWorkerRuntime<E, G, V>
         {
             let mut last = self.last_emitted.lock();
             let mut refused = self.refused.lock();
-            // Terminal requests leave both maps, so they stay bounded by the
-            // state's own bounded pending index.
             let live: BTreeSet<[u8; 32]> = pending.iter().map(|p| p.request_id.0).collect();
             last.retain(|id, _| live.contains(id));
             refused.retain(|id, _| live.contains(id));
-            // Offer due requests round-robin by requester, oldest admission
-            // first within each, so the bounded queue is fair across
-            // requesters as well as inside it.
             let mut by_requester: BTreeMap<[u8; 32], std::collections::VecDeque<_>> =
                 BTreeMap::new();
             let mut due: Vec<_> = pending
@@ -2117,8 +1807,6 @@ impl<E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWorkerRuntime<E, G, V>
                         .submit_for(item.request_id, job.requester, job.expires_at)
                     {
                         Ok(()) => {}
-                        // A full queue is backpressure, not a failure: the
-                        // rest are offered again next poll.
                         Err(NativeInferenceError::QueueFull) => break 'offer,
                         Err(error) => return Err(error),
                     }
@@ -2130,10 +1818,7 @@ impl<E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWorkerRuntime<E, G, V>
         }
         self.prune_settled_decisions(commitment);
         let now = self.state.height().saturating_add(1);
-        // A refusal runs nothing, so the next queued request is tried at once
-        // rather than after the idle interval; the queue bounds the loop.
         for _ in 0..MAX_QUEUE {
-            // Nothing live queued (or only expired calls, now dropped): idle.
             let Some(request_id) = self.worker.next_request(now) else {
                 return Ok(None);
             };
@@ -2168,9 +1853,6 @@ impl<E: NativeExecutor, G: VoteSigner, V: VoteSink> NativeWorkerRuntime<E, G, V>
         Ok(None)
     }
 
-    /// At most once per `NATIVE_DECISION_PRUNE_INTERVAL`, delete decision
-    /// files whose request has a settled canonical receipt. A failure is
-    /// logged and retried next interval: keeping a file is always safe.
     fn prune_settled_decisions(&self, commitment: Hash256) {
         {
             let mut at = self.pruned_at.lock();
@@ -2230,45 +1912,6 @@ fn verify_vote(vote: &InferenceVote, request_id: Hash256, tokens: &[u32]) -> boo
         .is_ok()
 }
 
-// ── Operator activation config (private protocol 4) ─────────────────────────
-//
-// The startup constructor was previously absent entirely: every caller of
-// `StateDB::activate_native_inference` lived in `#[cfg(test)]`, and nothing in
-// the node binary mentioned it. `docs/arc-chain-v2/native-runtime-candidate.md`
-// holds production EXECUTION behind model-quality qualification, which is a
-// different thing from having no way to configure or test activation at all.
-//
-// This adds the missing operator-facing seam. It introduces no new commitment
-// scheme, no new admission rule and no protocol surface: it deserialises the
-// EXISTING `InferenceAdmissionContext` and then defers entirely to the existing
-// `commitment()` validation and `activate_native_inference()` gate, which still
-// require an unused private genesis at height 0, a healthy persistent WAL and
-// the canonical account-root backend.
-
-// ── Bounded native worker runtime ───────────────────────────────────────────
-//
-// Activating the contract is not the same as running it: a request could be
-// admitted with no node process executing it and no finalization produced, so
-// settlement could never happen. This is the missing lifecycle.
-//
-// Default disabled, bounded, and cancellable. It runs only when the operator
-// asked for it AND the contract is actually activated, it sleeps between empty
-// polls rather than spinning, it backs off on error instead of hot-looping a
-// failing dependency, and it stops promptly on shutdown. Durability is the
-// `DecisionStore`'s: a vote persisted before a crash is re-emitted on restart
-// without recomputing, which `durable_vote_is_verified_and_reemitted_without_recompute`
-// already covers.
-
-/// A deterministic executor for integration testing ONLY.
-///
-/// It loads no model and produces output derived from the job's own committed
-/// fields, so the request → vote → finalize → receipt protocol can be exercised
-/// end to end without loading several multi-gigabyte models.
-///
-/// It is behind the `native-test-executor` cargo feature precisely so it cannot
-/// exist in a default build. **Evidence produced with it is integration
-/// coverage of the protocol. It qualifies no model and says nothing about
-/// production inference quality.**
 #[cfg(feature = "native-test-executor")]
 pub struct DeterministicTestExecutor {
     qualification: CanonicalI8Qualification,
@@ -2292,7 +1935,6 @@ impl NativeExecutor for DeterministicTestExecutor {
     }
 
     fn execute(&self, job: &PendingJob) -> Result<ExecutionOutput, NativeInferenceError> {
-        // Domain-separated so this output can never collide with a real one.
         let mut seed = Vec::new();
         seed.extend_from_slice(b"ARC-DETERMINISTIC-TEST-EXECUTOR-v1");
         seed.extend_from_slice(&self.qualification.artifact_hash.0);
@@ -2310,9 +1952,6 @@ impl NativeExecutor for DeterministicTestExecutor {
     }
 }
 
-/// Local NEW-request policy, shared by RPC, gossip and proposal/requeue paths.
-/// It is deliberately absent from StateDB and committed-block validation.
-/// Operator opt-in certifies rollout intent, not fleet readiness or model quality.
 #[derive(Default)]
 pub struct NativeRequestAdmission {
     operator_enabled: bool,
@@ -2325,7 +1964,6 @@ pub struct NativeRequestAdmission {
 #[derive(Default)]
 struct NativeRuntimeHealth {
     healthy_at: Option<std::time::Instant>,
-    // Cleared with health on every poll error and by NativeReadinessGuard.
     busy_since: Option<std::time::Instant>,
     unavailable_since: Option<std::time::Instant>,
 }
@@ -2335,9 +1973,6 @@ struct NativeAdmissionPolicy {
     executor: Weak<dyn NativeExecutor>,
 }
 
-/// Process-local compute barrier shared by every local inference execution
-/// path. It is intentionally separate from transaction admission: committed
-/// requests remain canonical and queued while a desktop updater drains work.
 #[derive(Default)]
 pub struct WorkerExecutionGate {
     state: Mutex<WorkerExecutionState>,
@@ -2353,8 +1988,6 @@ struct WorkerExecutionState {
     shutdown_committed: bool,
 }
 
-/// One admitted worker execution. Clones share one count, so a cancelled HTTP
-/// handler cannot report idle while its `spawn_blocking` closure still runs.
 #[derive(Clone)]
 pub struct WorkerExecutionPermit {
     _lease: Arc<WorkerExecutionLease>,
@@ -2384,7 +2017,6 @@ pub enum WorkerResumeError {
 }
 
 impl WorkerExecutionGate {
-    /// Admit a complete unit of local compute, or refuse it once drain begins.
     pub fn try_enter(self: &Arc<Self>) -> Option<WorkerExecutionPermit> {
         let mut state = self.state.lock();
         if state.closed {
@@ -2396,9 +2028,6 @@ impl WorkerExecutionGate {
         })
     }
 
-    /// Close admission and wait up to `timeout` for every already-admitted
-    /// execution to drop its lease. A timeout reopens admission atomically.
-    /// Success leaves the gate closed until a matching resume or process exit.
     pub async fn quiesce(
         self: &Arc<Self>,
         request_id: [u8; 32],
@@ -2499,7 +2128,6 @@ impl WorkerExecutionGate {
         }
     }
 
-    /// Reopen compute only for the request that closed the gate.
     pub fn resume(&self, request_id: [u8; 32]) -> Result<usize, WorkerResumeError> {
         let mut state = self.state.lock();
         if state.shutdown_committed {
@@ -2520,10 +2148,6 @@ impl WorkerExecutionGate {
         Ok(active_jobs)
     }
 
-    /// Permanently close execution admission once process shutdown begins,
-    /// whether from SIGINT/SIGTERM or the separate authenticated shutdown
-    /// channel. Before this commit, cancellation/GUI crash reopens the worker
-    /// when the quiescence lease expires.
     pub fn commit_shutdown(&self) {
         let mut state = self.state.lock();
         state.closed = true;
@@ -2556,8 +2180,6 @@ impl WorkerExecutionGate {
     }
 }
 
-/// Idle workers need fresh polls; an active poll gets a bounded execution
-/// window. Neither window overrides a stop, poll error or policy mismatch.
 const NATIVE_READINESS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
 const NATIVE_BUSY_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 const NATIVE_COHORT_READINESS_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
@@ -2600,9 +2222,6 @@ impl NativeRequestAdmission {
             || self.accepting_requests()
     }
 
-    /// Shared local compute barrier used by RPC and background worker paths.
-    /// This does not close canonical transaction admission; queued chain work
-    /// remains available after a pre-handoff resume or process restart.
     pub fn worker_execution_gate(&self) -> Arc<WorkerExecutionGate> {
         self.worker_execution.clone()
     }
@@ -2611,8 +2230,6 @@ impl NativeRequestAdmission {
         transactions.retain(|tx| self.allows(tx));
     }
 
-    /// Every local insertion/requeue uses the same check. A committed DAG
-    /// preimage is retained separately and must never be discarded here.
     pub(crate) fn insert(
         &self,
         mempool: &arc_mempool::Mempool,
@@ -2655,7 +2272,6 @@ impl NativeRequestAdmission {
             health.unavailable_since = None;
         } else {
             let since = *health.unavailable_since.get_or_insert(now);
-            // Grace preserves proven health; it never opens a cold runtime.
             if health.healthy_at.is_some() && since.elapsed() < NATIVE_COHORT_READINESS_GRACE {
                 health.healthy_at = Some(now);
             } else {
@@ -2682,7 +2298,6 @@ impl NativeRequestAdmission {
     }
 }
 
-/// Clears readiness on normal exit, error-limit exit and unwinding.
 struct NativeReadinessGuard(Arc<NativeRequestAdmission>);
 impl Drop for NativeReadinessGuard {
     fn drop(&mut self) {
@@ -2690,7 +2305,6 @@ impl Drop for NativeReadinessGuard {
     }
 }
 
-/// Handle to a running native worker loop.
 pub struct NativeRuntimeHandle {
     cancel: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
@@ -2698,9 +2312,6 @@ pub struct NativeRuntimeHandle {
 }
 
 impl NativeRuntimeHandle {
-    /// Signal the loop to stop and wait for it. Safe to call once; dropping the
-    /// handle without calling this also cancels, so a panicking caller cannot
-    /// leave the loop running.
     pub fn shutdown(mut self) {
         self.admission.stopped();
         self.cancel.store(true, Ordering::Release);
@@ -2725,14 +2336,10 @@ impl Drop for NativeRuntimeHandle {
     }
 }
 
-/// Bounds for the polling loop.
 #[derive(Debug, Clone, Copy)]
 pub struct NativeRuntimeBounds {
-    /// Sleep between polls that found nothing.
     pub idle_interval: std::time::Duration,
-    /// Sleep after a poll error, so a failing dependency is not hot-looped.
     pub error_backoff: std::time::Duration,
-    /// Stop the loop after this many consecutive errors. `None` = never stop.
     pub max_consecutive_errors: Option<u32>,
 }
 
@@ -2746,8 +2353,6 @@ impl Default for NativeRuntimeBounds {
     }
 }
 
-/// Spawn the bounded worker loop. The caller owns the cancellation flag, so a
-/// node shutdown path can stop it without owning the handle.
 pub fn spawn_native_runtime<E, G, V>(
     runtime: NativeWorkerRuntime<E, G, V>,
     bounds: NativeRuntimeBounds,
@@ -2795,8 +2400,6 @@ where
                     std::thread::sleep(bounds.idle_interval);
                     continue;
                 };
-                // A failed poll stays closed until a poll succeeds, even if
-                // the executor's preflight still reports ready on retries.
                 if consecutive_errors == 0 {
                     worker_admission.record_readiness(runtime.ready_for_requests());
                 }
@@ -2847,40 +2450,17 @@ where
     }
 }
 
-// ── Reference qualification (real-model execution only) ─────────────────────
-//
-// `CanonicalI8Qualification::reference_generation_qualified` is defined above as
-// a release decision made only after independent reference-output evidence.
-// Startup previously constructed it with `true` unconditionally, next to a
-// comment claiming it could not make that decision. That is a fabricated
-// attestation: matching artifact/profile/generation hashes establish execution
-// IDENTITY, not qualification, and a constructor's boolean check cannot protect
-// anything when its caller always passes true.
-//
-// It is now supplied as an explicit record, bound to one execution identity, or
-// real-model execution does not start. The record is an operator decision, not
-// a cryptographic proof and not evidence of model quality; it exists so the
-// decision is made deliberately, by a named party, with a stated basis, rather
-// than inferred from a flag.
-
-/// Why a reference-qualification record was rejected.
 #[derive(Debug)]
 pub enum QualificationError {
-    /// No record was supplied.
     Missing,
-    /// The file could not be read.
     Unreadable(String),
-    /// The file is not valid JSON for a [`NativeQualificationRecord`].
     Malformed(String),
-    /// The record declares the execution NOT qualified.
     NotQualified,
-    /// The record is bound to a different execution identity.
     IdentityMismatch {
         field: String,
         expected: String,
         found: String,
     },
-    /// The record omits who decided, when, or on what basis.
     Incomplete(String),
 }
 
@@ -2922,23 +2502,6 @@ impl std::fmt::Display for QualificationError {
 
 impl std::error::Error for QualificationError {}
 
-/// An operator's explicit reference-qualification decision for ONE execution
-/// identity.
-///
-/// ```json
-/// {
-///   "model_hash": "<64 hex>", "profile_hash": "<64 hex>",
-///   "generation_hash": "<64 hex>",
-///   "reference_generation_qualified": true,
-///   "decided_by": "release engineering",
-///   "decided_at": "2026-09-20",
-///   "evidence": "path or reference to the reference-output comparison"
-/// }
-/// ```
-///
-/// This is a decision record, not a proof. It does not make a model good; it
-/// records that a named party decided, on a stated basis, that this exact
-/// execution identity passed reference qualification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeQualificationRecord {
     pub model_hash: Hash256,
@@ -2951,24 +2514,16 @@ pub struct NativeQualificationRecord {
     pub decided_at: String,
     #[serde(default)]
     pub evidence: String,
-    /// BLAKE3 of the approved package manifest (`arc.model-package.v1`). A
-    /// reviewer approves a package by this hash; startup refuses to execute
-    /// a loaded artifact the manifest does not describe exactly.
     #[serde(default)]
     pub package_manifest_hash: Option<Hash256>,
 }
 
-/// A complete decision for real-model execution: the qualified identity and
-/// the package manifest it approved.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RealExecutionDecision {
     pub qualification: CanonicalI8Qualification,
     pub package_manifest_hash: Hash256,
 }
 
-/// Resolve the qualification for REAL-model execution, bound to `allowed`.
-/// See [`resolve_real_execution_decision`], which also returns the pinned
-/// package manifest hash.
 pub fn resolve_real_execution_qualification(
     path: Option<&std::path::Path>,
     allowed: &AllowedExecution,
@@ -2976,11 +2531,6 @@ pub fn resolve_real_execution_qualification(
     resolve_real_execution_decision(path, allowed).map(|decision| decision.qualification)
 }
 
-/// Resolve the decision for REAL-model execution, bound to `allowed`.
-///
-/// Returns `Err` for every path that is not an explicit, complete, matching,
-/// affirmative decision. Callers must run this **before** hashing or loading an
-/// artifact, so a missing decision costs nothing.
 pub fn resolve_real_execution_decision(
     path: Option<&std::path::Path>,
     allowed: &AllowedExecution,
@@ -3040,41 +2590,32 @@ pub fn resolve_real_execution_decision(
     })
 }
 
-/// Why an operator activation config was rejected.
 #[derive(Debug)]
 pub enum ActivationConfigError {
-    /// The file could not be read.
     Unreadable(String),
-    /// The file is not valid JSON for a [`NativeActivationRequest`].
     Malformed(String),
-    /// The assembled context failed the existing commitment validation.
     InvalidContext(String),
-    /// The chain is not a fresh private genesis.
     ChainNotEmpty(u64),
-    /// The node could not determine its own genesis binding or validator set.
     StateUnavailable(String),
-    /// An operator-supplied pin did not match what the node actually has.
     ExpectationMismatch {
         field: String,
         expected: String,
         actual: String,
     },
-    /// An operator config differs from the already-persisted activation.
     ReconfigurationRejected {
         field: String,
         persisted: String,
         requested: String,
     },
-    /// Activation itself refused.
     Refused(String),
-    /// A migration is authorised and waiting for its coordinated height. Not
-    /// a failure: the node keeps running and activates when the chain gets
-    /// there.
-    MigrationPending { at: u64, height: u64 },
-    /// A binding update is authorised and waiting for its coordinated
-    /// height. Also not a failure: the binding in force is unchanged and the
-    /// node keeps serving under it until the chain gets there.
-    BindingUpdatePending { at: u64, height: u64 },
+    MigrationPending {
+        at: u64,
+        height: u64,
+    },
+    BindingUpdatePending {
+        at: u64,
+        height: u64,
+    },
 }
 
 impl std::fmt::Display for ActivationConfigError {
@@ -3129,13 +2670,6 @@ impl std::fmt::Display for ActivationConfigError {
 
 impl std::error::Error for ActivationConfigError {}
 
-/// Optional operator pins. When present, the context the node assembles must
-/// match these exactly or activation is refused.
-///
-/// This exists so an approved activation is reproducible: an operator who has
-/// reviewed a specific validator set and genesis can require the node to
-/// confirm it rather than silently activating against whatever it happens to
-/// hold. Every pin is optional; pinning nothing is allowed but unreviewed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivationExpectations {
     #[serde(default)]
@@ -3146,35 +2680,6 @@ pub struct ActivationExpectations {
     pub members: Option<Vec<ValidatorMember>>,
 }
 
-/// The operator-facing activation request.
-///
-/// Deliberately NOT the full `InferenceAdmissionContext`. Three of that type's
-/// four inputs - the genesis binding, the member list and the validator-set
-/// hash - are facts the node already holds authoritatively, and requiring an
-/// operator to transcribe them produces exactly one outcome: transcription
-/// errors that surface as an opaque refusal at activation time. The node fills
-/// those in and the operator declares the one thing only they can decide, the
-/// execution allowlist, plus optional pins to make the result reviewable.
-///
-/// This introduces no commitment scheme and relaxes no admission rule: the
-/// assembled context goes through the same `commitment()` and the same
-/// `activate_native_inference()` gate as before.
-///
-/// ```json
-/// {
-///   "recovery_epoch": 0,
-///   "allowed_executions": [{
-///     "model_hash": "<64 hex>", "profile_hash": "<64 hex>",
-///     "generation_hash": "<64 hex>", "assignment_hash": "<64 hex>"
-///   }],
-///   "expect": { "chain_genesis": "<64 hex>" }
-/// }
-/// ```
-/// Unknown fields are refused rather than ignored: an activation config is
-/// how a chain's inference contract is pinned at height 0, and a binary that
-/// silently dropped a field it did not understand would commit a different
-/// contract commitment than its peers and fork the chain at its first block.
-/// Failing to parse stops that node instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeActivationRequest {
@@ -3183,50 +2688,23 @@ pub struct NativeActivationRequest {
     pub recovery_epoch: u64,
     #[serde(default)]
     pub expect: Option<ActivationExpectations>,
-    /// Commit-time selection rule (decision D20), fixed for the chain's life.
-    /// Absent: a new activation uses `skip-used-nonces-v2`, and a restart
-    /// resumes whatever the chain was activated with (chains from before D20
-    /// resume `count-every-candidate-v1`). Stated: it must match on restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_rule: Option<arc_state::NativeSelectionRule>,
-    /// Authorisation to activate on a chain that is ALREADY RUNNING. Absent
-    /// means fresh private genesis only, exactly as before. Every validator
-    /// must be given the identical record, because each of them performs the
-    /// same write at the height it names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration: Option<MigrationAuthorization>,
-    /// Publish this configuration as a NEW binding over the one already
-    /// active, naming the binding being replaced (hex of its commitment).
-    ///
-    /// Absent, any difference from the active binding is a reconfiguration
-    /// attempt and is refused, exactly as before - a typo must never change
-    /// a live binding. Present and matching, the new configuration governs
-    /// requests admitted from here on, while work already admitted settles
-    /// under the binding that accepted it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_from: Option<String>,
-    /// The coordinated height for that update: the single block at which
-    /// every validator publishes the new binding. Publishing writes state,
-    /// so doing it whenever each node happens to restart would leave them
-    /// deriving different roots. Required whenever `update_from` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_at_height: Option<u64>,
 }
 
-/// The operator's half of an existing-chain migration, as it appears in the
-/// activation config. It restates the chain it is for so a record cannot be
-/// copied to another chain, and the exact binding so it cannot authorise a
-/// different one than the operator reviewed.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MigrationAuthorization {
-    /// Hex of the chain's genesis network hash.
     pub chain_genesis: String,
     pub recovery_epoch: u64,
     pub validator_set_id: u64,
-    /// The coordinated height. Every validator activates exactly here.
     pub activation_height: u64,
-    /// Hex of the commitment of the binding being frozen.
     pub context_commitment: String,
 }
 
@@ -3243,7 +2721,6 @@ fn hash_from_hex(field: &str, value: &str) -> Result<Hash256, ActivationConfigEr
     Ok(Hash256(bytes))
 }
 
-/// Parse an operator activation request from JSON.
 pub fn load_activation_request(
     path: &std::path::Path,
 ) -> Result<NativeActivationRequest, ActivationConfigError> {
@@ -3252,8 +2729,6 @@ pub fn load_activation_request(
     serde_json::from_str(&raw).map_err(|e| ActivationConfigError::Malformed(e.to_string()))
 }
 
-/// Assemble the full admission context from node state plus the operator's
-/// allowlist, checking any pins the operator supplied.
 pub fn assemble_activation_context(
     state: &arc_state::StateDB,
     request: &NativeActivationRequest,
@@ -3334,37 +2809,12 @@ pub fn assemble_activation_context(
     Ok(context)
 }
 
-/// Activate the private native-inference contract from an operator config.
-///
-/// **Default off.** Nothing calls this unless the operator passes
-/// `--native-inference-activation <PATH>`. It does not enable production model
-/// execution: `CanonicalI8NativeExecutor::load_qualified` still enforces the
-/// artifact hash, versioned profile/generation commitments and the explicit
-/// reference-qualification flag independently of this.
-///
-/// The height check is redundant with the one inside
-/// `activate_native_inference`, deliberately: the real gate reports "requires
-/// unused private genesis", which does not tell an operator which of their
-/// assumptions was wrong. This reports the observed height.
 pub fn activate_native_inference_from_config(
     state: &arc_state::StateDB,
     path: &std::path::Path,
 ) -> Result<Hash256, ActivationConfigError> {
     let request = load_activation_request(path)?;
 
-    // RESTART PATH. A persisted context already exists, so this is a reopen,
-    // not a new activation.
-    //
-    // The first version of this function checked the height before looking for
-    // an existing context, which made an activated node unable to restart the
-    // moment it committed block 1: the operator's own flag became fatal. The
-    // fresh-genesis restriction belongs to a NEW activation only.
-    //
-    // On this path the PERSISTED binding is authoritative and the live
-    // committee is not consulted at all. Re-deriving members from
-    // `active_validators()` here would let a changed committee silently replace
-    // a frozen, operator-approved binding — which is the opposite of what
-    // freezing it is for.
     if let Some(persisted) = state.native_inference_context() {
         return resume_persisted_activation(state, &request, &persisted);
     }
@@ -3372,10 +2822,6 @@ pub fn activate_native_inference_from_config(
     let height = state.height();
     let context = assemble_activation_context(state, &request)?;
 
-    // MIGRATION. An operator record authorises activation on a chain that is
-    // already running. The record is checked against this chain's genesis,
-    // recovery epoch and validator set before anything is written, and the
-    // activation itself still happens only at the one coordinated height.
     if let Some(migration) = &request.migration {
         let record = arc_state::NativeMigrationRecord {
             chain_genesis: hash_from_hex("chain_genesis", &migration.chain_genesis)?,
@@ -3388,9 +2834,6 @@ pub fn activate_native_inference_from_config(
             .authorize_native_migration(record, context.clone())
             .map_err(|e| ActivationConfigError::Refused(e.to_string()))?;
         if height != migration.activation_height {
-            // Authorised, not yet due. The node keeps running; this is the
-            // normal state of every validator between being configured and
-            // the chain reaching the coordinated height.
             return Err(ActivationConfigError::MigrationPending {
                 at: migration.activation_height,
                 height,
@@ -3401,7 +2844,6 @@ pub fn activate_native_inference_from_config(
             .map_err(|e| ActivationConfigError::Refused(e.to_string()));
     }
 
-    // FRESH ACTIVATION. Unused private genesis only.
     if height != 0 {
         return Err(ActivationConfigError::ChainNotEmpty(height));
     }
@@ -3410,14 +2852,6 @@ pub fn activate_native_inference_from_config(
         .map_err(|e| ActivationConfigError::Refused(e.to_string()))
 }
 
-/// Validate an operator config against an already-persisted activation and
-/// resume it.
-///
-/// Every field the operator can state is compared against the frozen binding.
-/// Anything that differs is a reconfiguration attempt and is refused: the
-/// contract is explicitly not changeable after activation
-/// (`activate_native_inference` returns "native inference activation cannot
-/// change"), so the only honest outcomes here are "resume" or "refuse".
 fn resume_persisted_activation(
     state: &arc_state::StateDB,
     request: &NativeActivationRequest,
@@ -3447,9 +2881,6 @@ fn resume_persisted_activation(
             rule.as_str().to_string(),
         ));
     }
-    // An explicit, pinned update: the operator names the binding being
-    // replaced, so this can never fire on a mistyped config and never on a
-    // binding other than the one they reviewed.
     if let Some(replacing) = &request.update_from {
         let replacing = hash_from_hex("update_from", replacing)?;
         let current = persisted
@@ -3476,7 +2907,6 @@ fn resume_persisted_activation(
         state
             .authorize_binding_update(at, replacing, next)
             .map_err(|e| ActivationConfigError::Refused(e.to_string()))?;
-        // Due already, if this node is starting exactly at that height.
         state
             .apply_due_binding_update()
             .map_err(|e| ActivationConfigError::Refused(e.to_string()))?;
@@ -3496,8 +2926,6 @@ fn resume_persisted_activation(
         ));
     }
 
-    // Operator pins are compared against the PERSISTED binding, so a pin that
-    // matches the live committee but not the frozen one still fails.
     if let Some(expect) = &request.expect {
         if let Some(pin) = expect.chain_genesis
             && pin != persisted.domain.chain_genesis
@@ -3528,9 +2956,6 @@ fn resume_persisted_activation(
         }
     }
 
-    // Hands the persisted context straight back, which lands on the idempotent
-    // branch of `activate_native_inference` and revalidates the binding against
-    // the chain rather than trusting this function.
     state
         .activate_native_inference(persisted.clone())
         .map_err(|e| ActivationConfigError::Refused(e.to_string()))
@@ -3565,9 +2990,6 @@ mod tests {
             })
         }
     }
-    /// The one validator identity the test signer votes as. A worker refuses
-    /// a vote signed by anyone but the identity its decision store was opened
-    /// with, so every store paired with `Sign` is opened with this address.
     fn test_signer() -> &'static Arc<KeyPair> {
         static SIGNER: std::sync::OnceLock<Arc<KeyPair>> = std::sync::OnceLock::new();
         SIGNER.get_or_init(|| Arc::new(KeyPair::generate_ed25519()))
@@ -3619,8 +3041,6 @@ mod tests {
             n_rows: 0,
             n_cols: 0,
         };
-        // Deliberately no weights and no qualification claim. A policy
-        // refusal must precede all model/input processing in this fixture.
         let model = Arc::new(CachedIntegerModel {
             config: ModelConfig {
                 n_layers: 0,
@@ -3785,8 +3205,6 @@ mod tests {
             saved
         );
 
-        // A matching-policy replay still uses the original signed bytes; it
-        // must not touch this deliberately weightless executor's forward path.
         let dir = tempdir().unwrap();
         j.assignment_hash = local_canonical_assignment_hash();
         j.request_id = hash_bytes(b"matching-policy-replay-fixture");
@@ -3815,25 +3233,18 @@ mod tests {
 
     #[test]
     fn a_job_whose_kv_cache_exceeds_the_budget_is_refused_before_execution() {
-        // Canonical 7B: 32 layers x 4096 KV width -> 2 MiB per position.
         assert_eq!(native_kv_bytes(1, 32, 4096), Some(2 << 20));
         let budget = DEFAULT_NATIVE_KV_BUDGET_BYTES;
-        // 1 BOS + 1023 prompt + 1024 generated = 2048 positions = 4 GiB: fits.
         assert!(check_native_kv_budget(1023, 1024, 32, 4096, budget).is_ok());
-        // One more position does not.
         assert!(matches!(
             check_native_kv_budget(1024, 1024, 32, 4096, budget),
             Err(NativeInferenceError::Executor(message)) if message.contains("KV cache")
         ));
-        // The largest request the protocol admits (4096 positions) needs 8 GiB.
         assert!(check_native_kv_budget(2047, 2048, 32, 4096, budget).is_err());
         assert!(check_native_kv_budget(2047, 2048, 32, 4096, 8 << 30).is_ok());
         assert!(check_native_kv_budget(usize::MAX, 1, 32, 4096, u64::MAX).is_err());
-        // The cache grows by doubling: 3,000 positions hold 4,096 (8 GiB), so
-        // a 6 GiB budget refuses them although 3,000 x 2 MiB would fit.
         assert!(check_native_kv_budget(1499, 1500, 32, 4096, 6 << 30).is_err());
         assert!(check_native_kv_budget(1023, 1024, 32, 4096, 6 << 30).is_ok());
-        // What a node publishes as its limit follows the same rule.
         let per_position = 2 << 20;
         assert_eq!(allocatable_kv_positions(budget, per_position, 4096), 2048);
         assert_eq!(allocatable_kv_positions(6 << 30, per_position, 4096), 2048);
@@ -3877,7 +3288,6 @@ mod tests {
         assert_eq!(decision.package_manifest_hash, manifest);
         assert_eq!(decision.qualification.artifact_hash, tuple);
         assert!(decision.qualification.reference_generation_qualified);
-        // A decision that approves no package is incomplete.
         let unpinned = record(None);
         match resolve_real_execution_decision(Some(&unpinned), &allowed) {
             Err(QualificationError::Incomplete(missing)) => {
@@ -3895,8 +3305,6 @@ mod tests {
         assert_eq!(serving.executor.input_format(), "opaque_bytes");
         assert!(serving.tokenize_prompt("hello").is_err());
         assert_eq!(serving.decode_output(&[1, 0, 0, 0]), None);
-        // A canonical executor whose tokenizer could not be read serves
-        // execution but not tokenization.
         let canonical = NativeServing::canonical(None, Some(2_048));
         assert_eq!(canonical.max_positions, Some(2_048));
         assert_eq!(
@@ -3953,8 +3361,6 @@ mod tests {
             .unwrap(),
             ..v
         };
-        // A different validator's otherwise valid vote cannot be written in
-        // this validator-scoped anti-equivocation store.
         assert!(s.persist_signed(bad, &j).is_err());
     }
 
@@ -4036,11 +3442,6 @@ mod tests {
         assert_eq!(fs::read(path).unwrap(), before);
     }
 
-    /// The store is opened with the binding in force at startup. After a
-    /// binding update the jobs the chain hands this worker name a different
-    /// one, and a store that refused them left every validator unable to sign
-    /// anything - which across four node processes meant the chain admitted
-    /// paid work and executed none of it.
     #[test]
     fn a_decision_store_signs_for_the_binding_the_job_names() {
         let dir = tempdir().unwrap();
@@ -4055,7 +3456,6 @@ mod tests {
         )
         .unwrap();
 
-        // A job admitted under a LATER binding.
         let mut later = job();
         later.context = Hash256([0xB2; 32]);
         later.request_id = Hash256([0x33; 32]);
@@ -4069,12 +3469,9 @@ mod tests {
             .persist_signed(vote.clone(), &later)
             .expect("a worker must sign for the binding the job was admitted under");
 
-        // And it is namespaced by that binding, not by the opening one, so a
-        // decision under one binding can never be read as another's.
         assert!(store.path(later.context, later.request_id).exists());
         assert!(!store.path(opened_under.context, later.request_id).exists());
 
-        // A job from another chain is still refused.
         let mut elsewhere = later.clone();
         elsewhere.genesis = Hash256([0xCC; 32]);
         assert!(matches!(
@@ -4104,7 +3501,6 @@ mod tests {
         s.persist_signed(settled.1.clone(), &settled.0).unwrap();
         s.persist_signed(still_pending.1.clone(), &still_pending.0)
             .unwrap();
-        // An unreadable record is kept: it is not evidence of anything.
         fs::write(dir.path().join("unreadable.decision"), b"bad").unwrap();
 
         let removed = s.prune_terminal(|id| id == settled.0.request_id).unwrap();
@@ -4119,8 +3515,6 @@ mod tests {
             "a pending request keeps its record"
         );
         assert!(dir.path().join("unreadable.decision").exists());
-        // The kept record still protects: a different output for the pending
-        // request is refused as equivocation.
         let conflicting = StoredVote {
             output_hash: token_hash(&[99]),
             tokens: vec![99],
@@ -4131,8 +3525,6 @@ mod tests {
             s.persist_signed(conflicting, &still_pending.0),
             Err(NativeInferenceError::Equivocation)
         ));
-        // Another validator's store over the same directory prunes nothing of
-        // this validator's.
         let other =
             DecisionStore::open(dir.path(), Hash256([0xEE; 32]), j0.genesis, j0.context).unwrap();
         assert_eq!(other.prune_terminal(|_| true).unwrap(), 0);
@@ -4180,8 +3572,6 @@ mod tests {
             Err(NativeInferenceError::Cancelled)
         ));
 
-        // Expiry: a job at or past its signed expiry height is refused before
-        // the executor runs, whatever the queue says.
         let dir = tempdir().unwrap();
         let executor = Arc::new(CountingExec(std::sync::atomic::AtomicUsize::new(0)));
         let w = NativeWorker::new(
@@ -4255,8 +3645,6 @@ mod tests {
         let (w, executor) = numbered_worker(dir.path(), 5);
         let alice = Hash256([0xa1; 32]);
         let bob = Hash256([0xb0; 32]);
-        // Alice queues three requests before Bob queues one: Bob does not
-        // wait behind all of Alice's.
         for n in 1..=3 {
             w.submit_for(Hash256([n; 32]), alice, 100).unwrap();
         }
@@ -4273,8 +3661,6 @@ mod tests {
                 Hash256([3; 32])
             ]
         );
-        // At its expiry height a queued request is dropped unrun and frees
-        // its slot; nothing else was queued, so the worker is idle.
         w.submit_for(Hash256([5; 32]), bob, 20).unwrap();
         assert!(matches!(
             w.run_one(20),
@@ -4293,10 +3679,6 @@ mod tests {
 
     #[test]
     fn a_full_queue_is_backpressure_not_a_failure() {
-        // More due requests than queue slots used to fail the whole poll
-        // before anything ran, so the runtime stopped after repeated
-        // failures. The queue refuses the extra request; running one frees
-        // a slot for it.
         let dir = tempdir().unwrap();
         let count = (MAX_QUEUE + 1) as u8;
         let (w, executor) = numbered_worker(dir.path(), count);
@@ -4348,8 +3730,6 @@ mod tests {
         assert_eq!(executor.0.load(Ordering::SeqCst), 1);
     }
 
-    /// Synthetic CI-only executor. It proves the signed StateDB/mempool
-    /// settlement path; it is explicitly not a model-quality or P2P proof.
     struct FixtureExecutor;
     impl NativeExecutor for FixtureExecutor {
         fn ready_for_requests(&self, _: &InferenceAdmissionContext, _: u64) -> bool {
@@ -4429,8 +3809,6 @@ mod tests {
 
     fn request_for(fixture: &NativeFixture, nonce: u64, expires_at: u64) -> InferenceRequest {
         let tuple = fixture.context.allowed_executions[0];
-        // Fixture input uses the same pre-qualified LE-u32 wire shape required
-        // by CanonicalI8NativeExecutor, although this test uses FixtureExecutor.
         let input = token_bytes(&[11, 12]);
         InferenceRequest::sign(
             InferenceJob {
@@ -4476,8 +3854,6 @@ mod tests {
         transaction
     }
 
-    // ── Operator activation config ──────────────────────────────────────────
-
     fn marker() -> AllowedExecution {
         let m = hash_bytes(b"activation-config-test-marker");
         AllowedExecution {
@@ -4488,8 +3864,6 @@ mod tests {
         }
     }
 
-    /// A persistent StateDB with a seeded validator registry, which is what the
-    /// activation domain binds to.
     fn activatable_state(dir: &std::path::Path) -> (arc_state::StateDB, Vec<ValidatorMember>) {
         let genesis = hash_bytes(b"activation-config-test-genesis");
         let mut members: Vec<ValidatorMember> = (0u8..6)
@@ -4498,8 +3872,6 @@ mod tests {
                 stake: 1_000_000,
             })
             .collect();
-        // validate_members requires strictly ascending addresses
-        // (arc-types/src/inference_contract.rs:173).
         members.sort_by_key(|m| m.address.0);
         let prefunded: Vec<(Hash256, u64)> = members.iter().map(|m| (m.address, 0)).collect();
         let state = arc_state::StateDB::with_genesis_persistent(&prefunded, dir, genesis).unwrap();
@@ -4551,12 +3923,6 @@ mod tests {
         }
     }
 
-    /// The operator seam for an existing-chain migration. The config is
-    /// parsed, the record is built and offered to the state, and the state's
-    /// own checks decide - here, that this chain is not recovery-bound, so
-    /// the record does not authorise it. Nothing is activated either way.
-    /// The coordinated-height behaviour itself is qualified in arc-state
-    /// against a recovery-bound chain.
     #[test]
     fn a_migration_config_is_parsed_and_decided_by_the_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -4576,8 +3942,6 @@ mod tests {
         );
     }
 
-    /// A migration section that is not a chain identity at all is a config
-    /// error, named by field, not a silent zero hash.
     #[test]
     fn a_malformed_migration_identity_is_refused_by_field() {
         let dir = tempfile::tempdir().unwrap();
@@ -4608,8 +3972,6 @@ mod tests {
         assert!(state.native_inference_context().is_none());
     }
 
-    /// Without a migration section the fresh-genesis rule is exactly as it
-    /// was: a running chain is refused, by height.
     #[test]
     fn without_a_migration_a_running_chain_is_still_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -4633,8 +3995,6 @@ mod tests {
         ));
     }
 
-    /// The migration section survives a round trip and rejects a field the
-    /// operator misspelled, rather than ignoring it.
     #[test]
     fn a_migration_section_round_trips_and_refuses_unknown_fields() {
         let genesis = hash_bytes(b"round-trip");
@@ -4662,8 +4022,6 @@ mod tests {
         }
     }
 
-    /// The operator seam for a model upgrade: name the binding being
-    /// replaced, and the new configuration governs new work.
     #[test]
     fn a_pinned_update_publishes_a_new_binding() {
         let dir = tempfile::tempdir().unwrap();
@@ -4681,8 +4039,6 @@ mod tests {
         write_request(&path, &base);
         let v1 = activate_native_inference_from_config(&state, &path).expect("fresh activation");
 
-        // The same file with another allowed execution, unpinned: still a
-        // reconfiguration attempt, still refused.
         let mut changed = base.clone();
         changed.allowed_executions.push(upgraded());
         write_request(&path, &changed);
@@ -4698,7 +4054,6 @@ mod tests {
             "a refusal changes nothing"
         );
 
-        // Pinned to the wrong binding: refused, and still changes nothing.
         let mut wrong = changed.clone();
         wrong.update_from = Some(Hash256::ZERO.to_hex());
         write_request(&path, &wrong);
@@ -4713,8 +4068,6 @@ mod tests {
             vec![marker()]
         );
 
-        // Pinned, but with no coordinated height: refused, because every
-        // validator has to publish in the same block.
         let mut unscheduled = changed.clone();
         unscheduled.update_from = Some(v1.to_hex());
         write_request(&path, &unscheduled);
@@ -4725,7 +4078,6 @@ mod tests {
             other => panic!("expected a missing-height refusal, got {other:?}"),
         }
 
-        // Pinned and scheduled: authorised, and waiting for its height.
         let mut pinned = changed;
         pinned.update_from = Some(v1.to_hex());
         pinned.update_at_height = Some(2);
@@ -4742,7 +4094,6 @@ mod tests {
             "the binding in force is unchanged until the coordinated height"
         );
 
-        // The chain reaches that height and publishes it, in that block.
         let producer = state.native_inference_context().unwrap().members[0].address;
         while state.height() < 2 {
             state
@@ -4757,8 +4108,6 @@ mod tests {
         );
         assert_ne!(active.commitment().unwrap(), v1);
 
-        // Replaying the same file is now a wrong-pin refusal, because the
-        // binding it names is no longer the one in force.
         match activate_native_inference_from_config(&state, &path) {
             Err(ActivationConfigError::ReconfigurationRejected { field, .. }) => {
                 assert_eq!(field, "update_from");
@@ -4909,8 +4258,6 @@ mod tests {
             "the existing allowlist bound must still apply"
         );
 
-        // A stake-0 observer has no committee to bind, and must say so rather
-        // than producing an opaque refusal deeper in the stack.
         let obs_dir = dir.path().join("observer");
         let observer = arc_state::StateDB::with_genesis_persistent(
             &[(hash_bytes(b"x"), 0)],
@@ -4938,10 +4285,6 @@ mod tests {
 
     #[test]
     fn activation_resumes_after_a_committed_block_with_the_same_config() {
-        // The regression this exists for: the first version of the wrapper
-        // checked the height before looking for an existing context, so a node
-        // that activated at genesis and then committed block 1 could never be
-        // restarted with its own activation file.
         let dir = tempfile::tempdir().unwrap();
         let (state, members) = activatable_state(&dir.path().join("state"));
         let path = dir.path().join("activation.json");
@@ -4997,7 +4340,6 @@ mod tests {
             .execute_block_verified_at(&[], Hash256::ZERO, 1)
             .unwrap();
 
-        // A different allowlist is a reconfiguration attempt, not a restart.
         let other = hash_bytes(b"a different allowed execution");
         write_request(
             &path,
@@ -5023,7 +4365,6 @@ mod tests {
             other => panic!("expected ReconfigurationRejected, got {other:?}"),
         }
 
-        // A pin that does not match the FROZEN binding is refused too.
         write_request(
             &path,
             &NativeActivationRequest {
@@ -5049,7 +4390,6 @@ mod tests {
 
     #[test]
     fn the_selection_rule_is_fixed_at_activation_and_resumed_unchanged() {
-        // A chain activated with rule v1 (as every chain before D20 was).
         let dir = tempfile::tempdir().unwrap();
         let (state, _) = activatable_state(&dir.path().join("state"));
         let path = dir.path().join("activation.json");
@@ -5068,7 +4408,6 @@ mod tests {
             state.native_inference_context().unwrap().selection_rule,
             arc_state::NativeSelectionRule::CountEveryCandidateV1
         );
-        // An unchanged config that does not mention the rule resumes it.
         write_request(
             &path,
             &NativeActivationRequest {
@@ -5077,7 +4416,6 @@ mod tests {
             },
         );
         activate_native_inference_from_config(&state, &path).expect("resume keeps rule v1");
-        // Asking for another rule is a reconfiguration, refused.
         write_request(
             &path,
             &NativeActivationRequest {
@@ -5092,7 +4430,6 @@ mod tests {
             other => panic!("expected ReconfigurationRejected, got {other:?}"),
         }
 
-        // A new activation that does not mention the rule gets v2.
         let fresh_dir = tempfile::tempdir().unwrap();
         let (fresh, _) = activatable_state(&fresh_dir.path().join("state"));
         let fresh_path = fresh_dir.path().join("activation.json");
@@ -5117,22 +4454,6 @@ mod tests {
 
     #[test]
     fn activation_restart_never_absorbs_a_drifted_committee() {
-        // The dangerous case: the live validator registry moves on, and a
-        // restart re-derives members from it, silently replacing an
-        // operator-approved binding.
-        //
-        // That cannot happen, and the refusal comes from two independent
-        // places. The restart path here never consults `active_validators()`
-        // at all, and `validate_native_inference_activation` re-checks the
-        // context against the live registry BEFORE the idempotent branch, so
-        // even handing back the persisted context is refused once the registry
-        // has drifted.
-        //
-        // The operational consequence is worth stating plainly: changing the
-        // validator registry after activation makes the node unable to restart
-        // with its activation file. That is arc-state's existing fail-closed
-        // behaviour, not something this wrapper can or should paper over - a
-        // binding that no longer describes the chain should not be resumed.
         let dir = tempfile::tempdir().unwrap();
         let (state, original_members) = activatable_state(&dir.path().join("state"));
         let path = dir.path().join("activation.json");
@@ -5159,26 +4480,18 @@ mod tests {
         drifted.sort_by_key(|(a, _)| a.0);
         state.seed_genesis_validators(&drifted);
 
-        // The drift is refused at the first point it matters: block execution
-        // itself fails once the live registry no longer matches the frozen
-        // binding. The chain cannot quietly move on under a committee the
-        // contract was not bound to.
         let block = state.execute_block_verified_at(&[], Hash256::ZERO, 1);
         assert!(
             block.is_err(),
             "block execution must refuse to proceed under a drifted committee, got {block:?}"
         );
 
-        // And a restart attempt is refused as well, rather than re-deriving
-        // members from the drifted registry.
         let outcome = activate_native_inference_from_config(&state, &path);
         assert!(
             outcome.is_err(),
             "a drifted committee must refuse the restart, not absorb the new set"
         );
 
-        // Whatever happened, the frozen binding is untouched: the intruder
-        // never appears in it.
         let active = state.native_inference_context().unwrap();
         assert_eq!(
             active.members, original_members,
@@ -5192,12 +4505,6 @@ mod tests {
 
     #[test]
     fn a_restart_with_a_drifted_genesis_committee_is_refused_with_the_difference_and_a_remedy() {
-        // D2 in its real form. On a native-inference chain a block may carry
-        // only one native transaction, so a staking transaction can never move
-        // the registry. What CAN move it is a restart: the registry is
-        // re-seeded from the genesis file on every ordinary start. The check
-        // refuses a differing genesis before that re-seed, names each
-        // difference, and says what fixes it.
         let dir = tempfile::tempdir().unwrap();
         let (state, original_members) = activatable_state(&dir.path().join("state"));
         let path = dir.path().join("activation.json");
@@ -5219,13 +4526,11 @@ mod tests {
             members.iter().map(|m| (m.address, m.stake)).collect()
         };
 
-        // The activation-time committee is accepted, in any order.
         let mut shuffled = as_genesis(&original_members);
         shuffled.reverse();
         arc_state::inference_contract_state::genesis_committee_matches_binding(&shuffled, &bound)
             .expect("the same committee must be accepted");
 
-        // A member added, one removed, and one stake changed - all named.
         let intruder = hash_bytes(b"validator that joined after activation");
         let mut drifted = as_genesis(&original_members);
         let removed = drifted.remove(0).0;
@@ -5245,9 +4550,6 @@ mod tests {
             "{message}"
         );
         assert!(message.contains(&changed.to_hex()), "{message}");
-        // The refusal still names a remedy, and since versioned bindings
-        // made a committee change supported, that remedy is the supported
-        // path rather than "you cannot do this".
         assert!(
             message.contains("Restart with a genesis file that matches the current binding"),
             "{message}"
@@ -5257,7 +4559,6 @@ mod tests {
             "{message}"
         );
 
-        // Refusing touched nothing: the binding still resumes.
         assert_eq!(
             state.native_inference_context().unwrap().members,
             original_members
@@ -5268,10 +4569,6 @@ mod tests {
 
     #[test]
     fn a_registry_change_is_refused_by_the_executor_while_a_binding_is_active() {
-        // Defence in depth. On today's protocol-4 chains block admission
-        // refuses any non-native transaction first, so this guard cannot fire
-        // there; it exists so that a future admission change cannot quietly
-        // turn a staking transaction back into a chain-wide wedge.
         let dir = tempfile::tempdir().unwrap();
         let (state, _) = activatable_state(&dir.path().join("state"));
         let path = dir.path().join("activation.json");
@@ -5317,8 +4614,6 @@ mod tests {
                 update_at_height: None,
             },
         );
-        // Advance the chain with an empty block; there is deliberately no
-        // height setter on StateDB.
         state
             .execute_block_verified_at(&[], Hash256::ZERO, 1)
             .expect("empty block must apply");
@@ -5362,8 +4657,6 @@ mod tests {
             fixture.finalizer.clone(),
         ));
         let commitment = fixture.context.commitment().unwrap();
-        // `remove` transfers each secret key into its independent worker while
-        // retaining the fixture's persistent-state metadata for reopen checks.
         for index in 0..5 {
             let validator = fixture.validators.remove(0);
             let address = validator.address();
@@ -5609,8 +4902,6 @@ mod tests {
                 gate.accepting_requests(),
                 "execution can outlast an idle poll"
             );
-            // Windows measures `Instant` from boot, so a CI runner up for less
-            // than NATIVE_BUSY_MAX_AGE cannot represent an instant that old.
             if let Some(expired) = std::time::Instant::now().checked_sub(NATIVE_BUSY_MAX_AGE) {
                 gate.health.lock().busy_since = Some(expired);
                 assert!(!gate.accepting_requests(), "a hung poll eventually expires");
@@ -5995,8 +5286,6 @@ mod tests {
         handle.shutdown();
     }
 
-    /// Admit `requests` (one per block, as protocol 4 requires) and return
-    /// their ids.
     fn admit_requests(fixture: &NativeFixture, nonces: &[u64]) -> Vec<Hash256> {
         nonces
             .iter()
@@ -6033,10 +5322,6 @@ mod tests {
 
     #[test]
     fn a_byzantine_vote_for_an_invented_output_cannot_block_the_honest_certificate() {
-        // The collector used to keep ONE output per request, set by whichever
-        // vote arrived first. A byzantine member voting first for invented
-        // tokens made every honest vote an "equivocation": no certificate,
-        // and every honest node's own vote refused.
         let fixture = native_fixture();
         let [request_id] = admit_requests(&fixture, &[0])[..] else {
             unreachable!()
@@ -6050,7 +5335,6 @@ mod tests {
         let byzantine = &fixture.validators[5];
         sink.accept_peer_vote(&vote(request_id, &[99, 98], byzantine))
             .expect("a well-formed vote for another output is counted, not an error");
-        // The honest five agree on the real output: a strict supermajority of six.
         for honest in &fixture.validators[..5] {
             sink.accept_peer_vote(&vote(request_id, &[71, 72], honest))
                 .expect("an honest vote is never refused because of someone else's");
@@ -6060,7 +5344,6 @@ mod tests {
             1,
             "the honest certificate produced one finalize"
         );
-        // The byzantine member changing its vote is its own equivocation.
         assert!(matches!(
             sink.accept_peer_vote(&vote(request_id, &[71, 72], byzantine)),
             Err(NativeInferenceError::Equivocation)
@@ -6080,10 +5363,6 @@ mod tests {
 
     #[test]
     fn a_peer_vote_without_its_signed_output_or_from_a_non_member_is_refused() {
-        // Before any certificate exists, a vote must carry the output it
-        // signs: present, within the request's byte bound, hashing to the
-        // declared output hash, and signed over exactly those tokens, by a
-        // frozen member. A refused vote leaves no trace.
         let fixture = native_fixture();
         let [request_id] = admit_requests(&fixture, &[0])[..] else {
             unreachable!()
@@ -6124,7 +5403,6 @@ mod tests {
             .expect("the member's well-formed vote still counts after refused ones");
     }
 
-    /// Refuses one request (as the KV budget would), runs the rest.
     struct RefuseOne {
         refused: Hash256,
         calls: Mutex<Vec<Hash256>>,
@@ -6146,9 +5424,6 @@ mod tests {
 
     #[test]
     fn a_refused_request_is_tried_once_and_never_stops_the_worker() {
-        // Before: the refused request was queued again on every poll, every
-        // poll returned an error, nothing reset the runtime's error count,
-        // and after 60 polls the worker stopped for every other request too.
         let fixture = native_fixture();
         let mut ids = Vec::new();
         for nonce in 0..2 {
@@ -6207,18 +5482,12 @@ mod tests {
         assert!(votes >= 1);
     }
 
-    /// A pending source built before a binding update must still load work
-    /// admitted after it. Pinned to the commitment it started with, the
-    /// worker failed every poll the moment such a request appeared - across
-    /// four real node processes, that stopped the chain serving any paid work
-    /// at all, silently, from one configuration change onward.
     #[test]
     fn a_pending_source_follows_the_binding_in_force_not_the_one_it_started_with() {
         let fixture = native_fixture();
         let source =
             StatePendingSource::new(fixture.state.clone(), fixture.context.commitment().unwrap());
 
-        // The operator publishes a new binding, adding a model.
         let upgraded = hash_bytes(b"a newer model for the pending source");
         let mut next = fixture.context.clone();
         next.allowed_executions.push(AllowedExecution {
@@ -6232,7 +5501,6 @@ mod tests {
             .update_native_inference_binding(next)
             .expect("a running binding can be updated");
 
-        // Work admitted under the NEW binding.
         let request = request_for(&fixture, 0, 3);
         let request_id = request.job.request_id();
         let request_tx = signed_native(
@@ -6253,9 +5521,6 @@ mod tests {
         let job = source
             .load_pending(request_id)
             .expect("the worker must still be able to load work after an update");
-        // And the whole path, not just the load: the liveness check compared
-        // against the same startup-pinned commitment, so fixing one without
-        // the other simply moved where the worker stopped.
         source
             .ensure_live(&job, 0)
             .expect("and must consider that work live");
@@ -6263,11 +5528,6 @@ mod tests {
 
     #[test]
     fn a_request_settled_before_this_member_runs_it_is_a_refusal_not_a_failure() {
-        // Before: a queued request the chain settled first (finalized by the
-        // rest of the committee, or refunded) came back from the pending
-        // source as `Source(..)`, which counted toward the runtime's
-        // consecutive-error limit, so a member slower than the rest could
-        // stop its worker for good.
         let fixture = native_fixture();
         let request = request_for(&fixture, 0, 3);
         let request_id = request.job.request_id();
@@ -6318,10 +5578,6 @@ mod tests {
 
     #[test]
     fn a_committee_short_of_quorum_never_finalizes_and_the_request_refunds() {
-        // A live committee that cannot reach a strict two-thirds: four of six
-        // equal members vote, the request expires, the requester's refund
-        // lands, and the fifth vote that would have completed a certificate
-        // arrives too late to create one.
         let fixture = native_fixture();
         let request = request_for(&fixture, 0, 3);
         let request_id = request.job.request_id();
@@ -6391,9 +5647,6 @@ mod tests {
 
     #[test]
     fn two_requests_certified_together_both_finalize_from_one_finalizer() {
-        // Both finalizes used to be signed at the finalizer's current nonce:
-        // one executed, the other was dropped as stale, and its request -
-        // marked submitted - was never signed again.
         let fixture = native_fixture();
         let ids = admit_requests(&fixture, &[0, 1]);
         let mempool = Arc::new(Mempool::new(16));
@@ -6412,8 +5665,6 @@ mod tests {
             .state
             .execute_block_verified(&mempool.drain(1), fixture.requester.address())
             .unwrap();
-        // The second request's votes come round again (they are re-emitted
-        // every few seconds); its finalize now goes out at the next nonce.
         for id in &ids {
             sink.accept_peer_vote(&vote(*id, &[71, 72], &fixture.validators[0]))
                 .or_else(|error| match error {
@@ -6492,7 +5743,6 @@ mod tests {
             ),
             "Refunded"
         );
-        // A byte-for-byte replay cannot produce a second terminal receipt.
         assert!(
             fixture
                 .state

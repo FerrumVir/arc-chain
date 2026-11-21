@@ -1,12 +1,7 @@
-// Load ONE real Llama-2-7B weight tensor from GGUF, quantize three ways,
-// matmul against a realistic Q16 input, and compare to f32 ground truth.
-// Goal: localize whether the I16 regression is in the per-row math (probe
-// should fail) or higher up the stack (probe passes, bug is elsewhere).
 use arc_inference::cached_integer_model::{I8Weights, I16Weights};
 use candle_core::{Device, quantized::gguf_file};
 
 const ONE: i64 = 1 << 16;
-/// `$HOME/.arc-models/llama-2-7b.gguf`, resolved at run time.
 fn model_path() -> String {
     let home = std::env::var("HOME").expect("HOME is set");
     format!("{home}/.arc-models/llama-2-7b.gguf")
@@ -41,8 +36,6 @@ fn matmul_i8_scalar(w: &I8Weights, input: &[i64]) -> Vec<i64> {
     (0..w.n_rows)
         .map(|i| {
             let mut acc: i64 = 0;
-            // enumerate().take(n_cols) yields j in the same order as 0..n_cols,
-            // so the accumulation sequence — and therefore the result — is identical.
             for (j, &inp) in input.iter().enumerate().take(w.n_cols) {
                 acc += (w.data[i * w.n_cols + j] as i64) * inp;
             }
@@ -124,7 +117,6 @@ fn probe(tensor_name: &str, rows: usize, cols: usize) {
     let f32w = extract_f32(tensor_name);
     assert_eq!(f32w.len(), rows * cols, "shape mismatch");
 
-    // Stats on the raw weights
     let abs_max_per_row: Vec<f32> = (0..rows)
         .map(|i| {
             f32w[i * cols..(i + 1) * cols]
@@ -142,20 +134,18 @@ fn probe(tensor_name: &str, rows: usize, cols: usize) {
     let max_am = abs_max_per_row.iter().cloned().fold(0.0f32, f32::max);
     println!("abs_max range: [{:.4}, {:.4}]", min_am, max_am);
 
-    // Realistic Q16 input: RMSNormed activations, roughly N(0, 1) scaled to Q16
     let mut seed: u64 = 42;
     let f32_input: Vec<f32> = (0..cols)
         .map(|_| {
             seed = seed
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            // Box-Muller-ish trick: two uniforms → approximately normal via sum
             let u1 = ((seed >> 33) as f64 / u32::MAX as f64) - 0.5;
             seed = seed
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
             let u2 = ((seed >> 33) as f64 / u32::MAX as f64) - 0.5;
-            ((u1 + u2) * 2.0) as f32 // approximately N(0, ~0.67)
+            ((u1 + u2) * 2.0) as f32
         })
         .collect();
     let input_q16: Vec<i64> = f32_input
@@ -163,10 +153,8 @@ fn probe(tensor_name: &str, rows: usize, cols: usize) {
         .map(|&x| (x as f64 * ONE as f64).round() as i64)
         .collect();
 
-    // Ground truth
     let truth = matmul_f32(&f32w, rows, cols, &f32_input);
 
-    // Paths
     let w_i8 = I8Weights::quantize_f32(&f32w, rows, cols);
     let out_i8 = matmul_i8_scalar(&w_i8, &input_q16);
 

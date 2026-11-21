@@ -1,19 +1,4 @@
-// ─── @arc-chain/sdk ───────────────────────────────────────────
-// TypeScript SDK for the ARC Chain RPC API.
-//
-// Usage:
-//   import { ArcClient } from "@arc-chain/sdk";
-//
-//   const client = new ArcClient("http://localhost:9944");
-//   const health = await client.getHealth();
-//   const block  = await client.getBlock(42);
-//   const tx     = await client.getTxFull(block.tx_hashes[0]);
-
-// ─── Client ─────────────────────────────────────────────────
-
 export { ArcClient, ArcRpcError } from "./client.js";
-
-// ─── Utilities ──────────────────────────────────────────────
 
 export {
   isValidAddress,
@@ -26,24 +11,19 @@ export {
   addHexPrefix,
 } from "./utils.js";
 
-// ─── Types ──────────────────────────────────────────────────
-
 export type {
-  // Primitives
   Hash256,
   Address,
   HexString,
   PrefixedHexString,
   U64,
 
-  // Health & Info
   HealthResponse,
   GpuInfo,
   InfoResponse,
   NodeInfoResponse,
   StatsResponse,
 
-  // Blocks
   BlockHeader,
   BlockDetail,
   BlockSummary,
@@ -51,12 +31,10 @@ export type {
   BlockTxEntry,
   BlockTxsResponse,
 
-  // Merkle Proofs
   MerkleProofSibling,
   MerkleProof,
   BlockProofsResponse,
 
-  // Transactions
   TxReceipt,
   TxProof,
   TxSignature,
@@ -65,7 +43,6 @@ export type {
   TxSubmitResponse,
   TxSubmitBatchResponse,
 
-  // Transaction Body Variants (0x01 through 0x25)
   TransactionBody,
   TransactionType,
   TransferBody,
@@ -108,34 +85,27 @@ export type {
   InferenceFinalizeBody,
   CommunityInferenceRewardBody,
 
-  // Accounts
   Account,
   AccountTxs,
 
-  // Validators
   ValidatorInfo,
   ValidatorsResponse,
 
-  // Contracts
   ContractInfo,
   ContractEvent,
   ContractCallResult,
 
-  // Light Client
   LightSnapshot,
   SyncSnapshotInfo,
 
-  // Faucet
   FaucetClaimResponse,
   FaucetStatus,
   FaucetHealth,
 
-  // ETH JSON-RPC
   JsonRpcRequest,
   JsonRpcResponse,
   JsonRpcError,
 
-  // Client Options
   BlocksQueryOptions,
   BlockTxsQueryOptions,
   ContractCallOptions,

@@ -20,9 +20,6 @@ fn verify(
     payload_path: &Path,
     signature_path: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    // Tauri stores both the complete minisign public-key document in its JSON
-    // config and the complete minisign signature document in `.sig` as outer
-    // base64 strings. Decode those exactly as tauri-plugin-updater does.
     let public_key_document = decode_utf8("Tauri updater public key", public_key_base64)?;
     let signature_base64 = fs::read_to_string(signature_path)?;
     let signature_document = decode_utf8("Tauri updater signature", &signature_base64)?;

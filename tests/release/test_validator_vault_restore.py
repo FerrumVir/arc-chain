@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Hermetic adversarial tests for validator-vault restore and installation."""
 
 from __future__ import annotations
 
@@ -299,9 +298,6 @@ class Fixture:
 
     @staticmethod
     def key_json(index: int, address: str) -> bytes:
-        # These are deliberately non-production fixture bytes.  The mock exact
-        # pre-tag CLI performs the same public-only output contract as `arc
-        # keygen --verify-keyfile`; production bytes are never used by tests.
         return canonical(
             {
                 "scheme": "ed25519",
@@ -314,8 +310,6 @@ class Fixture:
     @classmethod
     def valid_members(cls) -> list[tuple[tarfile.TarInfo, bytes]]:
         result: list[tuple[tarfile.TarInfo, bytes]] = []
-        # Deliberately reverse archive order and use opaque filenames.  Mapping
-        # must come from CLI-verified public identity, never filename/order.
         for index, (_, address, _) in reversed(list(enumerate(NODES))):
             payload = cls.key_json(index, address)
             member = tarfile.TarInfo(f"private/identity-{index + 1}.json")
@@ -1327,8 +1321,6 @@ class ValidatorVaultRestoreTests(unittest.TestCase):
     def maintenance_union_bundle(
         self, stopped_names: set[str]
     ) -> tuple[object, Path, str, dict, dict]:
-        """Rewrite the valid active fixture as a sealed tagged-union bundle."""
-
         plan, plan_sha, bundle_path, _bundle_sha, *_rest = self.fixture.write_freeze_inputs()
         helper = load_helper_module()
         bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
@@ -1599,8 +1591,6 @@ class ValidatorVaultRestoreTests(unittest.TestCase):
             with self.subTest(label=label):
                 fixture = Fixture(self.root / label)
                 fixture.root.mkdir(exist_ok=True) if not fixture.root.exists() else None
-                # Fixture initialization needs its directory up front; rebuild
-                # the case beneath a dedicated temporary root instead.
                 members = copy.deepcopy(fixture.valid_members())
                 members[-1] = (bad, payload)
                 fixture.write_cms(members)
@@ -1648,7 +1638,6 @@ class ValidatorVaultRestoreTests(unittest.TestCase):
         self.fixture.root.mkdir(exist_ok=True) if not self.fixture.root.exists() else None
         other = self.root / "other-key.pem"
         shutil.copyfile(Fixture.private_key, other); other.chmod(0o600)
-        # A copied key still matches; generate an intentionally different one.
         run([str(Fixture.openssl), "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:3072", "-out", str(other)])
         other.chmod(0o600)
         command = self.fixture.restore_command()
@@ -1803,8 +1792,6 @@ class ValidatorVaultRestoreTests(unittest.TestCase):
         row = bundle["nodes"][0]
         persisted = row["persisted_head"]["value"]
         persisted["legacy_dag_round"]["inspection"]["source_consensus_round"] += 1
-        # Re-seal every outer layer an attacker controls, but deliberately
-        # leave the independently recomputed embedded inspection root intact.
         persisted_raw = canonical(persisted)
         row["persisted_head"]["sha256"] = hashlib.sha256(persisted_raw).hexdigest()
         inventory_row = next(
@@ -2056,7 +2043,6 @@ class ValidatorVaultRestoreTests(unittest.TestCase):
         combined = install_receipt.read_text() + second.stdout + second.stderr
         for index in range(1, 7):
             self.assertNotIn(f"{index:064x}", combined)
-        # A complete exact-match resume accepts all six without SCP mutation.
         receipt_before_resume = install_receipt.read_bytes()
         third = run(command)
         self.assertEqual(third.returncode, 0)
@@ -2066,7 +2052,6 @@ class ValidatorVaultRestoreTests(unittest.TestCase):
         self.assertTrue(all("arc-validator-vault-install." in path for path in uploaded_sources))
         self.assertTrue(all("/restored/keys/" not in path for path in uploaded_sources))
 
-        # Exact bytes with a mutable mode are not a valid receipt resume.
         install_receipt.chmod(0o600)
         wrong_mode = run(command, success=False)
         self.assertNotEqual(wrong_mode.returncode, 0)
@@ -2167,8 +2152,6 @@ class ValidatorVaultRestoreTests(unittest.TestCase):
         self.assertEqual(final.read_bytes(), b"wrong key bytes\n")
 
         final.unlink()
-        # A caller can rewrite JSON, its sidecar, and the command-line digest,
-        # but cannot make that forged root match the fresh remote helper result.
         proof = json.loads(proof_path.read_text())
         forged_complete = "c" * 64
         proof["nodes"][0]["stop_complete_sha256"] = forged_complete

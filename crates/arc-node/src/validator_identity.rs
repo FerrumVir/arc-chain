@@ -1,11 +1,3 @@
-//! Validator signing-key loading and explicit insecure development fallback.
-//!
-//! Production validators load the JSON format written by `arc keygen` from a
-//! mode-0600 regular file. Secret-derived identity is retained only for
-//! deliberately opted-in local development networks. A process-ephemeral
-//! observer identity is allowed only after the caller proves a strict local
-//! runtime boundary.
-
 use anyhow::{Context, Result, bail, ensure};
 use arc_crypto::{Hash256, KeyPair};
 use serde::Deserialize;
@@ -34,7 +26,6 @@ impl Drop for ArcKeyfile {
     }
 }
 
-/// Describes the non-secret source of the loaded validator identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdentitySource {
     Keyfile,
@@ -47,8 +38,6 @@ pub struct LoadedIdentity {
     pub source: IdentitySource,
 }
 
-/// Load an ARC CLI-compatible Ed25519 keyfile after enforcing its filesystem
-/// and self-consistency contract.
 pub fn load_ed25519_keyfile(path: &Path) -> Result<KeyPair> {
     let mut file = arc_crypto::secret_file::open_private(path).with_context(|| {
         format!(
@@ -126,7 +115,6 @@ pub fn load_ed25519_keyfile(path: &Path) -> Result<KeyPair> {
     Ok(keypair)
 }
 
-/// Select a validator identity under the production/dev policy.
 pub fn resolve_identity(
     keyfile: Option<&Path>,
     seed: Option<&str>,
@@ -179,8 +167,6 @@ pub fn resolve_identity(
     })
 }
 
-/// Legacy deterministic derivation, retained only behind the explicit policy
-/// above and for incomplete local-development genesis files.
 pub fn derive_insecure_seed_keypair(seed: &str) -> KeyPair {
     let mut secret = blake3::derive_key("ARC-chain-validator-keypair-v1", seed.as_bytes());
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret);

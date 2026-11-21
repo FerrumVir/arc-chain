@@ -1,27 +1,10 @@
-/**
- * ARC Chain SDK - TypeScript type definitions.
- *
- * Interfaces matching the ARC Chain RPC response shapes.
- */
-
 import type { U64 } from "./u64";
 export type { U64 } from "./u64";
 
-// ---------------------------------------------------------------------------
-// Primitive aliases
-// ---------------------------------------------------------------------------
-
-/** 32-byte hex-encoded hash (BLAKE3 digest, no `0x` prefix). */
 export type Hash256 = string;
 
-/** 32-byte hex-encoded account address (BLAKE3 of pubkey). */
 export type Address = string;
 
-// ---------------------------------------------------------------------------
-// Transaction types
-// ---------------------------------------------------------------------------
-
-/** Transaction type discriminant matching the Rust TxType enum. */
 export type TxType =
   | "Transfer"
   | "Settle"
@@ -37,7 +20,6 @@ export type TxType =
   | "ClaimRewards"
   | "UpdateStake";
 
-/** Transfer body. */
 export interface TransferBody {
   type: "Transfer";
   to: string;
@@ -45,7 +27,6 @@ export interface TransferBody {
   amount_commitment?: string | null;
 }
 
-/** Contract deployment body. */
 export interface DeployContractBody {
   type: "DeployContract";
   bytecode: string;
@@ -53,7 +34,6 @@ export interface DeployContractBody {
   state_rent_deposit: U64;
 }
 
-/** WASM contract call body. */
 export interface WasmCallBody {
   type: "WasmCall";
   contract: string;
@@ -63,7 +43,6 @@ export interface WasmCallBody {
   gas_limit: U64;
 }
 
-/** Stake/unstake body. */
 export interface StakeBody {
   type: "Stake";
   amount: U64;
@@ -71,7 +50,6 @@ export interface StakeBody {
   validator: string;
 }
 
-/** Settlement body. */
 export interface SettleBody {
   type: "Settle";
   agent_id: string;
@@ -81,7 +59,6 @@ export interface SettleBody {
   amount_commitment?: string | null;
 }
 
-/** Channel open body. */
 export interface ChannelOpenBody {
   type: "ChannelOpen";
   channel_id: Hash256;
@@ -90,7 +67,6 @@ export interface ChannelOpenBody {
   timeout_blocks: number;
 }
 
-/** Channel close body. */
 export interface ChannelCloseBody {
   type: "ChannelClose";
   channel_id: Hash256;
@@ -100,7 +76,6 @@ export interface ChannelCloseBody {
   state_nonce: number;
 }
 
-/** Channel dispute body. */
 export interface ChannelDisputeBody {
   type: "ChannelDispute";
   channel_id: Hash256;
@@ -111,7 +86,6 @@ export interface ChannelDisputeBody {
   challenge_period: number;
 }
 
-/** Union of all transaction body types. */
 export type TxBody =
   | TransferBody
   | DeployContractBody
@@ -122,10 +96,8 @@ export type TxBody =
   | ChannelCloseBody
   | ChannelDisputeBody;
 
-/** Alias for TxBody used by older code. */
 export type TransactionBody = TxBody;
 
-/** Ed25519 signature payload. */
 export interface Ed25519Signature {
   Ed25519: {
     public_key: string;
@@ -133,7 +105,6 @@ export interface Ed25519Signature {
   };
 }
 
-/** An unsigned or signed transaction. */
 export interface Transaction {
   tx_type: TxType;
   from: string;
@@ -143,27 +114,22 @@ export interface Transaction {
   body: TxBody;
   hash: string;
   signature: Ed25519Signature | null;
-  /** Exact domain used for the signing hash; null on pre-v3 chains. */
   transaction_domain: string | null;
-  // Convenience fields for transfer shorthand
   to?: string;
   amount?: U64;
 }
 
-/** Transfer builder output before signing. */
 export interface TransferTransaction
   extends Omit<Transaction, "tx_type" | "body"> {
   tx_type: "Transfer";
   body: TransferBody;
 }
 
-/** Transfer builder output after signing. */
 export interface SignedTransferTransaction
   extends Omit<TransferTransaction, "signature"> {
   signature: Ed25519Signature;
 }
 
-/** Exact flat write contract accepted by `POST /tx/submit`. */
 export interface SignedTransferSubmitPayload {
   from: Address;
   to: Address;
@@ -173,13 +139,8 @@ export interface SignedTransferSubmitPayload {
   tx_type?: "Transfer";
   signature: string;
   public_key: string;
-  /** Checked against `/network/info` and omitted from the HTTP body. */
   transaction_domain: string | null;
 }
-
-// ---------------------------------------------------------------------------
-// Account
-// ---------------------------------------------------------------------------
 
 export interface Account {
   address: string;
@@ -188,10 +149,6 @@ export interface Account {
   code_hash?: string;
   storage_root?: string;
 }
-
-// ---------------------------------------------------------------------------
-// Block
-// ---------------------------------------------------------------------------
 
 export interface BlockHeader {
   height: number;
@@ -219,10 +176,6 @@ export interface BlockSummary {
   producer: string;
 }
 
-// ---------------------------------------------------------------------------
-// Receipts & events
-// ---------------------------------------------------------------------------
-
 export interface EventLog {
   address: string;
   topics: string[];
@@ -243,10 +196,6 @@ export interface Receipt {
   inclusion_proof?: string | null;
   logs: EventLog[];
 }
-
-// ---------------------------------------------------------------------------
-// Chain info & stats
-// ---------------------------------------------------------------------------
 
 export interface ChainInfo {
   chain: string;
@@ -285,10 +234,6 @@ export interface NodeInfo {
   mempool_size: number;
 }
 
-// ---------------------------------------------------------------------------
-// Submission results
-// ---------------------------------------------------------------------------
-
 export interface SubmitResult {
   tx_hash: string;
   status: string;
@@ -300,10 +245,6 @@ export interface BatchResult {
   tx_hashes: string[];
 }
 
-// ---------------------------------------------------------------------------
-// ETH JSON-RPC
-// ---------------------------------------------------------------------------
-
 export interface EthRpcResponse {
   jsonrpc: string;
   id: number;
@@ -313,10 +254,6 @@ export interface EthRpcResponse {
     message: string;
   };
 }
-
-// ---------------------------------------------------------------------------
-// Contract
-// ---------------------------------------------------------------------------
 
 export interface ContractInfo {
   address: string;
@@ -333,10 +270,6 @@ export interface ContractCallResult {
   logs?: string[];
   events?: Array<{ topic: string; data: string }>;
 }
-
-// ---------------------------------------------------------------------------
-// Light client
-// ---------------------------------------------------------------------------
 
 export interface LightSnapshot {
   height: number;

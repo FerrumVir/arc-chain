@@ -5,14 +5,6 @@ import { fileURLToPath } from "node:url";
 import { PLAIN_COPY } from "../src/lib/plain-copy";
 import { describeConnection, isUnreachableMessage } from "../src/lib/connection";
 
-// Pure logic: no page. How the node's connection reads on every screen (the
-// titlebar pill, the sidebar chip, the Dashboard line, the strip on Home).
-//
-// A community node never has peers: arc-net admits only the validators. Its
-// healthy steady state is peers 0, height 0 and a coordinator answering, which
-// the native status reports as health "lite". Through v0.8.14 that read as
-// "Lite", "Running · 0 peers" and a client-mode banner.
-
 const __dirnameHere = path.dirname(fileURLToPath(import.meta.url));
 
 const community = {
@@ -30,12 +22,9 @@ test.describe("connection in plain words", () => {
     expect(view.label).toBe(PLAIN_COPY.connection.labels.connected);
     expect(view.level).toBe("live");
     expect(view.via).toBe("via LAX");
-    // The desktop's own probe reached the coordinator: ARC is connected. An observer node never talks to a
-    // coordinator, so the sentence does not say the node is.
     expect(view.sentence).toContain("ARC is connected to the network through LAX");
     expect(view.sentence).not.toContain("node is connected");
     expect(view.sentence).toContain("0 peers is normal");
-    // The native side names the origin whenever it reports "lite"; without one, say what is known.
     expect(describeConnection({ ...community, coordinatorUrl: null }).via).toBe("via a coordinator");
   });
 
@@ -61,7 +50,6 @@ test.describe("connection in plain words", () => {
       label: PLAIN_COPY.connection.labels.starting,
       level: "checking",
     });
-    // The native side still probes the seeds while the node is off; one answering is "lite".
     expect(
       describeConnection({ running: false, pid: null, health: "lite", coordinatorUrl: "https://149.28.32.76" }),
     ).toMatchObject({ state: "off", label: PLAIN_COPY.connection.labels.off, level: "off" });
@@ -83,7 +71,6 @@ test.describe("connection in plain words", () => {
     expect(isUnreachableMessage(native)).toBe(true);
     expect(isUnreachableMessage("arc-node exited unexpectedly (code 1)")).toBe(false);
     expect(isUnreachableMessage(null)).toBe(false);
-    // The wording it recognises is the wording rpc_client.rs writes.
     const rpcClient = fs.readFileSync(
       path.resolve(__dirnameHere, "..", "src-tauri", "src", "rpc_client.rs"),
       "utf8",

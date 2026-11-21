@@ -1,7 +1,3 @@
-//! Offline numerical conformance; run through scripts/qualification/run_low_residency_conformance.py.
-//! Modes: inspect, reference, coordinator. The runner waits for reference exit
-//! before exporting or starting row daemons. This is not a readiness/quality gate.
-
 #[cfg(unix)]
 #[path = "support/row_partition.rs"]
 mod row_partition;
@@ -48,7 +44,6 @@ mod unix {
     fn max_rss_bytes() -> Option<u64> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            // SAFETY: correctly sized, initialized output buffer, not retained.
             let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
             if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
                 return None;
@@ -100,9 +95,6 @@ mod unix {
         forward_ms: Vec<f64>,
     }
 
-    // Explicit generation-v2 replay, including its final non-EOS forward.
-    // Reference uses the existing resident forward, not the shared backend
-    // forward under test. Digests are captured before repetition penalties.
     fn trace(
         config: &ModelConfig,
         prompt: &[u32],
@@ -170,8 +162,6 @@ mod unix {
         #[serde(skip_serializing_if = "Option::is_none")]
         row_partition: Option<String>,
     }
-    // The first row of each owner is a separate, locally duplicated slice.
-    // The strict executor's slice cap therefore bounds proof partitions to 16.
     fn proof_partition_count(value: Option<&str>) -> Result<Option<usize>, String> {
         value
             .map(|value| {
@@ -216,7 +206,6 @@ mod unix {
                     .ok_or_else(|| "row size overflow".into())
             };
         if let Some(count) = partitions {
-            // Preflight EVERY bundle before the runner can start any export.
             let mut bundles = Vec::new();
             for rank in 0..count {
                 let id = format!("proof-{rank:03}");
@@ -299,8 +288,6 @@ mod unix {
         )
     }
 
-    // Local offline adapter: actual daemon processes, identical bounded row
-    // frames. The production pinned-SSH adapter is not replaced or modified.
     struct SocketWorker(Mutex<Option<UnixStream>>);
     impl RowWorker for SocketWorker {
         fn project(
@@ -362,8 +349,6 @@ mod unix {
     }
     type Plans = BTreeMap<(Option<usize>, TensorKey), ProjectionPlan>;
     type Workers = BTreeMap<String, Arc<dyn RowWorker>>;
-    // Validate the complete manifest union before opening any socket. The
-    // profile/identity/range gates are identical for whole and partial rows.
     fn plans_from_entries(
         entries: &[Worker],
         model: &impl CanonicalRowSource,
@@ -435,8 +420,6 @@ mod unix {
                     }
                 }
                 let owner = SliceOwner::Remote(assignment.worker_id.clone());
-                // Bounded independent numerical verification of EVERY owner;
-                // every primary row, including the checked one, stays remote.
                 slices.push(PlannedSlice {
                     owner: owner.clone(),
                     row_start: assignment.row_start,
@@ -702,8 +685,6 @@ mod unix {
                 .chain(std::iter::once((None, TensorKey::LmHead)));
                 let weights = keys
                     .map(|key| {
-                        // Uneven intervals, positive/negative inputs and canonical
-                        // integer arithmetic; these are tiny projection fixtures.
                         let rows = if key.0.is_none() { 5 } else { 7 };
                         let values = (0..rows * 2)
                             .map(|i| (i as f32 - 5.0) / 7.0)
@@ -807,7 +788,6 @@ mod unix {
                     "case {case}"
                 );
             }
-            // Whole-layer input cannot be reported as a two-owner proof.
             assert!(
                 plans_from_entries(&entries(&source, 1), &source, Hash256([7; 32]), Some(2))
                     .is_err()
@@ -944,8 +924,6 @@ mod unix {
                     .get("row_partition")
                     .is_none()
             );
-            // Metadata-only capacity preflight: no allocation of these
-            // advertised columns and no export can begin on this plan.
             let mut oversized = TinySource::new();
             for weights in oversized.weights.values_mut() {
                 weights.n_cols = MAX_CANONICAL_ROW_FILE_BYTES;
@@ -1005,8 +983,6 @@ mod unix {
                 result.output_hash,
                 arc_crypto::hash_bytes(&expected).to_hex()
             );
-            // Generation-v2 forwards the final selected non-EOS token even
-            // after consuming its one-token output budget.
             let one = trace(&config, &[4], 1, forward).unwrap();
             assert_eq!(one.output_token_ids, vec![3]);
             assert_eq!(one.positions.len(), 3);

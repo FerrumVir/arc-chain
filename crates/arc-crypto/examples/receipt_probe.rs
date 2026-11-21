@@ -1,4 +1,3 @@
-//! Print the full proof receipt for a fixed layer, for differential testing.
 use arc_crypto::inference_proof::dense_forward_i64;
 use arc_crypto::stwo_air::{try_prove_dense_packed, try_prove_dense_stark};
 

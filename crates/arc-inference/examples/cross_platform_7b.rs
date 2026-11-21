@@ -1,10 +1,3 @@
-//! Cross-platform determinism test for 7B models.
-//!
-//! Runs multiple prompts at varying token lengths and reports hashes.
-//! Compare ARM output against x86 output to verify cross-platform determinism.
-//!
-//! Usage: cargo run --example cross_platform_7b --features candle --release -- /path/to/model.gguf
-
 use arc_inference::cached_integer_model::load_cached_model;
 use std::time::Instant;
 
@@ -30,7 +23,6 @@ fn main() {
     println!("Memory: {} MB", model.memory_bytes() / (1024 * 1024));
     println!();
 
-    // Prompts designed to produce long outputs (no early EOS)
     let prompts: Vec<(&str, u32)> = vec![
         ("[INST] What is 2+2? [/INST]", 8),
         ("[INST] Explain what a blockchain is [/INST]", 32),
@@ -52,7 +44,7 @@ fn main() {
         ),
     ];
 
-    let eos = vec![2u32]; // </s> only, no 0
+    let eos = vec![2u32];
 
     for (prompt, max_tokens) in &prompts {
         let tokens = model.encode(prompt);
@@ -66,7 +58,6 @@ fn main() {
             0
         };
 
-        // Verify determinism: run again
         let (gen2, hash2) = model.generate(&tokens, *max_tokens, &eos);
         let det = if hash == hash2 && generated == gen2 {
             "PASS"

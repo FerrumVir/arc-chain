@@ -1,5 +1,3 @@
-// A/B probe: run same forward pass with different I16 dispatch combinations
-// to localize which matmul is producing the ~94× magnitude bug.
 use arc_inference::cached_integer_model::{CachedIntegerModel, KVCache, load_cached_model};
 
 fn forward_token(model: &CachedIntegerModel, tok: u32) -> Vec<i64> {

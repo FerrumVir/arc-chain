@@ -1,22 +1,3 @@
-//! Read a GGUF file's metadata - and only its metadata - without a model
-//! library, so startup can say what model it was given instead of assuming.
-//!
-//! Startup used to announce "Llama-2-7B, 32 layers, canonical INT8" for
-//! whatever `--model` pointed at. The shape now comes from the file's own
-//! header (`general.architecture`, `<arch>.block_count`, `general.name`), and
-//! [`supported_adapter`] decides - explicitly - whether this node has a
-//! conformant adapter for it. An architecture without one is refused, never
-//! forced through the Llama path.
-//!
-//! Bounded: at most `MAX_KV` entries and `MAX_TENSORS` tensors, strings of at
-//! most `MAX_STRING` bytes, arrays skipped element by element, so a hostile
-//! header cannot make startup loop or allocate without limit. What it can
-//! make startup hold is capped by those limits and by the file's own size,
-//! which is not small. Two bounds are stricter than the Python reader's (1 MiB
-//! strings instead of 16 MiB, at most 4,096 entries), so a file Python
-//! accepts can still be refused here, never the reverse. Both refuse a
-//! repeated metadata key or tensor name.
-
 use std::collections::BTreeMap;
 use std::io::Read;
 
@@ -32,10 +13,7 @@ pub enum MetaValue {
     Float(f64),
     Bool(bool),
     Str(String),
-    /// Arrays are skipped; only their length is kept.
-    Array {
-        len: u64,
-    },
+    Array { len: u64 },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -126,12 +104,10 @@ fn read_value(r: &mut impl Read, ty: u32) -> Result<MetaValue, MetaError> {
     Ok(MetaValue::Array { len })
 }
 
-/// The header key-values of a GGUF stream.
 pub fn read_metadata(r: &mut impl Read) -> Result<BTreeMap<String, MetaValue>, MetaError> {
     read_prefix(r).map(|(_, metadata)| metadata)
 }
 
-/// Magic, version, the tensor count and the metadata entries.
 fn read_prefix(r: &mut impl Read) -> Result<(u64, BTreeMap<String, MetaValue>), MetaError> {
     let mut magic = [0u8; 4];
     r.read_exact(&mut magic)?;
@@ -152,8 +128,6 @@ fn read_prefix(r: &mut impl Read) -> Result<(u64, BTreeMap<String, MetaValue>), 
         let key = read_string(r)?;
         let ty = read_u32(r)?;
         let value = read_value(r, ty)?;
-        // The Python reader refuses a repeated key: keeping either copy here
-        // would describe a file the manifest derivation rejects.
         if out.contains_key(&key) {
             return Err(MetaError::Duplicate(key));
         }
@@ -165,8 +139,6 @@ fn read_prefix(r: &mut impl Read) -> Result<(u64, BTreeMap<String, MetaValue>), 
 const MAX_TENSORS: u64 = 65_536;
 const MAX_DIMS: u32 = 4;
 
-/// One tensor's header entry, dimensions in the file's own order (the
-/// innermost, `ne0`, first).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorEntry {
     pub name: String,
@@ -174,7 +146,6 @@ pub struct TensorEntry {
     pub dims: Vec<u64>,
 }
 
-/// The metadata and the tensor inventory: everything before the tensor data.
 pub fn read_header(
     r: &mut impl Read,
 ) -> Result<(BTreeMap<String, MetaValue>, Vec<TensorEntry>), MetaError> {
@@ -214,10 +185,6 @@ pub fn read_header_from_path(
     read_header(&mut file)
 }
 
-/// BLAKE3 over the tensor inventory, as the package manifest records it
-/// (`tensors.inventory_blake3`): sorted by name; each entry is the name's
-/// length (u32 LE) and bytes, the GGML type (u32 LE), the dimension count
-/// (u32 LE) and each dimension (u64 LE) in file order.
 pub fn inventory_digest(tensors: &[TensorEntry]) -> [u8; 32] {
     let mut sorted: Vec<&TensorEntry> = tensors.iter().collect();
     sorted.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
@@ -234,7 +201,6 @@ pub fn inventory_digest(tensors: &[TensorEntry]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// What startup needs to know about a model file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelShape {
     pub architecture: String,
@@ -268,10 +234,6 @@ pub fn read_shape_from_path(path: &std::path::Path) -> Result<Option<ModelShape>
     Ok(model_shape(&read_metadata(&mut file)?))
 }
 
-/// Architectures this node has a conformant integer adapter for, and the
-/// execution profile each runs under. Anything else is refused at startup -
-/// an explicit, versioned list rather than an assumption that every model is
-/// Llama.
 pub fn supported_adapter(architecture: &str) -> Option<&'static str> {
     match architecture {
         "llama" => Some(crate::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE),
@@ -308,7 +270,6 @@ mod tests {
         v
     }
 
-    /// A header with no metadata and one 4-element F32 tensor per name.
     fn with_tensors(names: &[&str]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
@@ -346,7 +307,7 @@ mod tests {
     #[test]
     fn a_llama_header_yields_its_real_shape_and_a_supported_adapter() {
         let mut array = Vec::new();
-        array.extend_from_slice(&4u32.to_le_bytes()); // u32 elements
+        array.extend_from_slice(&4u32.to_le_bytes());
         array.extend_from_slice(&3u64.to_le_bytes());
         for n in [1u32, 2, 3] {
             array.extend_from_slice(&n.to_le_bytes());

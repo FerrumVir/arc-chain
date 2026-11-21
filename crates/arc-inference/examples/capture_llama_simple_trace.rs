@@ -1,9 +1,3 @@
-//! Capture direct greedy sampler traces from the locally patched pinned llama.cpp.
-//!
-//! The reference patch emits `ARC_REFERENCE_TRACE_JSON:` on stderr. This
-//! program records that source-provided token trace without re-tokenizing
-//! rendered completion text.
-
 use arc_inference::llama_spm_tokenizer::{
     GGUF_LLAMA_SPM_TOKENIZER_PROFILE_V1, LlamaGgufSpmTokenizer,
 };

@@ -1,11 +1,4 @@
 #!/usr/bin/env bash
-# Remote half of the two-phase ARC legacy freeze/archive protocol.
-#
-# A freeze capture is content-addressed by a separately sealed freeze plan. It
-# is completed before the recovery checkpoint or rollout manifest exists. A
-# later, independently authorized seal binds every unchanged capture to the
-# exact recovery checkpoint. Fork captures are retained and labelled; they are
-# never rewritten to look canonical.
 set -Eeuo pipefail
 umask 077
 
@@ -22,17 +15,10 @@ QUARANTINE_AUTHORIZATION_BASE="/root/arc-recovery-quarantine-authorizations"
 QUARANTINE_ROUND_BASE="/root/arc-recovery-quarantine-rounds"
 LIVE_SOURCE_CAPTURE_BASE="/root/arc-recovery-live-source-captures"
 QUARANTINE_ROUND_STATE_BASE="/etc/arc-recovery/network-fence-rounds"
-# The selector is intentionally boot-scoped.  Durable commit + persistence
-# authorizes re-creation only after a complete node transition exists; a reboot
-# before that receipt therefore collapses to the stopped-precommit classifier.
 QUARANTINE_ROUND_ACTIVE="/run/arc-recovery/active-network-fence"
 QUARANTINE_ROUND_DISPATCHER="/etc/arc-recovery/network-fence-dispatch"
 ARCHIVE_NODE_TEMP_PATH=""
 
-# Every semantic Python block runs through one normalized, inode/hash-pinned
-# root-owned interpreter under an empty environment and isolated mode.  The
-# guard is re-proved before every invocation so a path swap cannot silently
-# change the meaning of a recovery receipt.
 ARC_RECOVERY_PYTHON_LINK="/usr/bin/python3"
 [ -e "$ARC_RECOVERY_PYTHON_LINK" ] && [ ! -d "$ARC_RECOVERY_PYTHON_LINK" ] || {
     printf 'archive node: pinned Python entrypoint is missing\n' >&2
@@ -96,9 +82,6 @@ python3() {
 }
 
 cleanup_temporary_path() {
-    # Once stop.intent exists, a persistent restart fence may already have
-    # been installed even if its next durable marker was interrupted. Preserve
-    # the journal across SSH loss or reboot; only a lock holder may reconcile it.
     if [ -n "$ARCHIVE_NODE_TEMP_PATH" ]; then
         if { [ -f "$ARCHIVE_NODE_TEMP_PATH/00-quarantine-fleet-start-authorization.json" ] \
                 && [ ! -L "$ARCHIVE_NODE_TEMP_PATH/00-quarantine-fleet-start-authorization.json" ]; } \
@@ -396,9 +379,6 @@ print(digest.hexdigest())
 PY
 }
 
-# Slice the immutable WAL only at the exact checkpoint-prefix boundary emitted
-# by the read-only recovery exporter. This helper is intentionally testable in
-# isolation: it never guesses the boundary from file hashes or process exit.
 write_offline_wal_evidence() {
     python3 - "$1" "$2" "$3" "$4" <<'PY'
 import hashlib
@@ -496,8 +476,6 @@ output.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n
 PY
 }
 
-# Build an index over every regular file in a tree except the index itself and
-# its completion marker. Symlinks and special files are always rejected.
 write_tree_index() {
     local root="$1"
     local index_name="$2"
@@ -762,11 +740,6 @@ capture_pre_stop_evidence() {
     capture_optional_json "$rpc_base" /network/info "$evidence/network-info.json"
 }
 
-# These three live HTTP responses are preserved only as bounded diagnostic
-# evidence. They are not consensus state and are never reward evidence.  The
-# persistent per-endpoint intent journal makes an interrupted GET a one-way
-# transition: a retry records the interruption instead of issuing that GET
-# again. The final directory and receipt are create-only.
 capture_live_observation_receipt_at() {
     local partial="$1" final="$2" capture_id="$3" observation_generation="$4"
     local generation_receipt_sha="$5" drive_receipt_sha="$6" node="$7" freeze_sha="$8"
@@ -948,7 +921,6 @@ for directory in (partial / "journal", partial / "observations", partial / "raw"
         os.mkdir(directory, 0o700)
         fsync_dir(partial)
 
-# Fail closed on unexpected/symlink partial content rather than normalizing it.
 allowed = {pathlib.PurePosixPath(".arc-recovery-partial-owner")}
 for index, (slug, _) in enumerate(endpoints):
     for member in (
@@ -1035,8 +1007,6 @@ for index, (slug, endpoint) in enumerate(endpoints):
     error = None
     raw_complete = False
     if not created_attempt:
-        # A previous process crossed the durable request-intent boundary. Never
-        # issue the request a second time; preserve any durable raw prefix.
         error = "interrupted_after_durable_attempt_intent"
         if raw_path.exists() or raw_path.is_symlink():
             if raw_path.is_symlink() or not raw_path.is_file() or raw_path.lstat().st_mode & 0o222:
@@ -1163,9 +1133,6 @@ PY
             "labels=diagnostic,noncanonical,nonreward"
     fi
     verify_tree_index "$partial" live-observations.files.sha256 live-observations.complete
-    # Seal every byte and directory before the tree becomes visible at its
-    # immutable final name.  A crash after publication can therefore never
-    # expose a writable/rejected final tree.
     chmod -R a-w,go-rwx "$partial"
     python3 - "$partial" <<'PY'
 import os, pathlib, stat, sys
@@ -1208,18 +1175,11 @@ if renameat2 is not None:
     renameat2.restype=ctypes.c_int
     result=renameat2(-100,os.fsencode(source),-100,os.fsencode(target),1)
 else:
-    # Darwin's equivalent is renamex_np(..., RENAME_EXCL).  This path keeps
-    # local/macOS recovery rehearsals on the same no-replace contract.
     renamex=getattr(libc,"renamex_np",None)
     if renamex is None:
         raise SystemExit("create-only directory publication primitive is unavailable")
     renamex.argtypes=(ctypes.c_char_p,ctypes.c_char_p,ctypes.c_uint)
     renamex.restype=ctypes.c_int
-    # macOS refuses to rename even an owner-controlled directory once its own
-    # write bit is removed.  This branch exists only for local Darwin contract
-    # rehearsals (validator hosts are Linux); every member is already sealed.
-    # Restore/seal the root around the exclusive syscall without ever making a
-    # content file writable.
     os.chmod(source,0o700,follow_symlinks=False)
     result=renamex(os.fsencode(source),os.fsencode(target),4)
     if result==0:
@@ -1553,12 +1513,6 @@ if state.exists() or state.is_symlink():
              "apply":0o500,"nft":0o500,"table-binding.json":0o400,
              "nft-apply-intent.json":0o400,"persistence-plan.json":0o400,
              "contract.json":0o400}
-    # publish() uses a unique, destination-derived temporary name and seals it
-    # before renameat2(RENAME_NOREPLACE).  A crash before that rename is inert,
-    # but must not wedge the challenged zero-progress release forever.  Under
-    # the same round.lock, remove only exact reviewed destination partials with
-    # root-owned, single-link, bounded regular-file identity.  Anything else
-    # remains a hard failure.
     partial_re=__import__("re").compile(
         r"^\.(authorization\.json|readiness\.json|policy\.nft|apply|nft|"
         r"table-binding\.json|nft-apply-intent\.json|persistence-plan\.json|"
@@ -2072,9 +2026,6 @@ unit_enablement_state() {
 
 disable_and_verify_unit() {
     local unit="$1"
-    # Static/indirect units can make `systemctl disable` return nonzero even
-    # though no enablement symlink exists. Treat the command as best effort,
-    # then accept only an explicit, reviewed terminal state for this unit.
     systemctl disable "$unit" >/dev/null 2>&1 || true
     unit_enablement_state "$unit" >/dev/null
 }
@@ -2125,11 +2076,6 @@ materialize_absent_legacy_updater_anchor() {
             ;;
     esac
 
-    # systemd intentionally ignores a drop-in when no base unit exists.  The
-    # old fleet predates the updater units, so materialize a create-only,
-    # permanently non-startable base before relying on the persistent recovery
-    # drop-ins.  Every later source-manifest proof sees and hashes this exact
-    # regular file just like a pre-existing unit fragment.
     python3 - "$unit" "$anchor" <<'PY'
 import ctypes
 import errno
@@ -2181,10 +2127,6 @@ directory = os.open(parent, flags)
 try:
     temporary = f".{unit}.arc-recovery-anchor.partial"
 
-    # Reconcile only the deterministic partial owned by this exact unit.  A
-    # crash can leave an empty/prefix mode-0600 write or a complete mode-0444
-    # write, but never makes that partial authoritative.  Any other inode,
-    # bytes, link count, or mode fails closed.
     try:
         partial_details = os.stat(temporary, dir_fd=directory, follow_symlinks=False)
     except FileNotFoundError:
@@ -2246,8 +2188,6 @@ try:
                 -100, os.fsencode(source), -100, os.fsencode(path), 1
             )
         else:
-            # Validator hosts are Linux.  Darwin's exclusive equivalent keeps
-            # local contract tests on the same no-replace publication model.
             renamex = getattr(libc, "renamex_np", None)
             if renamex is None:
                 raise SystemExit("exclusive legacy updater anchor publication is unavailable")
@@ -2262,9 +2202,6 @@ try:
                 raise SystemExit(
                     f"exclusive legacy updater anchor publication failed: errno={error}"
                 )
-            # A same-lock retry can observe a target only after an external
-            # race.  Preserve no ambiguous partial and validate that target
-            # below as the exact immutable anchor.
             os.unlink(temporary, dir_fd=directory)
         os.fsync(directory)
         details = os.stat(unit, dir_fd=directory, follow_symlinks=False)
@@ -2287,8 +2224,6 @@ PY
 
 materialize_absent_legacy_updater_anchors() {
     local unit
-    # Refresh PID1's view first so a stale not-found result can never shadow a
-    # real vendor or administrator unit fragment.
     systemctl daemon-reload
     for unit in arc-node-update.service arc-node-update.timer; do
         materialize_absent_legacy_updater_anchor "$unit"
@@ -2318,9 +2253,6 @@ persist_legacy_restart_fence_files() {
     if [ "$#" -eq 0 ]; then
         set -- arc-self-heal.service arc-node.service arc-node-update.service arc-node-update.timer
     fi
-    # Gate state is owned by the caller. The same exact files are first staged
-    # fail-open behind a durable allow marker and later become fail-closed when
-    # the capture transaction atomically removes that marker.
     for unit in "$@"; do
         case "$unit" in
             arc-self-heal.service|arc-node.service|arc-node-update.service|arc-node-update.timer) ;;
@@ -2500,9 +2432,6 @@ PY
         die "selected supervisor is not active during barrier staging"
     case "$(systemctl show "$selected_unit" --property=Job --value)" in ''|0) ;; *) die "selected supervisor has a pending job" ;; esac
 
-    # Preparation does not issue a stop to an unsealed legacy unit. Every
-    # alternative must already be process-free and quiescent; the production
-    # fleet satisfies this invariant, and a divergent host fails closed.
     for unit in "$other_unit" arc-node-update.service arc-node-update.timer; do
         case "$(systemctl show "$unit" --property=ActiveState --value 2>/dev/null || printf 'not-found')" in inactive|failed|not-found) ;;
             *) die "alternative activation source is active before fence staging: $unit" ;;
@@ -2524,9 +2453,6 @@ PY
     disable_and_verify_unit arc-node-update.service
     disable_and_verify_unit arc-node-update.timer
 
-    # `systemctl disable` removes boot-activation symlinks. Make those metadata
-    # removals power-loss durable before a reboot can observe the still-present,
-    # intentionally fail-open allow marker, then re-prove the terminal state.
     sync
     for unit in "$other_unit" arc-node-update.service arc-node-update.timer; do
         unit_enablement_state "$unit" >/dev/null
@@ -2556,9 +2482,6 @@ PY
         die "selected supervisor stopped while staging barriers"
     case "$(systemctl show "$selected_unit" --property=Job --value)" in ''|0) ;; *) die "selected supervisor gained a job while staging barriers" ;; esac
 
-    # Preparation never reparents a live writer. A detached legacy writer is
-    # sealed in its existing root-session cgroup; capture freezes that cgroup
-    # independently after freezing the systemd supervisor.
     python3 - "$node" "$selected_unit" "$selected_pid" "$marker" <<'PY'
 import hashlib
 import json
@@ -2949,9 +2872,6 @@ def exact_identity(entry, label):
         raise SystemExit(f"{label} cgroup identity changed")
     return target
 
-# The prepare audit binds the original writer cgroup path/device/inode.  A
-# detached writer may move only into the deterministic recovery leaf under that
-# exact parent, and only after the durable leaf-move intent below exists.
 plan_path = pathlib.Path(f"/root/.arc-recovery-plans/{freeze_sha}/freeze.lock.json")
 if plan_path.is_symlink() or not plan_path.is_file():
     raise SystemExit("pinned freeze plan is missing during fast freeze")
@@ -3052,9 +2972,6 @@ def frozen_state(entry):
         raise SystemExit("cgroup.events has no exact frozen state")
     return int(values["frozen"])
 
-# The runtime safety intent is durable before this controller starts. Reload
-# and re-project it on every identity check so a unit-file edit, daemon reload,
-# or automatic lifecycle change cannot race any freezer write.
 safety_path = root / "01-prefreeze-runtime-safety-intent.json"
 if safety_path.is_symlink() or not safety_path.is_file():
     raise SystemExit("prefreeze runtime safety intent is missing")
@@ -3350,9 +3267,6 @@ for helper_pid in ancestor_pids():
 if writer_mode == "detached-root-session" and cgroup_subtree_pids(prepared_parent["path"]) != [writer_pid]:
     raise SystemExit("detached writer is not the sole process in its root-session subtree")
 
-# Prove the volatile, high-priority activation-gate substrate before freezing
-# anything. A submount or UnitPath priority drift is a preflight rejection, not
-# a failure discovered after the live writer is already frozen.
 unit_paths = subprocess.check_output(
     ["systemctl", "show", "--property=UnitPath", "--value"], text=True,
 ).split()
@@ -3444,10 +3358,6 @@ if writer_mode == "detached-root-session":
     finally: os.close(systemd_root)
     terminal_writer_contract = None
     if detached_parent_terminal:
-        # PID1 may have discarded the transient scope source after stopping its
-        # parent slice.  At this one-way phase, use only the canonical intent's
-        # sealed provenance plus the still root-owned runtime safety file; do
-        # not daemon-reload or project a dead unit as though it were active.
         terminal_intent_raw = intent_path.read_bytes(); terminal_intent = json.loads(terminal_intent_raw)
         terminal_writer_contract = terminal_intent.get("writer", {})
         if (terminal_intent_raw != canonical(terminal_intent)
@@ -3553,10 +3463,6 @@ if writer_mode == "detached-root-session":
     if not re.fullmatch(r"[0-9a-f]{32}", scope_invocation_id):
         raise SystemExit("detached writer scope InvocationID is malformed")
 
-# `systemctl cat` reads backing files immediately, even before daemon-reload.
-# Bind its pre-recovery projection before the exact recovery drop-in is written;
-# retries reuse only this canonical durable value instead of hashing the newly
-# installed barrier and falsely reporting drift.
 if intent_path.exists():
     if intent_path.is_symlink() or not intent_path.is_file():
         raise SystemExit("fast cgroup-freeze intent is unsafe")
@@ -3721,9 +3627,6 @@ if frozen_path.exists() or frozen_path.is_symlink():
 parent_already_released = False
 if writer_mode == "detached-root-session" and (
         parent_release_path.exists() or parent_release_path.is_symlink()):
-    # A durable parent-release receipt is a one-way phase transition.  Retrying
-    # must never write `1` back to the parent: the session scope may have gained
-    # an unrelated member after the owned leaf was sealed.
     _leaf_value, _leaf_raw, released_leaf = load_leaf_receipt()
     load_parent_release(released_leaf, _leaf_raw)
     if (local_freeze(prepared_parent) != 0
@@ -3740,10 +3643,6 @@ for entry in freeze_targets:
         continue
     if (entry["role"] == "writer-parent"
             and (leaf_receipt_path.exists() or leaf_receipt_path.is_symlink())):
-        # A leaf receipt without the release receipt is recoverable only while
-        # the whole parent subtree is still exactly the sealed writer in the
-        # independently frozen owned leaf.  Prove that immediately before the
-        # idempotent parent re-freeze.
         _leaf_value, _leaf_raw, pending_leaf = load_leaf_receipt()
         if (local_freeze(pending_leaf) != 1 or frozen_state(pending_leaf) != 1
                 or unified_cgroup(writer_pid) != pending_leaf["path"]
@@ -3826,9 +3725,6 @@ if writer_mode == "detached-root-session":
                 validate_identities()
                 if local_freeze(prepared_parent) != 1 or frozen_state(prepared_parent) != 1:
                     raise SystemExit("detached parent thawed before the sealed writer move")
-                # Set and verify the child's own freezer request before moving
-                # the writer.  Effective `frozen 1` inherited from the parent
-                # alone is not an independent safety barrier.
                 freezer = os.open("cgroup.freeze", os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=leaf_directory)
                 try:
                     os.write(freezer, b"1")
@@ -3884,10 +3780,6 @@ if writer_mode == "detached-root-session":
         "observed_frozen": True, "observed_populated": True,
     })
     leaf_raw = leaf_receipt_path.read_bytes()
-    # The parent was frozen only to make leaf creation/reparenting atomic with
-    # respect to the writer.  Once the child has its own local freeze bit and a
-    # durable inode-bound receipt, release the parent.  Stopping user-0.slice
-    # can no longer wake the writer because the child remains locally frozen.
     if local_freeze(prepared_parent) != 0:
         write_local_freeze(prepared_parent, 0)
     wait_frozen(prepared_parent, 0)
@@ -4450,11 +4342,6 @@ publish(frozen_path, value)
 PY
 }
 
-# Capture a live snapshot and the exact WAL prefix that commits it before any
-# restart-affecting or nft mutation.  Every request has a create-only attempt
-# journal.  A failed/torn attempt is retained and a fresh attempt is made; only
-# a pair that the pinned recovery binary strictly replays byte-for-byte can be
-# selected for a quarantine authorization.
 capture_live_legacy_source() {
     { [ "$#" -eq 31 ] || [ "$#" -eq 33 ] || [ "$#" -eq 34 ]; } || \
         die "live-source capture requires the exact writer, height, role, inspector, and optional normalization boundary"
@@ -4747,11 +4634,6 @@ def ipv4_loopback_reachable_listener_inodes(raw,port):
         if len(fields)<10:continue
         local,state,inode=fields[1],fields[3],fields[9]
         address,port_hex=local.split(":",1)
-        # An IPv4 wildcard listener is the socket selected by a connection to
-        # 127.0.0.1 when there is no more-specific loopback listener.  Legacy
-        # ARC nodes bind 0.0.0.0:9090, so both exact-loopback and wildcard are
-        # valid candidates; ownership and singleton checks below still bind
-        # the request to exactly one socket held by the sealed writer.
         if (state=="0A" and address in {"00000000","0100007F"}
                 and int(port_hex,16)==port):
             listeners.append(int(inode))
@@ -4810,9 +4692,6 @@ def verify_network_quarantine():
             or status.get("active") is not True or status.get("enabled") is not True
             or observed_head!=expected_head):
         fail("final source capture is not behind the exact stable full-host quarantine")
-    # nft counters (including the SSH allow rule carrying this invocation) may
-    # advance while the loopback snapshot is copied.  Bind the immutable policy
-    # roots and exact fenced head, not the mutable full status document hash.
     return {"receipt_sha256":status["receipt_sha256"],
             "owned_ruleset_stateless_sha256":status["owned_ruleset_stateless_sha256"],
             "head":observed_head,"active":True,"enabled":True}
@@ -5263,9 +5142,6 @@ if selected.exists() or selected.is_symlink():
     validate_selected_capture(raw,"selected live source capture")
     sys.stdout.buffer.write(raw);raise SystemExit(0)
 
-# A power loss may occur after the complete attempt receipt is fsynced but
-# before its generation selector is created.  Reconcile that gap without a
-# second snapshot request; every terminal attempt remains immutable evidence.
 completed=[]
 for receipt_path in sorted(attempts.glob("*/receipt.json")):
     receipt_raw=secure_raw(receipt_path,0o400,32*1024*1024)
@@ -5452,11 +5328,6 @@ raise SystemExit(f"no strictly replay-valid live snapshot/WAL pair after {MAX_AT
 PY
 }
 
-# Crash-safe quarantine rounds.  Authorization contains the full ordered set
-# of still-live targets and readiness contains an exact acceptance from every
-# one.  Each host selects only its own row.  These artifacts live outside
-# STOP_BASE and are immutable; callers cannot restate a writer identity or
-# extend a deadline on argv.
 quarantine_round_entry() {
     local mode="$1" capture_id="$2" node="$3" freeze_sha="$4" round="$5"
     local authorization_sha="$6" readiness_sha="${7:--}" applied_sha="${8:--}"
@@ -5687,7 +5558,6 @@ def publish(path, raw, mode_value):
             view = view[written:]
         os.fsync(descriptor)
         os.fchmod(descriptor, mode_value)
-        # The mode transition is evidence too; make it durable before publish.
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -6678,9 +6548,6 @@ def validate_authorization(raw):
     ]
     authorized = parse_utc(value.get("authorized_at"), "round authorization")
     deadline = parse_utc(value.get("authorization_deadline"), "round deadline")
-    # UTC values from the operator and six nodes are audit metadata, not a
-    # safety clock.  Hash-bound request/response causality establishes the
-    # public -> authenticated -> source-capture order.
     if (public_started > public_completed or cross_started > cross_completed
             or min(capture_completed) > max(capture_completed)
             or authorized > deadline):
@@ -6689,9 +6556,6 @@ def validate_authorization(raw):
             authorized < observation_selected_at
             or deadline > observation_selected_at + datetime.timedelta(seconds=300))):
         fail("first quarantine mutation exceeds the live-observation selection window")
-    # Prior-node UTC observations are intentionally not compared to operator
-    # UTC.  Their exact transition/status roots and writer identities provide
-    # the causal bracket.
     return value, target, deadline, public_row, cross_row, frozen
 
 def validate_acceptance(raw, auth, deadline, expected_node=None):
@@ -6886,10 +6750,6 @@ ProtectControlGroups=no
 WantedBy=multi-user.target
 '''.encode()
         dependencies = {}
-        # The frozen live supervisor is deliberately first.  Publishing its
-        # drop-in is the first restart-effective systemd mutation.  The
-        # required allow path is permanently absent, so a reboot after any
-        # subsequent prefix cannot create an unsealed replacement writer.
         legacy_units = [frozen["supervisor_unit"]]
         legacy_units.extend(unit_name for unit_name in (
             "arc-self-heal.service", "arc-node.service",
@@ -7103,8 +6963,6 @@ WantedBy=multi-user.target
         intent_prepared = parse_utc(
             intent.get("prepared_at"), "precommit apply-intent preparation"
         )
-        # These node UTC values are retained for audit only.  The create-only
-        # roots establish intent -> persistence-plan causality.
 
         legacy_start_allow = pathlib.Path(
             persistence_plan["legacy_start_allow_path"]
@@ -7112,14 +6970,7 @@ WantedBy=multi-user.target
         if legacy_start_allow.exists() or legacy_start_allow.is_symlink():
             fail("precommit legacy restart allow path unexpectedly exists")
 
-        # The plan above was create-only and fsynced before the first possible
-        # /etc mutation.  Once expiry plus stable absence proves the authorized
-        # writer gone (on this boot or a later one),
-        # finish only that exact fail-closed persistence closure.  This never
-        # calls the nft helper and never publishes the active selector.
         secure_dir(pathlib.Path("/etc/arc-recovery"), 0o700)
-        # Same order as initial apply: the selected live supervisor barrier is
-        # the first effective mutation; a missing dispatcher also fails closed.
         for dependency, dependency_value in dependencies.items():
             secure_systemd_dropin_dir(dependency.parent, create=True)
             publish(dependency, dependency_value, 0o400)
@@ -7321,10 +7172,6 @@ WantedBy=multi-user.target
             sys.stdout.buffer.write(preliminary_raw)
             raise SystemExit(0)
 
-        # Finalize the no-restart transition from the original, persistently
-        # stopped source.  The recovery binary is an offline command only: it
-        # opens no listener and the loader is read-only.  Held no-follow FDs,
-        # full stat projections, and hashes bracket every invocation.
         precommit_evidence_path = attempt / "precommit-stopped-status.json"
         if precommit_evidence_path.exists() or precommit_evidence_path.is_symlink():
             durable_precommit_raw = secure_read(precommit_evidence_path, 0o400)
@@ -8867,9 +8714,6 @@ WantedBy=multi-user.target
         if mode == "applied-status":
             sys.stdout.buffer.write(existing_applied_raw)
             raise SystemExit(0)
-        # The active selector is deliberately volatile.  Only a complete,
-        # durable node transition may recreate it after reboot; the permanent
-        # absent-allow drop-ins prove no legacy writer can be started first.
         active_value = (str(state) + "\n").encode()
         if not active_path.exists() and not active_path.is_symlink():
             live = writer_set()
@@ -9402,10 +9246,6 @@ WantedBy=multi-user.target
         live_writers = writer_set()
         if live_writers:
             verify_writer(target)
-        # A reboot after the durable node transition intentionally leaves the
-        # legacy writer absent while the volatile selector is reconstructed
-        # above from the applied commit.  That is already safer than signaling;
-        # create the exact stop intent and record an already-absent outcome.
         stop_intent_fixed = {
             "schema": "arc.recovery.stop-after-quarantine-round-intent.v1",
             "capture_id": capture_id, "freeze_plan_sha256": freeze_sha,
@@ -9713,9 +9553,6 @@ WantedBy=multi-user.target
         sys.stdout.buffer.write(canonical(status_value))
         raise SystemExit(0)
 
-    # Reaching this point proves the exact local authorization and readiness
-    # roots.  All remaining filesystem/service/kernel changes are downstream
-    # of those durable facts.
     def tool_bytes(path):
         details = path.lstat()
         if (path.is_symlink() or not stat.S_ISREG(details.st_mode)
@@ -10048,9 +9885,6 @@ publish(commit_path,canonical(commit),0o400);result(commit)
             fail("preexisting quarantine table identity is ambiguous")
         return rows[0].get("comment")
 
-    # Expired attempts with no exact kernel mutation stop here, before any
-    # /etc, systemd, STOP_BASE, or nft write.  An exact table is allowed through
-    # solely so the post-kernel/pre-receipt crash can be reconciled.
     existing_comment = system_table_comment()
     if existing_comment is None:
         enforce_monotonic_mutation_lease(readiness, acceptance, target, "apply entry")
@@ -10140,7 +9974,6 @@ publish(commit_path,canonical(commit),0o400);result(commit)
             "prepared_at": format_utc(persistence_prepared_at),
         }
         persistence_plan_raw = canonical(persistence_plan)
-        # This plan is durable before the first restart-affecting /etc write.
         publish(persistence_plan_path, persistence_plan_raw, 0o400)
     persistence_plan_sha = sha(persistence_plan_raw)
     contract = {
@@ -10167,10 +10000,6 @@ publish(commit_path,canonical(commit),0o400);result(commit)
     }
     publish(state / "contract.json", canonical(contract), 0o400)
 
-    # A precommit reboot must not start a writer and must not apply an expired
-    # fence.  The generic unit therefore exists before the nft batch but has no
-    # active selector until an applied.commit is durable.  Its ensure command
-    # fails closed while the selector is absent.
     verify_supervisor(frozen, target)
     legacy_start_allow = pathlib.Path(
         persistence_plan["legacy_start_allow_path"]
@@ -10181,8 +10010,6 @@ publish(commit_path,canonical(commit),0o400);result(commit)
         readiness, acceptance, target, "first restart-effective mutation"
     )
     secure_dir(pathlib.Path("/etc/arc-recovery"), 0o700)
-    # The selected frozen supervisor dependency is first in insertion order.
-    # A crash after this or any later prefix leaves boot activation fail-closed.
     for dependency, dependency_value in dependencies.items():
         secure_systemd_dropin_dir(dependency.parent)
         publish(dependency, dependency_value, 0o400)
@@ -10237,11 +10064,7 @@ publish(commit_path,canonical(commit),0o400);result(commit)
         publish(barrier_path, barrier_raw, 0o400)
     barrier_sha = sha(barrier_raw)
 
-    # Re-prove the exact live supervisor plus direct/detached writer immediately
-    # before the only initial kernel mutation.
     verify_supervisor(frozen, target)
-    # The pinned helper owns the exact gate -> nft -> applied.commit sequence.
-    # It is the sole command below that may call nft -f.
     commit_raw = subprocess.check_output([str(state / "apply"), "initial"])
     commit = parse_canonical(commit_raw, "quarantine nft applied commit")
     if (commit.get("schema") != APPLIED_COMMIT_SCHEMA
@@ -10403,7 +10226,6 @@ publish(commit_path,canonical(commit),0o400);result(commit)
         }
         ancestry_raw = canonical(ancestry)
         publish(ancestry_path, ancestry_raw, 0o400)
-        # Re-prove the exact table after every loopback/ancestry request.
         probe_raw = subprocess.check_output([str(state / "apply"), "probe"])
         probe = parse_canonical(probe_raw, "post-fence nft probe")
         if probe.get("owned_ruleset_stateless_sha256") != \
@@ -10785,13 +10607,9 @@ if mode == "authority":
     if partial_path.exists() or partial_path.is_symlink():
         partial_raw = read_partial(partial_path)
         if not is_complete_canonical(partial_raw):
-            # No terminal exists and authorization is non-disruptive.  A
-            # truncated, identity-safe partial proves no accepted latch, so it
-            # may be removed and freshly authorized inside the live window.
             os.unlink(partial_path)
             fsync_dir(generation)
         else:
-            # Canonical conflicting bytes are not a crash fragment.
             validate_payload(partial_raw)
             raw = partial_raw
     if raw is None:
@@ -10842,9 +10660,6 @@ except FileExistsError:
     if final_raw != raw:
         raise SystemExit("concurrent fleet-start authorization differs")
 else:
-    # link(2) is the no-replace commit point.  Removing the private partial
-    # leaves the terminal at link-count one; both directory transitions are
-    # then covered by one durability barrier.
     pass
 os.unlink(partial_path)
 fsync_dir(generation)
@@ -11439,9 +11254,6 @@ def create_exact(path, payload, mode):
         if (temporary.is_symlink() or not stat.S_ISREG(details.st_mode)
                 or details.st_uid != 0 or details.st_gid != 0 or details.st_nlink != 1):
             raise SystemExit(f"unsafe network-quarantine partial: {temporary}")
-        # This is our fixed-name, root-owned partial inside an already sealed
-        # directory.  A complete write is promoted; an interrupted write is
-        # discarded so a power-loss retry can finish the same transaction.
         if temporary.read_bytes() == payload:
             os.chmod(temporary, mode)
             os.replace(temporary, path)
@@ -11658,8 +11470,6 @@ def socket_inventory():
             address_hex, port_hex = fields[1].split(":", 1)
             protocol = "tcp" if name.startswith("tcp") else "udp"
             state_code = fields[3]
-            # TCP LISTEN and every bound UDP socket are relevant.  Connected
-            # TCP flows are deliberately not called listeners.
             if protocol == "tcp" and state_code != "0A": continue
             port = int(port_hex, 16)
             if port == 0: continue
@@ -13481,10 +13291,6 @@ proof={"schema":"arc.recovery.legacy-network-quarantine-public-cross-proof.v1",
 print(json.dumps(proof,sort_keys=True,separators=(",",":")))
 PY
 )"
-    # RPC work is deliberately bracketed by complete live fence proofs.  The
-    # status embedded in the returned receipt is the post-query snapshot, so a
-    # table/tool/unit/non-owned-firewall drift during the query cannot be hidden
-    # behind the earlier status.
     after_status="$(quarantine_status "$capture_id" "$node" "$freeze_sha")"
     python3 - "$proof" "$after_status" <<'PY'
 import hashlib,json,sys
@@ -13638,10 +13444,6 @@ pre_fence_quiesce() {
     stage_prefreeze_runtime_safety "$root" "$2" "$3" "$4" "$5" \
         "$7" "$8" "${13}"
     install_legacy_network_quarantine "$@"
-    # The quarantine-only phase intentionally leaves the exact writer live.
-    # Fleet orchestration performs external counter challenges and the public
-    # height cross-proof over authenticated loopback before a later fence-stop
-    # invocation enters the irreversible cgroup-freeze/TERM transaction.
     if [ "${ARC_RECOVERY_QUARANTINE_ONLY:-false}" = true ]; then
         return 0
     fi
@@ -13887,8 +13689,6 @@ if (safety.get("schema") != "arc.recovery.prefreeze-runtime-safety-intent.v1"
         or safety.get("pre_recovery_unit_configuration_sha256") != unit_configuration_sha
         or safety.get("pre_recovery_oom_policy") not in {"stop", "continue"}):
     raise SystemExit("prefreeze runtime safety contract differs from the frozen supervisor")
-# Reconstruct the content-sealed pre-recovery context while independently
-# proving that the live frozen unit has the safer runtime overlay applied.
 sealed_automatic_lifecycle = dict(automatic_lifecycle)
 sealed_automatic_lifecycle["OOMPolicy"] = safety["pre_recovery_oom_policy"]
 invocation_id = subprocess.check_output(
@@ -13954,10 +13754,6 @@ if not candidate.is_absolute():
 data_dir = pathlib.Path(os.path.realpath(candidate))
 if str(data_dir) != data_dir_raw or not data_dir.is_dir() or data_dir.is_symlink():
     raise SystemExit("writer real data directory differs from sealed audit")
-# The exact PID/start/executable/argv tuple is frozen before this verifier.
-# Validator address and stake are therefore inherited from the content-sealed
-# live audit; querying RPC here would require thawing the writer and reopen the
-# historical self-heal race.
 value = {
     "schema": "arc.recovery.exact-writer.v3",
     "freeze_plan_sha256": freeze_sha,
@@ -14126,7 +13922,6 @@ if intent_path.exists() or armed_path.exists() or intent_path.is_symlink() or ar
             raise SystemExit("durable stop armed marker differs from its intent")
     raise SystemExit(0)
 
-# Every byte transitively bound by stop.intent must reach stable storage first.
 for base, dirs, files in os.walk(root / "evidence", followlinks=False):
     for name in dirs:
         if (pathlib.Path(base) / name).is_symlink():
@@ -14227,7 +14022,6 @@ finally: os.close(directory)
 PY
 }
 
-# Current v5 barrier transaction.
 commit_restart_barrier() {
     local root="$1" selected_unit="$2" selected_main_pid="$3" sealed_boot_id="$4"
     local marker="/etc/arc-recovery/legacy-start-allowed" current_boot other_unit unit
@@ -14250,9 +14044,6 @@ commit_restart_barrier() {
         live_quarantine_barrier=true
     fi
 
-    # Marker absence plus a durable arm is the commit point even when a crash
-    # interrupted publication of the commit receipt. Re-fsync the parent and
-    # publish the inferred receipt without touching a stale PID or cgroup.
     if [ ! -e "$marker" ] && [ ! -L "$marker" ] \
             && [ "$live_quarantine_barrier" = false ]; then
         python3 - "$root" "$selected_unit" "$selected_main_pid" "$sealed_boot_id" <<'PY'
@@ -14366,9 +14157,6 @@ PY
     [ "$current_boot" = "$sealed_boot_id" ] || \
         die "sealed boot ended before barrier commit; marker remains present, so require a fresh audit/plan and send zero stale signals"
 
-    # Install exact volatile lifecycle safety for the four-unit activation
-    # closure. These files vanish on reboot while the still-present marker
-    # permits the prepared legacy unit to recover normally.
     python3 - "$selected_unit" <<'PY'
 import os
 import secrets
@@ -14467,10 +14255,6 @@ PY
             die "volatile control masks exist without a durable pre-mask activation gate"
     fi
 
-    # Seal the complete unmasked activation/lifecycle projection before the
-    # first volatile mask is created. A retry after any partial mask set can
-    # converge from this fsynced event without trying to reconstruct facts that
-    # PID1 intentionally hides behind LoadState=masked.
     python3 - "$root" "$selected_unit" "$selected_main_pid" "$sealed_boot_id" "$existing_control_masks" <<'PY'
 import hashlib
 import json
@@ -14725,9 +14509,6 @@ if event_path.exists() or event_path.is_symlink():
             or existing.get("persistent_control_masks_absent") is not True):
         raise SystemExit("durable pre-mask activation gate differs")
     if mask_count == 0:
-        # With no masks, recompute the full projection below and require exact
-        # equality; with partial masks, the durable event is the only valid
-        # representation of PID1's intentionally hidden pre-mask state.
         pass
     else:
         raise SystemExit(0)
@@ -14897,9 +14678,6 @@ else:
     finally: os.close(directory)
 PY
 
-    # `/run/systemd/system.control` precedes `/etc/systemd/system` in the unit
-    # load path. Use exact high-priority volatile masks and prove PID1's
-    # effective LoadState, never ordinary lower-priority runtime masks.
     python3 - "$selected_unit" <<'PY'
 import os
 import pathlib
@@ -15367,8 +15145,6 @@ else:
     directory = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
     try: os.fsync(directory)
     finally: os.close(directory)
-# Revalidate the exact frozen/masked state after the durable arm, then make the
-# single commit mutation through a sealed parent dirfd and fsync it.
 verify_pre_mask_sources()
 for entry in cgroups: subtree(entry)
 if (prop(selected, "FreezerState") not in {"running", "frozen"} or prop(selected, "Job") not in {"", "0"}
@@ -15641,9 +15417,6 @@ stop_node_cleanly() {
     local supervisor_argv_sha="${14}"
     local capture_id="${15}" node="${16}" freeze_sha="${17}"
     require_commands pgrep systemctl sync python3 find sort tail
-    # This verifier is intentionally the first state-sensitive operation in
-    # the stop controller.  No barrier commit, pidfd signal, or cgroup thaw is
-    # allowed unless the exact persistent host quarantine is still active.
     verify_legacy_network_quarantine "$root" "$capture_id" "$node" "$freeze_sha"
     commit_restart_barrier "$root" "$supervisor_unit" "$supervisor_pid" "$boot_id"
     record_committed_restart_barrier "$root" "$supervisor_unit" "$supervisor_pid"
@@ -15790,9 +15563,6 @@ def proc_start(pid):
     return int(proc_fields(pid)[19])
 
 def sealed_pid_state(pid, start):
-    # PID/start-ticks are meaningful only within the boot in which they were
-    # sealed.  A coincidental numeric PID and start-tick pair after reboot is
-    # a replacement process, never the historical target.
     current_boot = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     if current_boot != boot_id:
         try:
@@ -15843,9 +15613,6 @@ def verify_identity(pid, start, executable_path, executable_sha, argv_sha, expec
         raise SystemExit("sealed process argv changed before TERM")
     if expected_cgroup is not None and unified_cgroup(pid) != expected_cgroup:
         raise SystemExit("sealed process moved out of its frozen cgroup")
-    # The task-level verifier below rejects ptracing, job-control stops,
-    # blocked-only delivery, namespace-init default dispositions, and ambiguous
-    # thread-directed TERM. Call it here even when no TERM is pending.
     term_pending(pid)
 
 def term_pending(pid):
@@ -16116,9 +15883,6 @@ def member_absent(member):
         return False
     sealed_target_pids = {writer_pid, supervisor_pid}
     if member["pid"] not in sealed_target_pids:
-        # A reviewed transient `sleep <=60` is identified by its captured
-        # PID/start/ancestry. Global sleep argv matching would confuse an
-        # unrelated host sleep with a restart of this cgroup member.
         return True
     return not matching_processes(
         member["executable_path"], member["executable_sha256"], member["argv_sha256"],
@@ -16321,10 +16085,6 @@ def thaw(entry, intent_path):
     else:
         directory_path = cgroup_base(entry)
         if cgroup_state(entry) == "frozen":
-            # All legacy names are control-masked. The durable thaw intent
-            # authorizes only this exact dirfd/dev/inode kernel transition;
-            # name-based ThawUnit is forbidden because a unit name can be
-            # rebound while the sealed cgroup inode remains our authority.
             directory = os.open(
                 directory_path,
                 os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
@@ -17000,9 +16760,6 @@ if current_boot_id != boot_id:
     raise SystemExit(0)
 
 if "writer" in role_entries:
-    # Detached mode is deliberately two-stage.  The supervisor remains frozen
-    # and unsignaled until the writer is durably terminal, so even a default
-    # SIGTERM disposition cannot remove containment while the writer can run.
     supervisor_intent_path = root / "53-supervisor-cgroup-thaw-intent.json"
     writer_terminal_path = root / "52-writer-terminal-before-supervisor-thaw.json"
     if not thaw_intent_path.exists():
@@ -17027,9 +16784,6 @@ if "writer" in role_entries:
         cgroup_status = cgroup_state(role_entries["writer"])
         writer_members = [] if cgroup_status == "disappeared" else subtree_pids(role_entries["writer"])
         supervisor_status = cgroup_state(role_entries["supervisor"])
-        # An unsignaled supervisor disappearance has no durable causal/ordering
-        # proof tying it to the still-contained writer.  Do not pretend that is
-        # a valid v2 containment outcome: fail closed before publishing 52.
         if (supervisor_status != "frozen"
                 or cgroup_local_freeze(role_entries["supervisor"]) != 1
                 or term_progress("20-supervisor") != "missing"):
@@ -17327,7 +17081,6 @@ finally:
 PY
 }
 
-# Canonical verifier for the direct-cgroup-v2 offline-stop.v4 journal.
 verify_stop_journal_semantics() {
     local root="$1" capture_id="$2" node="$3" freeze_sha="$4"
     python3 - "$root" "$capture_id" "$node" "$freeze_sha" <<'PY'
@@ -18407,9 +18160,6 @@ def validate_thaw_chain(require_complete):
     if detached and "supervisor" in progress_values and "writer" not in progress_values:
         raise SystemExit("detached supervisor thaw receipt precedes writer thaw receipt")
     if writer_terminal is not None:
-        # Canonical v2 52 evidence admits only an exact locally/effectively
-        # frozen supervisor cgroup.  Pre-52 disappearance is intentionally not
-        # reconstructible from later absence and therefore remains fail-closed.
         containment = writer_terminal.get("supervisor_containment")
         if (not detached or "writer" not in progress_values
                 or (signal_events["30-writer"]["exited"] is None
@@ -18682,9 +18432,6 @@ fence_stop() {
     require_hash "$first_boundary_sha" "first-quarantine boundary hash"
     require_hash "$fleet_start_authorization_sha" "fleet-start authorization hash"
     require_hash "$fleet_start_readiness_sha" "fleet-start readiness hash"
-    # This is the first mutation entrypoint.  It must prove a remote authority
-    # accepted the fresh fleet boundary and that the exact latch was replicated
-    # before STOP_BASE or any runtime/network state can be touched.
     local fleet_start_authorization_payload
     fleet_start_authorization_payload="$(quarantine_fleet_authorization_exact \
         "$capture_id" "$node" "$freeze_sha" "$public_height_sha" \
@@ -18711,8 +18458,6 @@ if not parse(ready["completed_at"])<=now<=parse(auth["authorization_deadline"]):
     raise SystemExit(1)
 PY
         then
-            # A delayed retry is authorized only after nyc already completed
-            # the exact network quarantine inside the sealed live window.
             quarantine_status "$capture_id" "$node" "$freeze_sha" >/dev/null 2>&1 || \
                 die "stale fleet-start readiness has no completed nyc mutation proof; recapture a fresh generation"
         fi
@@ -19004,8 +18749,6 @@ PY
                 die "armed stop journal has no ownership marker"
             [ "$(cat "$temporary/.arc-recovery-partial-owner")" = "$partial_owner" ] || \
                 die "armed stop journal ownership differs"
-            # These are derived only after every pidfd action. If completion
-            # was not durable, regenerate them from the preserved source log.
             rm -f -- "$temporary/stop.files.sha256"
         else
             prepare_owned_partial_directory "$temporary" "$partial_owner"
@@ -20837,10 +20580,6 @@ else:
         except (UnicodeError,json.JSONDecodeError): parsed_existing=None
         if parsed_existing is not None and canonical(parsed_existing)==existing:
             raise SystemExit("persisted-head complete publication partial differs from re-executed receipt")
-        # A crash can leave any byte prefix, including one after completed_at.
-        # The exact 0700 ancestry plus root-owned fixed-name 0400/nlink1 inode
-        # identifies this as our incomplete publication; never interpret its
-        # bytes and never promote it.
         os.unlink(temporary)
         descriptor=os.open(output.parent,os.O_RDONLY|getattr(os,"O_DIRECTORY",0)|getattr(os,"O_NOFOLLOW",0))
         try: os.fsync(descriptor)
@@ -21064,10 +20803,6 @@ bind_capture() {
         --checkpoint "$stage_root/recovery.arcchkpt" \
         > "$temporary/final-checkpoint.inspect.json" 2> "$temporary/final-checkpoint.inspect.stderr"
 
-    # A final validator capture is classified only from that validator's own
-    # stopped data directory and its own on-disk snapshot.  The independently
-    # sealed canonical source snapshot is reference evidence; substituting it
-    # here would turn a real fork (or an unpaired capture) into invented state.
     python3 - "$capture_root/capture-source.json" \
         "$temporary/capture-snapshot.selection.json" <<'PY'
 import hashlib
@@ -21600,8 +21335,6 @@ for row in value["external_snapshots"]:
 PY
     )
 
-    # No model/build/git path is a member: the resolved model bytes are sealed
-    # independently in the rollout inventory and remain at their absolute path.
     tar --create --zstd --sort=name --numeric-owner --acls --xattrs --sparse \
         --one-file-system --file - --directory / "${members[@]}"
     verify_capture_source "$capture_root" "$capture_id" "$node"
@@ -21668,10 +21401,6 @@ quarantine_retire() {
     local stop_root="$STOP_BASE/$capture_id/$node"
     local retirement_root="$NETWORK_FENCE_STATE/retirements/$rollout_sha/$node"
     [ -d "$stop_root" ] && [ ! -L "$stop_root" ] || die "final stopped journal is unavailable for quarantine retirement"
-    # The first irreversible byte is published only after the complete stopped,
-    # restart-fenced, fully monitored state has been re-proved.  A retry after
-    # INTENT must not call the pre-retirement verifier because the table/unit
-    # are deliberately absent in later phases.
     if [ ! -e "$retirement_root/INTENT.json" ] && [ ! -L "$retirement_root/INTENT.json" ]; then
         stopped_status "$capture_id" "$node" >/dev/null
         quarantine_restart_status "$capture_id" "$node" "$freeze_sha" >/dev/null
@@ -21849,9 +21578,6 @@ if (monitor.get("network_quarantine_receipt_sha256") != sha(base_raw)
         or commit.get("allow_marker_absent") is not True):
     raise SystemExit("quarantine-retirement source receipt chain differs")
 
-# Status is deliberately read-only.  It accepts only a previously committed
-# terminal receipt and freshly re-proves the exact live postconditions without
-# daemon-reload, stop/disable, unlink, nft mutation, or journal publication.
 if mode == "status":
     receipt_path = journal / "RECEIPT.json"
     receipt, receipt_raw = load_json(
@@ -22009,9 +21735,6 @@ intent, intent_raw = stable_publish(
 )
 intent_sha = sha(intent_raw)
 
-# Phase 1: permanently retire the old public nginx path before opening any
-# network traffic.  The retained absent-marker condition prevents a reboot or
-# manual start from restoring it.
 nginx_dir = pathlib.Path("/etc/systemd/system/nginx.service.d")
 ensure_parent(nginx_dir, 0o755)
 nginx_barrier = nginx_dir / "zzzz-arc-recovery-retired.conf"
@@ -22028,8 +21751,6 @@ phase1, phase1_raw = stable_publish(
      "nginx_retirement_barrier_sha256": sha(nginx_barrier_raw), "complete": True},
 )
 
-# Phase 2: make the monitor stoppable without altering its sealed base unit,
-# then stop+disable it while its nft table is still the active safety barrier.
 unit_dir = unit.parent / f"{unit.name}.d"; ensure_parent(unit_dir, 0o755)
 retirement_dropin = unit_dir / "zzzz-arc-recovery-retired.conf"
 retirement_dropin_raw = b"[Unit]\nRefuseManualStop=no\n\n[Service]\nRestart=no\n"
@@ -22045,8 +21766,6 @@ phase2, phase2_raw = stable_publish(
      "retirement_dropin_sha256": sha(retirement_dropin_raw), "complete": True},
 )
 
-# Phase 3: remove only the exact capture-owned dependency drop-ins.  Both
-# independent legacy start-barrier sets are retained and re-hashed below.
 monitor_files = monitor.get("file_sha256")
 if not isinstance(monitor_files, dict): raise SystemExit("quarantine monitor file inventory is malformed")
 for legacy in units:
@@ -22080,9 +21799,6 @@ if pathlib.Path("/etc/arc-recovery/legacy-start-allowed").exists() or pathlib.Pa
         "/etc/arc-recovery/legacy-start-allowed").is_symlink():
     raise SystemExit("legacy start marker reappeared during quarantine retirement")
 
-# Phase 4: exact-match the owned table and the nonowned baseline, then delete
-# only that table with the sealed private nft copy.  A crash after deletion is
-# reconciled by the preceding durable phases and the retained start barriers.
 pinned_nft = state / "nft"
 pinned_raw = secure(pinned_nft, 0o500)
 pinned_sha = base.get("file_sha256", {}).get("nft")

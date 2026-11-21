@@ -51,14 +51,7 @@ import { useAppStore } from "../lib/store";
 import { DEFAULT_NODE_CONFIG } from "../lib/types";
 import { useUpdaterSnapshot } from "../lib/updater";
 
-// Host labels live in lib/hosts.ts so every screen names a seed identically.
-// "Which host" is load-bearing context for any chain number here, because the
-// seeds are independent chains (CLAUDE.md rule 4).
-
-// A running node that reaches nothing for this long steps out of the start-up stage, so the dashboard and its
-// connection line take over instead of the stage holding the whole screen.
 const PEER_WAIT_MS = 45_000;
-// How long the stage shows "Your node is live" when start-up finishes, before it steps aside.
 const LIVE_MOMENT_MS = 2_600;
 
 export function Dashboard() {
@@ -95,9 +88,6 @@ export function Dashboard() {
     queryFn: api.fetchNetworkStats,
     refetchInterval: 10_000,
   });
-  // Share Network's host overview so chain height and block age come from the
-  // same current source. `nodeStatus` only has the age from the first host
-  // election; using it here lets that timestamp grow stale while height moves.
   const {
     data: networkOverview,
     isError: networkOverviewError,
@@ -106,9 +96,6 @@ export function Dashboard() {
     queryFn: api.fetchNetworkOverview,
     refetchInterval: 10_000,
   });
-  // Whether the OS will bring the node back by itself. Polled rather than
-  // assumed from the config flag: the login item is registered separately, so
-  // the two can disagree and that disagreement is worth seeing.
   const { data: loginItem } = useQuery({
     queryKey: ["autostart"],
     queryFn: api.getAutostart,
@@ -167,10 +154,6 @@ export function Dashboard() {
     },
   });
 
-  // The crash banner's "Start again": clear the crash, then start. The error
-  // lives here, not in the banner, because clearing the crash unmounts the
-  // banner; a refused start is shown below as the start-failure panel, the
-  // way Home's strip keeps its Start errors.
   const startAgainMutation = useMutation({
     mutationFn: async () => {
       await api.clearCrash();
@@ -182,7 +165,6 @@ export function Dashboard() {
   });
 
   const running = !!status?.running;
-  // A start error is moot once the node runs, and a stop error once it has exited.
   useEffect(() => {
     if (running) {
       startMutation.reset();
@@ -191,56 +173,31 @@ export function Dashboard() {
     } else {
       stopMutation.reset();
     }
-    // The reset functions are stable; only the node's state decides.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [running]);
-  // The one start or restart that failed, if any, in the order the buttons sit on this screen.
   const startFailure = startMutation.error ?? restartMutation.error ?? startAgainMutation.error ?? null;
-  // An update ARC couldn't finish keeps the node until ARC exits, and Start and Restart are refused, so this screen
-  // offers what Home's node strip does: Quit ARC. The updater's own state says so, or a refused Start does when this
-  // window no longer has that state (after a reload).
   const update = useUpdaterSnapshot();
   const updateUnfinished =
     isUnfinishedUpdate(update) ||
     (startFailure !== null && classifyStartFailure(String(startFailure)) === "update-unfinished");
   const [quitting, setQuitting] = useState(false);
   const isExternal = running && status?.pid == null;
-  // Nothing is known until the first status arrives: the node may be running, or auto-starting in the background, so
-  // the screen says "Checking" rather than "stopped" and offers no Start button yet.
   const statusKnown = status !== undefined;
-  // How the node reaches the network, in plain words (lib/connection.ts). A community node has no peers by
-  // design (arc-net admits only the validators), so zero peers with a coordinator answering is connected, not
-  // stuck. Through v0.8.14 that state carried three banners: "HTTP client mode", "Client mode" with a
-  // "Reset peer state" button, and "Connecting to peers" counting up.
   const connection = describeConnection(status);
   const connecting = running && connection.state === "connecting";
   const connectedViaCoordinator =
     running && connection.state === "connected" && (status?.peers ?? 0) === 0;
   const isCrashed =
     !!status?.lastError && status.lastError.includes("exited unexpectedly");
-  // The status's own "nothing answered" text is this computer's connection, told by the subtitle; any other
-  // lastError that is not a crash is a start the app made by itself that failed, told like a refused Start.
   const reportedStartFailure =
     !running && !isCrashed && !isUnreachableMessage(status?.lastError) ? status?.lastError ?? null : null;
-  // Spawned but RPC not yet bound. arc-node spends most of its startup time
-  // loading the GGUF model into memory (especially in debug builds), during
-  // which /health doesn't respond, so status.running stays false even though
-  // the child process is alive and working. Without surfacing this, the
-  // Start button appears unresponsive for minutes.
   const isStarting =
     (!running && status?.pid != null) || startMutation.isPending || startAgainMutation.isPending;
 
-  // The node's start, drawn as the first arch of an aqueduct: every step is one the node actually reports. No model-load
-  // percentage exists, so that step shows work under way without claiming progress; catching up is drawn from the real
-  // local and chain heights. Once caught up, the Network screen carries the live aqueduct.
   const localHeight = status?.height ?? null;
-  // the chain's tip as the node reports it (the display string chainHeight above is the network overview's)
   const tipHeight = status?.chainHeight ?? null;
   const catchingUp =
     running && status?.chainParticipationEnabled === true && localHeight != null && tipHeight != null && tipHeight - localHeight > 50;
-  // "running" means the node's RPC already answers, so a running node that has reached nothing yet is connecting,
-  // not opening its port. With no model configured (an observer) there is no model to load: that process is
-  // opening its port.
   const findingPeers = running && (status?.peers ?? 0) === 0 && !catchingUp;
   const [peerWaitOver, setPeerWaitOver] = useState(false);
   useEffect(() => {
@@ -263,8 +220,6 @@ export function Dashboard() {
           : catchingUp
             ? "sync"
             : null;
-  // When start-up finishes connected (a peer, or a coordinator for a community node), the stage says so for a
-  // moment ("Your node is live"), then steps aside.
   const [liveUntil, setLiveUntil] = useState<number | null>(null);
   const prevStartupPhase = useRef<ArchChainPhase | null>(null);
   const connected = running && connection.state === "connected";
@@ -302,7 +257,6 @@ export function Dashboard() {
 
   const [addressCopied, setAddressCopied] = useState(false);
 
-  // How long the running node has been reaching for the network without an answer.
   const [syncElapsed, setSyncElapsed] = useState(0);
   const syncTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -475,7 +429,6 @@ export function Dashboard() {
         <ModelUnavailableBanner reason={status.modelUnavailable} />
       )}
 
-      {/* The header carries an update ARC couldn't finish, as one sentence and Quit ARC. */}
       {startFailure && !updateUnfinished && (
         <StartFailurePanel
           error={String(startFailure)}
@@ -490,9 +443,6 @@ export function Dashboard() {
         />
       )}
 
-      {/* A start the app made by itself (at launch, after a crash) that failed reads like a refused Start: one
-          sentence, one action, the native text behind Show details. Not shown twice when a pressed Start failed
-          the same way. */}
       {reportedStartFailure && !startFailure && !updateUnfinished && (
         <StartFailurePanel
           error={reportedStartFailure}
@@ -501,7 +451,6 @@ export function Dashboard() {
         />
       )}
 
-      {/* Only while the node is still running: once it has exited, a failed Stop is moot (and reset above). */}
       {stopMutation.error && running && !startFailure && (
         <ProblemNotice
           testId="mutation-error"
@@ -522,9 +471,6 @@ export function Dashboard() {
         />
       )}
 
-      {/* The connection, as status. A community node connects through a coordinator and has no peers, which is
-          its normal state; while nothing has answered yet the line counts the wait, and after a while it says to
-          check the internet connection. Nothing here is a fault, so nothing here is red. */}
       {connectedViaCoordinator && (
         <div
           className="connection-notice"
@@ -627,9 +573,6 @@ export function Dashboard() {
                 fontSize: "var(--text-sm)",
               }}
             >
-              {/* Rendered only when the chain actually reports it. It used
-                  to fall back to `?? 0`, which showed a confident "+0.00
-                  today" for a number nobody knew. */}
               {earnings?.fromChain === true && earnings.todayArc != null && (
                 <div>
                   <span style={{ color: "var(--success)" }}>+</span>{" "}
@@ -675,11 +618,6 @@ export function Dashboard() {
                 )}
               </dd>
               <dt>Last payout</dt>
-              {/* A block height is not a timestamp. Passing
-                  `last_attestation_block` (~123,462) to formatRelativeTime
-                  rendered "20770d ago" the moment the account earned
-                  anything. The two are now separate fields and rendered
-                  differently. */}
               <dd data-testid="last-payout">
                 {earnings?.lastPayoutAt
                   ? formatRelativeTime(earnings.lastPayoutAt)
@@ -714,8 +652,6 @@ export function Dashboard() {
         </div>
       </Card>
 
-      {/* Compact projection. The full version, with the treasury ceiling and
-          the complete assumptions line, lives on the Earnings screen. */}
       <div style={{ marginBottom: "var(--space-6)" }} data-testid="dashboard-projection">
         <ProjectedEarnings variant="tile" />
       </div>
@@ -801,8 +737,6 @@ export function Dashboard() {
                     <Zap />
                   </div>
                   <div className="feed-item-body">
-                    {/* The live seeds return flat tx records with no prompt
-                        text. Say so rather than rendering an empty title. */}
                     <div className="feed-item-title">
                       {a.inputPreview || (
                         <span style={{ color: "var(--text-muted)" }}>
@@ -811,8 +745,6 @@ export function Dashboard() {
                       )}
                     </div>
                     <div className="feed-item-meta">
-                      {/* Each of these is omitted when unknown, instead of
-                          being printed as a confident "0 tokens / 0ms". */}
                       {a.tokens != null && <span>{a.tokens} tokens</span>}
                       {a.latencyMs != null && <span>{a.latencyMs}ms</span>}
                       <span>{formatHash(a.txHash, 8)}</span>
@@ -905,8 +837,6 @@ export function Dashboard() {
         />
       </div>
         <Card>
-          {/* Everything in this card is YOUR node, read from
-              127.0.0.1:<rpcPort>. It used to be a remote seed's numbers. */}
           <CardHeader title="Your node" />
           <div className="kv">
             <dt>Connection</dt>
@@ -933,9 +863,6 @@ export function Dashboard() {
             <dd className="mono">:{status?.rpcPort ?? "-"}</dd>
             <dt>PID</dt>
             <dd>{status?.pid ?? "-"}</dd>
-            {/* The owner's first question: does this survive a restart on its
-                own? Answered here from the two things that decide it — the
-                config flag and the OS login item — rather than implied. */}
             <dt>Starts with OS</dt>
             <dd data-testid="dashboard-persistence">
               {(config?.autoStart ?? DEFAULT_NODE_CONFIG.autoStart)
@@ -1019,8 +946,6 @@ export function Dashboard() {
             </dd>
             <dt>Host block height</dt>
             <dd data-testid="dashboard-chain-height">{chainHeight}</dd>
-            {/* DAG rounds and health can advance without sealed blocks.
-                Height and age both come from the fresh host overview. */}
             <dt>Last block</dt>
             <dd
               data-testid="chain-block-age"
@@ -1032,12 +957,6 @@ export function Dashboard() {
             </dd>
           </div>
 
-          {/* Was `openExternal("http://140.82.16.112:3200")` labelled "Open
-              network explorer". Three things were wrong with that: the IP was
-              hardcoded to LAX rather than the seed this session actually reads,
-              :3200 is a network dashboard and not a block explorer, and the
-              deployed page carries dead tiles and stale copy. The in-app
-              Network screen reads the pinned host and can be trusted. */}
           <button
             className="btn btn-secondary"
             style={{

@@ -79,8 +79,6 @@ class LoopbackCohortSsh:
 
         self._start_child("loopback-host-keygen", [tools["ssh-keygen"], "-q", "-t", "ed25519",
                            "-N", "", "-f", str(host_key)], self.base_env)
-        # Children.wait is deliberately used so tool failures are recorded in
-        # the same evidence stream as model/coordinator processes.
         host_key_process = self.children.items[-1][0]
         self.children.wait(host_key_process, 15)
         os.chmod(host_key, 0o600)
@@ -144,8 +142,6 @@ class LoopbackCohortSsh:
         self.known_hosts.write_text(self.known_hosts_record(self._port, " ".join(public_host)), encoding="ascii")
         os.chmod(self.known_hosts, 0o600)
 
-        # Keep the real account HOME. A private wrapper suppresses file-based
-        # identities; the isolated SSH_AUTH_SOCK contains only this test key.
         self.environment = dict(self.base_env, SSH_AUTH_SOCK=str(agent_socket))
         self._agent = self._start_child("loopback-ssh-agent",
             [tools["ssh-agent"], "-D", "-a", str(agent_socket)], self.environment)
@@ -237,7 +233,7 @@ class LoopbackCohortSsh:
             try:
                 os.killpg(self._agent.pid, signal.SIGTERM)
                 agent_requested = True
-            except Exception as error:  # cleanup must still remove private material
+            except Exception as error:
                 failure = error
         if self._agent is not None and agent_requested:
             try:
@@ -254,9 +250,6 @@ class LoopbackCohortSsh:
                     failure = failure or error
             self.children.record_exit(self._agent)
         elif self._agent is not None and self._agent.poll() is None:
-            # Startup/authentication failed before the narrow expected-exit
-            # contract applies. Still stop our own agent, but never mark code 2
-            # from this path as an expected SIGTERM result.
             try:
                 self.children.stop([self._agent], timeout=5)
             except Exception as error:
@@ -316,7 +309,6 @@ class LoopbackCohortSsh:
 
 
 def smoke_main(argv=None):
-    """Exercise generated host pin, isolated agent authentication and teardown."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--smoke-output-dir", required=True, type=Path)
     args = parser.parse_args(argv)
@@ -325,7 +317,6 @@ def smoke_main(argv=None):
         parser.error("--smoke-output-dir must be absolute")
     output.mkdir(mode=0o700, parents=True, exist_ok=False)
 
-    # Use the same child supervisor/evidence format as the qualification runner.
     from run_low_residency_conformance import Children, require_clean_exits, write_json
 
     base_env = dict(os.environ)

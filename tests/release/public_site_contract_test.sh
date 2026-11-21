@@ -100,8 +100,6 @@ pages_workflow_is_pinned_and_self_contained() {
             return 1
         }
 
-    # Job-scoped permissions keep build code away from the OIDC token while
-    # the deployment job has only the three capabilities it needs.
     [ "$(grep -Fc 'id-token: write' "$WORKFLOW")" -eq 1 ] || {
         printf 'Pages OIDC write permission must exist only on the deploy job\n'
         return 1

@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Backward-compatible entry point. The release asset/root install.sh is the
-# single implementation so asset names, checksum policy, and service behavior
-# cannot drift between two installers.
 set -Eeuo pipefail
 
 if ! SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; then

@@ -4,10 +4,6 @@ import react from "@vitejs/plugin-react";
 const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig(async ({ mode }) => {
-  // Production Tauri builds bake TAURI_ENV_PLATFORM; everything else is a
-  // browser/dev build that gets the mock IPC. Flag used inside tauri.ts to
-  // refuse mock calls when !isTauri in a production build (can't fabricate
-  // node state from a production bundle served off a web host).
   const isProdTauriBundle =
     mode === "production" && !!process.env.TAURI_ENV_PLATFORM;
 

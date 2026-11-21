@@ -1,35 +1,13 @@
 #!/usr/bin/env bash
-# ARC Chain headless/server installer for Linux and macOS.
-#
-# Security and upgrade contract:
-#   - resolve one immutable vX.Y.Z release (never walk back to an older tag)
-#   - require the node, CLI, installer, and network config in that release
-#   - verify every downloaded file against that release's SHA256SUMS
-#   - keep validator identity out of argv and preserve it across upgrades
-#   - refuse downgrades and unknown installed versions
-#   - run stake-0 community mode only
 set -Eeuo pipefail
 umask 077
 
 REPOSITORY="${ARC_REPOSITORY:-FerrumVir/arc-chain}"
 API_ROOT="${ARC_GITHUB_API_ROOT:-https://api.github.com/repos/${REPOSITORY}}"
 DOWNLOAD_ROOT="${ARC_GITHUB_DOWNLOAD_ROOT:-https://github.com/${REPOSITORY}/releases/download}"
-# v0.8 closes admission, joins every producer/task, and then fsyncs the WAL.
-# Already-owned v0.8 community work retains the 4,000-second public window plus
-# its 300-second late-submit grace; reserve another two minutes for joins/fsync.
-# Released v0.7 binaries do not implement that barrier and are governed by the
-# separate recovered-fleet retirement gate below.
 GRACEFUL_STOP_TIMEOUT_SECS=4420
-# The managed system-user bridge cannot ask systemd to restart its root-owned
-# replacement unit:
-# its updater deliberately runs as the unprivileged community user. It sends
-# SIGTERM to its own node and relies on Restart=always instead. Cover the
-# v0.8 quiescence budget plus RestartSec=5 and a bounded startup allowance.
 SYSTEM_USER_RESTART_TIMEOUT_SECS=$((GRACEFUL_STOP_TIMEOUT_SECS + 30))
 
-# Community/reward RPC is explicit HTTPS configuration, separate from QUIC
-# P2P discovery. Every managed node receives the same reviewed six origins;
-# raw remote HTTP is deliberately not configurable through the installer.
 COMMUNITY_RPC_ORIGINS=(
     https://149.28.32.76
     https://140.82.16.112
@@ -225,16 +203,9 @@ elif [ -z "$SCOPE_HINT" ] || [ "$SCOPE_HINT" = auto ]; then
     fi
 fi
 if [ "$OS" = Linux ] && [ "$SCOPE_HINT" = system ]; then
-    # A root updater must not execute binaries from a user-renamable home
-    # directory. System installs therefore default beneath a root-owned parent.
     DEFAULT_ARC_DIR=/var/lib/arc-chain
 fi
 
-# Directory arguments are later passed to mkdir/chown/chmod, sometimes as
-# root.  Keep their spelling unambiguous so lexical checks cannot be bypassed
-# with a trailing slash, `..`, or an implementation-defined leading `//`.
-# This intentionally does not resolve symlinks: managed directory paths must
-# not contain them at all.
 NORMALIZED_DIRECTORY_PATH=""
 normalize_managed_directory_path() {
     local path_value="$1" path_label="$2"
@@ -348,8 +319,6 @@ if [ "$UNINSTALL" = false ] && [ "$ARC_DIR_PREEXISTED" = true ] \
     esac
 fi
 
-# Read only a strict key/value data file. Never source user-writable config:
-# the system updater runs as root and sourcing it would be privilege escalation.
 CONFIG_FILE="$ARC_DIR/install.conf"
 SEED_FILE="$ARC_DIR/identity/validator-seed"
 KEY_FILE="$ARC_DIR/identity/validator-key.json"
@@ -363,7 +332,7 @@ if [ -f "$CONFIG_FILE" ]; then
     [ ! -L "$CONFIG_FILE" ] || die "Refusing symlinked installer config: $CONFIG_FILE"
     while IFS='=' read -r key value; do
         case "$key" in
-            version) : ;; # Informational; the executable is authoritative.
+            version) : ;;
             rpc_port) SAVED_RPC_PORT="$value" ;;
             p2p_port) SAVED_P2P_PORT="$value" ;;
             data_dir) SAVED_DATA_DIR="$value" ;;
@@ -397,7 +366,6 @@ else
     if [ -n "$SAVED_DATA_DIR" ]; then
         NODE_DATA_DIR="$SAVED_DATA_DIR"
     elif [ "$LEGACY_ADOPTION_CANDIDATE" = true ]; then
-        # v0.7 data is preserved for forensics and never reused as v0.8 state.
         NODE_DATA_DIR="$ARC_DIR/data-v0.8"
     else
         NODE_DATA_DIR="$ARC_DIR/data"
@@ -411,10 +379,6 @@ else
     MODEL_PATH="$SAVED_MODEL_PATH"
 fi
 
-# A pending v0.7 adoption binds the manager choice as well as the data path.
-# Read only the narrow scope hint here so a crash after retiring a legacy
-# system supervisor resumes with the same privilege boundary. The complete
-# marker is authenticated and compared byte-for-byte before any mutation.
 PENDING_LEGACY_SCOPE=""
 PENDING_LEGACY_RPC_PORT=""
 PENDING_LEGACY_P2P_PORT=""
@@ -452,11 +416,6 @@ else
     SERVICE_SCOPE=user
 fi
 
-# The real v0.7 community installer put a user-owned ~/.arc behind a
-# root-owned system service. Preserve that safe split automatically: the new
-# system units stay root-owned, while both the node and updater execute as the
-# community user and every file under ~/.arc remains user-owned. This avoids a
-# root updater ever executing from a user-replaceable home directory.
 if [ "$OS" = Linux ] && [ "$LEGACY_ADOPTION_CANDIDATE" = true ] \
     && [ "$ARC_DIR" = "$LEGACY_USER_INSTALL_ROOT" ] \
     && [ "$INSTALL_SERVICE" = true ] && [ "$SERVICE_WAS_SET" = false ] \
@@ -509,10 +468,6 @@ valid_port "$RPC_PORT" || die "Invalid RPC port: $RPC_PORT"
 valid_port "$P2P_PORT" || die "Invalid P2P port: $P2P_PORT"
 [ "$RPC_PORT" != "$P2P_PORT" ] || die "RPC and P2P ports must be different"
 
-# Never chmod/chown a shared operating-system tree. Dedicated directories
-# below /var/lib, /srv, /opt, mounted volumes, or the install user's home are
-# supported; the roots themselves and executable/config/runtime namespaces are
-# not. Reject descendants of namespaces where chain data never belongs too.
 case "$NODE_DATA_DIR" in
     /|/bin|/bin/*|/boot|/boot/*|/dev|/dev/*|/etc|/etc/*|/lib|/lib/*|/lib32|/lib32/*|/lib64|/lib64/*|/proc|/proc/*|/root|/root/*|/run|/run/*|/sbin|/sbin/*|/sys|/sys/*|/tmp|/tmp/*|/usr|/usr/*|/var|/var/cache|/var/cache/*|/var/lib|/var/log|/var/log/*|/var/run|/var/run/*|/var/spool|/var/spool/*|/var/tmp|/var/tmp/*|/opt|/srv|/mnt|/media|/home|/Users|/Applications|/Applications/*|/Library|/Library/*|/System|/System/*|/private/etc|/private/etc/*|/private/tmp|/private/tmp/*|/private/usr|/private/usr/*|/private/var|/private/var/log|/private/var/log/*|/private/var/run|/private/var/run/*|/private/var/tmp|/private/var/tmp/*|"$TARGET_HOME")
         die "Refusing unsafe data directory; choose a dedicated ARC path: $NODE_DATA_DIR" ;;
@@ -562,9 +517,6 @@ as_target() {
     fi
 }
 
-# Execute a secret-file operation as the file's exact owner. The Rust CLI
-# independently revalidates ownership through the opened handle, so a path
-# swap between this lookup and open fails closed instead of changing trust.
 as_private_file_owner() {
     local private_path="$1" owner_uid
     shift
@@ -1459,11 +1411,6 @@ prepare_legacy_supervisor() {
         fi
     fi
 
-    # Older installers published the pending marker before the legacy archive.
-    # Continue to accept that recoverable crash state, but new migrations first
-    # fence the unsigned updater beneath the install lock, publish the archive,
-    # and only then publish the marker. Once an archive exists, later
-    # transaction crash states may legitimately have retired the source.
     if [ "$resume_mode" = true ] \
         && ! legacy_path_present "$LEGACY_PRESERVED_DIR"; then
         case "$LEGACY_SUPERVISOR_KIND" in
@@ -2085,9 +2032,6 @@ set_target_owner() {
 
 ensure_private_dir() {
     if [ "$CURRENT_UID" -eq 0 ] && [ "$TARGET_USER" != root ]; then
-        # A sudo install without a system service uses paths owned by the
-        # invoking user. Create them as that user instead of letting a root
-        # mkdir/chmod follow a path the user can race.
         as_target mkdir -p -- "$1"
         as_target chmod 700 "$1"
     else
@@ -2104,7 +2048,6 @@ validate_root_managed_parent_chain() {
     parent_path="$(dirname -- "$managed_path")"
     remainder="${parent_path#/}"
 
-    # `/` is part of every absolute path and must satisfy the same invariant.
     component_uid="$(stat -c %u -- /)" \
         || die "Could not inspect root while validating $path_label"
     component_mode="$(stat -c %a -- /)" \
@@ -2163,18 +2106,11 @@ if [ "$UNINSTALL" = false ]; then
                         validate_legacy_v07_layout
                         [ "$LEGACY_SOURCE_VERSION" = "$pending_source_version" ] \
                             || die "Pending adoption source version changed after marker creation"
-                        # Preserve compatibility with the old marker-before-
-                        # archive crash shape, but defer every publication until
-                        # the install lock is held and the unsigned updater is
-                        # stopped. The locked phase revalidates the live source.
                         prepare_legacy_supervisor true
                         LEGACY_ADOPTION_EVIDENCE_NEEDS_VALIDATION=true ;;
                     0.8.*|0.9.*|[1-9][0-9]*.*)
                         LEGACY_SOURCE_VERSION="$pending_source_version"
                         LEGACY_PARTIAL_RESUME=true
-                        # A newer binary proves the retirement/copy transaction
-                        # already began, so its pre-transaction archive must be
-                        # present before any partial supervisor is inspected.
                         validate_resumable_legacy_evidence
                         prepare_legacy_supervisor true
                         LEGACY_ADOPTION_EVIDENCE_NEEDS_VALIDATION=true ;;
@@ -2200,10 +2136,6 @@ if [ "$UNINSTALL" = false ]; then
         die "--update-only requires an existing marked ARC installation in $ARC_DIR"
     fi
 else
-    # Prove ownership before stopping services or removing even individually
-    # named files. A pending legacy-adoption marker is intentionally not an
-    # uninstall or purge capability. Purge checks the marker again immediately
-    # before recursion.
     validate_install_root_marker
 fi
 
@@ -2216,13 +2148,9 @@ if [ "$SERVICE_SCOPE" = system-user ]; then
 fi
 
 if [ "$SERVICE_SCOPE" = system ]; then
-    # Both trees will be created and permissioned by root. Every existing
-    # parent is verified before the first privileged filesystem mutation.
     validate_root_managed_parent_chain "$ARC_DIR" "System install directory"
     validate_root_managed_parent_chain "$NODE_DATA_DIR" "System data directory"
 elif [ "$CURRENT_UID" -eq 0 ] && [ "$TARGET_USER" = root ]; then
-    # A direct-root install has no less privilege merely because it omitted a
-    # service. Keep root mkdir/chmod away from attacker-writable ancestors.
     validate_root_managed_parent_chain "$ARC_DIR" "Root install directory"
     validate_root_managed_parent_chain "$NODE_DATA_DIR" "Root data directory"
 fi
@@ -2296,9 +2224,6 @@ uninstall_arc() {
         if [ "$SERVICE_SCOPE" = system ]; then
             as_root rm -rf -- "$ARC_DIR"
         elif [ "$CURRENT_UID" -eq 0 ] && [ "$TARGET_USER" != root ]; then
-            # A sudo install-only tree belongs to the invoking user. Purging
-            # as that user avoids turning a user-controlled rename race into
-            # an arbitrary root deletion primitive.
             as_target rm -rf -- "$ARC_DIR"
         else
             rm -rf -- "$ARC_DIR"
@@ -2327,8 +2252,6 @@ if [ "$ARC_DIR_PREEXISTED" = false ]; then
 fi
 
 if [ "$SERVICE_SCOPE" = system ]; then
-    # The daily updater is a root system service. Its executable and the node
-    # binary must therefore never be writable by the unprivileged node user.
     INSTALL_PARENT="$(dirname -- "$ARC_DIR")"
     as_root mkdir -p -- "$INSTALL_PARENT"
     PARENT_UID="$(stat -c %u "$INSTALL_PARENT")"
@@ -2341,10 +2264,6 @@ if [ "$SERVICE_SCOPE" = system ]; then
         die "System install parent must not be group/world writable: $INSTALL_PARENT"
     fi
     as_root mkdir -p -- "$ARC_DIR" "$ARC_DIR/bin" "$ARC_DIR/identity"
-    # A v0.7 adoption must prove that the v0.8 state path is still absent.
-    # Create it only after the compiled retirement verifier has published the
-    # matching offline receipt. Fresh installs and ordinary v0.8 updates keep
-    # the normal eager directory preparation.
     if [ "$LEGACY_ADOPTION_ACTIVE" = false ]; then
         as_root mkdir -p -- "$NODE_DATA_DIR"
     fi
@@ -2452,11 +2371,6 @@ fence_legacy_updater_before_network() {
                 fi
             fi ;;
     esac
-    # The v0.7 updater ignores this install lock. Re-read every source after
-    # it is definitely absent so a mid-reservation replacement cannot cross
-    # the transaction boundary unnoticed. Once fenced, it intentionally stays
-    # fenced on every failure: durable migration evidence must never coexist
-    # with an unsigned updater that can invalidate that evidence.
     revalidate_legacy_sources_after_updater_fence
 }
 
@@ -2498,9 +2412,6 @@ trap 'exit 143' TERM
 
 fence_legacy_updater_before_network
 if [ "$LEGACY_ADOPTION_ACTIVE" = true ]; then
-    # No marker or archive is published until the install lock is held and the
-    # unsigned v0.7 updater is absent. Archive-first publication means a crash
-    # cannot pin stale source bytes behind a live updater schedule.
     if [ "$LEGACY_ADOPTION_MARKER_NEEDS_CREATE" = true ]; then
         create_legacy_adoption_marker
         LEGACY_ADOPTION_MARKER_NEEDS_CREATE=false
@@ -2521,9 +2432,6 @@ strict_version() {
     printf '%s\n' "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'
 }
 
-# Bash arithmetic is signed and accepts implementation-specific integer
-# spellings.  Network evidence is compared arithmetically below, so accept
-# only canonical decimal integers small enough to remain portable.
 canonical_uint() {
     local value="$1"
     [ -n "$value" ] && [ "${#value}" -le 18 ] || return 1
@@ -2561,16 +2469,6 @@ github_curl() {
     curl "${args[@]}" "$url"
 }
 
-# GitHub's global `latest` pointer must remain on the v0.7-compatible release
-# until every unsigned v0.7 updater has been retired.  New headless installs
-# and the signed v0.8 updater therefore discover their own channel from the
-# release collection, then resolve and authenticate one exact immutable tag.
-#
-# This small JSON scanner deliberately recognizes only a top-level release
-# object's literal `tag_name` string.  A release body containing escaped JSON,
-# or a nested asset object, cannot inject a candidate.  The selected tag is
-# still treated only as discovery: the exact-tag response, protected source
-# commit, owner-signed manifest, and every payload are verified below.
 extract_top_level_release_tags() {
     awk '
         BEGIN {
@@ -2671,11 +2569,6 @@ extract_top_level_release_tags() {
     ' "$1"
 }
 
-# Emit exactly one top-level JSON scalar as either `string<TAB>value` or
-# `bare<TAB>value`. This keeps the installer dependency-free on minimal Linux
-# and macOS hosts while avoiding regex matches inside nested objects, arrays,
-# or quoted prose. Escaped top-level keys and escaped selected values fail
-# closed because every field consumed below has a canonical ASCII spelling.
 extract_unique_top_level_json_scalar() {
     local json_file="$1" wanted_key="$2"
     awk -v wanted="$wanted_key" '
@@ -2889,11 +2782,6 @@ select_headless_channel_version() {
     [ -s "$TMP_DIR/release-candidates" ] \
         || die "No ARC v0.8+ release tag is discoverable; use --version only with a reviewed exact tag"
 
-    # A tag name in the collection is discovery input, not a channel member.
-    # Walk candidates from highest to lowest and exact-resolve each one until
-    # an immutable stable protected-publisher release is found. Otherwise a
-    # manually published v999.0.0 draft/prerelease could poison every unpinned
-    # install even though a valid lower stable release still exists.
     : > "$TMP_DIR/release-candidates-rejected"
     while :; do
         candidate_version=""
@@ -2965,12 +2853,6 @@ if [ "$RELEASE_METADATA_PREFETCHED" = false ] \
     die "Could not read GitHub release metadata: $RELEASE_METADATA_URL"
 fi
 
-# SHA256SUMS and the payloads it authenticates live in the same GitHub
-# release. A mutable release could replace both together, so a checksum alone
-# is not an authenticity boundary. The protected publisher uses the repository
-# GITHUB_TOKEN, which GitHub records as github-actions[bot]. Require that
-# server-authenticated author as defense in depth; the owner-controlled
-# detached manifest signature below remains the cryptographic trust boundary.
 require_release_boolean() {
     local key="$1"
     local expected="$2"
@@ -2988,9 +2870,6 @@ require_release_boolean immutable true
 require_release_boolean draft false
 require_release_boolean prerelease false
 
-# GitHub's release API emits the top-level author object with `login` first.
-# Flatten whitespace only for this exact server-owned field; do not accept a
-# generic nested `login` from an asset uploader or other object.
 tr -d '\r\n' < "$TMP_DIR/release.json" > "$TMP_DIR/release-one-line.json"
 grep -Eq '"author"[[:space:]]*:[[:space:]]*\{[[:space:]]*"login"[[:space:]]*:[[:space:]]*"github-actions\[bot\]"([[:space:]]*[,}])' \
     "$TMP_DIR/release-one-line.json" \
@@ -3008,13 +2887,6 @@ strict_version "$VERSION" || die "Release tag is not strict vX.Y.Z: $RESOLVED_TA
 if [ -n "$REQUESTED_VERSION" ] && [ "$VERSION" != "$REQUESTED_VERSION" ]; then
     die "GitHub returned $RESOLVED_TAG when v$REQUESTED_VERSION was requested"
 fi
-
-# Do not scrape the release asset array with a greedy line-oriented regex.
-# GitHub serves API JSON minified on one line, where that approach captures
-# only the final `name` value. The exact immutable tag is resolved above; each
-# required asset is downloaded from that tag below with fail-on-404 and then
-# matched to exactly one SHA256SUMS entry. A missing asset therefore fails
-# closed without release walking or fallback.
 
 INSTALLED_VERSION=""
 if [ -x "$ARC_DIR/bin/arc-node" ]; then
@@ -3045,10 +2917,6 @@ github_curl "$RELEASE_URL/SHA256SUMS" > "$TMP_DIR/SHA256SUMS" \
 github_curl "$RELEASE_URL/SHA256SUMS.sig" > "$TMP_DIR/SHA256SUMS.sig" \
     || die "Could not download $RELEASE_URL/SHA256SUMS.sig"
 
-# The bootstrap installer comes from the owner-created protected source tag.
-# This detached signature extends that trust to every release asset and defeats
-# a manual or alternate-workflow first publication, even if GitHub reports it
-# as immutable and authored by github-actions[bot].
 printf '%s\n' \
     'arc-release namespaces="arc-release-manifest-v1" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPs2NAiDRXit9EM96A2GdXZgRqvXtl0lvryEAEAEjQfY arc-release-manifest-v1' \
     > "$TMP_DIR/arc-release-allowed-signers"
@@ -3117,8 +2985,6 @@ download_checked() {
     verify_file "$destination" "$asset"
 }
 
-# The signed asset set identifies the update profile, which cannot authorize
-# retirement even for an already stopped legacy install.
 if [ "$LEGACY_ADOPTION_ACTIVE" = true ] && awk '
     $2 == "arc-existing-chain-update-attestation.json" \
         || $2 == "*arc-existing-chain-update-attestation.json" \
@@ -3345,9 +3211,6 @@ write_legacy_retirement_supervisor_binding() {
             source_path="$LEGACY_PRESERVED_DIR/legacy-detached-topology"
             argv=("${LEGACY_DETACHED_RESTART_ARGS[@]}") ;;
         none)
-            # A stopped no-service v0.7 default has no live supervisor source.
-            # Bind the exact archived release version plus the only recognized
-            # stake-zero command that the legacy default layout can resume.
             supervisor_kind=manual
             source_path="$LEGACY_PRESERVED_DIR/version.txt"
             legacy_seed="$(sed -n '1p' "$LEGACY_PRESERVED_DIR/identity.seed")"
@@ -3427,10 +3290,6 @@ network_https_curl() {
 
 legacy_http_listener_responds() {
     local url="$1"
-    # No --fail: any HTTP status proves a legacy listener or proxy still
-    # answers on the exact port the released worker uses. Connection refusal,
-    # routing failure, or timeout proves that this host cannot open a new
-    # legacy claim/submit channel at the cutover boundary.
     curl --silent --show-error --output /dev/null \
         --proto '=http' --connect-timeout 3 --max-time 5 "$url"
 }
@@ -3533,9 +3392,6 @@ verify_legacy_v07_network_retirement() {
         fi
     done
 
-    # Released v0.7 workers use raw HTTP on every seed's :9090 and :3001.
-    # Prove those exact channels are unreachable from this worker before TERM;
-    # a long timeout cannot turn v0.7's immediate-exit handler into a drain.
     for origin in "${COMMUNITY_RPC_ORIGINS[@]}"; do
         host="${origin#https://}"
         for legacy_port in 9090 3001; do
@@ -3616,9 +3472,6 @@ create_legacy_retirement_intent() {
     if legacy_path_present "$LEGACY_RETIREMENT_INTENT"; then
         validate_owned_nonwritable_path "$LEGACY_RETIREMENT_INTENT" \
             "legacy retirement intent" file "$(legacy_expected_owner_uid)"
-        # Conservatively cross the no-restart boundary before parsing an
-        # existing create-only record. A malformed protected record must fail
-        # stopped; it must never cause the installer to revive v0.7.
         LEGACY_RETIREMENT_INTENT_DURABLE=true
     fi
     capture_legacy_retirement_process
@@ -3763,7 +3616,6 @@ finalize_legacy_retirement_receipt() {
         || die "Published retirement receipt differs from the verifier result"
     LEGACY_RETIREMENT_RECEIPT_SHA256="$reported_sha"
 
-    # Only the receipt may authorize creation of fresh v0.8 state.
     if [ "$SERVICE_SCOPE" = system ]; then
         as_root mkdir -- "$NODE_DATA_DIR" \
             || die "Could not create the receipt-authorized v0.8 data directory"
@@ -4063,10 +3915,6 @@ stop_launchd_node_gracefully() {
     esac
     kill -TERM "$pid" 2>/dev/null || return 1
 
-    # Wait for the exact process to finish. The caller disables the label
-    # first, so KeepAlive cannot turn this into an unbounded restart loop.
-    # For v0.8 this bounds its real quiescence barrier; for v0.7 it proves
-    # only TERM-without-KILL process death and must never be called a drain.
     for ((elapsed=0; elapsed<GRACEFUL_STOP_TIMEOUT_SECS; elapsed++)); do
         kill -0 "$pid" 2>/dev/null || return 0
         sleep 1
@@ -4106,9 +3954,6 @@ retire_legacy_runtime() {
                     || return 1
             fi
             if legacy_path_present "$LEGACY_LINUX_NODE_UNIT"; then
-                # The released v0.7 unit inherited systemd's short default
-                # stop timeout. Override only the runtime instance so a
-                # migration can never turn in-flight work into SIGKILL.
                 as_root systemctl set-property --runtime arc-node.service \
                     "TimeoutStopSec=${GRACEFUL_STOP_TIMEOUT_SECS}s" \
                     SendSIGKILL=no >/dev/null 2>&1 || return 1
@@ -4194,8 +4039,6 @@ restore_legacy_runtime_state() {
             else
                 as_root systemctl disable arc-node.service >/dev/null 2>&1 || true
             fi
-            # Restore the exact legacy files and node state, but never re-arm
-            # the unsigned updater while the durable migration marker remains.
             as_root systemctl disable --now arc-updater.timer \
                 >/dev/null 2>&1 || status=1
             as_root systemctl disable --now arc-updater.service \
@@ -4283,9 +4126,6 @@ restart_managed_system_user_node() {
                 fi
                 ;;
             activating|deactivating|reloading) ;;
-            # A managed Restart=always service should pass through activating /
-            # auto-restart. Inactive or failed is terminal evidence that the
-            # bridge did not restart, never a successful update.
             inactive|failed|*) return 1 ;;
         esac
         sleep 1
@@ -4362,8 +4202,6 @@ restore_launchd_state() {
         fi
     fi
     if [ "$node_unloaded" = true ] && [ "$PRIOR_LAUNCHD_NODE_LOADED" = true ]; then
-        # A disabled service cannot be bootstrapped. Restore the loaded state
-        # first, then reapply the exact prior persistent enablement override.
         launchctl enable "$LAUNCHD_DOMAIN/network.arc.node" || status=1
         launchctl bootstrap "$LAUNCHD_DOMAIN" "$NODE_PLIST" || status=1
     fi
@@ -4373,9 +4211,6 @@ restore_launchd_state() {
         launchctl enable "$LAUNCHD_DOMAIN/network.arc.node" || status=1
     fi
 
-    # A scheduled updater can be the process executing this rollback. Keep a
-    # previously loaded job in place; its restored on-disk plist is used on
-    # the next login/bootstrap without terminating the active transaction.
     if [ "$PRIOR_LAUNCHD_UPDATER_LOADED" = true ]; then
         if ! launchctl print "$LAUNCHD_DOMAIN/network.arc.update" >/dev/null 2>&1; then
             launchctl enable "$LAUNCHD_DOMAIN/network.arc.update" || status=1
@@ -4397,10 +4232,6 @@ enforce_post_intent_fail_stop() {
     [ "$LEGACY_RETIREMENT_INTENT_DURABLE" = true ] || return 1
     case "$LEGACY_SUPERVISOR_KIND" in
         linux-system)
-            # The restored on-disk unit may be v0.7 while systemd still has a
-            # v0.8 process loaded. Apply the no-KILL runtime boundary before
-            # stopping either generation, then leave every old/new updater
-            # and node unit disabled.
             as_root systemctl set-property --runtime arc-node.service \
                 "TimeoutStopSec=${GRACEFUL_STOP_TIMEOUT_SECS}s" \
                 SendSIGKILL=no >/dev/null 2>&1 || true
@@ -4545,8 +4376,6 @@ VALIDATOR_ADDRESS="$(as_target "$ARC_DIR/bin/arc-cli" keygen --verify-keyfile "$
 printf '%s\n' "$VALIDATOR_ADDRESS" | grep -Eq '^[0-9a-f]{64}$' \
     || die "Installed validator keyfile produced an invalid public address"
 
-# If an interrupted earlier install left both representations, prove that the
-# new keyfile preserves the same public identity before retiring the seed.
 if [ -n "$LEGACY_SEED_SOURCE" ] && [ "$KEY_FILE_PREEXISTED" = true ]; then
     IDENTITY_CHECK_FILE="$ARC_DIR/identity/.legacy-validator-key-check.json"
     if [ -e "$IDENTITY_CHECK_FILE" ] || [ -L "$IDENTITY_CHECK_FILE" ]; then
@@ -4568,8 +4397,6 @@ if [ -n "$LEGACY_SEED_SOURCE" ] && [ "$KEY_FILE_PREEXISTED" = true ]; then
 fi
 unset VALIDATOR_ADDRESS LEGACY_SEED_SOURCE KEY_FILE_PREEXISTED
 
-# A pre-v0.8.0 installer seed is retained only as protected migration
-# evidence. No active environment file or runner ever reads it again.
 if [ -e "$SEED_FILE" ]; then
     transactional_copy "$SEED_FILE" "$LEGACY_SEED_EVIDENCE" 600
     set_target_owner "$LEGACY_SEED_EVIDENCE"
@@ -4765,9 +4592,6 @@ install_launchd() {
     fi
     transactional_copy "$TMP_DIR/network.arc.node.plist" "$NODE_PLIST" 600 || return 1
     if launchctl print "$LAUNCHD_DOMAIN/network.arc.node" >/dev/null 2>&1; then
-        # The already-loaded plist may predate ExitTimeOut. Drain its exact
-        # node process explicitly before bootout so launchd's legacy default
-        # timeout cannot truncate accepted work or the final WAL fsync.
         launchctl disable "$LAUNCHD_DOMAIN/network.arc.node" || return 1
         stop_launchd_node_gracefully network.arc.node \
             "$ARC_DIR/bin/arc-node" "$ARC_DIR/bin/run-arc-node" || return 1
@@ -4868,9 +4692,6 @@ install_launchd_updater() {
         plutil -lint "$TMP_DIR/network.arc.update.plist" >/dev/null || return 1
     fi
     transactional_copy "$TMP_DIR/network.arc.update.plist" "$UPDATE_PLIST" 600 || return 1
-    # The loaded updater can be this installer process. Its arguments and
-    # schedule are stable, so replacing the plist is sufficient; unloading it
-    # here would terminate a valid update in the middle of its transaction.
     if ! launchctl print "$LAUNCHD_DOMAIN/network.arc.update" >/dev/null 2>&1; then
         launchctl bootstrap "$LAUNCHD_DOMAIN" "$UPDATE_PLIST" || return 1
     fi
@@ -4902,9 +4723,6 @@ rollback_and_die() {
 }
 
 if [ "$LEGACY_ADOPTION_ACTIVE" = true ]; then
-    # Re-check immediately before the first v0.8 launch.  A v0.7 binary does
-    # not honor the new lock namespace, and an operator could otherwise start
-    # the old path again during the file transaction.
     ensure_no_legacy_arc_processes
 fi
 

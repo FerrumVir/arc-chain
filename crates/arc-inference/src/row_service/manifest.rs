@@ -1,5 +1,3 @@
-//! Startup pins for the bytes decoded into a shared resident bundle.
-
 use super::invalid;
 use crate::cached_integer_model::GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE;
 use crate::tensor_parallel::{MAX_CANONICAL_ROW_FILE_BYTES, RowAssignment, TensorKey};
@@ -42,8 +40,6 @@ pub(super) struct PinnedManifest {
 }
 
 pub(super) fn regular_file(path: &Path) -> io::Result<std::fs::File> {
-    // NOFOLLOW rejects a replaced final symlink; NONBLOCK prevents a raced
-    // FIFO from hanging startup. Read and hash this very descriptor only.
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)

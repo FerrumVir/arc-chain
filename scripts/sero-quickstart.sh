@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Deprecated compatibility wrapper. Use ../install.sh directly for all new
-# headless installs; this wrapper no longer has an independent download path.
 set -Eeuo pipefail
 
 if ! SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; then

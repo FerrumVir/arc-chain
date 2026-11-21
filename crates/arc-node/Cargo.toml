@@ -9,20 +9,12 @@ license.workspace = true
 name = "arc-node"
 path = "src/main.rs"
 
-# Real Stwo Circle-STARK proofs enabled automatically in production (nightly).
-# Dev builds on stable use mock BLAKE3 verifier - proofs are structurally identical.
 [features]
 default = []
-# Integration-only deterministic native executor. Behind a feature so it cannot
-# exist in a default build; evidence produced with it is protocol coverage and
-# qualifies no model.
 native-test-executor = []
 benchmark-tools = ["arc-crypto/benchmark-tools", "arc-state/benchmark-tools"]
 candle = ["arc-inference/candle"]
 stwo-prover = ["arc-crypto/stwo-prover", "arc-state/stwo-prover"]
-# Historical public-testnet mutation drivers are inert, but keeping them behind
-# an explicit feature prevents default/release builds from treating them as
-# supported operational tools.
 retired-live-examples = []
 
 [[example]]

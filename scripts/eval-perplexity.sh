@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Perplexity evaluation for ARC Chain integer inference engine.
-# Downloads model + dataset if not present, runs INT8 (and optionally INT16) evaluation.
-#
-# Usage: ./scripts/eval-perplexity.sh [model_path] [dataset_path] [max_tokens]
-
 MODEL_DIR="${ARC_MODEL_DIR:-$HOME/.arc-models}"
 MODEL="${1:-$MODEL_DIR/llama-2-7b.Q8_0.gguf}"
 DATASET="${2:-$MODEL_DIR/wikitext-2-raw/wiki.test.raw}"
@@ -41,7 +36,6 @@ echo ""
 cargo run --example eval_perplexity --features candle --release -- \
     "$MODEL" "$DATASET" "$MAX_TOKENS"
 
-# Try INT16 if feature is available
 echo ""
 echo "=== Attempting INT16 evaluation ==="
 if cargo build --example eval_perplexity --features "candle,int16" --release 2>/dev/null; then

@@ -1,29 +1,5 @@
 import { expect, test, type Locator } from "@playwright/test";
 
-// The CANONICAL explorer (/explorer/index.html, the page the public site
-// publishes), through its deep-link routes, against a disposable protocol-4
-// network - e.g. the soak harness's `--workload native` validators:
-//   #/request/<id>  #/blocks/<start>  #/block/<h>  #/tx/<hash>  #/address/<a>
-//
-// A disposable chain has no production maintenance interlock, so the home
-// panels stay paused (explorer-localdev.spec.ts pins that) and nothing below
-// may be labelled canonical: the configured sources answer explicit lookups,
-// but nothing verifies them as the canonical timeline. The labels are
-// asserted, not assumed.
-//
-// What this adds over the node-only contract tests (explorer/test-contract.mjs)
-// is the rendered page in a real browser: the routes, the DOM a user reads,
-// the links between views and a reload. Every displayed value is compared
-// with the node's own JSON, never with anything the page computed.
-//
-// The configuration document describes this throwaway chain only. Its
-// checkpoint is one of the chain's own committed blocks, read from the node
-// as in explorer-localdev.spec.ts, and it reaches the page through the
-// page's existing configuration seam. It makes no recovery claim, and no
-// interlock evidence is synthesized.
-//
-// ARC_LOCALDEV_NATIVE_RPC: one node's RPC base (http://127.0.0.1:9960)
-// ARC_LOCALDEV_NATIVE_REPLICAS: the other nodes, comma-separated (optional)
 const RPC = process.env.ARC_LOCALDEV_NATIVE_RPC;
 const REPLICAS = (process.env.ARC_LOCALDEV_NATIVE_REPLICAS ?? "")
   .split(",")
@@ -39,8 +15,6 @@ async function get(base: string, path: string): Promise<Json | null> {
 }
 
 const bare = (value: unknown) => String(value ?? "").replace(/^0x/i, "").toLowerCase();
-// The page's integer rule (explorer/app.js formatExactInteger): a safe
-// non-negative integer is formatted, anything else reads "Unavailable".
 const exact = (value: unknown) =>
   typeof value === "number" && Number.isSafeInteger(value) && value >= 0
     ? new Intl.NumberFormat("en-US").format(value)
@@ -48,15 +22,12 @@ const exact = (value: unknown) =>
 const short = (hash: string) => `0x${hash.slice(0, 8)}…${hash.slice(-6)}`;
 const sourceId = (base: string) => `node-${new URL(base).port}`;
 
-/// The value cell of one labelled row of a detail grid.
 const field = (scope: Locator, label: string) =>
   scope
     .locator("div.detail-item")
     .filter({ has: scope.page().getByText(label, { exact: true }) })
     .locator("dd");
 
-/// A local-development configuration built from the live chain: the
-/// checkpoint is the first node's own block two below its tip.
 async function chainConfig(sources: string[]): Promise<Json> {
   const health = await get(RPC!, "/health");
   const height = Math.max(1, Number(health?.height ?? 0) - 2);
@@ -79,9 +50,6 @@ async function chainConfig(sources: string[]): Promise<Json> {
       legacyPublicMaxHeight: height,
       blockHash,
       stateRoot,
-      // A disposable chain has no recovery boundary or signed manifest. These
-      // reuse the same real block identity and assert nothing about a
-      // recovery that never happened.
       manifestHash: blockHash,
       boundaryBlockHash: blockHash,
       boundaryStateRoot: stateRoot,
@@ -106,8 +74,6 @@ async function chainConfig(sources: string[]): Promise<Json> {
 
 type Settled = { requestId: string; finalizeTx: string; height: number };
 
-/// The newest request settled by a NativeInferenceFinalize at least 20
-/// blocks below the tip, so every replica has applied it.
 async function settledRequest(): Promise<Settled | null> {
   const health = await get(RPC!, "/health");
   const tip = Number(health?.height ?? 0);
@@ -161,8 +127,6 @@ test.describe("canonical explorer routes against a local protocol-4 network", ()
     expect(receipts.map(Boolean), "every node holds the settled request's receipt").toEqual(
       NODES.map(() => true),
     );
-    // A chain property first: honest replicas record one settlement, and its
-    // credits add up to the reservation.
     const settlement = (r: Json) =>
       JSON.stringify([
         r.observed_status,
@@ -204,8 +168,6 @@ test.describe("canonical explorer routes against a local protocol-4 network", ()
           exact(r.admission_transaction?.block_height ?? r.admission_height),
         );
         await expect(field(card, "Terminal at")).toHaveText(exact(r.terminal_transaction?.block_height));
-        // Fields a node reports only once upgraded: shown when served, and
-        // never invented when not.
         await expect(field(card, "Expires at")).toHaveText(
           typeof r.expires_at === "number" ? `Height ${exact(r.expires_at)}` : "Unavailable from this node",
         );
@@ -246,7 +208,6 @@ test.describe("canonical explorer routes against a local protocol-4 network", ()
       await expect(cells.nth(3)).toHaveText(short(bare(block.hash)));
     }
 
-    // Into the block that settled the request: the newest row of the page.
     expect(newestFirst[0]?.height).toBe(start);
     await rows.first().locator("button.table-link").click();
     await expect(page).toHaveURL(new RegExp(`#/block/${start}$`));
@@ -258,12 +219,9 @@ test.describe("canonical explorer routes against a local protocol-4 network", ()
     await expect(field(content, "State root")).toHaveText(`0x${bare(block.header.state_root)}`);
     await expect(field(content, "Transactions")).toHaveText(exact(block.header.tx_count));
 
-    // Its transaction list links the finalize transaction.
     await content.locator(`ul.chip-list button[title="0x${found!.finalizeTx}"]`).click();
     await expect(page).toHaveURL(new RegExp(`#/tx/${found!.finalizeTx}$`));
     const full = (await get(RPC!, `/tx/${found!.finalizeTx}/full`))!;
-    // The checkpoint's legacy and current sources are the same node, which
-    // is asked once.
     const card = content.locator("article.occurrence-card");
     await expect(card).toHaveCount(1, { timeout: 30_000 });
     await expect(card.locator(".status-pill")).toHaveText("NOT CANONICAL");
@@ -277,8 +235,6 @@ test.describe("canonical explorer routes against a local protocol-4 network", ()
     const receipt = (await get(RPC!, `/native-inference/receipt/${found!.requestId}`))!;
     let requester = bare(receipt.requester);
     if (requester.length !== 64) {
-      // A node that does not report the requester yet: the admission
-      // transaction's signer is the requester.
       const admission = await get(RPC!, `/tx/${bare(receipt.admission_transaction?.tx_hash)}/full`);
       requester = bare(admission?.from);
     }
@@ -286,8 +242,6 @@ test.describe("canonical explorer routes against a local protocol-4 network", ()
 
     await page.goto(`/explorer/index.html#/address/${requester}`);
     const content = page.locator("#inspector-content");
-    // The requester keeps paying for requests, so each attempt compares one
-    // render with the node's state read right after it, until they match.
     await expect(async () => {
       await page.reload();
       await expect(page.locator("#inspector-kicker")).toHaveText("Address · source-separated", {
@@ -353,8 +307,6 @@ test.describe("canonical explorer routes against a local protocol-4 network", ()
     page,
   }) => {
     test.skip(!found, "no settled native request between 20 and 2,000 blocks below the tip");
-    // Port 9 has no listener: the same local configuration plus one replica
-    // that cannot be asked. This route overrides the one set in beforeEach.
     const withDeadReplica = await chainConfig([...NODES, "http://127.0.0.1:9"]);
     await page.route("**/arc-network.json", (route) =>
       route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(withDeadReplica) }),

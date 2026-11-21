@@ -1,16 +1,10 @@
-// Run candle through the same PPL loop our eval_perplexity uses.
-// If candle's PPL on the same tokens is ~5.5 → tokenization is correct and
-// something else in our integer path is off even though per-step argmax matches.
-// If candle's PPL is ~155 → the data/text/tokenization is bad (not our bug).
 use candle_core::{Device, Tensor};
 use candle_transformers::models::quantized_llama::ModelWeights;
 
-/// `$HOME/.arc-models/llama-2-7b.gguf`, resolved at run time.
 fn model_path() -> String {
     let home = std::env::var("HOME").expect("HOME is set");
     format!("{home}/.arc-models/llama-2-7b.gguf")
 }
-/// `$HOME/.arc-models/wiki.test.llama_bpe.json`, resolved at run time.
 fn tokens_path() -> String {
     let home = std::env::var("HOME").expect("HOME is set");
     format!("{home}/.arc-models/wiki.test.llama_bpe.json")
@@ -33,7 +27,6 @@ fn main() {
     let n = tokens.len().min(256);
     eprintln!("Evaluating {} tokens on candle reference", n);
 
-    // BOS
     let bos = Tensor::new(&[1u32], &device).unwrap().unsqueeze(0).unwrap();
     let _ = model.forward(&bos, 0).unwrap();
 
@@ -54,7 +47,6 @@ fn main() {
         };
         let v: Vec<f32> = logits.to_vec1().unwrap();
 
-        // log-softmax
         let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let log_sum_exp: f64 = v
             .iter()

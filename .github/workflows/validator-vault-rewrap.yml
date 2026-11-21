@@ -39,7 +39,7 @@ jobs:
       ciphertext_sha256: ${{ steps.authorize.outputs.ciphertext_sha256 }}
       restore_cert_sha256: ${{ steps.authorize.outputs.restore_cert_sha256 }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 1
@@ -101,8 +101,6 @@ jobs:
     permissions:
       contents: read
     steps:
-      # This protected job never checks out repository content. A compromised
-      # source helper therefore cannot persist and observe the later key window.
       - name: Reconfirm exact protected main before exposing secrets
         shell: bash
         env:
@@ -254,9 +252,6 @@ jobs:
           unset passphrase
           /usr/bin/chmod 600 "$plain_tar"
 
-          # Isolated stdlib code rewrites only verified, bounded in-memory
-          # payload slices. There is no checkout, import path, filesystem
-          # extraction, member-name output, or source-generated executable.
           /usr/bin/python3 -I - "$plain_tar" "$canonical_tar" <<'PY'
           import pathlib, stat, sys, tarfile
           import io, os, re, struct
@@ -492,8 +487,6 @@ jobs:
           /usr/bin/ln -- "$candidate_cms" "$cms_output"
           /usr/bin/unlink "$candidate_cms"
 
-          # No plaintext, passphrase, source ciphertext, or certificate remains
-          # when post-rewrap inspection and network-bound steps begin.
           clear_secret_material
           cms_text="$RUNNER_TEMP/arc-validator-vault-cms-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.txt"
           /usr/bin/openssl cms -cmsout -inform DER -in "$cms_output" -print -noout \
@@ -551,7 +544,7 @@ jobs:
 
       - id: upload
         name: Upload one-day encrypted operator restore artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ${{ steps.rewrap.outputs.artifact_name }}
           path: |

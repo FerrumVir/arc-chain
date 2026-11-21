@@ -1,9 +1,5 @@
 import { defineConfig, devices } from "@playwright/test";
 
-// Run the Vite dev server against the mock Tauri backend (isTauri = false).
-// This exercises every screen and every code path the user sees without needing
-// a running arc-node binary. Tauri-specific integration (child process) is
-// covered by Rust unit tests separately.
 export default defineConfig({
   testDir: "./tests",
   fullyParallel: true,

@@ -1,33 +1,8 @@
-/**
- * ARC Chain SDK -- Ethereum-standard ABI encoding/decoding.
- *
- * Provides functions for encoding and decoding function calls using the
- * Ethereum ABI specification, including function selectors via Keccak-256.
- *
- * @example
- * ```ts
- * import { encodeFunctionCall, decodeAbi } from "@arc-chain/sdk";
- *
- * const calldata = encodeFunctionCall(
- *   "transfer(address,uint256)",
- *   "0xdead000000000000000000000000000000000000",
- *   1000n,
- * );
- *
- * const [amount, flag] = decodeAbi(["uint256", "bool"], returnData);
- * ```
- */
-
 import { keccak_256 } from "@noble/hashes/sha3";
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 const WORD_SIZE = 32;
 const ZERO_WORD = new Uint8Array(WORD_SIZE);
 
-/** Regex matchers for ABI types */
 const UINT_RE = /^uint(\d+)$/;
 const INT_RE = /^int(\d+)$/;
 const BYTES_FIXED_RE = /^bytes(\d+)$/;
@@ -35,9 +10,6 @@ const ARRAY_FIXED_RE = /^(.+)\[(\d+)\]$/;
 const ARRAY_DYN_RE = /^(.+)\[\]$/;
 const TUPLE_RE = /^\((.+)\)$/;
 
-/**
- * Concatenate multiple Uint8Arrays into one.
- */
 function concat(...arrays: Uint8Array[]): Uint8Array {
   const total = arrays.reduce((sum, a) => sum + a.length, 0);
   const result = new Uint8Array(total);
@@ -49,9 +21,6 @@ function concat(...arrays: Uint8Array[]): Uint8Array {
   return result;
 }
 
-/**
- * Convert a hex string (with or without 0x prefix) to Uint8Array.
- */
 function hexToBytes(hex: string): Uint8Array {
   hex = hex.replace(/^0x/i, "");
   if (hex.length % 2 !== 0) hex = "0" + hex;
@@ -62,18 +31,12 @@ function hexToBytes(hex: string): Uint8Array {
   return bytes;
 }
 
-/**
- * Convert Uint8Array to hex string (no 0x prefix).
- */
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes)
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 }
 
-/**
- * Create a 32-byte word from a bigint (unsigned, big-endian, left-padded).
- */
 function uint256ToBytes(value: bigint): Uint8Array {
   const result = new Uint8Array(WORD_SIZE);
   let v = value;
@@ -84,9 +47,6 @@ function uint256ToBytes(value: bigint): Uint8Array {
   return result;
 }
 
-/**
- * Read a bigint from 32 bytes (big-endian, unsigned).
- */
 function bytesToUint256(data: Uint8Array, offset: number): bigint {
   let val = 0n;
   for (let i = 0; i < WORD_SIZE; i++) {
@@ -95,9 +55,6 @@ function bytesToUint256(data: Uint8Array, offset: number): bigint {
   return val;
 }
 
-/**
- * Read a bigint from 32 bytes (big-endian, signed two's complement).
- */
 function bytesToInt256(data: Uint8Array, offset: number): bigint {
   const unsigned = bytesToUint256(data, offset);
   const MAX_INT256 = (1n << 255n) - 1n;
@@ -107,9 +64,6 @@ function bytesToInt256(data: Uint8Array, offset: number): bigint {
   return unsigned;
 }
 
-/**
- * Convert a value to bigint, accepting number, string, or bigint.
- */
 function toBigInt(value: any): bigint {
   if (typeof value === "bigint") return value;
   if (typeof value === "number") return BigInt(value);
@@ -122,13 +76,6 @@ function toBigInt(value: any): bigint {
   throw new Error(`Cannot convert ${typeof value} to bigint`);
 }
 
-// ---------------------------------------------------------------------------
-// Type parsing
-// ---------------------------------------------------------------------------
-
-/**
- * Split comma-separated types inside a tuple, respecting nesting depth.
- */
 function splitTupleTypes(inner: string): string[] {
   const result: string[] = [];
   let depth = 0;
@@ -153,9 +100,6 @@ function splitTupleTypes(inner: string): string[] {
   return result;
 }
 
-/**
- * Parse a canonical function signature into (name, paramTypes).
- */
 function parseSignature(sig: string): [string, string[]] {
   const parenIdx = sig.indexOf("(");
   const name = sig.substring(0, parenIdx).trim();
@@ -164,9 +108,6 @@ function parseSignature(sig: string): [string, string[]] {
   return [name, splitTupleTypes(inner)];
 }
 
-/**
- * Check whether an ABI type is dynamically sized.
- */
 function isDynamic(typ: string): boolean {
   if (typ === "bytes" || typ === "string") return true;
 
@@ -184,10 +125,6 @@ function isDynamic(typ: string): boolean {
 
   return false;
 }
-
-// ---------------------------------------------------------------------------
-// Encoding
-// ---------------------------------------------------------------------------
 
 function encodeUint(value: any, bits: number): Uint8Array {
   const v = toBigInt(value);
@@ -207,7 +144,6 @@ function encodeInt(value: any, bits: number): Uint8Array {
     );
   }
   if (v >= 0n) return uint256ToBytes(v);
-  // Two's complement
   return uint256ToBytes((1n << 256n) + v);
 }
 
@@ -225,7 +161,6 @@ function encodeAddress(value: any): Uint8Array {
       `Address must be <= 20 bytes, got ${addrBytes.length}`
     );
   }
-  // Left-pad to 32 bytes
   const result = new Uint8Array(WORD_SIZE);
   result.set(addrBytes, WORD_SIZE - addrBytes.length);
   return result;
@@ -247,7 +182,6 @@ function encodeBytesFixed(value: Uint8Array | string, size: number): Uint8Array 
       `bytes${size} requires exactly ${size} bytes, got ${bytes.length}`
     );
   }
-  // Right-pad to 32 bytes
   const result = new Uint8Array(WORD_SIZE);
   result.set(bytes, 0);
   return result;
@@ -273,10 +207,6 @@ function encodeString(value: string): Uint8Array {
   return encodeBytesDynamic(bytes);
 }
 
-/**
- * Encode a single value for a given ABI type.
- * For dynamic types, returns the complete tail data (length + padded content).
- */
 function encodeSingle(typ: string, value: any): Uint8Array {
   if (typ === "address") return encodeAddress(value);
   if (typ === "bool") return encodeBool(value);
@@ -292,7 +222,6 @@ function encodeSingle(typ: string, value: any): Uint8Array {
   m = BYTES_FIXED_RE.exec(typ);
   if (m) return encodeBytesFixed(value, parseInt(m[1], 10));
 
-  // Fixed-size array: T[N]
   m = ARRAY_FIXED_RE.exec(typ);
   if (m) {
     const innerType = m[1];
@@ -306,7 +235,6 @@ function encodeSingle(typ: string, value: any): Uint8Array {
     return encodeArrayContents(innerType, arr);
   }
 
-  // Dynamic array: T[]
   m = ARRAY_DYN_RE.exec(typ);
   if (m) {
     const innerType = m[1];
@@ -315,7 +243,6 @@ function encodeSingle(typ: string, value: any): Uint8Array {
     return concat(lengthWord, encodeArrayContents(innerType, arr));
   }
 
-  // Tuple: (T1,T2,...)
   m = TUPLE_RE.exec(typ);
   if (m) {
     const subtypes = splitTupleTypes(m[1]);
@@ -330,17 +257,6 @@ function encodeArrayContents(innerType: string, items: any[]): Uint8Array {
   return encodeAbi(types, items);
 }
 
-/**
- * Encode a list of values according to the given ABI types.
- *
- * Follows Ethereum ABI encoding rules: static types are encoded inline
- * in the head section; dynamic types get an offset pointer in the head
- * pointing to their data in the tail section.
- *
- * @param types - ABI type strings, e.g. `["address", "uint256", "bytes"]`
- * @param values - Corresponding values to encode
- * @returns ABI-encoded bytes
- */
 export function encodeAbi(types: string[], values: any[]): Uint8Array {
   if (types.length !== values.length) {
     throw new Error(
@@ -368,10 +284,6 @@ export function encodeAbi(types: string[], values: any[]): Uint8Array {
 
   return concat(...headParts, ...tailParts);
 }
-
-// ---------------------------------------------------------------------------
-// Decoding
-// ---------------------------------------------------------------------------
 
 interface DecodeResult {
   value: any;
@@ -456,7 +368,6 @@ function decodeSingle(
   m = BYTES_FIXED_RE.exec(typ);
   if (m) return decodeBytesFixed(data, offset, parseInt(m[1], 10));
 
-  // Dynamic types: head word is an offset pointer
   if (typ === "string") {
     const tailOffset = Number(bytesToUint256(data, offset));
     const { value } = decodeString(data, baseOffset + tailOffset);
@@ -469,7 +380,6 @@ function decodeSingle(
     return { value, nextOffset: offset + WORD_SIZE };
   }
 
-  // Dynamic array: T[]
   m = ARRAY_DYN_RE.exec(typ);
   if (m) {
     const innerType = m[1];
@@ -486,7 +396,6 @@ function decodeSingle(
     return { value: items, nextOffset: offset + WORD_SIZE };
   }
 
-  // Fixed array: T[N]
   m = ARRAY_FIXED_RE.exec(typ);
   if (m) {
     const innerType = m[1];
@@ -514,7 +423,6 @@ function decodeSingle(
     }
   }
 
-  // Tuple: (T1,T2,...)
   m = TUPLE_RE.exec(typ);
   if (m) {
     const subtypes = splitTupleTypes(m[1]);
@@ -574,68 +482,20 @@ function decodeTuple(
   return results;
 }
 
-/**
- * Decode ABI-encoded data according to the given types.
- *
- * @param types - ABI type strings matching the encoded data layout
- * @param data - The ABI-encoded bytes (without a function selector)
- * @returns Array of decoded values
- */
 export function decodeAbi(types: string[], data: Uint8Array): any[] {
   return decodeTuple(types, data, 0, 0);
 }
 
-// ---------------------------------------------------------------------------
-// Function selectors and call encoding
-// ---------------------------------------------------------------------------
-
-/**
- * Compute the Keccak-256 hash.
- *
- * @param data - Bytes to hash
- * @returns 32-byte digest
- */
 export function keccak256(data: Uint8Array): Uint8Array {
   return keccak_256(data);
 }
 
-/**
- * Compute the 4-byte function selector for a canonical signature.
- *
- * The selector is the first 4 bytes of the Keccak-256 hash of the
- * canonical function signature (no spaces, no parameter names).
- *
- * @param signature - Canonical signature, e.g. `"transfer(address,uint256)"`
- * @returns 4-byte selector
- *
- * @example
- * ```ts
- * const sel = functionSelector("transfer(address,uint256)");
- * // sel.hex() === "a9059cbb"
- * ```
- */
 export function functionSelector(signature: string): Uint8Array {
   const encoder = new TextEncoder();
   const hash = keccak256(encoder.encode(signature));
   return hash.slice(0, 4);
 }
 
-/**
- * Encode a complete function call (selector + ABI-encoded arguments).
- *
- * @param signature - Canonical function signature, e.g. `"transfer(address,uint256)"`
- * @param args - Argument values matching the parameter types in the signature
- * @returns 4-byte selector followed by ABI-encoded arguments
- *
- * @example
- * ```ts
- * const data = encodeFunctionCall(
- *   "transfer(address,uint256)",
- *   "0xdead000000000000000000000000000000000000",
- *   1000n,
- * );
- * ```
- */
 export function encodeFunctionCall(
   signature: string,
   ...args: any[]
@@ -651,15 +511,6 @@ export function encodeFunctionCall(
   return concat(selector, encodedArgs);
 }
 
-/**
- * Decode the return data from a function call.
- *
- * Convenience alias for {@link decodeAbi}.
- *
- * @param types - ABI type strings of the return values
- * @param data - Raw bytes returned by the function call
- * @returns Array of decoded values
- */
 export function decodeFunctionResult(
   types: string[],
   data: Uint8Array
@@ -667,13 +518,6 @@ export function decodeFunctionResult(
   return decodeAbi(types, data);
 }
 
-/**
- * Decode calldata (selector + arguments) given the expected signature.
- *
- * @param signature - Canonical signature, e.g. `"transfer(address,uint256)"`
- * @param data - Full calldata including the 4-byte selector
- * @returns Tuple of [functionName, decodedArgs]
- */
 export function decodeFunctionInput(
   signature: string,
   data: Uint8Array

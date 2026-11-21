@@ -39,13 +39,10 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-try:  # blake3 is required for every digest; fail with a clear message at use.
+try:
     import blake3 as _blake3_module
 except ImportError:  # pragma: no cover - exercised only without the package
     _blake3_module = None
-
-# --------------------------------------------------------------------------
-# Identities (spec 1) and formats (spec 3)
 
 PROFILE_ID = "arc.hf-llama.i8-dyadic-row.q16.v1"
 GENERATION_RP64_ID = "arc.hf-chat.no-bos.rp64-argmax.le-u32.v1"
@@ -83,26 +80,22 @@ DTYPE_NUMPY = {"i8": np.dtype("i1"), "u8": np.dtype("u1"),
 
 
 class DomainError(ArithmeticError):
-    """A value left the domain of spec 9; the computation is refused."""
+    pass
 
 
 class PreparationError(ValueError):
-    """The BF16 source cannot be converted under spec 4 (refused)."""
+    pass
 
 
 class PackageError(ValueError):
-    """A package file does not satisfy spec 4.8/4.9."""
+    pass
 
 
 class RunError(ValueError):
-    """A cases/run document is malformed."""
+    pass
 
-
-# --------------------------------------------------------------------------
-# Primitive operations (spec 3)
 
 def tdiv(a: int, b: int) -> int:
-    """Integer division truncating toward zero."""
     if b == 0:
         raise DomainError("division by zero")
     q = abs(a) // abs(b)
@@ -110,7 +103,6 @@ def tdiv(a: int, b: int) -> int:
 
 
 def rha_ratio(num: int, den: int) -> int:
-    """num/den rounded half away from zero (den > 0), exactly."""
     if den <= 0:
         raise ValueError("rha_ratio needs a positive denominator")
     q = (2 * abs(num) + den) // (2 * den)
@@ -124,7 +116,6 @@ def check62(value: int, what: str) -> int:
 
 
 def canonical_json(obj: Any) -> bytes:
-    """Spec 4.9 canonical JSON bytes."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
 
 
@@ -142,31 +133,23 @@ def blake3_raw(data: bytes) -> bytes:
     return _blake3_ctor()(data).digest()
 
 
-# --------------------------------------------------------------------------
-# exp table (spec 5.1), computed as correctly rounded decimals
-
 _EXP_TABLE: Optional[List[int]] = None
 _EXP_TABLE_NP: Optional[np.ndarray] = None
 
 
 def build_exp_table() -> List[int]:
-    """T[i] = rha(e^(-(4096-i)/256) * 2^16), i in [0, 4096], from 60-digit decimals.
-
-    Every entry's distance from a rounding boundary is checked to be far larger
-    than the decimal error, so the rounding is provably correct.
-    """
     ctx = Context(prec=60)
     scale = Decimal(ONE)
     half = Decimal(1) / Decimal(2)
     table = []
     for i in range(4097):
-        x = Decimal(i - 4096) / Decimal(256)  # exact: 1/256 is a finite decimal
+        x = Decimal(i - 4096) / Decimal(256)
         v = ctx.multiply(ctx.exp(x), scale)
         n = int(v.to_integral_value(rounding=ROUND_FLOOR))
         frac = v - Decimal(n)
         if abs(frac - half) < Decimal("1e-40"):
             raise ArithmeticError(f"exp table entry {i} too close to a rounding boundary")
-        table.append(n + 1 if frac > half else n)  # values are positive: half-up == half-away
+        table.append(n + 1 if frac > half else n)
     return table
 
 
@@ -190,7 +173,6 @@ def exp_table_blake3(table: Optional[Sequence[int]] = None) -> str:
 
 
 def exp_q16(x: int) -> int:
-    """Spec 5.1 for x <= 0 (Q16 in, Q16 out). x > 0 never occurs in the profile."""
     if x > 0:
         raise DomainError(f"exp argument {x} is positive")
     if x == 0:
@@ -204,15 +186,11 @@ def exp_q16(x: int) -> int:
     return t[i] + (((t[i + 1] - t[i]) * f) >> 8)
 
 
-# --------------------------------------------------------------------------
-# RoPE tables (spec 4.5), big-int fixed point with range reduction
-
-_TABLE_BITS = 160  # fractional bits of the working precision
-_TABLE_BLOCK = 64  # p = 64*a + b: cos/sin of 64*a*w and b*w evaluated directly
+_TABLE_BITS = 160
+_TABLE_BLOCK = 64
 
 
 def _pi_fixed(bits: int) -> int:
-    """pi * 2^bits (error below one unit) by Machin's formula."""
     guard = 32
     one = 1 << (bits + guard)
 
@@ -229,9 +207,8 @@ def _pi_fixed(bits: int) -> int:
 
 
 def _sincos_fixed(x: int, bits: int, half_pi: int) -> Tuple[int, int]:
-    """(cos x, sin x) * 2^bits for a fixed-point angle x >= 0 (reduced mod pi/2)."""
-    n = (2 * x + half_pi) // (2 * half_pi)  # nearest multiple of pi/2
-    r = x - n * half_pi  # |r| <= pi/4 (plus a few units)
+    n = (2 * x + half_pi) // (2 * half_pi)
+    r = x - n * half_pi
     neg = r < 0
     ar = -r if neg else r
     r2 = (ar * ar) >> bits
@@ -264,7 +241,6 @@ def _sincos_fixed(x: int, bits: int, half_pi: int) -> Tuple[int, int]:
 
 
 def _omegas_fixed(theta: int, d_head: int, bits: int) -> List[int]:
-    """w_i = theta^(-2i/D) * 2^bits from 110-digit decimal ln/exp (correctly rounded)."""
     ctx = Context(prec=110)
     ln_theta = ctx.ln(Decimal(theta))
     scale = Decimal(1 << bits)
@@ -276,15 +252,6 @@ def _omegas_fixed(theta: int, d_head: int, bits: int) -> List[int]:
 
 
 def build_rope_tables(theta: int, d_head: int, max_seq: int) -> Tuple[np.ndarray, np.ndarray]:
-    """(cos, sin) as int32 arrays [max_seq, d_head/2], every entry correctly rounded.
-
-    cos(p*w) and sin(p*w) come from the angle-addition formula applied to two
-    directly evaluated angles (64a*w and b*w, p = 64a + b), each reduced mod
-    pi/2 and summed by Taylor series at 160 fractional bits. The absolute
-    error of every product is below 2^(160+8) units of 2^-320; an entry is
-    accepted only when its distance from the rounding boundary exceeds
-    2^(160+24) units, so every rounding is provably the exact one.
-    """
     if isinstance(theta, bool) or not isinstance(theta, int) or theta < 1:
         raise PreparationError(f"rope_theta must be a positive integer, got {theta!r}")
     if d_head < 2 or d_head % 2:
@@ -324,16 +291,11 @@ def build_rope_tables(theta: int, d_head: int, max_seq: int) -> Tuple[np.ndarray
 
 
 def rope_tables_blake3(cos: np.ndarray, sin: np.ndarray) -> str:
-    """BLAKE3 of cos (row-major LE i32) followed by sin (spec 4.5)."""
     return blake3_hex(np.ascontiguousarray(cos, dtype="<i4").tobytes()
                       + np.ascontiguousarray(sin, dtype="<i4").tobytes())
 
 
-# --------------------------------------------------------------------------
-# BF16 (spec 4.1)
-
 def bf16_parts(bits: int) -> Tuple[int, int, int]:
-    """(s, M, e) with value (-1)^s * M * 2^e; infinity/NaN refused."""
     if not 0 <= bits <= 0xFFFF:
         raise PreparationError(f"{bits} is not a 16-bit pattern")
     s = bits >> 15
@@ -347,17 +309,12 @@ def bf16_parts(bits: int) -> Tuple[int, int, int]:
 
 
 def bf16_value(bits: int) -> Fraction:
-    """Exact rational value of a BF16 pattern."""
     s, mant, e = bf16_parts(bits)
     v = Fraction(mant) * (Fraction(2) ** e)
     return -v if s else v
 
 
-# --------------------------------------------------------------------------
-# Per-row INT8 with a dyadic scale (spec 4.2)
-
 def quantize_row_exact(bits: Sequence[int]) -> Tuple[List[int], int, int]:
-    """Spec 4.2 for one row, literally, in Python ints (the test oracle)."""
     parts = [bf16_parts(b) for b in bits]
     mags = [b & 0x7FFF for b in bits]
     if not parts or max(mags) == 0:
@@ -390,7 +347,6 @@ def quantize_row_exact(bits: Sequence[int]) -> Tuple[List[int], int, int]:
 
 
 def _scale_lut() -> Tuple[np.ndarray, np.ndarray]:
-    """(mu, t) for every row-maximum significand M_A in [0, 255] (index 0 unused)."""
     mus = np.zeros(256, dtype=np.int64)
     ts = np.zeros(256, dtype=np.int64)
     for m_a in range(1, 256):
@@ -408,14 +364,6 @@ _SCALE_MU, _SCALE_T = _scale_lut()
 
 
 def quantize_rows(bits: np.ndarray, what: str = "tensor") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Vectorised spec 4.2 on a [rows, cols] array of BF16 patterns.
-
-    Returns (q int8 [rows, cols], mu int32 [rows], k uint8 [rows]). For an
-    element with d >= 16 the quotient is 0 whatever d is (127*M_j <= 32385 <
-    2^15 <= M_A*2^16 / 2), so d is clamped to 20 before shifting: this keeps
-    every intermediate below 2^29 and gives the same q as the literal formula,
-    including the d > 60 rule.
-    """
     b = np.asarray(bits).astype(np.int64)
     if b.ndim != 2:
         raise PreparationError(f"{what}: expected a matrix")
@@ -452,11 +400,7 @@ def quantize_rows(bits: np.ndarray, what: str = "tensor") -> Tuple[np.ndarray, n
     return q.astype(np.int8), mu.astype(np.int32), k.astype(np.uint8)
 
 
-# --------------------------------------------------------------------------
-# Norm gains (spec 4.3), epsilon (spec 4.4)
-
 def norm_gain(bits: int) -> int:
-    """g = rha(v * 2^16), exactly; refused when it does not fit the i64 storage."""
     s, mant, e = bf16_parts(bits)
     if e + 16 >= 0:
         g = mant << (e + 16)
@@ -469,7 +413,6 @@ def norm_gain(bits: int) -> int:
 
 
 def rms_eps_q32(eps: Any) -> int:
-    """rha(eps * 2^32) for eps read from JSON as the nearest double."""
     if isinstance(eps, bool) or not isinstance(eps, (int, float)):
         raise PreparationError(f"rms_norm_eps must be a number, got {eps!r}")
     if isinstance(eps, float) and not math.isfinite(eps):
@@ -481,9 +424,6 @@ def rms_eps_q32(eps: Any) -> int:
     return out
 
 
-# --------------------------------------------------------------------------
-# Model shape (spec 4.6) and package layout (spec 4.8)
-
 def _cfg_int(config: Dict[str, Any], key: str, minimum: int = 1) -> int:
     if key not in config:
         raise PreparationError(f"config.json lacks {key!r}")
@@ -494,7 +434,6 @@ def _cfg_int(config: Dict[str, Any], key: str, minimum: int = 1) -> int:
 
 
 def model_from_config(config: Dict[str, Any], max_seq: int) -> Dict[str, Any]:
-    """The package header's "model" object; unsupported configurations are refused."""
     def refuse(msg: str) -> None:
         raise PreparationError(f"unsupported config.json: {msg}")
 
@@ -572,7 +511,6 @@ def projection_shapes(model: Dict[str, Any]) -> Dict[str, Tuple[int, int]]:
 
 
 def package_layout(model: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Tensor entries in file order: name, dtype, shape, kind, source tensor."""
     v, d = model["vocab_size"], model["d_model"]
     s, h = model["max_seq"], model["d_head"] // 2
     shapes = projection_shapes(model)
@@ -602,7 +540,6 @@ def package_layout(model: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def source_tensor_shapes(model: Dict[str, Any]) -> Dict[str, Tuple[int, ...]]:
-    """The exact BF16 tensor set (name -> shape) spec 4.8 requires of the source."""
     out: Dict[str, Tuple[int, ...]] = {}
     for entry in package_layout(model):
         if entry["source"] and entry["kind"] in ("q", "norm"):
@@ -628,9 +565,6 @@ def build_header(model: Dict[str, Any], source: Dict[str, Any]) -> Dict[str, Any
     return {"schema": PACKAGE_SCHEMA, "profile": PROFILE_ID, "model": model,
             "source": source, "tensors": header_tensors(model)}
 
-
-# --------------------------------------------------------------------------
-# Source files: manifest verification and a minimal safetensors reader
 
 def sha256_file(path: Path, chunk: int = 1 << 20) -> Tuple[int, str]:
     h = hashlib.sha256()
@@ -678,7 +612,6 @@ def load_source_manifest(path: Path) -> Dict[str, Any]:
 
 
 def verify_source_files(source_dir: Path, manifest: Dict[str, Any]) -> None:
-    """Refuse unless every listed file has exactly the pinned length and SHA-256."""
     for entry in manifest["files"]:
         path = Path(source_dir) / entry["name"]
         if not path.is_file():
@@ -692,8 +625,6 @@ def verify_source_files(source_dir: Path, manifest: Dict[str, Any]) -> None:
 
 
 class SafetensorsShard:
-    """8-byte LE header length, JSON header, then the data region."""
-
     def __init__(self, path: Path):
         self.path = Path(path)
         size = self.path.stat().st_size
@@ -741,7 +672,6 @@ class SafetensorsShard:
 
 def open_source_tensors(source_dir: Path, manifest: Dict[str, Any],
                         model: Dict[str, Any]) -> Dict[str, Tuple[SafetensorsShard, str]]:
-    """Map every required tensor to its shard; refuse missing/extra/misshapen tensors."""
     expected = source_tensor_shapes(model)
     found: Dict[str, Tuple[SafetensorsShard, str]] = {}
     for entry in manifest["files"]:
@@ -763,9 +693,6 @@ def open_source_tensors(source_dir: Path, manifest: Dict[str, Any],
         raise PreparationError(f"source lacks {len(missing)} tensor(s), e.g. {missing[0]}")
     return found
 
-
-# --------------------------------------------------------------------------
-# Package writer (spec 4.8, 4.9)
 
 class _HashingWriter:
     def __init__(self, f):
@@ -790,7 +717,6 @@ def _chunk_rows(cols: int) -> int:
 
 
 def prepare_package(source_dir: Path, manifest_path: Path, out_path: Path) -> Dict[str, Any]:
-    """Verify the pinned source files, convert them, stream the package; return its identity."""
     source_dir, out_path = Path(source_dir), Path(out_path)
     manifest = load_source_manifest(Path(manifest_path))
     verify_source_files(source_dir, manifest)
@@ -855,9 +781,6 @@ def prepare_package(source_dir: Path, manifest_path: Path, out_path: Path) -> Di
     return {"bytes": size, "sha256": sha, "blake3": b3}
 
 
-# --------------------------------------------------------------------------
-# Package reader (spec 4.8, 4.9, value ranges of spec 3)
-
 _MODEL_KEYS = ("architecture", "n_layers", "d_model", "n_heads", "n_kv_heads", "d_head", "d_ff",
                "vocab_size", "max_seq", "rms_eps_q32", "rope_theta", "rope_layers", "tied_embeddings")
 
@@ -891,8 +814,6 @@ def _validate_model(model: Any) -> Dict[str, Any]:
 
 
 class Package:
-    """A validated arc.integer-package.v1 file with memory-mapped tensors."""
-
     def __init__(self, path: Path, *, check_values: bool = True, check_tables: bool = False):
         self.path = Path(path)
         self.size = self.path.stat().st_size
@@ -961,7 +882,6 @@ class Package:
         return [n[:-2] for n in self.entries if n.endswith(".q")]
 
     def check_values(self) -> None:
-        """q in [-127, 127]; mu = 0 (all-zero row, k = 16) or mu in [2^30, 2^31) with k in [16, 62]."""
         for base in self.scaled_names():
             q = self.tensor(base + ".q")
             mu = np.asarray(self.tensor(base + ".mu")).astype(np.int64)
@@ -1000,18 +920,13 @@ class Package:
         return {"bytes": size, "sha256": h.hexdigest(), "blake3": b3.hexdigest()}
 
 
-# --------------------------------------------------------------------------
-# Operators in Python ints (spec 5)
-
 def embed_int(q_row: Sequence[int], mu: int, k: int) -> List[int]:
-    """Spec 5.3: e_j = (q_tj * mu_t) >> (k_t - 16)."""
     sh = k - 16
     return [check62((qv * mu) >> sh, "embedding") for qv in q_row]
 
 
 def project_int(x: Sequence[int], rows: Sequence[Sequence[int]], mus: Sequence[int],
                 ks: Sequence[int], what: str = "projection") -> List[int]:
-    """Spec 5.2: y_i = (sum_j q_ij x_j * mu_i) >> k_i with the spec 9 checks."""
     if 127 * sum(abs(v) for v in x) >= 1 << 63:
         raise DomainError(f"{what}: 127 * sum|x| >= 2^63")
     out = []
@@ -1023,7 +938,6 @@ def project_int(x: Sequence[int], rows: Sequence[Sequence[int]], mus: Sequence[i
 
 def rmsnorm_int(x: Sequence[int], gains: Sequence[int], eps_q32: int,
                 what: str = "rmsnorm") -> List[int]:
-    """Spec 5.4."""
     n = len(x)
     v = sum(t * t for t in x) // n + eps_q32
     if v > 1 << 92:
@@ -1039,7 +953,6 @@ def rmsnorm_int(x: Sequence[int], gains: Sequence[int], eps_q32: int,
 
 
 def rope_int(u: Sequence[int], cos_row: Sequence[int], sin_row: Sequence[int]) -> List[int]:
-    """Spec 5.5 on one head vector (split-half pairing)."""
     h = len(u) // 2
     out = list(u)
     for i in range(h):
@@ -1051,7 +964,6 @@ def rope_int(u: Sequence[int], cos_row: Sequence[int], sin_row: Sequence[int]) -
 
 def attention_int(q: Sequence[int], keys: Sequence[Sequence[int]],
                   values: Sequence[Sequence[int]], lam: int) -> List[int]:
-    """Spec 5.6 for one query head over cached positions 0..p."""
     scores = [(sum(map(int.__mul__, q, kj)) * lam) >> 46 for kj in keys]
     top = max(scores)
     w = [exp_q16(s - top) for s in scores]
@@ -1060,7 +972,6 @@ def attention_int(q: Sequence[int], keys: Sequence[Sequence[int]],
 
 
 def silu_gate_int(g: int, u: int) -> int:
-    """Spec 5.7: a = (g * sigma(g) * u) >> 32."""
     if g >= 0:
         sig = (1 << 32) // (ONE + exp_q16(-g))
     else:
@@ -1080,8 +991,6 @@ def check_i32(values: Sequence[int], what: str) -> None:
 
 
 class SlowEngine:
-    """Spec 5.8 one token at a time with a KV cache, all in Python ints (tiny models)."""
-
     def __init__(self, pkg: Package):
         m = pkg.model
         self.model = m
@@ -1148,14 +1057,10 @@ class SlowEngine:
         return project_int(n, q_rows, mus, ks, "lm head")
 
 
-# --------------------------------------------------------------------------
-# Selection (spec 6.1) and digests (spec 6.3)
-
 def select_next(logits: Any, history: Sequence[int], selection: str) -> int:
-    """argmax (lowest id on ties), after the rp64 penalty when selected."""
     arr = np.array(logits, dtype=np.int64)
     if selection == "rp64-argmax":
-        for t in reversed(list(history)[-64:]):  # newest first, once per occurrence
+        for t in reversed(list(history)[-64:]):
             v = int(arr[t])
             v = tdiv(5 * v, 6) if v > 0 else tdiv(6 * v, 5)
             arr[t] = check62(v, "penalised logit")
@@ -1183,7 +1088,6 @@ def matrix_digest(cases: Sequence[Dict[str, Any]]) -> str:
 
 
 def validate_case(case: Any, model: Dict[str, Any], *, need_tokens: bool = False) -> Dict[str, Any]:
-    """Spec 6.2 input rules for one case (and the token list of a run when present)."""
     if not isinstance(case, dict):
         raise RunError("a case must be an object")
     cid = case.get("id")
@@ -1217,7 +1121,6 @@ def validate_case(case: Any, model: Dict[str, Any], *, need_tokens: bool = False
 
 
 def generate_case(engine: SlowEngine, case: Dict[str, Any]) -> Dict[str, Any]:
-    """Spec 6.2: P + len(out) - 1 forward calls; the last token is never forwarded."""
     engine.reset()
     hashes: List[bytes] = []
     logits: List[int] = []
@@ -1236,18 +1139,6 @@ def generate_case(engine: SlowEngine, case: Dict[str, Any]) -> Dict[str, Any]:
                 logits_hashes=[h.hex() for h in hashes], logits_digest=logits_digest(hashes))
 
 
-# --------------------------------------------------------------------------
-# Exact vectorised arithmetic for the fast path
-#
-# float64 matmul is exact when every partial sum it can form is an integer of
-# magnitude below 2^53: each partial sum of output (i, j) is bounded by
-# sum_t |a_it| |b_tj| <= (sum_t |a_it|) * max|b|. When that bound fails the
-# left operand (and, for attention, the right one) is split into
-# sign-magnitude limbs whose products satisfy it; each limb product is then
-# exact and the shifted limb products are summed in int64, where every
-# partial sum is bounded by sum_t |a_it| |b_tj| as well. Tests lower
-# FLOAT_EXACT_LIMIT to force the limb path on tiny models.
-
 FLOAT_EXACT_LIMIT = float(1 << 53)
 _M21 = (1 << 21) - 1
 _M31 = (1 << 31) - 1
@@ -1255,16 +1146,14 @@ _M32 = (1 << 32) - 1
 
 
 class _NeedSlow(Exception):
-    """A fast-path bound failed; the caller recomputes with Python ints."""
+    pass
 
 
 def _abs_sum_bound(a: np.ndarray) -> np.ndarray:
-    """An upper bound on sum |a| over the last axis (float64, relative slack 2^-30)."""
     return np.sum(np.abs(a).astype(np.float64), axis=-1) * (1.0 + 2.0 ** -30)
 
 
 def _limbs(a: np.ndarray, bits: int) -> List[np.ndarray]:
-    """a = sum_m limbs[m] << (bits*m); every limb has the sign of a and |limb| < 2^bits."""
     neg = a < 0
     mag = np.where(neg, -a, a)
     mask = (1 << bits) - 1
@@ -1278,13 +1167,6 @@ def _limbs(a: np.ndarray, bits: int) -> List[np.ndarray]:
 
 
 def _blas_int(af: np.ndarray, bf: np.ndarray) -> np.ndarray:
-    """float64 matmul of integer-valued operands whose partial sums are proven < 2^53, as int64.
-
-    macOS Accelerate sets spurious floating-point exception flags in dgemm
-    while returning exact results, so the flags are ignored here; as a
-    defensive check against a broken BLAS, the result must be finite and
-    integral (exactness itself rests on the bound, not on this check).
-    """
     with np.errstate(all="ignore"):
         r = np.matmul(af, bf)
     if r.size and not (np.all(np.isfinite(r)) and np.array_equal(r, np.trunc(r))):
@@ -1294,12 +1176,6 @@ def _blas_int(af: np.ndarray, bf: np.ndarray) -> np.ndarray:
 
 def _matmul_exact(a: np.ndarray, b: Optional[np.ndarray] = None, *, b_float: Optional[np.ndarray] = None,
                   b_max: Optional[int] = None, guard: bool = True) -> np.ndarray:
-    """Exact integer a @ b as int64 (a int64 [..., n, k]; b int64 [..., k, m] or b_float with |b| <= b_max).
-
-    With guard=True, raises _NeedSlow unless sum_t |a_it| |b_tj| < 2^62 is
-    proven; callers that have checked the exact spec 5.2 precondition
-    (127 * sum|x| < 2^63 with |b| <= 127) pass guard=False.
-    """
     if b_float is None:
         b_max = int(np.max(np.abs(b))) if b.size else 0
     k = a.shape[-1]
@@ -1333,13 +1209,6 @@ def _matmul_exact(a: np.ndarray, b: Optional[np.ndarray] = None, *, b_float: Opt
 
 
 def _mul_u31_shr(a: np.ndarray, m: Any, s: Any) -> np.ndarray:
-    """floor(a * m / 2^s) exactly for int64 a, 0 <= m < 2^31, 16 <= s <= 62 (m, s broadcast on the last axis).
-
-    a = ah*2^32 + al with 0 <= al < 2^32, so a*m = P*2^32 + Q with |P| < 2^62
-    and 0 <= Q < 2^63. For s >= 32 the result is (P + (Q >> 32)) >> (s - 32);
-    for s < 32 it is P*2^(32-s) + (Q >> s), computed only when it cannot
-    overflow (otherwise _NeedSlow).
-    """
     m = np.asarray(m, dtype=np.int64)
     s = np.asarray(s, dtype=np.int64)
     p = (a >> 32) * m
@@ -1360,11 +1229,6 @@ def _mul_u31_shr(a: np.ndarray, m: Any, s: Any) -> np.ndarray:
 
 
 def _mul_shr(a: np.ndarray, b: Any, s: int) -> np.ndarray:
-    """floor(a * b / 2^s) exactly for int64 |a|, |b| <= 2^62 and 31 <= s <= 62.
-
-    31-bit limbs: a*b = t2*2^62 + c1*2^31 + c0 with 0 <= c0, c1 < 2^31, then
-    floor = t2*2^(62-s) + (c1 >> (s-31)); _NeedSlow when that could overflow.
-    """
     b = np.asarray(b, dtype=np.int64)
     a1, a0 = a >> 31, a & _M31
     b1, b0 = b >> 31, b & _M31
@@ -1383,7 +1247,6 @@ def _check62_array(y: np.ndarray, what: str) -> np.ndarray:
 
 
 def _exp_vec(x: np.ndarray) -> np.ndarray:
-    """Spec 5.1 elementwise for int64 x <= 0."""
     if x.size and int(np.max(x)) > 0:
         raise DomainError("exp argument is positive")
     t = exp_table_np()
@@ -1402,13 +1265,6 @@ def _to_int64(rows: List[List[int]]) -> np.ndarray:
 
 
 class FastEngine:
-    """Exact batched forward: spec 5.8 at every position of every sequence (teacher forcing).
-
-    All positions of all sequences are stacked for the projections, layer by
-    layer, so every INT8 matrix is converted to float64 once per call. The
-    result at every position equals SlowEngine's bit for bit.
-    """
-
     def __init__(self, pkg: Package):
         self.pkg = pkg
         self.model = pkg.model
@@ -1425,8 +1281,6 @@ class FastEngine:
         return (self.pkg.tensor(base + ".q"),
                 np.asarray(self.pkg.tensor(base + ".mu")).astype(np.int64),
                 np.asarray(self.pkg.tensor(base + ".k")).astype(np.int64))
-
-    # -- operators ---------------------------------------------------------
 
     def _embed(self, tokens: np.ndarray) -> np.ndarray:
         q, mu, k = self._scaled("embed")
@@ -1470,7 +1324,7 @@ class FastEngine:
         if n > 1 << 19:
             raise _NeedSlow("rmsnorm width")
         mag = np.abs(x)
-        a, b, c = mag >> 42, (mag >> 21) & _M21, mag & _M21  # |x| = a*2^42 + b*2^21 + c
+        a, b, c = mag >> 42, (mag >> 21) & _M21, mag & _M21
         s4, s3 = (a * a).sum(axis=1), (2 * a * b).sum(axis=1)
         s2, s1, s0 = (2 * a * c + b * b).sum(axis=1), (2 * b * c).sum(axis=1), (c * c).sum(axis=1)
         maxabs = mag.max(axis=1)
@@ -1487,7 +1341,6 @@ class FastEngine:
             r[i] = ri
         if g.size and int(np.max(np.abs(g))) > LIM62:
             raise _NeedSlow("rmsnorm gain")
-        # |x*r| <= 2^62 and |g| <= 2^62, so |x*r*g| < 2^124 < 2^127 holds.
         return _check62_array(_mul_shr(x * r[:, None], g[None, :], 46), what)
 
     def _rope(self, x: np.ndarray, n_heads: int, positions: np.ndarray, what: str) -> np.ndarray:
@@ -1531,15 +1384,15 @@ class FastEngine:
         return out
 
     def _attention_fast(self, q3: np.ndarray, k3: np.ndarray, v3: np.ndarray) -> np.ndarray:
-        dot = _matmul_exact(q3, k3.transpose(0, 2, 1))  # [H, P, P], |dot| < 2^62 proven
+        dot = _matmul_exact(q3, k3.transpose(0, 2, 1))
         score = _mul_u31_shr(dot, self.lam, 46)
         p = q3.shape[1]
         causal = np.tril(np.ones((p, p), dtype=bool))
         top = np.where(causal, score, np.iinfo(np.int64).min).max(axis=2, keepdims=True)
-        w = _exp_vec(np.where(causal, score - top, -16 * ONE))  # masked -> exp(-16) = 0
+        w = _exp_vec(np.where(causal, score - top, -16 * ONE))
         z = w.sum(axis=2)[..., None]
         o = _matmul_exact(w, v3)
-        return np.where(o >= 0, o // z, -((-o) // z))  # tdiv, z > 0
+        return np.where(o >= 0, o // z, -((-o) // z))
 
     def _silu(self, g: np.ndarray, u: np.ndarray, what: str) -> np.ndarray:
         try:
@@ -1565,8 +1418,6 @@ class FastEngine:
     def _check_i32(x: np.ndarray, what: str) -> None:
         if x.size and (int(np.max(x)) > I32_MAX or int(np.min(x)) < I32_MIN):
             raise DomainError(f"{what}: a value does not fit the i32 KV cache")
-
-    # -- forward -----------------------------------------------------------
 
     def _layer(self, li: int, h: np.ndarray, positions: np.ndarray,
                starts: Sequence[int], lengths: Sequence[int]) -> np.ndarray:
@@ -1595,8 +1446,8 @@ class FastEngine:
         q, mu, k = self._scaled("embed")
         vocab, width = q.shape
         self._check_projection_input(n, "lm head")
-        group = max(1, min(n.shape[0], (1 << 25) // vocab))  # <= 256 MB of int64 logits
-        chunk = max(1, (1 << 24) // width)  # <= 128 MB of float64 weights
+        group = max(1, min(n.shape[0], (1 << 25) // vocab))
+        chunk = max(1, (1 << 24) // width)
         for g0 in range(0, n.shape[0], group):
             ng = n[g0:g0 + group]
             logits = np.empty((ng.shape[0], vocab), dtype=np.int64)
@@ -1609,7 +1460,6 @@ class FastEngine:
 
     def teacher_forced(self, sequences: Sequence[Sequence[int]],
                        on_logits: Callable[[int, int, np.ndarray], None]) -> None:
-        """Forward every sequence from position 0; on_logits(seq, pos, logits) in stacked order."""
         m = self.model
         seqs = [list(s) for s in sequences]
         for s in seqs:
@@ -1632,14 +1482,10 @@ class FastEngine:
         self._lm_head(n, seq_ids, positions, on_logits)
 
     def all_logits(self, sequences: Sequence[Sequence[int]]) -> List[List[np.ndarray]]:
-        """Every position's logits (small models / tests)."""
         out: List[List[np.ndarray]] = [[] for _ in sequences]
         self.teacher_forced(sequences, lambda s, p, lg: out[s].append(lg.copy()))
         return out
 
-
-# --------------------------------------------------------------------------
-# Runs: independent generation (slow path) and verification of a Rust run
 
 def _read_json(path: Path) -> Any:
     return json.loads(Path(path).read_bytes())
@@ -1650,7 +1496,6 @@ def _write_json(path: Path, obj: Any) -> None:
 
 
 def stop_rule_ok(case: Dict[str, Any]) -> bool:
-    """Spec 6.2: an eos token may only be last; without eos the run used all max_tokens."""
     toks = case["tokens"]
     if not toks or len(toks) > case["max_tokens"]:
         return False
@@ -1683,7 +1528,6 @@ def generate_run(pkg_path: Path, cases_path: Path) -> Dict[str, Any]:
 
 
 def verify_run(pkg_path: Path, run_path: Path) -> Tuple[Dict[str, Any], List[str]]:
-    """Teacher-force every case of a run with FastEngine; return (golden document, mismatches)."""
     run = _read_json(run_path)
     if not isinstance(run, dict) or run.get("schema") != RUN_SCHEMA:
         raise RunError(f"run must have schema {RUN_SCHEMA!r}")
@@ -1712,7 +1556,6 @@ def verify_run(pkg_path: Path, run_path: Path) -> Tuple[Dict[str, Any], List[str
         if 0 <= gi < len(c["tokens"]):
             st["tokens"].append(select_next(logits, c["tokens"][:gi], c["selection"]))
 
-    # A run with more than max_tokens tokens is reported (stop rule), not forwarded past max_seq.
     engine = FastEngine(pkg)
     engine.teacher_forced([c["prompt_tokens"] + c["tokens"][:c["max_tokens"]][:-1] for c in cases], on_logits)
     golden_cases = []
@@ -1764,9 +1607,6 @@ def verify_run(pkg_path: Path, run_path: Path) -> Tuple[Dict[str, Any], List[str
                          "fast_path_fallbacks": dict(engine.fallbacks), "all_match": not problems}}
     return golden, problems
 
-
-# --------------------------------------------------------------------------
-# CLI
 
 def _cmd_tables(args: argparse.Namespace) -> int:
     t = exp_table()

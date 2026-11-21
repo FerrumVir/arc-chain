@@ -1,7 +1,3 @@
-//! Benchmark INT8 cached model inference.
-//!
-//! Usage: cargo run --example bench_int8 --features candle --release -- /path/to/model.gguf [num_tokens]
-
 use arc_inference::cached_integer_model::{load_cached_model, load_cached_model_binary};
 use std::time::Instant;
 
@@ -27,7 +23,6 @@ fn main() {
     println!("Tokens to generate: {}", num_tokens);
     println!();
 
-    // Load model (GGUF or binary)
     let load_start = Instant::now();
     let model = if model_path.ends_with(".arc-int8") {
         load_cached_model_binary(model_path).expect("Failed to load binary model")
@@ -51,11 +46,9 @@ fn main() {
     println!("Vocab entries: {}", model.vocab.len());
     println!();
 
-    // Weight hash (for cross-platform verification)
     let whash = model.weight_hash();
     println!("Weight hash: 0x{}", hex::encode(&whash.0[..16]));
 
-    // Save binary weights if requested
     if let Some(save_to) = save_path {
         println!("\nSaving INT8 weights to {}...", save_to);
         model.save_weights(save_to).expect("Failed to save weights");
@@ -63,7 +56,6 @@ fn main() {
         println!("Saved: {} MB", file_size / (1024 * 1024));
     }
 
-    // Test prompt
     let prompt_text = "[INST] What is 2+2? [/INST]";
     let prompt_tokens = model.encode(prompt_text);
     println!("Prompt: \"{}\"", prompt_text);
@@ -73,7 +65,6 @@ fn main() {
         prompt_tokens.len()
     );
 
-    // Warmup run
     println!("\n--- Warmup ---");
     let eos = vec![2u32, 0];
     let warmup_start = Instant::now();
@@ -81,7 +72,6 @@ fn main() {
     let warmup_ms = warmup_start.elapsed().as_millis();
     println!("Warmup: {} tokens in {}ms", warmup_tokens.len(), warmup_ms);
 
-    // Benchmark run
     println!("\n--- Benchmark ---");
     let bench_start = Instant::now();
     let (generated, hash) = model.generate(&prompt_tokens, num_tokens, &eos);
@@ -100,7 +90,6 @@ fn main() {
     println!("Token IDs: {:?}", generated);
     println!("Decoded: \"{}\"", output_text);
 
-    // Determinism check: run again, verify identical hash
     println!("\n--- Determinism Check ---");
     let (gen2, hash2) = model.generate(&prompt_tokens, num_tokens, &eos);
     if hash == hash2 && generated == gen2 {
@@ -116,7 +105,6 @@ fn main() {
         );
     }
 
-    // Run 5 more times for consistency
     let mut all_match = true;
     for i in 0..5 {
         let (_, hi) = model.generate(&prompt_tokens, num_tokens, &eos);

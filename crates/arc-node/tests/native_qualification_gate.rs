@@ -1,18 +1,3 @@
-//! Real-model execution must not start without an explicit, identity-bound
-//! reference-qualification decision.
-//!
-//! Startup previously constructed `CanonicalI8Qualification` with
-//! `reference_generation_qualified: true` unconditionally, beside a comment
-//! claiming it could not make that decision. The executor's own check is
-//! useless when its caller always passes true, so this exercises the ACTUAL
-//! startup path by spawning the binary — a test of the resolver alone would not
-//! show that startup calls it.
-//!
-//! These cases load no model. Each one must be refused before the artifact is
-//! hashed, which is why the artifact path below deliberately does not exist:
-//! if a case ever reports an artifact error instead of a qualification error,
-//! the ordering has regressed.
-
 use arc_crypto::signature::KeyPair;
 use arc_crypto::{Hash256, hash_bytes};
 use std::path::{Path, PathBuf};
@@ -83,12 +68,9 @@ impl Fixture {
         path
     }
 
-    /// Start the node with the real-executor path selected and return its
-    /// combined output. Bounded: every case here must refuse and exit.
     fn run_real_executor(&self, port: u16, p2p: u16, qualification: Option<&Path>) -> String {
         let data = self.dir.path().join(format!("data-{port}"));
         std::fs::create_dir_all(&data).unwrap();
-        // Deliberately absent. A qualification refusal must happen first.
         let missing_artifact = self.dir.path().join("this-artifact-does-not-exist.gguf");
         assert!(!missing_artifact.exists());
 
@@ -137,7 +119,6 @@ fn real_execution_is_refused_without_a_qualification_record() {
         out.contains("explicit reference-qualification record"),
         "must name the missing decision; got:\n{out}"
     );
-    // Ordering: the absent artifact must NOT be what failed.
     assert!(
         !out.contains("this-artifact-does-not-exist"),
         "qualification must be rejected BEFORE the artifact is touched; got:\n{out}"
@@ -173,8 +154,6 @@ fn real_execution_is_refused_for_a_qualification_bound_to_another_identity() {
     let q = fx.write_qualification(
         "wrong-identity.json",
         serde_json::json!({
-            // Affirmative and complete, but for a model this activation does
-            // not allow. A decision is valid only for what it was made against.
             "model_hash": other.to_hex(),
             "profile_hash": fx.allowed[1].to_hex(),
             "generation_hash": fx.allowed[2].to_hex(),
@@ -210,9 +189,6 @@ fn real_execution_is_refused_when_the_decision_has_no_author_or_basis() {
     );
 }
 
-/// A fresh chain-run identity for every execution of this test. The genesis
-/// is otherwise byte-identical run to run, so without it the certificates of
-/// one run would verify against the next one's committee.
 fn chain_instance_id() -> String {
     format!(
         "{}-{}",

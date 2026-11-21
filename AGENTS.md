@@ -21,6 +21,17 @@ search for the symbol and re-check the line before you quote it.
    secret scan fails on any it finds (`.github/workflows/ci.yml:88-97`). Run
    it with `--worktree` before you commit; by default it scans only `HEAD`.
 6. **Update this file in the same PR** when you change behaviour it describes.
+7. **Write no code comments.** Make the code say it with a name, a type or a
+   smaller function. Put the reason for a change in the commit message or PR.
+   `python3 scripts/ci/no_comments.py` fails CI on any comment. It allows only
+   tool directives, license lines, clap `///` help text, PowerShell
+   comment-based help at the top of a script, and a Python module docstring
+   that the module reads through `__doc__`. It skips `vendor/`, `docs/`,
+   `papers/`, data such as genesis, seed and non-code fixture files, six
+   SHA-256-pinned files, and minified or source-map output.
+8. **Turn corrections into checks.** When a review finds a mistake that can
+   happen again, add a test, lint rule or script that fails on it. A sentence
+   in this file is the last resort, not the fix.
 
 ## What ARC is
 
@@ -144,6 +155,7 @@ at a time, and only the ones your change needs.
 | Golden vectors | `ARC_GOLDEN_REQUIRE_VECTORISED=1 cargo test -p arc-inference --lib --locked golden -- --nocapture` | `golden-vectors.yml:50`, `122` | yes |
 | Release contracts | `bash tests/release/run.sh` | 64 | |
 | Doc contracts | `bash tests/release/documentation_contract_test.sh` (CI runs it from `desktop/`) | 468 | |
+| No code comments | `python3 scripts/ci/no_comments.py`; its tests are in `scripts/ci/test_no_comments.py` | `no-comments` job | |
 | Secret scan | `bash tests/release/current_tree_secret_scan.sh --worktree` before you commit. CI runs it bare, which scans `HEAD` only. It downloads a pinned Gitleaks (`tests/release/current_tree_secret_scan.sh:17-24`, `58-74`) | 97 | |
 | Shell | `bash -n` on every `*.sh` under `scripts`, `deploy`, `tests/release`, `tests/integration`; `shellcheck -S warning` on those plus `install.sh` | 749-792 | |
 | Supply chain | `bash scripts/ci/run-cargo-deny.sh <manifest>` for each manifest listed | 733-736 | |
@@ -312,16 +324,16 @@ against v0.8.20. Treat it as historical. Some historical docs still carry
 sentences the doc contract test requires, so do not move or delete one
 without updating `tests/release/documentation_contract_test.sh`.
 
-Some code comments are stale too. `Cargo.toml:151` says 16 workspace members;
-there are 20. `rustfmt.toml:3-4` says CI formats on stable; CI uses the
-nightly pin (`ci.yml:182`). `crates/arc-node/Cargo.toml:12-13` says Stwo is
-on in production; default features are empty (line 15). The `--shard-range`
-help example (`main.rs:468-470`) is not on the six-range grid. Code comments
-that cite "CLAUDE.md rule N" (for example
-`desktop/src-tauri/src/commands.rs:1698`) mean the numbered rules in the
-[CLAUDE.md snapshot at 8949910b](https://github.com/FerrumVir/arc-chain/blob/8949910bdfd079bdef18d6a41b62f6838acf60b7/CLAUDE.md),
-not the current file. The current `CLAUDE.md` tags each kept rule with its
-snapshot number.
+Code comments were removed after 8949910b, and CI keeps them out. Citations
+in this file that point at a comment, such as `integer_engine.rs:1-8`, are
+read at that commit: `git show 8949910b:<path>`. Some of those comments were
+stale, so check them against the code. Comments there that cite "CLAUDE.md
+rule N" (for example `desktop/src-tauri/src/commands.rs:1698`) mean the
+numbered rules in the
+[CLAUDE.md snapshot at 8949910b](https://github.com/FerrumVir/arc-chain/blob/8949910bdfd079bdef18d6a41b62f6838acf60b7/CLAUDE.md).
+The current `CLAUDE.md` tags each kept rule with its snapshot number. Clap
+help text stays, and the `--shard-range` help example (`main.rs:468-470`) is
+not on the six-range grid.
 
 ## Keeping this file current
 
@@ -334,4 +346,5 @@ snapshot number.
   current row and remove its banner.
 - Keep this file under about 350 lines; put long explanations in `docs/`.
 - After any doc edit, run `bash tests/release/documentation_contract_test.sh`.
-  It pins exact sentences in several docs, including `CLAUDE.md` (line 400).
+  It pins exact sentences in several docs, including `CLAUDE.md`
+  (`CLAUDE_GUIDE` in that test).

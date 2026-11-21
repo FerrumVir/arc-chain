@@ -1,11 +1,6 @@
-// Add to lib.rs: pub mod governance;
-
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-// ─── Governance errors ──────────────────────────────────────────────────────
-
-/// Errors that can occur during governance operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GovernanceError {
     ProposalNotFound,
@@ -39,9 +34,6 @@ impl fmt::Display for GovernanceError {
 
 impl std::error::Error for GovernanceError {}
 
-// ─── Vote choice ────────────────────────────────────────────────────────────
-
-/// The three-way choice a voter can make on a proposal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VoteChoice {
     For,
@@ -49,207 +41,132 @@ pub enum VoteChoice {
     Abstain,
 }
 
-// ─── Vote ───────────────────────────────────────────────────────────────────
-
-/// A single vote cast on a proposal, weighted by the voter's stake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Vote {
-    /// Voter address (32-byte public key hash).
     pub voter: [u8; 32],
-    /// Stake-weighted voting power at time of vote.
     pub stake_weight: u128,
-    /// The voter's choice.
     pub choice: VoteChoice,
-    /// Block height when the vote was cast.
     pub cast_at: u64,
-    /// Optional reason or rationale for the vote.
     pub reason: Option<String>,
 }
 
-// ─── Proposal type ──────────────────────────────────────────────────────────
-
-/// The category of a governance proposal, carrying type-specific data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProposalType {
-    /// Upgrade the protocol to a new version.
     ProtocolUpgrade {
         version: String,
         features: Vec<String>,
     },
-    /// Change a protocol parameter.
     ParameterChange {
         parameter: String,
         old_value: String,
         new_value: String,
     },
-    /// Spend funds from the on-chain treasury.
     TreasurySpend {
         recipient: [u8; 32],
         amount: u64,
         reason: String,
     },
-    /// Emergency protocol action (elevated threshold).
-    EmergencyAction { action: String },
-    /// Add a new validator to the active set.
+    EmergencyAction {
+        action: String,
+    },
     AddValidator {
         address: [u8; 32],
         initial_stake: u64,
     },
-    /// Remove a validator from the active set.
-    RemoveValidator { address: [u8; 32], reason: String },
-    /// Toggle a feature flag on or off.
-    FeatureFlagToggle { feature: String, enabled: bool },
-    /// Arbitrary governance payload.
-    Custom { data: Vec<u8> },
+    RemoveValidator {
+        address: [u8; 32],
+        reason: String,
+    },
+    FeatureFlagToggle {
+        feature: String,
+        enabled: bool,
+    },
+    Custom {
+        data: Vec<u8>,
+    },
 }
 
-// ─── Proposal status ────────────────────────────────────────────────────────
-
-/// Lifecycle status of a governance proposal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProposalStatus {
-    /// Proposal created but voting has not started.
     Draft,
-    /// Voting is open.
     Active,
-    /// Quorum met and approval threshold exceeded.
     Passed,
-    /// Quorum not met or approval threshold not reached.
     Failed,
-    /// Successfully executed on-chain.
     Executed,
-    /// Cancelled by the proposer before execution.
     Cancelled,
-    /// Execution window expired without execution.
     Expired,
-    /// Vetoed by the security council.
     Vetoed,
 }
 
-// ─── Proposal ───────────────────────────────────────────────────────────────
-
-/// A governance proposal with full voting state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proposal {
-    /// Unique proposal identifier (monotonically increasing).
     pub id: u64,
-    /// Address of the proposer (must be Core tier staker).
     pub proposer: [u8; 32],
-    /// Short human-readable title.
     pub title: String,
-    /// Detailed description of the proposal.
     pub description: String,
-    /// The type-specific payload for this proposal.
     pub proposal_type: ProposalType,
-    /// Block height when the proposal was created.
     pub created_at: u64,
-    /// Block height when voting opens.
     pub voting_starts: u64,
-    /// Block height when voting closes.
     pub voting_ends: u64,
-    /// Number of blocks after approval before execution is allowed.
     pub execution_delay: u64,
-    /// Current lifecycle status.
     pub status: ProposalStatus,
-    /// Total stake-weighted votes in favour.
     pub votes_for: u128,
-    /// Total stake-weighted votes against.
     pub votes_against: u128,
-    /// Total stake-weighted abstentions.
     pub votes_abstain: u128,
-    /// Minimum total votes required for the result to be valid.
     pub quorum_required: u128,
-    /// Approval threshold in basis points (6000 = 60%).
     pub approval_threshold_bps: u16,
-    /// All individual votes cast on this proposal.
     pub voters: Vec<Vote>,
 }
 
-// ─── Governance config ──────────────────────────────────────────────────────
-
-/// Protocol-level governance parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GovernanceConfig {
-    /// Minimum stake to create a proposal (must be Core tier: 50M ARC).
     pub min_proposal_stake: u64,
-    /// Duration of the voting period in blocks (~7 days at 400 ms/block).
     pub voting_period_blocks: u64,
-    /// Timelock delay after approval before execution (~2 days).
     pub execution_delay_blocks: u64,
-    /// Quorum as a percentage of total staked supply (basis points; 4000 = 40%).
     pub quorum_percentage_bps: u16,
-    /// Standard approval threshold (basis points; 6000 = 60%).
     pub approval_threshold_bps: u16,
-    /// Emergency proposal approval threshold (basis points; 7500 = 75%).
     pub emergency_threshold_bps: u16,
-    /// Maximum number of proposals in Active status at once.
     pub max_active_proposals: u32,
-    /// Minimum blocks between proposals from the same address.
     pub proposal_cooldown_blocks: u64,
 }
 
 impl GovernanceConfig {
-    /// Sensible defaults for ARC Chain mainnet.
-    ///
-    /// Block time: ~400 ms
-    /// Voting period: ~7 days (1_512_000 blocks)
-    /// Execution delay: ~2 days (432_000 blocks)
-    /// Execution window: ~3 days after delay
     pub fn default_config() -> Self {
         Self {
-            min_proposal_stake: 50_000_000_000_000_000, // 50M ARC (Core tier)
-            voting_period_blocks: 1_512_000,            // ~7 days
-            execution_delay_blocks: 432_000,            // ~2 days
-            quorum_percentage_bps: 4000,                // 40%
-            approval_threshold_bps: 6000,               // 60%
-            emergency_threshold_bps: 7500,              // 75%
+            min_proposal_stake: 50_000_000_000_000_000,
+            voting_period_blocks: 1_512_000,
+            execution_delay_blocks: 432_000,
+            quorum_percentage_bps: 4000,
+            approval_threshold_bps: 6000,
+            emergency_threshold_bps: 7500,
             max_active_proposals: 10,
-            proposal_cooldown_blocks: 216_000, // ~1 day
+            proposal_cooldown_blocks: 216_000,
         }
     }
 
-    /// Calculate the absolute quorum amount from a percentage of total staked supply.
     pub fn quorum_amount(&self, total_staked: u128) -> u128 {
         total_staked * self.quorum_percentage_bps as u128 / 10_000
     }
 }
 
-// ─── Governance state ───────────────────────────────────────────────────────
-
-/// Aggregate on-chain governance state.
 #[derive(Debug, Clone, Default)]
 pub struct GovernanceState {
-    /// All proposals (active, passed, failed, etc.).
     pub proposals: Vec<Proposal>,
-    /// The next proposal ID to assign.
     pub next_proposal_id: u64,
-    /// Total ARC currently staked across all validators and delegators.
     pub total_staked_supply: u128,
-    /// Number of proposals currently in Active status.
     pub active_proposal_count: u32,
-    /// Lifetime count of proposals created.
     pub total_proposals_created: u64,
-    /// Lifetime count of proposals that passed.
     pub total_proposals_passed: u64,
-    /// Lifetime count of proposals that failed.
     pub total_proposals_failed: u64,
 }
 
-/// Maximum blocks after the execution delay during which a passed proposal
-/// can still be executed. After this window the proposal expires.
-const EXECUTION_WINDOW_BLOCKS: u64 = 648_000; // ~3 days
+const EXECUTION_WINDOW_BLOCKS: u64 = 648_000;
 
 impl GovernanceState {
-    /// Create a fresh governance state with no proposals.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Create a new governance proposal.
-    ///
-    /// The proposer must meet the minimum stake requirement. The proposal
-    /// enters `Active` status immediately with voting starting at the current
-    /// block height.
     pub fn create_proposal(
         &mut self,
         proposer: [u8; 32],
@@ -259,13 +176,10 @@ impl GovernanceState {
         current_height: u64,
         config: &GovernanceConfig,
     ) -> Result<u64, GovernanceError> {
-        // Enforce max active proposals.
         if self.active_proposal_count >= config.max_active_proposals {
             return Err(GovernanceError::TooManyActiveProposals);
         }
 
-        // Enforce per-proposer cooldown: find the most recent proposal by this
-        // proposer and ensure enough blocks have elapsed.
         let last_proposal_height = self
             .proposals
             .iter()
@@ -318,10 +232,6 @@ impl GovernanceState {
         Ok(id)
     }
 
-    /// Cast a vote on an active proposal.
-    ///
-    /// The vote must be cast while the proposal is Active and within the
-    /// voting window. Each address may only vote once per proposal.
     pub fn cast_vote(
         &mut self,
         proposal_id: u64,
@@ -346,12 +256,10 @@ impl GovernanceState {
             return Err(GovernanceError::VotingNotActive);
         }
 
-        // Check for duplicate votes.
         if proposal.voters.iter().any(|v| v.voter == vote.voter) {
             return Err(GovernanceError::AlreadyVoted);
         }
 
-        // Accumulate stake-weighted totals.
         match vote.choice {
             VoteChoice::For => proposal.votes_for += vote.stake_weight,
             VoteChoice::Against => proposal.votes_against += vote.stake_weight,
@@ -362,10 +270,6 @@ impl GovernanceState {
         Ok(())
     }
 
-    /// Finalize a proposal after the voting period ends.
-    ///
-    /// Checks quorum and approval threshold. Transitions the proposal to
-    /// `Passed` or `Failed`.
     pub fn finalize_proposal(
         &mut self,
         proposal_id: u64,
@@ -383,7 +287,6 @@ impl GovernanceState {
             return Err(GovernanceError::VotingNotActive);
         }
 
-        // Voting must have ended.
         if current_height < proposal.voting_ends {
             return Err(GovernanceError::VotingNotActive);
         }
@@ -391,7 +294,6 @@ impl GovernanceState {
         let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
         let quorum = config.quorum_amount(total_staked);
 
-        // Check quorum (total participation).
         if total_votes < quorum {
             proposal.status = ProposalStatus::Failed;
             self.active_proposal_count = self.active_proposal_count.saturating_sub(1);
@@ -399,13 +301,10 @@ impl GovernanceState {
             return Ok(ProposalStatus::Failed);
         }
 
-        // Check approval threshold (For votes as percentage of For + Against).
         let decisive_votes = proposal.votes_for + proposal.votes_against;
         let passes = if decisive_votes == 0 {
             false
         } else {
-            // For / (For + Against) >= threshold / 10_000
-            // Rearranged to avoid floats: For * 10_000 >= threshold * (For + Against)
             proposal.votes_for * 10_000 >= proposal.approval_threshold_bps as u128 * decisive_votes
         };
 
@@ -422,12 +321,10 @@ impl GovernanceState {
         }
     }
 
-    /// Look up a proposal by ID.
     pub fn get_proposal(&self, id: u64) -> Option<&Proposal> {
         self.proposals.iter().find(|p| p.id == id)
     }
 
-    /// Return all proposals that are currently in Active status.
     pub fn active_proposals(&self) -> Vec<&Proposal> {
         self.proposals
             .iter()
@@ -435,8 +332,6 @@ impl GovernanceState {
             .collect()
     }
 
-    /// Check whether a passed proposal is ready to execute (timelock elapsed,
-    /// execution window not expired).
     pub fn can_execute(&self, proposal_id: u64, current_height: u64) -> bool {
         let Some(proposal) = self.get_proposal(proposal_id) else {
             return false;
@@ -449,16 +344,11 @@ impl GovernanceState {
         current_height >= earliest && current_height <= latest
     }
 
-    /// Execute a passed proposal after the timelock delay.
-    ///
-    /// Returns the proposal on success. Actual side-effects (parameter
-    /// changes, treasury transfers, etc.) are handled by the caller.
     pub fn execute_proposal(
         &mut self,
         proposal_id: u64,
         current_height: u64,
     ) -> Result<&Proposal, GovernanceError> {
-        // First validate without borrowing mutably.
         let (status, voting_ends, execution_delay) = {
             let proposal = self
                 .proposals
@@ -486,7 +376,6 @@ impl GovernanceState {
             return Err(GovernanceError::ExecutionWindowExpired);
         }
 
-        // Transition to Executed.
         let proposal = self
             .proposals
             .iter_mut()
@@ -495,7 +384,6 @@ impl GovernanceState {
 
         proposal.status = ProposalStatus::Executed;
 
-        // Re-borrow as immutable for the return value.
         Ok(self
             .proposals
             .iter()
@@ -503,8 +391,6 @@ impl GovernanceState {
             .expect("proposal was just modified"))
     }
 
-    /// Cancel a proposal. Only the original proposer may cancel, and only
-    /// while the proposal is Active or Draft.
     pub fn cancel_proposal(
         &mut self,
         proposal_id: u64,
@@ -527,20 +413,16 @@ impl GovernanceState {
             proposal.status = ProposalStatus::Cancelled;
             Ok(())
         } else {
-            // Cannot cancel proposals that are already finalized.
             Err(GovernanceError::VotingNotActive)
         }
     }
 
-    /// Check whether a specific address has already voted on a proposal.
     pub fn has_voted(&self, proposal_id: u64, voter: &[u8; 32]) -> bool {
         self.get_proposal(proposal_id)
             .map(|p| p.voters.iter().any(|v| &v.voter == voter))
             .unwrap_or(false)
     }
 }
-
-// ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -554,8 +436,7 @@ mod tests {
 
     fn default_state_and_config() -> (GovernanceState, GovernanceConfig) {
         let mut state = GovernanceState::new();
-        // Set a reasonable total staked supply so quorum calculations work.
-        state.total_staked_supply = 500_000_000_000_000_000; // 500M ARC
+        state.total_staked_supply = 500_000_000_000_000_000;
         (state, GovernanceConfig::default_config())
     }
 
@@ -569,7 +450,6 @@ mod tests {
         }
     }
 
-    // 1. Create proposal with correct fields.
     #[test]
     fn test_create_proposal() {
         let (mut state, config) = default_state_and_config();
@@ -606,7 +486,6 @@ mod tests {
         assert_eq!(p.votes_abstain, 0);
     }
 
-    // 2. Vote For increments votes_for.
     #[test]
     fn test_cast_vote_for() {
         let (mut state, config) = default_state_and_config();
@@ -637,7 +516,6 @@ mod tests {
         assert_eq!(p.voters.len(), 1);
     }
 
-    // 3. Vote Against increments votes_against.
     #[test]
     fn test_cast_vote_against() {
         let (mut state, config) = default_state_and_config();
@@ -665,7 +543,6 @@ mod tests {
         assert_eq!(p.votes_against, 500_000);
     }
 
-    // 4. Double vote by the same address is rejected.
     #[test]
     fn test_double_vote_rejected() {
         let (mut state, config) = default_state_and_config();
@@ -689,21 +566,17 @@ mod tests {
         let result = state.cast_vote(0, vote2, 201);
         assert_eq!(result, Err(GovernanceError::AlreadyVoted));
 
-        // Totals should reflect only the first vote.
         let p = state.get_proposal(0).unwrap();
         assert_eq!(p.votes_for, 1_000);
         assert_eq!(p.votes_against, 0);
         assert_eq!(p.voters.len(), 1);
     }
 
-    // 5. Proposal passes when quorum is met and threshold exceeded.
     #[test]
     fn test_proposal_passes_with_quorum() {
         let (mut state, config) = default_state_and_config();
         let proposer = test_address(1);
 
-        // Total staked: 500M ARC. Quorum = 40% = 200M ARC.
-        // Threshold = 60%.
         state
             .create_proposal(
                 proposer,
@@ -719,7 +592,6 @@ mod tests {
             )
             .unwrap();
 
-        // Cast 250M For (well above quorum, 100% approval).
         let vote_for = Vote {
             voter: test_address(2),
             stake_weight: 250_000_000_000_000_000,
@@ -729,7 +601,6 @@ mod tests {
         };
         state.cast_vote(0, vote_for, 200).unwrap();
 
-        // Finalize after voting ends.
         let after_voting = 100 + config.voting_period_blocks + 1;
         let status = state
             .finalize_proposal(0, after_voting, state.total_staked_supply, &config)
@@ -740,13 +611,11 @@ mod tests {
         assert_eq!(state.active_proposal_count, 0);
     }
 
-    // 6. Proposal fails when quorum is not met.
     #[test]
     fn test_proposal_fails_no_quorum() {
         let (mut state, config) = default_state_and_config();
         let proposer = test_address(1);
 
-        // Quorum = 40% of 500M = 200M ARC.
         state
             .create_proposal(
                 proposer,
@@ -762,10 +631,9 @@ mod tests {
             )
             .unwrap();
 
-        // Only 1M ARC votes - way below 200M quorum.
         let vote = Vote {
             voter: test_address(2),
-            stake_weight: 1_000_000_000_000_000, // 1M ARC
+            stake_weight: 1_000_000_000_000_000,
             choice: VoteChoice::For,
             cast_at: 200,
             reason: None,
@@ -781,7 +649,6 @@ mod tests {
         assert_eq!(state.total_proposals_failed, 1);
     }
 
-    // 7. Proposal fails when quorum met but approval threshold not reached.
     #[test]
     fn test_proposal_fails_threshold() {
         let (mut state, config) = default_state_and_config();
@@ -798,8 +665,6 @@ mod tests {
             )
             .unwrap();
 
-        // 120M For, 130M Against = 250M total (above 200M quorum).
-        // For% = 120/250 = 48%, below 60% threshold.
         let vote_for = Vote {
             voter: test_address(2),
             stake_weight: 120_000_000_000_000_000,
@@ -825,7 +690,6 @@ mod tests {
         assert_eq!(status, ProposalStatus::Failed);
     }
 
-    // 8. Execution only allowed after delay, not before; and not after window.
     #[test]
     fn test_execute_after_delay() {
         let (mut state, config) = default_state_and_config();
@@ -845,17 +709,15 @@ mod tests {
             )
             .unwrap();
 
-        // Cast enough votes to pass.
         let vote = Vote {
             voter: test_address(2),
-            stake_weight: 300_000_000_000_000_000, // 300M - above quorum
+            stake_weight: 300_000_000_000_000_000,
             choice: VoteChoice::For,
             cast_at: 200,
             reason: None,
         };
         state.cast_vote(0, vote, 200).unwrap();
 
-        // Finalize.
         let voting_ends = 100 + config.voting_period_blocks;
         state
             .finalize_proposal(0, voting_ends + 1, state.total_staked_supply, &config)
@@ -863,24 +725,18 @@ mod tests {
 
         let earliest_execution = voting_ends + config.execution_delay_blocks;
 
-        // Too early - cannot execute.
         assert!(!state.can_execute(0, earliest_execution - 1));
 
-        // Exactly at the earliest allowed block.
         assert!(state.can_execute(0, earliest_execution));
 
-        // Within the execution window.
         assert!(state.can_execute(0, earliest_execution + 100));
 
-        // Execute.
         let p = state.execute_proposal(0, earliest_execution).unwrap();
         assert_eq!(p.status, ProposalStatus::Executed);
 
-        // Cannot execute again.
         assert!(!state.can_execute(0, earliest_execution + 1));
     }
 
-    // 9. Proposer can cancel their own proposal.
     #[test]
     fn test_cancel_proposal() {
         let (mut state, config) = default_state_and_config();
@@ -906,7 +762,6 @@ mod tests {
         assert_eq!(state.active_proposal_count, 0);
     }
 
-    // 10. Non-proposer cannot cancel.
     #[test]
     fn test_cancel_not_proposer_fails() {
         let (mut state, config) = default_state_and_config();
@@ -931,43 +786,32 @@ mod tests {
         assert_eq!(p.status, ProposalStatus::Active);
     }
 
-    // 11. GovernanceConfig defaults are sensible.
     #[test]
     fn test_governance_config_defaults() {
         let config = GovernanceConfig::default_config();
 
-        // Core tier minimum = 50M ARC.
         assert_eq!(config.min_proposal_stake, 50_000_000_000_000_000);
 
-        // Voting period: ~7 days (1_512_000 blocks at 400 ms/block).
         assert_eq!(config.voting_period_blocks, 1_512_000);
 
-        // Execution delay: ~2 days.
         assert_eq!(config.execution_delay_blocks, 432_000);
 
-        // Quorum: 40%.
         assert_eq!(config.quorum_percentage_bps, 4000);
 
-        // Standard threshold: 60%.
         assert_eq!(config.approval_threshold_bps, 6000);
 
-        // Emergency threshold: 75%.
         assert_eq!(config.emergency_threshold_bps, 7500);
 
-        // Max active proposals.
         assert!(config.max_active_proposals > 0);
 
-        // Quorum calculation: 40% of 1000 = 400.
         assert_eq!(config.quorum_amount(1000), 400);
     }
 
-    // 12. active_proposals only returns Active status proposals.
     #[test]
     fn test_active_proposals_filter() {
         let (mut state, config) = default_state_and_config();
         let proposer = test_address(1);
 
-        // Create 3 proposals with sufficient spacing to avoid cooldown.
         let spacing = config.proposal_cooldown_blocks;
 
         state
@@ -1005,7 +849,6 @@ mod tests {
 
         assert_eq!(state.active_proposals().len(), 3);
 
-        // Cancel P0.
         state.cancel_proposal(0, &proposer).unwrap();
 
         let active = state.active_proposals();

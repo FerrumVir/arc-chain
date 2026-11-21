@@ -42,29 +42,25 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from arc_soak import growth
 
-# Copied when present, byte for byte. Nothing else in the run directory is:
-# node data directories, backup archives and the ident-N/ directories stay put.
 RECORDS = ("run.json", "verdict.json", "report.txt", "events.log", "faults.jsonl",
            "agreement.jsonl", "samples.jsonl", "workload.jsonl", "diag.jsonl",
            "activation.json", "genesis.toml", "load-driver.log")
 IDENT_TXT = re.compile(r"^ident-[^/]+\.txt$")
 NODE_LOG = re.compile(r"^node-\d+\.\d+\.log$")
-# The analyzer's own fields; repeated as recorded, never recomputed here.
 VERDICT_FIELDS = ("status", "exit", "exit_code")
 REFUSED = 2
 
 
 class Refused(Exception):
-    """The collector will not run; the reason is printed and the exit is 2."""
+    pass
 
 
 def alive(pid: int) -> bool:
-    """True while a process with this id exists (signal 0 delivers nothing)."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    except PermissionError:  # it exists, owned by someone else
+    except PermissionError:
         return True
     return True
 
@@ -86,7 +82,6 @@ def _json(path: str) -> Optional[Any]:
 
 
 def _jsonl(path: str) -> Tuple[List[dict], int]:
-    """The JSON-object records of a .jsonl file, and how many non-blank lines were not."""
     records: List[dict] = []
     bad = 0
     if not os.path.isfile(path):
@@ -112,7 +107,6 @@ def _tally(values) -> Dict[str, int]:
 
 
 def summarize(run_dir: str) -> Dict[str, Any]:
-    """Repeat what the run recorded; decide nothing."""
     run = _json(os.path.join(run_dir, "run.json"))
     verdict = _json(os.path.join(run_dir, "verdict.json"))
     agreement, agreement_bad = _jsonl(os.path.join(run_dir, "agreement.jsonl"))
@@ -194,7 +188,6 @@ def collect(run_dir: str, out_dir: str, pid: Optional[int] = None, skip_s: float
             if not _regular(src):
                 skipped.append({"file": name, "reason": "not a regular file"})
                 continue
-            # mtime=0 keeps the archive a function of the log's bytes alone.
             with open(src, "rb") as fin, open(os.path.join(out_dir, name + ".gz"), "wb") as raw:
                 with gzip.GzipFile(filename=name, mode="wb", fileobj=raw, mtime=0) as gz:
                     shutil.copyfileobj(fin, gz, 1 << 20)
@@ -218,7 +211,6 @@ def collect(run_dir: str, out_dir: str, pid: Optional[int] = None, skip_s: float
         fh.write("\n")
     written.append("summary.json")
 
-    # Last: a bundle is complete exactly when its manifest exists.
     lines = [f"{sha256_file(os.path.join(out_dir, rel))}  {rel}" for rel in sorted(written)]
     with open(os.path.join(out_dir, "MANIFEST.sha256"), "w") as fh:
         fh.write("\n".join(lines) + "\n")

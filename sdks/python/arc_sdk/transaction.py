@@ -1,10 +1,3 @@
-"""
-ARC Chain SDK — Transaction builder.
-
-Constructs unsigned transaction dicts matching the ARC Chain RPC submission
-format, then signs them with Ed25519 and computes the BLAKE3 transaction hash.
-"""
-
 from __future__ import annotations
 
 import struct
@@ -15,7 +8,6 @@ import blake3
 from .crypto import KeyPair
 from .errors import ArcValidationError
 
-# Domain separation keys matching the Rust implementation.
 _TX_DOMAIN = "ARC-chain-tx-v1"
 _TX_DOMAIN_V3 = "ARC-chain-tx-v3"
 
@@ -40,21 +32,13 @@ def _normalize_transaction_domain(value: Optional[str]) -> Optional[str]:
 
 
 def _encode_body(body: Dict[str, Any]) -> bytes:
-    """
-    Encode a transaction body to bytes for hashing.
-
-    This produces a deterministic byte representation used for computing
-    the BLAKE3 signing hash. The encoding mirrors the Rust bincode
-    serialization order.
-    """
     parts: list[bytes] = []
     tx_body_type = body.get("type", "")
 
     if tx_body_type == "Transfer":
-        parts.append(struct.pack("<I", 0))  # bincode enum variant index
+        parts.append(struct.pack("<I", 0))
         parts.append(bytes.fromhex(body["to"]))
         parts.append(struct.pack("<Q", body["amount"]))
-        # amount_commitment: Option<[u8;32]>
         if body.get("amount_commitment"):
             parts.append(b"\x01")
             parts.append(bytes.fromhex(body["amount_commitment"]))
@@ -108,7 +92,6 @@ def _encode_body(body: Dict[str, Any]) -> bytes:
             parts.append(b"\x00")
 
     else:
-        # Fallback: serialize as-is for unknown types
         import json
 
         parts.append(json.dumps(body, sort_keys=True).encode("utf-8"))
@@ -125,12 +108,6 @@ def _compute_hash(
     gas_limit: int,
     transaction_domain: Optional[str] = None,
 ) -> str:
-    """
-    Compute the BLAKE3 signing hash for a transaction.
-
-    Matches the Rust ``Transaction::compute_hash()`` method:
-    ``tx_type || from || nonce || body || fee || gas_limit``
-    """
     normalized_domain = _normalize_transaction_domain(transaction_domain)
     h = blake3.blake3(
         derive_key_context=_TX_DOMAIN_V3 if normalized_domain is not None else _TX_DOMAIN
@@ -147,16 +124,6 @@ def _compute_hash(
 
 
 class TransactionBuilder:
-    """
-    Build unsigned ARC Chain transactions.
-
-    All build methods return a transaction dict that can be signed
-    with ``TransactionBuilder.sign()`` and then submitted via
-    ``ArcClient.submit_transaction()``.
-    """
-
-    # -- Transfer --
-
     @staticmethod
     def transfer(
         from_addr: str,
@@ -166,21 +133,6 @@ class TransactionBuilder:
         nonce: int = 0,
         transaction_domain: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Build an unsigned transfer transaction.
-
-        Args:
-            from_addr: 64-char hex sender address.
-            to_addr: 64-char hex recipient address.
-            amount: Amount in ARC tokens (smallest unit).
-            fee: Transaction fee (default 1).
-            nonce: Sender nonce for replay protection.
-            transaction_domain: Exact value advertised by ``/network/info``;
-                ``None`` only for pre-v3 chains.
-
-        Returns:
-            Unsigned transaction dict.
-        """
         _validate_address(from_addr, "from_addr")
         _validate_address(to_addr, "to_addr")
         if amount <= 0:
@@ -217,8 +169,6 @@ class TransactionBuilder:
             "transaction_domain": normalized_domain,
         }
 
-    # -- Deploy Contract --
-
     @staticmethod
     def deploy_contract(
         from_addr: str,
@@ -229,21 +179,6 @@ class TransactionBuilder:
         constructor_args: bytes = b"",
         state_rent_deposit: int = 0,
     ) -> Dict[str, Any]:
-        """
-        Build an unsigned contract deployment transaction.
-
-        Args:
-            from_addr: 64-char hex sender address.
-            code: WASM bytecode to deploy.
-            gas_limit: Maximum gas for deployment.
-            fee: Transaction fee.
-            nonce: Sender nonce.
-            constructor_args: ABI-encoded constructor arguments.
-            state_rent_deposit: Pre-paid state rent.
-
-        Returns:
-            Unsigned transaction dict.
-        """
         _validate_address(from_addr, "from_addr")
         if not code:
             raise ArcValidationError("Bytecode must not be empty", field="code")
@@ -268,8 +203,6 @@ class TransactionBuilder:
             "transaction_domain": None,
         }
 
-    # -- Call Contract --
-
     @staticmethod
     def call_contract(
         from_addr: str,
@@ -281,22 +214,6 @@ class TransactionBuilder:
         fee: int = 1,
         nonce: int = 0,
     ) -> Dict[str, Any]:
-        """
-        Build an unsigned WASM contract call transaction.
-
-        Args:
-            from_addr: 64-char hex sender address.
-            contract_addr: 64-char hex contract address.
-            calldata: ABI-encoded call data.
-            value: ARC tokens to send with the call.
-            gas_limit: Maximum gas for execution.
-            function: Function name to call.
-            fee: Transaction fee.
-            nonce: Sender nonce.
-
-        Returns:
-            Unsigned transaction dict.
-        """
         _validate_address(from_addr, "from_addr")
         _validate_address(contract_addr, "contract_addr")
 
@@ -322,8 +239,6 @@ class TransactionBuilder:
             "transaction_domain": None,
         }
 
-    # -- Stake --
-
     @staticmethod
     def stake(
         from_addr: str,
@@ -333,20 +248,6 @@ class TransactionBuilder:
         fee: int = 1,
         nonce: int = 0,
     ) -> Dict[str, Any]:
-        """
-        Build an unsigned stake/unstake transaction.
-
-        Args:
-            from_addr: 64-char hex sender address.
-            amount: Amount to stake or unstake.
-            validator: Validator address (defaults to self).
-            is_stake: True to stake, False to unstake.
-            fee: Transaction fee.
-            nonce: Sender nonce.
-
-        Returns:
-            Unsigned transaction dict.
-        """
         _validate_address(from_addr, "from_addr")
         if amount <= 0:
             raise ArcValidationError("Stake amount must be positive", field="amount")
@@ -374,8 +275,6 @@ class TransactionBuilder:
             "transaction_domain": None,
         }
 
-    # -- Settle --
-
     @staticmethod
     def settle(
         from_addr: str,
@@ -385,20 +284,6 @@ class TransactionBuilder:
         usage_units: int,
         nonce: int = 0,
     ) -> Dict[str, Any]:
-        """
-        Build an unsigned settlement transaction (zero fee).
-
-        Args:
-            from_addr: 64-char hex sender address.
-            agent_id: 64-char hex agent address.
-            service_hash: 64-char hex service hash.
-            amount: Settlement amount.
-            usage_units: Number of usage units consumed.
-            nonce: Sender nonce.
-
-        Returns:
-            Unsigned transaction dict.
-        """
         _validate_address(from_addr, "from_addr")
         _validate_address(agent_id, "agent_id")
 
@@ -424,26 +309,8 @@ class TransactionBuilder:
             "transaction_domain": None,
         }
 
-    # -- Signing --
-
     @staticmethod
     def sign(tx: Dict[str, Any], keypair: KeyPair) -> Dict[str, Any]:
-        """
-        Sign a transaction dict with the given key pair.
-
-        Computes the Ed25519 signature over the transaction hash and attaches
-        both the signature and the public key to the transaction.
-
-        Args:
-            tx: Unsigned transaction dict (from any build method).
-            keypair: Ed25519 key pair whose address matches tx["from"].
-
-        Returns:
-            Signed transaction dict (new copy, original is not modified).
-
-        Raises:
-            ArcValidationError: If the key pair address does not match tx["from"].
-        """
         sender = tx.get("from", "")
         kp_addr = keypair.address()
         if sender and sender != kp_addr:
@@ -489,7 +356,6 @@ class TransactionBuilder:
 
 
 def _validate_address(address: str, field_name: str) -> None:
-    """Validate that an address is a 64-character hex string."""
     if not address:
         raise ArcValidationError(f"{field_name} is required", field=field_name)
     if len(address) != 64:

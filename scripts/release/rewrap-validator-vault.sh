@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Rewrap one exact passphrase-encrypted validator vault to an operator's public
-# CMS certificate. Plaintext exists only in a private temporary directory and
-# is never listed, printed, extracted, or uploaded.
 set +x
 set -Eeuo pipefail
 umask 077
@@ -117,8 +114,6 @@ RSA_BITS="$(sed -n 's/.*Public-Key: (\([0-9][0-9]*\) bit).*/\1/p' "$CERT_TEXT")"
 [[ "$RSA_BITS" =~ ^[0-9]+$ ]] && [ "$RSA_BITS" -ge 3072 ] \
     || die 'restore certificate RSA key is smaller than 3072 bits'
 
-# An absent KeyUsage/EKU extension is unrestricted by X.509. When either is
-# present, it must explicitly permit key transport/CMS use.
 openssl x509 -in "$RESTORE_CERT" -noout -ext keyUsage \
     > "$KEY_USAGE" 2>/dev/null || die 'could not inspect certificate key usage'
 if [ -s "$KEY_USAGE" ] \
@@ -132,9 +127,6 @@ if [ -s "$EXTENDED_USAGE" ] \
     die 'restore certificate extended-key-usage extension does not permit CMS use'
 fi
 
-# Creation profile recovered from the original vault operation. There is no
-# fallback KDF/cipher guessing: one exact profile either authenticates the
-# operator passphrase and yields the expected tar structure, or the run fails.
 if ! printf '%s' "$ARC_VALIDATOR_VAULT_PASSPHRASE" | openssl enc -d \
     -aes-256-cbc \
     -pbkdf2 \
@@ -171,9 +163,6 @@ grep -Fq 'algorithm: aes-256-gcm' "$CMS_TEXT" \
 [ "$(grep -Fc 'OBJECT            :sha256' "$CMS_TEXT")" -ge 2 ] \
     || die 'CMS RSA-OAEP parameters do not use SHA-256'
 
-# Hard-link publication is create-only. The workflow places source, work, and
-# output beneath RUNNER_TEMP so crossing a filesystem is an error, not a reason
-# to fall back to an overwrite-capable copy.
 ln -- "$CANDIDATE_CMS" "$OUTPUT" \
     || die 'could not atomically publish the create-only CMS output'
 chmod 600 "$OUTPUT"

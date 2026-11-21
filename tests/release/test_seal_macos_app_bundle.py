@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Focused regression tests for ad-hoc sealing macOS desktop packages."""
 
 from __future__ import annotations
 

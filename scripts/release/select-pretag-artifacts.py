@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""Select the exact immutable pre-tag artifacts for one successful run.
-
-The GitHub Actions artifact service assigns an immutable ID and SHA-256 digest
-to every upload.  Artifact names additionally bind the candidate commit, run,
-attempt, and the SHA-256 of the inner tarball.  This selector turns the API
-response into the one small JSON value consumed by the tag workflow and fails
-closed on missing, duplicate, expired, empty, or ambiguously named artifacts.
-"""
 
 from __future__ import annotations
 

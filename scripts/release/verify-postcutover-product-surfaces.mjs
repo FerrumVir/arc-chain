@@ -1,10 +1,5 @@
 #!/usr/bin/env node
 
-// Read-only post-cutover acceptance for the product surfaces users actually
-// rely on. The recovery verifier proves consensus and the two real canaries;
-// this verifier takes those sealed identities and requires the dashboard and
-// explorer readers to expose the same mined 0x25 receipts and earnings.
-
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { readFile } from "node:fs/promises";

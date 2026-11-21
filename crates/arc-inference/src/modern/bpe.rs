@@ -1,17 +1,3 @@
-//! Byte-level BPE tokenizer for Hugging Face `tokenizer.json` files.
-//!
-//! Implements exactly the configuration SmolLM3 (and Llama-3) uses and refuses
-//! every other one: no normalizer; added tokens split out of the text first,
-//! leftmost-longest; a `Split` pre-tokenizer with one regex and `Isolated`
-//! behaviour; a `ByteLevel` mapping without prefix space or extra regex; a BPE
-//! model without dropout, unknown token, prefixes or byte fallback, optionally
-//! with `ignore_merges`; and a post-processor that adds nothing. The merge
-//! loop reproduces the reference implementation's priority order (lowest
-//! merge rank first, then leftmost), including how it discards stale queue
-//! entries, so ids match the `tokenizers` library.
-//!
-//! Tokenisation is not on the verification path: requests carry token ids.
-
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
@@ -19,7 +5,6 @@ use serde_json::Value;
 
 use super::ModernError;
 
-/// An added (special or user) token matched before pre-tokenisation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddedToken {
     pub id: u32,
@@ -27,7 +12,6 @@ pub struct AddedToken {
     pub special: bool,
 }
 
-/// A loaded byte-level BPE tokenizer.
 pub struct ByteLevelBpe {
     vocab: HashMap<String, u32>,
     id_to_token: HashMap<u32, String>,
@@ -39,7 +23,6 @@ pub struct ByteLevelBpe {
     char_to_byte: HashMap<char, u8>,
 }
 
-/// GPT-2's reversible byte to printable-character table.
 pub fn bytes_to_unicode() -> [char; 256] {
     let mut table = ['\0'; 256];
     let mut extra = 0u32;
@@ -82,7 +65,6 @@ struct Merge {
 
 impl Ord for Merge {
     fn cmp(&self, other: &Self) -> Ordering {
-        // A min-heap on rank, then on position, inside a max-heap.
         other
             .rank
             .cmp(&self.rank)
@@ -105,7 +87,6 @@ struct Symbol {
 }
 
 impl ByteLevelBpe {
-    /// Parse a `tokenizer.json`, refusing any configuration not implemented here.
     pub fn from_json(bytes: &[u8]) -> Result<Self, ModernError> {
         let root: Value =
             serde_json::from_slice(bytes).map_err(|e| invalid(format!("tokenizer.json: {e}")))?;
@@ -268,18 +249,14 @@ impl ByteLevelBpe {
         })
     }
 
-    /// Number of ids (model vocabulary plus added tokens).
     pub fn id_count(&self) -> usize {
         self.id_to_token.len()
     }
 
-    /// The added tokens, in file order.
     pub fn added_tokens(&self) -> &[AddedToken] {
         &self.added
     }
 
-    /// The leftmost added token at or after byte `from`; the longest one
-    /// among those starting at the same position.
     fn next_added(&self, text: &str, from: usize) -> Option<(usize, usize, u32)> {
         let mut best: Option<(usize, usize, u32)> = None;
         for token in &self.added {
@@ -298,7 +275,6 @@ impl ByteLevelBpe {
         best
     }
 
-    /// Encode `text` to token ids (no BOS or EOS is added).
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, ModernError> {
         let mut ids = Vec::new();
         let mut position = 0;
@@ -415,18 +391,14 @@ impl ByteLevelBpe {
         Ok(())
     }
 
-    /// The token string of `id` (byte-level characters for vocab tokens).
     pub fn token(&self, id: u32) -> Option<&str> {
         self.id_to_token.get(&id).map(String::as_str)
     }
 
-    /// Whether `id` is an added token marked special.
     pub fn is_special(&self, id: u32) -> bool {
         self.added.iter().any(|t| t.id == id && t.special)
     }
 
-    /// Decode ids to text, like the ByteLevel decoder; optionally drop
-    /// special tokens. Unknown ids are skipped.
     pub fn decode(&self, ids: &[u32], skip_special: bool) -> String {
         let mut bytes = Vec::new();
         for &id in ids {
@@ -453,7 +425,6 @@ impl ByteLevelBpe {
 mod tests {
     use super::*;
 
-    /// A tiny tokenizer.json with the SmolLM3 pre-tokenizer and a few merges.
     fn tiny() -> ByteLevelBpe {
         let table = bytes_to_unicode();
         let mut vocab = serde_json::Map::new();
@@ -524,7 +495,6 @@ mod tests {
         let t = tiny();
         assert_eq!(t.encode("hello").unwrap(), vec![id(&t, "hello")]);
         let space = bytes_to_unicode()[b' ' as usize];
-        // " world" is one regex piece; " w" and "or" merge, the rest stay bytes.
         assert_eq!(
             t.encode(" world").unwrap(),
             vec![
@@ -534,7 +504,6 @@ mod tests {
                 id(&t, "d")
             ]
         );
-        // "aaa": the leftmost equal-rank pair merges first.
         assert_eq!(t.encode("aaa").unwrap(), vec![id(&t, "aa"), id(&t, "a")]);
     }
 
@@ -543,7 +512,6 @@ mod tests {
         let t = tiny();
         let ids = t.encode("<|im_start|>hello<|im_end|>").unwrap();
         assert_eq!(ids, vec![900, id(&t, "hello"), 901]);
-        // "<|im" alone matches the shorter added token.
         let ids = t.encode("<|imx").unwrap();
         assert_eq!(ids[0], 902);
         assert_eq!(t.decode(&[900, id(&t, "hello"), 901], true), "hello");
@@ -559,7 +527,6 @@ mod tests {
         let text = "ab 12345\n\n  x's  ";
         let ids = t.encode(text).unwrap();
         assert_eq!(t.decode(&ids, false), text);
-        // "12345" splits as "123" + "45" (numbers in runs of at most three).
         let digits = t.encode("12345").unwrap();
         assert_eq!(
             digits,
@@ -571,7 +538,6 @@ mod tests {
                 id(&t, "5")
             ]
         );
-        // Unicode text round-trips through the byte-level mapping.
         let unicode = "café 中文 😀";
         assert_eq!(t.decode(&t.encode(unicode).unwrap(), false), unicode);
     }

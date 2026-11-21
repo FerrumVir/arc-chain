@@ -27,8 +27,6 @@ function runNpm(args, options) {
 }
 
 try {
-  // Build and pack from an isolated copy. A quality check must never delete or
-  // overwrite a developer's tracked dist/ changes through npm's prepack hook.
   mkdirSync(stagedPackage, { recursive: true });
   mkdirSync(archivesRoot, { recursive: true });
   mkdirSync(consumerRoot, { recursive: true });

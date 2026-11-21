@@ -1,15 +1,3 @@
-// Add to lib.rs: pub mod subnet;
-
-//! Subnet registry and state anchoring for ARC L1.
-//!
-//! Subnets are application-specific chains that settle their state roots to the
-//! ARC L1, inheriting its security guarantees. This module provides:
-//!
-//! - **Registration**: create, query, and deregister subnets.
-//! - **Anchoring**: subnets periodically submit state roots that are recorded on L1.
-//! - **Validator management**: validators opt-in to subnets and must meet stake requirements.
-//! - **Liveness checks**: detect subnets that have gone silent.
-
 use arc_crypto::Hash256;
 use arc_types::Address;
 use dashmap::DashMap;
@@ -17,12 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-// ── Type Aliases ────────────────────────────────────────────────────────────
-
-/// Unique identifier for a subnet (32-byte hash).
 pub type SubnetId = [u8; 32];
-
-// ── Errors ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum SubnetError {
@@ -54,120 +37,64 @@ pub enum SubnetError {
     InsufficientStake { have: u64, need: u64 },
 }
 
-// ── Subnet VM Type ──────────────────────────────────────────────────────────
-
-/// Virtual machine type that a subnet runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubnetVmType {
-    /// Ethereum Virtual Machine compatible.
     Evm,
-    /// WebAssembly runtime.
     Wasm,
-    /// Custom / application-specific VM.
     Custom,
-    /// ZK rollup proving system.
     ZkRollup,
 }
 
-// ── Subnet Status ───────────────────────────────────────────────────────────
-
-/// Lifecycle status of a subnet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubnetStatus {
-    /// Registered but not enough validators have joined.
     Pending,
-    /// Running and anchoring state roots.
     Active,
-    /// Temporarily halted by the owner.
     Paused,
-    /// Permanently shut down.
     Deregistered,
 }
 
-// ── Subnet Config ───────────────────────────────────────────────────────────
-
-/// Configuration for a subnet registered on ARC L1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubnetConfig {
-    /// Unique 32-byte identifier.
     pub subnet_id: SubnetId,
-    /// Human-readable name.
     pub name: String,
-    /// Address that registered this subnet (owner).
     pub owner: Address,
-    /// Unix timestamp of registration.
     pub created_at: u64,
-    /// VM type that the subnet runs.
     pub vm_type: SubnetVmType,
-    /// How often the subnet anchors state (in subnet blocks).
     pub anchor_interval: u64,
-    /// Minimum number of validators required for activation.
     pub min_validators: u32,
-    /// Maximum allowed validators.
     pub max_validators: u32,
-    /// ARC tokens each validator must stake to participate.
     pub stake_requirement: u64,
-    /// Current lifecycle status.
     pub status: SubnetStatus,
 }
 
-// ── State Anchor ────────────────────────────────────────────────────────────
-
-/// A state root anchor submitted from a subnet to the ARC L1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateAnchor {
-    /// The subnet this anchor belongs to.
     pub subnet_id: SubnetId,
-    /// Block height on the subnet at anchor time.
     pub subnet_height: u64,
-    /// Merkle state root of the subnet at this height.
     pub state_root: Hash256,
-    /// Transaction root of the subnet (enables tx inclusion proofs).
     pub tx_root: Hash256,
-    /// L1 block height where this anchor was recorded.
     pub anchor_height: u64,
-    /// Validator who submitted the anchor.
     pub submitter: Address,
-    /// Unix timestamp of submission.
     pub timestamp: u64,
 }
 
-// ── Subnet Validator ────────────────────────────────────────────────────────
-
-/// A validator that has opted-in to a specific subnet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubnetValidator {
-    /// Validator address.
     pub address: Address,
-    /// Which subnet this validator participates in.
     pub subnet_id: SubnetId,
-    /// Amount of ARC staked for this subnet.
     pub stake: u64,
-    /// Unix timestamp when the validator joined.
     pub joined_at: u64,
-    /// Whether this validator is currently active.
     pub is_active: bool,
 }
 
-// ── Subnet Registry ─────────────────────────────────────────────────────────
-
-/// Main subnet registry that tracks all subnets, their anchors, and validators.
-///
-/// All maps are concurrent (`DashMap`) so the registry is safe to share across
-/// threads without external locking.
 pub struct SubnetRegistry {
-    /// Subnet ID -> configuration.
     subnets: DashMap<SubnetId, SubnetConfig>,
-    /// Subnet ID -> chronologically ordered anchors.
     anchors: DashMap<SubnetId, Vec<StateAnchor>>,
-    /// Subnet ID -> list of opted-in validators.
     validators: DashMap<SubnetId, Vec<SubnetValidator>>,
-    /// Subnet ID -> most recent anchor (quick lookup).
     latest_anchor: DashMap<SubnetId, StateAnchor>,
 }
 
 impl SubnetRegistry {
-    /// Create an empty subnet registry.
     pub fn new() -> Self {
         Self {
             subnets: DashMap::new(),
@@ -177,15 +104,9 @@ impl SubnetRegistry {
         }
     }
 
-    // ── Registration ────────────────────────────────────────────────────
-
-    /// Register a new subnet on the L1. Returns the subnet ID on success.
-    ///
-    /// Fails if a subnet with the same ID already exists.
     pub fn register_subnet(&self, config: SubnetConfig) -> Result<SubnetId, SubnetError> {
         let id = config.subnet_id;
 
-        // Reject duplicates.
         if self.subnets.contains_key(&id) {
             return Err(SubnetError::AlreadyExists);
         }
@@ -197,10 +118,6 @@ impl SubnetRegistry {
         Ok(id)
     }
 
-    /// Deregister a subnet. Only the owner may do this.
-    ///
-    /// Sets the status to `Deregistered` but does not remove data so that
-    /// historical anchors remain queryable.
     pub fn deregister_subnet(
         &self,
         subnet_id: &SubnetId,
@@ -219,17 +136,14 @@ impl SubnetRegistry {
         Ok(())
     }
 
-    /// Look up a subnet by ID.
     pub fn get_subnet(&self, subnet_id: &SubnetId) -> Option<SubnetConfig> {
         self.subnets.get(subnet_id).map(|r| r.clone())
     }
 
-    /// Return all registered subnets (including deregistered ones).
     pub fn list_subnets(&self) -> Vec<SubnetConfig> {
         self.subnets.iter().map(|r| r.value().clone()).collect()
     }
 
-    /// Count subnets that are currently `Active`.
     pub fn active_subnet_count(&self) -> usize {
         self.subnets
             .iter()
@@ -237,13 +151,6 @@ impl SubnetRegistry {
             .count()
     }
 
-    // ── Anchoring ───────────────────────────────────────────────────────
-
-    /// Submit a state root anchor from a subnet.
-    ///
-    /// Validates:
-    /// - The subnet exists and is active.
-    /// - The anchor height is strictly greater than the previous anchor's height.
     pub fn submit_anchor(&self, anchor: StateAnchor) -> Result<(), SubnetError> {
         let subnet = self
             .subnets
@@ -255,7 +162,6 @@ impl SubnetRegistry {
         }
         drop(subnet);
 
-        // Enforce monotonically increasing subnet heights.
         if let Some(latest) = self.latest_anchor.get(&anchor.subnet_id)
             && anchor.subnet_height <= latest.subnet_height
         {
@@ -265,7 +171,6 @@ impl SubnetRegistry {
             });
         }
 
-        // Store the anchor.
         self.latest_anchor.insert(anchor.subnet_id, anchor.clone());
 
         self.anchors
@@ -276,12 +181,10 @@ impl SubnetRegistry {
         Ok(())
     }
 
-    /// Get the most recent anchor for a subnet.
     pub fn get_latest_anchor(&self, subnet_id: &SubnetId) -> Option<StateAnchor> {
         self.latest_anchor.get(subnet_id).map(|r| r.clone())
     }
 
-    /// Find the anchor at a specific subnet height (exact match).
     pub fn get_anchor_at_height(
         &self,
         subnet_id: &SubnetId,
@@ -295,22 +198,10 @@ impl SubnetRegistry {
         })
     }
 
-    /// Total number of anchors recorded for a subnet.
     pub fn anchor_count(&self, subnet_id: &SubnetId) -> usize {
         self.anchors.get(subnet_id).map(|a| a.len()).unwrap_or(0)
     }
 
-    // ── Validators ──────────────────────────────────────────────────────
-
-    /// A validator opts-in to a subnet.
-    ///
-    /// Validates:
-    /// - The subnet exists.
-    /// - The validator meets the stake requirement.
-    /// - The validator hasn't already joined.
-    ///
-    /// When the validator count reaches `min_validators`, the subnet is
-    /// automatically promoted from `Pending` to `Active`.
     pub fn join_subnet(
         &self,
         subnet_id: &SubnetId,
@@ -321,7 +212,6 @@ impl SubnetRegistry {
             .get(subnet_id)
             .ok_or(SubnetError::NotFound(*subnet_id))?;
 
-        // Stake check.
         if validator.stake < subnet.stake_requirement {
             return Err(SubnetError::InsufficientStake {
                 have: validator.stake,
@@ -330,7 +220,6 @@ impl SubnetRegistry {
         }
         drop(subnet);
 
-        // Duplicate check & insert.
         let mut vals = self.validators.entry(*subnet_id).or_default();
         if vals.iter().any(|v| v.address == validator.address) {
             return Err(SubnetError::ValidatorAlreadyJoined);
@@ -339,7 +228,6 @@ impl SubnetRegistry {
         let active_count = vals.iter().filter(|v| v.is_active).count() as u32;
         drop(vals);
 
-        // Auto-activate subnet when minimum validators reached.
         if let Some(mut subnet) = self.subnets.get_mut(subnet_id)
             && subnet.status == SubnetStatus::Pending
             && active_count >= subnet.min_validators
@@ -350,7 +238,6 @@ impl SubnetRegistry {
         Ok(())
     }
 
-    /// A validator leaves a subnet. Marks them as inactive and removes them.
     pub fn leave_subnet(&self, subnet_id: &SubnetId, address: &Address) -> Result<(), SubnetError> {
         if !self.subnets.contains_key(subnet_id) {
             return Err(SubnetError::NotFound(*subnet_id));
@@ -370,7 +257,6 @@ impl SubnetRegistry {
         Ok(())
     }
 
-    /// Return all validators currently in a subnet.
     pub fn subnet_validators(&self, subnet_id: &SubnetId) -> Vec<SubnetValidator> {
         self.validators
             .get(subnet_id)
@@ -378,11 +264,6 @@ impl SubnetRegistry {
             .unwrap_or_default()
     }
 
-    /// Check whether a subnet has submitted a recent anchor.
-    ///
-    /// Returns `true` if the latest anchor is within `max_anchor_age_secs` of
-    /// the current wall clock. Returns `false` if there is no anchor or if the
-    /// anchor is stale.
     pub fn check_liveness(&self, subnet_id: &SubnetId, max_anchor_age_secs: u64) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -395,16 +276,10 @@ impl SubnetRegistry {
             .unwrap_or(false)
     }
 
-    // ── Verification ────────────────────────────────────────────────────
-
-    /// Verify that anchors for a subnet have strictly increasing heights.
-    ///
-    /// Returns `true` if the sequence is valid (or empty). Returns `false` if
-    /// any anchor height is not greater than the previous one.
     pub fn verify_anchor_sequence(&self, subnet_id: &SubnetId) -> bool {
         let anchors = match self.anchors.get(subnet_id) {
             Some(a) => a,
-            None => return true, // No anchors yet is trivially valid.
+            None => return true,
         };
 
         anchors
@@ -419,14 +294,11 @@ impl Default for SubnetRegistry {
     }
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// Helper: current unix timestamp.
     fn now_ts() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -434,7 +306,6 @@ mod tests {
             .as_secs()
     }
 
-    /// Helper: create a SubnetConfig with sensible defaults.
     fn make_subnet(id: SubnetId, owner: Address) -> SubnetConfig {
         SubnetConfig {
             subnet_id: id,
@@ -450,21 +321,18 @@ mod tests {
         }
     }
 
-    /// Helper: deterministic SubnetId from a single byte.
     fn subnet_id(byte: u8) -> SubnetId {
         let mut id = [0u8; 32];
         id[0] = byte;
         id
     }
 
-    /// Helper: deterministic Address from a single byte.
     fn addr(byte: u8) -> Address {
         let mut a = [0u8; 32];
         a[0] = byte;
         Hash256(a)
     }
 
-    /// Helper: create a validator ready to join a subnet.
     fn make_validator(address: Address, subnet_id: SubnetId, stake: u64) -> SubnetValidator {
         SubnetValidator {
             address,
@@ -475,7 +343,6 @@ mod tests {
         }
     }
 
-    /// Helper: create a state anchor.
     fn make_anchor(subnet_id: SubnetId, subnet_height: u64, anchor_height: u64) -> StateAnchor {
         StateAnchor {
             subnet_id,
@@ -487,8 +354,6 @@ mod tests {
             timestamp: now_ts(),
         }
     }
-
-    // ── 1. Register & retrieve ──────────────────────────────────────────
 
     #[test]
     fn test_register_subnet() {
@@ -506,8 +371,6 @@ mod tests {
         assert_eq!(stored.status, SubnetStatus::Pending);
     }
 
-    // ── 2. Duplicate registration fails ─────────────────────────────────
-
     #[test]
     fn test_register_duplicate_fails() {
         let reg = SubnetRegistry::new();
@@ -518,8 +381,6 @@ mod tests {
         let err = reg.register_subnet(config).unwrap_err();
         assert_eq!(err, SubnetError::AlreadyExists);
     }
-
-    // ── 3. Owner can deregister ─────────────────────────────────────────
 
     #[test]
     fn test_deregister_subnet() {
@@ -535,8 +396,6 @@ mod tests {
         assert_eq!(stored.status, SubnetStatus::Deregistered);
     }
 
-    // ── 4. Non-owner cannot deregister ──────────────────────────────────
-
     #[test]
     fn test_deregister_not_owner_fails() {
         let reg = SubnetRegistry::new();
@@ -550,14 +409,12 @@ mod tests {
         assert_eq!(err, SubnetError::NotAuthorized);
     }
 
-    // ── 5. Submit and retrieve latest anchor ────────────────────────────
-
     #[test]
     fn test_submit_anchor() {
         let reg = SubnetRegistry::new();
         let id = subnet_id(5);
         let mut config = make_subnet(id, addr(0x01));
-        config.status = SubnetStatus::Active; // pre-activate
+        config.status = SubnetStatus::Active;
         reg.register_subnet(config).unwrap();
 
         let anchor = make_anchor(id, 100, 50);
@@ -568,8 +425,6 @@ mod tests {
         assert_eq!(latest.anchor_height, 50);
         assert_eq!(reg.anchor_count(&id), 1);
     }
-
-    // ── 6. Valid anchor sequence ────────────────────────────────────────
 
     #[test]
     fn test_anchor_sequence_valid() {
@@ -587,8 +442,6 @@ mod tests {
         assert_eq!(reg.anchor_count(&id), 3);
     }
 
-    // ── 7. Non-increasing anchor height rejected ────────────────────────
-
     #[test]
     fn test_anchor_sequence_invalid() {
         let reg = SubnetRegistry::new();
@@ -599,7 +452,6 @@ mod tests {
 
         reg.submit_anchor(make_anchor(id, 200, 1)).unwrap();
 
-        // Same height should fail.
         let err = reg.submit_anchor(make_anchor(id, 200, 2)).unwrap_err();
         assert_eq!(
             err,
@@ -609,7 +461,6 @@ mod tests {
             }
         );
 
-        // Lower height should also fail.
         let err = reg.submit_anchor(make_anchor(id, 100, 3)).unwrap_err();
         assert_eq!(
             err,
@@ -619,8 +470,6 @@ mod tests {
             }
         );
     }
-
-    // ── 8. Validator joins subnet ───────────────────────────────────────
 
     #[test]
     fn test_join_subnet() {
@@ -637,16 +486,14 @@ mod tests {
         assert_eq!(vals[0].address, addr(0x10));
     }
 
-    // ── 9. Insufficient stake rejected ──────────────────────────────────
-
     #[test]
     fn test_join_insufficient_stake() {
         let reg = SubnetRegistry::new();
         let id = subnet_id(9);
-        let config = make_subnet(id, addr(0x01)); // stake_requirement = 1_000
+        let config = make_subnet(id, addr(0x01));
         reg.register_subnet(config).unwrap();
 
-        let v = make_validator(addr(0x10), id, 500); // below requirement
+        let v = make_validator(addr(0x10), id, 500);
         let err = reg.join_subnet(&id, v).unwrap_err();
         assert_eq!(
             err,
@@ -656,8 +503,6 @@ mod tests {
             }
         );
     }
-
-    // ── 10. Validator leaves subnet ─────────────────────────────────────
 
     #[test]
     fn test_leave_subnet() {
@@ -673,30 +518,23 @@ mod tests {
         assert!(reg.subnet_validators(&id).is_empty());
     }
 
-    // ── 11. Auto-activation on min_validators reached ───────────────────
-
     #[test]
     fn test_subnet_activation() {
         let reg = SubnetRegistry::new();
         let id = subnet_id(11);
-        let config = make_subnet(id, addr(0x01)); // min_validators = 2
+        let config = make_subnet(id, addr(0x01));
         reg.register_subnet(config).unwrap();
 
-        // Status should be Pending before enough validators join.
         assert_eq!(reg.get_subnet(&id).unwrap().status, SubnetStatus::Pending,);
 
-        // First validator - still pending.
         reg.join_subnet(&id, make_validator(addr(0x10), id, 5_000))
             .unwrap();
         assert_eq!(reg.get_subnet(&id).unwrap().status, SubnetStatus::Pending,);
 
-        // Second validator - should now be Active.
         reg.join_subnet(&id, make_validator(addr(0x11), id, 5_000))
             .unwrap();
         assert_eq!(reg.get_subnet(&id).unwrap().status, SubnetStatus::Active,);
     }
-
-    // ── 12. Liveness check ──────────────────────────────────────────────
 
     #[test]
     fn test_check_liveness() {
@@ -706,36 +544,25 @@ mod tests {
         config.status = SubnetStatus::Active;
         reg.register_subnet(config).unwrap();
 
-        // No anchor yet - not live.
         assert!(!reg.check_liveness(&id, 60));
 
-        // Submit a fresh anchor.
         reg.submit_anchor(make_anchor(id, 100, 1)).unwrap();
 
-        // Should be live (anchor was just submitted, within 60s).
         assert!(reg.check_liveness(&id, 60));
 
-        // With a very tight window (0 seconds), it might or might not pass
-        // depending on timing. Use 1 second to be safe.
-        // But with max_age=0 it should be fine since timestamp == now.
-        // Let's just test that a very old anchor fails by using a stale one.
         let mut stale_anchor = make_anchor(id, 200, 2);
-        stale_anchor.timestamp = 1_000_000; // Way in the past (Jan 1970).
+        stale_anchor.timestamp = 1_000_000;
         reg.submit_anchor(stale_anchor).unwrap();
 
         assert!(!reg.check_liveness(&id, 60));
     }
 
-    // ── 13. List subnets ────────────────────────────────────────────────
-
     #[test]
     fn test_list_subnets() {
         let reg = SubnetRegistry::new();
 
-        // Empty registry.
         assert!(reg.list_subnets().is_empty());
 
-        // Add three subnets.
         reg.register_subnet(make_subnet(subnet_id(20), addr(0x01)))
             .unwrap();
         reg.register_subnet(make_subnet(subnet_id(21), addr(0x02)))
@@ -746,11 +573,8 @@ mod tests {
         let all = reg.list_subnets();
         assert_eq!(all.len(), 3);
 
-        // active_subnet_count should be 0 since they're all Pending.
         assert_eq!(reg.active_subnet_count(), 0);
     }
-
-    // ── 14. Get anchor at specific height ───────────────────────────────
 
     #[test]
     fn test_get_anchor_at_height() {
@@ -764,14 +588,12 @@ mod tests {
         reg.submit_anchor(make_anchor(id, 200, 2)).unwrap();
         reg.submit_anchor(make_anchor(id, 300, 3)).unwrap();
 
-        // Find exact height.
         let a = reg
             .get_anchor_at_height(&id, 200)
             .expect("should find height 200");
         assert_eq!(a.subnet_height, 200);
         assert_eq!(a.anchor_height, 2);
 
-        // Non-existent height returns None.
         assert!(reg.get_anchor_at_height(&id, 150).is_none());
     }
 }

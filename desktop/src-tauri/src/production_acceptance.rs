@@ -1,12 +1,3 @@
-//! Fail-closed, one-shot production acceptance for the exact shipped app.
-//!
-//! This is deliberately a command-line mode of the real Tauri executable,
-//! not an IPC command, WebDriver server, devtools hook, or arbitrary-origin
-//! diagnostic. It is entered only with one exact flag/argument shape before a
-//! Tauri Builder, WebView, plugin, or IPC handler is constructed. It calls the
-//! same native command-core functions as the WebView from an isolated
-//! `AppState`, emits one canonical create-only receipt, and exits.
-
 use crate::commands;
 use crate::types::{
     Earnings, EarningsProjection, InferenceResult, InferenceSettlement, NetworkOverview,
@@ -53,9 +44,6 @@ const RECEIPT_POLL_INTERVAL: Duration = Duration::from_secs(3);
 const MAX_EARNINGS_POLLS: u32 = 11;
 const MAX_EARNINGS_WAIT: Duration = Duration::from_secs(30);
 const MAX_PREFLIGHT_WAIT: Duration = Duration::from_secs(30);
-// Match the normal desktop's protocol-capped inference deadline: the server
-// may legitimately consume 3,900 seconds across worker execution, independent
-// verification, and reward approval, plus 60 seconds of client headroom.
 const MAX_DISPATCH_WAIT: Duration = Duration::from_secs(3_960);
 const MAX_FINAL_READ_WAIT: Duration = Duration::from_secs(30);
 const MAX_FINAL_READ_POLLS: u32 = 11;
@@ -301,12 +289,6 @@ pub(crate) fn store_is_empty(store: &crate::store::Store) -> bool {
     store.identity.is_none() && store.config.is_none() && store.data_migration_notice.is_none()
 }
 
-/// Run the packaged native-core proof without starting Tauri at all.
-///
-/// The normal desktop and this mode share `AppState` plus the command-core
-/// functions, but this evidence path deliberately has no renderer, IPC actor,
-/// plugin, tray, updater, autostart hook, or background page that could race
-/// its exact-one-dispatch state.
 pub(crate) async fn run_standalone(request: &Request) -> Result<(), String> {
     let app_data = prepare_isolated_app_data()?;
     let http = reqwest::Client::builder()
@@ -1244,11 +1226,6 @@ fn reviewed_environment_identity<I>(variables: I) -> Result<(Vec<String>, String
 where
     I: IntoIterator<Item = (OsString, OsString)>,
 {
-    // This mode is launched through `/usr/bin/env -i`. Rejecting every name
-    // outside this tiny data-only allowlist covers both known injection/trust
-    // variables (TAURI_AUTOMATION, TAURI_WEBVIEW_AUTOMATION, DYLD_*, LD_*,
-    // SSL_CERT_*, OPENSSL_*, language hooks, proxies) and future aliases we do
-    // not know to enumerate today.
     const ALLOWED: [&str; 6] = ["HOME", "LANG", "LC_ALL", "PATH", "RUST_LOG", "TMPDIR"];
     let mut normalized = Vec::new();
     let mut names = Vec::new();

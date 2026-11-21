@@ -1,21 +1,6 @@
-//! ARC Chain - Propose-Verify Multi-Proposer Benchmark
-//!
-//! Demonstrates the core scaling mechanism: multiple proposers execute
-//! non-overlapping transaction sets in parallel, then each proposer's
-//! state diff is verified by all other nodes (cheap O(k) check instead
-//! of full re-execution).
-//!
-//! This benchmark runs N "proposer threads" on the same machine, each
-//! with its own StateDB and transaction set. It measures:
-//!   1. Proposer throughput: execute + export_state_diff
-//!   2. Verifier throughput: apply_state_diff + verify root
-//!   3. Aggregate TPS across all proposers
-//!   4. Fraud detection: tampered diff caught by verifier
-
 mod ephemeral_keys;
 
 use arc_crypto::Hash256;
-// Pipeline not used - we call execute_block() directly to avoid channel overhead
 use arc_state::StateDB;
 use arc_types::Transaction;
 use clap::Parser;
@@ -66,8 +51,6 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
-/// Generate one process-local identity set, its unified genesis, and each
-/// proposer's signed transaction partition.
 fn build_benchmark_inputs(
     num_proposers: usize,
     senders_per_proposer: u8,
@@ -109,7 +92,6 @@ fn build_benchmark_inputs(
     (proposer_txs, genesis)
 }
 
-/// Run one proposer: execute all transactions, then export the state diff.
 fn run_proposer(
     _proposer_id: usize,
     transactions: &[Transaction],
@@ -119,8 +101,6 @@ fn run_proposer(
     let state = Arc::new(StateDB::with_genesis(genesis));
     let producer = genesis[0].0;
 
-    // Collect all touched addresses from transactions (execute_block drains
-    // dirty_accounts internally via compute_state_root, so we track them here)
     let mut touched: std::collections::HashSet<Hash256> = std::collections::HashSet::new();
     for tx in transactions {
         touched.insert(tx.from);
@@ -146,13 +126,11 @@ fn run_proposer(
             _ => {}
         }
     }
-    // Producer account also gets modified (block rewards)
     touched.insert(producer);
 
     let start = Instant::now();
     let mut total_success = 0usize;
 
-    // Execute in batches with GPU-accelerated signature verification
     for chunk in transactions.chunks(batch_size) {
         if let Ok((_block, receipts)) = state.execute_block_gpu_verified(chunk, producer) {
             total_success += receipts.iter().filter(|r| r.success).count();
@@ -161,7 +139,6 @@ fn run_proposer(
 
     let exec_elapsed = start.elapsed();
 
-    // Export state diff - pass the addresses we know were touched
     let dirty_addrs: Vec<Hash256> = touched.into_iter().collect();
     let diff = state.export_state_diff(&dirty_addrs);
 
@@ -186,7 +163,6 @@ fn main() {
     println!("  CPU cores:          {}", rayon::current_num_threads());
     println!();
 
-    // ── Phase 1: Pre-sign all transactions ──────────────────────────────
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  Phase 1: Pre-signing transactions");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -209,13 +185,10 @@ fn main() {
     );
     println!();
 
-    // ── Phase 2: Single proposer baseline ───────────────────────────────
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  Phase 2: Single-Proposer Baseline (1 node executes everything)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    // Run each proposer's tx set sequentially on a single node (how ETH/Solana work).
-    // We keep proposer ordering intact to preserve nonce correctness.
     let single_state = Arc::new(StateDB::with_genesis(&all_genesis));
     let single_producer = all_genesis[0].0;
 
@@ -239,7 +212,6 @@ fn main() {
     println!("    (This is what EVERY chain does today - 1 node re-executes everything)");
     println!();
 
-    // ── Phase 3: Multi-proposer parallel execution ──────────────────────
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!(
         "  Phase 3: Multi-Proposer (propose-verify, {} proposers in parallel)",
@@ -247,10 +219,8 @@ fn main() {
     );
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    // Run all proposers in parallel threads
     let proposer_start = Instant::now();
 
-    // All proposers start from the same unified genesis (just like real nodes)
     let handles: Vec<_> = (0..args.proposers)
         .map(|p| {
             let txs = proposer_txs[p].clone();
@@ -261,7 +231,6 @@ fn main() {
         })
         .collect();
 
-    // Collect proposer results
     let proposer_results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     let proposer_total_elapsed = proposer_start.elapsed();
 
@@ -284,7 +253,6 @@ fn main() {
         );
     }
 
-    // Aggregate TPS = total txs / wall-clock time (proposers ran in parallel)
     let aggregate_tps = total_proposer_success as f64 / proposer_total_elapsed.as_secs_f64();
 
     println!();
@@ -299,7 +267,6 @@ fn main() {
     );
     println!();
 
-    // ── Phase 4: Verifier applies all diffs ─────────────────────────────
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!(
         "  Phase 4: Verifier (apply + verify all {} state diffs)",
@@ -310,9 +277,6 @@ fn main() {
     let verify_start = Instant::now();
     let mut all_verified = true;
 
-    // Each proposer's diff is verified independently against the base state.
-    // In a real network, verifiers apply each proposer's diff to their own
-    // copy of the pre-round state (not sequentially on the same copy).
     for (i, (_, _, diff)) in proposer_results.iter().enumerate() {
         let verifier_state = Arc::new(StateDB::with_genesis(&all_genesis));
         let v_start = Instant::now();
@@ -355,17 +319,14 @@ fn main() {
     );
     println!();
 
-    // ── Phase 5: Fraud detection test ───────────────────────────────────
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  Phase 5: Fraud Detection Test");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    // Take the first proposer's diff and tamper with the root
     if let Some((_, _, good_diff)) = proposer_results.first() {
-        // Test 1: tampered root
         let fraud_state1 = Arc::new(StateDB::with_genesis(&all_genesis));
         let mut tampered = good_diff.clone();
-        tampered.new_root = Hash256([0xFF; 32]); // Clearly wrong root
+        tampered.new_root = Hash256([0xFF; 32]);
 
         let fraud_detected = !fraud_state1.verify_state_diff(&tampered);
         println!(
@@ -377,11 +338,10 @@ fn main() {
             }
         );
 
-        // Test 2: tampered balance
         let fraud_state2 = Arc::new(StateDB::with_genesis(&all_genesis));
         let mut tampered2 = good_diff.clone();
         if let Some(change) = tampered2.changes.first_mut() {
-            change.account.balance += 999_999; // Inflate a balance
+            change.account.balance += 999_999;
         }
         let fraud_detected2 = !fraud_state2.verify_state_diff(&tampered2);
         println!(
@@ -393,7 +353,6 @@ fn main() {
             }
         );
 
-        // Test 3: verify the VALID diff still passes
         let fraud_state3 = Arc::new(StateDB::with_genesis(&all_genesis));
         let valid = fraud_state3.verify_state_diff(good_diff);
         println!(
@@ -408,7 +367,6 @@ fn main() {
 
     println!();
 
-    // ── Summary ─────────────────────────────────────────────────────────
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  SUMMARY");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -461,7 +419,7 @@ fn main() {
 
     for (nodes, efficiency) in projections {
         let projected = per_proposer_tps * nodes as f64 * efficiency;
-        let eth_weighted = projected / 3.93; // ETH-equivalent weight
+        let eth_weighted = projected / 3.93;
         println!(
             "    │  {:>4} proposers: {:>8} TPS ({:>8} ETH-weighted) │",
             nodes,
@@ -473,7 +431,6 @@ fn main() {
     println!("    └────────────────────────────────────────────────────────┘");
     println!();
 
-    // vs ETH
     let eth_tps = 15.0;
     println!("    vs Ethereum ({:.0} TPS):", eth_tps);
     println!("      Single-node:    {:.0}x faster", single_tps / eth_tps);

@@ -1,25 +1,3 @@
-//! Atomic, bounded generations for the post-recovery consensus DAG WAL.
-//!
-//! A generation is immutable and content addressed. Its manifest binds the
-//! recovery checkpoint/domain, the validator set, the canonical state baseline,
-//! the DAG cursors, and the exact retained record log. Publishing is two phase:
-//! all generation files and namespace entries cross the platform durability
-//! barrier first, then `CURRENT` is atomically and durably replaced. Unix uses
-//! parent-directory fsync; Windows uses write-through namespace moves. Previous
-//! generations are never removed by ordinary generation publication.
-//!
-//! Every immutable generation owns `active-<generation-hash>.bin`. `CURRENT`
-//! selects both by the same hash. Active writes are whole checksummed batch
-//! frames under an OS advisory lock: a crash can leave only a valid prefix plus
-//! one classifiable torn final batch. The final bytes can be quarantined before
-//! append resumes; complete-frame corruption always fails closed.
-//!
-//! `CURRENT` is intentionally not treated as a cryptographic rollback oracle.
-//! Callers should persist [`GenerationPin`] in an independent recovery marker
-//! and pass it to [`GenerationStore::load_current`]. [`GenerationStore::audit`]
-//! additionally detects a pointer moved behind a preserved descendant or a
-//! fork/swap among the generations still present on disk.
-
 use arc_crypto::Hash256;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -51,7 +29,6 @@ const ACTIVE_BATCH_FIXED_BODY_BYTES: u64 = 1 + 8 + 4;
 const ACTIVE_BATCH_FRAME_OVERHEAD_BYTES: u64 = 4 + ACTIVE_BATCH_FIXED_BODY_BYTES + 32;
 const MAX_GENERATIONS_TO_AUDIT: usize = 10_000;
 
-/// Absolute fail-closed caps. A manifest may select lower limits, never higher.
 pub const HARD_MAX_RETAINED_RECORDS: u64 = 100_000;
 pub const HARD_MAX_RETAINED_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
 pub const HARD_MAX_SINGLE_RECORD_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
@@ -114,9 +91,6 @@ pub struct BaselineState {
     pub height: u64,
     pub block_hash: Hash256,
     pub state_root: Hash256,
-    /// The canonical header's decision commitment binds this exact anchor.
-    /// Missing in older, strictly contiguous generations; omitting None keeps
-    /// their canonical JSON and content-addressed hashes unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dag_anchor: Option<BaselineDagAnchor>,
 }
@@ -161,8 +135,6 @@ pub enum RetainedRecordKind {
     DagBlock = 2,
     RoundCursor = 3,
     Commit = 4,
-    /// Verified quorum authority needed to replay parents from an incomplete
-    /// recovery-domain round. Durable before that authority is used live.
     AbsenceCertificate = 5,
 }
 
@@ -245,9 +217,7 @@ pub struct RetainedRecordSet {
     pub record_count: u64,
     pub payload_bytes: u64,
     pub file_bytes: u64,
-    /// Minimum round present; physical record order is preserved separately.
     pub first_round: Option<u64>,
-    /// Maximum round present; physical record order is preserved separately.
     pub last_round: Option<u64>,
     pub records_file_hash: Hash256,
 }
@@ -315,9 +285,7 @@ pub struct RecordLogInspection {
     pub payload_bytes: u64,
     pub valid_prefix_bytes: u64,
     pub total_file_bytes: u64,
-    /// Minimum round in the valid prefix, not the first physical record.
     pub first_round: Option<u64>,
-    /// Maximum round in the valid prefix, not the last physical record.
     pub last_round: Option<u64>,
     pub valid_prefix_hash: Hash256,
     pub complete_file_hash: Hash256,
@@ -333,9 +301,7 @@ pub struct ActiveLogInspection {
     pub payload_bytes: u64,
     pub valid_prefix_bytes: u64,
     pub total_file_bytes: u64,
-    /// Minimum round in complete active batches, independent of append order.
     pub first_round: Option<u64>,
-    /// Maximum round in complete active batches, independent of append order.
     pub last_round: Option<u64>,
     pub valid_prefix_hash: Hash256,
     pub complete_file_hash: Hash256,
@@ -384,9 +350,6 @@ pub struct ActiveAppendReceipt {
     pub durable: bool,
 }
 
-/// Exact non-mutating usage projection for one active-log batch after
-/// idempotent duplicate elimination against both the immutable generation and
-/// the already-written active prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActiveBatchProjection {
     pub requested_records: u64,
@@ -518,9 +481,6 @@ struct ActiveLogHeader {
     limits: RetentionLimits,
 }
 
-/// Exclusive append handle for the active delta selected by `CURRENT`.
-/// Holding this value also holds the store write lock, so compaction cannot
-/// switch generations concurrently with a batch append.
 pub struct ActiveLogWriter {
     generation: VerifiedGeneration,
     path: PathBuf,
@@ -549,8 +509,6 @@ impl ActiveLogWriter {
         self.generation.pin
     }
 
-    /// Older rounds belong to this independently pinned canonical baseline;
-    /// their ancestors are not part of the generation's replay window.
     pub fn retention_floor_round(&self) -> u64 {
         self.generation.manifest.dag_cursor.retention_floor_round
     }
@@ -563,11 +521,6 @@ impl ActiveLogWriter {
         &self.inspection
     }
 
-    /// Project the exact records and payload bytes a later [`Self::append_batch`]
-    /// would add, without enforcing this generation's combined capacity. This
-    /// lets a rollover controller distinguish true new bytes from transaction
-    /// bodies repeated byte-identically by several validators in one round.
-    /// Identity conflicts and malformed records still fail closed.
     pub fn project_batch_usage(
         &self,
         records: &[RetainedDagRecord],
@@ -617,10 +570,6 @@ impl ActiveLogWriter {
         })
     }
 
-    /// Append one checksum-atomic batch. Every record and the combined
-    /// immutable-generation + active-delta limits are preflighted before the
-    /// first byte is written. A short/erroring write poisons this handle; after
-    /// restart the incomplete final batch is classified and excluded.
     pub fn append_batch(
         &mut self,
         records: &[RetainedDagRecord],
@@ -825,11 +774,6 @@ pub struct GenerationStore {
 }
 
 impl GenerationStore {
-    /// Construct a store rooted at one application-owned leaf. The immediate
-    /// parent must already exist; refusing to recursively invent missing
-    /// ancestors lets the sibling namespace lock durably prove the whole
-    /// store name on Windows instead of acknowledging state below an
-    /// unbarriered parent.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
@@ -865,10 +809,6 @@ impl GenerationStore {
         Ok(generation)
     }
 
-    /// Resume the one valid crash window where the deterministic sequence-zero
-    /// generation was published but `CURRENT` was not. No history is selected
-    /// unless the sole generation is the exact empty generation independently
-    /// derived by the caller for this recovery boundary.
     pub fn resume_unselected_initial(
         &self,
         expected: &GenerationInput,
@@ -951,9 +891,6 @@ impl GenerationStore {
         Ok(generation)
     }
 
-    /// Publish a generation compacted from an exact active-delta snapshot.
-    /// The external active pin prevents any append that occurred after the
-    /// caller streamed/prepared `records` from being silently omitted.
     pub fn append_compacted<I>(
         &self,
         expected_current: GenerationPin,
@@ -979,9 +916,6 @@ impl GenerationStore {
         Ok(generation)
     }
 
-    /// Verify `CURRENT`, its exact files, its binding, and an optional external
-    /// rollback pin. This performs no directory scan and is therefore bounded
-    /// by the manifest's retained-record limits.
     pub fn load_current(
         &self,
         expected_binding: &RecoveryDagBinding,
@@ -1058,11 +992,6 @@ impl GenerationStore {
         })
     }
 
-    /// Stream a previously verified generation without materializing its
-    /// retained payloads together in memory. The generation is reverified
-    /// before callbacks run and the streamed aggregate is checked again before
-    /// success is returned. A visitor must stage reversible in-memory work and
-    /// finalize it only after this method returns `Ok(())`.
     pub fn for_each_record<F>(&self, generation: &VerifiedGeneration, visitor: F) -> Result<()>
     where
         F: FnMut(RetainedDagRecord) -> Result<()>,
@@ -1086,8 +1015,6 @@ impl GenerationStore {
         Ok(())
     }
 
-    /// Open the active delta selected by the exact externally pinned CURRENT.
-    /// The returned writer holds the store's OS advisory lock until drop.
     pub fn open_current_active_writer(
         &self,
         expected_binding: &RecoveryDagBinding,
@@ -1172,10 +1099,6 @@ impl GenerationStore {
         })
     }
 
-    /// Stream the immutable generation followed by every complete active batch
-    /// selected by the same pinned CURRENT. The OS advisory lock prevents an
-    /// append or compaction switch during the snapshot. Visitors must stage
-    /// reversible effects until this method returns successfully.
     pub fn stream_current_generation_and_active<F>(
         &self,
         expected_binding: &RecoveryDagBinding,
@@ -1237,10 +1160,6 @@ impl GenerationStore {
         })
     }
 
-    /// Preserve and remove exactly one previously inspected torn final active
-    /// batch. The active log is re-inspected while holding the exclusive OS
-    /// advisory lock; any changed prefix, clean log, full-frame corruption, or
-    /// different tear boundary fails closed.
     pub fn quarantine_current_active_suffix(
         &self,
         expected_binding: &RecoveryDagBinding,
@@ -1345,10 +1264,6 @@ impl GenerationStore {
         })
     }
 
-    /// Audit all immutable manifest heads still present in this store. This is
-    /// deliberately separate from the bounded hot-path load. A stale pointer is
-    /// recoverable with [`Self::activate_existing_successor`]; it is never
-    /// silently advanced.
     pub fn audit(&self, expected_binding: &RecoveryDagBinding) -> Result<StoreAudit> {
         let current = self.load_current(expected_binding, None)?;
         let manifests = self.read_all_manifests(expected_binding)?;
@@ -1407,10 +1322,6 @@ impl GenerationStore {
         })
     }
 
-    /// Finish any generation-GC operation whose authorization anchor was
-    /// fsynced before a crash. Only hashes explicitly named by that anchor are
-    /// touched, and the current generation plus its exact predecessor are
-    /// re-derived from `CURRENT` and excluded before every rename/removal.
     pub fn recover_interrupted_ancestor_gc(
         &self,
         expected_binding: &RecoveryDagBinding,
@@ -1433,11 +1344,6 @@ impl GenerationStore {
                 pruned_generations: Vec::new(),
             });
         };
-        // Do not run the ordinary ancestry audit yet: a crash may have moved
-        // an early authorized target while a later target still names it as a
-        // parent. Validate the selected head, anchor path, and every remaining
-        // live/tombstoned target structurally, finish the complete authorized
-        // set, and only then require a clean audit.
         let manifests = self.read_all_manifests(expected_binding)?;
         validate_gc_anchor(&anchor, &current, &manifests)?;
         let anchor_bytes = canonical_json(&anchor, "GC anchor")?;
@@ -1464,11 +1370,6 @@ impl GenerationStore {
         })
     }
 
-    /// Bound on-disk generation history after the caller has durably advanced
-    /// both `CURRENT` and its independent external pin. The selected generation
-    /// and its exact immediate predecessor are never eligible. Older verified
-    /// generations are first authorized in an fsynced GC anchor, then renamed
-    /// out of the live namespace with a root-directory fsync before removal.
     pub fn prune_ancestors_keep_current_and_predecessor(
         &self,
         expected_binding: &RecoveryDagBinding,
@@ -1580,9 +1481,6 @@ impl GenerationStore {
         })
     }
 
-    /// Complete only the pointer phase for an already fsynced direct successor.
-    /// This is the explicit recovery path for a crash between generation publish
-    /// and `CURRENT` replacement.
     pub fn activate_existing_successor(
         &self,
         expected_current: GenerationPin,
@@ -1618,10 +1516,6 @@ impl GenerationStore {
         Ok(successor)
     }
 
-    /// Re-publish the exact selected pointer through every namespace barrier.
-    /// Startup uses this before creating an independent external pin so a
-    /// second crash cannot preserve the pin while losing a late-visible
-    /// `CURRENT` from the first crash.
     pub fn rebarrier_current_pointer(
         &self,
         expected_binding: &RecoveryDagBinding,
@@ -1742,10 +1636,6 @@ impl GenerationStore {
         Ok(())
     }
 
-    /// Recover the only dual-name state an older Unix no-replace helper could
-    /// create: hard-linking an active log into its authorized GC tombstone and
-    /// crashing before unlinking the live name. Both names must identify the
-    /// exact same regular inode; otherwise ambiguity remains fail-closed.
     fn recover_legacy_gc_active_dual_names(&self, targets: &[GenerationPin]) -> Result<()> {
         for target in targets {
             let active = self.active_log_path(*target);
@@ -1906,10 +1796,6 @@ impl GenerationStore {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => true,
                     #[cfg(windows)]
                     Err(error) => {
-                        // The write-through rename already retired the live
-                        // generation namespace. Antivirus/indexer locks may
-                        // delay physical directory removal; the fsynced GC
-                        // anchor authorizes an exact retry on next startup.
                         tracing::warn!(path = %generation_tombstone.display(), %error, "deferring recovery DAG generation tombstone cleanup");
                         false
                     }
@@ -2081,12 +1967,6 @@ impl GenerationStore {
         ensure_real_directory(&generation)?;
         #[cfg(windows)]
         {
-            // An unselected generation may have become visible even though a
-            // prior write-through rename reported a late error. Temporarily
-            // move it through one deterministic recovery namespace, then
-            // write-through move it back before CURRENT can depend on it. The
-            // locked startup path restores that exact intermediate if either
-            // move is interrupted.
             let staging = self
                 .root
                 .join(format!(".generation-rebarrier-{}", pin.hash.to_hex()));
@@ -2113,8 +1993,6 @@ impl GenerationStore {
         }
         #[cfg(not(windows))]
         {
-            // Unix generation publication already fsyncs the parent. Repeat
-            // that inexpensive barrier without creating a live-name gap.
             fsync_directory(&self.root)
         }
     }
@@ -2151,9 +2029,6 @@ impl GenerationStore {
                 "unselected successor has a non-empty or torn active log".into(),
             ));
         }
-        // Re-publish the exact header through the durable replace primitive.
-        // This closes the retry window where an earlier namespace operation
-        // made the name visible but returned before its durability guarantee.
         replace_synced_file_durably(&path, &bytes, "rebarrier empty active log")
     }
 
@@ -2173,8 +2048,6 @@ impl GenerationStore {
         let namespace_lock =
             arc_crypto::secret_file::acquire_private_directory_namespace_lock(&self.root)
                 .map_err(|error| io_error("lock generation-store namespace", &self.root, error))?;
-        // Restore before any absent-root check. Creating a fresh empty live
-        // root while the complete store is staged would strand chain history.
         namespace_lock
             .restore_interrupted()
             .map_err(|error| io_error("restore generation-store namespace", &self.root, error))?;
@@ -2308,9 +2181,6 @@ fn restore_interrupted_generation_rebarriers(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Reclaim only names that ARC itself reserves for unpublished work. The
-/// advisory writer lock must already be held: without it, a second process
-/// could mistake an actively-written generation for a crash orphan.
 fn cleanup_incomplete_store_staging(root: &Path) -> Result<()> {
     let entries = fs::read_dir(root)
         .map_err(|error| io_error("inspect incomplete generation staging in", root, error))?;
@@ -2348,9 +2218,6 @@ fn cleanup_incomplete_store_staging(root: &Path) -> Result<()> {
             continue;
         }
         if let Err(error) = fsync_directory(root) {
-            // These names are never interpreted as live state. If a late
-            // namespace-barrier error permits resurrection, the next locked
-            // startup recognizes and removes the exact same name again.
             tracing::warn!(path = %path.display(), %error, "recovery DAG staging cleanup barrier will be retried");
         }
     }
@@ -2371,12 +2238,6 @@ impl StoreLock {
         let path = root.join(WRITE_LOCK_FILE);
         let file = open_and_try_lock_store_file(&path)?;
 
-        // NTFS rejects a directory rename while any descendant file handle is
-        // open, even when that handle allows FILE_SHARE_DELETE (MS-FSA
-        // 2.1.5.15.12). Probe the legacy inner lock first, then close our own
-        // descendant handle while the stable sibling namespace lock remains
-        // held. The second try-lock prevents any legacy writer that appeared
-        // during the rename window from being followed by patched mutation.
         #[cfg(windows)]
         let file = {
             file.unlock().map_err(|error| {
@@ -2511,9 +2372,6 @@ fn validate_gc_anchor(
         }
     }
 
-    // The generation that authorized deletion must still be on the exact
-    // present path from externally selected CURRENT down to the retained
-    // boundary. This prevents a stale anchor from authorizing a fork head.
     let mut cursor = current.pin;
     let mut saw_authorizer = false;
     loop {
@@ -2941,9 +2799,6 @@ where
     })
 }
 
-/// Inspect a framed record log and classify only structurally incomplete final
-/// bytes as a torn suffix. A full frame with a bad checksum or invalid record is
-/// corruption and returns an error; it is never downgraded to a recoverable tear.
 pub fn inspect_record_log(path: &Path, limits: RetentionLimits) -> Result<RecordLogInspection> {
     scan_record_log(path, limits, |_| Ok(()))
 }
@@ -3100,7 +2955,6 @@ where
             .ok_or_else(|| GenerationError::Invalid("valid prefix size overflow".into()))?;
     }
 
-    // Both a clean scan and every accepted torn suffix end at physical EOF.
     if total_observed_bytes != total_file_bytes {
         return Err(GenerationError::Invalid(
             "record file length changed while it was being inspected".into(),
@@ -3119,9 +2973,6 @@ where
     })
 }
 
-/// Inspect the active delta bound to `generation`. Only an incomplete final
-/// batch frame is classified as torn. A complete bad checksum, malformed batch,
-/// invalid record, out-of-window round, or cap violation is fatal corruption.
 pub fn inspect_active_log(
     path: &Path,
     generation: &VerifiedGeneration,
@@ -3480,8 +3331,6 @@ fn maximum_active_batch_body_bytes(limits: RetentionLimits) -> Result<u64> {
 }
 
 fn maximum_active_file_bytes(limits: RetentionLimits) -> Result<u64> {
-    // Worst case is one record per batch, so every record pays both the batch
-    // envelope and its own length/fixed fields.
     limits
         .max_records
         .checked_mul(ACTIVE_BATCH_FRAME_OVERHEAD_BYTES + 4 + FRAME_FIXED_BODY_BYTES)
@@ -3636,9 +3485,6 @@ fn persist_exact_quarantine(
                 "existing active quarantine differs from the exact torn suffix".into(),
             ));
         }
-        // A prior publish can make the exact name visible and still return a
-        // late durability error. Replacing it with the same synced bytes makes
-        // the evidence namespace durable before the source can be truncated.
         replace_synced_file_durably(path, bytes, "rebarrier active quarantine")?;
         return Ok(());
     }
@@ -3741,10 +3587,6 @@ fn create_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Create a recovery directory and durably publish its name before returning.
-/// Production callers hold the node data-directory lock while this briefly
-/// rebarriers an existing root; standalone callers must provide equivalent
-/// semantic serialization.
 pub fn create_private_directory_durably(path: &Path) -> Result<()> {
     let namespace_lock = arc_crypto::secret_file::acquire_private_directory_namespace_lock(path)
         .map_err(|error| io_error("lock store directory namespace", path, error))?;
@@ -3875,10 +3717,6 @@ fn rename_no_replace(_source: &Path, _destination: &Path) -> io::Result<()> {
     ))
 }
 
-/// Rename one already-synced recovery artifact into its live namespace.
-///
-/// Windows performs the namespace mutation with `MOVEFILE_WRITE_THROUGH`;
-/// Unix callers must fsync the destination parent after this returns.
 pub fn rename_for_durable_publish(
     source: &Path,
     destination: &Path,
@@ -3887,9 +3725,6 @@ pub fn rename_for_durable_publish(
 ) -> Result<()> {
     #[cfg(windows)]
     {
-        // Windows exposes no documented parent-directory fsync. Its supported
-        // durability primitive is a write-through namespace move, which also
-        // works for same-volume directory publication.
         arc_crypto::secret_file::windows_move_path_write_through(
             source,
             destination,
@@ -3904,9 +3739,6 @@ pub fn rename_for_durable_publish(
             return fs::rename(source, destination)
                 .map_err(|error| io_error(operation, destination, error));
         }
-        // Linux and Darwin expose an atomic create-only rename for files and
-        // directories. Using one namespace operation avoids the dual-name
-        // crash state produced by hard-link-then-unlink publication.
         rename_no_replace(source, destination)
             .map_err(|error| io_error(operation, destination, error))
     }
@@ -3933,9 +3765,6 @@ fn fsync_directory(path: &Path) -> Result<()> {
     }
     #[cfg(not(unix))]
     {
-        // Windows namespace mutations use MoveFileExW with
-        // MOVEFILE_WRITE_THROUGH at the mutation site. Other non-Unix targets
-        // do not expose a portable directory-fsync primitive.
         let _ = path;
         Ok(())
     }
@@ -4357,9 +4186,6 @@ mod tests {
             assert!(observer.reached_failure, "missing point {crash_point:?}");
             assert!(error.to_string().contains("injected ancestor GC crash"));
 
-            // Startup recovery must never run the ordinary ancestry audit
-            // before finishing an anchored multi-target deletion. Pre-anchor
-            // faults legitimately leave the original clean chain intact.
             store.recover_interrupted_ancestor_gc(&binding()).unwrap();
             let recovered = store.audit(&binding()).unwrap();
             assert_eq!(recovered.current.pin, current);
@@ -5015,9 +4841,6 @@ mod tests {
         fs::write(&lock_path, b"stale owner from a dead process\n").unwrap();
         let recovered = StoreLock::acquire(store.root()).unwrap();
         recovered.release().unwrap();
-        // Windows byte-range locks are mandatory. Inspect the durable owner
-        // evidence only after releasing the lease; contention was already
-        // proved above while the first owner remained live.
         let evidence = fs::read_to_string(&lock_path).unwrap();
         assert!(evidence.contains("arc.recovery.dag-wal-lock.v2"));
         assert!(

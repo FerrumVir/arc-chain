@@ -19,11 +19,6 @@ fn map_err<E: std::fmt::Display>(e: E) -> String {
     paths::redact_home_text(&e.to_string())
 }
 
-/// Hardware detection is expensive — `System::new_all()` plus, on macOS, a
-/// `system_profiler` call that routinely takes 1-3s on a cold cache. It was
-/// being run twice per onboarding (once here, once inside `recommended_tier`)
-/// on a tokio worker with no `spawn_blocking`. The result never changes
-/// during a session, so detect once and hand out clones.
 pub(crate) fn cached_hardware() -> HardwareInfo {
     use std::sync::OnceLock;
     static HW: OnceLock<HardwareInfo> = OnceLock::new();
@@ -32,22 +27,10 @@ pub(crate) fn cached_hardware() -> HardwareInfo {
 
 #[tauri::command]
 pub async fn detect_hardware() -> CmdResult<HardwareInfo> {
-    // Off the async worker: the first call does real blocking I/O.
     tokio::task::spawn_blocking(cached_hardware)
         .await
         .map_err(map_err)
 }
-
-// ── Identity / IPC boundary ────────────────────────────────────────────────
-//
-// These three commands return `IdentityPublic`, never `Identity`. The BIP-39
-// phrase is the user's signing key; handing it to the WebView put it within
-// reach of DevTools, of any injected script, and — because the frontend
-// persisted whatever it received — of anything able to read the WebView
-// profile directory, where it sat in plaintext localStorage.
-//
-// The phrase stays Rust-side. `reveal_seed_phrase` hands it out exactly once,
-// on an explicit user action, for the backup screen.
 
 #[tauri::command]
 pub async fn generate_identity(state: State<'_, AppState>) -> CmdResult<IdentityPublic> {
@@ -57,17 +40,11 @@ pub async fn generate_identity(state: State<'_, AppState>) -> CmdResult<Identity
     generate_identity_if_missing(&mut store, &dir)
 }
 
-/// Return the existing wallet during onboarding even before a node config
-/// exists. The caller holds the store mutex across this check and creation so
-/// concurrent IPC requests cannot replace one generated seed with another.
 fn generate_identity_if_missing(store: &mut Store, dir: &Path) -> CmdResult<IdentityPublic> {
     if store.identity.is_none() {
         store.identity = Some(identity::generate());
     }
 
-    // Retain the generated identity if saving fails. Store::save_to can
-    // publish store.json before a later durability check fails, so a retry
-    // must persist this same key rather than generate a replacement.
     let public = IdentityPublic::from(store.identity.as_ref().unwrap());
     store.save_to(dir).map_err(map_err)?;
     Ok(public)
@@ -180,8 +157,6 @@ pub async fn import_identity(
 ) -> CmdResult<IdentityPublic> {
     require_settings_owner(&state).await?;
     state.cancel_startup_retry();
-    // Restoration path: user types their 12-word phrase on a new device
-    // and gets back the exact same address + signing keys.
     identity::validate_bip39(&phrase)?;
     let id = identity::derive(&phrase)?;
     let public = IdentityPublic::from(&id);
@@ -200,13 +175,6 @@ pub async fn load_identity(state: State<'_, AppState>) -> CmdResult<Option<Ident
     Ok(store.identity.as_ref().map(IdentityPublic::from))
 }
 
-/// Hand the recovery phrase to the UI for the "write this down" screen.
-///
-/// Deliberately a separate, explicit call rather than a field on the identity
-/// object: it makes every place the phrase reaches the WebView a single
-/// greppable call site, and it means the phrase is only in WebView memory
-/// while the backup screen is actually open. The frontend must never persist
-/// what this returns.
 #[tauri::command]
 pub async fn reveal_seed_phrase(state: State<'_, AppState>) -> CmdResult<String> {
     let store = state.store.lock().await;
@@ -217,17 +185,6 @@ pub async fn reveal_seed_phrase(state: State<'_, AppState>) -> CmdResult<String>
         .ok_or_else(|| "no identity on this device".to_string())
 }
 
-/// A preference save from Settings: ports, update and start flags.
-///
-/// Once onboarding has stored a config, this never changes the compute
-/// contribution state (`compute_consent`, `role`, `model_path`,
-/// `prevent_sleep_during_jobs`): those fields keep their stored values, and
-/// only `set_compute_contribution`, `set_prevent_sleep_during_jobs` and a
-/// completed promotion change them. The WebView submits its whole config
-/// snapshot, and a snapshot taken before "turn it off" still says consent,
-/// worker mode and the model path; written back while that switch awaited
-/// its node restart, it would start the node as a worker despite the
-/// refusal. Onboarding records its choice through `complete_onboarding`.
 #[tauri::command]
 pub async fn save_config(
     app: AppHandle,
@@ -237,15 +194,6 @@ pub async fn save_config(
     save_webview_config(&app, &state, config, ConfigSave::Preferences).await
 }
 
-/// Onboarding's one save. The wizard's model step is the consent question,
-/// so this is the one WebView save that records `compute_consent`, `role`
-/// and `model_path`. It runs before the main screens exist, so no Settings
-/// save can race it, and "Reset onboarding" re-runs the wizard over the
-/// existing store with a fresh, explicit answer.
-///
-/// A setup that turns compute on and names no core count gets the default
-/// cap, a quarter of the logical cores (`default_worker_threads`). A count
-/// already stored is kept (`apply_webview_config_save`).
 #[tauri::command]
 pub async fn complete_onboarding(
     app: AppHandle,
@@ -255,8 +203,6 @@ pub async fn complete_onboarding(
     require_settings_owner(&state).await?;
     let mut config = config;
     if takes_setup_core_default(&config) {
-        // The first hardware read can block for seconds (system_profiler).
-        // A failed read gives the smallest cap, one core.
         let logical_cores = tokio::task::spawn_blocking(|| cached_hardware().cpu_cores)
             .await
             .unwrap_or(0);
@@ -265,23 +211,13 @@ pub async fn complete_onboarding(
     save_webview_config(&app, &state, config, ConfigSave::Onboarding).await
 }
 
-/// Which screen submitted a whole-config save, and so what it may change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConfigSave {
-    /// Onboarding: records the contribution choice the wizard collected.
     Onboarding,
-    /// Settings: preferences only; the contribution state is native-owned.
     Preferences,
 }
 
-/// What the stored config becomes when the WebView submits `config`.
 fn apply_webview_config_save(store: &mut Store, mut config: NodeConfig, save: ConfigSave) {
-    // `data_dir` is a native chain-history boundary, not a WebView
-    // preference. Once one is persisted (including a freshly fenced v3
-    // directory), WebView saves may update ports and lifecycle flags but
-    // can never repoint the node at preserved v0.7 history. A future
-    // data-move feature needs its own verified native transaction instead
-    // of widening this IPC surface.
     preserve_authoritative_data_dir(&mut config, store.config.as_ref());
     match save {
         ConfigSave::Onboarding => {
@@ -291,11 +227,7 @@ fn apply_webview_config_save(store: &mut Store, mut config: NodeConfig, save: Co
                 config.compute_default_notice_pending = false;
             }
             if let Some(persisted) = store.config.as_ref() {
-                // The wizard never asks about unattended installs, so a re-run
-                // ("Reset onboarding") keeps the stored answer, like keep-awake.
                 config.auto_install_updates = persisted.auto_install_updates;
-                // Nor about cores: a stored count (the Settings slider, or an
-                // earlier setup's default) wins over this setup's default.
                 if persisted.worker_threads.is_some() {
                     config.worker_threads = persisted.worker_threads;
                 }
@@ -329,8 +261,6 @@ async fn save_webview_config(
     if !auto_start {
         state.cancel_startup_retry();
     }
-    // Keep the OS-level login item in sync with the user's stored
-    // preference. Errors here don't block the save - tray still works.
     let autostart = app.autolaunch();
     let current = autostart.is_enabled().unwrap_or(false);
     match (auto_start, current) {
@@ -345,10 +275,6 @@ async fn save_webview_config(
     Ok(())
 }
 
-/// Save a WebView-submitted config. A saved config is the user's answer, so
-/// the one-time unattended-install default is then recorded as applied too:
-/// if the launch failed to record it, a Settings "off" made since must not be
-/// turned back on at the next launch. That step is best-effort.
 fn persist_webview_config(store: &Store, dir: &Path) -> anyhow::Result<()> {
     store.save_to(dir)?;
     if let Err(error) = crate::auto_update::record_unattended_install_default(dir) {
@@ -357,10 +283,6 @@ fn persist_webview_config(store: &Store, dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `persist_webview_config`, and for setup's own save also the record that
-/// the compute question was just asked. Setup shows that question itself, so
-/// the one-time question for installs from before it (`claim_compute_prompt`)
-/// is never for an install that has just finished setup.
 fn persist_webview_save(store: &Store, dir: &Path, save: ConfigSave) -> anyhow::Result<()> {
     persist_webview_config(store, dir)?;
     if save == ConfigSave::Onboarding {
@@ -406,9 +328,6 @@ fn update_install_policy_for(os: &str, appimage: Option<&Path>) -> UpdateInstall
     }
 }
 
-/// Report whether this distribution can consume Tauri's updater payload.
-/// Linux package installs must remain owned by apt/dnf/rpm; only an actual
-/// AppImage launch receives in-app replacement.
 #[tauri::command]
 pub async fn update_install_policy() -> CmdResult<UpdateInstallPolicy> {
     let appimage = std::env::var_os("APPIMAGE").map(PathBuf::from);
@@ -418,10 +337,6 @@ pub async fn update_install_policy() -> CmdResult<UpdateInstallPolicy> {
     ))
 }
 
-/// What an app update would be told about where ARC runs, or None when the
-/// updater can replace it there (`update_location`, macOS only). Home reads
-/// it at launch and shows it as one calm line, so a copy opened from its
-/// disk image learns to move before an update needs it.
 #[tauri::command]
 pub async fn update_location_block() -> CmdResult<Option<String>> {
     Ok(crate::update_location::refusal().map(str::to_owned))
@@ -459,7 +374,6 @@ pub async fn dismiss_data_migration_notice(state: State<'_, AppState>) -> CmdRes
     store.save_to(&dir).map_err(map_err)
 }
 
-/// Launch set node data from an earlier install aside (`previous_install`).
 #[tauri::command]
 pub async fn load_previous_install_notice(
     state: State<'_, AppState>,
@@ -477,15 +391,6 @@ pub async fn dismiss_previous_install_notice(state: State<'_, AppState>) -> CmdR
     store.save_to(&dir).map_err(map_err)
 }
 
-/// The one path that actually starts arc-node.
-///
-/// Factored out of the `start_node` command so `lib.rs` `setup()` can launch
-/// the node on app start through exactly the same code — previously
-/// `auto_start` only toggled the OS login item, and nothing in the app ever
-/// spawned arc-node after onboarding finished.
-///
-/// Takes `&AppState` rather than `State<'_, AppState>` so it is callable both
-/// from a command and from a background task holding an `AppHandle`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StartupFailure {
     Transient(String),
@@ -525,16 +430,9 @@ impl From<&str> for StartupFailure {
     }
 }
 
-/// Which start transaction a caller runs, and so which access it has to the
-/// native start fence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartTransaction {
-    /// WebView Start/Retry and auto-start. Runs the recovery launch first if
-    /// a shutdown receipt is armed, then starts the current node.
     Start,
-    /// Launch-time reconciliation only. Runs the quarantined recovery launch
-    /// of the receipt-bound node and stops it. It must pass the launch-time
-    /// fence, because that fence is waiting for this step to finish.
     StartupRecoveryOnly,
 }
 
@@ -576,8 +474,6 @@ async fn start_node_transaction(
     let resources = resolve_testnet_resources(app);
     {
         let mut node = state.node.lock().await;
-        // Before the owner lock below, which an app update in this process
-        // may hold as its fence.
         node.refuse_start_during_update()?;
         if node.is_running() {
             return Ok(());
@@ -591,18 +487,12 @@ async fn start_node_transaction(
     .await
     .map_err(map_err)?
     .map_err(map_err)?;
-    // Recheck only after owning the cross-process data lifecycle. The lock is
-    // held through binary mutation, stable-resource materialization, receipt
-    // arm and the spawn outcome, closing check→replace races between GUIs.
     let recovery_launch = crate::node_manager::managed_shutdown_recovery_required(&config.data_dir)
         .map_err(map_err)?;
     if !recovery_launch {
         if !start_after_recovery {
             return Ok(());
         }
-        // Make sure we have a runnable binary only after proving there is no
-        // stale receipt bound to the currently installed bytes. Replacing an
-        // executable first would strand the only safe recovery identity.
         ensure_binary_inner_classified(app).await?;
     }
     let app_data_dir = state.data_dir.lock().await.clone();
@@ -618,12 +508,6 @@ async fn start_node_transaction(
         return Ok(());
     }
 
-    // A stale marker is a quarantined recovery transaction, not permission to
-    // expose the old receipt-bound node to the normal dashboard/RPC flow. The
-    // node's early authenticated request path defers exit until StateDB has
-    // opened/replayed, all writers join, and the final WAL fsync publishes the
-    // positive ACK. Only after exact death + ACK consumption may we replace
-    // the binary/stable network identity and launch the requested current node.
     node.stop()
         .await
         .map_err(|error| format!("managed-node durability recovery failed: {error}"))?;
@@ -683,8 +567,6 @@ pub(crate) async fn autostart_node_inner(
     start_node_transaction(app, state, StartTransaction::Start).await
 }
 
-/// Launch-time reconciliation's recovery launch. `lib.rs` calls this only
-/// while it holds the launch-time fence, which this transaction may pass.
 pub(crate) async fn recover_managed_shutdown_inner(
     app: &AppHandle,
     state: &AppState,
@@ -705,21 +587,11 @@ async fn require_start_fence(state: &AppState, access: StartAccess) -> Result<()
         .map_err(|error| paths::redact_home_text(&error))
 }
 
-/// Which boundary the desktop's own signed app update takes. A start refusal
-/// closes node starts and binary replacement, never the update that may carry
-/// its fix (`start_fence::app_update_boundary`). The fence leaves the
-/// in-progress state at most once, and a refusal holds until ARC restarts,
-/// so the boundary read here cannot go stale before the node lock is taken.
 async fn app_update_boundary(state: &AppState) -> Result<AppUpdateBoundary, String> {
     let fence = state.data_migration_error.lock().await.clone();
     crate::start_fence::app_update_boundary(fence.as_ref())
 }
 
-/// The macOS location check (`update_location`), first in both app-update
-/// entrypoints: before anything is cancelled, drained, stopped or fenced.
-/// The updater can't replace ARC from the mounted .dmg, a translocated copy
-/// or another volume, and its install would fail only after the one-way
-/// handoff. Refused here, the update stays available and the node runs on.
 fn refuse_update_from_wrong_location() -> CmdResult<()> {
     match crate::update_location::refusal() {
         Some(refusal) => Err(refusal.to_owned()),
@@ -727,7 +599,6 @@ fn refuse_update_from_wrong_location() -> CmdResult<()> {
     }
 }
 
-/// The fence check for every WebView entrypoint and auto-start.
 async fn require_data_migration_ready(state: &AppState) -> Result<(), String> {
     require_start_fence(state, StartAccess::Ordinary).await
 }
@@ -738,9 +609,6 @@ pub async fn start_node(
     state: State<'_, AppState>,
     config: NodeConfig,
 ) -> CmdResult<()> {
-    // Retain the command argument for IPC compatibility with older WebViews,
-    // but never trust it for chain-state selection. Onboarding persists its
-    // candidate first; the native store is the sole launch authority.
     let _ = config;
     start_node_inner(&app, &state).await
 }
@@ -755,31 +623,13 @@ pub async fn stop_node(state: State<'_, AppState>) -> CmdResult<()> {
     node.stop().await.map_err(map_err)
 }
 
-/// Establish the native updater/relaunch boundary.
-///
-/// Tauri replaces and relaunches the desktop process, but `arc-node` is a
-/// separate child (and is deliberately placed in a new process group on
-/// Windows). Without an explicit stop it survives the GUI update, so the new
-/// desktop can see a healthy old node and silently keep using an incompatible
-/// protocol. A failed stop blocks download/install instead of pretending the
-/// boundary is safe.
-///
-/// When no node runs and none may start (a start refusal, or a receipt whose
-/// recovery could not finish), there is nothing to stop. The update then takes
-/// the fenced boundary, so the release that fixes the refusal can install. A
-/// legacy v0.7 refusal, or a lease that can't be taken, still fails closed.
 #[tauri::command]
 pub async fn prepare_update_relaunch(state: State<'_, AppState>) -> CmdResult<()> {
     refuse_update_from_wrong_location()?;
-    // A wait for launch reconciliation returns here, before anything is
-    // cancelled, so pressing Install while ARC recovers keeps auto-start.
     let boundary = app_update_boundary(&state).await?;
     prepare_update_relaunch_inner(&state, boundary).await
 }
 
-/// Home's and the Dashboard's Update, after the location check. A slow crash
-/// wait (`ordinary_update_boundary_is_fenced`) takes the fenced boundary, so
-/// the update that may fix the crash installs instead of being refused.
 pub(crate) async fn prepare_update_relaunch_inner(
     state: &AppState,
     boundary: AppUpdateBoundary,
@@ -790,8 +640,6 @@ pub(crate) async fn prepare_update_relaunch_inner(
     let mut node = state.node.lock().await;
     let fenced = boundary == AppUpdateBoundary::Fenced || node.ordinary_update_boundary_is_fenced();
     let result = if fenced {
-        // Nothing runs to stop, so only a lease actually taken cancels
-        // auto-start.
         let prepared = node.prepare_fenced_update_relaunch();
         if prepared.is_ok() {
             state.cancel_startup_retry();
@@ -804,10 +652,6 @@ pub(crate) async fn prepare_update_relaunch_inner(
         .map_err(|error| format!("could not establish the native update lifecycle fence: {error}"))
 }
 
-/// Unattended updates require separate saved consent, idle app-side writes,
-/// and an authenticated compute drain from the exact managed child. When no
-/// node runs and none may start, there is no child to drain, and the update
-/// takes the fenced boundary.
 #[tauri::command]
 pub async fn try_prepare_auto_update_relaunch(
     state: State<'_, AppState>,
@@ -817,9 +661,6 @@ pub async fn try_prepare_auto_update_relaunch(
     try_prepare_auto_update_relaunch_inner(&state, boundary).await
 }
 
-/// The unattended Prepare after the location check. A crash-looping node is
-/// up only seconds an hour, so its slow wait takes the fenced boundary here
-/// instead of waiting for a running child to drain.
 pub(crate) async fn try_prepare_auto_update_relaunch_inner(
     state: &AppState,
     boundary: AppUpdateBoundary,
@@ -856,8 +697,6 @@ pub(crate) async fn try_prepare_auto_update_relaunch_inner(
             1,
         ));
     };
-    // Store before awaiting any child mutation. An interrupted IPC leaves the
-    // fence intact until Abort proves the node has resumed or safely stopped.
     *held = Some(fence);
     let Ok(mut node) = state.node.try_lock() else {
         *held = None;
@@ -867,10 +706,6 @@ pub(crate) async fn try_prepare_auto_update_relaunch_inner(
         ));
     };
     if boundary == AppUpdateBoundary::Fenced || node.ordinary_update_boundary_is_fenced() {
-        // No node runs or may start, so there is no worker to drain and
-        // nothing to resume. Without this the unattended update waited for a
-        // running node that the refusal it could fix never lets start. Only a
-        // lease actually taken cancels auto-start.
         let prepared = node.prepare_fenced_update_relaunch();
         if prepared.is_ok() {
             state.cancel_startup_retry();
@@ -889,27 +724,14 @@ pub(crate) async fn try_prepare_auto_update_relaunch_inner(
     result.map_err(|error| format!("automatic update preparation requires a safe abort: {error}"))
 }
 
-/// Seal the one-way native updater boundary immediately before invoking the
-/// signed installer. From this point the old node cannot be resumed by an
-/// abort command, even if installer IPC later rejects or disconnects.
 #[tauri::command]
 pub async fn begin_update_handoff(state: State<'_, AppState>) -> CmdResult<()> {
-    // Serialize with Abort, but do not introduce a new consent refusal here:
-    // the frontend commits its irreversible IPC boundary before this await.
-    // Native Prepare checks saved consent and the frontend checks generation
-    // immediately before invoking Handoff, with no intervening await.
     let _requests = state.auto_update_requests.lock().await;
     let mut node = state.node.lock().await;
     node.begin_update_handoff()
         .map_err(|error| format!("could not commit the native updater handoff: {error}"))
 }
 
-/// Release a prepared native update fence only when the signed installer
-/// rejects/cancels before accepting bundle mutation. If Prepare stopped one
-/// exact owned node, this same native transaction resumes that exact launch
-/// while continuously retaining its lifecycle lock. Successful installation
-/// deliberately has no release path in the old GUI: relaunch or manual quit
-/// must end that process before another node can start.
 #[tauri::command]
 pub async fn abort_update_relaunch(state: State<'_, AppState>) -> CmdResult<()> {
     let mut requests = state.auto_update_requests.lock().await;
@@ -923,8 +745,6 @@ pub async fn abort_update_relaunch(state: State<'_, AppState>) -> CmdResult<()> 
 
 #[tauri::command]
 pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
-    // The same migration fence as Start, checked before anything stops the
-    // node; restart_node_inner checks it again for its other callers.
     require_data_migration_ready(&state).await?;
     restart_node_inner(&app, &state).await
 }
@@ -932,8 +752,6 @@ pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResu
 pub(crate) async fn restart_node_inner(app: &AppHandle, state: &AppState) -> Result<(), String> {
     state.cancel_startup_retry();
     require_data_migration_ready(state).await?;
-    // Before the stop and the owner lock below: an app update in this
-    // process may hold the node, and only quitting ARC releases it.
     state.node.lock().await.refuse_start_during_update()?;
     let (cfg, mut recovery_phrase, persisted_address) = {
         let store = state.store.lock().await;
@@ -950,17 +768,6 @@ pub(crate) async fn restart_node_inner(app: &AppHandle, state: &AppState) -> Res
     recovery_phrase.zeroize();
     let validator_keyfile = keyfile_result?;
 
-    // ORDER MATTERS: stop the child BEFORE ensure_binary may rename over the
-    // executable.
-    //
-    // ensure_binary installs a download by renaming it over
-    // ~/.arc/bin/arc-node(.exe). On POSIX that succeeds against the old
-    // inode even while the process runs. Windows locks a running
-    // executable's image file, so MoveFileEx returns ERROR_ACCESS_DENIED —
-    // which made Restart fail on Windows only, and only when a version
-    // mismatch pushed it down the download path. Doing this in the old
-    // order also meant the same failure hit the observer→worker upgrade
-    // flow, which restarts immediately after switching roles.
     {
         let mut node = state.node.lock().await;
         node.stop().await.map_err(map_err)?;
@@ -979,8 +786,6 @@ pub(crate) async fn restart_node_inner(app: &AppHandle, state: &AppState) -> Res
         );
     }
 
-    // A restart is a good moment to pick up a newer arc-node, since the user
-    // is already paying the restart cost. Now safe: nothing holds the file.
     ensure_binary_inner(app).await?;
 
     let resources = resolve_testnet_resources(app);
@@ -990,32 +795,18 @@ pub(crate) async fn restart_node_inner(app: &AppHandle, state: &AppState) -> Res
         .map_err(map_err)
 }
 
-// ── Compute contribution (the user's answer) ──────────────────────────────
-//
-// Startup resolves an unanswered eligible install to the sharing default
-// before any node starts. Setup and the legacy v0.7 question keep their own
-// choices. A stored refusal always wins; switching off returns to observer.
-
-/// Shown when the app is asked to promote an install whose user never opted in.
 pub(crate) const COMPUTE_CONSENT_REQUIRED: &str =
     "Compute contribution is off. Turn it on in Settings to download the model and take ARC jobs on this computer.";
 
-/// Shown when the machine is below the worker memory floor.
 pub(crate) const COMPUTE_INELIGIBLE: &str =
     "This computer has less than 16 GB of memory, so it cannot run the ARC model. It stays an observer, which still relays and verifies.";
 
-/// Read the resolved contribution choice. Startup applies the eligible
-/// default first; raw legacy worker configs remain compatible. Failed default
-/// persistence and pending v0.7 questions must never silently promote.
 pub(crate) fn compute_contribution_enabled(config: &NodeConfig) -> bool {
     config
         .compute_consent
         .unwrap_or(config.role == "worker" && config.model_path.is_some())
 }
 
-/// Resolve an unanswered install once, before any node starts or the UI reads
-/// it. The legacy v0.7 question retains precedence. A persisted refusal is
-/// never changed. Keep the notice pending across hidden launches and crashes.
 pub(crate) fn apply_compute_default(
     store: &mut Store,
     ram_gb: u64,
@@ -1030,8 +821,6 @@ pub(crate) fn apply_compute_default(
     };
     if tier_for_ram_gb(ram_gb) == "none" {
         let changed = config.role != "observer";
-        // Enforce the worker floor without erasing the user's stored choices
-        // or model path. Promotion independently checks the same floor.
         config.role = "observer".into();
         return changed;
     }
@@ -1040,8 +829,6 @@ pub(crate) fn apply_compute_default(
     }
     let already_sharing = config.role == "worker" && config.model_path.is_some();
     if already_sharing {
-        // An unset count already means all cores. Do not apply setup's cap
-        // to a worker that was contributing before this migration.
         config.compute_consent = Some(true);
     } else {
         turn_on_compute(config, cores);
@@ -1050,39 +837,25 @@ pub(crate) fn apply_compute_default(
     true
 }
 
-/// The core cap setup stores for an install that contributes compute when
-/// none is stored yet: a quarter of the logical cores, rounded down, and at
-/// least one. `NodeManager::start` passes `worker_threads` to the node as
-/// `RAYON_NUM_THREADS` and `--threads`, the width of the pool AI jobs run
-/// on. The Settings slider (`set_worker_threads`) changes it.
 pub(crate) fn default_worker_threads(logical_cores: u32) -> u32 {
     (logical_cores / 4).max(1)
 }
 
-/// Setup and the unanswered-install migration apply the default core cap
-/// after recording yes, unless a count is already stored.
 fn takes_setup_core_default(config: &NodeConfig) -> bool {
     config.compute_consent == Some(true) && config.worker_threads.is_none()
 }
 
-/// Give a setup's config the default core cap for `logical_cores` when it
-/// takes one (`takes_setup_core_default`).
 fn apply_setup_core_default(config: &mut NodeConfig, logical_cores: u32) {
     if takes_setup_core_default(config) {
         config.worker_threads = Some(default_worker_threads(logical_cores));
     }
 }
 
-/// What a consented install still needs before it can take jobs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PromotionNeed {
-    /// The user has not opted in; never touch the machine.
     NoConsent,
-    /// Below the memory floor; stays an observer.
     Ineligible,
-    /// Already a worker with a model; nothing to do.
     Ready,
-    /// Download (or reuse) the model, switch to worker mode, restart.
     Promote,
 }
 
@@ -1098,9 +871,6 @@ pub(crate) fn promotion_need(config: &NodeConfig, ram_gb: u64) -> PromotionNeed 
     }
 }
 
-/// Contribution choices are changed by their own commands. A WebView save
-/// that does not carry them (a screen built before they existed) keeps the
-/// stored answers instead of silently erasing the user's consent.
 fn preserve_unsent_contribution_choices(config: &mut NodeConfig, persisted: Option<&NodeConfig>) {
     if let Some(persisted) = persisted {
         if config.compute_consent.is_none() {
@@ -1116,18 +886,6 @@ fn preserve_unsent_contribution_choices(config: &mut NodeConfig, persisted: Opti
     }
 }
 
-/// Compute contribution is native-owned once a config is stored: a
-/// preference save keeps the stored consent, keep-awake answer, role, model
-/// path and core count, whatever its snapshot says. Only
-/// `set_compute_contribution`, `set_prevent_sleep_during_jobs`,
-/// `set_worker_threads` and a completed promotion change them, and
-/// `complete_onboarding` records the wizard's choice. With nothing stored (a
-/// WebView from before `complete_onboarding` finishing its wizard through
-/// `save_config`) the submitted choice is the first answer, and is kept.
-///
-/// The core count matters because setup stores a default the WebView learns
-/// only by reading the config back: a Settings save from a snapshot taken
-/// before that read must not drop the cap to every core.
 fn preserve_native_contribution_state(config: &mut NodeConfig, persisted: Option<&NodeConfig>) {
     let Some(persisted) = persisted else {
         return;
@@ -1145,11 +903,6 @@ async fn current_config(state: &AppState) -> NodeConfig {
     state.store.lock().await.config.clone().unwrap_or_default()
 }
 
-/// Change the stored config under one store lock: read, update and write in
-/// the same store-then-data_dir lock order as `save_webview_config`. The
-/// dedicated contribution commands write this way instead of reading the
-/// config, awaiting, and writing it back whole: a transition persisted in
-/// between would otherwise be overwritten with the state read earlier.
 async fn update_stored_config(
     state: &AppState,
     update: impl FnOnce(&mut NodeConfig) + Send,
@@ -1165,7 +918,6 @@ async fn update_stored_config(
     Ok(config)
 }
 
-/// The store-side part of `update_stored_config`.
 fn update_stored_config_in(store: &mut Store, update: impl FnOnce(&mut NodeConfig)) -> NodeConfig {
     let mut config = store.config.clone().unwrap_or_default();
     update(&mut config);
@@ -1173,11 +925,6 @@ fn update_stored_config_in(store: &mut Store, update: impl FnOnce(&mut NodeConfi
     config
 }
 
-/// Record a finished promotion (worker mode with the verified model) only if
-/// the user still consents. The consent check and the write happen under one
-/// store lock, so a "turn it off" saved while the model downloaded is never
-/// overwritten with "on". Returns `None`, writing nothing, when consent was
-/// withdrawn.
 async fn persist_promotion_if_still_consented(
     state: &AppState,
     model_path: String,
@@ -1201,13 +948,6 @@ async fn persist_promotion_if_still_consented(
     Ok(Some(promoted))
 }
 
-/// Record a "no" to contributing compute: observer mode with no model path.
-///
-/// The model file stays on disk, but the node is no longer started with
-/// `--model`: an observer given a model still loads it (the Q4 engine holds
-/// about 4 GB of RAM) although it takes no jobs, which is not what someone
-/// who switched contribution off expects. Turning it back on reuses the file
-/// after re-checking its pinned SHA-256 (`existing_model_for_tier`).
 fn withdraw_compute_consent(config: &mut NodeConfig) {
     config.compute_consent = Some(false);
     config.compute_default_notice_pending = false;
@@ -1215,13 +955,6 @@ fn withdraw_compute_consent(config: &mut NodeConfig) {
     config.model_path = None;
 }
 
-/// Turn compute contribution on or off.
-///
-/// On: record the consent, then download the model if needed (resumable,
-/// with progress on `model-download-progress`), switch to worker mode, and
-/// restart the node so it registers and starts taking jobs. Off: record the
-/// refusal and return to observer mode now, without loading the model; the
-/// file stays on disk for a later "on".
 #[tauri::command]
 pub async fn set_compute_contribution(
     app: AppHandle,
@@ -1242,8 +975,6 @@ pub async fn set_compute_contribution(
     promote_consented_install_inner(&app, &state).await
 }
 
-/// Finish promoting an install whose user opted in: the model download may
-/// have been interrupted, or the user agreed on a machine that was offline.
 #[tauri::command]
 pub async fn promote_consented_install(
     app: AppHandle,
@@ -1252,19 +983,12 @@ pub async fn promote_consented_install(
     promote_consented_install_inner(&app, &state).await
 }
 
-/// One promotion at a time in this process, whoever asks: the startup hook,
-/// the background retry loop, `promote_consented_install`, and
-/// `set_compute_contribution(true)`. Model downloads are also serialized
-/// across processes by the per-target file lock in `download_model`; this
-/// keeps a background tick from queueing on that lock behind a user's
-/// download.
 static PROMOTION_FLIGHT: crate::background_promotion::SingleFlight<Result<NodeConfig, String>> =
     crate::background_promotion::SingleFlight::new();
 
 const PROMOTION_INTERRUPTED: &str =
     "Enabling compute contribution was interrupted. Try again; anything already downloaded is kept.";
 
-/// Promote, or wait for the promotion in flight and return its result.
 pub(crate) async fn promote_consented_install_inner(
     app: &AppHandle,
     state: &AppState,
@@ -1288,7 +1012,6 @@ async fn promote_consented_install_once(
     state: &AppState,
 ) -> Result<NodeConfig, String> {
     let config = current_config(state).await;
-    // The first hardware read can block for seconds (system_profiler).
     let ram_gb = tokio::task::spawn_blocking(|| cached_hardware().ram_gb)
         .await
         .map_err(map_err)?;
@@ -1296,10 +1019,6 @@ async fn promote_consented_install_once(
     match promotion_need(&config, ram_gb) {
         PromotionNeed::NoConsent => return Err(COMPUTE_CONSENT_REQUIRED.to_string()),
         PromotionNeed::Ineligible => return Err(COMPUTE_INELIGIBLE.to_string()),
-        // A worker whose model file is missing or unreadable is not ready:
-        // the node runs as an observer until the file is back (community PR
-        // #132). This request downloads it again, whether a user, the startup
-        // hook or the background retry loop made it.
         PromotionNeed::Ready
             if crate::node_manager::configured_model_unavailable(&config).is_none() =>
         {
@@ -1312,12 +1031,9 @@ async fn promote_consented_install_once(
         Some(path) => path,
         None => download_model(app.clone(), tier.to_string()).await?,
     };
-    // The download can take an hour. Honour a "turn it off" made meanwhile.
     let Some(promoted) = persist_promotion_if_still_consented(state, model_path).await? else {
         return Ok(current_config(state).await);
     };
-    // Apply it to a running node. A node the user stopped stays stopped and
-    // starts as a worker next time.
     let running = state.node.lock().await.is_running();
     if running {
         restart_node_inner(app, state).await?;
@@ -1325,8 +1041,6 @@ async fn promote_consented_install_once(
     Ok(promoted)
 }
 
-/// Whether a consented install still needs the promotion path: it is not a
-/// worker yet, or it is a worker whose model file is missing or unreadable.
 fn needs_promotion(config: &NodeConfig, ram_gb: u64) -> bool {
     match promotion_need(config, ram_gb) {
         PromotionNeed::Promote => true,
@@ -1335,11 +1049,6 @@ fn needs_promotion(config: &NodeConfig, ram_gb: u64) -> bool {
     }
 }
 
-/// Startup hook: once the node is up, finish enabling contribution for a
-/// consented install that is not a worker yet, or download a worker's
-/// missing model again. Silent when there is nothing to do; a failure is
-/// logged and retried by the background loop (`background_promotion`), on
-/// the next launch, or on a toggle.
 pub(crate) async fn promote_consented_install_on_startup(app: &AppHandle, state: &AppState) {
     let config = current_config(state).await;
     let ram_gb = tokio::task::spawn_blocking(|| cached_hardware().ram_gb)
@@ -1365,8 +1074,6 @@ pub(crate) async fn promote_consented_install_on_startup(app: &AppHandle, state:
         );
         return;
     }
-    // Preserve v0.8.19's startup recovery and shared single-flight path for
-    // users who already agreed, including workers with a missing model.
     match promote_consented_install_inner(app, state).await {
         Ok(_) => tracing::info!("compute contribution enabled: worker mode with a verified model"),
         Err(error) => {
@@ -1380,9 +1087,6 @@ fn startup_download_gate(
     conditions: &impl crate::background_promotion::DownloadConditions,
 ) -> Result<(), crate::background_promotion::SkipReason> {
     use crate::background_promotion::{download_gate, Trigger};
-    // The native bit records default enablement even after the notice was
-    // acknowledged (the separate v2 marker records that). It survives relaunch
-    // and stale Settings saves, until an explicit contribution choice replaces it.
     let trigger = if config.compute_default_notice_pending {
         Trigger::Background
     } else {
@@ -1391,19 +1095,8 @@ fn startup_download_gate(
     download_gate(trigger, conditions)
 }
 
-// ── One-time sharing notice ──────────────────────────────────────────────
-// Keep the v1 question marker for setup and the untouched v0.7 upgrade flow.
-// The default's v2 notice has its own marker: an old claim may have been
-// consumed before anybody saw it. A native pending bit is saved atomically
-// with the new sharing default, and only a rendered notice records v2.
-
-/// The marker's name. Its content is the time of the launch that recorded it,
-/// in milliseconds since the Unix epoch.
 const COMPUTE_PROMPT_MARKER: &str = "compute-prompt-shown-at.v1";
 
-/// Record the marker. `Ok(true)` means this call wrote it and `Ok(false)`
-/// that it was already there; the write is atomic and durable, so of two ARC
-/// desktops launching together only one gets `true`.
 fn record_compute_prompt(dir: &Path) -> std::io::Result<bool> {
     let now = chrono::Utc::now().timestamp_millis().max(0);
     arc_crypto::secret_file::durably_publish_new_private(
@@ -1412,9 +1105,6 @@ fn record_compute_prompt(dir: &Path) -> std::io::Result<bool> {
     )
 }
 
-/// The compute question was asked or answered by another route (setup, or the
-/// v0.7 upgrade question): the one-time question is not for this install.
-/// Best effort; a failed write is logged and the install may be asked once.
 pub(crate) fn note_compute_question_answered(dir: &Path) {
     if let Err(error) = record_compute_prompt(dir) {
         tracing::warn!(%error, "could not record that the compute question was already asked");
@@ -1433,8 +1123,6 @@ fn compute_notice_due(store: &Store, dir: &Path, ram_gb: u64) -> bool {
         && !dir.join(COMPUTE_NOTICE_MARKER).exists()
 }
 
-/// A read-only claim. The visible, mounted dialog acknowledges separately;
-/// a hidden window or an interrupted IPC call cannot consume the notice.
 #[tauri::command]
 pub async fn claim_compute_prompt(state: State<'_, AppState>) -> CmdResult<bool> {
     let store = state.store.lock().await;
@@ -1460,7 +1148,6 @@ pub async fn acknowledge_compute_notice(state: State<'_, AppState>) -> CmdResult
     Ok(())
 }
 
-/// Independent of the per-job setting; takes effect without a restart.
 #[tauri::command]
 pub async fn set_keep_awake_while_sharing(
     state: State<'_, AppState>,
@@ -1475,37 +1162,24 @@ pub async fn set_keep_awake_while_sharing(
     Ok(config)
 }
 
-/// An explicit answer supersedes automatic enablement and its download gate.
 fn record_explicit_compute_consent(config: &mut NodeConfig) {
     config.compute_consent = Some(true);
     config.compute_default_notice_pending = false;
 }
 
-/// What "Turn on" stores: consent, and the core cap setup stores when none is
-/// stored yet (`apply_setup_core_default`). A count someone chose stays.
 fn turn_on_compute(config: &mut NodeConfig, logical_cores: u32) {
     record_explicit_compute_consent(config);
     apply_setup_core_default(config, logical_cores);
 }
 
-/// "Turn on" in the one-time question. It stores what a setup that leaves
-/// compute on stores; the WebView then runs `promote_consented_install` in
-/// the background, as it does after setup: reuse or download the model,
-/// check its pinned SHA-256, record worker mode only if compute is still on,
-/// and restart a running node as a worker. "Not now" needs no command: the
-/// question is already recorded.
 #[tauri::command]
 pub async fn accept_compute_prompt(state: State<'_, AppState>) -> CmdResult<NodeConfig> {
-    // The first hardware read can block for seconds (system_profiler). A
-    // failed read gives the smallest cap, one core.
     let logical_cores = tokio::task::spawn_blocking(|| cached_hardware().cpu_cores)
         .await
         .unwrap_or(0);
     update_stored_config(&state, |config| turn_on_compute(config, logical_cores)).await
 }
 
-/// Keep the computer awake while a job runs. Takes effect the next time the
-/// node starts, so an in-flight job is not interrupted by a restart.
 #[tauri::command]
 pub async fn set_prevent_sleep_during_jobs(
     state: State<'_, AppState>,
@@ -1518,8 +1192,6 @@ pub async fn set_prevent_sleep_during_jobs(
     .await
 }
 
-/// Counts from the session's elected coordinator, using the existing
-/// redirect-fenced transport. Missing data is quiet and cached for 60 seconds.
 #[tauri::command]
 pub async fn fetch_worker_network(
     state: State<'_, AppState>,
@@ -1528,8 +1200,6 @@ pub async fn fetch_worker_network(
     Ok(crate::worker_network::fetch(&state.http, &host).await)
 }
 
-/// This machine's community worker: state and job counters, read from the
-/// local node only.
 #[tauri::command]
 pub async fn fetch_worker_status(
     state: State<'_, AppState>,
@@ -1539,30 +1209,13 @@ pub async fn fetch_worker_status(
     Ok(rpc_client::fetch_worker_status(&state.http, &local).await)
 }
 
-/// Stops the node, wipes the cached peer dial list (`known_peers.json` in
-/// the data directory), and restarts. This is the recovery button for
-/// "I had peers, then I restarted, now I'm stuck at 0 peers / Lite
-/// mode" — the most common cause is a stale peer cache pinning to dead
-/// or unreachable seeds. After wiping, the node falls back to the
-/// bundled testnet-seeds.txt and re-bootstraps.
-///
-/// All other state (WAL, blocks, identity, config) is preserved. Only
-/// the peer dial cache is removed.
 #[tauri::command]
 pub async fn reset_peer_state(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> CmdResult<ResetPeerStateResult> {
     state.cancel_startup_retry();
-    // This command mutates the configured data directory before restarting.
-    // Apply the same native migration fence first: when legacy selection is
-    // ambiguous, even deleting its peer cache would violate the promise that
-    // every preserved v0.7 byte remains untouched.
     require_data_migration_ready(&state).await?;
-    // Resolve the data dir through the SAME helper node_manager uses.
-    // Duplicating the expansion here (HOME-only) meant this deleted
-    // known_peers.json from a different directory than the node actually
-    // uses on Windows, then reported success.
     let (cfg, mut recovery_phrase, persisted_address) = {
         let store = state.store.lock().await;
         let cfg = store.config.clone().unwrap_or_default();
@@ -1581,10 +1234,6 @@ pub async fn reset_peer_state(
     let validator_keyfile = keyfile_result?;
     let resources = resolve_testnet_resources(&app);
 
-    // Stop first and retain the exact cross-process data-directory guard
-    // through deletion, binary readiness, receipt arm, and replacement spawn.
-    // Releasing it after Stop used to let a second GUI start a writer while
-    // this command removed that writer's peer cache.
     let lifecycle_lock = {
         let mut node = state.node.lock().await;
         node.stop_for_local_mutation().await.map_err(|error| {
@@ -1617,18 +1266,6 @@ pub async fn reset_peer_state(
     })
 }
 
-/// Health and progress of the node running on THIS machine.
-///
-/// The single most damaging bug in the app was that this read a remote seed:
-/// `wallet_host()` discarded its port argument and returned the LAX seed, so
-/// the Dashboard reported a datacenter's peers, uptime, version and height as
-/// the user's own. Consequences cascaded — `running` was always true, so the
-/// Start button was never rendered, Stop appeared to do nothing, and the
-/// entire lite/syncing UI was unreachable. The tray, which had always polled
-/// 127.0.0.1 correctly, contradicted the window on the same screen.
-///
-/// Local state now comes from the local node. Chain-wide numbers are still
-/// returned, but in clearly separate `chain*` fields.
 #[tauri::command]
 pub async fn node_status(state: State<'_, AppState>) -> CmdResult<NodeStatus> {
     node_status_inner(&state, crate::desktop_instance::closing()).await
@@ -1695,10 +1332,6 @@ async fn node_status_inner(state: &AppState, closing: bool) -> CmdResult<NodeSta
     Ok(status)
 }
 
-/// What a Start would be told by the start fence right now, or None when node
-/// starts are open. Home shows a blocked or recovering node from this before
-/// anyone presses Start. It reads only the fence, never the node mutex, so it
-/// answers during a long launch-time recovery too.
 #[tauri::command]
 pub async fn node_start_block(state: State<'_, AppState>) -> CmdResult<Option<String>> {
     Ok(start_block(&state).await)
@@ -1736,9 +1369,6 @@ pub async fn fetch_attestations(
     state: State<'_, AppState>,
     limit: Option<u32>,
 ) -> CmdResult<Vec<Attestation>> {
-    // The user's address is needed here, not just for display: it decides
-    // which attestations are credited as theirs. Without it the feed showed
-    // every validator's work as "+2.50 ARC" in the user's own earnings view.
     let address = {
         let store = state.store.lock().await;
         store.identity.as_ref().map(|i| i.address.clone())
@@ -1765,14 +1395,6 @@ pub async fn fetch_network_stats(state: State<'_, AppState>) -> CmdResult<Networ
     Ok(rpc_client::fetch_network_stats(&state.http, &host).await)
 }
 
-/// Enforce, natively, the same scheme policy the desktop capability declares.
-///
-/// `capabilities/default.json` scopes `shell:allow-open` to `http://**` and
-/// `https://**`, but this command reaches the OS handler through
-/// `OpenerExt::open_url`, which is a direct Rust call and therefore never
-/// consults that scope. Without this check an IPC caller could hand the
-/// platform handler a `file:`, `smb:`, or Windows shell URL that the app has
-/// no reason to open. Every in-app caller already passes an `http(s)` URL.
 fn external_web_url(url: &str) -> CmdResult<()> {
     let parsed = tauri::Url::parse(url)
         .map_err(|_| format!("refusing to open a malformed external URL: {url}"))?;
@@ -1792,21 +1414,6 @@ pub async fn open_external(app: AppHandle, url: String) -> CmdResult<()> {
     app.opener().open_url(url, None::<&str>).map_err(map_err)
 }
 
-// ── Chain visibility + projection (v0.8.0) ──────────────────────────────
-//
-// Every command here reads the pinned chain host from `chain_host()`, except
-// `fetch_node_contribution`, which describes the user's own machine and so
-// reads 127.0.0.1. None of them read a second seed: the seeds are independent
-// chains (CLAUDE.md rule 4), so comparing two would report a structural
-// disagreement as if it were a fault.
-//
-// Several of the endpoints behind these are newer than the deployed seed
-// binaries. That is expected, and each returns a struct carrying an
-// `unavailable` reason rather than an error — a 404 is information about the
-// host, not a failure of the app, and the UI states it.
-
-/// The finite reward treasury. Feeds the "how much is left" line that keeps a
-/// projection from implying an unlimited payout.
 #[tauri::command]
 pub async fn fetch_reward_economics(
     state: State<'_, AppState>,
@@ -1815,7 +1422,6 @@ pub async fn fetch_reward_economics(
     Ok(rpc_client::fetch_reward_economics(&state.http, &host).await)
 }
 
-/// Projection inputs for this device's address.
 #[tauri::command]
 pub async fn fetch_earnings_projection(
     state: State<'_, AppState>,
@@ -1835,9 +1441,6 @@ pub(crate) async fn fetch_earnings_projection_inner(
     rpc_client::fetch_earnings_projection(&state.http, &host, address).await
 }
 
-/// What the node on THIS machine is contributing. Local read by design — the
-/// whole bug class this app has been unwinding was showing a datacenter's
-/// numbers as the user's own.
 #[tauri::command]
 pub async fn fetch_node_contribution(
     state: State<'_, AppState>,
@@ -1848,7 +1451,6 @@ pub async fn fetch_node_contribution(
     Ok(rpc_client::fetch_node_contribution(&state.http, &local, cores).await)
 }
 
-/// Height, block age, validator split, peers and DAG round for the pinned host.
 #[tauri::command]
 pub async fn fetch_network_overview(
     state: State<'_, AppState>,
@@ -1863,9 +1465,6 @@ pub(crate) async fn fetch_network_overview_inner(
     fetch_network_overview_from_host_inner(state, &host).await
 }
 
-/// Read-only production acceptance preflight against one compiled origin.
-/// This does not establish or mutate a community receipt pin; only an exact
-/// successfully submitted 0x25 inference result may do that.
 pub(crate) async fn fetch_network_overview_from_host_inner(
     state: &AppState,
     host: &str,
@@ -1873,8 +1472,6 @@ pub(crate) async fn fetch_network_overview_from_host_inner(
     rpc_client::fetch_network_overview(&state.http, host).await
 }
 
-/// Read-only packaged-acceptance preflight for the exact profile-bound model
-/// that the sealed rollout says the production coordinator must serve.
 pub(crate) async fn fetch_production_model_identity_from_host_inner(
     state: &AppState,
     host: &str,
@@ -1899,7 +1496,6 @@ pub(crate) async fn fetch_recent_blocks_inner(
     rpc_client::fetch_recent_blocks(&state.http, &host, limit).await
 }
 
-/// Transactions inside one block. Called on expand, never on the poll path.
 #[tauri::command]
 pub async fn fetch_block_txs(
     state: State<'_, AppState>,
@@ -1910,8 +1506,6 @@ pub async fn fetch_block_txs(
     Ok(rpc_client::fetch_block_txs(&state.http, &host, height, limit.unwrap_or(50)).await)
 }
 
-/// Look one hash up on the pinned host. Replaces an `openExternal` to a
-/// hardcoded LAX IP serving a page that is not a block explorer.
 #[tauri::command]
 pub async fn lookup_tx(
     state: State<'_, AppState>,
@@ -1947,8 +1541,6 @@ pub async fn faucet_claim(state: State<'_, AppState>) -> CmdResult<FaucetResult>
     rpc_client::faucet_claim(&state.http, &host, &addr).await
 }
 
-/// Sign and submit an ARC transfer without ever handing recovery material to
-/// the WebView. IPC contains only the recipient and a decimal amount string.
 #[tauri::command]
 pub async fn send_arc(
     state: State<'_, AppState>,
@@ -1958,8 +1550,6 @@ pub async fn send_arc(
     send_arc_inner(&state, to, amount_arc).await
 }
 
-/// The transfer core, callable without a Tauri runtime (the live journey in
-/// `native_paid` drives it against a real chain).
 pub(crate) async fn send_arc_inner(
     state: &AppState,
     to: String,
@@ -1970,7 +1560,6 @@ pub(crate) async fn send_arc_inner(
         return Err("amount must be greater than zero".to_string());
     }
 
-    // Prevent concurrent clicks from reading and signing the same nonce.
     let _write_guard = state.wallet_write.lock().await;
     let address = {
         let store = state.store.lock().await;
@@ -1982,10 +1571,6 @@ pub(crate) async fn send_arc_inner(
     .ok_or_else(|| "no identity".to_string())?;
 
     let host = crate::wallet::validate_rpc_origin(&chain_host(state).await)?;
-    // A protocol-4 block carries only a native paid-inference transaction:
-    // its nodes refuse any other at submission and its blocks cannot include
-    // one. Say so before signing instead of after a refused submission. A
-    // host that cannot say is left to refuse the transfer itself.
     if crate::native_paid::host_carries_only_native_transactions(state, &host).await {
         return Err(
             "this chain carries only native paid-inference transactions, so a transfer can \
@@ -1998,10 +1583,6 @@ pub(crate) async fn send_arc_inner(
         .balance_base
         .parse::<u64>()
         .map_err(|_| "selected host returned an invalid wallet balance".to_string())?;
-    // Read the domain from the exact pinned origin before touching the
-    // recovery phrase. Missing v3 recovery metadata fails closed. The v3
-    // minimum fee is part of the signed transaction and therefore part of
-    // the available-balance decision too.
     let domain = rpc_client::transaction_signing_domain(&state.http, &host).await?;
     let fee_base = crate::wallet::transfer_fee_base(domain);
     let required = amount_base
@@ -2027,37 +1608,6 @@ pub(crate) async fn send_arc_inner(
     rpc_client::submit_signed_transfer(&state.http, &host, &tx, amount_base).await
 }
 
-// The chain host is elected ONCE and then pinned for the life of the
-// process. It is deliberately NOT re-elected on a timer.
-//
-// The seeds are not one chain. They share a DAG round but not state:
-// `/block/43000` returns a different hash on each, heights span 51k-135k, and
-// a faucet credit on LAX never appears on AMS. Silently migrating the wallet
-// to a different seed mid-session would make the user's balance change for no
-// visible reason, or make a faucet claim they just watched succeed vanish.
-// (See CLAUDE.md rule 4.)
-//
-// So: pick the freshest seed on the first chain read — which is the part the
-// old code got wrong, hard-pinning LAX even when it was six days stale — then
-// stay there and render unavailability if it later stops answering.
-
-/// The seed whose chain view we read balances, earnings, attestations and
-/// network stats from.
-///
-/// Chosen dynamically rather than pinned. The previous code hard-pinned LAX,
-/// which was a reasonable choice when it was written and a bad one now: four
-/// of the six seeds have not produced a block in roughly six days, and which
-/// of the remaining two is ahead changes over the course of a day. A pin
-/// means the wallet silently reads a stalled chain.
-///
-/// Selection is by freshest `/block/latest` header timestamp — the direct
-/// measure of "is this host still producing?", where `/health` alone is not
-/// (a stalled seed still reports `status: ok` and a healthy peer count, and
-/// its DAG round keeps advancing even while block height stands still).
-///
-/// All candidates are probed concurrently. Sequential probing with a 2s
-/// timeout each is up to 12s of dead air on a screen that repaints every
-/// 1.5s.
 async fn probe_chain_host(http: &reqwest::Client) -> Option<ChainHostChoice> {
     let mut set = tokio::task::JoinSet::new();
     for host in WALLET_HOSTS {
@@ -2085,9 +1635,6 @@ async fn probe_chain_host(http: &reqwest::Client) -> Option<ChainHostChoice> {
         });
     }
 
-    // Drain every probe rather than taking the first to answer: we want the
-    // FRESHEST host, not the FASTEST one. The quickest responder is often a
-    // stalled seed that simply has lower latency.
     let mut best: Option<ChainHostChoice> = None;
     while let Some(joined) = set.join_next().await {
         if let Ok(Some(choice)) = joined {
@@ -2111,23 +1658,12 @@ pub struct ChainHostChoice {
 }
 
 impl ChainHostChoice {
-    /// Age of this host's newest block. Surfaced so the UI can say "network
-    /// last produced a block 6 days ago" instead of implying everything is
-    /// fine.
     pub fn block_age_seconds(&self) -> u64 {
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
         now.saturating_sub(self.block_timestamp_ms) / 1000
     }
 }
 
-/// Resolve (and cache) the chain host for read-only chain queries.
-///
-/// `ARC_WALLET_HOST` pins it explicitly — the documented override for
-/// pointing the app at a local devnet or a specific seed. `ARC_TIER1_RPC` is
-/// still honored for backward compatibility with existing dev shells, but it
-/// is deliberately no longer the *first* thing checked and no longer silently
-/// redirects tier 1 alone: it redirects chain reads, which is what it always
-/// actually did.
 pub(crate) async fn chain_host(state: &AppState) -> String {
     for key in ["ARC_WALLET_HOST", "ARC_TIER1_RPC"] {
         if let Ok(env) = std::env::var(key) {
@@ -2138,18 +1674,10 @@ pub(crate) async fn chain_host(state: &AppState) -> String {
         }
     }
 
-    // A successful community inference creates an exact receipt-origin
-    // boundary for the remainder of this app session.  Do not health-failover
-    // this pin: an unavailable source must render unavailable, never silently
-    // substitute a structurally independent seed that cannot contain the
-    // transaction the user is inspecting.
     if let Some(host) = state.community_chain_host.lock().await.clone() {
         return host;
     }
 
-    // A displayed structural chain is an immutable session identity. If it
-    // stops answering, callers must render unavailable instead of switching
-    // wallet, earnings, or future reward writes to an independent seed.
     let pinned = {
         let cached = state.chain_host.lock().await;
         cached.as_ref().map(|(c, _)| c.host.clone())
@@ -2171,9 +1699,6 @@ pub(crate) async fn chain_host(state: &AppState) -> String {
             host
         }
         None => {
-            // Every seed refused or timed out. Fall back to the first
-            // candidate so the caller still produces a well-formed error
-            // against a real host rather than panicking on an empty string.
             tracing::warn!(
                 "no seed answered /block/latest; falling back to {}",
                 WALLET_HOSTS[0]
@@ -2183,9 +1708,6 @@ pub(crate) async fn chain_host(state: &AppState) -> String {
     }
 }
 
-/// The cached chain choice, without triggering a probe. Used by
-/// `node_status` to attach chain height/round/age after `chain_host` has
-/// already run.
 async fn cached_chain_choice(state: &AppState) -> Option<ChainHostChoice> {
     state
         .chain_host
@@ -2195,14 +1717,6 @@ async fn cached_chain_choice(state: &AppState) -> Option<ChainHostChoice> {
         .map(|(c, _)| c.clone())
 }
 
-/// A conservative upper bound for the number of tokens produced by ARC's
-/// raw-input tokenizer.
-///
-/// `CachedIntegerModel::encode` prepends one three-byte SentencePiece marker,
-/// replaces every ASCII space with that same three-byte marker, and then emits
-/// at most one token per transformed UTF-8 byte. Keeping the bound here in
-/// bytes means the desktop does not need the model vocabulary merely to avoid
-/// cancelling a valid coordinator request too early.
 fn inference_prompt_token_upper_bound(prompt: &str) -> u64 {
     const SENTENCEPIECE_MARKER_BYTES: u64 = 3;
 
@@ -2218,21 +1732,12 @@ fn inference_prompt_token_upper_bound(prompt: &str) -> u64 {
         })
 }
 
-/// Mirror the coordinator's protocol budget: worker inference, independent
-/// validator recomputation, and remote reward approvals can span three model
-/// passes. The server budgets the complete generation context -- one internal
-/// BOS position, the tokenized prompt, and requested output -- rather than
-/// output tokens alone. Add 60 seconds beyond its capped deadline so a valid
-/// settled response is never cancelled by the desktop first.
 fn inference_timeout(prompt: &str, max_tokens: u32) -> std::time::Duration {
     const MIN_SERVER_SECS: u64 = 45;
     const MAX_SERVER_SECS: u64 = 3_900;
     const CLAIM_WINDOW_SECS: u64 = 30;
     const CLIENT_HEADROOM_SECS: u64 = 60;
     const INTERNAL_BOS_POSITIONS: u64 = 1;
-    // One generation is budgeted at 3.3s/token. Dispatch can include the
-    // worker pass, coordinator verification, and validator approval pass,
-    // each with 50% headroom: ceil(14.85s * positions) + claim window.
     let required_positions = INTERNAL_BOS_POSITIONS
         .saturating_add(inference_prompt_token_upper_bound(prompt))
         .saturating_add(u64::from(max_tokens));
@@ -2244,17 +1749,11 @@ fn inference_timeout(prompt: &str, max_tokens: u32) -> std::time::Duration {
     std::time::Duration::from_secs(server_secs + CLIENT_HEADROOM_SECS)
 }
 
-/// How long a coordinator gets to answer `/health` before we skip it.
 const COORDINATOR_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InferenceProxyPolicy {
-    /// Interactive packaged UI honors an explicitly supplied HTTPS proxy.
-    /// This is required for restricted/headless environments and corporate
-    /// networks; redirects and automatic retries remain forbidden below.
     Configured,
-    /// Sealed packaged-native evidence must connect directly to its exact
-    /// compiled coordinator and separately rejects all ambient proxy inputs.
     AcceptanceDirect,
 }
 
@@ -2265,12 +1764,7 @@ fn inference_client(
 ) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .timeout(inference_timeout(prompt, max_tokens))
-        // Never let reqwest replay a protocol NACK behind the caller's
-        // exact-one-dispatch accounting.
         .retry(reqwest::retry::never())
-        // A POST may create a paid-on-chain reward.  Never let an HTTP
-        // redirect replay that write at a second origin; the caller selected
-        // and pinned one exact coordinator.
         .redirect(reqwest::redirect::Policy::none());
     if proxy_policy == InferenceProxyPolicy::AcceptanceDirect {
         builder = builder.no_proxy();
@@ -2287,12 +1781,8 @@ async fn health_ok(http: &reqwest::Client, host: &str, timeout: std::time::Durat
     )
 }
 
-/// The only error class the WebView may use to choose another inference
-/// route.  It is emitted exclusively before any inference POST is sent.
 pub(crate) const INFERENCE_PRE_DISPATCH_UNAVAILABLE: &str =
     "ARC_INFERENCE_PRE_DISPATCH_UNAVAILABLE";
-/// Every failure observed after the single POST begins is ambiguous with
-/// respect to remote assignment/settlement and therefore terminal.
 pub(crate) const INFERENCE_POST_OUTCOME_AMBIGUOUS: &str =
     "ARC_INFERENCE_POST_OUTCOME_AMBIGUOUS";
 
@@ -2300,17 +1790,10 @@ fn inference_pre_dispatch_unavailable(detail: impl std::fmt::Display) -> String 
     format!("{INFERENCE_PRE_DISPATCH_UNAVAILABLE}: {detail}")
 }
 
-/// The local node's RPC port, or `None` while the node mutex is held. A
-/// launch recovery, a Stop or Restart, or an update drain holds that mutex for
-/// minutes, and the chat must neither wait behind it nor send work to a node
-/// that may be stopping: it can still answer `/health` and then exit.
 fn try_local_rpc_port(state: &AppState) -> Option<u16> {
     state.node.try_lock().ok().map(|node| node.rpc_port)
 }
 
-/// The local node's RPC port, without waiting on the node mutex. While it is
-/// held the configured port stands in, which is enough to recognise the local
-/// node's address.
 async fn local_rpc_port(state: &AppState) -> u16 {
     if let Some(port) = try_local_rpc_port(state) {
         return port;
@@ -2339,20 +1822,6 @@ async fn inference_readiness_ok(http: &reqwest::Client, host: &str) -> Result<bo
     .map_err(|_| format!("{host} readiness timed out"))?
 }
 
-/// Coordinators to try, best first.
-///
-/// Two changes from the original, both of which matter on this network:
-///
-/// 1. **The local node goes first when it is up.** It is the only node
-///    running the current build — the public seeds are still on v0.7.9,
-///    whose coordinator is markedly slower — and routing through a
-///    datacenter to compute something the user's own machine can compute is
-///    both slower and a worse story to tell. It is skipped while a Stop,
-///    Restart or update holds the node.
-/// 2. **Remotes are probed concurrently**, and only reachable ones are
-///    returned, ordered by how fast they answered. The previous code walked
-///    a fixed list sequentially with a per-host inference timeout, so an
-///    unreachable host cost a full timeout before the next was tried.
 async fn coordinator_candidates(state: &AppState) -> Vec<String> {
     let mut ordered = Vec::new();
 
@@ -2394,10 +1863,6 @@ async fn coordinator_candidates(state: &AppState) -> Vec<String> {
     ordered
 }
 
-/// Once the session has either displayed an elected chain or accepted one
-/// exact community settlement, every later reward-producing write must stay
-/// on that structural chain. A receipt pin takes precedence; otherwise the
-/// already displayed cached read origin constrains the first write.
 async fn established_chain_origin(state: &AppState) -> Option<String> {
     if let Some(origin) = state.community_chain_host.lock().await.clone() {
         return Some(origin);
@@ -2483,8 +1948,6 @@ async fn pin_community_receipt_route(
         }
     }
     let mut routes = state.community_receipt_routes.lock().await;
-    // Keep the in-memory pin set bounded without evicting the receipt just
-    // returned. This state is session-local and only supports visible results.
     if routes.len() >= 512 && !routes.contains_key(&settlement.tx_hash) {
         if let Some(oldest_arbitrary_key) = routes.keys().next().cloned() {
             routes.remove(&oldest_arbitrary_key);
@@ -2501,11 +1964,6 @@ async fn pin_community_receipt_route(
     );
 }
 
-/// Independently read one canonical 0x25 receipt from the exact host that
-/// served the inference. The WebView cannot turn this into an arbitrary URL
-/// fetch or silently migrate a receipt lookup to another seed: only the exact
-/// current loopback node or a compiled-in coordinator origin is accepted, and
-/// `rpc_client` performs one identity-bound GET with redirects disabled.
 #[tauri::command]
 pub async fn fetch_community_reward_receipt(
     state: State<'_, AppState>,
@@ -2563,12 +2021,6 @@ pub(crate) async fn fetch_community_reward_receipt_inner(
     .await
 }
 
-/// Run inference on the local node.
-///
-/// Kept as its own command so the UI can show "served by your machine"
-/// truthfully. Previously this went to the LAX seed via `wallet_host`, while
-/// the Inference screen's help text claimed "your prompt goes to the local
-/// node" — it did not.
 #[tauri::command]
 pub async fn run_inference(
     state: State<'_, AppState>,
@@ -2592,8 +2044,6 @@ async fn run_inference_local_inner(
     chat_template: bool,
 ) -> CmdResult<InferenceResult> {
     let _write_guard = state.community_inference_write.lock().await;
-    // A launch recovery or a stop holds the node mutex for minutes. Nothing
-    // has been sent yet, so skip the local node and let the network answer.
     let port = match state.node.try_lock() {
         Ok(node) => node.rpc_port,
         Err(_) => return Err(inference_pre_dispatch_unavailable(
@@ -2633,18 +2083,6 @@ async fn run_inference_local_inner(
     Ok(result)
 }
 
-/// Milestone A (#35): observer / no-model nodes route inference through a
-/// testnet seed coordinator's `/inference/run_consensus` endpoint.
-///
-/// Iterates the built-in `COORDINATOR_HOSTS` list until one seed responds
-/// with success. Each request uses the same token-scaled deadline as the
-/// coordinator plus client headroom, so reward verification can settle
-/// without the desktop cancelling first.
-///
-/// This command is intentionally separate from `run_inference` so the UI
-/// can try the local node first (fast path when the user is a validator
-/// with --model loaded) and fall back here on 503 / network error without
-/// the Rust side having to know about the local node's role.
 #[tauri::command]
 pub async fn run_inference_via_coordinator(
     state: State<'_, AppState>,
@@ -2688,10 +2126,6 @@ async fn run_inference_via_coordinator_inner(
     let client = inference_client(prompt, max_tokens, proxy_policy)
         .map_err(inference_pre_dispatch_unavailable)?;
     let local_prefix = paths::local_host(local_rpc_port(state).await);
-    // `/run_consensus` is itself a write/compute operation.  Health probes
-    // may inspect as many candidates as needed, but after choosing the first
-    // reachable origin the app sends exactly one POST and never migrates the
-    // same click to another coordinator on an ambiguous outcome.
     let host = candidates
         .first()
         .expect("non-empty candidates established above");
@@ -3012,9 +2446,6 @@ mod inference_retry_tests {
                     .expect("write readiness response");
             } else {
                 post_hits.fetch_add(1, Ordering::SeqCst);
-                // Dropping the accepted socket without an HTTP response
-                // models a reset/EOF after the server may have accepted the
-                // write. The client must not try another origin.
             }
         }
     }
@@ -3109,7 +2540,6 @@ mod inference_retry_tests {
                 "unexpected request: {head}"
             );
             counted.fetch_add(1, Ordering::SeqCst);
-            // EOF before an HTTP response is an ambiguous write result.
         });
         let state = test_state();
 
@@ -3172,7 +2602,6 @@ mod inference_retry_tests {
         );
     }
 
-    /// A loopback protocol-4 or protocol-3 host, recording each requested path.
     async fn recording_host(context_status: u16) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -3232,11 +2661,8 @@ mod inference_retry_tests {
             if protocol_4 {
                 let error = outcome.unwrap_err();
                 assert!(error.contains("nothing was signed"), "{error}");
-                // Nothing past the check: no balance read, no submission.
                 assert_eq!(paths, ["/native-inference/context"]);
             } else {
-                // Not protocol-4: the transfer goes on to read the account. The
-                // stub has none, so it stops there, before any submission.
                 assert!(outcome.is_err());
                 assert!(
                     paths.iter().any(|path| path.starts_with("/account/")),
@@ -3251,14 +2677,6 @@ mod inference_retry_tests {
     }
 }
 
-/// Community-first coordinator inference. `/inference/run` dispatches to an
-/// eligible registered community worker before it considers local or sharded
-/// seed execution. The UI calls this before standalone `/run_consensus` so
-/// normal desktop traffic can actually reach community nodes.
-///
-/// Errors proving that a community assignment may still settle, plus terminal
-/// client/request errors, stop immediately. Retrying another coordinator in
-/// those cases could duplicate compute or a reward.
 #[tauri::command]
 pub async fn run_inference_via_coordinator_direct(
     state: State<'_, AppState>,
@@ -3304,9 +2722,6 @@ async fn run_inference_via_coordinator_direct_inner(
             "the immutable community receipt origin is unavailable; refusing cross-origin inference",
         ));
     }
-    // Readiness probes are mutation-free and may walk candidates.  The first
-    // origin that proves the exact v1 admission contract wins; after that
-    // selection there is exactly one POST, regardless of its outcome.
     let mut selected = None;
     let mut readiness_failures = Vec::new();
     for host in candidates {
@@ -3342,10 +2757,6 @@ async fn run_inference_via_coordinator_direct_inner(
     Ok(result)
 }
 
-/// One exact packaged-production dispatch.  The origin must be one of the six
-/// compiled ARC coordinators; it is health-probed and then receives exactly
-/// one POST.  Unlike the interactive availability path above, this function
-/// never retries a different coordinator after an ambiguous write outcome.
 pub(crate) async fn run_inference_via_exact_production_coordinator_inner(
     state: &AppState,
     source_host: &str,
@@ -3378,13 +2789,6 @@ fn settlement_write_unavailable<T>(flow: &str) -> CmdResult<T> {
     Err(format!("{} {}", flow, SETTLEMENT_WRITE_UNAVAILABLE))
 }
 
-/// Tier 1 settlement is intentionally unavailable in this recovery candidate.
-///
-/// This command used to derive a model ID from a static shape label, use VRF
-/// selection as though it authorized spend, and submit an
-/// `InferenceRequest` before the validator-approval protocol was complete.
-/// Its body now returns a typed error without probing a host, reading a nonce,
-/// signing a transaction, or performing any network write.
 #[tauri::command]
 pub async fn tier1_submit(
     state: State<'_, AppState>,
@@ -3405,11 +2809,6 @@ pub async fn tier1_submit(
     settlement_write_unavailable("Tier 1 on-chain inference")
 }
 
-/// Read the on-chain state of a Tier 1 request created by an older build.
-/// The current desktop does not submit or poll new requests. This read-only
-/// compatibility path looks up the host that accepted the original submit from
-/// `state.tier1_routes`; if missing (e.g. app restart between submit and
-/// poll), falls back to scanning every host.
 #[tauri::command]
 pub async fn tier1_result(
     state: State<'_, AppState>,
@@ -3439,11 +2838,6 @@ pub async fn tier1_result(
     ))
 }
 
-/// Tier 1 RPC host candidates in the order to try them. Honors
-/// `ARC_TIER1_RPC` (single host, for local dev). Otherwise shuffles
-/// `COORDINATOR_HOSTS` so load spreads across the 6 testnet seeds and a
-/// dead host (e.g. NYC = 149.28.32.76 was unreachable as of 2026-05-22)
-/// just causes one extra hop instead of a permanent failure.
 fn tier1_candidate_hosts() -> Vec<String> {
     if let Ok(env) = std::env::var("ARC_TIER1_RPC") {
         let trimmed = env.trim();
@@ -3457,24 +2851,10 @@ fn tier1_candidate_hosts() -> Vec<String> {
     hosts
 }
 
-/// Candidate hosts for free coordinator inference and read-only compatibility
-/// queries. New paid/Tier 1 request writes are disabled above.
 const COORDINATOR_HOSTS: [&str; 6] = rpc_client::PRODUCTION_RPC_ORIGINS;
 
-/// The public testnet seeds, as candidates for chain reads.
-///
-/// No longer a priority list with a pinned `[0]` — `chain_host()` elects the
-/// first session source by block freshness. Order is presentational only.
 const WALLET_HOSTS: [&str; 6] = rpc_client::PRODUCTION_RPC_ORIGINS;
 
-/// Paid inference escrow is intentionally unavailable in this recovery
-/// candidate.
-///
-/// The removed implementation opened escrow using a label-derived model ID
-/// before asking the coordinator to run the exact artifact. A candidate
-/// coordinator then rejected the mismatch, leaving funds locked until timeout.
-/// This command now returns an error before identity access, host probing,
-/// signing, nonce reads, transaction submission, or any other network write.
 #[tauri::command]
 pub async fn run_paid_inference(
     state: State<'_, AppState>,
@@ -3487,33 +2867,6 @@ pub async fn run_paid_inference(
     settlement_write_unavailable("Paid inference escrow")
 }
 
-// `check_for_update` (GitHub releases API) was deleted here deliberately.
-//
-// It was a second, independent notion of "is there an update" that
-// disagreed with the one the Install button actually used. Settings rendered
-// the button from this command's `tag_name != CARGO_PKG_VERSION`, but
-// clicking it called the Tauri updater's `check()`, which reads the signed
-// `latest.json`. Any tag that ships arc-node binaries without a desktop
-// bundle — exactly what a normal tag push produces — advanced `tag_name`
-// while publishing no manifest, so the app offered an update and then
-// reported "No update available." It was also an unauthenticated
-// api.github.com call subject to a 60/hr rate limit and the first thing to
-// fail behind a corporate proxy.
-//
-// Both the badge and the button now come from the updater plugin, which
-// reads the signed manifest and is the only source that can actually
-// install anything. The version string for display comes off the `Update`
-// object. See `Settings.tsx`.
-
-/// Write the in-memory log ring to a file the user picks.
-///
-/// The Download button built a `Blob`, made an `<a download>` and clicked it.
-/// WKWebView — the macOS webview — does not implement the `download`
-/// attribute for `blob:` URLs without a host-side download delegate, so the
-/// click was a silent no-op on macOS while appearing to work on Windows and
-/// Linux. Handing logs to support is the whole point of the button, so the
-/// failure was both invisible and consequential. Doing the write in Rust
-/// works identically everywhere.
 #[tauri::command]
 pub async fn save_logs(app: AppHandle, state: State<'_, AppState>) -> CmdResult<SavedLogs> {
     use tauri_plugin_dialog::DialogExt;
@@ -3538,8 +2891,6 @@ pub async fn save_logs(app: AppHandle, state: State<'_, AppState>) -> CmdResult<
         chrono::Utc::now().format("%Y%m%d-%H%M%S")
     );
 
-    // The dialog plugin's blocking picker would deadlock the async runtime;
-    // hop it onto a oneshot instead.
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
@@ -3551,7 +2902,6 @@ pub async fn save_logs(app: AppHandle, state: State<'_, AppState>) -> CmdResult<
     let picked = rx.await.map_err(map_err)?;
 
     let Some(path) = picked else {
-        // User cancelled - not an error.
         return Ok(SavedLogs {
             path: None,
             lines: entries.len(),
@@ -3569,16 +2919,6 @@ pub async fn save_logs(app: AppHandle, state: State<'_, AppState>) -> CmdResult<
     })
 }
 
-/// Change how many cores the node contributes.
-///
-/// Tries the cheap path first: `POST /node/threads` on the local node
-/// resizes rayon's pool in place, so "add two cores" takes effect without
-/// dropping the node off the network. That endpoint is being added
-/// chain-side and does not exist on shipped nodes yet, so a 404 (or any
-/// other refusal) falls back to a graceful restart with the new width. Both
-/// outcomes are reported honestly via `ThreadsApplied.restarted`, because
-/// "applied live" and "restarted your node" are very different things to
-/// have just done to someone.
 #[tauri::command]
 pub async fn set_worker_threads(
     app: AppHandle,
@@ -3594,10 +2934,6 @@ pub async fn set_worker_threads(
         ));
     }
 
-    // Persist first, so whichever path we take below (live reconfigure or
-    // restart) the new width survives — including if the user quits before
-    // it is applied. `restart_node` re-reads the config from the store, so
-    // this write is what it will pick up.
     let was_running = {
         let mut store = state.store.lock().await;
         let mut cfg = store.config.clone().unwrap_or_default();
@@ -3616,7 +2952,6 @@ pub async fn set_worker_threads(
         });
     }
 
-    // Attempt the live reconfigure.
     let port = state.node.lock().await.rpc_port;
     let url = format!("{}/node/threads", paths::local_host(port));
     let live = state
@@ -3653,11 +2988,6 @@ pub async fn set_worker_threads(
     })
 }
 
-/// Desktop and arc-node ship as a matched pair - the desktop's CARGO_PKG_VERSION
-/// is the same string arc-node prints from `--version` (both inherit from the
-/// release tag's workspace version). Mismatch → we have a stale arc-node from
-/// a previous release sitting in ~/.arc/bin and must redownload, otherwise
-/// chain bug fixes never reach existing users on auto-update.
 pub(crate) const EXPECTED_NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ARC_RELEASE_DOWNLOAD_ROOT: &str = "https://github.com/FerrumVir/arc-chain/releases/download";
 const ARC_RELEASE_REPOSITORY: &str = "FerrumVir/arc-chain";
@@ -3692,10 +3022,6 @@ fn classify_local_health(
     }
 }
 
-/// Probe the configured local RPC port before startup adopts a process it did
-/// not spawn. Only an exact matched-pair version is adoptable. Connection
-/// failure means no process is present; any successful but malformed, stale, or
-/// future response is incompatible and the desktop must start its own node.
 pub(crate) async fn probe_local_node_compatibility(
     http: &reqwest::Client,
     port: u16,
@@ -3731,8 +3057,6 @@ fn exact_release_asset_url(asset: &str) -> String {
     )
 }
 
-/// Read one GNU/BSD-style SHA256SUMS entry without accepting an ambiguous or
-/// path-substituted match. The release assembler emits exactly this shape.
 fn expected_release_sha256(manifest: &str, asset: &str) -> Result<[u8; 32], String> {
     let mut matches = manifest.lines().filter_map(|line| {
         let mut fields = line.split_whitespace();
@@ -3926,10 +3250,6 @@ fn binary_download_sidecar(target: &Path, nonce: u64) -> PathBuf {
     }
 }
 
-/// One independently created download. `create_new` prevents a concurrent
-/// desktop instance (or a stale symbolic link) from sharing/truncating the
-/// file whose signed digest this invocation is verifying. Drop is a cleanup
-/// backstop for every network, checksum, version, and install error path.
 struct PendingVerifiedDownload {
     path: PathBuf,
     file: Option<tokio::fs::File>,
@@ -3949,7 +3269,6 @@ impl PendingVerifiedDownload {
 
 impl Drop for PendingVerifiedDownload {
     fn drop(&mut self) {
-        // Close before unlinking: Windows refuses removal of an open file.
         self.file.take();
         let _ = std::fs::remove_file(&self.path);
     }
@@ -4021,9 +3340,6 @@ async fn acquire_exclusive_download_lock(
     .map_err(map_err)?
 }
 
-/// Serialize the complete inspect/download/verify/replace sequence across
-/// both tasks and desktop processes. The OS releases this advisory lock if a
-/// process crashes, so a stale lock file never strands future updates.
 async fn acquire_binary_install_lock(target: &Path) -> Result<std::fs::File, String> {
     acquire_exclusive_download_lock(binary_install_lock_path(target), "arc-node install").await
 }
@@ -4032,21 +3348,13 @@ async fn acquire_model_download_lock(target: &Path) -> Result<std::fs::File, Str
     acquire_exclusive_download_lock(model_download_lock_path(target), "model download").await
 }
 
-/// First-launch readiness check. Confirms the bundled testnet resources are
-/// resolvable AND the arc-node binary is present at the version this desktop
-/// was built against. If the binary is missing OR its `--version` doesn't
-/// match this desktop's `CARGO_PKG_VERSION`, downloads the matching arc-node
-/// binary from that exact immutable release for this platform. The onboarding
-/// screen calls this before launching the node, and `start_node` also calls
-/// it on every start so existing users picked up by the desktop auto-updater
-/// always get the matching arc-node binary instead of running a stale one.
 #[tauri::command]
 pub async fn ensure_binary(app: AppHandle, state: State<'_, AppState>) -> CmdResult<BinaryStatus> {
     require_data_migration_ready(&state).await?;
     {
         let node = state.node.lock().await;
         node.require_idle_for_binary_check().map_err(map_err)?;
-    } // Downloads must not hold the mutex needed by status, Stop and tray Quit.
+    }
     let configured_data_dir = state
         .store
         .lock()
@@ -4082,27 +3390,13 @@ fn installed(path: &Path) -> BinaryStatus {
     }
 }
 
-/// Make sure a runnable arc-node exists at the exact desktop version.
-///
-/// v0.7.10 and v0.7.11 were published without `arc-node-*` assets, which made
-/// every refresh return 404. Continuing with an older managed binary looked
-/// friendlier but silently paired incompatible protocols after upgrades. The
-/// unified release now makes a missing exact asset/checksum a publication
-/// failure; the desktop therefore fails closed instead of pretending a stale
-/// node is current. Operators who intentionally maintain a custom binary can
-/// select it explicitly with `ARC_NODE_BIN`.
-///
-/// Resolution order mirrors `node_manager::resolve_binary` so the thing this
-/// function blesses is the thing that actually gets spawned.
 async fn ensure_binary_inner(app: &AppHandle) -> Result<BinaryStatus, String> {
     ensure_binary_inner_classified(app)
         .await
         .map_err(|failure| paths::redact_home_text(&failure.to_string()))
 }
 
-async fn ensure_binary_inner_classified(app: &AppHandle) -> Result<BinaryStatus, StartupFailure> {
-    // 1. An explicitly configured binary is the operator's decision. Never
-    //    version-check it, never overwrite it.
+async fn ensure_binary_inner_classified(_app: &AppHandle) -> Result<BinaryStatus, StartupFailure> {
     if let Some(p) = crate::node_manager::env_binary_override() {
         if p.exists() {
             tracing::info!("using arc-node from env override: {}", p.display());
@@ -4128,10 +3422,6 @@ async fn ensure_binary_inner_classified(app: &AppHandle) -> Result<BinaryStatus,
         .await;
     let _process_guard = acquire_binary_install_lock(&target).await?;
 
-    // Complete or roll back a journaled Windows replacement before deciding
-    // whether the managed binary is missing/stale. This also restores `.old`
-    // files left by pre-journal desktop versions, so a power cut cannot turn
-    // a complete prior executable into an opaque "missing binary" state.
     let recovery_target = target.clone();
     tokio::task::spawn_blocking(move || {
         recover_interrupted_binary_install(&recovery_target, EXPECTED_NODE_VERSION)
@@ -4139,9 +3429,6 @@ async fn ensure_binary_inner_classified(app: &AppHandle) -> Result<BinaryStatus,
     .await
     .map_err(map_err)??;
 
-    // 2. A binary already in the managed location. Exact matches are reused;
-    //    older copies are replaced, and newer/unparseable copies stop with a
-    //    clear mismatch instead of silently coupling incompatible versions.
     if target.exists() {
         match read_arc_node_version(&target) {
             Some(ref v) if v == EXPECTED_NODE_VERSION => return Ok(installed(&target)),
@@ -4153,7 +3440,6 @@ async fn ensure_binary_inner_classified(app: &AppHandle) -> Result<BinaryStatus,
                         target.display(),
                         EXPECTED_NODE_VERSION
                     );
-                    // Fall through to the download attempt below.
                 } else if semver_gt(&v, EXPECTED_NODE_VERSION) {
                     return Err(format!(
                         "managed arc-node v{} is newer than desktop v{}. Upgrade the desktop, or set ARC_NODE_BIN explicitly if this pairing is intentional",
@@ -4178,28 +3464,18 @@ async fn ensure_binary_inner_classified(app: &AppHandle) -> Result<BinaryStatus,
             }
         }
     } else if let Some(dev) = crate::node_manager::dev_build_binary() {
-        // 3. A release build in this repo checkout. This is how the demo
-        //    machine runs: the checkout has a matching arc-node while the
-        //    published release has none.
         tracing::info!("using locally built arc-node: {}", dev.display());
         return Ok(installed(&dev));
     }
 
-    // 4. Download the exact release. An older or corrupt managed binary is not
-    //    a valid fallback across a protocol-version boundary.
     match download_arc_node(&target).await {
-        Ok(total_bytes) => {
-            let _ = app; // reserved for progress events via app.emit(...)
-            Ok(BinaryStatus {
-                path: target.to_string_lossy().into_owned(),
-                downloaded_bytes: total_bytes,
-                total_bytes,
-                already_installed: false,
-            })
-        }
+        Ok(total_bytes) => Ok(BinaryStatus {
+            path: target.to_string_lossy().into_owned(),
+            downloaded_bytes: total_bytes,
+            total_bytes,
+            already_installed: false,
+        }),
         Err(e) => {
-            // Last chance: a dev build we skipped earlier because the
-            // managed path existed but turned out unusable.
             if let Some(dev) = crate::node_manager::dev_build_binary() {
                 tracing::warn!(
                     "arc-node download failed ({}) - falling back to {}",
@@ -4215,8 +3491,6 @@ async fn ensure_binary_inner_classified(app: &AppHandle) -> Result<BinaryStatus,
     }
 }
 
-/// Fetch the platform's arc-node release asset and install it at `target`.
-/// Returns the byte count on success.
 async fn download_arc_node(target: &Path) -> Result<u64, StartupFailure> {
     let asset = platform_release_asset().ok_or_else(|| {
         format!(
@@ -4276,9 +3550,6 @@ async fn download_arc_node(target: &Path) -> Result<u64, StartupFailure> {
         "release checksum signature",
     )
     .await?;
-    // The checksum text is attacker-controlled until this succeeds. Verify the
-    // namespaced owner signature and exact repo/tag/commit header before using
-    // even one digest from it to authenticate an executable child process.
     verify_release_manifest_signature(&checksum_bytes, &signature_bytes)?;
     let checksum_manifest = std::str::from_utf8(&checksum_bytes)
         .map_err(|_| "release checksum manifest is not UTF-8".to_string())?;
@@ -4349,8 +3620,6 @@ async fn download_arc_node(target: &Path) -> Result<u64, StartupFailure> {
         )));
     }
 
-    // Verify the durable file, not only the network byte stream. The unique
-    // create-new sidecar means this digest belongs solely to this invocation.
     let persisted_path = pending.path.clone();
     let persisted_sha256 =
         tokio::task::spawn_blocking(move || sha256_regular_file(&persisted_path))
@@ -4387,8 +3656,6 @@ async fn download_arc_node(target: &Path) -> Result<u64, StartupFailure> {
         std::fs::set_permissions(target, perms).map_err(map_err)?;
     }
 
-    // Best-effort: strip any macOS quarantine flag on our own download.
-    // User still needs to allow the desktop .app itself past Gatekeeper.
     #[cfg(target_os = "macos")]
     {
         let _ = std::process::Command::new("xattr")
@@ -4629,9 +3896,6 @@ fn discard_invalid_binary_transaction(
     Ok(())
 }
 
-/// Complete or roll back the small journaled window required by Windows,
-/// where `rename` cannot atomically replace an existing executable. The old
-/// complete image is never deleted until the signed new image is at `target`.
 fn recover_interrupted_binary_install(target: &Path, expected_version: &str) -> Result<(), String> {
     let journal = binary_install_journal_path(target);
     let journal_metadata = match std::fs::symlink_metadata(&journal) {
@@ -4641,8 +3905,6 @@ fn recover_interrupted_binary_install(target: &Path, expected_version: &str) -> 
     };
 
     let Some(metadata) = journal_metadata else {
-        // Compatibility recovery for an interruption in the old, unjournaled
-        // Windows replacement sequence.
         restore_binary_rollback_if_missing(target)?;
         return Ok(());
     };
@@ -4739,8 +4001,6 @@ fn recover_interrupted_binary_install(target: &Path, expected_version: &str) -> 
         return Ok(());
     }
 
-    // The new image is incomplete or missing. Restore the last complete image
-    // and let normal exact-version logic fetch a fresh signed artifact.
     restore_binary_rollback_if_missing(target)?;
     let _ = std::fs::remove_file(&sidecar);
     let _ = std::fs::remove_file(&journal);
@@ -4794,9 +4054,6 @@ fn install_over_transactional(
     Ok(())
 }
 
-/// Move `tmp` onto `target`. Unix gets a single atomic rename. Windows cannot
-/// replace an existing executable with `rename`, so its fallback writes and
-/// fsyncs a recovery journal before moving the complete old image aside.
 fn install_over(tmp: &Path, target: &Path, expected_sha256: [u8; 32]) -> Result<(), String> {
     if sha256_regular_file(tmp)? != Some(expected_sha256) {
         return Err(format!(
@@ -4814,10 +4071,6 @@ fn install_over(tmp: &Path, target: &Path, expected_sha256: [u8; 32]) -> Result<
     install_over_transactional(tmp, target, expected_sha256)
 }
 
-/// Run `arc-node --version` and return the version token (e.g. "0.5.7").
-/// Returns None if the binary fails to launch (corrupt, wrong arch, missing
-/// Returns true if semver string `a` is strictly greater than `b`.
-/// Compares major.minor.patch numerically. Falls back to false on parse error.
 fn semver_gt(a: &str, b: &str) -> bool {
     let parse = |s: &str| -> Option<(u64, u64, u64)> {
         let mut parts = s.trim().split('.');
@@ -4835,16 +4088,9 @@ fn semver_gt(a: &str, b: &str) -> bool {
     }
 }
 
-/// shared lib) or prints something we can't parse - in either case the caller
-/// should redownload to recover.
 fn read_arc_node_version(binary: &std::path::Path) -> Option<String> {
     let mut cmd = std::process::Command::new(binary);
     cmd.arg("--version");
-    // Windows: suppress the console flash that would otherwise appear
-    // for ~50 ms on every Start/Restart click. Same CREATE_NO_WINDOW
-    // flag as in node_manager::start; see the comment there for the
-    // full rationale (this probe is short-lived so the crash risk is
-    // smaller, but the flicker is user-visible).
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -4856,7 +4102,6 @@ fn read_arc_node_version(binary: &std::path::Path) -> Option<String> {
         return None;
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // Expected format: "arc-node 0.5.7"
     stdout.split_whitespace().nth(1).map(|s| s.to_string())
 }
 
@@ -4892,27 +4137,11 @@ pub(crate) fn resolve_testnet_resources(app: &AppHandle) -> TestnetResources {
     }
 }
 
-// ─── Model download (community inference worker setup) ─────────────────────
-//
-// The desktop's #1 user complaint with v0.5.x: "I joined, I have peers, but
-// I have 0 attestations and 0 earnings." Root cause: onboarding defaulted to
-// `role: "observer"` with `model_path: None`, so node_manager never passed
-// `--community-mode` to arc-node, so the coordinator never dispatched
-// inference to the user. They were a passive validator forever.
-//
-// v0.8.0 downloads only the exact model artifact accepted by the recovered
-// production network. Offering hardware-sized alternatives here is actively
-// harmful: a TinyLlama or 13B worker can load successfully but its model ID can
-// never match a 7B production assignment, leaving the user with a multi-GB
-// download and zero eligible jobs. Other GGUFs may still be selected manually
-// for local inference, but the earning-compatible onboarding path is singular.
 struct ModelTierSpec {
     id: &'static str,
     display_name: &'static str,
     url: &'static str,
     size_bytes: u64,
-    /// SHA-256 from the repository's immutable LFS object ID. URLs may move,
-    /// but a desktop-selected tier must always resolve to these exact bytes.
     sha256: &'static str,
 }
 
@@ -4971,9 +4200,6 @@ fn model_path_for(tier: &str) -> PathBuf {
     models_dir().join(format!("{}.gguf", tier))
 }
 
-/// Sidecar naming used by builds before model downloads became resumable.
-/// Kept for tests that fabricate the leftovers `cleanup_model_download_sidecars`
-/// must still remove; production now resumes from [`model_partial_path`].
 #[cfg(test)]
 fn model_download_sidecar(target: &Path, nonce: u64) -> PathBuf {
     let suffix = format!("download-{}-{nonce:016x}", std::process::id());
@@ -5043,8 +4269,6 @@ fn cleanup_model_download_sidecars(target: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// List the tiers the desktop knows how to auto-download. Frontend uses this
-/// to render the picker.
 #[tauri::command]
 pub async fn list_model_tiers() -> CmdResult<Vec<ModelTierInfo>> {
     Ok(MODEL_TIERS
@@ -5058,30 +4282,15 @@ pub async fn list_model_tiers() -> CmdResult<Vec<ModelTierInfo>> {
         .collect())
 }
 
-/// Recommend the one production-compatible tier only when the machine has
-/// enough RAM. A larger GPU does not make a different model ID eligible.
-///
-/// Returns "none" when the machine isn't strong enough to run any tier
-/// usefully — frontend should offer "verifier-only" mode instead.
 #[tauri::command]
 pub async fn recommended_tier() -> CmdResult<String> {
     Ok(tier_for_ram_gb(hardware::detect().ram_gb).into())
 }
 
-/// The model tier a machine with `ram_gb` of memory can run. The canonical
-/// 7B package needs about 7.8 GB resident plus its KV cache (M1 manifest),
-/// so anything under 16 GB is offered no model rather than a failing one.
-///
-/// `ram_gb` is the marketed size from [`hardware::nominal_ram_gb`], not the
-/// OS-visible total floored to whole GiB: a 16 GB Windows or Linux machine
-/// reports 15.x GiB and must still be offered the model.
 pub(crate) fn tier_for_ram_gb(ram_gb: u64) -> &'static str {
     if ram_gb >= hardware::WORKER_MIN_NOMINAL_RAM_GB { "standard" } else { "none" }
 }
 
-/// Returns `Some(path)` only when the matching tier's GGUF is byte-for-byte
-/// the pinned artifact. Hashing runs off the async worker because these files
-/// are multi-gigabyte. A same-size mutation must never be treated as ready.
 #[tauri::command]
 pub async fn existing_model_for_tier(tier: String) -> CmdResult<Option<String>> {
     let Some(spec) = tier_spec(&tier) else {
@@ -5095,27 +4304,13 @@ pub async fn existing_model_for_tier(tier: String) -> CmdResult<Option<String>> 
     Ok(valid.then(|| p.to_string_lossy().into_owned()))
 }
 
-/// Consecutive attempts without a single new byte before a model download
-/// gives up. Any attempt that saves data resets the count, so a connection
-/// that drops every few minutes still finishes, and whatever is saved stays
-/// on disk for the next start either way.
 const MODEL_DOWNLOAD_MAX_STALLED_ATTEMPTS: u32 = 8;
-/// Times the saved bytes may be discarded, because a mirror cannot continue
-/// them (a `Restart`) or answered from byte 0 instead of resuming (a rewind),
-/// before the download stops instead of re-fetching gigabytes forever.
 const MODEL_DOWNLOAD_MAX_RESTARTS: u32 = 2;
 const MODEL_DOWNLOAD_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(2);
 const MODEL_DOWNLOAD_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
-/// A request or read that delivers nothing for this long is treated as a
-/// dropped connection: Wi-Fi changes, residential NATs, and sleeping laptops
-/// leave sockets half-open rather than closed.
 const MODEL_DOWNLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const MODEL_DOWNLOAD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-/// Free space required beyond the bytes still to download, so completing
-/// the model never fills the disk.
 const MODEL_DOWNLOAD_DISK_MARGIN_BYTES: u64 = 512 * 1024 * 1024;
-/// Emit progress at most every 250ms. Mirror chunks land in 8-64 KB units;
-/// emitting on every chunk would flood the IPC channel and pin the UI thread.
 const MODEL_PROGRESS_EMIT_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug)]
@@ -5134,7 +4329,6 @@ impl ModelDownloadPolicy {
         idle_timeout: MODEL_DOWNLOAD_IDLE_TIMEOUT,
     };
 
-    /// Exponential backoff for the `stalled`-th consecutive failure.
     fn retry_delay(&self, stalled: u32) -> std::time::Duration {
         let exponent = stalled.saturating_sub(1).min(16);
         self.retry_base
@@ -5143,31 +4337,19 @@ impl ModelDownloadPolicy {
     }
 }
 
-/// Why one HTTP attempt of a model download stopped.
 #[derive(Debug)]
 enum ModelAttemptFailure {
-    /// Network trouble: keep the saved bytes and retry from there.
     Transient(String),
-    /// The saved bytes cannot be continued (the mirror ignored or misreported
-    /// the range): discard them and retry from byte 0.
     Restart(String),
-    /// Retrying cannot help: the file is gone, the disk is full, or the
-    /// mirror serves an artifact of the wrong size.
     Fatal(String),
 }
 
-/// How to use a response to `GET` with `Range: bytes=<offset>-`.
 #[derive(Debug, PartialEq, Eq)]
 enum ModelRangePlan {
-    /// Cut the partial file to this length, then append the body. A length
-    /// below the saved bytes is a rewind (the mirror ignored or rejected the
-    /// Range), which the retry loop counts against the restart budget.
     AppendFrom(u64),
-    /// The partial file already holds every byte.
     Complete,
 }
 
-/// Parse `Content-Range: bytes <start>-<end>/<size|*>`.
 fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
     let rest = value.trim().strip_prefix("bytes ")?;
     let (range, size) = rest.split_once('/')?;
@@ -5260,15 +4442,11 @@ fn format_gb(bytes: u64) -> String {
     format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 
-/// The partial file a model download resumes from. Its name carries the
-/// pinned digest, so bytes saved for one artifact are never continued as
-/// another after a pin changes.
 fn model_partial_path(target: &Path, spec: &ModelTierSpec) -> PathBuf {
     let digest_prefix = &spec.sha256[..spec.sha256.len().min(16)];
     target.with_extension(format!("{digest_prefix}.partial"))
 }
 
-/// Remove resumable partials for `target` other than `keep`.
 fn cleanup_model_partials(target: &Path, keep: Option<&Path>) -> Result<(), String> {
     let Some(parent) = target.parent() else {
         return Ok(());
@@ -5300,9 +4478,6 @@ fn cleanup_model_partials(target: &Path, keep: Option<&Path>) -> Result<(), Stri
     Ok(())
 }
 
-/// Open (creating if needed) the partial download and return how many bytes
-/// it already holds. `restart`, or a partial longer than the artifact, cuts
-/// it back to empty.
 async fn prepare_model_partial(partial: &Path, total: u64, restart: bool) -> Result<u64, String> {
     match tokio::fs::symlink_metadata(partial).await {
         Ok(metadata) if !metadata.file_type().is_file() => {
@@ -5365,11 +4540,6 @@ fn model_progress(
     }
 }
 
-/// One HTTP attempt: request the bytes after `offset` and append them to the
-/// partial file. Returns once the partial holds all `total` bytes. When the
-/// mirror answers from an earlier byte than `offset`, the saved bytes from
-/// there are discarded and re-fetched, and `rewound_to` records that start
-/// so the caller can count the rewind whether or not the stream then fails.
 #[allow(clippy::too_many_arguments)]
 async fn model_download_attempt<F>(
     client: &reqwest::Client,
@@ -5421,8 +4591,6 @@ where
         ModelRangePlan::Complete => return Ok(()),
         ModelRangePlan::AppendFrom(start) => start,
     };
-    // A plain write handle positioned at `start`: Windows append-only
-    // handles can neither truncate nor flush to disk.
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .truncate(false)
@@ -5430,10 +4598,6 @@ where
         .await
         .map_err(|error| model_write_failure(partial, error))?;
     if start != offset {
-        // The mirror restarted from byte 0 instead of resuming. The saved
-        // bytes past `start` are discarded and fetched again; report that so
-        // the caller counts it against the restart budget whatever happens
-        // to this stream next.
         *rewound_to = Some(start);
         file.set_len(start)
             .await
@@ -5488,8 +4652,6 @@ where
         }
     }
     .await;
-    // Flush even after a failure: tokio completes writes in the background,
-    // and the next attempt must measure every byte already saved.
     let flushed = file.flush().await;
     streamed?;
     flushed.map_err(|error| model_write_failure(partial, error))?;
@@ -5511,10 +4673,6 @@ where
     Ok(())
 }
 
-/// Fill `partial` with all `total` bytes from `url`, resuming with HTTP Range
-/// requests from whatever an earlier attempt or app run saved. Transient
-/// failures retry with exponential backoff; the partial is never deleted
-/// here, so the next call resumes even after this one gives up.
 async fn download_model_resumable<F>(
     client: &reqwest::Client,
     url: &str,
@@ -5582,12 +4740,6 @@ where
             ),
             None => reason,
         };
-        // A `Restart` discards the saved bytes before the next attempt; a
-        // response that rewound has already discarded and re-fetched them.
-        // Both count against the same budget. Otherwise a mirror that ignores
-        // Range and keeps dropping the connection would re-fetch the file
-        // forever: each slightly longer partial would look like progress
-        // below, and nothing would ever report a `Restart`.
         if restart || rewound_to.is_some() {
             restarts = restarts.saturating_add(1);
             if restarts > MODEL_DOWNLOAD_MAX_RESTARTS {
@@ -5596,7 +4748,6 @@ where
                 ));
             }
         }
-        // Only a resumable attempt that saved new bytes counts as progress.
         stalled = if saved > offset && !restart && rewound_to.is_none() {
             1
         } else {
@@ -5621,8 +4772,6 @@ where
     }
 }
 
-/// Free space a model download lacks: the bytes still to fetch beyond the
-/// saved partial, plus `MODEL_DOWNLOAD_DISK_MARGIN_BYTES`.
 #[derive(Debug, PartialEq, Eq)]
 struct DiskShortfall {
     needed: u64,
@@ -5630,8 +4779,6 @@ struct DiskShortfall {
     dir: PathBuf,
 }
 
-/// The one free-space rule, used before a download starts and before each
-/// background retry. `None` when it fits, or when free space cannot be read.
 async fn model_disk_shortfall(target: &Path, spec: &ModelTierSpec) -> Option<DiskShortfall> {
     let parent = target.parent()?;
     let saved = model_partial_len(&model_partial_path(target, spec)).await;
@@ -5643,7 +4790,6 @@ async fn model_disk_shortfall(target: &Path, spec: &ModelTierSpec) -> Option<Dis
     })
 }
 
-/// The bytes needed when `available` is too little, else `None`.
 fn disk_shortfall(size_bytes: u64, saved_bytes: u64, available: u64) -> Option<u64> {
     let needed = size_bytes
         .saturating_sub(saved_bytes)
@@ -5651,9 +4797,6 @@ fn disk_shortfall(size_bytes: u64, saved_bytes: u64, available: u64) -> Option<u
     (available < needed).then_some(needed)
 }
 
-/// Free bytes needed when a background retry must wait for disk space. A model
-/// file already at its pinned size needs no download (promotion hashes and
-/// reuses it), so it is never short of space.
 async fn background_download_space_needed(tier: &str) -> Option<u64> {
     let spec = tier_spec(tier)?;
     let target = model_path_for(tier);
@@ -5669,7 +4812,6 @@ async fn background_download_space_needed(tier: &str) -> Option<u64> {
     }
 }
 
-/// The production environment of a background promotion tick.
 pub(crate) struct BackgroundPromotionEnv<'a> {
     pub app: &'a AppHandle,
     pub state: &'a AppState,
@@ -5716,9 +4858,6 @@ async fn verify_model_file_blocking(
         .map_err(map_err)?
 }
 
-/// Download, verify, and install `spec` at `target`. Callers hold the
-/// per-target download lock. Only bytes whose size and SHA-256 match the pin
-/// are ever renamed into place; a mismatching download is deleted.
 async fn download_verified_model<F>(
     client: &reqwest::Client,
     spec: &'static ModelTierSpec,
@@ -5730,7 +4869,6 @@ where
     F: FnMut(ModelDownloadProgress),
 {
     let tier = spec.id;
-    // Already downloaded and hash-verified → done.
     if verify_model_file_blocking(target, spec).await? {
         emit(model_progress(
             tier,
@@ -5777,9 +4915,6 @@ where
         ));
     }
 
-    // Atomic rename over any existing target. std::fs::rename uses
-    // MoveFileEx(REPLACE_EXISTING) on Windows since Rust 1.62, so this
-    // works cross-platform.
     std::fs::rename(&partial, target)
         .map_err(|e| format!("rename to {}: {}", target.display(), e))?;
     sync_parent_best_effort(target);
@@ -5793,15 +4928,6 @@ where
     Ok(target.to_string_lossy().into_owned())
 }
 
-/// Download the GGUF for `tier` to ~/.arc/models/<tier>.gguf, streaming
-/// progress events on the `model-download-progress` channel so the UI can
-/// render a real progress bar.
-///
-/// Resumable: bytes are saved to `<tier>.<digest>.partial` and later
-/// attempts (including after an app restart or reboot) continue with an HTTP
-/// Range request instead of starting over. The finished file must match the
-/// pinned size and SHA-256 before an atomic rename, so a crash or mirror
-/// mutation cannot replace a known good model.
 #[tauri::command]
 pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
     let spec = tier_spec(&tier).ok_or_else(|| format!("unknown model tier: {}", tier))?;
@@ -5810,12 +4936,7 @@ pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(map_err)?;
     }
-    // Onboarding and the existing-observer banner can request the same tier
-    // concurrently. Hold one OS-backed per-target lock across recheck,
-    // download, digest verification, fsync, and promotion; a waiter rechecks
-    // the completed target instead of writing the same partial file.
     let _download_guard = acquire_model_download_lock(&target).await?;
-    // Unique sidecars from earlier non-resumable builds are never resumed.
     cleanup_model_download_sidecars(&target)?;
 
     let client = reqwest::Client::builder()
@@ -5835,9 +4956,6 @@ pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
     .await
 }
 
-/// Delete a previously-downloaded model. Frontend uses this when the user
-/// switches tiers (e.g., from `tiny` → `standard`) so we don't leave 600 MB
-/// of dead weight on a laptop with limited disk.
 #[tauri::command]
 pub async fn remove_model(tier: String) -> CmdResult<()> {
     let p = model_path_for(&tier);
@@ -5848,9 +4966,6 @@ pub async fn remove_model(tier: String) -> CmdResult<()> {
     if p.exists() {
         std::fs::remove_file(&p).map_err(map_err)?;
     }
-    // Also clean sidecars from both the legacy deterministic scheme and the
-    // unique create-new scheme after holding the same per-target lock, plus
-    // any resumable partial download.
     let tmp = p.with_extension("download");
     if tmp.exists() {
         let _ = std::fs::remove_file(&tmp);
@@ -5859,9 +4974,6 @@ pub async fn remove_model(tier: String) -> CmdResult<()> {
     cleanup_model_partials(&p, None)?;
     Ok(())
 }
-
-#[allow(dead_code)]
-fn _path_helper(_: &Path) {} // keep `Path` import used if `model_path_for` returns inline
 
 #[cfg(test)]
 mod model_readiness_tests {
@@ -5882,12 +4994,10 @@ mod model_readiness_tests {
             sha256: digest,
         };
         assert_eq!(verify_model_file(&path, &spec), Ok(true));
-        // Same size, one byte flipped: never ready.
         let mut flipped = bytes.clone();
         flipped[3] ^= 1;
         std::fs::write(&path, &flipped).unwrap();
         assert_eq!(verify_model_file(&path, &spec), Ok(false));
-        // Truncated, then missing: not ready either.
         std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
         assert_eq!(verify_model_file(&path, &spec), Ok(false));
         std::fs::remove_file(&path).unwrap();
@@ -5905,8 +5015,6 @@ mod model_readiness_tests {
     #[test]
     fn sixteen_gb_windows_and_linux_readings_are_offered_the_model() {
         const GIB: u64 = 1024 * 1024 * 1024;
-        // What the OS reports on 16 GB machines: macOS exact, Windows and
-        // Linux 15.x GiB, an AMD APU with a 2 GiB frame buffer ~13.9 GiB.
         for visible in [16 * GIB, 159 * GIB / 10, 152 * GIB / 10, 139 * GIB / 10] {
             assert_eq!(
                 tier_for_ram_gb(hardware::nominal_ram_gb(visible)),
@@ -5914,7 +5022,6 @@ mod model_readiness_tests {
                 "{visible} visible bytes"
             );
         }
-        // 8 GB and 12 GB machines are still not offered a model they cannot run.
         for visible in [77 * GIB / 10, 116 * GIB / 10] {
             assert_eq!(
                 tier_for_ram_gb(hardware::nominal_ram_gb(visible)),
@@ -5954,17 +5061,12 @@ mod model_download_tests {
         }))
     }
 
-    /// One scripted response per accepted connection.
     #[derive(Clone, Copy)]
     enum Reply {
-        /// 200 announcing the full length, then the socket closes after
-        /// `send` bytes: a lost connection mid-download.
         FullThenDrop {
             send: usize,
         },
-        /// 200 with the whole payload, ignoring any Range header.
         Full,
-        /// 206 from the requested offset to the end.
         Partial,
         NotFound,
         Unavailable,
@@ -5998,7 +5100,6 @@ mod model_download_tests {
         })
     }
 
-    /// Serve `replies` in order, recording each request's Range start.
     async fn spawn_mirror(
         payload: Vec<u8>,
         replies: Vec<Reply>,
@@ -6089,7 +5190,6 @@ mod model_download_tests {
             plan(206, Some("bytes 100-199/200"), Some(100), 100).unwrap(),
             ModelRangePlan::AppendFrom(100)
         );
-        // The mirror ignored Range or chose to start over.
         assert_eq!(
             plan(200, None, Some(200), 100).unwrap(),
             ModelRangePlan::AppendFrom(0)
@@ -6114,7 +5214,6 @@ mod model_download_tests {
             plan(206, None, None, 100),
             Err(ModelAttemptFailure::Restart(_))
         ));
-        // A different-size artifact can never become the pinned model.
         assert!(matches!(
             plan(206, Some("bytes 100-299/300"), None, 100),
             Err(ModelAttemptFailure::Fatal(_))
@@ -6334,11 +5433,6 @@ mod model_download_tests {
 
     #[tokio::test]
     async fn a_mirror_that_ignores_range_and_keeps_dropping_stops_within_the_restart_budget() {
-        // ARC-48 F5: every reply ignores Range, answers 200 from byte 0 and
-        // drops the connection one byte further than the saved partial. The
-        // partial grew 101, 102, ... bytes, each attempt looked like
-        // progress, and nothing reported a `Restart`, so the loop re-fetched
-        // the file indefinitely. A rewind now spends the restart budget.
         let payload = fixture_payload();
         let saved = 100usize;
         let drops = (1..=10)
@@ -6352,8 +5446,6 @@ mod model_download_tests {
         let target = dir.path().join("standard.gguf");
         let partial = model_partial_path(&target, spec);
         std::fs::write(&partial, &payload[..saved]).unwrap();
-        // More stall budget than rewinds, so only the restart budget can
-        // stop this download.
         let policy = ModelDownloadPolicy {
             max_stalled_attempts: MODEL_DOWNLOAD_MAX_STALLED_ATTEMPTS,
             ..FAST_RETRY
@@ -6362,7 +5454,6 @@ mod model_download_tests {
         let error = download_verified_model(&reqwest::Client::new(), spec, &target, policy, |_| {})
             .await
             .unwrap_err();
-        // Ten replies were scripted; the download must stop long before.
         server.abort();
 
         assert!(error.contains("restarted from byte 0"), "{error}");
@@ -6378,7 +5469,6 @@ mod model_download_tests {
             ranges.windows(2).all(|pair| pair[0] <= pair[1]),
             "every attempt resumed from the saved bytes: {ranges:?}"
         );
-        // Whatever the last response saved is kept for the next run.
         let kept = std::fs::read(&partial).unwrap();
         assert!(
             kept.len() >= saved && kept.len() <= saved + 3,
@@ -6462,7 +5552,6 @@ mod release_binary_tests {
         use crate::start_fence::{check, StartFence};
         assert!(check(None, StartAccess::Ordinary).is_ok());
         let fence = StartFence::MigrationRefused("legacy data directory is a symbolic link".into());
-        // A real refusal blocks startup's own recovery launch too.
         for access in [StartAccess::Ordinary, StartAccess::StartupRecovery] {
             let error = check(Some(&fence), access)
                 .expect_err("an unresolved native migration fence must block every start path");
@@ -6496,12 +5585,12 @@ mod release_binary_tests {
         let tier1 = source_between(
             source,
             "pub async fn tier1_submit(",
-            "/// Read the on-chain state",
+            "pub async fn tier1_result(",
         );
         let paid = source_between(
             source,
             "pub async fn run_paid_inference(",
-            "// `check_for_update`",
+            "pub async fn save_logs(",
         );
 
         for (name, body) in [("tier1_submit", tier1), ("run_paid_inference", paid)] {
@@ -6544,8 +5633,6 @@ mod release_binary_tests {
             );
         }
 
-        // The native command must never be looser than the scope the shipped
-        // capability declares for the WebView's own opener.
         let capability = include_str!("../capabilities/default.json");
         assert!(capability.contains("\"url\": \"https://**\""));
         assert!(capability.contains("\"url\": \"http://**\""));
@@ -6591,8 +5678,6 @@ mod release_binary_tests {
             (estimated <= 3_900).then_some(estimated.max(45))
         }
 
-        // The UTF-8 byte bound accounts for the tokenizer's leading marker
-        // and its expansion of an ASCII space into a three-byte marker.
         let short_prompt = "ARC node";
         assert_eq!(inference_prompt_token_upper_bound(short_prompt), 13);
         assert_eq!(inference_prompt_token_upper_bound("🧪 "), 10);
@@ -6605,11 +5690,6 @@ mod release_binary_tests {
         );
         assert!(short_timeout < 10 * 60, "short prompts stay bounded");
 
-        // At one output token, a long prompt alone can consume almost the
-        // complete coordinator budget. The old output-only calculation gave
-        // this request 105 seconds and cancelled it thousands of seconds too
-        // early. The conservative prompt bound now covers that budget plus
-        // client headroom.
         let long_prompt = "x".repeat(255);
         let long_positions = 1 + inference_prompt_token_upper_bound(&long_prompt) + 1;
         assert_eq!(long_positions, 260);
@@ -6619,9 +5699,6 @@ mod release_binary_tests {
             admitted_coordinator_budget(long_positions).unwrap() + 60
         );
 
-        // One more raw byte crosses the coordinator's admitted deadline. The
-        // desktop saturates at the full 3,900s server cap plus 60s headroom,
-        // including for arithmetic-overflow-scale output requests.
         assert_eq!(inference_timeout(&"x".repeat(256), 1).as_secs(), 3_960);
         assert_eq!(inference_timeout("", u32::MAX).as_secs(), 3_960);
     }
@@ -6801,8 +5878,6 @@ mod release_binary_tests {
         std::fs::write(&sidecar, new).unwrap();
         let journal = write_binary_install_transaction(&sidecar, &target, digest).unwrap();
 
-        // Power loss after Windows moved the old image aside but before the
-        // verified sidecar reached the canonical path.
         std::fs::rename(&target, &rollback).unwrap();
         recover_interrupted_binary_install(&target, EXPECTED_NODE_VERSION).unwrap();
 
@@ -7078,17 +6153,14 @@ mod compute_contribution_tests {
 
     #[test]
     fn nothing_is_downloaded_or_promoted_without_consent() {
-        // Never asked: an observer stays an observer.
         assert_eq!(
             promotion_need(&config("observer", None, None), 16),
             PromotionNeed::NoConsent
         );
-        // An explicit no wins even with a model already on disk.
         assert_eq!(
             promotion_need(&config("observer", Some("/m.gguf"), Some(false)), 64),
             PromotionNeed::NoConsent
         );
-        // The default config's "worker" role without a model is not consent.
         assert!(!compute_contribution_enabled(&NodeConfig::default()));
         assert_eq!(
             promotion_need(&NodeConfig::default(), 64),
@@ -7148,7 +6220,6 @@ mod compute_contribution_tests {
             disk_shortfall(size, 0, size + margin - 1),
             Some(size + margin)
         );
-        // Saved bytes are kept and need no new room.
         assert_eq!(disk_shortfall(size, size - 1, margin + 1), None);
         assert_eq!(disk_shortfall(size, size - 1, margin), Some(margin + 1));
     }
@@ -7166,12 +6237,9 @@ mod compute_contribution_tests {
         withdraw_compute_consent(&mut worker);
         assert_eq!(worker.compute_consent, Some(false));
         assert_eq!(worker.role, "observer");
-        // No --model for an observer that said no: it would still hold the
-        // model in memory without taking jobs.
         assert_eq!(worker.model_path, None);
         assert_eq!(promotion_need(&worker, 64), PromotionNeed::NoConsent);
 
-        // Turning it back on promotes again (reusing the verified file).
         worker.compute_consent = Some(true);
         assert_eq!(promotion_need(&worker, 16), PromotionNeed::Promote);
     }
@@ -7218,15 +6286,12 @@ mod compute_contribution_tests {
         assert!(compute_contribution_enabled(&config));
     }
 
-    /// What `NodeManager::start` reads to decide on `--model` and
-    /// `--community-mode`: a worker launch needs both.
     fn launches_as_worker(config: &NodeConfig) -> bool {
         config.role == "worker" && config.model_path.is_some()
     }
 
     #[test]
     fn a_settings_save_cannot_restore_consent_the_user_withdrew() {
-        // Onboarding recorded a consented worker.
         let mut store = Store::default();
         apply_webview_config_save(
             &mut store,
@@ -7234,15 +6299,9 @@ mod compute_contribution_tests {
             ConfigSave::Onboarding,
         );
 
-        // The user turns contribution off. This is the write
-        // `set_compute_contribution(false)` makes before it awaits the node
-        // restart.
         let withdrawn = update_stored_config_in(&mut store, withdraw_compute_consent);
         assert_eq!(withdrawn.compute_consent, Some(false));
 
-        // While that restart is pending, Settings saves a port change from
-        // the snapshot it took before the switch: still consent, worker
-        // mode and the model path.
         let stale = NodeConfig {
             rpc_port: 10_001,
             ..config("worker", Some("/m.gguf"), Some(true))
@@ -7252,10 +6311,7 @@ mod compute_contribution_tests {
         let dir = tempfile::tempdir().unwrap();
         store.save_to(dir.path()).unwrap();
         let persisted = Store::load_from(dir.path()).config.unwrap();
-        // The preference itself is saved ...
         assert_eq!(persisted.rpc_port, 10_001);
-        // ... and the refusal stands: no consent, observer, no model, so
-        // the next start has nothing to promote and no `--model`.
         assert_eq!(persisted.compute_consent, Some(false));
         assert_eq!(persisted.role, "observer");
         assert_eq!(persisted.model_path, None);
@@ -7272,8 +6328,6 @@ mod compute_contribution_tests {
             config("observer", None, Some(false)),
             ConfigSave::Onboarding,
         );
-        // "Turn it on": the consent write, then the promotion that follows
-        // the model download, then keep-awake.
         update_stored_config_in(&mut store, |config| config.compute_consent = Some(true));
         update_stored_config_in(&mut store, |config| {
             config.role = "worker".into();
@@ -7300,9 +6354,6 @@ mod compute_contribution_tests {
 
     #[test]
     fn onboarding_records_its_choice_and_a_first_save_is_kept() {
-        // A WebView from before `complete_onboarding` finishes its wizard
-        // through `save_config`: with nothing stored, that is the first
-        // answer and is kept.
         let mut store = Store::default();
         apply_webview_config_save(
             &mut store,
@@ -7313,9 +6364,6 @@ mod compute_contribution_tests {
         assert_eq!(first.compute_consent, Some(true));
         assert!(launches_as_worker(&first));
 
-        // "Reset onboarding" re-runs the wizard over the existing store: its
-        // explicit no is recorded, and the keep-awake answer the wizard never
-        // asks about is kept.
         update_stored_config_in(&mut store, |config| {
             config.prevent_sleep_during_jobs = Some(true)
         });
@@ -7332,9 +6380,6 @@ mod compute_contribution_tests {
         assert!(!launches_as_worker(&persisted));
     }
 
-    /// The wizard never asks about unattended installs. A first run takes
-    /// the default; "Reset onboarding" keeps the stored answer, so it can't
-    /// turn an "off" back on. Only Settings changes it.
     #[test]
     fn a_rerun_wizard_keeps_the_unattended_install_answer() {
         let mut store = Store::default();
@@ -7352,7 +6397,6 @@ mod compute_contribution_tests {
         apply_webview_config_save(&mut store, off, ConfigSave::Preferences);
         assert!(!store.config.as_ref().unwrap().auto_install_updates);
 
-        // The re-run wizard submits the WebView default, which is on.
         apply_webview_config_save(
             &mut store,
             config("worker", Some("/m.gguf"), Some(true)),
@@ -7368,9 +6412,6 @@ mod compute_contribution_tests {
         assert!(store.config.as_ref().unwrap().auto_install_updates);
     }
 
-    /// The launch could not save the one-time default, so it recorded no
-    /// marker. A Settings "off" saved afterwards is the user's answer and must
-    /// survive the next launch.
     #[test]
     fn a_saved_settings_answer_is_never_overridden_by_the_one_time_default() {
         let dir = tempfile::tempdir().unwrap();
@@ -7418,10 +6459,8 @@ mod compute_contribution_tests {
     #[test]
     fn only_a_setup_that_turns_compute_on_without_a_core_count_takes_the_cap() {
         assert!(takes_setup_core_default(&config("observer", None, Some(true))));
-        // Compute off, or never asked: no cap is invented.
         assert!(!takes_setup_core_default(&config("observer", None, Some(false))));
         assert!(!takes_setup_core_default(&config("observer", None, None)));
-        // A count the save already carries stays.
         let named = NodeConfig {
             worker_threads: Some(10),
             ..config("observer", None, Some(true))
@@ -7429,8 +6468,6 @@ mod compute_contribution_tests {
         assert!(!takes_setup_core_default(&named));
     }
 
-    /// What `complete_onboarding` saves for `submitted` on a computer with
-    /// `logical_cores`.
     fn complete_setup(store: &mut Store, submitted: NodeConfig, logical_cores: u32) {
         let mut submitted = submitted;
         apply_setup_core_default(&mut submitted, logical_cores);
@@ -7439,8 +6476,6 @@ mod compute_contribution_tests {
 
     #[test]
     fn a_new_install_that_contributes_compute_starts_at_a_quarter_of_the_cores() {
-        // Setup with the switch left on: an observer until the background
-        // download makes it a worker, consenting, capped at 6 of 24 cores.
         let mut store = Store::default();
         complete_setup(&mut store, config("observer", None, Some(true)), 24);
         let saved = store.config.clone().unwrap();
@@ -7448,14 +6483,12 @@ mod compute_contribution_tests {
         assert_eq!(saved.worker_threads, Some(6));
         assert_eq!(promotion_need(&saved, 16), PromotionNeed::Promote);
 
-        // The promotion after the download keeps the cap the node runs with.
         update_stored_config_in(&mut store, |config| {
             config.role = "worker".into();
             config.model_path = Some("/m.gguf".into());
         });
         assert_eq!(store.config.unwrap().worker_threads, Some(6));
 
-        // Setup with the switch off stores no cap.
         let mut skipped = Store::default();
         complete_setup(&mut skipped, config("observer", None, Some(false)), 24);
         assert_eq!(skipped.config.unwrap().worker_threads, None);
@@ -7465,22 +6498,16 @@ mod compute_contribution_tests {
     fn a_rerun_setup_keeps_the_core_count_already_stored() {
         let mut store = Store::default();
         complete_setup(&mut store, config("observer", None, Some(true)), 24);
-        // The person raises it with the slider (what `set_worker_threads`
-        // writes before it applies the count).
         update_stored_config_in(&mut store, |config| config.worker_threads = Some(12));
 
-        // "Reset onboarding", switch left on: the default does not replace
-        // the chosen count ...
         complete_setup(&mut store, config("observer", None, Some(true)), 24);
         assert_eq!(store.config.as_ref().unwrap().worker_threads, Some(12));
-        // ... nor does a re-run that switches compute off.
         complete_setup(&mut store, config("observer", None, Some(false)), 24);
         assert_eq!(store.config.as_ref().unwrap().worker_threads, Some(12));
     }
 
     #[test]
     fn existing_installs_keep_their_core_count_and_consent() {
-        // A store written before setup stored a cap: every core, compute off.
         let existing: NodeConfig = serde_json::from_value(serde_json::json!({
             "role": "observer",
             "modelPath": null,
@@ -7498,7 +6525,6 @@ mod compute_contribution_tests {
             ..Store::default()
         };
 
-        // A Settings save, even from a snapshot with a count, changes neither.
         let stale = NodeConfig {
             rpc_port: 10_001,
             worker_threads: Some(3),
@@ -7510,8 +6536,6 @@ mod compute_contribution_tests {
         assert_eq!(persisted.compute_consent, Some(false));
         assert_eq!(persisted.worker_threads, None);
 
-        // Turning compute on in Settings, and the promotion after it, keep
-        // every core: only setup stores the default.
         update_stored_config_in(&mut store, |config| config.compute_consent = Some(true));
         update_stored_config_in(&mut store, |config| {
             config.role = "worker".into();
@@ -7519,8 +6543,6 @@ mod compute_contribution_tests {
         });
         assert_eq!(store.config.as_ref().unwrap().worker_threads, None);
 
-        // A count set with the slider survives a later Settings save that
-        // carries none.
         update_stored_config_in(&mut store, |config| config.worker_threads = Some(8));
         apply_webview_config_save(
             &mut store,
@@ -7529,8 +6551,6 @@ mod compute_contribution_tests {
         );
         assert_eq!(store.config.unwrap().worker_threads, Some(8));
     }
-
-    // ── The one-time question for an existing install ──
 
     fn test_identity() -> Identity {
         Identity {
@@ -7541,7 +6561,6 @@ mod compute_contribution_tests {
         }
     }
 
-    /// An install that finished setup earlier: an identity and a config.
     fn existing_install(role: &str, model: Option<&str>, consent: Option<bool>) -> Store {
         Store {
             identity: Some(test_identity()),
@@ -7592,7 +6611,7 @@ mod compute_contribution_tests {
             store.config.as_mut().unwrap().worker_threads = threads;
             assert!(apply_compute_default(&mut store, 64, 24, false));
             let config = store.config.as_ref().unwrap();
-            assert_eq!(config.worker_threads, threads); // None still means all cores.
+            assert_eq!(config.worker_threads, threads);
             assert_eq!(config.compute_consent, Some(true));
             assert!(!config.compute_default_notice_pending);
             assert_eq!(promotion_need(config, 64), PromotionNeed::Ready);
@@ -7697,7 +6716,7 @@ mod compute_contribution_tests {
     #[test]
     fn sharing_notice_survives_claims_and_old_marker_until_rendered_once() {
         let dir = tempfile::tempdir().unwrap();
-        record_compute_prompt(dir.path()).unwrap(); // Old unseen question must not suppress the notice.
+        record_compute_prompt(dir.path()).unwrap();
         let mut store = existing_install("observer", None, None);
         apply_compute_default(&mut store, 16, 24, false);
         store.save_to(dir.path()).unwrap();
@@ -7743,21 +6762,17 @@ mod compute_contribution_tests {
 
     #[test]
     fn turning_it_on_stores_what_a_setup_that_leaves_compute_on_stores() {
-        // Every core before; a quarter of 24 cores after, and the promotion
-        // that follows is the one setup takes.
         let mut said_no = config("observer", None, Some(false));
         turn_on_compute(&mut said_no, 24);
         assert_eq!(said_no.compute_consent, Some(true));
         assert_eq!(said_no.worker_threads, Some(6));
         assert_eq!(promotion_need(&said_no, 16), PromotionNeed::Promote);
 
-        // Never asked, and a computer with fewer than four cores: one core.
         let mut never_asked = config("observer", None, None);
         turn_on_compute(&mut never_asked, 3);
         assert_eq!(never_asked.compute_consent, Some(true));
         assert_eq!(never_asked.worker_threads, Some(1));
 
-        // A count someone chose stays, whatever the core count.
         let mut chosen = NodeConfig {
             worker_threads: Some(10),
             ..config("observer", None, Some(false))
@@ -7766,8 +6781,6 @@ mod compute_contribution_tests {
         assert_eq!(chosen.compute_consent, Some(true));
         assert_eq!(chosen.worker_threads, Some(10));
 
-        // It is stored under the lock like the Settings switch, and a later
-        // preference save from a stale snapshot cannot take it back.
         let mut store = Store {
             config: Some(config("observer", None, Some(false))),
             ..Store::default()
@@ -7786,9 +6799,6 @@ mod compute_contribution_tests {
 
 #[cfg(test)]
 mod start_fence_tests {
-    //! The launch-time start fence through `AppState`: the v0.8.12 deadlock,
-    //! where startup's recovery launch refused itself, and the transitions
-    //! that replace it.
     use super::{
         app_update_boundary, local_rpc_port, require_data_migration_ready, require_start_fence,
         run_inference_local_inner, start_block, try_local_rpc_port, StartTransaction,
@@ -7836,7 +6846,6 @@ mod start_fence_tests {
         assert_eq!(config.role, "observer");
         let saved = crate::store::Store::load_for_owner_probe(directory.path()).unwrap();
         assert_eq!(saved.config.unwrap().compute_consent, Some(false));
-        // Permitting settings does not permit an ordinary node start.
         assert!(require_start_fence(&state, StartAccess::Ordinary).await.is_err());
     }
 
@@ -7868,27 +6877,19 @@ mod start_fence_tests {
         &tail[..tail.find(end).expect("end marker")]
     }
 
-    /// The stuck state users hit. Startup holds the launch-time fence while
-    /// its recovery launch runs. That launch used to check the fence the
-    /// way a WebView click does, so it was refused with the fence's own
-    /// "in progress" text, and startup then kept that refusal as
-    /// "managed-node durability recovery failed: ..." on every launch.
     #[tokio::test]
     async fn startup_recovery_is_not_refused_by_its_own_launch_fence() {
         let state = state_with(Some(at_launch(None)));
 
-        // What the recovery launch got before this fix (ordinary access).
         let before = require_start_fence(&state, StartAccess::Ordinary)
             .await
             .unwrap_err();
         assert!(before.contains("startup reconciliation is still in progress"));
 
-        // The recovery-only transaction now passes its own launch fence.
         assert_eq!(
             require_start_fence(&state, StartTransaction::StartupRecoveryOnly.fence_access()).await,
             Ok(())
         );
-        // WebView Start/Retry, auto-start and every other entrypoint still wait.
         assert!(
             require_start_fence(&state, StartTransaction::Start.fence_access())
                 .await
@@ -7911,8 +6912,6 @@ mod start_fence_tests {
         );
     }
 
-    /// A recovery that really fails stays fail-closed for every caller, and
-    /// reports its own reason instead of a nested copy of the launch fence.
     #[tokio::test]
     async fn a_failed_startup_recovery_refuses_every_caller_with_its_reason() {
         let state = state_with(Some(at_launch(None)));
@@ -7928,8 +6927,6 @@ mod start_fence_tests {
         }
     }
 
-    /// The fence cannot tell callers apart, so pin which transaction each
-    /// entrypoint runs: only launch reconciliation may pass its own fence.
     #[test]
     fn only_launch_reconciliation_runs_the_recovery_only_transaction() {
         let source = include_str!("commands.rs");
@@ -7948,7 +6945,7 @@ mod start_fence_tests {
             (
                 "autostart_node_inner",
                 "pub(crate) async fn autostart_node_inner(",
-                "/// Launch-time reconciliation's recovery launch.",
+                "pub(crate) async fn recover_managed_shutdown_inner(",
             ),
         ] {
             let body = body_between(source, start, end);
@@ -7964,10 +6961,6 @@ mod start_fence_tests {
         assert!(!gate.contains("StartupRecovery"));
     }
 
-    /// The trap behind the stuck reports: a refusal closed the app update
-    /// too, so the release with the fix could not install. The update now
-    /// takes the fenced boundary while Start, auto-start, Restart and Ensure
-    /// binary keep refusing.
     #[tokio::test]
     async fn a_refusal_lets_the_app_update_through_and_keeps_node_starts_closed() {
         let state = state_with(Some(at_launch(None)));
@@ -7987,9 +6980,6 @@ mod start_fence_tests {
         );
     }
 
-    /// Home reads what a Start would be told, and its chat skips the local
-    /// node, without waiting on the node mutex that a launch recovery or a
-    /// stop holds for minutes.
     #[tokio::test]
     async fn home_never_waits_on_the_node_mutex() {
         let state = state_with(Some(at_launch(None)));
@@ -8009,17 +6999,14 @@ mod start_fence_tests {
             .err()
             .expect("a busy node mutex skips the local node");
         assert!(skipped.starts_with(INFERENCE_PRE_DISPATCH_UNAVAILABLE));
-        // The network fallback skips it too: a node being stopped can still
-        // answer /health and then exit under the one POST.
         assert_eq!(try_local_rpc_port(&state), None);
         let candidates = body_between(
             include_str!("commands.rs"),
             "async fn coordinator_candidates(",
-            "/// Once the session has either displayed",
+            "async fn established_chain_origin(",
         );
         assert!(candidates.contains("if let Some(port) = try_local_rpc_port(state) {"));
         assert!(!candidates.contains("local_rpc_port(state).await"));
-        // Recognising the local node's address still works.
         assert_eq!(local_rpc_port(&state).await, NodeConfig::default().rpc_port);
         let rpc_port = lifecycle_step.rpc_port;
         drop(lifecycle_step);
@@ -8042,9 +7029,6 @@ mod start_fence_tests {
         );
     }
 
-    /// Pin which rule each entrypoint uses: the two app-update entrypoints
-    /// pass a refusal, and nothing that starts arc-node or replaces its
-    /// binary does.
     #[test]
     fn only_the_app_update_entrypoints_pass_a_refusal() {
         let source = include_str!("commands.rs");
@@ -8052,20 +7036,18 @@ mod start_fence_tests {
             (
                 "prepare_update_relaunch",
                 "pub async fn prepare_update_relaunch(",
-                "/// Unattended updates require",
+                "pub async fn try_prepare_auto_update_relaunch(",
             ),
             (
                 "try_prepare_auto_update_relaunch",
                 "pub async fn try_prepare_auto_update_relaunch(",
-                "/// Seal the one-way native updater boundary",
+                "pub async fn begin_update_handoff(",
             ),
         ] {
             let body = body_between(source, start, end);
             assert!(body.contains("app_update_boundary(&state)"), "{name}");
             assert!(body.contains("prepare_fenced_update_relaunch()"), "{name}");
             assert!(!body.contains("require_data_migration_ready"), "{name}");
-            // A wait for launch reconciliation cancels nothing, and the fenced
-            // path cancels auto-start only once its lease is taken.
             let boundary_at = body.find("app_update_boundary(&state)").unwrap();
             let first_cancel = body.find("state.cancel_startup_retry()").unwrap();
             assert!(boundary_at < first_cancel, "{name}");
@@ -8089,11 +7071,6 @@ mod start_fence_tests {
         }
     }
 
-    /// A copy the updater can't replace (the mounted .dmg, a translocated
-    /// download, another volume) failed its install only after the node had
-    /// stopped and the handoff had begun. Both app-update entrypoints check
-    /// where ARC runs first, so a refusal leaves the node and the update as
-    /// they were.
     #[test]
     fn both_app_update_entrypoints_check_where_arc_runs_before_anything_else() {
         let source = include_str!("commands.rs");
@@ -8101,12 +7078,12 @@ mod start_fence_tests {
             (
                 "prepare_update_relaunch",
                 "pub async fn prepare_update_relaunch(",
-                "/// Unattended updates require",
+                "pub async fn try_prepare_auto_update_relaunch(",
             ),
             (
                 "try_prepare_auto_update_relaunch",
                 "pub async fn try_prepare_auto_update_relaunch(",
-                "/// Seal the one-way native updater boundary",
+                "pub async fn begin_update_handoff(",
             ),
         ] {
             let body = body_between(source, start, end);
@@ -8128,15 +7105,11 @@ mod start_fence_tests {
         let check = body_between(
             source,
             "fn refuse_update_from_wrong_location(",
-            "/// The fence check for every WebView entrypoint",
+            "async fn require_data_migration_ready(",
         );
         assert!(check.contains("crate::update_location::refusal()"));
     }
 
-    /// Start and Restart refuse while an app update holds the node before
-    /// they reach the lifecycle owner lock, or Restart's stop. That lock is
-    /// the update's own fence, and failing against it was reported as
-    /// "another ARC desktop currently owns the managed node lifecycle".
     #[test]
     fn start_and_restart_refuse_an_update_held_node_before_the_owner_lock() {
         let source = include_str!("commands.rs");
@@ -8150,7 +7123,7 @@ mod start_fence_tests {
             (
                 "restart_node_inner",
                 "pub(crate) async fn restart_node_inner(",
-                "// ── Compute contribution",
+                "pub(crate) const COMPUTE_CONSENT_REQUIRED: &str =",
                 "node.stop().await",
             ),
         ] {
@@ -8171,9 +7144,6 @@ mod start_fence_tests {
     }
 }
 
-/// Review finding 1 at the IPC entrypoints: Home's Update and the unattended
-/// updater both get past an exhausted crash budget's slow wait, and the
-/// retry they set aside never launches a node.
 #[cfg(test)]
 mod slow_crash_wait_update_tests {
     use super::*;
@@ -8222,8 +7192,6 @@ mod slow_crash_wait_update_tests {
                 *state.data_migration_error.lock().await =
                     Some(crate::start_fence::StartFence::OtherDesktop);
             }
-            // A concurrent start/stop can hold this lock. Neither refusal may
-            // wait for it, expose its retry schedule, or reach any RPC host.
             let node = state.node.lock().await;
             assert!(node.crash_retry_in_secs().is_some());
             let status = tokio::time::timeout(
@@ -8270,7 +7238,6 @@ mod slow_crash_wait_update_tests {
     #[tokio::test]
     async fn unattended_update_prepares_during_a_slow_crash_wait() {
         if !update_install_policy().await.unwrap().can_install {
-            // Package-managed Linux installs never self-update.
             return;
         }
         let (root, state) = slow_wait_state("unattended");

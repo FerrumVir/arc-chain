@@ -4,15 +4,6 @@ import { PLAIN_COPY } from "../lib/plain-copy";
 
 const COPIED_RESET_MS = 2_500;
 
-/**
- * One plain sentence about a problem, its one fix, and the native text one
- * click away. The same shape as the start-failure panel and the node strip on
- * Home: the sentence is the message, the raw text is never the headline, and
- * it can still be copied as it is for a report.
- *
- * `tone` "attention" is a real problem with a fix; "status" is something worth
- * knowing that nothing is wrong with.
- */
 export function ProblemNotice({
   title,
   body,
@@ -27,18 +18,15 @@ export function ProblemNotice({
 }: {
   title: string;
   body?: ReactNode;
-  /** The native text, shown under "Show details" and copied by "Copy details". */
   details?: string | null;
   detailsOpen?: boolean;
   tone?: "attention" | "status";
-  /** The one fix, already rendered as a button. */
   actions?: ReactNode;
   onDismiss?: () => void;
   dismissLabel?: string;
   dismissTestId?: string;
   testId?: string;
 }) {
-  // A toggle applies to the text it was made on; new text starts from the default.
   const [toggled, setToggled] = useState<{ details: string; open: boolean } | null>(null);
   const open = toggled !== null && toggled.details === details ? toggled.open : detailsOpen;
   const [copied, setCopied] = useState<"idle" | "copied" | "failed">("idle");
@@ -52,7 +40,6 @@ export function ProblemNotice({
 
   const copyDetails = () => {
     if (!details) return;
-    // Without a clipboard API the call throws before returning a promise.
     void Promise.resolve()
       .then(() => navigator.clipboard.writeText(details))
       .then(
@@ -123,7 +110,6 @@ export function ProblemNotice({
             </button>
           )}
         </div>
-        {/* The copy result, announced on its own. */}
         <span className="sr-only" aria-live="polite">
           {copied === "copied"
             ? PLAIN_COPY.actions.copied

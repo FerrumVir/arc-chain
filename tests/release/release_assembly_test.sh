@@ -152,8 +152,6 @@ complete_fixture_produces_verifiable_contract() {
         return 1
     }
 
-    # Published install guides pin an older tag. The candidate release must
-    # still ship this tree's installer, covered by its own manifest below.
     if ! cmp -s "$REPO_ROOT/install.sh" "$sandbox/output/install.sh"; then
         printf 'assembled release does not ship the current tree installer\n'
         return 1
@@ -637,8 +635,6 @@ assembler_preserves_unowned_and_last_good_outputs() {
 }
 
 cutover_fixture_ignores_parent_release_profile() (
-    # The release workflow exports its production profile to all quality gates.
-    # These fixtures exercise cutover assembly even during an existing-chain update.
     export RELEASE_PROFILE=existing-recovered-chain-update-v1
     complete_fixture_produces_verifiable_contract
 )

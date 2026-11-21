@@ -1,9 +1,3 @@
-//! One private Unix-socket daemon per resident bundle, shared by SSH relays.
-//! Daemon: tensor_row_shared_worker serve --rows-dir PATH --artifact HASH
-//!         --socket /private/owned-0700-directory/rows.sock [--max-clients 8]
-//! Relay (the cohort's SSH command): tensor_row_shared_worker relay --socket PATH
-//! This exposes no TCP listener and does not cache inference results.
-
 #[cfg(unix)]
 fn main() -> Result<(), String> {
     use arc_inference::row_service::{
@@ -58,8 +52,6 @@ fn main() -> Result<(), String> {
         return Err("mode must be serve or relay".into());
     }
     if std::env::var("ARC_QUALIFICATION_SIMD_CENSUS").as_deref() == Ok("1") {
-        // Diagnostic-only qualification path. Normal production starts leave
-        // the census disabled; this adds atomic counter work during inference.
         arc_inference::canonical_simd::reset_projection_census();
         arc_inference::canonical_simd::set_projection_census_enabled(true);
     }
@@ -85,8 +77,6 @@ fn main() -> Result<(), String> {
         }
     }
     limits.validate().map_err(|e| e.to_string())?;
-    // No connection can trigger a model load: the socket is reserved before
-    // loading, and connections are accepted only after that single load.
     let (_socket, listener) = PrivateRowSocket::bind(socket).map_err(|e| e.to_string())?;
     let bundle = match (values.get("--manifest"), values.get("--manifest-blake3")) {
         (None, None) => SharedRowBundle::load(rows, artifact),
@@ -99,8 +89,6 @@ fn main() -> Result<(), String> {
     }
     .map_err(|e| e.to_string())?;
     let service = SharedRowService::new(bundle, limits).map_err(|e| e.to_string())?;
-    // SAFETY: handlers only store into a lock-free AtomicBool, perform no
-    // allocation or I/O, and remain alive for the process lifetime.
     unsafe {
         libc::signal(libc::SIGTERM, stop as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, stop as *const () as libc::sighandler_t);

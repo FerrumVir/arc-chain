@@ -1,14 +1,5 @@
-// Integer matmul compute shader for on-chain inference.
-// Processes i8 weights packed as u32 (4 values per u32).
-// Each thread computes one output row's dot product.
-//
-// Weights: [out_size × in_size/4] u32 (packed i8×4)
-// Input: [in_size/4] u32 (packed i8×4)
-// Output: [out_size] i32 (scaled accumulator)
-// Scales: per-row i32 scale factors
-
 struct Params {
-    in_size: u32,     // actual number of i8 elements
+    in_size: u32,
     out_size: u32,
     scale_offset: u32,
     _pad: u32,
@@ -20,11 +11,9 @@ struct Params {
 @group(0) @binding(3) var<uniform> params: Params;
 @group(0) @binding(4) var<storage, read> scales: array<i32>;
 
-// Extract signed i8 from packed u32
 fn extract_i8(packed: u32, idx: u32) -> i32 {
     let shift = idx * 8u;
     let byte = (packed >> shift) & 0xFFu;
-    // Sign extend: if bit 7 is set, subtract 256
     return i32(byte) - i32((byte >> 7u) * 256u);
 }
 
@@ -42,7 +31,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var acc2: i32 = 0;
     var acc3: i32 = 0;
 
-    // 4-way ILP: process 4 packed u32s (16 i8 values) per iteration
     let quads = packed_cols / 4u;
     for (var j: u32 = 0u; j < quads; j = j + 1u) {
         let j4 = j * 4u;
@@ -65,7 +53,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     var acc = acc0 + acc1 + acc2 + acc3;
 
-    // Remainder
     for (var j = quads * 4u; j < packed_cols; j = j + 1u) {
         let w = weights[row_off + j];
         let i = input_data[j];

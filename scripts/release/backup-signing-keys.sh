@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# Create a create-only, encrypted, immediately restore-tested backup of the two
-# long-lived ARC release signing keys. The passphrase is supplied only through
-# ARC_SIGNING_BACKUP_PASSPHRASE and is removed from the child-process
-# environment before GnuPG is invoked.
 set +x
 set -Eeuo pipefail
 ulimit -c 0
@@ -90,8 +86,6 @@ printf '%s' "$PASSPHRASE" | gpg \
     "$WORK_DIR/signing-keys.tar"
 install -m 600 -- "$WORK_DIR/signing-keys.tar.gpg" "$OUTPUT"
 
-# A backup is not accepted until the just-written ciphertext restores and both
-# private keys compare byte-for-byte with their sources.
 printf '%s' "$PASSPHRASE" | gpg \
     --batch \
     --yes \

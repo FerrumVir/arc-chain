@@ -1,5 +1,3 @@
-//! Setup is complete only when both identity and configuration are saved.
-//! A login launch must leave unfinished setup visible.
 pub(crate) fn hide_on_launch(
     minimized: bool,
     has_tray: bool,

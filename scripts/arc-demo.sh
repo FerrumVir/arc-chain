@@ -1,22 +1,4 @@
 #!/usr/bin/env bash
-# ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain - Sharded Inference Demo (one command)
-#
-# This inspects one explicitly selected coordinator and labels the evidence it
-# actually returns. It does not establish that the public fleet shares one
-# canonical chain.
-#
-#   1. Discover the shard pipeline from /shards
-#   2. Run a real sharded inference and show every per-hop trace entry
-#   3. Re-run the same prompt and verify the hash is identical (determinism)
-#   4. Run a different prompt and verify the hash is different (isolation)
-#
-# Usage from a reviewed checkout:
-#   ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-demo.sh
-#
-#   # Or against a different coordinator:
-#   ARC_COORDINATOR=http://your-node:9090 bash arc-demo.sh
-# ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
 if [ -z "${ARC_COORDINATOR:-}" ]; then
@@ -25,19 +7,11 @@ if [ -z "${ARC_COORDINATOR:-}" ]; then
     exit 78
 fi
 COORDINATOR="$ARC_COORDINATOR"
-# 2026-04-27: the prior B prompt "The capital of France is" reliably
-# triggered a model-side collision with PROMPT_A on the testnet build -
-# both prompts produced identical output tokens for medium-length
-# 5-word inputs. A user-reported issue ("Hashes collided or B failed").
-# Switched to a structurally-distinct B prompt so the isolation check
-# produces an honest verdict rather than a misleading false negative.
-# Tracked separately as a model-determinism bug in the int8 forward.
 PROMPT_A="${ARC_PROMPT:-The largest planet is}"
 PROMPT_B="${ARC_PROMPT_B:-Pizza recipe ingredients include}"
 MAX_TOKENS="${ARC_MAX_TOKENS:-12}"
 TIMEOUT="${ARC_TIMEOUT:-300}"
 
-# Colors (only if stdout is a TTY)
 if [ -t 1 ]; then
     BOLD=$'\033[1m' DIM=$'\033[2m' RESET=$'\033[0m'
     GREEN=$'\033[32m' CYAN=$'\033[36m' YELLOW=$'\033[33m'
@@ -58,7 +32,6 @@ ${BOLD}${MAGENTA}
   ╚════════════════════════════════════════════════════════════╝${RESET}
 BANNER
 
-# Check we have python3 + curl
 if ! command -v curl >/dev/null; then
     printf "%s[FAIL]%s curl is not installed.\n" "$RED" "$RESET" >&2
     exit 1
@@ -72,13 +45,11 @@ printf "%sCoordinator:%s %s\n" "$DIM" "$RESET" "$COORDINATOR"
 printf "%sPrompts:%s     '%s'  +  '%s'\n" "$DIM" "$RESET" "$PROMPT_A" "$PROMPT_B"
 printf "%sMax tokens:%s  %s\n" "$DIM" "$RESET" "$MAX_TOKENS"
 
-# Build a JSON body for an inference request, properly escaping the prompt.
 build_body() {
     local prompt="$1" tokens="$2"
     python3 -c 'import json,sys; print(json.dumps({"input": sys.argv[1], "max_tokens": int(sys.argv[2])}))' "$prompt" "$tokens"
 }
 
-# ── 1. Discover the pipeline ────────────────────────────────────────────────
 section "1. Discover the shard pipeline"
 
 REGISTRY=$(curl -sf -m 30 "${COORDINATOR}/shards" 2>/dev/null || echo "")
@@ -115,7 +86,6 @@ for i, s in enumerate(shards):
     print(f"  #{i:<2} {s['node_name']:<6} {layers:<10} {count:<6} {mem:<10}  {s['socket_addr']}")
 PYEOF
 
-# ── 2. Run the sharded inference ────────────────────────────────────────────
 section "2. Run sharded inference"
 printf "  prompt: %s%s%s\n\n" "$BOLD" "$PROMPT_A" "$RESET"
 printf "  %s▶%s sending request through pipeline...\n" "$YELLOW" "$RESET"
@@ -162,7 +132,6 @@ for hop in d.get("shard_trace", []):
     typ = "TOKEN" if hop.get("is_terminal") else "hidden"
     print(f"    {h:<3} {n:<6} {lay:<10} {cm:<10} {wm:<10} {pb:<10} {typ}")
 
-# Honesty notes about what this table does and does not cover.
 traced = sum(hop.get("wall_ms", 0) or 0 for hop in d.get("shard_trace", []))
 total = d.get("total_ms", 0) or 0
 if not any_payload:
@@ -177,15 +146,9 @@ if total and traced and traced < total * 0.95:
     print("        makes the same round trips again and is not represented here.")
 PYEOF
 
-# ── 3. Determinism check ────────────────────────────────────────────────────
 section "3. Determinism check"
 printf "  Re-running the SAME prompt - hash should be %sIDENTICAL%s\n\n" "$BOLD" "$RESET"
 
-# The coordinator caches by (model, prompt, max_tokens), so a naive re-POST is
-# answered out of that cache in microseconds and proves nothing about the
-# pipeline. Ask for a genuine recomputation. Coordinators that predate the flag
-# ignore unknown JSON fields, so this is safe to send everywhere - what we
-# actually got is read back off cache.hit, not assumed from the flag.
 build_body_forced() {
     local prompt="$1" tokens="$2"
     python3 -c 'import json,sys; print(json.dumps({"input": sys.argv[1], "max_tokens": int(sys.argv[2]), "force_recompute": True}))' "$prompt" "$tokens"
@@ -227,7 +190,6 @@ else
     printf "\n  %s✗ Hashes diverged.%s\n" "$RED" "$RESET"
 fi
 
-# ── 4. Isolation check ──────────────────────────────────────────────────────
 section "4. Isolation check"
 printf "  Running a DIFFERENT prompt - hash should be %sDIFFERENT%s\n\n" "$BOLD" "$RESET"
 
@@ -259,7 +221,6 @@ else
     printf "  Re-run with structurally different prompts via ARC_PROMPT and ARC_PROMPT_B.%s\n" "$RESET"
 fi
 
-# ── 5. Summary ──────────────────────────────────────────────────────────────
 section "5. Summary"
 cat <<SUMMARY
 

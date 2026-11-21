@@ -1,26 +1,11 @@
-//! Maintained compatibility facade for ARC's historical bincode-v1 wire format.
-//!
-//! ARC hashes, signatures, WAL records, snapshots, and peer messages all commit
-//! to the bytes emitted by bincode 1's free `serialize` function. The bincode
-//! project is unmaintained, so this crate keeps the tiny API ARC uses while
-//! delegating serde encoding to the maintained `cu-bincode` fork. Its legacy
-//! configuration is deliberately bincode compatible: little-endian fixed-width
-//! integers, `u64` sequence lengths, and `u32` enum tags.
-
 use serde::{Deserialize, Serialize};
 
-/// Maximum encoded value size on compatibility persistence paths.
-///
-/// This matches the node's maximum state-sync response size. Unlike bincode 1,
-/// even the compatibility API never permits a forged length to request an
-/// unbounded allocation.
 const MAX_COMPAT_VALUE_BYTES: usize = 256 * 1024 * 1024;
 
 fn compat_config() -> impl cu_bincode::config::Config {
     cu_bincode::config::legacy().with_limit::<MAX_COMPAT_VALUE_BYTES>()
 }
 
-/// Serialization or deserialization failure.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("wire serialization failed: {0}")]
@@ -33,23 +18,15 @@ pub enum Error {
     TrailingBytes,
 }
 
-/// Compatibility result type retained for existing ARC call sites.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Serialize with bincode 1's free-function wire contract.
 pub fn serialize<T>(value: &T) -> Result<Vec<u8>>
 where
     T: Serialize + ?Sized,
 {
-    // Passing a reference supports unsized values such as slices while
-    // producing the same bytes as serializing the value itself.
     cu_bincode::serde::encode_to_vec(value, compat_config()).map_err(Error::Serialize)
 }
 
-/// Deserialize with bincode 1's free-function contract.
-///
-/// Trailing bytes remain accepted for compatibility. Untrusted network/RPC
-/// inputs must use [`deserialize_limited_exact`] instead.
 pub fn deserialize<'de, T>(bytes: &'de [u8]) -> Result<T>
 where
     T: Deserialize<'de>,
@@ -59,8 +36,6 @@ where
         .map_err(Error::Deserialize)
 }
 
-/// Deserialize an untrusted payload with a compile-time allocation/input cap
-/// and reject any ignored suffix.
 pub fn deserialize_limited_exact<'de, T, const LIMIT: usize>(bytes: &'de [u8]) -> Result<T>
 where
     T: Deserialize<'de>,

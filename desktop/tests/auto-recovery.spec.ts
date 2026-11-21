@@ -61,7 +61,6 @@ test("dismissing crash details does not hide a pending automatic retry", () => {
   expect(view.action).toBe("start-again");
 });
 
-// Review finding 1: a slow crash wait must not hide or block a ready update.
 test("a ready update during a slow crash wait offers Update, and Update installs", () => {
   const view = describeNodeStrip({
     ...base,
@@ -70,13 +69,10 @@ test("a ready update during a slow crash wait offers Update, and Update installs
   });
   expect(view.sentence).toBe(PLAIN_COPY.nodeStrip.updateAvailable);
   expect(view.action).toBe("update-arc");
-  // The button goes straight to the updater, whose native Prepare now takes
-  // over the slow wait (Rust: home_update_prepares_during_a_slow_crash_wait).
   const strip = fs.readFileSync(path.join(here, "../src/components/NodeStatusStrip.tsx"), "utf8");
   expect(strip).toMatch(/if \(action === "update-arc"\) \{\s*void appUpdater\.installAvailableUpdate\(\);/);
 });
 
-// Review finding 2: a model wait only replaces the "all is well" sentences.
 test.describe("a model wait never masks the node's own state", () => {
   const wait = { reason: "failed" } as const;
   const copy = PLAIN_COPY.nodeStrip;
@@ -154,8 +150,6 @@ test("desktop ownership and closing take precedence over slow recovery and updat
         const refused = describeNodeStrip(input);
         expect(refused.action).toBe(error === "ARC is closing" ? null : "close-copy");
         expect(refused.sentence).not.toContain("try again in");
-        // Once ownership is restored, the very same retry/update data is
-        // visible again. Refusal must hide it without deleting recovery.
         const restored = describeNodeStrip({ ...input, startBlock: null,
           status: { ...input.status!, lastError: null } });
         expect(restored.action).toBe(updateReady ? "update-arc" : "start-again");

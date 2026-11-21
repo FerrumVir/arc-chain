@@ -396,11 +396,6 @@ def offline_probe(pin, status=502, binary=None):
 
 
 def five_live_inputs(candidate=CANDIDATE, status=502):
-    """The real six-host fixtures with ams declared offline and the other five live.
-
-    Returns the five-host config and proof, the declared row, and the two rows ams
-    reported in the original capture (on its own, non-candidate binary).
-    """
     config = load("host-config-six-current-20260927.json")
     proof = load("six-host-before-cfd-20260927.json")
     offline = next(host for host in config["hosts"] if host["site"] == OFFLINE_SITE)
@@ -434,7 +429,6 @@ def check_quorum(config, proof, declared=None):
 
 
 def assembler_proof(config, proof, sites=(OFFLINE_SITE,), candidate=CANDIDATE):
-    """The assembler's own gate over files on disk, as the owner and the producer run it."""
     with tempfile.TemporaryDirectory() as td:
         config_path, proof_path = Path(td) / "host-config.json", Path(td) / "quorum-proof.json"
         config_path.write_text(json.dumps(config))
@@ -506,7 +500,6 @@ class DeclaredOfflineValidatorTests(unittest.TestCase):
         with self.assertRaisesRegex(mod.ProfileError, "authority differs"):
             mod.validate_certificate_authority(verified_certificate(), hosts, anonymous,
                                                anonymous["genesis_file_sha256"])
-        # The declaration needs its explicit confirmation, and a confirmation needs the declaration.
         for sites in ((), ("nrt",), (OFFLINE_SITE, OFFLINE_SITE)):
             with self.subTest(confirmed=sites):
                 with self.assertRaisesRegex(mod.ProfileError, "explicit --declared-offline confirmation"):
@@ -535,7 +528,6 @@ class DeclaredOfflineValidatorTests(unittest.TestCase):
                     check_quorum(c, p)
                 with self.assertRaisesRegex(RuntimeError, "declared-offline validator ams"):
                     assembler_proof(c, p)
-        # The capturer reached ams and sampled it, still on its old binary.
         c, p, _, rows = five_live_inputs()
         for sample, row in zip(p["samples"], rows):
             sample["nodes"].append(row)
@@ -550,8 +542,6 @@ class DeclaredOfflineValidatorTests(unittest.TestCase):
 
     def test_live_stake_below_quorum_fails(self):
         config, proof, _, _ = five_live_inputs()
-        # Same identities and total stake, but the declared validator holds enough that
-        # the five live hosts fall one short of the quorum.
         moves = {"nyc": 5666667, "lhr": 1000000}
         for host in config["hosts"]:
             host["stake"] -= moves.get(host["site"], 0)
@@ -588,7 +578,6 @@ class DeclaredOfflineValidatorTests(unittest.TestCase):
         with self.assertRaisesRegex(validator.GateError, "sample missing or duplicating a quorum host"):
             validator.validate_quorum_proof(silent, hosts, total, quorum, expected_network=expected,
                                             now=silent["captured_at_unix"] + 60)
-        # With ams declared, a second host that does not answer is a refusal, never a second offline validator.
         config, proof, _, _ = five_live_inputs()
         for sample in proof["samples"]:
             sample["nodes"] = [node for node in sample["nodes"] if node["site"] != "nrt"]
@@ -661,7 +650,6 @@ class DeclaredOfflineValidatorTests(unittest.TestCase):
             assembler_proof(config, probed, sites=())
 
     def run_assemble(self, config, proof, sites):
-        """assemble() with only artifact materialization and the checkpoint CLI stubbed."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config_path, proof_path = root / "host-config.json", root / "quorum-proof.json"
@@ -703,12 +691,10 @@ class DeclaredOfflineValidatorTests(unittest.TestCase):
         self.assertEqual((live["host_count"], live["online_stake"], live["declared_offline_sites"],
                           live["declared_offline_stake"]), (5, 33333333, [OFFLINE_SITE], declared["stake"]))
         self.assertEqual(mod.attested_proof_key(result), mod.LIVE_HOST_PROOF_KEY)
-        # Without the explicit confirmation the declaration is refused before the slow checkpoint check.
         refused, verify = self.run_assemble(config, proof, ())
         self.assertIsInstance(refused, mod.ProfileError)
         self.assertIn("explicit --declared-offline confirmation", str(refused))
         verify.assert_not_called()
-        # A six-host update keeps exactly today's shape.
         six = load("host-config-six-current-20260927.json")
         six_proof = load("six-host-before-cfd-20260927.json")
         for host in six["hosts"]:
@@ -767,8 +753,6 @@ class DeclaredOfflineValidatorTests(unittest.TestCase):
             self.assertIn("not a live publication-time assertion", reverification["proof_scope"])
             self.assertEqual(reverification["freshness_at_capture_unix"], 990)
             self.assertEqual(result["declared_offline_validators"], [declared])
-            # The producer derives the offline set from the host config itself; an owner
-            # declaration that the producer does not reproduce exactly is refused.
             producer.pop("declared_offline_validators")
             with mock.patch.object(mod, "assemble", side_effect=lambda supplied: copy.deepcopy(producer)), \
                  mock.patch.object(mod, "verify_owner_verifier"):
@@ -778,7 +762,6 @@ class DeclaredOfflineValidatorTests(unittest.TestCase):
 
 
 def synthetic_update_inputs(stakes=(11, 10, 10, 10, 10, 10), offline_count=2):
-    """Six synthetic validators, documentation IPs, and no captured fleet data."""
     sites = ("aaa", "bbb", "ccc", "ddd", "eee", "fff")
     total = sum(stakes)
     config = {"schema": validator.HOST_SCHEMA, "total_stake": total,
@@ -929,7 +912,6 @@ class TwoDeclaredOfflineTests(unittest.TestCase):
                 assembler_proof(config, proof, sites=sites)
 
     def assemble_synthetic(self, config, proof):
-        """Exercise real assembly/certificate bindings with synthetic artifact and CLI outputs."""
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config_path, proof_path = root / "config.json", root / "proof.json"
@@ -965,9 +947,7 @@ class TwoDeclaredOfflineTests(unittest.TestCase):
         cases = (((11, 10, 10, 10, 10, 10), 2, True),
                  ((12, 11, 10, 10, 9, 9), 2, True),
                  ((15, 14, 14, 14, 2, 2), 2, False),
-                 # Removing a smallest live stake leaves exactly quorum: still a margin.
                  ((14, 14, 13, 13, 4, 3), 2, False),
-                 # Losing only the largest live validator breaks quorum: not "any single".
                  ((30, 9, 9, 9, 2, 2), 2, False),
                  ((11, 10, 10, 10, 10, 10), 0, False))
         workflow = (ROOT.parents[1] / ".github/workflows/existing-chain-update-handoff.yml").read_text()
@@ -1060,8 +1040,6 @@ class TwoDeclaredOfflineTests(unittest.TestCase):
                                      "or two distinct three-letter sites separated by a comma.\n")
 
     def test_threshold_equals_node_rule_through_u64_max(self):
-        # Exact rule in crates/arc-types/src/lib.rs; cover every power-of-two
-        # boundary and its neighbours, including floating-point precision limits.
         totals = set(range(10_001))
         totals.update(2**bits + offset for bits in range(1, 65) for offset in (-1, 0, 1)
                       if 0 <= 2**bits + offset <= 2**64 - 1)
@@ -1088,7 +1066,6 @@ class TwoDeclaredOfflineTests(unittest.TestCase):
             check_quorum(config, proof)
         with self.assertRaisesRegex(RuntimeError, "cannot meet the stake quorum"):
             assembler_proof(config, proof, sites=("eee", "fff"))
-        # Supplying the old rounded-up threshold cannot authorize the update.
         config["quorum_stake"] = proof["quorum_stake"] = 40
         with self.assertRaisesRegex(validator.GateError, "strict supermajority threshold"):
             check_quorum(config, proof)

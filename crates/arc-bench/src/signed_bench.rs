@@ -1,17 +1,3 @@
-//! ARC Chain - Signed Transaction Benchmark Suite
-//!
-//! Measures real TPS with signature verification: Ed25519 (classical) vs ML-DSA-65 (quantum-proof).
-//!
-//! Usage:
-//!   arc-bench-signed [--txs N] [--mode unsigned|signed|batch-verified|ml-dsa|all] [--threads N]
-//!
-//! Modes:
-//!   unsigned       - No signature checks (baseline)
-//!   signed         - Generate real Ed25519-signed txs, verify each individually
-//!   batch-verified - Generate signed txs, batch_verify_ed25519() then execute
-//!   ml-dsa         - Generate ML-DSA-65 (post-quantum) signed txs + batch verify
-//!   all            - Run all modes including quantum comparison (default)
-
 use arc_crypto::signature::{ML_DSA_PK_LEN, ML_DSA_SIG_LEN};
 use arc_crypto::{Hash256, KeyPair, batch_verify_ed25519, batch_verify_ml_dsa, hash_bytes};
 use arc_state::StateDB;
@@ -19,10 +5,6 @@ use arc_types::Transaction;
 use clap::Parser;
 use rayon::prelude::*;
 use std::time::Instant;
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  CLI
-// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
 #[command(
@@ -42,10 +24,6 @@ struct Args {
     #[arg(long, default_value = "0")]
     threads: usize,
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn format_number(n: usize) -> String {
     if n >= 1_000_000 {
@@ -67,8 +45,6 @@ fn format_rate(rate: f64) -> String {
     }
 }
 
-/// Generate keypairs and signed transactions.
-/// Returns (transactions, keypairs, keygen_time, signing_time).
 fn generate_signed_transactions(
     count: usize,
 ) -> (
@@ -77,7 +53,6 @@ fn generate_signed_transactions(
     std::time::Duration,
     std::time::Duration,
 ) {
-    // Step 1: Generate keypairs (parallel)
     let keygen_start = Instant::now();
     let keypairs: Vec<KeyPair> = (0..count)
         .into_par_iter()
@@ -85,8 +60,6 @@ fn generate_signed_transactions(
         .collect();
     let keygen_time = keygen_start.elapsed();
 
-    // Step 2: Create and sign transactions
-    // Each sender transfers to the next keypair (circular)
     let sign_start = Instant::now();
     let transactions: Vec<Transaction> = keypairs
         .par_iter()
@@ -105,8 +78,6 @@ fn generate_signed_transactions(
     (transactions, keypairs, keygen_time, sign_time)
 }
 
-/// Generate ML-DSA-65 (post-quantum) keypairs and signed transactions.
-/// Returns (transactions, keypairs, keygen_time, signing_time).
 fn generate_ml_dsa_transactions(
     count: usize,
 ) -> (
@@ -115,7 +86,6 @@ fn generate_ml_dsa_transactions(
     std::time::Duration,
     std::time::Duration,
 ) {
-    // Step 1: Generate ML-DSA keypairs (parallel - heavier than Ed25519)
     let keygen_start = Instant::now();
     let keypairs: Vec<KeyPair> = (0..count)
         .into_par_iter()
@@ -123,7 +93,6 @@ fn generate_ml_dsa_transactions(
         .collect();
     let keygen_time = keygen_start.elapsed();
 
-    // Step 2: Create and sign transactions
     let sign_start = Instant::now();
     let transactions: Vec<Transaction> = keypairs
         .par_iter()
@@ -142,7 +111,6 @@ fn generate_ml_dsa_transactions(
     (transactions, keypairs, keygen_time, sign_time)
 }
 
-/// Benchmark: ML-DSA batch verification using Rayon parallel individual verification.
 fn bench_ml_dsa_batch_verify(transactions: &[Transaction]) -> f64 {
     let mut messages: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
     let mut signatures: Vec<[u8; ML_DSA_SIG_LEN]> = Vec::with_capacity(transactions.len());
@@ -172,14 +140,12 @@ fn bench_ml_dsa_batch_verify(transactions: &[Transaction]) -> f64 {
     transactions.len() as f64 / elapsed.as_secs_f64()
 }
 
-/// Benchmark: ML-DSA batch-verified block execution.
 fn bench_ml_dsa_batch_execution(transactions: &[Transaction], keypairs: &[KeyPair]) -> f64 {
     let state = state_for_signed(keypairs);
     let validator = keypairs[0].address();
 
     let start = Instant::now();
 
-    // Step 1: Batch verify all ML-DSA signatures
     let mut messages: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
     let mut sigs: Vec<[u8; ML_DSA_SIG_LEN]> = Vec::with_capacity(transactions.len());
     let mut pks: Vec<[u8; ML_DSA_PK_LEN]> = Vec::with_capacity(transactions.len());
@@ -201,7 +167,6 @@ fn bench_ml_dsa_batch_execution(transactions: &[Transaction], keypairs: &[KeyPai
     let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
     batch_verify_ml_dsa(&msg_refs, &sigs, &pks).expect("ML-DSA batch verify must succeed");
 
-    // Step 2: Execute block (sigs already verified)
     let (_, receipts) = state.execute_block(transactions, validator).unwrap();
 
     let elapsed = start.elapsed();
@@ -215,7 +180,6 @@ fn bench_ml_dsa_batch_execution(transactions: &[Transaction], keypairs: &[KeyPai
     transactions.len() as f64 / elapsed.as_secs_f64()
 }
 
-/// Generate unsigned transactions between random-ish accounts.
 fn generate_unsigned_transactions(count: usize) -> Vec<Transaction> {
     let num_agents = 10_000u32.min(count as u32);
     let txs_per_agent = (count as u32) / num_agents;
@@ -230,7 +194,6 @@ fn generate_unsigned_transactions(count: usize) -> Vec<Transaction> {
         .collect()
 }
 
-/// Create a StateDB pre-funded for unsigned transactions.
 fn state_for_unsigned(count: usize) -> StateDB {
     let num_agents = 10_000u32.min(count as u32);
     let accounts: Vec<(Hash256, u64)> = (0..num_agents)
@@ -239,7 +202,6 @@ fn state_for_unsigned(count: usize) -> StateDB {
     StateDB::with_genesis(&accounts)
 }
 
-/// Create a StateDB pre-funded for signed transactions.
 fn state_for_signed(keypairs: &[KeyPair]) -> StateDB {
     let accounts: Vec<(Hash256, u64)> = keypairs
         .iter()
@@ -248,40 +210,27 @@ fn state_for_signed(keypairs: &[KeyPair]) -> StateDB {
     StateDB::with_genesis(&accounts)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Benchmark Scenarios
-// ─────────────────────────────────────────────────────────────────────────────
-
 struct BenchResults {
     tx_count: usize,
     num_threads: usize,
-    // Ed25519 crypto micro-benchmarks
     keygen_rate: f64,
     signing_rate: f64,
     individual_verify_rate: f64,
     batch_verify_rate: f64,
     batch_speedup: f64,
-    // ML-DSA-65 crypto micro-benchmarks
     ml_dsa_keygen_rate: f64,
     ml_dsa_signing_rate: f64,
     ml_dsa_batch_verify_rate: f64,
-    // End-to-end execution
     unsigned_tps: f64,
     signed_tps: f64,
     batch_verified_tps: f64,
     ml_dsa_batch_tps: f64,
-    // SUSPECTED BUG, left as-is deliberately: both percentages are computed in
-    // `main` and stored here, but `print_results` never prints them, so the
-    // signature-overhead numbers the benchmark measures are silently dropped.
-    // Printing them would change this binary's output, so the dead-code lint is
-    // suppressed rather than the behaviour changed. See the task report.
     #[allow(dead_code)]
     sig_overhead_pct: f64,
     #[allow(dead_code)]
     batch_overhead_pct: f64,
 }
 
-/// Benchmark: individual signature verification.
 fn bench_individual_verify(transactions: &[Transaction]) -> f64 {
     let start = Instant::now();
     let verified: usize = transactions
@@ -293,10 +242,7 @@ fn bench_individual_verify(transactions: &[Transaction]) -> f64 {
     transactions.len() as f64 / elapsed.as_secs_f64()
 }
 
-/// Benchmark: batch verification using ed25519_dalek batch_verify.
-/// Uses parallel chunked batch verification for maximum throughput.
 fn bench_batch_verify(transactions: &[Transaction]) -> f64 {
-    // Extract components for batch verification
     let mut messages: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
     let mut signatures: Vec<ed25519_dalek::Signature> = Vec::with_capacity(transactions.len());
     let mut verifying_keys: Vec<ed25519_dalek::VerifyingKey> =
@@ -322,16 +268,12 @@ fn bench_batch_verify(transactions: &[Transaction]) -> f64 {
 
     let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
 
-    // Use larger chunks and parallelize across Rayon threads.
-    // ed25519-dalek batch_verify uses multi-scalar multiplication internally,
-    // giving ~2x speedup per batch. We chunk at 4096 and parallelize the chunks.
     let chunk_size = 4096;
     let n = transactions.len();
     let num_chunks = n.div_ceil(chunk_size);
 
     let start = Instant::now();
 
-    // Build chunk indices and verify in parallel
     let chunks: Vec<(usize, usize)> = (0..num_chunks)
         .map(|i| {
             let s = i * chunk_size;
@@ -349,7 +291,6 @@ fn bench_batch_verify(transactions: &[Transaction]) -> f64 {
     n as f64 / elapsed.as_secs_f64()
 }
 
-/// Benchmark: unsigned block execution (baseline).
 fn bench_unsigned_execution(count: usize) -> f64 {
     let state = state_for_unsigned(count);
     let transactions = generate_unsigned_transactions(count);
@@ -368,7 +309,6 @@ fn bench_unsigned_execution(count: usize) -> f64 {
     count as f64 / elapsed.as_secs_f64()
 }
 
-/// Benchmark: signed block execution (verify each individually during execution).
 fn bench_signed_execution(transactions: &[Transaction], keypairs: &[KeyPair]) -> f64 {
     let state = state_for_signed(keypairs);
     let validator = keypairs[0].address();
@@ -390,15 +330,12 @@ fn bench_signed_execution(transactions: &[Transaction], keypairs: &[KeyPair]) ->
     transactions.len() as f64 / elapsed.as_secs_f64()
 }
 
-/// Benchmark: batch-verified block execution.
-/// First batch-verify all signatures, then execute without per-tx sig checks.
 fn bench_batch_verified_execution(transactions: &[Transaction], keypairs: &[KeyPair]) -> f64 {
     let state = state_for_signed(keypairs);
     let validator = keypairs[0].address();
 
     let start = Instant::now();
 
-    // Step 1: Batch verify all signatures up front
     let mut messages: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
     let mut sigs: Vec<ed25519_dalek::Signature> = Vec::with_capacity(transactions.len());
     let mut vks: Vec<ed25519_dalek::VerifyingKey> = Vec::with_capacity(transactions.len());
@@ -439,8 +376,6 @@ fn bench_batch_verified_execution(transactions: &[Transaction], keypairs: &[KeyP
             .expect("batch verify must succeed");
     });
 
-    // Step 2: Execute block WITHOUT per-tx signature verification
-    // (signatures already verified in batch above)
     let (_, receipts) = state.execute_block(transactions, validator).unwrap();
 
     let elapsed = start.elapsed();
@@ -453,10 +388,6 @@ fn bench_batch_verified_execution(transactions: &[Transaction], keypairs: &[KeyP
 
     transactions.len() as f64 / elapsed.as_secs_f64()
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Output
-// ─────────────────────────────────────────────────────────────────────────────
 
 fn print_results(results: &BenchResults) {
     let w = 72;
@@ -573,14 +504,9 @@ fn print_results(results: &BenchResults) {
     println!();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Main
-// ─────────────────────────────────────────────────────────────────────────────
-
 fn main() {
     let args = Args::parse();
 
-    // Configure thread pool
     if args.threads > 0 {
         rayon::ThreadPoolBuilder::new()
             .num_threads(args.threads)
@@ -702,7 +628,6 @@ fn main() {
         }
 
         _ => {
-            // ── Ed25519: Generate signed transactions ────────────────
             println!(
                 "[1/9] Generating {} Ed25519 keypairs + signed transactions...",
                 format_number(n)
@@ -722,13 +647,11 @@ fn main() {
             );
             println!();
 
-            // ── Ed25519: Individual verification ─────────────────────
             println!("[2/9] Ed25519 individual signature verification...");
             let individual_verify_rate = bench_individual_verify(&txs);
             println!("  => {} verifies/sec", format_rate(individual_verify_rate));
             println!();
 
-            // ── Ed25519: Batch verification ──────────────────────────
             println!("[3/9] Ed25519 batch verification (multi-scalar multiplication)...");
             let batch_verify_rate = bench_batch_verify(&txs);
             let batch_speedup = batch_verify_rate / individual_verify_rate;
@@ -739,25 +662,21 @@ fn main() {
             );
             println!();
 
-            // ── Unsigned block execution ─────────────────────────────
             println!("[4/9] Unsigned block execution (baseline, no sig checks)...");
             let unsigned_tps = bench_unsigned_execution(n);
             println!("  => {} TPS", format_rate(unsigned_tps));
             println!();
 
-            // ── Ed25519: Signed block execution ──────────────────────
             println!("[5/9] Ed25519 signed block execution (per-tx verification)...");
             let signed_tps = bench_signed_execution(&txs, &keypairs);
             println!("  => {} TPS", format_rate(signed_tps));
             println!();
 
-            // ── Ed25519: Batch-verified block execution ──────────────
             println!("[6/9] Ed25519 batch-verified block execution...");
             let batch_verified_tps = bench_batch_verified_execution(&txs, &keypairs);
             println!("  => {} TPS", format_rate(batch_verified_tps));
             println!();
 
-            // ── ML-DSA-65: Generate quantum-proof transactions ───────
             println!(
                 "[7/9] Generating {} ML-DSA-65 keypairs + signed transactions...",
                 format_number(n)
@@ -778,7 +697,6 @@ fn main() {
             );
             println!();
 
-            // ── ML-DSA-65: Batch verification ────────────────────────
             println!("[8/9] ML-DSA-65 batch verification (Rayon parallel)...");
             let ml_dsa_batch_verify_rate = bench_ml_dsa_batch_verify(&ml_txs);
             println!(
@@ -787,13 +705,11 @@ fn main() {
             );
             println!();
 
-            // ── ML-DSA-65: Batch-verified block execution ────────────
             println!("[9/9] ML-DSA-65 batch-verified block execution...");
             let ml_dsa_batch_tps = bench_ml_dsa_batch_execution(&ml_txs, &ml_keypairs);
             println!("  => {} TPS (quantum-proof)", format_rate(ml_dsa_batch_tps));
             println!();
 
-            // ── Compute overhead ─────────────────────────────────────
             let sig_overhead_pct = if unsigned_tps > 0.0 {
                 ((unsigned_tps - signed_tps) / unsigned_tps) * 100.0
             } else {

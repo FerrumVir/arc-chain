@@ -1,12 +1,7 @@
-// Side-by-side candle vs integer forward at MULTIPLE positions. If our forward
-// matches candle at position 0 but diverges at position k, the KV cache path
-// (storage, attention read, online softmax, or RoPE position handling) is the
-// bug site.
 use arc_inference::cached_integer_model::{KVCache, load_cached_model};
 use candle_core::{Device, Tensor};
 use candle_transformers::models::quantized_llama::ModelWeights;
 
-/// `$HOME/.arc-models/llama-2-7b.gguf`, resolved at run time.
 fn model_path() -> String {
     let home = std::env::var("HOME").expect("HOME is set");
     format!("{home}/.arc-models/llama-2-7b.gguf")
@@ -60,9 +55,6 @@ fn main() {
     let integer_model = load_cached_model(&model_path()).unwrap();
     let mut cache = KVCache::new(integer_model.config.n_layers);
 
-    // Prompt: "The capital of France is"
-    // Real-tokenized via Llama BPE: [1, 450, 7483, 310, 3444, 338]
-    // (1=BOS, 450="The", 7483=" capital", 310=" of", 3444=" France", 338=" is")
     let tokens: Vec<u32> = vec![1, 450, 7483, 310, 3444, 338];
 
     eprintln!(
@@ -72,7 +64,6 @@ fn main() {
     eprintln!("{}", "-".repeat(80));
 
     for (pos, &tok) in tokens.iter().enumerate() {
-        // Candle: feed just this token, letting candle manage its own KV cache
         let t = Tensor::new(&[tok], &device).unwrap().unsqueeze(0).unwrap();
         let cl = candle_model.forward(&t, pos).unwrap();
         let cl = cl.squeeze(0).unwrap();
@@ -84,7 +75,6 @@ fn main() {
         let c_vec: Vec<f32> = cl.to_vec1().unwrap();
         let (c_ai, c_av) = argmax_f32(&c_vec);
 
-        // Ours: feed this token, accumulate KV
         let ol = integer_model.forward_one_token(tok, &mut cache);
         let (o_ai, o_av) = argmax_i64(&ol);
 

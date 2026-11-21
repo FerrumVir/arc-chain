@@ -1,20 +1,3 @@
-//! Row-partitioned execution of native paid requests on this operator's own
-//! machines: S1-S8 connected to the running node under option (a) of
-//! docs/design/assignment-node-integration.md.
-//!
-//! Every row a vote depends on is computed by this node, or by a machine the
-//! operator lists here and reaches over SSH with a pinned host key: the trust
-//! model's hard rule. Nothing here changes consensus. A slice from a machine
-//! is used only after its checks, and a failed or faulty one is recomputed
-//! here, so the output equals local execution unless one of the operator's
-//! own machines returns wrong rows that no check sampled. That is the
-//! operator's own fault, and costs only its own vote: the other members
-//! compute independently. The assignment certificate is this node's audit
-//! record, kept in a bounded ring and served to the operator only. Machines
-//! are connected and measured on a background thread, never while a paid
-//! request waits. S10, the multi-machine comparison, stays FAIL until a run
-//! on real machines passes.
-
 use crate::native_inference::NativeInferenceError;
 use arc_assign::book::{
     self, ChallengeBook, ChallengeState, Exclusion, Exclusions, Offer, ProbeBook,
@@ -44,8 +27,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-/// The coordinator's residency policy is explicit and shared by execution,
-/// placement and verification. A low-residency model has no local generator.
 #[derive(Clone)]
 pub(crate) enum CoordinatorModel {
     Resident(Arc<CachedIntegerModel>),
@@ -89,34 +70,20 @@ impl CoordinatorModel {
     }
 }
 
-/// Most machines one cohort lists.
 pub const MAX_COHORT_WORKERS: usize = 32;
-/// Heights a link measurement stays usable for placement.
 pub const LINK_MAX_AGE_HEIGHTS: u64 = 600;
-/// Failures per mille beyond which a link is not used.
 pub const LINK_MAX_FAILURE_PER_MILLE: u32 = 100;
-/// Heights per assignment epoch. Challenges and exclusions reset at each, and
-/// every machine is measured and challenged again, in the background.
 pub const EPOCH_HEIGHTS: u64 = 3_600;
-/// Records kept for the operator's view.
 pub const RECENT_RECORDS: usize = 256;
-/// Rows of the challenge projection (layer 0's gate, the widest): enough
-/// work (about 17M multiply-accumulates at 4096 columns) that link jitter
-/// cannot inflate the measured rate.
 const CHALLENGE_ROWS: usize = 4096;
-/// Wide calls per measurement; their median gives the bandwidth.
 const BULK_CALLS: usize = 3;
-/// Round-trip samples per measurement: one-row calls on a zero input.
 const PINGS: usize = 8;
-/// A link is measured again once its newest probe is this old, so an idle
-/// cohort's links do not go stale; a closed machine is retried as often.
 const PROBE_REFRESH_HEIGHTS: u64 = LINK_MAX_AGE_HEIGHTS / 2;
 const MAX_CONFIG_BYTES: u64 = 1 << 20;
 const MAX_CALL_TIMEOUT_MS: u64 = 600_000;
 const MAX_STARTUP_TIMEOUT_MS: u64 = 3_600_000;
 const MAX_SPOT_ROWS: u32 = 64;
 
-/// A generation's tokens and output hash, or why it stopped.
 type Generated = Result<(Vec<u32>, Hash256), NativeInferenceError>;
 
 fn default_max_workers() -> usize {
@@ -132,24 +99,16 @@ fn default_startup_timeout_ms() -> u64 {
     600_000
 }
 
-/// This operator's own row-worker machines (`--native-row-workers <path>`,
-/// JSON). Each runs `tensor_row_model_worker` on the same artifact and is
-/// reached over SSH with a pinned host key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RowCohortConfig {
     pub workers: Vec<RowWorkerEntry>,
-    /// Most machines one request is placed on.
     #[serde(default = "default_max_workers")]
     pub max_workers: usize,
-    /// Per mille of machine slices recomputed by another participant.
     #[serde(default = "default_duplicate_per_mille")]
     pub duplicate_per_mille: u32,
-    /// Rows of each projection this node recomputes itself, per request.
     #[serde(default = "default_spot_rows")]
     pub spot_rows_per_stage: u32,
-    /// Explicit fixed per-projection ownership; absent preserves the legacy
-    /// full-layer config and stable policy bytes. Requires low residency.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial_rows: Option<crate::row_residency::PartialRowConfig>,
 }
@@ -157,31 +116,18 @@ pub struct RowCohortConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RowWorkerEntry {
-    /// The operator's name for the machine, also its transport identity.
     pub id: String,
     pub ssh_program: PathBuf,
-    /// `user@host`, or `ssh://user@host:port`. ssh reads no configuration
-    /// file for these machines (the host-key pin must be exclusive), so the
-    /// key must be one of ssh's default identities or held by an agent.
     pub target: String,
     pub known_hosts: PathBuf,
     pub remote_command: Vec<String>,
-    /// Per call, once the machine has answered its first call.
     pub timeout_ms: u64,
-    /// The first call after connecting, which also covers the remote model
-    /// load.
     #[serde(default = "default_startup_timeout_ms")]
     pub startup_timeout_ms: u64,
     pub ram_headroom_bytes: u64,
     pub max_concurrency: u32,
-    /// Layers whose weights this machine holds, as half-open `[start, end)`
-    /// ranges - the same grid as `--shard-range`. Empty (the default) means
-    /// it loads the whole model, which is what every existing config does.
-    /// Declaring ranges lets a machine serve only the layers it can hold, so
-    /// its memory bounds its assignment instead of the model's total size.
     #[serde(default)]
     pub resident_layers: Vec<(u32, u32)>,
-    /// This ranged worker also holds the complete output head.
     #[serde(default)]
     pub resident_output: bool,
 }
@@ -207,8 +153,6 @@ impl RowCohortConfig {
         )
     }
 
-    /// The actual private-cohort policy authorized by a native request.
-    /// Workers and live observations remain certificate inputs, not policy.
     pub fn assignment_hash(&self, low_residency: bool) -> Hash256 {
         let (policy, verification) = self.placement_policy(low_residency, 0);
         if self.partial_rows.is_some() {
@@ -322,8 +266,6 @@ impl RowCohortConfig {
     }
 }
 
-/// Pick the lowest layer a worker declares resident. Empty residency retains
-/// the legacy full-model meaning and therefore probes layer zero.
 fn probe_layer_for_residency(
     resident_layers: &[(u32, u32)],
     layer_count: usize,
@@ -353,13 +295,9 @@ fn probe_layer_for_residency(
         .ok_or_else(|| "resident layer set is empty".into())
 }
 
-/// Whether a request's `Host` header names this machine itself (`localhost`,
-/// a 127/8 address or `[::1]`, with or without a port). A browser page that
-/// reaches the node through a rebound name carries that name instead.
 pub fn host_header_is_loopback(host: &str) -> bool {
     let digits = |port: &str| port.chars().all(|c| c.is_ascii_digit());
     if let Some(rest) = host.strip_prefix('[') {
-        // An IPv6 literal: `[addr]` or `[addr]:port`, nothing else.
         let Some((name, after)) = rest.split_once(']') else {
             return false;
         };
@@ -369,8 +307,6 @@ pub fn host_header_is_loopback(host: &str) -> bool {
                 .parse::<std::net::Ipv6Addr>()
                 .is_ok_and(|ip| ip.is_loopback());
     }
-    // A name or an IPv4 address, optionally `:port`; a bare IPv6 address has
-    // more than one colon and fails the port check.
     let (name, port) = host.split_once(':').unwrap_or((host, ""));
     digits(port)
         && (name.eq_ignore_ascii_case("localhost")
@@ -379,9 +315,6 @@ pub fn host_header_is_loopback(host: &str) -> bool {
                 .is_ok_and(|ip| ip.is_loopback()))
 }
 
-/// The identity a machine is placed, reserved and excluded under: this
-/// validator's address, the operator's id for the machine and where it is
-/// reached. Two validators' machines never share one.
 pub fn machine_address(validator: &Hash256, entry: &RowWorkerEntry) -> Hash256 {
     let mut hasher = blake3::Hasher::new_derive_key("ARC-operator-row-machine-v1");
     hasher.update(&validator.0);
@@ -392,7 +325,6 @@ pub fn machine_address(validator: &Hash256, entry: &RowWorkerEntry) -> Hash256 {
     Hash256(*hasher.finalize().as_bytes())
 }
 
-/// The digest a certificate binds for one machine's configuration entry.
 fn entry_digest(entry: &RowWorkerEntry) -> Hash256 {
     let mut hasher = blake3::Hasher::new_derive_key("ARC-operator-row-entry-v1");
     hasher.update(&serde_json::to_vec(entry).expect("a config entry serialises"));
@@ -436,8 +368,6 @@ fn tensor_name(tensor: TensorKey) -> &'static str {
     }
 }
 
-/// Every projection the canonical forward dispatches, in forward order: the
-/// backend's keys and the placement's stages, index for index.
 pub fn projection_stages(
     model: &dyn CanonicalRowSource,
 ) -> (Vec<(Option<usize>, TensorKey)>, Vec<Stage>) {
@@ -472,10 +402,6 @@ pub fn projection_stages(
     (kept, stages)
 }
 
-/// The verified backend's plans for a certificate: each stage's slices in
-/// row order (this node's rows local, a machine's remote), with the
-/// certificate's verification plan applied. A duplicated slice is recomputed
-/// by its checker; a spot row is recomputed by this node.
 pub fn plans_from(
     certificate: &AssignmentCertificate,
     keys: &[(Option<usize>, TensorKey)],
@@ -646,42 +572,25 @@ struct Books {
     probes: ProbeBook,
     ledger: ReservationLedger,
     exclusions: Exclusions,
-    /// Height of each machine's last completed measurement.
     attempted: BTreeMap<[u8; 32], u64>,
-    /// Machines with a measurement in flight on the background thread.
     measuring: BTreeSet<[u8; 32]>,
-    /// Height of the last round whose challenge could not be prepared; the
-    /// immediate challenge of an unchallenged machine waits a refresh
-    /// interval after it, rather than retrying on every request.
     material_failed_at: Option<u64>,
-    /// Machines whose failures a reconnect forgave this epoch: at most once
-    /// each, so a machine that answers pings but fails its real calls is not
-    /// placed again and again.
     forgiven: BTreeSet<[u8; 32]>,
 }
 
-/// One request's placement and what happened to it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CohortRecord {
     pub request_id: String,
     pub height: u64,
-    /// The certificate's hash; `None` when nothing was placed.
     pub certificate: Option<String>,
-    /// The machines the placement used, by id.
     pub machines: Vec<String>,
     pub predicted_token_us: u64,
     pub coordinator_only_token_us: u64,
-    /// Calls a machine answered.
     pub answered: u64,
-    /// Calls that failed and were computed here instead.
     pub fallbacks: u64,
-    /// Slices of excluded or disconnected machines, computed here without a
-    /// call.
     pub skipped: u64,
     pub faults: u64,
     pub elapsed_ms: u64,
-    /// `partitioned`, or `local: <why>`. A placed run in which no machine
-    /// answered says so.
     pub outcome: String,
 }
 
@@ -694,15 +603,11 @@ pub struct MachineView {
     pub free_slots: u32,
 }
 
-/// The operator's view of a cohort (`/assignment/cohort`, loopback only).
-/// Every count is bounded and is a growth gauge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CohortView {
     pub low_residency: bool,
     pub local_fallback_enabled: bool,
     pub partial_row_residency: bool,
-    /// Partial fixed placement has no modeled total latency. Canonical checks
-    /// read the local artifact and consume CPU/I/O, including full selected duplicates.
     pub placement_timing_prediction_available: bool,
     pub machines: Vec<MachineView>,
     pub coordinator_macs_per_s: u64,
@@ -714,30 +619,20 @@ pub struct CohortView {
     pub recent: Vec<CohortRecord>,
 }
 
-/// This operator's row cohort, connected and measured.
 pub struct RowCohort {
-    /// This cohort, for its background measurements.
     me: Weak<RowCohort>,
     model: CoordinatorModel,
     artifact: Hash256,
     config: RowCohortConfig,
     machines: Vec<Machine>,
     residency: Option<Vec<WorkerResidency>>,
-    /// Open connections, by machine id. A machine whose connection closed
-    /// (the SSH worker closes itself on any failure) is reconnected at its
-    /// next measurement.
     workers: Mutex<BTreeMap<String, Arc<SshStdioRowWorker>>>,
     coordinator_macs_per_s: u64,
     books: Mutex<Books>,
     recent: Mutex<VecDeque<CohortRecord>>,
-    /// The latest chain height a request brought; measurements finishing on
-    /// the background thread are recorded at it.
     last_height: AtomicU64,
 }
 
-/// One round's challenge: rows of a resident layer's gate for a height-seeded
-/// input, and the answer this node computed for it. Machines resident on the
-/// same layer share the material, so it is computed once per layer.
 struct ChallengeMaterial {
     layer: usize,
     tensor: TensorKey,
@@ -783,7 +678,6 @@ fn challenge_material_range(
                 ]
                 .concat(),
             );
-            // Q16 activations in [-2, 2).
             i64::from(u32::from_le_bytes([h.0[0], h.0[1], h.0[2], h.0[3]]) % (4 << 16)) - (2 << 16)
         })
         .collect();
@@ -801,7 +695,6 @@ fn challenge_material_range(
 }
 
 impl ChallengeMaterial {
-    /// The challenge call to one machine.
     fn request(
         &self,
         execution_profile: &str,
@@ -839,7 +732,6 @@ fn elapsed_us(elapsed: Duration) -> u64 {
         .max(1)
 }
 
-/// This node's own rate on the challenge projection: the kernel alone, timed.
 fn local_rate(model: &dyn CanonicalRowSource, height: u64) -> Result<u64, String> {
     let material = challenge_material(model, 0, height)?;
     let started = Instant::now();
@@ -860,8 +752,6 @@ fn local_rate(model: &dyn CanonicalRowSource, height: u64) -> Result<u64, String
     Ok(measured.measured_macs_per_s().max(1))
 }
 
-/// A one-row call on a zero input, which must answer a zero row. Its time is
-/// the link's round trip for an input of that projection's width.
 #[allow(clippy::too_many_arguments)]
 fn zero_call(
     model: &dyn CanonicalRowSource,
@@ -929,8 +819,6 @@ fn failed_probe() -> Probe {
     }
 }
 
-/// `elapsed` less the round trip, when the call took clearly longer than one
-/// round trip; otherwise `elapsed` itself, so jitter never inflates a rate.
 fn beyond_round_trip(elapsed: u64, rtt: Option<u64>) -> u64 {
     match rtt {
         Some(rtt) if elapsed > rtt.saturating_mul(2) => elapsed - rtt,
@@ -939,23 +827,14 @@ fn beyond_round_trip(elapsed: u64, rtt: Option<u64>) -> u64 {
     .max(1)
 }
 
-/// What one measurement of a machine found.
 struct Measurement {
     index: usize,
-    /// The connection, if one is open after the measurement.
     worker: Option<Arc<SshStdioRowWorker>>,
-    /// A new connection was made and answered.
     reconnected: bool,
     probes: Vec<Probe>,
-    /// When a challenge was due and the machine was reachable: the measured
-    /// rate, or why it was refused. An unreachable machine gets none, so it
-    /// can still take this epoch's challenge once it answers.
     challenge: Option<Result<u64, String>>,
 }
 
-/// Marks one machine as being measured, and clears the mark when dropped,
-/// however the measurement ends: recorded, panicked, or never started because
-/// no thread could be created.
 struct Measuring {
     cohort: Weak<RowCohort>,
     address: [u8; 32],
@@ -969,8 +848,6 @@ impl Drop for Measuring {
     }
 }
 
-/// A placed request's reservations, released when this is dropped: on the
-/// normal return, an early one, or an unwind.
 struct Reserved<'a> {
     cohort: &'a RowCohort,
     request: Hash256,
@@ -993,8 +870,6 @@ impl RowCohort {
         model: Arc<CachedIntegerModel>,
         artifact: Hash256,
     ) -> Arc<Self> {
-        // No model load, connections, measurement threads or qualification.
-        // Tests exercise policy refusal before any of those may be used.
         Arc::new_cyclic(|me| Self {
             me: me.clone(),
             model: CoordinatorModel::Resident(model),
@@ -1069,10 +944,6 @@ impl RowCohort {
         }
     }
 
-    /// Build the cohort and measure every listed machine on a background
-    /// thread (connecting, timing and challenging it). Until a machine is
-    /// measured it is not placed, and the node computes those rows itself, so
-    /// neither startup nor a request waits on a connect or a model load.
     pub fn connect(
         config: RowCohortConfig,
         validator: Hash256,
@@ -1089,9 +960,6 @@ impl RowCohort {
         )
     }
 
-    /// Connect an explicitly low-residency private coordinator through the same
-    /// measured production path. This constructs no admission/qualification
-    /// context; callers must separately enforce their activation policy.
     pub fn connect_low_residency(
         config: RowCohortConfig,
         validator: Hash256,
@@ -1143,8 +1011,6 @@ impl RowCohort {
             })
             .transpose()?;
         if model.is_low_residency() && residency.is_none() {
-            // Declaration is not readiness: measured workers must still pass
-            // exact placement and per-call verification before execution.
             for layer in 0..model.config().n_layers as u32 {
                 if !config.workers.iter().any(|w| {
                     w.resident_layers.is_empty()
@@ -1230,9 +1096,6 @@ impl RowCohort {
             .map(|machine| machine.address)
     }
 
-    /// An open connection to machine `index`, and whether it is new: the
-    /// current one, or a new one whose first call, under the startup timeout
-    /// that covers the remote model load, has answered.
     fn open_worker(
         &self,
         index: usize,
@@ -1276,9 +1139,6 @@ impl RowCohort {
         Ok((Arc::new(worker), true))
     }
 
-    /// Measure one machine: connect or reuse it, time `PINGS` zero-input
-    /// calls for the round trip and `BULK_CALLS` wide ones for bandwidth, and
-    /// run the challenge when one is given.
     fn measure_one(
         &self,
         height: u64,
@@ -1305,8 +1165,6 @@ impl RowCohort {
         let mut probes = Vec::new();
         let mut rtts = Vec::new();
         for ping in 0..PINGS as u64 {
-            // Once a failure has closed the session, further calls send
-            // nothing: they are not failed probes of the link.
             if !worker.is_open() {
                 break;
             }
@@ -1323,7 +1181,6 @@ impl RowCohort {
             ) {
                 Ok(rtt_us) => {
                     rtts.push(rtt_us);
-                    // No bytes: a ping says nothing about bandwidth.
                     probes.push(Probe {
                         rtt_us,
                         bytes: 0,
@@ -1336,9 +1193,6 @@ impl RowCohort {
         }
         rtts.sort_unstable();
         let rtt = rtts.get(rtts.len() / 2).copied();
-        // Bandwidth: the down projection's wider input, over the median of
-        // several wide calls less the round trip a ping of the model's width
-        // already costs.
         if let (Some(rtt), Some(narrow), Some(wide)) = (
             rtt,
             model.projection_shape(Some(probe_layer), TensorKey::Wq),
@@ -1375,8 +1229,6 @@ impl RowCohort {
                 });
             }
         }
-        // Only on a connection still open: a challenge that was never sent is
-        // no refusal, and the machine can take it once it answers.
         let challenge = match material {
             Some(material) if worker.is_open() => {
                 self.run_challenge(&worker, material, &entry.id, height, rtt)
@@ -1393,9 +1245,6 @@ impl RowCohort {
         }
     }
 
-    /// Send one machine its challenge. `None` when it was not delivered (the
-    /// connection had closed); otherwise the measured rate, or why the
-    /// machine failed it.
     fn run_challenge(
         &self,
         worker: &SshStdioRowWorker,
@@ -1431,10 +1280,6 @@ impl RowCohort {
         Some(Ok(measured.measured_macs_per_s()))
     }
 
-    /// Measure `due` machines, as `(index, challenge due)`, in the background:
-    /// one thread per machine, each recording its own result as soon as it
-    /// ends, so a slow machine delays no other. A machine already being
-    /// measured is left to that measurement.
     fn spawn_measure(&self, due: Vec<(usize, bool)>, height: u64) {
         let marked: Vec<(usize, bool, Measuring)> = {
             let mut books = self.books.lock();
@@ -1454,8 +1299,6 @@ impl RowCohort {
         }
         let me = self.me.clone();
         let epoch = height / EPOCH_HEIGHTS;
-        // If no thread starts, the closure (and every guard in it) is dropped,
-        // which clears the marks, and the machines are measured next time.
         let spawned = std::thread::Builder::new()
             .name("arc-row-cohort".into())
             .spawn(move || {
@@ -1515,9 +1358,6 @@ impl RowCohort {
         }
     }
 
-    /// Record one machine's measurement as soon as it ends, at the latest
-    /// height. A challenge answered for an epoch that has since ended is
-    /// dropped: the machine takes the new epoch's.
     fn record(&self, measurement: Measurement, started_epoch: u64) {
         let machine = &self.machines[measurement.index];
         let (lifted, refused) = {
@@ -1539,10 +1379,6 @@ impl RowCohort {
                     workers.remove(&machine.entry.id);
                 }
             }
-            // Only a real exclusion for failures, in the epoch the measurement
-            // started in, and at most once per machine per epoch. A reconnect
-            // of a machine that is not excluded leaves its failure count, so
-            // repeated failures still add up to an exclusion.
             let lifted = measurement.reconnected
                 && books.epoch == started_epoch
                 && matches!(
@@ -1563,8 +1399,6 @@ impl RowCohort {
                                 measured: 0,
                             });
                     let state = books.challenges.answer(&machine.address, checked, height);
-                    // A second answer in the same epoch is ignored by the book;
-                    // only a refusal it recorded is reported.
                     match (state, outcome) {
                         (Ok(ChallengeState::Refused), Err(error)) => Some(error),
                         _ => None,
@@ -1582,11 +1416,6 @@ impl RowCohort {
         }
     }
 
-    /// Sweep reservations of refund-eligible requests, and schedule
-    /// measurements without waiting for them. At a new epoch, challenges and
-    /// exclusions reset and every machine is measured again. Between epochs,
-    /// a machine is measured again once its link has gone stale or its
-    /// connection closed, at most once per `PROBE_REFRESH_HEIGHTS`.
     fn begin(&self, now: u64) {
         self.last_height.fetch_max(now, Ordering::Relaxed);
         let epoch = now / EPOCH_HEIGHTS;
@@ -1606,9 +1435,6 @@ impl RowCohort {
                         let material_ok = books
                             .material_failed_at
                             .is_none_or(|at| now.saturating_sub(at) >= PROBE_REFRESH_HEIGHTS);
-                        // An open machine that has not taken this epoch's
-                        // challenge (it was unreachable, or its measurement
-                        // spanned the epoch change) takes it now.
                         if open && unchallenged && material_ok {
                             return Some((index, true));
                         }
@@ -1729,9 +1555,6 @@ impl RowCohort {
         .map_err(|error| error.to_string())
     }
 
-    /// Refresh measurements even on an idle node. Low residency is ready only
-    /// when the same measured placement and strict coverage preflight used by
-    /// execution succeed. This reserves no slots and loads no model matrices.
     pub fn ready_for_requests(&self, now: u64) -> bool {
         if !self.model.is_low_residency() {
             return true;
@@ -1787,10 +1610,6 @@ impl RowCohort {
         .is_ok()
     }
 
-    /// Generate one request's tokens: placed on this cohort when placement
-    /// predicts the machines make it faster, locally otherwise. Either way the
-    /// tokens equal local execution's (see the module documentation). Never
-    /// waits on a machine's connect or measurement.
     #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
@@ -1846,8 +1665,6 @@ impl RowCohort {
         let (result, outcome) = match issued {
             Err(error) => local(format!("local: placement failed: {error}")),
             Ok(certificate) => {
-                // Authorization failures never enter the local-fallback
-                // branch and precede every plan, reservation and generation.
                 self.verify_certificate(&certificate, request, assignment, now)?;
                 record.certificate = Some(certificate.hash().to_hex());
                 record.predicted_token_us = certificate.placement.predicted_token_us;
@@ -1885,9 +1702,6 @@ impl RowCohort {
         result
     }
 
-    /// Run a placed request: reserve its slots, generate on the verified
-    /// backend, and release the slots on every exit path. `Err(why)` when it
-    /// could not run placed, so the caller runs it locally.
     #[allow(clippy::too_many_arguments)]
     fn run_placed(
         &self,
@@ -1977,8 +1791,6 @@ impl RowCohort {
                     "partitioned".into()
                 },
             )),
-            // The backend recomputes failed and faulty slices itself, so an
-            // error here is this node's own; run the request locally.
             Err(error) => Err(format!("local: the partitioned run stopped: {error}")),
         }
     }
@@ -1987,7 +1799,6 @@ impl RowCohort {
         self.model.is_low_residency()
     }
 
-    /// The operator's view: machines, bounded books and recent records.
     pub fn view(&self) -> CohortView {
         let books = self.books.lock();
         let workers = self.workers.lock();
@@ -2022,11 +1833,6 @@ impl RowCohort {
     }
 }
 
-/// Feeds the verified backend's events into the cohort's books. A failure
-/// counts toward exclusion and is a failed probe; a fault excludes the
-/// machine for the epoch with its evidence. An answered call's time mixes
-/// compute and queueing into the round trip, so it is not a link probe; it
-/// only ends a run of failures.
 struct CohortEvents<'a> {
     cohort: &'a RowCohort,
     certificate: Hash256,
@@ -2186,9 +1992,6 @@ mod tests {
         );
     }
 
-    /// The operator-facing template must be a config the real loader accepts.
-    /// It is the artifact handed to whoever sets up the second machine, so a
-    /// typo in it would be discovered on their host instead of in CI.
     #[test]
     fn the_documented_cohort_template_is_accepted_by_the_real_loader() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2199,9 +2002,6 @@ mod tests {
         let worker = &config.workers[0];
         assert_eq!(worker.id, "machine-b");
         assert_eq!(worker.max_concurrency, 1);
-        // The remote command must name the worker binary and pin the artifact
-        // the chain activated, or the machine would serve rows of some other
-        // model.
         assert!(
             worker
                 .remote_command
@@ -2258,8 +2058,6 @@ mod tests {
         let mut bad = entry("g");
         bad.startup_timeout_ms = 0;
         assert!(config(vec![bad]).validate().is_err());
-        // A known_hosts path ssh would split, expand or read relative to a
-        // directory is refused at load, not at the first connect.
         for path in [
             "/etc/arc/known hosts",
             "known_hosts",
@@ -2275,7 +2073,6 @@ mod tests {
     #[test]
     fn probe_and_challenge_use_a_declared_nonzero_resident_layer() {
         assert_eq!(probe_layer_for_residency(&[], 16).unwrap(), 0);
-        // Choose the lowest resident layer independent of declaration order.
         assert_eq!(
             probe_layer_for_residency(&[(8, 12), (4, 6)], 16).unwrap(),
             4
@@ -2453,15 +2250,11 @@ mod tests {
             assert_eq!(plan.spot_rows.len(), 2);
             for slice in &plan.slices {
                 if slice.owner == SliceOwner::Remote("rack-1".into()) {
-                    // Every machine slice is duplicated at 1000 per mille,
-                    // by this node when no other machine is placed.
                     assert_eq!(slice.duplicate_on, Some(SliceOwner::Local));
                 }
             }
         }
-        // A placement that names a machine the cohort does not list is refused.
         assert!(plans_from(&certificate, &keys, &BTreeMap::new()).is_err());
-        // So is one that names more stages than the model has.
         assert!(plans_from(&certificate, &keys[..1], &id_of).is_err());
     }
 
@@ -2477,8 +2270,6 @@ mod tests {
                 cols: 4096,
             })
             .collect();
-        // The machine declares, in its signed offer, that it holds layer 0
-        // only - it never loaded layer 1 and cannot serve a row of it.
         let candidate = Candidate {
             worker: machine,
             transport_id: "rack-1".into(),
@@ -2541,7 +2332,6 @@ mod tests {
             0,
             "and must never be planned a row of the layer it does not"
         );
-        // This node still covers every row of both layers.
         for plan in plans.values() {
             assert_eq!(plan.slices.first().unwrap().row_start, 0);
             assert_eq!(plan.slices.last().unwrap().row_end, 4096);
@@ -2562,15 +2352,11 @@ mod tests {
         let parsed: RowCohortConfig = serde_json::from_value(base.clone()).unwrap();
         parsed.validate().unwrap();
         assert_eq!(parsed.workers[0].resident_layers, vec![(0, 6), (11, 16)]);
-        // A half-open range that holds nothing is a configuration mistake,
-        // not a machine that silently serves no rows.
         let mut empty = base;
         empty["workers"][0]["resident_layers"] = serde_json::json!([[3, 3]]);
         let parsed: RowCohortConfig = serde_json::from_value(empty).unwrap();
         assert!(parsed.validate().is_err());
     }
-    // Synthetic row arithmetic, deliberately not a qualified model. These
-    // tests prove residency, verification and refusal at the real backend seam.
     type CheckedRows = (Option<usize>, TensorKey, usize, usize);
     struct TinyRowSource {
         config: ModelConfig,

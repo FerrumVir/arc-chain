@@ -56,9 +56,6 @@ COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 UTC_SECONDS_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 
-# This is the reviewed v0.8 trust-root mapping, not a mapping inferred from
-# private filenames or tar order.  A changed address requires a reviewed source
-# change, a new complete genesis, and a new protected-main pre-tag build.
 PRODUCTION_FLEET: tuple[tuple[str, str, str], ...] = (
     ("NYC", "adf4ff16f997c871c16f3897e67881311d08f975f28ebdcf79e86ea9e3b99d0f", "149.28.32.76"),
     ("LAX", "44d20543df6e76696da2ebbbd79e4243cd41729fa5b890e2618991e489314780", "140.82.16.112"),
@@ -94,7 +91,7 @@ STOPPED_STATUS_ARGV_FIELDS = (
 
 
 class VaultError(ValueError):
-    """A restore/install input violates the sealed production contract."""
+    pass
 
 
 def fail(message: str) -> NoReturn:
@@ -440,10 +437,6 @@ def sanitized_env(
     if remote:
         if tool_directory is None:
             fail("remote command environment requires one private tool directory")
-        # Do not expose the caller's ~/.ssh tree to OpenSSH.  The command also
-        # uses -F /dev/null, one explicit IdentityFile, IdentityAgent=none and
-        # an exact UserKnownHostsFile, but HOME remains private as defense in
-        # depth against any future client-side default lookup.
         environment["HOME"] = str(tool_directory)
     environment["PATH"] = (
         f"{tool_directory}:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -472,11 +465,6 @@ def secure_tool_ancestry(path: Path, label: str) -> os.stat_result:
             or not stat.S_ISDIR(details.st_mode)
             or details.st_uid not in (0, os.getuid())
             or permissions & 0o002
-            # Homebrew's Cellar is conventionally 0775 and operator-owned.
-            # Its reviewed file is still copied through one no-follow FD and
-            # accepted only when its immutable expected digest matches.  A
-            # group-writable directory not owned by this operator remains an
-            # unsafe substitution boundary.
             or (permissions & 0o020 and details.st_uid != os.getuid())
         ):
             fail(f"{label} has an unsafe owner/mode/type/symlink in its ancestry")
@@ -640,11 +628,6 @@ def verify_openssl_loader_trace(runtime: OpenSSLRuntime, trace: bytes, *, label:
     )
     lines = trace.splitlines()
     if sys.platform.startswith("linux"):
-        # LD_DEBUG=libs reports every search candidate as a ``trying file``
-        # line, including glibc-hwcaps paths that do not exist.  Only
-        # ``calling init`` identifies the object the loader actually mapped.
-        # Treating search probes as resolutions makes the hermetic check reject
-        # a valid private library on GNU/Linux.
         marker = b"calling init:"
         for dependency in dependencies:
             expected = os.fsencode(dependency)
@@ -654,8 +637,6 @@ def verify_openssl_loader_trace(runtime: OpenSSLRuntime, trace: bytes, *, label:
                 if marker not in line:
                     continue
                 candidate = line.split(marker, 1)[1].strip()
-                # Some loader versions append a namespace marker.  It is not
-                # part of the resolved pathname.
                 candidate = candidate.split(b" [", 1)[0].strip()
                 if candidate.rsplit(b"/", 1)[-1] == name:
                     loaded_paths.append(candidate)
@@ -770,8 +751,6 @@ def validate_cms_profile(openssl: OpenSSLRuntime, cms_path: Path) -> None:
         label="CMS profile inspection",
     ).stdout
     if cms_text.count(b"d.ktri") != 1 and cms_text.count(b"ktri") != 1:
-        # OpenSSL output varies by supported version; the exact one-recipient
-        # check below remains authoritative when the debug label is absent.
         if cms_text.count(b"issuerAndSerialNumber") != 1:
             fail("CMS artifact does not contain exactly one key-transport recipient")
     if cms_text.count(b"issuerAndSerialNumber") != 1:
@@ -866,9 +845,6 @@ def extract_six_keys(plain_tar: Path, extraction_root: Path) -> list[Path]:
     files: list[tuple[tarfile.TarInfo, tuple[str, ...]]] = []
     total = 0
     try:
-        # Parse and extract only from the already bounded no-follow read.  The
-        # path is never reopened after validation, eliminating a pathname
-        # substitution gap between the tar checks and member reads.
         with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
             if archive.pax_headers:
                 fail("decrypted vault has unsupported global PAX metadata")
@@ -1189,8 +1165,6 @@ def pin_openssl_runtime(
         libcrypto_name=libcrypto.name,
         digests=digests,
     )
-    # Prove both the copied image and the loader's resolved private dependency
-    # paths before any certificate, private key, or CMS byte is touched.
     run_openssl(runtime, ["version"], label="pinned OpenSSL loader proof")
     return runtime, digests
 
@@ -1308,14 +1282,6 @@ def publish_restore_output(
 
 
 def secure_cleanup(path: Path) -> None:
-    """Best-effort unlink through stable directory FDs without following links.
-
-    Overwriting by pathname is both ineffective on modern storage and unsafe:
-    a concurrent substitution could redirect it outside the private root.  All
-    secret removal here is therefore unlink-only and relative to no-follow
-    directory descriptors.
-    """
-
     def clear_directory(descriptor: int) -> None:
         try:
             names = [entry.name for entry in os.scandir(descriptor)]
@@ -1371,8 +1337,6 @@ def secure_cleanup(path: Path) -> None:
                             os.close(file_descriptor)
                     os.unlink(name, dir_fd=descriptor)
             except OSError:
-                # Cleanup must never turn a primary validation failure into a
-                # broader or path-following mutation attempt.
                 continue
         try:
             os.fsync(descriptor)
@@ -1801,8 +1765,6 @@ def load_legacy_maintenance_evidence_bundle(
     freeze_sha256: str,
     freeze_plan: Any,
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]], str]:
-    """Validate the generation-ledger tagged union emitted by archive-fleet."""
-
     value, expected = load_private_sealed_json(
         path,
         sidecar,
@@ -1854,7 +1816,6 @@ def load_legacy_maintenance_evidence_bundle(
         inventory.append({"node": node, "role": role, "sha256": root, "size": len(payload)})
         return inner, root
 
-    # Inventory order is consensus-like: it must match the producer exactly.
     authenticated, _authenticated_sha = sealed(
         bundle.get("authenticated_prefence_height_cross_proof"), "fleet",
         "authenticated-prefence-height-cross-proof",
@@ -2907,8 +2868,6 @@ esac
 
 
 def validate_exact_known_hosts(raw: bytes) -> None:
-    """Require the reviewed six-IP OpenSSH Ed25519 trust-anchor grammar."""
-
     try:
         text = raw.decode("ascii")
     except UnicodeDecodeError:
@@ -3392,11 +3351,6 @@ def _install_verified(args: argparse.Namespace, proof: Any) -> None:
         )
         sync_directory(pinned)
 
-        # This is a mandatory all-or-nothing preflight immediately before any
-        # key probe, upload, or install.  The remote helper is selected by the
-        # archive evidence's reviewed SHA-256 and reopens the actual v4 stop
-        # roots and persistent restart fence on each hard-coded production
-        # host.  A stale or merely self-hashed local JSON document cannot pass.
         def prove_node_stopped(node: str, host: str) -> None:
             node_evidence = stop_evidence[node]
             if (
@@ -3461,13 +3415,8 @@ def _install_verified(args: argparse.Namespace, proof: Any) -> None:
             node = genesis_row["node"]
             key = keys[node]
             host = NODE_TO_HOST[node]
-            # Repeat the authenticated fence/root proof at the per-node
-            # installation boundary, not only during the fleet preflight.
             prove_node_stopped(node, host)
             if final_reproof is None:
-                # Fetch protected main last and seal the complete second live
-                # proof at the immediate boundary before the first remote key
-                # probe or mutation.  All six fleet fences were already proved.
                 final_reproof = proof.recheck()
             probe = exact_control_line(
                 run_ssh(

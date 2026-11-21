@@ -1,14 +1,3 @@
-// The app's look, switched in one place.
-//
-// "engraved" is the website's language: white line on Arc blue, with Marcellus,
-// Hanken Grotesk and JetBrains Mono. "classic" is the original dark theme.
-// One attribute on <html> (`data-theme`) swaps every design token (see
-// styles/engraved.css); nothing else in the app branches on the theme except
-// the engraved illustrations, which read their ground colour from a token.
-//
-// To revert the product default, change DEFAULT_THEME. People can also switch
-// in Settings -> Appearance; that choice is remembered on this device only.
-
 import { useSyncExternalStore } from "react";
 
 export type Theme = "engraved" | "classic";
@@ -28,13 +17,10 @@ export function readStoredTheme(): Theme {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (isTheme(stored)) return stored;
   } catch {
-    // Storage can be unavailable (private mode, locked-down webview): use the default.
   }
   return DEFAULT_THEME;
 }
 
-// Only the classic theme sets Inter. It used to be a render-blocking remote stylesheet in index.html that every
-// launch waited on, including the engraved default and offline starts; now it is fetched only when classic is used.
 const INTER_HREF = "https://rsms.me/inter/inter.css";
 
 function ensureClassicFont(): void {
@@ -59,12 +45,10 @@ export function setTheme(theme: Theme): void {
   try {
     localStorage.setItem(STORAGE_KEY, theme);
   } catch {
-    // Not persisted, but still applied for this session.
   }
   applyTheme(theme);
 }
 
-/** Call once before the first render so the first paint is already themed. */
 export function initTheme(): Theme {
   const theme = readStoredTheme();
   applyTheme(theme);
@@ -82,7 +66,6 @@ export function useTheme(): Theme {
   );
 }
 
-/** The ground an engraving is printed on: the colour its masks paint. */
 export function engravingGround(): string {
   if (typeof document === "undefined") return "#002dde";
   const value = getComputedStyle(document.documentElement)

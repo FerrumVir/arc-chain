@@ -1,11 +1,3 @@
-// UNTESTED — requires hardware validation on Apple Silicon
-//
-// Argmax over i32 logits array — finds index of maximum value.
-// Ported from transformer.wgsl argmax kernel — must produce identical output.
-//
-// 256 threads, 1 threadgroup. Each thread strides over vocab (hardcoded 32000).
-// Threadgroup reduction finds global max index. Result written to result[0].
-
 #include <metal_stdlib>
 using namespace metal;
 

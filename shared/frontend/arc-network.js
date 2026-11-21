@@ -787,9 +787,6 @@
       && payload?.record_kind === "mined_inference_attestation"
       && payload?.tx_type === "InferenceAttestation"
       && payload?.tx_type_code === "0x16";
-    // Standalone transaction lookups may expose an exact numeric transaction
-    // type without the activity-record envelope. They may be categorized, but
-    // only the canonical activity shape below can prove a reward was paid.
     const lookupRewardIdentity = !activityEnvelope && typeCode === 0x25;
     const lookupInferenceIdentity = !activityEnvelope
       && (typeCode === 0x16 || normalizedType === "inferenceattestation");
@@ -879,11 +876,6 @@
     });
   }
 
-  // `/community/reward_receipt/0x{tx}` does not return the activity-feed
-  // envelope consumed by classifyReceipt(). It returns a direct settlement
-  // record whose identity and state matrix must be checked as one unit. Keep
-  // this parser separate so an arbitrary transaction response cannot acquire
-  // reward semantics merely by resembling one field from the settlement RPC.
   function classifyCommunityRewardReceipt(payload, expectedTxHash) {
     if (!isObject(payload)) return null;
     const MINED_FIELDS = [

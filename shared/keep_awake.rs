@@ -1,13 +1,3 @@
-/// Keeps the computer from idle-sleeping while a community job computes,
-/// when the operator enabled `--prevent-sleep-during-jobs`. Dropping the
-/// guard releases it. The machine may still sleep when the lid closes or
-/// when it is idle between jobs.
-///
-/// macOS holds `caffeinate -i -w <arc-node pid>` and Linux holds
-/// `systemd-inhibit ... tail --pid=<arc-node pid>`, so a crashed node can
-/// never leave the machine awake. Windows sets `ES_SYSTEM_REQUIRED` on the
-/// computing thread and clears it on drop; create and drop the guard on the
-/// same thread.
 #[must_use = "the computer may sleep again as soon as the guard is dropped"]
 pub struct KeepAwake {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -16,8 +6,6 @@ pub struct KeepAwake {
     thread_state_set: bool,
 }
 
-/// The helper command that keeps the machine awake while `pid` lives, on
-/// platforms that use one.
 pub fn keep_awake_helper_command(pid: u32) -> Option<(&'static str, Vec<String>)> {
     helper_command(std::env::consts::OS, pid, Purpose::Job)
 }
@@ -38,8 +26,6 @@ fn helper_command(os: &str, pid: u32, purpose: Purpose) -> Option<(&'static str,
         Some((
             "systemd-inhibit",
             vec![
-                // Sharing must allow explicit suspend. logind's idle lock only
-                // prevents IdleAction; it takes no sleep/key/display inhibitor.
                 match purpose {
                     Purpose::Job => "--what=idle:sleep",
                     Purpose::Sharing => "--what=idle",
@@ -75,19 +61,14 @@ mod windows_power {
 }
 
 impl KeepAwake {
-    /// Start keeping the machine awake if `enabled`; otherwise inert.
     pub fn begin(enabled: bool) -> Self {
         Self::begin_for_process(enabled, std::process::id())
     }
 
-    /// Same OS hold, released by Unix helpers if the watched worker exits.
     pub fn begin_for_process(enabled: bool, pid: u32) -> Self {
         Self::begin_with_purpose(enabled, pid, Purpose::Job)
     }
 
-    /// Opt-in idle-system-sleep hold for an available worker. Unlike the legacy
-    /// Linux per-job hold, this never inhibits an explicit suspend request.
-    /// No platform requests a display/screen-saver hold.
     pub fn begin_sharing_for_process(pid: u32) -> Self {
         Self::begin_with_purpose(true, pid, Purpose::Sharing)
     }
@@ -126,8 +107,6 @@ impl KeepAwake {
         #[cfg(windows)]
         {
             let thread_state_set = enabled && {
-                // SAFETY: SetThreadExecutionState only updates the calling
-                // thread's power request flags; it takes no pointers.
                 let previous = unsafe {
                     windows_power::SetThreadExecutionState(
                         windows_power::ES_CONTINUOUS | windows_power::ES_SYSTEM_REQUIRED,
@@ -144,7 +123,6 @@ impl KeepAwake {
         }
     }
 
-    /// Whether the guard is currently holding the machine awake.
     pub fn is_active(&self) -> bool {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
@@ -170,8 +148,6 @@ impl Drop for KeepAwake {
         }
         #[cfg(windows)]
         if self.thread_state_set {
-            // SAFETY: as in `begin`; ES_CONTINUOUS alone clears this
-            // thread's system-required request.
             unsafe {
                 windows_power::SetThreadExecutionState(windows_power::ES_CONTINUOUS);
             }
@@ -185,8 +161,6 @@ mod tests {
 
     #[test]
     fn sharing_helper_allows_manual_suspend_and_display_sleep() {
-        // Check both Unix command contracts on every test host. This does not
-        // claim runtime verification of Linux logind or a desktop environment.
         let (program, args) = helper_command("linux", 4242, Purpose::Sharing).unwrap();
         assert_eq!(program, "systemd-inhibit");
         assert_eq!(
@@ -204,7 +178,7 @@ mod tests {
         );
         let (program, args) = helper_command("macos", 4242, Purpose::Sharing).unwrap();
         assert_eq!(program, "/usr/bin/caffeinate");
-        assert_eq!(args, ["-i", "-w", "4242"]); // no -d display or -s forced sleep hold
+        assert_eq!(args, ["-i", "-w", "4242"]);
     }
 
     #[test]

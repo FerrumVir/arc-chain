@@ -11,15 +11,6 @@
     <meta name="theme-color" content="#002dde" />
     <meta name="color-scheme" content="dark" />
     <title>ARC - Node</title>
-    <!--
-      The launch screen. It is painted by this HTML alone, before any script or
-      bundled stylesheet has loaded, so the very first frame is already Arc blue
-      (the default "engraved" theme; lib/theme.ts switches the attribute if this
-      device chose "classic"). It sits outside #root, so React mounting never
-      restarts its animation; lib/boot.ts fades it out once the app knows what
-      to show. The CSP allows inline styles but not inline scripts, so nothing
-      here runs code.
-    -->
     <style>
       html { background: #002dde; }
       html[data-theme="classic"] { background: #060608; }
@@ -98,7 +89,6 @@
   <body>
     <div id="boot" class="boot" role="status" aria-label="Starting Arc">
       <div class="boot-mark">
-        <!-- one bay of the aqueduct: it draws itself, the keystone seats, then water runs along the top -->
         <svg class="boot-arch" viewBox="0 0 160 124" aria-hidden="true">
           <path class="water" d="M12 3H148" />
           <path class="ln" pathLength="1" d="M12 118V8H148V118" />

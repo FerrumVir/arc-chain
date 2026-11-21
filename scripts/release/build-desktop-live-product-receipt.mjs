@@ -1,10 +1,5 @@
 #!/usr/bin/env node
 
-// Create-only evidence for the post-cutover desktop product gate. This helper
-// runs only after `playwright test` succeeds (see desktop/package.json), then
-// independently re-reads the exact canary from the loopback node. A skipped,
-// flaky, partial, or prefix-only UI run cannot produce a receipt.
-
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
@@ -102,13 +97,6 @@ const BLOCK_RECEIPT_KEYS = Object.freeze([
   "logs", "success", "tx_hash", "value_commitment",
 ]);
 
-// A deliberately small, independently reviewed BLAKE3 implementation for the
-// sealed acceptance prompt.  The prompt is bounded far below one 1,024-byte
-// BLAKE3 chunk, so rejecting larger inputs keeps this verifier compact and
-// avoids silently exercising unreviewed tree-reduction code.  Known-answer
-// tests below are also evaluated at module load; the implementation source
-// digest is emitted in the receipt so downstream evidence binds the exact
-// verifier that recomputed the on-chain input hash.
 const BLAKE3_IV = Object.freeze([
   0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
   0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
@@ -125,7 +113,6 @@ function blake3Compress(chainingValue, blockWords, blockLength, flags) {
   const state = new Uint32Array(16);
   state.set(chainingValue, 0);
   state.set(BLAKE3_IV.slice(0, 4), 8);
-  // The short-input verifier always hashes chunk zero.
   state[12] = 0;
   state[13] = 0;
   state[14] = blockLength;

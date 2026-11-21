@@ -3,7 +3,6 @@ import { PLAIN_COPY } from "../src/lib/plain-copy";
 import { defaultWorkerThreads } from "../src/lib/types";
 import { seedComputePrompt, seedMockOverrides, seedOnboarded } from "./helpers";
 
-/** The node config the app saved, read from its persisted UI state. */
 async function savedConfig(page: Page) {
   return page.evaluate(() => {
     const raw = localStorage.getItem("arc-desktop-state-v1");
@@ -11,11 +10,6 @@ async function savedConfig(page: Page) {
   });
 }
 
-// Compute contribution is the user's answer. New installs start with it on
-// at setup where the model can run (onboarding.spec.ts); an install from
-// before that keeps its answer, here off. The node only downloads the model
-// and takes jobs while it is on, and the dashboard shows what this computer
-// actually did, read from its own node.
 test.describe("Explicit compute contribution choices", () => {
   test.beforeEach(async ({ page }) => {
     await seedOnboarded(page);
@@ -24,8 +18,6 @@ test.describe("Explicit compute contribution choices", () => {
   test("an explicit off stays off until changed, and per-job keep-awake waits for it", async ({
     page,
   }) => {
-    // The core cap setup stores for a compute-on install (mirrored from
-    // commands::default_worker_threads), and the share Settings states.
     for (const [cores, cap] of [
       [1, 1],
       [2, 1],
@@ -43,8 +35,6 @@ test.describe("Explicit compute contribution choices", () => {
     const share = PLAIN_COPY.settings.computeShare;
     const quarter =
       "Uses up to a quarter of your processor at low priority, and about 8 GB of memory while ARC Node is running. It keeps running on battery. Turn this off to stop ARC jobs and free that memory.";
-    // The other caps change the share and nothing else: the node starts at
-    // low priority and holds the model whatever its width.
     const rest =
       " at low priority, and about 8 GB of memory while ARC Node is running. It keeps running on battery. Turn this off to stop ARC jobs and free that memory.";
     const whole = `Uses up to your whole processor${rest}`;
@@ -52,7 +42,6 @@ test.describe("Explicit compute contribution choices", () => {
     expect(share(3, 12)).toBe(quarter);
     expect(share(1, 16)).toBe(quarter);
     expect(share(7, 24)).toBe(`Uses up to 7 of your 24 processor cores${rest}`);
-    // One core of two is more than a quarter, so it is not called one.
     expect(share(1, 2)).toBe(`Uses up to 1 of your 2 processor cores${rest}`);
     expect(share(24, 24)).toBe(whole);
     expect(share(null, 24)).toBe(whole);
@@ -63,19 +52,15 @@ test.describe("Explicit compute contribution choices", () => {
     const keepAwake = page.getByTestId("prevent-sleep-toggle");
     await expect(consent).not.toBeChecked();
     await expect(keepAwake).toBeDisabled();
-    // Off, so nothing is said about processor use.
     await expect(page.getByTestId("compute-share-note")).toHaveCount(0);
 
     await consent.click();
     await expect(consent).toBeChecked();
-    // This install never had a core cap. Turning compute on here keeps that
-    // (only setup stores the quarter), and the note says what it means.
     await expect(page.getByTestId("compute-share-note")).toHaveText(whole);
     await expect(keepAwake).toBeEnabled();
     await keepAwake.click();
     await expect(keepAwake).toBeChecked();
 
-    // Turning it off is one click and returns the node to observer mode.
     await consent.click();
     await expect(consent).not.toBeChecked();
     await expect(keepAwake).toBeDisabled();
@@ -123,8 +108,6 @@ test.describe("Explicit compute contribution choices", () => {
   });
 });
 
-// A stranded v0.7 install reaches this app through the v0.7 legacy bridge release.
-// The first launch asks once, in the user's words, before any compute runs.
 test.describe("First launch after a v0.7 upgrade", () => {
   const pendingQuestion = {
     load_legacy_compute_question: {
@@ -167,19 +150,12 @@ test.describe("First launch after a v0.7 upgrade", () => {
   });
 });
 
-// What the setup step and the Settings note say is what this release does:
-// the node starts at low operating-system priority, jobs use at most a
-// quarter of the logical cores, the model holds about 8 GB, nothing pauses
-// the node on battery, and it runs on after the window closes (the tray keeps
-// ARC up). No rule for idle time, heat or free memory exists yet, so none is
-// promised. Pure logic: no page.
 test.describe("Compute copy states this release's facts", () => {
   test("the setup step and every Settings note say priority, memory and battery", () => {
     const { body, belowMemoryFloor } = PLAIN_COPY.setup.compute;
     expect(body).toBe(
       "ARC Node can run AI jobs for the ARC network on this computer. It uses up to a quarter of your processor, at low priority so your own apps come first, and about 8 GB of memory while it is ready for jobs. It keeps running on battery. First it downloads the ARC model, about 4 GB, in the background. You can turn this off here or at any time in Settings.",
     );
-    // Below the memory requirement the step states the same facts.
     for (const fact of [
       "a quarter of your processor",
       "at low priority so your own apps come first",
@@ -194,7 +170,6 @@ test.describe("Compute copy states this release's facts", () => {
       expect(note).toContain("about 8 GB of memory while ARC Node is running");
       expect(note).toContain("It keeps running on battery.");
       expect(note).toContain("Turn this off to stop ARC jobs and free that memory.");
-      // The node runs on from the tray after the window closes.
       expect(note).not.toContain("while the app is open");
     }
     expect(body).not.toContain("while the app is open");
@@ -296,9 +271,6 @@ test.describe("The one-time sharing notice", () => {
   });
 });
 
-// Community PR #132: when the configured model file is missing or unreadable,
-// the native side starts the node as an observer without it and reports why.
-// The app says local compute is off, calmly, and leads to the re-download.
 test.describe("Model file unavailable", () => {
   const runningStatus = {
     running: true,
@@ -315,7 +287,6 @@ test.describe("Model file unavailable", () => {
     lastError: null,
     coordinatorUrl: null,
     chainHost: "http://140.82.16.112:9090",
-    // Caught up, so no start-up stage is drawn above the banners.
     chainHeight: 43_830,
     chainRound: 43_831,
     chainBlockAgeSeconds: 4,
@@ -340,7 +311,6 @@ test.describe("Model file unavailable", () => {
     await expect(banner).toContainText("Model file not found");
     await expect(banner).toContainText("local compute is off");
     await expect(banner).toContainText("re-download the model in Settings");
-    // A calm status, not the crash banner.
     await expect(page.getByTestId("crash-banner")).toHaveCount(0);
 
     await banner.getByTestId("btn-model-unavailable-settings").click();

@@ -1,18 +1,7 @@
-//! AVX-512 accelerated Ed25519 batch signature verification.
-//!
-//! Uses `curve25519-dalek` for curve arithmetic and adds AVX-512-specific
-//! optimizations on x86_64:
-//! - Batch k-scalar pre-computation in groups of 8 (AVX-512 register width)
-//! - Custom verification path: decompress → k-scalar → vartime_double_scalar_mul
-//! - Cache-line aligned batch scheduling
-//!
-//! On non-x86_64 or without AVX-512F, falls back to scalar verification.
-
 use crate::metal_verify::{GpuVerifyResult, VerifyTask};
 use std::time::Instant;
 use tracing::debug;
 
-/// AVX-512 batch Ed25519 verifier.
 pub struct Avx512Verifier {
     pub min_batch: usize,
     total_verified: u64,
@@ -79,11 +68,6 @@ impl Avx512Verifier {
     }
 }
 
-/// Core AVX-512 batch verification on x86_64.
-///
-/// When AVX-512F is available, processes signatures in cache-aligned groups
-/// of 8 (matching the 512-bit register width). Each group's SHA-512
-/// k-scalar computations benefit from the wider SIMD execution units.
 #[cfg(target_arch = "x86_64")]
 fn avx512_batch_verify_inner(tasks: &[VerifyTask]) -> Vec<bool> {
     use rayon::prelude::*;
@@ -92,9 +76,6 @@ fn avx512_batch_verify_inner(tasks: &[VerifyTask]) -> Vec<bool> {
         return scalar_batch_verify(tasks);
     }
 
-    // AVX-512 available: process in groups of 8 for cache-line alignment.
-    // SHA-512 on x86_64 with AVX-512 uses wider execution units automatically
-    // when compiled with target-feature=+avx512f.
     if tasks.len() < 64 {
         tasks.iter().map(verify_custom).collect()
     } else {
@@ -110,12 +91,6 @@ fn avx512_batch_verify_inner(tasks: &[VerifyTask]) -> Vec<bool> {
     scalar_batch_verify(tasks)
 }
 
-/// Custom Ed25519 verification using curve25519-dalek directly.
-///
-/// Same path as NEON verifier:
-/// 1. Decompress R and A
-/// 2. Compute k = SHA-512(R || A || msg) mod l
-/// 3. Check: [s]B - [k]A == R
 fn verify_custom(task: &VerifyTask) -> bool {
     use curve25519_dalek::EdwardsPoint;
     use curve25519_dalek::edwards::CompressedEdwardsY;

@@ -56,13 +56,6 @@ def operator_selection_remaining_ns(
     now_monotonic_ns: int | None = None,
     now_realtime_ns: int | None = None,
 ) -> int:
-    """Return a conservative same-invocation selection lease.
-
-    Python's portable monotonic clock does not include suspend on every
-    operator OS.  Realtime does, but may be stepped.  Requiring both elapsed
-    values to agree within one second makes either suspend or a wall-clock
-    step fail closed instead of extending the first-mutation window.
-    """
     for value, label in (
         (selected_monotonic_ns, "selection monotonic marker"),
         (selected_realtime_ns, "selection realtime marker"),
@@ -125,7 +118,6 @@ def read_canonical(path: Path, label: str, *, mode: int = 0o400) -> dict[str, An
 
 
 def publish(path: Path, value: Mapping[str, Any], label: str) -> str:
-    """Publish canonical bytes without replacing a concurrently-created final."""
     if not path.is_absolute() or path.suffix != ".json":
         fail(f"{label} output path is unsafe")
     payload = canonical(value)
@@ -620,12 +612,6 @@ def build_result(args: argparse.Namespace) -> dict[str, Any]:
     remaining_targets = [
         name for name in state["target_names"] if name not in transitioned_names
     ]
-    # A positive attempt result is create-only and may already be durable when
-    # the operator crashes before copying it into the immutable round prefix.
-    # Preserve its completion timestamp, then reconstruct and validate every
-    # other field from the current authorization/readiness/transition closure.
-    # Recomputing utc_now() here would make an otherwise exact crash resume
-    # conflict with its own terminal bytes forever.
     existing = None
     if args.output.exists() or args.output.is_symlink():
         existing = read_canonical(args.output, "existing round result")
@@ -836,9 +822,6 @@ def build_first_boundary(args: argparse.Namespace) -> dict[str, Any]:
         raise DriverError(
             "first quarantine boundary observation timeline differs"
         ) from error
-    # These UTC values originate on different hosts and are audit metadata.
-    # Causality is established by the exact selection root carried in the
-    # authorization, readiness, dispatch, transition and generation ledger.
     all_wrappers = [
         wrapper for row in ledger["rounds"]
         for wrapper in row["result"]["value"]["transitions"]

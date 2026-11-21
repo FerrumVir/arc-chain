@@ -1,23 +1,3 @@
-// System tray for ARC Node.
-//
-// The desktop app is designed to run continuously on a user's machine -
-// closing the window hides to the tray; the only way to actually stop
-// arc-node is the "Quit" menu item here. Pattern matches Tailscale,
-// Docker Desktop, Ollama.
-//
-// Menu layout:
-//   ARC Node                         (disabled header)
-//   -----
-//   Open                             show the window
-//   -----
-//   Status: <health>                 disabled, updated via ticker
-//   Round: <dag_round>               disabled, updated via ticker
-//   -----
-//   Quit ARC Node                    stop arc-node + exit app
-//
-// The status/round labels refresh every 5 s via a spawned tokio task
-// that pokes /health on the local node.
-
 use crate::AppState;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -35,11 +15,6 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
 
     let menu = Menu::with_items(app, &[&open_i, &sep1, &status_i, &round_i, &sep2, &quit_i])?;
 
-    // Left-click-to-open is a macOS/Windows menu-bar convention, and
-    // `TrayIconEvent::Click` is what implements it. Linux AppIndicator never
-    // delivers that event, so on Linux a left click would do nothing at all
-    // unless it opens the menu — which is the platform convention there
-    // anyway, and the only route to Quit.
     let menu_on_left_click = cfg!(target_os = "linux");
 
     let tray = TrayIconBuilder::with_id("main")
@@ -55,9 +30,6 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                 crate::sharing_awake::set_enabled(false);
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    // Stop arc-node cleanly before exiting; the window-close
-                    // hide-to-tray pattern means the node is otherwise left
-                    // running across window close.
                     if let Some(state) = handle.try_state::<AppState>() {
                         state.cancel_startup_retry();
                         if !state.another_desktop_owns_node().await {
@@ -71,9 +43,6 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
             }
             _ => {}
         })
-        // Left-clicking the tray icon pops open the window (macOS menu
-        // bar convention) rather than showing the menu (which right-click
-        // still does).
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
@@ -86,16 +55,11 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
             }
         })
         .icon(app.default_window_icon().cloned().unwrap_or_else(|| {
-            // Fallback: a 1px transparent PNG. Build is guaranteed to have
-            // the window icon, so this branch should never fire.
             tauri::image::Image::new(&[0; 4], 1, 1)
         }))
         .build(app)?;
     let _ = tray;
 
-    // Spawn a background refresh loop that updates the Status / Round
-    // items every 5 s from /health on the local node. Cheap: one HTTP
-    // round-trip to 127.0.0.1.
     let handle = app.clone();
     let status_item = status_i.clone();
     let round_item = round_i.clone();
@@ -111,7 +75,6 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                 *state.data_migration_error.lock().await,
                 Some(crate::start_fence::StartFence::OtherDesktop)
             ) {
-                // Reconciliation removed this refused copy's tray.
                 break;
             }
             let port = state.node.lock().await.rpc_port;
@@ -122,12 +85,6 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                 .timeout(std::time::Duration::from_secs(3))
                 .send()
                 .await;
-            // Plain words only. This loop sees the local /health alone, so it
-            // can say the node is running and how many peers it has, but not
-            // whether a coordinator answered; a community node has no peers
-            // by design, so "0 peers" and "syncing" are left out rather than
-            // shown as a fault. A missing /health is a node that is off or
-            // still loading its model.
             let (status_text, round_text) = match resp {
                 Ok(r) if r.status().is_success() => {
                     let v: serde_json::Value = r.json().await.unwrap_or(serde_json::Value::Null);

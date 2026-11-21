@@ -1,6 +1,3 @@
-//! Profile where time is spent in the INT8 forward pass.
-//! Usage: cargo run --example profile_int8 --features candle --release -- /path/to/model
-
 use arc_inference::cached_integer_model::*;
 use arc_inference::integer_lut::*;
 use std::time::Instant;
@@ -21,29 +18,21 @@ fn main() {
         cfg.n_layers, cfg.d_model, cfg.n_heads, cfg.n_kv_heads, cfg.d_ff, cfg.vocab_size
     );
 
-    // Profile a single forward pass (one token)
     let prompt = model.encode("What is 2+2?");
     let mut cache = KVCache::new(cfg.n_layers);
 
-    // Process prompt to build KV cache
     for &tok in &prompt {
         model.forward_one_token(tok, &mut cache);
     }
 
-    // Now profile ONE generation step
     let last_tok = *prompt.last().unwrap();
 
-    // Run 3 times, take the last (warm caches)
     for _ in 0..2 {
         let _ = model.forward_one_token(last_tok, &mut cache);
-        cache.seq_len -= 1; // reset so we can rerun
+        cache.seq_len -= 1;
         let layer_count = cfg.n_layers;
         for l in 0..layer_count {
             let kv_len = cfg.d_kv;
-            // KVCache holds full-precision Q16 i64 and no longer carries
-            // per-entry scales, so truncating k_data/v_data is the whole
-            // reset. The k_scales/v_scales truncations that used to sit here
-            // referenced fields that no longer exist.
             cache.k_data[l].truncate(cache.seq_len * kv_len);
             cache.v_data[l].truncate(cache.seq_len * kv_len);
         }
@@ -58,7 +47,6 @@ fn main() {
         total.as_secs_f64() * 1000.0
     );
 
-    // Profile individual matmul sizes
     println!("\n--- Matmul profiling (10 iterations each) ---");
 
     let d = cfg.d_model;
@@ -66,14 +54,12 @@ fn main() {
     let dkv = cfg.d_kv;
     let vocab = cfg.vocab_size;
 
-    // Create test inputs
     let input_d: Vec<i64> = (0..d).map(|i| (i as i64 % 200 - 100) * ONE / 100).collect();
     let input_ff: Vec<i64> = (0..dff)
         .map(|i| (i as i64 % 200 - 100) * ONE / 100)
         .collect();
 
     let profile_matmul = |name: &str, w: &I8Weights, input: &[i64], ins: usize, outs: usize| {
-        // Warmup
         let _ = matmul_fast(w, input, ins, outs);
 
         let start = Instant::now();
@@ -111,7 +97,6 @@ fn main() {
         "LM_head", vocab, d, lm_ms, lm_ms
     );
 
-    // Estimate breakdown
     let q_time = {
         let _ = matmul_fast(&l.wq, &input_d, d, d);
         let s = Instant::now();

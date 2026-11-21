@@ -1,11 +1,6 @@
-// Add to lib.rs: pub mod sdk;
-
 use crate::devtools::{AbiFunction, AbiType, ContractAbi, StateMutability};
 use serde::{Deserialize, Serialize};
 
-// ─── SDK language ────────────────────────────────────────────────────────────
-
-/// Target programming language for generated SDK code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SdkLanguage {
     Rust,
@@ -18,7 +13,6 @@ pub enum SdkLanguage {
 }
 
 impl SdkLanguage {
-    /// File extension for this language.
     pub fn extension(&self) -> &'static str {
         match self {
             Self::Rust => "rs",
@@ -31,7 +25,6 @@ impl SdkLanguage {
         }
     }
 
-    /// Display name for this language.
     pub fn display_name(&self) -> &'static str {
         match self {
             Self::Rust => "Rust",
@@ -45,9 +38,6 @@ impl SdkLanguage {
     }
 }
 
-// ─── SDK config ──────────────────────────────────────────────────────────────
-
-/// Configuration for SDK code generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SdkConfig {
     pub language: SdkLanguage,
@@ -57,7 +47,6 @@ pub struct SdkConfig {
 }
 
 impl SdkConfig {
-    /// Create a new SDK configuration.
     pub fn new(language: SdkLanguage, output_dir: &str, package_name: &str, version: &str) -> Self {
         Self {
             language,
@@ -68,9 +57,6 @@ impl SdkConfig {
     }
 }
 
-// ─── Param type ──────────────────────────────────────────────────────────────
-
-/// Parameter type descriptors for contract method bindings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ParamType {
     Uint256,
@@ -85,13 +71,12 @@ pub enum ParamType {
 }
 
 impl ParamType {
-    /// Convert to a language-specific type string.
     pub fn to_language_type(&self, language: SdkLanguage) -> String {
         match language {
             SdkLanguage::Rust => self.to_rust_type(),
             SdkLanguage::TypeScript => self.to_ts_type(),
             SdkLanguage::Python => self.to_python_type(),
-            _ => self.to_ts_type(), // fallback
+            _ => self.to_ts_type(),
         }
     }
 
@@ -143,9 +128,6 @@ impl ParamType {
     }
 }
 
-// ─── Method binding ──────────────────────────────────────────────────────────
-
-/// A single method binding extracted from a contract ABI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MethodBinding {
     pub name: String,
@@ -156,7 +138,6 @@ pub struct MethodBinding {
 }
 
 impl MethodBinding {
-    /// Create a new method binding.
     pub fn new(
         name: &str,
         inputs: Vec<ParamType>,
@@ -173,7 +154,6 @@ impl MethodBinding {
         }
     }
 
-    /// Convert an ABI function to a method binding.
     pub fn from_abi_function(func: &AbiFunction) -> Self {
         let inputs: Vec<ParamType> = func
             .inputs
@@ -200,7 +180,6 @@ impl MethodBinding {
     }
 }
 
-/// Convert a devtools AbiType to an SDK ParamType.
 fn abi_type_to_param_type(abi: &AbiType) -> ParamType {
     match abi {
         AbiType::Uint256 => ParamType::Uint256,
@@ -217,9 +196,6 @@ fn abi_type_to_param_type(abi: &AbiType) -> ParamType {
     }
 }
 
-// ─── Contract binding ────────────────────────────────────────────────────────
-
-/// A complete contract binding: contract metadata + all method bindings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContractBinding {
     pub contract_name: String,
@@ -229,7 +205,6 @@ pub struct ContractBinding {
 }
 
 impl ContractBinding {
-    /// Create a new contract binding.
     pub fn new(contract_name: &str, address: [u8; 32], abi: ContractAbi) -> Self {
         let methods = abi
             .functions
@@ -244,25 +219,19 @@ impl ContractBinding {
         }
     }
 
-    /// Look up a method binding by name.
     pub fn get_method(&self, name: &str) -> Option<&MethodBinding> {
         self.methods.iter().find(|m| m.name == name)
     }
 
-    /// Number of view-only methods.
     pub fn view_method_count(&self) -> usize {
         self.methods.iter().filter(|m| m.is_view).count()
     }
 
-    /// Number of state-mutating methods.
     pub fn mutating_method_count(&self) -> usize {
         self.methods.iter().filter(|m| !m.is_view).count()
     }
 }
 
-// ─── Generated code ──────────────────────────────────────────────────────────
-
-/// A single generated source file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneratedFile {
     pub path: String,
@@ -270,7 +239,6 @@ pub struct GeneratedFile {
 }
 
 impl GeneratedFile {
-    /// Create a new generated file.
     pub fn new(path: &str, content: &str) -> Self {
         Self {
             path: path.to_string(),
@@ -278,13 +246,11 @@ impl GeneratedFile {
         }
     }
 
-    /// Size of the generated content in bytes.
     pub fn size_bytes(&self) -> usize {
         self.content.len()
     }
 }
 
-/// The output of an SDK generation run: all generated files for a language.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneratedCode {
     pub language: SdkLanguage,
@@ -292,7 +258,6 @@ pub struct GeneratedCode {
 }
 
 impl GeneratedCode {
-    /// Create a new, empty generated code set.
     pub fn new(language: SdkLanguage) -> Self {
         Self {
             language,
@@ -300,25 +265,19 @@ impl GeneratedCode {
         }
     }
 
-    /// Add a generated file.
     pub fn add_file(&mut self, file: GeneratedFile) {
         self.files.push(file);
     }
 
-    /// Total number of generated files.
     pub fn file_count(&self) -> usize {
         self.files.len()
     }
 
-    /// Total size of all generated files in bytes.
     pub fn total_size_bytes(&self) -> usize {
         self.files.iter().map(|f| f.size_bytes()).sum()
     }
 }
 
-// ─── SDK generator ───────────────────────────────────────────────────────────
-
-/// SDK code generator - produces client bindings from contract ABIs.
 #[derive(Debug)]
 pub struct SdkGenerator {
     config: SdkConfig,
@@ -326,7 +285,6 @@ pub struct SdkGenerator {
 }
 
 impl SdkGenerator {
-    /// Create a new SDK generator with the given configuration.
     pub fn new(config: SdkConfig) -> Self {
         Self {
             config,
@@ -334,12 +292,10 @@ impl SdkGenerator {
         }
     }
 
-    /// Register a contract binding for code generation.
     pub fn add_binding(&mut self, binding: ContractBinding) {
         self.bindings.push(binding);
     }
 
-    /// Generate type definitions for all registered contracts.
     pub fn generate_types(&self) -> GeneratedCode {
         let mut code = GeneratedCode::new(self.config.language);
         let ext = self.config.language.extension();
@@ -358,7 +314,6 @@ impl SdkGenerator {
         code
     }
 
-    /// Generate method bindings (call wrappers) for all registered contracts.
     pub fn generate_bindings(&self) -> GeneratedCode {
         let mut code = GeneratedCode::new(self.config.language);
         let ext = self.config.language.extension();
@@ -377,32 +332,26 @@ impl SdkGenerator {
         code
     }
 
-    /// Generate a full client module (types + bindings + index).
     pub fn generate_client(&self) -> GeneratedCode {
         let mut code = GeneratedCode::new(self.config.language);
         let ext = self.config.language.extension();
 
-        // Types.
         let types = self.generate_types();
         for f in types.files {
             code.add_file(f);
         }
 
-        // Bindings.
         let bindings = self.generate_bindings();
         for f in bindings.files {
             code.add_file(f);
         }
 
-        // Index / entry file.
         let index_content = self.render_index();
         let index_path = format!("{}/index.{}", self.config.output_dir, ext);
         code.add_file(GeneratedFile::new(&index_path, &index_content));
 
         code
     }
-
-    // ── internal rendering ──
 
     fn render_types(&self, binding: &ContractBinding) -> String {
         let lang = self.config.language;
@@ -483,8 +432,6 @@ impl SdkGenerator {
     }
 }
 
-// ─── Tests ───────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,7 +478,6 @@ mod tests {
         abi
     }
 
-    // 1. SdkLanguage extensions.
     #[test]
     fn test_sdk_language_extensions() {
         assert_eq!(SdkLanguage::Rust.extension(), "rs");
@@ -543,7 +489,6 @@ mod tests {
         assert_eq!(SdkLanguage::Kotlin.extension(), "kt");
     }
 
-    // 2. ContractBinding from ABI - methods extracted correctly.
     #[test]
     fn test_contract_binding_from_abi() {
         let abi = sample_abi();
@@ -563,7 +508,6 @@ mod tests {
         assert!(balance_of.is_view);
     }
 
-    // 3. ParamType Rust type rendering.
     #[test]
     fn test_param_type_rust_rendering() {
         assert_eq!(
@@ -598,7 +542,6 @@ mod tests {
         );
     }
 
-    // 4. ParamType TypeScript type rendering.
     #[test]
     fn test_param_type_typescript_rendering() {
         assert_eq!(
@@ -626,7 +569,6 @@ mod tests {
         assert_eq!(arr.to_language_type(SdkLanguage::TypeScript), "string[]");
     }
 
-    // 5. ParamType Python type rendering.
     #[test]
     fn test_param_type_python_rendering() {
         assert_eq!(
@@ -650,7 +592,6 @@ mod tests {
         assert_eq!(arr.to_language_type(SdkLanguage::Python), "list[int]");
     }
 
-    // 6. SdkGenerator generates types.
     #[test]
     fn test_sdk_generator_types() {
         let config = SdkConfig::new(SdkLanguage::TypeScript, "./out", "arc-sdk", "1.0.0");
@@ -668,7 +609,6 @@ mod tests {
         );
     }
 
-    // 7. SdkGenerator generates full client.
     #[test]
     fn test_sdk_generator_client() {
         let config = SdkConfig::new(SdkLanguage::Rust, "./out", "arc-sdk", "0.1.0");
@@ -676,17 +616,14 @@ mod tests {
         generator.add_binding(ContractBinding::new("Token", test_hash(1), sample_abi()));
 
         let client = generator.generate_client();
-        // types (1) + bindings (1) + index (1) = 3 files.
         assert_eq!(client.file_count(), 3);
         assert!(client.total_size_bytes() > 0);
 
-        // Check that index file is present.
         let index = client.files.iter().find(|f| f.path.contains("index."));
         assert!(index.is_some());
         assert!(index.unwrap().content.contains("arc-sdk"));
     }
 
-    // 8. GeneratedFile and GeneratedCode sizes.
     #[test]
     fn test_generated_code_sizes() {
         let mut code = GeneratedCode::new(SdkLanguage::Python);
@@ -702,7 +639,6 @@ mod tests {
         );
     }
 
-    // 9. MethodBinding from ABI function.
     #[test]
     fn test_method_binding_from_abi() {
         let func = AbiFunction::new(
@@ -729,9 +665,8 @@ mod tests {
         assert!(!method.is_view);
         assert_eq!(method.inputs.len(), 2);
         assert_eq!(method.outputs.len(), 1);
-        assert_eq!(method.gas_estimate, 0); // default
+        assert_eq!(method.gas_estimate, 0);
 
-        // View function.
         let view_func = AbiFunction::new(
             "totalSupply",
             vec![],
@@ -745,7 +680,6 @@ mod tests {
         assert!(view_method.is_view);
     }
 
-    // 10. Serde round-trip for SdkConfig.
     #[test]
     fn test_sdk_config_serde() {
         let config = SdkConfig::new(SdkLanguage::Go, "./gen", "arc-go-sdk", "2.0.0");

@@ -1,21 +1,8 @@
-//! SmolLM3 chat prompt for one user turn (spec §7).
-//!
-//! Reproduces the pinned `chat_template.jinja` (revision a07cc9a0) for a
-//! single user message, no tools and `add_generation_prompt = true`. The
-//! template prints the current date; here the date is an explicit input, so
-//! every node renders identical text for the same request. CI compares this
-//! rendering with `transformers.apply_chat_template`.
-
-/// A single-turn chat request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatPrompt<'a> {
-    /// Optional system message (may carry `/think`, `/no_think` or
-    /// `/system_override`, as the template defines).
     pub system: Option<&'a str>,
     pub user: &'a str,
-    /// Reasoning mode when the system message does not choose one.
     pub thinking: bool,
-    /// The template's `Today Date`, formatted `%d %B %Y` (e.g. `06 October 2026`).
     pub today: &'a str,
 }
 
@@ -23,7 +10,6 @@ const DEFAULT_THINK: &str = "You are a helpful AI assistant named SmolLM, traine
 const DEFAULT_NO_THINK: &str =
     "You are a helpful AI assistant named SmolLM, trained by Hugging Face.\n\n";
 
-/// Render the prompt text exactly as the pinned template does.
 pub fn render(prompt: &ChatPrompt<'_>) -> String {
     let mut thinking = prompt.thinking;
     let mut custom: Option<String> = None;
@@ -43,7 +29,6 @@ pub fn render(prompt: &ChatPrompt<'_>) -> String {
     }
     let mode = if thinking { "/think" } else { "/no_think" };
     let mut out = String::from("<|im_start|>system\n");
-    // The template tests the original system message, not the stripped one.
     let overriding = prompt
         .system
         .is_some_and(|text| text.contains("/system_override"));
@@ -70,7 +55,6 @@ pub fn render(prompt: &ChatPrompt<'_>) -> String {
                 DEFAULT_NO_THINK
             }),
         }
-        // Without tools the template never closes the system block.
     }
     out.push_str("<|im_start|>user\n");
     out.push_str(prompt.user);

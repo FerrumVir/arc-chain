@@ -16,18 +16,8 @@ import type { InferenceResult } from "../lib/types";
 
 const EXAMPLES = ["The largest planet is", "Water boils at", "The sun is a", "Bitcoin is a"];
 
-// This exact native/browser sentinel is the only proof that no inference POST
-// was sent. Every other error may be an ambiguous accepted write and is
-// terminal for this click.
 const INFERENCE_PRE_DISPATCH_UNAVAILABLE = "ARC_INFERENCE_PRE_DISPATCH_UNAVAILABLE:";
 
-/// Local execution stays first. If this machine cannot serve, call a seed's
-/// `/inference/run` before the standalone consensus route: that endpoint gives
-/// registered community workers first refusal, then safely falls through to
-/// the seed's sharded/local execution. Only when every direct coordinator
-/// fails before completing a job do we use `/inference/run_consensus`.
-/// `onRoute` reports each route as this app dispatches to it: the app's own
-/// decisions, never a claim about the node's progress.
 async function runInferenceSmart(prompt: string, maxTokens: number, onRoute: (route: DispatchRoute) => void): Promise<InferenceResult> {
   const fallbackToCoordinator = async (): Promise<InferenceResult> => {
     try {
@@ -35,10 +25,6 @@ async function runInferenceSmart(prompt: string, maxTokens: number, onRoute: (ro
       return await api.runInferenceViaCoordinatorDirect(prompt, maxTokens);
     } catch (directErr) {
       const message = String(directErr instanceof Error ? directErr.message : directErr);
-      // The native/browser direct path may inspect multiple read-only
-      // readiness endpoints, but emits this typed sentinel only if it sent no
-      // POST at all. Never infer write safety from 503 text, connection
-      // errors, or a timeout: any of those can arrive after acceptance.
       if (message.startsWith(INFERENCE_PRE_DISPATCH_UNAVAILABLE)) {
         onRoute("consensus");
         return await api.runInferenceViaCoordinator(prompt, maxTokens);
@@ -49,14 +35,9 @@ async function runInferenceSmart(prompt: string, maxTokens: number, onRoute: (ro
 
   try {
     onRoute("local");
-    // An empty successful completion can be a legitimate immediate EOS. Do
-    // not duplicate it on another coordinator merely to manufacture text.
     return await api.runInference(prompt, maxTokens);
   } catch (err) {
     const msg = String(err instanceof Error ? err.message : err);
-    // A mutation-free readiness failure is the only safe reason to migrate
-    // the click. Any response/parse/reset/timeout after a local POST is
-    // terminal even when its text happens to mention 503 or "connection".
     if (msg.startsWith(INFERENCE_PRE_DISPATCH_UNAVAILABLE)) {
       return await fallbackToCoordinator();
     }
@@ -64,9 +45,6 @@ async function runInferenceSmart(prompt: string, maxTokens: number, onRoute: (ro
   }
 }
 
-// What the thread says while a question is out. A community node cannot
-// take questions itself (it has no peers and usually no model loaded), so
-// going to the network is the normal path, not a shortfall of "your node".
 const ROUTE_WAITING: Record<DispatchRoute, string> = {
   local: PLAIN_COPY.ask.askingNode,
   direct: PLAIN_COPY.ask.askingNetwork,
@@ -74,7 +52,6 @@ const ROUTE_WAITING: Record<DispatchRoute, string> = {
 };
 const ROUTE_SHORT: Record<DispatchRoute, string> = { local: "your node", direct: "the ARC network", consensus: "a network consensus run" };
 
-// After this long the waiting note says the network is slow today.
 const SLOW_AFTER_SECS = 60;
 
 function formatElapsed(seconds: number): string {
@@ -83,11 +60,9 @@ function formatElapsed(seconds: number): string {
   return `${minutes} min ${seconds % 60} s`;
 }
 
-/** Why a question got no answer, from the error the dispatch returned. The text itself stays behind Show details. */
 function describeFailure(error: string | undefined) {
   const raw = error ?? "";
   const copy = PLAIN_COPY.ask;
-  // This exact sentinel is the only proof that no inference POST was sent.
   if (raw.startsWith(INFERENCE_PRE_DISPATCH_UNAVAILABLE)) {
     return { kind: "not-sent" as const, title: copy.notSent, note: copy.notSentNote, retry: PLAIN_COPY.actions.tryAgain, raw };
   }
@@ -97,7 +72,6 @@ function describeFailure(error: string | undefined) {
   return { kind: "no-answer" as const, title: copy.noAnswer, note: copy.noAnswerNote, retry: PLAIN_COPY.actions.tryAgain, raw };
 }
 
-/** One short line for screen readers about the newest turn, instead of reading whole answers aloud. */
 function announce(turns: ChatTurn[]): string {
   const t = turns[turns.length - 1];
   if (!t) return "";
@@ -117,16 +91,10 @@ export function Inference() {
   const clear = useChatStore((s) => s.clear);
   const [draft, setDraft] = useState("");
   const [maxTokens, setMaxTokens] = useState(16);
-  // React's disabled prop is applied only after the next render. Two click or
-  // keyboard activations in the same event turn can otherwise start two
-  // requests, and therefore two reward-capable POSTs. This synchronous latch
-  // closes before the request starts and reopens only when it settles (or when
-  // the person explicitly stops waiting for it, in a later event).
   const latch = useRef(false);
   const activeId = useRef<string | null>(null);
   const composer = useRef<HTMLTextAreaElement>(null);
   const threadEnd = useRef<HTMLDivElement>(null);
-  // what each answer has shown about being checked and recorded, for the chat aqueduct
   const [facts, setFacts] = useState<Record<string, AnswerFacts>>({});
   const noteFacts = (id: string, f: AnswerFacts) =>
     setFacts((prev) => (prev[id]?.agreed === f.agreed && prev[id]?.height === f.height ? prev : { ...prev, [id]: f }));
@@ -165,15 +133,12 @@ export function Inference() {
     latch.current = false;
   };
 
-  // bring the newest turn into view as the thread grows or a turn settles: its top, so a long answer reads
-  // from its first line (the browser stops at the end of the thread, above the pinned composer)
   const lastKey = turns.length ? `${turns.length}:${turns[turns.length - 1].status}` : "0";
   useEffect(() => {
     if (!turns.length) return;
     const last = threadEnd.current?.previousElementSibling;
     last?.scrollIntoView({ block: "start", behavior: prefersReducedMotion() ? "auto" : "smooth" });
   }, [lastKey, turns.length]);
-  // the composer grows with its text, up to a limit, then scrolls
   useLayoutEffect(() => {
     const el = composer.current;
     if (!el) return;
@@ -190,10 +155,6 @@ export function Inference() {
         </div>
         <div className="chat-header-actions">
           <InfoPopover title="How this works">
-            {/* commands.rs: the first status poll pins the session's chain
-                host to one of the production coordinators, and the local
-                route then refuses before sending (run_inference_local_inner).
-                The direct route posts only to that pinned origin. */}
             <p data-testid="inference-route-help">
               Your prompt goes to the ARC coordinator this app reads the chain from (the same one for the whole session), at its{" "}
               <code>/inference/run</code> route. That coordinator offers it to a community worker first; if none takes it, ARC&rsquo;s own nodes can
@@ -220,21 +181,16 @@ export function Inference() {
         </div>
       </div>
 
-      {/* Home: the node's state and its one fix. The chat below answers from
-          the network whatever this says. */}
       <NodeStatusStrip />
       <UpdateLocationNotice />
 
       <ChatAqueduct turns={turns} facts={facts} onPick={pick} />
 
-      {/* Renders only when the pinned host's chain is a protocol-4 chain. */}
       <NativePaidRequests />
 
       <p className="sr-only" role="status" aria-live="polite" data-testid="inference-announce">
         {announce(turns)}
       </p>
-      {/* A band for the whole conversation sits here, full width of the chat column and above the thread
-          (see .chat-band in chat.css). The column is a flex column, so the band needs no other change. */}
       <section className="thread" aria-label="Conversation">
         {turns.length === 0 ? (
           <EmptyThread />
@@ -416,11 +372,6 @@ function Pending({ turn }: { turn: ChatTurn }) {
 
 const COPIED_RESET_MS = 2_500;
 
-/**
- * A question that got no answer: one plain sentence, what to do, and the text
- * that came back behind Show details, selectable and copyable for a report.
- * Through v0.8.14 the raw error was the body of this card, in red.
- */
 function Failed({ turn, latest, onRetry, disabled }: { turn: ChatTurn; latest: boolean; onRetry: () => void; disabled: boolean }) {
   const failure = describeFailure(turn.error);
   const tid = (name: string) => (latest ? name : `${name}-earlier`);
@@ -433,7 +384,6 @@ function Failed({ turn, latest, onRetry, disabled }: { turn: ChatTurn; latest: b
     return () => window.clearTimeout(timer);
   }, [copied]);
   const copyDetails = () => {
-    // Without a clipboard API the call throws before returning a promise.
     void Promise.resolve()
       .then(() => navigator.clipboard.writeText(failure.raw))
       .then(
@@ -473,7 +423,6 @@ function Failed({ turn, latest, onRetry, disabled }: { turn: ChatTurn; latest: b
           </button>
         )}
       </div>
-      {/* Rendered while hidden so aria-controls always names a real element. */}
       {failure.raw && (
         <pre id={detailsId} className="answer-details" hidden={!open} data-testid={tid("inference-error-details")}>
           {failure.raw}

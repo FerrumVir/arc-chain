@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Adversarial tests for validator-vault validation and canonicalization."""
 
 from __future__ import annotations
 
@@ -233,8 +232,6 @@ class ValidatorVaultArchiveTests(unittest.TestCase):
     def test_workflow_canonicalizes_macos_bsdtar_metadata_in_memory(self) -> None:
         members, expected = self.macos_members()
         source = self.archive(members, format=tarfile.PAX_FORMAT)
-        # libarchive stores some extended attributes as binary PAX values;
-        # Python exposes invalid UTF-8 octets through surrogateescape.
         marker = b"AgAAAAAAAABmacfixture"
         raw = source.read_bytes()
         self.assertIn(marker, raw)

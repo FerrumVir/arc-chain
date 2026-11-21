@@ -88,7 +88,6 @@ for (const sharingEligible of [false, undefined]) {
 }
 
 test.beforeEach(async ({ page, baseURL }) => {
-  // Every browser test is isolated from production services.
   await page.route("**/*", (route) => new URL(route.request().url()).origin === baseURL
     ? route.continue() : route.abort());
 });
@@ -232,7 +231,6 @@ for (const width of [1280, 960]) {
           ? PLAIN_COPY.nodeStrip.sharingIneligible : PLAIN_COPY.nodeStrip.sharingOff);
         if (tier === "standard") await expect(page.getByTestId("node-strip-share-note")).toBeVisible();
         if (width === 960) {
-          // Check initial paint, before any scrollIntoView or fill can conceal a regression.
           await expect(page.getByTestId("inference-prompt")).toBeInViewport({ ratio: 1 });
           await expect(page.getByTestId("btn-run-inference")).toBeInViewport({ ratio: 1 });
           expect(await page.getByTestId("btn-run-inference").evaluate((element) => {
@@ -281,8 +279,6 @@ for (const width of [1280, 960]) {
       await expect(page.locator(".answer-by")).toHaveText(PLAIN_COPY.answer.own);
       await page.locator("details.evidence summary").scrollIntoViewIfNeeded();
       await shot(page, "answer");
-      // A visible DOM node can still be covered by the sticky composer.
-      // Exercise the real click at the minimum window size as well.
       await page.locator("details.evidence summary").click();
       await expect(page.getByTestId("inference-consensus")).toBeVisible();
       await page.getByTestId("nav-settings").click();
@@ -388,7 +384,6 @@ test("Home closes a refused copy without enabling sharing below the memory floor
   const close = page.getByTestId("node-strip-action");
   await expect(close).toHaveText(PLAIN_COPY.actions.closeCopy);
   await expect(page.getByRole("button", { name: PLAIN_COPY.actions.shareComputer })).toHaveCount(0);
-  // Browser close-copy is a reload; native close-copy exits without Stop.
   await Promise.all([page.waitForEvent("load"), close.click()]);
   expect(await page.evaluate(() => JSON.parse(localStorage.getItem("arc-desktop-state-v1")!).config.computeConsent)).toBe(false);
 });

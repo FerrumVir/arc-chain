@@ -1,34 +1,3 @@
-//! M8: latency of the serving path the native executor actually calls
-//! (`CachedIntegerModel::try_generate_v2`) on the canonical profile.
-//!
-//! Measured, with repeated samples and distributions, never a single run:
-//!   * cold load: artifact to a resident canonical model;
-//!   * the first request after load, reported on its own and kept out of
-//!     every distribution (page faults and cold caches belong to it);
-//!   * time to first token: one-token generation (BOS + prompt prefill + one
-//!     selection), per prompt length;
-//!   * decode per token: (T(n tokens) - T(1 token)) / (n - 1);
-//!   * full request latency for n tokens, and the sequential throughput it
-//!     implies: the native worker executes one request at a time, so a
-//!     node's serving throughput is n / T(n) and concurrent requests wait
-//!     in its queue;
-//!   * peak resident memory, swap in use (before load, after load, at the
-//!     end) and the load average at the start and end, so a run that swapped
-//!     or shared the host says so.
-//!
-//! Each configuration runs with batched prefill OFF (the serving default) and
-//! ON (labelled). Every repeat must produce the same tokens, or the run
-//! aborts: a faster wrong answer is not a measurement.
-//!
-//! This is the model half of the serving path. The protocol half (admission,
-//! queueing, votes, certificate, settlement, retries) comes from a soak run's
-//! workload records (`scripts/benchmarks/native_request_latency.py`): with
-//! the deterministic executor it measures protocol overhead only, and the
-//! real executor stays gated on reference qualification (M4).
-//!
-//!   cargo run -p arc-inference --example serving_latency --features candle --release -- \
-//!     --model /path/model.gguf [--repeats 5] [--tokens 32] [--json-out out.json]
-
 use arc_inference::cached_integer_model::{
     GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, load_cached_model_canonical_i8_interleaved_rope,
 };
@@ -45,13 +14,11 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn max_rss_bytes() -> Option<u64> {
-    // SAFETY: getrusage with a zeroed, correctly sized out-parameter.
     unsafe {
         let mut usage: libc::rusage = std::mem::zeroed();
         if libc::getrusage(libc::RUSAGE_SELF, &mut usage) != 0 {
             return None;
         }
-        // ru_maxrss is bytes on macOS and kilobytes on Linux.
         #[cfg(target_os = "macos")]
         let bytes = usage.ru_maxrss as u64;
         #[cfg(target_os = "linux")]
@@ -65,10 +32,8 @@ fn max_rss_bytes() -> Option<u64> {
     None
 }
 
-/// Swap in use, in bytes, or None when the platform does not say.
 fn swap_used_bytes() -> Option<u64> {
     if cfg!(target_os = "macos") {
-        // `sysctl -n vm.swapusage`: "total = 2048.00M  used = 1034.25M  free = …"
         let out = std::process::Command::new("sysctl")
             .args(["-n", "vm.swapusage"])
             .output()
@@ -98,11 +63,9 @@ fn swap_used_bytes() -> Option<u64> {
     }
 }
 
-/// The 1, 5 and 15 minute load averages.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn load_average() -> Option<[f64; 3]> {
     let mut loads = [0f64; 3];
-    // SAFETY: getloadavg writes at most `nelem` (3) doubles into the buffer.
     let written = unsafe { libc::getloadavg(loads.as_mut_ptr(), 3) };
     (written == 3).then_some(loads)
 }
@@ -112,8 +75,6 @@ fn load_average() -> Option<[f64; 3]> {
     None
 }
 
-/// Memory the OS can hand out now, without evicting anything that is in use:
-/// free + inactive + speculative pages on macOS, `MemAvailable` on Linux.
 fn available_memory_bytes() -> Option<u64> {
     if cfg!(target_os = "macos") {
         let out = std::process::Command::new("vm_stat").output().ok()?;
@@ -145,23 +106,12 @@ fn available_memory_bytes() -> Option<u64> {
     }
 }
 
-/// A resident canonical model measured 6.7 GB for a 3.8 GB artifact (1.76x),
-/// so twice the artifact leaves room for that plus the KV cache and the
-/// process itself. Below this the run pages, and paging is what the previous
-/// attempt measured instead of the model.
 const REQUIRED_MEMORY_PER_ARTIFACT_BYTE: u64 = 2;
 
-/// The contaminated run started at a 1-minute load average of 7.08 on ten
-/// threads. Half the core count is the line between "this host is mine" and
-/// "something else is already using it".
 const MAX_START_LOAD_PER_CORE: f64 = 0.5;
 
-/// Swap that grows during the run means the model is being paged, which is
-/// exactly what invalidated the previous attempt (+5.24 GB). A clean run grows
-/// none; this allows a little for unrelated system activity.
 const MAX_SWAP_GROWTH_BYTES: u64 = 512 << 20;
 
-/// Why the host is not fit to measure on, or `None` if it is.
 fn contended(
     artifact_bytes: u64,
     cores: usize,
@@ -226,10 +176,6 @@ fn main() {
     assert!(repeats >= 3, "distributions need at least 3 samples");
     assert!(tokens >= 2, "decode needs at least two generated tokens");
 
-    // A contended host produces numbers that look like measurements and are
-    // not. The previous attempt ran ninety minutes and had to be thrown away:
-    // swap grew 5.24 GB and it started at a load average of 7.08 on ten
-    // threads. Check before spending that time, and again as it is spent.
     let allow_contended = args.iter().any(|a| a == "--allow-contended");
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     let artifact_bytes = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
@@ -262,23 +208,14 @@ fn main() {
     let rss_after_load = max_rss_bytes();
     let swap_after_load = swap_used_bytes();
     let eos = model.config.eos_tokens.clone();
-    // Deterministic synthetic prompts of fixed lengths: ids 100.. avoid BOS/EOS.
     let prompt =
         |len: usize| -> Vec<u32> { (0..len as u32).map(|i| 100 + (i * 37) % 30_000).collect() };
 
-    // The first request after load, on the serving default, kept out of the
-    // distributions below.
     canonical_prefill::set_batched_prefill_enabled(false);
     let first_request = Instant::now();
     model.try_generate_v2(&prompt(16), 1, &eos).expect("fits");
     let first_request_after_load_s = first_request.elapsed().as_secs_f64();
 
-    // Prompt lengths. The default is the full set; `--prompt-lens 16,128`
-    // exists because the 512-token configuration adds about 1 GB of KV cache
-    // on top of a ~6.7 GB resident model, which is what the OS killed this
-    // benchmark for on a 16 GB host. A run that measures fewer lengths says so
-    // in its own JSON (`prompt_lens`), so a shorter run can never be mistaken
-    // for a full one.
     let prompt_lens: Vec<usize> = match arg(&args, "--prompt-lens") {
         Some(list) => {
             let lens: Vec<usize> = list
@@ -308,8 +245,6 @@ fn main() {
                 let (first, _) = model.try_generate_v2(&p, 1, &eos).expect("fits");
                 let t1 = start.elapsed().as_secs_f64();
                 let start = Instant::now();
-                // EOS disabled: every run must produce exactly `tokens` tokens,
-                // so per-token decode is comparable across repeats.
                 let (all, _) = model.try_generate_v2(&p, tokens, &[]).expect("fits");
                 let tn = start.elapsed().as_secs_f64();
                 assert_eq!(
@@ -330,8 +265,6 @@ fn main() {
                 throughput.push(f64::from(tokens) / tn);
             }
             eprintln!("batched={batched} prompt={len}: done");
-            // Re-check before paying for the next configuration rather than
-            // discovering at the end that everything since was paging.
             if let Some(reason) = contended(artifact_bytes, cores, swap_before_load, true)
                 && !allow_contended
             {

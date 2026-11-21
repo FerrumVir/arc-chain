@@ -1,13 +1,3 @@
-"""Model preparation (GGUF f32 tensors -> integer state), per contract §8.
-
-A tiny Llama GGUF is described by a recipe of exactly-representable f32
-values. This module prepares it the way the contract says: per-row INT8 in
-f32, scales in f64, Q16 embeddings and norms, RoPE tables, the interleaved
-row rewrite. It then digests the prepared state and runs it. The Rust test
-writes the same GGUF with candle, loads it through the production loader, and
-must reach the same digest, logits and tokens.
-"""
-
 from __future__ import annotations
 
 import math
@@ -20,7 +10,7 @@ from arc_conformance import kat
 
 SHAPE = {"vocab_size": 12, "d_model": 8, "n_heads": 2, "n_kv_heads": 1,
          "d_ff": 16, "n_layers": 1, "max_seq": 4096, "rope_base": 10000.0}
-SEED = 0x7072_6570  # "prep"
+SEED = 0x7072_6570
 MASK64 = (1 << 64) - 1
 
 
@@ -32,7 +22,7 @@ def nearest_f32(decimal_text: str) -> np.float32:
     return min(candidates, key=lambda c: abs(Decimal(float(c)) - target))
 
 
-F32_1E_10 = nearest_f32("1e-10")  # Rust's `1e-10` literal in f32 context
+F32_1E_10 = nearest_f32("1e-10")
 
 
 class RecipeRng:
@@ -44,7 +34,6 @@ class RecipeRng:
         return self.state
 
     def weight(self) -> np.float32:
-        # k / 2^22 with |k| < 2^23: exact in f32, in [-2, 2).
         return np.float32(((self.next_u64() >> 40) - (1 << 23)) / float(1 << 22))
 
     def norm(self) -> np.float32:
@@ -52,7 +41,6 @@ class RecipeRng:
 
 
 def recipe():
-    """Tensors in the order both implementations draw them."""
     s = SHAPE
     d, vocab, d_ff = s["d_model"], s["vocab_size"], s["d_ff"]
     d_kv = d // s["n_heads"] * s["n_kv_heads"]
@@ -79,8 +67,6 @@ def recipe():
         matrix(f"{p}.ffn_down.weight", d, d_ff)
         norm(f"{p}.attn_norm.weight", d)
         norm(f"{p}.ffn_norm.weight", d)
-    # Token 0's embedding row is all zero: exercises the 1e-10 floor and the
-    # minimum scale of 1.
     name, rows, cols, values = tensors[0]
     values[:cols] = [np.float32(0.0)] * cols
     return tensors
@@ -129,7 +115,6 @@ def rope_tables(d_head, max_seq, base):
 
 
 def split_half_rows(data, scales, n_heads, d_head, cols):
-    """The loader's interleaved-profile rewrite: [e0,o0,e1,o1] -> [e0,e1,o0,o1]."""
     half = d_head // 2
     out_data, out_scales = list(data), list(scales)
     for head in range(n_heads):
@@ -178,14 +163,6 @@ def prepare():
 
 
 def prepared_digest(state) -> str:
-    """BLAKE3 of the prepared state in executed (split-half) row order.
-
-    Order: u64 n_layers, d_model, n_heads, n_kv_heads, d_ff, vocab_size,
-    max_seq; i64 attn_scale; rope cos then sin; embedding_q16; embedding_i8,
-    output, final_norm; then per layer wq, wk, wv, wo, w_gate, w_up, w_down,
-    attn_norm, ffn_norm. A matrix is its INT8 bytes then its i64 scales; all
-    integers little-endian.
-    """
     s = SHAPE
     d_head = s["d_model"] // s["n_heads"]
     out = bytearray()

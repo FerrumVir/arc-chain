@@ -4,13 +4,6 @@ import type { PreviousInstallNotice as Notice } from "../lib/types";
 import { PLAIN_COPY } from "../lib/plain-copy";
 import { api } from "../lib/tauri";
 
-/**
- * One calm sentence: launch found node data from an earlier ARC install whose
- * app data was gone, and set it aside (renamed beside itself, never deleted).
- * Shown during setup and on every screen after it until dismissed. A status,
- * not a problem: the node starts fresh, and a wallet comes back from its 12
- * words.
- */
 export function PreviousInstallNotice({
   notice,
   onDismissed,

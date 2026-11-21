@@ -1,10 +1,3 @@
-/**
- * ARC Chain SDK - Transaction builder.
- *
- * Constructs unsigned transaction objects matching the ARC Chain RPC format,
- * then signs them with Ed25519 and computes the BLAKE3 transaction hash.
- */
-
 import { blake3 } from "@noble/hashes/blake3";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils";
 import { KeyPair } from "./crypto";
@@ -24,15 +17,9 @@ import type {
 } from "./types";
 import { u64ToBigInt } from "./u64";
 
-/** Domain separation context matching the Rust implementation. */
 const TX_DOMAIN = "ARC-chain-tx-v1";
 const TX_DOMAIN_V3 = "ARC-chain-tx-v3";
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/** Encode a u64 as 8 little-endian bytes without passing through float math. */
 function encodeU64(value: U64, fieldName: string): Uint8Array {
   const exact = u64ToBigInt(value, fieldName);
   const buf = new ArrayBuffer(8);
@@ -41,14 +28,12 @@ function encodeU64(value: U64, fieldName: string): Uint8Array {
   return new Uint8Array(buf);
 }
 
-/** Encode a bincode enum discriminant as a 32-bit little-endian integer. */
 function encodeU32(value: number): Uint8Array {
   const buf = new ArrayBuffer(4);
   new DataView(buf).setUint32(0, value, true);
   return new Uint8Array(buf);
 }
 
-/** Concatenate multiple Uint8Arrays. */
 function concat(...arrays: Uint8Array[]): Uint8Array {
   let totalLen = 0;
   for (const a of arrays) totalLen += a.length;
@@ -87,16 +72,14 @@ function txTypeByteForSigning(txType: TxType): number {
   }
 }
 
-/** Encode a transaction body to bytes for hashing. */
 function encodeBody(body: TxBody): Uint8Array {
   const parts: Uint8Array[] = [];
 
   switch (body.type) {
     case "Transfer": {
-      parts.push(encodeU32(0)); // bincode TxBody::Transfer variant index
+      parts.push(encodeU32(0));
       parts.push(hexToBytes(body.to));
       parts.push(encodeU64(body.amount, "amount"));
-      // amount_commitment: Option<[u8;32]>
       if (body.amount_commitment) {
         parts.push(new Uint8Array([0x01]));
         parts.push(hexToBytes(body.amount_commitment));
@@ -151,7 +134,6 @@ function encodeBody(body: TxBody): Uint8Array {
       break;
     }
     default: {
-      // Fallback: JSON-serialize unknown body types
       const json = new TextEncoder().encode(JSON.stringify(body));
       parts.push(json);
     }
@@ -160,12 +142,6 @@ function encodeBody(body: TxBody): Uint8Array {
   return concat(...parts);
 }
 
-/**
- * Compute the BLAKE3 signing hash for a transaction.
- *
- * Matches the Rust `Transaction::compute_hash()`:
- * `tx_type || from || nonce || body || fee || gas_limit`
- */
 function computeHash(
   txTypeByte: number,
   fromAddr: string,
@@ -192,12 +168,10 @@ function computeHash(
     encodeU64(gasLimit, "gas_limit")
   );
 
-  // BLAKE3 with derive_key context
   const digest = blake3(data, { context });
   return bytesToHex(digest);
 }
 
-/** Validate that an address is a 64-character hex string. */
 function validateAddress(address: string, fieldName: string): void {
   if (!address) {
     throw new Error(`${fieldName} is required`);
@@ -207,34 +181,12 @@ function validateAddress(address: string, fieldName: string): void {
       `${fieldName} must be 64 hex characters, got ${address.length}`
     );
   }
-  // Check valid hex
   if (!/^[0-9a-fA-F]{64}$/.test(address)) {
     throw new Error(`${fieldName} is not valid hex`);
   }
 }
 
-// ---------------------------------------------------------------------------
-// TransactionBuilder
-// ---------------------------------------------------------------------------
-
-/**
- * Build unsigned ARC Chain transactions.
- *
- * All methods return a Transaction object that can be signed with
- * `TransactionBuilder.sign()` and submitted via `ArcClient.submitTransaction()`.
- */
 export class TransactionBuilder {
-  // -- Transfer --
-
-  /**
-   * Build an unsigned transfer transaction.
-   *
-   * @param fromAddr - 64-char hex sender address
-   * @param toAddr - 64-char hex recipient address
-   * @param amount - Amount in ARC tokens (smallest unit)
-   * @param fee - Transaction fee (default 1)
-   * @param nonce - Sender nonce for replay protection
-   */
   static transfer(
     fromAddr: string,
     toAddr: string,
@@ -280,19 +232,6 @@ export class TransactionBuilder {
     };
   }
 
-  // -- Deploy Contract --
-
-  /**
-   * Build an unsigned contract deployment transaction.
-   *
-   * @param fromAddr - 64-char hex sender address
-   * @param code - WASM bytecode as Uint8Array
-   * @param gasLimit - Maximum gas for deployment
-   * @param fee - Transaction fee
-   * @param nonce - Sender nonce
-   * @param constructorArgs - ABI-encoded constructor arguments
-   * @param stateRentDeposit - Pre-paid state rent
-   */
   static deployContract(
     fromAddr: string,
     code: Uint8Array,
@@ -326,20 +265,6 @@ export class TransactionBuilder {
     };
   }
 
-  // -- Call Contract --
-
-  /**
-   * Build an unsigned WASM contract call transaction.
-   *
-   * @param fromAddr - 64-char hex sender address
-   * @param contractAddr - 64-char hex contract address
-   * @param calldata - ABI-encoded call data as Uint8Array
-   * @param value - ARC tokens to send with the call
-   * @param gasLimit - Maximum gas for execution
-   * @param func - Function name to call
-   * @param fee - Transaction fee
-   * @param nonce - Sender nonce
-   */
   static callContract(
     fromAddr: string,
     contractAddr: string,
@@ -376,18 +301,6 @@ export class TransactionBuilder {
     };
   }
 
-  // -- Stake --
-
-  /**
-   * Build an unsigned stake/unstake transaction.
-   *
-   * @param fromAddr - 64-char hex sender address
-   * @param amount - Amount to stake or unstake
-   * @param isStake - True to stake, false to unstake
-   * @param validator - Validator address (defaults to self)
-   * @param fee - Transaction fee
-   * @param nonce - Sender nonce
-   */
   static stake(
     fromAddr: string,
     amount: U64,
@@ -425,18 +338,6 @@ export class TransactionBuilder {
     };
   }
 
-  // -- Settle --
-
-  /**
-   * Build an unsigned settlement transaction (zero fee).
-   *
-   * @param fromAddr - 64-char hex sender address
-   * @param agentId - 64-char hex agent address
-   * @param serviceHash - 64-char hex service hash
-   * @param amount - Settlement amount
-   * @param usageUnits - Usage units consumed
-   * @param nonce - Sender nonce
-   */
   static settle(
     fromAddr: string,
     agentId: string,
@@ -471,15 +372,6 @@ export class TransactionBuilder {
     };
   }
 
-  // -- Signing --
-
-  /**
-   * Sign a transaction with the given key pair.
-   *
-   * @param tx - Unsigned transaction from any build method
-   * @param keypair - Ed25519 key pair whose address matches tx.from
-   * @returns A new signed transaction (original is not modified)
-   */
   static async sign(
     tx: TransferTransaction,
     keypair: KeyPair,

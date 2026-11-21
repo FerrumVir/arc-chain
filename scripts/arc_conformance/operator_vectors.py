@@ -1,14 +1,3 @@
-"""Emit operator-level known answers from the independent reference.
-
-The committed model KAT does not pin every clause (see mutations.py): the
-repetition penalty's multiplicity and window, argmax tie-breaking, the
-interleaved-RoPE profile and generation v2 are never exercised there. These
-vectors cover them one operator at a time. The Rust engine is then checked
-against this file, so agreement is between two independent implementations.
-
-    python3 -m arc_conformance.operator_vectors > integer_operator_kat.json
-"""
-
 from __future__ import annotations
 
 import json
@@ -139,11 +128,6 @@ def attention_cases(rng: Lcg):
             [-3, 2, 5, 1, -(1 << 32) - 1, 1, 0, 1]]
     values = [[ONE, -ONE, 2 * ONE, 0, 5, -5, 9, -9], [3 * ONE, 1, -1, 7, -7, ONE, 0, 2]]
     case(q, keys, values, note="elements outside signed 32 bits; exact 64-bit products required")
-    # Deviation D1's boundary: the aarch64 fast path narrows Q and K to 32 bits
-    # only when every element lies in [-2^31, 2^31 - 1]. These sit exactly on
-    # the bounds (the fast path, which must stay exact) and one past them (the
-    # exact path). Each large element meets a small partner, so every product
-    # stays far inside signed 64 bits.
     lo, hi = -(1 << 31), (1 << 31) - 1
     q = [hi, 3, -2, 1, 0, 4, -1, lo]
     keys = [[7, 1, lo, -1, 2, 0, 3, 1], [-3, 2, 5, 1, hi, 1, 0, -1]]
@@ -181,7 +165,6 @@ def argmax_cases():
 
 
 def permuted_split_half_k(model, row):
-    """K as Rust stores it after rewriting GGUF adjacent pairs to split-half."""
     dh, half = model.d_head, model.d_head // 2
     out = []
     for h in range(len(row) // dh):
@@ -199,8 +182,6 @@ def interleaved_v2_section(fixture):
         model.forward(token, cache)
     rust_layout = {"k": [[permuted_split_half_k(model, r) for r in layer] for layer in cache["k"]],
                    "v": cache["v"], "len": cache["len"]}
-    # With this prompt the penalty changes the sixth token, so both sampling
-    # rules are pinned by the sequences themselves.
     prompt, max_tokens = [2, 7], 10
     free_run = model.generate_v2(prompt, max_tokens, [])
     eos = [free_run[2]]
@@ -254,7 +235,6 @@ def build_document():
 
 
 def verify(document: dict) -> list[str]:
-    """Recompute every vector with the current reference; list disagreements."""
     fresh = build_document()
     problems = []
 

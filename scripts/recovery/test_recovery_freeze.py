@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Focused unit tests for the standalone recovery_freeze v5 primitives."""
 
 from __future__ import annotations
 
