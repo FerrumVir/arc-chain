@@ -12,6 +12,6 @@
   "keywords": ["blockchain", "l1", "agents", "arc-chain", "typescript", "sdk"],
   "license": "MIT",
   "devDependencies": {
-    "typescript": "^5.9.3"
+    "typescript": "^7.0.2"
   }
 }
