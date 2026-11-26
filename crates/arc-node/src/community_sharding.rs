@@ -2279,7 +2279,7 @@ impl CommunityShardCoordinator {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use arc_inference::cached_integer_model::{
         ArithmeticProfile, CachedIntegerModel, CachedLayer, I8Weights, KVCache, ModelConfig,
@@ -2288,7 +2288,7 @@ mod tests {
 
     const Q16_ONE: i64 = 1i64 << 16;
 
-    fn test_hash(label: &[u8]) -> Hash256 {
+    pub(crate) fn test_hash(label: &[u8]) -> Hash256 {
         arc_crypto::hash_bytes(label)
     }
 
@@ -2361,7 +2361,7 @@ mod tests {
         }
     }
 
-    fn build_deterministic_integer_model(
+    pub(crate) fn build_deterministic_integer_model(
         vocab_size: usize,
         d_model: usize,
         n_heads: usize,
@@ -2452,7 +2452,7 @@ mod tests {
         }
     }
 
-    fn build_partial_integer_model(
+    pub(crate) fn build_partial_integer_model(
         full: &CachedIntegerModel,
         range: ShardLayerRange,
     ) -> CachedIntegerModel {
@@ -2504,7 +2504,10 @@ mod tests {
         }
     }
 
-    fn model_spec_from(model_id: Hash256, model: &CachedIntegerModel) -> TrustedModelSpec {
+    pub(crate) fn model_spec_from(
+        model_id: Hash256,
+        model: &CachedIntegerModel,
+    ) -> TrustedModelSpec {
         TrustedModelSpec {
             model_id,
             execution_profile: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
@@ -2516,7 +2519,7 @@ mod tests {
         }
     }
 
-    fn lease_req(
+    pub(crate) fn lease_req(
         worker_id: Hash256,
         spec: &TrustedModelSpec,
         max_resident_layers: usize,
@@ -2534,7 +2537,7 @@ mod tests {
         }
     }
 
-    fn ready_hb(
+    pub(crate) fn ready_hb(
         worker_id: Hash256,
         assignment: &ShardLeaseAssignment,
         ready: bool,
@@ -2550,7 +2553,10 @@ mod tests {
         }
     }
 
-    fn claim_req(worker_id: Hash256, assignment: &ShardLeaseAssignment) -> ShardClaimStepRequest {
+    pub(crate) fn claim_req(
+        worker_id: Hash256,
+        assignment: &ShardLeaseAssignment,
+    ) -> ShardClaimStepRequest {
         ShardClaimStepRequest {
             worker_id,
             lease_id: assignment.lease_id,
@@ -2620,7 +2626,7 @@ mod tests {
         }
     }
 
-    fn make_two_tile_coordinator(spec: &TrustedModelSpec) -> CommunityShardCoordinator {
+    pub(crate) fn make_two_tile_coordinator(spec: &TrustedModelSpec) -> CommunityShardCoordinator {
         let limits = CommunityShardLimits {
             target_partitions: 2,
             ..CommunityShardLimits::default()

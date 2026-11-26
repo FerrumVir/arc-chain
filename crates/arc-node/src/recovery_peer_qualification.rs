@@ -693,7 +693,7 @@ fn run_qualify_peer_state_command(
 
     let mut data_dir_lock = acquire_node_data_dir_lock(candidate_dir, None)?;
     audit_candidate_file_isolation(candidate_dir)?;
-    let mut state = StateDB::with_genesis_persistent_recovery_in_prepared_directory(
+    let state = StateDB::with_genesis_persistent_recovery_in_prepared_directory(
         &genesis_accounts,
         data_dir_lock.prepared_directory(),
         recovery_network,
@@ -739,7 +739,7 @@ fn run_qualify_peer_state_command(
     );
     install_startup_consensus_domains(&consensus.engine, genesis_hash, Some(actual_domain))
         .map_err(|error| anyhow::anyhow!("failed to install recovery consensus domain: {error}"))?;
-    let committee = consensus.engine.frozen_validator_set();
+    let committee = consensus.engine.frozen_validator_set().clone();
     ensure!(
         committee.epoch == 1 && committee.len() == approved_validators.len(),
         "constructed committee does not match approved epoch-1 genesis committee"

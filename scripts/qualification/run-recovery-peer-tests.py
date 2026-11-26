@@ -16,6 +16,13 @@ EXPECTED_BINARY_TESTS = {
     'recovery_peer_qualification_tests::qualify_peer_state_rejects_oversized_wrong_domain_forged_and_subquorum_certificates',
 }
 EXPECTED_LIBRARY_TESTS = {
+    'community_shard_executor::tests::full_pipeline_two_partial_executors_matches_try_generate_and_allows_terminal_retry',
+    'community_shard_executor::tests::constructor_rejects_full_model_bad_range_shape_profile_and_config',
+    'community_shard_executor::tests::step_retry_preserves_single_kv_advance_and_rejects_conflicts_and_order_violations',
+    'community_shard_executor::tests::rejects_invalid_work_auth_binding_inputs_history_terminal_and_deadlines',
+    'community_shard_executor::tests::cancellation_expiry_release_and_rebind_prevent_resurrection_and_fence_old_boots',
+    'community_shard_executor::tests::enforces_kv_budget_session_cap_tombstone_cap_and_fenced_boot_cap',
+
     'community_sharding::tests::community_sharding_real_integer_model_pipeline_matches_try_generate',
     'community_sharding::tests::community_sharding_join_gap_fails_closed_and_caps_partial_range',
     'community_sharding::tests::community_sharding_replicate_join_and_leave_idle_rebalance',
@@ -77,7 +84,7 @@ def main():
                 executables.setdefault(target["name"], set()).add(row["executable"])
     expected_targets = {
         "arc-node": (("tests::recovery_peer_", "recovery_peer_qualification_tests::"), EXPECTED_BINARY_TESTS),
-        "arc_node": (("community_sharding::tests::", "rpc::community_shard_http::tests::", "rpc::tests::community_auth_"), EXPECTED_LIBRARY_TESTS),
+        "arc_node": (("community_shard_executor::tests::", "community_sharding::tests::", "rpc::community_shard_http::tests::", "rpc::tests::community_auth_"), EXPECTED_LIBRARY_TESTS),
     }
     if set(executables) != set(expected_targets) or any(len(paths) != 1 for paths in executables.values()):
         raise SystemExit(f"Expected one node binary and one node library test executable, found {executables}")

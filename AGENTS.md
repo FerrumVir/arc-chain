@@ -271,6 +271,12 @@ nonce. The coordinator requires a loaded canonical model; it is off by default.
 The status route reports verified dispatch and rewards as disabled until their
 integration is qualified. This transport alone does not activate desktop nodes.
 
+`community_shard_executor.rs` executes only the assigned canonical partial
+model with per-session KV limits, exact-retry caching, cancellation retention,
+and lease/boot fences. It rejects full-model residency and non-owned weights.
+It is a synchronous worker component; the outbound worker loop and verified
+public dispatch still need integration.
+
 `arc-node operator recovery qualify-peer-state` opens an already copied,
 disposable `peer-recovery-candidate-*` directory. Its hash-pinned manifest binds
 the target signing record, genesis, state WAL, recovery domain, and raw finality
