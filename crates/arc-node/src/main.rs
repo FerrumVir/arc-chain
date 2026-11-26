@@ -9536,6 +9536,8 @@ mod tests {
     use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
     use serde_json::json;
 
+    include!("recovery_peer_replay_tests.rs");
+
     #[test]
     fn community_worker_batched_prefill_respects_opt_out_and_validator_role() {
         for setting in [None, Some("1"), Some(""), Some("other")] {

@@ -2,6 +2,15 @@ name: Linux candidate artifacts
 
 on:
   workflow_dispatch:
+    inputs:
+      qualification:
+        description: Full candidate qualification or isolated peer recovery tests
+        type: choice
+        required: true
+        default: full
+        options:
+          - full
+          - recovery-peer
   push:
     branches: [arc-chain-v2-implementation-20260919, arc-native-low-residency-20260927, arc-desktop-unattended-availability-20260927]
 
@@ -17,7 +26,45 @@ env:
   CARGO_BUILD_JOBS: 2
 
 jobs:
+  recovery-peer:
+    if: inputs.qualification == 'recovery-peer'
+    name: Signed peer recovery replay
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: nightly-2026-03-16
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+        with:
+          shared-key: recovery-peer
+          cache-on-failure: true
+      - name: Verify source identity and run every selected test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 scripts/ci/no_comments.py
+          python3 scripts/qualification/run-recovery-peer-tests.py \
+            --evidence-dir "$RUNNER_TEMP/recovery-peer-evidence"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: recovery-peer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/recovery-peer-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
   recovered-v3-paid-lifecycle:
+    if: inputs.qualification != 'recovery-peer'
     name: Recovered-v3 paid lifecycle (isolated Linux process test)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -159,6 +206,7 @@ jobs:
           retention-days: 14
 
   desktop-native-paid-test:
+    if: inputs.qualification != 'recovery-peer'
     name: Desktop native paid Rust tests (macOS)
     runs-on: ${{ startsWith(vars.ARC_MACOS_ARM_RUNNER, '[') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) && fromJSON(vars.ARC_MACOS_ARM_RUNNER) || 'macos-15' }}
     timeout-minutes: 45
@@ -236,6 +284,7 @@ jobs:
           exit 0
 
   linux-candidate:
+    if: inputs.qualification != 'recovery-peer'
     name: Linux production candidate
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -374,7 +423,7 @@ jobs:
 
   real-model-conformance:
     name: Fresh-runner real-model conformance (${{ matrix.layout }})
-    if: github.ref == 'refs/heads/arc-native-low-residency-20260927'
+    if: inputs.qualification != 'recovery-peer' && github.ref == 'refs/heads/arc-native-low-residency-20260927'
     strategy:
       fail-fast: false
       matrix:
