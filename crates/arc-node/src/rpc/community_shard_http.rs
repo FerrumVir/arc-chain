@@ -1545,4 +1545,328 @@ mod tests {
 
         server.abort();
     }
+
+    #[derive(Debug, Clone, serde::Serialize)]
+    struct TestShardClaimPayload {
+        worker_id: Hash256,
+        step: u64,
+    }
+
+    impl super::ShardWorkerRequestIdentity for TestShardClaimPayload {
+        fn request_worker_id(&self) -> Hash256 {
+            self.worker_id
+        }
+    }
+
+    fn sign_at_timestamp<T: serde::Serialize>(
+        path: &str,
+        payload: T,
+        keypair: &KeyPair,
+        target_coordinator: Hash256,
+        transaction_domain: Option<Hash256>,
+        timestamp_unix_ms: u64,
+    ) -> super::super::CommunitySignedRequest<T> {
+        let mut signed = super::super::sign_community_request(
+            path,
+            payload,
+            keypair,
+            target_coordinator,
+            transaction_domain,
+        )
+        .unwrap();
+        signed.timestamp_unix_ms = timestamp_unix_ms;
+        let commitment = super::super::community_request_commitment(
+            path,
+            signed.version,
+            signed.target_coordinator,
+            signed.transaction_domain,
+            signed.payload_hash,
+            signed.timestamp_unix_ms,
+            signed.nonce,
+        );
+        signed.signature = keypair.sign(&commitment).unwrap();
+        signed
+    }
+
+    #[tokio::test]
+    async fn community_shard_http_replay_cache_allows_over_64_claims_enforces_30s_skew_and_isolates_paths()
+     {
+        for exact in [
+            COMMUNITY_SHARD_LEASE_PATH,
+            COMMUNITY_SHARD_HEARTBEAT_PATH,
+            COMMUNITY_SHARD_CLAIM_STEP_PATH,
+            COMMUNITY_SHARD_SUBMIT_STEP_PATH,
+            COMMUNITY_SHARD_RELEASE_PATH,
+        ] {
+            assert!(super::super::is_community_shard_authenticated_path(exact));
+        }
+        for rejected in [
+            COMMUNITY_SHARD_STATUS_PATH,
+            "/community/shards/",
+            "/community/shards/unknown",
+            "/community/shards/lease/",
+            "/community/shards/claim_step?x=1",
+        ] {
+            assert!(!super::super::is_community_shard_authenticated_path(
+                rejected
+            ));
+        }
+
+        let model_id = arc_crypto::hash_bytes(b"http-shard-replay-model");
+        let node = build_test_node(Some(Arc::new(build_tiny_model(4))), Some(model_id));
+        init_community_shard_coordinator_with_limits(
+            &node,
+            CommunityShardLimits {
+                target_partitions: 2,
+                ..CommunityShardLimits::default()
+            },
+        )
+        .unwrap();
+
+        let worker_kp = KeyPair::generate_ed25519();
+        let worker_addr = worker_kp.address();
+        let domain = node.state.transaction_domain_hash();
+        register_worker_signed(
+            &node,
+            &worker_kp,
+            model_id,
+            vec![COMMUNITY_SHARD_CAPABILITY],
+        )
+        .await
+        .unwrap();
+
+        let lease_signed = sign_shard_worker_request(
+            COMMUNITY_SHARD_LEASE_PATH,
+            make_lease_request(worker_addr, model_id, 2),
+            &worker_kp,
+            node.validator_address,
+            domain,
+        )
+        .unwrap();
+        let lease = community_shard_lease_signed(AxumState(node.clone()), Json(lease_signed))
+            .await
+            .unwrap()
+            .0
+            .assignment;
+        assert_eq!(lease.lease_epoch, 1);
+        assert_eq!(node.community_shard_request_replays.lock().seen.len(), 1);
+        assert_eq!(node.community_request_replays.lock().seen.len(), 1);
+
+        let heartbeat = sign_shard_worker_request(
+            COMMUNITY_SHARD_HEARTBEAT_PATH,
+            ShardHeartbeatRequest {
+                worker_id: worker_addr,
+                lease_id: lease.lease_id,
+                lease_epoch: lease.lease_epoch,
+                model_id,
+                execution_profile: lease.execution_profile.clone(),
+                loaded_range: lease.range,
+                ready: true,
+            },
+            &worker_kp,
+            node.validator_address,
+            domain,
+        )
+        .unwrap();
+        community_shard_heartbeat_signed(AxumState(node.clone()), Json(heartbeat))
+            .await
+            .unwrap();
+
+        let mut first_claim = None;
+        let mut last_claim = None;
+        for step in 0u64..80 {
+            let signed = sign_shard_worker_request(
+                COMMUNITY_SHARD_CLAIM_STEP_PATH,
+                ShardClaimStepRequest {
+                    worker_id: worker_addr,
+                    lease_id: lease.lease_id,
+                    lease_epoch: lease.lease_epoch,
+                    model_id,
+                    execution_profile: lease.execution_profile.clone(),
+                },
+                &worker_kp,
+                node.validator_address,
+                domain,
+            )
+            .unwrap();
+            if step == 0 {
+                first_claim = Some(signed.clone());
+            }
+            if step == 79 {
+                last_claim = Some(signed.clone());
+            }
+            assert_eq!(
+                community_shard_claim_step_signed(AxumState(node.clone()), Json(signed))
+                    .await
+                    .unwrap()
+                    .0,
+                ShardClaimStepResponse::Idle,
+            );
+        }
+        assert_eq!(
+            super::super::authenticate_community_request(
+                &node,
+                COMMUNITY_SHARD_CLAIM_STEP_PATH,
+                first_claim.unwrap(),
+            )
+            .unwrap_err()
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            super::super::authenticate_community_request(
+                &node,
+                COMMUNITY_SHARD_CLAIM_STEP_PATH,
+                last_claim.unwrap(),
+            )
+            .unwrap_err()
+            .0,
+            StatusCode::CONFLICT
+        );
+
+        for (idx, path) in [
+            COMMUNITY_SHARD_HEARTBEAT_PATH,
+            COMMUNITY_SHARD_SUBMIT_STEP_PATH,
+            COMMUNITY_SHARD_RELEASE_PATH,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let signed = sign_shard_worker_request(
+                path,
+                TestShardClaimPayload {
+                    worker_id: worker_addr,
+                    step: 100 + idx as u64,
+                },
+                &worker_kp,
+                node.validator_address,
+                domain,
+            )
+            .unwrap();
+            super::super::authenticate_community_request(&node, path, signed).unwrap();
+        }
+        assert_eq!(node.community_shard_request_replays.lock().seen.len(), 85);
+        assert_eq!(node.community_request_replays.lock().seen.len(), 1);
+
+        let now = super::super::community_unix_ms().unwrap();
+        for bad_ts in [now.saturating_sub(31_000), now.saturating_add(31_000)] {
+            let signed = sign_at_timestamp(
+                COMMUNITY_SHARD_CLAIM_STEP_PATH,
+                SignedShardWorkerPayload::new(TestShardClaimPayload {
+                    worker_id: worker_addr,
+                    step: bad_ts,
+                }),
+                &worker_kp,
+                node.validator_address,
+                domain,
+                bad_ts,
+            );
+            assert_eq!(
+                super::super::authenticate_community_request(
+                    &node,
+                    COMMUNITY_SHARD_CLAIM_STEP_PATH,
+                    signed,
+                )
+                .unwrap_err()
+                .0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(node.community_shard_request_replays.lock().seen.len(), 85);
+
+        for ok_ts in [now.saturating_sub(25_000), now.saturating_add(25_000)] {
+            let signed = sign_at_timestamp(
+                COMMUNITY_SHARD_CLAIM_STEP_PATH,
+                SignedShardWorkerPayload::new(TestShardClaimPayload {
+                    worker_id: worker_addr,
+                    step: ok_ts,
+                }),
+                &worker_kp,
+                node.validator_address,
+                domain,
+                ok_ts,
+            );
+            super::super::authenticate_community_request(
+                &node,
+                COMMUNITY_SHARD_CLAIM_STEP_PATH,
+                signed,
+            )
+            .unwrap();
+        }
+        assert_eq!(node.community_shard_request_replays.lock().seen.len(), 87);
+
+        for unprivileged in [COMMUNITY_SHARD_STATUS_PATH, "/community/shards/unknown"] {
+            let signed = sign_at_timestamp(
+                unprivileged,
+                SignedShardWorkerPayload::new(TestShardClaimPayload {
+                    worker_id: worker_addr,
+                    step: 999,
+                }),
+                &worker_kp,
+                node.validator_address,
+                domain,
+                now.saturating_sub(31_000),
+            );
+            super::super::authenticate_community_request(&node, unprivileged, signed).unwrap();
+        }
+        assert_eq!(node.community_shard_request_replays.lock().seen.len(), 87);
+        assert_eq!(node.community_request_replays.lock().seen.len(), 3);
+
+        for _ in 3..super::super::COMMUNITY_AUTH_REPLAYS_PER_IDENTITY_MAX {
+            let signed = super::super::sign_community_request(
+                super::super::COMMUNITY_REGISTER_PATH,
+                make_register_req(&worker_kp, model_id, vec![COMMUNITY_SHARD_CAPABILITY]),
+                &worker_kp,
+                node.validator_address,
+                domain,
+            )
+            .unwrap();
+            super::super::authenticate_community_request(
+                &node,
+                super::super::COMMUNITY_REGISTER_PATH,
+                signed,
+            )
+            .unwrap();
+        }
+        let normal_over_cap = super::super::sign_community_request(
+            super::super::COMMUNITY_REGISTER_PATH,
+            make_register_req(&worker_kp, model_id, vec![COMMUNITY_SHARD_CAPABILITY]),
+            &worker_kp,
+            node.validator_address,
+            domain,
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::authenticate_community_request(
+                &node,
+                super::super::COMMUNITY_REGISTER_PATH,
+                normal_over_cap,
+            )
+            .unwrap_err()
+            .0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        let shard_after_normal_cap = sign_shard_worker_request(
+            COMMUNITY_SHARD_CLAIM_STEP_PATH,
+            TestShardClaimPayload {
+                worker_id: worker_addr,
+                step: 10_000,
+            },
+            &worker_kp,
+            node.validator_address,
+            domain,
+        )
+        .unwrap();
+        super::super::authenticate_community_request(
+            &node,
+            COMMUNITY_SHARD_CLAIM_STEP_PATH,
+            shard_after_normal_cap,
+        )
+        .unwrap();
+        assert_eq!(node.community_shard_request_replays.lock().seen.len(), 88);
+        node.community_shard_request_replays
+            .lock()
+            .assert_invariants();
+        node.community_request_replays.lock().assert_invariants();
+    }
 }

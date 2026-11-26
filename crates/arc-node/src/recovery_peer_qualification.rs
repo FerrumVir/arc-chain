@@ -1154,8 +1154,10 @@ mod recovery_peer_qualification_tests {
         let oversized_hash = qualification_test_sha256(&oversized_bytes);
         assert!(load_and_validate_candidate_manifest(&oversized_path, &oversized_hash).is_err());
 
-        let mut record = arc_consensus::view_change::ConsensusSigningRecord::default();
-        record.last_applied_round = Some(101);
+        let mut record = arc_consensus::view_change::ConsensusSigningRecord {
+            last_applied_round: Some(101),
+            ..Default::default()
+        };
         assert!(validate_target_signing_highwaters(&record, 10, 100).is_err());
         assert!(validate_target_signing_highwaters(&record, 10, 101).is_ok());
         record

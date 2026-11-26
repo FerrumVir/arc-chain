@@ -1780,3 +1780,734 @@ fn recovery_peer_replay_rejects_subquorum_forged_and_wrong_domain_skip_certifica
         Err(arc_consensus::ConsensusError::InsufficientParents)
     ));
 }
+
+fn peer_qualify_sha256_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn peer_qualify_flip_hex(hex_str: &str) -> String {
+    let mut chars: Vec<char> = hex_str.chars().collect();
+    chars[0] = if chars[0] == '0' { '1' } else { '0' };
+    chars.into_iter().collect()
+}
+
+fn peer_qualify_write_manifest(path: &Path, manifest: &PeerRecoveryCandidateManifest) -> String {
+    let bytes = serde_json::to_vec(manifest).unwrap();
+    std::fs::write(path, &bytes).unwrap();
+    peer_qualify_sha256_bytes(&bytes)
+}
+
+fn peer_qualify_file_snapshot(path: &Path) -> (String, u64) {
+    let input = recovery_read_only_input(path, "qualification snapshot").unwrap();
+    (input.sha256, input.size)
+}
+
+fn peer_qualify_expect_err(result: Result<()>, expected_substring: &str) {
+    let error = result.expect_err("expected qualification failure");
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains(expected_substring),
+        "expected error containing {expected_substring:?}, got {rendered:?}"
+    );
+}
+
+fn peer_qualify_write_genesis(path: &Path, validators: &[Hash256; 6]) {
+    let mut toml = String::from(
+        "[chain]\nname = \"arc-qualify-peer-state-e2e\"\nchain_id = \"0x415243\"\n\
+         validator_set_complete = true\ninstance_id = \"arc-qualify-peer-state-e2e\"\n\n",
+    );
+    for address in validators {
+        toml.push_str(&format!(
+            "[[accounts]]\naddress = \"{}\"\nbalance = 1_000_000_000_000\n\n",
+            address.to_hex()
+        ));
+    }
+    for (index, address) in validators.iter().enumerate() {
+        toml.push_str(&format!(
+            "[[validators]]\naddress = \"{}\"\nstake = {}\n\n",
+            address.to_hex(),
+            PEER_REPLAY_WEIGHTS[index]
+        ));
+    }
+    std::fs::write(path, toml).unwrap();
+}
+
+fn peer_qualify_assert_no_key_files(dir: &Path) {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in std::fs::read_dir(&current).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            assert!(!meta.file_type().is_symlink());
+            if meta.is_dir() {
+                pending.push(path);
+            } else {
+                assert!(meta.is_file());
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                assert!(
+                    !name.ends_with(".key")
+                        && !name.ends_with(".key.json")
+                        && !name.contains("secret")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn recovery_peer_qualify_command_accepts_persistent_candidate_and_rejects_mutations() {
+    use std::collections::HashMap;
+
+    use arc_consensus::ConsensusDomain;
+    use arc_consensus::view_change::{
+        AbsenceReason, ConsensusSigningRecord, FinalityCertificate, FinalityVote,
+        validator_set_hash,
+    };
+    use arc_state::recovery::{
+        ArcCheckpoint, RecoveryExportSpec, RecoveryImport, RecoveryValidator,
+        recovery_stake_reserve_address,
+    };
+    use arc_types::transaction::{JoinValidatorBody, Transaction, TxBody};
+
+    let recovery_epoch = 1u64;
+    let validator_set_id = 1u64;
+    let mut fixture = PeerReplayFixture::new(b"qualify-peer-state-e2e-placeholder");
+    let target_validator = fixture.validators[PEER_REPLAY_TARGET_INDEX];
+
+    let root = peer_replay_temp_dir("arc-qualify-peer-e2e-");
+    let genesis_path = root.path().join("genesis.toml");
+    peer_qualify_write_genesis(&genesis_path, &fixture.validators);
+    let (genesis, recovery_network) = recovery_network_from_genesis(
+        genesis_path.to_str().unwrap(),
+        recovery_epoch,
+        validator_set_id,
+    )
+    .unwrap();
+    let genesis_accounts = qualification_genesis_accounts(&genesis).unwrap();
+
+    let mut funds = genesis_accounts.clone();
+    funds.push((recovery_stake_reserve_address(), PEER_REPLAY_TOTAL_STAKE));
+    let source_genesis_state = StateDB::with_genesis(&funds);
+    let joins: Vec<Transaction> = (0..6usize)
+        .map(|index| {
+            let key = fixture.keypair(index);
+            let mut tx = Transaction::new_transfer(key.address(), key.address(), 0, 0);
+            tx.body = TxBody::JoinValidator(JoinValidatorBody {
+                pubkey: key.public_key_bytes().try_into().unwrap(),
+                initial_stake: PEER_REPLAY_WEIGHTS[index],
+            });
+            tx.tx_type = tx.body.tx_type();
+            tx.sign(&key).unwrap();
+            tx
+        })
+        .collect();
+    let (_, receipts) = source_genesis_state
+        .execute_block_adaptive_at_with_proof(
+            &joins,
+            fixture.validators[PEER_REPLAY_SOURCE_INDEX],
+            1,
+            Hash256::ZERO,
+        )
+        .unwrap();
+    assert!(receipts.iter().all(|receipt| receipt.success));
+    for address in &fixture.validators {
+        let mut account = source_genesis_state.get_account(address).unwrap();
+        account.staked_balance = 0;
+        source_genesis_state.update_account(address, account);
+    }
+    source_genesis_state
+        .execute_block_adaptive_at_with_proof(
+            &[],
+            fixture.validators[PEER_REPLAY_SOURCE_INDEX],
+            2,
+            Hash256::ZERO,
+        )
+        .unwrap();
+
+    let recovery_validators: Vec<RecoveryValidator> = (0..6usize)
+        .map(|index| {
+            let key = fixture.keypair(index);
+            RecoveryValidator {
+                address: key.address(),
+                public_key: key.public_key_bytes().try_into().unwrap(),
+                stake: PEER_REPLAY_WEIGHTS[index],
+            }
+        })
+        .collect();
+    let mut checkpoint = ArcCheckpoint::export_unsigned(
+        &source_genesis_state,
+        RecoveryExportSpec {
+            chain_id: recovery_network.chain_id.clone(),
+            genesis_hash: recovery_network.genesis_hash,
+            source_consensus_round: 100,
+            recovery_epoch,
+            validator_set_id,
+            validators: recovery_validators,
+            community_rewards_v1_activation_height: recovery_network
+                .community_rewards_v1_activation_height,
+            created_at_unix_ms: 3,
+        },
+    )
+    .unwrap();
+    for index in 0..6usize {
+        checkpoint.add_signature(&fixture.keypair(index)).unwrap();
+    }
+    let manifest_hash = checkpoint.manifest_hash();
+    let manifest_hex = manifest_hash.to_hex();
+    let approved_checkpoint_path = root.path().join("approved.arcchkpt");
+    checkpoint.write_to(&approved_checkpoint_path).unwrap();
+
+    let source_dir = root.path().join("source-lhr");
+    let candidate_dir = root
+        .path()
+        .join(format!("{PEER_RECOVERY_CANDIDATE_DIR_PREFIX}ams"));
+    std::fs::create_dir(&source_dir).unwrap();
+    std::fs::create_dir(&candidate_dir).unwrap();
+
+    let mut source_lock = acquire_node_data_dir_lock(&source_dir, None).unwrap();
+    let source_state = StateDB::with_genesis_persistent_recovery_in_prepared_directory(
+        &genesis_accounts,
+        source_lock.prepared_directory(),
+        recovery_network.clone(),
+        Some(RecoveryImport {
+            checkpoint_path: approved_checkpoint_path.clone(),
+            approved_manifest_hash: manifest_hash,
+        }),
+    )
+    .unwrap();
+    source_lock.finish_persistent_state_startup();
+    source_state.set_community_rewards_v1_activation_height(
+        recovery_network.community_rewards_v1_activation_height,
+    );
+
+    let active_context = source_state.recovery_context().unwrap();
+    assert_eq!(source_state.recovery_manifest_hash(), Some(manifest_hash));
+    assert_eq!(active_context.recovery_epoch, recovery_epoch);
+    assert_eq!(active_context.validator_set_id, validator_set_id);
+    let actual_domain = ConsensusDomain::new(
+        active_context.domain_hash(),
+        active_context.recovery_epoch,
+        active_context.validator_set_id,
+    );
+    assert_eq!(
+        actual_domain.domain_hash,
+        checkpoint.manifest.recovery_context().domain_hash()
+    );
+
+    let (target_stake, peer_validators) =
+        qualification_split_target_and_peers(&recovery_network.validators, target_validator)
+            .unwrap();
+    let probe_consensus =
+        ConsensusManager::new(target_validator, target_stake, 0, false, &peer_validators);
+    install_startup_consensus_domains(
+        &probe_consensus.engine,
+        recovery_network.genesis_hash,
+        Some(actual_domain),
+    )
+    .unwrap();
+    let committee = probe_consensus.engine.frozen_validator_set().clone();
+    let committee_hash = validator_set_hash(&committee);
+    assert_eq!(committee_hash, fixture.committee_hash);
+    drop(probe_consensus);
+
+    fixture.domain = actual_domain;
+    let window = fixture.build_live_quorum_window();
+    let transition_height = checkpoint.manifest.source_height + 1;
+    assert_eq!(source_state.height(), transition_height);
+    let baseline_block = source_state.get_block(transition_height).unwrap();
+
+    let (certified_block, _) = source_state
+        .execute_block_adaptive_at_with_proof(
+            &[],
+            window.candidate.author,
+            window.candidate.round,
+            window.candidate.state_decision_commitment(&actual_domain),
+        )
+        .unwrap();
+    source_state.try_sync_wal().unwrap();
+    let certified_height = transition_height + 1;
+    assert_eq!(source_state.height(), certified_height);
+    assert_eq!(
+        certified_block.hash,
+        source_state.get_block(certified_height).unwrap().hash
+    );
+    assert_eq!(
+        certified_block.header.state_root,
+        source_state.get_state_root()
+    );
+    assert!(
+        std::fs::metadata(source_dir.join("state.wal"))
+            .unwrap()
+            .len()
+            > 0
+    );
+    let certified_tx_root = qualification_block_tx_root(&certified_block);
+
+    let source_startup = prepare_recovery_dag_startup(&source_dir, &source_state)
+        .unwrap()
+        .unwrap();
+    assert_eq!(source_startup.binding.manifest_hash, manifest_hash);
+    assert_eq!(source_startup.binding.consensus_domain, actual_domain);
+    assert_eq!(source_startup.binding.transition_height, transition_height);
+    assert_eq!(
+        source_startup.binding.initial_consensus_round,
+        window.bootstrap
+    );
+    assert!(source_startup.archived_legacy_wal.is_none());
+
+    let source_gen_binding = generation_dag_binding(&source_startup).unwrap();
+    let source_store = GenerationStore::new(&source_startup.wal_dir);
+    let source_initial_generation = source_store
+        .create_initial(
+            GenerationInput {
+                binding: source_gen_binding.clone(),
+                baseline_state: DagBaselineState {
+                    height: transition_height,
+                    block_hash: baseline_block.hash,
+                    state_root: baseline_block.header.state_root,
+                    dag_anchor: None,
+                },
+                dag_cursor: DagCursor {
+                    committed_block_count: 0,
+                    next_dag_round: window.bootstrap,
+                    current_round: window.bootstrap,
+                    retention_floor_round: window.bootstrap,
+                    retention_ceiling_round: recovery_retention_ceiling(window.bootstrap).unwrap(),
+                },
+                retention_limits: RetentionLimits::default(),
+            },
+            window.records.clone(),
+        )
+        .unwrap();
+    validate_recovery_generation_anchor(&source_state, &source_startup, &source_initial_generation)
+        .unwrap();
+    let (staged, staged_summary) =
+        stage_recovery_generation_records(&source_store, &source_initial_generation).unwrap();
+    let source_engine = fixture.strict_engine(PEER_REPLAY_SOURCE_INDEX);
+    let source_replay = replay_recovery_dag_generation(
+        &source_engine,
+        &source_state,
+        &source_startup,
+        &source_initial_generation,
+        &staged,
+    )
+    .unwrap();
+    assert_eq!(
+        source_replay.repaired_commit,
+        Some((window.candidate.hash, window.candidate.round))
+    );
+    assert_eq!(source_replay.current_round, window.last_round + 1);
+    let source_compacted = compact_replayed_recovery_generation(
+        &source_store,
+        &source_state,
+        &source_startup,
+        &source_initial_generation,
+        &staged_summary,
+        &source_engine,
+        &staged,
+    )
+    .unwrap();
+    assert_ne!(source_compacted.pin, source_initial_generation.pin);
+    let source_audit = source_store.audit(&source_gen_binding).unwrap();
+    assert!(matches!(source_audit.status, StoreAuditStatus::Clean));
+    assert_eq!(source_audit.current.pin, source_compacted.pin);
+
+    let source_wal_dir = source_startup.wal_dir.clone();
+    source_state.try_sync_wal().unwrap();
+    drop(source_engine);
+    drop(source_state);
+    sync_directory(&source_wal_dir).unwrap();
+    sync_directory(&source_dir).unwrap();
+    drop(source_lock);
+
+    peer_replay_copy_dir(&source_dir, &candidate_dir);
+    write_recovery_dag_pin_atomically(&candidate_dir, manifest_hash, source_compacted.pin).unwrap();
+
+    let source_signing_record = ConsensusSigningRecord {
+        skipped_rounds: HashMap::from([(
+            window.bootstrap,
+            HashMap::from([(
+                fixture.validators[PEER_REPLAY_SECOND_ABSENT_INDEX],
+                AbsenceReason::NoBlock,
+            )]),
+        )]),
+        finality_votes: HashMap::new(),
+        last_applied_round: Some(window.candidate.round),
+    };
+    peer_replay_write_signing_record(
+        &source_dir.join("consensus-signing-record.bin"),
+        &source_signing_record,
+    );
+
+    let prior_target_height = transition_height;
+    let prior_target_highest_dag_round = window.bootstrap - 1;
+    let target_skip_round = window.bootstrap - 6;
+    let target_signing_record = ConsensusSigningRecord {
+        skipped_rounds: HashMap::from([(
+            target_skip_round,
+            HashMap::from([(fixture.validators[1], AbsenceReason::NoBlock)]),
+        )]),
+        finality_votes: HashMap::from([(
+            prior_target_height,
+            (
+                baseline_block.hash,
+                baseline_block.header.state_root,
+                qualification_block_tx_root(&baseline_block),
+            ),
+        )]),
+        last_applied_round: Some(target_skip_round),
+    };
+    peer_replay_write_signing_record(
+        &candidate_dir.join("consensus-signing-record.bin"),
+        &target_signing_record,
+    );
+
+    let make_finality_cert = |domain: ConsensusDomain,
+                              signer_indices: &[usize],
+                              block_hash: Hash256,
+                              state_root: Hash256,
+                              tx_root: Hash256|
+     -> FinalityCertificate {
+        let votes = signer_indices
+            .iter()
+            .map(|&index| {
+                FinalityVote::sign(
+                    domain,
+                    committee_hash,
+                    certified_height,
+                    block_hash,
+                    state_root,
+                    tx_root,
+                    &fixture.keypair(index),
+                )
+                .unwrap()
+            })
+            .collect();
+        FinalityCertificate {
+            domain,
+            validator_set_hash: committee_hash,
+            height: certified_height,
+            block_hash,
+            state_root,
+            tx_root,
+            votes,
+        }
+    };
+    let valid_cert = make_finality_cert(
+        actual_domain,
+        &[0, 1, 2, 3],
+        certified_block.hash,
+        certified_block.header.state_root,
+        certified_tx_root,
+    );
+    assert_eq!(
+        valid_cert.verify(&actual_domain, &committee),
+        Ok(PEER_REPLAY_STRICT_QUORUM)
+    );
+    let cert_path = root.path().join("finality.bin");
+    std::fs::write(&cert_path, bincode::serialize(&valid_cert).unwrap()).unwrap();
+
+    let candidate_wal_path = candidate_dir.join("state.wal");
+    let candidate_marker_path = candidate_dir.join("recovery.active");
+    let candidate_sign_path = candidate_dir.join("consensus-signing-record.bin");
+    let candidate_ckpt_path = candidate_dir.join(format!("recovery-{manifest_hex}.arcchkpt"));
+    let candidate_current_path = candidate_dir
+        .join(format!("dag-wal-recovery-{manifest_hex}"))
+        .join("CURRENT");
+    let candidate_pin_path = recovery_dag_pin_path(&candidate_dir, manifest_hash);
+
+    let wal_before = peer_qualify_file_snapshot(&candidate_wal_path);
+    let marker_before = peer_qualify_file_snapshot(&candidate_marker_path);
+    let sign_before = peer_qualify_file_snapshot(&candidate_sign_path);
+    let ckpt_before = peer_qualify_file_snapshot(&candidate_ckpt_path);
+    let current_before = peer_qualify_file_snapshot(&candidate_current_path);
+    let pin_before = peer_qualify_file_snapshot(&candidate_pin_path);
+    let genesis_before = peer_qualify_file_snapshot(&genesis_path);
+    let cert_before = peer_qualify_file_snapshot(&cert_path);
+    assert!(wal_before.1 > 0 && marker_before.1 > 0 && sign_before.1 > 0);
+    peer_qualify_assert_no_key_files(&candidate_dir);
+
+    let valid_manifest = PeerRecoveryCandidateManifest {
+        schema: PEER_RECOVERY_CANDIDATE_SCHEMA.to_string(),
+        candidate_data_dir: candidate_dir.display().to_string(),
+        source_data_dir: source_dir.display().to_string(),
+        expected_state_wal_sha256: wal_before.0.clone(),
+        genesis_path: genesis_path.display().to_string(),
+        expected_genesis_sha256: genesis_before.0.clone(),
+        expected_recovery_manifest_hash: manifest_hex.clone(),
+        recovery_epoch,
+        validator_set_id,
+        target_validator: target_validator.to_hex(),
+        expected_target_signing_record_sha256: sign_before.0.clone(),
+        prior_target_highest_dag_round,
+        prior_target_height,
+        finality_certificate_path: cert_path.display().to_string(),
+        expected_finality_certificate_sha256: cert_before.0.clone(),
+    };
+    let manifest_path = root.path().join("candidate-manifest.json");
+    let manifest_sha = peer_qualify_write_manifest(&manifest_path, &valid_manifest);
+
+    run_qualify_peer_state_command(manifest_path.to_str().unwrap(), &manifest_sha).unwrap();
+
+    assert_eq!(peer_qualify_file_snapshot(&candidate_wal_path), wal_before);
+    assert_eq!(
+        peer_qualify_file_snapshot(&candidate_marker_path),
+        marker_before
+    );
+    assert_eq!(
+        peer_qualify_file_snapshot(&candidate_sign_path),
+        sign_before
+    );
+    assert_eq!(
+        peer_qualify_file_snapshot(&candidate_ckpt_path),
+        ckpt_before
+    );
+    assert_eq!(
+        peer_qualify_file_snapshot(&candidate_current_path),
+        current_before
+    );
+    assert_eq!(peer_qualify_file_snapshot(&candidate_pin_path), pin_before);
+    assert_eq!(peer_qualify_file_snapshot(&genesis_path), genesis_before);
+    assert_eq!(peer_qualify_file_snapshot(&cert_path), cert_before);
+    assert_eq!(
+        read_recovery_dag_pin(&candidate_dir, manifest_hash)
+            .unwrap()
+            .unwrap()
+            .generation,
+        source_compacted.pin
+    );
+    peer_qualify_assert_no_key_files(&candidate_dir);
+
+    assert!(
+        run_qualify_peer_state_command(
+            manifest_path.to_str().unwrap(),
+            &peer_qualify_flip_hex(&manifest_sha),
+        )
+        .is_err()
+    );
+
+    let run_with_manifest = |label: &str, manifest: &PeerRecoveryCandidateManifest| -> Result<()> {
+        let path = root.path().join(format!("manifest-{label}.json"));
+        let sha = peer_qualify_write_manifest(&path, manifest);
+        run_qualify_peer_state_command(path.to_str().unwrap(), &sha)
+    };
+
+    let mut bad_prior_height = valid_manifest.clone();
+    bad_prior_height.prior_target_height = certified_height;
+    peer_qualify_expect_err(
+        run_with_manifest("bad-prior-height", &bad_prior_height),
+        "does not exceed prior_target_height",
+    );
+
+    let mut bad_prior_round_low = valid_manifest.clone();
+    bad_prior_round_low.prior_target_highest_dag_round = target_skip_round - 1;
+    peer_qualify_expect_err(
+        run_with_manifest("bad-prior-round-low", &bad_prior_round_low),
+        "below preserved target signing history",
+    );
+
+    let mut bad_prior_round_high = valid_manifest.clone();
+    bad_prior_round_high.prior_target_highest_dag_round = window.last_round + 1;
+    peer_qualify_expect_err(
+        run_with_manifest("bad-prior-round-high", &bad_prior_round_high),
+        "does not exceed prior_target_highest_dag_round",
+    );
+
+    let mut bad_wal_sha = valid_manifest.clone();
+    bad_wal_sha.expected_state_wal_sha256 = peer_qualify_flip_hex(&wal_before.0);
+    assert!(run_with_manifest("bad-wal-sha", &bad_wal_sha).is_err());
+
+    let run_with_cert = |label: &str, cert: &FinalityCertificate| -> Result<()> {
+        let path = root.path().join(format!("cert-{label}.bin"));
+        let bytes = bincode::serialize(cert).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut manifest = valid_manifest.clone();
+        manifest.finality_certificate_path = path.display().to_string();
+        manifest.expected_finality_certificate_sha256 = peer_qualify_sha256_bytes(&bytes);
+        run_with_manifest(label, &manifest)
+    };
+
+    let mut subquorum_cert = valid_cert.clone();
+    subquorum_cert.votes.truncate(3);
+    peer_qualify_expect_err(
+        run_with_cert("subquorum", &subquorum_cert),
+        "finality certificate failed domain/committee/quorum verification",
+    );
+
+    let mut forged_cert = valid_cert.clone();
+    forged_cert.votes[0].signature = forged_cert.votes[1].signature.clone();
+    peer_qualify_expect_err(
+        run_with_cert("forged-cert", &forged_cert),
+        "finality certificate failed domain/committee/quorum verification",
+    );
+
+    let wrong_domain = ConsensusDomain::new(
+        hash_bytes(b"qualify-peer-state-e2e-wrong-domain"),
+        recovery_epoch,
+        validator_set_id,
+    );
+    let wrong_domain_cert = make_finality_cert(
+        wrong_domain,
+        &[0, 1, 2, 3],
+        certified_block.hash,
+        certified_block.header.state_root,
+        certified_tx_root,
+    );
+    peer_qualify_expect_err(
+        run_with_cert("wrong-domain-cert", &wrong_domain_cert),
+        "finality certificate failed domain/committee/quorum verification",
+    );
+
+    let wrong_tip_cert = make_finality_cert(
+        actual_domain,
+        &[0, 1, 2, 3],
+        hash_bytes(b"qualify-peer-state-e2e-wrong-tip"),
+        certified_block.header.state_root,
+        certified_tx_root,
+    );
+    peer_qualify_expect_err(
+        run_with_cert("wrong-tip-cert", &wrong_tip_cert),
+        "candidate canonical block hash",
+    );
+
+    let run_mutated_dag = |label: &str, records: Vec<RetainedDagRecord>| -> Result<()> {
+        let mut_dir = root
+            .path()
+            .join(format!("{PEER_RECOVERY_CANDIDATE_DIR_PREFIX}{label}"));
+        peer_replay_copy_dir(&candidate_dir, &mut_dir);
+        let mut_dag_dir = mut_dir.join(format!("dag-wal-recovery-{manifest_hex}"));
+        std::fs::remove_dir_all(&mut_dag_dir).unwrap();
+        let mut_store = GenerationStore::new(&mut_dag_dir);
+        let mut_gen = mut_store
+            .create_initial(
+                GenerationInput {
+                    binding: source_gen_binding.clone(),
+                    baseline_state: DagBaselineState {
+                        height: transition_height,
+                        block_hash: baseline_block.hash,
+                        state_root: baseline_block.header.state_root,
+                        dag_anchor: None,
+                    },
+                    dag_cursor: DagCursor {
+                        committed_block_count: 0,
+                        next_dag_round: window.bootstrap,
+                        current_round: window.bootstrap,
+                        retention_floor_round: window.bootstrap,
+                        retention_ceiling_round: recovery_retention_ceiling(window.bootstrap)
+                            .unwrap(),
+                    },
+                    retention_limits: RetentionLimits::default(),
+                },
+                records,
+            )
+            .unwrap();
+        write_recovery_dag_pin_atomically(&mut_dir, manifest_hash, mut_gen.pin).unwrap();
+        let mut manifest = valid_manifest.clone();
+        manifest.candidate_data_dir = mut_dir.display().to_string();
+        run_with_manifest(label, &manifest)
+    };
+
+    run_mutated_dag("uncompacted-control", window.records.clone()).unwrap();
+
+    let target_block = window.blocks_by_round.last().unwrap()[0].clone();
+    let mut forged_dag_block = target_block.clone();
+    forged_dag_block.signature =
+        bincode::serialize(&fixture.keypair(1).sign(&forged_dag_block.hash).unwrap()).unwrap();
+    peer_qualify_expect_err(
+        run_mutated_dag(
+            "forged-dag-sig",
+            peer_replay_replace_block_record(
+                &window.records,
+                target_block.round,
+                target_block.author,
+                &forged_dag_block,
+            ),
+        ),
+        "signature failed verification",
+    );
+
+    let mut unsigned_dag_block = target_block.clone();
+    unsigned_dag_block.signature.clear();
+    peer_qualify_expect_err(
+        run_mutated_dag(
+            "unsigned-dag-block",
+            peer_replay_replace_block_record(
+                &window.records,
+                target_block.round,
+                target_block.author,
+                &unsigned_dag_block,
+            ),
+        ),
+        "has an empty signature",
+    );
+
+    let wrong_domain_dag_block = fixture.signed_block(
+        PEER_REPLAY_SOURCE_INDEX,
+        target_block.round,
+        target_block.parents.clone(),
+        &wrong_domain,
+    );
+    peer_qualify_expect_err(
+        run_mutated_dag(
+            "wrong-domain-dag-block",
+            peer_replay_replace_block_record(
+                &window.records,
+                target_block.round,
+                target_block.author,
+                &wrong_domain_dag_block,
+            ),
+        ),
+        "failed active recovery domain hash verification",
+    );
+
+    assert!(
+        run_mutated_dag(
+            "missing-tail-skip-cert",
+            peer_replay_remove_certificate_record(
+                &window.records,
+                window.last_round,
+                target_validator,
+            ),
+        )
+        .is_err()
+    );
+
+    let run_pin_mutation = |label: &str, pin: Option<GenerationPin>| -> Result<()> {
+        let mut_dir = root
+            .path()
+            .join(format!("{PEER_RECOVERY_CANDIDATE_DIR_PREFIX}{label}"));
+        peer_replay_copy_dir(&candidate_dir, &mut_dir);
+        match pin {
+            Some(stale_pin) => {
+                write_recovery_dag_pin_atomically(&mut_dir, manifest_hash, stale_pin).unwrap();
+            }
+            None => {
+                std::fs::remove_file(recovery_dag_pin_path(&mut_dir, manifest_hash)).unwrap();
+            }
+        }
+        let mut manifest = valid_manifest.clone();
+        manifest.candidate_data_dir = mut_dir.display().to_string();
+        run_with_manifest(label, &manifest)
+    };
+
+    peer_qualify_expect_err(
+        run_pin_mutation("missing-dag-pin", None),
+        "external pin is missing",
+    );
+    peer_qualify_expect_err(
+        run_pin_mutation("stale-dag-pin", Some(source_initial_generation.pin)),
+        "failed binding/pin verification",
+    );
+
+    assert_eq!(peer_qualify_file_snapshot(&candidate_wal_path), wal_before);
+    assert_eq!(
+        peer_qualify_file_snapshot(&candidate_marker_path),
+        marker_before
+    );
+    assert_eq!(
+        peer_qualify_file_snapshot(&candidate_sign_path),
+        sign_before
+    );
+}

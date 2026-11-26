@@ -7,6 +7,7 @@ import subprocess
 
 
 EXPECTED_BINARY_TESTS = {
+    "tests::recovery_peer_qualify_command_accepts_persistent_candidate_and_rejects_mutations",
     "tests::recovery_peer_generation_replays_for_different_absent_validator_compacts_and_restarts",
     "tests::recovery_peer_replay_rejects_unsigned_forged_and_wrong_domain_blocks",
     "tests::recovery_peer_replay_rejects_subquorum_forged_and_wrong_domain_skip_certificates",
@@ -16,6 +17,11 @@ EXPECTED_BINARY_TESTS = {
     'recovery_peer_qualification_tests::qualify_peer_state_rejects_oversized_wrong_domain_forged_and_subquorum_certificates',
 }
 EXPECTED_LIBRARY_TESTS = {
+    'rpc::tests::community_auth_replay_cache_capacity_expiry_and_clock_rollback',
+    'rpc::tests::community_auth_replay_cache_many_identities_bounded_counts',
+    'rpc::tests::community_auth_ordinary_paths_keep_64_cap_and_accept_31s_skew',
+    'rpc::community_shard_http::tests::community_shard_http_replay_cache_allows_over_64_claims_enforces_30s_skew_and_isolates_paths',
+
     'community_shard_executor::tests::full_pipeline_two_partial_executors_matches_try_generate_and_allows_terminal_retry',
     'community_shard_executor::tests::constructor_rejects_full_model_bad_range_shape_profile_and_config',
     'community_shard_executor::tests::step_retry_preserves_single_kv_advance_and_rejects_conflicts_and_order_violations',
@@ -24,6 +30,7 @@ EXPECTED_LIBRARY_TESTS = {
     'community_shard_executor::tests::enforces_kv_budget_session_cap_tombstone_cap_and_fenced_boot_cap',
 
     'community_sharding::tests::community_sharding_real_integer_model_pipeline_matches_try_generate',
+    'community_sharding::tests::community_sharding_hundred_workers_execute_fair_partial_pipelines',
     'community_sharding::tests::community_sharding_join_gap_fails_closed_and_caps_partial_range',
     'community_sharding::tests::community_sharding_replicate_join_and_leave_idle_rebalance',
     'community_sharding::tests::community_sharding_mid_session_expiry_and_provisioning_hard_deadline',

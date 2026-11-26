@@ -259,7 +259,8 @@ The full account is [docs/HOW-SHARDING-WORKS.md](docs/HOW-SHARDING-WORKS.md).
 layer-pipeline coordinator with expiring leases, fixed partial-layer tiles,
 session ownership, and idle-worker reassignment. Its outputs require independent
 verification and cannot authorize rewards. Its integer-model tests exercise
-different partial models, but the module alone does not connect desktop workers
+different partial models, including a 100-identity fairness simulation. This
+simulation is not evidence of 100 connected operators. The module alone does not connect desktop workers
 or replace the existing whole-job runtime described below.
 
 `--community-shard-coordinator` enables signed lease, heartbeat, claim, submit,
@@ -267,7 +268,10 @@ and release routes under `/community/shards/`. Workers must register the
 `shard-inference-v1` capability, an exact model commitment, and the canonical
 execution profile. Whole-model and shard capabilities cannot be combined.
 Requests bind the worker identity, coordinator, network domain, timestamp, and
-nonce. The coordinator requires a loaded canonical model; it is off by default.
+nonce. Shard mutations use a separate bounded replay cache with a 30-second
+clock window; ordinary-worker and validator authentication keep their existing
+limits. Expiry uses a queue and per-identity counts. The coordinator requires a
+loaded canonical model; it is off by default.
 The status route reports verified dispatch and rewards as disabled until their
 integration is qualified. This transport alone does not activate desktop nodes.
 

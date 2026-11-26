@@ -2861,6 +2861,228 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn community_sharding_hundred_workers_execute_fair_partial_pipelines() {
+        const WORKERS: usize = 100;
+        const TILES: usize = 6;
+        const TILE_LAYERS: usize = 2;
+        const CONCURRENT: usize = 16;
+        const BATCHES: usize = 2;
+        const PROMPT_TOKENS: usize = 2;
+        const GENERATED_TOKENS: u32 = 2;
+        const STEPS_PER_HOP: usize = 1 + PROMPT_TOKENS + GENERATED_TOKENS as usize;
+        struct SimWorker {
+            id: Hash256,
+            assignment: ShardLeaseAssignment,
+            model: CachedIntegerModel,
+            caches: BTreeMap<u64, KVCache>,
+            steps: usize,
+            sessions: BTreeSet<u64>,
+        }
+
+        let full = build_deterministic_integer_model(32, 16, 2, 32, 12, 64, vec![128_001, 128_009]);
+        assert!(full.has_all_transformer_layers() && full.has_canonical_i8_profile());
+        let spec = model_spec_from(test_hash(b"model-12l-100w"), &full);
+        let limits = CommunityShardLimits {
+            max_workers: WORKERS,
+            max_active_sessions: CONCURRENT,
+            max_sessions_per_worker: 1,
+            target_partitions: TILES,
+            ..CommunityShardLimits::default()
+        };
+        let mut coord =
+            CommunityShardCoordinator::new(test_hash(b"boot-100-workers"), spec.clone(), limits)
+                .expect("valid coordinator");
+        let expected_tiles: Vec<ShardLayerRange> = (0..TILES)
+            .map(|i| ShardLayerRange {
+                start_layer: i * TILE_LAYERS,
+                end_layer: (i + 1) * TILE_LAYERS,
+            })
+            .collect();
+        assert_eq!(coord.fixed_tiles(), expected_tiles.as_slice());
+
+        let start_ms: u64 = 1_000_000;
+        let mut now_ms = start_ms;
+        let mut workers = Vec::with_capacity(WORKERS);
+        let mut worker_idx = BTreeMap::new();
+        for idx in 0..WORKERS {
+            let id = test_hash(format!("community-worker-{idx:03}").as_bytes());
+            assert_ne!(id.0, [0u8; 32]);
+            assert!(worker_idx.insert(id.0, idx).is_none());
+            let lease = coord
+                .request_lease(id, now_ms, lease_req(id, &spec, TILE_LAYERS))
+                .expect("lease must succeed");
+            assert_eq!(lease.protocol_version, COMMUNITY_SHARD_PROTOCOL_VERSION);
+            assert_eq!(lease.ready_ttl_ms, DEFAULT_READY_TTL_MS);
+            assert_eq!(lease.assignment.range.len(), TILE_LAYERS);
+            assert!(lease.assignment.range.len() < full.config.n_layers);
+            let model = build_partial_integer_model(&full, lease.assignment.range);
+            assert!(!model.has_all_transformer_layers());
+            let hb = coord
+                .heartbeat(id, now_ms, ready_hb(id, &lease.assignment, true))
+                .expect("ready heartbeat must succeed");
+            assert!(matches!(
+                hb.directive,
+                HeartbeatDirective::Active { expires_at_unix_ms }
+                    if expires_at_unix_ms == now_ms + DEFAULT_READY_TTL_MS
+            ));
+            assert!(hb.cancellations.is_empty());
+            let snap = coord.worker_lease_snapshot(id).expect("lease snapshot");
+            assert!(snap.ready && snap.range == lease.assignment.range);
+            assert_eq!(snap.max_resident_layers, TILE_LAYERS);
+            workers.push(SimWorker {
+                id,
+                assignment: lease.assignment,
+                model,
+                caches: BTreeMap::new(),
+                steps: 0,
+                sessions: BTreeSet::new(),
+            });
+        }
+
+        assert_eq!(worker_idx.len(), WORKERS);
+        let status = coord.status_snapshot(now_ms);
+        assert!(status.fully_covered_ready && status.provisioning_workers == 0);
+        assert_eq!((status.ready_workers, status.tiles.len()), (WORKERS, TILES));
+        assert_eq!(
+            status.tiles.iter().map(|t| t.ready_workers).min(),
+            Some(CONCURRENT)
+        );
+        assert_eq!(
+            status.tiles.iter().map(|t| t.ready_workers).max(),
+            Some(CONCURRENT + 1)
+        );
+        assert_eq!(
+            status.tiles.iter().map(|t| t.ready_workers).sum::<usize>(),
+            WORKERS
+        );
+
+        for batch in 0..BATCHES {
+            now_ms += 100;
+            let mut sessions = Vec::with_capacity(CONCURRENT);
+            for slot in 0..CONCURRENT {
+                let n = batch * CONCURRENT + slot;
+                let t0 = ((n * 3 + 1) % 32) as u32;
+                let t1 = ((t0 as usize + 5 + (n % 7)) % 32) as u32;
+                let prompt = vec![t0, t1];
+                let (exp_tokens, canonical_digest) = full
+                    .try_generate(&prompt, GENERATED_TOKENS, &full.config.eos_tokens)
+                    .expect("try_generate");
+                assert_eq!(prompt.len(), PROMPT_TOKENS);
+                assert_eq!(exp_tokens.len(), GENERATED_TOKENS as usize);
+                assert_ne!(canonical_digest.0, [0u8; 32]);
+                let exp_digest = unverified_tokens_digest(
+                    spec.model_id,
+                    &spec.execution_profile,
+                    &prompt,
+                    &exp_tokens,
+                );
+                let sid = coord
+                    .open_session(now_ms, prompt.clone(), GENERATED_TOKENS)
+                    .expect("open_session");
+                sessions.push((sid, prompt, exp_tokens, exp_digest));
+            }
+            assert_eq!(coord.status_snapshot(now_ms).active_sessions, CONCURRENT);
+            assert_eq!(
+                coord.open_session(now_ms, vec![1, 2], 2),
+                Err(ShardCoordinatorError::SessionCapacityReached)
+            );
+            let mut completed = 0usize;
+            let mut rounds = 0usize;
+            while completed < CONCURRENT {
+                assert!(rounds < 32);
+                rounds += 1;
+                now_ms += 50;
+                let mut progressed = false;
+                for w in &mut workers {
+                    match coord
+                        .claim_step(w.id, now_ms, claim_req(w.id, &w.assignment))
+                        .expect("claim_step")
+                    {
+                        ShardClaimStepResponse::Idle => {}
+                        ShardClaimStepResponse::Step { work } => {
+                            assert_eq!(work.range, w.assignment.range);
+                            assert!(work.range.len() < full.config.n_layers);
+                            let req =
+                                execute_work_on_partial_model(w.id, &w.model, &mut w.caches, &work);
+                            let resp = coord.submit_step(w.id, now_ms, req).expect("submit_step");
+                            assert!(resp.accepted && !resp.session_aborted);
+                            w.steps += 1;
+                            w.sessions.insert(work.session_id.seq);
+                            progressed = true;
+                            if resp.session_completed {
+                                completed += 1;
+                            }
+                        }
+                        other => panic!("unexpected claim_step response: {other:?}"),
+                    }
+                }
+                assert!(progressed);
+            }
+            for (sid, prompt, exp_tokens, exp_digest) in sessions {
+                let pending = match coord.take_result(sid).expect("retained result") {
+                    SessionOutcome::PendingVerification(p) => p,
+                    other => panic!("expected PendingVerification, got {other:?}"),
+                };
+                assert_eq!((pending.session_id, pending.model_id), (sid, spec.model_id));
+                assert_eq!(pending.execution_profile, spec.execution_profile);
+                assert_eq!(pending.prompt_tokens, prompt);
+                assert_eq!(pending.unverified_generated_tokens, exp_tokens);
+                assert_eq!(pending.unverified_output_digest, exp_digest);
+                assert!(pending.terminal_logits_hashes.len() >= exp_tokens.len());
+                assert!(
+                    pending
+                        .terminal_logits_hashes
+                        .iter()
+                        .all(|h| h.0 != [0u8; 32])
+                );
+                assert!(
+                    !pending.stopped_by_eos
+                        && pending.verification_required
+                        && !pending.reward_eligible
+                );
+                let ranges: Vec<ShardLayerRange> =
+                    pending.participants.iter().map(|p| p.range).collect();
+                assert_eq!(ranges, expected_tiles);
+                let mut seen = BTreeSet::new();
+                for p in &pending.participants {
+                    assert!(seen.insert(p.worker_id.0));
+                    assert!(
+                        workers[worker_idx[&p.worker_id.0]]
+                            .sessions
+                            .contains(&sid.seq)
+                    );
+                }
+            }
+            if batch == 0 {
+                assert_eq!(
+                    workers.iter().filter(|w| w.steps > 0).count(),
+                    CONCURRENT * TILES
+                );
+            }
+        }
+
+        assert!(now_ms - start_ms < DEFAULT_READY_TTL_MS);
+        let end = coord.status_snapshot(now_ms);
+        assert!(end.fully_covered_ready && end.ready_workers == WORKERS);
+        assert_eq!(
+            end.active_sessions
+                + end.retained_results
+                + end.quarantined_workers
+                + end.queued_cancellations,
+            0
+        );
+        assert_eq!(workers.iter().filter(|w| w.steps > 0).count(), WORKERS);
+        assert_eq!(workers.iter().map(|w| w.sessions.len()).min(), Some(1));
+        assert_eq!(workers.iter().map(|w| w.sessions.len()).max(), Some(2));
+        let total_steps: usize = workers.iter().map(|w| w.steps).sum();
+        assert_eq!(total_steps, BATCHES * CONCURRENT * TILES * STEPS_PER_HOP);
+        for w in &workers {
+            assert_eq!(w.steps, w.sessions.len() * STEPS_PER_HOP);
+            assert!(w.caches.is_empty());
+        }
+    }
+
+    #[test]
     fn community_sharding_join_gap_fails_closed_and_caps_partial_range() {
         let model = build_deterministic_integer_model(32, 16, 2, 32, 4, 64, vec![]);
         let spec = model_spec_from(test_hash(b"model-gap"), &model);

@@ -138,6 +138,11 @@ const COMMUNITY_AUTH_REPLAY_CACHE_MAX: usize = 65_536;
 const COMMUNITY_VALIDATOR_REPLAY_CACHE_MAX: usize = 98_304;
 const COMMUNITY_AUTH_REPLAYS_PER_IDENTITY_MAX: usize = 64;
 const COMMUNITY_VALIDATOR_REPLAYS_PER_IDENTITY_MAX: usize = 16_384;
+const COMMUNITY_SHARD_AUTH_MAX_CLOCK_SKEW_MS: u64 = 30_000;
+const COMMUNITY_SHARD_AUTH_REPLAY_RETENTION_MS: u64 =
+    COMMUNITY_SHARD_AUTH_MAX_CLOCK_SKEW_MS * 2 + 1;
+const COMMUNITY_SHARD_REPLAY_CACHE_MAX: usize = 524_288;
+const COMMUNITY_SHARD_REPLAYS_PER_IDENTITY_MAX: usize = 4_096;
 const COMMUNITY_MUTATION_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const COMMUNITY_SUBMIT_BODY_LIMIT_BYTES: usize = 128 * 1024;
 const COMMUNITY_APPROVAL_BODY_LIMIT_BYTES: usize = 256 * 1024;
@@ -235,13 +240,28 @@ pub fn validate_community_rpc_bases(
     Ok(canonical.into_iter().collect())
 }
 
+fn is_community_shard_authenticated_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/community/shards/lease"
+            | "/community/shards/heartbeat"
+            | "/community/shards/claim_step"
+            | "/community/shards/submit_step"
+            | "/community/shards/release"
+    )
+}
+
 struct CommunityReplayCache {
     seen: HashMap<(Hash256, Hash256), u64>,
-    next_prune_unix_ms: u64,
+    per_identity: HashMap<Hash256, usize>,
+    expiry_queue: std::collections::VecDeque<(u64, Hash256, Hash256)>,
+    last_queued_expiry_unix_ms: u64,
+    retention_ms: u64,
     max_entries: usize,
     max_per_identity: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommunityReplayError {
     Replay,
     Capacity,
@@ -250,21 +270,63 @@ enum CommunityReplayError {
 
 impl Default for CommunityReplayCache {
     fn default() -> Self {
-        Self {
-            seen: HashMap::new(),
-            next_prune_unix_ms: 0,
-            max_entries: COMMUNITY_AUTH_REPLAY_CACHE_MAX,
-            max_per_identity: COMMUNITY_AUTH_REPLAYS_PER_IDENTITY_MAX,
-        }
+        Self::with_limits(
+            COMMUNITY_AUTH_REPLAY_CACHE_MAX,
+            COMMUNITY_AUTH_REPLAYS_PER_IDENTITY_MAX,
+            COMMUNITY_AUTH_REPLAY_RETENTION_MS,
+        )
     }
 }
 
 impl CommunityReplayCache {
-    fn validator_domain() -> Self {
+    fn with_limits(max_entries: usize, max_per_identity: usize, retention_ms: u64) -> Self {
         Self {
-            max_entries: COMMUNITY_VALIDATOR_REPLAY_CACHE_MAX,
-            max_per_identity: COMMUNITY_VALIDATOR_REPLAYS_PER_IDENTITY_MAX,
-            ..Self::default()
+            seen: HashMap::new(),
+            per_identity: HashMap::new(),
+            expiry_queue: std::collections::VecDeque::new(),
+            last_queued_expiry_unix_ms: 0,
+            retention_ms,
+            max_entries,
+            max_per_identity,
+        }
+    }
+
+    fn validator_domain() -> Self {
+        Self::with_limits(
+            COMMUNITY_VALIDATOR_REPLAY_CACHE_MAX,
+            COMMUNITY_VALIDATOR_REPLAYS_PER_IDENTITY_MAX,
+            COMMUNITY_AUTH_REPLAY_RETENTION_MS,
+        )
+    }
+
+    fn shard_domain() -> Self {
+        Self::with_limits(
+            COMMUNITY_SHARD_REPLAY_CACHE_MAX,
+            COMMUNITY_SHARD_REPLAYS_PER_IDENTITY_MAX,
+            COMMUNITY_SHARD_AUTH_REPLAY_RETENTION_MS,
+        )
+    }
+
+    fn prune_expired(&mut self, now_unix_ms: u64) {
+        while let Some(&(expiry, worker, nonce)) = self.expiry_queue.front() {
+            if expiry > now_unix_ms {
+                break;
+            }
+            self.expiry_queue.pop_front();
+            let removed = self.seen.remove(&(worker, nonce));
+            debug_assert_eq!(removed, Some(expiry));
+            if removed.is_none() {
+                continue;
+            }
+            if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                self.per_identity.entry(worker)
+            {
+                if *entry.get() <= 1 {
+                    entry.remove();
+                } else {
+                    *entry.get_mut() -= 1;
+                }
+            }
         }
     }
 
@@ -274,30 +336,44 @@ impl CommunityReplayCache {
         nonce: Hash256,
         now_unix_ms: u64,
     ) -> Result<(), CommunityReplayError> {
-        if now_unix_ms >= self.next_prune_unix_ms || self.seen.len() >= self.max_entries {
-            self.seen.retain(|_, expiry| *expiry > now_unix_ms);
-            self.next_prune_unix_ms = now_unix_ms.saturating_add(30_000);
-        }
+        self.prune_expired(now_unix_ms);
         if self.seen.contains_key(&(worker, nonce)) {
             return Err(CommunityReplayError::Replay);
         }
-        if self
-            .seen
-            .keys()
-            .filter(|(address, _)| *address == worker)
-            .count()
-            >= self.max_per_identity
-        {
+        if self.per_identity.get(&worker).copied().unwrap_or(0) >= self.max_per_identity {
             return Err(CommunityReplayError::IdentityCapacity);
         }
         if self.seen.len() >= self.max_entries {
             return Err(CommunityReplayError::Capacity);
         }
-        self.seen.insert(
-            (worker, nonce),
-            now_unix_ms.saturating_add(COMMUNITY_AUTH_REPLAY_RETENTION_MS),
-        );
+        let expiry_unix_ms = now_unix_ms
+            .saturating_add(self.retention_ms)
+            .max(self.last_queued_expiry_unix_ms);
+        self.last_queued_expiry_unix_ms = expiry_unix_ms;
+        self.seen.insert((worker, nonce), expiry_unix_ms);
+        *self.per_identity.entry(worker).or_insert(0) += 1;
+        self.expiry_queue.push_back((expiry_unix_ms, worker, nonce));
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn assert_invariants(&self) {
+        assert_eq!(self.seen.len(), self.expiry_queue.len());
+        assert!(self.seen.len() <= self.max_entries);
+        assert!(self.per_identity.len() <= self.seen.len());
+        let mut expected_counts: HashMap<Hash256, usize> = HashMap::new();
+        let mut prev_expiry = 0u64;
+        for &(expiry, worker, nonce) in &self.expiry_queue {
+            assert!(expiry >= prev_expiry);
+            assert!(expiry <= self.last_queued_expiry_unix_ms);
+            assert_eq!(self.seen.get(&(worker, nonce)), Some(&expiry));
+            *expected_counts.entry(worker).or_insert(0) += 1;
+            prev_expiry = expiry;
+        }
+        assert_eq!(self.per_identity, expected_counts);
+        for &count in self.per_identity.values() {
+            assert!(count > 0 && count <= self.max_per_identity);
+        }
     }
 }
 
@@ -366,6 +442,7 @@ pub struct NodeState {
     community_registration_gate: Arc<parking_lot::Mutex<()>>,
     community_request_replays: Arc<parking_lot::Mutex<CommunityReplayCache>>,
     community_validator_request_replays: Arc<parking_lot::Mutex<CommunityReplayCache>>,
+    community_shard_request_replays: Arc<parking_lot::Mutex<CommunityReplayCache>>,
     community_reward_approval_jobs: Arc<dashmap::DashMap<Hash256, Hash256>>,
     community_reward_approval_certificates: Arc<dashmap::DashMap<Hash256, Hash256>>,
     community_reward_submissions: Arc<dashmap::DashMap<Hash256, CommunityRewardSubmission>>,
@@ -1339,6 +1416,9 @@ pub fn build_node_state(
         )),
         community_validator_request_replays: Arc::new(parking_lot::Mutex::new(
             CommunityReplayCache::validator_domain(),
+        )),
+        community_shard_request_replays: Arc::new(parking_lot::Mutex::new(
+            CommunityReplayCache::shard_domain(),
         )),
         community_reward_approval_jobs: Arc::new(dashmap::DashMap::new()),
         community_reward_approval_certificates: Arc::new(dashmap::DashMap::new()),
@@ -11730,7 +11810,14 @@ where
             format!("cannot validate request time: {error}"),
         )
     })?;
-    if now_unix_ms.abs_diff(signed.timestamp_unix_ms) > COMMUNITY_AUTH_MAX_CLOCK_SKEW_MS {
+    let validator_domain = is_validator_authenticated_path(path);
+    let shard_domain = !validator_domain && is_community_shard_authenticated_path(path);
+    let max_clock_skew_ms = if shard_domain {
+        COMMUNITY_SHARD_AUTH_MAX_CLOCK_SKEW_MS
+    } else {
+        COMMUNITY_AUTH_MAX_CLOCK_SKEW_MS
+    };
+    if now_unix_ms.abs_diff(signed.timestamp_unix_ms) > max_clock_skew_ms {
         return Err((
             StatusCode::UNAUTHORIZED,
             "community request timestamp is stale or too far in the future".to_string(),
@@ -11793,7 +11880,6 @@ where
         .validate_for_auth()
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
 
-    let validator_domain = is_validator_authenticated_path(path);
     if validator_domain {
         if !node.state.is_validator(&worker_address) {
             return Err((
@@ -11820,6 +11906,8 @@ where
 
     let replay_cache = if validator_domain {
         &node.community_validator_request_replays
+    } else if shard_domain {
+        &node.community_shard_request_replays
     } else {
         &node.community_request_replays
     };
@@ -22283,6 +22371,9 @@ mod tests {
             community_validator_request_replays: Arc::new(parking_lot::Mutex::new(
                 CommunityReplayCache::validator_domain(),
             )),
+            community_shard_request_replays: Arc::new(parking_lot::Mutex::new(
+                CommunityReplayCache::shard_domain(),
+            )),
             community_reward_approval_jobs: Arc::new(dashmap::DashMap::new()),
             community_reward_approval_certificates: Arc::new(dashmap::DashMap::new()),
             community_reward_submissions: Arc::new(dashmap::DashMap::new()),
@@ -22982,6 +23073,305 @@ mod tests {
                 .1
                 .contains("do not reproduce their committed hash")
         );
+    }
+
+    fn replay_test_hash(tag: u8, value: u64) -> Hash256 {
+        let mut bytes = [0u8; 32];
+        bytes[0] = tag;
+        bytes[24..].copy_from_slice(&value.to_be_bytes());
+        Hash256(bytes)
+    }
+
+    fn sign_community_request_at_timestamp<T: Serialize>(
+        path: &str,
+        payload: T,
+        keypair: &arc_crypto::KeyPair,
+        target_coordinator: Hash256,
+        transaction_domain: Option<Hash256>,
+        timestamp_unix_ms: u64,
+    ) -> CommunitySignedRequest<T> {
+        let mut signed = super::sign_community_request(
+            path,
+            payload,
+            keypair,
+            target_coordinator,
+            transaction_domain,
+        )
+        .unwrap();
+        signed.timestamp_unix_ms = timestamp_unix_ms;
+        let commitment = super::community_request_commitment(
+            path,
+            signed.version,
+            signed.target_coordinator,
+            signed.transaction_domain,
+            signed.payload_hash,
+            signed.timestamp_unix_ms,
+            signed.nonce,
+        );
+        signed.signature = keypair.sign(&commitment).unwrap();
+        signed
+    }
+
+    #[test]
+    fn community_auth_replay_cache_capacity_expiry_and_clock_rollback() {
+        let ordinary = CommunityReplayCache::default();
+        assert_eq!(ordinary.max_entries, 65_536);
+        assert_eq!(ordinary.max_per_identity, 64);
+        assert_eq!(ordinary.retention_ms, 240_001);
+        let validator = CommunityReplayCache::validator_domain();
+        assert_eq!(validator.max_entries, 98_304);
+        assert_eq!(validator.max_per_identity, 16_384);
+        assert_eq!(validator.retention_ms, 240_001);
+        let shard = CommunityReplayCache::shard_domain();
+        assert_eq!(shard.max_entries, 524_288);
+        assert_eq!(shard.max_per_identity, 4_096);
+        assert_eq!(shard.retention_ms, 60_001);
+
+        let mut cache = CommunityReplayCache::with_limits(5, 2, 60_001);
+        let (w1, w2, w3, w4) = (
+            replay_test_hash(1, 1),
+            replay_test_hash(1, 2),
+            replay_test_hash(1, 3),
+            replay_test_hash(1, 4),
+        );
+        let (n1, n2, n3) = (
+            replay_test_hash(2, 1),
+            replay_test_hash(2, 2),
+            replay_test_hash(2, 3),
+        );
+
+        assert_eq!(cache.accept(w1, n1, 100_000), Ok(()));
+        assert_eq!(cache.accept(w1, n2, 100_010), Ok(()));
+        assert_eq!(
+            cache.accept(w1, n1, 100_010),
+            Err(CommunityReplayError::Replay)
+        );
+        assert_eq!(
+            cache.accept(w1, n3, 100_010),
+            Err(CommunityReplayError::IdentityCapacity)
+        );
+        assert_eq!(cache.accept(w2, n1, 100_020), Ok(()));
+        assert_eq!(cache.accept(w2, n2, 100_020), Ok(()));
+        assert_eq!(cache.accept(w3, n1, 100_030), Ok(()));
+        assert_eq!(
+            cache.accept(w3, n1, 100_030),
+            Err(CommunityReplayError::Replay)
+        );
+        assert_eq!(
+            cache.accept(w4, n1, 100_030),
+            Err(CommunityReplayError::Capacity)
+        );
+        assert_eq!(
+            cache.accept(w1, n3, 160_000),
+            Err(CommunityReplayError::IdentityCapacity)
+        );
+        assert_eq!(
+            cache.accept(w4, n1, 160_000),
+            Err(CommunityReplayError::Capacity)
+        );
+        assert_eq!(
+            cache.accept(w1, n1, 160_000),
+            Err(CommunityReplayError::Replay)
+        );
+        cache.assert_invariants();
+
+        assert_eq!(cache.accept(w1, n3, 160_001), Ok(()));
+        assert_eq!(
+            cache.accept(w1, n2, 160_001),
+            Err(CommunityReplayError::Replay)
+        );
+        cache.assert_invariants();
+
+        assert_eq!(cache.accept(w4, n1, 160_031), Ok(()));
+        assert_eq!(cache.seen.len(), 2);
+        assert_eq!(cache.per_identity.len(), 2);
+        cache.assert_invariants();
+
+        let mut rollback = CommunityReplayCache::with_limits(8, 4, 60_001);
+        assert_eq!(rollback.accept(w1, n1, 1_000_000), Ok(()));
+        assert_eq!(
+            rollback.accept(w1, n1, 950_000),
+            Err(CommunityReplayError::Replay)
+        );
+        assert_eq!(rollback.accept(w1, n2, 950_000), Ok(()));
+        assert_eq!(rollback.seen.get(&(w1, n2)), Some(&1_060_001));
+        assert_eq!(
+            rollback.accept(w1, n1, 1_010_001),
+            Err(CommunityReplayError::Replay)
+        );
+        assert_eq!(
+            rollback.accept(w1, n2, 1_010_001),
+            Err(CommunityReplayError::Replay)
+        );
+        assert_eq!(
+            rollback.accept(w1, n2, 1_060_000),
+            Err(CommunityReplayError::Replay)
+        );
+        rollback.assert_invariants();
+
+        assert_eq!(rollback.accept(w1, n3, 1_060_001), Ok(()));
+        assert_eq!(rollback.seen.len(), 1);
+        assert_eq!(rollback.per_identity.get(&w1), Some(&1));
+        rollback.assert_invariants();
+    }
+
+    #[test]
+    fn community_auth_replay_cache_many_identities_bounded_counts() {
+        let mut cache = CommunityReplayCache::with_limits(10_000, 100, 60_001);
+        for id in 0u64..100 {
+            let worker = replay_test_hash(3, id);
+            for seq in 0u64..100 {
+                let nonce = replay_test_hash(4, id * 1_000 + seq + 1);
+                assert_eq!(cache.accept(worker, nonce, 1_000_000 + id), Ok(()));
+            }
+            assert_eq!(
+                cache.accept(worker, replay_test_hash(5, id), 1_000_000 + id),
+                Err(CommunityReplayError::IdentityCapacity)
+            );
+        }
+        assert_eq!(cache.seen.len(), 10_000);
+        assert_eq!(cache.per_identity.len(), 100);
+        assert_eq!(
+            cache.accept(
+                replay_test_hash(3, 100),
+                replay_test_hash(5, 100),
+                1_000_099
+            ),
+            Err(CommunityReplayError::Capacity)
+        );
+        cache.assert_invariants();
+
+        assert_eq!(
+            cache.accept(
+                replay_test_hash(3, 100),
+                replay_test_hash(5, 100),
+                1_060_051
+            ),
+            Ok(())
+        );
+        assert_eq!(cache.seen.len(), 4_901);
+        assert_eq!(cache.per_identity.len(), 50);
+        cache.assert_invariants();
+
+        assert_eq!(
+            cache.accept(
+                replay_test_hash(3, 101),
+                replay_test_hash(5, 101),
+                1_200_000
+            ),
+            Ok(())
+        );
+        assert_eq!(cache.seen.len(), 1);
+        assert_eq!(cache.per_identity.len(), 1);
+        cache.assert_invariants();
+
+        let mut rotating = CommunityReplayCache::with_limits(100, 4, 1_000);
+        for id in 0u64..1_000 {
+            assert_eq!(
+                rotating.accept(
+                    replay_test_hash(6, id),
+                    replay_test_hash(7, id),
+                    10_000 + id * 20
+                ),
+                Ok(())
+            );
+            assert!(rotating.per_identity.len() <= 51);
+            assert!(rotating.seen.len() <= 51);
+        }
+        rotating.assert_invariants();
+    }
+
+    #[test]
+    fn community_auth_ordinary_paths_keep_64_cap_and_accept_31s_skew() {
+        for path in [
+            COMMUNITY_REGISTER_PATH,
+            COMMUNITY_HEARTBEAT_PATH,
+            COMMUNITY_CLAIM_WORK_PATH,
+            COMMUNITY_SUBMIT_WORK_PATH,
+            "/community/shards/status",
+            "/community/shards/",
+            "/community/shards/lease/",
+            "/community/shards/unknown",
+        ] {
+            assert!(!is_community_shard_authenticated_path(path));
+        }
+
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let node = fake_node_with_workers(Vec::new());
+        let domain = node.state.transaction_domain_hash();
+        let now = community_unix_ms().unwrap();
+
+        let past_31s = sign_community_request_at_timestamp(
+            COMMUNITY_REGISTER_PATH,
+            community_register_payload(&worker),
+            &worker,
+            node.validator_address,
+            domain,
+            now.saturating_sub(31_000),
+        );
+        authenticate_community_request(&node, COMMUNITY_REGISTER_PATH, past_31s.clone()).unwrap();
+
+        let future_31s = sign_community_request_at_timestamp(
+            COMMUNITY_REGISTER_PATH,
+            community_register_payload(&worker),
+            &worker,
+            node.validator_address,
+            domain,
+            now.saturating_add(31_000),
+        );
+        authenticate_community_request(&node, COMMUNITY_REGISTER_PATH, future_31s).unwrap();
+
+        for skew_ts in [now.saturating_sub(121_000), now.saturating_add(121_000)] {
+            let out_of_window = sign_community_request_at_timestamp(
+                COMMUNITY_REGISTER_PATH,
+                community_register_payload(&worker),
+                &worker,
+                node.validator_address,
+                domain,
+                skew_ts,
+            );
+            assert_eq!(
+                authenticate_community_request(&node, COMMUNITY_REGISTER_PATH, out_of_window)
+                    .unwrap_err()
+                    .0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        for _ in 2..COMMUNITY_AUTH_REPLAYS_PER_IDENTITY_MAX {
+            let req = super::sign_community_request(
+                COMMUNITY_REGISTER_PATH,
+                community_register_payload(&worker),
+                &worker,
+                node.validator_address,
+                domain,
+            )
+            .unwrap();
+            authenticate_community_request(&node, COMMUNITY_REGISTER_PATH, req).unwrap();
+        }
+        assert_eq!(
+            authenticate_community_request(&node, COMMUNITY_REGISTER_PATH, past_31s)
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        let over_cap = super::sign_community_request(
+            COMMUNITY_REGISTER_PATH,
+            community_register_payload(&worker),
+            &worker,
+            node.validator_address,
+            domain,
+        )
+        .unwrap();
+        assert_eq!(
+            authenticate_community_request(&node, COMMUNITY_REGISTER_PATH, over_cap)
+                .unwrap_err()
+                .0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(node.community_request_replays.lock().seen.len(), 64);
+        assert!(node.community_shard_request_replays.lock().seen.is_empty());
+        node.community_request_replays.lock().assert_invariants();
     }
 
     fn community_register_payload(keypair: &arc_crypto::KeyPair) -> CommunityRegisterRequest {
