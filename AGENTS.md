@@ -274,7 +274,11 @@ integration is qualified. This transport alone does not activate desktop nodes.
 `community_shard_executor.rs` executes only the assigned canonical partial
 model with per-session KV limits, exact-retry caching, cancellation retention,
 and lease/boot fences. It rejects full-model residency and non-owned weights.
-It is a synchronous worker component; the outbound worker loop and verified
+Hidden activations are limited to ±2^30 in Q16 at coordinator and executor
+boundaries; values outside that envelope are refused before arithmetic. The
+coordinator follows the canonical legacy generation sequence, including BOS,
+prompt prefill, repeating the final prompt token for first decode, and retaining
+the EOS output token. It is a synchronous worker component; the outbound worker loop and verified
 public dispatch still need integration.
 
 `load_cached_model_shard_canonical_i8` reads only its assigned layer weights
@@ -283,7 +287,7 @@ partial range before reading tensor weights. Its GGUF tests execute two partial
 models across prefill and decoding and compare tokens and logits hashes with
 the full canonical engine. It does not define downloadable partial artifacts.
 
-`arc-node operator recovery qualify-peer-state` opens an already copied,
+`arc-node recovery qualify-peer-state` opens an already copied,
 disposable `peer-recovery-candidate-*` directory. Its hash-pinned manifest binds
 the target signing record, genesis, state WAL, recovery domain, and raw finality
 certificate. It replays persistent state and signed DAG records without opening

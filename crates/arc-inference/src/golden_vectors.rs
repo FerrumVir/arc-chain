@@ -1219,11 +1219,13 @@ mod gguf_preparation {
         let mut last_cache = KVCache::new(4);
         let mut full_cache = KVCache::new(4);
         let mut generated = Vec::new();
-        for position in 0..prompt.len() + 3 {
-            let input = if position < prompt.len() {
-                prompt[position]
+        for position in 0..1 + prompt.len() + 4 {
+            let input = if position == 0 {
+                full.config.bos_token
+            } else if position <= prompt.len() {
+                prompt[position - 1]
             } else {
-                *generated.last().unwrap()
+                generated.last().copied().unwrap_or(*prompt.last().unwrap())
             };
             let hidden = match shard0
                 .forward_shard_token_with_history(
@@ -1268,7 +1270,7 @@ mod gguf_preparation {
                     },
                 ) => {
                     assert_eq!((id, logits_hash), (expected, expected_hash));
-                    if position >= prompt.len() - 1 {
+                    if position > prompt.len() {
                         generated.push(id);
                     }
                 }

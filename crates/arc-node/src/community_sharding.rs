@@ -12,6 +12,7 @@ pub const MAX_MODEL_LAYERS_HARD_CAP: usize = 1024;
 pub const MAX_EOS_TOKENS: usize = 64;
 pub const MAX_REASON_BYTES: usize = 256;
 pub const MAX_HIDDEN_LEN_HARD_CAP: usize = 65_536;
+pub const MAX_HIDDEN_ABS_Q16: i64 = 1 << 30;
 pub const MAX_SEQUENCE_POSITIONS_HARD_CAP: usize = 32_768;
 pub const MAX_GENERATED_TOKENS_HARD_CAP: u32 = 256;
 pub const MAX_RETAINED_RESULTS_HARD_CAP: usize = 256;
@@ -85,6 +86,7 @@ pub struct TrustedModelSpec {
     pub vocab_size: usize,
     pub max_seq: usize,
     pub eos_tokens: Vec<u32>,
+    pub bos_token: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,6 +178,7 @@ pub enum ShardCoordinatorError {
         expected: usize,
         actual: usize,
     },
+    HiddenValueOutOfBounds,
     HiddenHashMismatch,
     TokenOutOfRange {
         token_id: u32,
@@ -266,6 +269,10 @@ impl fmt::Display for ShardCoordinatorError {
                     "hidden state length {actual} does not match model width {expected}"
                 )
             }
+            Self::HiddenValueOutOfBounds => write!(
+                f,
+                "hidden activation exceeds the bounded community shard numeric envelope"
+            ),
             Self::HiddenHashMismatch => write!(f, "hidden state digest mismatch"),
             Self::TokenOutOfRange {
                 token_id,
@@ -642,6 +649,12 @@ struct QuarantineRecord {
     expires_at_unix_ms: u64,
 }
 
+pub fn hidden_values_within_bounds(hidden: &[i64]) -> bool {
+    hidden
+        .iter()
+        .all(|value| (-MAX_HIDDEN_ABS_Q16..=MAX_HIDDEN_ABS_Q16).contains(value))
+}
+
 pub fn hidden_state_hash(hidden: &[i64]) -> Hash256 {
     let mut bytes = Vec::with_capacity(hidden.len().saturating_mul(8));
     for value in hidden {
@@ -715,6 +728,11 @@ fn validate_model_and_limits(
     if !(2..=MAX_SEQUENCE_POSITIONS_HARD_CAP).contains(&model.max_seq) {
         return Err(ShardCoordinatorError::InvalidConfig(
             "max_seq must be in 2..=32768",
+        ));
+    }
+    if model.bos_token as usize >= model.vocab_size {
+        return Err(ShardCoordinatorError::InvalidConfig(
+            "bos_token is outside model vocabulary",
         ));
     }
     if model.eos_tokens.len() > MAX_EOS_TOKENS {
@@ -1155,13 +1173,17 @@ impl CommunityShardCoordinator {
         }
         let max_tokens_usize = usize::try_from(max_tokens)
             .map_err(|_| ShardCoordinatorError::InvalidPrompt("max_tokens overflow"))?;
-        let total_positions = prompt_tokens.len().checked_add(max_tokens_usize).ok_or(
-            ShardCoordinatorError::InvalidPrompt("total sequence length overflow"),
-        )?;
+        let total_positions = prompt_tokens
+            .len()
+            .checked_add(max_tokens_usize)
+            .and_then(|positions| positions.checked_add(1))
+            .ok_or(ShardCoordinatorError::InvalidPrompt(
+                "total sequence length overflow",
+            ))?;
         if total_positions > self.model.max_seq || total_positions > MAX_SEQUENCE_POSITIONS_HARD_CAP
         {
             return Err(ShardCoordinatorError::InvalidPrompt(
-                "prompt_tokens + max_tokens exceeds sequence position cap",
+                "BOS + prompt_tokens + max_tokens exceeds sequence position cap",
             ));
         }
         for &token in &prompt_tokens {
@@ -1210,7 +1232,7 @@ impl CommunityShardCoordinator {
         };
         let final_pos =
             total_positions
-                .checked_sub(2)
+                .checked_sub(1)
                 .ok_or(ShardCoordinatorError::InvalidPrompt(
                     "invalid final position",
                 ))?;
@@ -1229,7 +1251,7 @@ impl CommunityShardCoordinator {
             last_token: final_pos == 0,
             deadline_unix_ms: step_deadline,
             input: ShardStepInput::Token {
-                token: prompt_tokens[0],
+                token: self.model.bos_token,
             },
             generated_tokens: Vec::new(),
         };
@@ -1471,6 +1493,9 @@ impl CommunityShardCoordinator {
                             actual: hidden.len(),
                         });
                     }
+                    if !hidden_values_within_bounds(&hidden) {
+                        return Err(ShardCoordinatorError::HiddenValueOutOfBounds);
+                    }
                     if hidden_hash == Hash256::ZERO {
                         return Err(ShardCoordinatorError::ZeroDigest);
                     }
@@ -1588,21 +1613,23 @@ impl CommunityShardCoordinator {
                         .prompt_tokens
                         .len()
                         .checked_add(session.max_tokens as usize)
+                        .and_then(|positions| positions.checked_add(1))
                         .ok_or(ShardCoordinatorError::CounterOverflow)?;
                     let final_pos = total_positions
-                        .checked_sub(2)
+                        .checked_sub(1)
                         .ok_or(ShardCoordinatorError::CounterOverflow)?;
                     let was_last = session.outstanding_step.last_token;
-                    let is_prefill_only = session.position + 1 < session.prompt_tokens.len();
+                    let is_prefill_only = session.position <= session.prompt_tokens.len();
                     if is_prefill_only {
                         let next_pos = session
                             .position
                             .checked_add(1)
                             .ok_or(ShardCoordinatorError::CounterOverflow)?;
-                        let next_tok = session.prompt_tokens[next_pos];
+                        let next_tok = session.prompt_tokens
+                            [session.position.min(session.prompt_tokens.len() - 1)];
                         (None, next_tok, next_pos, final_pos, was_last, false)
                     } else if self.model.eos_tokens.contains(&token_id) {
-                        (Some(true), 0, session.position, final_pos, was_last, false)
+                        (Some(true), 0, session.position, final_pos, was_last, true)
                     } else {
                         let next_generated_len = session
                             .generated_tokens
@@ -2516,6 +2543,7 @@ pub(crate) mod tests {
             vocab_size: model.config.vocab_size,
             max_seq: model.config.max_seq,
             eos_tokens: model.config.eos_tokens.clone(),
+            bos_token: model.config.bos_token,
         }
     }
 
@@ -2637,7 +2665,9 @@ pub(crate) mod tests {
 
     #[test]
     fn community_sharding_real_integer_model_pipeline_matches_try_generate() {
-        let full = build_deterministic_integer_model(32, 16, 2, 32, 4, 64, vec![128_001, 128_009]);
+        let mut full =
+            build_deterministic_integer_model(32, 16, 2, 32, 4, 64, vec![128_001, 128_009]);
+        full.config.bos_token = 17;
         assert!(full.has_all_transformer_layers());
         assert!(full.has_canonical_i8_profile());
 
@@ -2753,7 +2783,9 @@ pub(crate) mod tests {
         );
 
         let eos_target = expected_tokens[2];
-        let full_eos = build_deterministic_integer_model(32, 16, 2, 32, 4, 64, vec![eos_target]);
+        let mut full_eos =
+            build_deterministic_integer_model(32, 16, 2, 32, 4, 64, vec![eos_target]);
+        full_eos.config.bos_token = full.config.bos_token;
         let spec_eos = model_spec_from(test_hash(b"tiny-int8-eos"), &full_eos);
         let mut coord_eos = make_two_tile_coordinator(&spec_eos);
         let l1 = coord_eos
@@ -3081,6 +3113,41 @@ pub(crate) mod tests {
             coord.session_status(sid).unwrap().expected_step_id,
             work1.step_id
         );
+
+        for value in [
+            i64::MIN,
+            -MAX_HIDDEN_ABS_Q16 - 1,
+            MAX_HIDDEN_ABS_Q16 + 1,
+            i64::MAX,
+        ] {
+            let hidden = vec![value; spec.d_model];
+            let invalid = ShardStepSubmitRequest {
+                worker_id: w1,
+                lease_id: l1.lease_id,
+                lease_epoch: l1.lease_epoch,
+                session_id: sid,
+                step_id: work1.step_id,
+                model_id: spec.model_id,
+                execution_profile: spec.execution_profile.clone(),
+                range: l1.range,
+                position: 0,
+                layers_processed: 2,
+                outcome: ShardStepOutcome::Completed {
+                    output: ShardStepOutput::Hidden {
+                        hidden_hash: hidden_state_hash(&hidden),
+                        hidden,
+                    },
+                },
+            };
+            assert_eq!(
+                coord.submit_step(w1, 101, invalid),
+                Err(ShardCoordinatorError::HiddenValueOutOfBounds)
+            );
+            assert_eq!(
+                coord.session_status(sid).unwrap().expected_step_id,
+                work1.step_id
+            );
+        }
 
         let short_hidden = vec![1i64; spec.d_model - 1];
         let short_hidden_hash = hidden_state_hash(&short_hidden);

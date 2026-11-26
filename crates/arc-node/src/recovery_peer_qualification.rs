@@ -1084,7 +1084,6 @@ mod recovery_peer_qualification_tests {
         assert!(qualification_split_target_and_peers(&[(target, 7), (peer, 0)], target).is_err());
         let cli = Cli::try_parse_from([
             "arc-node",
-            "operator",
             "recovery",
             "qualify-peer-state",
             "--candidate-manifest",

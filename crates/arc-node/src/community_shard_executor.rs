@@ -1,3 +1,4 @@
+use crate::community_sharding::hidden_values_within_bounds;
 use crate::community_sharding::{
     DEFAULT_JOB_DEADLINE_MS, DEFAULT_MAX_RETAINED_RESULTS, DEFAULT_MAX_SESSIONS_PER_WORKER,
     DEFAULT_STEP_TIMEOUT_MS, LeaseId, MAX_ACTIVE_SESSIONS_HARD_CAP, MAX_EOS_TOKENS,
@@ -103,6 +104,7 @@ pub enum ShardExecutorError {
         expected: usize,
         actual: usize,
     },
+    HiddenValueOutOfBounds,
     HiddenHashMismatch,
     ZeroDigest,
     HistoryTooLong {
@@ -206,6 +208,10 @@ impl fmt::Display for ShardExecutorError {
                     "hidden length {actual} does not match expected {expected}"
                 )
             }
+            Self::HiddenValueOutOfBounds => write!(
+                f,
+                "hidden activation exceeds the bounded community shard numeric envelope"
+            ),
             Self::HiddenHashMismatch => write!(f, "hidden state hash mismatch"),
             Self::ZeroDigest => write!(f, "digest must be nonzero"),
             Self::HistoryTooLong { max_len, actual } => {
@@ -465,6 +471,11 @@ fn validate_model_spec(spec: &TrustedModelSpec) -> Result<(), ShardExecutorError
             "max_seq must be 2..=32768",
         ));
     }
+    if spec.bos_token as usize >= spec.vocab_size {
+        return Err(ShardExecutorError::InvalidModelSpec(
+            "bos_token is outside model vocabulary",
+        ));
+    }
     if spec.eos_tokens.len() > MAX_EOS_TOKENS {
         return Err(ShardExecutorError::InvalidModelSpec(
             "eos_tokens exceeds limit",
@@ -575,6 +586,7 @@ fn validate_partial_model(
         || cfg.vocab_size != spec.vocab_size
         || cfg.max_seq != spec.max_seq
         || cfg.eos_tokens != spec.eos_tokens
+        || cfg.bos_token != spec.bos_token
     {
         return Err(ShardExecutorError::InvalidPartialModel(
             "model config does not match trusted spec",
@@ -778,6 +790,9 @@ fn validate_work(
                     actual: hidden.len(),
                 });
             }
+            if !hidden_values_within_bounds(hidden) {
+                return Err(ShardExecutorError::HiddenValueOutOfBounds);
+            }
             if is_zero_hash(*hidden_hash) {
                 return Err(ShardExecutorError::ZeroDigest);
             }
@@ -857,6 +872,9 @@ fn convert_shard_output(
                     expected: expected_hidden_len,
                     actual: hidden.len(),
                 });
+            }
+            if !hidden_values_within_bounds(&hidden) {
+                return Err(ShardExecutorError::HiddenValueOutOfBounds);
             }
             let hidden_hash = hidden_state_hash(&hidden);
             if is_zero_hash(hidden_hash) {
@@ -2368,6 +2386,24 @@ mod tests {
             exec2.execute_step(fx.coord_id, now + 10, &short_in2),
             Err(ShardExecutorError::InvalidHiddenLength { .. })
         ));
+        for value in [
+            i64::MIN,
+            i64::MAX,
+            crate::community_sharding::MAX_HIDDEN_ABS_Q16 + 1,
+        ] {
+            let hidden = vec![value; fx.spec.d_model];
+            let mut invalid = work2.clone();
+            invalid.input = ShardStepInput::Hidden {
+                hidden_hash: hidden_state_hash(&hidden),
+                hidden,
+            };
+            assert_eq!(
+                exec2.execute_step(fx.coord_id, now + 10, &invalid),
+                Err(ShardExecutorError::HiddenValueOutOfBounds)
+            );
+            assert_eq!(exec2.status().active_sessions, 0);
+            assert_eq!(exec2.status().reserved_kv_bytes, 0);
+        }
         let mut zero_hash2 = work2.clone();
         if let ShardStepInput::Hidden { hidden_hash, .. } = &mut zero_hash2.input {
             *hidden_hash = Hash256::ZERO;

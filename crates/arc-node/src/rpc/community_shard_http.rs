@@ -165,6 +165,7 @@ pub fn init_community_shard_coordinator_with_limits(
         vocab_size: model.config.vocab_size,
         max_seq: model.config.max_seq,
         eos_tokens: model.config.eos_tokens.clone(),
+        bos_token: model.config.bos_token,
     };
     let boot_nonce = arc_crypto::KeyPair::generate_ed25519().address();
     let coordinator = CommunityShardCoordinator::new(boot_nonce, spec, limits)
@@ -375,6 +376,7 @@ fn map_coordinator_error(error: ShardCoordinatorError) -> (StatusCode, String) {
         | ShardCoordinatorError::InvalidLayersProcessed { .. }
         | ShardCoordinatorError::TerminalModeMismatch { .. }
         | ShardCoordinatorError::InvalidHiddenLength { .. }
+        | ShardCoordinatorError::HiddenValueOutOfBounds
         | ShardCoordinatorError::HiddenHashMismatch
         | ShardCoordinatorError::TokenOutOfRange { .. }
         | ShardCoordinatorError::ZeroDigest
