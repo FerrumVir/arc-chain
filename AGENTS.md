@@ -359,6 +359,10 @@ The optional `partial_shard` worker status reports loading, lease expiry,
 reconnects, and partial steps separately from whole jobs. Expired ready or
 computing leases clear their displayed range; partial steps do not count as
 whole answers or rewards. Legacy whole-worker payloads omit these fields.
+The desktop rejects unknown or contradictory worker payloads, displays partial
+steps separately, and clears expired assignments. The Linux candidate workflow's
+`desktop-ui` mode builds the frontend, checks state transitions and captures the
+ready, computing, failed and stopped views in a single browser worker.
 
 `scripts/qualification/run-recovery-peer-tests.py` runs the exact mandatory
 recovery and sharding tests on a single build worker and rejects missing cases

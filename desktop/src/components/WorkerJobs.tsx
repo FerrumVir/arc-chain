@@ -6,18 +6,10 @@ import { PLAIN_COPY } from "../lib/plain-copy";
 import { api } from "../lib/tauri";
 import { formatInt, formatRelativeTime } from "../lib/format";
 import { useAppStore } from "../lib/store";
-import { computeContributionEnabled, type WorkerStatus } from "../lib/types";
+import { computeContributionEnabled } from "../lib/types";
+import { describeWorkerStatus, workerStateCopy } from "../lib/worker-status";
 
-const STATE_COPY: Record<string, string> = {
-  polling: "Ready: waiting for a job",
-  computing: "Computing a job now",
-  reconnecting: "Reconnecting to coordinators",
-};
-
-export function workerStateCopy(status: WorkerStatus): string {
-  if (!status.running) return "Not taking jobs";
-  return (status.state && STATE_COPY[status.state]) || "Running";
-}
+export { workerStateCopy };
 
 function count(value: number | null): string {
   return value === null ? "—" : formatInt(value);
@@ -49,24 +41,86 @@ export function WorkerJobsCard() {
     };
   }, [workerUnknownToUi, setConfig]);
 
+  const view = status === undefined ? undefined : describeWorkerStatus(status);
+
   return (
     <Card style={{ marginBottom: "var(--space-6)" }} data-testid="worker-jobs">
       <CardHeader
         title="Jobs on this computer"
         action={
-          status?.running ? (
+          view !== undefined && (view.kind !== "whole" || view.running) ? (
             <span
               data-testid="worker-jobs-state"
               style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}
             >
-              {workerStateCopy(status)}
+              {view.stateLabel}
             </span>
           ) : undefined
         }
       />
-      {status === undefined ? (
+      {status === undefined || view === undefined ? (
         <Skeleton width="60%" />
-      ) : status.running ? (
+      ) : view.kind === "whole" ? (
+        status.running ? (
+          <>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
+                gap: "var(--space-4)",
+              }}
+            >
+              <div>
+                <div className="stat-label">Completed</div>
+                <div className="stat-value mono" data-testid="worker-jobs-completed">
+                  {count(status.jobsCompleted)}
+                </div>
+              </div>
+              <div>
+                <div className="stat-label" title={PLAIN_COPY.dashboard.reportedChecksInfo}>
+                  {PLAIN_COPY.dashboard.reportedChecks}
+                </div>
+                <div className="stat-value mono" data-testid="worker-jobs-verified">
+                  {count(status.jobsVerified)}
+                </div>
+              </div>
+              <div>
+                <div className="stat-label">Coordinators</div>
+                <div className="stat-value mono" data-testid="worker-jobs-coordinators">
+                  {status.coordinatorsRegistered === null
+                    ? "—"
+                    : `${status.coordinatorsRegistered} of ${status.coordinatorsTotal ?? "?"}`}
+                </div>
+              </div>
+            </div>
+            <p
+              style={{
+                marginTop: "var(--space-3)",
+                fontSize: "var(--text-sm)",
+                color: "var(--text-muted)",
+                lineHeight: 1.5,
+              }}
+              data-testid="worker-jobs-detail"
+            >
+              {status.lastJobCompletedUnixMs !== null
+                ? `Last job ${formatRelativeTime(status.lastJobCompletedUnixMs)}. `
+                : "No job completed since the node started. "}
+              Counted since the node last started; a job is paid only through a
+              mined reward receipt.
+              {status.publicName ? ` Scoreboards show this computer as ${status.publicName}.` : ""}
+            </p>
+          </>
+        ) : (
+          <p
+            style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)", lineHeight: 1.5 }}
+            data-testid={contributing ? "worker-jobs-unavailable" : "worker-jobs-off"}
+          >
+            {contributing
+              ? (status.unavailable ?? PLAIN_COPY.workerJobs.wholeStarting)
+              : PLAIN_COPY.workerJobs.wholeNotContributing}
+          </p>
+        )
+      ) : view.kind === "partial_shard" ? (
         <>
           <div
             style={{
@@ -76,23 +130,21 @@ export function WorkerJobsCard() {
             }}
           >
             <div>
-              <div className="stat-label">Completed</div>
-              <div className="stat-value mono" data-testid="worker-jobs-completed">
-                {count(status.jobsCompleted)}
+              <div className="stat-label">{PLAIN_COPY.workerJobs.partialStepsRunLabel}</div>
+              <div className="stat-value mono" data-testid="worker-jobs-steps-executed">
+                {count(view.stepsExecuted)}
               </div>
             </div>
             <div>
-              <div className="stat-label" title={PLAIN_COPY.dashboard.reportedChecksInfo}>{PLAIN_COPY.dashboard.reportedChecks}</div>
-              <div className="stat-value mono" data-testid="worker-jobs-verified">
-                {count(status.jobsVerified)}
+              <div className="stat-label">{PLAIN_COPY.workerJobs.partialStepsSentLabel}</div>
+              <div className="stat-value mono" data-testid="worker-jobs-steps-submitted">
+                {count(view.stepsSubmitted)}
               </div>
             </div>
             <div>
-              <div className="stat-label">Coordinators</div>
-              <div className="stat-value mono" data-testid="worker-jobs-coordinators">
-                {status.coordinatorsRegistered === null
-                  ? "—"
-                  : `${status.coordinatorsRegistered} of ${status.coordinatorsTotal ?? "?"}`}
+              <div className="stat-label">{PLAIN_COPY.workerJobs.partialAssignedPartLabel}</div>
+              <div className="stat-value mono" data-testid="worker-jobs-assigned-range">
+                {view.assignedRangeLabel ?? "—"}
               </div>
             </div>
           </div>
@@ -105,22 +157,22 @@ export function WorkerJobsCard() {
             }}
             data-testid="worker-jobs-detail"
           >
-            {status.lastJobCompletedUnixMs !== null
-              ? `Last job ${formatRelativeTime(status.lastJobCompletedUnixMs)}. `
-              : "No job completed since the node started. "}
-            Counted since the node last started; a job is paid only through a
-            mined reward receipt.
-            {status.publicName ? ` Scoreboards show this computer as ${status.publicName}.` : ""}
+            {`${view.summary} `}
+            {view.lastError && (view.phase === "failed" || view.phase === "stopped")
+              ? `${view.lastError} `
+              : ""}
+            {view.lastStepSubmittedUnixMs !== null
+              ? `Last step ${formatRelativeTime(view.lastStepSubmittedUnixMs)}. `
+              : `${PLAIN_COPY.workerJobs.partialNoStepsYet} `}
+            {PLAIN_COPY.workerJobs.partialNoRewards}
           </p>
         </>
       ) : (
         <p
           style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)", lineHeight: 1.5 }}
-          data-testid={contributing ? "worker-jobs-unavailable" : "worker-jobs-off"}
+          data-testid="worker-jobs-invalid"
         >
-          {contributing
-            ? (status.unavailable ?? "The worker is starting.")
-            : "Compute contribution is off. Turn it on in Settings to take ARC jobs on this computer."}
+          {view.summary}
         </p>
       )}
     </Card>

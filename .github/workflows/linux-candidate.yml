@@ -12,6 +12,7 @@ on:
           - full
           - recovery-peer
           - desktop-shard
+          - desktop-ui
   push:
     branches: [arc-chain-v2-implementation-20260919, arc-native-low-residency-20260927, arc-desktop-unattended-availability-20260927]
 
@@ -27,6 +28,47 @@ env:
   CARGO_BUILD_JOBS: 2
 
 jobs:
+  desktop-ui:
+    if: inputs.qualification == 'desktop-ui'
+    name: Desktop worker status and rendered states
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.20.0
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Verify source and build desktop frontend
+        working-directory: desktop
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          npm ci
+          npm run build
+      - name: Check worker and recovery state transitions
+        working-directory: desktop
+        run: |
+          test "$(CI='' npx playwright test --list | sed -n 's/^Total: //p' | tail -n 1)" = '464 tests in 35 files'
+          npm run test:unit
+      - name: Render partial worker states
+        working-directory: desktop
+        run: |
+          npx playwright install --with-deps chromium
+          npx playwright test --config playwright.shard.config.ts --workers=1 --retries=0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: desktop-worker-status-${{ github.sha }}-${{ github.run_id }}
+          path: |
+            desktop/test-results/
+            desktop/playwright-report/
+          if-no-files-found: error
+          retention-days: 14
+
   recovery-peer:
     if: inputs.qualification == 'recovery-peer'
     name: Signed recovery and community sharding
@@ -73,7 +115,7 @@ jobs:
           retention-days: 14
 
   recovered-v3-paid-lifecycle:
-    if: inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard'
+    if: inputs.qualification != 'desktop-ui' && inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard'
     name: Recovered-v3 paid lifecycle (isolated Linux process test)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -215,7 +257,7 @@ jobs:
           retention-days: 14
 
   desktop-native-paid-test:
-    if: inputs.qualification != 'recovery-peer'
+    if: inputs.qualification != 'desktop-ui' && inputs.qualification != 'recovery-peer'
     name: Desktop lifecycle and native paid Rust tests (macOS)
     runs-on: ${{ startsWith(vars.ARC_MACOS_ARM_RUNNER, '[') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) && fromJSON(vars.ARC_MACOS_ARM_RUNNER) || 'macos-15' }}
     timeout-minutes: 45
@@ -299,7 +341,7 @@ jobs:
           exit 0
 
   linux-candidate:
-    if: inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard'
+    if: inputs.qualification != 'desktop-ui' && inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard'
     name: Linux production candidate
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -438,7 +480,7 @@ jobs:
 
   real-model-conformance:
     name: Fresh-runner real-model conformance (${{ matrix.layout }})
-    if: inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard' && github.ref == 'refs/heads/arc-native-low-residency-20260927'
+    if: inputs.qualification != 'desktop-ui' && inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard' && github.ref == 'refs/heads/arc-native-low-residency-20260927'
     strategy:
       fail-fast: false
       matrix:

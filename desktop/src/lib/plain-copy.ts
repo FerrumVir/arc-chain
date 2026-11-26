@@ -78,6 +78,16 @@ export const PLAIN_COPY = {
     shareDownload: "Sharing downloads the AI model (3.80 GB) if it is not already on this computer.",
     enablingSharing: "ARC is preparing to share. It will download the AI model (3.80 GB) if needed.",
     reconnectingWorker: "Your computer is reconnecting before it can answer questions.",
+    partialStarting: "Your computer is starting shared AI work.",
+    partialLoading: "Your computer is loading part of the AI model.",
+    partialReady: "Your computer is ready to help with shared AI steps (no rewards).",
+    partialSteps: (n: number) =>
+      `Your computer has helped with ${n} ${n === 1 ? "shared AI step" : "shared AI steps"} since it started (no rewards).`,
+    partialComputing: "Your computer is helping with a shared AI step right now (no rewards).",
+    partialReconnecting: "Your computer is reconnecting before it can help with shared AI steps.",
+    partialFailed: "Shared AI work stopped because of an error.",
+    partialStopped: "Shared AI work is stopped.",
+    workerStatusUnavailable: "Your computer's sharing status could not be confirmed.",
     answered: (n: number) => `Your computer has answered ${n} ${n === 1 ? "question" : "questions"} since it started.`,
     online: (n: number) => `${n} ${n === 1 ? "computer is" : "computers are"} online.`,
     registered: (n: number) => `${n} ${n === 1 ? "computer has" : "computers have"} registered.`,
@@ -262,5 +272,49 @@ export const PLAIN_COPY = {
     checkFailed:
       "ARC couldn't check for updates right now. It tries again later, and you can check again here.",
     installFailed: "The update didn't install. You can try again here.",
+  },
+  workerJobs: {
+    wholeStates: {
+      polling: "Ready: waiting for a job",
+      computing: "Computing a job now",
+      reconnecting: "Reconnecting to coordinators",
+      running: "Running",
+      notTakingJobs: "Not taking jobs",
+    },
+    wholeStarting: "The worker is starting.",
+    wholeNotContributing:
+      "Compute contribution is off. Turn it on in Settings to take ARC jobs on this computer.",
+    partialStates: {
+      starting: "Starting shared work",
+      loading: "Loading part of the AI model",
+      ready: "Ready for shared steps (no rewards)",
+      computing: "Running a shared step (no rewards)",
+      reconnecting: "Reconnecting for shared work",
+      failed: "Shared work failed",
+      stopped: "Shared work stopped",
+    },
+    partialSummaries: {
+      starting: "Shared AI work is starting on this computer.",
+      loading: "This computer is loading part of the AI model.",
+      ready: "This computer is ready to help with shared AI steps.",
+      computing: "This computer is helping with a shared AI step right now.",
+      reconnecting: "Reconnecting before this computer can take shared AI steps.",
+      reconnectingExpired:
+        "The previous assignment expired. Reconnecting before this computer can take shared AI steps.",
+      failed: "Shared AI work stopped because of an error.",
+      stopped: "Shared AI work is stopped.",
+    },
+    invalidState: "Status could not be confirmed",
+    invalidSummary:
+      "ARC could not confirm this computer's sharing status. No work is counted as earning rewards.",
+    unknownModeSummary:
+      "This computer reported a sharing mode that this version of ARC does not recognize. No work is counted as earning rewards.",
+    partialNoRewards: "Shared steps do not earn rewards and are not counted as completed questions.",
+    partialNoStepsYet: "No shared step sent since the node started.",
+    partialStepsRunLabel: "Steps run",
+    partialStepsSentLabel: "Steps sent",
+    partialAssignedPartLabel: "Assigned part",
+    partialAssignedPart: (layers: number, totalLayers: number) =>
+      `${layers} of ${totalLayers} layers`,
   },
 } as const;
