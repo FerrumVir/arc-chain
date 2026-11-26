@@ -268,6 +268,15 @@ The full account is [docs/HOW-SHARDING-WORKS.md](docs/HOW-SHARDING-WORKS.md).
   eligible waiting worker may take it. Every 4th decision tries an untried
   worker, if one is waiting
   (`crates/arc-node/src/rpc/community_routing.rs:186-205`, `239`, `280`).
+  Public-request and public-demo twin legs use this same speed preference,
+  among workers accepted by the independent-worker and diversity checks.
+  A held leg reselects if its chosen worker becomes a sibling or stops waiting.
+  Verified twin legs teach the router using coordinator-observed elapsed time
+  per model position; unverified output and worker-reported timing do not.
+  Caller twins dispatch immediately when no eligible waiter has a measured speed.
+  An ineligible caller leaves held twin work available to other workers, and a
+  declined twin clears its old availability claim until the next claim request.
+  Background twin jobs retain their existing fairness and reserve rules.
 - Validators hold layer ranges and verify results; each range needs 2
   agreeing signatures (`rpc.rs:6870-6876`). Prefill overlaps across hops,
   while decode passes every hop once per token (`rpc.rs:11989-11998`).
@@ -282,6 +291,10 @@ The full account is [docs/HOW-SHARDING-WORKS.md](docs/HOW-SHARDING-WORKS.md).
   (`desktop/src-tauri/src/commands.rs:981-1028`). They take whole jobs.
 - More workers add capacity only up to each coordinator's limit. One job gets
   faster only when routing finds a faster worker.
+- `/shards/auto_plan` returns a proposed layout without registering it. Its
+  node addresses must be authenticated validator identities from signed shard
+  announcements; malformed identities fail closed. A model hash is never a
+  node address (`crates/arc-node/src/rpc.rs`, `compute_auto_shard_plan`).
 
 ## Releases and versions
 
