@@ -163,7 +163,9 @@ export function WorkerJobsCard() {
               : ""}
             {view.lastStepSubmittedUnixMs !== null
               ? `Last step ${formatRelativeTime(view.lastStepSubmittedUnixMs)}. `
-              : `${PLAIN_COPY.workerJobs.partialNoStepsYet} `}
+              : view.stepsSubmitted === 0
+                ? `${PLAIN_COPY.workerJobs.partialNoStepsYet} `
+                : ""}
             {PLAIN_COPY.workerJobs.partialNoRewards}
           </p>
         </>
