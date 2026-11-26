@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use tower_http::cors::CorsLayer;
 
 mod community_routing;
+pub mod community_shard_dispatch;
 pub mod community_shard_http;
 mod teacher_forced;
 mod twin_dispatch;
@@ -2119,6 +2120,7 @@ pub async fn serve(
                 .layer(DefaultBodyLimit::max(COMMUNITY_SUBMIT_BODY_LIMIT_BYTES)),
         )
         .merge(community_shard_http::routes())
+        .merge(community_shard_dispatch::routes())
         .route(
             COMMUNITY_REWARD_APPROVE_PATH,
             post(community_reward_approve_signed)
@@ -12833,6 +12835,62 @@ async fn verify_community_result_with_quorum(
     })
 }
 
+struct CommunityVerificationCandidate<'a> {
+    verification_id: String,
+    input: &'a str,
+    max_tokens: u32,
+    model_id: Hash256,
+    execution_profile: &'a str,
+    submitted_at_unix_ms: i64,
+    expires_at_unix_ms: u64,
+    candidate_tokens: &'a [u32],
+    candidate_output: &'a str,
+    candidate_output_hash: Hash256,
+}
+
+fn build_community_verification_work_item(
+    node: &NodeState,
+    candidate: &CommunityVerificationCandidate<'_>,
+) -> WorkItem {
+    WorkItem {
+        job_id: candidate.verification_id.clone(),
+        input: candidate.input.to_string(),
+        max_tokens: candidate.max_tokens,
+        model_id: Some(format!("0x{}", candidate.model_id.to_hex())),
+        execution_profile: candidate.execution_profile.to_string(),
+        transaction_domain: node
+            .state
+            .transaction_domain_hash()
+            .map(|domain| format!("0x{}", domain.to_hex())),
+        expected_worker_id: None,
+        submitted_at_unix_ms: candidate.submitted_at_unix_ms,
+        expires_at_unix_ms: candidate.expires_at_unix_ms,
+    }
+}
+
+async fn verify_community_candidate_with_quorum(
+    node: &NodeState,
+    candidate: &CommunityVerificationCandidate<'_>,
+) -> Result<CommunityResultVerification, CommunityResultVerificationError> {
+    let work_item = build_community_verification_work_item(node, candidate);
+    let result = WorkResult {
+        output_tokens: Some(candidate.candidate_tokens.to_vec()),
+        job_id: candidate.verification_id.clone(),
+        worker_id: String::new(),
+        success: true,
+        declined: false,
+        output: candidate.candidate_output.to_string(),
+        output_hash: format!("0x{}", candidate.candidate_output_hash.to_hex()),
+        tokens_generated: candidate.candidate_tokens.len() as u64,
+        total_ms: 0,
+        ms_per_token: 0,
+        engine: candidate.execution_profile.to_string(),
+        error: None,
+        signed_attestation_hex: None,
+    };
+    verify_community_result_with_quorum(node, &work_item, &result).await
+}
+
 struct CommunityCanonicalRecompute {
     generated: Vec<u32>,
     output_text: String,
@@ -20833,7 +20891,7 @@ mod tests {
         assert_same_body(&submitted, &expected_submit);
     }
 
-    fn recovered_six_validator_state() -> (
+    pub(super) fn recovered_six_validator_state() -> (
         Vec<arc_crypto::KeyPair>,
         Arc<arc_state::StateDB>,
         std::path::PathBuf,

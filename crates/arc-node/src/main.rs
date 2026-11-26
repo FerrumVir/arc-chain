@@ -1,3 +1,4 @@
+mod community_shard_cli;
 mod config;
 mod legacy_retirement;
 mod recovery_descriptor;
@@ -650,6 +651,8 @@ struct Cli {
 
 #[derive(Clone, Debug, Subcommand)]
 enum OperatorCommand {
+    /// Run a standalone partial-model worker with pinned identity and memory limits.
+    CommunityShardWorker(community_shard_cli::CommunityShardWorkerArgs),
     /// Print the actual native assignment policy commitment without starting
     /// a node, connecting workers, reading chain state, or loading a model.
     NativeAssignmentPolicy {
@@ -4608,6 +4611,7 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
 
 async fn run_operator_command(command: OperatorCommand) -> Result<()> {
     match command {
+        OperatorCommand::CommunityShardWorker(args) => community_shard_cli::run(args).await,
         OperatorCommand::NativeAssignmentPolicy {
             row_workers,
             low_residency,

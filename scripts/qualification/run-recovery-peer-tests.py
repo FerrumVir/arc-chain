@@ -7,6 +7,14 @@ import subprocess
 
 
 EXPECTED_BINARY_TESTS = {
+    'community_shard_cli::tests::shutdown_signals_watch_and_drains_worker_and_prepare_without_abort',
+    'community_shard_cli::tests::partial_loader_admits_before_weights_and_verifies_artifact_before_and_after_load',
+    'community_shard_cli::tests::derive_all_roles_admission_enforces_budget_caps_and_first_embedding_floor',
+    'community_shard_cli::tests::prepare_rejects_wrong_artifact_pin_before_metadata_keys_or_network',
+    'community_shard_cli::tests::validate_args_rejects_zero_and_hard_cap_budgets_threads_and_insecure_urls',
+    'community_shard_cli::tests::cli_rejects_bad_identity_and_domain_hex',
+    'community_shard_cli::tests::cli_requires_pins_and_allows_missing_keyfile_only_for_check_only',
+    'community_shard_cli::tests::cli_parses_top_level_subcommand_and_rejects_operator_prefix',
     "tests::recovery_peer_qualify_command_accepts_persistent_candidate_and_rejects_mutations",
     "tests::recovery_peer_generation_replays_for_different_absent_validator_compacts_and_restarts",
     "tests::recovery_peer_replay_rejects_unsigned_forged_and_wrong_domain_blocks",
@@ -17,6 +25,17 @@ EXPECTED_BINARY_TESTS = {
     'recovery_peer_qualification_tests::qualify_peer_state_rejects_oversized_wrong_domain_forged_and_subquorum_certificates',
 }
 EXPECTED_LIBRARY_TESTS = {
+    'rpc::community_shard_dispatch::tests::outbound_workers_and_public_dispatch_return_independently_verified_answer',
+    'rpc::community_shard_dispatch::tests::validate_pending_result_rejects_altered_digest_and_eos_or_token_anomalies',
+    'rpc::community_shard_dispatch::tests::verification_candidate_binds_node_transaction_domain',
+    'rpc::community_shard_dispatch::tests::lost_notify_does_not_hang',
+    'rpc::community_shard_dispatch::tests::dropped_caller_future_synchronously_cancels_session_and_clears_retained_result',
+    'rpc::community_shard_dispatch::tests::body_input_capacity_and_disabled_failures',
+    'rpc::community_shard_dispatch::tests::missing_verification_replicas_fails_before_opening_session',
+    'rpc::community_shard_dispatch::tests::aborted_session_returns_no_answer',
+    'rpc::community_shard_dispatch::tests::tampered_generated_tokens_fail_verification_with_no_answer',
+    'rpc::community_shard_dispatch::tests::early_eos_two_partial_worker_session_returns_verified_answer',
+    'rpc::community_shard_dispatch::tests::valid_two_partial_worker_session_returns_verified_answer',
     'rpc::community_shard_http::worker_tests::hundred_signed_network_workers_all_execute_canonical_partial_inference',
     'rpc::community_shard_http::worker_tests::stalled_http_response_body_hits_total_elapsed_timeout',
     'rpc::community_shard_http::worker_tests::heartbeat_not_starved_by_instant_claim_responses_and_default_loopback_idles_cleanly',
@@ -124,8 +143,8 @@ def main():
                 executables.setdefault(target["name"], set()).add(row["executable"])
     expected_targets = {
         "arc_inference": (("canonical_shard_admission::candle_tests::", "golden_vectors::gguf_preparation::",), EXPECTED_INFERENCE_TESTS),
-        "arc-node": (("tests::recovery_peer_", "recovery_peer_qualification_tests::"), EXPECTED_BINARY_TESTS),
-        "arc_node": (("community_shard_worker::tests::", "rpc::community_shard_http::worker_tests::", "community_shard_executor::tests::", "community_sharding::tests::", "rpc::community_shard_http::tests::", "rpc::tests::community_auth_"), EXPECTED_LIBRARY_TESTS),
+        "arc-node": (("community_shard_cli::tests::", "tests::recovery_peer_", "recovery_peer_qualification_tests::"), EXPECTED_BINARY_TESTS),
+        "arc_node": (("rpc::community_shard_dispatch::tests::", "community_shard_worker::tests::", "rpc::community_shard_http::worker_tests::", "community_shard_executor::tests::", "community_sharding::tests::", "rpc::community_shard_http::tests::", "rpc::tests::community_auth_"), EXPECTED_LIBRARY_TESTS),
     }
     if set(executables) != set(expected_targets) or any(len(paths) != 1 for paths in executables.values()):
         raise SystemExit(f"Expected one executable for each node binary, node library, and inference library target, found {executables}")
@@ -152,6 +171,18 @@ def main():
             else:
                 passed.append(test)
                 print(f"PASS {test}")
+    non_candle_test = "canonical_shard_admission::non_candle_tests::non_candle_build_refuses_canonical_shard_metadata_inspection"
+    output = run_recorded(
+        ["cargo", "test", "--locked", "-p", "arc-inference", "--no-default-features", "--lib",
+         non_candle_test, "--", "--exact", "--test-threads=1"],
+        args.evidence_dir / "non-candle-admission.log", 1200,
+    )
+    if output.count("test result: ok. 1 passed; 0 failed; 0 ignored;") != 1:
+        failed.append(non_candle_test)
+        print(f"FAIL {non_candle_test}\n{output}")
+    else:
+        passed.append(non_candle_test)
+        print(f"PASS {non_candle_test}")
     with (args.evidence_dir / "result.json").open("x") as output:
         json.dump({"passed": passed, "failed": failed}, output, indent=2)
         output.write("\n")

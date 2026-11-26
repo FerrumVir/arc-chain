@@ -182,7 +182,7 @@ pub fn init_community_shard_coordinator_with_limits(
         n_layers = model.config.n_layers,
         d_model = model.config.d_model,
         tiles = tile_count,
-        "community shard coordinator worker transport enabled (verified dispatch not yet active)"
+        "community shard coordinator enabled (verified dispatch requires validator quorum; rewards disabled)"
     );
     Ok(())
 }
@@ -559,17 +559,19 @@ pub(crate) async fn community_shard_status(
         let guard = node.community_shard_coordinator.lock();
         guard.as_ref().map(|coord| coord.status_snapshot(now_ms))
     };
+    let verified_dispatch_enabled = snapshot.is_some()
+        && super::community_shard_dispatch::is_verified_dispatch_available(&node);
     Ok(Json(CommunityShardStatusResponse {
         enabled: snapshot.is_some(),
         protocol_version: COMMUNITY_SHARD_PROTOCOL_VERSION,
-        verified_dispatch_enabled: false,
+        verified_dispatch_enabled,
         rewards_enabled: false,
         status: snapshot,
     }))
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::community_sharding::{
         HeartbeatDirective, SessionOutcome, ShardLayerRange, ShardStepInput, ShardStepOutcome,
@@ -632,7 +634,7 @@ mod tests {
         }
     }
 
-    fn build_tiny_model(n_layers: usize) -> CachedIntegerModel {
+    pub(crate) fn build_tiny_model(n_layers: usize) -> CachedIntegerModel {
         let vocab_size = 32usize;
         let d_model = 16usize;
         let n_heads = 2usize;
@@ -717,7 +719,7 @@ mod tests {
         }
     }
 
-    fn slice_partial_model(
+    pub(crate) fn slice_partial_model(
         full: &CachedIntegerModel,
         range: ShardLayerRange,
     ) -> CachedIntegerModel {
@@ -823,7 +825,7 @@ mod tests {
         }
     }
 
-    async fn register_worker_signed(
+    pub(crate) async fn register_worker_signed(
         node: &super::super::NodeState,
         keypair: &KeyPair,
         model_id: Hash256,

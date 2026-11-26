@@ -272,8 +272,13 @@ nonce. Shard mutations use a separate bounded replay cache with a 30-second
 clock window; ordinary-worker and validator authentication keep their existing
 limits. Expiry uses a queue and per-identity counts. The coordinator requires a
 loaded canonical model; it is off by default.
-The status route reports verified dispatch and rewards as disabled until their
-integration is qualified. This transport alone does not activate desktop nodes.
+The status route reports verified dispatch available only with the enabled
+coordinator, canonical model, and an independent validator verification plan.
+`POST /inference/run_community_sharded` owns and cancels its shard session, checks
+its exact result digest, coverage, token limits and EOS, then uses the existing
+validator quorum verification before returning output. It shares the public
+inference capacity limit. Rewards remain disabled for these multi-worker results.
+This transport alone does not activate desktop nodes.
 
 `community_shard_executor.rs` executes only the assigned canonical partial
 model with per-session KV limits, exact-retry caching, cancellation retention,
@@ -287,9 +292,14 @@ signed shard identity, maintains leases during blocking model loads and executio
 and retries identical submissions using fresh request nonces. Shutdown drains
 blocking work before release; reassignment drops the previous partial model before
 loading the next. TLS coordinator identity and transaction domain are pinned by
-the caller. Public verified dispatch, the production loader command, and desktop
-activation still need integration. Network tests use small canonical fixtures;
-they do not establish deployed capacity or operator availability.
+the caller. `arc-node community-shard-worker` runs without chain state or inbound
+listeners. It requires coordinator, recovered-domain and full-artifact identity
+pins, a private worker key, and an explicit RAM budget. `--check-only` inspects
+admission without keys, network registration or tensor loading. Run mode uses one
+compute thread by default and drains work on shutdown. Its conservative admission
+requires capacity for all shard roles because role-aware placement is not yet
+implemented. Desktop activation still needs integration. Network tests use small
+canonical fixtures; they do not establish deployed capacity or operator availability.
 
 `load_cached_model_shard_canonical_i8` reads only its assigned layer weights
 from a GGUF, without preparing optional quantizations. It validates a strict

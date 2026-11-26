@@ -120,12 +120,6 @@ pub enum ShardAdmissionError {
     },
 }
 
-impl From<ShardAdmissionError> for crate::InferenceError {
-    fn from(error: ShardAdmissionError) -> Self {
-        crate::InferenceError::Runtime(error.to_string())
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactTrustBoundary {
     UnverifiedHeaderOnly,
@@ -232,8 +226,11 @@ impl CanonicalShardMetadata {
         reader: R,
         max_header_bytes: u64,
     ) -> Result<Self, ShardAdmissionError> {
-        let (meta, tensors, captured_header, _reader) =
-            read_bounded_header_with_limit(reader, max_header_bytes)?;
+        let ParsedGgufHeader {
+            metadata: meta,
+            tensors,
+            captured_header,
+        } = read_bounded_header_with_limit(reader, max_header_bytes)?;
         let header_bytes = captured_header.len_u64()?;
         let header = validate_header_metadata_and_tensors(&meta, &tensors)?;
         let header_inventory_digest = inventory_digest(&tensors);
@@ -862,18 +859,17 @@ impl<R: Read> Read for BoundedHeaderRecorder<R> {
 }
 
 #[cfg(feature = "candle")]
+struct ParsedGgufHeader {
+    metadata: BTreeMap<String, MetaValue>,
+    tensors: Vec<TensorEntry>,
+    captured_header: CapturedGgufHeader,
+}
+
+#[cfg(feature = "candle")]
 fn read_bounded_header_with_limit<R: Read>(
     reader: R,
     max_header_bytes: u64,
-) -> Result<
-    (
-        BTreeMap<String, MetaValue>,
-        Vec<TensorEntry>,
-        CapturedGgufHeader,
-        R,
-    ),
-    ShardAdmissionError,
-> {
+) -> Result<ParsedGgufHeader, ShardAdmissionError> {
     let mut recorder = BoundedHeaderRecorder::new(reader, max_header_bytes);
     let (meta, tensors) = match read_header(&mut recorder) {
         Ok(parsed) => parsed,
@@ -886,13 +882,17 @@ fn read_bounded_header_with_limit<R: Read>(
             return Err(ShardAdmissionError::Header(source));
         }
     };
-    let (captured, inner) = recorder.into_parts();
+    let (captured, _) = recorder.into_parts();
     if captured.len_u64()? > max_header_bytes {
         return Err(ShardAdmissionError::HeaderTooLarge {
             limit_bytes: max_header_bytes,
         });
     }
-    Ok((meta, tensors, captured, inner))
+    Ok(ParsedGgufHeader {
+        metadata: meta,
+        tensors,
+        captured_header: captured,
+    })
 }
 
 #[cfg(feature = "candle")]
@@ -2387,7 +2387,5 @@ mod non_candle_tests {
         };
         assert!(matches!(err, ShardAdmissionError::CandleFeatureDisabled));
         assert!(err.to_string().contains("candle feature not enabled"));
-        let converted: crate::InferenceError = err.into();
-        assert!(converted.to_string().contains("candle feature not enabled"));
     }
 }
