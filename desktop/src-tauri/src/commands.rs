@@ -246,7 +246,7 @@ async fn save_webview_config(
     config: NodeConfig,
     save: ConfigSave,
 ) -> CmdResult<()> {
-    require_settings_owner(&state).await?;
+    require_settings_owner(state).await?;
     let auto_start;
     {
         let mut store = state.store.lock().await;
@@ -907,7 +907,7 @@ async fn update_stored_config(
     state: &AppState,
     update: impl FnOnce(&mut NodeConfig) + Send,
 ) -> Result<NodeConfig, String> {
-    require_settings_owner(&state).await?;
+    require_settings_owner(state).await?;
     let mut store = state.store.lock().await;
     let config = update_stored_config_in(&mut store, update);
     let dir = state.data_dir.lock().await.clone();
@@ -929,7 +929,7 @@ async fn persist_promotion_if_still_consented(
     state: &AppState,
     model_path: String,
 ) -> Result<Option<NodeConfig>, String> {
-    require_settings_owner(&state).await?;
+    require_settings_owner(state).await?;
     let mut store = state.store.lock().await;
     let latest = store.config.clone().unwrap_or_default();
     if !compute_contribution_enabled(&latest) {
@@ -1312,8 +1312,8 @@ async fn node_status_inner(state: &AppState, closing: bool) -> CmdResult<NodeSta
     };
 
     let local = paths::local_host(port);
-    let chain = chain_host(&state).await;
-    let chain_choice = cached_chain_choice(&state).await;
+    let chain = chain_host(state).await;
+    let chain_choice = cached_chain_choice(state).await;
 
     let mut status =
         rpc_client::fetch_status(&state.http, &local, &chain, port, pid, address, crash).await;
@@ -1325,7 +1325,7 @@ async fn node_status_inner(state: &AppState, closing: bool) -> CmdResult<NodeSta
     status.cpu_cores = Some(cached_hardware().cpu_cores);
     status.model_unavailable = model_unavailable;
     status.crash_retry_in_secs = crash_retry_in_secs;
-    let config = current_config(&state).await;
+    let config = current_config(state).await;
     if needs_promotion(&config, cached_hardware().ram_gb) {
         status.model_download_wait = crate::background_promotion::waiting_status();
     }
@@ -2079,7 +2079,7 @@ async fn run_inference_local_inner(
     .await
     .map_err(inference_post_outcome_ambiguous)?;
     result.served_locally = true;
-    pin_community_receipt_route(&state, &host, &result).await;
+    pin_community_receipt_route(state, &host, &result).await;
     Ok(result)
 }
 
@@ -2140,7 +2140,7 @@ async fn run_inference_via_coordinator_inner(
     .await
     .map_err(inference_post_outcome_ambiguous)?;
     result.served_locally = *host == local_prefix;
-    pin_community_receipt_route(&state, host, &result).await;
+    pin_community_receipt_route(state, host, &result).await;
     Ok(result)
 }
 

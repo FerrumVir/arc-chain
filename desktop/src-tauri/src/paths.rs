@@ -128,7 +128,7 @@ fn redact_home_text_at(text: &str, home: &str, ignore_case: bool) -> String {
             let end = start + prefix.len();
             if result.is_char_boundary(start)
                 && result.is_char_boundary(end)
-                && result[end..].chars().next().map_or(true, |c| {
+                && result[end..].chars().next().is_none_or(|c| {
                     c.is_whitespace()
                         || matches!(
                             c,

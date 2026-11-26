@@ -1165,7 +1165,7 @@ fn input_kind_checked(
     if input.is_empty() || input.len() > context.max_input_bytes {
         return Err("the prepared input is empty or over the chain's input limit".into());
     }
-    if kind == INPUT_CANONICAL_TOKENS && input.len() % 4 != 0 {
+    if kind == INPUT_CANONICAL_TOKENS && !input.len().is_multiple_of(4) {
         return Err("the prepared input is not whole token ids".into());
     }
     Ok(kind)
