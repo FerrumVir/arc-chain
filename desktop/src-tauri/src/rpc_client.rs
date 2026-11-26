@@ -3610,6 +3610,52 @@ mod chain_read_tests {
     }
 
     #[test]
+    fn inference_parser_accepts_flat_community_sharded_response_without_inventing_settlement() {
+        let model_id = format!("0x{}", "33".repeat(32));
+        let output_hash = format!("0x{}", "44".repeat(32));
+        let value = json!({
+            "success": true,
+            "routed_via": "community_sharded_pipeline",
+            "input": "hello",
+            "output": "community sharded output",
+            "output_hash": output_hash,
+            "model_hash": model_id,
+            "model_id": model_id,
+            "model_name": "arc-model",
+            "protocol_version": 1,
+            "session_id": 9,
+            "execution_profile": arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE,
+            "generated_tokens": [10, 11, 12, 13],
+            "tokens_generated": 4,
+            "stopped_by_eos": true,
+            "total_ms": 321,
+            "deterministic": true,
+            "participants": [],
+            "participant_identity_basis": "worker_pubkey",
+            "verification": { "profile_bound": true, "quorum_verified": true, "execution_profile": arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE },
+            "rewards_enabled": false,
+            "reward_eligible": false
+        });
+        let parsed = parse_inference_run_value(&value, Some("https://sgp.example"), false)
+            .expect("flat community sharded response");
+        assert_eq!(parsed.input, "hello");
+        assert_eq!(parsed.output, "community sharded output");
+        assert_eq!(parsed.output_hash, output_hash);
+        assert_eq!(parsed.model_hash, model_id);
+        assert_eq!(parsed.tokens_generated, 4);
+        assert_eq!(parsed.inference_ms, 321);
+        assert_eq!(parsed.routed_via, "community_sharded_pipeline");
+        assert!(parsed.deterministic);
+        assert!(parsed.profile_bound);
+        assert!(parsed.quorum_verified);
+        assert!(parsed.attestation_status.is_none());
+        assert!(parsed.attestation_hash.is_empty());
+        assert!(parsed.tx_hash.is_empty());
+        assert!(parsed.settlement.is_none());
+        assert!(parsed.trace.is_none());
+    }
+
+    #[test]
     fn strip_0x_removes_either_prefix_case_and_lowercases() {
         assert_eq!(strip_0x("0xABCD"), "abcd");
         assert_eq!(strip_0x("0XABCD"), "abcd");

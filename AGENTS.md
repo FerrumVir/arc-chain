@@ -358,6 +358,20 @@ a create-only candidate. Its receipt is explicitly unqualified: capture of the
 remaining state, signed finality checks and full peer qualification are still
 required. It neither stops a service nor replaces any live state.
 
+`scripts/recovery/peer_capture.py` captures a bounded WAL tail and recovery files
+under a short cgroup-v2 freeze with an independent parent-death thaw watchdog.
+Its target publisher rejects stale destinations, verifies the whole pre-copy
+before and after appending, and retains the advisory lock through durable
+publication. Capture and publication receipts remain unqualified; finality and
+both signing-cursor bounds must pass the offline qualifier before activation.
+
+Normal `POST /inference/run` prefers an eligible complete community partial
+pipeline before whole-worker dispatch. It preserves forced-local, public-demo,
+and recovery-probe paths and forwards a selected partial pipeline's error
+without a second dispatch. Readiness includes this capacity through the existing
+v1 sharded flag, preserving its nine wire fields. Partial results retain their
+verification and participant evidence without inventing rewards or settlement.
+
 The optional `partial_shard` worker status reports loading, lease expiry,
 reconnects, and partial steps separately from whole jobs. Expired ready or
 computing leases clear their displayed range; partial steps do not count as

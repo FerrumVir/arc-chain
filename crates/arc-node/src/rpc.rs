@@ -6538,6 +6538,8 @@ struct InferenceReadinessResponse {
     mutation_free_observation: bool,
     #[serde(skip)]
     community_dispatch_blocked: Option<CommunityDispatchBlocked>,
+    #[serde(skip)]
+    community_sharded_ready: bool,
 }
 
 impl InferenceReadinessResponse {
@@ -6607,7 +6609,9 @@ fn inference_readiness_snapshot(node: &NodeState) -> InferenceReadinessResponse 
             (node.candle_engine.is_some() && node.candle_model_id == exact_model)
                 || model.has_all_transformer_layers()
         });
-    let sharded_pipeline_ready = exact_model.is_some_and(|model_id| {
+    let community_sharded_ready =
+        exact_model.is_some() && community_shard_dispatch::is_ready_pipeline_available(node);
+    let seed_sharded_pipeline_ready = exact_model.is_some_and(|model_id| {
         node.inference_model.is_some()
             && !local_model_ready
             && assemble_profile_bound_pipeline_for_model_with_identity_policy(
@@ -6619,6 +6623,7 @@ fn inference_readiness_snapshot(node: &NodeState) -> InferenceReadinessResponse 
             )
             .is_ok()
     });
+    let sharded_pipeline_ready = community_sharded_ready || seed_sharded_pipeline_ready;
     let safe_to_dispatch = community_dispatch_ready || local_model_ready || sharded_pipeline_ready;
 
     InferenceReadinessResponse {
@@ -6633,6 +6638,103 @@ fn inference_readiness_snapshot(node: &NodeState) -> InferenceReadinessResponse 
             arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
         mutation_free_observation: true,
         community_dispatch_blocked,
+        community_sharded_ready,
+    }
+}
+
+fn should_route_to_community_sharded(
+    force_local: bool,
+    public_demo: bool,
+    has_recovery_probe: bool,
+    readiness: &InferenceReadinessResponse,
+    dispatched_input: &str,
+    max_tokens: u32,
+) -> bool {
+    !force_local
+        && !public_demo
+        && !has_recovery_probe
+        && readiness.community_sharded_ready
+        && community_shard_dispatch::is_request_within_dispatch_bounds(dispatched_input, max_tokens)
+}
+
+#[cfg(test)]
+mod community_sharded_routing_tests {
+    use super::*;
+
+    fn ready_sharded_snapshot(community_sharded_ready: bool) -> InferenceReadinessResponse {
+        InferenceReadinessResponse {
+            schema: "arc.inference.readiness.v1",
+            safe_to_dispatch: community_sharded_ready,
+            community_dispatch_ready: false,
+            local_model_ready: false,
+            sharded_pipeline_ready: community_sharded_ready,
+            live_community_workers: 0,
+            model_id: Some(format!("0x{}", "11".repeat(32))),
+            required_community_execution_profile:
+                arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
+            mutation_free_observation: true,
+            community_dispatch_blocked: Some(CommunityDispatchBlocked::NoEligibleWorkers),
+            community_sharded_ready,
+        }
+    }
+
+    #[test]
+    fn readiness_v1_preserves_exact_nine_keys_when_community_sharded_ready() {
+        let value = serde_json::to_value(ready_sharded_snapshot(true)).expect("readiness json");
+        let object = value.as_object().expect("readiness object");
+        assert_eq!(object.len(), 9);
+        assert!(object.get("community_sharded_ready").is_none());
+        assert!(object.get("community_dispatch_blocked").is_none());
+        assert_eq!(object["schema"], json!("arc.inference.readiness.v1"));
+        assert_eq!(object["safe_to_dispatch"], json!(true));
+        assert_eq!(object["sharded_pipeline_ready"], json!(true));
+        assert_eq!(object["community_dispatch_ready"], json!(false));
+        assert_eq!(object["live_community_workers"], json!(0));
+        assert_eq!(object["mutation_free_observation"], json!(true));
+    }
+
+    #[test]
+    fn community_sharded_route_guards_enforce_eligibility_and_caps() {
+        let mut ready = ready_sharded_snapshot(true);
+        ready.community_dispatch_ready = true;
+        ready.local_model_ready = true;
+        let (prompt_cap, token_cap) = community_shard_dispatch::dispatch_caps();
+        let at_cap = "a".repeat(prompt_cap);
+        let over_cap = "a".repeat(prompt_cap + 1);
+        assert!(should_route_to_community_sharded(
+            false, false, false, &ready, &at_cap, token_cap
+        ));
+        assert!(!should_route_to_community_sharded(
+            true, false, false, &ready, "hi", 1
+        ));
+        assert!(!should_route_to_community_sharded(
+            false, true, false, &ready, "hi", 1
+        ));
+        assert!(!should_route_to_community_sharded(
+            false, false, true, &ready, "hi", 1
+        ));
+        assert!(!should_route_to_community_sharded(
+            false,
+            false,
+            false,
+            &ready_sharded_snapshot(false),
+            "hi",
+            1
+        ));
+        assert!(!should_route_to_community_sharded(
+            false, false, false, &ready, "", 1
+        ));
+        assert!(!should_route_to_community_sharded(
+            false, false, false, &ready, &over_cap, 1
+        ));
+        assert!(!should_route_to_community_sharded(
+            false,
+            false,
+            false,
+            &ready,
+            "hi",
+            token_cap + 1
+        ));
     }
 }
 
@@ -6953,6 +7055,24 @@ async fn inference_run(
             reason = blocked.code(),
             "community results cannot be verified now; serving this request without community dispatch"
         );
+    }
+    if should_route_to_community_sharded(
+        force_local,
+        public_demo,
+        recovery_probe_id.is_some(),
+        &readiness,
+        dispatched_input,
+        max_tokens,
+    ) {
+        let response = community_shard_dispatch::run_community_sharded_for_inference_run(
+            node.clone(),
+            input_text,
+            dispatched_input.to_string(),
+            max_tokens,
+        )
+        .await
+        .map_err(|(status, message)| api_error(status, message))?;
+        return Ok(Json(report_token_budget(response)));
     }
     if !force_local && readiness.community_dispatch_ready {
         let dispatched_at = std::time::Instant::now();

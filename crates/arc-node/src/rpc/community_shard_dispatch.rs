@@ -142,6 +142,100 @@ pub(crate) fn is_verified_dispatch_available(node: &super::NodeState) -> bool {
     ensure_verification_availability(node, ctx.model.config.n_layers, false).is_ok()
 }
 
+pub(crate) fn is_ready_pipeline_available(node: &super::NodeState) -> bool {
+    if is_shutting_down(node) || ensure_coordinator_enabled(node).is_err() {
+        return false;
+    }
+    let Ok(ctx) = load_canonical_dispatch_model(node) else {
+        return false;
+    };
+    if ensure_verification_availability(node, ctx.model.config.n_layers, false).is_err() {
+        return false;
+    }
+    let Ok(now_ms) = now_unix_ms() else {
+        return false;
+    };
+    node.community_shard_coordinator
+        .lock()
+        .as_ref()
+        .is_some_and(|coordinator| {
+            validate_coordinator_invariants(coordinator, ctx.model_id, &ctx.model).is_ok()
+                && coordinator
+                    .pipeline_capacity(now_ms)
+                    .ready_complete_pipelines
+                    > 0
+        })
+}
+
+pub(crate) fn is_request_within_dispatch_bounds(input: &str, max_tokens: u32) -> bool {
+    !input.is_empty()
+        && input.len() <= COMMUNITY_SHARD_DISPATCH_MAX_PROMPT_BYTES
+        && max_tokens > 0
+        && max_tokens <= effective_max_tokens_cap()
+}
+
+#[cfg(test)]
+pub(crate) fn dispatch_caps() -> (usize, u32) {
+    (
+        COMMUNITY_SHARD_DISPATCH_MAX_PROMPT_BYTES,
+        effective_max_tokens_cap(),
+    )
+}
+
+pub(crate) async fn run_community_sharded_for_inference_run(
+    node: super::NodeState,
+    input_text: &str,
+    dispatched_input: String,
+    max_tokens: u32,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let Json(response) = run_community_sharded(
+        AxumState(node),
+        Json(CommunityShardedInferenceRequest {
+            input: dispatched_input,
+            max_tokens,
+        }),
+    )
+    .await?;
+    let response_json = serde_json::to_value(response).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serialize community shard response: {error}"),
+        )
+    })?;
+    build_inference_run_flat_value(input_text, response_json)
+}
+
+fn build_inference_run_flat_value(
+    input_text: &str,
+    response_json: serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let serde_json::Value::Object(mut object) = response_json else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "community shard response was not a JSON object".to_string(),
+        ));
+    };
+    let model_hash = object
+        .get("model_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "community shard response omitted model_id".to_string(),
+            )
+        })?
+        .to_string();
+    object.insert("success".to_string(), serde_json::json!(true));
+    object.insert(
+        "routed_via".to_string(),
+        serde_json::json!("community_sharded_pipeline"),
+    );
+    object.insert("input".to_string(), serde_json::json!(input_text));
+    object.insert("deterministic".to_string(), serde_json::json!(true));
+    object.insert("model_hash".to_string(), serde_json::json!(model_hash));
+    Ok(serde_json::Value::Object(object))
+}
+
 pub(crate) async fn run_community_sharded(
     AxumState(node): AxumState<super::NodeState>,
     Json(req): Json<CommunityShardedInferenceRequest>,
@@ -474,6 +568,69 @@ fn validate_request_bounds(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod inference_run_adapter_tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_bounds_helper_matches_validate_request_bounds() {
+        let (prompt_cap, token_cap) = dispatch_caps();
+        for (input, max_tokens, expected) in [
+            ("".to_string(), 1, false),
+            ("a".to_string(), 0, false),
+            ("a".to_string(), 1, true),
+            ("a".to_string(), token_cap, true),
+            ("a".to_string(), token_cap + 1, false),
+            ("x".repeat(prompt_cap), 1, true),
+            ("x".repeat(prompt_cap + 1), 1, false),
+        ] {
+            assert_eq!(
+                is_request_within_dispatch_bounds(&input, max_tokens),
+                expected
+            );
+            let req = CommunityShardedInferenceRequest { input, max_tokens };
+            assert_eq!(validate_request_bounds(&req).is_ok(), expected);
+        }
+    }
+
+    #[test]
+    fn flat_adapter_copies_model_hash_preserves_verified_fields_and_omits_settlement() {
+        let model_id = format!("0x{}", "11".repeat(32));
+        let raw = serde_json::json!({
+            "protocol_version": 1,
+            "session_id": 7,
+            "model_name": "arc-model",
+            "model_id": model_id,
+            "execution_profile": CANONICAL_REWARD_INFERENCE_PROFILE,
+            "generated_tokens": [1, 2],
+            "tokens_generated": 2,
+            "output": "verified text",
+            "output_hash": format!("0x{}", "22".repeat(32)),
+            "stopped_by_eos": true,
+            "total_ms": 88,
+            "participants": [],
+            "participant_identity_basis": "worker_pubkey",
+            "verification": { "profile_bound": true, "quorum_verified": true, "execution_profile": CANONICAL_REWARD_INFERENCE_PROFILE },
+            "rewards_enabled": false,
+            "reward_eligible": false
+        });
+        let adapted = build_inference_run_flat_value("hello", raw).expect("adapted response");
+        assert_eq!(adapted["success"], serde_json::json!(true));
+        assert_eq!(
+            adapted["routed_via"],
+            serde_json::json!("community_sharded_pipeline")
+        );
+        assert_eq!(adapted["input"], serde_json::json!("hello"));
+        assert_eq!(adapted["deterministic"], serde_json::json!(true));
+        assert_eq!(adapted["model_hash"], adapted["model_id"]);
+        assert_eq!(adapted["output"], serde_json::json!("verified text"));
+        assert_eq!(adapted["rewards_enabled"], serde_json::json!(false));
+        assert_eq!(adapted["reward_eligible"], serde_json::json!(false));
+        assert!(adapted.get("attestation").is_none());
+        assert!(adapted.get("settlement").is_none());
+    }
 }
 
 fn load_canonical_dispatch_model(
