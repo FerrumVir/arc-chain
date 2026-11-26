@@ -751,6 +751,13 @@ enum RecoveryCommand {
         #[arg(long)]
         dag_wal_dir: String,
     },
+    /// Qualify a disposable copied peer recovery candidate offline without signing.
+    QualifyPeerState {
+        #[arg(long)]
+        candidate_manifest: String,
+        #[arg(long)]
+        expected_manifest_sha256: String,
+    },
     /// Materialize and strictly replay-validate the exact WAL prefix committed
     /// by a live `/sync/snapshot` capture.  The source directory is read-only;
     /// OUTPUT_DATA_DIR is create-only and contains an immutable snapshot/WAL
@@ -3761,8 +3768,14 @@ fn compact_replayed_recovery_generation(
     Ok(successor)
 }
 
+include!("recovery_peer_qualification.rs");
+
 fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
     match command {
+        RecoveryCommand::QualifyPeerState {
+            candidate_manifest,
+            expected_manifest_sha256,
+        } => run_qualify_peer_state_command(&candidate_manifest, &expected_manifest_sha256),
         RecoveryCommand::Inspect { checkpoint } => {
             let checkpoint = arc_state::recovery::ArcCheckpoint::read_from(checkpoint)?;
             print_recovery_summary(&checkpoint, "UNTRUSTED_INSPECTION", None)

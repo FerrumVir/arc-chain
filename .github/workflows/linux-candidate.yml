@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       qualification:
-        description: Full candidate qualification or isolated peer recovery tests
+        description: Full candidate qualification or focused recovery and sharding tests
         type: choice
         required: true
         default: full
@@ -28,7 +28,7 @@ env:
 jobs:
   recovery-peer:
     if: inputs.qualification == 'recovery-peer'
-    name: Signed peer recovery replay
+    name: Signed recovery and community sharding
     runs-on: ubuntu-24.04
     timeout-minutes: 70
     env:

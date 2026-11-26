@@ -5,6 +5,7 @@ pub mod block_stm;
 pub mod build_identity;
 pub mod chunk_cache;
 pub mod coalesce;
+pub mod community_sharding;
 pub mod community_worker;
 pub mod config;
 pub mod consensus;

@@ -6,10 +6,29 @@ from pathlib import Path
 import subprocess
 
 
-EXPECTED_TESTS = {
+EXPECTED_BINARY_TESTS = {
     "tests::recovery_peer_generation_replays_for_different_absent_validator_compacts_and_restarts",
     "tests::recovery_peer_replay_rejects_unsigned_forged_and_wrong_domain_blocks",
     "tests::recovery_peer_replay_rejects_subquorum_forged_and_wrong_domain_skip_certificates",
+    'recovery_peer_qualification_tests::qualify_peer_state_rejects_bad_manifest_schema_unknown_fields_limits_and_hash',
+    'recovery_peer_qualification_tests::qualify_peer_state_rejects_bad_paths_nesting_symlinks_and_hardlinks',
+    'recovery_peer_qualification_tests::qualify_peer_state_rejects_keyless_unsigned_forged_and_wrong_domain_dag_blocks',
+    'recovery_peer_qualification_tests::qualify_peer_state_rejects_oversized_wrong_domain_forged_and_subquorum_certificates',
+}
+EXPECTED_LIBRARY_TESTS = {
+    'community_sharding::tests::community_sharding_real_integer_model_pipeline_matches_try_generate',
+    'community_sharding::tests::community_sharding_join_gap_fails_closed_and_caps_partial_range',
+    'community_sharding::tests::community_sharding_replicate_join_and_leave_idle_rebalance',
+    'community_sharding::tests::community_sharding_mid_session_expiry_and_provisioning_hard_deadline',
+    'community_sharding::tests::community_sharding_output_tamper_wrong_hash_and_bounds_rejected',
+    'community_sharding::tests::community_sharding_identity_epoch_model_and_serde_mismatch_rejected',
+    'community_sharding::tests::community_sharding_no_duplicate_position_or_step_accepted',
+    'community_sharding::tests::community_sharding_bounds_exhaustion_and_retention_caps',
+    'community_sharding::tests::community_sharding_zero_and_overflow_params_fail',
+    'community_sharding::tests::community_sharding_hard_caps_enforced_for_sequence_tokens_and_retention',
+    'community_sharding::tests::community_sharding_request_lease_idempotent_retry_and_rebalance_epoch_fence',
+    'community_sharding::tests::community_sharding_rebalance_skips_unfillable_gap_and_overflowed_epoch',
+    'community_sharding::tests::community_sharding_decline_zero_layers_and_cancel_queue_churn_bounded',
 }
 
 
@@ -29,39 +48,54 @@ def main():
     args.evidence_dir.mkdir(parents=True, exist_ok=False)
     os.environ["CARGO_BUILD_JOBS"] = "1"
     compiled = run_recorded(
-        ["cargo", "test", "--locked", "-p", "arc-node", "--bin", "arc-node",
+        ["cargo", "test", "--locked", "-p", "arc-node", "--lib", "--bin", "arc-node",
          "--no-run", "--message-format=json-render-diagnostics"],
         args.evidence_dir / "compile.log", 3600,
     )
-    executables = set()
+    executables = {}
     for line in compiled.splitlines():
         if not line.startswith("{"):
             continue
         row = json.loads(line)
-        target = row.get("target", {})
-        if (row.get("reason") == "compiler-artifact" and target.get("name") == "arc-node"
-                and row.get("profile", {}).get("test") and row.get("executable")):
-            executables.add(row["executable"])
-    if len(executables) != 1:
-        raise SystemExit(f"Expected one arc-node test binary, found {len(executables)}")
-    binary = executables.pop()
-    listing = run_recorded(
-        [binary, "recovery_peer_", "--list"], args.evidence_dir / "selectors.log", 30,
-    )
-    selected = {line.removesuffix(": test") for line in listing.splitlines() if line.endswith(": test")}
-    if selected != EXPECTED_TESTS:
-        raise SystemExit(f"Recovery peer selectors differ: expected {sorted(EXPECTED_TESTS)}, found {sorted(selected)}")
-    for index, test in enumerate(sorted(EXPECTED_TESTS)):
-        output = run_recorded(
-            [binary, test, "--exact", "--nocapture", "--test-threads=1"],
-            args.evidence_dir / f"test-{index}.log", 120,
+        if (row.get("reason") == "compiler-artifact" and row.get("profile", {}).get("test")
+                and row.get("executable")):
+            target = row.get("target", {})
+            if target.get("name") in {"arc-node", "arc_node"}:
+                executables.setdefault(target["name"], set()).add(row["executable"])
+    expected_targets = {
+        "arc-node": ("recovery_peer_", EXPECTED_BINARY_TESTS),
+        "arc_node": ("community_sharding::tests::", EXPECTED_LIBRARY_TESTS),
+    }
+    if set(executables) != set(expected_targets) or any(len(paths) != 1 for paths in executables.values()):
+        raise SystemExit(f"Expected one node binary and one node library test executable, found {executables}")
+    passed, failed = [], []
+    for target, (selector, expected) in expected_targets.items():
+        binary = next(iter(executables[target]))
+        listing = run_recorded(
+            [binary, selector, "--list"], args.evidence_dir / f"selectors-{target}.log", 30,
         )
-        if output.count("test result: ok. 1 passed; 0 failed; 0 ignored;") != 1:
-            raise SystemExit(f"Test did not prove exactly one non-ignored passing case: {test}")
-        print(f"PASS {test}")
+        selected = {line.removesuffix(": test") for line in listing.splitlines() if line.endswith(": test")}
+        if selected != expected:
+            raise SystemExit(f"{target} selectors differ: expected {sorted(expected)}, found {sorted(selected)}")
+        for index, test in enumerate(sorted(expected)):
+            log = args.evidence_dir / f"test-{target}-{index}.log"
+            with log.open("x") as output:
+                result = subprocess.run(
+                    [binary, test, "--exact", "--nocapture", "--test-threads=1"],
+                    stdout=output, stderr=subprocess.STDOUT, timeout=120,
+                )
+            output = log.read_text()
+            if result.returncode or output.count("test result: ok. 1 passed; 0 failed; 0 ignored;") != 1:
+                failed.append(test)
+                print(f"FAIL {test}\n{output}")
+            else:
+                passed.append(test)
+                print(f"PASS {test}")
     with (args.evidence_dir / "result.json").open("x") as output:
-        json.dump({"binary": binary, "passed": sorted(EXPECTED_TESTS)}, output, indent=2)
+        json.dump({"passed": passed, "failed": failed}, output, indent=2)
         output.write("\n")
+    if failed:
+        raise SystemExit(f"{len(failed)} selected qualification tests failed; inspect the saved evidence")
 
 
 if __name__ == "__main__":

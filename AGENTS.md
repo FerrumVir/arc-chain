@@ -255,6 +255,25 @@ the unit tests (`scripts/ci_check.sh:219-242`), so it is heavy too.
 
 The full account is [docs/HOW-SHARDING-WORKS.md](docs/HOW-SHARDING-WORKS.md).
 
+`crates/arc-node/src/community_sharding.rs` supplies a bounded community
+layer-pipeline coordinator with expiring leases, fixed partial-layer tiles,
+session ownership, and idle-worker reassignment. Its outputs require independent
+verification and cannot authorize rewards. Its integer-model tests exercise
+different partial models, but the module alone does not connect desktop workers
+or replace the existing whole-job runtime described below.
+
+`arc-node operator recovery qualify-peer-state` opens an already copied,
+disposable `peer-recovery-candidate-*` directory. Its hash-pinned manifest binds
+the target signing record, genesis, state WAL, recovery domain, and raw finality
+certificate. It replays persistent state and signed DAG records without opening
+listeners, loading models, signing, or activating a validator. The command may
+write inside the disposable candidate; it does not establish capture atomicity
+or completeness of the operator's supplied prior signing high-water marks.
+`scripts/qualification/run-recovery-peer-tests.py` runs the exact mandatory
+recovery and sharding tests on a single build worker and rejects missing cases
+or ignored tests. Use the `recovery-peer` mode of the Linux candidate workflow
+when local resource limits prohibit compilation.
+
 - A coordinator receives `POST /inference/run` (`rpc.rs:2763`, `8212`) and
   runs at most 2 public jobs at once (`rpc.rs:179`).
 - A community job is never split. One stake-0 worker runs every layer

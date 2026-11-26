@@ -25,10 +25,24 @@ struct PeerReplayWindow {
     last_round: u64,
     candidate: DagBlock,
     blocks_by_round: Vec<Vec<DagBlock>>,
-    bootstrap_absence: arc_consensus::view_change::SkipCertificate,
-    target_absence: arc_consensus::view_change::SkipCertificate,
-    second_absence: arc_consensus::view_change::SkipCertificate,
+    absences_by_round: Vec<[arc_consensus::view_change::SkipCertificate; 2]>,
     records: Vec<RetainedDagRecord>,
+}
+
+impl PeerReplayWindow {
+    fn absence(
+        &self,
+        round: u64,
+        absentee_index: usize,
+    ) -> &arc_consensus::view_change::SkipCertificate {
+        let round_offset = usize::try_from(round - self.bootstrap).unwrap();
+        let slot = match absentee_index {
+            PEER_REPLAY_TARGET_INDEX => 0,
+            PEER_REPLAY_SECOND_ABSENT_INDEX => 1,
+            other => panic!("unexpected absentee index {other}"),
+        };
+        &self.absences_by_round[round_offset][slot]
+    }
 }
 
 impl PeerReplayFixture {
@@ -200,40 +214,41 @@ impl PeerReplayFixture {
 
         assert_eq!(bootstrap as usize % 6, PEER_REPLAY_SECOND_ABSENT_INDEX);
         assert_eq!((bootstrap + 1) as usize % 6, PEER_REPLAY_SOURCE_INDEX);
+        assert_eq!((bootstrap + 2) as usize % 6, 1);
         assert_eq!((bootstrap + 5) as usize % 6, PEER_REPLAY_TARGET_INDEX);
         assert_eq!(
             (bootstrap + 6) as usize % 6,
             PEER_REPLAY_SECOND_ABSENT_INDEX
         );
+        assert_eq!(last_round as usize % 6, PEER_REPLAY_SOURCE_INDEX);
 
-        let bootstrap_absence = self.skip_certificate(
-            self.domain,
-            self.committee_hash,
-            bootstrap,
-            self.validators[PEER_REPLAY_SECOND_ABSENT_INDEX],
-            &live_signers,
-        );
-        let target_absence = self.skip_certificate(
-            self.domain,
-            self.committee_hash,
-            bootstrap + 5,
-            self.validators[PEER_REPLAY_TARGET_INDEX],
-            &live_signers,
-        );
-        let second_absence = self.skip_certificate(
-            self.domain,
-            self.committee_hash,
-            bootstrap + 6,
-            self.validators[PEER_REPLAY_SECOND_ABSENT_INDEX],
-            &live_signers,
-        );
-        assert!(
-            bootstrap_absence
-                .verify(&self.domain, &self.committee)
-                .is_ok()
-        );
-        assert!(target_absence.verify(&self.domain, &self.committee).is_ok());
-        assert!(second_absence.verify(&self.domain, &self.committee).is_ok());
+        let mut absences_by_round = Vec::new();
+        for round in bootstrap..=last_round {
+            let target_cert = self.skip_certificate(
+                self.domain,
+                self.committee_hash,
+                round,
+                self.validators[PEER_REPLAY_TARGET_INDEX],
+                &live_signers,
+            );
+            let second_cert = self.skip_certificate(
+                self.domain,
+                self.committee_hash,
+                round,
+                self.validators[PEER_REPLAY_SECOND_ABSENT_INDEX],
+                &live_signers,
+            );
+            assert_eq!(
+                target_cert.verify(&self.domain, &self.committee).unwrap(),
+                PEER_REPLAY_STRICT_QUORUM
+            );
+            assert_eq!(
+                second_cert.verify(&self.domain, &self.committee).unwrap(),
+                PEER_REPLAY_STRICT_QUORUM
+            );
+            absences_by_round.push([target_cert, second_cert]);
+        }
+        assert_eq!(absences_by_round.len(), 8);
 
         let mut blocks_by_round: Vec<Vec<DagBlock>> = Vec::new();
         for round in bootstrap..=last_round {
@@ -268,13 +283,15 @@ impl PeerReplayFixture {
         assert_eq!(candidate.round, bootstrap + 1);
 
         let mut records = Vec::new();
-        for certificate in [&bootstrap_absence, &target_absence, &second_absence] {
-            let payload = bincode::serialize(certificate).unwrap();
-            records.push(RetainedDagRecord::absence_certificate(
-                certificate.round,
-                hash_bytes(&payload),
-                payload,
-            ));
+        for round_absences in &absences_by_round {
+            for certificate in round_absences {
+                let payload = bincode::serialize(certificate).unwrap();
+                records.push(RetainedDagRecord::absence_certificate(
+                    certificate.round,
+                    hash_bytes(&payload),
+                    payload,
+                ));
+            }
         }
         for round_blocks in &blocks_by_round {
             for block in round_blocks {
@@ -285,15 +302,14 @@ impl PeerReplayFixture {
                 ));
             }
         }
+        assert_eq!(records.len(), 48);
 
         PeerReplayWindow {
             bootstrap,
             last_round,
             candidate,
             blocks_by_round,
-            bootstrap_absence,
-            target_absence,
-            second_absence,
+            absences_by_round,
             records,
         }
     }
@@ -398,14 +414,14 @@ fn peer_replay_replace_block_record(
     target_author: Hash256,
     replacement: &DagBlock,
 ) -> Vec<RetainedDagRecord> {
-    let mut replaced = false;
+    let mut replaced = 0usize;
     let updated = records
         .iter()
         .map(|record| {
             if record.kind == RetainedRecordKind::DagBlock && record.round == target_round {
                 let decoded: DagBlock = bincode::deserialize(&record.payload).unwrap();
                 if decoded.author == target_author {
-                    replaced = true;
+                    replaced += 1;
                     return RetainedDagRecord::dag_block(
                         replacement.round,
                         replacement.hash,
@@ -416,7 +432,7 @@ fn peer_replay_replace_block_record(
             record.clone()
         })
         .collect();
-    assert!(replaced);
+    assert_eq!(replaced, 1);
     updated
 }
 
@@ -426,7 +442,7 @@ fn peer_replay_replace_certificate_record(
     target_absentee: Hash256,
     replacement: &arc_consensus::view_change::SkipCertificate,
 ) -> Vec<RetainedDagRecord> {
-    let mut replaced = false;
+    let mut replaced = 0usize;
     let updated = records
         .iter()
         .map(|record| {
@@ -435,7 +451,7 @@ fn peer_replay_replace_certificate_record(
                 let decoded: arc_consensus::view_change::SkipCertificate =
                     bincode::deserialize(&record.payload).unwrap();
                 if decoded.absentee == target_absentee {
-                    replaced = true;
+                    replaced += 1;
                     let payload = bincode::serialize(replacement).unwrap();
                     return RetainedDagRecord::absence_certificate(
                         replacement.round,
@@ -447,7 +463,34 @@ fn peer_replay_replace_certificate_record(
             record.clone()
         })
         .collect();
-    assert!(replaced);
+    assert_eq!(replaced, 1);
+    updated
+}
+
+fn peer_replay_remove_certificate_record(
+    records: &[RetainedDagRecord],
+    target_round: u64,
+    target_absentee: Hash256,
+) -> Vec<RetainedDagRecord> {
+    let mut removed = 0usize;
+    let updated: Vec<RetainedDagRecord> = records
+        .iter()
+        .filter(|record| {
+            if record.kind == RetainedRecordKind::AbsenceCertificate && record.round == target_round
+            {
+                let decoded: arc_consensus::view_change::SkipCertificate =
+                    bincode::deserialize(&record.payload).unwrap();
+                if decoded.absentee == target_absentee {
+                    removed += 1;
+                    return false;
+                }
+            }
+            true
+        })
+        .cloned()
+        .collect();
+    assert_eq!(removed, 1);
+    assert_eq!(updated.len() + 1, records.len());
     updated
 }
 
@@ -487,7 +530,9 @@ fn recovery_peer_generation_replays_for_different_absent_validator_compacts_and_
     );
     let older_skip_round = window.bootstrap - 6;
     let older_absentee = fixture.validators[1];
-    let in_window_skip_round = window.target_absence.round;
+    let in_window_skip_round = window
+        .absence(window.bootstrap + 5, PEER_REPLAY_TARGET_INDEX)
+        .round;
     let in_window_absentee = fixture.validators[PEER_REPLAY_SECOND_ABSENT_INDEX];
 
     let mut target_skipped_rounds = HashMap::new();
@@ -510,8 +555,9 @@ fn recovery_peer_generation_replays_for_different_absent_validator_compacts_and_
     let target_signing_bytes =
         peer_replay_write_signing_record(&target_signing_path, &target_signing_record);
 
-    let (source_replay, source_compacted, source_engine) = {
+    let (source_replay, source_compacted, source_engine, source_dir_path) = {
         let source_dir = peer_replay_temp_dir("arc-recovery-peer-replay-source");
+        let source_dir_path = source_dir.path().to_path_buf();
         let source_signing_path = source_dir.path().join("consensus-signing-record.bin");
         let source_signing_record = ConsensusSigningRecord {
             skipped_rounds: HashMap::from([(
@@ -541,8 +587,10 @@ fn recovery_peer_generation_replays_for_different_absent_validator_compacts_and_
         let (staged, staged_summary) =
             stage_recovery_generation_records(&source_store, &source_generation).unwrap();
         assert_eq!(staged, window.records);
+        assert_eq!(staged.len(), 48);
 
         let source_engine = fixture.strict_engine(PEER_REPLAY_SOURCE_INDEX);
+        assert!(source_engine.requires_full_round_participation());
         let source_replay = replay_recovery_dag_generation(
             &source_engine,
             &source_state,
@@ -561,6 +609,23 @@ fn recovery_peer_generation_replays_for_different_absent_validator_compacts_and_
             source_engine.committed_blocks(),
             vec![window.candidate.hash]
         );
+        assert_eq!(
+            source_engine.find_committed_anchor(&canonical_tip.header.proof_hash, &fixture.domain),
+            Some((window.candidate.hash, window.candidate.round))
+        );
+        for round in window.bootstrap..=window.last_round {
+            assert!(
+                source_engine
+                    .has_skip_certificate(round, &fixture.validators[PEER_REPLAY_TARGET_INDEX])
+            );
+            assert!(
+                source_engine.has_skip_certificate(
+                    round,
+                    &fixture.validators[PEER_REPLAY_SECOND_ABSENT_INDEX]
+                )
+            );
+            assert!(source_engine.has_quorum_parents_for_round(round));
+        }
 
         let source_compacted = compact_replayed_recovery_generation(
             &source_store,
@@ -572,6 +637,15 @@ fn recovery_peer_generation_replays_for_different_absent_validator_compacts_and_
             &staged,
         )
         .unwrap();
+        assert_eq!(source_compacted.manifest.baseline_state.height, 2);
+        assert_eq!(
+            source_compacted.manifest.baseline_state.block_hash,
+            canonical_tip.hash
+        );
+        assert_eq!(
+            source_compacted.manifest.baseline_state.state_root,
+            canonical_tip.header.state_root
+        );
         assert_eq!(
             source_compacted.manifest.baseline_state.dag_anchor,
             Some(BaselineDagAnchor {
@@ -580,27 +654,48 @@ fn recovery_peer_generation_replays_for_different_absent_validator_compacts_and_
             })
         );
         assert_eq!(
+            source_compacted.manifest.dag_cursor.committed_block_count,
+            1
+        );
+        assert_eq!(
             source_compacted.manifest.dag_cursor.next_dag_round,
+            window.candidate.round + 1
+        );
+        assert_eq!(
+            source_compacted.manifest.dag_cursor.retention_floor_round,
             window.candidate.round + 1
         );
         assert_eq!(
             source_compacted.manifest.dag_cursor.current_round,
             window.last_round + 1
         );
+        assert_eq!(
+            source_compacted.manifest.dag_cursor.retention_ceiling_round,
+            recovery_retention_ceiling(window.candidate.round + 1).unwrap()
+        );
+        assert_eq!(source_compacted.manifest.retained_records.record_count, 36);
 
         let target_startup = fixture.startup(target_dir.path());
         peer_replay_copy_dir(&source_startup.wal_dir, &target_startup.wal_dir);
-        (source_replay, source_compacted, source_engine)
+        (
+            source_replay,
+            source_compacted,
+            source_engine,
+            source_dir_path,
+        )
     };
+    assert!(!source_dir_path.exists());
 
     let target_startup = fixture.startup(target_dir.path());
     let target_store = GenerationStore::new(&target_startup.wal_dir);
     validate_recovery_generation_anchor(&target_state, &target_startup, &source_compacted).unwrap();
     let (copied_records, copied_summary) =
         stage_recovery_generation_records(&target_store, &source_compacted).unwrap();
-    assert_eq!(copied_records.len(), 26);
+    assert_eq!(copied_records.len(), 36);
     assert!(copied_records.iter().all(|record| {
-        record.kind != RetainedRecordKind::Commit && record.round > window.candidate.round
+        record.kind != RetainedRecordKind::Commit
+            && record.round > window.candidate.round
+            && record.round <= window.last_round
     }));
     let copied_block_count = copied_records
         .iter()
@@ -611,7 +706,7 @@ fn recovery_peer_generation_replays_for_different_absent_validator_compacts_and_
         .filter(|record| record.kind == RetainedRecordKind::AbsenceCertificate)
         .count();
     assert_eq!(copied_block_count, 24);
-    assert_eq!(copied_absence_count, 2);
+    assert_eq!(copied_absence_count, 12);
 
     let target_engine = fixture.strict_engine(PEER_REPLAY_TARGET_INDEX);
     let target_replay = replay_recovery_dag_generation(
@@ -633,18 +728,38 @@ fn recovery_peer_generation_replays_for_different_absent_validator_compacts_and_
         target_engine.last_committed_round(),
         source_engine.last_committed_round()
     );
-    assert!(target_engine.has_skip_certificate(
-        window.target_absence.round,
-        &fixture.validators[PEER_REPLAY_TARGET_INDEX]
-    ));
-    assert!(target_engine.has_skip_certificate(
-        window.second_absence.round,
-        &fixture.validators[PEER_REPLAY_SECOND_ABSENT_INDEX]
-    ));
-    assert!(!target_engine.has_skip_certificate(
-        window.bootstrap_absence.round,
-        &fixture.validators[PEER_REPLAY_SECOND_ABSENT_INDEX]
-    ));
+    assert!(target_engine.committed_blocks().is_empty());
+    assert_eq!(
+        target_engine.find_committed_anchor(&canonical_tip.header.proof_hash, &fixture.domain),
+        None
+    );
+    for round in window.bootstrap..=window.candidate.round {
+        assert!(
+            !target_engine
+                .has_skip_certificate(round, &fixture.validators[PEER_REPLAY_TARGET_INDEX])
+        );
+        assert!(
+            !target_engine
+                .has_skip_certificate(round, &fixture.validators[PEER_REPLAY_SECOND_ABSENT_INDEX])
+        );
+        assert!(!target_engine.has_quorum_parents_for_round(round));
+    }
+    for round in (window.candidate.round + 1)..=window.last_round {
+        assert!(
+            target_engine
+                .has_skip_certificate(round, &fixture.validators[PEER_REPLAY_TARGET_INDEX])
+        );
+        assert!(
+            target_engine
+                .has_skip_certificate(round, &fixture.validators[PEER_REPLAY_SECOND_ABSENT_INDEX])
+        );
+        assert!(target_engine.has_quorum_parents_for_round(round));
+    }
+    for round_blocks in &window.blocks_by_round[..2] {
+        for block in round_blocks {
+            assert!(target_engine.get_block(&block.hash).is_none());
+        }
+    }
     for round_blocks in &window.blocks_by_round[2..] {
         for block in round_blocks {
             assert!(target_engine.get_block(&block.hash).is_some());
@@ -666,6 +781,7 @@ fn recovery_peer_generation_replays_for_different_absent_validator_compacts_and_
     let target_restarted_engine = fixture.strict_engine(PEER_REPLAY_TARGET_INDEX);
     let (restarted_records, restarted_summary) =
         stage_recovery_generation_records(&target_store, &unchanged_on_target).unwrap();
+    assert_eq!(restarted_records.len(), 36);
     let target_restarted_replay = replay_recovery_dag_generation(
         &target_restarted_engine,
         &target_state,
@@ -683,6 +799,7 @@ fn recovery_peer_generation_replays_for_different_absent_validator_compacts_and_
         target_restarted_replay.next_commit_round,
         source_replay.next_commit_round
     );
+    assert!(target_restarted_engine.has_quorum_parents_for_round(window.last_round));
     assert_eq!(target_state.height(), source_state.height());
     assert_eq!(
         target_state.get_block(2).unwrap().header.state_root,
@@ -783,28 +900,180 @@ fn recovery_peer_generation_replays_for_different_absent_validator_compacts_and_
         vec![window.candidate.hash]
     );
 
+    let target_key = fixture.keypair(PEER_REPLAY_TARGET_INDEX);
     let next_round = window.last_round + 1;
-    let next_parents: Vec<Hash256> = window
+    let mut expected_next_parents: Vec<Hash256> = window
         .blocks_by_round
         .last()
         .unwrap()
         .iter()
         .map(|block| block.hash)
         .collect();
-    for author_index in [0usize, 1, 2, 3, PEER_REPLAY_TARGET_INDEX] {
+    expected_next_parents.sort_by_key(|hash| hash.0);
+
+    let target_live_block = target_restarted_engine
+        .propose_block(Vec::new(), next_round)
+        .unwrap();
+    assert_eq!(
+        target_live_block.author,
+        fixture.validators[PEER_REPLAY_TARGET_INDEX]
+    );
+    assert_eq!(target_live_block.round, next_round);
+    assert_eq!(target_live_block.parents, expected_next_parents);
+    assert_eq!(
+        target_live_block.hash,
+        target_live_block.compute_hash_in_domain(&fixture.domain)
+    );
+    assert_eq!(
+        target_live_block.ordering_commitment,
+        DagBlock::compute_ordering_commitment(&target_live_block.transactions)
+    );
+    assert!(!target_live_block.signature.is_empty());
+    assert!(
+        target_restarted_engine
+            .get_block(&target_live_block.hash)
+            .is_some()
+    );
+
+    let target_signatures = [
+        target_key.sign(&target_live_block.hash).unwrap(),
+        bincode::deserialize(&target_live_block.signature).unwrap(),
+    ];
+    for signature in &target_signatures {
+        signature
+            .verify(&target_live_block.hash, &target_live_block.author)
+            .unwrap();
+    }
+    assert!(
+        target_signatures[1]
+            .verify(
+                &target_live_block.hash,
+                &fixture.validators[PEER_REPLAY_SOURCE_INDEX],
+            )
+            .is_err()
+    );
+
+    assert!(matches!(
+        target_restarted_engine.propose_block(Vec::new(), next_round),
+        Err(arc_consensus::ConsensusError::DuplicateBlock)
+    ));
+    assert!(matches!(
+        target_restarted_engine.receive_block(&target_live_block),
+        Err(arc_consensus::ConsensusError::DuplicateBlock)
+    ));
+
+    let mut tampered_target_live = target_live_block.clone();
+    *tampered_target_live.signature.last_mut().unwrap() ^= 0xff;
+    assert!(matches!(
+        source_engine.receive_block(&tampered_target_live),
+        Err(arc_consensus::ConsensusError::InvalidSignature)
+    ));
+    assert!(source_engine.get_block(&target_live_block.hash).is_none());
+
+    source_engine.receive_block(&target_live_block).unwrap();
+    assert!(source_engine.get_block(&target_live_block.hash).is_some());
+    assert!(matches!(
+        source_engine.receive_block(&target_live_block),
+        Err(arc_consensus::ConsensusError::DuplicateBlock)
+    ));
+
+    let source_live_block = source_engine.propose_block(Vec::new(), next_round).unwrap();
+    assert_eq!(
+        source_live_block.author,
+        fixture.validators[PEER_REPLAY_SOURCE_INDEX]
+    );
+    assert_eq!(source_live_block.round, next_round);
+    assert_eq!(source_live_block.parents, expected_next_parents);
+    assert_eq!(
+        source_live_block.hash,
+        source_live_block.compute_hash_in_domain(&fixture.domain)
+    );
+    assert!(!source_live_block.signature.is_empty());
+    assert!(matches!(
+        source_engine.propose_block(Vec::new(), next_round),
+        Err(arc_consensus::ConsensusError::DuplicateBlock)
+    ));
+    target_restarted_engine
+        .receive_block(&source_live_block)
+        .unwrap();
+
+    for author_index in [1usize, 2, 3] {
         let live_block = fixture.signed_block(
             author_index,
             next_round,
-            next_parents.clone(),
+            expected_next_parents.clone(),
             &fixture.domain,
         );
         target_restarted_engine.receive_block(&live_block).unwrap();
-        let _ = target_restarted_engine.advance_round();
         source_engine.receive_block(&live_block).unwrap();
-        let _ = source_engine.advance_round();
     }
+
+    assert!(!target_restarted_engine.has_quorum_parents_for_round(next_round));
+    assert!(!source_engine.has_quorum_parents_for_round(next_round));
+    let _ = target_restarted_engine.advance_round();
+    let _ = source_engine.advance_round();
+    assert_eq!(target_restarted_engine.current_round(), next_round);
+    assert_eq!(source_engine.current_round(), next_round);
+
+    let next_round_live_signers = [0usize, 1, 2, 3, PEER_REPLAY_TARGET_INDEX];
+    let next_round_live_stake = fixture.committee.stake_for_addresses(&[
+        fixture.validators[0],
+        fixture.validators[1],
+        fixture.validators[2],
+        fixture.validators[3],
+        fixture.validators[PEER_REPLAY_TARGET_INDEX],
+    ]);
+    assert_eq!(next_round_live_stake, PEER_REPLAY_TOTAL_STAKE - 6_666_666);
+    let next_round_second_absence = fixture.skip_certificate(
+        fixture.domain,
+        fixture.committee_hash,
+        next_round,
+        fixture.validators[PEER_REPLAY_SECOND_ABSENT_INDEX],
+        &next_round_live_signers,
+    );
+    assert_eq!(
+        next_round_second_absence
+            .verify(&fixture.domain, &fixture.committee)
+            .unwrap(),
+        next_round_live_stake
+    );
+    assert_eq!(
+        target_restarted_engine
+            .register_skip_certificate(next_round_second_absence.clone())
+            .unwrap(),
+        next_round_live_stake
+    );
+    assert_eq!(
+        source_engine
+            .register_skip_certificate(next_round_second_absence)
+            .unwrap(),
+        next_round_live_stake
+    );
+    assert!(target_restarted_engine.has_quorum_parents_for_round(next_round));
+    assert!(source_engine.has_quorum_parents_for_round(next_round));
+    let _ = target_restarted_engine.advance_round();
+    let _ = source_engine.advance_round();
     assert_eq!(target_restarted_engine.current_round(), next_round + 1);
     assert_eq!(source_engine.current_round(), next_round + 1);
+
+    let followup_block = target_restarted_engine
+        .propose_block(Vec::new(), next_round + 1)
+        .unwrap();
+    assert_eq!(
+        followup_block.author,
+        fixture.validators[PEER_REPLAY_TARGET_INDEX]
+    );
+    assert_eq!(followup_block.round, next_round + 1);
+    assert_eq!(followup_block.parents.len(), 5);
+    assert!(followup_block.parents.contains(&target_live_block.hash));
+    assert!(followup_block.parents.contains(&source_live_block.hash));
+    assert_eq!(
+        followup_block.hash,
+        followup_block.compute_hash_in_domain(&fixture.domain)
+    );
+    assert!(!followup_block.signature.is_empty());
+    source_engine.receive_block(&followup_block).unwrap();
+    assert!(source_engine.get_block(&followup_block.hash).is_some());
 
     let retained_signing_bytes = std::fs::read(&target_signing_path).unwrap();
     assert_eq!(retained_signing_bytes, target_signing_bytes);
@@ -823,7 +1092,6 @@ fn recovery_peer_generation_replays_for_different_absent_validator_compacts_and_
         Some(&AbsenceReason::NoBlock)
     );
 
-    let target_key = fixture.keypair(PEER_REPLAY_TARGET_INDEX);
     let mut tracker = SkipTracker::new(
         fixture.domain,
         fixture.committee_hash,
@@ -919,7 +1187,7 @@ fn recovery_peer_replay_rejects_unsigned_forged_and_wrong_domain_blocks() {
             window.records.clone(),
         )
         .unwrap();
-    let (staged, _) = stage_recovery_generation_records(&store, &generation).unwrap();
+    let (staged, staged_summary) = stage_recovery_generation_records(&store, &generation).unwrap();
 
     let bootstrap_block = window.blocks_by_round[0][0].clone();
     assert_eq!(bootstrap_block.round, window.bootstrap);
@@ -1021,7 +1289,6 @@ fn recovery_peer_replay_rejects_unsigned_forged_and_wrong_domain_blocks() {
     }
 
     let source_engine = fixture.strict_engine(PEER_REPLAY_SOURCE_INDEX);
-    let (_, staged_summary) = stage_recovery_generation_records(&store, &generation).unwrap();
     replay_recovery_dag_generation(&source_engine, &state, &startup, &generation, &staged).unwrap();
     let compacted = compact_replayed_recovery_generation(
         &store,
@@ -1084,9 +1351,15 @@ fn recovery_peer_replay_rejects_subquorum_forged_and_wrong_domain_skip_certifica
             window.records.clone(),
         )
         .unwrap();
-    let (staged, _) = stage_recovery_generation_records(&store, &generation).unwrap();
+    let (staged, staged_summary) = stage_recovery_generation_records(&store, &generation).unwrap();
+    assert_eq!(staged.len(), 48);
 
-    let mut subquorum_bootstrap = window.bootstrap_absence.clone();
+    let bootstrap_leader_absence =
+        window.absence(window.bootstrap, PEER_REPLAY_SECOND_ABSENT_INDEX);
+    let target_leader_round = window.bootstrap + 5;
+    let target_leader_absence = window.absence(target_leader_round, PEER_REPLAY_TARGET_INDEX);
+
+    let mut subquorum_bootstrap = bootstrap_leader_absence.clone();
     subquorum_bootstrap.votes.truncate(3);
     peer_replay_expect_cert_err(
         subquorum_bootstrap.verify(&fixture.domain, &fixture.committee),
@@ -1096,7 +1369,7 @@ fn recovery_peer_replay_rejects_subquorum_forged_and_wrong_domain_skip_certifica
         },
     );
 
-    let mut subquorum_target = window.target_absence.clone();
+    let mut subquorum_target = target_leader_absence.clone();
     subquorum_target.votes.truncate(3);
     peer_replay_expect_cert_err(
         subquorum_target.verify(&fixture.domain, &fixture.committee),
@@ -1106,14 +1379,14 @@ fn recovery_peer_replay_rejects_subquorum_forged_and_wrong_domain_skip_certifica
         },
     );
 
-    let mut empty_cert = window.bootstrap_absence.clone();
+    let mut empty_cert = bootstrap_leader_absence.clone();
     empty_cert.votes.clear();
     peer_replay_expect_cert_err(
         empty_cert.verify(&fixture.domain, &fixture.committee),
         CertificateError::Empty,
     );
 
-    let mut duplicate_voter_cert = window.bootstrap_absence.clone();
+    let mut duplicate_voter_cert = bootstrap_leader_absence.clone();
     duplicate_voter_cert.votes[3] = duplicate_voter_cert.votes[0].clone();
     peer_replay_expect_cert_err(
         duplicate_voter_cert.verify(&fixture.domain, &fixture.committee),
@@ -1123,7 +1396,7 @@ fn recovery_peer_replay_rejects_subquorum_forged_and_wrong_domain_skip_certifica
     let outsider = arc_crypto::KeyPair::from_ed25519_secret_bytes(
         &hash_bytes(b"recovery-peer-replay-outsider-key").0,
     );
-    let mut outsider_cert = window.bootstrap_absence.clone();
+    let mut outsider_cert = bootstrap_leader_absence.clone();
     outsider_cert.votes[3] = SkipVote::sign(
         fixture.domain,
         fixture.committee_hash,
@@ -1139,7 +1412,7 @@ fn recovery_peer_replay_rejects_subquorum_forged_and_wrong_domain_skip_certifica
         CertificateError::UnknownVoter(outsider.address()),
     );
 
-    let mut bad_sig_cert = window.bootstrap_absence.clone();
+    let mut bad_sig_cert = bootstrap_leader_absence.clone();
     bad_sig_cert.votes[0].signature = bad_sig_cert.votes[1].signature.clone();
     peer_replay_expect_cert_err(
         bad_sig_cert.verify(&fixture.domain, &fixture.committee),
@@ -1264,7 +1537,7 @@ fn recovery_peer_replay_rejects_subquorum_forged_and_wrong_domain_skip_certifica
 
     let subquorum_target_records = peer_replay_replace_certificate_record(
         &staged,
-        window.target_absence.round,
+        target_leader_round,
         fixture.validators[PEER_REPLAY_TARGET_INDEX],
         &subquorum_target,
     );
@@ -1280,24 +1553,230 @@ fn recovery_peer_replay_rejects_subquorum_forged_and_wrong_domain_skip_certifica
         .is_err()
     );
 
-    let missing_target_absence: Vec<RetainedDagRecord> = staged
-        .iter()
-        .filter(|record| {
-            !(record.kind == RetainedRecordKind::AbsenceCertificate
-                && record.round == window.target_absence.round)
-        })
-        .cloned()
-        .collect();
-    assert_eq!(missing_target_absence.len() + 1, staged.len());
-    let missing_target_engine = fixture.strict_engine(PEER_REPLAY_TARGET_INDEX);
+    assert_eq!(target_leader_round as usize % 6, PEER_REPLAY_TARGET_INDEX);
+    let missing_leader_absence = peer_replay_remove_certificate_record(
+        &staged,
+        target_leader_round,
+        fixture.validators[PEER_REPLAY_TARGET_INDEX],
+    );
+    let missing_leader_engine = fixture.strict_engine(PEER_REPLAY_TARGET_INDEX);
+    let missing_leader_err = replay_recovery_dag_generation(
+        &missing_leader_engine,
+        &state,
+        &startup,
+        &generation,
+        &missing_leader_absence,
+    )
+    .unwrap_err();
     assert!(
-        replay_recovery_dag_generation(
-            &missing_target_engine,
+        missing_leader_err
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("insufficient parents"),
+        "unexpected missing-leader error: {missing_leader_err}"
+    );
+
+    for (label, round, absentee_index) in [
+        (
+            "bootstrap-nonleader-target",
+            window.bootstrap,
+            PEER_REPLAY_TARGET_INDEX,
+        ),
+        (
+            "live-leader-round-nonleader-target",
+            window.bootstrap + 2,
+            PEER_REPLAY_TARGET_INDEX,
+        ),
+        (
+            "live-leader-round-nonleader-second",
+            window.bootstrap + 2,
+            PEER_REPLAY_SECOND_ABSENT_INDEX,
+        ),
+        (
+            "absent-leader-round-nonleader-second",
+            target_leader_round,
+            PEER_REPLAY_SECOND_ABSENT_INDEX,
+        ),
+    ] {
+        assert_ne!(
+            round as usize % 6,
+            absentee_index,
+            "regression case {label} must remove a non-leader absence certificate"
+        );
+        let missing_nonleader = peer_replay_remove_certificate_record(
+            &staged,
+            round,
+            fixture.validators[absentee_index],
+        );
+        let missing_nonleader_engine = fixture.strict_engine(PEER_REPLAY_TARGET_INDEX);
+        let err = replay_recovery_dag_generation(
+            &missing_nonleader_engine,
             &state,
             &startup,
             &generation,
-            &missing_target_absence,
+            &missing_nonleader,
         )
-        .is_err()
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .to_ascii_lowercase()
+                .contains("insufficient parents"),
+            "missing non-leader absence {label} must fail with insufficient parents, got: {err}"
+        );
+    }
+
+    let direct_nonleader_engine = fixture.strict_engine(PEER_REPLAY_TARGET_INDEX);
+    assert!(direct_nonleader_engine.requires_full_round_participation());
+    direct_nonleader_engine
+        .install_recovery_cursor(startup.binding.source_consensus_round)
+        .unwrap();
+    direct_nonleader_engine
+        .install_recovery_generation_cursor(window.bootstrap, window.bootstrap, window.bootstrap)
+        .unwrap();
+    direct_nonleader_engine
+        .register_skip_certificate(bootstrap_leader_absence.clone())
+        .unwrap();
+    for block in &window.blocks_by_round[0] {
+        direct_nonleader_engine.receive_block(block).unwrap();
+        let _ = direct_nonleader_engine.advance_round();
+    }
+    assert!(!direct_nonleader_engine.has_quorum_parents_for_round(window.bootstrap));
+    assert_eq!(direct_nonleader_engine.current_round(), window.bootstrap);
+    assert!(matches!(
+        direct_nonleader_engine.receive_block(&window.blocks_by_round[1][0]),
+        Err(arc_consensus::ConsensusError::InsufficientParents)
+    ));
+    direct_nonleader_engine
+        .register_skip_certificate(
+            window
+                .absence(window.bootstrap, PEER_REPLAY_TARGET_INDEX)
+                .clone(),
+        )
+        .unwrap();
+    assert!(direct_nonleader_engine.has_quorum_parents_for_round(window.bootstrap));
+    let _ = direct_nonleader_engine.advance_round();
+    assert_eq!(
+        direct_nonleader_engine.current_round(),
+        window.bootstrap + 1
     );
+    direct_nonleader_engine
+        .receive_block(&window.blocks_by_round[1][0])
+        .unwrap();
+
+    let source_engine = fixture.strict_engine(PEER_REPLAY_SOURCE_INDEX);
+    replay_recovery_dag_generation(&source_engine, &state, &startup, &generation, &staged).unwrap();
+    let compacted = compact_replayed_recovery_generation(
+        &store,
+        &state,
+        &startup,
+        &generation,
+        &staged_summary,
+        &source_engine,
+        &staged,
+    )
+    .unwrap();
+    let (compacted_records, _) = stage_recovery_generation_records(&store, &compacted).unwrap();
+    assert_eq!(compacted_records.len(), 36);
+
+    for (label, round, absentee_index) in [
+        (
+            "compacted-boundary-nonleader-target",
+            window.bootstrap + 2,
+            PEER_REPLAY_TARGET_INDEX,
+        ),
+        (
+            "compacted-nonleader-second",
+            target_leader_round,
+            PEER_REPLAY_SECOND_ABSENT_INDEX,
+        ),
+    ] {
+        assert_ne!(
+            round as usize % 6,
+            absentee_index,
+            "compacted regression case {label} must remove a non-leader absence certificate"
+        );
+        let missing_compacted_nonleader = peer_replay_remove_certificate_record(
+            &compacted_records,
+            round,
+            fixture.validators[absentee_index],
+        );
+        let compacted_target_engine = fixture.strict_engine(PEER_REPLAY_TARGET_INDEX);
+        let err = replay_recovery_dag_generation(
+            &compacted_target_engine,
+            &state,
+            &startup,
+            &compacted,
+            &missing_compacted_nonleader,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .to_ascii_lowercase()
+                .contains("insufficient parents"),
+            "compacted missing non-leader absence {label} must fail with insufficient parents, got: {err}"
+        );
+    }
+
+    assert_ne!(
+        window.last_round as usize % 6,
+        PEER_REPLAY_SECOND_ABSENT_INDEX
+    );
+    let tail_parents: Vec<Hash256> = window
+        .blocks_by_round
+        .last()
+        .unwrap()
+        .iter()
+        .map(|block| block.hash)
+        .collect();
+    let next_round_block = fixture.signed_block(
+        PEER_REPLAY_SOURCE_INDEX,
+        window.last_round + 1,
+        tail_parents,
+        &fixture.domain,
+    );
+
+    let missing_last_round_nonleader = peer_replay_remove_certificate_record(
+        &staged,
+        window.last_round,
+        fixture.validators[PEER_REPLAY_SECOND_ABSENT_INDEX],
+    );
+    let tail_engine = fixture.strict_engine(PEER_REPLAY_TARGET_INDEX);
+    let tail_replay = replay_recovery_dag_generation(
+        &tail_engine,
+        &state,
+        &startup,
+        &generation,
+        &missing_last_round_nonleader,
+    )
+    .unwrap();
+    assert_eq!(tail_replay.current_round, window.last_round);
+    assert!(!tail_engine.has_quorum_parents_for_round(window.last_round));
+    assert!(matches!(
+        tail_engine.receive_block(&next_round_block),
+        Err(arc_consensus::ConsensusError::InsufficientParents)
+    ));
+
+    let missing_compacted_tail_nonleader = peer_replay_remove_certificate_record(
+        &compacted_records,
+        window.last_round,
+        fixture.validators[PEER_REPLAY_SECOND_ABSENT_INDEX],
+    );
+    let compacted_tail_engine = fixture.strict_engine(PEER_REPLAY_TARGET_INDEX);
+    replay_recovery_dag_generation(
+        &compacted_tail_engine,
+        &state,
+        &startup,
+        &compacted,
+        &missing_compacted_tail_nonleader,
+    )
+    .unwrap();
+    assert!(!compacted_tail_engine.has_quorum_parents_for_round(window.last_round));
+    assert!(matches!(
+        compacted_tail_engine.propose_block(Vec::new(), window.last_round + 1),
+        Err(arc_consensus::ConsensusError::InsufficientParents)
+    ));
+    assert!(matches!(
+        compacted_tail_engine.receive_block(&next_round_block),
+        Err(arc_consensus::ConsensusError::InsufficientParents)
+    ));
 }
