@@ -11,6 +11,8 @@ pub const CLAIM_IDLE_REPOLL: Duration = Duration::from_millis(500);
 
 pub const CLAIM_RETRY_CAP: Duration = Duration::from_secs(30);
 
+const MAX_STATUS_ERROR_BYTES: usize = 240;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerState {
@@ -37,6 +39,77 @@ impl WorkerState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerMode {
+    PartialShard,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartialShardPhase {
+    Starting,
+    Loading,
+    Ready,
+    Computing,
+    Reconnecting,
+    Failed,
+    Stopped,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct PartialShardLayerRangeSnapshot {
+    pub start_layer: usize,
+    pub end_layer: usize,
+    pub total_layers: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct PartialShardWorkerSnapshot {
+    pub phase: PartialShardPhase,
+    pub model_name: String,
+    pub model_id: String,
+    pub lease_seq: Option<u64>,
+    pub lease_epoch: Option<u64>,
+    pub assigned_range: Option<PartialShardLayerRangeSnapshot>,
+    pub ready_expires_at_unix_ms: Option<u64>,
+    pub lease_live: bool,
+    pub steps_executed: u64,
+    pub steps_submitted: u64,
+    pub submit_retries: u64,
+    pub submit_stale_conflicts: u64,
+    pub cancellations_applied: u64,
+    pub rebalances_completed: u64,
+    pub reconnect_attempts: u64,
+    pub last_heartbeat_unix_ms: Option<u64>,
+    pub last_step_submitted_unix_ms: Option<u64>,
+    pub last_error: Option<String>,
+    pub rewards_enabled: bool,
+    pub reward_eligible: bool,
+}
+
+#[derive(Debug)]
+struct PartialShardTelemetry {
+    model_name: String,
+    model_id: String,
+    total_layers: usize,
+    phase: PartialShardPhase,
+    lease_seq: Option<u64>,
+    lease_epoch: Option<u64>,
+    assigned_range: Option<PartialShardLayerRangeSnapshot>,
+    ready_expires_at_unix_ms: Option<u64>,
+    steps_executed: u64,
+    steps_submitted: u64,
+    submit_retries: u64,
+    submit_stale_conflicts: u64,
+    cancellations_applied: u64,
+    rebalances_completed: u64,
+    reconnect_attempts: u64,
+    last_heartbeat_unix_ms: Option<u64>,
+    last_step_submitted_unix_ms: Option<u64>,
+    last_error: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobOutcome {
     Completed { verified: bool },
@@ -60,6 +133,7 @@ pub struct CommunityWorkerStatus {
     jobs_declined: AtomicU64,
     last_job_completed_unix_ms: AtomicU64,
     last_registration_unix_ms: AtomicU64,
+    shard: Option<Mutex<PartialShardTelemetry>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -79,6 +153,10 @@ pub struct CommunityWorkerSnapshot {
     pub last_registration_unix_ms: Option<u64>,
     pub started_unix_ms: u64,
     pub prevent_sleep_during_jobs: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<WorkerMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shard: Option<PartialShardWorkerSnapshot>,
 }
 
 fn unix_ms_now() -> u64 {
@@ -90,6 +168,34 @@ fn unix_ms_now() -> u64 {
 
 fn nonzero(value: u64) -> Option<u64> {
     (value != 0).then_some(value)
+}
+
+pub fn sanitize_status_error(raw: &str) -> String {
+    let mut cleaned = String::new();
+    let mut last_space = true;
+    for ch in raw.chars() {
+        if ch.is_control() || ch.is_whitespace() {
+            if !last_space {
+                cleaned.push(' ');
+                last_space = true;
+            }
+        } else {
+            cleaned.push(ch);
+            last_space = false;
+        }
+        if cleaned.len() >= MAX_STATUS_ERROR_BYTES {
+            break;
+        }
+    }
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return "worker error".to_string();
+    }
+    let mut end = trimmed.len().min(MAX_STATUS_ERROR_BYTES);
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    trimmed[..end].to_string()
 }
 
 impl CommunityWorkerStatus {
@@ -114,6 +220,53 @@ impl CommunityWorkerStatus {
             jobs_declined: AtomicU64::new(0),
             last_job_completed_unix_ms: AtomicU64::new(0),
             last_registration_unix_ms: AtomicU64::new(0),
+            shard: None,
+        }
+    }
+
+    pub fn new_sharded(
+        worker_id: impl Into<String>,
+        public_name: impl Into<String>,
+        model_name: impl Into<String>,
+        model_id: impl Into<String>,
+        total_layers: usize,
+        prevent_sleep_during_jobs: bool,
+    ) -> Self {
+        Self {
+            worker_id: worker_id.into(),
+            public_name: public_name.into(),
+            coordinators_total: 1,
+            prevent_sleep_during_jobs,
+            started_unix_ms: unix_ms_now(),
+            state: AtomicU8::new(WorkerState::Reconnecting.encode()),
+            coordinators_registered: AtomicU32::new(0),
+            jobs_claimed: AtomicU64::new(0),
+            jobs_completed: AtomicU64::new(0),
+            jobs_verified: AtomicU64::new(0),
+            jobs_failed: AtomicU64::new(0),
+            jobs_declined: AtomicU64::new(0),
+            last_job_completed_unix_ms: AtomicU64::new(0),
+            last_registration_unix_ms: AtomicU64::new(0),
+            shard: Some(Mutex::new(PartialShardTelemetry {
+                model_name: model_name.into(),
+                model_id: model_id.into(),
+                total_layers,
+                phase: PartialShardPhase::Starting,
+                lease_seq: None,
+                lease_epoch: None,
+                assigned_range: None,
+                ready_expires_at_unix_ms: None,
+                steps_executed: 0,
+                steps_submitted: 0,
+                submit_retries: 0,
+                submit_stale_conflicts: 0,
+                cancellations_applied: 0,
+                rebalances_completed: 0,
+                reconnect_attempts: 0,
+                last_heartbeat_unix_ms: None,
+                last_step_submitted_unix_ms: None,
+                last_error: None,
+            })),
         }
     }
 
@@ -154,14 +307,267 @@ impl CommunityWorkerStatus {
         }
     }
 
+    fn with_shard<F>(&self, f: F)
+    where
+        F: FnOnce(&mut PartialShardTelemetry),
+    {
+        if let Some(lock) = self.shard.as_ref() {
+            let mut guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            f(&mut guard);
+        }
+    }
+
+    pub fn record_shard_registered(&self) {
+        self.record_registration_round(1);
+    }
+
+    pub fn record_shard_loading(
+        &self,
+        lease_seq: u64,
+        lease_epoch: u64,
+        start_layer: usize,
+        end_layer: usize,
+        total_layers: usize,
+    ) {
+        self.set_state(WorkerState::Reconnecting);
+        self.with_shard(|shard| {
+            shard.total_layers = total_layers;
+            shard.phase = PartialShardPhase::Loading;
+            shard.lease_seq = Some(lease_seq);
+            shard.lease_epoch = Some(lease_epoch);
+            shard.assigned_range = Some(PartialShardLayerRangeSnapshot {
+                start_layer,
+                end_layer,
+                total_layers,
+            });
+            shard.ready_expires_at_unix_ms = None;
+        });
+    }
+
+    pub fn record_shard_heartbeat_provisioning(&self) {
+        self.with_shard(|shard| {
+            shard.last_heartbeat_unix_ms = Some(unix_ms_now());
+        });
+    }
+
+    pub fn record_shard_ready(
+        &self,
+        lease_seq: u64,
+        lease_epoch: u64,
+        range: PartialShardLayerRangeSnapshot,
+        expires_at_unix_ms: u64,
+    ) {
+        self.record_registration_round(1);
+        self.set_state(WorkerState::Polling);
+        self.with_shard(|shard| {
+            shard.total_layers = range.total_layers;
+            shard.phase = PartialShardPhase::Ready;
+            shard.lease_seq = Some(lease_seq);
+            shard.lease_epoch = Some(lease_epoch);
+            shard.assigned_range = Some(range);
+            shard.ready_expires_at_unix_ms = Some(expires_at_unix_ms);
+            shard.last_heartbeat_unix_ms = Some(unix_ms_now());
+            shard.last_error = None;
+        });
+    }
+
+    pub fn record_shard_heartbeat_active(&self, expires_at_unix_ms: u64) {
+        self.with_shard(|shard| {
+            shard.ready_expires_at_unix_ms = Some(expires_at_unix_ms);
+            shard.last_heartbeat_unix_ms = Some(unix_ms_now());
+            if shard.phase == PartialShardPhase::Ready
+                || shard.phase == PartialShardPhase::Computing
+            {
+                shard.last_error = None;
+            }
+        });
+    }
+
+    pub fn record_shard_computing(&self) {
+        self.set_state(WorkerState::Computing);
+        self.with_shard(|shard| {
+            shard.phase = PartialShardPhase::Computing;
+        });
+    }
+
+    pub fn record_shard_idle_ready(&self) {
+        self.with_shard(|shard| {
+            if shard.phase == PartialShardPhase::Computing {
+                shard.phase = PartialShardPhase::Ready;
+                self.set_state(WorkerState::Polling);
+            }
+        });
+    }
+
+    pub fn record_shard_step_executed(&self) {
+        self.with_shard(|shard| {
+            shard.steps_executed = shard.steps_executed.saturating_add(1);
+        });
+    }
+
+    pub fn record_shard_step_submitted(&self) {
+        self.with_shard(|shard| {
+            shard.steps_submitted = shard.steps_submitted.saturating_add(1);
+            shard.last_step_submitted_unix_ms = Some(unix_ms_now());
+        });
+    }
+
+    pub fn record_shard_submit_retry(&self) {
+        self.with_shard(|shard| {
+            shard.submit_retries = shard.submit_retries.saturating_add(1);
+        });
+    }
+
+    pub fn record_shard_submit_stale_conflict(&self) {
+        self.with_shard(|shard| {
+            shard.submit_stale_conflicts = shard.submit_stale_conflicts.saturating_add(1);
+        });
+    }
+
+    pub fn record_shard_cancellation_applied(&self) {
+        self.with_shard(|shard| {
+            shard.cancellations_applied = shard.cancellations_applied.saturating_add(1);
+        });
+    }
+
+    pub fn record_shard_rebalance_completed(&self) {
+        self.with_shard(|shard| {
+            shard.rebalances_completed = shard.rebalances_completed.saturating_add(1);
+        });
+    }
+
+    pub fn record_shard_reconnecting(&self, reason: &str) {
+        self.record_registration_round(0);
+        self.set_state(WorkerState::Reconnecting);
+        self.with_shard(|shard| {
+            shard.phase = PartialShardPhase::Reconnecting;
+            shard.lease_seq = None;
+            shard.lease_epoch = None;
+            shard.assigned_range = None;
+            shard.ready_expires_at_unix_ms = None;
+            shard.last_error = Some(sanitize_status_error(reason));
+        });
+    }
+
+    pub fn record_shard_reconnect_attempt(&self, reason: &str) {
+        self.record_registration_round(0);
+        self.set_state(WorkerState::Reconnecting);
+        self.with_shard(|shard| {
+            shard.phase = PartialShardPhase::Reconnecting;
+            shard.lease_seq = None;
+            shard.lease_epoch = None;
+            shard.assigned_range = None;
+            shard.ready_expires_at_unix_ms = None;
+            shard.reconnect_attempts = shard.reconnect_attempts.saturating_add(1);
+            shard.last_error = Some(sanitize_status_error(reason));
+        });
+    }
+
+    pub fn record_shard_failed(&self, reason: &str) {
+        self.record_registration_round(0);
+        self.set_state(WorkerState::Reconnecting);
+        self.with_shard(|shard| {
+            shard.phase = PartialShardPhase::Failed;
+            shard.lease_seq = None;
+            shard.lease_epoch = None;
+            shard.assigned_range = None;
+            shard.ready_expires_at_unix_ms = None;
+            shard.last_error = Some(sanitize_status_error(reason));
+        });
+    }
+
+    pub fn record_shard_stopped(&self) {
+        self.record_registration_round(0);
+        self.set_state(WorkerState::Reconnecting);
+        self.with_shard(|shard| {
+            shard.phase = PartialShardPhase::Stopped;
+            shard.lease_seq = None;
+            shard.lease_epoch = None;
+            shard.assigned_range = None;
+            shard.ready_expires_at_unix_ms = None;
+        });
+    }
+
     pub fn snapshot(&self) -> CommunityWorkerSnapshot {
+        self.snapshot_at(unix_ms_now())
+    }
+
+    pub fn snapshot_at(&self, now_unix_ms: u64) -> CommunityWorkerSnapshot {
+        let mut state = WorkerState::decode(self.state.load(Ordering::Relaxed));
+        let mut coordinators_registered = self.coordinators_registered.load(Ordering::Relaxed);
+        let (mode, shard) = match self.shard.as_ref() {
+            Some(lock) => {
+                let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut phase = guard.phase;
+                let mut lease_seq = guard.lease_seq;
+                let mut lease_epoch = guard.lease_epoch;
+                let mut assigned_range = guard
+                    .assigned_range
+                    .as_ref()
+                    .filter(|range| {
+                        range.total_layers == guard.total_layers
+                            && range.total_layers >= 2
+                            && range.start_layer < range.end_layer
+                            && range.end_layer <= range.total_layers
+                            && range.end_layer - range.start_layer < range.total_layers
+                    })
+                    .cloned();
+                let mut ready_expires_at_unix_ms = guard.ready_expires_at_unix_ms;
+                let lease_live = matches!(
+                    phase,
+                    PartialShardPhase::Ready | PartialShardPhase::Computing
+                ) && assigned_range.is_some()
+                    && lease_seq.is_some_and(|seq| seq > 0)
+                    && lease_epoch.is_some_and(|epoch| epoch > 0)
+                    && ready_expires_at_unix_ms.is_some_and(|exp| now_unix_ms < exp);
+                if matches!(
+                    phase,
+                    PartialShardPhase::Ready | PartialShardPhase::Computing
+                ) && !lease_live
+                {
+                    phase = PartialShardPhase::Reconnecting;
+                    state = WorkerState::Reconnecting;
+                    coordinators_registered = 0;
+                    lease_seq = None;
+                    lease_epoch = None;
+                    assigned_range = None;
+                    ready_expires_at_unix_ms = None;
+                }
+                (
+                    Some(WorkerMode::PartialShard),
+                    Some(PartialShardWorkerSnapshot {
+                        phase,
+                        model_name: guard.model_name.clone(),
+                        model_id: guard.model_id.clone(),
+                        lease_seq,
+                        lease_epoch,
+                        assigned_range,
+                        ready_expires_at_unix_ms,
+                        lease_live,
+                        steps_executed: guard.steps_executed,
+                        steps_submitted: guard.steps_submitted,
+                        submit_retries: guard.submit_retries,
+                        submit_stale_conflicts: guard.submit_stale_conflicts,
+                        cancellations_applied: guard.cancellations_applied,
+                        rebalances_completed: guard.rebalances_completed,
+                        reconnect_attempts: guard.reconnect_attempts,
+                        last_heartbeat_unix_ms: guard.last_heartbeat_unix_ms,
+                        last_step_submitted_unix_ms: guard.last_step_submitted_unix_ms,
+                        last_error: guard.last_error.clone(),
+                        rewards_enabled: false,
+                        reward_eligible: false,
+                    }),
+                )
+            }
+            None => (None, None),
+        };
         CommunityWorkerSnapshot {
             schema: COMMUNITY_WORKER_STATUS_SCHEMA,
             worker_id: self.worker_id.clone(),
             public_name: self.public_name.clone(),
-            state: WorkerState::decode(self.state.load(Ordering::Relaxed)),
+            state,
             coordinators_total: self.coordinators_total,
-            coordinators_registered: self.coordinators_registered.load(Ordering::Relaxed),
+            coordinators_registered,
             jobs_claimed: self.jobs_claimed.load(Ordering::Relaxed),
             jobs_completed: self.jobs_completed.load(Ordering::Relaxed),
             jobs_verified: self.jobs_verified.load(Ordering::Relaxed),
@@ -175,6 +581,8 @@ impl CommunityWorkerStatus {
             ),
             started_unix_ms: self.started_unix_ms,
             prevent_sleep_during_jobs: self.prevent_sleep_during_jobs,
+            mode,
+            shard,
         }
     }
 }
@@ -304,6 +712,58 @@ pub use keep_awake::{KeepAwake, keep_awake_helper_command};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_snapshot_rejects_expired_or_malformed_leases_without_counting_whole_jobs() {
+        for computing in [false, true] {
+            let status =
+                CommunityWorkerStatus::new_sharded("worker", "node", "model", "id", 4, false);
+            status.record_shard_ready(
+                1,
+                1,
+                PartialShardLayerRangeSnapshot {
+                    start_layer: 0,
+                    end_layer: 2,
+                    total_layers: 4,
+                },
+                200,
+            );
+            status.record_shard_step_executed();
+            status.record_shard_step_submitted();
+            if computing {
+                status.record_shard_computing();
+            }
+            let live = status.snapshot_at(199);
+            let shard = live.shard.unwrap();
+            assert!(shard.lease_live);
+            assert_eq!(shard.steps_submitted, 1);
+            assert_eq!((live.jobs_completed, live.jobs_verified), (0, 0));
+            assert!(!shard.reward_eligible && !shard.rewards_enabled);
+            let expired = status.snapshot_at(200);
+            let shard = expired.shard.unwrap();
+            assert_eq!(shard.phase, PartialShardPhase::Reconnecting);
+            assert!(!shard.lease_live);
+            assert!(
+                shard.assigned_range.is_none()
+                    && shard.lease_seq.is_none()
+                    && shard.lease_epoch.is_none()
+            );
+            assert_eq!(expired.coordinators_registered, 0);
+            status.record_shard_ready(
+                1,
+                1,
+                PartialShardLayerRangeSnapshot {
+                    start_layer: 0,
+                    end_layer: 4,
+                    total_layers: 4,
+                },
+                300,
+            );
+            let malformed = status.snapshot_at(201).shard.unwrap();
+            assert_eq!(malformed.phase, PartialShardPhase::Reconnecting);
+            assert!(!malformed.lease_live);
+        }
+    }
 
     #[test]
     fn snapshot_counts_claims_completions_verifications_and_failures() {

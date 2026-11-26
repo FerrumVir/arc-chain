@@ -1616,3 +1616,198 @@ async fn auto_reconnect_recovers_after_503_outage_beyond_budget_and_executes_can
     assert!(s1.clean_release_sent);
     assert!(s2.clean_release_sent);
 }
+
+#[tokio::test]
+async fn partial_worker_telemetry_tracks_real_loading_ready_ttl_steps_stop_and_fatal_failure() {
+    use crate::community_worker::{
+        CommunityWorkerStatus, PartialShardPhase, WorkerMode, WorkerState,
+    };
+
+    let (full, spec) = make_tiny_model_and_spec(b"worker-telemetry-lifecycle");
+    let node = build_worker_test_node(Some(Arc::clone(&full)), Some(spec.model_id));
+    super::init_community_shard_coordinator_with_limits(
+        &node,
+        CommunityShardLimits {
+            target_partitions: 2,
+            ..CommunityShardLimits::default()
+        },
+    )
+    .expect("init coordinator");
+
+    let (base_url, srv) = spawn_router(build_production_router(node.clone())).await;
+    let kp1 = Arc::new(KeyPair::generate_ed25519());
+    let kp2 = Arc::new(KeyPair::generate_ed25519());
+    let telemetry = Arc::new(CommunityWorkerStatus::new_sharded(
+        format!("0x{}", kp1.address().to_hex()),
+        "telem-w1",
+        "arc-4L-16d-2h-32v",
+        spec.model_id.to_hex(),
+        spec.n_layers,
+        false,
+    ));
+    let whole_json =
+        serde_json::to_value(CommunityWorkerStatus::new("0xwhole", "whole", 1, false).snapshot())
+            .unwrap();
+    assert!(whole_json.get("mode").is_none());
+    assert!(whole_json.get("shard").is_none());
+
+    let (load_gate_tx, load_gate_rx) = std::sync::mpsc::channel::<()>();
+    let load_gate_rx = Arc::new(Mutex::new(Some(load_gate_rx)));
+    let full_for_w1 = Arc::clone(&full);
+    let gated_loader: PartialModelLoader = Arc::new(move |assignment| {
+        if let Some(rx) = load_gate_rx.lock().take() {
+            let _ = rx.recv_timeout(Duration::from_secs(10));
+        }
+        Ok(Arc::new(build_partial_integer_model(
+            &full_for_w1,
+            assignment.range,
+        )))
+    });
+
+    let (shut_tx, shut_rx) = watch::channel(false);
+    let mut cfg1 = worker_config(&base_url, &node, "telem-w1");
+    cfg1.telemetry = Some(Arc::clone(&telemetry).into());
+    let w1 = tokio::spawn(run_community_shard_worker(
+        cfg1,
+        Arc::clone(&kp1),
+        spec.clone(),
+        gated_loader,
+        shut_rx.clone(),
+    ));
+
+    let load_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snap = telemetry.snapshot();
+        if snap
+            .shard
+            .as_ref()
+            .is_some_and(|s| s.phase == PartialShardPhase::Loading)
+        {
+            let shard = snap.shard.unwrap();
+            assert_eq!(snap.mode, Some(WorkerMode::PartialShard));
+            assert!(!shard.lease_live);
+            assert!(shard.assigned_range.is_some());
+            assert!(!shard.rewards_enabled && !shard.reward_eligible);
+            assert_eq!(snap.jobs_completed, 0);
+            assert_eq!(snap.jobs_verified, 0);
+            break;
+        }
+        assert!(Instant::now() < load_deadline, "expected Loading telemetry");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let _ = load_gate_tx.send(());
+
+    let w2 = tokio::spawn(run_community_shard_worker(
+        worker_config(&base_url, &node, "telem-w2"),
+        Arc::clone(&kp2),
+        spec.clone(),
+        partial_loader(Arc::clone(&full)),
+        shut_rx,
+    ));
+
+    wait_for_condition(&node, Duration::from_secs(10), |coord| {
+        coord.status_snapshot(now_ms()).fully_covered_ready
+    })
+    .await;
+
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if telemetry
+            .snapshot()
+            .shard
+            .as_ref()
+            .is_some_and(|shard| shard.phase == PartialShardPhase::Ready)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "ready heartbeat was not reflected in worker telemetry"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let ready_snap = telemetry.snapshot();
+    let ready_shard = ready_snap.shard.as_ref().expect("shard snapshot");
+    assert_eq!(ready_snap.state, WorkerState::Polling);
+    assert_eq!(ready_shard.phase, PartialShardPhase::Ready);
+    assert!(ready_shard.lease_live);
+    let expires = ready_shard.ready_expires_at_unix_ms.expect("expiry");
+    let expired_snap = telemetry.snapshot_at(expires);
+    let expired_shard = expired_snap.shard.as_ref().expect("expired shard");
+    assert_eq!(expired_snap.state, WorkerState::Reconnecting);
+    assert_eq!(expired_shard.phase, PartialShardPhase::Reconnecting);
+    assert!(!expired_shard.lease_live);
+    assert!(expired_shard.assigned_range.is_none());
+    assert!(expired_shard.lease_seq.is_none());
+
+    let prompt = vec![1u32, 4, 7];
+    let max_tokens = 2u32;
+    let session_id = node
+        .community_shard_coordinator
+        .lock()
+        .as_mut()
+        .expect("coord")
+        .open_session(now_ms(), prompt.clone(), max_tokens)
+        .expect("open session");
+    let outcome = wait_for_session_result(&node, session_id, Duration::from_secs(10)).await;
+    let SessionOutcome::PendingVerification(pending) = outcome else {
+        panic!("expected pending verification");
+    };
+    let (expected_tokens, _) = full
+        .try_generate(&prompt, max_tokens, &full.config.eos_tokens)
+        .expect("try_generate");
+    assert_eq!(pending.unverified_generated_tokens, expected_tokens);
+
+    let _ = shut_tx.send(true);
+    let s1 = w1.await.expect("join w1").expect("w1 ok");
+    let _s2 = w2.await.expect("join w2").expect("w2 ok");
+
+    let stopped_snap = telemetry.snapshot();
+    let stopped_shard = stopped_snap.shard.as_ref().expect("stopped shard");
+    assert_eq!(stopped_shard.phase, PartialShardPhase::Stopped);
+    assert!(!stopped_shard.lease_live);
+    assert!(stopped_shard.assigned_range.is_none());
+    assert_eq!(stopped_shard.steps_executed, s1.steps_executed);
+    assert_eq!(stopped_shard.steps_submitted, s1.steps_submitted);
+    assert_eq!(stopped_snap.jobs_completed, 0);
+    assert_eq!(stopped_snap.jobs_verified, 0);
+    assert!(!stopped_shard.rewards_enabled && !stopped_shard.reward_eligible);
+
+    let fatal_telem = Arc::new(CommunityWorkerStatus::new_sharded(
+        "0xfatal",
+        "fatal-w",
+        "arc-4L-16d-2h-32v",
+        spec.model_id.to_hex(),
+        spec.n_layers,
+        false,
+    ));
+    let mut bad_cfg = worker_config(&base_url, &node, "fatal-w");
+    bad_cfg.coordinator_id = arc_crypto::hash_bytes(b"wrong-coord-pin");
+    bad_cfg.telemetry = Some(Arc::clone(&fatal_telem).into());
+    let (_tx, rx) = watch::channel(false);
+    let err = run_community_shard_worker(
+        bad_cfg,
+        Arc::new(KeyPair::generate_ed25519()),
+        spec,
+        partial_loader(full),
+        rx,
+    )
+    .await
+    .unwrap_err();
+    srv.abort();
+    assert!(matches!(
+        err,
+        CommunityShardWorkerError::AuthenticationOrAuthorization { status: 403, .. }
+    ));
+    let failed_snap = fatal_telem.snapshot();
+    let failed_shard = failed_snap.shard.as_ref().expect("failed shard");
+    assert_eq!(failed_shard.phase, PartialShardPhase::Failed);
+    assert!(!failed_shard.lease_live);
+    assert!(
+        failed_shard
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("403"))
+    );
+    assert_eq!(failed_snap.coordinators_registered, 0);
+}

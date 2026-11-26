@@ -2284,12 +2284,158 @@ pub async fn fetch_worker_status(
 }
 
 pub(crate) fn worker_status_from_json(value: &Value) -> crate::types::WorkerStatus {
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    worker_status_from_json_at(value, now_unix_ms)
+}
+
+fn sanitize_worker_error(raw: &str) -> String {
+    const MAX_BYTES: usize = 240;
+    let mut cleaned = String::new();
+    let mut last_space = true;
+    for ch in raw.chars() {
+        if ch.is_control() || ch.is_whitespace() {
+            if !last_space {
+                cleaned.push(' ');
+                last_space = true;
+            }
+        } else {
+            cleaned.push(ch);
+            last_space = false;
+        }
+        if cleaned.len() >= MAX_BYTES {
+            break;
+        }
+    }
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return "worker error".to_string();
+    }
+    let mut end = trimmed.len().min(MAX_BYTES);
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    trimmed[..end].to_string()
+}
+
+fn partial_shard_status_from_json(
+    value: &Value,
+    now_unix_ms: u64,
+) -> crate::types::PartialShardWorkerStatus {
+    let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
+    let count = |key: &str| value.get(key).and_then(Value::as_u64);
+    let flag = |key: &str| value.get(key).and_then(Value::as_bool).unwrap_or(false);
+    let raw_phase = value.get("phase").and_then(Value::as_str);
+    let mut phase = match raw_phase {
+        Some(
+            valid @ ("starting" | "loading" | "ready" | "computing" | "reconnecting" | "failed"
+            | "stopped"),
+        ) => Some(valid.to_string()),
+        _ => None,
+    };
+    let mut lease_seq = count("lease_seq");
+    let mut lease_epoch = count("lease_epoch");
+    let mut assigned_range = value.get("assigned_range").and_then(|r| {
+        let start_layer = r.get("start_layer")?.as_u64()?;
+        let end_layer = r.get("end_layer")?.as_u64()?;
+        let total_layers = r.get("total_layers")?.as_u64()?;
+        (total_layers >= 2
+            && start_layer < end_layer
+            && end_layer <= total_layers
+            && end_layer - start_layer < total_layers)
+            .then_some(crate::types::PartialShardRangeStatus {
+                start_layer,
+                end_layer,
+                total_layers,
+            })
+    });
+    let mut ready_expires_at_unix_ms = count("ready_expires_at_unix_ms");
+    let lease_live = matches!(phase.as_deref(), Some("ready" | "computing"))
+        && flag("lease_live")
+        && assigned_range.is_some()
+        && lease_seq.is_some_and(|seq| seq > 0)
+        && lease_epoch.is_some_and(|epoch| epoch > 0)
+        && ready_expires_at_unix_ms.is_some_and(|exp| now_unix_ms < exp);
+    if matches!(phase.as_deref(), Some("ready" | "computing")) && !lease_live {
+        phase = Some("reconnecting".to_string());
+        lease_seq = None;
+        lease_epoch = None;
+        assigned_range = None;
+        ready_expires_at_unix_ms = None;
+    }
+    let last_error = value
+        .get("last_error")
+        .and_then(Value::as_str)
+        .map(sanitize_worker_error);
+    crate::types::PartialShardWorkerStatus {
+        phase,
+        model_name: text("model_name"),
+        model_id: text("model_id"),
+        lease_seq,
+        lease_epoch,
+        assigned_range,
+        ready_expires_at_unix_ms,
+        lease_live,
+        steps_executed: count("steps_executed"),
+        steps_submitted: count("steps_submitted"),
+        submit_retries: count("submit_retries"),
+        submit_stale_conflicts: count("submit_stale_conflicts"),
+        cancellations_applied: count("cancellations_applied"),
+        rebalances_completed: count("rebalances_completed"),
+        reconnect_attempts: count("reconnect_attempts"),
+        last_heartbeat_unix_ms: count("last_heartbeat_unix_ms"),
+        last_step_submitted_unix_ms: count("last_step_submitted_unix_ms"),
+        last_error,
+        rewards_enabled: false,
+        reward_eligible: false,
+    }
+}
+
+pub(crate) fn worker_status_from_json_at(
+    value: &Value,
+    now_unix_ms: u64,
+) -> crate::types::WorkerStatus {
     let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
     let count = |key: &str| value.get(key).and_then(Value::as_u64);
     let small = |key: &str| count(key).and_then(|n| u32::try_from(n).ok());
+    let mode = match value.get("mode") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(mode)) => Some(mode.clone()),
+        Some(_) => Some("unrecognized".to_string()),
+    };
+    let shard = value
+        .get("shard")
+        .filter(|v| v.is_object())
+        .map(|v| partial_shard_status_from_json(v, now_unix_ms));
+    let (running, unavailable) = if mode.as_deref() == Some("partial_shard") {
+        match shard.as_ref().and_then(|s| s.phase.as_deref()) {
+            Some("failed") => (
+                false,
+                shard
+                    .as_ref()
+                    .and_then(|s| s.last_error.clone())
+                    .or_else(|| Some("Partial worker stopped after an error.".to_string())),
+            ),
+            Some("stopped") => (false, Some("Partial worker stopped.".to_string())),
+            Some("starting" | "loading" | "ready" | "computing" | "reconnecting") => (true, None),
+            _ => (
+                false,
+                Some("Partial worker reported an unrecognized status.".to_string()),
+            ),
+        }
+    } else if mode.is_none() && value.get("shard").is_none_or(Value::is_null) {
+        (true, None)
+    } else {
+        (
+            false,
+            Some("Worker reported an unrecognized mode.".to_string()),
+        )
+    };
     crate::types::WorkerStatus {
-        running: true,
-        unavailable: None,
+        running,
+        unavailable,
         state: text("state"),
         public_name: text("public_name"),
         coordinators_registered: small("coordinators_registered"),
@@ -2304,6 +2450,157 @@ pub(crate) fn worker_status_from_json(value: &Value) -> crate::types::WorkerStat
         prevent_sleep_during_jobs: value
             .get("prevent_sleep_during_jobs")
             .and_then(Value::as_bool),
+        mode,
+        shard,
+    }
+}
+
+#[cfg(test)]
+mod partial_worker_status_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn whole_worker_payload_preserves_legacy_parsing() {
+        let parsed = worker_status_from_json_at(
+            &json!({
+                "state": "polling",
+                "public_name": "node-a",
+                "coordinators_registered": 1,
+                "coordinators_total": 2,
+                "jobs_completed": 3,
+                "jobs_verified": 2
+            }),
+            10_000,
+        );
+        assert!(parsed.running);
+        assert!(parsed.unavailable.is_none());
+        assert!(parsed.mode.is_none());
+        assert!(parsed.shard.is_none());
+        assert_eq!(parsed.jobs_completed, Some(3));
+        assert_eq!(parsed.jobs_verified, Some(2));
+    }
+
+    #[test]
+    fn partial_shard_parser_requires_valid_live_range_and_expires_computing() {
+        let live = json!({
+            "mode": "partial_shard",
+            "shard": {
+                "phase": "computing",
+                "lease_seq": 1,
+                "lease_epoch": 1,
+                "assigned_range": {"start_layer": 0, "end_layer": 2, "total_layers": 4},
+                "lease_live": true,
+                "ready_expires_at_unix_ms": 200
+            }
+        });
+        assert!(
+            worker_status_from_json_at(&live, 199)
+                .shard
+                .unwrap()
+                .lease_live
+        );
+        for field in ["lease_seq", "lease_epoch", "assigned_range"] {
+            let mut malformed = live.clone();
+            malformed["shard"].as_object_mut().unwrap().remove(field);
+            let parsed = worker_status_from_json_at(&malformed, 199).shard.unwrap();
+            assert!(!parsed.lease_live);
+            assert_eq!(parsed.phase.as_deref(), Some("reconnecting"));
+            assert!(parsed.assigned_range.is_none());
+        }
+        let expired = worker_status_from_json_at(&live, 200).shard.unwrap();
+        assert_eq!(expired.phase.as_deref(), Some("reconnecting"));
+        assert!(expired.lease_epoch.is_none() && expired.lease_seq.is_none());
+        let mut full_range = live.clone();
+        full_range["shard"]["assigned_range"]["end_layer"] = json!(4);
+        assert!(
+            !worker_status_from_json_at(&full_range, 199)
+                .shard
+                .unwrap()
+                .lease_live
+        );
+        let unknown =
+            worker_status_from_json_at(&json!({"mode": "unknown", "state": "polling"}), 199);
+        assert!(!unknown.running);
+        for payload in [json!({"mode": 7}), json!({"shard": {}})] {
+            assert!(!worker_status_from_json_at(&payload, 199).running);
+        }
+        for field in ["lease_seq", "lease_epoch"] {
+            let mut zero = live.clone();
+            zero["shard"][field] = json!(0);
+            assert!(
+                !worker_status_from_json_at(&zero, 199)
+                    .shard
+                    .unwrap()
+                    .lease_live
+            );
+        }
+    }
+
+    #[test]
+    fn partial_shard_parser_clears_expired_ready_and_marks_failed_or_unknown_stopped() {
+        let live = json!({
+            "state": "polling",
+            "mode": "partial_shard",
+            "jobs_completed": 0,
+            "jobs_verified": 0,
+            "shard": {
+                "phase": "ready",
+                "model_name": "arc-4L-16d",
+                "model_id": "abcd",
+                "lease_seq": 2,
+                "lease_epoch": 1,
+                "assigned_range": { "start_layer": 0, "end_layer": 2, "total_layers": 4 },
+                "ready_expires_at_unix_ms": 20_000,
+                "lease_live": true,
+                "steps_executed": 5,
+                "steps_submitted": 5,
+                "rewards_enabled": false,
+                "reward_eligible": false
+            }
+        });
+        let active = worker_status_from_json_at(&live, 19_000);
+        assert!(active.running);
+        let shard = active.shard.as_ref().unwrap();
+        assert_eq!(shard.phase.as_deref(), Some("ready"));
+        assert!(shard.lease_live);
+        assert!(shard.assigned_range.is_some());
+        assert!(!shard.rewards_enabled && !shard.reward_eligible);
+
+        let expired = worker_status_from_json_at(&live, 20_000);
+        assert!(expired.running);
+        let exp_shard = expired.shard.as_ref().unwrap();
+        assert_eq!(exp_shard.phase.as_deref(), Some("reconnecting"));
+        assert!(!exp_shard.lease_live);
+        assert!(exp_shard.assigned_range.is_none());
+        assert!(exp_shard.lease_seq.is_none());
+
+        let failed = worker_status_from_json_at(
+            &json!({
+                "state": "reconnecting",
+                "mode": "partial_shard",
+                "shard": {
+                    "phase": "failed",
+                    "lease_live": false,
+                    "last_error": "HTTP 403\n\tauth rejected",
+                    "rewards_enabled": false,
+                    "reward_eligible": false
+                }
+            }),
+            10_000,
+        );
+        assert!(!failed.running);
+        assert_eq!(
+            failed.unavailable.as_deref(),
+            Some("HTTP 403 auth rejected")
+        );
+
+        let unknown = worker_status_from_json_at(
+            &json!({ "mode": "partial_shard", "shard": { "phase": "mystery" } }),
+            10_000,
+        );
+        assert!(!unknown.running);
+        assert!(unknown.unavailable.is_some());
     }
 }
 

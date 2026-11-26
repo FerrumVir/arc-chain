@@ -355,6 +355,11 @@ a create-only candidate. Its receipt is explicitly unqualified: capture of the
 remaining state, signed finality checks and full peer qualification are still
 required. It neither stops a service nor replaces any live state.
 
+The optional `partial_shard` worker status reports loading, lease expiry,
+reconnects, and partial steps separately from whole jobs. Expired ready or
+computing leases clear their displayed range; partial steps do not count as
+whole answers or rewards. Legacy whole-worker payloads omit these fields.
+
 `scripts/qualification/run-recovery-peer-tests.py` runs the exact mandatory
 recovery and sharding tests on a single build worker and rejects missing cases
 or ignored tests. Use the `recovery-peer` mode of the Linux candidate workflow

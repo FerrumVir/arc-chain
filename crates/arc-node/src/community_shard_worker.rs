@@ -12,6 +12,7 @@ use crate::community_sharding::{
     ShardLeaseResponse, ShardReleaseRequest, ShardReleaseResponse, ShardStepOutcome,
     ShardStepSubmitRequest, ShardStepSubmitResponse, ShardStepWork, TrustedModelSpec,
 };
+use crate::community_worker::CommunityWorkerStatus;
 use crate::rpc::community_shard_http::{
     COMMUNITY_SHARD_CAPABILITY, COMMUNITY_SHARD_CLAIM_STEP_PATH, COMMUNITY_SHARD_HEARTBEAT_PATH,
     COMMUNITY_SHARD_LEASE_PATH, COMMUNITY_SHARD_RELEASE_PATH,
@@ -70,6 +71,33 @@ const MAX_RELEASE_TRANSIENT_ATTEMPTS: usize = 2;
 pub type PartialModelLoader =
     Arc<dyn Fn(&ShardLeaseAssignment) -> anyhow::Result<Arc<CachedIntegerModel>> + Send + Sync>;
 
+#[derive(Clone, Debug)]
+pub struct ShardWorkerTelemetrySink(Arc<CommunityWorkerStatus>);
+
+impl ShardWorkerTelemetrySink {
+    pub fn new(status: Arc<CommunityWorkerStatus>) -> Self {
+        Self(status)
+    }
+
+    pub fn status(&self) -> &Arc<CommunityWorkerStatus> {
+        &self.0
+    }
+}
+
+impl From<Arc<CommunityWorkerStatus>> for ShardWorkerTelemetrySink {
+    fn from(status: Arc<CommunityWorkerStatus>) -> Self {
+        Self(status)
+    }
+}
+
+impl PartialEq for ShardWorkerTelemetrySink {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ShardWorkerTelemetrySink {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommunityShardWorkerConfig {
     pub coordinator_base_url: String,
@@ -95,6 +123,7 @@ pub struct CommunityShardWorkerConfig {
     pub max_consecutive_lease_reacquires: usize,
     pub reconnect_base_backoff_ms: u64,
     pub reconnect_max_backoff_ms: u64,
+    pub telemetry: Option<ShardWorkerTelemetrySink>,
 }
 
 impl CommunityShardWorkerConfig {
@@ -131,6 +160,7 @@ impl CommunityShardWorkerConfig {
             max_consecutive_lease_reacquires: DEFAULT_MAX_CONSECUTIVE_LEASE_REACQUIRES,
             reconnect_base_backoff_ms: DEFAULT_RECONNECT_BASE_BACKOFF_MS,
             reconnect_max_backoff_ms: DEFAULT_RECONNECT_MAX_BACKOFF_MS,
+            telemetry: None,
         }
     }
 
@@ -381,6 +411,7 @@ enum CancellableCall<T> {
 enum HeartbeatOutcome {
     Continue {
         cancellations: Vec<SessionCancellationNotice>,
+        expires_at_unix_ms: Option<u64>,
     },
     Transient,
     Rebalance(ShardLeaseAssignment),
@@ -474,7 +505,16 @@ pub async fn run_community_shard_worker(
     loader: PartialModelLoader,
     shutdown: watch::Receiver<bool>,
 ) -> Result<WorkerRunSummary, CommunityShardWorkerError> {
-    let mut runtime = WorkerRuntime::new(config, keypair, model_spec, loader, shutdown)?;
+    let telemetry = config.telemetry.clone();
+    let mut runtime = match WorkerRuntime::new(config, keypair, model_spec, loader, shutdown) {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            if let Some(sink) = telemetry.as_ref() {
+                sink.status().record_shard_failed(&err.to_string());
+            }
+            return Err(err);
+        }
+    };
     let final_result = loop {
         match runtime.run().await {
             Ok(()) => break Ok(()),
@@ -487,6 +527,10 @@ pub async fn run_community_shard_worker(
         }
     };
     runtime.cleanup_on_exit().await;
+    match &final_result {
+        Ok(()) => runtime.telemetry(|status| status.record_shard_stopped()),
+        Err(err) => runtime.telemetry(|status| status.record_shard_failed(&err.to_string())),
+    }
     final_result?;
     Ok(runtime.summary)
 }
@@ -611,10 +655,20 @@ impl WorkerRuntime {
             self.active_lease = Some(assignment.clone());
             self.summary.clean_release_sent = false;
             self.consecutive_heartbeat_transients = 0;
+            self.telemetry(|status| {
+                status.record_shard_loading(
+                    assignment.lease_id.seq,
+                    assignment.lease_epoch,
+                    assignment.range.start_layer,
+                    assignment.range.end_layer,
+                    self.model_spec.n_layers,
+                )
+            });
             match self.load_and_bind_lease(assignment).await? {
                 LoadOutcome::Bound => {
                     if is_rebalance {
                         self.summary.rebalances_completed += 1;
+                        self.telemetry(|status| status.record_shard_rebalance_completed());
                     }
                 }
                 LoadOutcome::Rebalance(next) => {
@@ -624,6 +678,9 @@ impl WorkerRuntime {
                 LoadOutcome::Reacquire {
                     needs_reregister: rereg,
                 } => {
+                    self.telemetry(|status| {
+                        status.record_shard_reconnecting("lease reacquire required")
+                    });
                     self.release_local_and_remote().await;
                     needs_reregister = rereg;
                     if !self.wait_reacquire_backoff().await? {
@@ -646,6 +703,9 @@ impl WorkerRuntime {
                 StepCycleOutcome::Reacquire {
                     needs_reregister: rereg,
                 } => {
+                    self.telemetry(|status| {
+                        status.record_shard_reconnecting("lease reacquire required")
+                    });
                     self.release_local_and_remote().await;
                     needs_reregister = rereg;
                     if !self.wait_reacquire_backoff().await? {
@@ -663,6 +723,9 @@ impl WorkerRuntime {
                 StepCycleOutcome::Reacquire {
                     needs_reregister: rereg,
                 } => {
+                    self.telemetry(|status| {
+                        status.record_shard_reconnecting("lease reacquire required")
+                    });
                     self.release_local_and_remote().await;
                     needs_reregister = rereg;
                     if !self.wait_reacquire_backoff().await? {
@@ -671,6 +734,15 @@ impl WorkerRuntime {
                 }
                 StepCycleOutcome::Shutdown => return Ok(()),
             }
+        }
+    }
+
+    fn telemetry<F>(&self, f: F)
+    where
+        F: FnOnce(&CommunityWorkerStatus),
+    {
+        if let Some(sink) = self.config.telemetry.as_ref() {
+            f(sink.status());
         }
     }
 
@@ -688,6 +760,7 @@ impl WorkerRuntime {
         }
         self.consecutive_reconnects = self.consecutive_reconnects.saturating_add(1);
         self.summary.reconnect_attempts = self.summary.reconnect_attempts.saturating_add(1);
+        self.telemetry(|status| status.record_shard_reconnect_attempt(&error.to_string()));
         let backoff_ms = compute_backoff_ms(
             self.config.reconnect_base_backoff_ms,
             self.config.reconnect_max_backoff_ms,
@@ -836,6 +909,7 @@ impl WorkerRuntime {
                         });
                     }
                     self.summary.registrations += 1;
+                    self.telemetry(|status| status.record_shard_registered());
                     return Ok(RegisterOutcome::Registered);
                 }
                 CancellableCall::Completed(HttpCallResult::HttpError { status, body }) => {
@@ -969,6 +1043,7 @@ impl WorkerRuntime {
                     match self.send_heartbeat_once(&assignment, false).await {
                         HeartbeatOutcome::Continue { .. } => {
                             next_hb = self.next_heartbeat_deadline();
+                            self.telemetry(|status| status.record_shard_heartbeat_provisioning());
                         }
                         HeartbeatOutcome::Transient => {
                             next_hb = self.next_transient_heartbeat_deadline();
@@ -1051,7 +1126,24 @@ impl WorkerRuntime {
                 });
             }
             match self.send_heartbeat_once(&assignment, true).await {
-                HeartbeatOutcome::Continue { cancellations } => {
+                HeartbeatOutcome::Continue {
+                    cancellations,
+                    expires_at_unix_ms,
+                } => {
+                    if let Some(expires) = expires_at_unix_ms {
+                        self.telemetry(|status| {
+                            status.record_shard_ready(
+                                assignment.lease_id.seq,
+                                assignment.lease_epoch,
+                                crate::community_worker::PartialShardLayerRangeSnapshot {
+                                    start_layer: assignment.range.start_layer,
+                                    end_layer: assignment.range.end_layer,
+                                    total_layers: self.model_spec.n_layers,
+                                },
+                                expires,
+                            )
+                        });
+                    }
                     self.apply_cancellations(&cancellations)?;
                     return Ok(StepCycleOutcome::Continue);
                 }
@@ -1171,7 +1263,9 @@ impl WorkerRuntime {
                                 .execute_and_submit_step(*work, &mut next_heartbeat_at)
                                 .await?
                             {
-                                StepCycleOutcome::Continue => {}
+                                StepCycleOutcome::Continue => {
+                                    self.telemetry(|status| status.record_shard_idle_ready());
+                                }
                                 other => return Ok(other),
                             }
                         }
@@ -1266,6 +1360,7 @@ impl WorkerRuntime {
         let mut exec = self.executor.take().ok_or_else(|| {
             CommunityShardWorkerError::InvalidLease("executor unbound during step".to_string())
         })?;
+        self.telemetry(|status| status.record_shard_computing());
         let coord_id = self.config.coordinator_id;
         let prevent_sleep_during_jobs = self.config.prevent_sleep_during_jobs;
         let work_for_exec = work.clone();
@@ -1298,8 +1393,14 @@ impl WorkerRuntime {
                 res = &mut exec_handle => break res,
                 _ = tokio::time::sleep_until(next_hb) => {
                     match self.send_heartbeat_once(&assignment, true).await {
-                        HeartbeatOutcome::Continue { cancellations } => {
+                        HeartbeatOutcome::Continue {
+                            cancellations,
+                            expires_at_unix_ms,
+                        } => {
                             *next_heartbeat_at = self.next_heartbeat_deadline();
+                            if let Some(expires) = expires_at_unix_ms {
+                                self.telemetry(|status| status.record_shard_heartbeat_active(expires));
+                            }
                             for notice in cancellations {
                                 if notice.session_id == work.session_id
                                     && notice.lease_id == assignment.lease_id
@@ -1365,6 +1466,7 @@ impl WorkerRuntime {
         let (submit_req, is_completed) = match exec_outcome {
             Ok(req) => {
                 self.summary.steps_executed += 1;
+                self.telemetry(|status| status.record_shard_step_executed());
                 (req, true)
             }
             Err(err) => match classify_executor_error(err)? {
@@ -1436,8 +1538,14 @@ impl WorkerRuntime {
                     });
                 };
                 match self.send_heartbeat_once(&assignment, true).await {
-                    HeartbeatOutcome::Continue { cancellations } => {
+                    HeartbeatOutcome::Continue {
+                        cancellations,
+                        expires_at_unix_ms,
+                    } => {
                         *next_heartbeat_at = self.next_heartbeat_deadline();
+                        if let Some(expires) = expires_at_unix_ms {
+                            self.telemetry(|status| status.record_shard_heartbeat_active(expires));
+                        }
                         let cancelled = cancellations.iter().any(|notice| {
                             notice.session_id == submit_req.session_id
                                 && notice.lease_id == assignment.lease_id
@@ -1478,10 +1586,12 @@ impl WorkerRuntime {
                     if resp.accepted {
                         if is_completed {
                             self.summary.steps_submitted += 1;
+                            self.telemetry(|status| status.record_shard_step_submitted());
                         }
                         return Ok(SubmitOutcome::Accepted);
                     }
                     self.summary.submit_stale_conflicts += 1;
+                    self.telemetry(|status| status.record_shard_submit_stale_conflict());
                     return Ok(SubmitOutcome::StaleOrExpired);
                 }
                 CancellableCall::Completed(HttpCallResult::HttpError { status, body }) => {
@@ -1499,6 +1609,7 @@ impl WorkerRuntime {
                     }
                     if is_submit_terminal_step_stale(status, &body) {
                         self.summary.submit_stale_conflicts += 1;
+                        self.telemetry(|status| status.record_shard_submit_stale_conflict());
                         return Ok(SubmitOutcome::StaleOrExpired);
                     }
                     if matches!(
@@ -1521,6 +1632,7 @@ impl WorkerRuntime {
                 CancellableCall::Completed(HttpCallResult::Transient(_)) => {
                     attempt = attempt.saturating_add(1);
                     self.summary.submit_retries += 1;
+                    self.telemetry(|status| status.record_shard_submit_retry());
                     let now_ms = checked_now_unix_ms()?;
                     if now_ms >= deadline_unix_ms {
                         return Ok(SubmitOutcome::StaleOrExpired);
@@ -1585,8 +1697,14 @@ impl WorkerRuntime {
                     });
                 };
                 match self.send_heartbeat_once(&assignment, true).await {
-                    HeartbeatOutcome::Continue { cancellations } => {
+                    HeartbeatOutcome::Continue {
+                        cancellations,
+                        expires_at_unix_ms,
+                    } => {
                         *next_heartbeat_at = self.next_heartbeat_deadline();
+                        if let Some(expires) = expires_at_unix_ms {
+                            self.telemetry(|status| status.record_shard_heartbeat_active(expires));
+                        }
                         let cancelled_watched = watched_session.is_some_and(|sid| {
                             cancellations.iter().any(|notice| {
                                 notice.session_id == sid
@@ -1633,8 +1751,14 @@ impl WorkerRuntime {
         next_heartbeat_at: &mut Instant,
     ) -> Result<StepCycleOutcome, CommunityShardWorkerError> {
         match self.send_heartbeat_once(assignment, true).await {
-            HeartbeatOutcome::Continue { cancellations } => {
+            HeartbeatOutcome::Continue {
+                cancellations,
+                expires_at_unix_ms,
+            } => {
                 *next_heartbeat_at = self.next_heartbeat_deadline();
+                if let Some(expires) = expires_at_unix_ms {
+                    self.telemetry(|status| status.record_shard_heartbeat_active(expires));
+                }
                 self.apply_cancellations(&cancellations)?;
                 Ok(StepCycleOutcome::Continue)
             }
@@ -1704,6 +1828,7 @@ impl WorkerRuntime {
                         }
                         HeartbeatOutcome::Continue {
                             cancellations: resp.cancellations,
+                            expires_at_unix_ms: None,
                         }
                     }
                     HeartbeatDirective::Active { expires_at_unix_ms } if ready => {
@@ -1718,6 +1843,7 @@ impl WorkerRuntime {
                         }
                         HeartbeatOutcome::Continue {
                             cancellations: resp.cancellations,
+                            expires_at_unix_ms: Some(expires_at_unix_ms),
                         }
                     }
                     HeartbeatDirective::Rebalance { assignment: next } => {
@@ -1795,6 +1921,9 @@ impl WorkerRuntime {
             match exec.apply_cancellation(self.config.coordinator_id, now_ms, notice) {
                 Ok(_) => {
                     self.summary.cancellations_applied += 1;
+                    if let Some(sink) = self.config.telemetry.as_ref() {
+                        sink.status().record_shard_cancellation_applied();
+                    }
                 }
                 Err(
                     ShardExecutorError::ExecutorReleased

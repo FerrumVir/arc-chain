@@ -205,6 +205,16 @@ impl ManagedLaunchPlan {
         self
     }
 
+    fn resume_compute_mode(&self) -> Option<&ManagedComputeLaunchMode> {
+        if self.dropped_model.is_some()
+            && matches!(self.compute_mode, ManagedComputeLaunchMode::Observer)
+        {
+            None
+        } else {
+            Some(&self.compute_mode)
+        }
+    }
+
     fn verify(
         &self,
         lifecycle_lock: &ManagedLifecycleLock,
@@ -2134,7 +2144,7 @@ impl NodeManager {
             config,
             visible_ram_bytes,
             recovery_launch,
-            resume_plan.map(|plan| &plan.compute_mode),
+            resume_plan.and_then(ManagedLaunchPlan::resume_compute_mode),
             PRODUCTION_SHARD_COORDINATOR,
         )?;
         if recovery_launch && config.model_path.is_some() {

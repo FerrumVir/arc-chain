@@ -280,6 +280,7 @@ jobs:
         run: |
           cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib native_paid:: -- --test-threads=1
           cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib node_manager:: -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib partial_worker_status_tests:: -- --test-threads=1
       - name: Lint desktop lifecycle and worker integration
         run: cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --locked --lib --tests -- -D warnings
 

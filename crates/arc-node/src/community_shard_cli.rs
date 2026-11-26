@@ -1063,6 +1063,7 @@ pub async fn run(args: CommunityShardWorkerArgs) -> Result<()> {
 
 async fn drive_integrated_worker_task<F, Fut>(
     report: AdmissionReport,
+    status: Option<Arc<arc_node::community_worker::CommunityWorkerStatus>>,
     mut shutdown_rx: watch::Receiver<bool>,
     run_worker: F,
 ) where
@@ -1070,6 +1071,9 @@ async fn drive_integrated_worker_task<F, Fut>(
     Fut: Future<Output = std::result::Result<WorkerRunSummary, CommunityShardWorkerError>>,
 {
     if *shutdown_rx.borrow_and_update() {
+        if let Some(status) = status.as_ref() {
+            status.record_shard_stopped();
+        }
         tracing::info!(
             coordinator_url = %report.coordinator_url,
             "Integrated community shard worker skipped start because shutdown was already requested"
@@ -1124,9 +1128,21 @@ pub(crate) fn spawn_integrated_worker(
     let report = prepared.report;
     let mut config = prepared.config;
     config.auto_reconnect = true;
+    let status = arc_node::community_worker::install(Arc::new(
+        arc_node::community_worker::CommunityWorkerStatus::new_sharded(
+            format!("0x{}", keypair.address().to_hex()),
+            &report.worker_name,
+            &report.model_name,
+            &report.model_id,
+            report.n_layers,
+            config.prevent_sleep_during_jobs,
+        ),
+    ));
+    config.telemetry = Some(Arc::clone(&status).into());
     let model_spec = prepared.model_spec;
     Ok(tokio::spawn(drive_integrated_worker_task(
         report,
+        Some(status),
         shutdown_rx,
         move |worker_shutdown_rx| {
             run_community_shard_worker(config, keypair, model_spec, loader, worker_shutdown_rx)
@@ -1262,6 +1278,7 @@ mod tests {
         let drained_task = Arc::clone(&drained);
         let runtime_task = tokio::spawn(drive_integrated_worker_task(
             dummy_integrated_admission_report(),
+            None,
             runtime_shutdown_rx,
             move |mut shutdown_rx| async move {
                 let _ = started_tx.send(());
@@ -1289,6 +1306,7 @@ mod tests {
         let entered_task = Arc::clone(&entered);
         drive_integrated_worker_task(
             dummy_integrated_admission_report(),
+            None,
             runtime_shutdown_rx,
             move |_shutdown_rx| async move {
                 entered_task.store(true, Ordering::Release);
