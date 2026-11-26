@@ -381,6 +381,14 @@ fn may_take(state: &mut RoutingState, node: &NodeState, worker: &str, work: &mut
         workers.retain(|id| twin_dispatch::may_claim(node, &work.item.job_id, id));
     }
     let eligible = workers.iter().any(|id| id == worker);
+    if caller_twin
+        && eligible
+        && workers
+            .iter()
+            .all(|id| !state.seconds_per_position.contains_key(id))
+    {
+        return true;
+    }
     if work.chosen.as_ref().is_none_or(|id| !workers.contains(id)) {
         work.chosen = choose(state, &mut workers, work.explore);
         tracing::debug!(job_id = %work.item.job_id, chosen_worker = ?work.chosen,

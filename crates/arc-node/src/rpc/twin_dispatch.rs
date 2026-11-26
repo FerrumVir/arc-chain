@@ -3221,6 +3221,20 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn caller_twins_do_not_delay_a_waiter_without_measured_speed_alternatives() {
+        for reserve in [0, 1] {
+            for source in [DemandSource::PublicRequest, DemandSource::PublicDemo] {
+                let node = fanout_node(3, reserve, 8);
+                community_routing::assigned(&node, "worker-2");
+                let id = enqueue_latency_group(&node, source);
+                let start = tokio::time::Instant::now();
+                assert_eq!(poll_latency(&node, "worker-2").await.unwrap().job_id, id);
+                assert_eq!(start.elapsed(), Duration::ZERO);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn caller_twins_reselect_when_the_fastest_waiter_disappears() {
         for reserve in [0, 1] {
