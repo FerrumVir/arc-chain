@@ -508,7 +508,7 @@ fn derive_all_roles_admission<A: ShardBudgetAdmitter>(
 ) -> Result<AllRolesAdmissionReport> {
     let n_layers = admitter.n_layers();
     ensure!(
-        n_layers >= 2 && n_layers <= MAX_MODEL_LAYERS_HARD_CAP,
+        (2..=MAX_MODEL_LAYERS_HARD_CAP).contains(&n_layers),
         "model n_layers {n_layers} must be in 2..={MAX_MODEL_LAYERS_HARD_CAP} for partial sharding"
     );
     let protocol_max = admitter.max_shard_layers().min(n_layers - 1);

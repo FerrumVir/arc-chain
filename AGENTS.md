@@ -279,6 +279,11 @@ its exact result digest, coverage, token limits and EOS, then uses the existing
 validator quorum verification before returning output. It shares the public
 inference capacity limit. Rewards remain disabled for these multi-worker results.
 This transport alone does not activate desktop nodes.
+The rollout manifest's optional `gateway.community_sharding` boolean adds the
+exact shard routes and coordinator flag only when enabled. Disabled rendering
+preserves the sealed gateway bytes. Metadata and public requests are capped at
+16 KiB, step submissions at 2 MiB, with a separate worker rate limit. The
+validator IP restrictions and interlock remain required for every upstream.
 
 `community_shard_executor.rs` executes only the assigned canonical partial
 model with per-session KV limits, exact-retry caching, cancellation retention,

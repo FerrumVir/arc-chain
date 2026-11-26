@@ -74,6 +74,7 @@ PROTECTED_FLAGS = {
     "--community",
     "--community-mode",
     "--community-rpc-url",
+    "--community-shard-coordinator",
     "--data-dir",
     "--enable-i16",
     "--genesis",
@@ -185,6 +186,24 @@ DEFAULT_PUBLIC_POST_PATHS = (
     "/tx/submit_batch",
     "/faucet/claim",
 )
+COMMUNITY_SHARD_STATUS_PATH = "/community/shards/status"
+COMMUNITY_SHARD_INFERENCE_PATH = "/inference/run_community_sharded"
+COMMUNITY_SHARD_METADATA_POST_PATHS = (
+    "/community/shards/lease",
+    "/community/shards/heartbeat",
+    "/community/shards/claim_step",
+    "/community/shards/release",
+)
+COMMUNITY_SHARD_SUBMIT_POST_PATH = "/community/shards/submit_step"
+COMMUNITY_SHARD_PUBLIC_GET_PATHS = (COMMUNITY_SHARD_STATUS_PATH,)
+COMMUNITY_SHARD_PUBLIC_POST_PATHS = (
+    COMMUNITY_SHARD_INFERENCE_PATH,
+    "/community/shards/lease",
+    "/community/shards/heartbeat",
+    "/community/shards/claim_step",
+    "/community/shards/submit_step",
+    "/community/shards/release",
+)
 PUBLIC_PARAMETERIZED_GET_PATHS = (
     "/block/{height}",
     "/block/{height}/txs",
@@ -220,6 +239,40 @@ NODE_SERVICE_RESTART_TIMEOUT_SECONDS = NODE_GRACEFUL_STOP_TIMEOUT_SECONDS + 60
 PRODUCTION_ROLLBACK_TIMEOUT_SECONDS = NODE_GRACEFUL_STOP_TIMEOUT_SECONDS + 300
 VALIDATOR_APPROVAL_TIMEOUT_SECONDS = 1500
 WORKER_SUBMIT_TIMEOUT_SECONDS = 2700
+COMMUNITY_SHARD_RATE_LIMIT_RPS = 100
+COMMUNITY_SHARD_RATE_BURST = 200
+COMMUNITY_SHARD_CONN_LIMIT_PER_IP = 32
+COMMUNITY_SHARD_PROXY_CONNECT_TIMEOUT_SECONDS = 5
+COMMUNITY_SHARD_STATUS_READ_TIMEOUT_SECONDS = 60
+COMMUNITY_SHARD_METADATA_TIMEOUT_SECONDS = 30
+COMMUNITY_SHARD_SUBMIT_TIMEOUT_SECONDS = 60
+
+
+def gateway_community_sharding_enabled(gateway: Mapping[str, Any]) -> bool:
+    if "community_sharding" not in gateway:
+        return False
+    raw = gateway["community_sharding"]
+    if type(raw) is not bool:
+        fail("manifest.gateway.community_sharding must be a boolean")
+    return raw
+
+
+def expected_public_get_paths(community_sharding: bool = False) -> tuple[str, ...]:
+    if type(community_sharding) is not bool:
+        fail("community_sharding flag must be a boolean")
+    if community_sharding:
+        return DEFAULT_PUBLIC_GET_PATHS + COMMUNITY_SHARD_PUBLIC_GET_PATHS
+    return DEFAULT_PUBLIC_GET_PATHS
+
+
+def expected_public_post_paths(community_sharding: bool = False) -> tuple[str, ...]:
+    if type(community_sharding) is not bool:
+        fail("community_sharding flag must be a boolean")
+    if community_sharding:
+        return DEFAULT_PUBLIC_POST_PATHS + COMMUNITY_SHARD_PUBLIC_POST_PATHS
+    return DEFAULT_PUBLIC_POST_PATHS
+
+
 LEGACY_ARCHIVE_USER = "arc-archive"
 CADDY_USER = "arc-caddy"
 NGINX_FILTER_USER = "arc-rpc-filter"
@@ -1933,7 +1986,7 @@ def validate_manifest(
         manifest["gateway"],
         "manifest.gateway",
         ("mode",),
-        ("acme_email", "public_get_paths", "public_post_paths"),
+        ("acme_email", "public_get_paths", "public_post_paths", "community_sharding"),
     )
     if mode == "local":
         if gateway != {"mode": "none"}:
@@ -1944,10 +1997,21 @@ def validate_manifest(
         email = required_string(gateway.get("acme_email"), "manifest.gateway.acme_email")
         if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
             fail("manifest.gateway.acme_email is invalid")
-        for key, expected in (("public_get_paths", DEFAULT_PUBLIC_GET_PATHS), ("public_post_paths", DEFAULT_PUBLIC_POST_PATHS)):
+        community_sharding = gateway_community_sharding_enabled(gateway)
+        for key, expected in (
+            ("public_get_paths", expected_public_get_paths(community_sharding)),
+            ("public_post_paths", expected_public_post_paths(community_sharding)),
+        ):
             paths = gateway.get(key)
             if paths != list(expected):
-                fail(f"manifest.gateway.{key} must exactly match the sealed protocol-v3 allowlist")
+                if community_sharding:
+                    fail(
+                        f"manifest.gateway.{key} must exactly match the sealed protocol-v3 "
+                        "community-sharding allowlist"
+                    )
+                fail(
+                    f"manifest.gateway.{key} must exactly match the sealed protocol-v3 allowlist"
+                )
 
     validators = manifest["validators"]
     if not isinstance(validators, list) or len(validators) != REQUIRED_VALIDATORS:
@@ -7167,6 +7231,12 @@ class RecoveryRollout:
             base += ["--data-dir", data_dir_override or node["data_dir"]]
         return base
 
+    def community_sharding_enabled(self) -> bool:
+        enabled = gateway_community_sharding_enabled(self.manifest["gateway"])
+        if enabled and self.manifest["mode"] != "production":
+            fail("community_sharding gateway extension is only permitted in production mode")
+        return enabled
+
     def runtime_argv(self, node: Mapping[str, Any], *, remote: bool = False) -> list[str]:
         if remote:
             root = node["remote_root"]
@@ -7177,6 +7247,7 @@ class RecoveryRollout:
             genesis = self.manifest["artifacts"]["genesis"]["path"]
         peers = [candidate["p2p_advertise"] for candidate in self.validators if candidate["name"] != node["name"]]
         community_origins = [candidate["rpc_url"] for candidate in self.validators]
+        community_sharding = self.community_sharding_enabled()
         inference_args: list[str] = []
         history_args: list[str] = []
         if self.manifest["mode"] == "production":
@@ -7184,6 +7255,8 @@ class RecoveryRollout:
             history_args = ["--archive"]
             for start, end in node["shard_ranges"]:
                 inference_args.extend(("--shard-range", f"{start}:{end}"))
+            if community_sharding:
+                inference_args.append("--community-shard-coordinator")
         rpc_args = ["--rpc", node["rpc_listen"]]
         if remote and self.manifest["mode"] == "production":
             rpc_args = ["--rpc-unix", self.validator_rpc_socket(node)]
@@ -7238,6 +7311,10 @@ class RecoveryRollout:
             self.say(
                 "  inference topology:          canonical Llama-2-7B / 32 layers / exact 3x replication / 16 layers per validator"
             )
+            if self.community_sharding_enabled():
+                self.say(
+                    "  community sharding:         enabled (--community-shard-coordinator; explicit shard routes; rewards disabled)"
+                )
         for node in self.validators:
             shard_note = ""
             if self.manifest["mode"] == "production":
@@ -10564,7 +10641,7 @@ WantedBy=multi-user.target
 
     def caddyfile(self, node: Mapping[str, Any]) -> str:
         get_paths = " ".join(self.manifest["gateway"]["public_get_paths"])
-        post_paths = " ".join(self.manifest["gateway"]["public_post_paths"])
+        community_sharding = self.community_sharding_enabled()
         validator_ips = " ".join(peer["host"] for peer in self.validators)
         public_filter = self.caddy_unix_upstream(self.filter_public_socket(node))
         archive_filter = self.caddy_unix_upstream(self.filter_archive_socket(node))
@@ -10572,6 +10649,76 @@ WantedBy=multi-user.target
             header_up Host 127.0.0.1
             header_up X-Forwarded-For {{remote_host}}
         }}"""
+        if community_sharding:
+            post_paths = " ".join(DEFAULT_PUBLIC_POST_PATHS)
+            preflight_post_paths = " ".join(
+                (*DEFAULT_PUBLIC_POST_PATHS, COMMUNITY_SHARD_INFERENCE_PATH)
+            )
+            shard_metadata_paths = " ".join(COMMUNITY_SHARD_METADATA_POST_PATHS)
+            community_shard_routes = f"""
+    @communityShardInferenceCors {{
+        method POST
+        header Origin {PUBLIC_BROWSER_ORIGIN}
+        path {COMMUNITY_SHARD_INFERENCE_PATH}
+    }}
+    handle @communityShardInferenceCors {{
+        header Access-Control-Allow-Origin "{PUBLIC_BROWSER_ORIGIN}"
+        header Vary "Origin"
+        request_body {{
+            max_size 16KiB
+        }}
+        reverse_proxy {public_filter} {{
+            header_up Host 127.0.0.1
+            header_up X-Forwarded-For {{remote_host}}
+        }}
+    }}
+
+    @communityShardInference {{
+        method POST
+        path {COMMUNITY_SHARD_INFERENCE_PATH}
+    }}
+    handle @communityShardInference {{
+        request_body {{
+            max_size 16KiB
+        }}
+        reverse_proxy {public_filter} {{
+            header_up Host 127.0.0.1
+            header_up X-Forwarded-For {{remote_host}}
+        }}
+    }}
+
+    @communityShardMetadata {{
+        method POST
+        path {shard_metadata_paths}
+    }}
+    handle @communityShardMetadata {{
+        request_body {{
+            max_size 16KiB
+        }}
+        reverse_proxy {public_filter} {{
+            header_up Host 127.0.0.1
+            header_up X-Forwarded-For {{remote_host}}
+        }}
+    }}
+
+    @communityShardSubmit {{
+        method POST
+        path {COMMUNITY_SHARD_SUBMIT_POST_PATH}
+    }}
+    handle @communityShardSubmit {{
+        request_body {{
+            max_size 2MiB
+        }}
+        reverse_proxy {public_filter} {{
+            header_up Host 127.0.0.1
+            header_up X-Forwarded-For {{remote_host}}
+        }}
+    }}
+"""
+        else:
+            post_paths = " ".join(self.manifest["gateway"]["public_post_paths"])
+            preflight_post_paths = post_paths
+            community_shard_routes = ""
         archive_route = ""
         if self.legacy_archive_for(node) is not None:
             prefix = f"/legacy/{node['name']}"
@@ -10676,7 +10823,7 @@ WantedBy=multi-user.target
         method OPTIONS
         header Origin {PUBLIC_BROWSER_ORIGIN}
         header Access-Control-Request-Method POST
-        path {post_paths}
+        path {preflight_post_paths}
     }}
     handle @writePreflight {{
         header Access-Control-Allow-Origin "{PUBLIC_BROWSER_ORIGIN}"
@@ -10748,7 +10895,7 @@ WantedBy=multi-user.target
             header_up X-Forwarded-For {{remote_host}}
         }}
     }}
-
+{community_shard_routes}
     @validatorApproval {{
         method POST
         path /internal/community/reward/approve
@@ -10823,6 +10970,62 @@ WantedBy=multi-user.target
         location / {{ return 404; }}
     }}
 """
+        community_shard_zones = ""
+        community_shard_locations = ""
+        if self.community_sharding_enabled():
+            community_shard_zones = (
+                f"\n    limit_req_zone $binary_remote_addr zone=arc_community_shard_{zone}:10m "
+                f"rate={COMMUNITY_SHARD_RATE_LIMIT_RPS}r/s;"
+                f"\n    limit_conn_zone $binary_remote_addr zone=arc_community_shard_conn_{zone}:10m;"
+            )
+            community_shard_locations = f"""
+        location = {COMMUNITY_SHARD_STATUS_PATH} {{
+            auth_request /__arc_interlock_gate;
+            limit_except GET OPTIONS {{ deny all; }}
+            client_max_body_size 1k;
+            limit_req zone=arc_read_{zone} burst=60 nodelay;
+            proxy_pass {upstream};
+            proxy_http_version 1.1;
+            proxy_connect_timeout {COMMUNITY_SHARD_PROXY_CONNECT_TIMEOUT_SECONDS}s;
+            proxy_read_timeout {COMMUNITY_SHARD_STATUS_READ_TIMEOUT_SECONDS}s;
+            proxy_send_timeout {COMMUNITY_SHARD_METADATA_TIMEOUT_SECONDS}s;
+        }}
+        location = {COMMUNITY_SHARD_INFERENCE_PATH} {{
+            auth_request /__arc_interlock_gate;
+            limit_except POST OPTIONS {{ deny all; }}
+            client_max_body_size 16k;
+            limit_req zone=arc_write_{zone} burst=10 nodelay;
+            limit_conn arc_conn_{zone} 4;
+            proxy_pass {upstream};
+            proxy_http_version 1.1;
+            proxy_connect_timeout {COMMUNITY_SHARD_PROXY_CONNECT_TIMEOUT_SECONDS}s;
+            proxy_read_timeout {PUBLIC_INFERENCE_TIMEOUT_SECONDS}s;
+            proxy_send_timeout 60s;
+        }}
+        location ~ ^/community/shards/(?:lease|heartbeat|claim_step|release)$ {{
+            auth_request /__arc_interlock_gate;
+            limit_except POST {{ deny all; }}
+            client_max_body_size 16k;
+            limit_req zone=arc_community_shard_{zone} burst={COMMUNITY_SHARD_RATE_BURST} nodelay;
+            limit_conn arc_community_shard_conn_{zone} {COMMUNITY_SHARD_CONN_LIMIT_PER_IP};
+            proxy_pass {upstream};
+            proxy_http_version 1.1;
+            proxy_connect_timeout {COMMUNITY_SHARD_PROXY_CONNECT_TIMEOUT_SECONDS}s;
+            proxy_read_timeout {COMMUNITY_SHARD_METADATA_TIMEOUT_SECONDS}s;
+            proxy_send_timeout {COMMUNITY_SHARD_METADATA_TIMEOUT_SECONDS}s;
+        }}
+        location = {COMMUNITY_SHARD_SUBMIT_POST_PATH} {{
+            auth_request /__arc_interlock_gate;
+            limit_except POST {{ deny all; }}
+            client_max_body_size 2m;
+            limit_req zone=arc_community_shard_{zone} burst={COMMUNITY_SHARD_RATE_BURST} nodelay;
+            limit_conn arc_community_shard_conn_{zone} {COMMUNITY_SHARD_CONN_LIMIT_PER_IP};
+            proxy_pass {upstream};
+            proxy_http_version 1.1;
+            proxy_connect_timeout {COMMUNITY_SHARD_PROXY_CONNECT_TIMEOUT_SECONDS}s;
+            proxy_read_timeout {COMMUNITY_SHARD_SUBMIT_TIMEOUT_SECONDS}s;
+            proxy_send_timeout {COMMUNITY_SHARD_SUBMIT_TIMEOUT_SECONDS}s;
+        }}"""
         return f"""daemon off;
 worker_processes 1;
 pid {root}/rpc-filter-state/nginx-filter.pid;
@@ -10836,7 +11039,7 @@ http {{
     limit_req_zone $binary_remote_addr zone=arc_read_{zone}:10m rate=30r/s;
     limit_req_zone $binary_remote_addr zone=arc_write_{zone}:10m rate=30r/m;
     limit_req_zone $binary_remote_addr zone=arc_shard_{zone}:10m rate=100r/s;
-    limit_conn_zone $binary_remote_addr zone=arc_conn_{zone}:10m;
+    limit_conn_zone $binary_remote_addr zone=arc_conn_{zone}:10m;{community_shard_zones}
     real_ip_header X-Forwarded-For;
     real_ip_recursive on;
     proxy_set_header Host 127.0.0.1;
@@ -10926,7 +11129,7 @@ http {{
             proxy_http_version 1.1;
             proxy_read_timeout 120s;
             proxy_send_timeout 30s;
-        }}
+        }}{community_shard_locations}
         location = /internal/community/reward/approve {{
             auth_request /__arc_interlock_gate;
 {allow_lines}
@@ -10957,9 +11160,42 @@ http {{
 """
 
     @staticmethod
+    def _extract_braced_blocks(text: str, headers: Iterable[str]) -> dict[str, str]:
+        wanted = set(headers)
+        found: dict[str, str] = {}
+        lines = text.splitlines()
+        index = 0
+        while index < len(lines):
+            header = lines[index].strip()
+            if header not in wanted:
+                index += 1
+                continue
+            if header in found:
+                fail(f"duplicate gateway config block: {header}")
+            block: list[str] = []
+            depth = 0
+            while index < len(lines):
+                current = lines[index]
+                block.append(current)
+                depth += current.count("{") - current.count("}")
+                index += 1
+                if depth == 0:
+                    break
+            if depth != 0:
+                fail(f"unterminated gateway config block: {header}")
+            found[header] = "\n".join(block)
+        return found
+
+    @staticmethod
     def validate_gateway_security_contract(
-        maintenance: str, live: str, rpc_filter: str
+        maintenance: str,
+        live: str,
+        rpc_filter: str,
+        *,
+        community_sharding: bool = False,
     ) -> None:
+        if type(community_sharding) is not bool:
+            fail("community_sharding contract flag must be a boolean")
         for label, config in (("maintenance Caddy", maintenance), ("live Caddy", live)):
             if config.count("admin off") != 1:
                 fail(f"{label} must disable the Caddy admin API exactly once")
@@ -10969,6 +11205,30 @@ http {{
             ):
                 if forbidden in config:
                     fail(f"{label} contains forbidden handler/configuration: {forbidden}")
+        community_shard_paths = (
+            *COMMUNITY_SHARD_PUBLIC_GET_PATHS,
+            *COMMUNITY_SHARD_PUBLIC_POST_PATHS,
+        )
+        community_shard_tokens = (
+            "/community/shards/",
+            "arc_community_shard_",
+            "@communityShard",
+        )
+        for forbidden in (*community_shard_paths, *community_shard_tokens):
+            if forbidden in maintenance:
+                fail(
+                    f"maintenance Caddy must not expose community shard configuration: {forbidden}"
+                )
+        maintenance_blocks = RecoveryRollout._extract_braced_blocks(
+            maintenance, ("@validatorControl {",)
+        )
+        maintenance_control = maintenance_blocks.get("@validatorControl {")
+        if (
+            maintenance_control is None
+            or "method POST" not in maintenance_control
+            or re.search(r"^\s*remote_ip\s+\S+", maintenance_control, re.MULTILINE) is None
+        ):
+            fail("maintenance Caddy weakens internal validator IP restriction")
         if "forward_auth" in rpc_filter:
             fail("RPC filter must not reintroduce a Caddy forward_auth handler")
         gate_proxy = "gate.sock:/gate;"
@@ -10978,8 +11238,12 @@ http {{
         proxy_count = rpc_filter.count("proxy_pass http://")
         auth_count = rpc_filter.count("auth_request /__arc_interlock_gate;")
         status_proxy_count = rpc_filter.count("gate.sock:/maintenance/status;")
+        expected_proxy_count = (14 if community_sharding else 10) + (
+            2 if gate_proxy_count == 2 else 0
+        )
+        expected_rpc_upstreams = 12 if community_sharding else 8
         if (
-            proxy_count not in {10, 12}
+            proxy_count != expected_proxy_count
             or status_proxy_count != 1
             or auth_count != proxy_count - gate_proxy_count - status_proxy_count
         ):
@@ -11033,7 +11297,7 @@ http {{
             or "127.0.0.1:18081" in rpc_filter
             or rpc_filter.count("proxy_pass http://unix:/run/arc-lfi-")
             != gate_proxy_count + 1
-            or rpc_filter.count("proxy_pass http://unix:/run/arc-v3-rpc-") != 8
+            or rpc_filter.count("proxy_pass http://unix:/run/arc-v3-rpc-") != expected_rpc_upstreams
             or rpc_filter.count("proxy_pass http://unix:/run/arc-archive-rpc-")
             != gate_proxy_count - 1
             or "proxy_pass http://127.0.0.1:" in rpc_filter
@@ -11050,6 +11314,153 @@ http {{
             != 1
         ):
             fail("RPC filter is not permission-sealed on exact Unix sockets")
+        if (
+            len(
+                re.findall(
+                    r"^\s*limit_req_zone \$binary_remote_addr zone=arc_write_[a-z0-9]{1,20}:10m rate=30r/m;\s*$",
+                    rpc_filter,
+                    re.MULTILINE,
+                )
+            )
+            != 1
+        ):
+            fail("RPC filter altered the ordinary 30r/m write rate zone")
+        internal_nginx_headers = (
+            "location = /internal/community/reward/approve {",
+            "location ~ ^/(?:shards/announce|inference/(?:forward_shard|cleanup_shard))$ {",
+        )
+        shard_nginx_headers = (
+            f"location = {COMMUNITY_SHARD_STATUS_PATH} {{",
+            f"location = {COMMUNITY_SHARD_INFERENCE_PATH} {{",
+            "location ~ ^/community/shards/(?:lease|heartbeat|claim_step|release)$ {",
+            f"location = {COMMUNITY_SHARD_SUBMIT_POST_PATH} {{",
+        )
+        nginx_blocks = RecoveryRollout._extract_braced_blocks(
+            rpc_filter, (*internal_nginx_headers, *shard_nginx_headers)
+        )
+        for header in internal_nginx_headers:
+            block = nginx_blocks.get(header)
+            if block is None:
+                fail(f"RPC filter omits internal validator route: {header}")
+            if (
+                re.search(r"^\s*allow [0-9a-zA-Z.:/-]+;\s*$", block, re.MULTILINE) is None
+                or re.search(r"^\s*deny all;\s*$", block, re.MULTILINE) is None
+                or "limit_except POST { deny all; }" not in block
+            ):
+                fail(f"RPC filter weakens internal validator IP/method restriction on {header}")
+        if not community_sharding:
+            for forbidden in (*community_shard_paths, *community_shard_tokens):
+                if forbidden in live:
+                    fail(
+                        f"live Caddy must not expose community shard configuration when disabled: {forbidden}"
+                    )
+                if forbidden in rpc_filter:
+                    fail(
+                        f"RPC filter must not expose community shard configuration when disabled: {forbidden}"
+                    )
+        else:
+            shard_rate_matches = re.findall(
+                r"^\s*limit_req_zone \$binary_remote_addr zone=arc_community_shard_[a-z0-9]{1,20}:10m rate=([0-9]+)r/s;\s*$",
+                rpc_filter,
+                re.MULTILINE,
+            )
+            if (
+                len(shard_rate_matches) != 1
+                or not (1 <= int(shard_rate_matches[0]) <= COMMUNITY_SHARD_RATE_LIMIT_RPS)
+            ):
+                fail("RPC filter must define an independent community shard rate zone <= 100r/s")
+            shard_conn_matches = re.findall(
+                r"^\s*limit_conn_zone \$binary_remote_addr zone=arc_community_shard_conn_[a-z0-9]{1,20}:10m;\s*$",
+                rpc_filter,
+                re.MULTILINE,
+            )
+            if len(shard_conn_matches) != 1:
+                fail("RPC filter must define an independent community shard connection zone")
+            status_block = nginx_blocks.get(shard_nginx_headers[0])
+            inference_block = nginx_blocks.get(shard_nginx_headers[1])
+            metadata_block = nginx_blocks.get(shard_nginx_headers[2])
+            submit_block = nginx_blocks.get(shard_nginx_headers[3])
+            if (
+                status_block is None
+                or inference_block is None
+                or metadata_block is None
+                or submit_block is None
+            ):
+                fail("RPC filter omits one or more required community shard locations")
+            if (
+                "limit_except GET OPTIONS { deny all; }" not in status_block
+                or "client_max_body_size 1k;" not in status_block
+                or re.search(
+                    r"^\s*limit_req zone=arc_read_[a-z0-9]{1,20} burst=60 nodelay;\s*$",
+                    status_block,
+                    re.MULTILINE,
+                )
+                is None
+                or f"proxy_connect_timeout {COMMUNITY_SHARD_PROXY_CONNECT_TIMEOUT_SECONDS}s;" not in status_block
+                or f"proxy_read_timeout {COMMUNITY_SHARD_STATUS_READ_TIMEOUT_SECONDS}s;" not in status_block
+                or f"proxy_send_timeout {COMMUNITY_SHARD_METADATA_TIMEOUT_SECONDS}s;" not in status_block
+            ):
+                fail("RPC filter community shard status route violates method/body/rate/timeout policy")
+            if (
+                "limit_except POST OPTIONS { deny all; }" not in inference_block
+                or "client_max_body_size 16k;" not in inference_block
+                or re.search(
+                    r"^\s*limit_req zone=arc_write_[a-z0-9]{1,20} burst=10 nodelay;\s*$",
+                    inference_block,
+                    re.MULTILINE,
+                )
+                is None
+                or re.search(
+                    r"^\s*limit_conn arc_conn_[a-z0-9]{1,20} 4;\s*$",
+                    inference_block,
+                    re.MULTILINE,
+                )
+                is None
+                or f"proxy_connect_timeout {COMMUNITY_SHARD_PROXY_CONNECT_TIMEOUT_SECONDS}s;" not in inference_block
+                or f"proxy_read_timeout {PUBLIC_INFERENCE_TIMEOUT_SECONDS}s;" not in inference_block
+                or "proxy_send_timeout 60s;" not in inference_block
+            ):
+                fail("RPC filter community sharded inference route violates method/body/admission/timeout policy")
+            if (
+                "limit_except POST { deny all; }" not in metadata_block
+                or "client_max_body_size 16k;" not in metadata_block
+                or re.search(
+                    rf"^\s*limit_req zone=arc_community_shard_[a-z0-9]{{1,20}} burst={COMMUNITY_SHARD_RATE_BURST} nodelay;\s*$",
+                    metadata_block,
+                    re.MULTILINE,
+                )
+                is None
+                or re.search(
+                    rf"^\s*limit_conn arc_community_shard_conn_[a-z0-9]{{1,20}} {COMMUNITY_SHARD_CONN_LIMIT_PER_IP};\s*$",
+                    metadata_block,
+                    re.MULTILINE,
+                )
+                is None
+                or f"proxy_connect_timeout {COMMUNITY_SHARD_PROXY_CONNECT_TIMEOUT_SECONDS}s;" not in metadata_block
+                or f"proxy_read_timeout {COMMUNITY_SHARD_METADATA_TIMEOUT_SECONDS}s;" not in metadata_block
+                or f"proxy_send_timeout {COMMUNITY_SHARD_METADATA_TIMEOUT_SECONDS}s;" not in metadata_block
+            ):
+                fail("RPC filter community shard metadata route violates method/body/rate/timeout policy")
+            if (
+                "limit_except POST { deny all; }" not in submit_block
+                or "client_max_body_size 2m;" not in submit_block
+                or re.search(
+                    rf"^\s*limit_req zone=arc_community_shard_[a-z0-9]{{1,20}} burst={COMMUNITY_SHARD_RATE_BURST} nodelay;\s*$",
+                    submit_block,
+                    re.MULTILINE,
+                )
+                is None
+                or re.search(
+                    rf"^\s*limit_conn arc_community_shard_conn_[a-z0-9]{{1,20}} {COMMUNITY_SHARD_CONN_LIMIT_PER_IP};\s*$",
+                    submit_block,
+                    re.MULTILINE,
+                )
+                is None
+                or f"proxy_connect_timeout {COMMUNITY_SHARD_PROXY_CONNECT_TIMEOUT_SECONDS}s;" not in submit_block
+                or f"proxy_read_timeout {COMMUNITY_SHARD_SUBMIT_TIMEOUT_SECONDS}s;" not in submit_block
+                or f"proxy_send_timeout {COMMUNITY_SHARD_SUBMIT_TIMEOUT_SECONDS}s;" not in submit_block
+            ):
+                fail("RPC filter community shard submit route violates method/body/rate/timeout policy")
         for label, config in (("maintenance Caddy", maintenance), ("live Caddy", live)):
             unix_upstreams = config.count("reverse_proxy unix//run/arc-rpc-filter-")
             if unix_upstreams < 1:
@@ -11108,6 +11519,131 @@ http {{
                 inspected += 1
             if inspected != unix_upstreams:
                 fail(f"{label} Unix upstream inventory differs")
+        live_headers = [
+            "@readPreflight {",
+            "@writePreflight {",
+            "@corsRead {",
+            "@read {",
+            "@corsWrite {",
+            "@write {",
+            "@validatorApproval {",
+            "@validatorShard {",
+        ]
+        if community_sharding:
+            live_headers.extend(
+                (
+                    "@communityShardInferenceCors {",
+                    "handle @communityShardInferenceCors {",
+                    "@communityShardInference {",
+                    "handle @communityShardInference {",
+                    "@communityShardMetadata {",
+                    "handle @communityShardMetadata {",
+                    "@communityShardSubmit {",
+                    "handle @communityShardSubmit {",
+                )
+            )
+        live_blocks = RecoveryRollout._extract_braced_blocks(live, live_headers)
+        for header in live_headers:
+            if header not in live_blocks:
+                fail(f"live Caddy omits required block: {header}")
+        expected_read_path = (
+            "path "
+            + " ".join(expected_public_get_paths(community_sharding))
+            + " /block/* /tx/* /account/* /account/*/txs /worker/earnings/* /community/reward_receipt/* /community/reward_job/*"
+        )
+        expected_write_path = "path " + " ".join(DEFAULT_PUBLIC_POST_PATHS)
+        expected_write_preflight_path = (
+            "path "
+            + " ".join((*DEFAULT_PUBLIC_POST_PATHS, COMMUNITY_SHARD_INFERENCE_PATH))
+            if community_sharding
+            else expected_write_path
+        )
+        for header in ("@readPreflight {", "@corsRead {", "@read {"):
+            path_lines = [
+                line.strip()
+                for line in live_blocks[header].splitlines()
+                if line.strip().startswith("path ")
+            ]
+            if path_lines != [expected_read_path]:
+                fail(f"live Caddy {header} path allowlist differs from sealed contract")
+        for header in ("@corsWrite {", "@write {"):
+            path_lines = [
+                line.strip()
+                for line in live_blocks[header].splitlines()
+                if line.strip().startswith("path ")
+            ]
+            if path_lines != [expected_write_path]:
+                fail(f"live Caddy {header} path allowlist differs from sealed contract")
+        preflight_write_paths = [
+            line.strip()
+            for line in live_blocks["@writePreflight {"].splitlines()
+            if line.strip().startswith("path ")
+        ]
+        if preflight_write_paths != [expected_write_preflight_path]:
+            fail("live Caddy @writePreflight path allowlist differs from sealed contract")
+        for header, expected_internal_path in (
+            ("@validatorApproval {", "path /internal/community/reward/approve"),
+            (
+                "@validatorShard {",
+                "path /shards/announce /inference/forward_shard /inference/cleanup_shard",
+            ),
+        ):
+            block = live_blocks[header]
+            path_lines = [
+                line.strip()
+                for line in block.splitlines()
+                if line.strip().startswith("path ")
+            ]
+            if (
+                path_lines != [expected_internal_path]
+                or "method POST" not in block
+                or re.search(r"^\s*remote_ip\s+\S+", block, re.MULTILINE) is None
+            ):
+                fail(f"live Caddy weakens internal validator matcher {header}")
+        if community_sharding:
+            for matcher, handle, expected_path, expected_max in (
+                (
+                    "@communityShardInferenceCors {",
+                    "handle @communityShardInferenceCors {",
+                    f"path {COMMUNITY_SHARD_INFERENCE_PATH}",
+                    "max_size 16KiB",
+                ),
+                (
+                    "@communityShardInference {",
+                    "handle @communityShardInference {",
+                    f"path {COMMUNITY_SHARD_INFERENCE_PATH}",
+                    "max_size 16KiB",
+                ),
+                (
+                    "@communityShardMetadata {",
+                    "handle @communityShardMetadata {",
+                    "path " + " ".join(COMMUNITY_SHARD_METADATA_POST_PATHS),
+                    "max_size 16KiB",
+                ),
+                (
+                    "@communityShardSubmit {",
+                    "handle @communityShardSubmit {",
+                    f"path {COMMUNITY_SHARD_SUBMIT_POST_PATH}",
+                    "max_size 2MiB",
+                ),
+            ):
+                matcher_block = live_blocks[matcher]
+                handle_block = live_blocks[handle]
+                path_lines = [
+                    line.strip()
+                    for line in matcher_block.splitlines()
+                    if line.strip().startswith("path ")
+                ]
+                if path_lines != [expected_path] or "method POST" not in matcher_block:
+                    fail(f"live Caddy community shard matcher {matcher} violates path/method policy")
+                if expected_max not in handle_block:
+                    fail(f"live Caddy community shard handle {handle} violates request_body limit")
+            for non_cors_handle in (
+                "handle @communityShardMetadata {",
+                "handle @communityShardSubmit {",
+            ):
+                if "Access-Control-Allow-Origin" in live_blocks[non_cors_handle]:
+                    fail(f"live Caddy {non_cors_handle} must not emit browser CORS headers")
 
     def gateway_unit(self, node: Mapping[str, Any]) -> str:
         root = node["remote_root"]
@@ -11718,7 +12254,10 @@ done
             live_caddy = self.caddyfile(node)
             rpc_filter = self.nginx_filter(node)
             self.validate_gateway_security_contract(
-                maintenance_caddy, live_caddy, rpc_filter
+                maintenance_caddy,
+                live_caddy,
+                rpc_filter,
+                community_sharding=self.community_sharding_enabled(),
             )
             configs = {
                 node["service_name"]: self.systemd_unit(node),

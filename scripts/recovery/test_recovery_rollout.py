@@ -671,6 +671,435 @@ class RecoveryRolloutTests(unittest.TestCase):
     def fixture(self, **kwargs):
         return ManifestFixture(self.root, **kwargs).value
 
+    def community_sharding_fixture(self) -> dict:
+        value = self.fixture(production=True)
+        value["gateway"]["community_sharding"] = True
+        value["gateway"]["public_get_paths"] = list(
+            rollout.expected_public_get_paths(True)
+        )
+        value["gateway"]["public_post_paths"] = list(
+            rollout.expected_public_post_paths(True)
+        )
+        return value
+
+    @staticmethod
+    def mutate_after(text: str, marker: str, old: str, new: str) -> str:
+        start = text.index(marker)
+        pos = text.index(old, start)
+        return text[:pos] + new + text[pos + len(old) :]
+
+    def test_community_sharding_absent_and_false_preserve_legacy_outputs(self) -> None:
+        for path in (
+            *rollout.COMMUNITY_SHARD_PUBLIC_GET_PATHS,
+            *rollout.COMMUNITY_SHARD_PUBLIC_POST_PATHS,
+        ):
+            self.assertNotIn(path, rollout.DEFAULT_PUBLIC_GET_PATHS)
+            self.assertNotIn(path, rollout.DEFAULT_PUBLIC_POST_PATHS)
+        absent = self.fixture(production=True)
+        explicit_false = copy.deepcopy(absent)
+        explicit_false["gateway"]["community_sharding"] = False
+        rollout.validate_manifest(absent)
+        rollout.validate_manifest(explicit_false)
+        harness_absent = rollout.RecoveryRollout(absent, "d" * 64, output=io.StringIO())
+        harness_false = rollout.RecoveryRollout(
+            explicit_false, "d" * 64, output=io.StringIO()
+        )
+        node = absent["validators"][0]
+        maintenance_absent = harness_absent.maintenance_caddyfile(node)
+        live_absent = harness_absent.caddyfile(node)
+        filter_absent = harness_absent.nginx_filter(node)
+        self.assertEqual(maintenance_absent, harness_false.maintenance_caddyfile(node))
+        self.assertEqual(live_absent, harness_false.caddyfile(node))
+        self.assertEqual(filter_absent, harness_false.nginx_filter(node))
+        self.assertEqual(
+            harness_absent.runtime_argv(node, remote=False),
+            harness_false.runtime_argv(node, remote=False),
+        )
+        self.assertEqual(
+            harness_absent.runtime_argv(node, remote=True),
+            harness_false.runtime_argv(node, remote=True),
+        )
+        self.assertEqual(
+            harness_absent.systemd_unit(node), harness_false.systemd_unit(node)
+        )
+        self.assertNotIn(
+            "--community-shard-coordinator",
+            harness_absent.runtime_argv(node, remote=False),
+        )
+        self.assertNotIn(
+            "--community-shard-coordinator",
+            harness_absent.runtime_argv(node, remote=True),
+        )
+        self.assertNotIn(
+            "--community-shard-coordinator", harness_absent.systemd_unit(node)
+        )
+        for token in (
+            *rollout.COMMUNITY_SHARD_PUBLIC_GET_PATHS,
+            *rollout.COMMUNITY_SHARD_PUBLIC_POST_PATHS,
+            "/community/shards/",
+            "arc_community_shard_",
+            "@communityShard",
+        ):
+            self.assertNotIn(token, maintenance_absent)
+            self.assertNotIn(token, live_absent)
+            self.assertNotIn(token, filter_absent)
+        self.assertEqual(filter_absent.count("proxy_pass http://"), 10)
+        for rendered, expected_sha256 in (
+            (maintenance_absent, "cf6acff951c32ffdcd93bf874466ed18aad85306baf10b0757f2cd310f3ec5f5"),
+            (live_absent, "f305d1a3055932ca926393b1412e7d50ca90bb9e08287b0d9e56ff077c2af093"),
+            (filter_absent, "6ddd69487b448e82015d28437ed7ed2dbdf012c24a2b6b8bd96e5d4d9b51b55d"),
+        ):
+            self.assertEqual(
+                hashlib.sha256(rendered.replace(str(self.root), "/fixture").encode()).hexdigest(),
+                expected_sha256,
+                "disabled sharding changed the sealed pre-extension gateway bytes",
+            )
+        self.assertEqual(filter_absent.count("proxy_pass http://unix:/run/arc-v3-rpc-"), 8)
+        self.assertEqual(filter_absent.count("auth_request /__arc_interlock_gate;"), 8)
+        harness_absent.validate_gateway_security_contract(
+            maintenance_absent, live_absent, filter_absent
+        )
+        with self.assertRaisesRegex(rollout.RolloutError, "fail-closed interlock"):
+            harness_absent.validate_gateway_security_contract(
+                maintenance_absent,
+                live_absent,
+                filter_absent,
+                community_sharding=True,
+            )
+        for leaked in (
+            *rollout.COMMUNITY_SHARD_PUBLIC_GET_PATHS,
+            *rollout.COMMUNITY_SHARD_PUBLIC_POST_PATHS,
+        ):
+            with self.assertRaisesRegex(
+                rollout.RolloutError, "must not expose community shard"
+            ):
+                harness_absent.validate_gateway_security_contract(
+                    maintenance_absent,
+                    live_absent.replace("/models/shards", f"/models/shards {leaked}", 1),
+                    filter_absent,
+                    community_sharding=False,
+                )
+            with self.assertRaisesRegex(
+                rollout.RolloutError, "must not expose community shard"
+            ):
+                harness_absent.validate_gateway_security_contract(
+                    maintenance_absent,
+                    live_absent,
+                    self.mutate_after(
+                        filter_absent,
+                        "location ~ ^/(?:health|",
+                        "models/shards",
+                        f"models/shards|{leaked}",
+                    ),
+                    community_sharding=False,
+                )
+
+    def test_community_sharding_manifest_validation_rejects_invalid_flags_and_paths(self) -> None:
+        enabled = self.community_sharding_fixture()
+        rollout.validate_manifest(enabled)
+        for bad_local_flag in (False, True, "false", 1):
+            local_manifest = self.fixture(production=False)
+            local_manifest["gateway"]["community_sharding"] = bad_local_flag
+            with self.assertRaisesRegex(rollout.RolloutError, "gateway.mode=none"):
+                rollout.validate_manifest(local_manifest)
+        for bad_type in (1, 0, "true", "false", None, []):
+            broken = self.community_sharding_fixture()
+            broken["gateway"]["community_sharding"] = bad_type
+            with self.assertRaisesRegex(rollout.RolloutError, "must be a boolean"):
+                rollout.validate_manifest(broken)
+        for flag in (None, False):
+            for field, extra_path in (
+                ("public_get_paths", rollout.COMMUNITY_SHARD_STATUS_PATH),
+                ("public_post_paths", rollout.COMMUNITY_SHARD_INFERENCE_PATH),
+                ("public_post_paths", rollout.COMMUNITY_SHARD_SUBMIT_POST_PATH),
+            ):
+                broken = self.fixture(production=True)
+                if flag is not None:
+                    broken["gateway"]["community_sharding"] = flag
+                broken["gateway"][field] = [*broken["gateway"][field], extra_path]
+                with self.assertRaisesRegex(
+                    rollout.RolloutError, "sealed protocol-v3 allowlist"
+                ):
+                    rollout.validate_manifest(broken)
+        for field, legacy in (
+            ("public_get_paths", rollout.DEFAULT_PUBLIC_GET_PATHS),
+            ("public_post_paths", rollout.DEFAULT_PUBLIC_POST_PATHS),
+        ):
+            broken = self.community_sharding_fixture()
+            broken["gateway"][field] = list(legacy)
+            with self.assertRaisesRegex(
+                rollout.RolloutError, "community-sharding allowlist"
+            ):
+                rollout.validate_manifest(broken)
+        for field, required_paths in (
+            ("public_get_paths", rollout.COMMUNITY_SHARD_PUBLIC_GET_PATHS),
+            ("public_post_paths", rollout.COMMUNITY_SHARD_PUBLIC_POST_PATHS),
+        ):
+            for omitted in required_paths:
+                broken = self.community_sharding_fixture()
+                broken["gateway"][field] = [
+                    path for path in broken["gateway"][field] if path != omitted
+                ]
+                with self.assertRaisesRegex(
+                    rollout.RolloutError, "community-sharding allowlist"
+                ):
+                    rollout.validate_manifest(broken)
+        for field, extra in (
+            ("public_get_paths", "/community/shards/debug"),
+            ("public_post_paths", "/inference/run_sharded"),
+            ("public_post_paths", "/inference/forward_shard"),
+            ("public_post_paths", "/internal/community/reward/approve"),
+        ):
+            broken = self.community_sharding_fixture()
+            broken["gateway"][field] = [*broken["gateway"][field], extra]
+            with self.assertRaisesRegex(
+                rollout.RolloutError, "community-sharding allowlist"
+            ):
+                rollout.validate_manifest(broken)
+        for base_manifest in (
+            self.fixture(production=True),
+            self.community_sharding_fixture(),
+        ):
+            for raw_flag in (
+                "--community-shard-coordinator",
+                "--community-shard-coordinator=true",
+            ):
+                broken = copy.deepcopy(base_manifest)
+                broken["validators"][0]["extra_args"] = [raw_flag]
+                with self.assertRaisesRegex(
+                    rollout.RolloutError, "protected flag --community-shard-coordinator"
+                ):
+                    rollout.validate_manifest(broken)
+        schema = json.loads(
+            MODULE_PATH.with_name("recovery-manifest.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        schema_get_sets: set[tuple[str, ...]] = set()
+        schema_post_sets: set[tuple[str, ...]] = set()
+        stack: list[object] = [schema["properties"]["gateway"]]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, dict):
+                get_node = current.get("public_get_paths")
+                if isinstance(get_node, dict) and isinstance(get_node.get("const"), list):
+                    schema_get_sets.add(tuple(get_node["const"]))
+                post_node = current.get("public_post_paths")
+                if isinstance(post_node, dict) and isinstance(post_node.get("const"), list):
+                    schema_post_sets.add(tuple(post_node["const"]))
+                stack.extend(current.values())
+            elif isinstance(current, list):
+                stack.extend(current)
+        self.assertEqual(
+            schema_get_sets,
+            {
+                rollout.expected_public_get_paths(False),
+                rollout.expected_public_get_paths(True),
+            },
+        )
+        self.assertEqual(
+            schema_post_sets,
+            {
+                rollout.expected_public_post_paths(False),
+                rollout.expected_public_post_paths(True),
+            },
+        )
+
+    def test_community_sharding_enabled_gateway_argv_and_security_contract(self) -> None:
+        enabled = self.community_sharding_fixture()
+        harness = rollout.RecoveryRollout(enabled, "d" * 64, output=io.StringIO())
+        node = enabled["validators"][0]
+        local_argv = harness.runtime_argv(node, remote=False)
+        remote_argv = harness.runtime_argv(node, remote=True)
+        unit = harness.systemd_unit(node)
+        self.assertEqual(local_argv.count("--community-shard-coordinator"), 1)
+        self.assertEqual(remote_argv.count("--community-shard-coordinator"), 1)
+        self.assertLess(
+            remote_argv.index("--model"),
+            remote_argv.index("--community-shard-coordinator"),
+        )
+        self.assertEqual(unit.count("--community-shard-coordinator"), 1)
+        maintenance = harness.maintenance_caddyfile(node)
+        live = harness.caddyfile(node)
+        rpc_filter = harness.nginx_filter(node)
+        self.assertNotIn("/community/shards/", maintenance)
+        self.assertNotIn(rollout.COMMUNITY_SHARD_INFERENCE_PATH, maintenance)
+        self.assertEqual(rpc_filter.count("proxy_pass http://"), 14)
+        self.assertEqual(rpc_filter.count("proxy_pass http://unix:/run/arc-v3-rpc-"), 12)
+        self.assertEqual(rpc_filter.count("auth_request /__arc_interlock_gate;"), 12)
+        self.assertIn("zone=arc_write_nyc:10m rate=30r/m;", rpc_filter)
+        self.assertIn("zone=arc_community_shard_nyc:10m rate=100r/s;", rpc_filter)
+        self.assertIn("zone=arc_community_shard_conn_nyc:10m;", rpc_filter)
+        self.assertIn("max_size 16KiB", live)
+        self.assertIn("max_size 2MiB", live)
+        harness.validate_gateway_security_contract(
+            maintenance, live, rpc_filter, community_sharding=True
+        )
+        with mock.patch.object(
+            harness, "legacy_archive_for", return_value={"node": node["name"]}
+        ), mock.patch.object(
+            harness,
+            "legacy_archive_rpc_socket",
+            return_value="/run/arc-archive-rpc-nyc.sock",
+        ):
+            archive_live = harness.caddyfile(node)
+            archive_filter = harness.nginx_filter(node)
+            self.assertEqual(archive_filter.count("proxy_pass http://"), 16)
+            self.assertEqual(
+                archive_filter.count("proxy_pass http://unix:/run/arc-v3-rpc-"), 12
+            )
+            self.assertEqual(
+                archive_filter.count("auth_request /__arc_interlock_gate;"), 13
+            )
+            harness.validate_gateway_security_contract(
+                maintenance, archive_live, archive_filter, community_sharding=True
+            )
+        with self.assertRaisesRegex(rollout.RolloutError, "fail-closed interlock"):
+            harness.validate_gateway_security_contract(maintenance, live, rpc_filter)
+        with self.assertRaisesRegex(rollout.RolloutError, "must be a boolean"):
+            harness.validate_gateway_security_contract(
+                maintenance, live, rpc_filter, community_sharding=1
+            )
+        for marker in (
+            f"location = {rollout.COMMUNITY_SHARD_STATUS_PATH} {{",
+            f"location = {rollout.COMMUNITY_SHARD_INFERENCE_PATH} {{",
+            "location ~ ^/community/shards/(?:lease|heartbeat|claim_step|release)$ {",
+            f"location = {rollout.COMMUNITY_SHARD_SUBMIT_POST_PATH} {{",
+        ):
+            hostile = self.mutate_after(
+                rpc_filter,
+                marker,
+                "            auth_request /__arc_interlock_gate;\n",
+                "",
+            )
+            with self.assertRaisesRegex(
+                rollout.RolloutError,
+                "omits the fail-closed interlock|not exactly fail-closed",
+            ):
+                harness.validate_gateway_security_contract(
+                    maintenance, live, hostile, community_sharding=True
+                )
+        for marker, old_text, new_text, pattern in (
+            (
+                f"location = {rollout.COMMUNITY_SHARD_STATUS_PATH} {{",
+                "client_max_body_size 1k;",
+                "client_max_body_size 1m;",
+                "status route",
+            ),
+            (
+                f"location = {rollout.COMMUNITY_SHARD_STATUS_PATH} {{",
+                "limit_except GET OPTIONS { deny all; }",
+                "limit_except GET POST { deny all; }",
+                "status route",
+            ),
+            (
+                f"location = {rollout.COMMUNITY_SHARD_INFERENCE_PATH} {{",
+                "client_max_body_size 16k;",
+                "client_max_body_size 1m;",
+                "inference route",
+            ),
+            (
+                f"location = {rollout.COMMUNITY_SHARD_INFERENCE_PATH} {{",
+                "proxy_send_timeout 60s;",
+                "proxy_send_timeout 3600s;",
+                "inference route",
+            ),
+            (
+                "location ~ ^/community/shards/(?:lease|heartbeat|claim_step|release)$ {",
+                "client_max_body_size 16k;",
+                "client_max_body_size 1m;",
+                "metadata route",
+            ),
+            (
+                "location ~ ^/community/shards/(?:lease|heartbeat|claim_step|release)$ {",
+                "limit_except POST { deny all; }",
+                "limit_except GET POST { deny all; }",
+                "metadata route",
+            ),
+            (
+                "location ~ ^/community/shards/(?:lease|heartbeat|claim_step|release)$ {",
+                "proxy_read_timeout 30s;",
+                "proxy_read_timeout 3600s;",
+                "metadata route",
+            ),
+            (
+                f"location = {rollout.COMMUNITY_SHARD_SUBMIT_POST_PATH} {{",
+                "client_max_body_size 2m;",
+                "client_max_body_size 4m;",
+                "submit route",
+            ),
+            (
+                f"location = {rollout.COMMUNITY_SHARD_SUBMIT_POST_PATH} {{",
+                "proxy_send_timeout 60s;",
+                "proxy_send_timeout 3600s;",
+                "submit route",
+            ),
+            (
+                "zone=arc_community_shard_nyc:10m ",
+                "rate=100r/s;",
+                "rate=101r/s;",
+                "rate zone <= 100r/s",
+            ),
+            (
+                "zone=arc_write_nyc:10m ",
+                "rate=30r/m;",
+                "rate=100r/s;",
+                "ordinary 30r/m write rate zone",
+            ),
+            (
+                "location = /internal/community/reward/approve {",
+                "            deny all;\n",
+                "",
+                "internal validator IP/method restriction",
+            ),
+            (
+                "location ~ ^/(?:shards/announce|inference/(?:forward_shard|cleanup_shard))$ {",
+                "            deny all;\n",
+                "",
+                "internal validator IP/method restriction",
+            ),
+        ):
+            with self.assertRaisesRegex(rollout.RolloutError, pattern):
+                harness.validate_gateway_security_contract(
+                    maintenance,
+                    live,
+                    self.mutate_after(rpc_filter, marker, old_text, new_text),
+                    community_sharding=True,
+                )
+        for marker, old_text, new_text, pattern in (
+            ("handle @communityShardMetadata {", "max_size 16KiB", "max_size 1MB", "request_body limit"),
+            ("handle @communityShardSubmit {", "max_size 2MiB", "max_size 4MB", "request_body limit"),
+            (
+                "handle @communityShardMetadata {",
+                "        request_body {\n",
+                '        header Access-Control-Allow-Origin "https://ferrumvir.github.io"\n        request_body {\n',
+                "must not emit browser CORS headers",
+            ),
+            ("@validatorApproval {", "        remote_ip ", "        header X-No-Ip ", "weakens internal validator matcher"),
+            ("@validatorShard {", "        remote_ip ", "        header X-No-Ip ", "weakens internal validator matcher"),
+        ):
+            with self.assertRaisesRegex(rollout.RolloutError, pattern):
+                harness.validate_gateway_security_contract(
+                    maintenance,
+                    self.mutate_after(live, marker, old_text, new_text),
+                    rpc_filter,
+                    community_sharding=True,
+                )
+        with self.assertRaisesRegex(
+            rollout.RolloutError, "maintenance Caddy must not expose"
+        ):
+            harness.validate_gateway_security_contract(
+                self.mutate_after(
+                    maintenance,
+                    "@maintenanceStatusCors {",
+                    "path /maintenance/status",
+                    f"path /maintenance/status {rollout.COMMUNITY_SHARD_STATUS_PATH}",
+                ),
+                live,
+                rpc_filter,
+                community_sharding=True,
+            )
+
     @staticmethod
     def reward_receipt_row(
         item,
