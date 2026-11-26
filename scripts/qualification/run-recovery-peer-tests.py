@@ -52,6 +52,14 @@ EXPECTED_LIBRARY_TESTS = {
 }
 
 
+EXPECTED_INFERENCE_TESTS = {
+    'golden_vectors::gguf_preparation::a_gguf_prepared_by_the_canonical_loader_matches_the_independent_reference',
+    'golden_vectors::gguf_preparation::a_gguf_missing_a_norm_weight_is_refused_by_the_canonical_loader',
+    'golden_vectors::gguf_preparation::canonical_i8_partial_shards_match_full_engine_and_ownership',
+    'golden_vectors::gguf_preparation::canonical_i8_shard_loader_rejects_invalid_ranges_before_reading_tensor_weights',
+}
+
+
 def run_recorded(command, log, timeout):
     with log.open("x") as output:
         result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT, timeout=timeout)
@@ -68,7 +76,7 @@ def main():
     args.evidence_dir.mkdir(parents=True, exist_ok=False)
     os.environ["CARGO_BUILD_JOBS"] = "1"
     compiled = run_recorded(
-        ["cargo", "test", "--locked", "-p", "arc-node", "--lib", "--bin", "arc-node",
+        ["cargo", "test", "--locked", "-p", "arc-node", "-p", "arc-inference", "--features", "candle", "--lib", "--bin", "arc-node",
          "--no-run", "--message-format=json-render-diagnostics"],
         args.evidence_dir / "compile.log", 3600,
     )
@@ -80,14 +88,15 @@ def main():
         if (row.get("reason") == "compiler-artifact" and row.get("profile", {}).get("test")
                 and row.get("executable")):
             target = row.get("target", {})
-            if target.get("name") in {"arc-node", "arc_node"}:
+            if target.get("name") in {"arc-node", "arc_node", "arc_inference"}:
                 executables.setdefault(target["name"], set()).add(row["executable"])
     expected_targets = {
+        "arc_inference": (("golden_vectors::gguf_preparation::",), EXPECTED_INFERENCE_TESTS),
         "arc-node": (("tests::recovery_peer_", "recovery_peer_qualification_tests::"), EXPECTED_BINARY_TESTS),
         "arc_node": (("community_shard_executor::tests::", "community_sharding::tests::", "rpc::community_shard_http::tests::", "rpc::tests::community_auth_"), EXPECTED_LIBRARY_TESTS),
     }
     if set(executables) != set(expected_targets) or any(len(paths) != 1 for paths in executables.values()):
-        raise SystemExit(f"Expected one node binary and one node library test executable, found {executables}")
+        raise SystemExit(f"Expected one executable for each node binary, node library, and inference library target, found {executables}")
     passed, failed = [], []
     for target, (prefixes, expected) in expected_targets.items():
         binary = next(iter(executables[target]))

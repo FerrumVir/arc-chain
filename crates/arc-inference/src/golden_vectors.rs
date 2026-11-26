@@ -841,7 +841,8 @@ fn golden_interleaved_profile_matches_the_reference_on_both_kernels() {
 mod gguf_preparation {
     use super::*;
     use crate::cached_integer_model::{
-        GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, load_cached_model_canonical_i8_interleaved_rope,
+        GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, load_cached_model_canonical_i8,
+        load_cached_model_canonical_i8_interleaved_rope, load_cached_model_shard_canonical_i8,
     };
     use candle_core::quantized::{GgmlDType, QTensor, gguf_file};
     use candle_core::{Device, Tensor};
@@ -921,6 +922,15 @@ mod gguf_preparation {
     }
 
     fn write_gguf(recipe: &Recipe, omit: Option<&str>) -> std::path::PathBuf {
+        let tag = omit.unwrap_or("complete").replace('.', "_");
+        write_gguf_filtered(recipe, &tag, |name| Some(name) != omit)
+    }
+
+    fn write_gguf_filtered(
+        recipe: &Recipe,
+        tag: &str,
+        keep: impl Fn(&str) -> bool,
+    ) -> std::path::PathBuf {
         let dim = |key: &str| recipe.shape[key].as_u64().unwrap() as u32;
         let vocab: Vec<gguf_file::Value> = (0..dim("vocab_size"))
             .map(|token| gguf_file::Value::String(format!("kat_{token}")))
@@ -954,7 +964,7 @@ mod gguf_preparation {
         let tensors: Vec<(String, QTensor)> = recipe
             .tensors
             .iter()
-            .filter(|(name, _, _)| Some(name.as_str()) != omit)
+            .filter(|(name, _, _)| keep(name.as_str()))
             .map(|(name, shape, values)| {
                 let tensor = Tensor::from_vec(values.clone(), shape.as_slice(), &Device::Cpu)
                     .expect("recipe tensor");
@@ -962,11 +972,7 @@ mod gguf_preparation {
                 (name.clone(), tensor)
             })
             .collect();
-        let path = std::env::temp_dir().join(format!(
-            "arc-prep-{}-{}.gguf",
-            std::process::id(),
-            omit.unwrap_or("complete").replace('.', "_")
-        ));
+        let path = std::env::temp_dir().join(format!("arc-prep-{}-{tag}.gguf", std::process::id()));
         let mut file = std::fs::File::create(&path).expect("create test GGUF");
         let metadata: Vec<(&str, &gguf_file::Value)> =
             metadata.iter().map(|(key, value)| (*key, value)).collect();
@@ -1097,4 +1103,239 @@ mod gguf_preparation {
             Ok(_) => panic!("a GGUF without blk.0.ffn_norm.weight must not load"),
         }
     }
+
+    struct TempGguf(std::path::PathBuf);
+
+    impl Drop for TempGguf {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn shard_recipe(n_layers: usize) -> Recipe {
+        let shape = serde_json::json!({
+            "n_layers": n_layers,
+            "d_model": 16,
+            "n_heads": 4,
+            "n_kv_heads": 2,
+            "d_ff": 24,
+            "vocab_size": 16,
+        });
+        let (d, vocab, d_ff, d_kv) = (16, 16, 24, 8);
+        let mut rng = RecipeRng(0x5A17_C4A1_18E0_0001u64 ^ (n_layers as u64));
+        let mut tensors = vec![
+            matrix(&mut rng, "token_embd.weight".into(), vocab, d),
+            matrix(&mut rng, "output.weight".into(), vocab, d),
+            norm(&mut rng, "output_norm.weight".into(), d),
+        ];
+        for layer in 0..n_layers {
+            let p = format!("blk.{layer}");
+            tensors.push(matrix(&mut rng, format!("{p}.attn_q.weight"), d, d));
+            tensors.push(matrix(&mut rng, format!("{p}.attn_k.weight"), d_kv, d));
+            tensors.push(matrix(&mut rng, format!("{p}.attn_v.weight"), d_kv, d));
+            tensors.push(matrix(&mut rng, format!("{p}.attn_output.weight"), d, d));
+            tensors.push(matrix(&mut rng, format!("{p}.ffn_gate.weight"), d_ff, d));
+            tensors.push(matrix(&mut rng, format!("{p}.ffn_up.weight"), d_ff, d));
+            tensors.push(matrix(&mut rng, format!("{p}.ffn_down.weight"), d, d_ff));
+            tensors.push(norm(&mut rng, format!("{p}.attn_norm.weight"), d));
+            tensors.push(norm(&mut rng, format!("{p}.ffn_norm.weight"), d));
+        }
+        Recipe { shape, tensors }
+    }
+
+    fn assert_i8_eq(a: &I8Weights, b: &I8Weights) {
+        assert_eq!((a.n_rows, a.n_cols), (b.n_rows, b.n_cols));
+        assert_eq!(a.data, b.data);
+        assert_eq!(a.scales, b.scales);
+    }
+
+    fn assert_canonical_no_optional_quants(model: &CachedIntegerModel) {
+        assert!(model.has_canonical_i8_profile());
+        assert!(model.q4_layers.is_none() && model.q4_output.is_none());
+        assert!(model.i16_layers.is_none() && model.i16_output.is_none());
+        assert!(model.block_i8_layers.is_none() && model.block_i8_output.is_none());
+        assert!(model.ternary_layers.is_none() && model.ternary_output.is_none());
+        assert!(model.ternary_hybrid_layers.is_none() && model.ternary_hybrid_output.is_none());
+    }
+
+    #[test]
+    fn canonical_i8_partial_shards_match_full_engine_and_ownership() {
+        let r = shard_recipe(4);
+        let full_f = TempGguf(write_gguf_filtered(&r, "shard_full", |_| true));
+        let full = load_cached_model_canonical_i8(full_f.0.to_str().unwrap()).expect("full load");
+        let shard0 = load_cached_model_shard_canonical_i8(full_f.0.to_str().unwrap(), 0, 2)
+            .expect("shard0 partial load");
+        let shard1 = load_cached_model_shard_canonical_i8(full_f.0.to_str().unwrap(), 2, 4)
+            .expect("shard1 partial load");
+        assert!(full.has_all_transformer_layers());
+        assert!(!shard0.has_all_transformer_layers() && !shard1.has_all_transformer_layers());
+        for m in [&full, &shard0, &shard1] {
+            assert_canonical_no_optional_quants(m);
+            assert_eq!(
+                m.config.rope_cos.len(),
+                m.config.max_seq * (m.config.d_head / 2)
+            );
+            assert_eq!(
+                m.config.rope_sin.len(),
+                m.config.max_seq * (m.config.d_head / 2)
+            );
+            assert_eq!(m.config.rope_cos, full.config.rope_cos);
+            assert_eq!(m.config.rope_sin, full.config.rope_sin);
+            assert_eq!(m.config.attn_scale, full.config.attn_scale);
+            assert_eq!(m.config.vocab_size, full.config.vocab_size);
+        }
+        assert_eq!(shard0.embedding_q16, full.embedding_q16);
+        assert_i8_eq(&shard0.embedding_i8, &full.embedding_i8);
+        assert!(shard0.output_weight.data.is_empty() && shard0.final_norm.is_empty());
+        assert!(shard1.embedding_q16.is_empty() && shard1.embedding_i8.data.is_empty());
+        assert_i8_eq(&shard1.output_weight, &full.output_weight);
+        assert_eq!(shard1.final_norm, full.final_norm);
+        for l in 0..4 {
+            assert_eq!(shard0.layers[l].is_loaded(), l < 2);
+            assert_eq!(shard1.layers[l].is_loaded(), l >= 2);
+            let (owned, other) = if l < 2 {
+                (&shard0.layers[l], &shard1.layers[l])
+            } else {
+                (&shard1.layers[l], &shard0.layers[l])
+            };
+            assert!(other.wq.data.is_empty() && other.attn_norm.is_empty());
+            for (a, b) in [
+                (&owned.wq, &full.layers[l].wq),
+                (&owned.wk, &full.layers[l].wk),
+                (&owned.wv, &full.layers[l].wv),
+                (&owned.wo, &full.layers[l].wo),
+                (&owned.w_gate, &full.layers[l].w_gate),
+                (&owned.w_up, &full.layers[l].w_up),
+                (&owned.w_down, &full.layers[l].w_down),
+            ] {
+                assert_i8_eq(a, b);
+            }
+            assert_eq!(owned.attn_norm, full.layers[l].attn_norm);
+            assert_eq!(owned.ffn_norm, full.layers[l].ffn_norm);
+        }
+        use crate::cached_integer_model::{KVCache, ShardInput, ShardOutput};
+        let prompt = [1u32, 3, 5, 7];
+        let mut first_cache = KVCache::new(4);
+        let mut last_cache = KVCache::new(4);
+        let mut full_cache = KVCache::new(4);
+        let mut generated = Vec::new();
+        for position in 0..prompt.len() + 3 {
+            let input = if position < prompt.len() {
+                prompt[position]
+            } else {
+                *generated.last().unwrap()
+            };
+            let hidden = match shard0
+                .forward_shard_token_with_history(
+                    ShardInput::Token(input),
+                    &mut first_cache,
+                    0,
+                    2,
+                    position,
+                    &generated,
+                )
+                .expect("first partial forward")
+            {
+                ShardOutput::Hidden(hidden) => hidden,
+                other => panic!("expected hidden activation: {other:?}"),
+            };
+            let partial = shard1
+                .forward_shard_token_with_history(
+                    ShardInput::Hidden(hidden),
+                    &mut last_cache,
+                    2,
+                    4,
+                    position,
+                    &generated,
+                )
+                .expect("last partial forward");
+            let reference = full
+                .forward_shard_token_with_history(
+                    ShardInput::Token(input),
+                    &mut full_cache,
+                    0,
+                    4,
+                    position,
+                    &generated,
+                )
+                .expect("full canonical forward");
+            match (partial, reference) {
+                (
+                    ShardOutput::Token { id, logits_hash },
+                    ShardOutput::Token {
+                        id: expected,
+                        logits_hash: expected_hash,
+                    },
+                ) => {
+                    assert_eq!((id, logits_hash), (expected, expected_hash));
+                    if position >= prompt.len() - 1 {
+                        generated.push(id);
+                    }
+                }
+                other => panic!("expected terminal outputs: {other:?}"),
+            }
+        }
+        let (expected, _) = full.try_generate(&prompt, 4, &[]).expect("full generation");
+        assert_eq!(generated, expected);
+        assert!(first_cache.k_data[2..].iter().all(Vec::is_empty));
+        assert!(first_cache.v_data[2..].iter().all(Vec::is_empty));
+        assert!(last_cache.k_data[..2].iter().all(Vec::is_empty));
+        assert!(last_cache.v_data[..2].iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn canonical_i8_shard_loader_rejects_invalid_ranges_before_reading_tensor_weights() {
+        let meta4 = TempGguf(write_gguf_filtered(&shard_recipe(4), "shard_meta4", |_| {
+            false
+        }));
+        for (s, e) in [
+            (0, 0),
+            (2, 2),
+            (2, 1),
+            (4, 0),
+            (0, 5),
+            (3, 5),
+            (0, usize::MAX),
+            (0, 4),
+            (0, 3),
+            (1, 4),
+        ] {
+            let Err(err) = load_cached_model_shard_canonical_i8(meta4.0.to_str().unwrap(), s, e)
+            else {
+                panic!("range [{s}, {e}) must be rejected");
+            };
+            assert!(
+                err.to_string().contains("Invalid canonical shard range"),
+                "{err}"
+            );
+        }
+        let meta1 = TempGguf(write_gguf_filtered(&shard_recipe(1), "shard_meta1", |_| {
+            false
+        }));
+        let Err(err) = load_cached_model_shard_canonical_i8(meta1.0.to_str().unwrap(), 0, 1) else {
+            panic!("1-layer full range must be rejected");
+        };
+        assert!(
+            err.to_string().contains("Invalid canonical shard range"),
+            "{err}"
+        );
+        let Err(err) = load_cached_model_shard_canonical_i8(meta4.0.to_str().unwrap(), 0, 2) else {
+            panic!("tensorless GGUF must fail on tensor read for valid range");
+        };
+        assert!(err.to_string().contains("token_embd.weight"), "{err}");
+    }
+}
+
+#[cfg(not(feature = "candle"))]
+#[test]
+fn canonical_i8_shard_loader_reports_missing_candle_feature() {
+    let Err(err) =
+        crate::cached_integer_model::load_cached_model_shard_canonical_i8("x.gguf", 0, 1)
+    else {
+        panic!("non-candle build must return error");
+    };
+    assert!(
+        err.to_string().contains("candle feature not enabled"),
+        "{err}"
+    );
 }

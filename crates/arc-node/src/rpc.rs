@@ -28682,6 +28682,7 @@ mod tests {
                     crate::twin::TwinConfig::default(),
                     false,
                     CommunityProfileServing::default(),
+                    false,
                 )
                 .await
                 .unwrap();
@@ -28769,6 +28770,7 @@ mod tests {
                 crate::twin::TwinConfig::default(),
                 false,
                 CommunityProfileServing::default(),
+                false,
             )
             .await
         });

@@ -4982,6 +4982,24 @@ pub fn load_cached_model_canonical_i8(
 }
 
 #[cfg(feature = "candle")]
+pub fn load_cached_model_shard_canonical_i8(
+    path: &str,
+    start_layer: usize,
+    end_layer: usize,
+) -> Result<CachedIntegerModel, crate::InferenceError> {
+    let model = load_cached_model_shard_profile_with_mode(
+        path,
+        start_layer,
+        end_layer,
+        ShardRangeMode::StrictPartial,
+        false,
+    )?;
+    debug_assert!(!model.has_all_transformer_layers());
+    debug_assert!(model.has_canonical_i8_profile());
+    Ok(model)
+}
+
+#[cfg(feature = "candle")]
 pub fn load_cached_model_canonical_i8_interleaved_rope(
     path: &str,
 ) -> Result<CachedIntegerModel, crate::InferenceError> {
@@ -5145,10 +5163,65 @@ pub(crate) fn config_from_gguf(
 }
 
 #[cfg(feature = "candle")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShardRangeMode {
+    Clamped,
+    StrictPartial,
+}
+
+#[cfg(feature = "candle")]
+fn validate_canonical_partial_shard_range(
+    start_layer: usize,
+    end_layer: usize,
+    n_layers: usize,
+) -> Result<(), crate::InferenceError> {
+    if start_layer >= end_layer {
+        return Err(crate::InferenceError::Runtime(format!(
+            "Invalid canonical shard range: [{start_layer}, {end_layer}) is empty or reversed (n_layers={n_layers})"
+        )));
+    }
+    if end_layer > n_layers {
+        return Err(crate::InferenceError::Runtime(format!(
+            "Invalid canonical shard range: [{start_layer}, {end_layer}) is out of bounds (n_layers={n_layers})"
+        )));
+    }
+    let owned_layers = end_layer - start_layer;
+    if owned_layers == n_layers {
+        return Err(crate::InferenceError::Runtime(format!(
+            "Invalid canonical shard range: [{start_layer}, {end_layer}) covers full model (n_layers={n_layers})"
+        )));
+    }
+    let max_owned_layers = n_layers.div_ceil(2);
+    if owned_layers > max_owned_layers {
+        return Err(crate::InferenceError::Runtime(format!(
+            "Invalid canonical shard range: [{start_layer}, {end_layer}) owns {owned_layers} layers, exceeding ceil(n_layers/2)={max_owned_layers} (n_layers={n_layers})"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "candle")]
 fn load_cached_model_shard_profile(
     path: &str,
     start_layer: usize,
     end_layer: usize,
+    include_optional_quantizations: bool,
+) -> Result<CachedIntegerModel, crate::InferenceError> {
+    load_cached_model_shard_profile_with_mode(
+        path,
+        start_layer,
+        end_layer,
+        ShardRangeMode::Clamped,
+        include_optional_quantizations,
+    )
+}
+
+#[cfg(feature = "candle")]
+fn load_cached_model_shard_profile_with_mode(
+    path: &str,
+    start_layer: usize,
+    end_layer: usize,
+    range_mode: ShardRangeMode,
     include_optional_quantizations: bool,
 ) -> Result<CachedIntegerModel, crate::InferenceError> {
     use crate::InferenceError;
@@ -5156,15 +5229,11 @@ fn load_cached_model_shard_profile(
     use candle_core::quantized::gguf_file;
 
     let device = Device::Cpu;
-    let gguf_path = path.to_string();
-
-    let (config, vocab) = {
-        let mut reader = std::fs::File::open(&gguf_path)
-            .map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
-        let content = gguf_file::Content::read(&mut reader)
-            .map_err(|e| InferenceError::Runtime(format!("GGUF: {e}")))?;
-        config_from_gguf(&content)?
-    };
+    let mut reader =
+        std::fs::File::open(path).map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
+    let content = gguf_file::Content::read(&mut reader)
+        .map_err(|e| InferenceError::Runtime(format!("GGUF: {e}")))?;
+    let (config, vocab) = config_from_gguf(&content)?;
     let (n_layers, d_model, d_ff, d_kv, vocab_size) = (
         config.n_layers,
         config.d_model,
@@ -5173,12 +5242,21 @@ fn load_cached_model_shard_profile(
         config.vocab_size,
     );
 
-    let end_layer = end_layer.min(n_layers);
-    if start_layer >= end_layer {
-        return Err(InferenceError::Runtime(format!(
-            "Invalid shard range: [{start_layer}, {end_layer}) is empty (n_layers={n_layers})"
-        )));
-    }
+    let end_layer = match range_mode {
+        ShardRangeMode::Clamped => {
+            let end_layer = end_layer.min(n_layers);
+            if start_layer >= end_layer {
+                return Err(InferenceError::Runtime(format!(
+                    "Invalid shard range: [{start_layer}, {end_layer}) is empty (n_layers={n_layers})"
+                )));
+            }
+            end_layer
+        }
+        ShardRangeMode::StrictPartial => {
+            validate_canonical_partial_shard_range(start_layer, end_layer, n_layers)?;
+            end_layer
+        }
+    };
     let is_first = start_layer == 0;
     let is_last = end_layer == n_layers;
 
@@ -5191,11 +5269,6 @@ fn load_cached_model_shard_profile(
         is_last,
         "Loading GGUF SHARD"
     );
-
-    let mut reader = std::fs::File::open(&gguf_path)
-        .map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
-    let content = gguf_file::Content::read(&mut reader)
-        .map_err(|e| InferenceError::Runtime(format!("GGUF: {e}")))?;
 
     let extract_f32 = |reader: &mut std::fs::File,
                        content: &gguf_file::Content,
@@ -5500,6 +5573,17 @@ pub fn load_cached_model_shard(
 #[cfg(not(feature = "candle"))]
 pub fn load_cached_model_canonical_i8(
     _path: &str,
+) -> Result<CachedIntegerModel, crate::InferenceError> {
+    Err(crate::InferenceError::Runtime(
+        "candle feature not enabled".into(),
+    ))
+}
+
+#[cfg(not(feature = "candle"))]
+pub fn load_cached_model_shard_canonical_i8(
+    _path: &str,
+    _start_layer: usize,
+    _end_layer: usize,
 ) -> Result<CachedIntegerModel, crate::InferenceError> {
     Err(crate::InferenceError::Runtime(
         "candle feature not enabled".into(),
