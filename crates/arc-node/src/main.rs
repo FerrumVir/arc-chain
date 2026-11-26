@@ -505,6 +505,13 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     community_release_on_verification: bool,
 
+    /// Coordinator: enable additive signed HTTP shard-worker lease and
+    /// step-compute endpoints under /community/shards/*. Requires a loaded
+    /// canonical INT8 integer --model with an exact artifact commitment.
+    /// Does not expose public unverified shard dispatch or rewards. Off by default.
+    #[arg(long, default_value_t = false)]
+    community_shard_coordinator: bool,
+
     /// Validator: the community reward profiles this validator verifies, as a
     /// comma-separated list. `legacy-split-half` is today's live profile and
     /// must stay listed. Adding `rope-interleaved-v1` (the GGUF
@@ -9467,6 +9474,7 @@ async fn run_arc_node() -> Result<()> {
             interleaved_rope_qk,
             interleaved_rope_shard_infos,
         },
+        cli.community_shard_coordinator,
     )
     .await;
 
@@ -10663,6 +10671,7 @@ mod tests {
                     arc_node::twin::TwinConfig::default(),
                     false,
                     rpc::CommunityProfileServing::default(),
+                    false,
                 )
                 .await
                 .unwrap();

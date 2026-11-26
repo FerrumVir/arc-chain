@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use tower_http::cors::CorsLayer;
 
 mod community_routing;
+pub mod community_shard_http;
 mod teacher_forced;
 mod twin_dispatch;
 use teacher_forced::try_teacher_forced_community_output;
@@ -381,6 +382,9 @@ pub struct NodeState {
     pub community_active_jobs: Arc<dashmap::DashMap<String, String>>,
     community_routing: Arc<parking_lot::Mutex<community_routing::RoutingState>>,
     community_twin: Arc<twin_dispatch::CommunityTwinState>,
+    community_shard_coordinator:
+        Arc<parking_lot::Mutex<Option<crate::community_sharding::CommunityShardCoordinator>>>,
+    community_shard_notify: Arc<tokio::sync::Notify>,
     pub inference_http: reqwest::Client,
     pub sharded_cache_hits: Arc<AtomicU64>,
     pub sharded_run_meta: Arc<dashmap::DashMap<String, Value>>,
@@ -1350,6 +1354,8 @@ pub fn build_node_state(
         community_twin: Arc::new(twin_dispatch::CommunityTwinState::new(
             crate::twin::TwinConfig::default(),
         )),
+        community_shard_coordinator: Arc::new(parking_lot::Mutex::new(None)),
+        community_shard_notify: Arc::new(tokio::sync::Notify::new()),
         inference_http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::none())
@@ -1671,6 +1677,7 @@ pub async fn serve(
     community_twin: crate::twin::TwinConfig,
     community_release_on_verification: bool,
     community_profiles: CommunityProfileServing,
+    community_shard_coordinator: bool,
 ) -> anyhow::Result<()> {
     if community_rewards_v1_enabled && state.community_rewards_v1_activation_height().is_none() {
         anyhow::bail!(
@@ -1711,6 +1718,7 @@ pub async fn serve(
             "community release on verification enabled: verified answers are returned before reward approvals, which continue on the settlement retry path"
         );
     }
+    community_shard_http::init_community_shard_coordinator(&node, community_shard_coordinator)?;
     if let Some(dv) = dag_validators {
         node.dag_validators = dv;
     }
@@ -2030,6 +2038,7 @@ pub async fn serve(
             post(community_submit_work_signed)
                 .layer(DefaultBodyLimit::max(COMMUNITY_SUBMIT_BODY_LIMIT_BYTES)),
         )
+        .merge(community_shard_http::routes())
         .route(
             COMMUNITY_REWARD_APPROVE_PATH,
             post(community_reward_approve_signed)
@@ -11948,6 +11957,16 @@ async fn community_register(
     let serves_inference = capabilities
         .iter()
         .any(|capability| capability == "inference");
+    let serves_shard_inference = capabilities
+        .iter()
+        .any(|capability| capability == community_shard_http::COMMUNITY_SHARD_CAPABILITY);
+    if serves_inference && serves_shard_inference {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "worker cannot combine whole-model 'inference' and 'shard-inference-v1' capabilities"
+                .to_string(),
+        ));
+    }
     let model = req.model.and_then(|value| {
         let trimmed = value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -11968,14 +11987,16 @@ async fn community_register(
         let trimmed = value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     });
-    if serves_inference && (model.is_none() || model_id.is_none() || execution_profile.is_none()) {
+    if (serves_inference || serves_shard_inference)
+        && (model.is_none() || model_id.is_none() || execution_profile.is_none())
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             "inference workers must register a display model, exact model_id, and execution_profile"
                 .to_string(),
         ));
     }
-    if serves_inference
+    if (serves_inference || serves_shard_inference)
         && execution_profile.as_deref()
             != Some(arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE)
     {
@@ -22276,6 +22297,8 @@ mod tests {
             community_twin: Arc::new(twin_dispatch::CommunityTwinState::new(
                 crate::twin::TwinConfig::default(),
             )),
+            community_shard_coordinator: Arc::new(parking_lot::Mutex::new(None)),
+            community_shard_notify: Arc::new(tokio::sync::Notify::new()),
             attestation_nonce: Arc::new(AtomicU64::new(0)),
             latency_stats: Arc::new(dashmap::DashMap::new()),
 

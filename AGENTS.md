@@ -262,6 +262,15 @@ verification and cannot authorize rewards. Its integer-model tests exercise
 different partial models, but the module alone does not connect desktop workers
 or replace the existing whole-job runtime described below.
 
+`--community-shard-coordinator` enables signed lease, heartbeat, claim, submit,
+and release routes under `/community/shards/`. Workers must register the
+`shard-inference-v1` capability, an exact model commitment, and the canonical
+execution profile. Whole-model and shard capabilities cannot be combined.
+Requests bind the worker identity, coordinator, network domain, timestamp, and
+nonce. The coordinator requires a loaded canonical model; it is off by default.
+The status route reports verified dispatch and rewards as disabled until their
+integration is qualified. This transport alone does not activate desktop nodes.
+
 `arc-node operator recovery qualify-peer-state` opens an already copied,
 disposable `peer-recovery-candidate-*` directory. Its hash-pinned manifest binds
 the target signing record, genesis, state WAL, recovery domain, and raw finality

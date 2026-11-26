@@ -484,27 +484,23 @@ fn qualification_genesis_accounts(genesis: &config::GenesisConfig) -> Result<Vec
 }
 
 fn qualification_split_target_and_peers(
-    validators: &[arc_state::recovery::RecoveryValidator],
+    validators: &[(Hash256, u64)],
     target_validator: Hash256,
 ) -> Result<(u64, Vec<(Hash256, u64)>)> {
     let mut seen = std::collections::HashSet::with_capacity(validators.len());
     let mut target_stake = None;
     let mut peers = Vec::with_capacity(validators.len().saturating_sub(1));
-    for validator in validators {
+    for &(address, stake) in validators {
         ensure!(
-            seen.insert(validator.address),
+            seen.insert(address),
             "duplicate validator {} in approved genesis validator set",
-            validator.address
+            address
         );
-        ensure!(
-            validator.stake > 0,
-            "approved validator {} has zero stake",
-            validator.address
-        );
-        if validator.address == target_validator {
-            target_stake = Some(validator.stake);
+        ensure!(stake > 0, "approved validator {} has zero stake", address);
+        if address == target_validator {
+            target_stake = Some(stake);
         } else {
-            peers.push((validator.address, validator.stake));
+            peers.push((address, stake));
         }
     }
     let stake = target_stake.ok_or_else(|| {
@@ -1077,6 +1073,15 @@ mod recovery_peer_qualification_tests {
 
     #[test]
     fn qualify_peer_state_rejects_bad_manifest_schema_unknown_fields_limits_and_hash() {
+        let target = hash_bytes(b"qualified-target");
+        let peer = hash_bytes(b"qualified-peer");
+        assert_eq!(
+            qualification_split_target_and_peers(&[(target, 7), (peer, 11)], target).unwrap(),
+            (7, vec![(peer, 11)])
+        );
+        assert!(qualification_split_target_and_peers(&[(peer, 11)], target).is_err());
+        assert!(qualification_split_target_and_peers(&[(target, 7), (target, 7)], target).is_err());
+        assert!(qualification_split_target_and_peers(&[(target, 7), (peer, 0)], target).is_err());
         let cli = Cli::try_parse_from([
             "arc-node",
             "operator",

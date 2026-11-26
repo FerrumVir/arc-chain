@@ -55,6 +55,12 @@ jobs:
           python3 scripts/ci/no_comments.py
           python3 scripts/qualification/run-recovery-peer-tests.py \
             --evidence-dir "$RUNNER_TEMP/recovery-peer-evidence"
+      - name: Lint recovery and sharding targets
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cargo clippy --locked -p arc-node --lib --bin arc-node --tests -- -D warnings \
+            2>&1 | tee "$RUNNER_TEMP/recovery-peer-evidence/clippy.log"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:

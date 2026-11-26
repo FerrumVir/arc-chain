@@ -29,6 +29,19 @@ EXPECTED_LIBRARY_TESTS = {
     'community_sharding::tests::community_sharding_request_lease_idempotent_retry_and_rebalance_epoch_fence',
     'community_sharding::tests::community_sharding_rebalance_skips_unfillable_gap_and_overflowed_epoch',
     'community_sharding::tests::community_sharding_decline_zero_layers_and_cancel_queue_churn_bounded',
+    'rpc::community_shard_http::tests::community_shard_http_init_requires_model_artifact_canonical_profile_and_runs_once',
+    'rpc::community_shard_http::tests::community_shard_http_auth_rejects_unregistered_forged_domain_outer_inner_and_replay',
+    'rpc::community_shard_http::tests::community_shard_http_rejects_missing_capability_whole_mix_model_mismatch_and_expired',
+    'rpc::community_shard_http::tests::community_shard_http_disabled_coordinator_returns_503_and_honest_status',
+    'rpc::community_shard_http::tests::community_shard_http_lifecycle_lease_ready_claim_submit_status_and_release',
+    'rpc::community_shard_http::tests::community_shard_http_router_body_limits_enforced',
+    'rpc::tests::community_auth_valid_signature_registers_claimed_worker',
+    'rpc::tests::community_auth_guards_all_four_mutation_handlers',
+    'rpc::tests::community_auth_unsigned_legacy_body_fails_closed',
+    'rpc::tests::community_auth_rejects_wrong_key_path_payload_and_stale_timestamp',
+    'rpc::tests::community_auth_fresh_requests_have_distinct_random_nonces',
+    'rpc::tests::community_auth_is_bound_to_exact_coordinator_and_recovery_domain',
+    'rpc::tests::community_auth_concurrent_replay_is_atomically_rejected',
 }
 
 
@@ -63,18 +76,18 @@ def main():
             if target.get("name") in {"arc-node", "arc_node"}:
                 executables.setdefault(target["name"], set()).add(row["executable"])
     expected_targets = {
-        "arc-node": ("recovery_peer_", EXPECTED_BINARY_TESTS),
-        "arc_node": ("community_sharding::tests::", EXPECTED_LIBRARY_TESTS),
+        "arc-node": (("tests::recovery_peer_", "recovery_peer_qualification_tests::"), EXPECTED_BINARY_TESTS),
+        "arc_node": (("community_sharding::tests::", "rpc::community_shard_http::tests::", "rpc::tests::community_auth_"), EXPECTED_LIBRARY_TESTS),
     }
     if set(executables) != set(expected_targets) or any(len(paths) != 1 for paths in executables.values()):
         raise SystemExit(f"Expected one node binary and one node library test executable, found {executables}")
     passed, failed = [], []
-    for target, (selector, expected) in expected_targets.items():
+    for target, (prefixes, expected) in expected_targets.items():
         binary = next(iter(executables[target]))
         listing = run_recorded(
-            [binary, selector, "--list"], args.evidence_dir / f"selectors-{target}.log", 30,
+            [binary, "--list"], args.evidence_dir / f"selectors-{target}.log", 30,
         )
-        selected = {line.removesuffix(": test") for line in listing.splitlines() if line.endswith(": test")}
+        selected = {line.removesuffix(": test") for line in listing.splitlines() if line.endswith(": test") and line.startswith(prefixes)}
         if selected != expected:
             raise SystemExit(f"{target} selectors differ: expected {sorted(expected)}, found {sorted(selected)}")
         for index, test in enumerate(sorted(expected)):
