@@ -438,6 +438,10 @@ when local resource limits prohibit compilation.
 
 ## Releases and versions
 
+The macOS bundle sealer reads the release version from the repository Tauri
+configuration and rejects mismatched app identity or version before modifying
+packages. Archive and DMG verification use the same captured version.
+
 - The version is in `Cargo.toml:28`, `desktop/package.json:4`,
   `desktop/src-tauri/tauri.conf.json:4` and `desktop/src-tauri/Cargo.toml:3`
   (0.8.20 at 8949910b).

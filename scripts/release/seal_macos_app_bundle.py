@@ -9,18 +9,22 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import shutil
 import subprocess
 import tempfile
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TAURI_CONFIG_RELATIVE = Path("desktop") / "src-tauri" / "tauri.conf.json"
 APP_NAME = "ARC Node.app"
 APP_IDENTIFIER = "network.arc.desktop"
-APP_VERSION = "0.8.23"
 EXECUTABLE_NAME = "arc-desktop"
+VERSION_RE = re.compile(r"\A(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
 CODE_SIGN = Path("/usr/bin/codesign")
 HDITIL = Path("/usr/bin/hdiutil")
 TAR = Path("/usr/bin/tar")
@@ -38,16 +42,59 @@ def one_match(directory: Path, pattern: str, description: str) -> Path:
     return matches[0]
 
 
-def app_identity(app: Path) -> Path:
+def expected_app_version(repo_root: Path | None = None) -> str:
+    base_root = REPO_ROOT if repo_root is None else repo_root
+    try:
+        resolved_root = base_root.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError("repository root for desktop Tauri config is invalid") from error
+    if not resolved_root.is_dir():
+        raise RuntimeError("repository root for desktop Tauri config is invalid")
+    config_path = resolved_root / TAURI_CONFIG_RELATIVE
+    if config_path.is_symlink() or not config_path.is_file():
+        raise RuntimeError("desktop Tauri config is missing or symlinked")
+    try:
+        resolved_config = config_path.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError("desktop Tauri config is unreadable") from error
+    if resolved_config != config_path or not resolved_config.is_relative_to(resolved_root):
+        raise RuntimeError("desktop Tauri config escapes repository boundary")
+    try:
+        document = json.loads(resolved_config.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise RuntimeError("desktop Tauri config is missing or invalid JSON") from error
+    if not isinstance(document, dict):
+        raise RuntimeError("desktop Tauri config must be a JSON object")
+    product_name = document.get("productName")
+    identifier = document.get("identifier")
+    version = document.get("version")
+    if (not isinstance(product_name, str)
+            or f"{product_name}.app" != APP_NAME
+            or not isinstance(identifier, str)
+            or identifier != APP_IDENTIFIER):
+        raise RuntimeError("desktop Tauri config identity does not match release pins")
+    if not isinstance(version, str) or VERSION_RE.fullmatch(version) is None:
+        raise RuntimeError("desktop Tauri config version must be strict MAJOR.MINOR.PATCH")
+    return version
+
+
+def app_identity(app: Path, expected_version: str | None = None) -> Path:
+    version = expected_app_version() if expected_version is None else expected_version
+    if not isinstance(version, str) or VERSION_RE.fullmatch(version) is None:
+        raise RuntimeError("expected macOS app version must be strict MAJOR.MINOR.PATCH")
     if app.is_symlink() or not app.is_dir() or app.name != APP_NAME:
         raise RuntimeError("unexpected macOS app bundle path")
     info = app / "Contents" / "Info.plist"
+    if info.is_symlink() or not info.is_file():
+        raise RuntimeError("macOS app Info.plist is missing or invalid")
     try:
         document = plistlib.loads(info.read_bytes())
     except (OSError, ValueError, plistlib.InvalidFileException) as error:
         raise RuntimeError("macOS app Info.plist is missing or invalid") from error
+    if not isinstance(document, dict):
+        raise RuntimeError("macOS app Info.plist is missing or invalid")
     if (document.get("CFBundleIdentifier") != APP_IDENTIFIER
-            or document.get("CFBundleShortVersionString") != APP_VERSION
+            or document.get("CFBundleShortVersionString") != version
             or document.get("CFBundleExecutable") != EXECUTABLE_NAME):
         raise RuntimeError("macOS app identity/version/executable does not match release pins")
     executable = app / "Contents" / "MacOS" / EXECUTABLE_NAME
@@ -56,13 +103,14 @@ def app_identity(app: Path) -> Path:
     return executable
 
 
-def verify_app(app: Path) -> str:
-    executable = app_identity(app)
+def verify_app(app: Path, expected_version: str | None = None) -> str:
+    executable = app_identity(app, expected_version)
     run([str(CODE_SIGN), "--verify", "--deep", "--strict", "--verbose=2", str(app)])
     return hashlib.sha256(executable.read_bytes()).hexdigest()
 
 
 def seal_and_repackage(bundle_root: Path) -> dict[str, str]:
+    expected_version = expected_app_version()
     bundle_root = bundle_root.resolve(strict=True)
     app_dir = bundle_root / "macos"
     dmg_dir = bundle_root / "dmg"
@@ -73,14 +121,14 @@ def seal_and_repackage(bundle_root: Path) -> dict[str, str]:
     if len(apps) != 1:
         raise RuntimeError(f"expected one Tauri app bundle; found {len(apps)}")
     app = apps[0]
-    executable = app_identity(app)
+    app_identity(app, expected_version)
     if not CODE_SIGN.is_file() or not HDITIL.is_file() or not TAR.is_file():
         raise RuntimeError("required macOS packaging tool is missing")
     archive = one_match(app_dir, "*.app.tar.gz", "app updater archive")
     dmg = one_match(dmg_dir, "*.dmg", "disk image")
 
     run([str(CODE_SIGN), "--force", "--deep", "--sign", "-", str(app)])
-    source_hash = verify_app(app)
+    source_hash = verify_app(app, expected_version)
 
     with tempfile.TemporaryDirectory(prefix="arc-sealed-macos-", dir=bundle_root) as temp:
         work = Path(temp)
@@ -101,7 +149,7 @@ def seal_and_repackage(bundle_root: Path) -> dict[str, str]:
                 run([str(TAR), "-xzf", str(archive_tmp), "-C", str(extracted_root)],
                     env={**os.environ, "COPYFILE_DISABLE": "1"})
                 archived_app = extracted_root / APP_NAME
-                if verify_app(archived_app) != source_hash:
+                if verify_app(archived_app, expected_version) != source_hash:
                     raise RuntimeError("updater archive app differs from sealed source app")
 
             run([str(HDITIL), "create", "-ov", "-format", "UDZO", "-volname", "ARC Node",
@@ -113,7 +161,7 @@ def seal_and_repackage(bundle_root: Path) -> dict[str, str]:
             mounted_apps = sorted(mount.glob("*.app"))
             if len(mounted_apps) != 1:
                 raise RuntimeError(f"rebuilt DMG must contain exactly one app; found {len(mounted_apps)}")
-            if verify_app(mounted_apps[0]) != source_hash:
+            if verify_app(mounted_apps[0], expected_version) != source_hash:
                 raise RuntimeError("DMG app differs from sealed source app")
             run([str(HDITIL), "detach", str(mount), "-quiet"])
             attached = False
@@ -129,7 +177,7 @@ def seal_and_repackage(bundle_root: Path) -> dict[str, str]:
         root = Path(temp)
         run([str(TAR), "-xzf", str(archive), "-C", str(root)],
             env={**os.environ, "COPYFILE_DISABLE": "1"})
-        if verify_app(root / APP_NAME) != source_hash:
+        if verify_app(root / APP_NAME, expected_version) != source_hash:
             raise RuntimeError("final updater archive failed strict bundle verification")
     return {"app": str(app), "archive": str(archive), "dmg": str(dmg),
             "executable_sha256": source_hash}
