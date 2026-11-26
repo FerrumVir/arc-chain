@@ -16388,6 +16388,24 @@ fn plan_shard_join(total_layers: usize, existing: &[ShardInfo]) -> Option<(usize
         .map(|(range, _)| range)
 }
 
+fn count_covered_shard_layers(
+    total_layers: usize,
+    ranges: impl Iterator<Item = (usize, usize)>,
+) -> usize {
+    let mut ranges: Vec<_> = ranges
+        .map(|(start, end)| (start.min(total_layers), end.min(total_layers)))
+        .filter(|(start, end)| start < end)
+        .collect();
+    ranges.sort_unstable();
+    let mut covered_to = 0;
+    let mut covered_count = 0;
+    for (start, end) in ranges {
+        covered_count += end.saturating_sub(covered_to.max(start));
+        covered_to = covered_to.max(end);
+    }
+    covered_count
+}
+
 async fn shard_join(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<ShardJoinRequest>,
@@ -16424,29 +16442,14 @@ async fn shard_join(
             )
         })?;
 
-    let mut new_covered: Vec<bool> = vec![false; req.total_layers as usize];
-    for s in fresh_shards(&node.shard_registry)
-        .iter()
-        .filter(|s| parse_hash256_hex(&s.model_id, "shard model_id").ok() == Some(model_hash))
-        .filter(|s| s.execution_profile == req.execution_profile)
-    {
-        for c in new_covered
-            .iter_mut()
-            .take(s.end_layer.min(req.total_layers as usize))
-            .skip(s.start_layer)
-        {
-            *c = true;
-        }
-    }
-    for covered in new_covered
-        .iter_mut()
-        .take(assigned_end)
-        .skip(assigned_start)
-    {
-        *covered = true;
-    }
-    let fully_covered = new_covered.iter().all(|&c| c);
-    let covered_count = new_covered.iter().filter(|&&c| c).count();
+    let covered_count = count_covered_shard_layers(
+        req.total_layers as usize,
+        existing
+            .iter()
+            .map(|shard| (shard.start_layer, shard.end_layer))
+            .chain(std::iter::once((assigned_start, assigned_end))),
+    );
+    let fully_covered = covered_count == req.total_layers as usize;
 
     Ok(Json(json!({
         "ok": true,
@@ -29142,6 +29145,64 @@ mod tests {
             .into_iter()
             .filter(|s| seen.insert((s.start_layer, s.end_layer)))
             .collect()
+    }
+
+    #[test]
+    fn shard_join_coverage_matches_exhaustive_small_bitmap() {
+        for total_layers in 0..=8 {
+            for a_start in 0..=10 {
+                for a_end in 0..=10 {
+                    for b_start in 0..=10 {
+                        for b_end in 0..=10 {
+                            let ranges = [(a_start, a_end), (b_start, b_end), (2, 7)];
+                            let expected = (0..total_layers)
+                                .filter(|layer| {
+                                    ranges
+                                        .iter()
+                                        .any(|(start, end)| start <= layer && layer < end)
+                                })
+                                .count();
+                            assert_eq!(
+                                count_covered_shard_layers(total_layers, ranges.into_iter()),
+                                expected,
+                                "count the union of clipped ranges, including overlaps and gaps"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shard_join_large_layer_count_does_not_allocate_per_layer() {
+        let node = fake_node_with_workers(Vec::new());
+        let Json(plan) = shard_join(
+            AxumState(node.clone()),
+            Json(ShardJoinRequest {
+                socket_addr: "203.0.113.1:9090".to_string(),
+                node_name: "planner-only".to_string(),
+                model_id: format!("0x{}", arc_crypto::hash_bytes(b"large-layer-plan").to_hex()),
+                execution_profile: canonical_profile(),
+                model_name: "planner-test".to_string(),
+                total_layers: u32::MAX,
+                available_memory_mb: 1,
+                gpu_tier: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan["assigned_start_layer"], 0);
+        assert_eq!(plan["assigned_end_layer"], u32::MAX);
+        assert_eq!(plan["pipeline_fully_covered"], true);
+        assert_eq!(
+            plan["pipeline_coverage"],
+            format!("{0}/{0}", u32::MAX),
+            "compute coverage from interval boundaries, never a caller-sized layer bitmap"
+        );
+        assert_eq!(plan["registered"], false);
+        assert!(node.shard_registry.is_empty());
+        assert_eq!(node.multi_model_registry.total_shard_nodes(), 0);
     }
 
     #[test]

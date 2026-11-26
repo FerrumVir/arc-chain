@@ -285,6 +285,8 @@ The full account is [docs/HOW-SHARDING-WORKS.md](docs/HOW-SHARDING-WORKS.md).
   six-range grid (with no holders it is the whole model). When every layer is
   covered, it replicates an on-grid range or returns 409 (`main.rs:591-602`;
   `rpc.rs:19342-19355`, `19360-19374`, `19417-19423`).
+  Join-plan coverage uses interval boundaries from the same fresh registry
+  snapshot as placement; a caller's layer count never sizes a coverage bitmap.
 - v0.8.20 desktops share by default on eligible machines. A new sharer gets a
   core cap of a quarter of the logical cores (at least one) unless a count is
   stored; an install already sharing keeps its cores
