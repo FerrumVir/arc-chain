@@ -338,10 +338,10 @@ impl LeaseFenceTracker {
 
     fn record(&mut self, assignment: &ShardLeaseAssignment) {
         let boot = assignment.lease_id.boot_nonce;
-        if let Some((hw_boot, _, _)) = self.high_water {
-            if boot != hw_boot {
-                self.fenced_boot_nonces.insert(hw_boot.0);
-            }
+        if let Some((hw_boot, _, _)) = self.high_water
+            && boot != hw_boot
+        {
+            self.fenced_boot_nonces.insert(hw_boot.0);
         }
         self.high_water = Some((boot, assignment.lease_id.seq, assignment.lease_epoch));
     }
@@ -649,35 +649,33 @@ impl WorkerRuntime {
     }
 
     fn drop_loaded_model_only(&mut self) -> Result<(), CommunityShardWorkerError> {
-        if let Some(exec) = self.executor.as_mut() {
-            if exec.lease().is_some() {
-                let now_ms = checked_now_unix_ms()?;
-                let _ = exec.release(now_ms)?;
-            }
+        if let Some(exec) = self.executor.as_mut()
+            && exec.lease().is_some()
+        {
+            let now_ms = checked_now_unix_ms()?;
+            let _ = exec.release(now_ms)?;
         }
         Ok(())
     }
 
     async fn release_local_and_remote(&mut self) {
         let mut release_req = None;
-        if let Some(exec) = self.executor.as_mut() {
-            if exec.lease().is_some() {
-                if let Ok(now_ms) = checked_now_unix_ms() {
-                    if let Ok(req) = exec.release(now_ms) {
-                        release_req = Some(req);
-                    }
-                }
-            }
+        if let Some(exec) = self.executor.as_mut()
+            && exec.lease().is_some()
+            && let Ok(now_ms) = checked_now_unix_ms()
+            && let Ok(req) = exec.release(now_ms)
+        {
+            release_req = Some(req);
         }
         let lease_fallback = self.active_lease.take();
-        if release_req.is_none() {
-            if let Some(lease) = lease_fallback {
-                release_req = Some(ShardReleaseRequest {
-                    worker_id: self.worker_id,
-                    lease_id: lease.lease_id,
-                    lease_epoch: lease.lease_epoch,
-                });
-            }
+        if release_req.is_none()
+            && let Some(lease) = lease_fallback
+        {
+            release_req = Some(ShardReleaseRequest {
+                worker_id: self.worker_id,
+                lease_id: lease.lease_id,
+                lease_epoch: lease.lease_epoch,
+            });
         }
         if let Some(req) = release_req {
             let release_deadline =
@@ -2010,10 +2008,10 @@ async fn read_bounded_success_body(
     path: &'static str,
     max_bytes: usize,
 ) -> Result<BodyReadOutcome, CommunityShardWorkerError> {
-    if let Some(len) = response.content_length() {
-        if len > max_bytes as u64 {
-            return Err(CommunityShardWorkerError::ResponseTooLarge { path, max_bytes });
-        }
+    if let Some(len) = response.content_length()
+        && len > max_bytes as u64
+    {
+        return Err(CommunityShardWorkerError::ResponseTooLarge { path, max_bytes });
     }
     let mut buf = Vec::new();
     loop {

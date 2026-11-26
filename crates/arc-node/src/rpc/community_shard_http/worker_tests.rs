@@ -128,10 +128,10 @@ where
         let notified = node.community_shard_notify.notified();
         {
             let guard = node.community_shard_coordinator.lock();
-            if let Some(coord) = guard.as_ref() {
-                if pred(coord) {
-                    return;
-                }
+            if let Some(coord) = guard.as_ref()
+                && pred(coord)
+            {
+                return;
             }
         }
         let now = Instant::now();
@@ -154,10 +154,10 @@ async fn wait_for_session_result(
         let notified = node.community_shard_notify.notified();
         {
             let mut guard = node.community_shard_coordinator.lock();
-            if let Some(coord) = guard.as_mut() {
-                if let Some(outcome) = coord.take_result(session_id) {
-                    return outcome;
-                }
+            if let Some(coord) = guard.as_mut()
+                && let Some(outcome) = coord.take_result(session_id)
+            {
+                return outcome;
             }
         }
         let now = Instant::now();

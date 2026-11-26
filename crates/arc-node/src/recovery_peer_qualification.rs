@@ -984,6 +984,309 @@ fn run_qualify_peer_state_command(
     Ok(())
 }
 
+const PEER_RECOVERY_CAPTURE_INSPECTION_SCHEMA: &str = "arc.peer-recovery.capture-inspection.v1";
+
+struct InspectPeerCaptureArgs {
+    candidate_dir: PathBuf,
+    expected_recovery_manifest_hash: String,
+    recovery_epoch: u64,
+    validator_set_id: u64,
+    target_signing_record_path: PathBuf,
+    expected_target_signing_record_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SigningRecordHighwaters {
+    skipped_rounds_count: usize,
+    finality_votes_count: usize,
+    max_skipped_round: Option<u64>,
+    last_applied_round: Option<u64>,
+    highest_observed_dag_round: Option<u64>,
+    max_finality_vote_height: Option<u64>,
+}
+
+#[derive(Debug)]
+struct PeerCaptureStoreInspection {
+    generation_pin: GenerationPin,
+    dag_baseline_height: u64,
+    commit_record_count: u64,
+    candidate_certificate_heights: [u64; 2],
+    generation_current_round: u64,
+    generation_next_dag_round: u64,
+    max_retained_dag_round: Option<u64>,
+    target_signing_record_sha256: String,
+    target_signing_highwaters: SigningRecordHighwaters,
+}
+
+#[derive(Debug, Serialize)]
+struct PeerCaptureInspectionReport {
+    schema: &'static str,
+    status: &'static str,
+    candidate_dir: String,
+    recovery_manifest_hash: String,
+    recovery_epoch: u64,
+    validator_set_id: u64,
+    consensus_domain_hash: String,
+    generation_pin_sequence: u64,
+    generation_pin_hash: String,
+    dag_baseline_height: u64,
+    commit_record_count: u64,
+    candidate_certificate_heights: [u64; 2],
+    generation_current_round: u64,
+    generation_next_dag_round: u64,
+    max_retained_dag_round: Option<u64>,
+    target_signing_record_sha256: String,
+    target_signing_highwaters: SigningRecordHighwaters,
+    not_verified_by_capture_inspection: Vec<&'static str>,
+}
+
+fn summarize_signing_record_highwaters(
+    record: &arc_consensus::view_change::ConsensusSigningRecord,
+) -> SigningRecordHighwaters {
+    let max_skipped_round = record.skipped_rounds.keys().copied().max();
+    let last_applied_round = record.last_applied_round;
+    let highest_observed_dag_round = match (max_skipped_round, last_applied_round) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(round), None) | (None, Some(round)) => Some(round),
+        (None, None) => None,
+    };
+    let max_finality_vote_height = record.finality_votes.keys().copied().max();
+    SigningRecordHighwaters {
+        skipped_rounds_count: record.skipped_rounds.len(),
+        finality_votes_count: record.finality_votes.len(),
+        max_skipped_round,
+        last_applied_round,
+        highest_observed_dag_round,
+        max_finality_vote_height,
+    }
+}
+
+fn ensure_candidate_dir_for_capture_inspection(candidate_dir: &Path) -> Result<PathBuf> {
+    let raw_name = candidate_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("candidate_dir must have a valid UTF-8 basename"))?;
+    ensure!(
+        raw_name.starts_with(PEER_RECOVERY_CANDIDATE_DIR_PREFIX)
+            && raw_name.len() > PEER_RECOVERY_CANDIDATE_DIR_PREFIX.len(),
+        "candidate_dir basename {raw_name:?} must start with {PEER_RECOVERY_CANDIDATE_DIR_PREFIX:?}"
+    );
+    let canonical = ensure_non_symlink_directory(candidate_dir, "candidate_dir")?;
+    let canonical_name = canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("canonical candidate_dir lacks a valid basename"))?;
+    ensure!(
+        canonical_name.starts_with(PEER_RECOVERY_CANDIDATE_DIR_PREFIX)
+            && canonical_name.len() > PEER_RECOVERY_CANDIDATE_DIR_PREFIX.len(),
+        "canonical candidate_dir basename {canonical_name:?} must start with {PEER_RECOVERY_CANDIDATE_DIR_PREFIX:?}"
+    );
+    audit_candidate_file_isolation(&canonical)?;
+    Ok(canonical)
+}
+
+fn inspect_persistent_peer_capture_store(
+    candidate_dir: &Path,
+    expected_manifest_hash: Hash256,
+    gen_binding: &GenerationDagBinding,
+    target_signing_record_path: &Path,
+    expected_target_signing_record_sha256: &str,
+) -> Result<PeerCaptureStoreInspection> {
+    let canonical_candidate = ensure_candidate_dir_for_capture_inspection(candidate_dir)?;
+    validate_expected_sha256_hex(
+        expected_target_signing_record_sha256,
+        "expected_target_signing_record_sha256",
+    )?;
+    let (signing_bytes, signing_input) = read_bounded_regular_file_with_hash(
+        target_signing_record_path,
+        MAX_QUALIFICATION_SIGNING_RECORD_BYTES,
+        expected_target_signing_record_sha256,
+        "target consensus-signing-record.bin",
+    )?;
+    let signing_record = arc_consensus::view_change::ConsensusSigningRecord::decode(&signing_bytes)
+        .context("failed to strictly decode target consensus-signing-record.bin")?;
+    let target_signing_highwaters = summarize_signing_record_highwaters(&signing_record);
+
+    let dag_wal_dir = canonical_candidate.join(format!(
+        "dag-wal-recovery-{}",
+        expected_manifest_hash.to_hex()
+    ));
+    let _ = ensure_non_symlink_directory(&dag_wal_dir, "candidate recovery DAG WAL")?;
+    let _ = recovery_read_only_input(
+        &dag_wal_dir.join("CURRENT"),
+        "candidate recovery DAG CURRENT",
+    )?;
+    let external_pin = read_recovery_dag_pin(&canonical_candidate, expected_manifest_hash)?
+        .ok_or_else(|| {
+            anyhow::anyhow!("candidate recovery DAG external pin is missing; refusing inspection")
+        })?;
+
+    let store = GenerationStore::new(&dag_wal_dir);
+    let selected_generation = store
+        .load_current(gen_binding, Some(external_pin.generation))
+        .context("candidate recovery DAG generation failed binding/pin verification")?;
+    let audit = store
+        .audit(gen_binding)
+        .context("candidate recovery DAG generation store audit failed")?;
+    ensure!(
+        matches!(audit.status, StoreAuditStatus::Clean)
+            && audit.current.pin == selected_generation.pin,
+        "candidate recovery DAG generation store is not cleanly pinned"
+    );
+
+    let (records, summary) =
+        stream_recovery_generation_records(&store, gen_binding, selected_generation.pin)?;
+    ensure!(
+        summary.generation_pin == selected_generation.pin
+            && summary.active_pin.generation_pin == selected_generation.pin,
+        "streamed recovery DAG pin differs from selected generation"
+    );
+    ensure!(
+        summary.active_suffix == TornSuffix::Clean,
+        "candidate recovery DAG active log has torn suffix {:?}; refusing quarantine",
+        summary.active_suffix
+    );
+    ensure!(
+        summary.active_valid_prefix_bytes == summary.active_total_file_bytes,
+        "candidate recovery DAG active log has {} trailing bytes beyond valid prefix",
+        summary
+            .active_total_file_bytes
+            .saturating_sub(summary.active_valid_prefix_bytes)
+    );
+
+    let mut block_rounds = std::collections::HashMap::<Hash256, u64>::new();
+    let mut max_retained_dag_round: Option<u64> = None;
+    for record in &records {
+        if record.kind == RetainedRecordKind::DagBlock {
+            block_rounds.insert(record.object_hash, record.round);
+            max_retained_dag_round = Some(
+                max_retained_dag_round.map_or(record.round, |current| current.max(record.round)),
+            );
+        }
+    }
+
+    let mut commit_record_count = 0u64;
+    for record in &records {
+        if record.kind == RetainedRecordKind::Commit {
+            ensure!(
+                block_rounds.get(&record.object_hash) == Some(&record.round),
+                "retained DAG commit {} at round {} has no matching retained DAG block",
+                record.object_hash,
+                record.round
+            );
+            commit_record_count = commit_record_count
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("retained DAG commit count overflows u64"))?;
+        }
+    }
+
+    let dag_baseline_height = selected_generation.manifest.baseline_state.height;
+    let committed_height = dag_baseline_height
+        .checked_add(commit_record_count)
+        .ok_or_else(|| anyhow::anyhow!("committed height overflows u64"))?;
+    let tail_repaired_height = committed_height
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("tail-repaired height overflows u64"))?;
+
+    Ok(PeerCaptureStoreInspection {
+        generation_pin: selected_generation.pin,
+        dag_baseline_height,
+        commit_record_count,
+        candidate_certificate_heights: [committed_height, tail_repaired_height],
+        generation_current_round: selected_generation.manifest.dag_cursor.current_round,
+        generation_next_dag_round: selected_generation.manifest.dag_cursor.next_dag_round,
+        max_retained_dag_round,
+        target_signing_record_sha256: signing_input.sha256,
+        target_signing_highwaters,
+    })
+}
+
+fn run_inspect_peer_capture_command(args: InspectPeerCaptureArgs) -> Result<()> {
+    ensure!(args.recovery_epoch > 0, "recovery_epoch must be non-zero");
+    ensure!(
+        args.validator_set_id > 0,
+        "validator_set_id must be non-zero"
+    );
+    let expected_manifest_hash = parse_strict_hash256(
+        &args.expected_recovery_manifest_hash,
+        "expected_recovery_manifest_hash",
+    )?;
+    let candidate_dir = ensure_candidate_dir_for_capture_inspection(&args.candidate_dir)?;
+    let checkpoint_path = candidate_dir.join(format!(
+        "recovery-{}.arcchkpt",
+        expected_manifest_hash.to_hex()
+    ));
+    let _ = recovery_read_only_input(&checkpoint_path, "candidate active ARCCHKPT")?;
+    let checkpoint =
+        arc_state::recovery::ArcCheckpoint::read_from(&checkpoint_path).with_context(|| {
+            format!(
+                "failed to read candidate active recovery checkpoint {}",
+                checkpoint_path.display()
+            )
+        })?;
+    ensure!(
+        checkpoint.manifest_hash() == expected_manifest_hash,
+        "candidate checkpoint hash {} differs from expected {}",
+        checkpoint.manifest_hash(),
+        expected_manifest_hash
+    );
+    checkpoint
+        .verify_content()
+        .context("candidate active recovery checkpoint content failed verification")?;
+    let context = checkpoint.manifest.recovery_context();
+    ensure!(
+        context.recovery_epoch == args.recovery_epoch
+            && context.validator_set_id == args.validator_set_id,
+        "candidate checkpoint context ({}, {}) differs from expected ({}, {})",
+        context.recovery_epoch,
+        context.validator_set_id,
+        args.recovery_epoch,
+        args.validator_set_id
+    );
+    let validator_set_commitment = checkpoint_validator_set_commitment(&checkpoint.manifest)?;
+    let gen_binding = GenerationDagBinding {
+        recovery_manifest_hash: expected_manifest_hash,
+        recovery_domain: context.domain_hash(),
+        validator_set_commitment,
+    };
+
+    let inspection = inspect_persistent_peer_capture_store(
+        &candidate_dir,
+        expected_manifest_hash,
+        &gen_binding,
+        &args.target_signing_record_path,
+        &args.expected_target_signing_record_sha256,
+    )?;
+
+    let report = PeerCaptureInspectionReport {
+        schema: PEER_RECOVERY_CAPTURE_INSPECTION_SCHEMA,
+        status: "INSPECTED_CAPTURE_DAG_AND_SIGNING_RECORD_ONLY",
+        candidate_dir: candidate_dir.display().to_string(),
+        recovery_manifest_hash: expected_manifest_hash.to_hex(),
+        recovery_epoch: context.recovery_epoch,
+        validator_set_id: context.validator_set_id,
+        consensus_domain_hash: context.domain_hash().to_hex(),
+        generation_pin_sequence: inspection.generation_pin.sequence,
+        generation_pin_hash: inspection.generation_pin.hash.to_hex(),
+        dag_baseline_height: inspection.dag_baseline_height,
+        commit_record_count: inspection.commit_record_count,
+        candidate_certificate_heights: inspection.candidate_certificate_heights,
+        generation_current_round: inspection.generation_current_round,
+        generation_next_dag_round: inspection.generation_next_dag_round,
+        max_retained_dag_round: inspection.max_retained_dag_round,
+        target_signing_record_sha256: inspection.target_signing_record_sha256,
+        target_signing_highwaters: inspection.target_signing_highwaters,
+        not_verified_by_capture_inspection: vec![
+            "does_not_open_state_db_or_read_or_verify_state_wal",
+            "does_not_verify_dag_block_signatures_or_finality_certificate",
+            "does_not_replace_qualify_peer_state_as_final_qualification_authority",
+            "does_not_certify_source_capture_atomicity_or_signing_history_completeness",
+        ],
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
 #[cfg(test)]
 mod recovery_peer_qualification_tests {
     use super::*;
@@ -1367,6 +1670,318 @@ mod recovery_peer_qualification_tests {
                 expected: Box::new(domain),
                 found: Box::new(wrong_domain),
             })
+        );
+    }
+    fn qualification_test_signed_dag_block(
+        keypair: &arc_crypto::KeyPair,
+        round: u64,
+        parents: Vec<Hash256>,
+        domain: &arc_consensus::ConsensusDomain,
+    ) -> arc_consensus::DagBlock {
+        let mut block = arc_consensus::DagBlock {
+            author: keypair.address(),
+            round,
+            parents,
+            transactions: Vec::new(),
+            timestamp: round,
+            hash: Hash256::ZERO,
+            signature: Vec::new(),
+            ordering_commitment: arc_consensus::DagBlock::compute_ordering_commitment(&[]),
+        };
+        block.hash = block.compute_hash_in_domain(domain);
+        block.signature = bincode::serialize(&keypair.sign(&block.hash).unwrap()).unwrap();
+        block
+    }
+
+    #[test]
+    fn inspect_peer_capture_reads_real_persistent_generation_and_target_signing_record() {
+        let cli = Cli::try_parse_from([
+            "arc-node",
+            "recovery",
+            "inspect-peer-capture",
+            "--candidate-dir",
+            "/tmp/peer-recovery-candidate-sgp",
+            "--expected-recovery-manifest-hash",
+            &"a".repeat(64),
+            "--recovery-epoch",
+            "1",
+            "--validator-set-id",
+            "1",
+            "--target-signing-record",
+            "/tmp/consensus-signing-record.bin",
+            "--expected-target-signing-record-sha256",
+            &"b".repeat(64),
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.operator_command,
+            Some(OperatorCommand::Recovery {
+                command: RecoveryCommand::InspectPeerCapture { .. }
+            })
+        ));
+
+        let (keys, _, domain, committee_hash) = qualification_test_committee();
+        let manifest_hash = hash_bytes(b"inspect-peer-capture-manifest");
+        let gen_binding = GenerationDagBinding {
+            recovery_manifest_hash: manifest_hash,
+            recovery_domain: domain.domain_hash,
+            validator_set_commitment: committee_hash,
+        };
+
+        let root = tempfile::Builder::new()
+            .prefix("arc-inspect-peer-capture-")
+            .tempdir()
+            .unwrap();
+        let candidate_dir = root.path().join("peer-recovery-candidate-sgp");
+        std::fs::create_dir(&candidate_dir).unwrap();
+        let dag_wal_dir =
+            candidate_dir.join(format!("dag-wal-recovery-{}", manifest_hash.to_hex()));
+
+        let base_round = 29_119_000u64;
+        let base_height = 17_773_590u64;
+        let block_0 =
+            qualification_test_signed_dag_block(&keys[0], base_round, Vec::new(), &domain);
+        let block_1 = qualification_test_signed_dag_block(
+            &keys[1],
+            base_round + 1,
+            vec![block_0.hash],
+            &domain,
+        );
+        let records = vec![
+            RetainedDagRecord::dag_block(
+                block_0.round,
+                block_0.hash,
+                bincode::serialize(&block_0).unwrap(),
+            ),
+            RetainedDagRecord::dag_block(
+                block_1.round,
+                block_1.hash,
+                bincode::serialize(&block_1).unwrap(),
+            ),
+            RetainedDagRecord::commit(block_0.round, block_0.hash),
+            RetainedDagRecord::commit(block_1.round, block_1.hash),
+        ];
+
+        let store = GenerationStore::new(&dag_wal_dir);
+        let generation = store
+            .create_initial(
+                GenerationInput {
+                    binding: gen_binding.clone(),
+                    baseline_state: DagBaselineState {
+                        height: base_height,
+                        block_hash: hash_bytes(b"sgp-baseline-block"),
+                        state_root: hash_bytes(b"sgp-baseline-state-root"),
+                        dag_anchor: None,
+                    },
+                    dag_cursor: DagCursor {
+                        committed_block_count: 0,
+                        next_dag_round: base_round,
+                        current_round: base_round,
+                        retention_floor_round: base_round,
+                        retention_ceiling_round: recovery_retention_ceiling(base_round).unwrap(),
+                    },
+                    retention_limits: RetentionLimits::default(),
+                },
+                records,
+            )
+            .unwrap();
+        write_recovery_dag_pin_atomically(&candidate_dir, manifest_hash, generation.pin).unwrap();
+
+        let mut signing_record = arc_consensus::view_change::ConsensusSigningRecord {
+            last_applied_round: Some(25_656_605),
+            ..Default::default()
+        };
+        signing_record
+            .skipped_rounds
+            .entry(25_656_607)
+            .or_default()
+            .insert(
+                keys[5].address(),
+                arc_consensus::view_change::AbsenceReason::NoBlock,
+            );
+        signing_record.finality_votes.insert(
+            15_297_331,
+            (
+                hash_bytes(b"sgp-prior-block"),
+                hash_bytes(b"sgp-prior-state"),
+                hash_bytes(b"sgp-prior-tx"),
+            ),
+        );
+        let signing_bytes = signing_record.encode();
+        let signing_sha256 = qualification_test_sha256(&signing_bytes);
+        let signing_path = candidate_dir.join("consensus-signing-record.bin");
+        std::fs::write(&signing_path, &signing_bytes).unwrap();
+
+        let inspection = inspect_persistent_peer_capture_store(
+            &candidate_dir,
+            manifest_hash,
+            &gen_binding,
+            &signing_path,
+            &signing_sha256,
+        )
+        .unwrap();
+        assert_eq!(inspection.generation_pin, generation.pin);
+        assert_eq!(inspection.dag_baseline_height, base_height);
+        assert_eq!(inspection.commit_record_count, 2);
+        assert_eq!(
+            inspection.candidate_certificate_heights,
+            [17_773_592, 17_773_593]
+        );
+        assert_eq!(inspection.max_retained_dag_round, Some(base_round + 1));
+        assert_eq!(inspection.target_signing_record_sha256, signing_sha256);
+        assert_eq!(
+            inspection.target_signing_highwaters,
+            SigningRecordHighwaters {
+                skipped_rounds_count: 1,
+                finality_votes_count: 1,
+                max_skipped_round: Some(25_656_607),
+                last_applied_round: Some(25_656_605),
+                highest_observed_dag_round: Some(25_656_607),
+                max_finality_vote_height: Some(15_297_331),
+            }
+        );
+        assert_eq!(std::fs::read(&signing_path).unwrap(), signing_bytes);
+
+        let mut wrong_domain_binding = gen_binding.clone();
+        wrong_domain_binding.recovery_domain = hash_bytes(b"wrong-domain");
+        assert!(
+            inspect_persistent_peer_capture_store(
+                &candidate_dir,
+                manifest_hash,
+                &wrong_domain_binding,
+                &signing_path,
+                &signing_sha256,
+            )
+            .is_err()
+        );
+
+        let wrong_sha = "0".repeat(64);
+        assert!(
+            inspect_persistent_peer_capture_store(
+                &candidate_dir,
+                manifest_hash,
+                &gen_binding,
+                &signing_path,
+                &wrong_sha,
+            )
+            .is_err()
+        );
+
+        let corrupt_signing_path = root.path().join("corrupt-signing-record.bin");
+        let corrupt_bytes = b"not-a-valid-signing-record";
+        std::fs::write(&corrupt_signing_path, corrupt_bytes).unwrap();
+        let corrupt_sha = qualification_test_sha256(corrupt_bytes);
+        assert!(
+            inspect_persistent_peer_capture_store(
+                &candidate_dir,
+                manifest_hash,
+                &gen_binding,
+                &corrupt_signing_path,
+                &corrupt_sha,
+            )
+            .is_err()
+        );
+
+        let unpinned_dir = root.path().join("peer-recovery-candidate-unpinned");
+        std::fs::create_dir(&unpinned_dir).unwrap();
+        let unpinned_wal =
+            unpinned_dir.join(format!("dag-wal-recovery-{}", manifest_hash.to_hex()));
+        GenerationStore::new(&unpinned_wal)
+            .create_initial(
+                GenerationInput {
+                    binding: gen_binding.clone(),
+                    baseline_state: DagBaselineState {
+                        height: base_height,
+                        block_hash: hash_bytes(b"unpinned-block"),
+                        state_root: hash_bytes(b"unpinned-root"),
+                        dag_anchor: None,
+                    },
+                    dag_cursor: DagCursor {
+                        committed_block_count: 0,
+                        next_dag_round: base_round,
+                        current_round: base_round,
+                        retention_floor_round: base_round,
+                        retention_ceiling_round: recovery_retention_ceiling(base_round).unwrap(),
+                    },
+                    retention_limits: RetentionLimits::default(),
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(
+            inspect_persistent_peer_capture_store(
+                &unpinned_dir,
+                manifest_hash,
+                &gen_binding,
+                &signing_path,
+                &signing_sha256,
+            )
+            .is_err()
+        );
+
+        let orphan_dir = root.path().join("peer-recovery-candidate-orphan-commit");
+        std::fs::create_dir(&orphan_dir).unwrap();
+        let orphan_wal = orphan_dir.join(format!("dag-wal-recovery-{}", manifest_hash.to_hex()));
+        let orphan_gen = GenerationStore::new(&orphan_wal)
+            .create_initial(
+                GenerationInput {
+                    binding: gen_binding.clone(),
+                    baseline_state: DagBaselineState {
+                        height: base_height,
+                        block_hash: hash_bytes(b"orphan-block"),
+                        state_root: hash_bytes(b"orphan-root"),
+                        dag_anchor: None,
+                    },
+                    dag_cursor: DagCursor {
+                        committed_block_count: 0,
+                        next_dag_round: base_round,
+                        current_round: base_round,
+                        retention_floor_round: base_round,
+                        retention_ceiling_round: recovery_retention_ceiling(base_round).unwrap(),
+                    },
+                    retention_limits: RetentionLimits::default(),
+                },
+                vec![RetainedDagRecord::commit(
+                    base_round,
+                    hash_bytes(b"missing-dag-block"),
+                )],
+            )
+            .unwrap();
+        write_recovery_dag_pin_atomically(&orphan_dir, manifest_hash, orphan_gen.pin).unwrap();
+        assert!(
+            inspect_persistent_peer_capture_store(
+                &orphan_dir,
+                manifest_hash,
+                &gen_binding,
+                &signing_path,
+                &signing_sha256,
+            )
+            .is_err()
+        );
+
+        let non_candidate_dir = root.path().join("live-source-dir");
+        std::fs::create_dir(&non_candidate_dir).unwrap();
+        assert!(
+            inspect_persistent_peer_capture_store(
+                &non_candidate_dir,
+                manifest_hash,
+                &gen_binding,
+                &signing_path,
+                &signing_sha256,
+            )
+            .is_err()
+        );
+
+        std::fs::remove_file(dag_wal_dir.join("CURRENT")).unwrap();
+        assert!(
+            inspect_persistent_peer_capture_store(
+                &candidate_dir,
+                manifest_hash,
+                &gen_binding,
+                &signing_path,
+                &signing_sha256,
+            )
+            .is_err()
         );
     }
 }

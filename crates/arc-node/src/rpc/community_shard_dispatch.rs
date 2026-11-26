@@ -59,7 +59,7 @@ pub struct CommunityShardedInferenceResponse {
     pub total_ms: u64,
     pub participants: Vec<CommunityShardParticipantSummary>,
     pub participant_identity_basis: &'static str,
-    pub verification: super::CommunityVerificationSummary,
+    verification: super::CommunityVerificationSummary,
     pub rewards_enabled: bool,
     pub reward_eligible: bool,
 }
@@ -495,23 +495,10 @@ fn encode_and_preflight_prompt(
             ));
         }
     }
-    let max_tokens_usize = usize::try_from(max_tokens).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            "max_tokens overflowed sequence bounds".to_string(),
-        )
-    })?;
-    let total_positions = prompt_tokens
-        .len()
-        .checked_add(max_tokens_usize)
-        .and_then(|positions| positions.checked_add(1))
-        .ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                "BOS + prompt_tokens + max_tokens overflowed sequence bounds".to_string(),
-            )
-        })?;
-    if total_positions > model.config.max_seq || total_positions > MAX_SEQUENCE_POSITIONS_HARD_CAP {
+    let preflight = model
+        .preflight_generation(prompt_tokens.len(), max_tokens)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    if preflight.required_positions > MAX_SEQUENCE_POSITIONS_HARD_CAP {
         return Err((
             StatusCode::BAD_REQUEST,
             format!(
@@ -521,9 +508,6 @@ fn encode_and_preflight_prompt(
             ),
         ));
     }
-    model
-        .preflight_generation(prompt_tokens.len(), max_tokens)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     Ok(prompt_tokens)
 }
 
@@ -730,11 +714,7 @@ fn validate_pending_result(
         }
     }
     validate_pending_eos_and_logits(pending, max_tokens, &model.config.eos_tokens)?;
-    if pending
-        .terminal_logits_hashes
-        .iter()
-        .any(|hash| *hash == Hash256::ZERO)
-    {
+    if pending.terminal_logits_hashes.contains(&Hash256::ZERO) {
         return Err((
             StatusCode::BAD_GATEWAY,
             "community shard result contains a zero terminal logits hash".to_string(),

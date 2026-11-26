@@ -2229,6 +2229,34 @@ fn recovery_peer_qualify_command_accepts_persistent_candidate_and_rejects_mutati
     assert!(wal_before.1 > 0 && marker_before.1 > 0 && sign_before.1 > 0);
     peer_qualify_assert_no_key_files(&candidate_dir);
 
+    run_inspect_peer_capture_command(InspectPeerCaptureArgs {
+        candidate_dir: candidate_dir.clone(),
+        expected_recovery_manifest_hash: manifest_hex.clone(),
+        recovery_epoch,
+        validator_set_id,
+        target_signing_record_path: candidate_sign_path.clone(),
+        expected_target_signing_record_sha256: sign_before.0.clone(),
+    })
+    .unwrap();
+    let inspected = inspect_persistent_peer_capture_store(
+        &candidate_dir,
+        manifest_hash,
+        &source_gen_binding,
+        &candidate_sign_path,
+        &sign_before.0,
+    )
+    .unwrap();
+    assert!(
+        inspected
+            .candidate_certificate_heights
+            .contains(&certified_height)
+    );
+    assert_eq!(
+        inspected.target_signing_highwaters.max_finality_vote_height,
+        Some(prior_target_height)
+    );
+    assert_eq!(peer_qualify_file_snapshot(&candidate_wal_path), wal_before);
+
     let valid_manifest = PeerRecoveryCandidateManifest {
         schema: PEER_RECOVERY_CANDIDATE_SCHEMA.to_string(),
         candidate_data_dir: candidate_dir.display().to_string(),

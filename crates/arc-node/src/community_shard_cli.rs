@@ -395,6 +395,11 @@ fn validate_args_with_parallelism(
 }
 
 fn ensure_regular_model_file(path: &Path) -> Result<()> {
+    ensure!(
+        path.to_str().is_some(),
+        "model artifact path {} is not valid UTF-8",
+        path.display()
+    );
     let meta = std::fs::metadata(path).with_context(|| {
         format!(
             "model path {} must reference an existing local regular file (model downloads are disabled)",
@@ -857,12 +862,13 @@ where
     S: Future<Output = &'static str>,
 {
     tokio::select! {
-        result = &mut handle => result.context("model preparation task panicked")?,
+        biased;
         signal_name = shutdown_signal => {
             cancel.store(true, Ordering::Release);
             let _ = handle.await;
             bail!("shutdown requested ({signal_name}) during model preparation; blocking task drained");
         }
+        result = &mut handle => result.context("model preparation task panicked")?,
     }
 }
 
@@ -877,7 +883,7 @@ where
 {
     tokio::pin!(worker_future);
     tokio::select! {
-        result = &mut worker_future => result,
+        biased;
         signal_name = shutdown_signal => {
             eprintln!(
                 "received {signal_name}; signaling community shard worker shutdown and awaiting drain"
@@ -885,6 +891,7 @@ where
             let _ = shutdown_tx.send(true);
             worker_future.await
         }
+        result = &mut worker_future => result,
     }
 }
 
@@ -1496,5 +1503,66 @@ mod tests {
             .to_string();
         assert!(prepare_drained.load(Ordering::Acquire));
         assert!(prep_err.contains("blocking task drained"), "{prep_err}");
+    }
+    #[tokio::test]
+    async fn pending_shutdown_signal_preempts_worker_first_poll_and_prepare_completion() {
+        for _ in 0..64 {
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let saw_shutdown_on_first_poll = Arc::new(AtomicBool::new(false));
+            let saw_flag = Arc::clone(&saw_shutdown_on_first_poll);
+            let worker_future = async move {
+                saw_flag.store(*shutdown_rx.borrow(), Ordering::Release);
+                Ok::<WorkerRunSummary, anyhow::Error>(WorkerRunSummary::default())
+            };
+            drive_worker_with_shutdown(worker_future, shutdown_tx, std::future::ready("SIGTERM"))
+                .await
+                .unwrap();
+            assert!(
+                saw_shutdown_on_first_poll.load(Ordering::Acquire),
+                "already-pending shutdown signal must set watch before first worker poll"
+            );
+
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let handle = tokio::task::spawn_blocking(move || {
+                let _ = done_tx.send(());
+                Ok::<(), anyhow::Error>(())
+            });
+            let _ = done_rx.await;
+            tokio::task::yield_now().await;
+            let err = await_prepare_with_cancel(
+                handle,
+                Arc::clone(&cancel),
+                std::future::ready("SIGINT"),
+            )
+            .await
+            .err()
+            .expect("already-pending shutdown signal must abort preparation");
+            assert!(cancel.load(Ordering::Acquire));
+            assert!(err.to_string().contains("shutdown requested (SIGINT)"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_rejects_non_utf8_model_path_before_hashing_or_check_only_pass() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = TempPath::new("non-utf8-dir");
+        std::fs::create_dir(&dir.0).unwrap();
+        let bad_file = dir.0.join(OsStr::from_bytes(b"model-\xff.gguf"));
+        std::fs::write(&bad_file, b"non-empty bytes").unwrap();
+
+        let mut args = parse_worker_args(&base_argv()).unwrap();
+        args.model_path = bad_file;
+        args.check_only = true;
+        args.worker_key_file = None;
+        let validated = validate_args_with_parallelism(&args, 4).unwrap();
+        let err = prepare_model_blocking(&args, &validated, &AtomicBool::new(false))
+            .err()
+            .expect("non-UTF-8 model path must fail during preparation")
+            .to_string();
+        assert!(err.contains("not valid UTF-8"), "{err}");
     }
 }

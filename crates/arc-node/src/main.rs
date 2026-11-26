@@ -768,6 +768,22 @@ enum RecoveryCommand {
         #[arg(long)]
         expected_manifest_sha256: String,
     },
+    /// Inspect a copied peer recovery candidate DAG generation and target signing record without opening StateDB.
+    /// Reports the two candidate finality certificate heights and preserved target signing-record highwaters.
+    InspectPeerCapture {
+        #[arg(long)]
+        candidate_dir: String,
+        #[arg(long)]
+        expected_recovery_manifest_hash: String,
+        #[arg(long)]
+        recovery_epoch: u64,
+        #[arg(long)]
+        validator_set_id: u64,
+        #[arg(long)]
+        target_signing_record: String,
+        #[arg(long)]
+        expected_target_signing_record_sha256: String,
+    },
     /// Materialize and strictly replay-validate the exact WAL prefix committed
     /// by a live `/sync/snapshot` capture.  The source directory is read-only;
     /// OUTPUT_DATA_DIR is create-only and contains an immutable snapshot/WAL
@@ -3786,6 +3802,21 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
             candidate_manifest,
             expected_manifest_sha256,
         } => run_qualify_peer_state_command(&candidate_manifest, &expected_manifest_sha256),
+        RecoveryCommand::InspectPeerCapture {
+            candidate_dir,
+            expected_recovery_manifest_hash,
+            recovery_epoch,
+            validator_set_id,
+            target_signing_record,
+            expected_target_signing_record_sha256,
+        } => run_inspect_peer_capture_command(InspectPeerCaptureArgs {
+            candidate_dir: PathBuf::from(candidate_dir),
+            expected_recovery_manifest_hash,
+            recovery_epoch,
+            validator_set_id,
+            target_signing_record_path: PathBuf::from(target_signing_record),
+            expected_target_signing_record_sha256,
+        }),
         RecoveryCommand::Inspect { checkpoint } => {
             let checkpoint = arc_state::recovery::ArcCheckpoint::read_from(checkpoint)?;
             print_recovery_summary(&checkpoint, "UNTRUSTED_INSPECTION", None)

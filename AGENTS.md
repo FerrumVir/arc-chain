@@ -325,6 +325,11 @@ certificate. It replays persistent state and signed DAG records without opening
 listeners, loading models, signing, or activating a validator. The command may
 write inside the disposable candidate; it does not establish capture atomicity
 or completeness of the operator's supplied prior signing high-water marks.
+`recovery inspect-peer-capture` inspects a disposable copied DAG generation and
+preserved target signing record to locate candidate certificate heights before
+full WAL replay. It does not verify the state WAL, DAG signatures, finality, or
+complete prior signing history; `qualify-peer-state` remains required.
+
 `scripts/qualification/run-recovery-peer-tests.py` runs the exact mandatory
 recovery and sharding tests on a single build worker and rejects missing cases
 or ignored tests. Use the `recovery-peer` mode of the Linux candidate workflow

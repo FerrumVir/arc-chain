@@ -7,6 +7,9 @@ import subprocess
 
 
 EXPECTED_BINARY_TESTS = {
+    'recovery_peer_qualification_tests::inspect_peer_capture_reads_real_persistent_generation_and_target_signing_record',
+    'community_shard_cli::tests::pending_shutdown_signal_preempts_worker_first_poll_and_prepare_completion',
+    'community_shard_cli::tests::prepare_rejects_non_utf8_model_path_before_hashing_or_check_only_pass',
     'community_shard_cli::tests::shutdown_signals_watch_and_drains_worker_and_prepare_without_abort',
     'community_shard_cli::tests::partial_loader_admits_before_weights_and_verifies_artifact_before_and_after_load',
     'community_shard_cli::tests::derive_all_roles_admission_enforces_budget_caps_and_first_embedding_floor',
