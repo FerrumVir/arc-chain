@@ -140,3 +140,46 @@ class PeerCapturePublishTests(unittest.TestCase):
                 pc.write_exclusive_json(destination, {"status": "unqualified"})
         self.assertFalse(destination.exists())
         self.assertFalse(destination.with_name(destination.name + ".partial").exists())
+
+    def test_shrunken_prefix_is_not_zero_extended_during_rollback(self):
+        bundle, _, _ = self._capture_valid_bundle()
+        real_fsync = pc.os.fsync
+        shrunk = False
+
+        def shrink_after_tail_append(fd):
+            nonlocal shrunk
+            real_fsync(fd)
+            st = os.fstat(fd)
+            if st.st_ino == self.precopy_ino and st.st_size > len(self.prefix) and not shrunk:
+                shrunk = True
+                os.ftruncate(fd, len(self.prefix) - 8)
+
+        with patch.object(pc.os, "fsync", side_effect=shrink_after_tail_append):
+            with self.assertRaisesRegex(pc.CaptureError, "recopy the verified source prefix"):
+                self.publish(bundle)
+        self.assertTrue(shrunk)
+        self.assertEqual((self.cand / pc.PRECOPY_WAL_NAME).read_bytes(), self.prefix[:-8])
+        self.assertFalse((self.cand / "state.wal").exists())
+        self.assertFalse((self.cand / "recovery.active").exists())
+
+    def test_mutated_prefix_is_not_claimed_restored_after_tail_rollback(self):
+        bundle, _, _ = self._capture_valid_bundle()
+        real_fsync = pc.os.fsync
+        mutated = False
+
+        def mutate_after_tail_append(fd):
+            nonlocal mutated
+            real_fsync(fd)
+            st = os.fstat(fd)
+            if st.st_ino == self.precopy_ino and st.st_size > len(self.prefix) and not mutated:
+                mutated = True
+                os.pwrite(fd, b"changed!", 0)
+
+        with patch.object(pc.os, "fsync", side_effect=mutate_after_tail_append):
+            with self.assertRaisesRegex(pc.CaptureError, "prefix bytes mutated.*cannot be restored"):
+                self.publish(bundle)
+        self.assertTrue(mutated)
+        self.assertEqual((self.cand / pc.PRECOPY_WAL_NAME).read_bytes(), b"changed!" + self.prefix[8:])
+        self.assertFalse((self.cand / "state.wal").exists())
+        with self.assertRaisesRegex(pc.CaptureError, "prefix sha256"):
+            self.publish(bundle)

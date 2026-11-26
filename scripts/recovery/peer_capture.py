@@ -1292,8 +1292,12 @@ def _rollback_precommit_publish(
             errors.append(f"unlink {staged_manifest_partial.name}: {exc}")
     if tail_append_started:
         try:
-            os.ftruncate(wal_fd, prefix_bytes)
-            os.fsync(wal_fd)
+            current_size = os.fstat(wal_fd).st_size
+            if current_size < prefix_bytes:
+                errors.append(f"precopy shrank below prefix_bytes ({current_size} < {prefix_bytes}); recopy the verified source prefix instead of extending missing bytes")
+            else:
+                os.ftruncate(wal_fd, prefix_bytes)
+                os.fsync(wal_fd)
         except OSError as exc:
             errors.append(f"restore precopy length to {prefix_bytes}: {exc}")
     for path in reversed(created_files):
@@ -1493,8 +1497,10 @@ def publish_bundle_into_candidate(
             (verify_prefix if verified < prefix_bytes else verify_tail).update(chunk)
             verify_full.update(chunk)
             verified += len(chunk)
-        if os.read(wal_fd, 1) or verify_prefix.hexdigest() != prefix_sha or verify_tail.hexdigest() != tail_sha:
-            raise CaptureError("prefix or tail bytes mutated during publish")
+        if verify_prefix.hexdigest() != prefix_sha:
+            raise CaptureError("precopy prefix bytes mutated during publish and cannot be restored; recopy the verified source prefix")
+        if os.read(wal_fd, 1) or verify_tail.hexdigest() != tail_sha:
+            raise CaptureError("tail bytes mutated during publish")
         if stat_tuple(os.fstat(wal_fd)) != stat_tuple(appended_stat) or stat_tuple(require_regular_single_link(precopy_path, PRECOPY_WAL_NAME)) != stat_tuple(appended_stat):
             raise CaptureError("precopy file changed during post-append verification")
         publish_manifest = {

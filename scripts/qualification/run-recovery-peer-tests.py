@@ -41,6 +41,9 @@ EXPECTED_BINARY_TESTS = {
     'recovery_peer_qualification_tests::qualify_peer_state_rejects_oversized_wrong_domain_forged_and_subquorum_certificates',
 }
 EXPECTED_LIBRARY_TESTS = {
+    'rpc::community_shard_dispatch::tests::inference_run_routes_eligible_request_to_outbound_partial_workers',
+    'rpc::community_shard_dispatch::tests::inference_run_partial_failure_and_bypass_guards_never_fallback_or_duplicate',
+    'rpc::community_shard_dispatch::tests::readiness_snapshot_reflects_ready_community_shards_mutation_free',
     'rpc::community_sharded_routing_tests::readiness_v1_preserves_exact_nine_keys_when_community_sharded_ready',
     'rpc::community_sharded_routing_tests::community_sharded_route_guards_enforce_eligibility_and_caps',
     'rpc::community_shard_dispatch::inference_run_adapter_tests::dispatch_bounds_helper_matches_validate_request_bounds',

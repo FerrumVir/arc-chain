@@ -1837,6 +1837,517 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inference_run_routes_eligible_request_to_outbound_partial_workers() {
+        use crate::community_shard_worker::{
+            CommunityShardWorkerConfig, PartialModelLoader, run_community_shard_worker,
+        };
+        let fixture =
+            build_verified_fixture(2, 2, CommunityShardLimits::default(), None, false).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let app = routes()
+            .merge(crate::rpc::community_shard_http::routes())
+            .route(
+                crate::rpc::COMMUNITY_REGISTER_PATH,
+                post(crate::rpc::community_register_signed),
+            )
+            .route("/inference/run", post(crate::rpc::inference_run))
+            .with_state(fixture.coordinator.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let spec = fixture
+            .coordinator
+            .community_shard_coordinator
+            .lock()
+            .as_ref()
+            .unwrap()
+            .model_spec()
+            .clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut workers = tokio::task::JoinSet::new();
+        for index in 0..2 {
+            let full = Arc::clone(&fixture.model);
+            let loader: PartialModelLoader = Arc::new(move |assignment| {
+                Ok(Arc::new(slice_partial_model(&full, assignment.range)))
+            });
+            let mut config = CommunityShardWorkerConfig::new(
+                origin.clone(),
+                fixture.coordinator.validator_address,
+                fixture.coordinator.state.transaction_domain_hash(),
+                2,
+                format!("inference-run-partial-{index}"),
+                model_display_name(&fixture.model),
+                "test-loopback",
+            );
+            config.allow_insecure_for_loopback = true;
+            config.idle_poll_interval_ms = 20;
+            workers.spawn(run_community_shard_worker(
+                config,
+                Arc::new(KeyPair::generate_ed25519()),
+                spec.clone(),
+                loader,
+                shutdown_rx.clone(),
+            ));
+        }
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let readiness = loop {
+            let notified = fixture.coordinator.community_shard_notify.notified();
+            let snap = crate::rpc::inference_readiness_snapshot(&fixture.coordinator);
+            if snap.community_sharded_ready {
+                break snap;
+            }
+            assert!(
+                tokio::time::Instant::now() < ready_deadline,
+                "outbound partial workers must become ready"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(50), notified).await;
+        };
+        assert!(
+            readiness.sharded_pipeline_ready
+                && readiness.safe_to_dispatch
+                && readiness.local_model_ready
+        );
+        assert!(!readiness.community_dispatch_ready);
+        assert_eq!(readiness.live_community_workers, 0);
+
+        let prompt = "ARC";
+        let max_tokens = 3u32;
+        let (canonical, canonical_hash) = fixture
+            .model
+            .try_generate(
+                &fixture.model.encode(prompt),
+                max_tokens,
+                &fixture.model.config.eos_tokens,
+            )
+            .unwrap();
+        let reply: Result<(StatusCode, Value), reqwest::Error> = async {
+            let response = reqwest::Client::new()
+                .post(format!("{origin}/inference/run"))
+                .timeout(Duration::from_secs(30))
+                .json(&serde_json::json!({ "input": prompt, "max_tokens": max_tokens }))
+                .send()
+                .await?;
+            let status = response.status();
+            Ok((status, response.json().await?))
+        }
+        .await;
+        shutdown_tx.send(true).unwrap();
+        while let Some(worker) = workers.join_next().await {
+            let summary = worker.unwrap().unwrap();
+            assert!(summary.steps_executed > 0 && summary.clean_release_sent);
+        }
+        server.abort();
+
+        let (status, body) = reply.unwrap();
+        let expected_model_id = format!("0x{}", fixture.model_id.to_hex());
+        let expected_output_hash = format!("0x{}", canonical_hash.to_hex());
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["success"], true);
+        assert_eq!(body["routed_via"], "community_sharded_pipeline");
+        assert_eq!(body["input"], prompt);
+        assert_eq!(body["deterministic"], true);
+        assert_eq!(body["protocol_version"], COMMUNITY_SHARD_PROTOCOL_VERSION);
+        assert_eq!(body["model_id"], expected_model_id);
+        assert_eq!(body["model_hash"], expected_model_id);
+        assert_eq!(
+            body["execution_profile"],
+            CANONICAL_REWARD_INFERENCE_PROFILE
+        );
+        assert_eq!(body["generated_tokens"], serde_json::json!(canonical));
+        assert_eq!(body["tokens_generated"], canonical.len());
+        assert_eq!(body["output"], fixture.model.decode(&canonical));
+        assert_eq!(body["output_hash"], expected_output_hash);
+        assert_eq!(body["stopped_by_eos"], false);
+        assert_eq!(body["participants"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            body["participant_identity_basis"],
+            COMMUNITY_SHARD_PARTICIPANT_IDENTITY_BASIS
+        );
+        assert_eq!(body["verification"]["quorum_verified"], true);
+        assert_eq!(body["verification"]["profile_bound"], true);
+        assert_eq!(body["verification"]["ranges"], 2);
+        assert_eq!(
+            body["verification"]["execution_profile"],
+            CANONICAL_REWARD_INFERENCE_PROFILE
+        );
+        assert_eq!(
+            body["verification"]["signatures_required_per_quorum"],
+            COMMUNITY_VERIFICATION_SIGNATURES_REQUIRED
+        );
+        assert_eq!(body["verification"]["output_hash"], expected_output_hash);
+        assert_eq!(body["rewards_enabled"], false);
+        assert_eq!(body["reward_eligible"], false);
+        assert!(
+            body.get("attestation").is_none()
+                && body.get("settlement").is_none()
+                && body.get("inference").is_none()
+        );
+        let snap = fixture
+            .coordinator
+            .community_shard_coordinator
+            .lock()
+            .as_ref()
+            .unwrap()
+            .status_snapshot(now_unix_ms().unwrap());
+        assert_eq!(snap.active_sessions, 0);
+        assert_eq!(snap.retained_results, 0);
+        assert_eq!(
+            fixture
+                .coordinator
+                .community_shard_dispatch_in_flight
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_run_partial_failure_and_bypass_guards_never_fallback_or_duplicate() {
+        let fixture =
+            build_verified_fixture(2, 2, CommunityShardLimits::default(), None, true).await;
+        let snap_ready = crate::rpc::inference_readiness_snapshot(&fixture.coordinator);
+        assert!(snap_ready.community_sharded_ready && snap_ready.local_model_ready);
+
+        let public_demo_err = crate::rpc::inference_run(
+            AxumState(fixture.coordinator.clone()),
+            Some(Json(
+                serde_json::json!({ "input": "ARC", "max_tokens": 2, "public_demo": true }),
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(public_demo_err.0, StatusCode::SERVICE_UNAVAILABLE);
+
+        let probe_err = crate::rpc::inference_run(
+            AxumState(fixture.coordinator.clone()),
+            Some(Json(serde_json::json!({ "input": "ARC", "max_tokens": 2, "recovery_probe_id": "00".repeat(32) }))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(probe_err.0, StatusCode::BAD_REQUEST);
+
+        let Json(local_body) = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::rpc::inference_run(
+                AxumState(fixture.coordinator.clone()),
+                Some(Json(
+                    serde_json::json!({ "input": "ARC", "max_tokens": 2, "force_local": true }),
+                )),
+            ),
+        )
+        .await
+        .expect("force_local must bypass idle partial workers")
+        .expect("force_local must succeed on ready local model");
+        assert_ne!(
+            local_body.get("routed_via").and_then(Value::as_str),
+            Some("community_sharded_pipeline")
+        );
+        {
+            let now_ms = now_unix_ms().unwrap();
+            let mut guard = fixture.coordinator.community_shard_coordinator.lock();
+            let core = guard.as_mut().unwrap();
+            assert_eq!(core.status_snapshot(now_ms).active_sessions, 0);
+            for worker in &fixture.workers {
+                let claim = core
+                    .claim_step(
+                        worker.worker_id,
+                        now_ms,
+                        ShardClaimStepRequest {
+                            worker_id: worker.worker_id,
+                            lease_id: worker.assignment.lease_id,
+                            lease_epoch: worker.assignment.lease_epoch,
+                            model_id: worker.assignment.model_id,
+                            execution_profile: worker.assignment.execution_profile.clone(),
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(claim, ShardClaimStepResponse::Idle);
+            }
+        }
+
+        let busy_now_ms = now_unix_ms().unwrap();
+        let busy_session_id = fixture
+            .coordinator
+            .community_shard_coordinator
+            .lock()
+            .as_mut()
+            .unwrap()
+            .open_session(busy_now_ms, fixture.model.encode("ARC"), 1)
+            .unwrap();
+        let busy_err = crate::rpc::inference_run(
+            AxumState(fixture.coordinator.clone()),
+            Some(Json(serde_json::json!({ "input": "ARC", "max_tokens": 2 }))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(busy_err.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            fixture
+                .coordinator
+                .community_shard_dispatch_in_flight
+                .load(Ordering::Acquire),
+            0
+        );
+        {
+            let mut guard = fixture.coordinator.community_shard_coordinator.lock();
+            let core = guard.as_mut().unwrap();
+            assert_eq!(
+                core.status_snapshot(now_unix_ms().unwrap()).active_sessions,
+                1
+            );
+            core.cancel_session(
+                busy_now_ms,
+                busy_session_id,
+                SessionAbortReason::CallerCancelled,
+            )
+            .unwrap();
+            let _ = core.take_result(busy_session_id);
+        }
+
+        let fail_fixture =
+            build_verified_fixture(2, 2, CommunityShardLimits::default(), None, true).await;
+        let claimed_sessions = Arc::new(std::sync::Mutex::new(HashSet::<u64>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let driver = tokio::spawn({
+            let coordinator = fail_fixture.coordinator.clone();
+            let workers = clone_workers(&fail_fixture.workers);
+            let claimed_sessions = claimed_sessions.clone();
+            let stop = stop.clone();
+            async move {
+                let domain = coordinator.state.transaction_domain_hash();
+                while !stop.load(Ordering::Acquire) {
+                    let mut progressed = false;
+                    for worker in &workers {
+                        let signed_claim = sign_shard_worker_request(
+                            COMMUNITY_SHARD_CLAIM_STEP_PATH,
+                            ShardClaimStepRequest {
+                                worker_id: worker.worker_id,
+                                lease_id: worker.assignment.lease_id,
+                                lease_epoch: worker.assignment.lease_epoch,
+                                model_id: worker.assignment.model_id,
+                                execution_profile: worker.assignment.execution_profile.clone(),
+                            },
+                            &worker.keypair,
+                            coordinator.validator_address,
+                            domain,
+                        )
+                        .unwrap();
+                        if let Ok(Json(ShardClaimStepResponse::Step { work })) =
+                            community_shard_claim_step_signed(
+                                AxumState(coordinator.clone()),
+                                Json(signed_claim),
+                            )
+                            .await
+                        {
+                            progressed = true;
+                            claimed_sessions.lock().unwrap().insert(work.session_id.seq);
+                            let signed_submit = sign_shard_worker_request(
+                                COMMUNITY_SHARD_SUBMIT_STEP_PATH,
+                                ShardStepSubmitRequest {
+                                    worker_id: worker.worker_id,
+                                    lease_id: work.lease_id,
+                                    lease_epoch: work.lease_epoch,
+                                    session_id: work.session_id,
+                                    step_id: work.step_id,
+                                    model_id: work.model_id,
+                                    execution_profile: work.execution_profile.clone(),
+                                    range: work.range,
+                                    position: work.position,
+                                    layers_processed: work.range.len(),
+                                    outcome: ShardStepOutcome::Failed {
+                                        reason: "simulated partial worker failure".to_string(),
+                                    },
+                                },
+                                &worker.keypair,
+                                coordinator.validator_address,
+                                domain,
+                            )
+                            .unwrap();
+                            let resp = community_shard_submit_step_signed(
+                                AxumState(coordinator.clone()),
+                                Json(signed_submit),
+                            )
+                            .await
+                            .unwrap()
+                            .0;
+                            assert!(resp.accepted);
+                        }
+                    }
+                    if !progressed {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }
+            }
+        });
+        let fail_err = crate::rpc::inference_run(
+            AxumState(fail_fixture.coordinator.clone()),
+            Some(Json(serde_json::json!({ "input": "ARC", "max_tokens": 2 }))),
+        )
+        .await
+        .unwrap_err();
+        stop.store(true, Ordering::Release);
+        driver.await.unwrap();
+        assert_eq!(fail_err.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(claimed_sessions.lock().unwrap().len(), 1);
+        let fail_snap = fail_fixture
+            .coordinator
+            .community_shard_coordinator
+            .lock()
+            .as_ref()
+            .unwrap()
+            .status_snapshot(now_unix_ms().unwrap());
+        assert_eq!(fail_snap.active_sessions, 0);
+        assert_eq!(fail_snap.retained_results, 0);
+        assert_eq!(
+            fail_fixture
+                .coordinator
+                .community_shard_dispatch_in_flight
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            fail_fixture
+                .coordinator
+                .community_shard_dispatch_permits
+                .available_permits(),
+            super::super::COMMUNITY_SHARD_DISPATCH_CONCURRENCY_HARD_CAP
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_snapshot_reflects_ready_community_shards_mutation_free() {
+        let mut fixture =
+            build_verified_fixture(2, 2, CommunityShardLimits::default(), None, false).await;
+        let before_workers = crate::rpc::inference_readiness_snapshot(&fixture.coordinator);
+        assert!(!before_workers.community_sharded_ready && !before_workers.sharded_pipeline_ready);
+        assert!(
+            !before_workers.community_dispatch_ready && before_workers.mutation_free_observation
+        );
+        assert_eq!(before_workers.live_community_workers, 0);
+
+        attach_ready_partial_workers(&mut fixture, 2).await;
+        let (before_status, before_capacity, before_deadlines) = {
+            let now_ms = now_unix_ms().unwrap();
+            let guard = fixture.coordinator.community_shard_coordinator.lock();
+            let core = guard.as_ref().unwrap();
+            let deadlines: Vec<Option<u64>> = fixture
+                .workers
+                .iter()
+                .map(|w| {
+                    core.worker_lease_snapshot(w.worker_id)
+                        .map(|l| l.deadline_unix_ms)
+                })
+                .collect();
+            (
+                core.status_snapshot(now_ms),
+                core.pipeline_capacity(now_ms),
+                deadlines,
+            )
+        };
+        let before_permits = fixture
+            .coordinator
+            .community_shard_dispatch_permits
+            .available_permits();
+        let before_in_flight = fixture
+            .coordinator
+            .community_shard_dispatch_in_flight
+            .load(Ordering::Acquire);
+
+        let ready = crate::rpc::inference_readiness_snapshot(&fixture.coordinator);
+        assert!(
+            ready.community_sharded_ready && ready.sharded_pipeline_ready && ready.safe_to_dispatch
+        );
+        assert!(!ready.community_dispatch_ready && ready.mutation_free_observation);
+        assert_eq!(ready.live_community_workers, 0);
+        let wire = serde_json::to_value(&ready).unwrap();
+        let obj = wire.as_object().unwrap();
+        assert_eq!(obj.len(), 9);
+        assert!(obj.get("community_sharded_ready").is_none());
+        assert_eq!(obj["schema"], "arc.inference.readiness.v1");
+        assert_eq!(obj["safe_to_dispatch"], true);
+        assert_eq!(obj["sharded_pipeline_ready"], true);
+        assert_eq!(obj["community_dispatch_ready"], false);
+        assert_eq!(obj["live_community_workers"], 0);
+        assert_eq!(obj["model_id"], format!("0x{}", fixture.model_id.to_hex()));
+        assert_eq!(
+            obj["required_community_execution_profile"],
+            CANONICAL_REWARD_INFERENCE_PROFILE
+        );
+        assert_eq!(obj["mutation_free_observation"], true);
+
+        let (after_status, after_capacity, after_deadlines) = {
+            let now_ms = now_unix_ms().unwrap();
+            let guard = fixture.coordinator.community_shard_coordinator.lock();
+            let core = guard.as_ref().unwrap();
+            let deadlines: Vec<Option<u64>> = fixture
+                .workers
+                .iter()
+                .map(|w| {
+                    core.worker_lease_snapshot(w.worker_id)
+                        .map(|l| l.deadline_unix_ms)
+                })
+                .collect();
+            (
+                core.status_snapshot(now_ms),
+                core.pipeline_capacity(now_ms),
+                deadlines,
+            )
+        };
+        assert_eq!(
+            after_status.fully_covered_ready,
+            before_status.fully_covered_ready
+        );
+        assert_eq!(after_status.active_sessions, before_status.active_sessions);
+        assert_eq!(
+            after_status.retained_results,
+            before_status.retained_results
+        );
+        assert_eq!(
+            after_status.queued_cancellations,
+            before_status.queued_cancellations
+        );
+        assert_eq!(
+            after_capacity.ready_complete_pipelines,
+            before_capacity.ready_complete_pipelines
+        );
+        assert_eq!(
+            after_capacity.idle_complete_pipelines,
+            before_capacity.idle_complete_pipelines
+        );
+        assert_eq!(after_deadlines, before_deadlines);
+        assert_eq!(
+            fixture
+                .coordinator
+                .community_shard_dispatch_permits
+                .available_permits(),
+            before_permits
+        );
+        assert_eq!(
+            fixture
+                .coordinator
+                .community_shard_dispatch_in_flight
+                .load(Ordering::Acquire),
+            before_in_flight
+        );
+
+        fixture.coordinator.dag_validators.write().truncate(1);
+        let unverified = crate::rpc::inference_readiness_snapshot(&fixture.coordinator);
+        assert!(!unverified.community_sharded_ready && !unverified.sharded_pipeline_ready);
+        let final_guard = fixture.coordinator.community_shard_coordinator.lock();
+        let final_core = final_guard.as_ref().unwrap();
+        let final_now_ms = now_unix_ms().unwrap();
+        assert!(final_core.status_snapshot(final_now_ms).fully_covered_ready);
+        assert_eq!(
+            final_core
+                .pipeline_capacity(final_now_ms)
+                .ready_complete_pipelines,
+            1
+        );
+        assert_eq!(final_core.status_snapshot(final_now_ms).active_sessions, 0);
+        assert_eq!(final_core.status_snapshot(final_now_ms).retained_results, 0);
+    }
+
+    #[tokio::test]
     async fn valid_two_partial_worker_session_returns_verified_answer() {
         let fixture =
             build_verified_fixture(2, 2, CommunityShardLimits::default(), None, true).await;
