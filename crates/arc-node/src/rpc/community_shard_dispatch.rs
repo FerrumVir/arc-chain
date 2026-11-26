@@ -2176,6 +2176,7 @@ mod tests {
     async fn lost_notify_does_not_hang() {
         let limits = CommunityShardLimits {
             job_deadline_ms: 30_000,
+            step_timeout_ms: 20_000,
             ..CommunityShardLimits::default()
         };
         let fixture = build_verified_fixture(2, 2, limits, None, true).await;

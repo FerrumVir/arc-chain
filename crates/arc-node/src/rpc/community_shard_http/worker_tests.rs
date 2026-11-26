@@ -161,7 +161,18 @@ async fn wait_for_session_result(
             }
         }
         let now = Instant::now();
-        assert!(now < deadline, "timed out waiting for session outcome");
+        if now >= deadline {
+            let guard = node.community_shard_coordinator.lock();
+            let coordinator = guard.as_ref().unwrap();
+            let session = coordinator.session_status(session_id);
+            let worker = session
+                .as_ref()
+                .and_then(|session| coordinator.worker_lease_snapshot(session.expected_worker));
+            panic!(
+                "timed out waiting for session {session_id:?}: session={session:?}, expected_worker={worker:?}, coordinator={:?}",
+                coordinator.status_snapshot(now_ms())
+            );
+        }
         let remaining = (deadline - now).min(Duration::from_millis(50));
         let _ = tokio::time::timeout(remaining, notified).await;
     }
@@ -436,8 +447,12 @@ async fn two_partial_workers_execute_real_networked_pipeline_matching_try_genera
 
     assert_eq!(s1.registrations, 1);
     assert_eq!(s2.registrations, 1);
-    assert!(s1.steps_executed > 0 && s1.steps_submitted == s1.steps_executed);
-    assert!(s2.steps_executed > 0 && s2.steps_submitted == s2.steps_executed);
+    let expected_steps = 1 + prompt.len() as u64 + u64::from(max_tokens);
+    for summary in [&s1, &s2] {
+        assert_eq!(summary.steps_executed, expected_steps);
+        assert!(summary.steps_submitted <= summary.steps_executed);
+        assert!(summary.steps_executed - summary.steps_submitted <= 1);
+    }
     assert!(s1.clean_release_sent);
     assert!(s2.clean_release_sent);
 }
@@ -743,7 +758,8 @@ async fn heartbeat_runs_during_blocked_load_and_active_state_and_shutdown_drains
 
     let _ = gate_tx.send(());
     let summary1 = w1.await.expect("join w1").expect("w1 clean shutdown");
-    assert!(summary1.heartbeats_sent >= 2);
+    assert!(observer.provisioning_count.load(Ordering::SeqCst) >= 2);
+    assert!(summary1.heartbeats_sent >= 1);
     assert_eq!(summary1.models_loaded, 0);
     assert!(summary1.clean_release_sent);
     assert!(
@@ -779,7 +795,8 @@ async fn heartbeat_runs_during_blocked_load_and_active_state_and_shutdown_drains
     let _ = shut2_tx.send(true);
     let summary2 = w2.await.expect("join w2").expect("w2 clean shutdown");
     srv.abort();
-    assert!(summary2.heartbeats_sent >= 3);
+    assert!(observer.ready_count.load(Ordering::SeqCst) >= 3);
+    assert!(summary2.heartbeats_sent >= 2);
     assert!(summary2.clean_release_sent);
 }
 
@@ -1295,7 +1312,8 @@ async fn heartbeat_not_starved_by_instant_claim_responses_and_default_loopback_i
     let summary = worker.await.expect("join worker").expect("worker ok");
     srv.abort();
     assert!(st.claim_calls.load(Ordering::SeqCst) >= 10);
-    assert!(summary.heartbeats_sent >= 4);
+    assert!(st.ready_heartbeats.load(Ordering::SeqCst) >= 4);
+    assert!(summary.heartbeats_sent >= 3);
     assert!(summary.clean_release_sent);
 
     let (prod_base, prod_srv) = spawn_router(build_production_router(node.clone())).await;
@@ -1432,7 +1450,10 @@ async fn hundred_signed_network_workers_all_execute_canonical_partial_inference(
                 .collect::<Vec<_>>()
         };
         for session in sessions {
-            let outcome = wait_for_session_result(&node, session, Duration::from_secs(40)).await;
+            let outcome = tokio::select! {
+                outcome = wait_for_session_result(&node, session, Duration::from_secs(40)) => outcome,
+                exited = workers.join_next() => panic!("worker exited before completing session {session:?}: {exited:?}"),
+            };
             let SessionOutcome::PendingVerification(result) = outcome else {
                 panic!("expected completed partial pipeline: {outcome:?}");
             };
