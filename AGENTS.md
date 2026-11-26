@@ -334,6 +334,10 @@ or completeness of the operator's supplied prior signing high-water marks.
 preserved target signing record to locate candidate certificate heights before
 full WAL replay. It does not verify the state WAL, DAG signatures, finality, or
 complete prior signing history; `qualify-peer-state` remains required.
+`scripts/recovery/wal_precopy.py` streams a bounded append-only WAL prefix into
+a create-only candidate. Its receipt is explicitly unqualified: capture of the
+remaining state, signed finality checks and full peer qualification are still
+required. It neither stops a service nor replaces any live state.
 
 `scripts/qualification/run-recovery-peer-tests.py` runs the exact mandatory
 recovery and sharding tests on a single build worker and rejects missing cases
