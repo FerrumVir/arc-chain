@@ -25,6 +25,8 @@ EXPECTED_BINARY_TESTS = {
     'recovery_peer_qualification_tests::qualify_peer_state_rejects_oversized_wrong_domain_forged_and_subquorum_certificates',
 }
 EXPECTED_LIBRARY_TESTS = {
+    'community_shard_worker::tests::transient_heartbeat_backoff_grows_and_resets_after_success',
+    'community_shard_worker::tests::elapsed_idle_wait_returns_before_overdue_heartbeat_but_shutdown_wins',
     'rpc::community_shard_dispatch::tests::outbound_workers_and_public_dispatch_return_independently_verified_answer',
     'rpc::community_shard_dispatch::tests::validate_pending_result_rejects_altered_digest_and_eos_or_token_anomalies',
     'rpc::community_shard_dispatch::tests::verification_candidate_binds_node_transaction_domain',

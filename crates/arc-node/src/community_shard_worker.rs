@@ -442,6 +442,7 @@ struct WorkerRuntime {
     fence: LeaseFenceTracker,
     consecutive_reacquires: usize,
     consecutive_reregisters: usize,
+    consecutive_heartbeat_transients: usize,
     summary: WorkerRunSummary,
 }
 
@@ -508,6 +509,7 @@ impl WorkerRuntime {
             fence: LeaseFenceTracker::default(),
             consecutive_reacquires: 0,
             consecutive_reregisters: 0,
+            consecutive_heartbeat_transients: 0,
             summary: WorkerRunSummary::default(),
         })
     }
@@ -576,6 +578,7 @@ impl WorkerRuntime {
             self.fence.record(&assignment);
             self.active_lease = Some(assignment.clone());
             self.summary.clean_release_sent = false;
+            self.consecutive_heartbeat_transients = 0;
             match self.load_and_bind_lease(assignment).await? {
                 LoadOutcome::Bound => {
                     if is_rebalance {
@@ -1499,6 +1502,9 @@ impl WorkerRuntime {
                 return Ok(WaitOutcome::Shutdown);
             }
             let now = Instant::now();
+            if now >= wait_until {
+                return Ok(WaitOutcome::Elapsed);
+            }
             if now >= *next_heartbeat_at {
                 let Some(assignment) = self.active_lease.clone() else {
                     return Ok(WaitOutcome::Reacquire {
@@ -1534,9 +1540,6 @@ impl WorkerRuntime {
                 }
                 continue;
             }
-            if now >= wait_until {
-                return Ok(WaitOutcome::Elapsed);
-            }
             let next_hb = *next_heartbeat_at;
             tokio::select! {
                 biased;
@@ -1545,12 +1548,8 @@ impl WorkerRuntime {
                         return Ok(WaitOutcome::Shutdown);
                     }
                 }
+                _ = tokio::time::sleep_until(wait_until) => return Ok(WaitOutcome::Elapsed),
                 _ = tokio::time::sleep_until(next_hb) => {}
-                _ = tokio::time::sleep_until(wait_until) => {
-                    if Instant::now() < *next_heartbeat_at {
-                        return Ok(WaitOutcome::Elapsed);
-                    }
-                }
             }
         }
     }
@@ -1619,6 +1618,7 @@ impl WorkerRuntime {
                     });
                 }
                 self.summary.heartbeats_sent += 1;
+                self.consecutive_heartbeat_transients = 0;
                 match resp.directive {
                     HeartbeatDirective::Provisioning { deadline_unix_ms } if !ready => {
                         if deadline_unix_ms == 0 {
@@ -1749,11 +1749,13 @@ impl WorkerRuntime {
         Instant::now() + Duration::from_millis(self.config.heartbeat_interval_ms)
     }
 
-    fn next_transient_heartbeat_deadline(&self) -> Instant {
-        let ms = self
-            .config
-            .retry_base_backoff_ms
-            .min(self.config.heartbeat_interval_ms);
+    fn next_transient_heartbeat_deadline(&mut self) -> Instant {
+        self.consecutive_heartbeat_transients =
+            self.consecutive_heartbeat_transients.saturating_add(1);
+        let ms = compute_transient_heartbeat_backoff_ms(
+            &self.config,
+            self.consecutive_heartbeat_transients,
+        );
         Instant::now() + Duration::from_millis(ms)
     }
 
@@ -2301,6 +2303,18 @@ fn compute_backoff_ms(base_ms: u64, max_ms: u64, attempt: usize) -> u64 {
     base_ms.saturating_mul(1u64 << shift).min(max_ms)
 }
 
+fn compute_transient_heartbeat_backoff_ms(
+    config: &CommunityShardWorkerConfig,
+    consecutive_transients: usize,
+) -> u64 {
+    let cap_ms = config
+        .retry_max_backoff_ms
+        .min(config.heartbeat_interval_ms)
+        .max(1);
+    let base_ms = config.retry_base_backoff_ms.min(cap_ms).max(1);
+    compute_backoff_ms(base_ms, cap_ms, consecutive_transients)
+}
+
 fn is_registration_missing_error(status: StatusCode, body: &str) -> bool {
     status == StatusCode::NOT_FOUND
         && (body.contains(COMMUNITY_REGISTER_PATH)
@@ -2516,6 +2530,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn elapsed_idle_wait_returns_before_overdue_heartbeat_but_shutdown_wins() {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let loader: PartialModelLoader =
+            Arc::new(|_| anyhow::bail!("idle wait must not load weights"));
+        let mut runtime = WorkerRuntime::new(
+            base_config("https://coord.example.com"),
+            Arc::new(KeyPair::generate_ed25519()),
+            test_spec(4),
+            loader,
+            shutdown_rx,
+        )
+        .unwrap();
+        let mut heartbeat_deadline = Instant::now() - Duration::from_secs(1);
+        assert!(matches!(
+            runtime
+                .wait_with_heartbeats(Duration::ZERO, &mut heartbeat_deadline, None)
+                .await
+                .unwrap(),
+            WaitOutcome::Elapsed
+        ));
+        shutdown_tx.send(true).unwrap();
+        assert!(matches!(
+            runtime
+                .wait_with_heartbeats(Duration::ZERO, &mut heartbeat_deadline, None)
+                .await
+                .unwrap(),
+            WaitOutcome::Shutdown
+        ));
+    }
+
+    #[tokio::test]
     async fn runtime_rejects_invalid_config_and_non_ed25519_before_loader() {
         let spec = test_spec(4);
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2635,5 +2680,122 @@ mod tests {
         short.request_timeout_ms = 200;
         assert!(validate_lease_response(&short, &spec, &make_resp(249), now_ms, &fence).is_err());
         assert!(validate_lease_response(&short, &spec, &make_resp(250), now_ms, &fence).is_ok());
+    }
+
+    fn test_runtime_lease(spec: &TrustedModelSpec) -> ShardLeaseAssignment {
+        ShardLeaseAssignment {
+            lease_id: LeaseId {
+                boot_nonce: arc_crypto::hash_bytes(b"worker-unit-hb-boot"),
+                seq: 1,
+            },
+            lease_epoch: 1,
+            model_id: spec.model_id,
+            execution_profile: spec.execution_profile.clone(),
+            range: ShardLayerRange {
+                start_layer: 0,
+                end_layer: 2,
+            },
+            provisioning_deadline_unix_ms: checked_now_unix_ms().expect("unix ms") + 60_000,
+        }
+    }
+
+    async fn spawn_hb_router(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn transient_heartbeat_backoff_grows_and_resets_after_success() {
+        use axum::extract::State;
+        use axum::routing::post;
+
+        async fn flaky_hb_handler(
+            State(calls): State<Arc<AtomicUsize>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> Result<axum::Json<ShardHeartbeatResponse>, (StatusCode, String)> {
+            let idx = calls.fetch_add(1, Ordering::SeqCst);
+            if idx == 3 {
+                return Ok(axum::Json(ShardHeartbeatResponse {
+                    directive: HeartbeatDirective::Active {
+                        expires_at_unix_ms: checked_now_unix_ms().expect("unix ms") + 45_000,
+                    },
+                    cancellations: Vec::new(),
+                }));
+            }
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "transient heartbeat failure".to_string(),
+            ))
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new()
+            .route(COMMUNITY_SHARD_HEARTBEAT_PATH, post(flaky_hb_handler))
+            .with_state(Arc::clone(&calls));
+        let (base_url, server) = spawn_hb_router(app).await;
+
+        let spec = test_spec(4);
+        let mut cfg = base_config(&base_url);
+        cfg.allow_insecure_for_loopback = true;
+        cfg.heartbeat_interval_ms = 200;
+        cfg.retry_base_backoff_ms = 20;
+        cfg.retry_max_backoff_ms = 120;
+        let loader: PartialModelLoader = Arc::new(|_| anyhow::bail!("loader unused"));
+        let (_tx, rx) = watch::channel(false);
+        let mut runtime = WorkerRuntime::new(
+            cfg,
+            Arc::new(KeyPair::generate_ed25519()),
+            spec.clone(),
+            loader,
+            rx,
+        )
+        .expect("runtime");
+        let lease = test_runtime_lease(&spec);
+        runtime.active_lease = Some(lease.clone());
+        runtime.ready_ttl_ms = Some(45_000);
+
+        let mut next_hb = Instant::now();
+        for (expected_count, expected_ms) in [(1usize, 20u64), (2, 40), (3, 80)] {
+            let out = runtime
+                .send_due_heartbeat(&lease, &mut next_hb)
+                .await
+                .expect("transient heartbeat continues");
+            assert!(matches!(out, StepCycleOutcome::Continue));
+            assert_eq!(runtime.consecutive_heartbeat_transients, expected_count);
+            assert_eq!(
+                compute_transient_heartbeat_backoff_ms(&runtime.config, expected_count),
+                expected_ms
+            );
+        }
+
+        let recovered = runtime
+            .send_due_heartbeat(&lease, &mut next_hb)
+            .await
+            .expect("recovered heartbeat succeeds");
+        assert!(matches!(recovered, StepCycleOutcome::Continue));
+        assert_eq!(runtime.consecutive_heartbeat_transients, 0);
+        assert_eq!(runtime.summary.heartbeats_sent, 1);
+
+        let post_reset = runtime
+            .send_due_heartbeat(&lease, &mut next_hb)
+            .await
+            .expect("post-reset transient continues");
+        assert!(matches!(post_reset, StepCycleOutcome::Continue));
+        assert_eq!(runtime.consecutive_heartbeat_transients, 1);
+        assert!(next_hb.saturating_duration_since(Instant::now()) <= Duration::from_millis(20));
+
+        runtime.config.heartbeat_interval_ms = 60;
+        assert_eq!(
+            compute_transient_heartbeat_backoff_ms(&runtime.config, 4),
+            60
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        server.abort();
     }
 }

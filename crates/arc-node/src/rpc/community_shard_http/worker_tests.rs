@@ -1392,7 +1392,7 @@ async fn stalled_http_response_body_hits_total_elapsed_timeout() {
     assert!(started.elapsed() < Duration::from_secs(3));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hundred_signed_network_workers_all_execute_canonical_partial_inference() {
     let full = Arc::new(build_deterministic_integer_model(
         32,
@@ -1416,8 +1416,8 @@ async fn hundred_signed_network_workers_all_execute_canonical_partial_inference(
         assert!(identities.insert(key.address().to_hex()));
         let mut config = worker_config(&base_url, &node, &format!("network-worker-{index}"));
         config.model_name = super::super::model_display_name(&full);
-        config.idle_poll_interval_ms = 200;
-        config.heartbeat_interval_ms = 1_000;
+        config.idle_poll_interval_ms = 250;
+        config.heartbeat_interval_ms = 5_000;
         workers.spawn(run_community_shard_worker(
             config,
             key,
@@ -1470,6 +1470,8 @@ async fn hundred_signed_network_workers_all_execute_canonical_partial_inference(
     assert_eq!(participants, identities);
     shutdown_tx.send(true).unwrap();
     let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let steps_per_session_per_worker = 1 + prompt.len() as u64 + u64::from(max_tokens);
+    let mut total_steps_executed = 0u64;
     let mut finished = 0;
     while let Some(joined) = tokio::time::timeout_at(drain_deadline, workers.join_next())
         .await
@@ -1478,9 +1480,17 @@ async fn hundred_signed_network_workers_all_execute_canonical_partial_inference(
         let summary = joined.expect("worker join").expect("worker exit");
         assert_eq!(summary.registrations, 1);
         assert!(summary.steps_executed > 0);
+        assert_eq!(summary.steps_executed % steps_per_session_per_worker, 0);
+        assert!(summary.steps_submitted <= summary.steps_executed);
+        assert!(summary.steps_executed - summary.steps_submitted <= 1);
         assert!(summary.clean_release_sent);
+        total_steps_executed += summary.steps_executed;
         finished += 1;
     }
     server.abort();
     assert_eq!(finished, 100);
+    assert_eq!(
+        total_steps_executed,
+        5 * 4 * 6 * steps_per_session_per_worker
+    );
 }
