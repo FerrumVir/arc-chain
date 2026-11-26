@@ -2343,6 +2343,14 @@ fn recovery_peer_qualify_command_accepts_persistent_candidate_and_rejects_mutati
         "does not exceed prior_target_highest_dag_round",
     );
 
+    let mut overlapping_commit_cursor = valid_manifest.clone();
+    assert!(source_replay.next_commit_round < source_replay.current_round);
+    overlapping_commit_cursor.prior_target_highest_dag_round = source_replay.next_commit_round;
+    peer_qualify_expect_err(
+        run_with_manifest("overlapping-commit-cursor", &overlapping_commit_cursor),
+        "capture newer committed history before resuming skip voting",
+    );
+
     let mut bad_wal_sha = valid_manifest.clone();
     bad_wal_sha.expected_state_wal_sha256 = peer_qualify_flip_hex(&wal_before.0);
     assert!(run_with_manifest("bad-wal-sha", &bad_wal_sha).is_err());

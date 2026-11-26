@@ -872,6 +872,12 @@ fn run_qualify_peer_state_command(
         manifest.prior_target_highest_dag_round
     );
     ensure!(
+        replay.next_commit_round > manifest.prior_target_highest_dag_round,
+        "restored DAG next commit round {} does not exceed prior_target_highest_dag_round {}; capture newer committed history before resuming skip voting",
+        replay.next_commit_round,
+        manifest.prior_target_highest_dag_round
+    );
+    ensure!(
         consensus.engine.current_round() == replay.current_round
             && consensus.engine.last_committed_round() == replay.next_commit_round,
         "replayed consensus cursors drifted from returned replay summary"
