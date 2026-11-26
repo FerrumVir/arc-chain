@@ -17,6 +17,11 @@ EXPECTED_BINARY_TESTS = {
     'recovery_peer_qualification_tests::qualify_peer_state_rejects_oversized_wrong_domain_forged_and_subquorum_certificates',
 }
 EXPECTED_LIBRARY_TESTS = {
+    'rpc::community_shard_http::worker_tests::hundred_signed_network_workers_all_execute_canonical_partial_inference',
+    'rpc::community_shard_http::worker_tests::stalled_http_response_body_hits_total_elapsed_timeout',
+    'rpc::community_shard_http::worker_tests::heartbeat_not_starved_by_instant_claim_responses_and_default_loopback_idles_cleanly',
+    'community_shard_worker::tests::lease_ttl_validation_enforces_request_and_connect_timeout_headroom',
+    'community_shard_worker::tests::config_rejects_extreme_timings_and_reacquires_and_accepts_short_timings',
     'community_shard_worker::tests::config_rejects_insecure_non_literal_loopback_urls_and_bad_layer_budget',
     'community_shard_worker::tests::pre_loader_lease_validation_rejects_full_range_ttl_expiry_and_fenced_boot',
     'community_shard_worker::tests::runtime_rejects_invalid_config_and_non_ed25519_before_loader',
@@ -70,6 +75,16 @@ EXPECTED_LIBRARY_TESTS = {
 
 
 EXPECTED_INFERENCE_TESTS = {
+    'canonical_shard_admission::candle_tests::admit_rejects_zero_kv_cache_and_zero_working_set_budgets',
+    'canonical_shard_admission::candle_tests::rejects_layer_ceiling_above_1024_and_accepts_1024_boundary_without_weights',
+    'canonical_shard_admission::candle_tests::content_parses_captured_header_only_never_reads_past_header_or_mutated_source',
+    'canonical_shard_admission::candle_tests::boundary_overflow_undersized_cap_reserved_kv_and_header_limit',
+    'canonical_shard_admission::candle_tests::rejects_empty_reversed_out_of_bounds_full_and_over_half_ranges',
+    'canonical_shard_admission::candle_tests::first_shard_embedding_budget_dwarfs_interior_and_last_shard',
+    'canonical_shard_admission::candle_tests::metadata_array_heap_storage_is_included_in_loading_budget',
+    'canonical_shard_admission::candle_tests::rejects_malformed_geometry_ceilings_coercions_and_non_llama',
+    'canonical_shard_admission::candle_tests::real_candle_written_non_square_gguf_matches_canonical_loader',
+    'canonical_shard_admission::candle_tests::header_only_gguf_without_weights_inspects_and_admits_partial_ranges',
     'golden_vectors::gguf_preparation::a_gguf_prepared_by_the_canonical_loader_matches_the_independent_reference',
     'golden_vectors::gguf_preparation::a_gguf_missing_a_norm_weight_is_refused_by_the_canonical_loader',
     'golden_vectors::gguf_preparation::canonical_i8_partial_shards_match_full_engine_and_ownership',
@@ -108,7 +123,7 @@ def main():
             if target.get("name") in {"arc-node", "arc_node", "arc_inference"}:
                 executables.setdefault(target["name"], set()).add(row["executable"])
     expected_targets = {
-        "arc_inference": (("golden_vectors::gguf_preparation::",), EXPECTED_INFERENCE_TESTS),
+        "arc_inference": (("canonical_shard_admission::candle_tests::", "golden_vectors::gguf_preparation::",), EXPECTED_INFERENCE_TESTS),
         "arc-node": (("tests::recovery_peer_", "recovery_peer_qualification_tests::"), EXPECTED_BINARY_TESTS),
         "arc_node": (("community_shard_worker::tests::", "rpc::community_shard_http::worker_tests::", "community_shard_executor::tests::", "community_sharding::tests::", "rpc::community_shard_http::tests::", "rpc::tests::community_auth_"), EXPECTED_LIBRARY_TESTS),
     }

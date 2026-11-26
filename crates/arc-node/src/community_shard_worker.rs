@@ -33,19 +33,26 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::watch;
-use tokio::time::{Interval, MissedTickBehavior};
+use tokio::time::Instant;
 
 pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 10_000;
 pub const MIN_HEARTBEAT_INTERVAL_MS: u64 = 20;
+pub const MAX_IDLE_POLL_INTERVAL_MS: u64 = 10_000;
 pub const DEFAULT_IDLE_POLL_INTERVAL_MS: u64 = 250;
+pub const MAX_CONNECT_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
+pub const MAX_REQUEST_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 15_000;
+pub const MAX_RELEASE_TIMEOUT_MS: u64 = 10_000;
 pub const DEFAULT_RELEASE_TIMEOUT_MS: u64 = 5_000;
+pub const MAX_RETRY_BACKOFF_MS: u64 = 10_000;
 pub const DEFAULT_RETRY_BASE_BACKOFF_MS: u64 = 100;
 pub const DEFAULT_RETRY_MAX_BACKOFF_MS: u64 = 2_000;
+pub const MAX_REACQUIRE_BACKOFF_MS: u64 = 30_000;
 pub const DEFAULT_REACQUIRE_BASE_BACKOFF_MS: u64 = 250;
 pub const DEFAULT_REACQUIRE_MAX_BACKOFF_MS: u64 = 5_000;
 pub const DEFAULT_MAX_CONSECUTIVE_LEASE_REACQUIRES: usize = 8;
+pub const MAX_CONSECUTIVE_LEASE_REACQUIRES_HARD_CAP: usize = 64;
 
 const MAX_RESPONSE_BODY_BYTES: usize = COMMUNITY_SHARD_SUBMIT_BODY_LIMIT_BYTES;
 const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
@@ -162,28 +169,54 @@ impl CommunityShardWorkerConfig {
                 "heartbeat_interval_ms must be in {MIN_HEARTBEAT_INTERVAL_MS}..={DEFAULT_HEARTBEAT_INTERVAL_MS}"
             )));
         }
-        if self.idle_poll_interval_ms == 0
-            || self.connect_timeout_ms == 0
-            || self.request_timeout_ms == 0
-            || self.release_timeout_ms == 0
+        if self.idle_poll_interval_ms == 0 || self.idle_poll_interval_ms > MAX_IDLE_POLL_INTERVAL_MS
         {
+            return Err(CommunityShardWorkerError::InvalidConfig(format!(
+                "idle_poll_interval_ms must be in 1..={MAX_IDLE_POLL_INTERVAL_MS}"
+            )));
+        }
+        if self.connect_timeout_ms == 0 || self.connect_timeout_ms > MAX_CONNECT_TIMEOUT_MS {
+            return Err(CommunityShardWorkerError::InvalidConfig(format!(
+                "connect_timeout_ms must be in 1..={MAX_CONNECT_TIMEOUT_MS}"
+            )));
+        }
+        if self.request_timeout_ms == 0 || self.request_timeout_ms > MAX_REQUEST_TIMEOUT_MS {
+            return Err(CommunityShardWorkerError::InvalidConfig(format!(
+                "request_timeout_ms must be in 1..={MAX_REQUEST_TIMEOUT_MS}"
+            )));
+        }
+        if self.connect_timeout_ms > self.request_timeout_ms {
             return Err(CommunityShardWorkerError::InvalidConfig(
-                "poll and timeout durations must be nonzero".to_string(),
+                "connect_timeout_ms cannot exceed request_timeout_ms".to_string(),
             ));
+        }
+        if self.release_timeout_ms == 0 || self.release_timeout_ms > MAX_RELEASE_TIMEOUT_MS {
+            return Err(CommunityShardWorkerError::InvalidConfig(format!(
+                "release_timeout_ms must be in 1..={MAX_RELEASE_TIMEOUT_MS}"
+            )));
         }
         if self.retry_base_backoff_ms == 0
             || self.retry_base_backoff_ms > self.retry_max_backoff_ms
-            || self.reacquire_base_backoff_ms == 0
-            || self.reacquire_base_backoff_ms > self.reacquire_max_backoff_ms
+            || self.retry_max_backoff_ms > MAX_RETRY_BACKOFF_MS
         {
-            return Err(CommunityShardWorkerError::InvalidConfig(
-                "backoff bounds must be nonzero with base <= max".to_string(),
-            ));
+            return Err(CommunityShardWorkerError::InvalidConfig(format!(
+                "retry backoff bounds must be in 1..={MAX_RETRY_BACKOFF_MS} with base <= max"
+            )));
         }
-        if self.max_consecutive_lease_reacquires == 0 {
-            return Err(CommunityShardWorkerError::InvalidConfig(
-                "max_consecutive_lease_reacquires must be nonzero".to_string(),
-            ));
+        if self.reacquire_base_backoff_ms == 0
+            || self.reacquire_base_backoff_ms > self.reacquire_max_backoff_ms
+            || self.reacquire_max_backoff_ms > MAX_REACQUIRE_BACKOFF_MS
+        {
+            return Err(CommunityShardWorkerError::InvalidConfig(format!(
+                "reacquire backoff bounds must be in 1..={MAX_REACQUIRE_BACKOFF_MS} with base <= max"
+            )));
+        }
+        if self.max_consecutive_lease_reacquires == 0
+            || self.max_consecutive_lease_reacquires > MAX_CONSECUTIVE_LEASE_REACQUIRES_HARD_CAP
+        {
+            return Err(CommunityShardWorkerError::InvalidConfig(format!(
+                "max_consecutive_lease_reacquires must be in 1..={MAX_CONSECUTIVE_LEASE_REACQUIRES_HARD_CAP}"
+            )));
         }
         normalize_and_validate_coordinator_url(
             &self.coordinator_base_url,
@@ -542,6 +575,7 @@ impl WorkerRuntime {
             };
             self.fence.record(&assignment);
             self.active_lease = Some(assignment.clone());
+            self.summary.clean_release_sent = false;
             match self.load_and_bind_lease(assignment).await? {
                 LoadOutcome::Bound => {
                     if is_rebalance {
@@ -643,13 +677,21 @@ impl WorkerRuntime {
             }
         }
         if let Some(req) = release_req {
-            let timeout = Duration::from_millis(self.config.release_timeout_ms);
+            let release_deadline =
+                Instant::now() + Duration::from_millis(self.config.release_timeout_ms);
             for attempt in 0..MAX_RELEASE_TRANSIENT_ATTEMPTS {
+                let Some(remaining) = release_deadline.checked_duration_since(Instant::now())
+                else {
+                    break;
+                };
+                if remaining.is_zero() {
+                    break;
+                }
                 match self
                     .post_signed_shard_once::<ShardReleaseRequest, ShardReleaseResponse>(
                         COMMUNITY_SHARD_RELEASE_PATH,
                         &req,
-                        timeout,
+                        remaining,
                     )
                     .await
                 {
@@ -662,10 +704,16 @@ impl WorkerRuntime {
                     Ok(HttpCallResult::Transient(_))
                         if attempt + 1 < MAX_RELEASE_TRANSIENT_ATTEMPTS =>
                     {
-                        tokio::time::sleep(Duration::from_millis(
-                            self.config.retry_base_backoff_ms,
-                        ))
-                        .await;
+                        let Some(left) = release_deadline.checked_duration_since(Instant::now())
+                        else {
+                            break;
+                        };
+                        let sleep_dur =
+                            Duration::from_millis(self.config.retry_base_backoff_ms).min(left);
+                        if sleep_dur.is_zero() {
+                            break;
+                        }
+                        tokio::time::sleep(sleep_dur).await;
                     }
                     _ => break,
                 }
@@ -823,7 +871,7 @@ impl WorkerRuntime {
         let loader = Arc::clone(&self.loader);
         let assignment_for_loader = assignment.clone();
         let mut load_handle = tokio::task::spawn_blocking(move || loader(&assignment_for_loader));
-        let mut hb_interval = self.make_heartbeat_interval();
+        let mut next_hb = self.next_heartbeat_deadline();
         let mut shutdown = self.shutdown.clone();
         let mut abandoned: Option<LoadAbandonment> = None;
 
@@ -836,10 +884,21 @@ impl WorkerRuntime {
                 break load_handle.await;
             }
             tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        abandoned = Some(LoadAbandonment::Shutdown);
+                    }
+                }
                 res = &mut load_handle => break res,
-                _ = hb_interval.tick() => {
+                _ = tokio::time::sleep_until(next_hb) => {
                     match self.send_heartbeat_once(&assignment, false).await {
-                        HeartbeatOutcome::Continue { .. } | HeartbeatOutcome::Transient => {}
+                        HeartbeatOutcome::Continue { .. } => {
+                            next_hb = self.next_heartbeat_deadline();
+                        }
+                        HeartbeatOutcome::Transient => {
+                            next_hb = self.next_transient_heartbeat_deadline();
+                        }
                         HeartbeatOutcome::Rebalance(next) => {
                             abandoned = Some(LoadAbandonment::Rebalance(next));
                         }
@@ -852,11 +911,6 @@ impl WorkerRuntime {
                         HeartbeatOutcome::Fatal(err) => {
                             abandoned = Some(LoadAbandonment::Fatal(err));
                         }
-                    }
-                }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        abandoned = Some(LoadAbandonment::Shutdown);
                     }
                 }
             }
@@ -928,7 +982,7 @@ impl WorkerRuntime {
                     return Ok(StepCycleOutcome::Continue);
                 }
                 HeartbeatOutcome::Transient => {
-                    attempt += 1;
+                    attempt = attempt.saturating_add(1);
                     let backoff_ms = compute_backoff_ms(
                         self.config.retry_base_backoff_ms,
                         self.config.retry_max_backoff_ms,
@@ -960,7 +1014,7 @@ impl WorkerRuntime {
     }
 
     async fn run_active_loop(&mut self) -> Result<StepCycleOutcome, CommunityShardWorkerError> {
-        let mut hb_interval = self.make_heartbeat_interval();
+        let mut next_heartbeat_at = self.next_heartbeat_deadline();
         let mut transient_claim_errors = 0usize;
         loop {
             if *self.shutdown.borrow() {
@@ -973,6 +1027,15 @@ impl WorkerRuntime {
             let assignment = self.active_lease.clone().ok_or_else(|| {
                 CommunityShardWorkerError::InvalidLease("missing active lease".to_string())
             })?;
+            if Instant::now() >= next_heartbeat_at {
+                match self
+                    .send_due_heartbeat(&assignment, &mut next_heartbeat_at)
+                    .await?
+                {
+                    StepCycleOutcome::Continue => {}
+                    other => return Ok(other),
+                }
+            }
             let claim_req = ShardClaimStepRequest {
                 worker_id: self.worker_id,
                 lease_id: assignment.lease_id,
@@ -980,7 +1043,7 @@ impl WorkerRuntime {
                 model_id: assignment.model_id,
                 execution_profile: assignment.execution_profile.clone(),
             };
-            let timeout = Duration::from_millis(self.config.request_timeout_ms);
+            let timeout = Duration::from_millis(self.active_request_timeout_ms());
             match self
                 .post_signed_shard_cancellable::<ShardClaimStepRequest, ShardClaimStepResponse>(
                     COMMUNITY_SHARD_CLAIM_STEP_PATH,
@@ -996,7 +1059,7 @@ impl WorkerRuntime {
                         ShardClaimStepResponse::Idle => {
                             let wait = Duration::from_millis(self.config.idle_poll_interval_ms);
                             match self
-                                .wait_with_heartbeats(wait, &mut hb_interval, None)
+                                .wait_with_heartbeats(wait, &mut next_heartbeat_at, None)
                                 .await?
                             {
                                 WaitOutcome::Elapsed | WaitOutcome::WatchedSessionCancelled => {}
@@ -1031,7 +1094,7 @@ impl WorkerRuntime {
                         }
                         ShardClaimStepResponse::Step { work } => {
                             match self
-                                .execute_and_submit_step(*work, &mut hb_interval)
+                                .execute_and_submit_step(*work, &mut next_heartbeat_at)
                                 .await?
                             {
                                 StepCycleOutcome::Continue => {}
@@ -1068,7 +1131,7 @@ impl WorkerRuntime {
                     });
                 }
                 CancellableCall::Completed(HttpCallResult::Transient(_)) => {
-                    transient_claim_errors += 1;
+                    transient_claim_errors = transient_claim_errors.saturating_add(1);
                     let wait_ms = compute_backoff_ms(
                         self.config.retry_base_backoff_ms,
                         self.config.retry_max_backoff_ms,
@@ -1077,7 +1140,7 @@ impl WorkerRuntime {
                     match self
                         .wait_with_heartbeats(
                             Duration::from_millis(wait_ms),
-                            &mut hb_interval,
+                            &mut next_heartbeat_at,
                             None,
                         )
                         .await?
@@ -1099,7 +1162,7 @@ impl WorkerRuntime {
     async fn execute_and_submit_step(
         &mut self,
         work: ShardStepWork,
-        hb_interval: &mut Interval,
+        next_heartbeat_at: &mut Instant,
     ) -> Result<StepCycleOutcome, CommunityShardWorkerError> {
         let assignment = self.active_lease.clone().ok_or_else(|| {
             CommunityShardWorkerError::InvalidLease("missing active lease".to_string())
@@ -1148,11 +1211,19 @@ impl WorkerRuntime {
             if stop_reason.is_some() {
                 break exec_handle.await;
             }
+            let next_hb = *next_heartbeat_at;
             tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        stop_reason = Some(ComputeStop::Shutdown);
+                    }
+                }
                 res = &mut exec_handle => break res,
-                _ = hb_interval.tick() => {
+                _ = tokio::time::sleep_until(next_hb) => {
                     match self.send_heartbeat_once(&assignment, true).await {
                         HeartbeatOutcome::Continue { cancellations } => {
+                            *next_heartbeat_at = self.next_heartbeat_deadline();
                             for notice in cancellations {
                                 if notice.session_id == work.session_id
                                     && notice.lease_id == assignment.lease_id
@@ -1160,13 +1231,16 @@ impl WorkerRuntime {
                                 {
                                     current_session_cancelled = true;
                                 }
-                                if queued_cancellations.len() < MAX_CANCELLATIONS_PER_WORKER_HARD_CAP
-                                {
-                                    queued_cancellations.push_back(notice);
-                                }
+                                push_bounded_cancellation(
+                                    &mut queued_cancellations,
+                                    notice,
+                                    work.session_id,
+                                );
                             }
                         }
-                        HeartbeatOutcome::Transient => {}
+                        HeartbeatOutcome::Transient => {
+                            *next_heartbeat_at = self.next_transient_heartbeat_deadline();
+                        }
                         HeartbeatOutcome::Rebalance(next) => {
                             stop_reason = Some(ComputeStop::Rebalance(next));
                         }
@@ -1179,11 +1253,6 @@ impl WorkerRuntime {
                         HeartbeatOutcome::Fatal(err) => {
                             stop_reason = Some(ComputeStop::Fatal(err));
                         }
-                    }
-                }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        stop_reason = Some(ComputeStop::Shutdown);
                     }
                 }
             }
@@ -1249,7 +1318,12 @@ impl WorkerRuntime {
         };
 
         match self
-            .submit_step_with_retry(submit_req, work.deadline_unix_ms, is_completed, hb_interval)
+            .submit_step_with_retry(
+                submit_req,
+                work.deadline_unix_ms,
+                is_completed,
+                next_heartbeat_at,
+            )
             .await?
         {
             SubmitOutcome::Accepted | SubmitOutcome::StaleOrExpired => {
@@ -1268,7 +1342,7 @@ impl WorkerRuntime {
         submit_req: ShardStepSubmitRequest,
         deadline_unix_ms: u64,
         is_completed: bool,
-        hb_interval: &mut Interval,
+        next_heartbeat_at: &mut Instant,
     ) -> Result<SubmitOutcome, CommunityShardWorkerError> {
         let mut attempt = 0usize;
         loop {
@@ -1279,8 +1353,42 @@ impl WorkerRuntime {
             if now_ms >= deadline_unix_ms {
                 return Ok(SubmitOutcome::StaleOrExpired);
             }
+            if Instant::now() >= *next_heartbeat_at {
+                let Some(assignment) = self.active_lease.clone() else {
+                    return Ok(SubmitOutcome::Reacquire {
+                        needs_reregister: false,
+                    });
+                };
+                match self.send_heartbeat_once(&assignment, true).await {
+                    HeartbeatOutcome::Continue { cancellations } => {
+                        *next_heartbeat_at = self.next_heartbeat_deadline();
+                        let cancelled = cancellations.iter().any(|notice| {
+                            notice.session_id == submit_req.session_id
+                                && notice.lease_id == assignment.lease_id
+                                && notice.lease_epoch == assignment.lease_epoch
+                        });
+                        self.apply_cancellations(&cancellations)?;
+                        if cancelled {
+                            return Ok(SubmitOutcome::StaleOrExpired);
+                        }
+                    }
+                    HeartbeatOutcome::Transient => {
+                        *next_heartbeat_at = self.next_transient_heartbeat_deadline();
+                    }
+                    HeartbeatOutcome::Rebalance(next) => return Ok(SubmitOutcome::Rebalance(next)),
+                    HeartbeatOutcome::Reacquire { needs_reregister } => {
+                        return Ok(SubmitOutcome::Reacquire { needs_reregister });
+                    }
+                    HeartbeatOutcome::Shutdown => return Ok(SubmitOutcome::Shutdown),
+                    HeartbeatOutcome::Fatal(err) => return Err(err),
+                }
+            }
+            let now_ms = checked_now_unix_ms()?;
+            if now_ms >= deadline_unix_ms {
+                return Ok(SubmitOutcome::StaleOrExpired);
+            }
             let remaining_ms = deadline_unix_ms.saturating_sub(now_ms);
-            let timeout_ms = self.config.request_timeout_ms.min(remaining_ms).max(1);
+            let timeout_ms = self.active_request_timeout_ms().min(remaining_ms).max(1);
             match self
                 .post_signed_shard_cancellable::<ShardStepSubmitRequest, ShardStepSubmitResponse>(
                     COMMUNITY_SHARD_SUBMIT_STEP_PATH,
@@ -1335,7 +1443,7 @@ impl WorkerRuntime {
                     });
                 }
                 CancellableCall::Completed(HttpCallResult::Transient(_)) => {
-                    attempt += 1;
+                    attempt = attempt.saturating_add(1);
                     self.summary.submit_retries += 1;
                     let now_ms = checked_now_unix_ms()?;
                     if now_ms >= deadline_unix_ms {
@@ -1353,7 +1461,7 @@ impl WorkerRuntime {
                     match self
                         .wait_with_heartbeats(
                             Duration::from_millis(backoff_ms),
-                            hb_interval,
+                            next_heartbeat_at,
                             Some(submit_req.session_id),
                         )
                         .await?
@@ -1378,58 +1486,96 @@ impl WorkerRuntime {
     async fn wait_with_heartbeats(
         &mut self,
         duration: Duration,
-        hb_interval: &mut Interval,
+        next_heartbeat_at: &mut Instant,
         watched_session: Option<SessionId>,
     ) -> Result<WaitOutcome, CommunityShardWorkerError> {
         let mut shutdown = self.shutdown.clone();
         if *shutdown.borrow() {
             return Ok(WaitOutcome::Shutdown);
         }
-        let sleep = tokio::time::sleep(duration);
-        tokio::pin!(sleep);
+        let wait_until = Instant::now() + duration;
         loop {
-            tokio::select! {
-                _ = &mut sleep => return Ok(WaitOutcome::Elapsed),
-                _ = hb_interval.tick() => {
-                    let assignment = match self.active_lease.clone() {
-                        Some(lease) => lease,
-                        None => {
-                            return Ok(WaitOutcome::Reacquire {
-                                needs_reregister: false,
-                            });
+            if *shutdown.borrow() {
+                return Ok(WaitOutcome::Shutdown);
+            }
+            let now = Instant::now();
+            if now >= *next_heartbeat_at {
+                let Some(assignment) = self.active_lease.clone() else {
+                    return Ok(WaitOutcome::Reacquire {
+                        needs_reregister: false,
+                    });
+                };
+                match self.send_heartbeat_once(&assignment, true).await {
+                    HeartbeatOutcome::Continue { cancellations } => {
+                        *next_heartbeat_at = self.next_heartbeat_deadline();
+                        let cancelled_watched = watched_session.is_some_and(|sid| {
+                            cancellations.iter().any(|notice| {
+                                notice.session_id == sid
+                                    && notice.lease_id == assignment.lease_id
+                                    && notice.lease_epoch == assignment.lease_epoch
+                            })
+                        });
+                        self.apply_cancellations(&cancellations)?;
+                        if cancelled_watched {
+                            return Ok(WaitOutcome::WatchedSessionCancelled);
                         }
-                    };
-                    match self.send_heartbeat_once(&assignment, true).await {
-                        HeartbeatOutcome::Continue { cancellations } => {
-                            let cancelled_watched = watched_session.is_some_and(|sid| {
-                                cancellations.iter().any(|notice| {
-                                    notice.session_id == sid
-                                        && notice.lease_id == assignment.lease_id
-                                        && notice.lease_epoch == assignment.lease_epoch
-                                })
-                            });
-                            self.apply_cancellations(&cancellations)?;
-                            if cancelled_watched {
-                                return Ok(WaitOutcome::WatchedSessionCancelled);
-                            }
-                        }
-                        HeartbeatOutcome::Transient => {}
-                        HeartbeatOutcome::Rebalance(next) => {
-                            return Ok(WaitOutcome::Rebalance(next));
-                        }
-                        HeartbeatOutcome::Reacquire { needs_reregister } => {
-                            return Ok(WaitOutcome::Reacquire { needs_reregister });
-                        }
-                        HeartbeatOutcome::Shutdown => return Ok(WaitOutcome::Shutdown),
-                        HeartbeatOutcome::Fatal(err) => return Err(err),
                     }
+                    HeartbeatOutcome::Transient => {
+                        *next_heartbeat_at = self.next_transient_heartbeat_deadline();
+                    }
+                    HeartbeatOutcome::Rebalance(next) => {
+                        return Ok(WaitOutcome::Rebalance(next));
+                    }
+                    HeartbeatOutcome::Reacquire { needs_reregister } => {
+                        return Ok(WaitOutcome::Reacquire { needs_reregister });
+                    }
+                    HeartbeatOutcome::Shutdown => return Ok(WaitOutcome::Shutdown),
+                    HeartbeatOutcome::Fatal(err) => return Err(err),
                 }
+                continue;
+            }
+            if now >= wait_until {
+                return Ok(WaitOutcome::Elapsed);
+            }
+            let next_hb = *next_heartbeat_at;
+            tokio::select! {
+                biased;
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         return Ok(WaitOutcome::Shutdown);
                     }
                 }
+                _ = tokio::time::sleep_until(next_hb) => {}
+                _ = tokio::time::sleep_until(wait_until) => {
+                    if Instant::now() < *next_heartbeat_at {
+                        return Ok(WaitOutcome::Elapsed);
+                    }
+                }
             }
+        }
+    }
+
+    async fn send_due_heartbeat(
+        &mut self,
+        assignment: &ShardLeaseAssignment,
+        next_heartbeat_at: &mut Instant,
+    ) -> Result<StepCycleOutcome, CommunityShardWorkerError> {
+        match self.send_heartbeat_once(assignment, true).await {
+            HeartbeatOutcome::Continue { cancellations } => {
+                *next_heartbeat_at = self.next_heartbeat_deadline();
+                self.apply_cancellations(&cancellations)?;
+                Ok(StepCycleOutcome::Continue)
+            }
+            HeartbeatOutcome::Transient => {
+                *next_heartbeat_at = self.next_transient_heartbeat_deadline();
+                Ok(StepCycleOutcome::Continue)
+            }
+            HeartbeatOutcome::Rebalance(next) => Ok(StepCycleOutcome::Rebalance(next)),
+            HeartbeatOutcome::Reacquire { needs_reregister } => {
+                Ok(StepCycleOutcome::Reacquire { needs_reregister })
+            }
+            HeartbeatOutcome::Shutdown => Ok(StepCycleOutcome::Shutdown),
+            HeartbeatOutcome::Fatal(err) => Err(err),
         }
     }
 
@@ -1447,10 +1593,11 @@ impl WorkerRuntime {
             loaded_range: assignment.range,
             ready,
         };
-        let timeout_ms = self
+        let half_ttl_ms = self
             .ready_ttl_ms
-            .map(|ttl| self.config.request_timeout_ms.min((ttl / 2).max(1)))
+            .map(|ttl| (ttl / 2).max(1))
             .unwrap_or(self.config.request_timeout_ms);
+        let timeout_ms = self.active_request_timeout_ms().min(half_ttl_ms).max(1);
         let call = match self
             .post_signed_shard_cancellable::<ShardHeartbeatRequest, ShardHeartbeatResponse>(
                 COMMUNITY_SHARD_HEARTBEAT_PATH,
@@ -1589,12 +1736,25 @@ impl WorkerRuntime {
         Ok(())
     }
 
-    fn make_heartbeat_interval(&self) -> Interval {
-        let mut interval =
-            tokio::time::interval(Duration::from_millis(self.config.heartbeat_interval_ms));
-        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        interval.reset();
-        interval
+    fn active_request_timeout_ms(&self) -> u64 {
+        self.ready_ttl_ms
+            .map(|ttl| {
+                let budget = ttl.saturating_sub(self.config.heartbeat_interval_ms).max(1);
+                self.config.request_timeout_ms.min(budget)
+            })
+            .unwrap_or(self.config.request_timeout_ms)
+    }
+
+    fn next_heartbeat_deadline(&self) -> Instant {
+        Instant::now() + Duration::from_millis(self.config.heartbeat_interval_ms)
+    }
+
+    fn next_transient_heartbeat_deadline(&self) -> Instant {
+        let ms = self
+            .config
+            .retry_base_backoff_ms
+            .min(self.config.heartbeat_interval_ms);
+        Instant::now() + Duration::from_millis(ms)
     }
 
     async fn sleep_until_shutdown(&self, duration: Duration) -> bool {
@@ -1718,18 +1878,23 @@ impl WorkerRuntime {
     where
         Resp: DeserializeOwned,
     {
+        let deadline = Instant::now() + timeout;
         let url = format!("{}{}", self.base_url, path);
-        let response = match self
+        let send_fut = self
             .http
             .post(url)
             .header(header::CONTENT_TYPE, "application/json")
             .timeout(timeout)
             .body(encoded)
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(err) => return Ok(HttpCallResult::Transient(err.to_string())),
+            .send();
+        let response = match tokio::time::timeout_at(deadline, send_fut).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(err)) => return Ok(HttpCallResult::Transient(err.to_string())),
+            Err(_) => {
+                return Ok(HttpCallResult::Transient(
+                    "HTTP request timed out waiting for response headers".to_string(),
+                ));
+            }
         };
         let status = response.status();
         if status.is_redirection() {
@@ -1739,7 +1904,7 @@ impl WorkerRuntime {
             });
         }
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            let detail = read_bounded_error_snippet(response).await;
+            let detail = read_bounded_error_snippet_until(response, deadline).await;
             return Err(CommunityShardWorkerError::AuthenticationOrAuthorization {
                 path,
                 status: status.as_u16(),
@@ -1747,7 +1912,7 @@ impl WorkerRuntime {
             });
         }
         if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-            let detail = read_bounded_error_snippet(response).await;
+            let detail = read_bounded_error_snippet_until(response, deadline).await;
             return Ok(HttpCallResult::Transient(format!(
                 "HTTP {}: {}",
                 status.as_u16(),
@@ -1755,17 +1920,26 @@ impl WorkerRuntime {
             )));
         }
         if !status.is_success() {
-            let body = read_bounded_error_snippet(response).await;
+            let body = read_bounded_error_snippet_until(response, deadline).await;
             return Ok(HttpCallResult::HttpError { status, body });
         }
-        let body_bytes =
-            match read_bounded_success_body(response, path, MAX_RESPONSE_BODY_BYTES).await {
-                Ok(BodyReadOutcome::Bytes(bytes)) => bytes,
-                Ok(BodyReadOutcome::TransportError(detail)) => {
-                    return Ok(HttpCallResult::Transient(detail));
-                }
-                Err(err) => return Err(err),
-            };
+        let body_bytes = match tokio::time::timeout_at(
+            deadline,
+            read_bounded_success_body(response, path, MAX_RESPONSE_BODY_BYTES),
+        )
+        .await
+        {
+            Ok(Ok(BodyReadOutcome::Bytes(bytes))) => bytes,
+            Ok(Ok(BodyReadOutcome::TransportError(detail))) => {
+                return Ok(HttpCallResult::Transient(detail));
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                return Ok(HttpCallResult::Transient(
+                    "HTTP response body timed out".to_string(),
+                ));
+            }
+        };
         let parsed = serde_json::from_slice::<Resp>(&body_bytes).map_err(|err| {
             CommunityShardWorkerError::MalformedResponse {
                 path,
@@ -1858,16 +2032,19 @@ async fn read_bounded_success_body(
     }
 }
 
-async fn read_bounded_error_snippet(mut response: reqwest::Response) -> String {
+async fn read_bounded_error_snippet_until(
+    mut response: reqwest::Response,
+    deadline: Instant,
+) -> String {
     let mut buf = Vec::new();
     while buf.len() < MAX_ERROR_BODY_BYTES {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
+        match tokio::time::timeout_at(deadline, response.chunk()).await {
+            Ok(Ok(Some(chunk))) => {
                 let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(buf.len());
                 let take = remaining.min(chunk.len());
                 buf.extend_from_slice(&chunk[..take]);
             }
-            Ok(None) | Err(_) => break,
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
         }
     }
     let lossy = String::from_utf8_lossy(&buf);
@@ -2026,13 +2203,31 @@ fn validate_lease_response(
             response.protocol_version
         )));
     }
-    let min_ready_ttl_ms = config.heartbeat_interval_ms.checked_mul(2).ok_or_else(|| {
+    let min_cadence_ttl_ms = config.heartbeat_interval_ms.checked_mul(2).ok_or_else(|| {
         CommunityShardWorkerError::InvalidConfig("heartbeat interval overflow".to_string())
     })?;
+    let min_request_ttl_ms = config
+        .heartbeat_interval_ms
+        .checked_add(config.request_timeout_ms)
+        .ok_or_else(|| {
+            CommunityShardWorkerError::InvalidConfig("request timeout overflow".to_string())
+        })?;
+    let min_connect_ttl_ms = config
+        .heartbeat_interval_ms
+        .checked_add(config.connect_timeout_ms)
+        .ok_or_else(|| {
+            CommunityShardWorkerError::InvalidConfig("connect timeout overflow".to_string())
+        })?;
+    let min_ready_ttl_ms = min_cadence_ttl_ms
+        .max(min_request_ttl_ms)
+        .max(min_connect_ttl_ms);
     if response.ready_ttl_ms == 0 || response.ready_ttl_ms < min_ready_ttl_ms {
         return Err(CommunityShardWorkerError::InvalidLease(format!(
-            "ready_ttl_ms {} is too short for heartbeat cadence {}",
-            response.ready_ttl_ms, config.heartbeat_interval_ms
+            "ready_ttl_ms {} is too short for heartbeat {} and timeouts ({}/{})",
+            response.ready_ttl_ms,
+            config.heartbeat_interval_ms,
+            config.connect_timeout_ms,
+            config.request_timeout_ms
         )));
     }
     validate_lease_assignment(config, model_spec, &response.assignment, now_ms, fence)
@@ -2146,6 +2341,34 @@ fn truncate_utf8_bytes(input: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     input[..end].to_string()
+}
+
+fn push_bounded_cancellation(
+    queue: &mut VecDeque<SessionCancellationNotice>,
+    notice: SessionCancellationNotice,
+    active_session: SessionId,
+) {
+    if queue.iter().any(|existing| {
+        existing.session_id == notice.session_id
+            && existing.lease_id == notice.lease_id
+            && existing.lease_epoch == notice.lease_epoch
+    }) {
+        return;
+    }
+    if queue.len() >= MAX_CANCELLATIONS_PER_WORKER_HARD_CAP {
+        if notice.session_id != active_session {
+            return;
+        }
+        if let Some(idx) = queue
+            .iter()
+            .position(|existing| existing.session_id != active_session)
+        {
+            queue.remove(idx);
+        } else {
+            return;
+        }
+    }
+    queue.push_back(notice);
 }
 
 #[cfg(test)]
@@ -2325,5 +2548,92 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, CommunityShardWorkerError::InvalidKeyPair(_)));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn config_rejects_extreme_timings_and_reacquires_and_accepts_short_timings() {
+        let spec = test_spec(4);
+        let base = base_config("https://coord.example.com");
+        assert!(base.validate(&spec).is_ok());
+
+        let mut short = base.clone();
+        short.heartbeat_interval_ms = MIN_HEARTBEAT_INTERVAL_MS;
+        short.idle_poll_interval_ms = 1;
+        short.connect_timeout_ms = 50;
+        short.request_timeout_ms = 100;
+        short.release_timeout_ms = 100;
+        short.retry_base_backoff_ms = 10;
+        short.retry_max_backoff_ms = 50;
+        short.reacquire_base_backoff_ms = 10;
+        short.reacquire_max_backoff_ms = 50;
+        short.max_consecutive_lease_reacquires = 1;
+        assert!(short.validate(&spec).is_ok());
+
+        let bad_cases: [Box<dyn Fn(&mut CommunityShardWorkerConfig)>; 10] = [
+            Box::new(|c| c.heartbeat_interval_ms = u64::MAX),
+            Box::new(|c| c.idle_poll_interval_ms = u64::MAX),
+            Box::new(|c| c.connect_timeout_ms = u64::MAX),
+            Box::new(|c| c.request_timeout_ms = u64::MAX),
+            Box::new(|c| c.release_timeout_ms = u64::MAX),
+            Box::new(|c| c.retry_max_backoff_ms = u64::MAX),
+            Box::new(|c| c.reacquire_max_backoff_ms = u64::MAX),
+            Box::new(|c| c.max_consecutive_lease_reacquires = usize::MAX),
+            Box::new(|c| {
+                c.max_consecutive_lease_reacquires = MAX_CONSECUTIVE_LEASE_REACQUIRES_HARD_CAP + 1
+            }),
+            Box::new(|c| {
+                c.connect_timeout_ms = 5_000;
+                c.request_timeout_ms = 4_000;
+            }),
+        ];
+        for mutate in bad_cases {
+            let mut cfg = base.clone();
+            mutate(&mut cfg);
+            assert!(cfg.validate(&spec).is_err());
+        }
+    }
+
+    #[test]
+    fn lease_ttl_validation_enforces_request_and_connect_timeout_headroom() {
+        let spec = test_spec(4);
+        let now_ms = 1_700_000_000_000u64;
+        let fence = LeaseFenceTracker::default();
+        let lease = ShardLeaseAssignment {
+            lease_id: LeaseId {
+                boot_nonce: arc_crypto::hash_bytes(b"ttl-headroom-boot"),
+                seq: 1,
+            },
+            lease_epoch: 1,
+            model_id: spec.model_id,
+            execution_profile: spec.execution_profile.clone(),
+            range: ShardLayerRange {
+                start_layer: 0,
+                end_layer: 2,
+            },
+            provisioning_deadline_unix_ms: now_ms + 30_000,
+        };
+        let make_resp = |ready_ttl_ms| ShardLeaseResponse {
+            protocol_version: COMMUNITY_SHARD_PROTOCOL_VERSION,
+            assignment: lease.clone(),
+            ready_ttl_ms,
+        };
+
+        let defaults = base_config("https://coord.example.com");
+        assert!(
+            validate_lease_response(&defaults, &spec, &make_resp(24_999), now_ms, &fence).is_err()
+        );
+        assert!(
+            validate_lease_response(&defaults, &spec, &make_resp(25_000), now_ms, &fence).is_ok()
+        );
+        assert!(
+            validate_lease_response(&defaults, &spec, &make_resp(45_000), now_ms, &fence).is_ok()
+        );
+
+        let mut short = defaults;
+        short.heartbeat_interval_ms = 50;
+        short.connect_timeout_ms = 100;
+        short.request_timeout_ms = 200;
+        assert!(validate_lease_response(&short, &spec, &make_resp(249), now_ms, &fence).is_err());
+        assert!(validate_lease_response(&short, &spec, &make_resp(250), now_ms, &fence).is_ok());
     }
 }

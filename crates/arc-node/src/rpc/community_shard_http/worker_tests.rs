@@ -7,9 +7,10 @@ use crate::community_sharding::tests::{
 };
 use crate::community_sharding::{
     COMMUNITY_SHARD_PROTOCOL_VERSION, CommunityShardCoordinator, CommunityShardLimits, LeaseId,
-    SessionAbortReason, SessionId, SessionOutcome, ShardHeartbeatRequest, ShardHeartbeatResponse,
-    ShardLayerRange, ShardLeaseAssignment, ShardLeaseRequest, ShardLeaseResponse,
-    ShardStepSubmitRequest, ShardStepSubmitResponse, TrustedModelSpec,
+    SessionAbortReason, SessionId, SessionOutcome, ShardClaimStepRequest, ShardClaimStepResponse,
+    ShardHeartbeatRequest, ShardHeartbeatResponse, ShardLayerRange, ShardLeaseAssignment,
+    ShardLeaseRequest, ShardLeaseResponse, ShardStepSubmitRequest, ShardStepSubmitResponse,
+    TrustedModelSpec,
 };
 use arc_crypto::{Hash256, KeyPair};
 use arc_inference::cached_integer_model::{CANONICAL_REWARD_INFERENCE_PROFILE, CachedIntegerModel};
@@ -293,8 +294,13 @@ async fn worker_rejects_redirect_auth_bad_lease_ttl_and_oversized_body_before_lo
         },
         ShardLeaseResponse {
             protocol_version: COMMUNITY_SHARD_PROTOCOL_VERSION,
-            assignment: base_assignment,
+            assignment: base_assignment.clone(),
             ready_ttl_ms: 50,
+        },
+        ShardLeaseResponse {
+            protocol_version: COMMUNITY_SHARD_PROTOCOL_VERSION,
+            assignment: base_assignment,
+            ready_ttl_ms: 10_000,
         },
     ];
     for bad_resp in cases {
@@ -815,8 +821,12 @@ async fn rebalance_and_coordinator_restart_drop_old_model_before_reload_and_fenc
             })
         };
 
+    let mut cfg1 = worker_config(&base_url, &node, "rebal-w1");
+    cfg1.connect_timeout_ms = 100;
+    cfg1.request_timeout_ms = 200;
+    cfg1.release_timeout_ms = 200;
     let w1 = tokio::spawn(run_community_shard_worker(
-        worker_config(&base_url, &node, "rebal-w1"),
+        cfg1,
         Arc::new(KeyPair::generate_ed25519()),
         spec.clone(),
         make_drop_checking_loader(Arc::clone(&full), Arc::clone(&drop_verified_count)),
@@ -903,8 +913,12 @@ async fn rebalance_and_coordinator_restart_drop_old_model_before_reload_and_fenc
         other => panic!("expected active directive for dummy worker, got {other:?}"),
     };
 
+    let mut cfg3 = worker_config(&base_url, &node, "rebal-w3");
+    cfg3.connect_timeout_ms = 100;
+    cfg3.request_timeout_ms = 200;
+    cfg3.release_timeout_ms = 200;
     let w3 = tokio::spawn(run_community_shard_worker(
-        worker_config(&base_url, &node, "rebal-w3"),
+        cfg3,
         Arc::new(KeyPair::generate_ed25519()),
         spec.clone(),
         make_drop_checking_loader(Arc::clone(&full), Arc::clone(&drop_verified_count)),
@@ -919,21 +933,14 @@ async fn rebalance_and_coordinator_restart_drop_old_model_before_reload_and_fenc
     while now_ms() <= dummy_expires_at + 30 {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    let exp = node
-        .community_shard_coordinator
-        .lock()
-        .as_mut()
-        .expect("coord")
-        .expire_stale(now_ms());
-    assert_eq!(exp.expired_leases, 1);
-    assert_eq!(exp.rebalanced_workers, 1);
-
     wait_for_condition(&node, Duration::from_secs(10), |coord| {
         let snap = coord.status_snapshot(now_ms());
-        snap.fully_covered_ready && snap.ready_workers == 2
+        snap.fully_covered_ready
+            && snap.ready_workers == 2
+            && coord.worker_lease_snapshot(dummy_kp.address()).is_none()
+            && drop_verified_count.load(Ordering::SeqCst) >= 1
     })
     .await;
-    assert!(drop_verified_count.load(Ordering::SeqCst) >= 1);
 
     let new_boot = arc_crypto::hash_bytes(b"coordinator-restarted-boot-2");
     let restarted_coord =
@@ -1158,4 +1165,301 @@ async fn cancellation_during_retry_backoff_prevents_stale_submit() {
         0
     );
     assert!(s1.cancellations_applied >= 1);
+}
+
+#[tokio::test]
+async fn heartbeat_not_starved_by_instant_claim_responses_and_default_loopback_idles_cleanly() {
+    let (full, spec) = make_tiny_model_and_spec(b"worker-hb-starvation-and-defaults");
+    let node = build_worker_test_node(Some(Arc::clone(&full)), Some(spec.model_id));
+    super::init_community_shard_coordinator_with_limits(
+        &node,
+        CommunityShardLimits {
+            target_partitions: 2,
+            ..CommunityShardLimits::default()
+        },
+    )
+    .expect("init coordinator");
+
+    struct StarvationState {
+        node: super::super::NodeState,
+        claim_calls: AtomicUsize,
+        ready_heartbeats: AtomicUsize,
+        notify: Notify,
+    }
+
+    async fn instant_claim_handler(
+        AxumState(state): AxumState<Arc<StarvationState>>,
+        Json(_signed): Json<
+            super::super::CommunitySignedRequest<
+                super::SignedShardWorkerPayload<ShardClaimStepRequest>,
+            >,
+        >,
+    ) -> Json<ShardClaimStepResponse> {
+        state.claim_calls.fetch_add(1, Ordering::SeqCst);
+        Json(ShardClaimStepResponse::CancelSessions {
+            cancellations: Vec::new(),
+        })
+    }
+
+    async fn counting_hb_handler(
+        AxumState(state): AxumState<Arc<StarvationState>>,
+        Json(signed): Json<
+            super::super::CommunitySignedRequest<
+                super::SignedShardWorkerPayload<ShardHeartbeatRequest>,
+            >,
+        >,
+    ) -> Result<Json<ShardHeartbeatResponse>, (StatusCode, String)> {
+        let is_ready = signed.payload.request.ready;
+        let res =
+            super::community_shard_heartbeat_signed(AxumState(state.node.clone()), Json(signed))
+                .await;
+        if res.is_ok() && is_ready {
+            state.ready_heartbeats.fetch_add(1, Ordering::SeqCst);
+            state.notify.notify_waiters();
+        }
+        res
+    }
+
+    let st = Arc::new(StarvationState {
+        node: node.clone(),
+        claim_calls: AtomicUsize::new(0),
+        ready_heartbeats: AtomicUsize::new(0),
+        notify: Notify::new(),
+    });
+
+    let base_routes = Router::new()
+        .route(
+            super::super::COMMUNITY_REGISTER_PATH,
+            post(super::super::community_register_signed),
+        )
+        .route(
+            super::COMMUNITY_SHARD_LEASE_PATH,
+            post(super::community_shard_lease_signed).layer(DefaultBodyLimit::max(
+                super::COMMUNITY_SHARD_METADATA_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
+            super::COMMUNITY_SHARD_SUBMIT_STEP_PATH,
+            post(super::community_shard_submit_step_signed).layer(DefaultBodyLimit::max(
+                super::COMMUNITY_SHARD_SUBMIT_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
+            super::COMMUNITY_SHARD_RELEASE_PATH,
+            post(super::community_shard_release_signed).layer(DefaultBodyLimit::max(
+                super::COMMUNITY_SHARD_METADATA_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
+            super::COMMUNITY_SHARD_STATUS_PATH,
+            get(super::community_shard_status),
+        )
+        .with_state(node.clone());
+
+    let wrapped_routes = Router::new()
+        .route(
+            super::COMMUNITY_SHARD_CLAIM_STEP_PATH,
+            post(instant_claim_handler),
+        )
+        .route(
+            super::COMMUNITY_SHARD_HEARTBEAT_PATH,
+            post(counting_hb_handler),
+        )
+        .with_state(Arc::clone(&st));
+
+    let (base_url, srv) = spawn_router(base_routes.merge(wrapped_routes)).await;
+    let (shut_tx, shut_rx) = watch::channel(false);
+    let mut cfg = worker_config(&base_url, &node, "starve-check");
+    cfg.heartbeat_interval_ms = 35;
+    let worker = tokio::spawn(run_community_shard_worker(
+        cfg,
+        Arc::new(KeyPair::generate_ed25519()),
+        spec.clone(),
+        partial_loader(Arc::clone(&full)),
+        shut_rx,
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while st.ready_heartbeats.load(Ordering::SeqCst) < 4 {
+        let notified = st.notify.notified();
+        if st.ready_heartbeats.load(Ordering::SeqCst) >= 4 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "heartbeats starved under instant claim loop"
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(50), notified).await;
+    }
+    let _ = shut_tx.send(true);
+    let summary = worker.await.expect("join worker").expect("worker ok");
+    srv.abort();
+    assert!(st.claim_calls.load(Ordering::SeqCst) >= 10);
+    assert!(summary.heartbeats_sent >= 4);
+    assert!(summary.clean_release_sent);
+
+    let (prod_base, prod_srv) = spawn_router(build_production_router(node.clone())).await;
+    let (def_tx, def_rx) = watch::channel(false);
+    let mut default_cfg = CommunityShardWorkerConfig::new(
+        &prod_base,
+        node.validator_address,
+        node.state.transaction_domain_hash(),
+        2,
+        "default-loopback-idle",
+        "arc-4L-16d-2h-32v",
+        "linux-x86_64",
+    );
+    default_cfg.allow_insecure_for_loopback = true;
+    let def_worker = tokio::spawn(run_community_shard_worker(
+        default_cfg,
+        Arc::new(KeyPair::generate_ed25519()),
+        spec,
+        partial_loader(full),
+        def_rx,
+    ));
+    wait_for_condition(&node, Duration::from_secs(5), |coord| {
+        coord.status_snapshot(now_ms()).ready_workers == 1
+    })
+    .await;
+    let _ = def_tx.send(true);
+    let def_summary = def_worker.await.expect("join default").expect("default ok");
+    prod_srv.abort();
+    assert_eq!(def_summary.registrations, 1);
+    assert!(def_summary.clean_release_sent);
+}
+
+#[tokio::test]
+async fn stalled_http_response_body_hits_total_elapsed_timeout() {
+    let (full, spec) = make_tiny_model_and_spec(b"worker-stalled-body-timeout");
+    let node = build_worker_test_node(Some(Arc::clone(&full)), Some(spec.model_id));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled listener");
+    let addr = listener.local_addr().expect("stalled addr");
+    let stalled_srv = tokio::spawn(async move {
+        let mut held_streams = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut req_buf = [0u8; 4096];
+            let _ = stream.read(&mut req_buf).await;
+            let header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/json\r\n\r\n";
+            let _ = stream.write_all(header).await;
+            let _ = stream.flush().await;
+            held_streams.push(stream);
+        }
+    });
+
+    let mut cfg = worker_config(&format!("http://{addr}"), &node, "stalled-body");
+    cfg.connect_timeout_ms = 50;
+    cfg.request_timeout_ms = 80;
+    cfg.retry_base_backoff_ms = 10;
+    cfg.retry_max_backoff_ms = 20;
+
+    let (_tx, rx) = watch::channel(false);
+    let started = Instant::now();
+    let err = run_community_shard_worker(
+        cfg,
+        Arc::new(KeyPair::generate_ed25519()),
+        spec,
+        partial_loader(full),
+        rx,
+    )
+    .await
+    .unwrap_err();
+    stalled_srv.abort();
+
+    assert!(matches!(
+        err,
+        CommunityShardWorkerError::TransientBudgetExhausted { .. }
+    ));
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+#[tokio::test]
+async fn hundred_signed_network_workers_all_execute_canonical_partial_inference() {
+    let full = Arc::new(build_deterministic_integer_model(
+        32,
+        16,
+        2,
+        32,
+        12,
+        64,
+        vec![128_001, 128_009],
+    ));
+    let spec = model_spec_from(arc_crypto::hash_bytes(b"hundred-network-workers"), &full);
+    let node = build_worker_test_node(Some(Arc::clone(&full)), Some(spec.model_id));
+    super::init_community_shard_coordinator_with_limits(&node, CommunityShardLimits::default())
+        .expect("coordinator");
+    let (base_url, server) = spawn_router(build_production_router(node.clone())).await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut workers = tokio::task::JoinSet::new();
+    let mut identities = std::collections::BTreeSet::new();
+    for index in 0..100 {
+        let key = Arc::new(KeyPair::generate_ed25519());
+        assert!(identities.insert(key.address().to_hex()));
+        let mut config = worker_config(&base_url, &node, &format!("network-worker-{index}"));
+        config.model_name = super::super::model_display_name(&full);
+        config.idle_poll_interval_ms = 200;
+        config.heartbeat_interval_ms = 1_000;
+        workers.spawn(run_community_shard_worker(
+            config,
+            key,
+            spec.clone(),
+            partial_loader(Arc::clone(&full)),
+            shutdown_rx.clone(),
+        ));
+    }
+    wait_for_condition(&node, Duration::from_secs(30), |coordinator| {
+        let status = coordinator.status_snapshot(now_ms());
+        status.ready_workers == 100 && status.fully_covered_ready
+    })
+    .await;
+    let prompt = vec![5, 9];
+    let max_tokens = 2;
+    let (canonical, _) = full
+        .try_generate(&prompt, max_tokens, &full.config.eos_tokens)
+        .unwrap();
+    let mut participants = std::collections::BTreeSet::new();
+    for _ in 0..5 {
+        let sessions = {
+            let mut guard = node.community_shard_coordinator.lock();
+            let coordinator = guard.as_mut().unwrap();
+            (0..4)
+                .map(|_| {
+                    coordinator
+                        .open_session(now_ms(), prompt.clone(), max_tokens)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        for session in sessions {
+            let outcome = wait_for_session_result(&node, session, Duration::from_secs(40)).await;
+            let SessionOutcome::PendingVerification(result) = outcome else {
+                panic!("expected completed partial pipeline: {outcome:?}");
+            };
+            assert_eq!(result.unverified_generated_tokens, canonical);
+            assert!(result.verification_required);
+            assert!(!result.reward_eligible);
+            assert_eq!(result.participants.len(), 6);
+            for participant in result.participants {
+                assert_eq!(participant.range.len(), 2);
+                participants.insert(participant.worker_id.to_hex());
+            }
+        }
+    }
+    assert_eq!(participants, identities);
+    shutdown_tx.send(true).unwrap();
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut finished = 0;
+    while let Some(joined) = tokio::time::timeout_at(drain_deadline, workers.join_next())
+        .await
+        .expect("workers must drain and release")
+    {
+        let summary = joined.expect("worker join").expect("worker exit");
+        assert_eq!(summary.registrations, 1);
+        assert!(summary.steps_executed > 0);
+        assert!(summary.clean_release_sent);
+        finished += 1;
+    }
+    server.abort();
+    assert_eq!(finished, 100);
 }

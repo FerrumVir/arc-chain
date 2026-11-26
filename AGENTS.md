@@ -297,6 +297,17 @@ partial range before reading tensor weights. Its GGUF tests execute two partial
 models across prefill and decoding and compare tokens and logits hashes with
 the full canonical engine. It does not define downloadable partial artifacts.
 
+`canonical_shard_admission` inspects one bounded, captured GGUF header before
+canonical config allocation. It checks geometry and estimates partial-model
+residency, first-shard embeddings, last-shard output weights, temporary loading
+buffers, metadata heap storage, and reserved KV bytes. Admission rejects a range
+that exceeds the caller's explicit RAM budget. This estimate is conservative
+payload accounting, not a guarantee of process RSS; artifact identity still
+requires the full-file commitment. Worker timing and reconnect limits are bounded,
+and active heartbeats run even under a continuous stream of work. A network test
+exercises 100 signed worker identities using tiny canonical models; it does not
+prove 100 independent live operators or production-model speed.
+
 `arc-node recovery qualify-peer-state` opens an already copied,
 disposable `peer-recovery-candidate-*` directory. Its hash-pinned manifest binds
 the target signing record, genesis, state WAL, recovery domain, and raw finality
