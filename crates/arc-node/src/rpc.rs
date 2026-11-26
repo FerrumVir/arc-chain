@@ -16277,8 +16277,14 @@ async fn compute_auto_shard_plan(
             && shard.execution_profile == req.execution_profile
     }) {
         if seen_nodes.insert(s.node_name.clone()) {
+            let address = parse_canonical_shard_validator_identity(&s.node_name).ok_or_else(|| {
+                api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "auto-shard planning requires authenticated validator identities; submit signed shard announcements",
+                )
+            })?;
             capabilities.push(arc_inference::distributed::NodeCapability {
-                address: Hash256(parse_hash(&s.model_id).unwrap_or([0u8; 32])),
+                address,
                 socket_addr: s.socket_addr.clone(),
                 gpu_tier: 0,
                 available_memory: (s.memory_mb as u64) * 1024 * 1024,
@@ -28489,16 +28495,22 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(missing_plan_profile.0, StatusCode::BAD_REQUEST);
-        let Json(first_plan) =
-            compute_auto_shard_plan(AxumState(node.clone()), Json(plan_request()))
-                .await
-                .unwrap();
-        let Json(second_plan) =
-            compute_auto_shard_plan(AxumState(node.clone()), Json(plan_request()))
-                .await
-                .unwrap();
-        assert_eq!(first_plan, second_plan);
-        assert_eq!(first_plan["registered_in_multi_model_registry"], false);
+        let first_plan = compute_auto_shard_plan(AxumState(node.clone()), Json(plan_request()))
+            .await
+            .unwrap_err();
+        let second_plan = compute_auto_shard_plan(AxumState(node.clone()), Json(plan_request()))
+            .await
+            .unwrap_err();
+        assert_eq!(first_plan.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(second_plan.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            first_plan
+                .1
+                .0
+                .error
+                .contains("authenticated validator identities")
+        );
+        assert_eq!(first_plan.1.0.error, second_plan.1.0.error);
         assert_eq!(node.shard_registry.len(), 1);
         assert_eq!(node.multi_model_registry.total_shard_nodes(), 0);
         assert_eq!(
@@ -28524,6 +28536,51 @@ mod tests {
         assert_eq!(model_view["fully_covered"], false);
         assert_eq!(model_view["profile_bound"], false);
         assert!(model_view["pipeline"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_shard_plan_preserves_distinct_authenticated_validator_addresses() {
+        let model_id = arc_crypto::hash_bytes(b"planner-identity-regression");
+        let node = fake_node_with_workers(Vec::new());
+        let holders = [
+            authenticated_shard(b"validator-a", "203.0.113.1:9090", model_id),
+            authenticated_shard(b"validator-b", "203.0.113.2:9090", model_id),
+        ];
+        let expected: std::collections::BTreeSet<String> = holders
+            .iter()
+            .map(|holder| holder.node_name.clone())
+            .collect();
+        for holder in holders {
+            node.shard_registry.insert(
+                shard_registry_key(&holder),
+                (holder, std::time::Instant::now()),
+            );
+        }
+        let Json(response) = compute_auto_shard_plan(
+            AxumState(node.clone()),
+            Json(AutoShardPlanRequest {
+                model_id: format!("0x{}", model_id.to_hex()),
+                execution_profile: canonical_profile(),
+                total_layers: 32,
+                total_params_b: 7.0,
+            }),
+        )
+        .await
+        .unwrap();
+        let actual: std::collections::BTreeSet<String> = response["plan"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["node_address"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "use each authenticated validator identity, never the shared model hash"
+        );
+        assert!(!actual.contains(&format!("0x{}", model_id.to_hex())));
+        assert_eq!(response["node_count"], 2);
+        assert_eq!(node.multi_model_registry.total_shard_nodes(), 0);
+        assert_eq!(node.shard_registry.len(), 2);
     }
 
     #[tokio::test]
@@ -28798,6 +28855,28 @@ mod tests {
             models_view["models"][0]["execution_profile"],
             canonical_profile()
         );
+        drop(registered);
+        let Json(plan) = compute_auto_shard_plan(
+            AxumState(coordinator.clone()),
+            Json(AutoShardPlanRequest {
+                model_id: format!("0x{}", model_id.to_hex()),
+                execution_profile: canonical_profile(),
+                total_layers: 1,
+                total_params_b: 0.1,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            plan["plan"][0]["node_address"],
+            format!("0x{}", holder_key.address().to_hex()),
+            "auto-shard planning must preserve the signer bound during announcement ingestion"
+        );
+        assert_eq!(plan["registered_in_multi_model_registry"], false);
+        let Json(models_after_plan) = get_models(AxumState(coordinator.clone())).await;
+        assert_eq!(models_after_plan, models_view);
+        assert_eq!(coordinator.shard_registry.len(), 1);
+        assert_eq!(coordinator.multi_model_registry.total_shard_nodes(), 1);
     }
 
     #[tokio::test]

@@ -282,6 +282,10 @@ The full account is [docs/HOW-SHARDING-WORKS.md](docs/HOW-SHARDING-WORKS.md).
   (`desktop/src-tauri/src/commands.rs:981-1028`). They take whole jobs.
 - More workers add capacity only up to each coordinator's limit. One job gets
   faster only when routing finds a faster worker.
+- `/shards/auto_plan` returns a proposed layout without registering it. Its
+  node addresses must be authenticated validator identities from signed shard
+  announcements; malformed identities fail closed. A model hash is never a
+  node address (`crates/arc-node/src/rpc.rs`, `compute_auto_shard_plan`).
 
 ## Releases and versions
 
