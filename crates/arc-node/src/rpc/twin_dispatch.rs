@@ -49,6 +49,7 @@ struct TwinLeg {
     worker: Option<String>,
     status: LegStatus,
     terminal_at_unix_ms: Option<u64>,
+    observed_latency: Option<f64>,
     result: Option<WorkResult>,
     attestation: Option<arc_types::Transaction>,
 }
@@ -122,6 +123,7 @@ struct LegSnapshot {
     job_nonce: u64,
     worker: Option<String>,
     status: LegStatus,
+    observed_latency: Option<f64>,
     result: Option<WorkResult>,
     attestation: Option<arc_types::Transaction>,
     region: Option<twin::RegionTag>,
@@ -523,6 +525,7 @@ impl CommunityTwinState {
         status: LegStatus,
         result: WorkResult,
         attestation: Option<arc_types::Transaction>,
+        observed_latency: Option<f64>,
         now: u64,
     ) -> Option<(String, bool)> {
         let mut guard = self.inner.lock();
@@ -545,6 +548,7 @@ impl CommunityTwinState {
         leg.worker = Some(result.worker_id.clone());
         leg.status = status;
         leg.terminal_at_unix_ms = Some(now);
+        leg.observed_latency = observed_latency;
         leg.result = Some(result);
         leg.attestation = attestation;
         let ready = group.legs.iter().all(|leg| leg.status.is_terminal());
@@ -607,6 +611,7 @@ impl CommunityTwinState {
                 job_nonce: leg.job_nonce,
                 worker: leg.worker.clone(),
                 status: leg.status,
+                observed_latency: leg.observed_latency,
                 result: leg.result.clone(),
                 attestation: leg.attestation.clone(),
                 region: leg
@@ -861,6 +866,15 @@ pub(super) fn is_twin_leg(node: &NodeState, job_id: &str) -> bool {
     node.community_twin.is_twin_leg(job_id)
 }
 
+pub(super) fn is_caller_twin_leg(node: &NodeState, job_id: &str) -> bool {
+    let inner = node.community_twin.inner.lock();
+    inner
+        .leg_to_group
+        .get(job_id)
+        .and_then(|(group_id, _)| inner.groups.get(group_id))
+        .is_some_and(|group| !group.source.is_pump())
+}
+
 pub(super) fn claim_decision(
     node: &NodeState,
     job_id: &str,
@@ -1113,12 +1127,13 @@ pub(super) fn submit_twin_leg(
     attestation: Option<arc_types::Transaction>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let job_id = result.job_id.clone();
-    if reservation.take().is_none() {
+    let Some(pending) = reservation.take() else {
         return Err((
             StatusCode::CONFLICT,
             format!("pending twin leg {job_id} changed before it was recorded"),
         ));
-    }
+    };
+    let observed_latency = community_routing::observed_twin_latency(node, &pending, &result);
     let _active_job_reservation = ActiveCommunityJobReservation {
         active_jobs: node.community_active_jobs.clone(),
         worker_id: assigned_worker,
@@ -1148,10 +1163,14 @@ pub(super) fn submit_twin_leg(
     } else {
         LegStatus::Failed
     };
-    match node
-        .community_twin
-        .record_submission(&job_id, status, result, attestation, now_unix_ms())
-    {
+    match node.community_twin.record_submission(
+        &job_id,
+        status,
+        result,
+        attestation,
+        observed_latency,
+        now_unix_ms(),
+    ) {
         Some((group_id, ready)) => {
             if ready {
                 spawn_twin_resolution(node, group_id.clone());
@@ -1314,6 +1333,7 @@ async fn dispatch_twin_started(
             worker: None,
             status: LegStatus::Unclaimed,
             terminal_at_unix_ms: None,
+            observed_latency: None,
             result: None,
             attestation: None,
         });
@@ -2050,6 +2070,9 @@ async fn resolve_twin_group(node: &NodeState, group_id: &str) {
         if counted == Some(true)
             && let Some(result) = leg.result.as_ref()
         {
+            if let Some(sample) = leg.observed_latency {
+                community_routing::record_verified_twin_latency(node, worker_id, sample);
+            }
             record_latency(
                 &node.latency_stats,
                 &format!("worker:{worker_id}"),
@@ -2720,6 +2743,8 @@ mod tests {
         submit(&node, result(&second, "w2", "five")).await;
 
         let outcome = outcome_of(dispatcher).await;
+        assert!(community_routing::sample(&node, "w1").is_none());
+        assert!(community_routing::sample(&node, "w2").is_none());
         assert_eq!(outcome.receipt.verdict, Verdict::Unverified);
         assert_eq!(
             outcome.receipt.comparison.result,
@@ -3082,6 +3107,7 @@ mod tests {
                 worker: None,
                 status: LegStatus::Unclaimed,
                 terminal_at_unix_ms: None,
+                observed_latency: None,
                 result: None,
                 attestation: None,
             }],
@@ -3089,6 +3115,172 @@ mod tests {
             outcome_tx: None,
             state: GroupState::Collecting,
             _pump_slot: None,
+        }
+    }
+
+    fn latency_node(reserve: usize) -> NodeState {
+        let node = fanout_node(3, reserve, 8);
+        for (id, seconds) in [("worker-0", 1), ("worker-1", 4), ("worker-2", 20)] {
+            community_routing::open_claim(
+                &node,
+                id,
+                parse_hash256_hex(&test_model_id(), "model").unwrap(),
+            );
+            community_routing::record_slow(&node, id, seconds, 1);
+        }
+        node
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn verified_twins_teach_routing_observed_latency_only_after_verification() {
+        let node = twin_node(&["w1", "w2"], enabled());
+        let dispatcher = spawn_dispatch(&node, DemandSource::PublicRequest);
+        wait_for_pending(&node, 2).await;
+        let first = job_of(&claim(&node, "w1").await);
+        let second = job_of(&claim(&node, "w2").await);
+        for id in [&first, &second] {
+            node.community_work_results
+                .as_ref()
+                .unwrap()
+                .get_mut(id)
+                .unwrap()
+                .assigned_at = Some(tokio::time::Instant::now());
+        }
+        tokio::time::advance(Duration::from_millis(40)).await;
+        let mut first_result = result(&first, "w1", "four");
+        first_result.total_ms = 777_777;
+        submit(&node, first_result).await;
+        assert!(community_routing::sample(&node, "w1").is_none());
+        tokio::time::advance(Duration::from_millis(60)).await;
+        submit(&node, result(&second, "w2", "four")).await;
+        let outcome = outcome_of(dispatcher).await;
+        assert_eq!(outcome.receipt.verdict, Verdict::Verified);
+        let (_, preflight) =
+            community_worker_generation_context(node.inference_model.as_ref().unwrap(), "x x", 2)
+                .unwrap();
+        let positions = preflight.required_positions as f64;
+        assert_eq!(
+            community_routing::sample(&node, "w1"),
+            Some(0.04 / positions)
+        );
+        assert_eq!(
+            community_routing::sample(&node, "w2"),
+            Some(0.1 / positions)
+        );
+    }
+
+    fn enqueue_latency_group(node: &NodeState, source: DemandSource) -> String {
+        let id = arc_crypto::hash_bytes(b"latency-group").to_hex();
+        let group = synthetic_group(&id, source);
+        let item = group.legs[0].item.clone();
+        node.community_twin
+            .register_group(id.clone(), group)
+            .unwrap();
+        assert!(requeue_twin_leg(node, item, Hash256::ZERO, 0));
+        id
+    }
+
+    fn add_claimed_latency_sibling(node: &NodeState, group_id: &str, worker: &str) {
+        let mut sibling = synthetic_group("sibling", DemandSource::PublicRequest)
+            .legs
+            .pop()
+            .unwrap();
+        sibling.worker = Some(worker.into());
+        sibling.status = LegStatus::Submitted;
+        node.community_twin
+            .inner
+            .lock()
+            .groups
+            .get_mut(group_id)
+            .unwrap()
+            .legs
+            .push(sibling);
+    }
+
+    async fn poll_latency(node: &NodeState, worker: &str) -> Option<WorkItem> {
+        community_routing::poll(
+            node,
+            worker,
+            &mut *node.community_work_queue.as_ref().unwrap().lock().await,
+            &community_routing::ClaimPoll::default(),
+        )
+        .ok()
+        .flatten()
+    }
+
+    #[tokio::test]
+    async fn caller_twins_prefer_the_fastest_eligible_waiter_in_both_routing_modes() {
+        for reserve in [0, 1] {
+            for source in [DemandSource::PublicRequest, DemandSource::PublicDemo] {
+                let node = latency_node(reserve);
+                let id = enqueue_latency_group(&node, source);
+                assert!(poll_latency(&node, "worker-2").await.is_none());
+                assert!(poll_latency(&node, "worker-1").await.is_none());
+                assert_eq!(poll_latency(&node, "worker-0").await.unwrap().job_id, id);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_twins_reselect_when_the_fastest_waiter_disappears() {
+        for reserve in [0, 1] {
+            let node = latency_node(reserve);
+            let id = enqueue_latency_group(&node, DemandSource::PublicRequest);
+            assert!(poll_latency(&node, "worker-2").await.is_none());
+            node.community_active_jobs.remove("worker-0");
+            assert_eq!(poll_latency(&node, "worker-1").await.unwrap().job_id, id);
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_twins_reselect_when_the_chosen_waiter_becomes_a_sibling() {
+        for reserve in [0, 1] {
+            let node = latency_node(reserve);
+            let id = enqueue_latency_group(&node, DemandSource::PublicRequest);
+            assert!(poll_latency(&node, "worker-2").await.is_none());
+            add_claimed_latency_sibling(&node, &id, "worker-0");
+            assert!(!may_claim(&node, &id, "worker-0"));
+            assert_eq!(poll_latency(&node, "worker-1").await.unwrap().job_id, id);
+            assert_eq!(
+                claim_decision(&node, &id, "worker-1"),
+                Some(ClaimDecision::Accept)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_twins_preserve_diversity_before_comparing_worker_speed() {
+        for reserve in [0, 1] {
+            let node = latency_node(reserve);
+            let id = enqueue_latency_group(&node, DemandSource::PublicRequest);
+            for (worker, platform) in [
+                ("worker-0", "windows-x86_64"),
+                ("worker-1", "macos-aarch64"),
+                ("worker-2", "windows-x86_64"),
+            ] {
+                node.community_workers
+                    .get_mut(worker)
+                    .unwrap()
+                    .value_mut()
+                    .0
+                    .platform = platform.into();
+            }
+            add_claimed_latency_sibling(&node, &id, "worker-2");
+            assert!(!may_claim(&node, &id, "worker-0"));
+            assert_eq!(poll_latency(&node, "worker-1").await.unwrap().job_id, id);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caller_twins_release_the_speed_preference_at_the_existing_deadline() {
+        for reserve in [0, 1] {
+            let node = latency_node(reserve);
+            let id = enqueue_latency_group(&node, DemandSource::PublicRequest);
+            assert!(poll_latency(&node, "worker-2").await.is_none());
+            tokio::time::advance(Duration::from_millis(1_499)).await;
+            assert!(poll_latency(&node, "worker-2").await.is_none());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert_eq!(poll_latency(&node, "worker-2").await.unwrap().job_id, id);
         }
     }
 

@@ -134,6 +134,30 @@ pub(super) fn record_accepted(
     );
 }
 
+pub(super) fn observed_twin_latency(
+    node: &NodeState,
+    pending: &PendingCommunityWork,
+    result: &WorkResult,
+) -> Option<f64> {
+    if !result.success || result.declined {
+        return None;
+    }
+    let start = pending.assigned_at?;
+    let end = pending.first_submit_at?;
+    let model = node.inference_model.as_ref()?;
+    let tokens = u32::try_from(result.tokens_generated).ok()?;
+    let (_, preflight) =
+        community_worker_generation_context(model, &pending.item.input, tokens).ok()?;
+    Some(
+        end.saturating_duration_since(start).as_secs_f64()
+            / preflight.required_positions.max(1) as f64,
+    )
+}
+
+pub(super) fn record_verified_twin_latency(node: &NodeState, worker: &str, sample: f64) {
+    record(&mut node.community_routing.lock(), worker, sample);
+}
+
 fn waiting(
     state: &RoutingState,
     node: &NodeState,
@@ -236,7 +260,10 @@ pub(super) fn poll(
     }
     match queue.try_recv() {
         Ok(item) => {
-            if item.expected_worker_id.is_some() || twin_dispatch::is_twin_leg(node, &item.job_id) {
+            if item.expected_worker_id.is_some()
+                || (twin_dispatch::is_twin_leg(node, &item.job_id)
+                    && !twin_dispatch::is_caller_twin_leg(node, &item.job_id))
+            {
                 return Ok(Some(item));
             }
             state.decisions = state.decisions.wrapping_add(1);
@@ -297,7 +324,9 @@ fn poll_with_reserve(
         let twin = twin_dispatch::is_twin_leg(node, &candidate.item.job_id);
         let eligible = selected.is_none()
             && !claim.excludes(&candidate.item.job_id)
-            && if targeted.is_some() || twin {
+            && if targeted.is_some()
+                || (twin && !twin_dispatch::is_caller_twin_leg(node, &candidate.item.job_id))
+            {
                 targeted.is_none_or(|id| id == worker)
                     && twin_dispatch::may_claim(node, &candidate.item.job_id, worker)
             } else {
@@ -338,12 +367,19 @@ fn may_take(state: &mut RoutingState, node: &NodeState, worker: &str, work: &mut
     let elapsed = pending.routing.enqueued_at.elapsed();
     let excluded_worker = pending.routing.excluded_worker.clone();
     drop(pending);
+    let caller_twin = twin_dispatch::is_caller_twin_leg(node, &work.item.job_id);
+    if caller_twin && !twin_dispatch::may_claim(node, &work.item.job_id, worker) {
+        return node.community_twin.config.effective_reserve() == 0;
+    }
     let mut workers = waiting(
         state,
         node,
         work.item.model_id.as_deref(),
         excluded_worker.as_deref(),
     );
+    if caller_twin {
+        workers.retain(|id| twin_dispatch::may_claim(node, &work.item.job_id, id));
+    }
     let eligible = workers.iter().any(|id| id == worker);
     if work.chosen.as_ref().is_none_or(|id| !workers.contains(id)) {
         work.chosen = choose(state, &mut workers, work.explore);

@@ -268,6 +268,12 @@ The full account is [docs/HOW-SHARDING-WORKS.md](docs/HOW-SHARDING-WORKS.md).
   eligible waiting worker may take it. Every 4th decision tries an untried
   worker, if one is waiting
   (`crates/arc-node/src/rpc/community_routing.rs:186-205`, `239`, `280`).
+  Public-request and public-demo twin legs use this same speed preference,
+  among workers accepted by the independent-worker and diversity checks.
+  A held leg reselects if its chosen worker becomes a sibling or stops waiting.
+  Verified twin legs teach the router using coordinator-observed elapsed time
+  per model position; unverified output and worker-reported timing do not.
+  Background twin jobs retain their existing fairness and reserve rules.
 - Validators hold layer ranges and verify results; each range needs 2
   agreeing signatures (`rpc.rs:6870-6876`). Prefill overlaps across hops,
   while decode passes every hop once per token (`rpc.rs:11989-11998`).
