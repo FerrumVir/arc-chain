@@ -2265,22 +2265,6 @@ fn verify_post_recovery_wal_reread(
     Ok(())
 }
 
-fn verify_post_recovery_prefix_reread(
-    summary: RepairableWalSummary,
-    plan: &PostRecoveryWalPlan,
-) -> Result<(), StateError> {
-    if summary.entry_count != plan.accepted_entry_count
-        || summary.original_bytes != plan.report.recovery_wal_accepted_prefix_bytes
-        || summary.original_hash != plan.accepted_prefix_hash
-        || summary.torn_tail.is_some()
-    {
-        return Err(StateError::PersistenceError(
-            "repaired recovery WAL differs from its validated accepted prefix".into(),
-        ));
-    }
-    Ok(())
-}
-
 #[derive(Default)]
 struct VerifiedRecoveryWalReplay {
     verified_root: Option<Hash256>,
@@ -3277,7 +3261,7 @@ impl StateDB {
         }
 
         if wal_existed {
-            staged.apply_verified_recovery_wal_stream(&wal_path, &wal_plan, true)?;
+            staged.apply_verified_recovery_wal_stream(&wal_path, &wal_plan)?;
         }
         staged.rebuild_recovery_transaction_indexes(&checkpoint.payload)?;
         staged.verify_recovery_restart(&wal_plan, &checkpoint)?;
@@ -3434,7 +3418,6 @@ impl StateDB {
         &self,
         path: &Path,
         plan: &PostRecoveryWalPlan,
-        expect_original_file: bool,
     ) -> Result<usize, StateError> {
         let mut replay = VerifiedRecoveryWalReplay::default();
         let mut replay_error = None;
@@ -3452,11 +3435,7 @@ impl StateDB {
                 StateError::PersistenceError(format!("failed to stream post-recovery WAL: {error}"))
             })
         })?;
-        if expect_original_file {
-            verify_post_recovery_wal_reread(summary, plan)?;
-        } else {
-            verify_post_recovery_prefix_reread(summary, plan)?;
-        }
+        verify_post_recovery_wal_reread(summary, plan)?;
         Ok(replay.root_computations)
     }
 
@@ -3808,7 +3787,6 @@ mod tests {
             torn_tail: None,
         };
         assert!(verify_post_recovery_wal_reread(changed, &plan).is_err());
-        assert!(verify_post_recovery_prefix_reread(changed, &plan).is_err());
 
         let empty_plan = PostRecoveryWalPlan {
             accepted_entry_count: 0,
@@ -3832,7 +3810,6 @@ mod tests {
             torn_tail: None,
         };
         assert!(verify_post_recovery_wal_reread(added, &empty_plan).is_err());
-        assert!(verify_post_recovery_prefix_reread(added, &empty_plan).is_err());
     }
 
     #[test]
@@ -5653,6 +5630,11 @@ mod tests {
                 .to_string()
                 .contains("recovery WAL changed after checkpoint validation")
         );
+        assert!(
+            flip_err
+                .to_string()
+                .contains("digest mismatch before writer attach")
+        );
         fs::write(&wal_a, &original_bytes).unwrap();
 
         let wal_for_replace = wal_a.clone();
@@ -5678,6 +5660,11 @@ mod tests {
             replace_err
                 .to_string()
                 .contains("recovery WAL changed after checkpoint validation")
+        );
+        assert!(
+            replace_err
+                .to_string()
+                .contains("digest mismatch before writer attach")
         );
         fs::write(&wal_a, &original_bytes).unwrap();
 
