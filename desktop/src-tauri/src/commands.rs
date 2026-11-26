@@ -6996,8 +6996,7 @@ mod start_fence_tests {
 
         let skipped = run_inference_local_inner(&state, "The largest planet is", 1, true)
             .await
-            .err()
-            .expect("a busy node mutex skips the local node");
+            .expect_err("a busy node mutex skips the local node");
         assert!(skipped.starts_with(INFERENCE_PRE_DISPATCH_UNAVAILABLE));
         assert_eq!(try_local_rpc_port(&state), None);
         let candidates = body_between(
