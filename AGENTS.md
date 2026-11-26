@@ -257,7 +257,10 @@ The full account is [docs/HOW-SHARDING-WORKS.md](docs/HOW-SHARDING-WORKS.md).
 
 `crates/arc-node/src/community_sharding.rs` supplies a bounded community
 layer-pipeline coordinator with expiring leases, fixed partial-layer tiles,
-session ownership, and idle-worker reassignment. Its outputs require independent
+session ownership, and idle-worker reassignment. Ready transitions rebalance
+idle workers toward uncovered or underrepresented tiles without reducing the
+current complete-pipeline floor; rejoining identities enter the current fairness
+sequence. Its outputs require independent
 verification and cannot authorize rewards. Its integer-model tests exercise
 different partial models, including a 100-identity fairness simulation. This
 simulation is not evidence of 100 connected operators. The module alone does not connect desktop workers

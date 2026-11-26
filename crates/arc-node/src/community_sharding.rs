@@ -998,7 +998,7 @@ impl CommunityShardCoordinator {
             },
             pending_rebalance_from: None,
             active_sessions: BTreeSet::new(),
-            last_assigned_seq: 0,
+            last_assigned_seq: self.next_assignment_seq,
         };
         self.leases.insert(authenticated_worker.0, lease);
 
@@ -1077,17 +1077,15 @@ impl CommunityShardCoordinator {
         }
         lease.pending_rebalance_from = None;
 
-        let directive = match lease.phase {
-            LeasePhase::Provisioning { deadline_unix_ms } => {
+        let transitioned_to_ready = match lease.phase {
+            LeasePhase::Provisioning { .. } => {
                 if req.ready {
                     lease.phase = LeasePhase::Ready {
                         expires_at_unix_ms: next_ready_expiry,
                     };
-                    HeartbeatDirective::Active {
-                        expires_at_unix_ms: next_ready_expiry,
-                    }
+                    true
                 } else {
-                    HeartbeatDirective::Provisioning { deadline_unix_ms }
+                    false
                 }
             }
             LeasePhase::Ready { .. } => {
@@ -1097,8 +1095,38 @@ impl CommunityShardCoordinator {
                 lease.phase = LeasePhase::Ready {
                     expires_at_unix_ms: next_ready_expiry,
                 };
-                HeartbeatDirective::Active {
-                    expires_at_unix_ms: next_ready_expiry,
+                false
+            }
+        };
+
+        if transitioned_to_ready {
+            let _ = self.rebalance_idle_workers(now_ms);
+        }
+
+        let directive = {
+            let lease = self
+                .leases
+                .get(&authenticated_worker.0)
+                .ok_or(ShardCoordinatorError::LeaseNotFound)?;
+            if lease.lease_epoch != req.lease_epoch {
+                HeartbeatDirective::Rebalance {
+                    assignment: ShardLeaseAssignment {
+                        lease_id: lease.lease_id,
+                        lease_epoch: lease.lease_epoch,
+                        model_id: self.model.model_id,
+                        execution_profile: self.model.execution_profile.clone(),
+                        range: lease.range,
+                        provisioning_deadline_unix_ms: lease.provisioning_deadline_unix_ms,
+                    },
+                }
+            } else {
+                match lease.phase {
+                    LeasePhase::Provisioning { deadline_unix_ms } => {
+                        HeartbeatDirective::Provisioning { deadline_unix_ms }
+                    }
+                    LeasePhase::Ready { expires_at_unix_ms } => {
+                        HeartbeatDirective::Active { expires_at_unix_ms }
+                    }
                 }
             }
         };
@@ -1156,7 +1184,7 @@ impl CommunityShardCoordinator {
                 aborted_sessions.push(session_id);
             }
         }
-        let _ = self.try_rebalance_gaps(now_ms);
+        let _ = self.rebalance_idle_workers(now_ms);
 
         Ok(ShardReleaseResponse {
             released: true,
@@ -1305,7 +1333,7 @@ impl CommunityShardCoordinator {
             return Err(ShardCoordinatorError::SessionNotFound);
         }
         let _ = self.abort_session_internal(session_id.seq, now_ms, reason, None);
-        let _ = self.try_rebalance_gaps(now_ms);
+        let _ = self.rebalance_idle_workers(now_ms);
         Ok(())
     }
 
@@ -1464,7 +1492,7 @@ impl CommunityShardCoordinator {
                     },
                     None,
                 );
-                let _ = self.try_rebalance_gaps(now_ms);
+                let _ = self.rebalance_idle_workers(now_ms);
                 return Ok(ShardStepSubmitResponse {
                     accepted: true,
                     session_completed: false,
@@ -1481,7 +1509,7 @@ impl CommunityShardCoordinator {
                     },
                     None,
                 );
-                let _ = self.try_rebalance_gaps(now_ms);
+                let _ = self.rebalance_idle_workers(now_ms);
                 return Ok(ShardStepSubmitResponse {
                     accepted: true,
                     session_completed: false,
@@ -1698,7 +1726,7 @@ impl CommunityShardCoordinator {
                             reward_eligible: false,
                         })),
                     );
-                    let _ = self.try_rebalance_gaps(now_ms);
+                    let _ = self.rebalance_idle_workers(now_ms);
                     return Ok(ShardStepSubmitResponse {
                         accepted: true,
                         session_completed: true,
@@ -1842,7 +1870,7 @@ impl CommunityShardCoordinator {
         }
 
         let rebalanced_workers = if expired_leases > 0 || aborted_sessions > 0 {
-            self.try_rebalance_gaps(now_ms)
+            self.rebalance_idle_workers(now_ms)
         } else {
             0
         };
@@ -1899,7 +1927,7 @@ impl CommunityShardCoordinator {
                 expires_at_unix_ms,
             },
         );
-        let _ = self.try_rebalance_gaps(now_ms);
+        let _ = self.rebalance_idle_workers(now_ms);
         Ok(())
     }
 
@@ -2173,7 +2201,7 @@ impl CommunityShardCoordinator {
         Ok(hops)
     }
 
-    fn try_rebalance_gaps(&mut self, now_ms: u64) -> usize {
+    fn rebalance_idle_workers(&mut self, now_ms: u64) -> usize {
         let Some(provisioning_deadline) = now_ms.checked_add(self.limits.provisioning_ttl_ms)
         else {
             return 0;
@@ -2197,37 +2225,52 @@ impl CommunityShardCoordinator {
                     _ => {}
                 }
             }
-            let chosen = self
-                .tiles
-                .iter()
-                .copied()
-                .filter(|tile| total_by_tile.get(tile).copied().unwrap_or(0) == 0)
-                .find_map(|gap_tile| {
-                    let candidate_key = self
-                        .leases
-                        .values()
-                        .filter(|lease| {
-                            matches!(
+            let mut target_tiles = self.tiles.clone();
+            target_tiles.sort_by_key(|tile| {
+                (
+                    total_by_tile.get(tile).copied().unwrap_or(0),
+                    ready_by_tile.get(tile).copied().unwrap_or(0),
+                    tile.start_layer,
+                    tile.end_layer,
+                )
+            });
+            let chosen = target_tiles.into_iter().find_map(|target_tile| {
+                let target_total = total_by_tile.get(&target_tile).copied().unwrap_or(0);
+                let target_ready = ready_by_tile.get(&target_tile).copied().unwrap_or(0);
+                let candidate_key = self
+                    .leases
+                    .values()
+                    .filter(|lease| {
+                        let source_total = total_by_tile.get(&lease.range).copied().unwrap_or(0);
+                        let source_ready = ready_by_tile.get(&lease.range).copied().unwrap_or(0);
+                        lease.range != target_tile
+                            && matches!(
                                 lease.phase,
                                 LeasePhase::Ready { expires_at_unix_ms }
                                     if now_ms < expires_at_unix_ms
-                            ) && lease.active_sessions.is_empty()
-                                && lease.max_resident_layers >= gap_tile.len()
-                                && lease.lease_epoch.checked_add(1).is_some()
-                                && ready_by_tile.get(&lease.range).copied().unwrap_or(0) >= 2
-                        })
-                        .max_by(|a, b| {
-                            let count_a = ready_by_tile.get(&a.range).copied().unwrap_or(0);
-                            let count_b = ready_by_tile.get(&b.range).copied().unwrap_or(0);
-                            count_a
-                                .cmp(&count_b)
-                                .then_with(|| b.max_resident_layers.cmp(&a.max_resident_layers))
-                                .then_with(|| b.worker_id.0.cmp(&a.worker_id.0))
-                        })
-                        .map(|lease| lease.worker_id.0);
-                    candidate_key.map(|key| (gap_tile, key))
-                });
-            let Some((gap_tile, candidate_key)) = chosen else {
+                            )
+                            && lease.active_sessions.is_empty()
+                            && lease.max_resident_layers >= target_tile.len()
+                            && lease.lease_epoch.checked_add(1).is_some()
+                            && source_ready >= 2
+                            && source_total >= target_total.saturating_add(2)
+                            && source_ready > target_ready
+                    })
+                    .max_by(|a, b| {
+                        let ready_a = ready_by_tile.get(&a.range).copied().unwrap_or(0);
+                        let ready_b = ready_by_tile.get(&b.range).copied().unwrap_or(0);
+                        let total_a = total_by_tile.get(&a.range).copied().unwrap_or(0);
+                        let total_b = total_by_tile.get(&b.range).copied().unwrap_or(0);
+                        ready_a
+                            .cmp(&ready_b)
+                            .then_with(|| total_a.cmp(&total_b))
+                            .then_with(|| b.max_resident_layers.cmp(&a.max_resident_layers))
+                            .then_with(|| b.worker_id.0.cmp(&a.worker_id.0))
+                    })
+                    .map(|lease| lease.worker_id.0);
+                candidate_key.map(|key| (target_tile, key))
+            });
+            let Some((target_tile, candidate_key)) = chosen else {
                 break;
             };
             let Some(lease) = self.leases.get_mut(&candidate_key) else {
@@ -2239,7 +2282,7 @@ impl CommunityShardCoordinator {
             let previous_epoch = lease.lease_epoch;
             let previous_range = lease.range;
             lease.lease_epoch = next_epoch;
-            lease.range = gap_tile;
+            lease.range = target_tile;
             lease.provisioning_deadline_unix_ms = provisioning_deadline;
             lease.phase = LeasePhase::Provisioning {
                 deadline_unix_ms: provisioning_deadline,
@@ -4559,5 +4602,340 @@ pub(crate) mod tests {
             hard_coord.open_session(now_ms, vec![1], 2),
             Err(ShardCoordinatorError::SessionCapacityReached)
         );
+    }
+
+    #[test]
+    fn heartbeat_ready_transition_heals_coverage_gap_without_deadlock() {
+        let model = TrustedModelSpec {
+            model_id: test_hash(b"liveness-gap-model-24l"),
+            execution_profile: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+            n_layers: 24,
+            d_model: 16,
+            vocab_size: 32,
+            max_seq: 64,
+            eos_tokens: vec![2],
+            bos_token: 0,
+        };
+        let mut now_ms = 10_000u64;
+        let mut coord = CommunityShardCoordinator::new(
+            test_hash(b"liveness-gap-boot"),
+            model.clone(),
+            CommunityShardLimits::default(),
+        )
+        .unwrap();
+
+        let mut workers: Vec<(Hash256, ShardLeaseAssignment)> = (0..7)
+            .map(|idx| {
+                let id = test_hash(format!("liveness-worker-{idx:02}").as_bytes());
+                let resp = coord
+                    .request_lease(id, now_ms, lease_req(id, &model, 4))
+                    .unwrap();
+                (id, resp.assignment)
+            })
+            .collect();
+
+        for (id, assignment) in &workers[..6] {
+            let hb = coord
+                .heartbeat(*id, now_ms, ready_hb(*id, assignment, true))
+                .unwrap();
+            assert!(matches!(hb.directive, HeartbeatDirective::Active { .. }));
+        }
+
+        now_ms += 1_000;
+        let (leaving_id, leaving_assignment) = workers.remove(5);
+        let missing_tile = leaving_assignment.range;
+        coord
+            .release_lease(
+                leaving_id,
+                now_ms,
+                ShardReleaseRequest {
+                    worker_id: leaving_id,
+                    lease_id: leaving_assignment.lease_id,
+                    lease_epoch: leaving_assignment.lease_epoch,
+                },
+            )
+            .unwrap();
+        assert_eq!(coord.pipeline_capacity(now_ms).ready_complete_pipelines, 0);
+        assert_eq!(
+            coord.status_snapshot(now_ms).tiles[5].provisioning_workers,
+            0
+        );
+
+        now_ms += 1_000;
+        let (late_id, late_assignment) = workers[5].clone();
+        let late_hb = coord
+            .heartbeat(late_id, now_ms, ready_hb(late_id, &late_assignment, true))
+            .unwrap();
+        if let HeartbeatDirective::Rebalance { assignment } = late_hb.directive {
+            workers[5].1 = assignment;
+        }
+
+        now_ms += 1_000;
+        for (id, assignment) in &mut workers {
+            let hb = coord
+                .heartbeat(*id, now_ms, ready_hb(*id, assignment, true))
+                .unwrap();
+            if let HeartbeatDirective::Rebalance {
+                assignment: rebalanced,
+            } = hb.directive
+            {
+                assert_eq!(rebalanced.range, missing_tile);
+                let ready = coord
+                    .heartbeat(*id, now_ms, ready_hb(*id, &rebalanced, true))
+                    .unwrap();
+                assert!(matches!(ready.directive, HeartbeatDirective::Active { .. }));
+                *assignment = rebalanced;
+            }
+        }
+
+        let status = coord.status_snapshot(now_ms);
+        assert!(status.fully_covered_ready);
+        assert_eq!(coord.pipeline_capacity(now_ms).ready_complete_pipelines, 1);
+        assert!(coord.open_session(now_ms, vec![1], 2).is_ok());
+    }
+
+    #[test]
+    fn rebalance_recovers_post_churn_throughput_and_heterogeneous_tile_balance() {
+        let model_24 = TrustedModelSpec {
+            model_id: test_hash(b"skew-model-24l"),
+            execution_profile: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+            n_layers: 24,
+            d_model: 16,
+            vocab_size: 32,
+            max_seq: 64,
+            eos_tokens: vec![2],
+            bos_token: 0,
+        };
+        let mut now_ms = 20_000u64;
+        let mut coord = CommunityShardCoordinator::new(
+            test_hash(b"skew-boot-24l"),
+            model_24.clone(),
+            CommunityShardLimits::default(),
+        )
+        .unwrap();
+
+        let mut workers: Vec<(Hash256, ShardLeaseAssignment)> = (0..100)
+            .map(|idx| register_ready_capacity_worker(&mut coord, &model_24, now_ms, idx, 4))
+            .collect();
+        assert_eq!(coord.pipeline_capacity(now_ms).ready_complete_pipelines, 16);
+
+        let tile4 = coord.fixed_tiles()[4];
+        let leaving: Vec<(Hash256, ShardLeaseAssignment)> = workers
+            .iter()
+            .filter(|(_, a)| a.range == tile4)
+            .take(15)
+            .cloned()
+            .collect();
+        for (id, assignment) in &leaving {
+            coord
+                .release_lease(
+                    *id,
+                    now_ms,
+                    ShardReleaseRequest {
+                        worker_id: *id,
+                        lease_id: assignment.lease_id,
+                        lease_epoch: assignment.lease_epoch,
+                    },
+                )
+                .unwrap();
+            assert!(coord.pipeline_capacity(now_ms).ready_complete_pipelines >= 1);
+        }
+        workers.retain(|(id, _)| !leaving.iter().any(|(left, _)| left == id));
+
+        now_ms += 1_000;
+        for (id, assignment) in &mut workers {
+            let hb = coord
+                .heartbeat(*id, now_ms, ready_hb(*id, assignment, true))
+                .unwrap();
+            if let HeartbeatDirective::Rebalance {
+                assignment: rebalanced,
+            } = hb.directive
+            {
+                let ready = coord
+                    .heartbeat(*id, now_ms, ready_hb(*id, &rebalanced, true))
+                    .unwrap();
+                assert!(matches!(ready.directive, HeartbeatDirective::Active { .. }));
+                *assignment = rebalanced;
+            }
+        }
+        assert_eq!(coord.pipeline_capacity(now_ms).ready_complete_pipelines, 14);
+
+        let model_32 = TrustedModelSpec {
+            model_id: test_hash(b"hetero-model-32l"),
+            execution_profile: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+            n_layers: 32,
+            d_model: 16,
+            vocab_size: 32,
+            max_seq: 64,
+            eos_tokens: vec![2],
+            bos_token: 0,
+        };
+        let mut hetero_ms = 30_000u64;
+        let mut hetero_coord = CommunityShardCoordinator::new(
+            test_hash(b"hetero-boot-32l"),
+            model_32.clone(),
+            CommunityShardLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(hetero_coord.fixed_tiles()[0].len(), 6);
+        assert_eq!(hetero_coord.fixed_tiles()[1].len(), 6);
+        assert_eq!(hetero_coord.fixed_tiles()[2].len(), 5);
+
+        let mut hetero_workers = Vec::with_capacity(100);
+        for idx in 0..20 {
+            hetero_workers.push(register_ready_capacity_worker(
+                &mut hetero_coord,
+                &model_32,
+                hetero_ms,
+                idx,
+                6,
+            ));
+        }
+        for idx in 20..100 {
+            hetero_workers.push(register_ready_capacity_worker(
+                &mut hetero_coord,
+                &model_32,
+                hetero_ms,
+                idx,
+                5,
+            ));
+        }
+
+        hetero_ms += 1_000;
+        for (id, assignment) in &mut hetero_workers {
+            let hb = hetero_coord
+                .heartbeat(*id, hetero_ms, ready_hb(*id, assignment, true))
+                .unwrap();
+            if let HeartbeatDirective::Rebalance {
+                assignment: rebalanced,
+            } = hb.directive
+            {
+                let ready = hetero_coord
+                    .heartbeat(*id, hetero_ms, ready_hb(*id, &rebalanced, true))
+                    .unwrap();
+                assert!(matches!(ready.directive, HeartbeatDirective::Active { .. }));
+                *assignment = rebalanced;
+            }
+        }
+        let hetero_cap = hetero_coord.pipeline_capacity(hetero_ms);
+        assert_eq!(hetero_cap.ready_complete_pipelines, 10);
+        let hetero_status = hetero_coord.status_snapshot(hetero_ms);
+        assert_eq!(hetero_status.tiles[0].ready_workers, 10);
+        assert_eq!(hetero_status.tiles[1].ready_workers, 10);
+    }
+
+    #[test]
+    fn rejoining_worker_cannot_jump_lru_fairness_queue() {
+        let model = TrustedModelSpec {
+            model_id: test_hash(b"fairness-model-12l"),
+            execution_profile: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+            n_layers: 12,
+            d_model: 16,
+            vocab_size: 32,
+            max_seq: 64,
+            eos_tokens: vec![2],
+            bos_token: 0,
+        };
+        let mut now_ms = 40_000u64;
+        let mut coord = CommunityShardCoordinator::new(
+            test_hash(b"fairness-boot"),
+            model.clone(),
+            CommunityShardLimits::default(),
+        )
+        .unwrap();
+
+        let workers: Vec<(Hash256, ShardLeaseAssignment)> = (0..12)
+            .map(|idx| register_ready_capacity_worker(&mut coord, &model, now_ms, idx, 2))
+            .collect();
+        let tile5 = coord.fixed_tiles()[5];
+        let tile5_workers: Vec<(Hash256, ShardLeaseAssignment)> = workers
+            .iter()
+            .filter(|(_, a)| a.range == tile5)
+            .cloned()
+            .collect();
+        assert_eq!(tile5_workers.len(), 2);
+
+        let s1 = coord.open_session(now_ms, vec![1], 2).unwrap();
+        let chosen_first = tile5_workers
+            .iter()
+            .find(|(id, _)| coord.worker_lease_snapshot(*id).unwrap().active_sessions == 1)
+            .cloned()
+            .unwrap();
+        let other = tile5_workers
+            .iter()
+            .find(|(id, _)| *id != chosen_first.0)
+            .cloned()
+            .unwrap();
+        coord
+            .cancel_session(now_ms, s1, SessionAbortReason::CallerCancelled)
+            .unwrap();
+
+        let s2 = coord.open_session(now_ms, vec![1], 2).unwrap();
+        assert_eq!(
+            coord
+                .worker_lease_snapshot(other.0)
+                .unwrap()
+                .active_sessions,
+            1
+        );
+        coord
+            .cancel_session(now_ms, s2, SessionAbortReason::CallerCancelled)
+            .unwrap();
+
+        let s3 = coord.open_session(now_ms, vec![1], 2).unwrap();
+        assert_eq!(
+            coord
+                .worker_lease_snapshot(chosen_first.0)
+                .unwrap()
+                .active_sessions,
+            1
+        );
+        coord
+            .cancel_session(now_ms, s3, SessionAbortReason::CallerCancelled)
+            .unwrap();
+
+        now_ms += 100;
+        coord
+            .release_lease(
+                chosen_first.0,
+                now_ms,
+                ShardReleaseRequest {
+                    worker_id: chosen_first.0,
+                    lease_id: chosen_first.1.lease_id,
+                    lease_epoch: chosen_first.1.lease_epoch,
+                },
+            )
+            .unwrap();
+        let rejoined = coord
+            .request_lease(chosen_first.0, now_ms, lease_req(chosen_first.0, &model, 2))
+            .unwrap();
+        assert_eq!(rejoined.assignment.range, tile5);
+        let hb = coord
+            .heartbeat(
+                chosen_first.0,
+                now_ms,
+                ready_hb(chosen_first.0, &rejoined.assignment, true),
+            )
+            .unwrap();
+        assert!(matches!(hb.directive, HeartbeatDirective::Active { .. }));
+
+        let s4 = coord.open_session(now_ms, vec![1], 2).unwrap();
+        assert_eq!(
+            coord
+                .worker_lease_snapshot(other.0)
+                .unwrap()
+                .active_sessions,
+            1
+        );
+        assert_eq!(
+            coord
+                .worker_lease_snapshot(chosen_first.0)
+                .unwrap()
+                .active_sessions,
+            0
+        );
+        coord
+            .cancel_session(now_ms, s4, SessionAbortReason::CallerCancelled)
+            .unwrap();
     }
 }
