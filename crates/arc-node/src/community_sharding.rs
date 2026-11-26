@@ -20,7 +20,7 @@ pub const MAX_CANCELLATIONS_PER_WORKER_HARD_CAP: usize = 128;
 pub const MAX_CANCELLATION_QUEUES_HARD_CAP: usize = 256;
 pub const MAX_FAILED_WORKERS_HARD_CAP: usize = 256;
 pub const DEFAULT_MAX_WORKERS: usize = 128;
-pub const DEFAULT_MAX_ACTIVE_SESSIONS: usize = 4;
+pub const DEFAULT_MAX_ACTIVE_SESSIONS: usize = 24;
 pub const DEFAULT_MAX_SESSIONS_PER_WORKER: usize = 1;
 pub const DEFAULT_TARGET_PARTITIONS: usize = 6;
 pub const DEFAULT_MAX_HIDDEN_LEN: usize = 16_384;
@@ -574,6 +574,15 @@ pub struct CoordinatorStatusSnapshot {
     pub retained_results: usize,
     pub queued_cancellations: usize,
     pub quarantined_workers: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardPipelineCapacity {
+    pub ready_complete_pipelines: usize,
+    pub idle_complete_pipelines: usize,
+    pub active_sessions: usize,
+    pub max_active_sessions: usize,
+    pub effective_session_capacity: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2020,6 +2029,54 @@ impl CommunityShardCoordinator {
             retained_results: self.completed_results.len(),
             queued_cancellations,
             quarantined_workers,
+        }
+    }
+
+    pub fn pipeline_capacity(&self, now_ms: u64) -> ShardPipelineCapacity {
+        let mut ready_slots_by_tile: BTreeMap<ShardLayerRange, usize> =
+            self.tiles.iter().map(|tile| (*tile, 0usize)).collect();
+        let mut idle_slots_by_tile: BTreeMap<ShardLayerRange, usize> =
+            self.tiles.iter().map(|tile| (*tile, 0usize)).collect();
+        for lease in self.leases.values() {
+            let is_ready = matches!(
+                lease.phase,
+                LeasePhase::Ready { expires_at_unix_ms } if now_ms < expires_at_unix_ms
+            );
+            if !is_ready || self.is_quarantined(lease.worker_id, now_ms) {
+                continue;
+            }
+            if let Some(ready_slots) = ready_slots_by_tile.get_mut(&lease.range) {
+                *ready_slots = ready_slots.saturating_add(self.limits.max_sessions_per_worker);
+            }
+            let remaining_slots = self
+                .limits
+                .max_sessions_per_worker
+                .saturating_sub(lease.active_sessions.len());
+            if let Some(idle_slots) = idle_slots_by_tile.get_mut(&lease.range) {
+                *idle_slots = idle_slots.saturating_add(remaining_slots);
+            }
+        }
+        let ready_complete_pipelines = self
+            .tiles
+            .iter()
+            .map(|tile| ready_slots_by_tile.get(tile).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+        let idle_complete_pipelines = self
+            .tiles
+            .iter()
+            .map(|tile| idle_slots_by_tile.get(tile).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+        let effective_session_capacity = ready_complete_pipelines
+            .min(self.limits.max_active_sessions)
+            .min(MAX_ACTIVE_SESSIONS_HARD_CAP);
+        ShardPipelineCapacity {
+            ready_complete_pipelines,
+            idle_complete_pipelines,
+            active_sessions: self.sessions.len(),
+            max_active_sessions: self.limits.max_active_sessions,
+            effective_session_capacity,
         }
     }
 
@@ -4247,6 +4304,260 @@ pub(crate) mod tests {
         assert_eq!(
             coord.worker_quarantine_reason(w1, 200 + DEFAULT_QUARANTINE_TTL_MS),
             None
+        );
+    }
+    fn register_ready_capacity_worker(
+        coord: &mut CommunityShardCoordinator,
+        model: &TrustedModelSpec,
+        now_ms: u64,
+        index: usize,
+        max_resident_layers: usize,
+    ) -> (Hash256, ShardLeaseAssignment) {
+        let worker_id = test_hash(format!("capacity-worker-{index}").as_bytes());
+        let assignment = coord
+            .request_lease(
+                worker_id,
+                now_ms,
+                ShardLeaseRequest {
+                    worker_id,
+                    protocol_version: COMMUNITY_SHARD_PROTOCOL_VERSION,
+                    model_id: model.model_id,
+                    execution_profile: model.execution_profile.clone(),
+                    n_layers: model.n_layers,
+                    d_model: model.d_model,
+                    vocab_size: model.vocab_size,
+                    max_seq: model.max_seq,
+                    max_resident_layers,
+                },
+            )
+            .unwrap()
+            .assignment;
+        let hb = coord
+            .heartbeat(
+                worker_id,
+                now_ms,
+                ShardHeartbeatRequest {
+                    worker_id,
+                    lease_id: assignment.lease_id,
+                    lease_epoch: assignment.lease_epoch,
+                    model_id: model.model_id,
+                    execution_profile: model.execution_profile.clone(),
+                    loaded_range: assignment.range,
+                    ready: true,
+                },
+            )
+            .unwrap();
+        assert!(matches!(hb.directive, HeartbeatDirective::Active { .. }));
+        (worker_id, assignment)
+    }
+
+    #[test]
+    fn pipeline_capacity_scales_across_6_12_24_and_100_workers_and_tracks_churn() {
+        let model = TrustedModelSpec {
+            model_id: test_hash(b"capacity-model-24l"),
+            execution_profile: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+            n_layers: 24,
+            d_model: 16,
+            vocab_size: 32,
+            max_seq: 64,
+            eos_tokens: vec![2],
+            bos_token: 0,
+        };
+        let limits = CommunityShardLimits::default();
+        assert_eq!(limits.max_active_sessions, 24);
+        assert_eq!(limits.max_sessions_per_worker, 1);
+        assert_eq!(limits.target_partitions, 6);
+
+        let now_ms = 10_000u64;
+        let mut coord =
+            CommunityShardCoordinator::new(test_hash(b"capacity-boot"), model.clone(), limits)
+                .unwrap();
+        assert_eq!(coord.fixed_tiles().len(), 6);
+
+        let mut registered = Vec::new();
+        for index in 0..5 {
+            registered.push(register_ready_capacity_worker(
+                &mut coord, &model, now_ms, index, 4,
+            ));
+        }
+        let partial = coord.pipeline_capacity(now_ms);
+        assert_eq!(partial.ready_complete_pipelines, 0);
+        assert_eq!(partial.idle_complete_pipelines, 0);
+        assert_eq!(partial.effective_session_capacity, 0);
+
+        for (target_workers, expected_pipelines) in [(6usize, 1usize), (12, 2), (24, 4), (100, 16)]
+        {
+            while registered.len() < target_workers {
+                let next_index = registered.len();
+                registered.push(register_ready_capacity_worker(
+                    &mut coord, &model, now_ms, next_index, 4,
+                ));
+            }
+            let cap = coord.pipeline_capacity(now_ms);
+            assert_eq!(cap.ready_complete_pipelines, expected_pipelines);
+            assert_eq!(cap.idle_complete_pipelines, expected_pipelines);
+            assert_eq!(cap.effective_session_capacity, expected_pipelines);
+            assert_eq!(cap.active_sessions, 0);
+
+            let mut open_ids = Vec::with_capacity(expected_pipelines);
+            for _ in 0..expected_pipelines {
+                open_ids.push(coord.open_session(now_ms, vec![1], 2).unwrap());
+            }
+            let busy = coord.pipeline_capacity(now_ms);
+            assert_eq!(busy.ready_complete_pipelines, expected_pipelines);
+            assert_eq!(busy.idle_complete_pipelines, 0);
+            assert_eq!(busy.active_sessions, expected_pipelines);
+            assert!(coord.open_session(now_ms, vec![1], 2).is_err());
+
+            for session_id in open_ids {
+                coord
+                    .cancel_session(now_ms, session_id, SessionAbortReason::CallerCancelled)
+                    .unwrap();
+            }
+            let restored = coord.pipeline_capacity(now_ms);
+            assert_eq!(restored.active_sessions, 0);
+            assert_eq!(restored.idle_complete_pipelines, expected_pipelines);
+        }
+
+        let target_tile = coord.fixed_tiles()[4];
+        let tile4_workers: Vec<(Hash256, ShardLeaseAssignment)> = registered
+            .iter()
+            .filter(|(_, assignment)| assignment.range == target_tile)
+            .cloned()
+            .collect();
+        assert_eq!(tile4_workers.len(), 16);
+
+        let (leaving_worker, leaving_assignment) = &tile4_workers[0];
+        coord
+            .release_lease(
+                *leaving_worker,
+                now_ms,
+                ShardReleaseRequest {
+                    worker_id: *leaving_worker,
+                    lease_id: leaving_assignment.lease_id,
+                    lease_epoch: leaving_assignment.lease_epoch,
+                },
+            )
+            .unwrap();
+        let after_leave = coord.pipeline_capacity(now_ms);
+        assert_eq!(after_leave.ready_complete_pipelines, 15);
+        assert_eq!(after_leave.effective_session_capacity, 15);
+
+        coord
+            .quarantine_worker(
+                tile4_workers[1].0,
+                now_ms,
+                WorkerFaultReason::OutputVerificationMismatch,
+            )
+            .unwrap();
+        let after_quarantine = coord.pipeline_capacity(now_ms);
+        assert_eq!(after_quarantine.ready_complete_pipelines, 14);
+        assert_eq!(after_quarantine.effective_session_capacity, 14);
+
+        for (worker_id, assignment) in &tile4_workers[2..] {
+            coord
+                .release_lease(
+                    *worker_id,
+                    now_ms,
+                    ShardReleaseRequest {
+                        worker_id: *worker_id,
+                        lease_id: assignment.lease_id,
+                        lease_epoch: assignment.lease_epoch,
+                    },
+                )
+                .unwrap();
+        }
+        let uncovered = coord.pipeline_capacity(now_ms);
+        assert_eq!(uncovered.ready_complete_pipelines, 0);
+        assert_eq!(uncovered.effective_session_capacity, 0);
+        assert_eq!(coord.status_snapshot(now_ms).tiles[4].ready_workers, 0);
+
+        let mut expiry_coord = CommunityShardCoordinator::new(
+            test_hash(b"capacity-expiry-boot"),
+            model.clone(),
+            CommunityShardLimits::default(),
+        )
+        .unwrap();
+        for index in 0..6 {
+            let _ = register_ready_capacity_worker(&mut expiry_coord, &model, now_ms, index, 4);
+        }
+        assert_eq!(
+            expiry_coord
+                .pipeline_capacity(now_ms)
+                .ready_complete_pipelines,
+            1
+        );
+        let expired_ms = now_ms + DEFAULT_READY_TTL_MS;
+        let expired = expiry_coord.pipeline_capacity(expired_ms);
+        assert_eq!(expired.ready_complete_pipelines, 0);
+        assert_eq!(expired.effective_session_capacity, 0);
+    }
+
+    #[test]
+    fn pipeline_capacity_respects_default_24_and_hard_cap_64() {
+        let model = TrustedModelSpec {
+            model_id: test_hash(b"capacity-model-hardcap"),
+            execution_profile: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+            n_layers: 24,
+            d_model: 16,
+            vocab_size: 32,
+            max_seq: 64,
+            eos_tokens: vec![2],
+            bos_token: 0,
+        };
+        let now_ms = 20_000u64;
+
+        let default_limits = CommunityShardLimits {
+            target_partitions: 2,
+            ..CommunityShardLimits::default()
+        };
+        let mut default_coord = CommunityShardCoordinator::new(
+            test_hash(b"capacity-default-cap"),
+            model.clone(),
+            default_limits,
+        )
+        .unwrap();
+        for index in 0..MAX_WORKERS_HARD_CAP {
+            let _ = register_ready_capacity_worker(&mut default_coord, &model, now_ms, index, 12);
+        }
+        let default_cap = default_coord.pipeline_capacity(now_ms);
+        assert_eq!(default_cap.ready_complete_pipelines, 64);
+        assert_eq!(default_cap.effective_session_capacity, 24);
+        for _ in 0..24 {
+            let _ = default_coord.open_session(now_ms, vec![1], 2).unwrap();
+        }
+        assert_eq!(
+            default_coord.open_session(now_ms, vec![1], 2),
+            Err(ShardCoordinatorError::SessionCapacityReached)
+        );
+
+        let hard_limits = CommunityShardLimits {
+            target_partitions: 2,
+            max_active_sessions: MAX_ACTIVE_SESSIONS_HARD_CAP,
+            ..CommunityShardLimits::default()
+        };
+        let mut hard_coord = CommunityShardCoordinator::new(
+            test_hash(b"capacity-hard-cap"),
+            model.clone(),
+            hard_limits,
+        )
+        .unwrap();
+        for index in 0..MAX_WORKERS_HARD_CAP {
+            let _ = register_ready_capacity_worker(&mut hard_coord, &model, now_ms, index, 12);
+        }
+        let hard_cap = hard_coord.pipeline_capacity(now_ms);
+        assert_eq!(hard_cap.ready_complete_pipelines, 64);
+        assert_eq!(hard_cap.effective_session_capacity, 64);
+        for _ in 0..MAX_ACTIVE_SESSIONS_HARD_CAP {
+            let _ = hard_coord.open_session(now_ms, vec![1], 2).unwrap();
+        }
+        assert_eq!(
+            hard_coord.pipeline_capacity(now_ms).idle_complete_pipelines,
+            0
+        );
+        assert_eq!(
+            hard_coord.open_session(now_ms, vec![1], 2),
+            Err(ShardCoordinatorError::SessionCapacityReached)
         );
     }
 }

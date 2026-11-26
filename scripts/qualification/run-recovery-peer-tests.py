@@ -41,6 +41,14 @@ EXPECTED_BINARY_TESTS = {
     'recovery_peer_qualification_tests::qualify_peer_state_rejects_oversized_wrong_domain_forged_and_subquorum_certificates',
 }
 EXPECTED_LIBRARY_TESTS = {
+    'community_sharding::tests::pipeline_capacity_scales_across_6_12_24_and_100_workers_and_tracks_churn',
+    'community_sharding::tests::pipeline_capacity_respects_default_24_and_hard_cap_64',
+    'rpc::community_shard_dispatch::tests::four_concurrent_sharded_sessions_scale_past_verifier_cap_two',
+    'rpc::community_shard_dispatch::tests::shutdown_cancels_in_flight_and_verification_queued_sharded_requests',
+    'rpc::community_shard_dispatch::tests::verification_wait_deadline_exhaustion_fails_bounded_and_releases_slot',
+    'community_shard_worker::tests::auto_reconnect_stops_during_backoff_without_extra_http_and_fails_closed_on_auth',
+    'community_shard_worker::tests::auto_reconnect_drops_weights_and_retains_boot_fence_across_outage',
+    'rpc::community_shard_http::worker_tests::auto_reconnect_recovers_after_503_outage_beyond_budget_and_executes_canonical_step',
     'community_shard_worker::tests::transient_heartbeat_backoff_grows_and_resets_after_success',
     'community_shard_worker::tests::elapsed_idle_wait_returns_before_overdue_heartbeat_but_shutdown_wins',
     'rpc::community_shard_dispatch::tests::outbound_workers_and_public_dispatch_return_independently_verified_answer',

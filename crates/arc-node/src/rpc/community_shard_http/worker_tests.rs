@@ -1494,3 +1494,125 @@ async fn hundred_signed_network_workers_all_execute_canonical_partial_inference(
         5 * 4 * 6 * steps_per_session_per_worker
     );
 }
+
+#[tokio::test]
+async fn auto_reconnect_recovers_after_503_outage_beyond_budget_and_executes_canonical_step() {
+    let (full, spec) = make_tiny_model_and_spec(b"worker-auto-reconnect-503-recovery");
+    let node = build_worker_test_node(Some(Arc::clone(&full)), Some(spec.model_id));
+    super::init_community_shard_coordinator_with_limits(
+        &node,
+        CommunityShardLimits {
+            target_partitions: 2,
+            ..CommunityShardLimits::default()
+        },
+    )
+    .expect("init coordinator");
+
+    let kp1 = Arc::new(KeyPair::generate_ed25519());
+    let kp2 = Arc::new(KeyPair::generate_ed25519());
+
+    struct OutageRegisterState {
+        node: super::super::NodeState,
+        target_worker_hex: String,
+        target_calls: AtomicUsize,
+    }
+
+    async fn outage_register_handler(
+        AxumState(state): AxumState<Arc<OutageRegisterState>>,
+        Json(signed): Json<
+            super::super::CommunitySignedRequest<super::super::CommunityRegisterRequest>,
+        >,
+    ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+        if signed.payload.worker_id == state.target_worker_hex {
+            let attempt = state.target_calls.fetch_add(1, Ordering::SeqCst);
+            if attempt < 8 {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "temporary coordinator outage".to_string(),
+                ));
+            }
+        }
+        super::super::community_register_signed(AxumState(state.node.clone()), Json(signed)).await
+    }
+
+    let outage_state = Arc::new(OutageRegisterState {
+        node: node.clone(),
+        target_worker_hex: format!("0x{}", kp1.address().to_hex()),
+        target_calls: AtomicUsize::new(0),
+    });
+    let app = super::routes().with_state(node.clone()).merge(
+        Router::new()
+            .route(
+                super::super::COMMUNITY_REGISTER_PATH,
+                post(outage_register_handler),
+            )
+            .with_state(Arc::clone(&outage_state)),
+    );
+    let (base_url, srv) = spawn_router(app).await;
+    let (shut_tx, shut_rx) = watch::channel(false);
+
+    let mut cfg1 = worker_config(&base_url, &node, "reconnect-w1");
+    cfg1.auto_reconnect = true;
+    cfg1.retry_base_backoff_ms = 10;
+    cfg1.retry_max_backoff_ms = 15;
+    cfg1.reconnect_base_backoff_ms = 20;
+    cfg1.reconnect_max_backoff_ms = 60;
+    let cfg2 = worker_config(&base_url, &node, "reconnect-w2");
+
+    let w1 = tokio::spawn(run_community_shard_worker(
+        cfg1,
+        Arc::clone(&kp1),
+        spec.clone(),
+        partial_loader(Arc::clone(&full)),
+        shut_rx.clone(),
+    ));
+    let w2 = tokio::spawn(run_community_shard_worker(
+        cfg2,
+        Arc::clone(&kp2),
+        spec,
+        partial_loader(Arc::clone(&full)),
+        shut_rx,
+    ));
+
+    wait_for_condition(&node, Duration::from_secs(10), |coord| {
+        coord.status_snapshot(now_ms()).fully_covered_ready
+    })
+    .await;
+
+    let prompt = vec![1u32, 5, 9];
+    let max_tokens = 2u32;
+    let session_id = node
+        .community_shard_coordinator
+        .lock()
+        .as_mut()
+        .expect("coord")
+        .open_session(now_ms(), prompt.clone(), max_tokens)
+        .expect("open session");
+
+    let outcome = wait_for_session_result(&node, session_id, Duration::from_secs(10)).await;
+    let pending = match outcome {
+        SessionOutcome::PendingVerification(pending) => pending,
+        other => panic!("expected pending verification, got {other:?}"),
+    };
+    assert!(pending.verification_required);
+    assert!(!pending.reward_eligible);
+    let (expected_tokens, _) = full
+        .try_generate(&prompt, max_tokens, &full.config.eos_tokens)
+        .expect("full try_generate");
+    assert_eq!(pending.unverified_generated_tokens, expected_tokens);
+
+    let _ = shut_tx.send(true);
+    let s1 = w1.await.expect("join w1").expect("w1 ok");
+    let s2 = w2.await.expect("join w2").expect("w2 ok");
+    srv.abort();
+
+    assert_eq!(outage_state.target_calls.load(Ordering::SeqCst), 9);
+    assert!(s1.reconnect_attempts >= 1);
+    assert_eq!(s1.registrations, 1);
+    assert_eq!(
+        s1.steps_executed,
+        1 + prompt.len() as u64 + u64::from(max_tokens)
+    );
+    assert!(s1.clean_release_sent);
+    assert!(s2.clean_release_sent);
+}

@@ -11,6 +11,7 @@ on:
         options:
           - full
           - recovery-peer
+          - desktop-shard
   push:
     branches: [arc-chain-v2-implementation-20260919, arc-native-low-residency-20260927, arc-desktop-unattended-availability-20260927]
 
@@ -18,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: linux-candidate-${{ github.ref }}
+  group: linux-candidate-${{ github.ref }}-${{ inputs.qualification || 'full' }}
   cancel-in-progress: true
 
 env:
@@ -72,7 +73,7 @@ jobs:
           retention-days: 14
 
   recovered-v3-paid-lifecycle:
-    if: inputs.qualification != 'recovery-peer'
+    if: inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard'
     name: Recovered-v3 paid lifecycle (isolated Linux process test)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -215,11 +216,12 @@ jobs:
 
   desktop-native-paid-test:
     if: inputs.qualification != 'recovery-peer'
-    name: Desktop native paid Rust tests (macOS)
+    name: Desktop lifecycle and native paid Rust tests (macOS)
     runs-on: ${{ startsWith(vars.ARC_MACOS_ARM_RUNNER, '[') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) && fromJSON(vars.ARC_MACOS_ARM_RUNNER) || 'macos-15' }}
     timeout-minutes: 45
     env:
       RUSTUP_TOOLCHAIN: stable
+      CARGO_BUILD_JOBS: 1
     steps:
       - name: Prepare self-hosted runner
         if: runner.environment == 'self-hosted'
@@ -275,7 +277,11 @@ jobs:
           shared-key: desktop-native-paid-macos
 
       - name: Test desktop native paid request Rust code
-        run: 'cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib native_paid::'
+        run: |
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib native_paid:: -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib node_manager:: -- --test-threads=1
+      - name: Lint desktop lifecycle and worker integration
+        run: cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --locked --lib --tests -- -D warnings
 
       - name: Clean up self-hosted runner
         if: always() && runner.environment == 'self-hosted'
@@ -292,7 +298,7 @@ jobs:
           exit 0
 
   linux-candidate:
-    if: inputs.qualification != 'recovery-peer'
+    if: inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard'
     name: Linux production candidate
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -431,7 +437,7 @@ jobs:
 
   real-model-conformance:
     name: Fresh-runner real-model conformance (${{ matrix.layout }})
-    if: inputs.qualification != 'recovery-peer' && github.ref == 'refs/heads/arc-native-low-residency-20260927'
+    if: inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard' && github.ref == 'refs/heads/arc-native-low-residency-20260927'
     strategy:
       fail-fast: false
       matrix:

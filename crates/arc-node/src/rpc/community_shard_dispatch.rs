@@ -15,6 +15,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub const COMMUNITY_SHARD_DISPATCH_PATH: &str = "/inference/run_community_sharded";
@@ -27,6 +28,7 @@ pub const COMMUNITY_SHARD_PARTICIPANT_IDENTITY_BASIS: &str =
 const COMMUNITY_SHARD_WAIT_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
 const COMMUNITY_SHARD_WAIT_MIN_SLICE_MS: u64 = 10;
 const COMMUNITY_SHARD_DEADLINE_GRACE_MS: u64 = 250;
+const COMMUNITY_SHARD_VERIFY_PERMIT_WAIT_CAP: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +70,17 @@ struct VerifiedDispatchContext {
     model: Arc<CachedIntegerModel>,
     model_name: String,
     model_id: Hash256,
+}
+
+struct OwnedShardDispatchGuard {
+    in_flight: Arc<AtomicUsize>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for OwnedShardDispatchGuard {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct OwnedShardSessionGuard {
@@ -134,23 +147,17 @@ pub(crate) async fn run_community_sharded(
     Json(req): Json<CommunityShardedInferenceRequest>,
 ) -> Result<Json<CommunityShardedInferenceResponse>, (StatusCode, String)> {
     let started_at = Instant::now();
+    ensure_not_shutting_down(&node)?;
     ensure_coordinator_enabled(&node)?;
     validate_request_bounds(&req)?;
 
-    let _inference_permit = node
-        .public_inference_permits
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| {
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                "public inference capacity is saturated; retry after 2 seconds".to_string(),
-            )
-        })?;
+    let admission_now_ms = now_unix_ms()?;
+    let _dispatch_guard = acquire_shard_dispatch_slot(&node, admission_now_ms)?;
 
     let ctx = load_canonical_dispatch_model(&node)?;
     let prompt_tokens = encode_and_preflight_prompt(&ctx.model, &req.input, req.max_tokens)?;
     ensure_verification_availability(&node, ctx.model.config.n_layers, true)?;
+    ensure_not_shutting_down(&node)?;
 
     let open_now_ms = now_unix_ms()?;
     let (session_id, session_deadline_ms) = {
@@ -162,9 +169,27 @@ pub(crate) async fn run_community_sharded(
             )
         })?;
         validate_coordinator_invariants(coordinator, ctx.model_id, &ctx.model)?;
-        let session_id = coordinator
-            .open_session(open_now_ms, prompt_tokens.clone(), req.max_tokens)
-            .map_err(map_open_session_error)?;
+        let session_id =
+            match coordinator.open_session(open_now_ms, prompt_tokens.clone(), req.max_tokens) {
+                Ok(session_id) => session_id,
+                Err(ShardCoordinatorError::InsufficientShardCoverage { missing_range }) => {
+                    if coordinator
+                        .pipeline_capacity(open_now_ms)
+                        .ready_complete_pipelines
+                        > 0
+                    {
+                        return Err((
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "community shard pipeline capacity is saturated; retry shortly"
+                                .to_string(),
+                        ));
+                    }
+                    return Err(map_open_session_error(
+                        ShardCoordinatorError::InsufficientShardCoverage { missing_range },
+                    ));
+                }
+                Err(error) => return Err(map_open_session_error(error)),
+            };
         let session_deadline_ms = coordinator
             .session_status(session_id)
             .map(|status| status.deadline_unix_ms)
@@ -216,6 +241,27 @@ pub(crate) async fn run_community_sharded(
         candidate_output_hash,
     };
 
+    let verify_now_ms = now_unix_ms()?;
+    let remaining_before_deadline_ms = session_deadline_ms.saturating_sub(verify_now_ms);
+    if remaining_before_deadline_ms == 0 {
+        return Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "community shard session deadline expired before validator verification".to_string(),
+        ));
+    }
+    let verify_wait_budget = Duration::from_millis(remaining_before_deadline_ms)
+        .min(COMMUNITY_SHARD_VERIFY_PERMIT_WAIT_CAP);
+    let verify_wait_deadline =
+        monotonic_deadline.min(tokio::time::Instant::now() + verify_wait_budget);
+    let verify_permit = acquire_verification_permit(&node, verify_wait_deadline).await?;
+    if now_unix_ms()? >= session_deadline_ms {
+        drop(verify_permit);
+        return Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "community shard session deadline expired while awaiting validator verification capacity"
+                .to_string(),
+        ));
+    }
     let verified = super::verify_community_candidate_with_quorum(&node, &candidate)
         .await
         .map_err(|error| match error {
@@ -228,6 +274,7 @@ pub(crate) async fn run_community_sharded(
                 format!("validator quorum verification unavailable: {reason}"),
             ),
         })?;
+    drop(verify_permit);
 
     if verified.execution_profile != CANONICAL_REWARD_INFERENCE_PROFILE {
         return Err((
@@ -286,6 +333,100 @@ pub(crate) async fn run_community_sharded(
         rewards_enabled: false,
         reward_eligible: false,
     }))
+}
+
+fn is_shutting_down(node: &super::NodeState) -> bool {
+    node.runtime_shutdown
+        .as_ref()
+        .is_some_and(|shutdown| *shutdown.borrow() || shutdown.has_changed().is_err())
+}
+
+fn ensure_not_shutting_down(node: &super::NodeState) -> Result<(), (StatusCode, String)> {
+    if is_shutting_down(node) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node is shutting down; community shard inference unavailable".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn acquire_shard_dispatch_slot(
+    node: &super::NodeState,
+    now_ms: u64,
+) -> Result<OwnedShardDispatchGuard, (StatusCode, String)> {
+    let permit = node
+        .community_shard_dispatch_permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "community shard dispatch capacity is saturated; retry shortly".to_string(),
+            )
+        })?;
+    let mut guard = node.community_shard_coordinator.lock();
+    let coordinator = guard.as_mut().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "community shard coordinator is disabled".to_string(),
+        )
+    })?;
+    coordinator.expire_stale(now_ms);
+    let capacity = coordinator.pipeline_capacity(now_ms);
+    if capacity.ready_complete_pipelines == 0 {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no complete ready community shard pipeline is available".to_string(),
+        ));
+    }
+    let in_flight = node
+        .community_shard_dispatch_in_flight
+        .load(Ordering::Acquire);
+    if in_flight >= capacity.effective_session_capacity || capacity.idle_complete_pipelines == 0 {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "community shard pipeline capacity is saturated; retry shortly".to_string(),
+        ));
+    }
+    node.community_shard_dispatch_in_flight
+        .fetch_add(1, Ordering::AcqRel);
+    Ok(OwnedShardDispatchGuard {
+        in_flight: node.community_shard_dispatch_in_flight.clone(),
+        _permit: permit,
+    })
+}
+
+async fn acquire_verification_permit(
+    node: &super::NodeState,
+    wait_deadline: tokio::time::Instant,
+) -> Result<tokio::sync::OwnedSemaphorePermit, (StatusCode, String)> {
+    ensure_not_shutting_down(node)?;
+    let mut shutdown = node.runtime_shutdown.clone();
+    let permit_fut = node.public_inference_permits.clone().acquire_owned();
+    tokio::select! {
+        biased;
+        _ = super::wait_for_optional_runtime_shutdown(&mut shutdown) => {
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "node is shutting down; validator verification cancelled".to_string(),
+            ))
+        }
+        permit = permit_fut => {
+            permit.map_err(|_| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "public inference verification capacity is closed".to_string(),
+                )
+            })
+        }
+        _ = tokio::time::sleep_until(wait_deadline) => {
+            Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                "validator verification capacity remained saturated past deadline".to_string(),
+            ))
+        }
+    }
 }
 
 fn ensure_coordinator_enabled(node: &super::NodeState) -> Result<(), (StatusCode, String)> {
@@ -580,7 +721,9 @@ async fn wait_for_session_outcome(
     session_id: SessionId,
     monotonic_deadline: tokio::time::Instant,
 ) -> Result<SessionOutcome, (StatusCode, String)> {
+    let mut shutdown = node.runtime_shutdown.clone();
     loop {
+        ensure_not_shutting_down(node)?;
         let notified = node.community_shard_notify.notified();
         tokio::pin!(notified);
         let _ = notified.as_mut().enable();
@@ -636,7 +779,16 @@ async fn wait_for_session_outcome(
         let wait_slice = remaining_monotonic
             .min(wall_hint)
             .min(COMMUNITY_SHARD_WAIT_RECHECK_INTERVAL);
-        let _ = tokio::time::timeout(wait_slice, notified).await;
+        tokio::select! {
+            biased;
+            _ = super::wait_for_optional_runtime_shutdown(&mut shutdown) => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "node is shutting down; community shard session cancelled".to_string(),
+                ));
+            }
+            _ = tokio::time::timeout(wait_slice, notified) => {}
+        }
     }
 }
 
@@ -1002,7 +1154,7 @@ mod tests {
     use serde_json::Value;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
 
     struct SignedPartialWorker {
         keypair: Arc<KeyPair>,
@@ -1256,6 +1408,80 @@ mod tests {
             workers,
             validator_handles,
             temporary,
+        }
+    }
+
+    async fn attach_ready_partial_workers(fixture: &mut VerifiedDispatchFixture, count: usize) {
+        let domain = fixture.coordinator.state.transaction_domain_hash();
+        for _ in 0..count {
+            let keypair = Arc::new(KeyPair::generate_ed25519());
+            let worker_id = keypair.address();
+            register_worker_signed(
+                &fixture.coordinator,
+                &keypair,
+                fixture.model_id,
+                vec![COMMUNITY_SHARD_CAPABILITY],
+            )
+            .await
+            .unwrap();
+            let lease_signed = sign_shard_worker_request(
+                COMMUNITY_SHARD_LEASE_PATH,
+                ShardLeaseRequest {
+                    worker_id,
+                    protocol_version: COMMUNITY_SHARD_PROTOCOL_VERSION,
+                    model_id: fixture.model_id,
+                    execution_profile: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+                    n_layers: fixture.model.config.n_layers,
+                    d_model: fixture.model.config.d_model,
+                    vocab_size: fixture.model.config.vocab_size,
+                    max_seq: fixture.model.config.max_seq,
+                    max_resident_layers: 2,
+                },
+                &keypair,
+                fixture.coordinator.validator_address,
+                domain,
+            )
+            .unwrap();
+            let assignment = community_shard_lease_signed(
+                AxumState(fixture.coordinator.clone()),
+                Json(lease_signed),
+            )
+            .await
+            .unwrap()
+            .0
+            .assignment;
+            let partial_model = Arc::new(slice_partial_model(&fixture.model, assignment.range));
+            assert!(!partial_model.has_all_transformer_layers());
+            let hb_signed = sign_shard_worker_request(
+                COMMUNITY_SHARD_HEARTBEAT_PATH,
+                ShardHeartbeatRequest {
+                    worker_id,
+                    lease_id: assignment.lease_id,
+                    lease_epoch: assignment.lease_epoch,
+                    model_id: fixture.model_id,
+                    execution_profile: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+                    loaded_range: assignment.range,
+                    ready: true,
+                },
+                &keypair,
+                fixture.coordinator.validator_address,
+                domain,
+            )
+            .unwrap();
+            let hb = community_shard_heartbeat_signed(
+                AxumState(fixture.coordinator.clone()),
+                Json(hb_signed),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert!(matches!(hb.directive, HeartbeatDirective::Active { .. }));
+            fixture.workers.push(SignedPartialWorker {
+                keypair,
+                worker_id,
+                assignment,
+                partial_model,
+            });
         }
     }
 
@@ -2051,13 +2277,16 @@ mod tests {
         let mut held_permits = Vec::new();
         while let Ok(permit) = fixture
             .coordinator
-            .public_inference_permits
+            .community_shard_dispatch_permits
             .clone()
             .try_acquire_owned()
         {
             held_permits.push(permit);
         }
-        assert!(!held_permits.is_empty());
+        assert_eq!(
+            held_permits.len(),
+            super::super::COMMUNITY_SHARD_DISPATCH_CONCURRENCY_HARD_CAP
+        );
 
         let saturated_resp = client
             .post(&url)
@@ -2069,9 +2298,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(saturated_resp.status(), StatusCode::TOO_MANY_REQUESTS);
-
+        assert_eq!(
+            fixture
+                .coordinator
+                .community_shard_dispatch_in_flight
+                .load(Ordering::Acquire),
+            0
+        );
         drop(held_permits);
+
+        let busy_now_ms = crate::rpc::community_unix_ms().unwrap();
+        let busy_session_id = fixture
+            .coordinator
+            .community_shard_coordinator
+            .lock()
+            .as_mut()
+            .unwrap()
+            .open_session(busy_now_ms, fixture.model.encode("ARC"), 1)
+            .unwrap();
+        let busy_resp = client
+            .post(&url)
+            .json(&CommunityShardedInferenceRequest {
+                input: "ARC".to_string(),
+                max_tokens: 1,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(busy_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        {
+            let mut guard = fixture.coordinator.community_shard_coordinator.lock();
+            let core = guard.as_mut().unwrap();
+            core.cancel_session(
+                busy_now_ms,
+                busy_session_id,
+                SessionAbortReason::CallerCancelled,
+            )
+            .unwrap();
+            let _ = core.take_result(busy_session_id);
+        }
+
         server.abort();
+
+        let uncovered_fixture =
+            build_verified_fixture(2, 2, CommunityShardLimits::default(), None, false).await;
+        let Err((uncovered_code, _)) = run_community_sharded(
+            AxumState(uncovered_fixture.coordinator.clone()),
+            Json(CommunityShardedInferenceRequest {
+                input: "ARC".to_string(),
+                max_tokens: 1,
+            }),
+        )
+        .await
+        else {
+            panic!("uncovered cluster must return 503");
+        };
+        assert_eq!(uncovered_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            uncovered_fixture
+                .coordinator
+                .community_shard_dispatch_in_flight
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            uncovered_fixture
+                .coordinator
+                .community_shard_dispatch_permits
+                .available_permits(),
+            super::super::COMMUNITY_SHARD_DISPATCH_CONCURRENCY_HARD_CAP
+        );
     }
 
     #[tokio::test]
@@ -2081,6 +2377,10 @@ mod tests {
         let permits_before = fixture
             .coordinator
             .public_inference_permits
+            .available_permits();
+        let dispatch_permits_before = fixture
+            .coordinator
+            .community_shard_dispatch_permits
             .available_permits();
 
         let mut fut = Box::pin(run_community_sharded(
@@ -2093,6 +2393,20 @@ mod tests {
         let timed_out = tokio::time::timeout(Duration::from_millis(80), &mut fut).await;
         assert!(timed_out.is_err());
 
+        assert_eq!(
+            fixture
+                .coordinator
+                .community_shard_dispatch_in_flight
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            fixture
+                .coordinator
+                .community_shard_dispatch_permits
+                .available_permits(),
+            dispatch_permits_before - 1
+        );
         let now_ms = crate::rpc::community_unix_ms().unwrap();
         {
             let guard = fixture.coordinator.community_shard_coordinator.lock();
@@ -2109,6 +2423,20 @@ mod tests {
                 .public_inference_permits
                 .available_permits(),
             permits_before
+        );
+        assert_eq!(
+            fixture
+                .coordinator
+                .community_shard_dispatch_in_flight
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            fixture
+                .coordinator
+                .community_shard_dispatch_permits
+                .available_permits(),
+            dispatch_permits_before
         );
         let cancel_now_ms = crate::rpc::community_unix_ms().unwrap();
         {
@@ -2189,6 +2517,571 @@ mod tests {
         assert!(response.verification.quorum_verified);
         assert!(!response.rewards_enabled);
         assert!(!response.reward_eligible);
+    }
+
+    #[tokio::test]
+    async fn four_concurrent_sharded_sessions_scale_past_verifier_cap_two() {
+        let mut fixture =
+            build_verified_fixture(2, 2, CommunityShardLimits::default(), None, false).await;
+        attach_ready_partial_workers(&mut fixture, 8).await;
+
+        let now_ms = crate::rpc::community_unix_ms().unwrap();
+        let capacity = fixture
+            .coordinator
+            .community_shard_coordinator
+            .lock()
+            .as_ref()
+            .unwrap()
+            .pipeline_capacity(now_ms);
+        assert_eq!(capacity.ready_complete_pipelines, 4);
+        assert_eq!(capacity.idle_complete_pipelines, 4);
+        assert_eq!(capacity.effective_session_capacity, 4);
+        assert_eq!(capacity.max_active_sessions, 24);
+
+        let prompt = "ARC";
+        let max_tokens = 2u32;
+        let prompt_tokens = fixture.model.encode(prompt);
+        let (expected_tokens, expected_hash) = fixture
+            .model
+            .try_generate(&prompt_tokens, max_tokens, &fixture.model.config.eos_tokens)
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = routes().with_state(fixture.coordinator.clone());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let url = format!("http://{addr}{COMMUNITY_SHARD_DISPATCH_PATH}");
+        let client = reqwest::Client::new();
+
+        let mut held_public_permits = Vec::new();
+        while let Ok(permit) = fixture
+            .coordinator
+            .public_inference_permits
+            .clone()
+            .try_acquire_owned()
+        {
+            held_public_permits.push(permit);
+        }
+        assert_eq!(
+            held_public_permits.len(),
+            super::super::PUBLIC_INFERENCE_CONCURRENCY
+        );
+        assert!(
+            fixture
+                .coordinator
+                .public_inference_permits
+                .clone()
+                .try_acquire_owned()
+                .is_err()
+        );
+
+        let mut handles = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let client = client.clone();
+            let url = url.clone();
+            handles.push(tokio::spawn(async move {
+                let resp = client
+                    .post(&url)
+                    .timeout(Duration::from_secs(30))
+                    .json(&CommunityShardedInferenceRequest {
+                        input: prompt.to_string(),
+                        max_tokens,
+                    })
+                    .send()
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let body = resp.text().await.unwrap();
+                (status, body)
+            }));
+        }
+
+        let active_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let check_ms = crate::rpc::community_unix_ms().unwrap();
+            let active = fixture
+                .coordinator
+                .community_shard_coordinator
+                .lock()
+                .as_ref()
+                .unwrap()
+                .status_snapshot(check_ms)
+                .active_sessions;
+            let in_flight = fixture
+                .coordinator
+                .community_shard_dispatch_in_flight
+                .load(Ordering::Acquire);
+            if active == 4 && in_flight == 4 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < active_deadline,
+                "expected 4 concurrent active sessions while public permits are held, got active={active} in_flight={in_flight}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let fifth_while_executing = client
+            .post(&url)
+            .json(&CommunityShardedInferenceRequest {
+                input: prompt.to_string(),
+                max_tokens,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            fifth_while_executing.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let driver = spawn_partial_worker_driver(
+            fixture.coordinator.clone(),
+            clone_workers(&fixture.workers),
+            WorkerBehavior::Honest,
+            true,
+            stop.clone(),
+        );
+
+        let remote_done_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let check_ms = crate::rpc::community_unix_ms().unwrap();
+            let snap = fixture
+                .coordinator
+                .community_shard_coordinator
+                .lock()
+                .as_ref()
+                .unwrap()
+                .status_snapshot(check_ms);
+            if snap.active_sessions == 0 && snap.retained_results == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < remote_done_deadline,
+                "all 4 remote sessions must finish and enter verification queue"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            fixture
+                .coordinator
+                .community_shard_dispatch_in_flight
+                .load(Ordering::Acquire),
+            4
+        );
+
+        let fifth_while_verify_queued = client
+            .post(&url)
+            .json(&CommunityShardedInferenceRequest {
+                input: prompt.to_string(),
+                max_tokens,
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            fifth_while_verify_queued.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        drop(held_public_permits);
+
+        for handle in handles {
+            let (status, body) = tokio::time::timeout(Duration::from_secs(15), handle)
+                .await
+                .expect("verified response must arrive within deadline")
+                .unwrap();
+            assert_eq!(status, StatusCode::OK, "unexpected response body: {body}");
+            let json: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                json["generated_tokens"],
+                serde_json::to_value(&expected_tokens).unwrap()
+            );
+            assert_eq!(json["output_hash"], format!("0x{}", expected_hash.to_hex()));
+            assert_eq!(json["verification"]["quorum_verified"], true);
+            assert_eq!(json["rewards_enabled"], false);
+            assert_eq!(json["reward_eligible"], false);
+        }
+
+        stop.store(true, Ordering::Release);
+        driver.await.unwrap();
+        server.abort();
+
+        let final_ms = crate::rpc::community_unix_ms().unwrap();
+        let snap = fixture
+            .coordinator
+            .community_shard_coordinator
+            .lock()
+            .as_ref()
+            .unwrap()
+            .status_snapshot(final_ms);
+        assert_eq!(snap.active_sessions, 0);
+        assert_eq!(snap.retained_results, 0);
+        assert_eq!(
+            fixture
+                .coordinator
+                .community_shard_dispatch_in_flight
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            fixture
+                .coordinator
+                .community_shard_dispatch_permits
+                .available_permits(),
+            super::super::COMMUNITY_SHARD_DISPATCH_CONCURRENCY_HARD_CAP
+        );
+        assert_eq!(
+            fixture
+                .coordinator
+                .public_inference_permits
+                .available_permits(),
+            super::super::PUBLIC_INFERENCE_CONCURRENCY
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_in_flight_and_verification_queued_sharded_requests() {
+        let mut remote_fixture =
+            build_verified_fixture(2, 2, CommunityShardLimits::default(), None, true).await;
+        let (remote_shutdown_tx, remote_shutdown_rx) = tokio::sync::watch::channel(false);
+        remote_fixture.coordinator.runtime_shutdown = Some(remote_shutdown_rx);
+
+        let remote_task = tokio::spawn({
+            let node = remote_fixture.coordinator.clone();
+            async move {
+                run_community_sharded(
+                    AxumState(node),
+                    Json(CommunityShardedInferenceRequest {
+                        input: "ARC".to_string(),
+                        max_tokens: 2,
+                    }),
+                )
+                .await
+            }
+        });
+        let wait_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let now_ms = crate::rpc::community_unix_ms().unwrap();
+            let active = remote_fixture
+                .coordinator
+                .community_shard_coordinator
+                .lock()
+                .as_ref()
+                .unwrap()
+                .status_snapshot(now_ms)
+                .active_sessions;
+            if active == 1 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < wait_deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let barrier_task = tokio::spawn({
+            let node = remote_fixture.coordinator.clone();
+            async move { super::super::wait_for_inference_compute_barrier(&node).await }
+        });
+        remote_shutdown_tx.send(true).unwrap();
+
+        let remote_res = tokio::time::timeout(Duration::from_secs(3), remote_task)
+            .await
+            .expect("shutdown must cancel in-flight remote session promptly")
+            .unwrap();
+        assert_eq!(remote_res.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
+        tokio::time::timeout(Duration::from_secs(3), barrier_task)
+            .await
+            .expect("compute barrier must complete without deadlock")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            remote_fixture
+                .coordinator
+                .community_shard_dispatch_in_flight
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            remote_fixture
+                .coordinator
+                .community_shard_coordinator
+                .lock()
+                .as_ref()
+                .unwrap()
+                .status_snapshot(crate::rpc::community_unix_ms().unwrap())
+                .active_sessions,
+            0
+        );
+
+        let mut queued_fixture =
+            build_verified_fixture(2, 2, CommunityShardLimits::default(), None, true).await;
+        let (queued_shutdown_tx, queued_shutdown_rx) = tokio::sync::watch::channel(false);
+        queued_fixture.coordinator.runtime_shutdown = Some(queued_shutdown_rx);
+
+        let mut held_public_permits = Vec::new();
+        while let Ok(permit) = queued_fixture
+            .coordinator
+            .public_inference_permits
+            .clone()
+            .try_acquire_owned()
+        {
+            held_public_permits.push(permit);
+        }
+        let queued_task = tokio::spawn({
+            let node = queued_fixture.coordinator.clone();
+            async move {
+                run_community_sharded(
+                    AxumState(node),
+                    Json(CommunityShardedInferenceRequest {
+                        input: "ARC".to_string(),
+                        max_tokens: 1,
+                    }),
+                )
+                .await
+            }
+        });
+        let open_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let active = queued_fixture
+                .coordinator
+                .community_shard_coordinator
+                .lock()
+                .as_ref()
+                .unwrap()
+                .status_snapshot(crate::rpc::community_unix_ms().unwrap())
+                .active_sessions;
+            if active == 1 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < open_deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let driver = spawn_partial_worker_driver(
+            queued_fixture.coordinator.clone(),
+            clone_workers(&queued_fixture.workers),
+            WorkerBehavior::Honest,
+            true,
+            stop.clone(),
+        );
+        let queued_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snap = queued_fixture
+                .coordinator
+                .community_shard_coordinator
+                .lock()
+                .as_ref()
+                .unwrap()
+                .status_snapshot(crate::rpc::community_unix_ms().unwrap());
+            if snap.active_sessions == 0 && snap.retained_results == 0 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < queued_deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            queued_fixture
+                .coordinator
+                .community_shard_dispatch_in_flight
+                .load(Ordering::Acquire),
+            1
+        );
+        queued_shutdown_tx.send(true).unwrap();
+        let queued_res = tokio::time::timeout(Duration::from_secs(3), queued_task)
+            .await
+            .expect("shutdown must cancel verification-queued request promptly")
+            .unwrap();
+        assert_eq!(queued_res.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
+        let rejected_after_shutdown = run_community_sharded(
+            AxumState(queued_fixture.coordinator.clone()),
+            Json(CommunityShardedInferenceRequest {
+                input: "ARC".to_string(),
+                max_tokens: 1,
+            }),
+        )
+        .await;
+        assert_eq!(
+            rejected_after_shutdown.unwrap_err().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            queued_fixture
+                .coordinator
+                .community_shard_dispatch_in_flight
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            queued_fixture
+                .coordinator
+                .community_shard_dispatch_permits
+                .available_permits(),
+            super::super::COMMUNITY_SHARD_DISPATCH_CONCURRENCY_HARD_CAP
+        );
+        stop.store(true, Ordering::Release);
+        driver.await.unwrap();
+        drop(held_public_permits);
+        super::super::wait_for_inference_compute_barrier(&queued_fixture.coordinator)
+            .await
+            .unwrap();
+
+        let drain_fixture =
+            build_verified_fixture(2, 2, CommunityShardLimits::default(), None, true).await;
+        let mut drain_public_permits = Vec::new();
+        while let Ok(permit) = drain_fixture
+            .coordinator
+            .public_inference_permits
+            .clone()
+            .try_acquire_owned()
+        {
+            drain_public_permits.push(permit);
+        }
+        let drain_task = tokio::spawn({
+            let node = drain_fixture.coordinator.clone();
+            async move {
+                run_community_sharded(
+                    AxumState(node),
+                    Json(CommunityShardedInferenceRequest {
+                        input: "ARC".to_string(),
+                        max_tokens: 1,
+                    }),
+                )
+                .await
+            }
+        });
+        let drain_open_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let active = drain_fixture
+                .coordinator
+                .community_shard_coordinator
+                .lock()
+                .as_ref()
+                .unwrap()
+                .status_snapshot(crate::rpc::community_unix_ms().unwrap())
+                .active_sessions;
+            if active == 1 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < drain_open_deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let drain_stop = Arc::new(AtomicBool::new(false));
+        let drain_driver = spawn_partial_worker_driver(
+            drain_fixture.coordinator.clone(),
+            clone_workers(&drain_fixture.workers),
+            WorkerBehavior::Honest,
+            true,
+            drain_stop.clone(),
+        );
+        let drain_queued_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snap = drain_fixture
+                .coordinator
+                .community_shard_coordinator
+                .lock()
+                .as_ref()
+                .unwrap()
+                .status_snapshot(crate::rpc::community_unix_ms().unwrap());
+            if snap.active_sessions == 0 && snap.retained_results == 0 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < drain_queued_deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let drain_barrier = tokio::spawn({
+            let node = drain_fixture.coordinator.clone();
+            async move { super::super::wait_for_inference_compute_barrier(&node).await }
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!drain_barrier.is_finished());
+        drop(drain_public_permits);
+        let Json(verified_resp) = tokio::time::timeout(Duration::from_secs(10), drain_task)
+            .await
+            .expect("queued verifier must not AB-BA deadlock with compute barrier")
+            .unwrap()
+            .unwrap();
+        assert!(verified_resp.verification.quorum_verified);
+        tokio::time::timeout(Duration::from_secs(5), drain_barrier)
+            .await
+            .expect("compute barrier must finish after queued verifier releases dispatch slot")
+            .unwrap()
+            .unwrap();
+        drain_stop.store(true, Ordering::Release);
+        drain_driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn verification_wait_deadline_exhaustion_fails_bounded_and_releases_slot() {
+        let limits = CommunityShardLimits {
+            job_deadline_ms: 1_200,
+            step_timeout_ms: 1_000,
+            ..CommunityShardLimits::default()
+        };
+        let fixture = build_verified_fixture(2, 2, limits, None, true).await;
+        let mut held_public_permits = Vec::new();
+        while let Ok(permit) = fixture
+            .coordinator
+            .public_inference_permits
+            .clone()
+            .try_acquire_owned()
+        {
+            held_public_permits.push(permit);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let driver = spawn_partial_worker_driver(
+            fixture.coordinator.clone(),
+            clone_workers(&fixture.workers),
+            WorkerBehavior::Honest,
+            true,
+            stop.clone(),
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_community_sharded(
+                AxumState(fixture.coordinator.clone()),
+                Json(CommunityShardedInferenceRequest {
+                    input: "ARC".to_string(),
+                    max_tokens: 1,
+                }),
+            ),
+        )
+        .await
+        .expect("verification permit wait must time out within bounded job deadline");
+        stop.store(true, Ordering::Release);
+        driver.await.unwrap();
+        drop(held_public_permits);
+
+        let (status, message) = result.unwrap_err();
+        assert_eq!(
+            status,
+            StatusCode::GATEWAY_TIMEOUT,
+            "unexpected error: {message}"
+        );
+        assert_eq!(
+            fixture
+                .coordinator
+                .community_shard_dispatch_in_flight
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            fixture
+                .coordinator
+                .community_shard_dispatch_permits
+                .available_permits(),
+            super::super::COMMUNITY_SHARD_DISPATCH_CONCURRENCY_HARD_CAP
+        );
+        let snap = fixture
+            .coordinator
+            .community_shard_coordinator
+            .lock()
+            .as_ref()
+            .unwrap()
+            .status_snapshot(crate::rpc::community_unix_ms().unwrap());
+        assert_eq!(snap.active_sessions, 0);
+        assert_eq!(snap.retained_results, 0);
     }
 
     #[test]

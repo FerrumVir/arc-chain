@@ -276,8 +276,10 @@ The status route reports verified dispatch available only with the enabled
 coordinator, canonical model, and an independent validator verification plan.
 `POST /inference/run_community_sharded` owns and cancels its shard session, checks
 its exact result digest, coverage, token limits and EOS, then uses the existing
-validator quorum verification before returning output. It shares the public
-inference capacity limit. Rewards remain disabled for these multi-worker results.
+validator quorum verification before returning output. Public shard admission follows complete ready pipelines, with a default cap of
+24 sessions and a hard cap of 64. Independent verification alone holds the shared
+public compute permits; queued verification and shutdown stay bounded. Rewards
+remain disabled for these multi-worker results.
 This transport alone does not activate desktop nodes.
 `--community-shard-worker` integrates the pinned partial worker into a managed
 stake-zero node while preserving local RPC and the shutdown durability barrier.
@@ -285,6 +287,14 @@ It excludes whole-model and validator roles, requires explicit model and network
 pins and a memory budget, and defaults to one compute thread. Existing local
 recovery domains must match the supplied pin. Stop closes worker admission before
 the lifecycle waits for drained tasks and acknowledges the WAL receipt.
+Integrated workers retry exhausted transient connection failures with bounded,
+cancellable backoff while retaining lease fences. Authentication, model and
+protocol errors still stop the worker; the local RPC remaining up is not proof
+that the worker is serving.
+The desktop derives partial-worker mode from existing compute consent and typed
+release pins, preserving managed identity and update rollback. Production pins
+remain unset until a deployed coordinator and model are verified; current builds
+therefore keep their existing whole-worker launch path.
 The rollout manifest's optional `gateway.community_sharding` boolean adds the
 exact shard routes and coordinator flag only when enabled. Disabled rendering
 preserves the sealed gateway bytes. Metadata and public requests are capped at

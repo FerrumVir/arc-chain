@@ -1101,6 +1101,7 @@ async fn drive_integrated_worker_task<F, Fut>(
                 cancellations_applied = summary.cancellations_applied,
                 rebalances_completed = summary.rebalances_completed,
                 clean_release_sent = summary.clean_release_sent,
+                reconnect_attempts = summary.reconnect_attempts,
                 "Integrated community shard worker stopped at the lifecycle barrier"
             );
         }
@@ -1121,7 +1122,8 @@ pub(crate) fn spawn_integrated_worker(
 ) -> Result<JoinHandle<()>> {
     let loader = prepared.build_loader()?;
     let report = prepared.report;
-    let config = prepared.config;
+    let mut config = prepared.config;
+    config.auto_reconnect = true;
     let model_spec = prepared.model_spec;
     Ok(tokio::spawn(drive_integrated_worker_task(
         report,

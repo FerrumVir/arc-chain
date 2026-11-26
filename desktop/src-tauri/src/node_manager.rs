@@ -43,6 +43,40 @@ const DESKTOP_NETWORK_RESOURCE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const DESKTOP_SHUTDOWN_PUBLICATION_RETRIES: usize = 250;
 const DESKTOP_SHUTDOWN_PUBLICATION_RETRY_DELAY: Duration = Duration::from_millis(20);
 const LEGACY_VALIDATOR_SEED_MAX_BYTES: usize = 1_024;
+const SHARD_MIN_AVAILABLE_RESERVE_BYTES: u64 = 4 * crate::hardware::GIB;
+const SHARD_MIN_WORKING_SET_BYTES: u64 = 512 * 1024 * 1024;
+const SHARD_DEFAULT_WORKER_THREADS: u32 = 1;
+const SHARD_MAX_WORKER_THREADS: u32 = 64;
+const REQUIRED_COMMUNITY_SHARD_WORKER_FLAGS: &[&str] = &[
+    "--threads",
+    "--community-shard-worker",
+    "--community-shard-coordinator-url",
+    "--community-shard-coordinator-id",
+    "--community-shard-transaction-domain",
+    "--community-shard-expected-model-id",
+    "--community-shard-max-working-set-bytes",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PinnedShardCoordinator {
+    pub(crate) coordinator_url: &'static str,
+    pub(crate) coordinator_id: &'static str,
+    pub(crate) transaction_domain: &'static str,
+    pub(crate) expected_model_id: &'static str,
+    pub(crate) allow_insecure_for_loopback: bool,
+}
+
+pub(crate) const PRODUCTION_SHARD_COORDINATOR: Option<PinnedShardCoordinator> = None;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ManagedComputeLaunchMode {
+    Observer,
+    FullIntegerWorker,
+    CommunityShardWorker {
+        pin: PinnedShardCoordinator,
+        max_working_set_bytes: u64,
+    },
+}
 
 pub(crate) fn refresh_process_command_metadata(system: &mut sysinfo::System) {
     system.refresh_processes_specifics(
@@ -139,6 +173,7 @@ struct ManagedLaunchPlan {
     seeds: ExactLaunchFile,
     genesis: ExactLaunchFile,
     dropped_model: Option<String>,
+    compute_mode: ManagedComputeLaunchMode,
 }
 
 impl ManagedLaunchPlan {
@@ -149,6 +184,11 @@ impl ManagedLaunchPlan {
         resources: &TestnetResources,
     ) -> anyhow::Result<Self> {
         let (seeds, genesis) = required_testnet_resources(resources)?;
+        let compute_mode = if config.role == "worker" && config.model_path.is_some() {
+            ManagedComputeLaunchMode::FullIntegerWorker
+        } else {
+            ManagedComputeLaunchMode::Observer
+        };
         Ok(Self {
             config: config.clone(),
             validator_keyfile: ExactLaunchFile::capture(validator_keyfile, "validator key")?,
@@ -156,7 +196,13 @@ impl ManagedLaunchPlan {
             seeds: ExactLaunchFile::capture(seeds, "seed identity")?,
             genesis: ExactLaunchFile::capture(genesis, "genesis identity")?,
             dropped_model: None,
+            compute_mode,
         })
+    }
+
+    fn with_compute_mode(mut self, compute_mode: ManagedComputeLaunchMode) -> Self {
+        self.compute_mode = compute_mode;
+        self
     }
 
     fn verify(
@@ -377,7 +423,8 @@ fn lifecycle_lock_error(error: std::io::Error) -> anyhow::Error {
 pub fn probe_existing_managed_lifecycle_owner(configured_data_dir: &str) -> anyhow::Result<()> {
     let data_dir = resolve_data_dir(configured_data_dir);
     validate_configured_directory_ancestry_no_link(&data_dir)?;
-    let owner_path = data_dir.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME)
+    let owner_path = data_dir
+        .join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME)
         .join(DESKTOP_LIFECYCLE_OWNER_LOCK_FILE_NAME);
     let file = match arc_crypto::secret_file::open_private_read_write(&owner_path) {
         Ok(file) => file,
@@ -1062,8 +1109,7 @@ fn write_desktop_shutdown_request(
                             control.request_file.display()
                         ));
                     }
-                    Err(_) => {
-                    }
+                    Err(_) => {}
                 }
             }
             Err(error) => {
@@ -1959,6 +2005,15 @@ impl NodeManager {
             Some(ram_gb) => effective_launch_config_for_ram(config, ram_gb),
             None => effective_launch_config(config),
         };
+        let (detected_visible_ram_bytes, logical_cores) =
+            crate::hardware::visible_ram_bytes_and_cores();
+        #[cfg(not(test))]
+        let visible_ram_bytes = detected_visible_ram_bytes;
+        #[cfg(test)]
+        let visible_ram_bytes = self
+            .test_ram_gb
+            .map(|ram_gb| ram_gb.saturating_mul(crate::hardware::GIB))
+            .unwrap_or(detected_visible_ram_bytes);
         if matches!(effective, std::borrow::Cow::Owned(_)) {
             push_log(
                 &self.logs,
@@ -2075,6 +2130,23 @@ impl NodeManager {
             .await;
         }
 
+        let launch_mode = resolve_managed_compute_launch_mode(
+            config,
+            visible_ram_bytes,
+            recovery_launch,
+            resume_plan.map(|plan| &plan.compute_mode),
+            PRODUCTION_SHARD_COORDINATOR,
+        )?;
+        if recovery_launch && config.model_path.is_some() {
+            push_log(
+                &self.logs,
+                "warn",
+                "unresolved shutdown durability barrier detected; launching observer-only without a model or worker flags to finish the WAL receipt"
+                    .to_string(),
+            )
+            .await;
+        }
+
         let mut cmd = Command::new(&binary);
         cmd.arg("--rpc")
             .arg(format!("127.0.0.1:{}", rpc_port))
@@ -2097,7 +2169,8 @@ impl NodeManager {
                 .arg(hex::encode(lifecycle_lock.session_nonce()?));
         }
 
-        if let Some(n) = config.worker_threads.filter(|n| *n > 0) {
+        let launch_threads = resolve_launch_worker_threads(config, &launch_mode, logical_cores);
+        if let Some(n) = launch_threads {
             cmd.env("RAYON_NUM_THREADS", n.to_string());
             if binary_supports_flag(&binary, "--threads") {
                 cmd.arg("--threads").arg(n.to_string());
@@ -2121,19 +2194,8 @@ impl NodeManager {
             .arg("--genesis")
             .arg(genesis_file);
 
-        if config.role == "worker" && config.model_path.is_some() {
-            if !binary_supports_flag(&binary, "--community-rpc-url") {
-                anyhow::bail!(
-                    "this arc-node predates secure community RPC origins; update arc-node before starting community mode"
-                );
-            }
-            if !binary_supports_flag(&binary, "--full-integer-worker") {
-                anyhow::bail!(
-                    "this arc-node cannot run a deterministic community worker without announcing an overlapping shard; update arc-node before starting worker mode"
-                );
-            }
-        }
-        if keep_awake_during_jobs_requested(config) {
+        ensure_binary_supports_compute_mode(&binary, &launch_mode)?;
+        if keep_awake_during_jobs_for_mode(config, &launch_mode) {
             if binary_supports_flag(&binary, "--prevent-sleep-during-jobs") {
                 cmd.arg("--prevent-sleep-during-jobs");
             } else {
@@ -2147,10 +2209,11 @@ impl NodeManager {
             }
         }
 
-        append_compute_launch_args(&mut cmd, config);
+        append_compute_launch_args_for_mode(&mut cmd, config, &launch_mode);
 
         let mut launch_plan =
-            ManagedLaunchPlan::capture(config, &validator_keyfile, &binary, &stable_resources)?;
+            ManagedLaunchPlan::capture(config, &validator_keyfile, &binary, &stable_resources)?
+                .with_compute_mode(launch_mode.clone());
         launch_plan.dropped_model = dropped_model;
 
         push_log(
@@ -2161,21 +2224,31 @@ impl NodeManager {
                 binary.display(),
                 rpc_port,
                 p2p_port,
-                if config.role == "worker" && config.model_path.is_some() {
-                    "--community-mode --full-integer-worker "
-                } else {
-                    ""
+                match &launch_mode {
+                    ManagedComputeLaunchMode::FullIntegerWorker => {
+                        "--community-mode --full-integer-worker ".to_string()
+                    }
+                    ManagedComputeLaunchMode::CommunityShardWorker {
+                        max_working_set_bytes,
+                        ..
+                    } => format!(
+                        "--community-shard-worker --community-shard-max-working-set-bytes {} ",
+                        max_working_set_bytes
+                    ),
+                    ManagedComputeLaunchMode::Observer => String::new(),
                 },
-                config
-                    .worker_threads
-                    .filter(|n| *n > 0)
+                launch_threads
                     .map(|n| format!("({} cores) ", n))
                     .unwrap_or_default(),
-                config
-                    .model_path
-                    .as_deref()
-                    .map(|p| format!("--model {}", p))
-                    .unwrap_or_else(|| "(observer, no --model)".into()),
+                if matches!(launch_mode, ManagedComputeLaunchMode::Observer) {
+                    "(observer, no --model)".into()
+                } else {
+                    config
+                        .model_path
+                        .as_deref()
+                        .map(|p| format!("--model {}", p))
+                        .unwrap_or_else(|| "(observer, no --model)".into())
+                },
             ),
         )
         .await;
@@ -2329,8 +2402,8 @@ impl NodeManager {
                     self.active_launch_plan = None;
                 }
             }
-            Ok(None) => { }
-            Err(_) => { }
+            Ok(None) => {}
+            Err(_) => {}
         }
     }
 
@@ -3167,6 +3240,247 @@ pub(crate) fn effective_launch_config_for_ram(
         })
     } else {
         std::borrow::Cow::Borrowed(config)
+    }
+}
+
+fn validate_nonzero_hex64(value: &str, name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value.len() == 64
+            && value
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)),
+        "pinned shard {name} must contain exactly 64 lowercase hexadecimal characters"
+    );
+    let decoded =
+        hex::decode(value).with_context(|| format!("invalid pinned shard {name} hex encoding"))?;
+    anyhow::ensure!(
+        decoded.len() == 32 && decoded.iter().any(|&byte| byte != 0),
+        "pinned shard {name} must decode to a nonzero 32-byte hash"
+    );
+    Ok(())
+}
+
+impl PinnedShardCoordinator {
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.coordinator_url.is_empty() && self.coordinator_url == self.coordinator_url.trim(),
+            "pinned shard coordinator URL must be trimmed and non-empty"
+        );
+        let parsed = reqwest::Url::parse(self.coordinator_url)
+            .context("invalid pinned shard coordinator URL")?;
+        anyhow::ensure!(
+            parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.query().is_none()
+                && parsed.fragment().is_none()
+                && matches!(parsed.path(), "" | "/"),
+            "pinned shard coordinator URL must be a bare origin without credentials, path, query, or fragment"
+        );
+        if self.allow_insecure_for_loopback {
+            anyhow::ensure!(
+                cfg!(test),
+                "production shard coordinator pins must require HTTPS"
+            );
+            anyhow::ensure!(
+                parsed.scheme() == "http"
+                    && matches!(parsed.host_str(), Some("127.0.0.1") | Some("[::1]")),
+                "loopback shard coordinator URL must use http://127.0.0.1 or http://[::1]"
+            );
+        } else {
+            anyhow::ensure!(
+                parsed.scheme() == "https"
+                    && parsed.host_str().is_some_and(|host| !host.is_empty()),
+                "pinned shard coordinator URL must use HTTPS"
+            );
+        }
+        validate_nonzero_hex64(self.coordinator_id, "coordinator_id")?;
+        validate_nonzero_hex64(self.transaction_domain, "transaction_domain")?;
+        validate_nonzero_hex64(self.expected_model_id, "expected_model_id")?;
+        Ok(())
+    }
+}
+
+fn shard_working_set_budget_bytes(visible_ram_bytes: u64) -> anyhow::Result<u64> {
+    let after_reserve = visible_ram_bytes
+        .checked_sub(SHARD_MIN_AVAILABLE_RESERVE_BYTES)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "visible memory ({visible_ram_bytes} bytes) does not exceed the mandatory {} byte reserve for partial-shard worker admission",
+                SHARD_MIN_AVAILABLE_RESERVE_BYTES
+            )
+        })?;
+    let budget = after_reserve.min(visible_ram_bytes / 2);
+    anyhow::ensure!(
+        budget >= SHARD_MIN_WORKING_SET_BYTES,
+        "derived partial-shard working-set budget ({budget} bytes from {visible_ram_bytes} visible bytes) is below the {} byte minimum",
+        SHARD_MIN_WORKING_SET_BYTES
+    );
+    Ok(budget)
+}
+
+fn resolve_managed_compute_launch_mode(
+    config: &NodeConfig,
+    visible_ram_bytes: u64,
+    recovery_launch: bool,
+    resume_compute_mode: Option<&ManagedComputeLaunchMode>,
+    shard_pin: Option<PinnedShardCoordinator>,
+) -> anyhow::Result<ManagedComputeLaunchMode> {
+    if recovery_launch {
+        return Ok(ManagedComputeLaunchMode::Observer);
+    }
+    let worker_ready = config.role == "worker"
+        && config.model_path.is_some()
+        && crate::commands::compute_contribution_enabled(config);
+    if let Some(captured_mode) = resume_compute_mode {
+        if !worker_ready {
+            return Ok(ManagedComputeLaunchMode::Observer);
+        }
+        if let ManagedComputeLaunchMode::CommunityShardWorker {
+            pin,
+            max_working_set_bytes,
+        } = captured_mode
+        {
+            pin.validate()?;
+            anyhow::ensure!(
+                *max_working_set_bytes >= SHARD_MIN_WORKING_SET_BYTES,
+                "captured partial-shard working-set budget is below the minimum"
+            );
+            anyhow::ensure!(
+                *max_working_set_bytes <= shard_working_set_budget_bytes(visible_ram_bytes)?,
+                "captured partial-shard budget exceeds current visible memory; restart with a freshly admitted launch plan"
+            );
+        }
+        return Ok(captured_mode.clone());
+    }
+    if !worker_ready {
+        return Ok(ManagedComputeLaunchMode::Observer);
+    }
+    if let Some(pin) = shard_pin {
+        pin.validate()?;
+        let max_working_set_bytes = shard_working_set_budget_bytes(visible_ram_bytes)?;
+        return Ok(ManagedComputeLaunchMode::CommunityShardWorker {
+            pin,
+            max_working_set_bytes,
+        });
+    }
+    Ok(ManagedComputeLaunchMode::FullIntegerWorker)
+}
+
+fn resolve_launch_worker_threads(
+    config: &NodeConfig,
+    launch_mode: &ManagedComputeLaunchMode,
+    logical_cores: u32,
+) -> Option<u32> {
+    match launch_mode {
+        ManagedComputeLaunchMode::CommunityShardWorker { .. } => {
+            let max_threads = logical_cores.clamp(1, SHARD_MAX_WORKER_THREADS);
+            Some(
+                config
+                    .worker_threads
+                    .filter(|n| *n > 0)
+                    .unwrap_or(SHARD_DEFAULT_WORKER_THREADS)
+                    .min(max_threads),
+            )
+        }
+        ManagedComputeLaunchMode::FullIntegerWorker | ManagedComputeLaunchMode::Observer => {
+            config.worker_threads.filter(|n| *n > 0)
+        }
+    }
+}
+
+fn ensure_binary_supports_compute_mode_with<F>(
+    binary: &Path,
+    launch_mode: &ManagedComputeLaunchMode,
+    mut supports_flag: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&str) -> bool,
+{
+    match launch_mode {
+        ManagedComputeLaunchMode::Observer => Ok(()),
+        ManagedComputeLaunchMode::FullIntegerWorker => {
+            if !supports_flag("--community-rpc-url") {
+                anyhow::bail!(
+                    "this arc-node predates secure community RPC origins; update arc-node before starting community mode"
+                );
+            }
+            if !supports_flag("--full-integer-worker") {
+                anyhow::bail!(
+                    "this arc-node cannot run a deterministic community worker without announcing an overlapping shard; update arc-node before starting worker mode"
+                );
+            }
+            Ok(())
+        }
+        ManagedComputeLaunchMode::CommunityShardWorker { pin, .. } => {
+            for &flag in REQUIRED_COMMUNITY_SHARD_WORKER_FLAGS {
+                if !supports_flag(flag) {
+                    anyhow::bail!(
+                        "arc-node at {} lacks integrated partial-shard worker flag {flag}; update arc-node before starting partial-shard worker mode",
+                        binary.display()
+                    );
+                }
+            }
+            if pin.allow_insecure_for_loopback
+                && !supports_flag("--community-shard-allow-insecure-for-loopback")
+            {
+                anyhow::bail!(
+                    "arc-node at {} lacks integrated partial-shard loopback flag --community-shard-allow-insecure-for-loopback; update arc-node before starting partial-shard worker mode",
+                    binary.display()
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn ensure_binary_supports_compute_mode(
+    binary: &Path,
+    launch_mode: &ManagedComputeLaunchMode,
+) -> anyhow::Result<()> {
+    ensure_binary_supports_compute_mode_with(binary, launch_mode, |flag| {
+        binary_supports_flag(binary, flag)
+    })
+}
+
+fn keep_awake_during_jobs_for_mode(
+    config: &NodeConfig,
+    launch_mode: &ManagedComputeLaunchMode,
+) -> bool {
+    !matches!(launch_mode, ManagedComputeLaunchMode::Observer)
+        && keep_awake_during_jobs_requested(config)
+}
+
+fn append_compute_launch_args_for_mode(
+    cmd: &mut Command,
+    config: &NodeConfig,
+    launch_mode: &ManagedComputeLaunchMode,
+) {
+    match launch_mode {
+        ManagedComputeLaunchMode::Observer => {}
+        ManagedComputeLaunchMode::FullIntegerWorker => append_compute_launch_args(cmd, config),
+        ManagedComputeLaunchMode::CommunityShardWorker {
+            pin,
+            max_working_set_bytes,
+        } => {
+            cmd.arg("--community-shard-worker")
+                .arg("--community-shard-coordinator-url")
+                .arg(pin.coordinator_url)
+                .arg("--community-shard-coordinator-id")
+                .arg(pin.coordinator_id)
+                .arg("--community-shard-transaction-domain")
+                .arg(pin.transaction_domain)
+                .arg("--community-shard-expected-model-id")
+                .arg(pin.expected_model_id)
+                .arg("--community-shard-max-working-set-bytes")
+                .arg(max_working_set_bytes.to_string());
+            if pin.allow_insecure_for_loopback {
+                cmd.arg("--community-shard-allow-insecure-for-loopback");
+            }
+            if let Some(model) = &config.model_path {
+                cmd.arg("--model").arg(model);
+            }
+        }
     }
 }
 
@@ -5128,14 +5442,21 @@ mod tests {
     #[test]
     fn existing_owner_probe_never_changes_directory_contents() {
         fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
-            fn walk(root: &Path, at: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+            fn walk(
+                root: &Path,
+                at: &Path,
+                out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+            ) {
                 for entry in std::fs::read_dir(at).unwrap() {
                     let path = entry.unwrap().path();
                     if path.is_dir() {
                         out.insert(path.strip_prefix(root).unwrap().to_owned(), Vec::new());
                         walk(root, &path, out);
                     } else {
-                        out.insert(path.strip_prefix(root).unwrap().to_owned(), std::fs::read(&path).unwrap());
+                        out.insert(
+                            path.strip_prefix(root).unwrap().to_owned(),
+                            std::fs::read(&path).unwrap(),
+                        );
                     }
                 }
             }
@@ -5159,7 +5480,8 @@ mod tests {
         let before = snapshot(root.path());
         probe_existing_managed_lifecycle_owner(&configured).unwrap();
         assert_eq!(snapshot(root.path()), before);
-        let owner_path = data.join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME)
+        let owner_path = data
+            .join(DESKTOP_SHUTDOWN_CONTROL_DIR_NAME)
             .join(DESKTOP_LIFECYCLE_OWNER_LOCK_FILE_NAME);
         let owner_bytes = std::fs::read(&owner_path).unwrap();
         let owner = arc_crypto::secret_file::open_private_read_write(&owner_path).unwrap();
@@ -8364,5 +8686,329 @@ mod keep_awake_flag_tests {
             ..on
         };
         assert!(!keep_awake_during_jobs_requested(&no_model));
+    }
+}
+
+#[cfg(test)]
+mod managed_shard_launch_tests {
+    use super::*;
+    use crate::store::Store;
+
+    const TEST_COORDINATOR_ID: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    const TEST_TRANSACTION_DOMAIN: &str =
+        "2222222222222222222222222222222222222222222222222222222222222222";
+    const TEST_EXPECTED_MODEL_ID: &str =
+        "3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn valid_test_pin() -> PinnedShardCoordinator {
+        PinnedShardCoordinator {
+            coordinator_url: "https://coordinator.example.invalid",
+            coordinator_id: TEST_COORDINATOR_ID,
+            transaction_domain: TEST_TRANSACTION_DOMAIN,
+            expected_model_id: TEST_EXPECTED_MODEL_ID,
+            allow_insecure_for_loopback: false,
+        }
+    }
+
+    fn consenting_worker(model: &str, worker_threads: Option<u32>) -> NodeConfig {
+        NodeConfig {
+            role: "worker".into(),
+            model_path: Some(model.into()),
+            compute_consent: Some(true),
+            prevent_sleep_during_jobs: Some(true),
+            worker_threads,
+            ..NodeConfig::default()
+        }
+    }
+
+    fn build_args_and_rayon_env(
+        config: &NodeConfig,
+        mode: &ManagedComputeLaunchMode,
+        logical_cores: u32,
+    ) -> (Vec<String>, Option<String>) {
+        let mut cmd = Command::new("arc-node-not-executed");
+        if let Some(n) = resolve_launch_worker_threads(config, mode, logical_cores) {
+            cmd.env("RAYON_NUM_THREADS", n.to_string());
+            cmd.arg("--threads").arg(n.to_string());
+        }
+        if keep_awake_during_jobs_for_mode(config, mode) {
+            cmd.arg("--prevent-sleep-during-jobs");
+        }
+        append_compute_launch_args_for_mode(&mut cmd, config, mode);
+        let std_cmd = cmd.as_std();
+        let args = std_cmd
+            .get_args()
+            .map(|arg| arg.to_str().unwrap().to_owned())
+            .collect();
+        let rayon_env = std_cmd
+            .get_envs()
+            .find(|(k, _)| *k == "RAYON_NUM_THREADS")
+            .and_then(|(_, v)| v.map(|value| value.to_str().unwrap().to_owned()));
+        (args, rayon_env)
+    }
+
+    #[test]
+    fn production_pin_is_none_and_preserves_whole_worker_byte_for_byte() {
+        assert!(PRODUCTION_SHARD_COORDINATOR.is_none());
+        let config = consenting_worker("/models/standard.gguf", None);
+        let mode = resolve_managed_compute_launch_mode(
+            &config,
+            16 * crate::hardware::GIB,
+            false,
+            None,
+            PRODUCTION_SHARD_COORDINATOR,
+        )
+        .unwrap();
+        assert_eq!(mode, ManagedComputeLaunchMode::FullIntegerWorker);
+        let (args, rayon_env) = build_args_and_rayon_env(&config, &mode, 8);
+        assert!(rayon_env.is_none());
+        assert!(!args.iter().any(|a| a == "--threads"));
+        assert!(!args.iter().any(|a| a == "--community-shard-worker"));
+        assert!(args.iter().any(|a| a == "--community-mode"));
+        assert!(args.iter().any(|a| a == "--full-integer-worker"));
+        assert!(args.iter().any(|a| a == "--community-rpc-url"));
+        assert!(args.iter().any(|a| a == "--prevent-sleep-during-jobs"));
+    }
+
+    #[test]
+    fn consenting_worker_chooses_partial_shards_with_visible_memory_budget_and_thread_policy() {
+        let pin = valid_test_pin();
+        let visible_14_gib = 14 * crate::hardware::GIB;
+        assert_eq!(crate::hardware::nominal_ram_gb(visible_14_gib), 16);
+        let config = consenting_worker("/models/standard.gguf", None);
+        let effective = effective_launch_config_for_ram(&config, 16);
+        let mode =
+            resolve_managed_compute_launch_mode(&effective, visible_14_gib, false, None, Some(pin))
+                .unwrap();
+        assert_eq!(
+            mode,
+            ManagedComputeLaunchMode::CommunityShardWorker {
+                pin,
+                max_working_set_bytes: 7 * crate::hardware::GIB,
+            }
+        );
+        let (args, rayon_env) = build_args_and_rayon_env(&effective, &mode, 8);
+        assert_eq!(rayon_env.as_deref(), Some("1"));
+        assert_eq!(
+            args,
+            vec![
+                "--threads",
+                "1",
+                "--prevent-sleep-during-jobs",
+                "--community-shard-worker",
+                "--community-shard-coordinator-url",
+                "https://coordinator.example.invalid",
+                "--community-shard-coordinator-id",
+                TEST_COORDINATOR_ID,
+                "--community-shard-transaction-domain",
+                TEST_TRANSACTION_DOMAIN,
+                "--community-shard-expected-model-id",
+                TEST_EXPECTED_MODEL_ID,
+                "--community-shard-max-working-set-bytes",
+                &(7 * crate::hardware::GIB).to_string(),
+                "--model",
+                "/models/standard.gguf",
+            ]
+        );
+        assert!(!args.iter().any(|a| a == "--full-integer-worker"));
+        assert!(!args.iter().any(|a| a == "--community-mode"));
+        assert!(!args.iter().any(|a| a == "--community-rpc-url"));
+
+        let override_cfg = consenting_worker("/models/standard.gguf", Some(3));
+        assert_eq!(
+            resolve_launch_worker_threads(&override_cfg, &mode, 8),
+            Some(3)
+        );
+        let clamped_cfg = consenting_worker("/models/standard.gguf", Some(96));
+        assert_eq!(
+            resolve_launch_worker_threads(&clamped_cfg, &mode, 4),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn withdrawn_consent_and_observer_never_enter_shard_mode_and_store_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = NodeConfig {
+            compute_consent: Some(false),
+            ..consenting_worker("/models/standard.gguf", None)
+        };
+        Store {
+            config: Some(stored.clone()),
+            ..Store::default()
+        }
+        .save_to(dir.path())
+        .unwrap();
+        let before = std::fs::read(dir.path().join("store.json")).unwrap();
+        let reopened = Store::load_from(dir.path()).config.unwrap();
+        let effective = effective_launch_config_for_ram(&reopened, 16);
+        let mode = resolve_managed_compute_launch_mode(
+            &effective,
+            16 * crate::hardware::GIB,
+            false,
+            None,
+            Some(valid_test_pin()),
+        )
+        .unwrap();
+        assert_eq!(mode, ManagedComputeLaunchMode::Observer);
+        let (args, rayon_env) = build_args_and_rayon_env(&effective, &mode, 8);
+        assert!(args.is_empty());
+        assert!(rayon_env.is_none());
+        assert_eq!(
+            std::fs::read(dir.path().join("store.json")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn invalid_pins_low_visible_memory_and_old_binary_fail_closed_without_whole_fallback() {
+        let config = consenting_worker("/models/standard.gguf", None);
+        let bad_pins = [
+            PinnedShardCoordinator {
+                coordinator_url: "http://coordinator.example.invalid",
+                ..valid_test_pin()
+            },
+            PinnedShardCoordinator {
+                coordinator_url: "http://coordinator.example.invalid",
+                allow_insecure_for_loopback: true,
+                ..valid_test_pin()
+            },
+            PinnedShardCoordinator {
+                coordinator_id: "0000000000000000000000000000000000000000000000000000000000000000",
+                ..valid_test_pin()
+            },
+            PinnedShardCoordinator {
+                expected_model_id: "ABCD",
+                ..valid_test_pin()
+            },
+        ];
+        for bad_pin in bad_pins {
+            assert!(resolve_managed_compute_launch_mode(
+                &config,
+                16 * crate::hardware::GIB,
+                false,
+                None,
+                Some(bad_pin),
+            )
+            .is_err());
+        }
+        for visible in [
+            0,
+            4 * crate::hardware::GIB,
+            4 * crate::hardware::GIB + 256 * 1024 * 1024,
+        ] {
+            assert!(resolve_managed_compute_launch_mode(
+                &config,
+                visible,
+                false,
+                None,
+                Some(valid_test_pin()),
+            )
+            .is_err());
+        }
+        let shard_mode = ManagedComputeLaunchMode::CommunityShardWorker {
+            pin: valid_test_pin(),
+            max_working_set_bytes: 7 * crate::hardware::GIB,
+        };
+        let err = ensure_binary_supports_compute_mode_with(
+            Path::new("/tmp/old-arc-node"),
+            &shard_mode,
+            |flag| flag == "--full-integer-worker" || flag == "--community-rpc-url",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("update arc-node"));
+    }
+
+    #[test]
+    fn recovery_launch_is_observer_only_and_rollback_preserves_captured_whole_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let canonical_data_dir = data_dir.canonicalize().unwrap();
+        let keyfile = dir.path().join("validator.key");
+        let binary = dir.path().join("arc-node");
+        let seeds = dir.path().join("seeds.txt");
+        let genesis = dir.path().join("genesis.toml");
+        for file in [&keyfile, &binary, &seeds, &genesis] {
+            std::fs::write(file, b"fixture").unwrap();
+        }
+        let config = NodeConfig {
+            data_dir: canonical_data_dir.to_string_lossy().into_owned(),
+            ..consenting_worker("/models/standard.gguf", None)
+        };
+        let resources = TestnetResources {
+            seeds_file: Some(seeds),
+            genesis_file: Some(genesis),
+        };
+        let captured_whole =
+            ManagedLaunchPlan::capture(&config, &keyfile, &binary, &resources).unwrap();
+        assert_eq!(
+            captured_whole.compute_mode,
+            ManagedComputeLaunchMode::FullIntegerWorker
+        );
+        let lock = ManagedLifecycleLock {
+            data_dir: canonical_data_dir,
+            _file: std::fs::File::open(&binary).unwrap(),
+            namespace_guard: None,
+            namespace_prepared: true,
+            session_nonce: Some([0x55; 32]),
+        };
+        captured_whole.verify(&lock).unwrap();
+
+        let rollback_mode = resolve_managed_compute_launch_mode(
+            &config,
+            16 * crate::hardware::GIB,
+            false,
+            Some(&captured_whole.compute_mode),
+            Some(valid_test_pin()),
+        )
+        .unwrap();
+        assert_eq!(rollback_mode, ManagedComputeLaunchMode::FullIntegerWorker);
+
+        let recovery_mode = resolve_managed_compute_launch_mode(
+            &config,
+            16 * crate::hardware::GIB,
+            true,
+            Some(&captured_whole.compute_mode),
+            Some(valid_test_pin()),
+        )
+        .unwrap();
+        assert_eq!(recovery_mode, ManagedComputeLaunchMode::Observer);
+        ensure_binary_supports_compute_mode_with(&binary, &recovery_mode, |_| false).unwrap();
+        let (recovery_args, _) = build_args_and_rayon_env(&config, &recovery_mode, 8);
+        assert!(recovery_args.is_empty());
+    }
+    #[test]
+    fn direct_mode_resolution_respects_withdrawn_consent_and_rechecks_resume_memory() {
+        let withdrawn = NodeConfig {
+            compute_consent: Some(false),
+            ..consenting_worker("/models/standard.gguf", None)
+        };
+        assert_eq!(
+            resolve_managed_compute_launch_mode(
+                &withdrawn,
+                16 * crate::hardware::GIB,
+                false,
+                None,
+                Some(valid_test_pin())
+            )
+            .unwrap(),
+            ManagedComputeLaunchMode::Observer
+        );
+        let config = consenting_worker("/models/standard.gguf", None);
+        let captured = ManagedComputeLaunchMode::CommunityShardWorker {
+            pin: valid_test_pin(),
+            max_working_set_bytes: 8 * crate::hardware::GIB,
+        };
+        let error = resolve_managed_compute_launch_mode(
+            &config,
+            12 * crate::hardware::GIB,
+            false,
+            Some(&captured),
+            Some(valid_test_pin()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("current visible memory"));
     }
 }

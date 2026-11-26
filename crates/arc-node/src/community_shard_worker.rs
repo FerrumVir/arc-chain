@@ -53,6 +53,9 @@ pub const DEFAULT_REACQUIRE_BASE_BACKOFF_MS: u64 = 250;
 pub const DEFAULT_REACQUIRE_MAX_BACKOFF_MS: u64 = 5_000;
 pub const DEFAULT_MAX_CONSECUTIVE_LEASE_REACQUIRES: usize = 8;
 pub const MAX_CONSECUTIVE_LEASE_REACQUIRES_HARD_CAP: usize = 64;
+pub const DEFAULT_RECONNECT_BASE_BACKOFF_MS: u64 = 5_000;
+pub const DEFAULT_RECONNECT_MAX_BACKOFF_MS: u64 = 60_000;
+pub const MAX_RECONNECT_BACKOFF_MS: u64 = 60_000;
 
 const MAX_RESPONSE_BODY_BYTES: usize = COMMUNITY_SHARD_SUBMIT_BODY_LIMIT_BYTES;
 const MAX_ERROR_BODY_BYTES: usize = 4 * 1024;
@@ -79,6 +82,7 @@ pub struct CommunityShardWorkerConfig {
     pub platform: String,
     pub allow_insecure_for_loopback: bool,
     pub prevent_sleep_during_jobs: bool,
+    pub auto_reconnect: bool,
     pub heartbeat_interval_ms: u64,
     pub idle_poll_interval_ms: u64,
     pub connect_timeout_ms: u64,
@@ -89,6 +93,8 @@ pub struct CommunityShardWorkerConfig {
     pub reacquire_base_backoff_ms: u64,
     pub reacquire_max_backoff_ms: u64,
     pub max_consecutive_lease_reacquires: usize,
+    pub reconnect_base_backoff_ms: u64,
+    pub reconnect_max_backoff_ms: u64,
 }
 
 impl CommunityShardWorkerConfig {
@@ -112,6 +118,7 @@ impl CommunityShardWorkerConfig {
             platform: platform.into(),
             allow_insecure_for_loopback: false,
             prevent_sleep_during_jobs: false,
+            auto_reconnect: false,
             heartbeat_interval_ms: DEFAULT_HEARTBEAT_INTERVAL_MS,
             idle_poll_interval_ms: DEFAULT_IDLE_POLL_INTERVAL_MS,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
@@ -122,6 +129,8 @@ impl CommunityShardWorkerConfig {
             reacquire_base_backoff_ms: DEFAULT_REACQUIRE_BASE_BACKOFF_MS,
             reacquire_max_backoff_ms: DEFAULT_REACQUIRE_MAX_BACKOFF_MS,
             max_consecutive_lease_reacquires: DEFAULT_MAX_CONSECUTIVE_LEASE_REACQUIRES,
+            reconnect_base_backoff_ms: DEFAULT_RECONNECT_BASE_BACKOFF_MS,
+            reconnect_max_backoff_ms: DEFAULT_RECONNECT_MAX_BACKOFF_MS,
         }
     }
 
@@ -220,6 +229,14 @@ impl CommunityShardWorkerConfig {
                 "max_consecutive_lease_reacquires must be in 1..={MAX_CONSECUTIVE_LEASE_REACQUIRES_HARD_CAP}"
             )));
         }
+        if self.reconnect_base_backoff_ms == 0
+            || self.reconnect_base_backoff_ms > self.reconnect_max_backoff_ms
+            || self.reconnect_max_backoff_ms > MAX_RECONNECT_BACKOFF_MS
+        {
+            return Err(CommunityShardWorkerError::InvalidConfig(format!(
+                "reconnect backoff bounds must be in 1..={MAX_RECONNECT_BACKOFF_MS} with base <= max"
+            )));
+        }
         normalize_and_validate_coordinator_url(
             &self.coordinator_base_url,
             self.allow_insecure_for_loopback,
@@ -240,6 +257,7 @@ pub struct WorkerRunSummary {
     pub cancellations_applied: u64,
     pub rebalances_completed: u64,
     pub clean_release_sent: bool,
+    pub reconnect_attempts: u64,
 }
 
 #[derive(Debug, Error)]
@@ -445,6 +463,7 @@ struct WorkerRuntime {
     consecutive_reacquires: usize,
     consecutive_reregisters: usize,
     consecutive_heartbeat_transients: usize,
+    consecutive_reconnects: usize,
     summary: WorkerRunSummary,
 }
 
@@ -456,9 +475,19 @@ pub async fn run_community_shard_worker(
     shutdown: watch::Receiver<bool>,
 ) -> Result<WorkerRunSummary, CommunityShardWorkerError> {
     let mut runtime = WorkerRuntime::new(config, keypair, model_spec, loader, shutdown)?;
-    let run_result = runtime.run().await;
+    let final_result = loop {
+        match runtime.run().await {
+            Ok(()) => break Ok(()),
+            Err(err) if runtime.config.auto_reconnect && is_auto_reconnectable(&err) => {
+                if !runtime.reconnect_after_transient(&err).await {
+                    break Ok(());
+                }
+            }
+            Err(err) => break Err(err),
+        }
+    };
     runtime.cleanup_on_exit().await;
-    run_result?;
+    final_result?;
     Ok(runtime.summary)
 }
 
@@ -512,6 +541,7 @@ impl WorkerRuntime {
             consecutive_reacquires: 0,
             consecutive_reregisters: 0,
             consecutive_heartbeat_transients: 0,
+            consecutive_reconnects: 0,
             summary: WorkerRunSummary::default(),
         })
     }
@@ -607,6 +637,7 @@ impl WorkerRuntime {
                 StepCycleOutcome::Continue => {
                     self.consecutive_reacquires = 0;
                     self.consecutive_reregisters = 0;
+                    self.consecutive_reconnects = 0;
                 }
                 StepCycleOutcome::Rebalance(next) => {
                     pending_rebalance = Some(next);
@@ -648,6 +679,46 @@ impl WorkerRuntime {
         self.executor = None;
         self.active_lease = None;
         self.ready_ttl_ms = None;
+    }
+
+    async fn reconnect_after_transient(&mut self, error: &CommunityShardWorkerError) -> bool {
+        self.cleanup_for_reconnect().await;
+        if self.is_shutdown_requested() {
+            return false;
+        }
+        self.consecutive_reconnects = self.consecutive_reconnects.saturating_add(1);
+        self.summary.reconnect_attempts = self.summary.reconnect_attempts.saturating_add(1);
+        let backoff_ms = compute_backoff_ms(
+            self.config.reconnect_base_backoff_ms,
+            self.config.reconnect_max_backoff_ms,
+            self.consecutive_reconnects,
+        );
+        tracing::warn!(
+            %error,
+            attempt = self.consecutive_reconnects,
+            backoff_ms,
+            "community shard worker transient outage; backing off before reconnect"
+        );
+        !self
+            .sleep_until_shutdown(Duration::from_millis(backoff_ms))
+            .await
+    }
+
+    async fn cleanup_for_reconnect(&mut self) {
+        self.release_local_and_remote().await;
+        if let Some(exec) = self.executor.as_mut()
+            && let Ok(now_ms) = checked_now_unix_ms()
+        {
+            exec.sweep_expired(now_ms);
+        }
+        self.ready_ttl_ms = None;
+        self.consecutive_reacquires = 0;
+        self.consecutive_reregisters = 0;
+        self.consecutive_heartbeat_transients = 0;
+    }
+
+    fn is_shutdown_requested(&self) -> bool {
+        *self.shutdown.borrow() || self.shutdown.has_changed().is_err()
     }
 
     fn drop_loaded_model_only(&mut self) -> Result<(), CommunityShardWorkerError> {
@@ -2317,6 +2388,13 @@ fn compute_transient_heartbeat_backoff_ms(
     compute_backoff_ms(base_ms, cap_ms, consecutive_transients)
 }
 
+fn is_auto_reconnectable(error: &CommunityShardWorkerError) -> bool {
+    matches!(
+        error,
+        CommunityShardWorkerError::TransientBudgetExhausted { .. }
+    )
+}
+
 fn is_registration_missing_error(status: StatusCode, body: &str) -> bool {
     status == StatusCode::NOT_FOUND
         && (body.contains(COMMUNITY_REGISTER_PATH)
@@ -2616,7 +2694,7 @@ mod tests {
         short.max_consecutive_lease_reacquires = 1;
         assert!(short.validate(&spec).is_ok());
 
-        let bad_cases: [fn(&mut CommunityShardWorkerConfig); 10] = [
+        let bad_cases: [fn(&mut CommunityShardWorkerConfig); 13] = [
             |c| c.heartbeat_interval_ms = u64::MAX,
             |c| c.idle_poll_interval_ms = u64::MAX,
             |c| c.connect_timeout_ms = u64::MAX,
@@ -2624,6 +2702,12 @@ mod tests {
             |c| c.release_timeout_ms = u64::MAX,
             |c| c.retry_max_backoff_ms = u64::MAX,
             |c| c.reacquire_max_backoff_ms = u64::MAX,
+            |c| c.reconnect_max_backoff_ms = u64::MAX,
+            |c| c.reconnect_base_backoff_ms = 0,
+            |c| {
+                c.reconnect_base_backoff_ms = 10_000;
+                c.reconnect_max_backoff_ms = 5_000;
+            },
             |c| c.max_consecutive_lease_reacquires = usize::MAX,
             |c| c.max_consecutive_lease_reacquires = MAX_CONSECUTIVE_LEASE_REACQUIRES_HARD_CAP + 1,
             |c| {
@@ -2797,5 +2881,283 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 5);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn auto_reconnect_stops_during_backoff_without_extra_http_and_fails_closed_on_auth() {
+        use axum::extract::State;
+        use axum::routing::post;
+        use tokio::sync::Notify;
+
+        struct RegisterCounter {
+            calls: AtomicUsize,
+            status: StatusCode,
+            notify: Notify,
+        }
+
+        async fn reg_handler(
+            State(state): State<Arc<RegisterCounter>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> (StatusCode, String) {
+            state.calls.fetch_add(1, Ordering::SeqCst);
+            state.notify.notify_waiters();
+            (state.status, "rejected".to_string())
+        }
+
+        let spec = test_spec(4);
+        let loader: PartialModelLoader = Arc::new(|_| anyhow::bail!("loader unused"));
+
+        let outage_state = Arc::new(RegisterCounter {
+            calls: AtomicUsize::new(0),
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            notify: Notify::new(),
+        });
+        let (outage_url, outage_srv) = spawn_hb_router(
+            axum::Router::new()
+                .route(COMMUNITY_REGISTER_PATH, post(reg_handler))
+                .with_state(Arc::clone(&outage_state)),
+        )
+        .await;
+        let mut outage_cfg = base_config(&outage_url);
+        outage_cfg.allow_insecure_for_loopback = true;
+        outage_cfg.auto_reconnect = true;
+        outage_cfg.retry_base_backoff_ms = 5;
+        outage_cfg.retry_max_backoff_ms = 5;
+        outage_cfg.reconnect_base_backoff_ms = 5_000;
+        outage_cfg.reconnect_max_backoff_ms = 5_000;
+        let (shut_tx, shut_rx) = watch::channel(false);
+        let mut runtime = WorkerRuntime::new(
+            outage_cfg,
+            Arc::new(KeyPair::generate_ed25519()),
+            spec.clone(),
+            Arc::clone(&loader),
+            shut_rx,
+        )
+        .unwrap();
+        let error = runtime.run().await.unwrap_err();
+        assert!(is_auto_reconnectable(&error));
+        assert_eq!(
+            outage_state.calls.load(Ordering::SeqCst),
+            MAX_REGISTER_TRANSIENT_ATTEMPTS
+        );
+        let mut reconnect = Box::pin(runtime.reconnect_after_transient(&error));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(reconnect.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let stop_started = Instant::now();
+        shut_tx.send(true).unwrap();
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), reconnect)
+                .await
+                .unwrap()
+        );
+        runtime.cleanup_on_exit().await;
+        outage_srv.abort();
+        assert!(stop_started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            outage_state.calls.load(Ordering::SeqCst),
+            MAX_REGISTER_TRANSIENT_ATTEMPTS
+        );
+        assert_eq!(runtime.summary.reconnect_attempts, 1);
+
+        let auth_state = Arc::new(RegisterCounter {
+            calls: AtomicUsize::new(0),
+            status: StatusCode::FORBIDDEN,
+            notify: Notify::new(),
+        });
+        let (auth_url, auth_srv) = spawn_hb_router(
+            axum::Router::new()
+                .route(COMMUNITY_REGISTER_PATH, post(reg_handler))
+                .with_state(Arc::clone(&auth_state)),
+        )
+        .await;
+        let mut auth_cfg = base_config(&auth_url);
+        auth_cfg.allow_insecure_for_loopback = true;
+        auth_cfg.auto_reconnect = true;
+        let (_tx, rx) = watch::channel(false);
+        let err = run_community_shard_worker(
+            auth_cfg,
+            Arc::new(KeyPair::generate_ed25519()),
+            spec,
+            loader,
+            rx,
+        )
+        .await
+        .unwrap_err();
+        auth_srv.abort();
+        assert!(matches!(
+            err,
+            CommunityShardWorkerError::AuthenticationOrAuthorization { status: 403, .. }
+        ));
+        assert_eq!(auth_state.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn auto_reconnect_drops_weights_and_retains_boot_fence_across_outage() {
+        use crate::community_sharding::tests::{
+            build_deterministic_integer_model, build_partial_integer_model, model_spec_from,
+        };
+        use axum::extract::State;
+        use axum::routing::post;
+        use parking_lot::Mutex;
+        use std::sync::Weak;
+        use std::sync::atomic::AtomicBool;
+
+        struct FenceServerState {
+            spec: TrustedModelSpec,
+            boot1: Hash256,
+            boot2: Hash256,
+            lease_calls: AtomicUsize,
+            weights_dropped_on_reconnect: AtomicBool,
+            prior_weaks: Arc<Mutex<Vec<Weak<CachedIntegerModel>>>>,
+        }
+
+        async fn reg_ok(body: axum::Json<serde_json::Value>) -> axum::Json<serde_json::Value> {
+            let worker_id = body.0["payload"]["worker_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            axum::Json(serde_json::json!({ "ok": true, "worker_id": worker_id }))
+        }
+
+        async fn lease_handler(
+            State(state): State<Arc<FenceServerState>>,
+            _body: axum::Json<serde_json::Value>,
+        ) -> Result<axum::Json<ShardLeaseResponse>, (StatusCode, String)> {
+            let idx = state.lease_calls.fetch_add(1, Ordering::SeqCst);
+            if (2..8).contains(&idx) {
+                return Err((StatusCode::SERVICE_UNAVAILABLE, "outage".to_string()));
+            }
+            if idx == 8 {
+                let all_dropped = state
+                    .prior_weaks
+                    .lock()
+                    .iter()
+                    .all(|weak| weak.upgrade().is_none());
+                state
+                    .weights_dropped_on_reconnect
+                    .store(all_dropped, Ordering::SeqCst);
+            }
+            let (boot_nonce, seq) = match idx {
+                0 => (state.boot1, 1),
+                1 => (state.boot2, 1),
+                _ => (state.boot1, 99),
+            };
+            Ok(axum::Json(ShardLeaseResponse {
+                protocol_version: COMMUNITY_SHARD_PROTOCOL_VERSION,
+                assignment: ShardLeaseAssignment {
+                    lease_id: LeaseId { boot_nonce, seq },
+                    lease_epoch: 1,
+                    model_id: state.spec.model_id,
+                    execution_profile: state.spec.execution_profile.clone(),
+                    range: ShardLayerRange {
+                        start_layer: 0,
+                        end_layer: 2,
+                    },
+                    provisioning_deadline_unix_ms: checked_now_unix_ms().unwrap() + 60_000,
+                },
+                ready_ttl_ms: 45_000,
+            }))
+        }
+
+        async fn hb_ok(_body: axum::Json<serde_json::Value>) -> axum::Json<ShardHeartbeatResponse> {
+            axum::Json(ShardHeartbeatResponse {
+                directive: HeartbeatDirective::Active {
+                    expires_at_unix_ms: checked_now_unix_ms().unwrap() + 45_000,
+                },
+                cancellations: Vec::new(),
+            })
+        }
+
+        async fn claim_boot_mismatch(_body: axum::Json<serde_json::Value>) -> (StatusCode, String) {
+            (
+                StatusCode::CONFLICT,
+                "identifier boot_nonce does not match coordinator".to_string(),
+            )
+        }
+
+        async fn release_ok(
+            _body: axum::Json<serde_json::Value>,
+        ) -> axum::Json<ShardReleaseResponse> {
+            axum::Json(ShardReleaseResponse {
+                released: true,
+                aborted_sessions: Vec::new(),
+            })
+        }
+
+        let full = Arc::new(build_deterministic_integer_model(
+            32,
+            16,
+            2,
+            32,
+            4,
+            64,
+            vec![128_001],
+        ));
+        let spec = model_spec_from(arc_crypto::hash_bytes(b"fence-reconnect-spec"), &full);
+        let prior_weaks: Arc<Mutex<Vec<Weak<CachedIntegerModel>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let loader_calls = Arc::new(AtomicUsize::new(0));
+        let weaks_for_loader = Arc::clone(&prior_weaks);
+        let calls_for_loader = Arc::clone(&loader_calls);
+        let full_for_loader = Arc::clone(&full);
+        let loader: PartialModelLoader = Arc::new(move |assignment| {
+            calls_for_loader.fetch_add(1, Ordering::SeqCst);
+            let partial = Arc::new(build_partial_integer_model(
+                &full_for_loader,
+                assignment.range,
+            ));
+            weaks_for_loader.lock().push(Arc::downgrade(&partial));
+            Ok(partial)
+        });
+
+        let state = Arc::new(FenceServerState {
+            spec: spec.clone(),
+            boot1: arc_crypto::hash_bytes(b"fence-boot-1"),
+            boot2: arc_crypto::hash_bytes(b"fence-boot-2"),
+            lease_calls: AtomicUsize::new(0),
+            weights_dropped_on_reconnect: AtomicBool::new(false),
+            prior_weaks,
+        });
+        let app = axum::Router::new()
+            .route(COMMUNITY_REGISTER_PATH, post(reg_ok))
+            .route(COMMUNITY_SHARD_LEASE_PATH, post(lease_handler))
+            .route(COMMUNITY_SHARD_HEARTBEAT_PATH, post(hb_ok))
+            .route(COMMUNITY_SHARD_CLAIM_STEP_PATH, post(claim_boot_mismatch))
+            .route(COMMUNITY_SHARD_RELEASE_PATH, post(release_ok))
+            .with_state(Arc::clone(&state));
+        let (base_url, server) = spawn_hb_router(app).await;
+
+        let mut cfg = base_config(&base_url);
+        cfg.allow_insecure_for_loopback = true;
+        cfg.auto_reconnect = true;
+        cfg.heartbeat_interval_ms = 50;
+        cfg.retry_base_backoff_ms = 5;
+        cfg.retry_max_backoff_ms = 10;
+        cfg.reacquire_base_backoff_ms = 10;
+        cfg.reacquire_max_backoff_ms = 20;
+        cfg.reconnect_base_backoff_ms = 20;
+        cfg.reconnect_max_backoff_ms = 40;
+        let (_tx, rx) = watch::channel(false);
+        let err = run_community_shard_worker(
+            cfg,
+            Arc::new(KeyPair::generate_ed25519()),
+            spec,
+            loader,
+            rx,
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+
+        assert!(matches!(
+            err,
+            CommunityShardWorkerError::InvalidLease(msg) if msg.contains("fenced")
+        ));
+        assert!(state.weights_dropped_on_reconnect.load(Ordering::SeqCst));
+        assert_eq!(loader_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.lease_calls.load(Ordering::SeqCst), 9);
     }
 }

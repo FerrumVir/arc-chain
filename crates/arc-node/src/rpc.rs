@@ -109,6 +109,8 @@ const INFERENCE_RESULT_CAP: usize = 512;
 const INFERENCE_RESULT_TTL_MS: u64 = 60 * 60 * 1_000;
 const INFERENCE_ACTIVITY_PAGE_MAX: usize = 100;
 const PUBLIC_INFERENCE_CONCURRENCY: usize = 2;
+const COMMUNITY_SHARD_DISPATCH_CONCURRENCY_HARD_CAP: usize =
+    crate::community_sharding::MAX_ACTIVE_SESSIONS_HARD_CAP;
 const VALIDATOR_SHARD_CONCURRENCY: usize = 3;
 const VALIDATOR_SHARD_QUEUE_CAP: usize = 36;
 const VALIDATOR_SHARD_QUEUE_TIMEOUT_SECS: u64 = 120;
@@ -463,6 +465,8 @@ pub struct NodeState {
     community_shard_coordinator:
         Arc<parking_lot::Mutex<Option<crate::community_sharding::CommunityShardCoordinator>>>,
     community_shard_notify: Arc<tokio::sync::Notify>,
+    community_shard_dispatch_permits: Arc<tokio::sync::Semaphore>,
+    community_shard_dispatch_in_flight: Arc<std::sync::atomic::AtomicUsize>,
     pub inference_http: reqwest::Client,
     pub sharded_cache_hits: Arc<AtomicU64>,
     pub sharded_run_meta: Arc<dashmap::DashMap<String, Value>>,
@@ -1437,6 +1441,10 @@ pub fn build_node_state(
         )),
         community_shard_coordinator: Arc::new(parking_lot::Mutex::new(None)),
         community_shard_notify: Arc::new(tokio::sync::Notify::new()),
+        community_shard_dispatch_permits: Arc::new(tokio::sync::Semaphore::new(
+            COMMUNITY_SHARD_DISPATCH_CONCURRENCY_HARD_CAP,
+        )),
+        community_shard_dispatch_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         inference_http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::none())
@@ -2254,6 +2262,14 @@ async fn join_node_runtime_tasks(node: &NodeState) -> anyhow::Result<()> {
 }
 
 async fn wait_for_inference_compute_barrier(node: &NodeState) -> anyhow::Result<()> {
+    let community_shard_dispatch = node
+        .community_shard_dispatch_permits
+        .clone()
+        .acquire_many_owned(COMMUNITY_SHARD_DISPATCH_CONCURRENCY_HARD_CAP as u32)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("community shard dispatch semaphore closed during shutdown")
+        })?;
     let public = node
         .public_inference_permits
         .clone()
@@ -2272,7 +2288,7 @@ async fn wait_for_inference_compute_barrier(node: &NodeState) -> anyhow::Result<
         .acquire_many_owned(VALIDATOR_SHARD_CONCURRENCY as u32)
         .await
         .map_err(|_| anyhow::anyhow!("validator shard semaphore closed during shutdown"))?;
-    drop((public, approvals, shards));
+    drop((community_shard_dispatch, public, approvals, shards));
     Ok(())
 }
 
@@ -22448,6 +22464,10 @@ mod tests {
             )),
             community_shard_coordinator: Arc::new(parking_lot::Mutex::new(None)),
             community_shard_notify: Arc::new(tokio::sync::Notify::new()),
+            community_shard_dispatch_permits: Arc::new(tokio::sync::Semaphore::new(
+                COMMUNITY_SHARD_DISPATCH_CONCURRENCY_HARD_CAP,
+            )),
+            community_shard_dispatch_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             attestation_nonce: Arc::new(AtomicU64::new(0)),
             latency_stats: Arc::new(dashmap::DashMap::new()),
 
