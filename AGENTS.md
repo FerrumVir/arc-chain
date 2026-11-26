@@ -282,8 +282,14 @@ Hidden activations are limited to ±2^30 in Q16 at coordinator and executor
 boundaries; values outside that envelope are refused before arithmetic. The
 coordinator follows the canonical legacy generation sequence, including BOS,
 prompt prefill, repeating the final prompt token for first decode, and retaining
-the EOS output token. It is a synchronous worker component; the outbound worker loop and verified
-public dispatch still need integration.
+the EOS output token. The outbound `community_shard_worker` runtime registers a
+signed shard identity, maintains leases during blocking model loads and execution,
+and retries identical submissions using fresh request nonces. Shutdown drains
+blocking work before release; reassignment drops the previous partial model before
+loading the next. TLS coordinator identity and transaction domain are pinned by
+the caller. Public verified dispatch, the production loader command, and desktop
+activation still need integration. Network tests use small canonical fixtures;
+they do not establish deployed capacity or operator availability.
 
 `load_cached_model_shard_canonical_i8` reads only its assigned layer weights
 from a GGUF, without preparing optional quantizations. It validates a strict

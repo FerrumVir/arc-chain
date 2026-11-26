@@ -6,6 +6,7 @@ pub mod build_identity;
 pub mod chunk_cache;
 pub mod coalesce;
 pub mod community_shard_executor;
+pub mod community_shard_worker;
 pub mod community_sharding;
 pub mod community_worker;
 pub mod config;

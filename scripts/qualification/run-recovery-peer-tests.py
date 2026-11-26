@@ -17,6 +17,16 @@ EXPECTED_BINARY_TESTS = {
     'recovery_peer_qualification_tests::qualify_peer_state_rejects_oversized_wrong_domain_forged_and_subquorum_certificates',
 }
 EXPECTED_LIBRARY_TESTS = {
+    'community_shard_worker::tests::config_rejects_insecure_non_literal_loopback_urls_and_bad_layer_budget',
+    'community_shard_worker::tests::pre_loader_lease_validation_rejects_full_range_ttl_expiry_and_fenced_boot',
+    'community_shard_worker::tests::runtime_rejects_invalid_config_and_non_ed25519_before_loader',
+    'rpc::community_shard_http::worker_tests::worker_rejects_redirect_auth_bad_lease_ttl_and_oversized_body_before_loader',
+    'rpc::community_shard_http::worker_tests::two_partial_workers_execute_real_networked_pipeline_matching_try_generate',
+    'rpc::community_shard_http::worker_tests::transient_submit_response_loss_retries_without_recompute_or_false_success',
+    'rpc::community_shard_http::worker_tests::heartbeat_runs_during_blocked_load_and_active_state_and_shutdown_drains',
+    'rpc::community_shard_http::worker_tests::rebalance_and_coordinator_restart_drop_old_model_before_reload_and_fence',
+    'rpc::community_shard_http::worker_tests::cancellation_during_retry_backoff_prevents_stale_submit',
+
     'rpc::tests::community_auth_replay_cache_capacity_expiry_and_clock_rollback',
     'rpc::tests::community_auth_replay_cache_many_identities_bounded_counts',
     'rpc::tests::community_auth_ordinary_paths_keep_64_cap_and_accept_31s_skew',
@@ -100,7 +110,7 @@ def main():
     expected_targets = {
         "arc_inference": (("golden_vectors::gguf_preparation::",), EXPECTED_INFERENCE_TESTS),
         "arc-node": (("tests::recovery_peer_", "recovery_peer_qualification_tests::"), EXPECTED_BINARY_TESTS),
-        "arc_node": (("community_shard_executor::tests::", "community_sharding::tests::", "rpc::community_shard_http::tests::", "rpc::tests::community_auth_"), EXPECTED_LIBRARY_TESTS),
+        "arc_node": (("community_shard_worker::tests::", "rpc::community_shard_http::worker_tests::", "community_shard_executor::tests::", "community_sharding::tests::", "rpc::community_shard_http::tests::", "rpc::tests::community_auth_"), EXPECTED_LIBRARY_TESTS),
     }
     if set(executables) != set(expected_targets) or any(len(paths) != 1 for paths in executables.values()):
         raise SystemExit(f"Expected one executable for each node binary, node library, and inference library target, found {executables}")

@@ -1668,9 +1668,15 @@ mod tests {
             domain,
         )
         .unwrap();
-        community_shard_heartbeat_signed(AxumState(node.clone()), Json(heartbeat))
-            .await
-            .unwrap();
+        let heartbeat_response =
+            community_shard_heartbeat_signed(AxumState(node.clone()), Json(heartbeat))
+                .await
+                .unwrap();
+        assert!(matches!(
+            heartbeat_response.0.directive,
+            HeartbeatDirective::Active { .. }
+        ));
+        assert!(heartbeat_response.0.cancellations.is_empty());
 
         let mut first_claim = None;
         let mut last_claim = None;
@@ -1870,3 +1876,6 @@ mod tests {
         node.community_request_replays.lock().assert_invariants();
     }
 }
+
+#[cfg(test)]
+mod worker_tests;
