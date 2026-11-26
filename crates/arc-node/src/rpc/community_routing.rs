@@ -62,6 +62,12 @@ pub(super) fn assigned(node: &NodeState, worker: &str) {
     node.community_routing.lock().assigned.insert(worker.into());
 }
 
+pub(super) fn record_declined(node: &NodeState, worker: &str) {
+    let mut state = node.community_routing.lock();
+    state.assigned.insert(worker.into());
+    state.claims.insert(worker.into(), None);
+}
+
 fn record(state: &mut RoutingState, worker: &str, sample: f64) {
     state.assigned.insert(worker.into());
     state
@@ -105,9 +111,7 @@ pub(super) fn record_accepted(
     submit_arrived: TokioInstant,
 ) {
     if result.declined {
-        let mut state = node.community_routing.lock();
-        state.assigned.insert(result.worker_id.clone());
-        state.claims.insert(result.worker_id.clone(), None);
+        record_declined(node, &result.worker_id);
         return;
     }
     if !result.success {
@@ -249,7 +253,10 @@ pub(super) fn poll(
     let held = std::mem::take(&mut state.held);
     let mut selected = None;
     for mut work in held {
-        if selected.is_none() && may_take(&mut state, node, worker, &mut work) {
+        let eligible = !claim.excludes(&work.item.job_id)
+            && (!twin_dispatch::is_caller_twin_leg(node, &work.item.job_id)
+                || twin_dispatch::may_claim(node, &work.item.job_id, worker));
+        if selected.is_none() && eligible && may_take(&mut state, node, worker, &mut work) {
             selected = Some(work.item);
         } else {
             state.held.push(work);

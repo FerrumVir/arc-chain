@@ -274,6 +274,8 @@ The full account is [docs/HOW-SHARDING-WORKS.md](docs/HOW-SHARDING-WORKS.md).
   Verified twin legs teach the router using coordinator-observed elapsed time
   per model position; unverified output and worker-reported timing do not.
   Caller twins dispatch immediately when no eligible waiter has a measured speed.
+  An ineligible caller leaves held twin work available to other workers, and a
+  declined twin clears its old availability claim until the next claim request.
   Background twin jobs retain their existing fairness and reserve rules.
 - Validators hold layer ranges and verify results; each range needs 2
   agreeing signatures (`rpc.rs:6870-6876`). Prefill overlaps across hops,

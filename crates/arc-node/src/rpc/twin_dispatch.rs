@@ -1134,6 +1134,9 @@ pub(super) fn submit_twin_leg(
         ));
     };
     let observed_latency = community_routing::observed_twin_latency(node, &pending, &result);
+    if result.declined {
+        community_routing::record_declined(node, &result.worker_id);
+    }
     let _active_job_reservation = ActiveCommunityJobReservation {
         active_jobs: node.community_active_jobs.clone(),
         worker_id: assigned_worker,
@@ -3170,7 +3173,11 @@ mod tests {
     }
 
     fn enqueue_latency_group(node: &NodeState, source: DemandSource) -> String {
-        let id = arc_crypto::hash_bytes(b"latency-group").to_hex();
+        enqueue_named_latency_group(node, source, "latency-group")
+    }
+
+    fn enqueue_named_latency_group(node: &NodeState, source: DemandSource, name: &str) -> String {
+        let id = arc_crypto::hash_bytes(name.as_bytes()).to_hex();
         let group = synthetic_group(&id, source);
         let item = group.legs[0].item.clone();
         node.community_twin
@@ -3259,6 +3266,86 @@ mod tests {
                 claim_decision(&node, &id, "worker-1"),
                 Some(ClaimDecision::Accept)
             );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ineligible_callers_preserve_held_twin_work_and_can_reach_other_groups() {
+        for reserve in [0, 1] {
+            for other_group in [false, true] {
+                let node = latency_node(reserve);
+                let id = enqueue_latency_group(&node, DemandSource::PublicRequest);
+                add_claimed_latency_sibling(&node, &id, "worker-0");
+                assert!(poll_latency(&node, "worker-2").await.is_none());
+                let start = tokio::time::Instant::now();
+                assert!(poll_latency(&node, "worker-0").await.is_none());
+                if other_group {
+                    let other = enqueue_named_latency_group(
+                        &node,
+                        DemandSource::PublicRequest,
+                        "other-latency-group",
+                    );
+                    assert_eq!(poll_latency(&node, "worker-0").await.unwrap().job_id, other);
+                }
+                assert_eq!(start.elapsed(), Duration::ZERO);
+                assert_eq!(poll_latency(&node, "worker-1").await.unwrap().job_id, id);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn caller_twin_second_leg_uses_next_fastest_worker_after_first_claim() {
+        for reserve in [0, 1] {
+            let node = latency_node(reserve);
+            let dispatcher = spawn_dispatch(&node, DemandSource::PublicRequest);
+            wait_for_pending(&node, 2).await;
+            assert!(poll_latency(&node, "worker-2").await.is_none());
+            assert!(poll_latency(&node, "worker-1").await.is_none());
+            node.community_active_jobs.remove("worker-0");
+            let start = tokio::time::Instant::now();
+            let first = job_of(&claim(&node, "worker-0").await);
+            node.community_active_jobs.remove("worker-1");
+            let second = job_of(&claim(&node, "worker-1").await);
+            assert_ne!(first, second);
+            assert_eq!(start.elapsed(), Duration::ZERO);
+            let inner = node.community_twin.inner.lock();
+            assert_eq!(inner.leg_to_group[&first].0, inner.leg_to_group[&second].0);
+            drop(inner);
+            dispatcher.abort();
+            let _ = dispatcher.await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn declined_twin_invalidates_the_previous_waiter_until_a_fresh_claim() {
+        for reserve in [0, 1] {
+            let node = latency_node(reserve);
+            let dispatcher = spawn_dispatch(&node, DemandSource::PublicRequest);
+            wait_for_pending(&node, 2).await;
+            node.community_active_jobs.remove("worker-0");
+            let first = job_of(&claim(&node, "worker-0").await);
+            submit(&node, failed(&first, "worker-0", true)).await;
+            node.community_active_jobs.remove("worker-1");
+            node.community_active_jobs.remove("worker-2");
+            node.community_active_jobs
+                .insert("worker-0".into(), String::new());
+            assert!(!community_routing::has_other_waiter(
+                &node,
+                &test_model_id(),
+                "unrelated"
+            ));
+            community_routing::open_claim(
+                &node,
+                "worker-0",
+                parse_hash256_hex(&test_model_id(), "model").unwrap(),
+            );
+            assert!(community_routing::has_other_waiter(
+                &node,
+                &test_model_id(),
+                "unrelated"
+            ));
+            dispatcher.abort();
+            let _ = dispatcher.await;
         }
     }
 
