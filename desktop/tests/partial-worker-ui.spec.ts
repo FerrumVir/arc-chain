@@ -63,6 +63,8 @@ for (const phase of ["ready", "computing", "failed", "stopped"] as const) {
     await expect(card.getByTestId("worker-jobs-verified")).toHaveCount(0);
     await expect(card.getByTestId("worker-jobs-detail")).toContainText(PLAIN_COPY.workerJobs.partialNoRewards);
     await expect(card.getByTestId("worker-jobs-assigned-range")).toHaveText(phase === "ready" || phase === "computing" ? "6 of 32 layers" : "—");
+    await expect(page.locator("#boot")).toHaveCount(0);
+    await card.getByTestId("worker-jobs-steps-executed").click({ trial: true });
     await card.screenshot({ path: testInfo.outputPath(`partial-worker-${phase}.png`) });
   });
 }
