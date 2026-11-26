@@ -2471,17 +2471,27 @@ fn recovery_peer_qualify_command_accepts_persistent_candidate_and_rejects_mutati
         "failed active recovery domain hash verification",
     );
 
-    assert!(
-        run_mutated_dag(
-            "missing-tail-skip-cert",
-            peer_replay_remove_certificate_record(
-                &window.records,
-                window.last_round,
-                target_validator,
-            ),
-        )
-        .is_err()
-    );
+    for absentee in [
+        target_validator,
+        fixture.validators[PEER_REPLAY_SECOND_ABSENT_INDEX],
+    ] {
+        assert!(
+            run_mutated_dag(
+                &format!("missing-parent-skip-cert-{}", absentee.to_hex()),
+                peer_replay_remove_certificate_record(
+                    &window.records,
+                    window.last_round - 1,
+                    absentee,
+                ),
+            )
+            .is_err()
+        );
+    }
+    run_mutated_dag(
+        "partial-current-round-with-complete-parent",
+        peer_replay_remove_certificate_record(&window.records, window.last_round, target_validator),
+    )
+    .unwrap();
 
     let run_pin_mutation = |label: &str, pin: Option<GenerationPin>| -> Result<()> {
         let mut_dir = root
