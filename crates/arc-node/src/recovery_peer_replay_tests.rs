@@ -2403,6 +2403,15 @@ fn recovery_peer_qualify_command_accepts_persistent_candidate_and_rejects_mutati
                 records,
             )
             .unwrap();
+        let original_binding = candidate_dir
+            .join(format!("dag-wal-recovery-{manifest_hex}"))
+            .join("recovery-dag.binding.json");
+        let mutation_binding = mut_dag_dir.join("recovery-dag.binding.json");
+        std::fs::copy(&original_binding, &mutation_binding).unwrap();
+        assert_eq!(
+            peer_qualify_file_snapshot(&mutation_binding),
+            peer_qualify_file_snapshot(&original_binding),
+        );
         write_recovery_dag_pin_atomically(&mut_dir, manifest_hash, mut_gen.pin).unwrap();
         let mut manifest = valid_manifest.clone();
         manifest.candidate_data_dir = mut_dir.display().to_string();
