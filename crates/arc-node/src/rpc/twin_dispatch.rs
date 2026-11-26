@@ -3308,9 +3308,10 @@ mod tests {
             let second = job_of(&claim(&node, "worker-1").await);
             assert_ne!(first, second);
             assert_eq!(start.elapsed(), Duration::ZERO);
-            let inner = node.community_twin.inner.lock();
-            assert_eq!(inner.leg_to_group[&first].0, inner.leg_to_group[&second].0);
-            drop(inner);
+            {
+                let inner = node.community_twin.inner.lock();
+                assert_eq!(inner.leg_to_group[&first].0, inner.leg_to_group[&second].0);
+            }
             dispatcher.abort();
             let _ = dispatcher.await;
         }
