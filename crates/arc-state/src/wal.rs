@@ -746,6 +746,188 @@ impl WalWriter {
         let mut expected_sequence = Some(0u64);
         Self::validate_existing_segment_handle(&path, &file, &mut expected_sequence)?;
         let seq = expected_sequence.unwrap_or(0);
+        Self::spawn_from_open_file(path, file, seq)
+    }
+
+    pub(crate) fn attach_verified_recovery_wal(
+        path: impl AsRef<Path>,
+        must_exist: bool,
+        expected_bytes: u64,
+        expected_hash: blake3::Hash,
+        expected_next_sequence: u64,
+    ) -> std::io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if path.file_name() != Some(std::ffi::OsStr::new("state.wal")) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("verified recovery WAL attachment requires state.wal: {path:?}"),
+            ));
+        }
+        let empty_hash = blake3::hash(&[]);
+        if !must_exist
+            && (expected_bytes != 0 || expected_next_sequence != 0 || expected_hash != empty_hash)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "new recovery WAL must start empty at sequence 0",
+            ));
+        }
+        if expected_bytes == 0 && (expected_next_sequence != 0 || expected_hash != empty_hash) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "empty recovery WAL must have empty hash and sequence 0",
+            ));
+        }
+        if expected_bytes != 0 && expected_next_sequence == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "non-empty verified recovery WAL must have non-zero next sequence",
+            ));
+        }
+
+        let file = if must_exist {
+            let pre_metadata = fs::symlink_metadata(&path)?;
+            if pre_metadata.file_type().is_symlink() || !pre_metadata.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("recovery WAL is not a regular non-symlink file: {path:?}"),
+                ));
+            }
+            if pre_metadata.len() != expected_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "recovery WAL size changed before writer attach: expected {expected_bytes}, actual {}",
+                        pre_metadata.len()
+                    ),
+                ));
+            }
+            cleanup_create_staging_for_target(&path)?;
+            open_existing_append_file_durably(&path)?
+        } else {
+            cleanup_create_staging_for_target(&path)?;
+            create_new_append_file_durably(&path)?
+        };
+
+        Self::verify_recovery_wal_handle(&path, &file, expected_bytes, expected_hash)?;
+        Self::spawn_from_open_file(path, file, expected_next_sequence)
+    }
+
+    fn verify_recovery_wal_handle(
+        path: &Path,
+        file: &File,
+        expected_bytes: u64,
+        expected_hash: blake3::Hash,
+    ) -> std::io::Result<()> {
+        let path_metadata = fs::symlink_metadata(path)?;
+        if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("recovery WAL is not a regular non-symlink file: {path:?}"),
+            ));
+        }
+        let original_metadata = file.metadata()?;
+        if !original_metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("recovery WAL handle is not a regular file: {path:?}"),
+            ));
+        }
+        let original_identity = WalFileIdentity::from_metadata(&original_metadata);
+        #[cfg(windows)]
+        let original_file_identity = {
+            let id = windows_wal_file_identity(file)?;
+            let path_file = arc_crypto::secret_file::open_owned_nofollow_read(path)?;
+            if windows_wal_file_identity(&path_file)? != id {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("recovery WAL changed while being opened: {path:?}"),
+                ));
+            }
+            id
+        };
+        if WalFileIdentity::from_metadata(&path_metadata) != original_identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("recovery WAL changed while being opened: {path:?}"),
+            ));
+        }
+        if original_identity.len != expected_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "recovery WAL size changed before writer attach: expected {expected_bytes}, actual {}",
+                    original_identity.len
+                ),
+            ));
+        }
+
+        let mut reader = file.try_clone()?;
+        let actual_hash = hash_file_range(&mut reader, 0, expected_bytes)?;
+        let mut extra = [0u8; 1];
+        loop {
+            match reader.read(&mut extra) {
+                Ok(0) => break,
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("recovery WAL grew while verifying: {path:?}"),
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        if actual_hash != expected_hash {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "recovery WAL digest mismatch before writer attach: expected {expected_hash}, actual {actual_hash}"
+                ),
+            ));
+        }
+
+        let final_handle_identity = WalFileIdentity::from_metadata(&reader.metadata()?);
+        let retained_handle_identity = WalFileIdentity::from_metadata(&file.metadata()?);
+        let final_path_metadata = fs::symlink_metadata(path)?;
+        if final_path_metadata.file_type().is_symlink() || !final_path_metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("recovery WAL changed type while verifying: {path:?}"),
+            ));
+        }
+        let final_path_identity = WalFileIdentity::from_metadata(&final_path_metadata);
+        if final_handle_identity != original_identity
+            || retained_handle_identity != original_identity
+            || final_path_identity != original_identity
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("recovery WAL changed while verifying: {path:?}"),
+            ));
+        }
+        #[cfg(windows)]
+        {
+            let final_path_file = arc_crypto::secret_file::open_owned_nofollow_read(path)?;
+            if windows_wal_file_identity(&reader)? != original_file_identity
+                || windows_wal_file_identity(file)? != original_file_identity
+                || windows_wal_file_identity(&final_path_file)? != original_file_identity
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("recovery WAL changed while verifying: {path:?}"),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn spawn_from_open_file(
+        path: PathBuf,
+        file: File,
+        next_sequence: u64,
+    ) -> std::io::Result<Self> {
         let mut writer = BufWriter::with_capacity(256 * 1024, file);
 
         let (sender, receiver): (Sender<WalCommand>, Receiver<WalCommand>) = channel::unbounded();
@@ -777,7 +959,7 @@ impl WalWriter {
         Ok(Self {
             sender,
             admission: Mutex::new(WalAdmission {
-                next_sequence: seq,
+                next_sequence,
                 accepting: true,
             }),
             handle: Some(handle),
@@ -3165,6 +3347,95 @@ mod tests {
         ));
 
         fs::remove_file(not_a_directory).unwrap();
+    }
+
+    #[test]
+    fn attach_verified_recovery_wal_enforces_name_invariants_identity_and_sequence() {
+        let dir = tmp_dir("wal_attach_verified_recovery");
+        let empty_hash = blake3::hash(&[]);
+        let non_empty_hash = blake3::hash(b"payload");
+        let wrong_name = dir.join("wal-00000000.bin");
+        assert_eq!(
+            WalWriter::attach_verified_recovery_wal(&wrong_name, false, 0, empty_hash, 0)
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+
+        let wal_path = dir.join("state.wal");
+        assert!(
+            WalWriter::attach_verified_recovery_wal(&wal_path, false, 1, non_empty_hash, 1)
+                .is_err()
+        );
+        assert!(
+            WalWriter::attach_verified_recovery_wal(&wal_path, false, 0, empty_hash, 1).is_err()
+        );
+        assert!(
+            WalWriter::attach_verified_recovery_wal(&wal_path, true, 0, non_empty_hash, 0).is_err()
+        );
+        assert!(
+            WalWriter::attach_verified_recovery_wal(&wal_path, true, 16, non_empty_hash, 0)
+                .is_err()
+        );
+        assert_eq!(
+            WalWriter::attach_verified_recovery_wal(&wal_path, true, 0, empty_hash, 0)
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!wal_path.exists());
+
+        let mut created =
+            WalWriter::attach_verified_recovery_wal(&wal_path, false, 0, empty_hash, 0).unwrap();
+        assert_eq!(created.sequence(), 0);
+        created.shutdown().unwrap();
+        assert_eq!(
+            WalWriter::attach_verified_recovery_wal(&wal_path, false, 0, empty_hash, 0)
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+
+        append_encoded_entry(&wal_path, &checkpoint_entry(0));
+        append_encoded_entry(&wal_path, &checkpoint_entry(1));
+        let raw = fs::read(&wal_path).unwrap();
+        let digest = blake3::hash(&raw);
+        assert!(
+            WalWriter::attach_verified_recovery_wal(
+                &wal_path,
+                true,
+                raw.len() as u64 - 1,
+                digest,
+                2
+            )
+            .is_err()
+        );
+        assert!(
+            WalWriter::attach_verified_recovery_wal(
+                &wal_path,
+                true,
+                raw.len() as u64,
+                non_empty_hash,
+                2
+            )
+            .is_err()
+        );
+
+        let mut attached =
+            WalWriter::attach_verified_recovery_wal(&wal_path, true, raw.len() as u64, digest, 2)
+                .unwrap();
+        assert_eq!(attached.sequence(), 2);
+        attached.append(WalOp::Checkpoint(hash_bytes(b"post-attach")), 2);
+        attached.sync().unwrap();
+        assert_eq!(attached.sequence(), 3);
+        attached.shutdown().unwrap();
+        let entries = read_wal(&wal_path);
+        let sequences: Vec<u64> = entries.iter().map(|entry| entry.sequence).collect();
+        assert_eq!(sequences, vec![0, 1, 2]);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

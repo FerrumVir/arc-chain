@@ -364,6 +364,10 @@ Its target publisher rejects stale destinations, verifies the whole pre-copy
 before and after appending, and retains the advisory lock through durable
 publication. Capture and publication receipts remain unqualified; finality and
 both signing-cursor bounds must pass the offline qualifier before activation.
+Recovery startup retains its verified replayed state and binds the WAL writer
+to the exact opened file bytes and accepted sequence before returning it. It
+rejects missing or changed WALs and preserves tail quarantine and native-context
+restoration; it does not bypass replay, checkpoint roots, or signed DAG checks.
 
 Normal `POST /inference/run` prefers an eligible complete community partial
 pipeline before whole-worker dispatch. It preserves forced-local, public-demo,

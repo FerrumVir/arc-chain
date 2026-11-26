@@ -146,6 +146,15 @@ EXPECTED_INFERENCE_TESTS = {
 }
 
 
+EXPECTED_STATE_TESTS = {
+    'wal::tests::attach_verified_recovery_wal_enforces_name_invariants_identity_and_sequence',
+    'recovery::tests::staged_attach_clean_and_quarantined_restart_supports_subsequent_commits_and_restarts',
+    'recovery::tests::staged_attach_rejects_wal_mutation_deletion_and_path_replacement_before_binding',
+    'recovery::tests::staged_attach_enforces_new_empty_wal_discipline_and_pre_attach_failure_isolation',
+    'recovery::tests::prepared_recovery_restart_restores_rooted_native_migration_and_context',
+}
+
+
 def run_recorded(command, log, timeout):
     with log.open("x") as output:
         result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT, timeout=timeout)
@@ -162,7 +171,7 @@ def main():
     args.evidence_dir.mkdir(parents=True, exist_ok=False)
     os.environ["CARGO_BUILD_JOBS"] = "1"
     compiled = run_recorded(
-        ["cargo", "test", "--locked", "-p", "arc-node", "-p", "arc-inference", "--features", "candle", "--lib", "--bin", "arc-node",
+        ["cargo", "test", "--locked", "-p", "arc-node", "-p", "arc-inference", "-p", "arc-state", "--features", "candle", "--lib", "--bin", "arc-node",
          "--no-run", "--message-format=json-render-diagnostics"],
         args.evidence_dir / "compile.log", 3600,
     )
@@ -174,15 +183,16 @@ def main():
         if (row.get("reason") == "compiler-artifact" and row.get("profile", {}).get("test")
                 and row.get("executable")):
             target = row.get("target", {})
-            if target.get("name") in {"arc-node", "arc_node", "arc_inference"}:
+            if target.get("name") in {"arc-node", "arc_node", "arc_inference", "arc_state"}:
                 executables.setdefault(target["name"], set()).add(row["executable"])
     expected_targets = {
+        "arc_state": (("wal::tests::attach_verified_recovery_wal_", "recovery::tests::staged_attach_", "recovery::tests::prepared_recovery_restart_restores_rooted_native_migration_and_context"), EXPECTED_STATE_TESTS),
         "arc_inference": (("canonical_shard_admission::candle_tests::", "golden_vectors::gguf_preparation::",), EXPECTED_INFERENCE_TESTS),
         "arc-node": (("integrated_shard_worker_tests::", "community_shard_cli::tests::", "tests::recovery_peer_", "recovery_peer_qualification_tests::"), EXPECTED_BINARY_TESTS),
         "arc_node": (("rpc::community_sharded_routing_tests::", "rpc::community_shard_dispatch::inference_run_adapter_tests::", "community_worker::tests::partial_snapshot_", "rpc::community_shard_dispatch::tests::", "community_shard_worker::tests::", "rpc::community_shard_http::worker_tests::", "community_shard_executor::tests::", "community_sharding::tests::", "rpc::community_shard_http::tests::", "rpc::tests::community_auth_"), EXPECTED_LIBRARY_TESTS),
     }
     if set(executables) != set(expected_targets) or any(len(paths) != 1 for paths in executables.values()):
-        raise SystemExit(f"Expected one executable for each node binary, node library, and inference library target, found {executables}")
+        raise SystemExit(f"Expected one executable for each node binary, node library, inference library, and state library target, found {executables}")
     passed, failed = [], []
     for target, (prefixes, expected) in expected_targets.items():
         binary = next(iter(executables[target]))
