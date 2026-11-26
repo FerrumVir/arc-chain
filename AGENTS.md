@@ -279,6 +279,12 @@ its exact result digest, coverage, token limits and EOS, then uses the existing
 validator quorum verification before returning output. It shares the public
 inference capacity limit. Rewards remain disabled for these multi-worker results.
 This transport alone does not activate desktop nodes.
+`--community-shard-worker` integrates the pinned partial worker into a managed
+stake-zero node while preserving local RPC and the shutdown durability barrier.
+It excludes whole-model and validator roles, requires explicit model and network
+pins and a memory budget, and defaults to one compute thread. Existing local
+recovery domains must match the supplied pin. Stop closes worker admission before
+the lifecycle waits for drained tasks and acknowledges the WAL receipt.
 The rollout manifest's optional `gateway.community_sharding` boolean adds the
 exact shard routes and coordinator flag only when enabled. Disabled rendering
 preserves the sealed gateway bytes. Metadata and public requests are capped at

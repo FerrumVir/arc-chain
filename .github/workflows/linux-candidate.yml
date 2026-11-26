@@ -54,6 +54,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           python3 scripts/ci/no_comments.py
           python3 -m unittest scripts.recovery.test_recovery_rollout
+          python3 -m unittest scripts.recovery.test_wal_precopy
           python3 scripts/qualification/run-recovery-peer-tests.py \
             --evidence-dir "$RUNNER_TEMP/recovery-peer-evidence"
       - name: Lint recovery and sharding targets

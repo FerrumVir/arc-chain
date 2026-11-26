@@ -78,6 +78,7 @@ pub struct CommunityShardWorkerConfig {
     pub model_name: String,
     pub platform: String,
     pub allow_insecure_for_loopback: bool,
+    pub prevent_sleep_during_jobs: bool,
     pub heartbeat_interval_ms: u64,
     pub idle_poll_interval_ms: u64,
     pub connect_timeout_ms: u64,
@@ -110,6 +111,7 @@ impl CommunityShardWorkerConfig {
             model_name: model_name.into(),
             platform: platform.into(),
             allow_insecure_for_loopback: false,
+            prevent_sleep_during_jobs: false,
             heartbeat_interval_ms: DEFAULT_HEARTBEAT_INTERVAL_MS,
             idle_poll_interval_ms: DEFAULT_IDLE_POLL_INTERVAL_MS,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
@@ -1194,8 +1196,10 @@ impl WorkerRuntime {
             CommunityShardWorkerError::InvalidLease("executor unbound during step".to_string())
         })?;
         let coord_id = self.config.coordinator_id;
+        let prevent_sleep_during_jobs = self.config.prevent_sleep_during_jobs;
         let work_for_exec = work.clone();
         let mut exec_handle = tokio::task::spawn_blocking(move || {
+            let _keep_awake = crate::community_worker::KeepAwake::begin(prevent_sleep_during_jobs);
             let result = exec.execute_step(coord_id, start_now_ms, &work_for_exec);
             (exec, result)
         });
@@ -2612,22 +2616,20 @@ mod tests {
         short.max_consecutive_lease_reacquires = 1;
         assert!(short.validate(&spec).is_ok());
 
-        let bad_cases: [Box<dyn Fn(&mut CommunityShardWorkerConfig)>; 10] = [
-            Box::new(|c| c.heartbeat_interval_ms = u64::MAX),
-            Box::new(|c| c.idle_poll_interval_ms = u64::MAX),
-            Box::new(|c| c.connect_timeout_ms = u64::MAX),
-            Box::new(|c| c.request_timeout_ms = u64::MAX),
-            Box::new(|c| c.release_timeout_ms = u64::MAX),
-            Box::new(|c| c.retry_max_backoff_ms = u64::MAX),
-            Box::new(|c| c.reacquire_max_backoff_ms = u64::MAX),
-            Box::new(|c| c.max_consecutive_lease_reacquires = usize::MAX),
-            Box::new(|c| {
-                c.max_consecutive_lease_reacquires = MAX_CONSECUTIVE_LEASE_REACQUIRES_HARD_CAP + 1
-            }),
-            Box::new(|c| {
+        let bad_cases: [fn(&mut CommunityShardWorkerConfig); 10] = [
+            |c| c.heartbeat_interval_ms = u64::MAX,
+            |c| c.idle_poll_interval_ms = u64::MAX,
+            |c| c.connect_timeout_ms = u64::MAX,
+            |c| c.request_timeout_ms = u64::MAX,
+            |c| c.release_timeout_ms = u64::MAX,
+            |c| c.retry_max_backoff_ms = u64::MAX,
+            |c| c.reacquire_max_backoff_ms = u64::MAX,
+            |c| c.max_consecutive_lease_reacquires = usize::MAX,
+            |c| c.max_consecutive_lease_reacquires = MAX_CONSECUTIVE_LEASE_REACQUIRES_HARD_CAP + 1,
+            |c| {
                 c.connect_timeout_ms = 5_000;
                 c.request_timeout_ms = 4_000;
-            }),
+            },
         ];
         for mutate in bad_cases {
             let mut cfg = base.clone();

@@ -7,6 +7,19 @@ import subprocess
 
 
 EXPECTED_BINARY_TESTS = {
+    'community_shard_cli::tests::integrated_shard_worker_shared_prepare_cancels_when_shutdown_flag_set',
+    'community_shard_cli::tests::integrated_shard_worker_shared_prepare_rejects_unpinned_model_before_metadata_parse',
+    'community_shard_cli::tests::integrated_shard_worker_runtime_task_drains_before_join_returns',
+    'community_shard_cli::tests::integrated_shard_worker_skips_start_when_shutdown_already_requested',
+    'integrated_shard_worker_tests::integrated_shard_worker_parses_explicit_pins_and_defaults_to_one_thread',
+    'integrated_shard_worker_tests::integrated_shard_worker_respects_explicit_threads_and_rejects_zero',
+    'integrated_shard_worker_tests::integrated_shard_worker_requires_all_immutable_pins_and_budget',
+    'integrated_shard_worker_tests::integrated_shard_worker_rejects_pin_flags_without_mode_flag',
+    'integrated_shard_worker_tests::integrated_shard_worker_rejects_incompatible_roles_and_capability_mixing',
+    'integrated_shard_worker_tests::integrated_shard_worker_requires_persistent_identity_and_forbids_ephemeral_or_seed',
+    'integrated_shard_worker_tests::integrated_shard_worker_enforces_https_or_explicit_literal_loopback',
+    'integrated_shard_worker_tests::integrated_shard_worker_transaction_domain_guard_handles_none_match_and_mismatch',
+
     'recovery_peer_qualification_tests::inspect_peer_capture_reads_real_persistent_generation_and_target_signing_record',
     'community_shard_cli::tests::pending_shutdown_signal_preempts_worker_first_poll_and_prepare_completion',
     'community_shard_cli::tests::prepare_rejects_non_utf8_model_path_before_hashing_or_check_only_pass',
@@ -148,7 +161,7 @@ def main():
                 executables.setdefault(target["name"], set()).add(row["executable"])
     expected_targets = {
         "arc_inference": (("canonical_shard_admission::candle_tests::", "golden_vectors::gguf_preparation::",), EXPECTED_INFERENCE_TESTS),
-        "arc-node": (("community_shard_cli::tests::", "tests::recovery_peer_", "recovery_peer_qualification_tests::"), EXPECTED_BINARY_TESTS),
+        "arc-node": (("integrated_shard_worker_tests::", "community_shard_cli::tests::", "tests::recovery_peer_", "recovery_peer_qualification_tests::"), EXPECTED_BINARY_TESTS),
         "arc_node": (("rpc::community_shard_dispatch::tests::", "community_shard_worker::tests::", "rpc::community_shard_http::worker_tests::", "community_shard_executor::tests::", "community_sharding::tests::", "rpc::community_shard_http::tests::", "rpc::tests::community_auth_"), EXPECTED_LIBRARY_TESTS),
     }
     if set(executables) != set(expected_targets) or any(len(paths) != 1 for paths in executables.values()):

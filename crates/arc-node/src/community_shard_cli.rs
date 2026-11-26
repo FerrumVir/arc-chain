@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use arc_crypto::Hash256;
+use arc_crypto::{Hash256, KeyPair};
 use arc_inference::cached_integer_model::{
     CANONICAL_REWARD_INFERENCE_PROFILE, CachedIntegerModel, load_cached_model_shard_canonical_i8,
 };
@@ -9,7 +9,8 @@ use arc_inference::canonical_shard_admission::{
 use arc_inference::model_artifact::ModelArtifactCommitment;
 use arc_node::community_shard_executor::{DEFAULT_MAX_KV_CACHE_BYTES, MAX_KV_CACHE_BYTES_HARD_CAP};
 use arc_node::community_shard_worker::{
-    CommunityShardWorkerConfig, PartialModelLoader, WorkerRunSummary, run_community_shard_worker,
+    CommunityShardWorkerConfig, CommunityShardWorkerError, PartialModelLoader, WorkerRunSummary,
+    run_community_shard_worker,
 };
 use arc_node::community_sharding::{
     MAX_EOS_TOKENS, MAX_HIDDEN_LEN_HARD_CAP, MAX_MODEL_LAYERS_HARD_CAP,
@@ -79,17 +80,58 @@ pub struct CommunityShardWorkerArgs {
     #[arg(long)]
     pub allow_insecure_for_loopback: bool,
 
+    /// Keep the host awake only while executing an assigned partial-model step.
+    #[arg(long)]
+    pub prevent_sleep_during_jobs: bool,
+
     /// Verify pinned artifact and conservative all-roles admission, print JSON report, and exit without key loading, Rayon init, weights, or network.
     #[arg(long)]
     pub check_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ValidatedInputs {
-    normalized_coordinator_url: String,
-    worker_name: String,
-    platform: String,
-    max_kv_cache_bytes_u64: u64,
+pub(crate) struct ShardWorkerLaunchSpec {
+    pub(crate) coordinator_url: String,
+    pub(crate) coordinator_id: Hash256,
+    pub(crate) transaction_domain: Hash256,
+    pub(crate) expected_model_id: Hash256,
+    pub(crate) model_path: PathBuf,
+    pub(crate) worker_name: String,
+    pub(crate) max_working_set_bytes: u64,
+    pub(crate) max_kv_cache_bytes: usize,
+    pub(crate) max_resident_layers: Option<usize>,
+    pub(crate) threads: usize,
+    pub(crate) allow_insecure_for_loopback: bool,
+    pub(crate) prevent_sleep_during_jobs: bool,
+    pub(crate) report_mode: &'static str,
+}
+
+impl ShardWorkerLaunchSpec {
+    fn from_cli_args(args: &CommunityShardWorkerArgs) -> Self {
+        Self {
+            coordinator_url: args.coordinator_url.clone(),
+            coordinator_id: args.coordinator_id,
+            transaction_domain: args.transaction_domain,
+            expected_model_id: args.expected_model_id,
+            model_path: args.model_path.clone(),
+            worker_name: args.worker_name.clone(),
+            max_working_set_bytes: args.max_working_set_bytes,
+            max_kv_cache_bytes: args.max_kv_cache_bytes,
+            max_resident_layers: args.max_resident_layers,
+            threads: args.threads,
+            allow_insecure_for_loopback: args.allow_insecure_for_loopback,
+            prevent_sleep_during_jobs: args.prevent_sleep_during_jobs,
+            report_mode: if args.check_only { "check-only" } else { "run" },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ValidatedInputs {
+    pub(crate) normalized_coordinator_url: String,
+    pub(crate) worker_name: String,
+    pub(crate) platform: String,
+    pub(crate) max_kv_cache_bytes_u64: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -177,12 +219,27 @@ pub struct AdmissionReport {
     pub admission: AllRolesAdmissionReport,
 }
 
-struct PreparedWorker {
+pub(crate) struct PreparedWorker {
     artifact: Arc<ModelArtifactCommitment>,
     metadata: Arc<CanonicalShardMetadata>,
     model_spec: TrustedModelSpec,
     config: CommunityShardWorkerConfig,
-    report: AdmissionReport,
+    pub(crate) report: AdmissionReport,
+}
+
+impl PreparedWorker {
+    pub(crate) fn build_loader(&self) -> Result<PartialModelLoader> {
+        let max_kv_cache_bytes_u64 = u64::try_from(self.report.max_kv_cache_bytes)
+            .context("--max-kv-cache-bytes exceeds u64 range")?;
+        Ok(build_partial_model_loader(
+            Arc::clone(&self.artifact),
+            Arc::clone(&self.metadata),
+            self.model_spec.model_id,
+            self.report.admission.admitted_max_resident_layers,
+            self.report.max_working_set_bytes,
+            max_kv_cache_bytes_u64,
+        ))
+    }
 }
 
 struct WidthRoleEstimates {
@@ -262,7 +319,7 @@ impl ShutdownSignals {
     }
 }
 
-fn parse_nonzero_hash256(encoded: &str) -> std::result::Result<Hash256, String> {
+pub(crate) fn parse_nonzero_hash256(encoded: &str) -> std::result::Result<Hash256, String> {
     if encoded.len() != 64 {
         return Err("must contain exactly 64 hexadecimal characters (32 bytes)".to_string());
     }
@@ -290,7 +347,7 @@ fn canonical_model_name(metadata: &CanonicalShardMetadata) -> String {
     )
 }
 
-fn host_available_parallelism() -> usize {
+pub(crate) fn host_available_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
@@ -309,6 +366,85 @@ fn validate_thread_count(threads: usize, available_parallelism: usize) -> Result
         "--threads {threads} exceeds host available parallelism ({available})"
     );
     Ok(())
+}
+
+pub(crate) fn validate_launch_spec_with_parallelism(
+    spec: &ShardWorkerLaunchSpec,
+    available_parallelism: usize,
+) -> Result<ValidatedInputs> {
+    ensure!(
+        spec.coordinator_id != Hash256::ZERO,
+        "--coordinator-id must be nonzero"
+    );
+    ensure!(
+        spec.transaction_domain != Hash256::ZERO,
+        "--transaction-domain must be nonzero"
+    );
+    ensure!(
+        spec.expected_model_id != Hash256::ZERO,
+        "--expected-model-id must be nonzero"
+    );
+    ensure!(
+        spec.max_working_set_bytes > 0,
+        "--max-working-set-bytes must be nonzero"
+    );
+    ensure!(
+        spec.max_kv_cache_bytes > 0 && spec.max_kv_cache_bytes <= MAX_KV_CACHE_BYTES_HARD_CAP,
+        "--max-kv-cache-bytes {} must be in 1..={MAX_KV_CACHE_BYTES_HARD_CAP}",
+        spec.max_kv_cache_bytes
+    );
+    let max_kv_cache_bytes_u64 =
+        u64::try_from(spec.max_kv_cache_bytes).context("--max-kv-cache-bytes exceeds u64 range")?;
+    ensure!(
+        spec.max_working_set_bytes >= max_kv_cache_bytes_u64,
+        "--max-working-set-bytes ({}) must be at least --max-kv-cache-bytes ({})",
+        spec.max_working_set_bytes,
+        spec.max_kv_cache_bytes
+    );
+    if let Some(limit) = spec.max_resident_layers {
+        let protocol_cap = MAX_MODEL_LAYERS_HARD_CAP.div_ceil(2);
+        ensure!(
+            limit >= 1 && limit <= protocol_cap,
+            "--max-resident-layers {limit} must be in 1..={protocol_cap}"
+        );
+    }
+    validate_thread_count(spec.threads, available_parallelism)?;
+    let worker_name = spec.worker_name.trim().to_string();
+    ensure!(
+        !worker_name.is_empty() && !worker_name.chars().any(char::is_control),
+        "--worker-name must be non-empty without control characters"
+    );
+    let platform = current_platform();
+    let probe_spec = TrustedModelSpec {
+        model_id: spec.expected_model_id,
+        execution_profile: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+        n_layers: 2,
+        d_model: 64,
+        vocab_size: 32,
+        max_seq: 64,
+        eos_tokens: vec![2],
+        bos_token: 1,
+    };
+    let mut probe_config = CommunityShardWorkerConfig::new(
+        spec.coordinator_url.clone(),
+        spec.coordinator_id,
+        Some(spec.transaction_domain),
+        1,
+        worker_name.clone(),
+        "arc-2L-64d-1h-32v",
+        platform.clone(),
+    );
+    probe_config.allow_insecure_for_loopback = spec.allow_insecure_for_loopback;
+    probe_config.executor_config.max_kv_cache_bytes = spec.max_kv_cache_bytes;
+    let normalized_coordinator_url = probe_config
+        .validate(&probe_spec)
+        .context("invalid community shard worker CLI configuration")?;
+    Ok(ValidatedInputs {
+        normalized_coordinator_url,
+        worker_name,
+        platform,
+        max_kv_cache_bytes_u64,
+    })
 }
 
 fn validate_args_with_parallelism(
@@ -331,67 +467,8 @@ fn validate_args_with_parallelism(
         args.check_only || args.worker_key_file.is_some(),
         "--worker-key-file is required unless --check-only is set"
     );
-    ensure!(
-        args.max_working_set_bytes > 0,
-        "--max-working-set-bytes must be nonzero"
-    );
-    ensure!(
-        args.max_kv_cache_bytes > 0 && args.max_kv_cache_bytes <= MAX_KV_CACHE_BYTES_HARD_CAP,
-        "--max-kv-cache-bytes {} must be in 1..={MAX_KV_CACHE_BYTES_HARD_CAP}",
-        args.max_kv_cache_bytes
-    );
-    let max_kv_cache_bytes_u64 =
-        u64::try_from(args.max_kv_cache_bytes).context("--max-kv-cache-bytes exceeds u64 range")?;
-    ensure!(
-        args.max_working_set_bytes >= max_kv_cache_bytes_u64,
-        "--max-working-set-bytes ({}) must be at least --max-kv-cache-bytes ({})",
-        args.max_working_set_bytes,
-        args.max_kv_cache_bytes
-    );
-    if let Some(limit) = args.max_resident_layers {
-        let protocol_cap = MAX_MODEL_LAYERS_HARD_CAP.div_ceil(2);
-        ensure!(
-            limit >= 1 && limit <= protocol_cap,
-            "--max-resident-layers {limit} must be in 1..={protocol_cap}"
-        );
-    }
-    validate_thread_count(args.threads, available_parallelism)?;
-    let worker_name = args.worker_name.trim().to_string();
-    ensure!(
-        !worker_name.is_empty() && !worker_name.chars().any(char::is_control),
-        "--worker-name must be non-empty without control characters"
-    );
-    let platform = current_platform();
-    let probe_spec = TrustedModelSpec {
-        model_id: args.expected_model_id,
-        execution_profile: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
-        n_layers: 2,
-        d_model: 64,
-        vocab_size: 32,
-        max_seq: 64,
-        eos_tokens: vec![2],
-        bos_token: 1,
-    };
-    let mut probe_config = CommunityShardWorkerConfig::new(
-        args.coordinator_url.clone(),
-        args.coordinator_id,
-        Some(args.transaction_domain),
-        1,
-        worker_name.clone(),
-        "arc-2L-64d-1h-32v",
-        platform.clone(),
-    );
-    probe_config.allow_insecure_for_loopback = args.allow_insecure_for_loopback;
-    probe_config.executor_config.max_kv_cache_bytes = args.max_kv_cache_bytes;
-    let normalized_coordinator_url = probe_config
-        .validate(&probe_spec)
-        .context("invalid community shard worker CLI configuration")?;
-    Ok(ValidatedInputs {
-        normalized_coordinator_url,
-        worker_name,
-        platform,
-        max_kv_cache_bytes_u64,
-    })
+    let spec = ShardWorkerLaunchSpec::from_cli_args(args);
+    validate_launch_spec_with_parallelism(&spec, available_parallelism)
 }
 
 fn ensure_regular_model_file(path: &Path) -> Result<()> {
@@ -601,8 +678,8 @@ fn derive_all_roles_admission<A: ShardBudgetAdmitter>(
     })
 }
 
-fn prepare_model_blocking(
-    args: &CommunityShardWorkerArgs,
+pub(crate) fn prepare_launch_spec_blocking(
+    spec: &ShardWorkerLaunchSpec,
     validated: &ValidatedInputs,
     cancel: &AtomicBool,
 ) -> Result<PreparedWorker> {
@@ -610,20 +687,20 @@ fn prepare_model_blocking(
         !cancel.load(Ordering::Acquire),
         "model preparation canceled"
     );
-    ensure_regular_model_file(&args.model_path)?;
-    let artifact = ModelArtifactCommitment::from_path(&args.model_path).with_context(|| {
+    ensure_regular_model_file(&spec.model_path)?;
+    let artifact = ModelArtifactCommitment::from_path(&spec.model_path).with_context(|| {
         format!(
             "failed to compute BLAKE3 commitment for {}",
-            args.model_path.display()
+            spec.model_path.display()
         )
     })?;
     ensure!(
-        artifact.model_id() == args.expected_model_id,
+        artifact.model_id() == spec.expected_model_id,
         "model artifact {} BLAKE3 digest {} does not match pinned --expected-model-id {}; \
          refusing metadata parsing, key loading, or coordinator registration",
-        args.model_path.display(),
+        spec.model_path.display(),
         artifact.model_id().to_hex(),
-        args.expected_model_id.to_hex()
+        spec.expected_model_id.to_hex()
     );
     ensure!(
         !cancel.load(Ordering::Acquire),
@@ -633,18 +710,18 @@ fn prepare_model_blocking(
         CanonicalShardMetadata::from_committed_artifact(&artifact).with_context(|| {
             format!(
                 "failed to inspect committed model artifact {}",
-                args.model_path.display()
+                spec.model_path.display()
             )
         })?;
     ensure!(
         !cancel.load(Ordering::Acquire),
         "model preparation canceled"
     );
-    validate_metadata_against_protocol(&metadata, args.expected_model_id, artifact.size_bytes())?;
+    validate_metadata_against_protocol(&metadata, spec.expected_model_id, artifact.size_bytes())?;
     let admission = derive_all_roles_admission(
         &metadata,
-        args.max_resident_layers,
-        args.max_working_set_bytes,
+        spec.max_resident_layers,
+        spec.max_working_set_bytes,
         validated.max_kv_cache_bytes_u64,
     )?;
     let model_name = canonical_model_name(&metadata);
@@ -660,31 +737,32 @@ fn prepare_model_blocking(
     };
     let mut config = CommunityShardWorkerConfig::new(
         validated.normalized_coordinator_url.clone(),
-        args.coordinator_id,
-        Some(args.transaction_domain),
+        spec.coordinator_id,
+        Some(spec.transaction_domain),
         admission.admitted_max_resident_layers,
         validated.worker_name.clone(),
         model_name.clone(),
         validated.platform.clone(),
     );
-    config.allow_insecure_for_loopback = args.allow_insecure_for_loopback;
-    config.executor_config.max_kv_cache_bytes = args.max_kv_cache_bytes;
+    config.allow_insecure_for_loopback = spec.allow_insecure_for_loopback;
+    config.prevent_sleep_during_jobs = spec.prevent_sleep_during_jobs;
+    config.executor_config.max_kv_cache_bytes = spec.max_kv_cache_bytes;
     let normalized_coordinator_url = config
         .validate(&model_spec)
         .context("worker configuration failed validation against committed model spec")?;
     let report = AdmissionReport {
-        mode: if args.check_only { "check-only" } else { "run" },
+        mode: spec.report_mode,
         estimate_basis: ESTIMATE_BASIS_NOTE,
         role_placement_limitation: ROLE_PLACEMENT_LIMITATION_NOTE,
         coordinator_url: normalized_coordinator_url,
-        coordinator_id: args.coordinator_id.to_hex(),
-        transaction_domain: args.transaction_domain.to_hex(),
-        allow_insecure_for_loopback: args.allow_insecure_for_loopback,
+        coordinator_id: spec.coordinator_id.to_hex(),
+        transaction_domain: spec.transaction_domain.to_hex(),
+        allow_insecure_for_loopback: spec.allow_insecure_for_loopback,
         worker_name: validated.worker_name.clone(),
         platform: validated.platform.clone(),
-        threads: args.threads,
+        threads: spec.threads,
         model_name,
-        model_path: args.model_path.display().to_string(),
+        model_path: spec.model_path.display().to_string(),
         model_id: artifact.model_id().to_hex(),
         artifact_size_bytes: artifact.size_bytes(),
         execution_profile: metadata.canonical_profile().to_string(),
@@ -702,8 +780,8 @@ fn prepare_model_blocking(
         eos_tokens: metadata.eos_tokens().to_vec(),
         has_tied_output_head: metadata.has_tied_output_head(),
         header_bytes: metadata.header_bytes(),
-        max_working_set_bytes: args.max_working_set_bytes,
-        max_kv_cache_bytes: args.max_kv_cache_bytes,
+        max_working_set_bytes: spec.max_working_set_bytes,
+        max_kv_cache_bytes: spec.max_kv_cache_bytes,
         admission,
     };
     Ok(PreparedWorker {
@@ -713,6 +791,15 @@ fn prepare_model_blocking(
         config,
         report,
     })
+}
+
+fn prepare_model_blocking(
+    args: &CommunityShardWorkerArgs,
+    validated: &ValidatedInputs,
+    cancel: &AtomicBool,
+) -> Result<PreparedWorker> {
+    let spec = ShardWorkerLaunchSpec::from_cli_args(args);
+    prepare_launch_spec_blocking(&spec, validated, cancel)
 }
 
 #[derive(Clone, Copy)]
@@ -840,7 +927,7 @@ fn build_partial_model_loader(
     })
 }
 
-fn configure_global_rayon_pool(threads: usize) -> Result<()> {
+pub(crate) fn configure_global_rayon_pool(threads: usize) -> Result<()> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(|index| format!("arc-shard-rayon-{index}"))
@@ -951,14 +1038,7 @@ pub async fn run(args: CommunityShardWorkerArgs) -> Result<()> {
     )?);
     let worker_address = keypair.address();
     configure_global_rayon_pool(args.threads)?;
-    let loader = build_partial_model_loader(
-        Arc::clone(&prepared.artifact),
-        Arc::clone(&prepared.metadata),
-        args.expected_model_id,
-        prepared.report.admission.admitted_max_resident_layers,
-        args.max_working_set_bytes,
-        validated.max_kv_cache_bytes_u64,
-    );
+    let loader = prepared.build_loader()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let worker_future = run_community_shard_worker(
         prepared.config,
@@ -981,6 +1061,77 @@ pub async fn run(args: CommunityShardWorkerArgs) -> Result<()> {
     Ok(())
 }
 
+async fn drive_integrated_worker_task<F, Fut>(
+    report: AdmissionReport,
+    mut shutdown_rx: watch::Receiver<bool>,
+    run_worker: F,
+) where
+    F: FnOnce(watch::Receiver<bool>) -> Fut,
+    Fut: Future<Output = std::result::Result<WorkerRunSummary, CommunityShardWorkerError>>,
+{
+    if *shutdown_rx.borrow_and_update() {
+        tracing::info!(
+            coordinator_url = %report.coordinator_url,
+            "Integrated community shard worker skipped start because shutdown was already requested"
+        );
+        return;
+    }
+    tracing::info!(
+        coordinator_url = %report.coordinator_url,
+        coordinator_id = %report.coordinator_id,
+        transaction_domain = %report.transaction_domain,
+        model_id = %report.model_id,
+        model_name = %report.model_name,
+        admitted_max_resident_layers = report.admission.admitted_max_resident_layers,
+        threads = report.threads,
+        worker_name = %report.worker_name,
+        "Integrated community shard worker started"
+    );
+    match run_worker(shutdown_rx).await {
+        Ok(summary) => {
+            tracing::info!(
+                registrations = summary.registrations,
+                leases_acquired = summary.leases_acquired,
+                models_loaded = summary.models_loaded,
+                heartbeats_sent = summary.heartbeats_sent,
+                steps_executed = summary.steps_executed,
+                steps_submitted = summary.steps_submitted,
+                submit_retries = summary.submit_retries,
+                submit_stale_conflicts = summary.submit_stale_conflicts,
+                cancellations_applied = summary.cancellations_applied,
+                rebalances_completed = summary.rebalances_completed,
+                clean_release_sent = summary.clean_release_sent,
+                "Integrated community shard worker stopped at the lifecycle barrier"
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                coordinator_url = %report.coordinator_url,
+                "Integrated community shard worker exited with error"
+            );
+        }
+    }
+}
+
+pub(crate) fn spawn_integrated_worker(
+    prepared: PreparedWorker,
+    keypair: Arc<KeyPair>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<JoinHandle<()>> {
+    let loader = prepared.build_loader()?;
+    let report = prepared.report;
+    let config = prepared.config;
+    let model_spec = prepared.model_spec;
+    Ok(tokio::spawn(drive_integrated_worker_task(
+        report,
+        shutdown_rx,
+        move |worker_shutdown_rx| {
+            run_community_shard_worker(config, keypair, model_spec, loader, worker_shutdown_rx)
+        },
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,6 +1139,163 @@ mod tests {
     use arc_node::community_sharding::{LeaseId, ShardLayerRange};
     use clap::Parser;
     use std::sync::atomic::AtomicU64;
+
+    fn dummy_integrated_admission_report() -> AdmissionReport {
+        let role = RoleBudgetReport {
+            start_layer: 0,
+            end_layer: 1,
+            owned_layers: 1,
+            is_first_shard: true,
+            is_last_shard: false,
+            layer_weights_bytes: 1024,
+            first_embedding_bytes: 1024,
+            output_head_and_norm_bytes: 0,
+            reserved_kv_cache_bytes: 1024,
+            resident_payload_bytes: 2048,
+            resident_budget_bytes: 3072,
+            peak_loading_transient_bytes: 512,
+            peak_loading_budget_bytes: 3584,
+        };
+        AdmissionReport {
+            mode: "integrated",
+            estimate_basis: ESTIMATE_BASIS_NOTE,
+            role_placement_limitation: ROLE_PLACEMENT_LIMITATION_NOTE,
+            coordinator_url: "https://coordinator.example.com".to_string(),
+            coordinator_id: Hash256([0x11; 32]).to_hex(),
+            transaction_domain: Hash256([0x22; 32]).to_hex(),
+            allow_insecure_for_loopback: false,
+            worker_name: "worker-integrated".to_string(),
+            platform: current_platform(),
+            threads: DEFAULT_WORKER_THREADS,
+            model_name: "arc-2L-64d-1h-32v".to_string(),
+            model_path: "/tmp/model.gguf".to_string(),
+            model_id: Hash256([0x33; 32]).to_hex(),
+            artifact_size_bytes: 4096,
+            execution_profile: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+            architecture: "llama".to_string(),
+            n_layers: 2,
+            d_model: 64,
+            n_heads: 1,
+            n_kv_heads: 1,
+            d_ff: 128,
+            d_kv: 64,
+            d_head: 64,
+            vocab_size: 32,
+            max_seq: 64,
+            bos_token: 1,
+            eos_tokens: vec![2],
+            has_tied_output_head: false,
+            header_bytes: 512,
+            max_working_set_bytes: 512 * 1024 * 1024,
+            max_kv_cache_bytes: DEFAULT_MAX_KV_CACHE_BYTES,
+            admission: AllRolesAdmissionReport {
+                protocol_max_resident_layers: 1,
+                requested_max_resident_layers: None,
+                admitted_max_resident_layers: 1,
+                worst_case_resident_budget_bytes: 3072,
+                worst_case_peak_loading_budget_bytes: 3584,
+                first_role: role.clone(),
+                last_role: role,
+                interior_role: None,
+            },
+        }
+    }
+
+    fn sample_integrated_launch_spec(model_path: PathBuf) -> ShardWorkerLaunchSpec {
+        ShardWorkerLaunchSpec {
+            coordinator_url: "https://coordinator.example.com".to_string(),
+            coordinator_id: Hash256([0x11; 32]),
+            transaction_domain: Hash256([0x22; 32]),
+            expected_model_id: Hash256([0x33; 32]),
+            model_path,
+            worker_name: "worker-integrated".to_string(),
+            max_working_set_bytes: 512 * 1024 * 1024,
+            max_kv_cache_bytes: DEFAULT_MAX_KV_CACHE_BYTES,
+            max_resident_layers: None,
+            threads: DEFAULT_WORKER_THREADS,
+            allow_insecure_for_loopback: false,
+            report_mode: "integrated",
+            prevent_sleep_during_jobs: false,
+        }
+    }
+
+    #[test]
+    fn integrated_shard_worker_shared_prepare_cancels_when_shutdown_flag_set() {
+        let spec = sample_integrated_launch_spec(PathBuf::from("/nonexistent/model.gguf"));
+        let validated = validate_launch_spec_with_parallelism(&spec, 4).unwrap();
+        let cancel = AtomicBool::new(true);
+        let error = prepare_launch_spec_blocking(&spec, &validated, &cancel)
+            .err()
+            .expect("canceled preparation must fail");
+        assert!(error.to_string().contains("model preparation canceled"));
+    }
+
+    #[test]
+    fn integrated_shard_worker_shared_prepare_rejects_unpinned_model_before_metadata_parse() {
+        static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "arc-integrated-shard-mismatch-{}-{seq}.gguf",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"not-a-valid-gguf-header").unwrap();
+        let spec = sample_integrated_launch_spec(path.clone());
+        let validated = validate_launch_spec_with_parallelism(&spec, 4).unwrap();
+        let cancel = AtomicBool::new(false);
+        let result = prepare_launch_spec_blocking(&spec, &validated, &cancel);
+        let _ = std::fs::remove_file(&path);
+        let error = result.err().expect("mismatched digest must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match pinned --expected-model-id")
+        );
+    }
+
+    #[tokio::test]
+    async fn integrated_shard_worker_runtime_task_drains_before_join_returns() {
+        let (runtime_shutdown_tx, runtime_shutdown_rx) = watch::channel(false);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let drained = Arc::new(AtomicBool::new(false));
+        let drained_task = Arc::clone(&drained);
+        let runtime_task = tokio::spawn(drive_integrated_worker_task(
+            dummy_integrated_admission_report(),
+            runtime_shutdown_rx,
+            move |mut shutdown_rx| async move {
+                let _ = started_tx.send(());
+                let _ = shutdown_rx.changed().await;
+                assert!(*shutdown_rx.borrow());
+                drained_task.store(true, Ordering::Release);
+                Ok(WorkerRunSummary {
+                    clean_release_sent: true,
+                    ..Default::default()
+                })
+            },
+        ));
+        started_rx.await.unwrap();
+        assert!(!drained.load(Ordering::Acquire));
+        let _ = runtime_shutdown_tx.send(true);
+        runtime_task.await.unwrap();
+        assert!(drained.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn integrated_shard_worker_skips_start_when_shutdown_already_requested() {
+        let (runtime_shutdown_tx, runtime_shutdown_rx) = watch::channel(false);
+        let _ = runtime_shutdown_tx.send(true);
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_task = Arc::clone(&entered);
+        drive_integrated_worker_task(
+            dummy_integrated_admission_report(),
+            runtime_shutdown_rx,
+            move |_shutdown_rx| async move {
+                entered_task.store(true, Ordering::Release);
+                Ok(WorkerRunSummary::default())
+            },
+        )
+        .await;
+        assert!(!entered.load(Ordering::Acquire));
+    }
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -1314,8 +1622,7 @@ mod tests {
         assert!(derive_all_roles_admission(&admitter, Some(17), 10_000, 100).is_err());
 
         let too_tight = derive_all_roles_admission(&admitter, None, 700, 100)
-            .err()
-            .expect("first embedding exceeding 1-layer budget must fail")
+            .expect_err("first embedding exceeding 1-layer budget must fail")
             .to_string();
         assert!(
             too_tight.contains("cannot admit even 1 resident layer"),
@@ -1536,8 +1843,7 @@ mod tests {
                 std::future::ready("SIGINT"),
             )
             .await
-            .err()
-            .expect("already-pending shutdown signal must abort preparation");
+            .expect_err("already-pending shutdown signal must abort preparation");
             assert!(cancel.load(Ordering::Acquire));
             assert!(err.to_string().contains("shutdown requested (SIGINT)"));
         }
