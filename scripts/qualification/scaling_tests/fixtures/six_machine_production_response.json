@@ -1,0 +1,229 @@
+{
+  "source_workflow_run_id": "45934137869",
+  "source_workflow_run_attempt": "1",
+  "source_controller_evidence_sha256": "98c96cc43b175e4d67536999f295e31ce2d7d5654952263a8383315750c67b8f",
+  "classification": "captured_prior_ephemeral_ci_production_responses_not_new_measurement",
+  "counts_toward_operator_target": false,
+  "dispatches": [
+    {
+      "response": {
+        "execution_profile": "INT8 integer (per-row, cross-platform deterministic)",
+        "generated_tokens": [
+          29991,
+          306
+        ],
+        "model_id": "0x934efc12a2ed8372a944e5aaedf059a8a0f42c0906f6b2f1fb3626bdeb1ffa67",
+        "model_name": "arc-32L-4096d-32h-32000v",
+        "output": "! I",
+        "output_hash": "0x4c615983e03012d8570ab21134d444ed13839ac5ff5a1d711d13c11c1fdd542d",
+        "participant_identity_basis": "node_key_not_proof_of_independent_operator",
+        "participants": [
+          {
+            "lease_epoch": 1,
+            "lease_id": {
+              "boot_nonce": "bfbaef6eddd6ffed7f32c59968ac160970beb2f74110c01e0c3c88eb1ef86554",
+              "seq": 18
+            },
+            "range": {
+              "end_layer": 6,
+              "start_layer": 0
+            },
+            "worker_id": "0xb4816d5b5347e7b395fa9b212ed7c248a1c520cd68854ff132f25da35714b0db"
+          },
+          {
+            "lease_epoch": 1,
+            "lease_id": {
+              "boot_nonce": "bfbaef6eddd6ffed7f32c59968ac160970beb2f74110c01e0c3c88eb1ef86554",
+              "seq": 19
+            },
+            "range": {
+              "end_layer": 12,
+              "start_layer": 6
+            },
+            "worker_id": "0xdf1cc8d2dcc83ff1daef7804a8721bb2080ca7b6cc40c69bcf87db8234933512"
+          },
+          {
+            "lease_epoch": 1,
+            "lease_id": {
+              "boot_nonce": "bfbaef6eddd6ffed7f32c59968ac160970beb2f74110c01e0c3c88eb1ef86554",
+              "seq": 20
+            },
+            "range": {
+              "end_layer": 17,
+              "start_layer": 12
+            },
+            "worker_id": "0xfe01790e50b7d308f1dc26e25fd567f4a44c2b70fa27785476e65730839f692e"
+          },
+          {
+            "lease_epoch": 1,
+            "lease_id": {
+              "boot_nonce": "bfbaef6eddd6ffed7f32c59968ac160970beb2f74110c01e0c3c88eb1ef86554",
+              "seq": 21
+            },
+            "range": {
+              "end_layer": 22,
+              "start_layer": 17
+            },
+            "worker_id": "0xd6ed641434c7ff6d600b93de967fcc636892e05dbbe50e4db98e636d94dee7e7"
+          },
+          {
+            "lease_epoch": 1,
+            "lease_id": {
+              "boot_nonce": "bfbaef6eddd6ffed7f32c59968ac160970beb2f74110c01e0c3c88eb1ef86554",
+              "seq": 22
+            },
+            "range": {
+              "end_layer": 27,
+              "start_layer": 22
+            },
+            "worker_id": "0x568d1e66cc6965e2573c9aeb30ea522e1b1cfd38b0573016af00a52469bdf7ac"
+          },
+          {
+            "lease_epoch": 1,
+            "lease_id": {
+              "boot_nonce": "bfbaef6eddd6ffed7f32c59968ac160970beb2f74110c01e0c3c88eb1ef86554",
+              "seq": 23
+            },
+            "range": {
+              "end_layer": 32,
+              "start_layer": 27
+            },
+            "worker_id": "0xaa2d8acb59f7438fb1da9d4f76297db865c5683d7e2c9610bd926223b49625c3"
+          }
+        ],
+        "protocol_version": 1,
+        "reward_eligible": false,
+        "rewards_enabled": false,
+        "session_id": {
+          "boot_nonce": "bfbaef6eddd6ffed7f32c59968ac160970beb2f74110c01e0c3c88eb1ef86554",
+          "seq": 2
+        },
+        "stopped_by_eos": false,
+        "tokens_generated": 2,
+        "total_ms": 25265,
+        "verification": {
+          "execution_profile": "INT8 integer (per-row, cross-platform deterministic)",
+          "method": "authenticated_shard_quorum_2_of_3_per_range",
+          "output_hash": "0x4c615983e03012d8570ab21134d444ed13839ac5ff5a1d711d13c11c1fdd542d",
+          "profile_bound": true,
+          "quorum_verified": true,
+          "range_position_quorums": 24,
+          "ranges": 6,
+          "replicas_contacted_per_quorum": 3,
+          "signatures_required_per_quorum": 2,
+          "tokens_generated": 2
+        }
+      }
+    },
+    {
+      "response": {
+        "execution_profile": "INT8 integer (per-row, cross-platform deterministic)",
+        "generated_tokens": [
+          29991,
+          306
+        ],
+        "model_id": "0x934efc12a2ed8372a944e5aaedf059a8a0f42c0906f6b2f1fb3626bdeb1ffa67",
+        "model_name": "arc-32L-4096d-32h-32000v",
+        "output": "! I",
+        "output_hash": "0x4c615983e03012d8570ab21134d444ed13839ac5ff5a1d711d13c11c1fdd542d",
+        "participant_identity_basis": "node_key_not_proof_of_independent_operator",
+        "participants": [
+          {
+            "lease_epoch": 1,
+            "lease_id": {
+              "boot_nonce": "bfbaef6eddd6ffed7f32c59968ac160970beb2f74110c01e0c3c88eb1ef86554",
+              "seq": 18
+            },
+            "range": {
+              "end_layer": 6,
+              "start_layer": 0
+            },
+            "worker_id": "0xb4816d5b5347e7b395fa9b212ed7c248a1c520cd68854ff132f25da35714b0db"
+          },
+          {
+            "lease_epoch": 1,
+            "lease_id": {
+              "boot_nonce": "bfbaef6eddd6ffed7f32c59968ac160970beb2f74110c01e0c3c88eb1ef86554",
+              "seq": 19
+            },
+            "range": {
+              "end_layer": 12,
+              "start_layer": 6
+            },
+            "worker_id": "0xdf1cc8d2dcc83ff1daef7804a8721bb2080ca7b6cc40c69bcf87db8234933512"
+          },
+          {
+            "lease_epoch": 1,
+            "lease_id": {
+              "boot_nonce": "bfbaef6eddd6ffed7f32c59968ac160970beb2f74110c01e0c3c88eb1ef86554",
+              "seq": 20
+            },
+            "range": {
+              "end_layer": 17,
+              "start_layer": 12
+            },
+            "worker_id": "0xfe01790e50b7d308f1dc26e25fd567f4a44c2b70fa27785476e65730839f692e"
+          },
+          {
+            "lease_epoch": 1,
+            "lease_id": {
+              "boot_nonce": "bfbaef6eddd6ffed7f32c59968ac160970beb2f74110c01e0c3c88eb1ef86554",
+              "seq": 21
+            },
+            "range": {
+              "end_layer": 22,
+              "start_layer": 17
+            },
+            "worker_id": "0xd6ed641434c7ff6d600b93de967fcc636892e05dbbe50e4db98e636d94dee7e7"
+          },
+          {
+            "lease_epoch": 1,
+            "lease_id": {
+              "boot_nonce": "bfbaef6eddd6ffed7f32c59968ac160970beb2f74110c01e0c3c88eb1ef86554",
+              "seq": 22
+            },
+            "range": {
+              "end_layer": 27,
+              "start_layer": 22
+            },
+            "worker_id": "0x568d1e66cc6965e2573c9aeb30ea522e1b1cfd38b0573016af00a52469bdf7ac"
+          },
+          {
+            "lease_epoch": 1,
+            "lease_id": {
+              "boot_nonce": "bfbaef6eddd6ffed7f32c59968ac160970beb2f74110c01e0c3c88eb1ef86554",
+              "seq": 23
+            },
+            "range": {
+              "end_layer": 32,
+              "start_layer": 27
+            },
+            "worker_id": "0xaa2d8acb59f7438fb1da9d4f76297db865c5683d7e2c9610bd926223b49625c3"
+          }
+        ],
+        "protocol_version": 1,
+        "reward_eligible": false,
+        "rewards_enabled": false,
+        "session_id": {
+          "boot_nonce": "bfbaef6eddd6ffed7f32c59968ac160970beb2f74110c01e0c3c88eb1ef86554",
+          "seq": 3
+        },
+        "stopped_by_eos": false,
+        "tokens_generated": 2,
+        "total_ms": 23941,
+        "verification": {
+          "execution_profile": "INT8 integer (per-row, cross-platform deterministic)",
+          "method": "authenticated_shard_quorum_2_of_3_per_range",
+          "output_hash": "0x4c615983e03012d8570ab21134d444ed13839ac5ff5a1d711d13c11c1fdd542d",
+          "profile_bound": true,
+          "quorum_verified": true,
+          "range_position_quorums": 24,
+          "ranges": 6,
+          "replicas_contacted_per_quorum": 3,
+          "signatures_required_per_quorum": 2,
+          "tokens_generated": 2
+        }
+      }
+    }
+  ]
+}
