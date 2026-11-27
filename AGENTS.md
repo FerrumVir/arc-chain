@@ -315,6 +315,10 @@ unresolved shutdown recovery retain observer mode. An absent pin preserves the
 whole-worker path for rollback tests.
 Settings reads preserve saved compute choices and model selection. Memory limits
 apply to the launch configuration without inventing a saved compute opt-out.
+Desktop lifecycle and private-directory namespace ownership explicitly unlock
+when released, so an inherited duplicate descriptor cannot retain an aborted
+update's ownership. A duplicate closing later cannot release the next owner's
+independently acquired lock.
 Launches serialize the node guard before reading current saved settings, and a
 newer lifecycle action cancels a pending launch. Settings writers release the
 store guard before waiting for the node. Interrupted shutdown retains the child,
@@ -470,6 +474,24 @@ when local resource limits prohibit compilation.
   node addresses must be authenticated validator identities from signed shard
   announcements; malformed identities fail closed. A model hash is never a
   node address (`crates/arc-node/src/rpc.rs`, `compute_auto_shard_plan`).
+
+The manual community-shard qualification workflows use temporary GitHub-hosted
+workers and never count them toward an operator target. The scaling qualification
+binds twelve distinct machine boots and measures six sequential requests on six
+workers, six requests at concurrency two on twelve workers, then six sequential
+requests after the added workers leave. It records client timing, exact participants,
+and server-reported verification; it does not prove unbounded scaling or independent
+client verification. Phase artifacts bind workflow, attempt and cohort digest.
+Cleanup proves each owned worker released its lease and deleted its temporary key.
+The controller never retries an inference POST. These workflows require an exact
+completed Linux candidate and a quiet coordinator; do not overlap them with a
+coordinator restart or count synthetic fixtures as measured performance.
+The bounded phase-evidence parser reads the production text formatter inside
+journal JSON `MESSAGE` fields and joins only supplied, independently validated
+response session keys. It preserves missing and aborted phases, rejects duplicate
+events and malformed target records, and does not infer server concurrency or
+request success. Its formatter fixtures are synthetic until a deployed capture
+has been checked; the parser's regression tests run in the script-suite CI gate.
 
 ## Releases and versions
 
