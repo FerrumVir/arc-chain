@@ -36,13 +36,13 @@ def _max_concurrency(intervals: list[tuple[int, int]]) -> int:
     return peak
 
 
-def _analyze_arm(name: str, arm: Mapping[str, object], worker_count: int, cap: int, seen_ids: set[str]) -> tuple[frozenset[str], int, int, str, dict[str, int | float]]:
+def _analyze_arm(name: str, arm: Mapping[str, object], worker_count: int, cap: int, seen_ids: set[str], request_count: int = 6) -> tuple[frozenset[str], int, int, str, dict[str, int | float]]:
     if not isinstance(arm, Mapping) or set(arm.keys()) != _ARM_KEYS:
         raise ValueError(f"{name} arm keys must equal {sorted(_ARM_KEYS)}")
     workers = _worker_set(arm["workers"], worker_count, f"{name}.workers")
     requests = arm["requests"]
-    if not isinstance(requests, (list, tuple)) or len(requests) != 6:
-        raise ValueError(f"{name}.requests must have exactly 6 records")
+    if not isinstance(requests, (list, tuple)) or len(requests) != request_count:
+        raise ValueError(f"{name}.requests must have exactly {request_count} records")
     intervals: list[tuple[int, int]] = []
     participating: set[str] = set()
     hashes: set[str] = set()
@@ -78,13 +78,37 @@ def _analyze_arm(name: str, arm: Mapping[str, object], worker_count: int, cap: i
     latencies = sorted((e - s) / _NS_PER_S for s, e in intervals)
     metrics: dict[str, int | float] = {
         "worker_count": worker_count, "participating_worker_count": len(participating),
-        "completed_requests": 6, "wall_seconds": wall_ns / _NS_PER_S,
-        "throughput_rps": (6 * _NS_PER_S) / wall_ns, "observed_max_concurrency": observed_max,
+        "completed_requests": request_count, "wall_seconds": wall_ns / _NS_PER_S,
+        "throughput_rps": (request_count * _NS_PER_S) / wall_ns, "observed_max_concurrency": observed_max,
         "median_latency_s": _percentile(latencies, 50.0), "p95_latency_s": _percentile(latencies, 95.0),
     }
     return workers, first_start, last_end, next(iter(hashes)), metrics
 
 
+def analyze_overlap(before: Mapping[str, object], overlap: Mapping[str, object], after: Mapping[str, object]) -> dict[str, object]:
+    seen_ids: set[str] = set()
+    b_w, _, b_end, b_h, b_m = _analyze_arm("baseline_before", before, 12, 2, seen_ids, 6)
+    e_w, e_start, e_end, e_h, e_m = _analyze_arm("overlap", overlap, 12, 4, seen_ids, 12)
+    a_w, a_start, _, a_h, a_m = _analyze_arm("baseline_after", after, 12, 2, seen_ids, 6)
+    if a_w != b_w or e_w != b_w:
+        raise ValueError("all overlap arms must use the same twelve workers")
+    if len({b_h, e_h, a_h}) != 1:
+        raise ValueError("all arms must share one deterministic output_hash")
+    if b_end > e_start or e_end > a_start:
+        raise ValueError("overlap arms must finish in order without overlapping windows")
+    for metrics in (b_m, e_m, a_m):
+        metrics["observed_client_in_flight_peak"] = metrics.pop("observed_max_concurrency")
+    b_rps, e_rps, a_rps = float(b_m["throughput_rps"]), float(e_m["throughput_rps"]), float(a_m["throughput_rps"])
+    baseline = (b_rps + a_rps) / 2.0
+    return {
+        "status": "measured_only", "experiment": "fixed_twelve_worker_verification_overlap",
+        "no_real_operator_count": True, "throughput_ratio_is_measurement_only": True,
+        "client_intervals_are_not_server_admission": True, "verification_basis": "server_reported_only",
+        "output_hash": b_h, "offered_concurrency_caps": [2, 4, 2],
+        "arms": {"baseline_before": b_m, "overlap": e_m, "baseline_after": a_m},
+        "comparison": {"baseline_mean_throughput_rps": baseline, "overlap_throughput_rps": e_rps,
+                       "throughput_ratio": e_rps / baseline, "baseline_drift": abs(a_rps - b_rps) / baseline},
+    }
 def analyze_scaling(before: Mapping[str, object], expanded: Mapping[str, object], after: Mapping[str, object]) -> dict[str, object]:
     seen_ids: set[str] = set()
     b_w, _, b_end, b_h, b_m = _analyze_arm("before", before, 6, 1, seen_ids)

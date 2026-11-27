@@ -8,6 +8,7 @@ import time
 import community_shard_six_machine as qual
 import scaling_benchmark
 import scaling_controller
+import experiment_profile as experiments
 
 SCHEMA = 'arc.community-shard-scaling.cohort.v1'
 PHASES = ('before', 'expanded', 'after')
@@ -55,6 +56,7 @@ def list_artifacts(workflow, token, deadline):
 
 
 def initialize(args):
+    profile = experiments.select(getattr(args, 'mode', 'scaling'))
     out = Path(args.output_dir)
     deadline = time.monotonic() + INITIALIZATION_TIMEOUT_SECONDS
     need(not (out / 'cohort.json').exists(), 'cohort already initialized; use this run evidence without restarting phases')
@@ -91,7 +93,7 @@ def initialize(args):
     qual.assert_status_no_external_interference(status, max_workers=0)
     boot = qual.normalize_hex64(status['status']['boot_nonce'], 'coordinator boot nonce')
     scaling_controller._verify_status_pins_and_health(status, boot)
-    cohort = {'schema': SCHEMA, 'workflow_run_id': run, 'workflow_run_attempt': attempt,
+    cohort = {'schema': profile.schema('cohort'), 'workflow_run_id': run, 'workflow_run_attempt': attempt,
               'candidate_run_id': candidate, 'candidate_run_attempt': candidate_attempt, 'candidate_sha': source,
               'coordinator_boot_nonce': boot, 'identities': [normalized[slot] for slot in qual.SCALING_SLOTS],
               'classification': 'ephemeral_ci', 'counts_toward_operator_target': False,
@@ -102,37 +104,37 @@ def initialize(args):
     print(json.dumps({'cohort_sha256': digest, 'distinct_machines': 12, 'counts_toward_operator_target': False}))
 
 
-def read_cohort(directory):
+def read_cohort(directory, profile=experiments.SCALING):
     path = directory / 'cohort.json'
     need(path.is_file() and not path.is_symlink(), 'cohort must be a regular local evidence file')
     with path.open('rb') as stream:
         raw = stream.read(qual.MAX_JSON_FILE_BYTES + 1)
     need(len(raw) <= qual.MAX_JSON_FILE_BYTES, 'cohort exceeds evidence bound')
     cohort = json.loads(raw)
-    need(cohort.get('schema') == SCHEMA and cohort.get('counts_toward_operator_target') is False, 'invalid scaling cohort scope')
+    need(cohort.get('schema') == profile.schema('cohort') and cohort.get('counts_toward_operator_target') is False, 'invalid experiment cohort scope')
     expected = qual.read_bounded_json_file(directory / 'cohort-digest.json')['cohort_sha256']
     need(hashlib.sha256(raw).hexdigest() == expected, 'cohort bytes changed after initialization')
     identities = qual.validate_worker_identities(cohort['identities'], cohort['workflow_run_id'], cohort['workflow_run_attempt'], cohort['candidate_run_id'], cohort['candidate_run_attempt'], cohort['candidate_sha'], expected_slots=qual.SCALING_SLOTS)
     return cohort, identities, expected
 
 
-def validate_phase_order(directory, name):
-    need(name in PHASES, 'unknown scaling arm')
-    for phase in PHASES[:PHASES.index(name)]:
+def validate_phase_order(directory, name, profile=experiments.SCALING):
+    index = profile.phase_index(name)
+    for phase in profile.phases[:index]:
         need((directory / (phase + '-attempts.json')).is_file(), 'previous arm evidence missing: ' + phase)
         report = qual.read_bounded_json_file(directory / (phase + '-attempts.json'))
         need(report.get('arm_status') == 'succeeded', 'previous arm did not succeed: ' + phase)
         need((directory / (phase + '-arm.json')).is_file(), 'previous arm measurement missing: ' + phase)
-    need(not any((directory / (phase + suffix)).exists() or (directory / (phase + suffix)).is_symlink() for phase in PHASES[PHASES.index(name):] for suffix in ('-arm.json', '-attempts.json')), 'phase already attempted or later phase evidence exists; do not repeat inference POSTs')
-    need(not (directory / 'scaling-measurement.json').exists(), 'scaling measurement already exists')
+    need(not any((directory / (phase + suffix)).exists() or (directory / (phase + suffix)).is_symlink() for phase in profile.phases[index:] for suffix in ('-arm.json', '-attempts.json')), 'phase already attempted or later phase evidence exists; do not repeat inference POSTs')
+    need(not (directory / profile.measurement_file).exists(), 'experiment measurement already exists')
 
 
-def compare_phase_responses(directory, phases):
+def compare_phase_responses(directory, phases, profile=experiments.SCALING):
     sessions = set()
     baseline = None
     for phase in phases:
         report = qual.read_bounded_json_file(directory / (phase + '-attempts.json'))
-        need(report.get('arm_status') == 'succeeded' and len(report['attempts']) == 6, 'incomplete arm evidence: ' + phase)
+        need(report.get('arm_status') == 'succeeded' and len(report['attempts']) == profile.requests(phase), 'incomplete arm evidence: ' + phase)
         for attempt in report['attempts']:
             need(attempt['status'] == 'succeeded' and attempt['dispatch_uncertain'] is False, 'uncertain or failed dispatch cannot count')
             response = attempt['parsed_response']
@@ -147,10 +149,13 @@ def compare_phase_responses(directory, phases):
                     raise difference
 
 
-def reconstruct_arm(name, report, expected_workers, boot):
+def reconstruct_arm(name, report, expected_workers, boot, profile=experiments.SCALING):
     need(report.get('arm_status') == 'succeeded', 'arm did not succeed: ' + name)
+    phase_index = profile.phase_index(name)
+    if profile is experiments.OVERLAP:
+        need(report.get('experiment_mode') == 'overlap' and report.get('max_concurrency') == profile.offered_caps[phase_index], 'overlap attempt evidence has wrong experiment or offered cap')
     attempts = report.get('attempts')
-    need(isinstance(attempts, list) and len(attempts) == 6, 'arm must contain six exact dispatch attempts')
+    need(isinstance(attempts, list) and len(attempts) == profile.requests(name), 'arm must contain its exact dispatch attempt count')
     requests = []
     for index, attempt in enumerate(attempts, 1):
         need(attempt.get('id') == name + '-' + str(index), 'attempt identity or order changed')
@@ -168,32 +173,39 @@ def reconstruct_arm(name, report, expected_workers, boot):
 
 
 def measure(args):
+    profile = experiments.select(getattr(args, 'mode', 'scaling'))
     directory = Path(args.output_dir)
-    cohort, identities, _ = read_cohort(directory)
-    validate_phase_order(directory, args.name)
-    slots = qual.SCALING_SLOTS if args.name == 'expanded' else qual.EXPECTED_SLOTS
+    cohort, identities, _ = read_cohort(directory, profile)
+    validate_phase_order(directory, args.name, profile)
+    slots = profile.slots(args.name)
     workers = {identities[slot]['worker_id'] for slot in slots}
-    prior_phases = PHASES[:PHASES.index(args.name)]
+    prior_phases = profile.phases[:profile.phase_index(args.name)]
     baseline_response = None
     prior_sessions = set()
     for previous_phase in prior_phases:
-        previous_slots = qual.SCALING_SLOTS if previous_phase == 'expanded' else qual.EXPECTED_SLOTS
+        previous_slots = profile.slots(previous_phase)
         previous_workers = {identities[slot]['worker_id'] for slot in previous_slots}
         report = qual.read_bounded_json_file(directory / (previous_phase + '-attempts.json'))
-        reconstructed = reconstruct_arm(previous_phase, report, previous_workers, cohort['coordinator_boot_nonce'])
+        reconstructed = reconstruct_arm(previous_phase, report, previous_workers, cohort['coordinator_boot_nonce'], profile)
         need(reconstructed == qual.read_bounded_json_file(directory / (previous_phase + '-arm.json')), 'previous phase measurement changed')
         for attempt in report['attempts']:
             response = attempt['parsed_response']
             baseline_response = response if baseline_response is None else baseline_response
             prior_sessions.add((qual.normalize_hex64(response['session_id']['boot_nonce'], 'prior session boot'), response['session_id']['seq']))
-    compare_phase_responses(directory, prior_phases)
-    arm = scaling_controller.run_arm(args.name, workers, directory / (args.name + '-attempts.json'), cohort['coordinator_boot_nonce'], expected_baseline_response=baseline_response, prior_session_keys=prior_sessions)
-    compare_phase_responses(directory, PHASES[:PHASES.index(args.name) + 1])
+    compare_phase_responses(directory, prior_phases, profile)
+    if profile is experiments.OVERLAP:
+        from overlap_controller import run_overlap_arm
+        execute = run_overlap_arm
+    else:
+        execute = scaling_controller.run_arm
+    arm = execute(args.name, workers, directory / (args.name + '-attempts.json'), cohort['coordinator_boot_nonce'], expected_baseline_response=baseline_response, prior_session_keys=prior_sessions)
+    compare_phase_responses(directory, profile.phases[:profile.phase_index(args.name) + 1], profile)
     write_new(directory / (args.name + '-arm.json'), arm)
-    if args.name == 'after':
-        arms = [qual.read_bounded_json_file(directory / (phase + '-arm.json')) for phase in PHASES]
-        summary = scaling_benchmark.analyze_scaling(*arms)
-        write_new(directory / 'scaling-measurement.json', summary)
+    if args.name == profile.phases[-1]:
+        arms = [qual.read_bounded_json_file(directory / (phase + '-arm.json')) for phase in profile.phases]
+        analyze = scaling_benchmark.analyze_overlap if profile is experiments.OVERLAP else scaling_benchmark.analyze_scaling
+        summary = analyze(*arms)
+        write_new(directory / profile.measurement_file, summary)
         print(json.dumps(summary))
     else:
         print(json.dumps({'arm': args.name, 'completed_requests': len(arm['requests']), 'workers': len(arm['workers'])}))
@@ -206,8 +218,10 @@ def main():
     for key in ('workflow-run-id', 'workflow-run-attempt', 'candidate-run-id', 'candidate-run-attempt', 'candidate-sha', 'output-dir'):
         initialize_parser.add_argument('--' + key, required=True)
     initialize_parser.set_defaults(function=initialize)
+    initialize_parser.add_argument('--mode', choices=('scaling', 'overlap'), default='scaling')
     measure_parser = commands.add_parser('arm')
-    measure_parser.add_argument('name', choices=PHASES)
+    measure_parser.add_argument('name', choices=(*experiments.SCALING.phases, *experiments.OVERLAP.phases))
+    measure_parser.add_argument('--mode', choices=('scaling', 'overlap'), default='scaling')
     measure_parser.add_argument('--output-dir', required=True)
     measure_parser.set_defaults(function=measure)
     args = parser.parse_args()

@@ -214,6 +214,8 @@ def _check_consistency(base: dict[str, Any], cur: dict[str, Any], base_id: str, 
 def _dispatch_one(
     store: EvidenceStore, arm_name: str, index: int, expected_workers: set[str],
     expected_boot: str, get_monotonic_ns: Callable[[], int],
+    timeout_seconds: float = DISPATCH_TIMEOUT_SECONDS,
+    request_once_fn: Callable[..., tuple[int, Any, int]] | None = None,
 ) -> dict[str, Any]:
     req_id, payload = f"{arm_name}-{index}", copy.deepcopy(qual.DISPATCH_PAYLOAD)
     start_ns = get_monotonic_ns()
@@ -223,8 +225,9 @@ def _dispatch_one(
         store.update_attempt(req_id, status="failed", error=str(err))
         return {"index": index, "error": err}
     try:
-        http_status, parsed_response, _ = qual.coordinator_request_once(
-            "POST", qual.DISPATCH_PATH, DISPATCH_TIMEOUT_SECONDS, json_body=payload,
+        request_once = qual.coordinator_request_once if request_once_fn is None else request_once_fn
+        http_status, parsed_response, _ = request_once(
+            "POST", qual.DISPATCH_PATH, timeout_seconds, json_body=payload,
         )
     except EXPECTED_EXCEPTIONS as exc:
         end_ns = get_monotonic_ns()

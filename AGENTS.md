@@ -351,7 +351,7 @@ pins, a private worker key, and an explicit RAM budget. `--check-only` inspects
 admission without keys, network registration or tensor loading. Run mode uses one
 compute thread by default and drains work on shutdown. Its conservative admission
 requires capacity for all shard roles because role-aware placement is not yet
-implemented. Desktop activation still needs integration. Network tests use small
+implemented. The desktop uses the managed integration described above. Network tests use small
 canonical fixtures; they do not establish deployed capacity or operator availability.
 
 `load_cached_model_shard_canonical_i8` reads only its assigned layer weights
@@ -434,7 +434,7 @@ when local resource limits prohibit compilation.
 
 - A coordinator receives `POST /inference/run` (`rpc.rs:2763`, `8212`) and
   runs at most 2 public jobs at once (`rpc.rs:179`).
-- A community job is never split. One stake-0 worker runs every layer
+- A legacy whole-worker community job is never split. One stake-0 worker runs every layer
   (`main.rs:435-446`, `8461-8467`, `9189-9206`); the job carries no layer
   range (`rpc.rs:14626-14664`).
 - Twin execution, off by default, runs the same job on two workers and
@@ -492,6 +492,15 @@ response session keys. It preserves missing and aborted phases, rejects duplicat
 events and malformed target records, and does not infer server concurrency or
 request success. Its formatter fixtures are synthetic until a deployed capture
 has been checked; the parser's regression tests run in the script-suite CI gate.
+The optional overlap experiment keeps twelve temporary machines for all three
+arms and offers concurrency two, four, then two, with six, twelve, then six
+requests. Its cohort, phase, supervisor and summary schemas are distinct from
+worker-count scaling. Every machine starts with the cohort and stops on the
+verified completion marker. Client HTTP intervals remain separate from server
+phase timings; neither proves server admission concurrency. Phase reports first
+snapshot and validate the bounded controller files, then correlate supplied
+journal records without publishing raw logs or treating them as authenticated
+request-success evidence.
 
 ## Releases and versions
 
