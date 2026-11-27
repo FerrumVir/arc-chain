@@ -142,7 +142,7 @@ jobs:
     name: Ephemeral shard worker (slot ${{ matrix.slot }})
     needs: [validate]
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       max-parallel: 6
@@ -189,8 +189,8 @@ jobs:
         run: |
           set -Eeuo pipefail
           mkdir -p "$(dirname "$MODEL_PATH")"
-          curl --silent --show-error --fail --location --retry 2 --retry-all-errors --retry-max-time 360 \
-            --connect-timeout 15 --max-time 240 --max-filesize 4081004224 --proto '=https' --proto-redir '=https' --tlsv1.2 \
+          timeout --kill-after=15 645 curl --silent --show-error --fail --location --retry 2 --retry-all-errors --retry-max-time 300 \
+            --connect-timeout 15 --max-time 600 --max-filesize 4081004224 --proto '=https' --proto-redir '=https' --tlsv1.2 \
             --output "$MODEL_PATH" "$GGUF_URL"
           python3 scripts/qualification/community_shard_six_machine.py verify-gguf \
             --model-path "$MODEL_PATH"
@@ -285,7 +285,7 @@ jobs:
             --identity-dir "$IDENTITY_DIR" \
             --work-dir "$WORK_DIR" \
             --evidence-dir "$EVIDENCE_DIR" \
-            --max-seconds 1620
+            --max-seconds 2400
 
       - name: Stop owned transient systemd worker unit on all paths
         if: always()
@@ -338,7 +338,7 @@ jobs:
     name: Dispatch controller (2 sequential requests)
     needs: [validate]
     runs-on: ubuntu-24.04
-    timeout-minutes: 32
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:

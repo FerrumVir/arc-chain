@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import stat
@@ -175,6 +176,38 @@ def make_dispatch_response(seq: int) -> dict:
 
 
 class TestNormalizationAndHttpGuards(unittest.TestCase):
+    def test_lifecycle_budgets_cover_slow_download_and_match_workflow(self) -> None:
+        qual.validate_lifecycle_time_budgets()
+        source = Path(qual.__file__).resolve()
+        workflow = source.parent / "community-shard-six-machine.yml"
+        if not workflow.is_file():
+            workflow = source.parents[2] / ".github/workflows/community-shard-six-machine.yml"
+        text = workflow.read_text(encoding="utf-8")
+        worker = text.split("\n  shard-worker:\n", 1)[1].split("\n  controller:\n", 1)[0]
+        controller = text.split("\n  controller:\n", 1)[1].split("\n  aggregate:\n", 1)[0]
+        aggregate = text.split("\n  aggregate:\n", 1)[1]
+        self.assertEqual(re.findall(r"timeout-minutes: (\d+)", worker), [str(qual.WORKER_JOB_TIMEOUT_MINUTES)])
+        self.assertEqual(re.findall(r"timeout-minutes: (\d+)", controller), [str(qual.CONTROLLER_JOB_TIMEOUT_MINUTES)])
+        for flag, expected in [("--max-time", qual.MODEL_DOWNLOAD_ATTEMPT_SECONDS), ("--retry-max-time", qual.MODEL_DOWNLOAD_RETRY_WINDOW_SECONDS), ("--retry", qual.MODEL_DOWNLOAD_RETRIES), ("--max-seconds", qual.DEFAULT_WORKER_SUPERVISOR_MAX_SECONDS)]:
+            self.assertEqual(re.findall(re.escape(flag) + r" (\d+)", worker), [str(expected)], flag)
+        self.assertEqual(re.findall(r"timeout --kill-after=(\d+) (\d+) curl", worker), [(str(qual.MODEL_DOWNLOAD_KILL_GRACE_SECONDS), str(qual.MODEL_DOWNLOAD_TOTAL_SECONDS))])
+        self.assertEqual(re.findall(r"--cleanup-wait-seconds (\d+)", aggregate), [str(qual.DEFAULT_CLEANUP_WAIT_SECONDS)])
+        for constant, value, message in [
+            ("MODEL_DOWNLOAD_RETRY_WINDOW_SECONDS", 0, "keep the retry window positive"),
+            ("MODEL_DOWNLOAD_RETRY_WINDOW_SECONDS", 600, "keep the retry window positive"),
+            ("MODEL_DOWNLOAD_TOTAL_SECONDS", 599, "increase the outer download deadline"),
+            ("ARTIFACT_AND_CLEANUP_GRACE_SECONDS", 74, "increase cleanup grace"),
+            ("CONTROLLER_IDENTITY_TIMEOUT_SECONDS", 420, "increase identity wait"),
+            ("DEFAULT_WORKER_SUPERVISOR_MAX_SECONDS", 1620, "increase worker lifetime"),
+            ("DEFAULT_WORKER_SUPERVISOR_MAX_SECONDS", 2220, "increase worker lifetime"),
+            ("MAX_WORKER_SUPERVISOR_SECONDS", 1800, "worker lifetime exceeds the hard supervisor bound"),
+            ("WORKER_JOB_TIMEOUT_MINUTES", 40, "increase worker job timeout"),
+            ("CONTROLLER_JOB_TIMEOUT_MINUTES", 32, "increase controller job timeout"),
+        ]:
+            with self.subTest(constant=constant), mock.patch.object(qual, constant, value):
+                with self.assertRaisesRegex(qual.QualificationError, message):
+                    qual.validate_lifecycle_time_budgets()
+
     def test_kernel_boot_id_read_is_bounded_and_validated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "boot_id"

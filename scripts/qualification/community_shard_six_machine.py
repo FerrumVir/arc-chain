@@ -63,13 +63,22 @@ MAX_EVIDENCE_DIR_BYTES = 24 * 1024 * 1024
 MAX_GH_ARTIFACT_PAGES = 5
 MIN_MEM_AVAILABLE_BYTES = 12 * 1024 * 1024 * 1024
 MIN_DISK_FREE_BYTES = 12 * 1024 * 1024 * 1024
-DEFAULT_WORKER_SUPERVISOR_MAX_SECONDS = 1620
-MAX_WORKER_SUPERVISOR_SECONDS = 1800
+MODEL_DOWNLOAD_ATTEMPT_SECONDS = 600
+MODEL_DOWNLOAD_RETRY_WINDOW_SECONDS = 300
+MODEL_DOWNLOAD_RETRIES = 2
+MODEL_DOWNLOAD_TOTAL_SECONDS = 645
+MODEL_DOWNLOAD_KILL_GRACE_SECONDS = 15
+PREPARATION_GRACE_SECONDS = 240
+ARTIFACT_AND_CLEANUP_GRACE_SECONDS = 180
+WORKER_JOB_TIMEOUT_MINUTES = 60
+CONTROLLER_JOB_TIMEOUT_MINUTES = 45
+DEFAULT_WORKER_SUPERVISOR_MAX_SECONDS = 2400
+MAX_WORKER_SUPERVISOR_SECONDS = 2400
 RUNTIME_MAX_GRACE_SECONDS = 60
 DEFAULT_CLEANUP_WAIT_SECONDS = 65
 WORKER_POLL_INTERVAL_SECONDS = 30
 MAX_POLL_BACKOFF_SECONDS = 120
-CONTROLLER_IDENTITY_TIMEOUT_SECONDS = 420
+CONTROLLER_IDENTITY_TIMEOUT_SECONDS = 900
 CONTROLLER_READINESS_TIMEOUT_SECONDS = 300
 CONTROLLER_POLL_INTERVAL_SECONDS = 5
 REQUIRED_PROVENANCE_PIN_KEYS = frozenset(
@@ -1559,7 +1568,32 @@ def validate_candidate_run_api(
     return run_payload, expected_artifact, meta, digest_hex
 
 
+def validate_lifecycle_time_budgets() -> None:
+    if not 0 < MODEL_DOWNLOAD_RETRY_WINDOW_SECONDS < MODEL_DOWNLOAD_ATTEMPT_SECONDS:
+        raise QualificationError("keep the retry window positive and below a full download attempt")
+    if MODEL_DOWNLOAD_ATTEMPT_SECONDS > MODEL_DOWNLOAD_TOTAL_SECONDS:
+        raise QualificationError("increase the outer download deadline to allow one full attempt")
+    if ARTIFACT_AND_CLEANUP_GRACE_SECONDS < 75:
+        raise QualificationError("increase cleanup grace to cover both bounded systemd cleanup commands")
+    download_bound = MODEL_DOWNLOAD_TOTAL_SECONDS + MODEL_DOWNLOAD_KILL_GRACE_SECONDS
+    preparation_bound = download_bound + PREPARATION_GRACE_SECONDS
+    if CONTROLLER_IDENTITY_TIMEOUT_SECONDS < preparation_bound:
+        raise QualificationError("increase identity wait to cover model download, retries, and preparation")
+    dispatch_bound = CONTROLLER_IDENTITY_TIMEOUT_SECONDS + CONTROLLER_READINESS_TIMEOUT_SECONDS + 2 * DISPATCH_TIMEOUT_SECONDS
+    completion_bound = dispatch_bound + ARTIFACT_AND_CLEANUP_GRACE_SECONDS
+    if DEFAULT_WORKER_SUPERVISOR_MAX_SECONDS < completion_bound + MAX_POLL_BACKOFF_SECONDS:
+        raise QualificationError("increase worker lifetime to cover cohort readiness, both dispatches, and cleanup")
+    if DEFAULT_WORKER_SUPERVISOR_MAX_SECONDS > MAX_WORKER_SUPERVISOR_SECONDS:
+        raise QualificationError("worker lifetime exceeds the hard supervisor bound")
+    worker_job_bound = preparation_bound + DEFAULT_WORKER_SUPERVISOR_MAX_SECONDS + RUNTIME_MAX_GRACE_SECONDS + ARTIFACT_AND_CLEANUP_GRACE_SECONDS
+    if 60 * WORKER_JOB_TIMEOUT_MINUTES < worker_job_bound:
+        raise QualificationError("increase worker job timeout to include download, systemd lifetime, and cleanup")
+    if 60 * CONTROLLER_JOB_TIMEOUT_MINUTES < completion_bound:
+        raise QualificationError("increase controller job timeout to include startup, dispatches, and cleanup")
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
+    validate_lifecycle_time_budgets()
     token = os.environ.get("GH_TOKEN", "")
     candidate_run_id = validate_positive_id(args.candidate_run_id, "candidate_run_id")
     candidate_run_attempt = validate_positive_id(args.candidate_run_attempt, "candidate_run_attempt")
