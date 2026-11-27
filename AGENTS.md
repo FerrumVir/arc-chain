@@ -282,10 +282,20 @@ The status route reports verified dispatch available only with the enabled
 coordinator, canonical model, and an independent validator verification plan.
 `POST /inference/run_community_sharded` owns and cancels its shard session, checks
 its exact result digest, coverage, token limits and EOS, then uses the existing
-validator quorum verification before returning output. Public shard admission follows complete ready pipelines, with a default cap of
-24 sessions and a hard cap of 64. Independent verification alone holds the shared
-public compute permits; queued verification and shutdown stay bounded. Rewards
+validator quorum verification before returning output. Public shard admission requires
+an idle complete pipeline. Requests may overlap two additional verification slots,
+while the configured overall cap remains 24 by default and at most 64.
+Independent verification alone holds the shared public compute permits; queued
+verification and shutdown stay bounded. Rewards
 remain disabled for these multi-worker results.
+Structured phase timing records shard execution, verification permit wait, and
+quorum verification under the public coordinator boot nonce and session sequence.
+The events contain no prompt, output, tokens, or keys. They record returned awaits;
+an interrupted future can leave an incomplete trace, which must not be counted as
+zero-duration work or a successful request.
+Coordinator abort events include the same HTTP status returned to the caller. A
+captured-event regression fixes the allowed field set and rejects private failure
+details or model data in timing records.
 This transport alone does not activate desktop nodes.
 `--community-shard-worker` integrates the pinned partial worker into a managed
 stake-zero node while preserving local RPC and the shutdown durability barrier.
@@ -472,12 +482,12 @@ packages. Archive and DMG verification use the same captured version.
   (0.8.20 at 8949910b).
 - List tags by date with `git for-each-ref --sort=-creatordate refs/tags`. An
   older pre-release tag sorts above v0.8.x under version sort.
-- `CHANGELOG.md` is newest first. Its v0.8.25 entry is a release-preparation
+- `CHANGELOG.md` is newest first. Its v0.8.26 entry is a release-preparation
   snapshot dated 2026-11-27 and makes no publication or fleet-activation claim.
 - `.github/workflows/release.yml` runs on a `v*.*.*` tag push or a manual
   dispatch (lines 8-12). The current procedures are
   `scripts/release/EXISTING-CHAIN-UPDATE.md` and `scripts/recovery/README.md`.
-- The doc contract test pins the published (0.8.16) and candidate (0.8.25)
+- The doc contract test pins the published (0.8.16) and candidate (0.8.26)
   versions (`tests/release/documentation_contract_test.sh:41`, `47`). README
   install steps name the published one. The test's comment (lines 42-46) says
   they move to a newer release in the documentation change that follows its
