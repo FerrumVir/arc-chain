@@ -288,6 +288,11 @@ while the configured overall cap remains 24 by default and at most 64.
 Independent verification alone holds the shared public compute permits; queued
 verification and shutdown stay bounded. Rewards
 remain disabled for these multi-worker results.
+Structured phase timing records shard execution, verification permit wait, and
+quorum verification under the public coordinator boot nonce and session sequence.
+The events contain no prompt, output, tokens, or keys. They record returned awaits;
+an interrupted future can leave an incomplete trace, which must not be counted as
+zero-duration work or a successful request.
 This transport alone does not activate desktop nodes.
 `--community-shard-worker` integrates the pinned partial worker into a managed
 stake-zero node while preserving local RPC and the shutdown durability barrier.

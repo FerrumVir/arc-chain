@@ -369,6 +369,27 @@ fn build_inference_run_flat_value(
     Ok(serde_json::Value::Object(object))
 }
 
+fn log_community_shard_phase(
+    boot_nonce: &str,
+    session_id: SessionId,
+    phase: &'static str,
+    started_at: Instant,
+    returned_ok: bool,
+    error_status: Option<u16>,
+) {
+    let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        target: "arc::community_shard_phase",
+        boot_nonce,
+        session_seq = session_id.seq,
+        phase,
+        duration_ms,
+        returned_ok,
+        error_status,
+        "community shard phase timing"
+    );
+}
+
 pub(crate) async fn run_community_sharded(
     AxumState(node): AxumState<super::NodeState>,
     Json(req): Json<CommunityShardedInferenceRequest>,
@@ -426,12 +447,23 @@ pub(crate) async fn run_community_sharded(
         (session_id, session_deadline_ms)
     };
     let mut session_guard = OwnedShardSessionGuard::new(node.clone(), session_id, open_now_ms);
+    let session_boot_nonce = session_id.boot_nonce.to_hex();
 
     let job_budget_ms = session_deadline_ms.saturating_sub(open_now_ms);
     let monotonic_deadline = tokio::time::Instant::now()
         + Duration::from_millis(job_budget_ms.saturating_add(COMMUNITY_SHARD_DEADLINE_GRACE_MS));
 
-    let outcome = wait_for_session_outcome(&node, session_id, monotonic_deadline).await?;
+    let shard_execution_started = Instant::now();
+    let outcome = wait_for_session_outcome(&node, session_id, monotonic_deadline).await;
+    log_community_shard_phase(
+        &session_boot_nonce,
+        session_id,
+        "shard_execution",
+        shard_execution_started,
+        matches!(&outcome, Ok(SessionOutcome::PendingVerification(_))),
+        outcome.as_ref().err().map(|(status, _)| status.as_u16()),
+    );
+    let outcome = outcome?;
     session_guard.disarm();
 
     let pending = match outcome {
@@ -482,7 +514,20 @@ pub(crate) async fn run_community_sharded(
         .min(COMMUNITY_SHARD_VERIFY_PERMIT_WAIT_CAP);
     let verify_wait_deadline =
         monotonic_deadline.min(tokio::time::Instant::now() + verify_wait_budget);
-    let verify_permit = acquire_verification_permit(&node, verify_wait_deadline).await?;
+    let verify_permit_started = Instant::now();
+    let verify_permit = acquire_verification_permit(&node, verify_wait_deadline).await;
+    log_community_shard_phase(
+        &session_boot_nonce,
+        session_id,
+        "verifier_permit_wait",
+        verify_permit_started,
+        verify_permit.is_ok(),
+        verify_permit
+            .as_ref()
+            .err()
+            .map(|(status, _)| status.as_u16()),
+    );
+    let verify_permit = verify_permit?;
     if now_unix_ms()? >= session_deadline_ms {
         drop(verify_permit);
         return Err((
@@ -491,6 +536,7 @@ pub(crate) async fn run_community_sharded(
                 .to_string(),
         ));
     }
+    let quorum_verify_started = Instant::now();
     let verified = super::verify_community_candidate_with_quorum(&node, &candidate)
         .await
         .map_err(|error| match error {
@@ -502,7 +548,16 @@ pub(crate) async fn run_community_sharded(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("validator quorum verification unavailable: {reason}"),
             ),
-        })?;
+        });
+    log_community_shard_phase(
+        &session_boot_nonce,
+        session_id,
+        "quorum_verification",
+        quorum_verify_started,
+        verified.is_ok(),
+        verified.as_ref().err().map(|(status, _)| status.as_u16()),
+    );
+    let verified = verified?;
     drop(verify_permit);
 
     if verified.execution_profile != CANONICAL_REWARD_INFERENCE_PROFILE {
