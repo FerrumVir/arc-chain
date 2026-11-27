@@ -917,7 +917,7 @@ jobs:
 
       - name: Upload create-only exact-SHA staging artifact
         id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: ${{ steps.package.outputs.artifact_name }}
           path: |
@@ -1169,7 +1169,7 @@ jobs:
 
       - name: Upload create-only unsigned desktop handoff
         id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: ${{ steps.handoff.outputs.artifact_name }}
           path: |
@@ -1351,7 +1351,7 @@ jobs:
 
       - name: Upload one create-only direct-signer handoff
         id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: ${{ steps.seal.outputs.artifact_name }}
           path: desktop-signer-handoff/*
@@ -1867,7 +1867,7 @@ jobs:
 
       - name: Upload create-only signed desktop candidate
         id: upload
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: ${{ steps.package.outputs.artifact_name }}
           path: |

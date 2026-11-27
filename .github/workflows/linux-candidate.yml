@@ -59,7 +59,7 @@ jobs:
         run: |
           npx playwright install --with-deps chromium
           npx playwright test --config playwright.shard.config.ts --workers=1 --retries=0
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
           name: desktop-worker-status-${{ github.sha }}-${{ github.run_id }}
@@ -106,7 +106,7 @@ jobs:
           set -Eeuo pipefail
           cargo clippy --locked --keep-going -p arc-node -p arc-inference -p arc-state --features candle --lib --bin arc-node --tests -- -D warnings \
             2>&1 | tee "$RUNNER_TEMP/recovery-peer-evidence/clippy.log"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
           name: recovery-peer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -241,7 +241,7 @@ jobs:
             fi
           done
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
           name: arc-recovered-v3-paid-lifecycle-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -385,7 +385,7 @@ jobs:
 
       - name: Retain early SSH smoke evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: arc-loopback-ssh-smoke-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/loopback-ssh-smoke/
@@ -485,7 +485,7 @@ jobs:
           } > "$RUNNER_TEMP/linux-candidate/PROVENANCE.txt"
           (cd "$RUNNER_TEMP/linux-candidate" && sha256sum -- * > SHA256SUMS)
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: arc-linux-candidate-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/linux-candidate/
@@ -701,7 +701,7 @@ jobs:
 
       - name: Retain conformance evidence (never the model)
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: arc-real-model-conformance-${{ matrix.layout }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |

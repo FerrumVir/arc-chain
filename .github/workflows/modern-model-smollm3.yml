@@ -104,7 +104,7 @@ jobs:
           print(json.dumps(digests, indent=1))
           assert len(set(digests.values())) == 1, "Rust scalar, Rust SIMD and Python generation differ"
           PY
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
           name: tiny-unit
@@ -215,7 +215,7 @@ jobs:
               --tokenizer "$MODEL_DIR/tokenizer.json" --cases "$CASES" --kernel "$kernel" \
               --out "$EVIDENCE/smollm3-run-$kernel.json"
           done
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
           name: evidence-${{ matrix.os }}
@@ -259,7 +259,7 @@ jobs:
           python scripts/arc_modern/hf_checks.py compare-tokens --model-dir "$RUNNER_TEMP/tok" \
             --corpus "$ev/tokenizer-corpus.jsonl" --rust "$ev/tokenizer-rust.jsonl" \
             --out "$ev/tokenizer-check.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
           name: evidence-tokenizer
@@ -331,7 +331,7 @@ jobs:
           cd scripts
           python -m arc_conformance.modern_reference verify-run --package "$MODEL_DIR/rust.arcipkg" \
             --run "$EVIDENCE/reference-rust-run.json" --out "$EVIDENCE/python-golden.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
           name: evidence-reference
@@ -408,7 +408,7 @@ jobs:
             "Federal Register 2026-20493 (public domain, published after the model's data cutoff), first 1024 tokens"
           run_text alice scripts/arc_modern/data/alice_ch1.txt \
             "Alice in Wonderland ch. 1 (public domain, likely memorised), first 1024 tokens"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
           name: evidence-quality
@@ -491,7 +491,7 @@ jobs:
           PY
           fi
           exit "$status"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
           name: modern-model-report
