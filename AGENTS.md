@@ -477,6 +477,11 @@ when local resource limits prohibit compilation.
 
 The manual community-shard qualification workflows use temporary GitHub-hosted
 workers and never count them toward an operator target. The scaling qualification
+selects either the pinned Singapore or Amsterdam coordinator; all worker, transport,
+readiness and cleanup checks use that same identity. Both selections require a quiet
+coordinator with zero existing partial workers and sessions. Existing Singapore
+artifacts retain their original identity and default selection.
+The scaling qualification
 binds twelve distinct machine boots and measures six sequential requests on six
 workers, six requests at concurrency two on twelve workers, then six sequential
 requests after the added workers leave. It records client timing, exact participants,

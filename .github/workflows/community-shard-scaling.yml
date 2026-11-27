@@ -1,5 +1,6 @@
 name: Community Shard Scaling and Overlap Qualification
 env:
+  ARC_SHARD_QUAL_SITE: ${{ inputs.coordinator_site || 'sgp' }}
   QUALIFICATION_MODE: ${{ inputs.mode || 'scaling' }}
   BEFORE_ARM: ${{ inputs.mode == 'overlap' && 'baseline_before' || 'before' }}
   MIDDLE_ARM: ${{ inputs.mode == 'overlap' && 'overlap' || 'expanded' }}
@@ -12,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   validate:
-    name: Validate candidate and SGP baseline
+    name: Validate candidate and pinned coordinator baseline
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -26,11 +27,14 @@ jobs:
         fetch-depth: 1
         persist-credentials: false
     - name: Check qualification harness before remote inference
+      env:
+        ARC_SHARD_QUAL_SITE: sgp
       run: |
+        python3 -m unittest discover -s scripts/qualification/tests -p 'test_coordinator_target.py' -q
         python3 -m unittest discover -s scripts/qualification/tests -p 'test_community_shard_six_machine.py' -q
         python3 -m unittest discover -s scripts/qualification/tests -p 'test_scaling_cohort.py' -q
         PYTHONPATH=scripts/qualification:scripts/qualification/tests python3 -m unittest discover -s scripts/qualification/scaling_tests -p 'test*.py' -q
-        python3 scripts/ci/no_comments.py scripts/qualification/*.py scripts/qualification/tests/test_community_shard_six_machine.py scripts/qualification/tests/test_scaling_cohort.py scripts/qualification/scaling_tests/*.py .github/workflows/community-shard-scaling.yml
+        python3 scripts/ci/no_comments.py scripts/qualification/*.py scripts/qualification/tests/test_community_shard_six_machine.py scripts/qualification/tests/test_scaling_cohort.py scripts/qualification/tests/test_coordinator_target.py scripts/qualification/scaling_tests/*.py .github/workflows/community-shard-scaling.yml
     - name: Resolve pinned candidate inputs
       id: resolve_inputs
       env:
@@ -82,7 +86,7 @@ jobs:
         path: candidate-source
         fetch-depth: 1
         persist-credentials: false
-    - name: Validate candidate run and SGP readiness baseline
+    - name: Validate candidate run and pinned coordinator readiness baseline
       env:
         GH_TOKEN: ${{ github.token }}
         CANDIDATE_RUN_ID: ${{ steps.resolve_inputs.outputs.candidate_run_id }}
@@ -543,6 +547,12 @@ jobs:
 'on':
   workflow_dispatch:
     inputs:
+      coordinator_site:
+        description: Pinned coordinator; requires zero existing partial workers and sessions
+        required: true
+        default: sgp
+        type: choice
+        options: [sgp, ams]
       mode:
         description: Worker-count scaling or fixed twelve-worker verification overlap
         required: true
