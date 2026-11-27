@@ -158,7 +158,7 @@ def make_dispatch_response(seq: int) -> dict:
         "participants": participants,
         "participant_identity_basis": "node_key_not_proof_of_independent_operator",
         "verification": {
-            "method": "teacher_forced_2_of_2",
+            "method": "authenticated_shard_quorum_2_of_2_per_range",
             "profile_bound": True,
             "quorum_verified": True,
             "execution_profile": qual.CANONICAL_EXECUTION_PROFILE,
@@ -379,6 +379,69 @@ class TestExitReportParsing(unittest.TestCase):
 
 
 class TestDispatchAndAggregateProofs(unittest.TestCase):
+    def test_verification_contract_matches_actual_rust_serializer(self) -> None:
+        root = Path(os.environ.get("ARC_QUALIFICATION_SOURCE_ROOT", str(Path(qual.__file__).resolve().parents[2])))
+        rpc = (root / "crates/arc-node/src/rpc.rs").read_text(encoding="utf-8")
+        body = rpc.split("struct CommunityVerificationSummary {", 1)[1].split("\n}", 1)[0]
+        fields = set(re.findall(r"^\s+(\w+):", body, re.MULTILINE))
+        optional = set(re.findall(r'#\[serde\(skip_serializing_if = "Vec::is_empty"\)\]\s+(\w+):', body))
+        self.assertEqual(qual.VERIFICATION_OPTIONAL_KEYS, optional)
+        self.assertEqual(qual.VERIFICATION_REQUIRED_KEYS, fields - optional)
+        for suffix in ["2_OF_3", "2_OF_2", "MIXED"]:
+            actual = re.findall(r"const COMMUNITY_VERIFICATION_METHOD_" + suffix + r': &str =\s*"([^"]+)";', rpc)
+            self.assertEqual(actual, [getattr(qual, "VERIFICATION_METHOD_" + suffix)])
+
+    def test_three_replica_and_mixed_verification_match_wire_contract(self) -> None:
+        ids = {make_worker_id(slot) for slot in qual.EXPECTED_SLOTS}
+        all_three = make_dispatch_response(1)
+        verification = all_three["verification"]
+        verification["method"] = qual.VERIFICATION_METHOD_2_OF_3
+        verification["replicas_contacted_per_quorum"] = 3
+        del verification["ranges_verified_2_of_2"]
+        qual.validate_dispatch_response(all_three, ids)
+        mixed = make_dispatch_response(2)
+        mixed["verification"]["method"] = qual.VERIFICATION_METHOD_MIXED
+        mixed["verification"]["ranges_verified_2_of_2"] = [[11, 22]]
+        qual.validate_dispatch_response(mixed, ids)
+        invalid = []
+        for field, value in [("replicas_contacted_per_quorum", 2), ("ranges_verified_2_of_2", []), ("method", "teacher_forced_2_of_2"), ("range_position_quorums", 5), ("range_position_quorums", 3), ("extra", True)]:
+            bad = copy.deepcopy(all_three)
+            bad["verification"][field] = value
+            invalid.append(bad)
+        for ranges in [[], [[0, 11], [10, 22]], [[0, 33]], [[11, 11]], [[0, 11], [11, 22], [22, 32]]]:
+            bad = copy.deepcopy(mixed)
+            bad["verification"]["ranges_verified_2_of_2"] = ranges
+            invalid.append(bad)
+        missing = copy.deepcopy(mixed)
+        del missing["verification"]["ranges_verified_2_of_2"]
+        invalid.append(missing)
+        for index, bad in enumerate(invalid):
+            with self.subTest(index=index), self.assertRaises(qual.QualificationError):
+                qual.validate_dispatch_response(bad, ids)
+
+    def test_dispatch_attempt_preserves_response_on_validation_failure_without_retry(self) -> None:
+        ids = {make_worker_id(slot) for slot in qual.EXPECTED_SLOTS}
+        response = make_dispatch_response(1)
+        response["verification"]["quorum_verified"] = False
+        record = {}
+        with mock.patch.object(qual, "coordinator_request_once", return_value=(200, response, 123)) as request:
+            with self.assertRaises(qual.QualificationError):
+                qual.perform_and_record_dispatch_once(record, 1, ids)
+        request.assert_called_once_with("POST", qual.DISPATCH_PATH, float(qual.DISPATCH_TIMEOUT_SECONDS), json_body=qual.DISPATCH_PAYLOAD)
+        self.assertEqual(len(record["dispatches"]), 1)
+        self.assertEqual(record["dispatches"][0]["response"], response)
+        self.assertEqual(record["dispatches"][0]["monotonic_latency_ms"], 123)
+
+    def test_ambiguous_dispatch_failure_records_one_attempt_without_retry(self) -> None:
+        record = {}
+        with mock.patch.object(qual, "coordinator_request_once", side_effect=qual.QualificationError("response timeout")) as request:
+            with self.assertRaisesRegex(qual.QualificationError, "response timeout"):
+                qual.perform_and_record_dispatch_once(record, 1, set())
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(len(record["dispatches"]), 1)
+        self.assertIsNone(record["dispatches"][0]["response"])
+        self.assertEqual(record["dispatches"][0]["request_payload"], qual.DISPATCH_PAYLOAD)
+
     def test_two_dispatches_pass_and_reject_tampering(self) -> None:
         expected_ids = {make_worker_id(slot) for slot in qual.EXPECTED_SLOTS}
         r1 = make_dispatch_response(1)

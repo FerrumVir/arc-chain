@@ -176,9 +176,12 @@ VERIFICATION_REQUIRED_KEYS = frozenset(
         "range_position_quorums",
         "signatures_required_per_quorum",
         "replicas_contacted_per_quorum",
-        "ranges_verified_2_of_2",
     }
 )
+VERIFICATION_OPTIONAL_KEYS = frozenset({"ranges_verified_2_of_2"})
+VERIFICATION_METHOD_2_OF_3 = "authenticated_shard_quorum_2_of_3_per_range"
+VERIFICATION_METHOD_2_OF_2 = "authenticated_shard_quorum_2_of_2_per_range"
+VERIFICATION_METHOD_MIXED = "authenticated_shard_quorum_2_of_3_or_2_of_2_per_range"
 RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,18}$")
 SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -1209,12 +1212,13 @@ def validate_dispatch_response(
     verification = response["verification"]
     if not isinstance(verification, dict):
         raise QualificationError("dispatch response verification must be object")
-    if set(verification.keys()) != VERIFICATION_REQUIRED_KEYS:
+    if not VERIFICATION_REQUIRED_KEYS <= set(verification) or set(verification) - VERIFICATION_REQUIRED_KEYS - VERIFICATION_OPTIONAL_KEYS:
         missing = sorted(VERIFICATION_REQUIRED_KEYS - set(verification.keys()))
-        extra = sorted(set(verification.keys()) - VERIFICATION_REQUIRED_KEYS)
+        extra = sorted(set(verification.keys()) - VERIFICATION_REQUIRED_KEYS - VERIFICATION_OPTIONAL_KEYS)
         raise QualificationError(f"verification keys mismatch: missing={missing} extra={extra}")
-    if not isinstance(verification["method"], str) or not verification["method"].strip():
-        raise QualificationError("verification method must be non-empty")
+    method = verification["method"]
+    if method not in (VERIFICATION_METHOD_2_OF_3, VERIFICATION_METHOD_2_OF_2, VERIFICATION_METHOD_MIXED):
+        raise QualificationError("verification method is not an authenticated two-signature quorum")
     if verification["profile_bound"] is not True:
         raise QualificationError("verification profile_bound must be true")
     if verification["quorum_verified"] is not True:
@@ -1225,17 +1229,24 @@ def validate_dispatch_response(
         raise QualificationError("verification output_hash mismatch")
     if not is_strict_int(verification["tokens_generated"]) or verification["tokens_generated"] != tokens_generated:
         raise QualificationError("verification tokens_generated mismatch")
-    if not is_strict_positive_int(verification["ranges"]):
+    if not is_strict_positive_int(verification["ranges"]) or verification["ranges"] > EXPECTED_TOTAL_LAYERS:
         raise QualificationError("verification ranges count invalid")
-    if not is_strict_positive_int(verification["range_position_quorums"]):
+    if not is_strict_positive_int(verification["range_position_quorums"]) or verification["range_position_quorums"] % verification["ranges"] != 0 or verification["range_position_quorums"] < verification["ranges"] * tokens_generated:
         raise QualificationError("verification range_position_quorums invalid")
     if not is_strict_int(verification["signatures_required_per_quorum"]) or verification["signatures_required_per_quorum"] != 2:
         raise QualificationError("verification signatures_required_per_quorum must be 2")
-    if not is_strict_int(verification["replicas_contacted_per_quorum"]) or verification["replicas_contacted_per_quorum"] < 2:
-        raise QualificationError("verification replicas_contacted_per_quorum must be >= 2")
-    verified_ranges_raw = verification["ranges_verified_2_of_2"]
-    if not isinstance(verified_ranges_raw, list) or len(verified_ranges_raw) != verification["ranges"]:
-        raise QualificationError("verification ranges_verified_2_of_2 length mismatch")
+    expected_replicas = 3 if method == VERIFICATION_METHOD_2_OF_3 else 2
+    if not is_strict_int(verification["replicas_contacted_per_quorum"]) or verification["replicas_contacted_per_quorum"] != expected_replicas:
+        raise QualificationError("verification replica count does not match its quorum method")
+    if method == VERIFICATION_METHOD_2_OF_3:
+        if "ranges_verified_2_of_2" in verification:
+            raise QualificationError("all-three-replica verification must omit the two-replica range field")
+        return response
+    verified_ranges_raw = verification.get("ranges_verified_2_of_2")
+    if not isinstance(verified_ranges_raw, list) or not verified_ranges_raw or len(verified_ranges_raw) > verification["ranges"]:
+        raise QualificationError("verification two-replica ranges must be a nonempty bounded subset")
+    if (len(verified_ranges_raw) == verification["ranges"]) != (method == VERIFICATION_METHOD_2_OF_2):
+        raise QualificationError("verification two-replica range count does not match its quorum method")
     verified_ranges: list[tuple[int, int]] = []
     for pair in verified_ranges_raw:
         if not isinstance(pair, list) or len(pair) != 2:
@@ -1243,7 +1254,14 @@ def validate_dispatch_response(
         if not (is_strict_nonneg_int(pair[0]) and is_strict_positive_int(pair[1])):
             raise QualificationError("verification range bounds invalid")
         verified_ranges.append((pair[0], pair[1]))
-    validate_contiguous_ranges(verified_ranges, EXPECTED_TOTAL_LAYERS, max_tile_layers=None)
+    ordered = sorted(verified_ranges)
+    previous_end = 0
+    for start, end in ordered:
+        if start < previous_end or end <= start or end > EXPECTED_TOTAL_LAYERS:
+            raise QualificationError("verification two-replica ranges overlap or exceed model bounds")
+        previous_end = end
+    if method == VERIFICATION_METHOD_2_OF_2:
+        validate_contiguous_ranges(verified_ranges, EXPECTED_TOTAL_LAYERS, max_tile_layers=None)
     return response
 
 
@@ -2354,6 +2372,24 @@ def cmd_worker_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def perform_and_record_dispatch_once(record: dict[str, Any], index: int, expected_worker_ids: set[str]) -> dict[str, Any]:
+    attempt = {
+        "request_index": index,
+        "sent_at_utc": utc_now_iso(),
+        "request_payload": dict(DISPATCH_PAYLOAD),
+        "monotonic_latency_ms": None,
+        "response": None,
+    }
+    record.setdefault("dispatches", []).append(attempt)
+    _, response, monotonic_ms = coordinator_request_once(
+        "POST", DISPATCH_PATH, float(DISPATCH_TIMEOUT_SECONDS), json_body=DISPATCH_PAYLOAD,
+    )
+    attempt["monotonic_latency_ms"] = monotonic_ms
+    attempt["response"] = response
+    validate_dispatch_response(response, expected_worker_ids)
+    return attempt
+
+
 def cmd_controller(args: argparse.Namespace) -> int:
     token = os.environ.get("GH_TOKEN", "")
     run_id = validate_positive_id(args.workflow_run_id, "workflow_run_id")
@@ -2475,25 +2511,9 @@ def cmd_controller(args: argparse.Namespace) -> int:
         record["ready_dispatch_readiness"] = ready_readiness
         record["ready_shard_status"] = ready_status
         dispatches: list[dict[str, Any]] = []
+        record["dispatches"] = dispatches
         for idx in (1, 2):
-            sent_at = utc_now_iso()
-            _, resp_body, monotonic_ms = coordinator_request_once(
-                "POST",
-                DISPATCH_PATH,
-                float(DISPATCH_TIMEOUT_SECONDS),
-                json_body=DISPATCH_PAYLOAD,
-            )
-            validate_dispatch_response(resp_body, expected_worker_ids)
-            dispatches.append(
-                {
-                    "request_index": idx,
-                    "sent_at_utc": sent_at,
-                    "request_payload": DISPATCH_PAYLOAD,
-                    "monotonic_latency_ms": monotonic_ms,
-                    "response": resp_body,
-                }
-            )
-            record["dispatches"] = dispatches
+            perform_and_record_dispatch_once(record, idx, expected_worker_ids)
         validate_two_dispatch_responses(
             dispatches[0]["response"],
             dispatches[1]["response"],
