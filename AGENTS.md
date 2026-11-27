@@ -476,7 +476,10 @@ when local resource limits prohibit compilation.
   node address (`crates/arc-node/src/rpc.rs`, `compute_auto_shard_plan`).
 
 The manual community-shard qualification workflows use temporary GitHub-hosted
-workers and never count them toward an operator target. The scaling qualification
+workers and never count them toward an operator target. Artifact downloads resolve
+the GitHub CLI from the caller's PATH before launching that exact executable with
+the minimal child environment, so user-local CLI installations work without
+inheriting proxy or debug settings. The scaling qualification
 selects either the pinned Singapore or Amsterdam coordinator; all worker, transport,
 readiness and cleanup checks use that same identity. Both selections require a quiet
 coordinator with zero existing partial workers and sessions. Existing Singapore

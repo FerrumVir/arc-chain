@@ -213,6 +213,13 @@ def minimal_host_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def github_cli_executable() -> str:
+    executable = shutil.which("gh")
+    if executable is None:
+        raise QualificationError("Install GitHub CLI and expose gh on the caller PATH before downloading artifacts")
+    return str(Path(executable).resolve(strict=True))
+
+
 def redact_secret(text: str, secret: str) -> str:
     if secret:
         return text.replace(secret, "<redacted>")
@@ -756,6 +763,7 @@ def download_validated_artifact_by_id(
             f"artifact {artifact_name} size {size_bytes!r} exceeds bound {max_bytes}"
         )
     expected_zip_sha256 = parse_artifact_sha256_digest(artifact_meta, artifact_name)
+    gh_executable = github_cli_executable()
     dest_dir.parent.mkdir(parents=True, exist_ok=True)
     gh_env = minimal_host_env({"GH_TOKEN": token})
     endpoint = f"/repos/{EXPECTED_REPO}/actions/artifacts/{artifact_id}/zip"
@@ -769,7 +777,7 @@ def download_validated_artifact_by_id(
         try:
             proc = subprocess.Popen(
                 [
-                    "gh",
+                    gh_executable,
                     "api",
                     "-H",
                     "Accept: application/vnd.github+json",
@@ -828,6 +836,8 @@ def download_validated_artifact_by_id(
                     pass
             if stderr_thread is not None:
                 stderr_thread.join(timeout=5)
+            if proc is not None and proc.stdout is not None:
+                proc.stdout.close()
         if timed_out.is_set():
             raise QualificationError(f"gh api download timed out for {artifact_name} (id={artifact_id})")
         if rc != 0:

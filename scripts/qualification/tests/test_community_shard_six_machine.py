@@ -844,9 +844,11 @@ class TestProvenanceAndArtifactIntegrity(unittest.TestCase):
         def fake_popen(cmd: list[str], **kwargs: object) -> FakeZipProc:
             captured["cmd"] = cmd
             captured["env"] = kwargs.get("env")
-            return FakeZipProc(zip_bytes)
+            process = FakeZipProc(zip_bytes)
+            captured["process"] = process
+            return process
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(qual, "github_cli_executable", return_value="/trusted/bin/gh"):
             dest = Path(tmp) / "slot-1"
             with mock.patch.dict(
                 os.environ,
@@ -863,9 +865,10 @@ class TestProvenanceAndArtifactIntegrity(unittest.TestCase):
                         "tok-dl-secret-5555",
                     )
             self.assertEqual((dest / "worker-identity.json").read_text(encoding="utf-8"), '{"slot":1}\n')
+            self.assertTrue(captured["process"].stdout.closed)
             cmd = captured["cmd"]
             assert isinstance(cmd, list)
-            self.assertEqual(cmd[:2], ["gh", "api"])
+            self.assertEqual(cmd[:2], ["/trusted/bin/gh", "api"])
             self.assertEqual(cmd[-1], f"/repos/{qual.EXPECTED_REPO}/actions/artifacts/777/zip")
             env = captured["env"]
             assert isinstance(env, dict)
@@ -887,6 +890,7 @@ class TestProvenanceAndArtifactIntegrity(unittest.TestCase):
                         "tok-dl-secret-5555",
                     )
             self.assertFalse((bad_dest / "worker-identity.json").exists())
+            self.assertTrue(captured["process"].stdout.closed)
 
             bad_size_meta = dict(meta, size_in_bytes=len(zip_bytes) + 1)
             with mock.patch.object(subprocess, "Popen", side_effect=fake_popen):
@@ -899,6 +903,39 @@ class TestProvenanceAndArtifactIntegrity(unittest.TestCase):
                         qual.MAX_IDENTITY_ARTIFACT_BYTES,
                         "tok-dl-secret-5555",
                     )
+            self.assertTrue(captured["process"].stdout.closed)
+
+    def test_artifact_download_finds_user_cli_without_inheriting_caller_environment(self) -> None:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("worker-identity.json", '{"slot":1}\n')
+        payload = buf.getvalue()
+        meta = {
+            "id": 777, "name": "qual-worker-identity-r9001-a1-slot-1", "expired": False,
+            "size_in_bytes": len(payload), "digest": "sha256:" + hashlib.sha256(payload).hexdigest(),
+            "workflow_run": {"id": 9001},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            user_bin = root / "user bin"
+            user_bin.mkdir()
+            gh = user_bin / "gh"
+            gh.write_text(
+                f"#!{sys.executable}\nimport os, sys\n"
+                "assert 'GH_DEBUG' not in os.environ\n"
+                "assert 'HTTPS_PROXY' not in os.environ\n"
+                f"assert {str(user_bin)!r} not in os.environ['PATH']\n"
+                "assert sys.argv[1] == 'api'\n"
+                f"sys.stdout.buffer.write(bytes.fromhex({payload.hex()!r}))\n"
+            )
+            gh.chmod(0o700)
+            with mock.patch.dict(os.environ, {"PATH": str(user_bin), "GH_DEBUG": "api", "HTTPS_PROXY": "http://proxy.invalid"}):
+                qual.download_validated_artifact_by_id("9001", meta["name"], meta, root / "download", 4096, "test-token")
+            self.assertEqual((root / "download/worker-identity.json").read_text(), '{"slot":1}\n')
+
+    def test_missing_github_cli_names_the_required_fix(self) -> None:
+        with mock.patch.object(qual.shutil, "which", return_value=None), self.assertRaisesRegex(qual.QualificationError, "Install GitHub CLI"):
+            qual.github_cli_executable()
 
     def test_extract_validated_zip_archive_rejects_traversal_symlink_count_and_bomb(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
