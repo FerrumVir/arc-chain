@@ -187,6 +187,9 @@ DEFAULT_PUBLIC_POST_PATHS = (
     "/faucet/claim",
 )
 COMMUNITY_SHARD_STATUS_PATH = "/community/shards/status"
+COMMUNITY_SHARD_DISPATCH_READINESS_PATH = (
+    "/inference/community_shards/dispatch_readiness"
+)
 COMMUNITY_SHARD_INFERENCE_PATH = "/inference/run_community_sharded"
 COMMUNITY_SHARD_METADATA_POST_PATHS = (
     "/community/shards/lease",
@@ -195,7 +198,10 @@ COMMUNITY_SHARD_METADATA_POST_PATHS = (
     "/community/shards/release",
 )
 COMMUNITY_SHARD_SUBMIT_POST_PATH = "/community/shards/submit_step"
-COMMUNITY_SHARD_PUBLIC_GET_PATHS = (COMMUNITY_SHARD_STATUS_PATH,)
+COMMUNITY_SHARD_PUBLIC_GET_PATHS = (
+    COMMUNITY_SHARD_STATUS_PATH,
+    COMMUNITY_SHARD_DISPATCH_READINESS_PATH,
+)
 COMMUNITY_SHARD_PUBLIC_POST_PATHS = (
     COMMUNITY_SHARD_INFERENCE_PATH,
     "/community/shards/lease",
@@ -10990,6 +10996,17 @@ WantedBy=multi-user.target
             proxy_read_timeout {COMMUNITY_SHARD_STATUS_READ_TIMEOUT_SECONDS}s;
             proxy_send_timeout {COMMUNITY_SHARD_METADATA_TIMEOUT_SECONDS}s;
         }}
+        location = {COMMUNITY_SHARD_DISPATCH_READINESS_PATH} {{
+            auth_request /__arc_interlock_gate;
+            limit_except GET OPTIONS {{ deny all; }}
+            client_max_body_size 1k;
+            limit_req zone=arc_read_{zone} burst=60 nodelay;
+            proxy_pass {upstream};
+            proxy_http_version 1.1;
+            proxy_connect_timeout {COMMUNITY_SHARD_PROXY_CONNECT_TIMEOUT_SECONDS}s;
+            proxy_read_timeout {COMMUNITY_SHARD_STATUS_READ_TIMEOUT_SECONDS}s;
+            proxy_send_timeout {COMMUNITY_SHARD_METADATA_TIMEOUT_SECONDS}s;
+        }}
         location = {COMMUNITY_SHARD_INFERENCE_PATH} {{
             auth_request /__arc_interlock_gate;
             limit_except POST OPTIONS {{ deny all; }}
@@ -11211,6 +11228,7 @@ http {{
         )
         community_shard_tokens = (
             "/community/shards/",
+            "/inference/community_shards/",
             "arc_community_shard_",
             "@communityShard",
         )
@@ -11238,10 +11256,10 @@ http {{
         proxy_count = rpc_filter.count("proxy_pass http://")
         auth_count = rpc_filter.count("auth_request /__arc_interlock_gate;")
         status_proxy_count = rpc_filter.count("gate.sock:/maintenance/status;")
-        expected_proxy_count = (14 if community_sharding else 10) + (
+        expected_proxy_count = (15 if community_sharding else 10) + (
             2 if gate_proxy_count == 2 else 0
         )
-        expected_rpc_upstreams = 12 if community_sharding else 8
+        expected_rpc_upstreams = 13 if community_sharding else 8
         if (
             proxy_count != expected_proxy_count
             or status_proxy_count != 1
@@ -11329,11 +11347,19 @@ http {{
             "location = /internal/community/reward/approve {",
             "location ~ ^/(?:shards/announce|inference/(?:forward_shard|cleanup_shard))$ {",
         )
+        shard_read_nginx_headers = tuple(
+            f"location = {path} {{" for path in COMMUNITY_SHARD_PUBLIC_GET_PATHS
+        )
+        shard_inference_header = f"location = {COMMUNITY_SHARD_INFERENCE_PATH} {{"
+        shard_metadata_header = (
+            "location ~ ^/community/shards/(?:lease|heartbeat|claim_step|release)$ {"
+        )
+        shard_submit_header = f"location = {COMMUNITY_SHARD_SUBMIT_POST_PATH} {{"
         shard_nginx_headers = (
-            f"location = {COMMUNITY_SHARD_STATUS_PATH} {{",
-            f"location = {COMMUNITY_SHARD_INFERENCE_PATH} {{",
-            "location ~ ^/community/shards/(?:lease|heartbeat|claim_step|release)$ {",
-            f"location = {COMMUNITY_SHARD_SUBMIT_POST_PATH} {{",
+            *shard_read_nginx_headers,
+            shard_inference_header,
+            shard_metadata_header,
+            shard_submit_header,
         )
         nginx_blocks = RecoveryRollout._extract_braced_blocks(
             rpc_filter, (*internal_nginx_headers, *shard_nginx_headers)
@@ -11376,31 +11402,35 @@ http {{
             )
             if len(shard_conn_matches) != 1:
                 fail("RPC filter must define an independent community shard connection zone")
-            status_block = nginx_blocks.get(shard_nginx_headers[0])
-            inference_block = nginx_blocks.get(shard_nginx_headers[1])
-            metadata_block = nginx_blocks.get(shard_nginx_headers[2])
-            submit_block = nginx_blocks.get(shard_nginx_headers[3])
+            for read_header in shard_read_nginx_headers:
+                read_block = nginx_blocks.get(read_header)
+                if read_block is None:
+                    fail("RPC filter omits one or more required community shard locations")
+                if (
+                    "limit_except GET OPTIONS { deny all; }" not in read_block
+                    or "client_max_body_size 1k;" not in read_block
+                    or re.search(
+                        r"^\s*limit_req zone=arc_read_[a-z0-9]{1,20} burst=60 nodelay;\s*$",
+                        read_block,
+                        re.MULTILINE,
+                    )
+                    is None
+                    or f"proxy_connect_timeout {COMMUNITY_SHARD_PROXY_CONNECT_TIMEOUT_SECONDS}s;" not in read_block
+                    or f"proxy_read_timeout {COMMUNITY_SHARD_STATUS_READ_TIMEOUT_SECONDS}s;" not in read_block
+                    or f"proxy_send_timeout {COMMUNITY_SHARD_METADATA_TIMEOUT_SECONDS}s;" not in read_block
+                ):
+                    fail(
+                        f"RPC filter community shard read/status route {read_header} violates method/body/rate/timeout policy"
+                    )
+            inference_block = nginx_blocks.get(shard_inference_header)
+            metadata_block = nginx_blocks.get(shard_metadata_header)
+            submit_block = nginx_blocks.get(shard_submit_header)
             if (
-                status_block is None
-                or inference_block is None
+                inference_block is None
                 or metadata_block is None
                 or submit_block is None
             ):
                 fail("RPC filter omits one or more required community shard locations")
-            if (
-                "limit_except GET OPTIONS { deny all; }" not in status_block
-                or "client_max_body_size 1k;" not in status_block
-                or re.search(
-                    r"^\s*limit_req zone=arc_read_[a-z0-9]{1,20} burst=60 nodelay;\s*$",
-                    status_block,
-                    re.MULTILINE,
-                )
-                is None
-                or f"proxy_connect_timeout {COMMUNITY_SHARD_PROXY_CONNECT_TIMEOUT_SECONDS}s;" not in status_block
-                or f"proxy_read_timeout {COMMUNITY_SHARD_STATUS_READ_TIMEOUT_SECONDS}s;" not in status_block
-                or f"proxy_send_timeout {COMMUNITY_SHARD_METADATA_TIMEOUT_SECONDS}s;" not in status_block
-            ):
-                fail("RPC filter community shard status route violates method/body/rate/timeout policy")
             if (
                 "limit_except POST OPTIONS { deny all; }" not in inference_block
                 or "client_max_body_size 16k;" not in inference_block

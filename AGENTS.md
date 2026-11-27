@@ -298,9 +298,11 @@ cancellable backoff while retaining lease fences. Authentication, model and
 protocol errors still stop the worker; the local RPC remaining up is not proof
 that the worker is serving.
 The desktop derives partial-worker mode from existing compute consent and typed
-release pins, preserving managed identity and update rollback. Production pins
-remain unset until a deployed coordinator and model are verified; current builds
-therefore keep their existing whole-worker launch path.
+release pins, preserving managed identity and update rollback. The release pins
+Singapore's verified coordinator identity, recovered domain and canonical model.
+Eligible desktop workers use partial shards; explicit compute opt-outs and
+unresolved shutdown recovery retain observer mode. An absent pin preserves the
+whole-worker path for rollback tests.
 The rollout manifest's optional `gateway.community_sharding` boolean adds the
 exact shard routes and coordinator flag only when enabled. Disabled rendering
 preserves the sealed gateway bytes. Metadata and public requests are capped at
@@ -333,6 +335,9 @@ from a GGUF, without preparing optional quantizations. It validates a strict
 partial range before reading tensor weights. Its GGUF tests execute two partial
 models across prefill and decoding and compare tokens and logits hashes with
 the full canonical engine. It does not define downloadable partial artifacts.
+Validator range loading uses the same canonical-only preparation without transient
+optional quantizations. Clamped terminal ranges retain their output head; golden
+checks cover full, split and disjoint ranges against the canonical engine.
 
 `canonical_shard_admission` inspects one bounded, captured GGUF header before
 canonical config allocation. It checks geometry and estimates partial-model
@@ -381,6 +386,13 @@ and recovery-probe paths and forwards a selected partial pipeline's error
 without a second dispatch. Readiness includes this capacity through the existing
 v1 sharded flag, preserving its nine wire fields. Partial results retain their
 verification and participant evidence without inventing rewards or settlement.
+Desktop direct inference first checks the compiled partial coordinator through a
+bounded, read-only, uncached readiness endpoint that binds coordinator, domain,
+model and prompt capabilities. Its dedicated compute-only POST cannot change
+wallet or receipt origins; explicit custom origins retain their existing path.
+Sharding-enabled gateway generation admits this exact GET route with the same
+interlock, method and resource bounds as shard status. Preflight failures may continue the existing route selection. Once a POST is
+attempted, errors are terminal and cannot trigger another inference dispatch.
 
 The optional `partial_shard` worker status reports loading, lease expiry,
 reconnects, and partial steps separately from whole jobs. Expired ready or

@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State as AxumState},
     http::StatusCode,
-    routing::post,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -19,6 +19,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub const COMMUNITY_SHARD_DISPATCH_PATH: &str = "/inference/run_community_sharded";
+pub const COMMUNITY_SHARD_DISPATCH_READINESS_PATH: &str =
+    "/inference/community_shards/dispatch_readiness";
+pub const COMMUNITY_SHARD_DISPATCH_READINESS_SCHEMA: &str =
+    "arc.community_shard.dispatch_readiness.v1";
 pub const COMMUNITY_SHARD_DISPATCH_BODY_LIMIT_BYTES: usize = 16 * 1024;
 pub const COMMUNITY_SHARD_DISPATCH_MAX_PROMPT_BYTES: usize = 1000;
 pub const COMMUNITY_SHARD_DISPATCH_MAX_TOKENS: u32 = 64;
@@ -35,6 +39,8 @@ const COMMUNITY_SHARD_VERIFY_PERMIT_WAIT_CAP: Duration = Duration::from_secs(60)
 pub struct CommunityShardedInferenceRequest {
     pub input: String,
     pub max_tokens: u32,
+    #[serde(default)]
+    pub chat_template: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +70,26 @@ pub struct CommunityShardedInferenceResponse {
     verification: super::CommunityVerificationSummary,
     pub rewards_enabled: bool,
     pub reward_eligible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommunityShardDispatchReadinessResponse {
+    pub schema: &'static str,
+    pub mutation_free_observation: bool,
+    pub enabled: bool,
+    pub protocol_version: u16,
+    pub verified_dispatch_enabled: bool,
+    pub sharded_pipeline_ready: bool,
+    pub safe_to_dispatch: bool,
+    pub rewards_enabled: bool,
+    pub chat_template_supported: bool,
+    pub coordinator_id: Option<String>,
+    pub transaction_domain: Option<String>,
+    pub model_id: Option<String>,
+    pub execution_profile: &'static str,
+    pub max_prompt_bytes: usize,
+    pub chat_template_overhead_bytes: usize,
+    pub max_tokens_cap: u32,
 }
 
 struct VerifiedDispatchContext {
@@ -127,12 +153,31 @@ impl Drop for OwnedShardSessionGuard {
 }
 
 pub fn routes() -> Router<super::NodeState> {
-    Router::new().route(
-        COMMUNITY_SHARD_DISPATCH_PATH,
-        post(run_community_sharded).layer(DefaultBodyLimit::max(
-            COMMUNITY_SHARD_DISPATCH_BODY_LIMIT_BYTES,
-        )),
-    )
+    Router::new()
+        .route(
+            COMMUNITY_SHARD_DISPATCH_PATH,
+            post(run_community_sharded).layer(DefaultBodyLimit::max(
+                COMMUNITY_SHARD_DISPATCH_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
+            COMMUNITY_SHARD_DISPATCH_READINESS_PATH,
+            get(community_shard_dispatch_readiness),
+        )
+}
+
+async fn community_shard_dispatch_readiness(
+    AxumState(node): AxumState<super::NodeState>,
+) -> (
+    axum::http::HeaderMap,
+    Json<CommunityShardDispatchReadinessResponse>,
+) {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    (headers, Json(build_dispatch_readiness_response(&node)))
 }
 
 pub(crate) fn is_verified_dispatch_available(node: &super::NodeState) -> bool {
@@ -182,6 +227,94 @@ pub(crate) fn dispatch_caps() -> (usize, u32) {
     )
 }
 
+fn format_dispatched_input(
+    input: &str,
+    chat_template: bool,
+    has_vocab: bool,
+    model_artifact_id: Option<Hash256>,
+) -> String {
+    if has_vocab {
+        if let Some(wrapped) =
+            super::coordinator_chat_input(input, chat_template, model_artifact_id)
+        {
+            return wrapped;
+        }
+    }
+    input.to_string()
+}
+
+fn resolve_dispatched_input(
+    node: &super::NodeState,
+    req: &CommunityShardedInferenceRequest,
+) -> String {
+    let has_vocab = node
+        .inference_model
+        .as_ref()
+        .is_some_and(|model| !model.vocab.is_empty());
+    format_dispatched_input(
+        &req.input,
+        req.chat_template,
+        has_vocab,
+        node.model_artifact_id,
+    )
+}
+
+fn chat_template_overhead_bytes_for(has_vocab: bool, model_artifact_id: Option<Hash256>) -> usize {
+    if !has_vocab {
+        return 0;
+    }
+    super::coordinator_chat_input("a", true, model_artifact_id)
+        .map_or(0, |wrapped| wrapped.len().saturating_sub(1))
+}
+
+fn build_dispatch_readiness_response(
+    node: &super::NodeState,
+) -> CommunityShardDispatchReadinessResponse {
+    let coordinator_id = (node.validator_address != Hash256::ZERO)
+        .then(|| format!("0x{}", node.validator_address.to_hex()));
+    let transaction_domain = node
+        .state
+        .transaction_domain_hash()
+        .map(|domain| format!("0x{}", domain.to_hex()));
+    let enabled = node.community_shard_coordinator.lock().is_some();
+    let shutting_down = is_shutting_down(node);
+    let verified_dispatch_enabled =
+        enabled && !shutting_down && is_verified_dispatch_available(node);
+    let sharded_pipeline_ready = is_ready_pipeline_available(node);
+    let model_id = load_canonical_dispatch_model(node)
+        .ok()
+        .map(|ctx| format!("0x{}", ctx.model_id.to_hex()));
+    let has_vocab = node
+        .inference_model
+        .as_ref()
+        .is_some_and(|model| !model.vocab.is_empty());
+    let chat_template_overhead_bytes =
+        chat_template_overhead_bytes_for(has_vocab, node.model_artifact_id);
+    let identity_bound =
+        coordinator_id.is_some() && transaction_domain.is_some() && model_id.is_some();
+    let safe_to_dispatch =
+        enabled && verified_dispatch_enabled && sharded_pipeline_ready && identity_bound;
+
+    CommunityShardDispatchReadinessResponse {
+        schema: COMMUNITY_SHARD_DISPATCH_READINESS_SCHEMA,
+        mutation_free_observation: true,
+        enabled,
+        protocol_version: COMMUNITY_SHARD_PROTOCOL_VERSION,
+        verified_dispatch_enabled,
+        sharded_pipeline_ready,
+        safe_to_dispatch,
+        rewards_enabled: false,
+        chat_template_supported: true,
+        coordinator_id,
+        transaction_domain,
+        model_id,
+        execution_profile: CANONICAL_REWARD_INFERENCE_PROFILE,
+        max_prompt_bytes: COMMUNITY_SHARD_DISPATCH_MAX_PROMPT_BYTES,
+        chat_template_overhead_bytes,
+        max_tokens_cap: effective_max_tokens_cap(),
+    }
+}
+
 pub(crate) async fn run_community_sharded_for_inference_run(
     node: super::NodeState,
     input_text: &str,
@@ -193,6 +326,7 @@ pub(crate) async fn run_community_sharded_for_inference_run(
         Json(CommunityShardedInferenceRequest {
             input: dispatched_input,
             max_tokens,
+            chat_template: false,
         }),
     )
     .await?;
@@ -244,12 +378,14 @@ pub(crate) async fn run_community_sharded(
     ensure_not_shutting_down(&node)?;
     ensure_coordinator_enabled(&node)?;
     validate_request_bounds(&req)?;
+    let dispatched_input = resolve_dispatched_input(&node, &req);
+    validate_dispatched_input_bounds(&dispatched_input)?;
 
     let admission_now_ms = now_unix_ms()?;
     let _dispatch_guard = acquire_shard_dispatch_slot(&node, admission_now_ms)?;
 
     let ctx = load_canonical_dispatch_model(&node)?;
-    let prompt_tokens = encode_and_preflight_prompt(&ctx.model, &req.input, req.max_tokens)?;
+    let prompt_tokens = encode_and_preflight_prompt(&ctx.model, &dispatched_input, req.max_tokens)?;
     ensure_verification_availability(&node, ctx.model.config.n_layers, true)?;
     ensure_not_shutting_down(&node)?;
 
@@ -324,7 +460,7 @@ pub(crate) async fn run_community_sharded(
     );
     let candidate = super::CommunityVerificationCandidate {
         verification_id,
-        input: &req.input,
+        input: &dispatched_input,
         max_tokens: req.max_tokens,
         model_id: ctx.model_id,
         execution_profile: CANONICAL_REWARD_INFERENCE_PROFILE,
@@ -570,6 +706,25 @@ fn validate_request_bounds(
     Ok(())
 }
 
+fn validate_dispatched_input_bounds(dispatched_input: &str) -> Result<(), (StatusCode, String)> {
+    if dispatched_input.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "input must not be empty".to_string(),
+        ));
+    }
+    if dispatched_input.len() > COMMUNITY_SHARD_DISPATCH_MAX_PROMPT_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "dispatched input exceeds maximum {COMMUNITY_SHARD_DISPATCH_MAX_PROMPT_BYTES} bytes, got {}",
+                dispatched_input.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod inference_run_adapter_tests {
     use super::*;
@@ -590,9 +745,81 @@ mod inference_run_adapter_tests {
                 is_request_within_dispatch_bounds(&input, max_tokens),
                 expected
             );
-            let req = CommunityShardedInferenceRequest { input, max_tokens };
+            let req = CommunityShardedInferenceRequest {
+                input,
+                max_tokens,
+                chat_template: false,
+            };
             assert_eq!(validate_request_bounds(&req).is_ok(), expected);
         }
+    }
+
+    #[test]
+    fn community_sharded_request_serde_defaults_chat_template_false_and_rejects_unknown_fields() {
+        let legacy: CommunityShardedInferenceRequest =
+            serde_json::from_str(r#"{"input":"hello","max_tokens":8}"#)
+                .expect("legacy request without chat_template");
+        assert_eq!(legacy.input, "hello");
+        assert_eq!(legacy.max_tokens, 8);
+        assert!(!legacy.chat_template);
+
+        let templated: CommunityShardedInferenceRequest =
+            serde_json::from_str(r#"{"input":"hello","max_tokens":8,"chat_template":true}"#)
+                .expect("request with chat_template");
+        assert!(templated.chat_template);
+
+        let unknown = serde_json::from_str::<CommunityShardedInferenceRequest>(
+            r#"{"input":"hello","max_tokens":8,"chat_template":true,"extra":1}"#,
+        );
+        assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn chat_template_formatting_matches_inference_run_and_preserves_1000_byte_dispatched_cap() {
+        let llama2 = Some(super::super::LLAMA2_CHAT_ARTIFACT_ID);
+        let other_model = Some(Hash256([0x11; 32]));
+
+        assert_eq!(
+            format_dispatched_input("  hello  ", true, true, llama2),
+            "[INST] hello [/INST]"
+        );
+        assert_eq!(
+            format_dispatched_input("[INST] hello [/INST]", false, true, llama2),
+            "[INST] hello [/INST]"
+        );
+        assert_eq!(
+            format_dispatched_input("hello", true, false, llama2),
+            "hello"
+        );
+        assert_eq!(
+            format_dispatched_input("hello", true, true, other_model),
+            "hello"
+        );
+        assert_eq!(chat_template_overhead_bytes_for(true, llama2), 15);
+        assert_eq!(chat_template_overhead_bytes_for(false, llama2), 0);
+        assert_eq!(chat_template_overhead_bytes_for(true, other_model), 0);
+
+        let overhead = chat_template_overhead_bytes_for(true, llama2);
+        let fits_raw = "x".repeat(COMMUNITY_SHARD_DISPATCH_MAX_PROMPT_BYTES - overhead);
+        let fits_dispatched = format_dispatched_input(&fits_raw, true, true, llama2);
+        assert_eq!(
+            fits_dispatched.len(),
+            COMMUNITY_SHARD_DISPATCH_MAX_PROMPT_BYTES
+        );
+        assert!(validate_dispatched_input_bounds(&fits_dispatched).is_ok());
+
+        let over_raw = "x".repeat(COMMUNITY_SHARD_DISPATCH_MAX_PROMPT_BYTES - overhead + 1);
+        let over_dispatched = format_dispatched_input(&over_raw, true, true, llama2);
+        assert_eq!(
+            over_dispatched.len(),
+            COMMUNITY_SHARD_DISPATCH_MAX_PROMPT_BYTES + 1
+        );
+        assert_eq!(
+            validate_dispatched_input_bounds(&over_dispatched)
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[test]
@@ -2215,6 +2442,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compute_only_readiness_binds_identity_and_is_read_only_over_http() {
+        let mut fixture =
+            build_verified_fixture(2, 2, CommunityShardLimits::default(), None, false).await;
+        assert!(!build_dispatch_readiness_response(&fixture.coordinator).safe_to_dispatch);
+        attach_ready_partial_workers(&mut fixture, 2).await;
+        let snapshot = || {
+            fixture
+                .coordinator
+                .community_shard_coordinator
+                .lock()
+                .as_ref()
+                .unwrap()
+                .status_snapshot(now_unix_ms().unwrap())
+        };
+        let before = snapshot();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let app = routes().with_state(fixture.coordinator.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("{origin}{COMMUNITY_SHARD_DISPATCH_READINESS_PATH}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store"
+        );
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body.as_object().unwrap().len(), 16);
+        assert_eq!(body["schema"], COMMUNITY_SHARD_DISPATCH_READINESS_SCHEMA);
+        assert_eq!(body["safe_to_dispatch"], true);
+        assert_eq!(body["rewards_enabled"], false);
+        assert_eq!(body["chat_template_supported"], true);
+        assert_eq!(
+            body["coordinator_id"],
+            format!("0x{}", fixture.coordinator.validator_address.to_hex())
+        );
+        assert_eq!(
+            body["transaction_domain"],
+            format!(
+                "0x{}",
+                fixture
+                    .coordinator
+                    .state
+                    .transaction_domain_hash()
+                    .unwrap()
+                    .to_hex()
+            )
+        );
+        assert_eq!(body["model_id"], format!("0x{}", fixture.model_id.to_hex()));
+        assert_eq!(before, snapshot());
+        server.abort();
+        let shutdown = fixture.coordinator.runtime_shutdown.clone();
+        let (sender, receiver) = tokio::sync::watch::channel(true);
+        fixture.coordinator.runtime_shutdown = Some(receiver);
+        assert!(!build_dispatch_readiness_response(&fixture.coordinator).safe_to_dispatch);
+        drop(sender);
+        fixture.coordinator.runtime_shutdown = shutdown;
+        fixture.coordinator.dag_validators.write().truncate(1);
+        assert!(!build_dispatch_readiness_response(&fixture.coordinator).safe_to_dispatch);
+        *fixture.coordinator.community_shard_coordinator.lock() = None;
+        assert!(!build_dispatch_readiness_response(&fixture.coordinator).safe_to_dispatch);
+    }
+
+    #[tokio::test]
     async fn readiness_snapshot_reflects_ready_community_shards_mutation_free() {
         let mut fixture =
             build_verified_fixture(2, 2, CommunityShardLimits::default(), None, false).await;
@@ -2401,6 +2702,7 @@ mod tests {
             .json(&CommunityShardedInferenceRequest {
                 input: prompt.to_string(),
                 max_tokens,
+                chat_template: false,
             })
             .send()
             .await
@@ -2538,6 +2840,7 @@ mod tests {
         let request = CommunityShardedInferenceRequest {
             input: "ARC".into(),
             max_tokens: 3,
+            chat_template: false,
         };
         let (canonical, canonical_hash) = fixture
             .model
@@ -2622,6 +2925,7 @@ mod tests {
             Json(CommunityShardedInferenceRequest {
                 input: prompt.to_string(),
                 max_tokens,
+                chat_template: false,
             }),
         )
         .await
@@ -2659,6 +2963,7 @@ mod tests {
             Json(CommunityShardedInferenceRequest {
                 input: "ARC".to_string(),
                 max_tokens: 2,
+                chat_template: false,
             }),
         )
         .await;
@@ -2704,6 +3009,7 @@ mod tests {
             Json(CommunityShardedInferenceRequest {
                 input: "ARC".to_string(),
                 max_tokens: 2,
+                chat_template: false,
             }),
         )
         .await;
@@ -2749,6 +3055,7 @@ mod tests {
                 Json(CommunityShardedInferenceRequest {
                     input: "ARC".to_string(),
                     max_tokens: 2,
+                    chat_template: false,
                 }),
             )
             .await;
@@ -2797,6 +3104,7 @@ mod tests {
             Json(CommunityShardedInferenceRequest {
                 input: "ARC".to_string(),
                 max_tokens: 2,
+                chat_template: false,
             }),
         )
         .await
@@ -2833,6 +3141,7 @@ mod tests {
             Json(CommunityShardedInferenceRequest {
                 input: "ARC".to_string(),
                 max_tokens: 2,
+                chat_template: false,
             }),
         )
         .await
@@ -2877,6 +3186,7 @@ mod tests {
             .json(&CommunityShardedInferenceRequest {
                 input: String::new(),
                 max_tokens: 1,
+                chat_template: false,
             })
             .send()
             .await
@@ -2888,6 +3198,7 @@ mod tests {
             .json(&CommunityShardedInferenceRequest {
                 input: "a".repeat(COMMUNITY_SHARD_DISPATCH_MAX_PROMPT_BYTES + 1),
                 max_tokens: 1,
+                chat_template: false,
             })
             .send()
             .await
@@ -2899,6 +3210,7 @@ mod tests {
             .json(&CommunityShardedInferenceRequest {
                 input: "ARC".to_string(),
                 max_tokens: 0,
+                chat_template: false,
             })
             .send()
             .await
@@ -2910,6 +3222,7 @@ mod tests {
             .json(&CommunityShardedInferenceRequest {
                 input: "ARC".to_string(),
                 max_tokens: COMMUNITY_SHARD_DISPATCH_MAX_TOKENS + 1,
+                chat_template: false,
             })
             .send()
             .await
@@ -2923,6 +3236,7 @@ mod tests {
                 .json(&CommunityShardedInferenceRequest {
                     input: zero_encoded_prompt.to_string(),
                     max_tokens: 1,
+                    chat_template: false,
                 })
                 .send()
                 .await
@@ -2936,6 +3250,7 @@ mod tests {
             .json(&CommunityShardedInferenceRequest {
                 input: context_overflow_prompt,
                 max_tokens: 55,
+                chat_template: false,
             })
             .send()
             .await
@@ -2961,6 +3276,7 @@ mod tests {
             .json(&CommunityShardedInferenceRequest {
                 input: "ARC".to_string(),
                 max_tokens: 1,
+                chat_template: false,
             })
             .send()
             .await
@@ -2989,6 +3305,7 @@ mod tests {
             .json(&CommunityShardedInferenceRequest {
                 input: "ARC".to_string(),
                 max_tokens: 1,
+                chat_template: false,
             })
             .send()
             .await
@@ -3015,6 +3332,7 @@ mod tests {
             Json(CommunityShardedInferenceRequest {
                 input: "ARC".to_string(),
                 max_tokens: 1,
+                chat_template: false,
             }),
         )
         .await
@@ -3056,6 +3374,7 @@ mod tests {
             Json(CommunityShardedInferenceRequest {
                 input: "ARC".to_string(),
                 max_tokens: 2,
+                chat_template: false,
             }),
         ));
         let timed_out = tokio::time::timeout(Duration::from_millis(80), &mut fut).await;
@@ -3173,6 +3492,7 @@ mod tests {
                 Json(CommunityShardedInferenceRequest {
                     input: "ARC".to_string(),
                     max_tokens: 2,
+                    chat_template: false,
                 }),
             ),
         )
@@ -3256,6 +3576,7 @@ mod tests {
                     .json(&CommunityShardedInferenceRequest {
                         input: prompt.to_string(),
                         max_tokens,
+                        chat_template: false,
                     })
                     .send()
                     .await
@@ -3296,6 +3617,7 @@ mod tests {
             .json(&CommunityShardedInferenceRequest {
                 input: prompt.to_string(),
                 max_tokens,
+                chat_template: false,
             })
             .send()
             .await
@@ -3346,6 +3668,7 @@ mod tests {
             .json(&CommunityShardedInferenceRequest {
                 input: prompt.to_string(),
                 max_tokens,
+                chat_template: false,
             })
             .send()
             .await
@@ -3426,6 +3749,7 @@ mod tests {
                     Json(CommunityShardedInferenceRequest {
                         input: "ARC".to_string(),
                         max_tokens: 2,
+                        chat_template: false,
                     }),
                 )
                 .await
@@ -3505,6 +3829,7 @@ mod tests {
                     Json(CommunityShardedInferenceRequest {
                         input: "ARC".to_string(),
                         max_tokens: 1,
+                        chat_template: false,
                     }),
                 )
                 .await
@@ -3567,6 +3892,7 @@ mod tests {
             Json(CommunityShardedInferenceRequest {
                 input: "ARC".to_string(),
                 max_tokens: 1,
+                chat_template: false,
             }),
         )
         .await;
@@ -3614,6 +3940,7 @@ mod tests {
                     Json(CommunityShardedInferenceRequest {
                         input: "ARC".to_string(),
                         max_tokens: 1,
+                        chat_template: false,
                     }),
                 )
                 .await
@@ -3712,6 +4039,7 @@ mod tests {
                 Json(CommunityShardedInferenceRequest {
                     input: "ARC".to_string(),
                     max_tokens: 1,
+                    chat_template: false,
                 }),
             ),
         )

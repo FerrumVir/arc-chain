@@ -66,7 +66,14 @@ pub(crate) struct PinnedShardCoordinator {
     pub(crate) allow_insecure_for_loopback: bool,
 }
 
-pub(crate) const PRODUCTION_SHARD_COORDINATOR: Option<PinnedShardCoordinator> = None;
+pub(crate) const PRODUCTION_SHARD_COORDINATOR: Option<PinnedShardCoordinator> =
+    Some(PinnedShardCoordinator {
+        coordinator_url: "https://149.28.153.31",
+        coordinator_id: "f521309b041da7aefc742548bdc002c31b47183aacfbbbf245ded09845d0415b",
+        transaction_domain: "3b9147e44d878646caf2d0729d06bd2e082b265e0525760595bd10605f37a10f",
+        expected_model_id: "934efc12a2ed8372a944e5aaedf059a8a0f42c0906f6b2f1fb3626bdeb1ffa67",
+        allow_insecure_for_loopback: false,
+    });
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ManagedComputeLaunchMode {
@@ -3272,7 +3279,7 @@ fn validate_nonzero_hex64(value: &str, name: &str) -> anyhow::Result<()> {
 }
 
 impl PinnedShardCoordinator {
-    fn validate(&self) -> anyhow::Result<()> {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.coordinator_url.is_empty() && self.coordinator_url == self.coordinator_url.trim(),
             "pinned shard coordinator URL must be trimmed and non-empty"
@@ -8759,15 +8766,14 @@ mod managed_shard_launch_tests {
     }
 
     #[test]
-    fn production_pin_is_none_and_preserves_whole_worker_byte_for_byte() {
-        assert!(PRODUCTION_SHARD_COORDINATOR.is_none());
+    fn absent_pin_preserves_whole_worker_byte_for_byte() {
         let config = consenting_worker("/models/standard.gguf", None);
         let mode = resolve_managed_compute_launch_mode(
             &config,
             16 * crate::hardware::GIB,
             false,
             None,
-            PRODUCTION_SHARD_COORDINATOR,
+            None,
         )
         .unwrap();
         assert_eq!(mode, ManagedComputeLaunchMode::FullIntegerWorker);
@@ -8779,6 +8785,80 @@ mod managed_shard_launch_tests {
         assert!(args.iter().any(|a| a == "--full-integer-worker"));
         assert!(args.iter().any(|a| a == "--community-rpc-url"));
         assert!(args.iter().any(|a| a == "--prevent-sleep-during-jobs"));
+    }
+
+    #[test]
+    fn production_pin_activates_shards_on_the_recovered_network_and_preserves_opt_outs() {
+        let pin = PRODUCTION_SHARD_COORDINATOR
+            .expect("release must activate its verified shard coordinator");
+        pin.validate().unwrap();
+        assert!(!pin.allow_insecure_for_loopback);
+        let network: serde_json::Value =
+            serde_json::from_str(include_str!("../../../shared/frontend/arc-network.json"))
+                .unwrap();
+        assert_eq!(
+            network["checkpoint"]["recoveryDomain"].as_str(),
+            Some(pin.transaction_domain)
+        );
+        assert!(network["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|source| source["region"] == "sgp"
+                && source["enabled"] == true
+                && source["baseUrl"] == pin.coordinator_url));
+        let mut config = consenting_worker("/models/standard.gguf", None);
+        let mode = resolve_managed_compute_launch_mode(
+            &config,
+            16 * crate::hardware::GIB,
+            false,
+            None,
+            Some(pin),
+        )
+        .unwrap();
+        assert!(matches!(
+            mode,
+            ManagedComputeLaunchMode::CommunityShardWorker { .. }
+        ));
+        let (args, threads) = build_args_and_rayon_env(&config, &mode, 8);
+        assert_eq!(threads.as_deref(), Some("1"));
+        for (flag, expected) in [
+            ("--community-shard-coordinator-url", pin.coordinator_url),
+            ("--community-shard-coordinator-id", pin.coordinator_id),
+            (
+                "--community-shard-transaction-domain",
+                pin.transaction_domain,
+            ),
+            ("--community-shard-expected-model-id", pin.expected_model_id),
+        ] {
+            assert!(args
+                .windows(2)
+                .any(|pair| pair[0] == flag && pair[1] == expected));
+        }
+        assert!(!args.iter().any(|arg| arg == "--full-integer-worker"));
+        assert_eq!(
+            resolve_managed_compute_launch_mode(
+                &config,
+                16 * crate::hardware::GIB,
+                true,
+                None,
+                Some(pin)
+            )
+            .unwrap(),
+            ManagedComputeLaunchMode::Observer
+        );
+        config.compute_consent = Some(false);
+        assert_eq!(
+            resolve_managed_compute_launch_mode(
+                &config,
+                16 * crate::hardware::GIB,
+                false,
+                None,
+                Some(pin)
+            )
+            .unwrap(),
+            ManagedComputeLaunchMode::Observer
+        );
     }
 
     #[test]

@@ -323,6 +323,12 @@ jobs:
           cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib native_paid:: -- --test-threads=1
           cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib node_manager:: -- --test-threads=1
           cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib partial_worker_status_tests:: -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib community_shard_route_tests:: -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib inference_retry_tests:: -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib shard_dispatch_readiness_parser_enforces_exact_contract_and_invariants -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib community_sharded_response_parser_validates_non_settling_quorum_and_rejects_violations -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib shard_readiness_enforces_streaming_body_cap_without_content_length -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib settlement_write_gate_explains_why_it_is_closed -- --test-threads=1
           cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib inference_parser_accepts_flat_community_sharded_response_without_inventing_settlement -- --test-threads=1
       - name: Lint desktop lifecycle and worker integration
         run: cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --locked --lib --tests -- -D warnings

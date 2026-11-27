@@ -5625,15 +5625,17 @@ pub fn load_cached_model_ranges(
     }
 
     if sorted.len() == 1 {
-        return load_cached_model_shard(path, sorted[0].0, sorted[0].1);
+        let mut single = load_cached_model_shard_profile(path, sorted[0].0, sorted[0].1, false)?;
+        single.enforce_canonical_i8_profile();
+        return Ok(single);
     }
 
-    let mut aggregate = load_cached_model_shard(path, sorted[0].0, sorted[0].1)?;
+    let mut aggregate = load_cached_model_shard_profile(path, sorted[0].0, sorted[0].1, false)?;
     let n_layers = aggregate.config.n_layers;
     aggregate.enforce_canonical_i8_profile();
 
     for &(start, end) in &sorted[1..] {
-        let mut other = load_cached_model_shard(path, start, end)?;
+        let mut other = load_cached_model_shard_profile(path, start, end, false)?;
         other.enforce_canonical_i8_profile();
         if other.layers.len() != aggregate.layers.len() {
             return Err(InferenceError::Runtime(format!(
@@ -5652,7 +5654,7 @@ pub fn load_cached_model_ranges(
             aggregate.embedding_q16 = std::mem::take(&mut other.embedding_q16);
             aggregate.embedding_i8 = std::mem::replace(&mut other.embedding_i8, I8Weights::empty());
         }
-        if end == n_layers {
+        if end.min(n_layers) == n_layers {
             if aggregate.output_weight.n_rows == 0 && other.output_weight.n_rows != 0 {
                 aggregate.output_weight =
                     std::mem::replace(&mut other.output_weight, I8Weights::empty());

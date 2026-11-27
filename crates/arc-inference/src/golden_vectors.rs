@@ -841,8 +841,9 @@ fn golden_interleaved_profile_matches_the_reference_on_both_kernels() {
 mod gguf_preparation {
     use super::*;
     use crate::cached_integer_model::{
-        GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, load_cached_model_canonical_i8,
-        load_cached_model_canonical_i8_interleaved_rope, load_cached_model_shard_canonical_i8,
+        GGUF_INTERLEAVED_ROPE_I8_INFERENCE_PROFILE, KVCache, ShardInput, ShardOutput,
+        load_cached_model_canonical_i8, load_cached_model_canonical_i8_interleaved_rope,
+        load_cached_model_ranges, load_cached_model_shard, load_cached_model_shard_canonical_i8,
     };
     use candle_core::quantized::{GgmlDType, QTensor, gguf_file};
     use candle_core::{Device, Tensor};
@@ -1156,6 +1157,203 @@ mod gguf_preparation {
         assert!(model.block_i8_layers.is_none() && model.block_i8_output.is_none());
         assert!(model.ternary_layers.is_none() && model.ternary_output.is_none());
         assert!(model.ternary_hybrid_layers.is_none() && model.ternary_hybrid_output.is_none());
+    }
+
+    #[test]
+    fn load_cached_model_ranges_canonical_i8_parity_clamping_and_roles() {
+        let assert_layer_eq =
+            |a: &crate::cached_integer_model::CachedLayer,
+             b: &crate::cached_integer_model::CachedLayer| {
+                assert_i8_eq(&a.wq, &b.wq);
+                assert_i8_eq(&a.wk, &b.wk);
+                assert_i8_eq(&a.wv, &b.wv);
+                assert_i8_eq(&a.wo, &b.wo);
+                assert_i8_eq(&a.w_gate, &b.w_gate);
+                assert_i8_eq(&a.w_up, &b.w_up);
+                assert_i8_eq(&a.w_down, &b.w_down);
+                assert_eq!(a.attn_norm, b.attn_norm);
+                assert_eq!(a.ffn_norm, b.ffn_norm);
+            };
+
+        let r4 = shard_recipe(4);
+        let f4 = TempGguf(write_gguf_filtered(&r4, "ranges_4l", |_| true));
+        let p4 = f4.0.to_str().unwrap();
+        let full = load_cached_model_canonical_i8(p4).expect("canonical full load");
+        assert_canonical_no_optional_quants(&full);
+
+        let mut legacy = load_cached_model_shard(p4, 0, 4).expect("legacy full load");
+        assert!(!legacy.has_canonical_i8_profile());
+        assert!(legacy.i16_layers.is_some() && legacy.i16_output.is_some());
+        legacy.enforce_canonical_i8_profile();
+        assert_canonical_no_optional_quants(&legacy);
+
+        let expected_digest = prepared_digest(&legacy);
+        assert_eq!(prepared_digest(&full), expected_digest);
+        let seq = [1u32, 3, 5, 7];
+        let prompt = [1u32, 3, 5];
+        let expected_seq = run_whole_model(&full, &seq);
+        let expected_gen = full
+            .try_generate(&prompt, 3, &full.config.eos_tokens)
+            .expect("full try_generate");
+
+        let full_cases: &[&[(usize, usize)]] = &[
+            &[(0, 4)],
+            &[(0, usize::MAX)],
+            &[(0, 2), (2, 4)],
+            &[(2, 4), (0, 2)],
+            &[(0, 1), (1, 3), (3, 4)],
+            &[(0, 2), (2, 99)],
+            &[(0, 1), (1, 2), (2, usize::MAX)],
+        ];
+        for &ranges in full_cases {
+            let model = load_cached_model_ranges(p4, ranges)
+                .unwrap_or_else(|e| panic!("ranges {ranges:?} failed: {e}"));
+            assert_canonical_no_optional_quants(&model);
+            assert!(model.has_all_transformer_layers(), "ranges {ranges:?}");
+            assert_eq!(
+                prepared_digest(&model),
+                expected_digest,
+                "digest mismatch for {ranges:?}"
+            );
+            assert_eq!(
+                run_whole_model(&model, &seq),
+                expected_seq,
+                "sequence mismatch for {ranges:?}"
+            );
+            assert_eq!(
+                model
+                    .try_generate(&prompt, 3, &model.config.eos_tokens)
+                    .expect("range try_generate"),
+                expected_gen,
+                "generation mismatch for {ranges:?}"
+            );
+        }
+
+        let partial_cases: &[(&[(usize, usize)], [bool; 4], bool, bool)] = &[
+            (&[(1, 3)], [false, true, true, false], false, false),
+            (&[(0, 1), (3, 4)], [true, false, false, true], true, true),
+            (&[(1, 2), (3, 10)], [false, true, false, true], false, true),
+            (&[(0, 1), (2, 3)], [true, false, true, false], true, false),
+        ];
+        for &(ranges, expected_loaded, expect_first, expect_last) in partial_cases {
+            let model = load_cached_model_ranges(p4, ranges)
+                .unwrap_or_else(|e| panic!("partial ranges {ranges:?} failed: {e}"));
+            assert_canonical_no_optional_quants(&model);
+            assert!(!model.has_all_transformer_layers(), "ranges {ranges:?}");
+            for (idx, &should_load) in expected_loaded.iter().enumerate() {
+                assert_eq!(
+                    model.layers[idx].is_loaded(),
+                    should_load,
+                    "layer {idx} loaded mismatch for {ranges:?}"
+                );
+                if should_load {
+                    assert_layer_eq(&model.layers[idx], &full.layers[idx]);
+                }
+            }
+            if expect_first {
+                assert_eq!(model.embedding_q16, full.embedding_q16);
+                assert_i8_eq(&model.embedding_i8, &full.embedding_i8);
+            } else {
+                assert!(model.embedding_q16.is_empty() && model.embedding_i8.n_rows == 0);
+            }
+            if expect_last {
+                assert_i8_eq(&model.output_weight, &full.output_weight);
+                assert_eq!(model.final_norm, full.final_norm);
+            } else {
+                assert!(model.output_weight.n_rows == 0 && model.final_norm.is_empty());
+            }
+        }
+
+        let disjoint_ends = load_cached_model_ranges(p4, &[(0, 1), (3, 10)]).unwrap();
+        let interior = load_cached_model_ranges(p4, &[(1, 3)]).unwrap();
+        let mut cache_ends = KVCache::new(full.config.n_layers);
+        let mut cache_mid = KVCache::new(full.config.n_layers);
+        for (pos, &tok) in seq.iter().enumerate() {
+            let h0 = match disjoint_ends
+                .forward_shard_token_with_history(
+                    ShardInput::Token(tok),
+                    &mut cache_ends,
+                    0,
+                    1,
+                    pos,
+                    &[],
+                )
+                .expect("disjoint hop 0..1")
+            {
+                ShardOutput::Hidden(h) => h,
+                ShardOutput::Token { .. } => panic!("expected hidden output from 0..1"),
+            };
+            let h1 = match interior
+                .forward_shard_token_with_history(
+                    ShardInput::Hidden(h0),
+                    &mut cache_mid,
+                    1,
+                    3,
+                    pos,
+                    &[],
+                )
+                .expect("interior hop 1..3")
+            {
+                ShardOutput::Hidden(h) => h,
+                ShardOutput::Token { .. } => panic!("expected hidden output from 1..3"),
+            };
+            let (next_tok, logits_hash) = match disjoint_ends
+                .forward_shard_token_with_history(
+                    ShardInput::Hidden(h1),
+                    &mut cache_ends,
+                    3,
+                    4,
+                    pos,
+                    &[],
+                )
+                .expect("disjoint hop 3..4")
+            {
+                ShardOutput::Token { id, logits_hash } => (id, logits_hash),
+                ShardOutput::Hidden(_) => panic!("expected terminal token from 3..4"),
+            };
+            assert_eq!(next_tok, expected_seq.next_tokens[pos]);
+            assert_eq!(hex::encode(logits_hash.0), expected_seq.logits_hashes[pos]);
+        }
+
+        let r2 = shard_recipe(2);
+        let f2 = TempGguf(write_gguf_filtered(&r2, "ranges_2l", |_| true));
+        let p2 = f2.0.to_str().unwrap();
+        let full2 = load_cached_model_canonical_i8(p2).expect("2-layer full load");
+        let expected_digest2 = prepared_digest(&full2);
+        let expected_seq2 = run_whole_model(&full2, &seq);
+        for ranges in [
+            &[(0, 2)][..],
+            &[(0, usize::MAX)][..],
+            &[(0, 1), (1, 2)][..],
+            &[(0, 1), (1, 5)][..],
+        ] {
+            let model = load_cached_model_ranges(p2, ranges)
+                .unwrap_or_else(|e| panic!("2-layer ranges {ranges:?} failed: {e}"));
+            assert_canonical_no_optional_quants(&model);
+            assert_eq!(prepared_digest(&model), expected_digest2);
+            assert_eq!(run_whole_model(&model, &seq), expected_seq2);
+        }
+
+        let invalid_cases: &[(&[(usize, usize)], &str)] = &[
+            (&[], "no ranges provided"),
+            (&[(0, 3), (2, 4)], "Overlapping shard ranges"),
+            (&[(2, 4), (0, 3)], "Overlapping shard ranges"),
+            (&[(2, 2)], "Invalid shard range"),
+            (&[(3, 1)], "Invalid shard range"),
+            (&[(4, 6)], "Invalid shard range"),
+            (&[(0, 2), (4, 6)], "Invalid shard range"),
+            (&[(0, 2), (2, 2)], "Invalid shard range"),
+        ];
+        for &(ranges, expected_err) in invalid_cases {
+            let err = match load_cached_model_ranges(p4, ranges) {
+                Err(error) => error,
+                Ok(_) => panic!("ranges {ranges:?} must fail"),
+            };
+            assert!(
+                err.to_string().contains(expected_err),
+                "ranges {ranges:?} returned unexpected error: {err}"
+            );
+        }
     }
 
     #[test]

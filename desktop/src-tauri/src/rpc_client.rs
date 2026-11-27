@@ -1565,6 +1565,223 @@ pub async fn inference_readiness(http: &reqwest::Client, base_url: &str) -> Resu
     Ok(safe)
 }
 
+pub const COMMUNITY_SHARD_PROTOCOL_VERSION_V1: u16 = 1;
+const COMMUNITY_SHARD_DISPATCH_READINESS_SCHEMA: &str = "arc.community_shard.dispatch_readiness.v1";
+const COMMUNITY_SHARD_PARTICIPANT_IDENTITY_BASIS: &str =
+    "node_key_not_proof_of_independent_operator";
+const COMMUNITY_SHARD_READINESS_MAX_BYTES: usize = 8_192;
+const COMMUNITY_SHARD_DISPATCH_RESPONSE_MAX_BYTES: usize = 256 * 1024;
+const COMMUNITY_SHARD_ERROR_BODY_MAX_BYTES: usize = 4_096;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommunityShardDispatchReadiness {
+    pub enabled: bool,
+    pub protocol_version: u16,
+    pub verified_dispatch_enabled: bool,
+    pub sharded_pipeline_ready: bool,
+    pub safe_to_dispatch: bool,
+    pub rewards_enabled: bool,
+    pub chat_template_supported: bool,
+    pub coordinator_id: Option<String>,
+    pub transaction_domain: Option<String>,
+    pub model_id: Option<String>,
+    pub execution_profile: String,
+    pub max_prompt_bytes: usize,
+    pub chat_template_overhead_bytes: usize,
+    pub max_tokens_cap: u32,
+}
+
+async fn read_bounded_response_bytes(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(format!("{label} response exceeds {max_bytes} bytes"));
+    }
+    let initial_cap = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .map_or(0, |length| length.min(max_bytes));
+    let mut body = Vec::with_capacity(initial_cap);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("{label} body failed: {error}"))?
+    {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(format!("{label} response exceeds {max_bytes} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn parse_community_shard_dispatch_readiness_value(
+    base_url: &str,
+    value: &Value,
+) -> Result<CommunityShardDispatchReadiness, String> {
+    const PROFILE: &str = arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE;
+    const KEYS: [&str; 16] = [
+        "schema",
+        "mutation_free_observation",
+        "enabled",
+        "protocol_version",
+        "verified_dispatch_enabled",
+        "sharded_pipeline_ready",
+        "safe_to_dispatch",
+        "rewards_enabled",
+        "chat_template_supported",
+        "coordinator_id",
+        "transaction_domain",
+        "model_id",
+        "execution_profile",
+        "max_prompt_bytes",
+        "chat_template_overhead_bytes",
+        "max_tokens_cap",
+    ];
+
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{base_url} shard readiness response is not an object"))?;
+    if object.len() != KEYS.len() || !KEYS.iter().all(|key| object.contains_key(*key)) {
+        return Err(format!(
+            "{base_url} shard readiness fields differ from the reviewed {COMMUNITY_SHARD_DISPATCH_READINESS_SCHEMA} contract"
+        ));
+    }
+    if object.get("schema").and_then(Value::as_str)
+        != Some(COMMUNITY_SHARD_DISPATCH_READINESS_SCHEMA)
+        || object
+            .get("mutation_free_observation")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || object.get("execution_profile").and_then(Value::as_str) != Some(PROFILE)
+    {
+        return Err(format!(
+            "{base_url} shard readiness provenance/profile is not the reviewed contract"
+        ));
+    }
+    let bool_field = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| format!("{base_url} shard readiness {key} is not boolean"))
+    };
+    let enabled = bool_field("enabled")?;
+    let verified_dispatch_enabled = bool_field("verified_dispatch_enabled")?;
+    let sharded_pipeline_ready = bool_field("sharded_pipeline_ready")?;
+    let safe_to_dispatch = bool_field("safe_to_dispatch")?;
+    let rewards_enabled = bool_field("rewards_enabled")?;
+    let chat_template_supported = bool_field("chat_template_supported")?;
+    if rewards_enabled {
+        return Err(format!(
+            "{base_url} shard readiness reported rewards_enabled=true on compute-only route"
+        ));
+    }
+    let protocol_version = object
+        .get("protocol_version")
+        .and_then(Value::as_u64)
+        .and_then(|v| u16::try_from(v).ok())
+        .ok_or_else(|| format!("{base_url} shard readiness protocol_version is invalid"))?;
+    let max_prompt_bytes = object
+        .get("max_prompt_bytes")
+        .and_then(Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+        .filter(|v| *v > 0)
+        .ok_or_else(|| format!("{base_url} shard readiness max_prompt_bytes is invalid"))?;
+    let chat_template_overhead_bytes = object
+        .get("chat_template_overhead_bytes")
+        .and_then(Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+        .filter(|v| *v <= max_prompt_bytes)
+        .ok_or_else(|| {
+            format!("{base_url} shard readiness chat_template_overhead_bytes is invalid")
+        })?;
+    let max_tokens_cap = object
+        .get("max_tokens_cap")
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .filter(|v| *v > 0)
+        .ok_or_else(|| format!("{base_url} shard readiness max_tokens_cap is invalid"))?;
+    let opt_non_empty = |key: &str| -> Result<Option<String>, String> {
+        match object.get(key) {
+            Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) if is_canonical_hash32(s) => Ok(Some(s.clone())),
+            _ => Err(format!(
+                "{base_url} shard readiness {key} is neither null nor non-empty string"
+            )),
+        }
+    };
+    let coordinator_id = opt_non_empty("coordinator_id")?;
+    let transaction_domain = opt_non_empty("transaction_domain")?;
+    let model_id = match object.get("model_id") {
+        Some(Value::Null) => None,
+        Some(Value::String(s)) if is_canonical_hash32(s) => Some(s.clone()),
+        _ => {
+            return Err(format!(
+                "{base_url} shard readiness model_id is neither null nor canonical hash"
+            ))
+        }
+    };
+    let identity_bound =
+        coordinator_id.is_some() && transaction_domain.is_some() && model_id.is_some();
+    if safe_to_dispatch
+        != (enabled && verified_dispatch_enabled && sharded_pipeline_ready && identity_bound)
+    {
+        return Err(format!(
+            "{base_url} shard readiness route facts are internally inconsistent"
+        ));
+    }
+    Ok(CommunityShardDispatchReadiness {
+        enabled,
+        protocol_version,
+        verified_dispatch_enabled,
+        sharded_pipeline_ready,
+        safe_to_dispatch,
+        rewards_enabled,
+        chat_template_supported,
+        coordinator_id,
+        transaction_domain,
+        model_id,
+        execution_profile: PROFILE.to_string(),
+        max_prompt_bytes,
+        chat_template_overhead_bytes,
+        max_tokens_cap,
+    })
+}
+
+pub async fn community_shard_dispatch_readiness(
+    http: &reqwest::Client,
+    base_url: &str,
+) -> Result<CommunityShardDispatchReadiness, String> {
+    let base_url = base_url.trim_end_matches('/');
+    let response = http
+        .get(format!(
+            "{base_url}/inference/community_shards/dispatch_readiness"
+        ))
+        .send()
+        .await
+        .map_err(|error| format!("{base_url} shard readiness transport failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "{base_url} shard readiness returned HTTP {}",
+            response.status()
+        ));
+    }
+    let bytes = read_bounded_response_bytes(
+        response,
+        COMMUNITY_SHARD_READINESS_MAX_BYTES,
+        &format!("{base_url} shard readiness"),
+    )
+    .await?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("{base_url} shard readiness JSON is invalid: {error}"))?;
+    parse_community_shard_dispatch_readiness_value(base_url, &value)
+}
+
 pub async fn run_inference(
     http: &reqwest::Client,
     base_url: &str,
@@ -1760,6 +1977,258 @@ pub async fn run_inference_remote(
     }
     let v: Value = resp.json().await.map_err(|e| e.to_string())?;
     parse_inference_run_value(&v, Some(coord_base), false)
+}
+
+fn parse_community_sharded_response_value(
+    value: &Value,
+    coord_base: &str,
+    requested_prompt: &str,
+    requested_max_tokens: u32,
+    expected_model_id: &str,
+) -> Result<InferenceResult, String> {
+    const PROFILE: &str = arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE;
+    const FORBIDDEN_KEYS: [&str; 12] = [
+        "settlement",
+        "attestation",
+        "tx_hash",
+        "attestation_status",
+        "attestation_hash",
+        "explorer_url",
+        "inference",
+        "trace",
+        "consensus",
+        "success",
+        "routed_via",
+        "error",
+    ];
+    const KEYS: [&str; 16] = [
+        "protocol_version",
+        "session_id",
+        "model_name",
+        "model_id",
+        "execution_profile",
+        "generated_tokens",
+        "tokens_generated",
+        "output",
+        "output_hash",
+        "stopped_by_eos",
+        "total_ms",
+        "participants",
+        "participant_identity_basis",
+        "verification",
+        "rewards_enabled",
+        "reward_eligible",
+    ];
+    const PARTICIPANT_KEYS: [&str; 4] = ["worker_id", "lease_id", "lease_epoch", "range"];
+
+    let object = value
+        .as_object()
+        .ok_or_else(|| "community sharded response is not a JSON object".to_string())?;
+    for forbidden in FORBIDDEN_KEYS {
+        if object.contains_key(forbidden) {
+            return Err(format!(
+                "community sharded compute-only response contains forbidden field {forbidden}"
+            ));
+        }
+    }
+    if object.len() != KEYS.len() || !KEYS.iter().all(|key| object.contains_key(*key)) {
+        return Err(
+            "community sharded response fields differ from the compute-only contract".to_string(),
+        );
+    }
+    if object.get("protocol_version").and_then(Value::as_u64)
+        != Some(u64::from(COMMUNITY_SHARD_PROTOCOL_VERSION_V1))
+    {
+        return Err("community sharded response protocol_version mismatch".to_string());
+    }
+    if object.get("session_id").is_none_or(Value::is_null) {
+        return Err("community sharded response omitted session_id".to_string());
+    }
+    if object
+        .get("model_name")
+        .and_then(Value::as_str)
+        .is_none_or(|s| s.trim().is_empty())
+    {
+        return Err("community sharded response model_name is invalid".to_string());
+    }
+    let model_id = object
+        .get("model_id")
+        .and_then(Value::as_str)
+        .filter(|s| is_canonical_hash32(s) && *s == expected_model_id)
+        .ok_or_else(|| "community sharded response model_id does not match pin".to_string())?
+        .to_string();
+    if object.get("execution_profile").and_then(Value::as_str) != Some(PROFILE) {
+        return Err("community sharded response execution_profile mismatch".to_string());
+    }
+    if object.get("rewards_enabled").and_then(Value::as_bool) != Some(false)
+        || object.get("reward_eligible").and_then(Value::as_bool) != Some(false)
+    {
+        return Err(
+            "community sharded response did not confirm rewards_enabled=false and reward_eligible=false"
+                .to_string(),
+        );
+    }
+    let generated_tokens = object
+        .get("generated_tokens")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "community sharded response generated_tokens is not an array".to_string())?;
+    if !generated_tokens
+        .iter()
+        .all(|tok| tok.as_u64().and_then(|v| u32::try_from(v).ok()).is_some())
+    {
+        return Err("community sharded response contains invalid token id".to_string());
+    }
+    let tokens_generated = object
+        .get("tokens_generated")
+        .and_then(Value::as_u64)
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| "community sharded response tokens_generated is invalid".to_string())?;
+    if tokens_generated != generated_tokens.len()
+        || tokens_generated > requested_max_tokens as usize
+    {
+        return Err(
+            "community sharded response tokens_generated exceeds bounds or token list length"
+                .to_string(),
+        );
+    }
+    if object.get("output").and_then(Value::as_str).is_none() {
+        return Err("community sharded response output is not a string".to_string());
+    }
+    if !object
+        .get("output_hash")
+        .and_then(Value::as_str)
+        .is_some_and(is_canonical_hash32)
+    {
+        return Err("community sharded response output_hash is not canonical hash".to_string());
+    }
+    if object
+        .get("stopped_by_eos")
+        .and_then(Value::as_bool)
+        .is_none()
+    {
+        return Err("community sharded response stopped_by_eos is not boolean".to_string());
+    }
+    if object.get("total_ms").and_then(Value::as_u64).is_none() {
+        return Err("community sharded response total_ms is not an integer".to_string());
+    }
+    if object
+        .get("participant_identity_basis")
+        .and_then(Value::as_str)
+        != Some(COMMUNITY_SHARD_PARTICIPANT_IDENTITY_BASIS)
+    {
+        return Err("community sharded response participant_identity_basis mismatch".to_string());
+    }
+    let participants = object
+        .get("participants")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| {
+            "community sharded response participants list is empty or invalid".to_string()
+        })?;
+    for participant in participants {
+        let p = participant
+            .as_object()
+            .ok_or_else(|| "community sharded participant entry is not an object".to_string())?;
+        if p.len() != PARTICIPANT_KEYS.len()
+            || !PARTICIPANT_KEYS.iter().all(|key| p.contains_key(*key))
+            || !p
+                .get("worker_id")
+                .and_then(Value::as_str)
+                .is_some_and(is_canonical_hash32)
+            || p.get("lease_id").is_none_or(Value::is_null)
+            || p.get("lease_epoch").and_then(Value::as_u64).is_none()
+            || p.get("range").is_none_or(Value::is_null)
+        {
+            return Err("community sharded participant entry failed strict validation".to_string());
+        }
+    }
+    let verification = object
+        .get("verification")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "community sharded response verification is not an object".to_string())?;
+    if verification.get("profile_bound").and_then(Value::as_bool) != Some(true)
+        || verification.get("quorum_verified").and_then(Value::as_bool) != Some(true)
+        || verification
+            .get("execution_profile")
+            .and_then(Value::as_str)
+            != Some(PROFILE)
+    {
+        return Err(
+            "community sharded response did not pass validator profile_bound and quorum_verified checks"
+                .to_string(),
+        );
+    }
+
+    let mut adapted = object.clone();
+    adapted.insert("success".to_string(), serde_json::json!(true));
+    adapted.insert(
+        "routed_via".to_string(),
+        serde_json::json!("community_sharded_pipeline"),
+    );
+    adapted.insert("input".to_string(), serde_json::json!(requested_prompt));
+    adapted.insert("deterministic".to_string(), serde_json::json!(true));
+    adapted.insert("model_hash".to_string(), serde_json::json!(model_id));
+
+    let parsed = parse_inference_run_value(
+        &Value::Object(adapted),
+        Some(coord_base.trim_end_matches('/')),
+        false,
+    )?;
+    if parsed.settlement.is_some()
+        || parsed.attestation_status.is_some()
+        || !parsed.attestation_hash.is_empty()
+        || !parsed.tx_hash.is_empty()
+        || !parsed.profile_bound
+        || !parsed.quorum_verified
+        || parsed.model_hash != expected_model_id
+        || parsed.routed_via != "community_sharded_pipeline"
+        || parsed.served_locally
+    {
+        return Err("community sharded parsed result violated compute-only invariants".to_string());
+    }
+    Ok(parsed)
+}
+
+pub async fn run_community_sharded_inference(
+    http: &reqwest::Client,
+    coord_base: &str,
+    prompt: &str,
+    max_tokens: u32,
+    chat_template: bool,
+    expected_model_id: &str,
+) -> Result<InferenceResult, String> {
+    let base = coord_base.trim_end_matches('/');
+    let resp = http
+        .post(format!("{base}/inference/run_community_sharded"))
+        .json(&serde_json::json!({
+            "input": prompt,
+            "max_tokens": max_tokens,
+            "chat_template": chat_template,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("{base}: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = read_bounded_response_bytes(
+            resp,
+            COMMUNITY_SHARD_ERROR_BODY_MAX_BYTES,
+            &format!("{base} community sharded error"),
+        )
+        .await
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+        return Err(format!("HTTP {status} from {base}: {body}"));
+    }
+    let bytes = read_bounded_response_bytes(
+        resp,
+        COMMUNITY_SHARD_DISPATCH_RESPONSE_MAX_BYTES,
+        &format!("{base} community sharded"),
+    )
+    .await?;
+    let v: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("{base} community sharded JSON is invalid: {e}"))?;
+    parse_community_sharded_response_value(&v, base, prompt, max_tokens, expected_model_id)
 }
 
 pub async fn tier1_result(
@@ -3653,6 +4122,256 @@ mod chain_read_tests {
         assert!(parsed.tx_hash.is_empty());
         assert!(parsed.settlement.is_none());
         assert!(parsed.trace.is_none());
+    }
+
+    fn valid_shard_readiness_json(model_id: &str) -> Value {
+        json!({
+            "schema": COMMUNITY_SHARD_DISPATCH_READINESS_SCHEMA,
+            "mutation_free_observation": true,
+            "enabled": true,
+            "protocol_version": COMMUNITY_SHARD_PROTOCOL_VERSION_V1,
+            "verified_dispatch_enabled": true,
+            "sharded_pipeline_ready": true,
+            "safe_to_dispatch": true,
+            "rewards_enabled": false,
+            "chat_template_supported": true,
+            "coordinator_id": format!("0x{}", "11".repeat(32)),
+            "transaction_domain": format!("0x{}", "22".repeat(32)),
+            "model_id": model_id,
+            "execution_profile": arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE,
+            "max_prompt_bytes": 1000,
+            "chat_template_overhead_bytes": 15,
+            "max_tokens_cap": 64
+        })
+    }
+
+    fn valid_community_sharded_response_json(model_id: &str, output_hash: &str) -> Value {
+        let worker_id = format!("0x{}", "55".repeat(32));
+        json!({
+            "protocol_version": COMMUNITY_SHARD_PROTOCOL_VERSION_V1,
+            "session_id": { "boot_nonce": format!("0x{}", "66".repeat(32)), "seq": 9 },
+            "model_name": "arc-model",
+            "model_id": model_id,
+            "execution_profile": arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE,
+            "generated_tokens": [10, 11, 12, 13],
+            "tokens_generated": 4,
+            "output": "community sharded output",
+            "output_hash": output_hash,
+            "stopped_by_eos": true,
+            "total_ms": 321,
+            "participants": [
+                {
+                    "worker_id": worker_id,
+                    "lease_id": 1,
+                    "lease_epoch": 2,
+                    "range": { "start_layer": 0, "end_layer": 11 }
+                }
+            ],
+            "participant_identity_basis": COMMUNITY_SHARD_PARTICIPANT_IDENTITY_BASIS,
+            "verification": {
+                "profile_bound": true,
+                "quorum_verified": true,
+                "execution_profile": arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE
+            },
+            "rewards_enabled": false,
+            "reward_eligible": false
+        })
+    }
+
+    #[test]
+    fn shard_dispatch_readiness_parser_enforces_exact_contract_and_invariants() {
+        let model_id = format!("0x{}", "33".repeat(32));
+        let valid = valid_shard_readiness_json(&model_id);
+        let parsed = parse_community_shard_dispatch_readiness_value("https://sgp.example", &valid)
+            .expect("valid shard dispatch readiness");
+        assert!(parsed.safe_to_dispatch);
+        assert!(parsed.chat_template_supported);
+        assert!(!parsed.rewards_enabled);
+        assert_eq!(parsed.max_prompt_bytes, 1000);
+        assert_eq!(parsed.chat_template_overhead_bytes, 15);
+        assert_eq!(parsed.max_tokens_cap, 64);
+        assert_eq!(
+            parsed.coordinator_id.as_deref(),
+            Some(format!("0x{}", "11".repeat(32)).as_str())
+        );
+        assert_eq!(
+            parsed.transaction_domain.as_deref(),
+            Some(format!("0x{}", "22".repeat(32)).as_str())
+        );
+        assert_eq!(parsed.model_id.as_deref(), Some(model_id.as_str()));
+
+        let mut rewards_true = valid.clone();
+        rewards_true["rewards_enabled"] = json!(true);
+        assert!(parse_community_shard_dispatch_readiness_value(
+            "https://sgp.example",
+            &rewards_true
+        )
+        .is_err());
+
+        let mut missing_pin_but_safe = valid.clone();
+        missing_pin_but_safe["coordinator_id"] = Value::Null;
+        assert!(parse_community_shard_dispatch_readiness_value(
+            "https://sgp.example",
+            &missing_pin_but_safe
+        )
+        .is_err());
+
+        let mut extra_key = valid.clone();
+        extra_key["unexpected"] = json!(true);
+        assert!(
+            parse_community_shard_dispatch_readiness_value("https://sgp.example", &extra_key)
+                .is_err()
+        );
+
+        let mut bad_overhead = valid.clone();
+        bad_overhead["chat_template_overhead_bytes"] = json!(1001);
+        assert!(parse_community_shard_dispatch_readiness_value(
+            "https://sgp.example",
+            &bad_overhead
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn community_sharded_response_parser_validates_non_settling_quorum_and_rejects_violations() {
+        let model_id = format!("0x{}", "33".repeat(32));
+        let other_model = format!("0x{}", "77".repeat(32));
+        let output_hash = format!("0x{}", "44".repeat(32));
+        let valid = valid_community_sharded_response_json(&model_id, &output_hash);
+
+        let parsed = parse_community_sharded_response_value(
+            &valid,
+            "https://sgp.example/",
+            "hello",
+            16,
+            &model_id,
+        )
+        .expect("valid community sharded response");
+        assert_eq!(parsed.input, "hello");
+        assert_eq!(parsed.output, "community sharded output");
+        assert_eq!(parsed.output_hash, output_hash);
+        assert_eq!(parsed.model_hash, model_id);
+        assert_eq!(parsed.tokens_generated, 4);
+        assert_eq!(parsed.inference_ms, 321);
+        assert_eq!(parsed.routed_via, "community_sharded_pipeline");
+        assert_eq!(parsed.coordinator.as_deref(), Some("https://sgp.example"));
+        assert!(parsed.deterministic);
+        assert!(parsed.profile_bound);
+        assert!(parsed.quorum_verified);
+        assert!(!parsed.served_locally);
+        assert!(parsed.settlement.is_none());
+        assert!(parsed.attestation_status.is_none());
+        assert!(parsed.attestation_hash.is_empty());
+        assert!(parsed.tx_hash.is_empty());
+
+        assert!(parse_community_sharded_response_value(
+            &valid,
+            "https://sgp.example",
+            "hello",
+            16,
+            &other_model
+        )
+        .is_err());
+        assert!(parse_community_sharded_response_value(
+            &valid,
+            "https://sgp.example",
+            "hello",
+            3,
+            &model_id
+        )
+        .is_err());
+
+        for bad in [
+            {
+                let mut v = valid.clone();
+                v["rewards_enabled"] = json!(true);
+                v
+            },
+            {
+                let mut v = valid.clone();
+                v["reward_eligible"] = json!(true);
+                v
+            },
+            {
+                let mut v = valid.clone();
+                v["settlement"] = json!({ "status": "confirmed" });
+                v
+            },
+            {
+                let mut v = valid.clone();
+                v["attestation"] = json!({ "status": "submitted_to_mempool", "tx_hash": "0xaa" });
+                v
+            },
+            {
+                let mut v = valid.clone();
+                v["tx_hash"] = json!("0xaa");
+                v
+            },
+            {
+                let mut v = valid.clone();
+                v["verification"]["quorum_verified"] = json!(false);
+                v
+            },
+            {
+                let mut v = valid.clone();
+                v["verification"]["profile_bound"] = json!(false);
+                v
+            },
+            {
+                let mut v = valid.clone();
+                v["participants"] = json!([]);
+                v
+            },
+        ] {
+            assert!(parse_community_sharded_response_value(
+                &bad,
+                "https://sgp.example",
+                "hello",
+                16,
+                &model_id,
+            )
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn shard_readiness_enforces_streaming_body_cap_without_content_length() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+                );
+                let chunk = vec![b' '; 2_048];
+                let header = format!("{:x}\r\n", chunk.len());
+                for _ in 0..8 {
+                    if stream.write_all(header.as_bytes()).is_err()
+                        || stream.write_all(&chunk).is_err()
+                        || stream.write_all(b"\r\n").is_err()
+                    {
+                        break;
+                    }
+                }
+                let _ = stream.write_all(b"0\r\n\r\n");
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .expect("client");
+        let err = community_shard_dispatch_readiness(&client, &format!("http://{addr}"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("exceeds 8192 bytes"), "{err}");
+        let _ = server.join();
     }
 
     #[test]

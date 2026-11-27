@@ -737,6 +737,7 @@ class RecoveryRolloutTests(unittest.TestCase):
             *rollout.COMMUNITY_SHARD_PUBLIC_GET_PATHS,
             *rollout.COMMUNITY_SHARD_PUBLIC_POST_PATHS,
             "/community/shards/",
+            "/inference/community_shards/",
             "arc_community_shard_",
             "@communityShard",
         ):
@@ -810,6 +811,10 @@ class RecoveryRolloutTests(unittest.TestCase):
         for flag in (None, False):
             for field, extra_path in (
                 ("public_get_paths", rollout.COMMUNITY_SHARD_STATUS_PATH),
+                (
+                    "public_get_paths",
+                    rollout.COMMUNITY_SHARD_DISPATCH_READINESS_PATH,
+                ),
                 ("public_post_paths", rollout.COMMUNITY_SHARD_INFERENCE_PATH),
                 ("public_post_paths", rollout.COMMUNITY_SHARD_SUBMIT_POST_PATH),
             ):
@@ -846,6 +851,7 @@ class RecoveryRolloutTests(unittest.TestCase):
                     rollout.validate_manifest(broken)
         for field, extra in (
             ("public_get_paths", "/community/shards/debug"),
+            ("public_get_paths", "/inference/community_shards/debug"),
             ("public_post_paths", "/inference/run_sharded"),
             ("public_post_paths", "/inference/forward_shard"),
             ("public_post_paths", "/internal/community/reward/approve"),
@@ -923,10 +929,17 @@ class RecoveryRolloutTests(unittest.TestCase):
         live = harness.caddyfile(node)
         rpc_filter = harness.nginx_filter(node)
         self.assertNotIn("/community/shards/", maintenance)
+        self.assertNotIn("/inference/community_shards/", maintenance)
+        self.assertNotIn(rollout.COMMUNITY_SHARD_DISPATCH_READINESS_PATH, maintenance)
         self.assertNotIn(rollout.COMMUNITY_SHARD_INFERENCE_PATH, maintenance)
-        self.assertEqual(rpc_filter.count("proxy_pass http://"), 14)
-        self.assertEqual(rpc_filter.count("proxy_pass http://unix:/run/arc-v3-rpc-"), 12)
-        self.assertEqual(rpc_filter.count("auth_request /__arc_interlock_gate;"), 12)
+        self.assertIn(rollout.COMMUNITY_SHARD_DISPATCH_READINESS_PATH, live)
+        self.assertIn(
+            f"location = {rollout.COMMUNITY_SHARD_DISPATCH_READINESS_PATH} {{",
+            rpc_filter,
+        )
+        self.assertEqual(rpc_filter.count("proxy_pass http://"), 15)
+        self.assertEqual(rpc_filter.count("proxy_pass http://unix:/run/arc-v3-rpc-"), 13)
+        self.assertEqual(rpc_filter.count("auth_request /__arc_interlock_gate;"), 13)
         self.assertIn("zone=arc_write_nyc:10m rate=30r/m;", rpc_filter)
         self.assertIn("zone=arc_community_shard_nyc:10m rate=100r/s;", rpc_filter)
         self.assertIn("zone=arc_community_shard_conn_nyc:10m;", rpc_filter)
@@ -944,12 +957,12 @@ class RecoveryRolloutTests(unittest.TestCase):
         ):
             archive_live = harness.caddyfile(node)
             archive_filter = harness.nginx_filter(node)
-            self.assertEqual(archive_filter.count("proxy_pass http://"), 16)
+            self.assertEqual(archive_filter.count("proxy_pass http://"), 17)
             self.assertEqual(
-                archive_filter.count("proxy_pass http://unix:/run/arc-v3-rpc-"), 12
+                archive_filter.count("proxy_pass http://unix:/run/arc-v3-rpc-"), 13
             )
             self.assertEqual(
-                archive_filter.count("auth_request /__arc_interlock_gate;"), 13
+                archive_filter.count("auth_request /__arc_interlock_gate;"), 14
             )
             harness.validate_gateway_security_contract(
                 maintenance, archive_live, archive_filter, community_sharding=True
@@ -962,6 +975,7 @@ class RecoveryRolloutTests(unittest.TestCase):
             )
         for marker in (
             f"location = {rollout.COMMUNITY_SHARD_STATUS_PATH} {{",
+            f"location = {rollout.COMMUNITY_SHARD_DISPATCH_READINESS_PATH} {{",
             f"location = {rollout.COMMUNITY_SHARD_INFERENCE_PATH} {{",
             "location ~ ^/community/shards/(?:lease|heartbeat|claim_step|release)$ {",
             f"location = {rollout.COMMUNITY_SHARD_SUBMIT_POST_PATH} {{",
@@ -990,6 +1004,30 @@ class RecoveryRolloutTests(unittest.TestCase):
                 f"location = {rollout.COMMUNITY_SHARD_STATUS_PATH} {{",
                 "limit_except GET OPTIONS { deny all; }",
                 "limit_except GET POST { deny all; }",
+                "status route",
+            ),
+            (
+                f"location = {rollout.COMMUNITY_SHARD_DISPATCH_READINESS_PATH} {{",
+                "client_max_body_size 1k;",
+                "client_max_body_size 1m;",
+                "status route",
+            ),
+            (
+                f"location = {rollout.COMMUNITY_SHARD_DISPATCH_READINESS_PATH} {{",
+                "limit_except GET OPTIONS { deny all; }",
+                "limit_except GET POST { deny all; }",
+                "status route",
+            ),
+            (
+                f"location = {rollout.COMMUNITY_SHARD_DISPATCH_READINESS_PATH} {{",
+                "burst=60 nodelay;",
+                "burst=600 nodelay;",
+                "status route",
+            ),
+            (
+                f"location = {rollout.COMMUNITY_SHARD_DISPATCH_READINESS_PATH} {{",
+                "proxy_read_timeout 60s;",
+                "proxy_read_timeout 3600s;",
                 "status route",
             ),
             (
@@ -1077,6 +1115,30 @@ class RecoveryRolloutTests(unittest.TestCase):
             ),
             ("@validatorApproval {", "        remote_ip ", "        header X-No-Ip ", "weakens internal validator matcher"),
             ("@validatorShard {", "        remote_ip ", "        header X-No-Ip ", "weakens internal validator matcher"),
+            (
+                "@readPreflight {",
+                f" {rollout.COMMUNITY_SHARD_DISPATCH_READINESS_PATH}",
+                "",
+                "path allowlist differs from sealed contract",
+            ),
+            (
+                "@corsRead {",
+                f" {rollout.COMMUNITY_SHARD_DISPATCH_READINESS_PATH}",
+                "",
+                "path allowlist differs from sealed contract",
+            ),
+            (
+                "@read {",
+                f" {rollout.COMMUNITY_SHARD_DISPATCH_READINESS_PATH}",
+                "",
+                "path allowlist differs from sealed contract",
+            ),
+            (
+                "@write {",
+                "/faucet/claim",
+                f"/faucet/claim {rollout.COMMUNITY_SHARD_DISPATCH_READINESS_PATH}",
+                "path allowlist differs from sealed contract",
+            ),
         ):
             with self.assertRaisesRegex(rollout.RolloutError, pattern):
                 harness.validate_gateway_security_contract(
@@ -1085,20 +1147,24 @@ class RecoveryRolloutTests(unittest.TestCase):
                     rpc_filter,
                     community_sharding=True,
                 )
-        with self.assertRaisesRegex(
-            rollout.RolloutError, "maintenance Caddy must not expose"
+        for leaked_path in (
+            rollout.COMMUNITY_SHARD_STATUS_PATH,
+            rollout.COMMUNITY_SHARD_DISPATCH_READINESS_PATH,
         ):
-            harness.validate_gateway_security_contract(
-                self.mutate_after(
-                    maintenance,
-                    "@maintenanceStatusCors {",
-                    "path /maintenance/status",
-                    f"path /maintenance/status {rollout.COMMUNITY_SHARD_STATUS_PATH}",
-                ),
-                live,
-                rpc_filter,
-                community_sharding=True,
-            )
+            with self.assertRaisesRegex(
+                rollout.RolloutError, "maintenance Caddy must not expose"
+            ):
+                harness.validate_gateway_security_contract(
+                    self.mutate_after(
+                        maintenance,
+                        "@maintenanceStatusCors {",
+                        "path /maintenance/status",
+                        f"path /maintenance/status {leaked_path}",
+                    ),
+                    live,
+                    rpc_filter,
+                    community_sharding=True,
+                )
 
     @staticmethod
     def reward_receipt_row(

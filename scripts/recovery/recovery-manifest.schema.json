@@ -646,7 +646,8 @@
                 "/shards",
                 "/models",
                 "/models/shards",
-                "/community/shards/status"
+                "/community/shards/status",
+                "/inference/community_shards/dispatch_readiness"
               ]
             },
             "public_post_paths": {

@@ -41,6 +41,9 @@ EXPECTED_BINARY_TESTS = {
     'recovery_peer_qualification_tests::qualify_peer_state_rejects_oversized_wrong_domain_forged_and_subquorum_certificates',
 }
 EXPECTED_LIBRARY_TESTS = {
+    'rpc::community_shard_dispatch::tests::compute_only_readiness_binds_identity_and_is_read_only_over_http',
+    'rpc::community_shard_dispatch::inference_run_adapter_tests::community_sharded_request_serde_defaults_chat_template_false_and_rejects_unknown_fields',
+    'rpc::community_shard_dispatch::inference_run_adapter_tests::chat_template_formatting_matches_inference_run_and_preserves_1000_byte_dispatched_cap',
     'rpc::community_shard_dispatch::tests::inference_run_routes_eligible_request_to_outbound_partial_workers',
     'rpc::community_shard_dispatch::tests::inference_run_partial_failure_and_bypass_guards_never_fallback_or_duplicate',
     'rpc::community_shard_dispatch::tests::readiness_snapshot_reflects_ready_community_shards_mutation_free',
@@ -133,6 +136,7 @@ EXPECTED_LIBRARY_TESTS = {
 
 
 EXPECTED_INFERENCE_TESTS = {
+    'golden_vectors::gguf_preparation::load_cached_model_ranges_canonical_i8_parity_clamping_and_roles',
     'canonical_shard_admission::candle_tests::admit_rejects_zero_kv_cache_and_zero_working_set_budgets',
     'canonical_shard_admission::candle_tests::rejects_layer_ceiling_above_1024_and_accepts_1024_boundary_without_weights',
     'canonical_shard_admission::candle_tests::content_parses_captured_header_only_never_reads_past_header_or_mutated_source',
