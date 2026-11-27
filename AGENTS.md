@@ -351,8 +351,9 @@ pins, a private worker key, and an explicit RAM budget. `--check-only` inspects
 admission without keys, network registration or tensor loading. Run mode uses one
 compute thread by default and drains work on shutdown. Its conservative admission
 requires capacity for all shard roles because role-aware placement is not yet
-implemented. The desktop uses the managed integration described above. Network tests use small
-canonical fixtures; they do not establish deployed capacity or operator availability.
+implemented. The integrated desktop path described above selects this runtime for eligible
+workers. Network tests use small canonical fixtures; they do not establish
+deployed capacity or operator availability.
 
 `load_cached_model_shard_canonical_i8` reads only its assigned layer weights
 from a GGUF, without preparing optional quantizations. It validates a strict
@@ -432,9 +433,11 @@ recovery and sharding tests on a single build worker and rejects missing cases
 or ignored tests. Use the `recovery-peer` mode of the Linux candidate workflow
 when local resource limits prohibit compilation.
 
-- A coordinator receives `POST /inference/run` (`rpc.rs:2763`, `8212`) and
-  runs at most 2 public jobs at once (`rpc.rs:179`).
-- A legacy whole-worker community job is never split. One stake-0 worker runs every layer
+### Whole-model compatibility path
+
+- Whole-model public jobs retain the two-permit compute limit described at
+  `8949910b` (`rpc.rs:179`). The partial pipeline above has separate admission.
+- A whole-model worker job is not split. One stake-0 worker runs every layer
   (`main.rs:435-446`, `8461-8467`, `9189-9206`); the job carries no layer
   range (`rpc.rs:14626-14664`).
 - Twin execution, off by default, runs the same job on two workers and
@@ -526,11 +529,14 @@ packages. Archive and DMG verification use the same captured version.
 - `.github/workflows/release.yml` runs on a `v*.*.*` tag push or a manual
   dispatch (lines 8-12). The current procedures are
   `scripts/release/EXISTING-CHAIN-UPDATE.md` and `scripts/recovery/README.md`.
-- The doc contract test pins the published (0.8.16) and candidate (0.8.26)
-  versions (`tests/release/documentation_contract_test.sh:41`, `47`). README
-  install steps name the published one. The test's comment (lines 42-46) says
-  they move to a newer release in the documentation change that follows its
-  publication, together with these values.
+- The doc contract test pins the published and candidate versions at 0.8.26
+  and the exact published installer digest. Active install links change only
+  after immutable publication is verified; historical version observations
+  remain dated. The contract checks the current-status heading link, separates
+  desktop partial shards from whole-model headless installs, and keeps partial
+  rewards disabled. Each active install guide must state that this update profile
+  refuses legacy v0.7 migration; a separately qualified cutover release with
+  authentic cutover and retirement evidence is required.
 - JavaScript audit gates use `scripts/release/npm-audit-gate.py` and the
   dated `npm-audit-exceptions.json` policy; see the dependency audit policy in
   `scripts/release/EXISTING-CHAIN-UPDATE.md`. Every root advisory must match

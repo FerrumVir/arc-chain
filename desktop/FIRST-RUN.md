@@ -76,24 +76,20 @@ chmod +x arc-desktop-linux-x86_64.AppImage
    never places the phrase or secret key in node arguments, environment, or
    logs and reuses the same protected keyfile across restarts.
 4. **Contributes compute while Contribute compute is on.** Setup starts with
-   the switch on when the computer meets the memory requirement for the ARC
-   model (where the model is marked Recommended) and off otherwise; switch it
-   off there or at any time in **Settings → Contribute compute**. ARC never
-   runs jobs on your computer while it is off. When it is on, the node starts
-   first, ARC downloads the model (3.80 GB) in the background, then restarts
-   the node as a worker and attempts community-worker registration. Jobs use
-   up to a quarter of the processor cores unless you change **Settings →
-   Compute contribution**, at low operating-system priority so your own apps
-   come first; the node holds about 8 GB of memory while it is ready for jobs
-   and keeps running on battery. A computer that finished setup before this
-   default and has compute off is asked once, after the update, whether to
-   turn it on (**Turn on** or **Not now**) and is not asked again. Registration
-   alone does not prove that the worker is eligible, reachable, receiving
-   jobs, or earning rewards; those states must be visible in the app. The
-   Dashboard's **Jobs on this computer** card shows the jobs this computer
-   completed and the ones the network verified since the node last started.
-   **Keep this computer awake while a job runs** (Settings) holds off idle
-   sleep only while a job is computing.
+   the switch on for eligible computers and off otherwise. An explicit saved
+   opt-out stays off; change it at any time in **Settings → Contribute compute**.
+   Compute contribution requires at least 16 GB nominal RAM.
+   Smaller computers remain observers. ARC first verifies the pinned model
+   download and completes any pending shutdown recovery. Eligible v0.8.26 workers
+   connect to the pinned coordinator, acquire a shard lease, and then load
+   only their assigned partial layers. The coordinator rebalances shard ranges.
+   A complete pipeline needs ready workers covering all six ranges.
+   Partial steps are not completed answers or rewards. Multi-worker rewards remain disabled.
+   The app shows partial-worker loading, assignment, reconnects and submitted
+   steps separately from whole-model jobs. Registration alone does not prove
+   that this computer has completed inference. Compute settings still control
+   resource use, and **Keep this computer awake while a job runs** holds off
+   idle sleep only while a job is computing.
 5. **Submits** a testnet faucet request when onboarding reaches that step. A
    submission is not a balance credit; only a successful mined receipt on the
    selected chain confirms it. The public fleet was divergent at the

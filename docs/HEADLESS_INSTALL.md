@@ -36,30 +36,32 @@ macOS or Windows-version floor.
 
 ## Linux and macOS
 
-For the published v0.8.16 release, download the installer from the
+For the published v0.8.26 release, download the installer from the
 owner-created protected source tag and pin the same version when running it.
 Keeping download and execution separate makes network errors visible and
 lets you inspect the script first.
 
 The v0.8.x release is intentionally not GitHub's global `latest` while legacy
 v0.7 updaters remain deployed. Those unsigned updaters are not a migration
-path: the first v0.7-to-v0.8 upgrade must use the exact protected tag and
-verified installer below.
+path. This release uses `existing-recovered-chain-update-v1`.
+The v0.8.26 update profile refuses legacy v0.7 migration. A separately qualified cutover release with authentic cutover and retirement evidence is required.
+An exact protected tag and verified installer do not reconstruct those inputs.
 
 Installs whose released v0.7 updater still runs unattended can instead be
-moved by the owner-published legacy bridge release. It starts the pinned,
+moved only by a separately qualified, owner-published legacy bridge release
+with the required cutover and retirement evidence; v0.8.26 does not supply it. It starts the pinned,
 signature-verified v0.8 node at stake 0 in a fresh data directory and never
 writes v0.7 data. See [LEGACY-BRIDGE.md](LEGACY-BRIDGE.md).
 
 ```bash
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.16/install.sh
-ARC_INSTALL_SHA256=893e930610f6380fe6b75cca64ca84ff84f9e711a3da09345abe86b4a66f1e8e
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.26/install.sh
+ARC_INSTALL_SHA256=118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
 fi
-bash install.sh --version 0.8.16
+bash install.sh --version 0.8.26
 ```
 
 The branch above uses `sha256sum` on Linux and the standard `shasum` fallback
@@ -90,16 +92,16 @@ requires every supported platform before it can publish anything.
 
 ```bash
 # Non-root Linux: ~/.arc plus a systemd user service
-bash install.sh --version 0.8.16
+bash install.sh --version 0.8.26
 
 # Root/sudo Linux: root-owned programs in /var/lib/arc-chain and a system
 # service whose node process/data/identity belong to the invoking sudo user.
 # A direct root login intentionally runs the node as root.
-sudo bash install.sh --version 0.8.16 --system-service
+sudo bash install.sh --version 0.8.26 --system-service
 
 # Custom install root, chain data volume, RPC, and P2P ports
 bash install.sh \
-  --version 0.8.16 \
+  --version 0.8.26 \
   --install-dir "$HOME/.arc-custom" \
   --data-dir "$HOME/arc-chain-data" \
   --port 19090 \
@@ -107,10 +109,10 @@ bash install.sh \
 
 # Install and verify only. No service, background process, health request, or
 # update schedule is created.
-bash install.sh --version 0.8.16 --no-service --no-auto-update
+bash install.sh --version 0.8.26 --no-service --no-auto-update
 
 # Load a local model and become eligible to execute compatible inference work.
-bash install.sh --version 0.8.16 --model /absolute/path/to/model.gguf
+bash install.sh --version 0.8.26 --model /absolute/path/to/model.gguf
 ```
 
 The default node is deliberately `--stake 0 --community-mode`, with the EVM RPC
@@ -184,7 +186,7 @@ printf '%s  %s\n' \
   08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa \
   "$HOME/.arc-models/llama2-7b.gguf" | sha256sum -c -
 
-bash install.sh --version 0.8.16 \
+bash install.sh --version 0.8.26 \
   --model "$HOME/.arc-models/llama2-7b.gguf"
 ```
 
@@ -222,8 +224,8 @@ final data directory remains owned by the node account.
 The install root is different from the chain data marker described below. A
 fresh install atomically creates `.arc-chain-install-root`, bound to the exact
 normalized install path. Later installs and updates require it and never adopt
-an arbitrary existing unmarked directory. There is one narrow bridge for the
-affected community: exact default `~/.arc` and `/var/lib/arc-chain` roots may
+an arbitrary existing unmarked directory. For releases carrying authentic cutover and retirement evidence, there is one
+narrow bridge for the affected community: exact default `~/.arc` and `/var/lib/arc-chain` roots may
 be adopted only when ownership, every ancestor's write permissions, all path
 components, the v0.7.x binary/version pair, ARC genesis, seeds, identity, data,
 and optional updater/model match the recognized legacy layout. Custom roots
@@ -317,7 +319,7 @@ fresh data directory it writes `genesis.network-hash`. Startup fails closed if
 an existing WAL has no marker or if the stored hash differs from the selected
 genesis. A reachable HTTP process is not permission to bypass that check.
 
-Do not point v0.8.16 at a v0.7.11-or-earlier data directory. For a stake-zero
+Do not point v0.8.26 at a v0.7.11-or-earlier data directory. For a stake-zero
 observer, stop the old service, back up its identity and data for forensics, and
 install with a fresh data directory (for example a new `--data-dir` path). Do
 not copy the old WAL into it. A validator may move state only through the
@@ -434,14 +436,14 @@ needed to diagnose a failed recovery.
 
 | Symptom | Safe check and action |
 |---|---|
-| `sudo authorization failed` | Install as the login user with `bash install.sh --version 0.8.16 --user-service`, or deliberately use `sudo bash install.sh --version 0.8.16 --system-service`. Do not mix the two scopes. |
+| `sudo authorization failed` | Install as the login user with `bash install.sh --version 0.8.26 --user-service`, or deliberately use `sudo bash install.sh --version 0.8.26 --system-service`. Do not mix the two scopes. |
 | `No systemd user manager is reachable` over SSH | Use the explicit system service command above, or install with `--no-service` and run the printed command under your own supervisor. `sudo loginctl enable-linger "$USER"` is an optional administrator decision for a user service that must start before login. |
 | Model file is unreadable | As the account that will run the node, use `test -r /absolute/path/to/model.gguf`. Move the model to a directory that account can traverse or correct only the specific file/directory ownership; do not make the model or identity world-writable. |
 | Port is already in use | On Linux inspect `ss -ltnp` for RPC and `ss -lunp` for P2P, then choose unused explicit values with `--port` and `--p2p-port`. Do not kill an unidentified process. |
 | Service starts but health is `degraded` | Read the matching user/system journal above, confirm peers and the selected genesis/checkpoint, and run `bash scripts/arc-diagnose.sh` from a reviewed checkout. `degraded` is not fixed by exposing RPC publicly or reusing an old WAL. |
 | Update says no existing installation | Run the updater from the same install scope and exact install directory recorded in `install.conf`. A `--no-auto-update` install intentionally has no retained updater. |
 | Legacy adoption rejects a service or PID | Do not rename or weaken files to bypass the check. Confirm that the service is the unmodified v0.7 default, that both `arc-updater` units are present or absent together, that `node.pid` still names the live ARC process, and that `~/.arc` plus its ancestors are not symlinks or group/world writable. Stop and preserve an unrecognized custom layout for manual review. |
-| Installer reports an incomplete release or checksum/signature failure | Stop. Confirm the exact v0.8.16 release contains every required platform asset and signed manifest. Never fall back to a desktop package, a moving URL, or an unsigned older binary. |
+| Installer reports an incomplete release or checksum/signature failure | Stop. Confirm the exact v0.8.26 release contains every required platform asset and signed manifest. Never fall back to a desktop package, a moving URL, or an unsigned older binary. |
 
 For a support report, share the operating system/architecture, release version,
 service scope, redacted journal error, local `/health` response, and the output
@@ -481,7 +483,7 @@ Run the same updater manually:
 sudo /var/lib/arc-chain/bin/arc-installer --update-only --install-dir /var/lib/arc-chain --system-service
 ```
 
-Those commands intentionally do not pin v0.8.16: update mode resolves the
+Those commands intentionally do not pin v0.8.26: update mode resolves the
 newest complete release and then refuses equality or downgrade. They are
 available only when the original install kept auto-update enabled; an install
 made with `--no-auto-update` does not install `arc-installer`.
@@ -489,10 +491,10 @@ made with `--no-auto-update` does not install `arc-installer`.
 Pinning is deterministic and never means “nearest available version”:
 
 ```bash
-bash install.sh --version 0.8.16
+bash install.sh --version 0.8.26
 ```
 
-If `v0.8.16` lacks any required asset or checksum, installation fails with the
+If `v0.8.26` lacks any required asset or checksum, installation fails with the
 missing filename. If a newer version is already installed, the command refuses
 to downgrade it.
 
@@ -505,7 +507,7 @@ the same release and the allowed-signers file from the protected source tag:
 - `arc-cli-windows-x86_64.exe`
 - `SHA256SUMS`
 - `SHA256SUMS.sig`
-- `release/arc-release-allowed-signers` from tag `v0.8.16`
+- `release/arc-release-allowed-signers` from tag `v0.8.26`
 
 Windows OpenSSH 8.1 or newer is required; `ssh -V` prints the installed
 version. First use that client to authenticate the exact manifest, then compare

@@ -13,7 +13,17 @@ ARC's protocol and product code are developed in this repository. Reviewed
 upstream components vendored for reproducibility are identified under
 `vendor/`; they are not represented as ARC-authored code.
 
-## v0.8.16 release status and quickstart
+## v0.8.26 release status and quickstart
+
+**Published update (2026-11-27):** v0.8.26 updates the existing recovered chain.
+It includes desktop recovery reconciliation and bounded overlap between shard
+execution and verification. Eligible desktop workers use pinned partial shards
+with automatic assignment and rebalancing.
+Multi-worker rewards remain disabled. Headless `--model` installs remain whole-model workers.
+Publication does not establish 100 active operators or unbounded scaling.
+
+The v0.8.26 update profile refuses legacy v0.7 migration. A separately qualified cutover release with authentic cutover and retirement evidence is required.
+The dated v0.8.16 observation below remains a historical record.
 
 <!-- ARC_PUBLIC_TRUTH_BEGIN -->
 > **Status (2026-11-02):** v0.8.16 was released on 2026-10-27. On 2026-10-31
@@ -32,30 +42,31 @@ upstream components vendored for reproducibility are identified under
 
 This README does not use the moving `latest` release as an install source. The
 immutable v0.8.x release is intentionally not promoted to GitHub's global
-`latest` channel while unsigned v0.7 updaters remain in the field. A first
-v0.7-to-v0.8 migration is therefore manual and pinned to the exact tag; the
-legacy updater is not a supported migration mechanism.
+`latest` channel while unsigned v0.7 updaters remain in the field. The
+legacy updater is not a supported migration mechanism. This release uses
+`existing-recovered-chain-update-v1`, which refuses legacy migration; an exact
+tag does not change that release profile.
 
 The protected v0.8.0 tag has no published assets. The current release is
-v0.8.16. The
-[exact v0.8.16 release](https://github.com/FerrumVir/arc-chain/releases/tag/v0.8.16)
+v0.8.26. The
+[exact v0.8.26 release](https://github.com/FerrumVir/arc-chain/releases/tag/v0.8.26)
 carries the signed release assets, `SHA256SUMS`, and `SHA256SUMS.sig`, so an
 SSH/EC2/VPS operator can run:
 
 ```bash
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.16/install.sh
-ARC_INSTALL_SHA256=893e930610f6380fe6b75cca64ca84ff84f9e711a3da09345abe86b4a66f1e8e
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.26/install.sh
+ARC_INSTALL_SHA256=118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
 fi
 # Observer/router quickstart. Add a verified --model path to execute inference.
-bash install.sh --version 0.8.16
+bash install.sh --version 0.8.26
 ```
 
-Expected `install.sh` SHA-256 for v0.8.16:
-`893e930610f6380fe6b75cca64ca84ff84f9e711a3da09345abe86b4a66f1e8e`.
+Expected `install.sh` SHA-256 for v0.8.26:
+`118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c`.
 
 The unified release contract restores headless Linux amd64 and arm64, Intel
 and Apple Silicon macOS, Windows CLI binaries, signed desktop-updater payloads,
@@ -166,15 +177,15 @@ trade, not a better prover.
 
 ### Desktop GUI (requires a screen)
 
-| Desktop build target | Normalized v0.8.16 asset |
+| Desktop build target | Normalized v0.8.26 asset |
 |---|---|
-| **macOS — Apple Silicon** (built/packaged on macOS 15) | [DMG](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.16/arc-desktop-macos-arm64.dmg) |
-| **macOS — Intel** (built/packaged on macOS 15 Intel) | [DMG](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.16/arc-desktop-macos-x86_64.dmg) |
-| **Windows — x86_64** (built/packaged on GitHub `windows-latest`) | [NSIS installer](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.16/arc-desktop-windows-x86_64-setup.exe) · [MSI](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.16/arc-desktop-windows-x86_64.msi) |
-| **Linux desktop — x86_64** (built/packaged on Ubuntu 24.04) | [AppImage](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.16/arc-desktop-linux-x86_64.AppImage) · [.deb](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.16/arc-desktop-linux-x86_64.deb) · [.rpm](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.16/arc-desktop-linux-x86_64.rpm) |
+| **macOS — Apple Silicon** (built/packaged on macOS 15) | [DMG](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.26/arc-desktop-macos-arm64.dmg) |
+| **macOS — Intel** (built/packaged on macOS 15 Intel) | [DMG](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.26/arc-desktop-macos-x86_64.dmg) |
+| **Windows — x86_64** (built/packaged on GitHub `windows-latest`) | [NSIS installer](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.26/arc-desktop-windows-x86_64-setup.exe) · [MSI](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.26/arc-desktop-windows-x86_64.msi) |
+| **Linux desktop — x86_64** (built/packaged on Ubuntu 24.04) | [AppImage](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.26/arc-desktop-linux-x86_64.AppImage) · [.deb](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.26/arc-desktop-linux-x86_64.deb) · [.rpm](https://github.com/FerrumVir/arc-chain/releases/download/v0.8.26/arc-desktop-linux-x86_64.rpm) |
 
-These stable names are generated by the unified v0.8.16 release pipeline, and
-the links point at the published v0.8.16 release.
+These stable names are generated by the unified v0.8.26 release pipeline, and
+the links point at the published v0.8.26 release.
 The macOS package metadata declares 11.0 as its minimum, but CI currently runs
 the package only on macOS 15; no older-macOS or Windows-version runtime floor is
 claimed until those exact versions receive a release-blocking test.
@@ -205,10 +216,10 @@ and FAQ.
 
 ### Headless / server node (no GUI or display required)
 
-The v0.8.16 headless assets target Linux x86_64/amd64 and ARM64, macOS Apple
+The v0.8.26 headless assets target Linux x86_64/amd64 and ARM64, macOS Apple
 Silicon and Intel, and Windows x86_64. The installer supports Linux and macOS;
 Windows Server operators download the two `.exe` assets and `SHA256SUMS`
-manually from the exact v0.8.16 release. The Linux x86_64/amd64 artifact is
+manually from the exact v0.8.26 release. The Linux x86_64/amd64 artifact is
 built on Ubuntu 22.04 and must boot with `DISPLAY` unset on Ubuntu 22.04,
 24.04, and 26.04 before publication; the ARM64 artifact has the same GUI-free
 runtime gate on Ubuntu 24.04 and 26.04. The macOS binaries boot on macOS 15
@@ -216,22 +227,22 @@ Apple-Silicon and Intel runners, and the Windows x86_64 binary boots on GitHub's
 `windows-latest` runner; those gates do not establish older OS-version floors.
 
 The following recovery command is intentionally pinned to the complete
-`v0.8.16` release. The moving `latest` alias is never used by the initial
+`v0.8.26` release. The moving `latest` alias is never used by the initial
 install command.
 
 ```bash
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.16/install.sh
-ARC_INSTALL_SHA256=893e930610f6380fe6b75cca64ca84ff84f9e711a3da09345abe86b4a66f1e8e
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.26/install.sh
+ARC_INSTALL_SHA256=118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c
 if command -v sha256sum >/dev/null 2>&1; then
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | sha256sum -c -
 else
   printf '%s  %s\n' "$ARC_INSTALL_SHA256" install.sh | shasum -a 256 -c -
 fi
-bash install.sh --version 0.8.16
+bash install.sh --version 0.8.26
 ```
 
 Expected `install.sh` SHA-256:
-`893e930610f6380fe6b75cca64ca84ff84f9e711a3da09345abe86b4a66f1e8e`.
+`118bcfc38f152acb33d241ff7f8c8737de8a291718a0f6ab97d4fe42516ad22c`.
 
 The bootstrap installer comes from the owner-created protected source tag.
 It resolves an exact immutable, non-draft release, requires GitHub to identify
@@ -255,7 +266,8 @@ Dedicated descendants such as `/var/lib/arc-chain/data`, `/srv/arc-data`, and
 A fresh install atomically claims its dedicated install directory with an
 ARC marker bound to that exact normalized path. Updates require the marker, so
 the installer will not silently claim a pre-existing unmarked directory. The
-only compatibility exception is an exact default `~/.arc` (or the system
+only compatibility exception, for a release carrying authentic cutover and
+retirement evidence, is an exact default `~/.arc` (or the system
 default `/var/lib/arc-chain`) containing a fully recognized, correctly owned,
 non-symlinked v0.7.x community-node layout beneath non-writable ancestors. It
 is processed only while the install lock is held: the unsigned updater is
@@ -328,18 +340,18 @@ Useful server options:
 
 ```bash
 # SSH-only Ubuntu server, custom RPC/P2P ports and data volume
-bash install.sh --version 0.8.16 \
+bash install.sh --version 0.8.26 \
   --port 19090 --p2p-port 19091 --data-dir /srv/arc-data
 
 # Install binaries/config only; print the command but do not start anything
-bash install.sh --version 0.8.16 --no-service --no-auto-update
+bash install.sh --version 0.8.26 --no-service --no-auto-update
 
 # Serve deterministic community inference. The installer adds
 # --full-integer-worker; it does not advertise this home node as a layer shard.
-bash install.sh --version 0.8.16 --model /absolute/path/to/model.gguf
+bash install.sh --version 0.8.26 --model /absolute/path/to/model.gguf
 
 # Reproducible pin; an older version is rejected if a newer one is installed
-bash install.sh --version 0.8.16
+bash install.sh --version 0.8.26
 ```
 
 For an install that kept the scheduled updater, the manual commands are:
@@ -354,7 +366,7 @@ sudo /var/lib/arc-chain/bin/arc-installer --update-only --install-dir /var/lib/a
 
 Update mode intentionally resolves the newest immutable, non-draft release,
 requires the complete bundle for the installed platform, verifies it, and
-refuses equality or downgrade; do not add `--version 0.8.16` when the goal is to
+refuses equality or downgrade; do not add `--version 0.8.26` when the goal is to
 discover a later safe update.
 
 Managed v0.8 macOS nodes receive a 4,420-second launchd `ExitTimeOut`, covering
@@ -931,7 +943,7 @@ See `docs/HOW-SHARDING-WORKS.md` for the wire protocol.
 **Superseded.** This section is the dated record from the 2026-08-31 source
 freeze, kept for history. It was written before v0.8.16 was released on
 2026-10-27 and no longer describes the network. For the current status, see
-[v0.8.16 release status and quickstart](#v0816-release-status-and-quickstart).
+[v0.8.26 release status and quickstart](#v0826-release-status-and-quickstart).
 
 > **Source-freeze snapshot (2026-08-31; tag-stable):** At this commit's review
 > cutoff, v0.8.0 / protocol v3 was not published or deployed, and GitHub
