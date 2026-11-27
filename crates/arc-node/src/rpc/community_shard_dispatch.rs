@@ -612,7 +612,8 @@ fn acquire_shard_dispatch_slot(
     let in_flight = node
         .community_shard_dispatch_in_flight
         .load(Ordering::Acquire);
-    if in_flight >= capacity.effective_session_capacity || capacity.idle_complete_pipelines == 0 {
+    let request_capacity = shard_dispatch_request_capacity(capacity);
+    if in_flight >= request_capacity || capacity.idle_complete_pipelines == 0 {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             "community shard pipeline capacity is saturated; retry shortly".to_string(),
@@ -624,6 +625,16 @@ fn acquire_shard_dispatch_slot(
         in_flight: node.community_shard_dispatch_in_flight.clone(),
         _permit: permit,
     })
+}
+
+fn shard_dispatch_request_capacity(
+    capacity: crate::community_sharding::ShardPipelineCapacity,
+) -> usize {
+    capacity
+        .effective_session_capacity
+        .saturating_add(super::PUBLIC_INFERENCE_CONCURRENCY)
+        .min(capacity.max_active_sessions)
+        .min(super::COMMUNITY_SHARD_DISPATCH_CONCURRENCY_HARD_CAP)
 }
 
 async fn acquire_verification_permit(
@@ -3508,9 +3519,66 @@ mod tests {
 
     #[tokio::test]
     async fn four_concurrent_sharded_sessions_scale_past_verifier_cap_two() {
-        let mut fixture =
-            build_verified_fixture(2, 2, CommunityShardLimits::default(), None, false).await;
-        attach_ready_partial_workers(&mut fixture, 8).await;
+        assert_bounded_verification_overlap(CommunityShardLimits::default(), 4, 6, false).await;
+    }
+
+    #[tokio::test]
+    async fn verification_overlap_respects_configured_request_cap() {
+        for max_active_sessions in [4, 5] {
+            let limits = CommunityShardLimits {
+                max_active_sessions,
+                ..CommunityShardLimits::default()
+            };
+            assert_bounded_verification_overlap(limits, 4, max_active_sessions, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn single_pipeline_overlaps_bounded_verification_and_drains_on_shutdown() {
+        for shutdown in [false, true] {
+            assert_bounded_verification_overlap(CommunityShardLimits::default(), 1, 3, shutdown)
+                .await;
+        }
+    }
+
+    #[test]
+    fn verification_overlap_capacity_preserves_configured_and_hard_bounds() {
+        for (pipelines, configured, expected) in [
+            (1, 24, 3),
+            (4, 24, 6),
+            (4, 5, 5),
+            (4, 4, 4),
+            (10, 4, 4),
+            (22, 24, 24),
+            (23, 24, 24),
+            (24, 24, 24),
+            (64, 64, 64),
+            (64, 100, 64),
+            (1, 0, 0),
+            (usize::MAX, usize::MAX, 64),
+        ] {
+            let capacity = crate::community_sharding::ShardPipelineCapacity {
+                ready_complete_pipelines: pipelines,
+                idle_complete_pipelines: pipelines,
+                active_sessions: 0,
+                max_active_sessions: configured,
+                effective_session_capacity: pipelines.min(configured),
+            };
+            assert_eq!(shard_dispatch_request_capacity(capacity), expected);
+        }
+    }
+
+    async fn assert_bounded_verification_overlap(
+        limits: CommunityShardLimits,
+        pipelines: usize,
+        expected_requests: usize,
+        shutdown: bool,
+    ) {
+        let max_active_sessions = limits.max_active_sessions;
+        let mut fixture = build_verified_fixture(2, 2, limits, None, false).await;
+        attach_ready_partial_workers(&mut fixture, pipelines * 2).await;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        fixture.coordinator.runtime_shutdown = Some(shutdown_rx);
 
         let now_ms = crate::rpc::community_unix_ms().unwrap();
         let capacity = fixture
@@ -3520,10 +3588,10 @@ mod tests {
             .as_ref()
             .unwrap()
             .pipeline_capacity(now_ms);
-        assert_eq!(capacity.ready_complete_pipelines, 4);
-        assert_eq!(capacity.idle_complete_pipelines, 4);
-        assert_eq!(capacity.effective_session_capacity, 4);
-        assert_eq!(capacity.max_active_sessions, 24);
+        assert_eq!(capacity.ready_complete_pipelines, pipelines);
+        assert_eq!(capacity.idle_complete_pipelines, pipelines);
+        assert_eq!(capacity.effective_session_capacity, pipelines);
+        assert_eq!(capacity.max_active_sessions, max_active_sessions);
 
         let prompt = "ARC";
         let max_tokens = 2u32;
@@ -3564,11 +3632,10 @@ mod tests {
                 .is_err()
         );
 
-        let mut handles = Vec::with_capacity(4);
-        for _ in 0..4 {
+        let spawn_request = || {
             let client = client.clone();
             let url = url.clone();
-            handles.push(tokio::spawn(async move {
+            tokio::spawn(async move {
                 let resp = client
                     .post(&url)
                     .timeout(Duration::from_secs(30))
@@ -3583,7 +3650,11 @@ mod tests {
                 let status = resp.status();
                 let body = resp.text().await.unwrap();
                 (status, body)
-            }));
+            })
+        };
+        let mut handles = Vec::with_capacity(expected_requests);
+        for _ in 0..pipelines {
+            handles.push(spawn_request());
         }
 
         let active_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -3601,12 +3672,12 @@ mod tests {
                 .coordinator
                 .community_shard_dispatch_in_flight
                 .load(Ordering::Acquire);
-            if active == 4 && in_flight == 4 {
+            if active == pipelines && in_flight == pipelines {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < active_deadline,
-                "expected 4 concurrent active sessions while public permits are held, got active={active} in_flight={in_flight}"
+                "expected {pipelines} concurrent active sessions while public permits are held, got active={active} in_flight={in_flight}"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -3650,7 +3721,7 @@ mod tests {
             }
             assert!(
                 tokio::time::Instant::now() < remote_done_deadline,
-                "all 4 remote sessions must finish and enter verification queue"
+                "all initial remote sessions must finish and enter verification queue"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -3659,10 +3730,87 @@ mod tests {
                 .coordinator
                 .community_shard_dispatch_in_flight
                 .load(Ordering::Acquire),
-            4
+            pipelines
         );
 
-        let fifth_while_verify_queued = client
+        stop.store(true, Ordering::Release);
+        driver.await.unwrap();
+        for queued in (pipelines + 1)..=expected_requests {
+            handles.push(spawn_request());
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let now_ms = crate::rpc::community_unix_ms().unwrap();
+                let capacity = fixture
+                    .coordinator
+                    .community_shard_coordinator
+                    .lock()
+                    .as_ref()
+                    .unwrap()
+                    .pipeline_capacity(now_ms);
+                let in_flight = fixture
+                    .coordinator
+                    .community_shard_dispatch_in_flight
+                    .load(Ordering::Acquire);
+                if in_flight == queued
+                    && capacity.active_sessions == 1
+                    && capacity.idle_complete_pipelines == pipelines - 1
+                {
+                    break;
+                }
+                assert!(
+                    !handles.last().unwrap().is_finished(),
+                    "idle workers must accept bounded work while earlier results await verification"
+                );
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "accepted work must execute while earlier results await verification"
+                );
+                tokio::task::yield_now().await;
+            }
+            if queued == expected_requests {
+                let rejected = client
+                    .post(&url)
+                    .json(&CommunityShardedInferenceRequest {
+                        input: prompt.to_string(),
+                        max_tokens,
+                        chat_template: false,
+                    })
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+            }
+            let wave_stop = Arc::new(AtomicBool::new(false));
+            let wave_driver = spawn_partial_worker_driver(
+                fixture.coordinator.clone(),
+                clone_workers(&fixture.workers),
+                WorkerBehavior::Honest,
+                true,
+                wave_stop.clone(),
+            );
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let snapshot = fixture
+                    .coordinator
+                    .community_shard_coordinator
+                    .lock()
+                    .as_ref()
+                    .unwrap()
+                    .status_snapshot(crate::rpc::community_unix_ms().unwrap());
+                if snapshot.active_sessions == 0 && snapshot.retained_results == 0 {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "overlapped work must enter the bounded verification queue"
+                );
+                tokio::task::yield_now().await;
+            }
+            wave_stop.store(true, Ordering::Release);
+            wave_driver.await.unwrap();
+        }
+
+        let over_capacity_while_verify_queued = client
             .post(&url)
             .json(&CommunityShardedInferenceRequest {
                 input: prompt.to_string(),
@@ -3673,17 +3821,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            fifth_while_verify_queued.status(),
+            over_capacity_while_verify_queued.status(),
             StatusCode::TOO_MANY_REQUESTS
         );
 
-        drop(held_public_permits);
+        if shutdown {
+            shutdown_tx.send(true).unwrap();
+        } else {
+            held_public_permits.clear();
+        }
 
         for handle in handles {
             let (status, body) = tokio::time::timeout(Duration::from_secs(15), handle)
                 .await
                 .expect("verified response must arrive within deadline")
                 .unwrap();
+            if shutdown {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+                continue;
+            }
             assert_eq!(status, StatusCode::OK, "unexpected response body: {body}");
             let json: Value = serde_json::from_str(&body).unwrap();
             assert_eq!(
@@ -3696,8 +3852,14 @@ mod tests {
             assert_eq!(json["reward_eligible"], false);
         }
 
-        stop.store(true, Ordering::Release);
-        driver.await.unwrap();
+        held_public_permits.clear();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            super::super::wait_for_inference_compute_barrier(&fixture.coordinator),
+        )
+        .await
+        .expect("overlapped requests must release the shutdown barrier")
+        .unwrap();
         server.abort();
 
         let final_ms = crate::rpc::community_unix_ms().unwrap();

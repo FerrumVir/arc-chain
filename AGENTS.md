@@ -282,9 +282,11 @@ The status route reports verified dispatch available only with the enabled
 coordinator, canonical model, and an independent validator verification plan.
 `POST /inference/run_community_sharded` owns and cancels its shard session, checks
 its exact result digest, coverage, token limits and EOS, then uses the existing
-validator quorum verification before returning output. Public shard admission follows complete ready pipelines, with a default cap of
-24 sessions and a hard cap of 64. Independent verification alone holds the shared
-public compute permits; queued verification and shutdown stay bounded. Rewards
+validator quorum verification before returning output. Public shard admission requires
+an idle complete pipeline. Requests may overlap two additional verification slots,
+while the configured overall cap remains 24 by default and at most 64.
+Independent verification alone holds the shared public compute permits; queued
+verification and shutdown stay bounded. Rewards
 remain disabled for these multi-worker results.
 This transport alone does not activate desktop nodes.
 `--community-shard-worker` integrates the pinned partial worker into a managed
