@@ -443,10 +443,55 @@ impl StartTransaction {
     }
 }
 
+fn ensure_launch_not_superseded(
+    cancel_watch: &tokio::sync::watch::Receiver<()>,
+) -> Result<(), StartupFailure> {
+    if cancel_watch.has_changed().unwrap_or(true) {
+        return Err(StartupFailure::Terminal(
+            "node launch superseded by a newer lifecycle action".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn with_current_launch_config<T, F, Fut>(
+    store: &tokio::sync::Mutex<crate::store::Store>,
+    cancel_watch: &tokio::sync::watch::Receiver<()>,
+    locked_data_dir: &str,
+    expected_address: &str,
+    launch: F,
+) -> Result<T, StartupFailure>
+where
+    F: FnOnce(NodeConfig) -> Fut,
+    Fut: std::future::Future<Output = Result<T, StartupFailure>>,
+{
+    let store_guard = store.lock().await;
+    ensure_launch_not_superseded(cancel_watch)?;
+    let current_address = store_guard
+        .identity
+        .as_ref()
+        .map(|identity| identity.address.as_str());
+    if current_address != Some(expected_address) {
+        return Err(StartupFailure::Terminal(
+            "saved validator identity changed while preparing to start arc-node".into(),
+        ));
+    }
+    let config = store_guard.config.clone().unwrap_or_default();
+    if config.data_dir != locked_data_dir {
+        return Err(StartupFailure::Terminal(
+            "managed node data directory changed while preparing to start arc-node".into(),
+        ));
+    }
+    let result = launch(config).await;
+    drop(store_guard);
+    result
+}
+
 async fn start_node_transaction(
     app: &AppHandle,
     state: &AppState,
     transaction: StartTransaction,
+    cancel_watch: tokio::sync::watch::Receiver<()>,
 ) -> Result<(), StartupFailure> {
     require_start_fence(state, transaction.fence_access()).await?;
     let start_after_recovery = transaction.starts_current_node();
@@ -468,8 +513,18 @@ async fn start_node_transaction(
     let resources = resolve_testnet_resources(app);
     {
         let mut node = state.node.lock().await;
+        ensure_launch_not_superseded(&cancel_watch)?;
         node.refuse_start_during_update()?;
-        if node.is_running() {
+        if node.requires_completed_stop_before_start() {
+            if let Err(error) = node.stop().await {
+                if !crate::node_manager::is_managed_durability_recovery_required(&error)
+                    || node.is_running()
+                    || node.requires_completed_stop_before_start()
+                {
+                    return Err(map_err(error).into());
+                }
+            }
+        } else if node.is_running() {
             return Ok(());
         }
         node.require_no_pending_crash_recovery().map_err(map_err)?;
@@ -494,13 +549,36 @@ async fn start_node_transaction(
         identity::ensure_validator_keyfile(&app_data_dir, &recovery_phrase, &persisted_address);
     recovery_phrase.zeroize();
     let validator_keyfile = keyfile_result?;
+    if !recovery_launch {
+        let mut node = state.node.lock().await;
+        let node_ref = &mut *node;
+        let validator_keyfile_ref = &validator_keyfile;
+        let resources_ref = &resources;
+        return with_current_launch_config(
+            &state.store,
+            &cancel_watch,
+            &config.data_dir,
+            &persisted_address,
+            |launch_config| async move {
+                node_ref
+                    .start(
+                        &launch_config,
+                        validator_keyfile_ref,
+                        resources_ref,
+                        lifecycle_lock,
+                    )
+                    .await
+                    .map_err(map_err)?;
+                Ok(())
+            },
+        )
+        .await;
+    }
     let mut node = state.node.lock().await;
+    ensure_launch_not_superseded(&cancel_watch)?;
     node.start(&config, &validator_keyfile, &resources, lifecycle_lock)
         .await
         .map_err(map_err)?;
-    if !recovery_launch {
-        return Ok(());
-    }
 
     node.stop()
         .await
@@ -510,6 +588,7 @@ async fn start_node_transaction(
     if !start_after_recovery {
         return Ok(());
     }
+    ensure_launch_not_superseded(&cancel_watch)?;
 
     let lock_data_dir = config.data_dir.clone();
     let lifecycle_lock = tokio::task::spawn_blocking(move || {
@@ -526,17 +605,36 @@ async fn start_node_transaction(
     }
     ensure_binary_inner_classified(app).await?;
     let mut node = state.node.lock().await;
-    node.start(&config, &validator_keyfile, &resources, lifecycle_lock)
-        .await
-        .map_err(map_err)?;
-    Ok(())
+    let node_ref = &mut *node;
+    let validator_keyfile_ref = &validator_keyfile;
+    let resources_ref = &resources;
+    with_current_launch_config(
+        &state.store,
+        &cancel_watch,
+        &config.data_dir,
+        &persisted_address,
+        |launch_config| async move {
+            node_ref
+                .start(
+                    &launch_config,
+                    validator_keyfile_ref,
+                    resources_ref,
+                    lifecycle_lock,
+                )
+                .await
+                .map_err(map_err)?;
+            Ok(())
+        },
+    )
+    .await
 }
 
 pub async fn start_node_inner(app: &AppHandle, state: &AppState) -> Result<(), String> {
     state.startup_retry_cancel.send_replace(());
+    let cancel_watch = state.startup_retry_cancel.subscribe();
     require_start_fence(state, StartAccess::Ordinary).await?;
     state.node.lock().await.cancel_slow_crash_retry();
-    start_node_transaction(app, state, StartTransaction::Start)
+    start_node_transaction(app, state, StartTransaction::Start, cancel_watch)
         .await
         .map_err(|failure| paths::redact_home_text(&failure.to_string()))
 }
@@ -545,6 +643,7 @@ pub(crate) async fn autostart_node_inner(
     app: &AppHandle,
     state: &AppState,
 ) -> Result<(), StartupFailure> {
+    let cancel_watch = state.startup_retry_cancel.subscribe();
     {
         let store = state.store.lock().await;
         if !store
@@ -558,16 +657,22 @@ pub(crate) async fn autostart_node_inner(
             ));
         }
     }
-    start_node_transaction(app, state, StartTransaction::Start).await
+    start_node_transaction(app, state, StartTransaction::Start, cancel_watch).await
 }
 
 pub(crate) async fn recover_managed_shutdown_inner(
     app: &AppHandle,
     state: &AppState,
 ) -> Result<(), String> {
-    start_node_transaction(app, state, StartTransaction::StartupRecoveryOnly)
-        .await
-        .map_err(|failure| paths::redact_home_text(&failure.to_string()))
+    let cancel_watch = state.startup_retry_cancel.subscribe();
+    start_node_transaction(
+        app,
+        state,
+        StartTransaction::StartupRecoveryOnly,
+        cancel_watch,
+    )
+    .await
+    .map_err(|failure| paths::redact_home_text(&failure.to_string()))
 }
 
 async fn require_settings_owner(state: &AppState) -> Result<(), String> {
@@ -609,11 +714,16 @@ pub async fn start_node(
 
 #[tauri::command]
 pub async fn stop_node(state: State<'_, AppState>) -> CmdResult<()> {
+    stop_node_inner(&state).await
+}
+
+pub(crate) async fn stop_node_inner(state: &AppState) -> CmdResult<()> {
     if state.another_desktop_owns_node().await {
         return Err(crate::start_fence::ALREADY_OPEN.into());
     }
     state.cancel_startup_retry();
     let mut node = state.node.lock().await;
+    state.cancel_startup_retry();
     node.stop().await.map_err(map_err)
 }
 
@@ -745,8 +855,42 @@ pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResu
 
 pub(crate) async fn restart_node_inner(app: &AppHandle, state: &AppState) -> Result<(), String> {
     state.cancel_startup_retry();
+    let cancel_watch = state.startup_retry_cancel.subscribe();
+    restart_node_transaction(app, state, cancel_watch, RestartTarget::Any).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestartTarget {
+    Any,
+    RunningNode,
+    RunningObserver,
+    Compute,
+}
+
+async fn restart_node_transaction(
+    app: &AppHandle,
+    state: &AppState,
+    cancel_watch: tokio::sync::watch::Receiver<()>,
+    target: RestartTarget,
+) -> Result<(), String> {
     require_data_migration_ready(state).await?;
-    state.node.lock().await.refuse_start_during_update()?;
+    let mut node = state.node.lock().await;
+    ensure_launch_not_superseded(&cancel_watch).map_err(|failure| failure.to_string())?;
+    node.refuse_start_during_update()?;
+    let matches = match target {
+        RestartTarget::Any => true,
+        RestartTarget::RunningNode => node.pid().is_some(),
+        RestartTarget::RunningObserver => node.running_as_observer(),
+        RestartTarget::Compute => node.has_pending_or_running_compute(),
+    };
+    if !matches {
+        return Ok(());
+    }
+    if matches!(target, RestartTarget::RunningNode | RestartTarget::RunningObserver)
+        && node.requires_completed_stop_before_start()
+    {
+        return Err("Managed node recovery is still completing; compute will retry afterward.".into());
+    }
     let (cfg, mut recovery_phrase, persisted_address) = {
         let store = state.store.lock().await;
         let cfg = store.config.clone().unwrap_or_default();
@@ -762,10 +906,19 @@ pub(crate) async fn restart_node_inner(app: &AppHandle, state: &AppState) -> Res
     recovery_phrase.zeroize();
     let validator_keyfile = keyfile_result?;
 
-    {
-        let mut node = state.node.lock().await;
-        node.stop().await.map_err(map_err)?;
+    if let Err(error) = node.stop().await {
+        if !crate::node_manager::is_managed_durability_recovery_required(&error)
+            || node.is_running()
+            || node.requires_completed_stop_before_start()
+        {
+            return Err(map_err(error));
+        }
+        drop(node);
+        return start_node_transaction(app, state, StartTransaction::Start, cancel_watch)
+            .await
+            .map_err(|failure| failure.to_string());
     }
+    ensure_launch_not_superseded(&cancel_watch).map_err(|failure| failure.to_string())?;
 
     let lock_data_dir = cfg.data_dir.clone();
     let lifecycle_lock = tokio::task::spawn_blocking(move || {
@@ -783,10 +936,29 @@ pub(crate) async fn restart_node_inner(app: &AppHandle, state: &AppState) -> Res
     ensure_binary_inner(app).await?;
 
     let resources = resolve_testnet_resources(app);
-    let mut node = state.node.lock().await;
-    node.start(&cfg, &validator_keyfile, &resources, lifecycle_lock)
-        .await
-        .map_err(map_err)
+    let node_ref = &mut *node;
+    let validator_keyfile_ref = &validator_keyfile;
+    let resources_ref = &resources;
+    with_current_launch_config(
+        &state.store,
+        &cancel_watch,
+        &cfg.data_dir,
+        &persisted_address,
+        |launch_cfg| async move {
+            node_ref
+                .start(
+                    &launch_cfg,
+                    validator_keyfile_ref,
+                    resources_ref,
+                    lifecycle_lock,
+                )
+                .await
+                .map_err(map_err)?;
+            Ok(())
+        },
+    )
+    .await
+    .map_err(|failure| failure.to_string())
 }
 
 pub(crate) const COMPUTE_CONSENT_REQUIRED: &str =
@@ -959,10 +1131,7 @@ pub async fn set_compute_contribution(
     if !enabled {
         crate::sharing_awake::set_enabled(false);
         let config = update_stored_config(&state, withdraw_compute_consent).await?;
-        let running = state.node.lock().await.is_running();
-        if running {
-            restart_node_inner(&app, &state).await?;
-        }
+        reconcile_running_compute(&app, &state, RestartTarget::Compute).await?;
         return Ok(config);
     }
     update_stored_config(&state, record_explicit_compute_consent).await?;
@@ -1016,7 +1185,8 @@ async fn promote_consented_install_once(
         PromotionNeed::Ready
             if crate::node_manager::configured_model_unavailable(&config).is_none() =>
         {
-            return Ok(config)
+            reconcile_running_compute(app, state, RestartTarget::RunningObserver).await?;
+            return Ok(current_config(state).await);
         }
         PromotionNeed::Ready if tier == "none" => return Err(COMPUTE_INELIGIBLE.to_string()),
         PromotionNeed::Ready | PromotionNeed::Promote => {}
@@ -1028,19 +1198,75 @@ async fn promote_consented_install_once(
     let Some(promoted) = persist_promotion_if_still_consented(state, model_path).await? else {
         return Ok(current_config(state).await);
     };
-    let running = state.node.lock().await.is_running();
-    if running {
-        restart_node_inner(app, state).await?;
-    }
+    reconcile_running_compute(app, state, RestartTarget::RunningNode).await?;
     Ok(promoted)
 }
 
-fn needs_promotion(config: &NodeConfig, ram_gb: u64) -> bool {
+async fn reconcile_running_compute(
+    app: &AppHandle,
+    state: &AppState,
+    target: RestartTarget,
+) -> Result<(), String> {
+    let cancel_watch = state.startup_retry_cancel.subscribe();
+    restart_node_transaction(app, state, cancel_watch, target).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComputeReconcileAction {
+    None,
+    RestartRunningObserver,
+    PromoteModel,
+}
+
+pub(crate) fn compute_reconcile_action(
+    config: &NodeConfig,
+    ram_gb: u64,
+    running_as_observer: bool,
+) -> ComputeReconcileAction {
     match promotion_need(config, ram_gb) {
-        PromotionNeed::Promote => true,
-        PromotionNeed::Ready => crate::node_manager::configured_model_unavailable(config).is_some(),
-        PromotionNeed::NoConsent | PromotionNeed::Ineligible => false,
+        PromotionNeed::NoConsent | PromotionNeed::Ineligible => ComputeReconcileAction::None,
+        PromotionNeed::Promote => ComputeReconcileAction::PromoteModel,
+        PromotionNeed::Ready => {
+            if crate::node_manager::configured_model_unavailable(config).is_some() {
+                ComputeReconcileAction::PromoteModel
+            } else if running_as_observer {
+                ComputeReconcileAction::RestartRunningObserver
+            } else {
+                ComputeReconcileAction::None
+            }
+        }
     }
+}
+
+fn needs_promotion(config: &NodeConfig, ram_gb: u64) -> bool {
+    matches!(
+        compute_reconcile_action(config, ram_gb, false),
+        ComputeReconcileAction::PromoteModel
+    )
+}
+
+fn startup_promotion_skip_reason(
+    config: &NodeConfig,
+    conditions: &impl crate::background_promotion::DownloadConditions,
+    disk_space_needed: Option<u64>,
+    cached_model_ready: bool,
+) -> Option<crate::background_promotion::SkipReason> {
+    if cached_model_ready {
+        return None;
+    }
+    if let Err(reason) = startup_download_gate(config, conditions) {
+        return Some(reason);
+    }
+    disk_space_needed
+        .map(|needed_bytes| crate::background_promotion::SkipReason::DiskFull { needed_bytes })
+}
+
+async fn cached_model_verified_for_tier(tier: &str) -> bool {
+    existing_model_for_tier(tier.to_string())
+        .await
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 pub(crate) async fn promote_consented_install_on_startup(app: &AppHandle, state: &AppState) {
@@ -1048,25 +1274,28 @@ pub(crate) async fn promote_consented_install_on_startup(app: &AppHandle, state:
     let ram_gb = tokio::task::spawn_blocking(|| cached_hardware().ram_gb)
         .await
         .unwrap_or(0);
-    if !needs_promotion(&config, ram_gb) {
-        return;
-    }
-    if let Err(reason) =
-        startup_download_gate(&config, &crate::background_promotion::SystemConditions)
-    {
-        crate::background_promotion::record_outcome(
-            &crate::background_promotion::TickOutcome::Skipped(reason),
-        );
-        tracing::info!(?reason, "default-enabled startup promotion deferred");
-        return;
-    }
-    if let Some(needed_bytes) = background_download_space_needed(tier_for_ram_gb(ram_gb)).await {
-        crate::background_promotion::record_outcome(
-            &crate::background_promotion::TickOutcome::Skipped(
-                crate::background_promotion::SkipReason::DiskFull { needed_bytes },
-            ),
-        );
-        return;
+    let running_as_observer = state.node.lock().await.running_as_observer();
+    match compute_reconcile_action(&config, ram_gb, running_as_observer) {
+        ComputeReconcileAction::None => return,
+        ComputeReconcileAction::RestartRunningObserver => {}
+        ComputeReconcileAction::PromoteModel => {
+            let tier = tier_for_ram_gb(ram_gb);
+            let disk_space_needed = background_download_space_needed(tier).await;
+            if let Some(reason) = startup_promotion_skip_reason(
+                &config,
+                &crate::background_promotion::SystemConditions,
+                disk_space_needed,
+                false,
+            ) {
+                if !cached_model_verified_for_tier(tier).await {
+                    crate::background_promotion::record_outcome(
+                        &crate::background_promotion::TickOutcome::Skipped(reason),
+                    );
+                    tracing::info!(?reason, "default-enabled startup promotion deferred");
+                    return;
+                }
+            }
+        }
     }
     match promote_consented_install_inner(app, state).await {
         Ok(_) => tracing::info!("compute contribution enabled: worker mode with a verified model"),
@@ -3317,15 +3546,8 @@ pub async fn set_worker_threads(
         ));
     }
 
-    let was_running = {
-        let mut store = state.store.lock().await;
-        let mut cfg = store.config.clone().unwrap_or_default();
-        cfg.worker_threads = Some(threads);
-        store.config = Some(cfg);
-        let dir = state.data_dir.lock().await.clone();
-        store.save_to(&dir).map_err(map_err)?;
-        state.node.lock().await.is_running()
-    };
+    update_stored_config(&state, |config| config.worker_threads = Some(threads)).await?;
+    let was_running = state.node.lock().await.is_running();
 
     if !was_running {
         return Ok(ThreadsApplied {
@@ -5210,12 +5432,20 @@ impl crate::background_promotion::TickEnv for BackgroundPromotionEnv<'_> {
         let tier = tier_for_ram_gb(ram_gb);
         let model_unavailable = need == PromotionNeed::Ready
             && crate::node_manager::configured_model_unavailable(&config).is_some();
+        let running_as_observer = self.state.node.lock().await.running_as_observer();
         let wants_download = need == PromotionNeed::Promote || model_unavailable;
+        let cached_model_ready = if wants_download {
+            cached_model_verified_for_tier(tier).await
+        } else {
+            false
+        };
         crate::background_promotion::PromotionFacts {
             need,
             model_unavailable,
             model_fits: tier != "none",
-            disk_space_needed: if wants_download {
+            running_as_observer,
+            cached_model_ready,
+            disk_space_needed: if wants_download && !cached_model_ready {
                 background_download_space_needed(tier).await
             } else {
                 None
@@ -6530,6 +6760,98 @@ mod release_binary_tests {
 mod compute_contribution_tests {
     use super::*;
 
+    #[test]
+    fn restored_missing_model_reconciles_running_observer_but_preserves_stopped_opt_out_and_floor()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("standard.gguf");
+        let model_str = model_path.to_string_lossy().into_owned();
+        let saved = config("worker", Some(&model_str), Some(true));
+
+        assert_eq!(
+            compute_reconcile_action(&saved, 16, true),
+            ComputeReconcileAction::PromoteModel
+        );
+
+        std::fs::write(&model_path, b"model").unwrap();
+        assert_eq!(
+            compute_reconcile_action(&saved, 16, true),
+            ComputeReconcileAction::RestartRunningObserver
+        );
+        assert_eq!(
+            compute_reconcile_action(&saved, 16, false),
+            ComputeReconcileAction::None
+        );
+
+        let opted_out = config("worker", Some(&model_str), Some(false));
+        assert_eq!(
+            compute_reconcile_action(&opted_out, 16, true),
+            ComputeReconcileAction::None
+        );
+
+        assert_eq!(
+            compute_reconcile_action(&saved, 8, true),
+            ComputeReconcileAction::None
+        );
+    }
+
+    #[test]
+    fn startup_promotion_gate_allows_cached_model_but_defers_uncached_download() {
+        struct StubConditions {
+            power: crate::background_promotion::PowerSource,
+            metered: Option<bool>,
+        }
+        impl crate::background_promotion::DownloadConditions for StubConditions {
+            fn power_source(&self) -> crate::background_promotion::PowerSource {
+                self.power
+            }
+
+            fn network_metered(&self) -> Option<bool> {
+                self.metered
+            }
+        }
+
+        let mut default_enabled = config("observer", None, Some(true));
+        default_enabled.compute_default_notice_pending = true;
+        let battery = StubConditions {
+            power: crate::background_promotion::PowerSource::Battery,
+            metered: Some(false),
+        };
+        let metered = StubConditions {
+            power: crate::background_promotion::PowerSource::Mains,
+            metered: Some(true),
+        };
+        let mains = StubConditions {
+            power: crate::background_promotion::PowerSource::Mains,
+            metered: Some(false),
+        };
+
+        assert_eq!(
+            startup_promotion_skip_reason(&default_enabled, &battery, None, false),
+            Some(crate::background_promotion::SkipReason::OnBattery)
+        );
+        assert_eq!(
+            startup_promotion_skip_reason(&default_enabled, &battery, None, true),
+            None
+        );
+        assert_eq!(
+            startup_promotion_skip_reason(&default_enabled, &metered, None, false),
+            Some(crate::background_promotion::SkipReason::MeteredNetwork)
+        );
+        assert_eq!(
+            startup_promotion_skip_reason(&default_enabled, &metered, None, true),
+            None
+        );
+        assert_eq!(
+            startup_promotion_skip_reason(&default_enabled, &mains, Some(4096), false),
+            Some(crate::background_promotion::SkipReason::DiskFull { needed_bytes: 4096 })
+        );
+        assert_eq!(
+            startup_promotion_skip_reason(&default_enabled, &mains, Some(4096), true),
+            None
+        );
+    }
+
     fn config(role: &str, model: Option<&str>, consent: Option<bool>) -> NodeConfig {
         NodeConfig {
             role: role.into(),
@@ -7308,6 +7630,275 @@ mod start_fence_tests {
         }
     }
 
+    fn test_identity(address: &str) -> crate::types::Identity {
+        crate::types::Identity {
+            address: address.into(),
+            public_key: String::new(),
+            seed_phrase: String::new(),
+            created_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_invalidates_launches_queued_after_its_initial_cancel() {
+        let state = Arc::new(state_with(None));
+        let held_node = state.node.lock().await;
+        let mut initial_watch = state.startup_retry_cancel.subscribe();
+        let stop_state = state.clone();
+        let stop = tokio::spawn(async move { super::stop_node_inner(&stop_state).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), initial_watch.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let queued_launch = state.startup_retry_cancel.subscribe();
+        assert!(super::ensure_launch_not_superseded(&queued_launch).is_ok());
+        drop(held_node);
+        stop.await.unwrap().unwrap();
+        assert!(super::ensure_launch_not_superseded(&queued_launch).is_err());
+    }
+
+    #[tokio::test]
+    async fn opt_out_during_preparation_launches_with_current_observer_settings() {
+        let state = Arc::new(state_with(None));
+        let directory = tempfile::tempdir().unwrap();
+        *state.data_dir.lock().await = directory.path().to_path_buf();
+        let address = "11".repeat(32);
+        {
+            let mut store = state.store.lock().await;
+            store.identity = Some(test_identity(&address));
+            store.config = Some(super::NodeConfig {
+                data_dir: "/locked/node-data".into(),
+                role: "worker".into(),
+                model_path: Some("/model.gguf".into()),
+                compute_consent: Some(true),
+                ..super::NodeConfig::default()
+            });
+        }
+        let cancel_watch = state.startup_retry_cancel.subscribe();
+        let (prepared, preparation) = tokio::sync::oneshot::channel();
+        let launch_state = state.clone();
+        let launch = tokio::spawn(async move {
+            preparation.await.unwrap();
+            let _node = launch_state.node.lock().await;
+            super::with_current_launch_config(
+                &launch_state.store,
+                &cancel_watch,
+                "/locked/node-data",
+                &address,
+                |config| async move { Ok(config) },
+            )
+            .await
+        });
+        super::update_stored_config(&state, super::withdraw_compute_consent)
+            .await
+            .unwrap();
+        prepared.send(()).unwrap();
+        let config = launch.await.unwrap().unwrap();
+        assert_eq!(config.compute_consent, Some(false));
+        assert_eq!(config.role, "observer");
+        assert_eq!(config.model_path, None);
+    }
+
+    #[tokio::test]
+    async fn launch_boundary_sees_promotion_while_waiting_for_node_and_blocks_opt_out_inside_launch(
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let locked_dir = directory
+            .path()
+            .join("node-data")
+            .to_string_lossy()
+            .into_owned();
+        let model_path = directory.path().join("standard.gguf");
+        std::fs::write(&model_path, b"model").unwrap();
+        let model_str = model_path.to_string_lossy().into_owned();
+        let expected_address = "0x1111111111111111111111111111111111111111";
+
+        let state = Arc::new(state_with(None));
+        *state.data_dir.lock().await = directory.path().to_path_buf();
+        {
+            let mut store = state.store.lock().await;
+            store.identity = Some(test_identity(expected_address));
+            store.config = Some(super::NodeConfig {
+                data_dir: locked_dir.clone(),
+                role: "observer".into(),
+                model_path: None,
+                compute_consent: Some(true),
+                ..super::NodeConfig::default()
+            });
+            store.save_to(directory.path()).unwrap();
+        }
+
+        state.cancel_startup_retry();
+        let cancel_watch = state.startup_retry_cancel.subscribe();
+        let held_node = state.node.lock().await;
+        let waiting_for_node = Arc::new(tokio::sync::Notify::new());
+        let launch_entered = Arc::new(tokio::sync::Notify::new());
+        let release_launch = Arc::new(tokio::sync::Notify::new());
+
+        let launcher = {
+            let state = state.clone();
+            let locked_dir = locked_dir.clone();
+            let waiting_for_node = waiting_for_node.clone();
+            let launch_entered = launch_entered.clone();
+            let release_launch = release_launch.clone();
+            tokio::spawn(async move {
+                waiting_for_node.notify_one();
+                let _node = state.node.lock().await;
+                super::with_current_launch_config(
+                    &state.store,
+                    &cancel_watch,
+                    &locked_dir,
+                    expected_address,
+                    |launch_cfg| async move {
+                        launch_entered.notify_one();
+                        release_launch.notified().await;
+                        Ok(launch_cfg)
+                    },
+                )
+                .await
+            })
+        };
+
+        waiting_for_node.notified().await;
+        tokio::task::yield_now().await;
+
+        let promoted = super::persist_promotion_if_still_consented(&state, model_str.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(promoted.role, "worker");
+        assert_eq!(promoted.model_path.as_deref(), Some(model_str.as_str()));
+
+        drop(held_node);
+        launch_entered.notified().await;
+
+        let opt_out_state = state.clone();
+        let mut opt_out = tokio::spawn(async move {
+            super::update_stored_config(&opt_out_state, super::withdraw_compute_consent).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut opt_out)
+                .await
+                .is_err(),
+            "opt-out writer must block on store guard until committed launch completes"
+        );
+
+        release_launch.notify_one();
+        let launched_cfg = launcher.await.unwrap().unwrap();
+        assert_eq!(launched_cfg.data_dir, locked_dir);
+        assert_eq!(launched_cfg.role, "worker");
+        assert_eq!(launched_cfg.model_path.as_deref(), Some(model_str.as_str()));
+        assert_eq!(launched_cfg.compute_consent, Some(true));
+
+        let opted_out = opt_out.await.unwrap().unwrap();
+        assert_eq!(opted_out.compute_consent, Some(false));
+        assert_eq!(opted_out.role, "observer");
+        assert_eq!(opted_out.model_path, None);
+        let saved = crate::store::Store::load_for_owner_probe(directory.path()).unwrap();
+        assert_eq!(saved.config.unwrap().compute_consent, Some(false));
+        assert_eq!(saved.identity.unwrap().address, expected_address);
+    }
+
+    #[tokio::test]
+    async fn launch_boundary_rejects_superseded_cancel_changed_data_dir_and_changed_identity() {
+        let locked_dir = "/locked/node-data";
+        let expected_address = "0x1111111111111111111111111111111111111111";
+        let other_address = "0x2222222222222222222222222222222222222222";
+        let state = state_with(None);
+        {
+            let mut store = state.store.lock().await;
+            store.identity = Some(test_identity(expected_address));
+            store.config = Some(super::NodeConfig {
+                data_dir: locked_dir.into(),
+                role: "worker".into(),
+                compute_consent: Some(true),
+                ..super::NodeConfig::default()
+            });
+        }
+
+        state.cancel_startup_retry();
+        let cancel_watch = state.startup_retry_cancel.subscribe();
+        state.cancel_startup_retry();
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let _node = state.node.lock().await;
+            let count = launches.clone();
+            let result = super::with_current_launch_config(
+                &state.store,
+                &cancel_watch,
+                locked_dir,
+                expected_address,
+                |_cfg| async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await;
+            assert!(result.is_err());
+        }
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let fresh_watch = state.startup_retry_cancel.subscribe();
+        state.store.lock().await.config.as_mut().unwrap().data_dir = "/changed/node-data".into();
+        {
+            let _node = state.node.lock().await;
+            let count = launches.clone();
+            let result = super::with_current_launch_config(
+                &state.store,
+                &fresh_watch,
+                locked_dir,
+                expected_address,
+                |_cfg| async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await;
+            assert!(result.is_err());
+        }
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        state.store.lock().await.config.as_mut().unwrap().data_dir = locked_dir.into();
+        for mutated_identity in [Some(test_identity(other_address)), None] {
+            state.store.lock().await.identity = mutated_identity;
+            let _node = state.node.lock().await;
+            let count = launches.clone();
+            let result = super::with_current_launch_config(
+                &state.store,
+                &fresh_watch,
+                locked_dir,
+                expected_address,
+                |_cfg| async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await;
+            assert!(result.is_err());
+        }
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        state.store.lock().await.identity = Some(test_identity(expected_address));
+        {
+            let _node = state.node.lock().await;
+            let count = launches.clone();
+            let launched = super::with_current_launch_config(
+                &state.store,
+                &fresh_watch,
+                locked_dir,
+                expected_address,
+                |cfg| async move {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(cfg)
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(launched.data_dir, locked_dir);
+        }
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     fn body_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         let start_at = source.find(start).expect("start marker");
         let tail = &source[start_at..];
@@ -7386,7 +7977,10 @@ mod start_fence_tests {
             ),
         ] {
             let body = body_between(source, start, end);
-            assert!(body.contains("StartTransaction::Start)"), "{name}");
+            assert!(
+                body.contains("StartTransaction::Start, cancel_watch)"),
+                "{name}"
+            );
             assert!(!body.contains("StartupRecoveryOnly"), "{name}");
         }
         let gate = body_between(

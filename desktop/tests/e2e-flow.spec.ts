@@ -599,7 +599,7 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     );
     expect(
       startWrapper.match(
-        /start_node_transaction\(app, state, StartTransaction::Start\)/g,
+        /start_node_transaction\(app, state, StartTransaction::Start, cancel_watch\)/g,
       ),
     ).toHaveLength(2);
     expect(startWrapper).not.toContain("StartupRecoveryOnly");
@@ -607,8 +607,8 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
     expect(commands).toContain(
       "require_start_fence(state, StartAccess::Ordinary).await",
     );
-    expect(commands).toContain(
-      "start_node_transaction(app, state, StartTransaction::StartupRecoveryOnly)",
+    expect(commands).toMatch(
+      /start_node_transaction\(\s*app,\s*state,\s*StartTransaction::StartupRecoveryOnly,\s*cancel_watch,?\s*\)/,
     );
     expect(startWrapper).not.toContain("node.start(");
     expect(restart).toContain("require_data_migration_ready(&state).await?");
@@ -658,8 +658,18 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
 
   test("Quit menu stops arc-node cleanly before app.exit", () => {
     expect(tray).toMatch(/"quit"\s*=>/);
-    expect(tray).toMatch(/node\.stop\(\)/);
-    expect(tray).toMatch(/handle\.exit\(0\)/);
+    const stop = tray.indexOf("crate::commands::stop_node_inner(&state).await");
+    const exit = tray.indexOf("handle.exit(0)");
+    expect(stop, "Quit must await the shared Stop fence before exiting").toBeGreaterThanOrEqual(0);
+    expect(exit).toBeGreaterThan(stop);
+    const stopInnerBegin = commands.indexOf("pub(crate) async fn stop_node_inner(");
+    expect(stopInnerBegin).toBeGreaterThanOrEqual(0);
+    const stopInnerEnd = commands.indexOf("\n}", stopInnerBegin);
+    expect(stopInnerEnd).toBeGreaterThan(stopInnerBegin);
+    const stopInner = commands.slice(stopInnerBegin, stopInnerEnd);
+    expect(stopInner).toMatch(
+      /state\.cancel_startup_retry\(\);\s*let mut node = state\.node\.lock\(\)\.await;\s*state\.cancel_startup_retry\(\);\s*node\.stop\(\)\.await/,
+    );
   });
 });
 

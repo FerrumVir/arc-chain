@@ -322,6 +322,9 @@ jobs:
         run: |
           cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib native_paid:: -- --test-threads=1
           cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib node_manager:: -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib background_promotion:: -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib compute_contribution_tests:: -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib start_fence_tests:: -- --test-threads=1
           cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib partial_worker_status_tests:: -- --test-threads=1
           cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib below_floor_config_roundtrip_preserves_choices_and_launches_only_observer -- --test-threads=1
           cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib community_shard_route_tests:: -- --test-threads=1
