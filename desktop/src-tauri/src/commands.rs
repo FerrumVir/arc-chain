@@ -516,7 +516,14 @@ async fn start_node_transaction(
         ensure_launch_not_superseded(&cancel_watch)?;
         node.refuse_start_during_update()?;
         if node.requires_completed_stop_before_start() {
-            node.stop().await.map_err(map_err)?;
+            if let Err(error) = node.stop().await {
+                if !crate::node_manager::is_managed_durability_recovery_required(&error)
+                    || node.is_running()
+                    || node.requires_completed_stop_before_start()
+                {
+                    return Err(map_err(error).into());
+                }
+            }
         } else if node.is_running() {
             return Ok(());
         }
@@ -707,11 +714,16 @@ pub async fn start_node(
 
 #[tauri::command]
 pub async fn stop_node(state: State<'_, AppState>) -> CmdResult<()> {
+    stop_node_inner(&state).await
+}
+
+pub(crate) async fn stop_node_inner(state: &AppState) -> CmdResult<()> {
     if state.another_desktop_owns_node().await {
         return Err(crate::start_fence::ALREADY_OPEN.into());
     }
     state.cancel_startup_retry();
     let mut node = state.node.lock().await;
+    state.cancel_startup_retry();
     node.stop().await.map_err(map_err)
 }
 
@@ -844,17 +856,41 @@ pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResu
 pub(crate) async fn restart_node_inner(app: &AppHandle, state: &AppState) -> Result<(), String> {
     state.cancel_startup_retry();
     let cancel_watch = state.startup_retry_cancel.subscribe();
-    restart_node_transaction(app, state, cancel_watch, None).await
+    restart_node_transaction(app, state, cancel_watch, RestartTarget::Any).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestartTarget {
+    Any,
+    RunningNode,
+    RunningObserver,
+    Compute,
 }
 
 async fn restart_node_transaction(
     app: &AppHandle,
     state: &AppState,
     cancel_watch: tokio::sync::watch::Receiver<()>,
-    required_running_pid: Option<u32>,
+    target: RestartTarget,
 ) -> Result<(), String> {
     require_data_migration_ready(state).await?;
-    state.node.lock().await.refuse_start_during_update()?;
+    let mut node = state.node.lock().await;
+    ensure_launch_not_superseded(&cancel_watch).map_err(|failure| failure.to_string())?;
+    node.refuse_start_during_update()?;
+    let matches = match target {
+        RestartTarget::Any => true,
+        RestartTarget::RunningNode => node.pid().is_some(),
+        RestartTarget::RunningObserver => node.running_as_observer(),
+        RestartTarget::Compute => node.has_pending_or_running_compute(),
+    };
+    if !matches {
+        return Ok(());
+    }
+    if matches!(target, RestartTarget::RunningNode | RestartTarget::RunningObserver)
+        && node.requires_completed_stop_before_start()
+    {
+        return Err("Managed node recovery is still completing; compute will retry afterward.".into());
+    }
     let (cfg, mut recovery_phrase, persisted_address) = {
         let store = state.store.lock().await;
         let cfg = store.config.clone().unwrap_or_default();
@@ -870,15 +906,17 @@ async fn restart_node_transaction(
     recovery_phrase.zeroize();
     let validator_keyfile = keyfile_result?;
 
-    {
-        let mut node = state.node.lock().await;
-        ensure_launch_not_superseded(&cancel_watch).map_err(|failure| failure.to_string())?;
-        if required_running_pid.is_some_and(|pid| {
-            node.pid() != Some(pid) || node.requires_completed_stop_before_start()
-        }) {
-            return Ok(());
+    if let Err(error) = node.stop().await {
+        if !crate::node_manager::is_managed_durability_recovery_required(&error)
+            || node.is_running()
+            || node.requires_completed_stop_before_start()
+        {
+            return Err(map_err(error));
         }
-        node.stop().await.map_err(map_err)?;
+        drop(node);
+        return start_node_transaction(app, state, StartTransaction::Start, cancel_watch)
+            .await
+            .map_err(|failure| failure.to_string());
     }
     ensure_launch_not_superseded(&cancel_watch).map_err(|failure| failure.to_string())?;
 
@@ -898,7 +936,6 @@ async fn restart_node_transaction(
     ensure_binary_inner(app).await?;
 
     let resources = resolve_testnet_resources(app);
-    let mut node = state.node.lock().await;
     let node_ref = &mut *node;
     let validator_keyfile_ref = &validator_keyfile;
     let resources_ref = &resources;
@@ -1092,11 +1129,9 @@ pub async fn set_compute_contribution(
 ) -> CmdResult<NodeConfig> {
     require_settings_owner(&state).await?;
     if !enabled {
-        state.cancel_startup_retry();
-        let cancel_watch = state.startup_retry_cancel.subscribe();
         crate::sharing_awake::set_enabled(false);
         let config = update_stored_config(&state, withdraw_compute_consent).await?;
-        reconcile_running_compute(&app, &state, cancel_watch, false).await?;
+        reconcile_running_compute(&app, &state, RestartTarget::Compute).await?;
         return Ok(config);
     }
     update_stored_config(&state, record_explicit_compute_consent).await?;
@@ -1139,7 +1174,6 @@ async fn promote_consented_install_once(
     app: &AppHandle,
     state: &AppState,
 ) -> Result<NodeConfig, String> {
-    let cancel_watch = state.startup_retry_cancel.subscribe();
     let config = current_config(state).await;
     let ram_gb = tokio::task::spawn_blocking(|| cached_hardware().ram_gb)
         .await
@@ -1151,7 +1185,7 @@ async fn promote_consented_install_once(
         PromotionNeed::Ready
             if crate::node_manager::configured_model_unavailable(&config).is_none() =>
         {
-            reconcile_running_compute(app, state, cancel_watch, true).await?;
+            reconcile_running_compute(app, state, RestartTarget::RunningObserver).await?;
             return Ok(current_config(state).await);
         }
         PromotionNeed::Ready if tier == "none" => return Err(COMPUTE_INELIGIBLE.to_string()),
@@ -1164,30 +1198,17 @@ async fn promote_consented_install_once(
     let Some(promoted) = persist_promotion_if_still_consented(state, model_path).await? else {
         return Ok(current_config(state).await);
     };
-    reconcile_running_compute(app, state, cancel_watch, false).await?;
+    reconcile_running_compute(app, state, RestartTarget::RunningNode).await?;
     Ok(promoted)
 }
 
 async fn reconcile_running_compute(
     app: &AppHandle,
     state: &AppState,
-    cancel_watch: tokio::sync::watch::Receiver<()>,
-    observer_only: bool,
+    target: RestartTarget,
 ) -> Result<(), String> {
-    let pid = {
-        let node = state.node.lock().await;
-        ensure_launch_not_superseded(&cancel_watch).map_err(|failure| failure.to_string())?;
-        if node.requires_completed_stop_before_start()
-            || (observer_only && !node.running_as_observer())
-        {
-            return Ok(());
-        }
-        node.pid()
-    };
-    if let Some(pid) = pid {
-        restart_node_transaction(app, state, cancel_watch, Some(pid)).await?;
-    }
-    Ok(())
+    let cancel_watch = state.startup_retry_cancel.subscribe();
+    restart_node_transaction(app, state, cancel_watch, target).await
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7616,6 +7637,66 @@ mod start_fence_tests {
             seed_phrase: String::new(),
             created_at: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn stop_invalidates_launches_queued_after_its_initial_cancel() {
+        let state = Arc::new(state_with(None));
+        let held_node = state.node.lock().await;
+        let mut initial_watch = state.startup_retry_cancel.subscribe();
+        let stop_state = state.clone();
+        let stop = tokio::spawn(async move { super::stop_node_inner(&stop_state).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), initial_watch.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let queued_launch = state.startup_retry_cancel.subscribe();
+        assert!(super::ensure_launch_not_superseded(&queued_launch).is_ok());
+        drop(held_node);
+        stop.await.unwrap().unwrap();
+        assert!(super::ensure_launch_not_superseded(&queued_launch).is_err());
+    }
+
+    #[tokio::test]
+    async fn opt_out_during_preparation_launches_with_current_observer_settings() {
+        let state = Arc::new(state_with(None));
+        let directory = tempfile::tempdir().unwrap();
+        *state.data_dir.lock().await = directory.path().to_path_buf();
+        let address = "11".repeat(32);
+        {
+            let mut store = state.store.lock().await;
+            store.identity = Some(test_identity(&address));
+            store.config = Some(super::NodeConfig {
+                data_dir: "/locked/node-data".into(),
+                role: "worker".into(),
+                model_path: Some("/model.gguf".into()),
+                compute_consent: Some(true),
+                ..super::NodeConfig::default()
+            });
+        }
+        let cancel_watch = state.startup_retry_cancel.subscribe();
+        let (prepared, preparation) = tokio::sync::oneshot::channel();
+        let launch_state = state.clone();
+        let launch = tokio::spawn(async move {
+            preparation.await.unwrap();
+            let _node = launch_state.node.lock().await;
+            super::with_current_launch_config(
+                &launch_state.store,
+                &cancel_watch,
+                "/locked/node-data",
+                &address,
+                |config| async move { Ok(config) },
+            )
+            .await
+        });
+        super::update_stored_config(&state, super::withdraw_compute_consent)
+            .await
+            .unwrap();
+        prepared.send(()).unwrap();
+        let config = launch.await.unwrap().unwrap();
+        assert_eq!(config.compute_consent, Some(false));
+        assert_eq!(config.role, "observer");
+        assert_eq!(config.model_path, None);
     }
 
     #[tokio::test]

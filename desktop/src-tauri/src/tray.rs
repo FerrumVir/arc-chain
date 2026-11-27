@@ -31,11 +31,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Some(state) = handle.try_state::<AppState>() {
-                        state.cancel_startup_retry();
-                        if !state.another_desktop_owns_node().await {
-                            let mut node = state.node.lock().await;
-                            let _ = node.stop().await;
-                        }
+                        let _ = crate::commands::stop_node_inner(&state).await;
                     }
                     crate::sharing_awake::set_enabled(false);
                     handle.exit(0);

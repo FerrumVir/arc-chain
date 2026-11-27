@@ -1983,6 +1983,13 @@ impl NodeManager {
                 }))
     }
 
+    pub(crate) fn has_pending_or_running_compute(&self) -> bool {
+        (self.child.is_some() || self.desired_running)
+            && self.active_launch_plan.as_ref().is_some_and(|plan| {
+                !matches!(plan.compute_mode, ManagedComputeLaunchMode::Observer)
+            })
+    }
+
     pub async fn start(
         &mut self,
         config: &NodeConfig,
@@ -7710,6 +7717,39 @@ mod tests {
         manager.child = None;
         manager.shutdown_control = None;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compute_opt_out_targets_live_recovery_and_pending_crash_plans() {
+        let (root, _configured, mut manager, mut plan) =
+            updater_resume_fixture("compute-opt-out-target");
+        plan.compute_mode = ManagedComputeLaunchMode::FullIntegerWorker;
+        manager.active_launch_plan = Some(plan);
+        manager.desired_running = true;
+        assert!(manager.has_pending_or_running_compute());
+        manager.clear_desired_running();
+        assert!(!manager.has_pending_or_running_compute());
+
+        let child = Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        manager.child = Some(child);
+        assert!(manager.has_pending_or_running_compute());
+        manager.active_recovery_launch = true;
+        assert!(manager.running_as_observer());
+        assert!(manager.has_pending_or_running_compute());
+        manager.active_launch_plan.as_mut().unwrap().compute_mode =
+            ManagedComputeLaunchMode::Observer;
+        assert!(!manager.has_pending_or_running_compute());
+        let child = manager.child.as_mut().unwrap();
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        manager.child = None;
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
