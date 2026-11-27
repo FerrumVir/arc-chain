@@ -599,7 +599,18 @@ fn windows_canonical_namespace_leaf(target: &Path) -> io::Result<std::ffi::OsStr
 
 pub struct PrivateDirectoryNamespaceLock {
     target: PathBuf,
-    _file: File,
+    file: File,
+}
+
+impl Drop for PrivateDirectoryNamespaceLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.file.unlock() {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "failed to release private directory namespace lock: {error}"
+            );
+        }
+    }
 }
 
 pub struct PreparedPrivateDirectoryNamespaceLock {
@@ -712,12 +723,10 @@ fn acquire_private_directory_namespace_lock_with_mode(
     } else {
         file.lock()?;
     }
+    let lock = PrivateDirectoryNamespaceLock { target, file };
     #[cfg(windows)]
-    windows_canonical_namespace_leaf(&target)?;
-    Ok(PrivateDirectoryNamespaceLock {
-        target,
-        _file: file,
-    })
+    windows_canonical_namespace_leaf(&lock.target)?;
+    Ok(lock)
 }
 
 fn open_private_namespace_lock_after_create(path: &Path, nonblocking: bool) -> io::Result<File> {
@@ -2880,6 +2889,33 @@ mod tests {
         create_private_directory_tree(&nested).unwrap();
         for directory in [root.0.join("one"), root.0.join("one/two"), nested] {
             validate_private_directory(&directory).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn namespace_lock_drop_releases_inherited_duplicates_and_preserves_successors() {
+        for prepare in [false, true] {
+            let root = TestDir::new("namespace-inherited-descriptor");
+            secure_private_directory_tree(&root.0).unwrap();
+            let target = root.0.join("data-v3");
+            secure_private_directory_tree(&target).unwrap();
+            let owner = acquire_private_directory_namespace_lock(&target).unwrap();
+            let inherited = owner.file.try_clone().unwrap();
+            assert!(try_acquire_private_directory_namespace_lock(&target).is_err());
+            if prepare {
+                let prepared = owner.rebarrier_into_prepared().unwrap();
+                assert!(try_acquire_private_directory_namespace_lock(&target).is_err());
+                drop(prepared);
+            } else {
+                drop(owner);
+            }
+            let successor = try_acquire_private_directory_namespace_lock(&target)
+                .expect("namespace ownership must unlock before inherited descriptors close");
+            drop(inherited);
+            assert!(try_acquire_private_directory_namespace_lock(&target).is_err());
+            drop(successor);
+            drop(try_acquire_private_directory_namespace_lock(&target).unwrap());
         }
     }
 
