@@ -18,6 +18,21 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.24 - Release-preparation snapshot (2026-11-26)
+
+> **Candidate note:** This entry records the v0.8.24 release-preparation
+> snapshot. It does not claim publication, deployment, or 100 active operators.
+
+- Recovery reuses its verified state and attaches the WAL writer to the exact
+  accepted file, with restart and file-mutation regression checks.
+- Community workers support signed partial-model leases, automatic assignment,
+  readiness-triggered rebalancing, and capacity recovery after worker departures.
+- Inference dispatch can use complete community shard pipelines while retaining
+  independent validator verification and truthful settlement status.
+- Desktop integration preserves existing compute choices, model and network pins,
+  memory admission, managed identity, update rollback, and durable shutdown.
+- macOS packaging derives the version from the checked Tauri release configuration.
+
 ## v0.8.23 - Release-preparation snapshot (2026-11-18)
 
 > **Candidate note:** This entry records the v0.8.23 release-preparation

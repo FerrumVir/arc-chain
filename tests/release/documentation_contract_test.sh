@@ -38,7 +38,8 @@ DESKTOP_DISTRIBUTION="$REPO_ROOT/desktop/DISTRIBUTION.md"
 DESKTOP_GAPS="$REPO_ROOT/desktop/PRODUCTION_GAPS.md"
 CLAUDE_GUIDE="$REPO_ROOT/CLAUDE.md"
 RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
-CANDIDATE_VERSION=0.8.23
+CANDIDATE_VERSION=0.8.24
+CANDIDATE_SNAPSHOT_DATE=2026-11-26
 PUBLISHED_VERSION=0.8.16
 PUBLISHED_INSTALLER_SHA256=893e930610f6380fe6b75cca64ca84ff84f9e711a3da09345abe86b4a66f1e8e
 
@@ -105,7 +106,7 @@ candidate_version_is_consistent() {
         'desktop npm lock package root does not match the recovery candidate' || return 1
     require_literal "$RELEASE_WORKFLOW" '"desktop-npm-lock-root:$DESKTOP_NPM_LOCK_ROOT_VERSION"' \
         'release tag gate does not validate the npm lock package root' || return 1
-    require_literal "$CHANGELOG" "## v$CANDIDATE_VERSION - Release-preparation snapshot (2026-11-18)" \
+    require_literal "$CHANGELOG" "## v$CANDIDATE_VERSION - Release-preparation snapshot ($CANDIDATE_SNAPSHOT_DATE)" \
         'changelog is missing the current release-preparation entry' || return 1
     require_literal "$CHANGELOG" '## v0.8.0 - Release-preparation snapshot (2026-08-31)' \
         'changelog no longer preserves the historical v0.8.0 source-freeze heading' || return 1
@@ -2399,8 +2400,8 @@ PY
     }
 }
 
-run_test 'workspace, desktop, and changelog agree on unreleased v0.8.23; README names published v0.8.16' candidate_version_is_consistent
-run_test 'install commands pin exact published v0.8.16 without claiming v0.8.23 is published' candidate_install_commands_are_exact_and_honest
+run_test 'workspace, desktop, and changelog agree on the release candidate; README names published v0.8.16' candidate_version_is_consistent
+run_test 'install commands pin exact published v0.8.16 without claiming the candidate is published' candidate_install_commands_are_exact_and_honest
 run_test 'README and headless guide share the same unpinned update-only commands' manual_updater_commands_are_identical
 run_test 'headless platform claims match the canonical release asset contract' headless_platform_claims_match_release_assets
 run_test 'desktop docs and generated release notes match artifacts, updater, and reward evidence' desktop_and_release_notes_match_the_artifact_and_reward_contract
