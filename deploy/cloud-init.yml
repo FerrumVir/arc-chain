@@ -1,4 +1,0 @@
-#cloud-config
-
-final_message: >-
-  ARC legacy cloud-init retired; no ARC software, identity, or service was installed.
