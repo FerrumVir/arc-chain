@@ -155,6 +155,7 @@ EXPECTED_INFERENCE_TESTS = {
 
 
 EXPECTED_STATE_TESTS = {
+    'wal::tests::verified_recovery_identity_probe_preserves_writer_and_rejects_path_replacement',
     'recovery::tests::restart_quarantines_complete_first_block_without_a_checkpoint_to_empty_base',
     'recovery::tests::restart_quarantines_a_torn_first_post_recovery_frame_to_empty_base',
     'recovery::tests::streaming_recovery_reread_rejects_same_size_mutation_and_added_empty_plan_entry',

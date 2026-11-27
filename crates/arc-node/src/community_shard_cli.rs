@@ -1869,26 +1869,35 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn prepare_rejects_non_utf8_model_path_before_hashing_or_check_only_pass() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
+        use std::ffi::OsString;
+        #[cfg(unix)]
+        use std::os::unix::ffi::OsStringExt;
+        #[cfg(windows)]
+        use std::os::windows::ffi::OsStringExt;
 
         let dir = TempPath::new("non-utf8-dir");
         std::fs::create_dir(&dir.0).unwrap();
-        let bad_file = dir.0.join(OsStr::from_bytes(b"model-\xff.gguf"));
-        std::fs::write(&bad_file, b"non-empty bytes").unwrap();
+        #[cfg(unix)]
+        let bad_name = OsString::from_vec(b"model-\xff.gguf".to_vec());
+        #[cfg(windows)]
+        let bad_name = OsString::from_wide(&[0x6d, 0x6f, 0x64, 0x65, 0x6c, 0xd800]);
+        let bad_file = dir.0.join(bad_name);
+        assert!(bad_file.to_str().is_none());
 
         let mut args = parse_worker_args(&base_argv()).unwrap();
         args.model_path = bad_file;
-        args.check_only = true;
-        args.worker_key_file = None;
-        let validated = validate_args_with_parallelism(&args, 4).unwrap();
-        let err = prepare_model_blocking(&args, &validated, &AtomicBool::new(false))
-            .err()
-            .expect("non-UTF-8 model path must fail during preparation")
-            .to_string();
-        assert!(err.contains("not valid UTF-8"), "{err}");
+        for check_only in [false, true] {
+            args.check_only = check_only;
+            args.worker_key_file = (!check_only).then(|| dir.0.join("unread-key.json"));
+            let validated = validate_args_with_parallelism(&args, 4).unwrap();
+            let err = prepare_model_blocking(&args, &validated, &AtomicBool::new(false))
+                .err()
+                .expect("non-UTF-8 model path must fail before filesystem access")
+                .to_string();
+            assert!(err.contains("not valid UTF-8"), "{err}");
+        }
     }
 }

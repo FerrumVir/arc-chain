@@ -837,7 +837,7 @@ impl WalWriter {
         #[cfg(windows)]
         let original_file_identity = {
             let id = windows_wal_file_identity(file)?;
-            let path_file = arc_crypto::secret_file::open_owned_nofollow_read(path)?;
+            let path_file = arc_crypto::secret_file::open_owned_nofollow_identity_probe(path)?;
             if windows_wal_file_identity(&path_file)? != id {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -908,7 +908,8 @@ impl WalWriter {
         }
         #[cfg(windows)]
         {
-            let final_path_file = arc_crypto::secret_file::open_owned_nofollow_read(path)?;
+            let final_path_file =
+                arc_crypto::secret_file::open_owned_nofollow_identity_probe(path)?;
             if windows_wal_file_identity(&reader)? != original_file_identity
                 || windows_wal_file_identity(file)? != original_file_identity
                 || windows_wal_file_identity(&final_path_file)? != original_file_identity
@@ -3347,6 +3348,33 @@ mod tests {
         ));
 
         fs::remove_file(not_a_directory).unwrap();
+    }
+
+    #[test]
+    fn verified_recovery_identity_probe_preserves_writer_and_rejects_path_replacement() {
+        let dir = tmp_dir("wal_recovery_identity_probe");
+        let wal_path = dir.join("state.wal");
+        let file = create_new_append_file_durably(&wal_path).unwrap();
+        WalWriter::verify_recovery_wal_handle(&wal_path, &file, 0, blake3::hash(&[]))
+            .expect("identity probing must remain compatible with the retained append writer");
+        #[cfg(windows)]
+        assert_eq!(
+            arc_crypto::secret_file::open_private_read_write(&wal_path)
+                .err()
+                .expect("identity probing must not permit a second WAL writer")
+                .raw_os_error(),
+            Some(32)
+        );
+        let replacement = dir.join("replacement.wal");
+        drop(create_new_append_file_durably(&replacement).unwrap());
+        fs::rename(&wal_path, dir.join("retained.wal")).unwrap();
+        fs::rename(&replacement, &wal_path).unwrap();
+        let error = WalWriter::verify_recovery_wal_handle(&wal_path, &file, 0, blake3::hash(&[]))
+            .expect_err("an identical-content replacement must not match the retained handle");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("changed while being opened"));
+        drop(file);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
