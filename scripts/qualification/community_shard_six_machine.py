@@ -1261,6 +1261,29 @@ def validate_two_dispatch_responses(
         raise QualificationError("stopped_by_eos differed across two identical requests")
 
 
+def validate_boot_id(value: Any) -> str:
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", value
+    ):
+        raise QualificationError("machine boot_id must be a canonical nonzero Linux boot UUID")
+    return value
+
+
+def read_kernel_boot_id(path: Path = Path("/proc/sys/kernel/random/boot_id")) -> str:
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(65)
+    except OSError as exc:
+        raise QualificationError(f"failed to read machine boot_id: {exc}") from exc
+    if len(raw) > 64:
+        raise QualificationError("machine boot_id exceeds the bounded UUID format")
+    try:
+        value = raw.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise QualificationError("machine boot_id must be ASCII") from exc
+    return validate_boot_id(value.strip())
+
+
 def validate_worker_identities(
     identities: list[dict[str, Any]],
     expected_run_id: str,
@@ -1275,7 +1298,7 @@ def validate_worker_identities(
     by_slot: dict[int, dict[str, Any]] = {}
     seen_worker_ids: set[str] = set()
     seen_runner_names: set[str] = set()
-    seen_hostnames: set[str] = set()
+    seen_boot_ids: set[str] = set()
     for record in identities:
         if not isinstance(record, dict):
             raise QualificationError("worker identity record must be JSON object")
@@ -1313,10 +1336,11 @@ def validate_worker_identities(
             raise QualificationError(f"missing hostname for slot {slot}")
         if runner_name in seen_runner_names:
             raise QualificationError(f"duplicate runner_name across slots: {runner_name}")
-        if hostname in seen_hostnames:
-            raise QualificationError(f"duplicate hostname across slots: {hostname}")
+        boot_id = validate_boot_id(record.get("boot_id"))
+        if boot_id in seen_boot_ids:
+            raise QualificationError(f"duplicate machine boot_id across slots: {boot_id}")
         seen_runner_names.add(runner_name)
-        seen_hostnames.add(hostname)
+        seen_boot_ids.add(boot_id)
         normalized_copy = dict(record)
         normalized_copy["worker_id"] = wid
         normalized_copy["candidate_sha"] = norm_sha
@@ -1607,6 +1631,7 @@ def cmd_check_resources(args: argparse.Namespace) -> int:
         "checked_at_utc": utc_now_iso(),
         "runner_name": os.environ.get("RUNNER_NAME", ""),
         "hostname": socket.gethostname(),
+        "boot_id": read_kernel_boot_id(),
         "mem_bytes": mem,
         "disk_total_bytes": disk.total,
         "disk_free_bytes": disk.free,
@@ -1758,6 +1783,13 @@ def cmd_worker_create_identity(args: argparse.Namespace) -> int:
     arc_bin = Path(args.candidate_dir) / "arc"
     if arc_bin.is_symlink() or not arc_bin.is_file():
         raise QualificationError("arc CLI binary missing")
+    runner_name = os.environ.get("RUNNER_NAME", "")
+    if not runner_name.strip():
+        raise QualificationError("RUNNER_NAME environment variable must be non-empty")
+    hostname = socket.gethostname()
+    if not hostname.strip():
+        raise QualificationError("hostname must be non-empty")
+    boot_id = read_kernel_boot_id()
     key_path = Path(args.private_key_path)
     key_path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(key_path.parent, 0o700)
@@ -1804,8 +1836,9 @@ def cmd_worker_create_identity(args: argparse.Namespace) -> int:
         "slot": slot,
         "worker_name": worker_name,
         "worker_id": raw_addr,
-        "runner_name": os.environ.get("RUNNER_NAME", ""),
-        "hostname": socket.gethostname(),
+        "runner_name": runner_name,
+        "hostname": hostname,
+        "boot_id": boot_id,
         "workflow_run_id": run_id,
         "workflow_run_attempt": attempt,
         "candidate_run_id": cand_run_id,
@@ -1813,8 +1846,6 @@ def cmd_worker_create_identity(args: argparse.Namespace) -> int:
         "candidate_sha": cand_sha,
         "created_at_utc": utc_now_iso(),
     }
-    if not identity["runner_name"]:
-        raise QualificationError("RUNNER_NAME environment variable must be non-empty")
     identity_dir = Path(args.identity_dir)
     write_json_file(identity_dir / "worker-identity.json", identity)
     verify_evidence_dir_no_secrets(identity_dir, extra_secret_values=extract_private_key_secrets(key_path))
@@ -1980,6 +2011,8 @@ def cmd_worker_run(args: argparse.Namespace) -> int:
     runtime_max_sec = max_seconds + RUNTIME_MAX_GRACE_SECONDS
     identity_path = Path(args.identity_dir) / "worker-identity.json"
     identity = read_bounded_json_file(identity_path)
+    if validate_boot_id(identity.get("boot_id")) != read_kernel_boot_id():
+        raise QualificationError("worker identity belongs to a different machine boot")
     expected_worker_id = normalize_hex64(identity["worker_id"], "identity.worker_id")
     worker_name = make_worker_name(run_id, attempt, slot)
     if identity.get("worker_name") != worker_name:
@@ -2249,6 +2282,7 @@ def cmd_worker_run(args: argparse.Namespace) -> int:
         "worker_id": expected_worker_id,
         "runner_name": identity["runner_name"],
         "hostname": identity["hostname"],
+        "boot_id": identity["boot_id"],
         "workflow_run_id": run_id,
         "workflow_run_attempt": attempt,
         "candidate_run_id": identity["candidate_run_id"],
@@ -2500,7 +2534,7 @@ def evaluate_aggregate(
             continue
         ev_by_slot[slot] = ev
     worker_summaries: list[dict[str, Any]] = []
-    seen_ev_hosts: set[str] = set()
+    seen_ev_boot_ids: set[str] = set()
     seen_ev_runners: set[str] = set()
     for slot in EXPECTED_SLOTS:
         ev = ev_by_slot.get(slot)
@@ -2534,7 +2568,10 @@ def evaluate_aggregate(
             failures.append(f"slot {slot} candidate_sha mismatch")
         if ev.get("runner_name") != ident["runner_name"] or ev.get("hostname") != ident["hostname"]:
             failures.append(f"slot {slot} host/runner mismatch between identity and evidence")
-        seen_ev_hosts.add(str(ev.get("hostname", "")))
+        if ev.get("boot_id") != ident["boot_id"]:
+            failures.append(f"slot {slot} machine boot_id mismatch between identity and evidence")
+        else:
+            seen_ev_boot_ids.add(ident["boot_id"])
         seen_ev_runners.add(str(ev.get("runner_name", "")))
         exit_rep = ev.get("exit_report")
         try:
@@ -2563,6 +2600,7 @@ def evaluate_aggregate(
                     "worker_name": ident["worker_name"],
                     "runner_name": ident["runner_name"],
                     "hostname": ident["hostname"],
+                    "boot_id": ident["boot_id"],
                     "systemd_memory_peak_bytes": ev.get("systemd_memory_peak_bytes"),
                     "steps_executed": summary["steps_executed"],
                     "steps_submitted": summary["steps_submitted"],
@@ -2571,8 +2609,8 @@ def evaluate_aggregate(
             )
         except QualificationError as exc:
             failures.append(f"slot {slot} exit_report invalid: {exc}")
-    if len(seen_ev_hosts) != len(EXPECTED_SLOTS) or len(seen_ev_runners) != len(EXPECTED_SLOTS):
-        failures.append("worker evidences do not come from 6 distinct hosts/runners")
+    if len(seen_ev_boot_ids) != len(EXPECTED_SLOTS) or len(seen_ev_runners) != len(EXPECTED_SLOTS):
+        failures.append("worker evidences do not come from 6 distinct machine boots and runners")
     dispatch_summaries: list[dict[str, Any]] = []
     norm_expected_sha = normalize_git_sha(expected_candidate_sha)
     if not isinstance(controller_evidence, dict):
@@ -2655,6 +2693,7 @@ def evaluate_aggregate(
         "ephemeral_qualification_workers": len(EXPECTED_SLOTS),
         "counts_toward_operator_target": False,
         "real_operators_proven": 0,
+        "machine_identity_basis": "distinct_linux_kernel_boot_ids_and_github_runner_names",
         "verification_basis": VERIFICATION_BASIS,
         "repository": EXPECTED_REPO,
         "coordinator_url": COORDINATOR_URL,

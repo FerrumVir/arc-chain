@@ -90,7 +90,8 @@ def make_identities(
                 "worker_name": qual.make_worker_name(run_id, attempt, slot),
                 "worker_id": make_worker_id(slot),
                 "runner_name": f"GitHub Actions {100 + slot}",
-                "hostname": f"fv-az-{slot}",
+                "hostname": "shared-image-hostname",
+                "boot_id": f"00000000-0000-4000-8000-{slot:012d}",
                 "workflow_run_id": run_id,
                 "workflow_run_attempt": attempt,
                 "candidate_run_id": cand_run_id,
@@ -174,6 +175,23 @@ def make_dispatch_response(seq: int) -> dict:
 
 
 class TestNormalizationAndHttpGuards(unittest.TestCase):
+    def test_kernel_boot_id_read_is_bounded_and_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "boot_id"
+            expected = "550e8400-e29b-41d4-a716-446655440000"
+            path.write_text(expected + "\n", encoding="ascii")
+            self.assertEqual(qual.read_kernel_boot_id(path), expected)
+            for invalid in ["", "0" * 36, "00000000-0000-0000-0000-000000000000", expected.replace("41d4", "11d4"), expected.replace("a716", "1716"), expected.upper(), expected + "x" * 100]:
+                path.write_text(invalid, encoding="ascii")
+                with self.assertRaises(qual.QualificationError):
+                    qual.read_kernel_boot_id(path)
+            path.write_bytes(b"\xff" * 16)
+            with self.assertRaisesRegex(qual.QualificationError, "ASCII"):
+                qual.read_kernel_boot_id(path)
+            path.unlink()
+            with self.assertRaisesRegex(qual.QualificationError, "failed to read"):
+                qual.read_kernel_boot_id(path)
+
     def test_normalize_hex64(self) -> None:
         raw = "0x" + "AB" * 32
         self.assertEqual(qual.normalize_hex64(raw, "pin"), "ab" * 32)
@@ -393,11 +411,11 @@ class TestDispatchAndAggregateProofs(unittest.TestCase):
         with self.assertRaises(qual.QualificationError):
             qual.validate_dispatch_response(dup_lease_seq, expected_ids)
 
-    def test_identities_reject_duplicate_host_or_secret(self) -> None:
+    def test_identities_allow_cloned_hostname_but_reject_duplicate_boot_or_secret(self) -> None:
         ids = make_identities()
         qual.validate_worker_identities(ids, "9001", "1", "8001", "1", "7145f682" + "a" * 32)
         dup_host = copy.deepcopy(ids)
-        dup_host[1]["hostname"] = dup_host[0]["hostname"]
+        dup_host[1]["boot_id"] = dup_host[0]["boot_id"]
         with self.assertRaises(qual.QualificationError):
             qual.validate_worker_identities(dup_host, "9001", "1", "8001", "1", "7145f682" + "a" * 32)
         leaked = copy.deepcopy(ids)
@@ -420,6 +438,7 @@ class TestDispatchAndAggregateProofs(unittest.TestCase):
                     "worker_name": ident["worker_name"],
                     "runner_name": ident["runner_name"],
                     "hostname": ident["hostname"],
+                    "boot_id": ident["boot_id"],
                     "workflow_run_id": "9001",
                     "workflow_run_attempt": "1",
                     "candidate_run_id": "8001",
@@ -468,6 +487,31 @@ class TestDispatchAndAggregateProofs(unittest.TestCase):
         self.assertIs(summary["counts_toward_operator_target"], False)
         self.assertEqual(summary["real_operators_proven"], 0)
         self.assertTrue(summary["cleanup_verified_zero_workers"])
+        self.assertEqual(summary["machine_identity_basis"], "distinct_linux_kernel_boot_ids_and_github_runner_names")
+        self.assertEqual([row["boot_id"] for row in summary["workers"]], [row["boot_id"] for row in identities])
+
+        for field, value in [("boot_id", identities[1]["boot_id"]), ("boot_id", None), ("hostname", "different")]:
+            with self.subTest(field=field, value=value):
+                changed = copy.deepcopy(evidences)
+                if value is None:
+                    changed[0].pop(field)
+                else:
+                    changed[0][field] = value
+                failure = qual.evaluate_aggregate(
+                    identities=identities,
+                    worker_evidences=changed,
+                    controller_evidence=ctrl,
+                    cleanup_readiness=make_readiness(ready=False),
+                    cleanup_status=make_shard_status(0),
+                    cleanup_error=None,
+                    expected_run_id="9001",
+                    expected_attempt="1",
+                    expected_candidate_run_id="8001",
+                    expected_candidate_attempt="1",
+                    expected_candidate_sha=cand_sha,
+                )
+                self.assertEqual(failure["overall_status"], "failed")
+                self.assertTrue(any("mismatch" in error for error in failure["failures"]))
 
         unclean = copy.deepcopy(evidences)
         unclean[2]["exit_report"]["summary"]["clean_release_sent"] = False
@@ -788,6 +832,53 @@ class TestProvenanceAndArtifactIntegrity(unittest.TestCase):
 
 
 class TestWorkerEnvAndLifecycleSignals(unittest.TestCase):
+    def setUp(self) -> None:
+        patcher = mock.patch.object(qual, "read_kernel_boot_id", return_value="00000000-0000-4000-8000-000000000001")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_host_identity_is_validated_before_key_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            candidate = root / "candidate"
+            candidate.mkdir()
+            (candidate / "arc").write_bytes(b"test")
+            key = root / "private" / "key.json"
+            args = argparse.Namespace(slot=1, workflow_run_id="9001", workflow_run_attempt="1", candidate_run_id="8001", candidate_run_attempt="1", candidate_sha="7145f682" + "a" * 32, candidate_dir=str(candidate), private_key_path=str(key))
+            with mock.patch.object(subprocess, "run") as generate:
+                with mock.patch.dict(os.environ, {"RUNNER_NAME": " "}):
+                    with self.assertRaisesRegex(qual.QualificationError, "RUNNER_NAME"):
+                        qual.cmd_worker_create_identity(args)
+                with mock.patch.dict(os.environ, {"RUNNER_NAME": "runner"}):
+                    with mock.patch.object(qual, "read_kernel_boot_id", side_effect=qual.QualificationError("invalid boot")):
+                        with self.assertRaisesRegex(qual.QualificationError, "invalid boot"):
+                            qual.cmd_worker_create_identity(args)
+                generate.assert_not_called()
+                self.assertFalse(key.parent.exists())
+
+    def test_worker_rejects_missing_or_malformed_boot_before_launch(self) -> None:
+        for value in [None, "invalid"]:
+            with tempfile.TemporaryDirectory() as tmp:
+                args, key, work, evidence, identity = self._setup_worker_fixture(Path(tmp))
+                if value is None:
+                    identity.pop("boot_id")
+                else:
+                    identity["boot_id"] = value
+                qual.write_json_file(Path(args.identity_dir) / "worker-identity.json", identity)
+                with mock.patch.object(subprocess, "Popen") as launch:
+                    with self.assertRaisesRegex(qual.QualificationError, "boot_id"):
+                        qual.cmd_worker_run(args)
+                    launch.assert_not_called()
+
+    def test_worker_rejects_identity_from_another_machine_boot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args, key, work, evidence, identity = self._setup_worker_fixture(Path(tmp))
+            with mock.patch.object(qual, "read_kernel_boot_id", return_value="00000000-0000-4000-8000-000000000002"):
+                with mock.patch.object(subprocess, "Popen") as launch:
+                    with self.assertRaisesRegex(qual.QualificationError, "different machine boot"):
+                        qual.cmd_worker_run(args)
+                    launch.assert_not_called()
+
     def _setup_worker_fixture(self, root: Path, slot: int = 1) -> tuple[argparse.Namespace, Path, Path, Path, dict]:
         cand_dir = root / "cand"
         cand_dir.mkdir()
@@ -967,6 +1058,7 @@ class TestWorkerEnvAndLifecycleSignals(unittest.TestCase):
             self.assertTrue((work_dir / "worker-stdout.log").is_file())
             ev = json.loads((ev_dir / "worker-evidence.json").read_text(encoding="utf-8"))
             self.assertTrue(ev["passed"])
+            self.assertEqual(ev["boot_id"], "00000000-0000-4000-8000-000000000001")
             self.assertEqual(ev["runtime_max_seconds"], 180)
             self.assertEqual(ev["poll_error_count"], 1)
             self.assertEqual(ev["poll_not_modified_count"], 1)
