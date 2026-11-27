@@ -461,6 +461,18 @@ when local resource limits prohibit compilation.
   announcements; malformed identities fail closed. A model hash is never a
   node address (`crates/arc-node/src/rpc.rs`, `compute_auto_shard_plan`).
 
+The manual community-shard qualification workflows use temporary GitHub-hosted
+workers and never count them toward an operator target. The scaling qualification
+binds twelve distinct machine boots and measures six sequential requests on six
+workers, six requests at concurrency two on twelve workers, then six sequential
+requests after the added workers leave. It records client timing, exact participants,
+and server-reported verification; it does not prove unbounded scaling or independent
+client verification. Phase artifacts bind workflow, attempt and cohort digest.
+Cleanup proves each owned worker released its lease and deleted its temporary key.
+The controller never retries an inference POST. These workflows require an exact
+completed Linux candidate and a quiet coordinator; do not overlap them with a
+coordinator restart or count synthetic fixtures as measured performance.
+
 ## Releases and versions
 
 The macOS bundle sealer reads the release version from the repository Tauri
