@@ -472,6 +472,12 @@ Cleanup proves each owned worker released its lease and deleted its temporary ke
 The controller never retries an inference POST. These workflows require an exact
 completed Linux candidate and a quiet coordinator; do not overlap them with a
 coordinator restart or count synthetic fixtures as measured performance.
+The bounded phase-evidence parser reads the production text formatter inside
+journal JSON `MESSAGE` fields and joins only supplied, independently validated
+response session keys. It preserves missing and aborted phases, rejects duplicate
+events and malformed target records, and does not infer server concurrency or
+request success. Its formatter fixtures are synthetic until a deployed capture
+has been checked; the parser's regression tests run in the script-suite CI gate.
 
 ## Releases and versions
 
