@@ -315,6 +315,9 @@ unresolved shutdown recovery retain observer mode. An absent pin preserves the
 whole-worker path for rollback tests.
 Settings reads preserve saved compute choices and model selection. Memory limits
 apply to the launch configuration without inventing a saved compute opt-out.
+Desktop lifecycle ownership explicitly unlocks when its owner is released, so an
+inherited duplicate descriptor cannot retain an aborted update's ownership. A
+duplicate closing later cannot release the next owner's independently acquired lock.
 Launches serialize the node guard before reading current saved settings, and a
 newer lifecycle action cancels a pending launch. Settings writers release the
 store guard before waiting for the node. Interrupted shutdown retains the child,

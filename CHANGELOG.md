@@ -23,6 +23,9 @@ All notable changes to ARC Chain are tracked here. This project follows
 > **Candidate note:** This entry records the v0.8.26 release-preparation
 > snapshot. It does not claim deployment, measured acceleration, or 100 operators.
 
+- Desktop update abort explicitly releases lifecycle ownership even when another
+  process temporarily retains an inherited file descriptor. Regression checks
+  preserve the unresolved recovery receipt and the next owner's exclusive lock.
 - Shard dispatch can begin new work while completed shard sessions wait for
   independent validator verification, within complete ready pipeline capacity
   plus two verification slots and the existing configured and hard limits.

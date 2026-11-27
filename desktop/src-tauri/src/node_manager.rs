@@ -117,10 +117,39 @@ struct DesktopShutdownControl {
 
 pub struct ManagedLifecycleLock {
     data_dir: PathBuf,
-    _file: std::fs::File,
+    owner_lock: ManagedLifecycleOwnerLock,
     namespace_guard: Option<arc_crypto::secret_file::PrivateDirectoryNamespaceLock>,
     namespace_prepared: bool,
     session_nonce: Option<[u8; 32]>,
+}
+
+struct ManagedLifecycleOwnerLock {
+    file: std::fs::File,
+    locked: bool,
+}
+
+impl ManagedLifecycleOwnerLock {
+    fn acquire(file: std::fs::File) -> std::io::Result<Self> {
+        file.try_lock_exclusive()?;
+        Ok(Self { file, locked: true })
+    }
+
+    fn release(mut self) -> std::io::Result<()> {
+        fs2::FileExt::unlock(&self.file)?;
+        self.locked = false;
+        Ok(())
+    }
+}
+
+impl Drop for ManagedLifecycleOwnerLock {
+    fn drop(&mut self) {
+        if !self.locked {
+            return;
+        }
+        if let Err(error) = fs2::FileExt::unlock(&self.file) {
+            tracing::error!(%error, "failed to release managed desktop lifecycle ownership");
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -545,10 +574,10 @@ fn acquire_managed_lifecycle_lock_for_reconciliation(
         arc_crypto::secret_file::desktop_lifecycle_owner_lock_payload(),
     )?;
     let file = arc_crypto::secret_file::open_private_read_write(&owner_path)?;
-    file.try_lock_exclusive().map_err(lifecycle_lock_error)?;
+    let owner_lock = ManagedLifecycleOwnerLock::acquire(file).map_err(lifecycle_lock_error)?;
     Ok(ManagedLifecycleLock {
         data_dir,
-        _file: file,
+        owner_lock,
         namespace_guard: Some(data_namespace_lock),
         namespace_prepared: false,
         session_nonce: None,
@@ -628,9 +657,10 @@ fn refresh_managed_lifecycle_namespace(
         Err(error) => return Err(error.into()),
     }
 
-    fs2::FileExt::unlock(&lifecycle_lock._file)
+    lifecycle_lock
+        .owner_lock
+        .release()
         .context("cannot release provisional desktop lifecycle lock before namespace refresh")?;
-    drop(lifecycle_lock._file);
     control_namespace_lock
         .rebarrier_existing()
         .with_context(|| {
@@ -679,7 +709,7 @@ fn refresh_managed_lifecycle_namespace(
         arc_crypto::secret_file::desktop_lifecycle_owner_lock_payload(),
     )?;
     let file = arc_crypto::secret_file::open_private_read_write(&owner_path)?;
-    file.try_lock_exclusive().map_err(|error| {
+    let owner_lock = ManagedLifecycleOwnerLock::acquire(file).map_err(|error| {
         anyhow::anyhow!(
             "managed lifecycle ownership changed during namespace refresh for {}: {error}",
             data_dir.display()
@@ -688,7 +718,7 @@ fn refresh_managed_lifecycle_namespace(
     drop(data_namespace_lock);
     Ok(ManagedLifecycleLock {
         data_dir,
-        _file: file,
+        owner_lock,
         namespace_guard: None,
         namespace_prepared: true,
         session_nonce: Some(session_nonce),
@@ -6087,6 +6117,62 @@ mod tests {
         assert!(manager.abort_update_relaunch().await.is_err());
         assert!(manager.update_lifecycle_lock.is_some());
         drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fenced_update_abort_releases_owner_despite_an_inherited_descriptor() {
+        let root = resource_test_dir("fenced-update-inherited-owner");
+        let data = root.join("data-v3");
+        let (_control, _genesis) =
+            receipt_control_for_executable(&data, &std::env::current_exe().unwrap());
+        let configured = data.to_string_lossy().into_owned();
+        let mut manager = NodeManager::new();
+        manager.configure_managed_data_dir(&configured).unwrap();
+        manager.prepare_fenced_update_relaunch().unwrap();
+        let inherited = manager
+            .update_lifecycle_lock
+            .as_ref()
+            .unwrap()
+            .owner_lock
+            .file
+            .try_clone()
+            .unwrap();
+        let contender = contend_for_lifecycle_lock(&configured);
+        assert!(
+            contender.contains(crate::start_fence::ALREADY_OPEN),
+            "{contender}"
+        );
+        manager.abort_update_relaunch().await.unwrap();
+        assert!(managed_shutdown_recovery_required(&configured).unwrap());
+        let owner = acquire_managed_lifecycle_lock(&configured).expect(
+            "aborting the update must explicitly unlock ownership despite an inherited descriptor",
+        );
+        assert!(manager.child.is_none());
+        drop(owner);
+        drop(inherited);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_lifecycle_owner_drop_releases_duplicates_without_unlocking_a_successor() {
+        let root = resource_test_dir("managed-owner-duplicate");
+        arc_crypto::secret_file::secure_private_directory_tree(&root).unwrap();
+        let path = root.join("owner.lock");
+        let file = arc_crypto::secret_file::create_new_private(&path).unwrap();
+        let owner = ManagedLifecycleOwnerLock::acquire(file).unwrap();
+        let inherited = owner.file.try_clone().unwrap();
+        let probe = || arc_crypto::secret_file::open_private_read_write(&path).unwrap();
+        assert!(ManagedLifecycleOwnerLock::acquire(probe()).is_err());
+        drop(owner);
+        let successor = ManagedLifecycleOwnerLock::acquire(probe())
+            .expect("a closed owner must unlock its duplicated open-file description");
+        drop(inherited);
+        assert!(ManagedLifecycleOwnerLock::acquire(probe()).is_err());
+        successor.release().unwrap();
+        drop(ManagedLifecycleOwnerLock::acquire(probe()).unwrap());
         std::fs::remove_dir_all(root).unwrap();
     }
 
