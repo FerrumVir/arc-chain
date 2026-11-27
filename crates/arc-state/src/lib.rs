@@ -1713,6 +1713,11 @@ impl StateDB {
         let mut seen = HashSet::with_capacity(body.validator_approvals.len());
         let mut approved_stake = 0u128;
 
+        let mut parsed_approvals = Vec::with_capacity(body.validator_approvals.len());
+        let mut ed_sigs = Vec::with_capacity(body.validator_approvals.len());
+        let mut ed_vks = Vec::with_capacity(body.validator_approvals.len());
+        let mut can_batch = true;
+
         for approval in &body.validator_approvals {
             if !seen.insert(approval.validator.0) {
                 return Err(StateError::ExecutionError(format!(
@@ -1726,16 +1731,44 @@ impl StateDB {
                     approval.validator.to_hex()
                 )));
             };
-            approval
-                .as_signature()
-                .verify(&commitment, &approval.validator)
-                .map_err(|_| {
-                    StateError::ExecutionError(format!(
-                        "community inference reward: invalid Ed25519 approval from {}",
-                        approval.validator.to_hex()
-                    ))
-                })?;
-            approved_stake += u128::from(*stake);
+            if arc_crypto::address_from_ed25519_pubkey(&approval.public_key) != approval.validator {
+                can_batch = false;
+            } else if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&approval.public_key) {
+                let mut sig_bytes = [0u8; 64];
+                sig_bytes[..32].copy_from_slice(&approval.signature_halves[0]);
+                sig_bytes[32..].copy_from_slice(&approval.signature_halves[1]);
+                ed_sigs.push(ed25519_dalek::Signature::from_bytes(&sig_bytes));
+                ed_vks.push(vk);
+            } else {
+                can_batch = false;
+            }
+            parsed_approvals.push((*stake, approval));
+        }
+
+        let commit_bytes = commitment.as_bytes().as_slice();
+        let msgs = vec![commit_bytes; ed_sigs.len()];
+
+        if can_batch
+            && !ed_sigs.is_empty()
+            && arc_crypto::signature::batch_verify_ed25519(&msgs, &ed_sigs, &ed_vks).is_ok()
+        {
+            for (stake, _) in parsed_approvals {
+                approved_stake += u128::from(stake);
+            }
+        } else {
+            approved_stake = 0;
+            for (stake, approval) in parsed_approvals {
+                approval
+                    .as_signature()
+                    .verify(&commitment, &approval.validator)
+                    .map_err(|_| {
+                        StateError::ExecutionError(format!(
+                            "community inference reward: invalid Ed25519 approval from {}",
+                            approval.validator.to_hex()
+                        ))
+                    })?;
+                approved_stake += u128::from(stake);
+            }
         }
 
         if approved_stake < required_stake {
@@ -3125,9 +3158,19 @@ impl StateDB {
         let recovery_domain = self.transaction_domain_hash();
         {
             let mut ed_indices: Vec<usize> = Vec::new();
-            let mut ed_msgs: Vec<Vec<u8>> = Vec::new();
+            let mut ed_msgs: Vec<&[u8]> = Vec::new();
             let mut ed_sigs: Vec<ed25519_dalek::Signature> = Vec::new();
             let mut ed_vks: Vec<ed25519_dalek::VerifyingKey> = Vec::new();
+
+            let mut ml_indices: Vec<usize> = Vec::new();
+            let mut ml_msgs: Vec<&[u8]> = Vec::new();
+            let mut ml_sigs: Vec<&[u8]> = Vec::new();
+            let mut ml_pks: Vec<&[u8]> = Vec::new();
+
+            let mut falcon_indices: Vec<usize> = Vec::new();
+            let mut falcon_msgs: Vec<&[u8]> = Vec::new();
+            let mut falcon_sigs: Vec<&[u8]> = Vec::new();
+            let mut falcon_pks: Vec<&[u8]> = Vec::new();
 
             for (i, tx) in transactions.iter().enumerate() {
                 if tx.is_unsigned() || tx.sig_verified {
@@ -3141,33 +3184,73 @@ impl StateDB {
                     batch_sig_valid[i] = Some(false);
                     continue;
                 }
-                if let arc_crypto::signature::Signature::Ed25519 {
-                    public_key,
-                    signature,
-                } = &tx.signature
-                {
-                    if arc_crypto::address_from_ed25519_pubkey(public_key) != tx.from {
+                match &tx.signature {
+                    arc_crypto::signature::Signature::Ed25519 {
+                        public_key,
+                        signature,
+                    } => {
+                        if arc_crypto::address_from_ed25519_pubkey(public_key) != tx.from {
+                            batch_sig_valid[i] = Some(false);
+                            continue;
+                        }
+                        if signature.len() == 64
+                            && let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(public_key)
+                        {
+                            let mut sig_bytes = [0u8; 64];
+                            sig_bytes.copy_from_slice(signature);
+                            ed_indices.push(i);
+                            ed_msgs.push(tx.hash.as_bytes().as_slice());
+                            ed_sigs.push(ed25519_dalek::Signature::from_bytes(&sig_bytes));
+                            ed_vks.push(vk);
+                            continue;
+                        }
                         batch_sig_valid[i] = Some(false);
-                        continue;
                     }
-                    if signature.len() == 64
-                        && let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(public_key)
-                    {
-                        let mut sig_bytes = [0u8; 64];
-                        sig_bytes.copy_from_slice(signature);
-                        ed_indices.push(i);
-                        ed_msgs.push(tx.hash.0.to_vec());
-                        ed_sigs.push(ed25519_dalek::Signature::from_bytes(&sig_bytes));
-                        ed_vks.push(vk);
-                        continue;
+                    arc_crypto::signature::Signature::MlDsa65 {
+                        public_key,
+                        signature,
+                    } => {
+                        if arc_crypto::address_from_ml_dsa_pubkey(public_key) != tx.from {
+                            batch_sig_valid[i] = Some(false);
+                            continue;
+                        }
+                        if signature.len() == arc_crypto::ML_DSA_SIG_LEN
+                            && public_key.len() == arc_crypto::ML_DSA_PK_LEN
+                        {
+                            ml_indices.push(i);
+                            ml_msgs.push(tx.hash.as_bytes().as_slice());
+                            ml_sigs.push(signature.as_slice());
+                            ml_pks.push(public_key.as_slice());
+                            continue;
+                        }
+                        batch_sig_valid[i] = Some(false);
                     }
-                    batch_sig_valid[i] = Some(false);
+                    arc_crypto::signature::Signature::Falcon512 {
+                        public_key,
+                        signature,
+                    } => {
+                        if arc_crypto::address_from_falcon_pubkey(public_key) != tx.from {
+                            batch_sig_valid[i] = Some(false);
+                            continue;
+                        }
+                        if public_key.len() == arc_crypto::FALCON_PK_LEN
+                            && !signature.is_empty()
+                            && signature.len() <= arc_crypto::FALCON_SIG_MAX_LEN
+                        {
+                            falcon_indices.push(i);
+                            falcon_msgs.push(tx.hash.as_bytes().as_slice());
+                            falcon_sigs.push(signature.as_slice());
+                            falcon_pks.push(public_key.as_slice());
+                            continue;
+                        }
+                        batch_sig_valid[i] = Some(false);
+                    }
+                    _ => {}
                 }
             }
 
             if !ed_indices.is_empty() {
-                let msg_refs: Vec<&[u8]> = ed_msgs.iter().map(|m| m.as_slice()).collect();
-                match arc_crypto::signature::batch_verify_ed25519(&msg_refs, &ed_sigs, &ed_vks) {
+                match arc_crypto::signature::batch_verify_ed25519(&ed_msgs, &ed_sigs, &ed_vks) {
                     Ok(()) => {
                         for &idx in &ed_indices {
                             batch_sig_valid[idx] = Some(true);
@@ -3181,6 +3264,21 @@ impl StateDB {
                             batch_sig_valid[idx] = Some(valid);
                         }
                     }
+                }
+            }
+
+            if !ml_indices.is_empty() {
+                let results = arc_crypto::ml_dsa_batch_verify(&ml_pks, &ml_msgs, &ml_sigs);
+                for (&idx, valid) in ml_indices.iter().zip(results) {
+                    batch_sig_valid[idx] = Some(valid);
+                }
+            }
+
+            if !falcon_indices.is_empty() {
+                let results =
+                    arc_crypto::falcon_batch_verify(&falcon_pks, &falcon_msgs, &falcon_sigs);
+                for (&idx, valid) in falcon_indices.iter().zip(results) {
+                    batch_sig_valid[idx] = Some(valid);
                 }
             }
         }
@@ -10444,6 +10542,78 @@ mod tests {
                 .unwrap_or(0),
             0
         );
+    }
+
+    #[test]
+    fn batch_verified_mixed_algorithms_execute_successfully() {
+        use arc_crypto::signature::KeyPair;
+
+        let kp_ed = KeyPair::generate_ed25519();
+        let kp_ml = KeyPair::generate_ml_dsa();
+        let kp_falcon = KeyPair::generate_falcon512();
+
+        let recipient = addr(88);
+        let starting_balance = 500_000;
+        let state = StateDB::with_genesis(&[
+            (kp_ed.address(), starting_balance),
+            (kp_ml.address(), starting_balance),
+            (kp_falcon.address(), starting_balance),
+        ]);
+
+        let mut tx_ed = Transaction::new_transfer(kp_ed.address(), recipient, 1_000, 0);
+        tx_ed.sign(&kp_ed).unwrap();
+
+        let mut tx_ml = Transaction::new_transfer(kp_ml.address(), recipient, 2_000, 0);
+        tx_ml.sign(&kp_ml).unwrap();
+
+        let mut tx_falcon = Transaction::new_transfer(kp_falcon.address(), recipient, 3_000, 0);
+        tx_falcon.sign(&kp_falcon).unwrap();
+
+        let (block, receipts) = state
+            .execute_block_verified(&[tx_ed, tx_ml, tx_falcon], addr(99))
+            .unwrap();
+        assert_eq!(receipts.len(), 3);
+        assert!(receipts[0].success, "Ed25519 transfer should succeed");
+        assert!(receipts[1].success, "ML-DSA-65 transfer should succeed");
+        assert!(receipts[2].success, "Falcon-512 transfer should succeed");
+        assert_eq!(block.header.height, 1);
+        assert_eq!(state.get_account(&recipient).unwrap().balance, 6_000);
+    }
+
+    #[test]
+    fn batch_verified_ml_dsa_and_falcon_isolated_failures() {
+        use arc_crypto::signature::KeyPair;
+
+        let kp_ed = KeyPair::generate_ed25519();
+        let kp_ml = KeyPair::generate_ml_dsa();
+        let kp_falcon = KeyPair::generate_falcon512();
+        let bad_signer = KeyPair::generate_ml_dsa();
+
+        let recipient = addr(89);
+        let starting_balance = 500_000;
+        let state = StateDB::with_genesis(&[
+            (kp_ed.address(), starting_balance),
+            (kp_ml.address(), starting_balance),
+            (kp_falcon.address(), starting_balance),
+        ]);
+
+        let mut tx_ed = Transaction::new_transfer(kp_ed.address(), recipient, 1_000, 0);
+        tx_ed.sign(&kp_ed).unwrap();
+
+        let mut tx_ml_bad = Transaction::new_transfer(kp_ml.address(), recipient, 2_000, 0);
+        tx_ml_bad.sign(&bad_signer).unwrap();
+
+        let mut tx_falcon = Transaction::new_transfer(kp_falcon.address(), recipient, 3_000, 0);
+        tx_falcon.sign(&kp_falcon).unwrap();
+
+        let (_, receipts) = state
+            .execute_block_verified(&[tx_ed, tx_ml_bad, tx_falcon], addr(99))
+            .unwrap();
+        assert_eq!(receipts.len(), 3);
+        assert!(receipts[0].success, "Ed25519 tx should succeed");
+        assert!(!receipts[1].success, "Bad ML-DSA tx should fail");
+        assert!(receipts[2].success, "Falcon tx should succeed");
+        assert_eq!(state.get_account(&recipient).unwrap().balance, 4_000);
     }
 
     #[test]

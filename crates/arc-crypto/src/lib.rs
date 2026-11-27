@@ -41,10 +41,11 @@ pub use proof_compress::{
     CompressionStats, CompressionType, ProofAggregator, compress_proof, decompress_proof,
 };
 pub use signature::{
-    FALCON_PK_LEN, FALCON_SIG_MAX_LEN, FALCON_SK_LEN, KeyPair, Signature, SignatureError,
-    address_from_ed25519_pubkey, address_from_falcon_pubkey, address_from_ml_dsa_pubkey,
-    address_from_secp256k1_pubkey, batch_verify_ed25519, batch_verify_falcon512,
-    batch_verify_ml_dsa, falcon_batch_verify, falcon_keygen, falcon_sign, falcon_verify,
+    FALCON_PK_LEN, FALCON_SIG_MAX_LEN, FALCON_SK_LEN, KeyPair, ML_DSA_PK_LEN, ML_DSA_SIG_LEN,
+    ML_DSA_SK_LEN, Signature, SignatureError, address_from_ed25519_pubkey,
+    address_from_falcon_pubkey, address_from_ml_dsa_pubkey, address_from_secp256k1_pubkey,
+    batch_verify_arc_ed25519, batch_verify_ed25519, batch_verify_falcon512, batch_verify_ml_dsa,
+    falcon_batch_verify, falcon_keygen, falcon_sign, falcon_verify, ml_dsa_batch_verify,
 };
 #[cfg(feature = "benchmark-tools")]
 pub use signature::{benchmark_address, benchmark_keypair};
