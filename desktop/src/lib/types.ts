@@ -494,6 +494,44 @@ export interface ModelDownloadProgress {
   message?: string | null;
 }
 
+export type PartialShardPhase =
+  | "starting"
+  | "loading"
+  | "ready"
+  | "computing"
+  | "reconnecting"
+  | "failed"
+  | "stopped";
+
+export interface PartialShardRangeStatus {
+  startLayer: number;
+  endLayer: number;
+  totalLayers: number;
+}
+
+export interface PartialShardWorkerStatus {
+  phase: string | null;
+  modelName: string | null;
+  modelId: string | null;
+  leaseSeq: number | null;
+  leaseEpoch: number | null;
+  assignedRange: PartialShardRangeStatus | null;
+  readyExpiresAtUnixMs: number | null;
+  leaseLive: boolean;
+  stepsExecuted: number | null;
+  stepsSubmitted: number | null;
+  submitRetries: number | null;
+  submitStaleConflicts: number | null;
+  cancellationsApplied: number | null;
+  rebalancesCompleted: number | null;
+  reconnectAttempts: number | null;
+  lastHeartbeatUnixMs: number | null;
+  lastStepSubmittedUnixMs: number | null;
+  lastError: string | null;
+  rewardsEnabled: boolean;
+  rewardEligible: boolean;
+}
+
 export interface WorkerStatus {
   running: boolean;
   unavailable: string | null;
@@ -509,6 +547,8 @@ export interface WorkerStatus {
   lastJobCompletedUnixMs: number | null;
   startedUnixMs: number | null;
   preventSleepDuringJobs: boolean | null;
+  mode?: string | null;
+  shard?: PartialShardWorkerStatus | null;
 }
 
 export type ModelDownloadWait =

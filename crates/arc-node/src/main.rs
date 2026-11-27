@@ -1,3 +1,4 @@
+mod community_shard_cli;
 mod config;
 mod legacy_retirement;
 mod recovery_descriptor;
@@ -445,6 +446,72 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     full_integer_worker: bool,
 
+    /// Run an integrated stake-zero partial-shard community worker inside this
+    /// managed node without loading Candle, tokenizer-only, or full model
+    /// weights, and without registering whole-model or validator shard roles.
+    /// Requires explicit immutable coordinator, transaction-domain, model
+    /// commitment, and working-set RAM budget pins. Defaults to 1 compute
+    /// thread unless --threads is explicitly supplied.
+    #[arg(long, default_value_t = false)]
+    community_shard_worker: bool,
+
+    /// Pinned coordinator base URL for --community-shard-worker (HTTPS
+    /// required unless --community-shard-allow-insecure-for-loopback is set
+    /// with a literal loopback address).
+    #[arg(long, value_name = "URL", requires = "community_shard_worker")]
+    community_shard_coordinator_url: Option<String>,
+
+    /// Pinned nonzero 64-hex coordinator identity (32-byte Hash256) for
+    /// --community-shard-worker.
+    #[arg(
+        long,
+        value_name = "HEX64",
+        value_parser = community_shard_cli::parse_nonzero_hash256,
+        requires = "community_shard_worker"
+    )]
+    community_shard_coordinator_id: Option<Hash256>,
+
+    /// Pinned nonzero 64-hex transaction domain (32-byte Hash256) configured
+    /// by the launcher for --community-shard-worker. Cross-checked against any
+    /// active local recovery domain.
+    #[arg(
+        long,
+        value_name = "HEX64",
+        value_parser = community_shard_cli::parse_nonzero_hash256,
+        requires = "community_shard_worker"
+    )]
+    community_shard_transaction_domain: Option<Hash256>,
+
+    /// Pinned nonzero 64-hex full-artifact BLAKE3 model_id for
+    /// --community-shard-worker. Verified before GGUF header inspection.
+    #[arg(
+        long,
+        value_name = "HEX64",
+        value_parser = community_shard_cli::parse_nonzero_hash256,
+        requires = "community_shard_worker"
+    )]
+    community_shard_expected_model_id: Option<Hash256>,
+
+    /// Explicit conservative peak working-set payload budget in bytes for
+    /// --community-shard-worker.
+    #[arg(long, value_name = "BYTES", requires = "community_shard_worker")]
+    community_shard_max_working_set_bytes: Option<u64>,
+
+    /// Optional maximum reserved KV cache budget in bytes for
+    /// --community-shard-worker (default 256 MiB, hard cap 1 GiB).
+    #[arg(long, value_name = "BYTES", requires = "community_shard_worker")]
+    community_shard_max_kv_cache_bytes: Option<usize>,
+
+    /// Optional upper bound on resident layers for --community-shard-worker
+    /// (must be in 1..=ceil(n_layers/2) and strictly less than n_layers).
+    #[arg(long, value_name = "LAYERS", requires = "community_shard_worker")]
+    community_shard_max_resident_layers: Option<usize>,
+
+    /// Allow plaintext HTTP only for literal loopback coordinator URLs
+    /// (127.0.0.1 / [::1]) in --community-shard-worker mode.
+    #[arg(long, default_value_t = false, requires = "community_shard_worker")]
+    community_shard_allow_insecure_for_loopback: bool,
+
     /// First layer index to load (inclusive). Pipeline-parallel sharding.
     /// Together with --shard-end, makes this node a SHARD HOLDER for a slice
     /// of the model. Embeddings load only when --shard-start=0; output head
@@ -504,6 +571,13 @@ struct Cli {
     /// off. Off by default; see docs/twin-execution.md, section 13.
     #[arg(long, default_value_t = false)]
     community_release_on_verification: bool,
+
+    /// Coordinator: enable additive signed HTTP shard-worker lease and
+    /// step-compute endpoints under /community/shards/*. Requires a loaded
+    /// canonical INT8 integer --model with an exact artifact commitment.
+    /// Does not expose public unverified shard dispatch or rewards. Off by default.
+    #[arg(long, default_value_t = false)]
+    community_shard_coordinator: bool,
 
     /// Validator: the community reward profiles this validator verifies, as a
     /// comma-separated list. `legacy-split-half` is today's live profile and
@@ -643,6 +717,8 @@ struct Cli {
 
 #[derive(Clone, Debug, Subcommand)]
 enum OperatorCommand {
+    /// Run a standalone partial-model worker with pinned identity and memory limits.
+    CommunityShardWorker(community_shard_cli::CommunityShardWorkerArgs),
     /// Print the actual native assignment policy commitment without starting
     /// a node, connecting workers, reading chain state, or loading a model.
     NativeAssignmentPolicy {
@@ -750,6 +826,29 @@ enum RecoveryCommand {
     InspectLegacyDagRound {
         #[arg(long)]
         dag_wal_dir: String,
+    },
+    /// Qualify a disposable copied peer recovery candidate offline without signing.
+    QualifyPeerState {
+        #[arg(long)]
+        candidate_manifest: String,
+        #[arg(long)]
+        expected_manifest_sha256: String,
+    },
+    /// Inspect a copied peer recovery candidate DAG generation and target signing record without opening StateDB.
+    /// Reports the two candidate finality certificate heights and preserved target signing-record highwaters.
+    InspectPeerCapture {
+        #[arg(long)]
+        candidate_dir: String,
+        #[arg(long)]
+        expected_recovery_manifest_hash: String,
+        #[arg(long)]
+        recovery_epoch: u64,
+        #[arg(long)]
+        validator_set_id: u64,
+        #[arg(long)]
+        target_signing_record: String,
+        #[arg(long)]
+        expected_target_signing_record_sha256: String,
     },
     /// Materialize and strictly replay-validate the exact WAL prefix committed
     /// by a live `/sync/snapshot` capture.  The source directory is read-only;
@@ -3761,8 +3860,29 @@ fn compact_replayed_recovery_generation(
     Ok(successor)
 }
 
+include!("recovery_peer_qualification.rs");
+
 fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
     match command {
+        RecoveryCommand::QualifyPeerState {
+            candidate_manifest,
+            expected_manifest_sha256,
+        } => run_qualify_peer_state_command(&candidate_manifest, &expected_manifest_sha256),
+        RecoveryCommand::InspectPeerCapture {
+            candidate_dir,
+            expected_recovery_manifest_hash,
+            recovery_epoch,
+            validator_set_id,
+            target_signing_record,
+            expected_target_signing_record_sha256,
+        } => run_inspect_peer_capture_command(InspectPeerCaptureArgs {
+            candidate_dir: PathBuf::from(candidate_dir),
+            expected_recovery_manifest_hash,
+            recovery_epoch,
+            validator_set_id,
+            target_signing_record_path: PathBuf::from(target_signing_record),
+            expected_target_signing_record_sha256,
+        }),
         RecoveryCommand::Inspect { checkpoint } => {
             let checkpoint = arc_state::recovery::ArcCheckpoint::read_from(checkpoint)?;
             print_recovery_summary(&checkpoint, "UNTRUSTED_INSPECTION", None)
@@ -4588,6 +4708,7 @@ fn run_recovery_operator_command(command: RecoveryCommand) -> Result<()> {
 
 async fn run_operator_command(command: OperatorCommand) -> Result<()> {
     match command {
+        OperatorCommand::CommunityShardWorker(args) => community_shard_cli::run(args).await,
         OperatorCommand::NativeAssignmentPolicy {
             row_workers,
             low_residency,
@@ -5762,6 +5883,10 @@ fn validate_full_integer_worker_role(
         return Ok(());
     }
     ensure!(
+        !cli.community_shard_worker,
+        "--full-integer-worker is incompatible with --community-shard-worker; whole-model and partial-shard worker roles cannot be combined"
+    );
+    ensure!(
         stake == 0,
         "--full-integer-worker is a stake-zero community role"
     );
@@ -5788,6 +5913,182 @@ fn validate_full_integer_worker_role(
             && !cli.auto_shard_join,
         "--full-integer-worker must not carry shard ranges or --auto-shard-join; it never advertises validator shards"
     );
+    Ok(())
+}
+
+fn resolve_integrated_shard_threads(
+    explicit_threads_source: Option<clap::parser::ValueSource>,
+    cli_threads: usize,
+) -> usize {
+    match explicit_threads_source {
+        Some(clap::parser::ValueSource::CommandLine)
+        | Some(clap::parser::ValueSource::EnvVariable) => cli_threads,
+        _ => community_shard_cli::DEFAULT_WORKER_THREADS,
+    }
+}
+
+fn validate_community_shard_worker_role(
+    cli: &Cli,
+    stake: u64,
+    community_rpc_bases: &[String],
+    allow_insecure_community_rpc: bool,
+    threads: usize,
+    available_parallelism: usize,
+) -> Result<
+    Option<(
+        community_shard_cli::ShardWorkerLaunchSpec,
+        community_shard_cli::ValidatedInputs,
+    )>,
+> {
+    if !cli.community_shard_worker {
+        ensure!(
+            cli.community_shard_coordinator_url.is_none()
+                && cli.community_shard_coordinator_id.is_none()
+                && cli.community_shard_transaction_domain.is_none()
+                && cli.community_shard_expected_model_id.is_none()
+                && cli.community_shard_max_working_set_bytes.is_none()
+                && cli.community_shard_max_kv_cache_bytes.is_none()
+                && cli.community_shard_max_resident_layers.is_none()
+                && !cli.community_shard_allow_insecure_for_loopback,
+            "--community-shard-* worker pin and budget flags require --community-shard-worker"
+        );
+        return Ok(None);
+    }
+    ensure!(
+        stake == 0,
+        "--community-shard-worker is a stake-zero community role"
+    );
+    ensure!(
+        !cli.no_community,
+        "--community-shard-worker is incompatible with --no-community"
+    );
+    ensure!(
+        !cli.full_integer_worker,
+        "--community-shard-worker is incompatible with --full-integer-worker; whole-model and partial-shard worker roles cannot be combined"
+    );
+    ensure!(
+        !cli.community && !cli.community_mode,
+        "--community-shard-worker is incompatible with --community and --community-mode; it never downloads models or registers whole-model capabilities"
+    );
+    ensure!(
+        community_rpc_bases.is_empty(),
+        "--community-shard-worker forbids --community-rpc-url and ARC_COMMUNITY_RPC_URLS; configure only the single pinned --community-shard-coordinator-url"
+    );
+    ensure!(
+        !allow_insecure_community_rpc,
+        "--community-shard-worker forbids --allow-insecure-community-rpc; use HTTPS or --community-shard-allow-insecure-for-loopback for literal loopback testing"
+    );
+    ensure!(
+        !cli.community_shard_coordinator,
+        "--community-shard-worker is incompatible with --community-shard-coordinator"
+    );
+    ensure!(
+        !cli.enable_community_rewards_v1,
+        "--community-shard-worker is incompatible with --enable-community-rewards-v1; multi-worker shard results are not reward-eligible"
+    );
+    ensure!(
+        !cli.community_release_on_verification
+            && !cli.community_twin_execution
+            && !cli.community_demand_pump
+            && !cli.community_demand_dry_run
+            && !cli.community_region_probe,
+        "--community-shard-worker is incompatible with coordinator and whole-worker community flags"
+    );
+    ensure!(
+        !cli.tokenizer_only,
+        "--community-shard-worker is incompatible with --tokenizer-only"
+    );
+    ensure!(
+        !cli.enable_i16,
+        "--community-shard-worker is pinned to the canonical per-row INT8 profile and is incompatible with --enable-i16"
+    );
+    ensure!(
+        cli.shard_ranges.is_empty()
+            && cli.shard_start.is_none()
+            && cli.shard_end.is_none()
+            && !cli.auto_shard_join
+            && cli.shard_hosts.is_empty(),
+        "--community-shard-worker must not carry validator shard ranges, --shard-hosts, or --auto-shard-join"
+    );
+    ensure!(
+        !cli.proposer_mode
+            && cli.native_inference_activation.is_none()
+            && !cli.native_inference_runtime,
+        "--community-shard-worker is incompatible with proposer and native validator inference roles"
+    );
+    let model_path = cli.model.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("--community-shard-worker requires --model <exact GGUF path>")
+    })?;
+    ensure!(
+        !model_path.ends_with(".arc-int8"),
+        "--community-shard-worker requires a canonical GGUF --model artifact, not .arc-int8"
+    );
+    let coordinator_url = cli
+        .community_shard_coordinator_url
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "--community-shard-worker requires pinned --community-shard-coordinator-url"
+            )
+        })?
+        .clone();
+    let coordinator_id = cli.community_shard_coordinator_id.ok_or_else(|| {
+        anyhow::anyhow!("--community-shard-worker requires pinned --community-shard-coordinator-id")
+    })?;
+    let transaction_domain = cli.community_shard_transaction_domain.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--community-shard-worker requires pinned --community-shard-transaction-domain"
+        )
+    })?;
+    let expected_model_id = cli.community_shard_expected_model_id.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--community-shard-worker requires pinned --community-shard-expected-model-id"
+        )
+    })?;
+    let max_working_set_bytes = cli.community_shard_max_working_set_bytes.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--community-shard-worker requires explicit --community-shard-max-working-set-bytes"
+        )
+    })?;
+    let max_kv_cache_bytes = cli
+        .community_shard_max_kv_cache_bytes
+        .unwrap_or(arc_node::community_shard_executor::DEFAULT_MAX_KV_CACHE_BYTES);
+    let spec = community_shard_cli::ShardWorkerLaunchSpec {
+        coordinator_url,
+        coordinator_id,
+        transaction_domain,
+        expected_model_id,
+        model_path: PathBuf::from(model_path),
+        worker_name: "arc-integrated-shard-worker".to_string(),
+        max_working_set_bytes,
+        max_kv_cache_bytes,
+        max_resident_layers: cli.community_shard_max_resident_layers,
+        threads,
+        allow_insecure_for_loopback: cli.community_shard_allow_insecure_for_loopback,
+        report_mode: "integrated",
+        prevent_sleep_during_jobs: cli.prevent_sleep_during_jobs,
+    };
+    let validated =
+        community_shard_cli::validate_launch_spec_with_parallelism(&spec, available_parallelism)?;
+    Ok(Some((spec, validated)))
+}
+
+fn validate_pinned_shard_transaction_domain(
+    pinned_transaction_domain: Hash256,
+    active_local_recovery_domain: Option<Hash256>,
+) -> Result<()> {
+    ensure!(
+        pinned_transaction_domain != Hash256::ZERO,
+        "--community-shard-transaction-domain must be nonzero"
+    );
+    if let Some(local_domain) = active_local_recovery_domain {
+        ensure!(
+            local_domain == pinned_transaction_domain,
+            "--community-shard-transaction-domain {} does not match this node's active local recovery transaction domain {}",
+            pinned_transaction_domain.to_hex(),
+            local_domain.to_hex()
+        );
+    }
     Ok(())
 }
 
@@ -5852,7 +6153,8 @@ fn validate_benchmark_runtime(
             && !cli.auto_shard_join
             && !cli.enable_community_rewards_v1
             && !cli.community
-            && !cli.community_mode,
+            && !cli.community_mode
+            && !cli.community_shard_worker,
         "--benchmark forbids community, shard, reward, and auto-join network targets"
     );
 
@@ -5863,6 +6165,7 @@ fn identity_requires_persistent_role(cli: &Cli, community_rpc_urls: &[String]) -
     cli.community
         || cli.community_mode
         || cli.full_integer_worker
+        || cli.community_shard_worker
         || cli.enable_community_rewards_v1
         || !community_rpc_urls.is_empty()
         || !cli.shard_hosts.is_empty()
@@ -6708,7 +7011,10 @@ async fn run_arc_node() -> Result<()> {
         }
         cli.community_mode = true;
     }
-    if (cli.community || cli.community_mode || cli.stake == 0) && cli.model.is_none() {
+    if !cli.community_shard_worker
+        && (cli.community || cli.community_mode || cli.stake == 0)
+        && cli.model.is_none()
+    {
         cli.model = auto_discover_model();
         if cli.model.is_none() && cli.community {
             cli.model = auto_download_model(&shutdown_requested).await;
@@ -6929,6 +7235,19 @@ async fn run_arc_node() -> Result<()> {
             .map_err(anyhow::Error::msg)
             .context("invalid community RPC configuration")?;
     validate_full_integer_worker_role(&cli, stake, &community_rpc_bases)?;
+    let integrated_shard_threads =
+        resolve_integrated_shard_threads(matches.value_source("threads"), cli.threads);
+    let mut integrated_shard_launch = validate_community_shard_worker_role(
+        &cli,
+        stake,
+        &community_rpc_bases,
+        allow_insecure_community_rpc,
+        integrated_shard_threads,
+        community_shard_cli::host_available_parallelism(),
+    )?;
+    if let Some((spec, _)) = integrated_shard_launch.as_ref() {
+        community_shard_cli::configure_global_rayon_pool(spec.threads)?;
+    }
     let mut raw_coordinator_rpc_bases = community_rpc_bases.clone();
     for shard_host in &cli.shard_hosts {
         let shard_host = shard_host.trim();
@@ -7069,6 +7388,23 @@ async fn run_arc_node() -> Result<()> {
     let validator_address = identity.keypair.address();
     let identity_source = identity.source;
     let validator_keypair = identity.keypair;
+    if let Some((spec, validated)) = integrated_shard_launch.as_mut() {
+        let worker_id = format!("0x{}", hex::encode(validator_address.0));
+        let (public_worker_name, rejected_nickname) =
+            community_registration_name(&worker_id, cli.node_name.as_deref());
+        if let Some(reason) = rejected_nickname {
+            tracing::warn!(
+                public_name = %public_worker_name,
+                reason,
+                "--node-name is not used on public community scoreboards"
+            );
+        }
+        spec.worker_name = public_worker_name;
+        *validated = community_shard_cli::validate_launch_spec_with_parallelism(
+            spec,
+            community_shard_cli::host_available_parallelism(),
+        )?;
+    }
 
     if stake > 0 {
         match genesis_cfg.as_ref() {
@@ -7115,31 +7451,40 @@ async fn run_arc_node() -> Result<()> {
         return Ok(());
     }
 
-    let model_artifact = cli
-        .model
-        .as_deref()
-        .map(arc_inference::model_artifact::ModelArtifactCommitment::from_path)
-        .transpose()
-        .context("cannot establish the exact --model artifact commitment")?;
+    let model_artifact = if cli.community_shard_worker {
+        None
+    } else {
+        cli.model
+            .as_deref()
+            .map(arc_inference::model_artifact::ModelArtifactCommitment::from_path)
+            .transpose()
+            .context("cannot establish the exact --model artifact commitment")?
+    };
     let model_artifact_id = model_artifact.as_ref().map(|artifact| artifact.model_id());
-    let model_shape = match cli.model.as_deref() {
-        Some(path) if !path.ends_with(".arc-int8") => {
-            let shape = arc_inference::gguf_meta::read_shape_from_path(Path::new(path))
-                .context("cannot read the --model GGUF header")?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("the --model GGUF header names no architecture and block count")
-                })?;
-            if arc_inference::gguf_meta::supported_adapter(&shape.architecture).is_none() {
-                anyhow::bail!(
-                    "--model is a '{}' model ({} blocks); this build has a conformant integer \
-                     adapter only for: llama",
-                    shape.architecture,
-                    shape.block_count
-                );
+    let model_shape = if cli.community_shard_worker {
+        None
+    } else {
+        match cli.model.as_deref() {
+            Some(path) if !path.ends_with(".arc-int8") => {
+                let shape = arc_inference::gguf_meta::read_shape_from_path(Path::new(path))
+                    .context("cannot read the --model GGUF header")?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "the --model GGUF header names no architecture and block count"
+                        )
+                    })?;
+                if arc_inference::gguf_meta::supported_adapter(&shape.architecture).is_none() {
+                    anyhow::bail!(
+                        "--model is a '{}' model ({} blocks); this build has a conformant integer \
+                         adapter only for: llama",
+                        shape.architecture,
+                        shape.block_count
+                    );
+                }
+                Some(shape)
             }
-            Some(shape)
+            _ => None,
         }
-        _ => None,
     };
 
     if cli.auto_shard_join
@@ -7404,6 +7749,12 @@ async fn run_arc_node() -> Result<()> {
         &desktop_shutdown_receipt,
     )? {
         return Ok(());
+    }
+    if let Some((spec, _)) = integrated_shard_launch.as_ref() {
+        let local_recovery_domain = state
+            .recovery_context()
+            .map(|context| context.domain_hash());
+        validate_pinned_shard_transaction_domain(spec.transaction_domain, local_recovery_domain)?;
     }
 
     if complete_startup_shutdown_if_requested(
@@ -7785,8 +8136,12 @@ async fn run_arc_node() -> Result<()> {
     let (candle_engine, candle_model_id): (
         Option<Arc<arc_inference::candle_backend::GgufEngine>>,
         Option<arc_crypto::Hash256>,
-    ) = if is_shard_holder || cli.full_integer_worker {
-        if cli.full_integer_worker {
+    ) = if is_shard_holder || cli.full_integer_worker || cli.community_shard_worker {
+        if cli.community_shard_worker {
+            tracing::info!(
+                "Integrated community shard-worker mode - candle backend and full model loading SKIPPED; partial weights load on lease acquisition"
+            );
+        } else if cli.full_integer_worker {
             tracing::info!(
                 "Full integer community-worker mode - candle backend SKIPPED; validator shard advertisement remains disabled"
             );
@@ -7818,7 +8173,9 @@ async fn run_arc_node() -> Result<()> {
     };
 
     let inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>> =
-        if let Some(model_path) = &cli.model {
+        if cli.community_shard_worker {
+            None
+        } else if let Some(model_path) = &cli.model {
             tracing::info!("Loading model from {}...", model_path);
             let load_start = Instant::now();
             let load_result = if cli.tokenizer_only || candle_engine.is_some() {
@@ -7953,6 +8310,44 @@ async fn run_arc_node() -> Result<()> {
             "--full-integer-worker invariant failed: worker must use the canonical per-row INT8 profile and must not advertise shard ranges"
         );
     }
+    let prepared_shard_worker = if let Some((spec, validated)) = integrated_shard_launch.take() {
+        let cancel_prepare = Arc::clone(&shutdown_requested);
+        let prepare_result = tokio::task::spawn_blocking(move || {
+            community_shard_cli::prepare_launch_spec_blocking(
+                &spec,
+                &validated,
+                cancel_prepare.as_ref(),
+            )
+        })
+        .await
+        .context("integrated community shard worker preparation task panicked")?;
+        if complete_startup_shutdown_if_requested(
+            &shutdown_requested,
+            Some(state.as_ref()),
+            &desktop_shutdown_receipt,
+        )? {
+            return Ok(());
+        }
+        let prepared = prepare_result?;
+        ensure!(
+            candle_engine.is_none() && inference_model.is_none() && held_ranges.is_empty(),
+            "--community-shard-worker invariant failed: candle backend, full integer model, and validator shard ranges must remain unloaded"
+        );
+        tracing::info!(
+            coordinator_url = %prepared.report.coordinator_url,
+            coordinator_id = %prepared.report.coordinator_id,
+            transaction_domain = %prepared.report.transaction_domain,
+            model_id = %prepared.report.model_id,
+            model_name = %prepared.report.model_name,
+            admitted_max_resident_layers = prepared.report.admission.admitted_max_resident_layers,
+            max_working_set_bytes = prepared.report.max_working_set_bytes,
+            threads = prepared.report.threads,
+            "Prepared integrated community shard worker (no tensor weights loaded at startup)"
+        );
+        Some(prepared)
+    } else {
+        None
+    };
     if complete_startup_shutdown_if_requested(
         &shutdown_requested,
         Some(state.as_ref()),
@@ -8485,7 +8880,8 @@ async fn run_arc_node() -> Result<()> {
         }
     }
 
-    let community_mode = (cli.community_mode || stake == 0) && !cli.no_community;
+    let community_mode =
+        (cli.community_mode || stake == 0) && !cli.no_community && !cli.community_shard_worker;
     let community_networking = community_mode && !community_rpc_bases.is_empty();
     if cli.no_community && (cli.community_mode || stake == 0) {
         tracing::info!(
@@ -9401,6 +9797,15 @@ async fn run_arc_node() -> Result<()> {
         }
     }
 
+    if let Some(prepared_shard_worker) = prepared_shard_worker {
+        let shard_worker_task = community_shard_cli::spawn_integrated_worker(
+            prepared_shard_worker,
+            Arc::new(validator_keypair.clone()),
+            background_admission_shutdown_rx.clone(),
+        )?;
+        runtime_tasks.push(shard_worker_task);
+    }
+
     let coordinator_seed_rpcs = coordinator_rpc_bases;
 
     let compute_threads =
@@ -9454,6 +9859,7 @@ async fn run_arc_node() -> Result<()> {
             interleaved_rope_qk,
             interleaved_rope_shard_infos,
         },
+        cli.community_shard_coordinator,
     )
     .await;
 
@@ -9531,10 +9937,334 @@ async fn run_arc_node() -> Result<()> {
 }
 
 #[cfg(test)]
+mod integrated_shard_worker_tests {
+    use super::*;
+
+    const TEST_COORDINATOR_ID: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    const TEST_TRANSACTION_DOMAIN: &str =
+        "2222222222222222222222222222222222222222222222222222222222222222";
+    const TEST_EXPECTED_MODEL_ID: &str =
+        "3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn base_shard_worker_args() -> Vec<&'static str> {
+        vec![
+            "arc-node",
+            "--community-shard-worker",
+            "--model",
+            "/tmp/test-model.gguf",
+            "--validator-key-file",
+            "/tmp/worker.key",
+            "--community-shard-coordinator-url",
+            "https://coordinator.example.com",
+            "--community-shard-coordinator-id",
+            TEST_COORDINATOR_ID,
+            "--community-shard-transaction-domain",
+            TEST_TRANSACTION_DOMAIN,
+            "--community-shard-expected-model-id",
+            TEST_EXPECTED_MODEL_ID,
+            "--community-shard-max-working-set-bytes",
+            "536870912",
+        ]
+    }
+
+    fn parse_cli_and_matches(args: &[&str]) -> (Cli, clap::ArgMatches) {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let matches = Cli::command().try_get_matches_from(args).unwrap();
+        (cli, matches)
+    }
+
+    #[test]
+    fn integrated_shard_worker_parses_explicit_pins_and_defaults_to_one_thread() {
+        let args = base_shard_worker_args();
+        let (cli, matches) = parse_cli_and_matches(&args);
+        let threads =
+            resolve_integrated_shard_threads(matches.value_source("threads"), cli.threads);
+        assert_eq!(threads, community_shard_cli::DEFAULT_WORKER_THREADS);
+        assert!(identity_requires_persistent_role(&cli, &[]));
+        let (spec, validated) =
+            validate_community_shard_worker_role(&cli, 0, &[], false, threads, 4)
+                .unwrap()
+                .expect("shard worker launch spec expected");
+        assert_eq!(spec.threads, 1);
+        assert_eq!(
+            spec.max_kv_cache_bytes,
+            arc_node::community_shard_executor::DEFAULT_MAX_KV_CACHE_BYTES
+        );
+        assert_eq!(
+            validated.normalized_coordinator_url,
+            "https://coordinator.example.com"
+        );
+        assert_eq!(spec.coordinator_id, Hash256([0x11; 32]));
+        assert_eq!(spec.transaction_domain, Hash256([0x22; 32]));
+        assert_eq!(spec.expected_model_id, Hash256([0x33; 32]));
+    }
+
+    #[test]
+    fn integrated_shard_worker_respects_explicit_threads_and_rejects_zero() {
+        let mut args = base_shard_worker_args();
+        args.extend(["--threads", "2"]);
+        let (cli, matches) = parse_cli_and_matches(&args);
+        let threads =
+            resolve_integrated_shard_threads(matches.value_source("threads"), cli.threads);
+        assert_eq!(threads, 2);
+        let (spec, _) = validate_community_shard_worker_role(&cli, 0, &[], false, threads, 4)
+            .unwrap()
+            .expect("shard worker launch spec expected");
+        assert_eq!(spec.threads, 2);
+
+        let mut zero_args = base_shard_worker_args();
+        zero_args.extend(["--threads", "0"]);
+        let (zero_cli, zero_matches) = parse_cli_and_matches(&zero_args);
+        let zero_threads = resolve_integrated_shard_threads(
+            zero_matches.value_source("threads"),
+            zero_cli.threads,
+        );
+        assert_eq!(zero_threads, 0);
+        let error = validate_community_shard_worker_role(&zero_cli, 0, &[], false, zero_threads, 4)
+            .unwrap_err();
+        assert!(error.to_string().contains("--threads must be at least 1"));
+    }
+
+    #[test]
+    fn integrated_shard_worker_requires_all_immutable_pins_and_budget() {
+        let removable_pairs = [
+            ("--model", "--model"),
+            (
+                "--community-shard-coordinator-url",
+                "--community-shard-coordinator-url",
+            ),
+            (
+                "--community-shard-coordinator-id",
+                "--community-shard-coordinator-id",
+            ),
+            (
+                "--community-shard-transaction-domain",
+                "--community-shard-transaction-domain",
+            ),
+            (
+                "--community-shard-expected-model-id",
+                "--community-shard-expected-model-id",
+            ),
+            (
+                "--community-shard-max-working-set-bytes",
+                "--community-shard-max-working-set-bytes",
+            ),
+        ];
+        for (flag, expected_fragment) in removable_pairs {
+            let mut args = base_shard_worker_args();
+            let idx = args.iter().position(|entry| *entry == flag).unwrap();
+            args.drain(idx..=idx + 1);
+            let cli = Cli::try_parse_from(&args).unwrap();
+            let error =
+                validate_community_shard_worker_role(&cli, 0, &[], false, 1, 4).unwrap_err();
+            assert!(
+                error.to_string().contains(expected_fragment),
+                "missing {flag} should mention {expected_fragment}, got: {error}"
+            );
+        }
+
+        let mut int8_args = base_shard_worker_args();
+        let idx = int8_args
+            .iter()
+            .position(|entry| *entry == "--model")
+            .unwrap();
+        int8_args[idx + 1] = "/tmp/model.arc-int8";
+        let cli = Cli::try_parse_from(&int8_args).unwrap();
+        let error = validate_community_shard_worker_role(&cli, 0, &[], false, 1, 4).unwrap_err();
+        assert!(error.to_string().contains(".arc-int8"));
+
+        let zero_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        for hash_flag in [
+            "--community-shard-coordinator-id",
+            "--community-shard-transaction-domain",
+            "--community-shard-expected-model-id",
+        ] {
+            let mut args = base_shard_worker_args();
+            let idx = args.iter().position(|entry| *entry == hash_flag).unwrap();
+            args[idx + 1] = zero_hash;
+            assert!(Cli::try_parse_from(&args).is_err());
+        }
+    }
+
+    #[test]
+    fn integrated_shard_worker_rejects_pin_flags_without_mode_flag() {
+        let parse_err = Cli::try_parse_from([
+            "arc-node",
+            "--community-shard-coordinator-url",
+            "https://coordinator.example.com",
+        ]);
+        assert!(parse_err.is_err());
+
+        let mut cli = Cli::try_parse_from(["arc-node"]).unwrap();
+        cli.community_shard_max_working_set_bytes = Some(536_870_912);
+        let error = validate_community_shard_worker_role(&cli, 0, &[], false, 1, 4).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("require --community-shard-worker")
+        );
+    }
+
+    #[test]
+    fn integrated_shard_worker_rejects_incompatible_roles_and_capability_mixing() {
+        let base = Cli::try_parse_from(base_shard_worker_args()).unwrap();
+        assert!(validate_community_shard_worker_role(&base, 500_000, &[], false, 1, 4).is_err());
+        assert!(
+            validate_community_shard_worker_role(
+                &base,
+                0,
+                &["https://other.example.com".to_string()],
+                false,
+                1,
+                4,
+            )
+            .is_err()
+        );
+        assert!(validate_community_shard_worker_role(&base, 0, &[], true, 1, 4).is_err());
+
+        let conflicting_flag_sets: &[&[&str]] = &[
+            &["--full-integer-worker"],
+            &["--no-community"],
+            &["--community"],
+            &["--community-mode"],
+            &["--community-shard-coordinator"],
+            &["--enable-community-rewards-v1"],
+            &["--tokenizer-only"],
+            &["--enable-i16"],
+            &["--shard-range", "0:4"],
+            &["--shard-start", "0", "--shard-end", "4"],
+            &["--auto-shard-join"],
+            &["--shard-hosts", "127.0.0.1:9944"],
+            &["--proposer-mode"],
+            &["--community-twin-execution"],
+            &["--community-region-probe"],
+        ];
+        for extra in conflicting_flag_sets {
+            let mut args = base_shard_worker_args();
+            args.extend_from_slice(extra);
+            let cli = Cli::try_parse_from(&args).unwrap();
+            assert!(
+                validate_community_shard_worker_role(&cli, 0, &[], false, 1, 4).is_err(),
+                "extra flags {extra:?} must be rejected in --community-shard-worker mode"
+            );
+        }
+
+        let mut combined_full = base_shard_worker_args();
+        combined_full.extend([
+            "--full-integer-worker",
+            "--community-rpc-url",
+            "https://seed.example.com",
+        ]);
+        let combined_cli = Cli::try_parse_from(&combined_full).unwrap();
+        let full_err = validate_full_integer_worker_role(
+            &combined_cli,
+            0,
+            &["https://seed.example.com".to_string()],
+        )
+        .unwrap_err();
+        assert!(
+            full_err
+                .to_string()
+                .contains("incompatible with --community-shard-worker")
+        );
+
+        #[cfg(feature = "benchmark-tools")]
+        {
+            let mut bench_args = base_shard_worker_args();
+            bench_args.extend(["--benchmark", "--insecure-dev-validator-seed"]);
+            let bench_cli = Cli::try_parse_from(&bench_args).unwrap();
+            assert!(validate_benchmark_runtime(&bench_cli, "127.0.0.1:9944", &[], &[], 1).is_err());
+        }
+    }
+
+    #[test]
+    fn integrated_shard_worker_requires_persistent_identity_and_forbids_ephemeral_or_seed() {
+        let cli = Cli::try_parse_from(base_shard_worker_args()).unwrap();
+        assert!(identity_requires_persistent_role(&cli, &[]));
+        assert!(
+            validate_identity_runtime(&cli, "127.0.0.1:9944", &[], &[], false, false, 0).is_err()
+        );
+        let mut seed_args = base_shard_worker_args();
+        seed_args.extend([
+            "--validator-seed",
+            "dev-seed",
+            "--insecure-dev-validator-seed",
+        ]);
+        let seed_cli = Cli::try_parse_from(&seed_args).unwrap();
+        assert!(
+            validate_identity_runtime(&seed_cli, "127.0.0.1:9944", &[], &[], false, true, 0)
+                .is_err()
+        );
+        let allow_ephemeral =
+            validate_identity_runtime(&cli, "127.0.0.1:9944", &[], &[], true, false, 0).unwrap();
+        assert!(!allow_ephemeral);
+    }
+
+    #[test]
+    fn integrated_shard_worker_enforces_https_or_explicit_literal_loopback() {
+        let mut remote_http = base_shard_worker_args();
+        let idx = remote_http
+            .iter()
+            .position(|entry| *entry == "--community-shard-coordinator-url")
+            .unwrap();
+        remote_http[idx + 1] = "http://coordinator.example.com:9090";
+        remote_http.push("--community-shard-allow-insecure-for-loopback");
+        let remote_cli = Cli::try_parse_from(&remote_http).unwrap();
+        assert!(validate_community_shard_worker_role(&remote_cli, 0, &[], false, 1, 4).is_err());
+
+        let mut loopback_http = base_shard_worker_args();
+        let idx = loopback_http
+            .iter()
+            .position(|entry| *entry == "--community-shard-coordinator-url")
+            .unwrap();
+        loopback_http[idx + 1] = "http://127.0.0.1:9090";
+        let blocked_cli = Cli::try_parse_from(&loopback_http).unwrap();
+        assert!(validate_community_shard_worker_role(&blocked_cli, 0, &[], false, 1, 4).is_err());
+
+        loopback_http.push("--community-shard-allow-insecure-for-loopback");
+        let allowed_cli = Cli::try_parse_from(&loopback_http).unwrap();
+        let (_, validated) =
+            validate_community_shard_worker_role(&allowed_cli, 0, &[], false, 1, 4)
+                .unwrap()
+                .expect("loopback HTTP with explicit opt-in should validate");
+        assert_eq!(
+            validated.normalized_coordinator_url,
+            "http://127.0.0.1:9090"
+        );
+    }
+
+    #[test]
+    fn integrated_shard_worker_transaction_domain_guard_handles_none_match_and_mismatch() {
+        let pinned = Hash256([0x22; 32]);
+        let other = Hash256([0x99; 32]);
+
+        validate_pinned_shard_transaction_domain(pinned, None).unwrap();
+        validate_pinned_shard_transaction_domain(pinned, Some(pinned)).unwrap();
+
+        let mismatch = validate_pinned_shard_transaction_domain(pinned, Some(other)).unwrap_err();
+        assert!(
+            mismatch
+                .to_string()
+                .contains("does not match this node's active local recovery transaction domain")
+        );
+
+        let zero_err = validate_pinned_shard_transaction_domain(Hash256::ZERO, None).unwrap_err();
+        assert!(
+            zero_err
+                .to_string()
+                .contains("--community-shard-transaction-domain must be nonzero")
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
     use serde_json::json;
+
+    include!("recovery_peer_replay_tests.rs");
 
     #[test]
     fn community_worker_batched_prefill_respects_opt_out_and_validator_role() {
@@ -10648,6 +11378,7 @@ mod tests {
                     arc_node::twin::TwinConfig::default(),
                     false,
                     rpc::CommunityProfileServing::default(),
+                    false,
                 )
                 .await
                 .unwrap();

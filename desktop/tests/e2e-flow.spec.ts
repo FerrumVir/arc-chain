@@ -320,7 +320,25 @@ test.describe("Spawn CLI contract (Rust source)", () => {
     ]) {
       expect(activeStart).toContain(flag);
     }
-    expect(activeStart).toContain("append_compute_launch_args(&mut cmd, config);");
+    expect(activeStart).toContain("ensure_binary_supports_compute_mode(&binary, &launch_mode)?;");
+    expect(activeStart).toContain("append_compute_launch_args_for_mode(&mut cmd, config, &launch_mode);");
+    const modeBegin = production.indexOf("fn append_compute_launch_args_for_mode(");
+    expect(modeBegin).toBeGreaterThanOrEqual(0);
+    const modeEnd = production.indexOf("\n}\n", modeBegin);
+    expect(modeEnd).toBeGreaterThan(modeBegin);
+    const modeArgs = production.slice(modeBegin, modeEnd);
+    expect(modeArgs).toContain("ManagedComputeLaunchMode::Observer => {}");
+    expect(modeArgs).toContain("ManagedComputeLaunchMode::FullIntegerWorker => append_compute_launch_args(cmd, config)");
+    for (const flag of [
+      '"--community-shard-worker"',
+      '"--community-shard-coordinator-url"',
+      '"--community-shard-coordinator-id"',
+      '"--community-shard-transaction-domain"',
+      '"--community-shard-expected-model-id"',
+      '"--community-shard-max-working-set-bytes"',
+    ]) {
+      expect(modeArgs).toContain(flag);
+    }
     const computeBegin = production.indexOf("fn append_compute_launch_args(");
     expect(computeBegin).toBeGreaterThanOrEqual(0);
     const computeEnd = production.indexOf("\n}\n", computeBegin);

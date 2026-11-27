@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -11,6 +12,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[2]
 WORKFLOW = ROOT / ".github/workflows/release.yml"
+TAURI_CONFIG = ROOT / "desktop/src-tauri/tauri.conf.json"
+VERSION_RE = re.compile(r"\A(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z")
+
+
+def current_repo_version() -> str:
+    document = json.loads(TAURI_CONFIG.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise ValueError("desktop Tauri config must be a JSON object")
+    version = document.get("version")
+    if not isinstance(version, str) or VERSION_RE.fullmatch(version) is None:
+        raise ValueError(f"desktop Tauri config version must be strict MAJOR.MINOR.PATCH: {version!r}")
+    return version
 
 
 def version_check_shell() -> str:
@@ -22,11 +35,12 @@ def version_check_shell() -> str:
 
 
 class ReleaseWorkflowVersionCheckTests(unittest.TestCase):
-    def run_check(self, root: Path) -> subprocess.CompletedProcess[str]:
+    def run_check(self, root: Path, version: str | None = None) -> subprocess.CompletedProcess[str]:
+        target_version = current_repo_version() if version is None else version
         return subprocess.run(
             ["bash", "-euo", "pipefail", "-c", version_check_shell()],
             cwd=root,
-            env={**os.environ, "VERSION": "0.8.23", "TAG": "v0.8.23"},
+            env={**os.environ, "VERSION": target_version, "TAG": f"v{target_version}"},
             text=True,
             capture_output=True,
             check=False,
@@ -62,6 +76,12 @@ class ReleaseWorkflowVersionCheckTests(unittest.TestCase):
             result = self.run_check(fixture)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("desktop-npm version is 0.8.0", result.stdout + result.stderr)
+
+    def test_actual_workflow_version_block_rejects_mismatched_target_version(self) -> None:
+        major, minor, patch = (int(part) for part in current_repo_version().split("."))
+        other_version = f"{major}.{minor}.{patch + 1}"
+        result = self.run_check(ROOT, version=other_version)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

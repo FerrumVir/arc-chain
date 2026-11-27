@@ -1,7 +1,7 @@
 use crate::types::HardwareInfo;
 use sysinfo::System;
 
-const GIB: u64 = 1024 * 1024 * 1024;
+pub(crate) const GIB: u64 = 1024 * 1024 * 1024;
 
 pub const WORKER_MIN_NOMINAL_RAM_GB: u64 = 16;
 
@@ -27,11 +27,16 @@ pub fn nominal_ram_gb(visible_bytes: u64) -> u64 {
     visible_bytes / GIB
 }
 
-pub(crate) fn compute_capacity() -> (u64, u32) {
+pub(crate) fn visible_ram_bytes_and_cores() -> (u64, u32) {
     let mut sys = System::new();
     sys.refresh_memory_specifics(sysinfo::MemoryRefreshKind::new().with_ram());
     sys.refresh_cpu_list(sysinfo::CpuRefreshKind::new());
-    (nominal_ram_gb(sys.total_memory()), sys.cpus().len() as u32)
+    (sys.total_memory(), sys.cpus().len() as u32)
+}
+
+pub(crate) fn compute_capacity() -> (u64, u32) {
+    let (visible_bytes, cores) = visible_ram_bytes_and_cores();
+    (nominal_ram_gb(visible_bytes), cores)
 }
 
 pub fn detect() -> HardwareInfo {

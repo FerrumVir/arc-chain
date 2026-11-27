@@ -102,6 +102,39 @@ pub struct PreviousInstallNotice {
     pub set_aside_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartialShardRangeStatus {
+    pub start_layer: u64,
+    pub end_layer: u64,
+    pub total_layers: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartialShardWorkerStatus {
+    pub phase: Option<String>,
+    pub model_name: Option<String>,
+    pub model_id: Option<String>,
+    pub lease_seq: Option<u64>,
+    pub lease_epoch: Option<u64>,
+    pub assigned_range: Option<PartialShardRangeStatus>,
+    pub ready_expires_at_unix_ms: Option<u64>,
+    pub lease_live: bool,
+    pub steps_executed: Option<u64>,
+    pub steps_submitted: Option<u64>,
+    pub submit_retries: Option<u64>,
+    pub submit_stale_conflicts: Option<u64>,
+    pub cancellations_applied: Option<u64>,
+    pub rebalances_completed: Option<u64>,
+    pub reconnect_attempts: Option<u64>,
+    pub last_heartbeat_unix_ms: Option<u64>,
+    pub last_step_submitted_unix_ms: Option<u64>,
+    pub last_error: Option<String>,
+    pub rewards_enabled: bool,
+    pub reward_eligible: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeStatus {
@@ -626,4 +659,6 @@ pub struct WorkerStatus {
     pub last_job_completed_unix_ms: Option<u64>,
     pub started_unix_ms: Option<u64>,
     pub prevent_sleep_during_jobs: Option<bool>,
+    pub mode: Option<String>,
+    pub shard: Option<PartialShardWorkerStatus>,
 }

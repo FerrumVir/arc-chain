@@ -262,7 +262,6 @@ mod tests {
     use super::*;
     use crate::store::Store;
     use crate::types::{Identity, NodeConfig};
-    use fs2::FileExt as _;
     use std::time::{Duration, UNIX_EPOCH};
 
     const CONTROL: &str = arc_crypto::secret_file::DESKTOP_SHUTDOWN_CONTROL_DIR_NAME;

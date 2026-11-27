@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import plistlib
 from pathlib import Path
 import shutil
@@ -37,11 +38,8 @@ class BundleSealingTests(unittest.TestCase):
         executable.chmod(0o755)
         (app / "Contents/Resources").mkdir()
         (app / "Contents/Resources/config.txt").write_text("resource\n")
-        (app / "Contents/Info.plist").write_bytes(plistlib.dumps({
-            "CFBundleIdentifier": seal.APP_IDENTIFIER,
-            "CFBundleShortVersionString": seal.APP_VERSION,
-            "CFBundleExecutable": seal.EXECUTABLE_NAME,
-        }))
+        self.expected_version = seal.expected_app_version()
+        self.write_info_plist(version=self.expected_version)
         self.archive = self.macos / "ARC Node.app.tar.gz"
         self.archive.write_bytes(b"old archive")
         self.dmg_dir.mkdir()
@@ -56,6 +54,32 @@ class BundleSealingTests(unittest.TestCase):
         seal.HDITIL.touch()
         self.commands: list[list[str]] = []
         self.dmg_source: Path | None = None
+        self._repo_counter = 0
+
+    def write_info_plist(
+        self,
+        *,
+        identifier: str = seal.APP_IDENTIFIER,
+        version: str | None = None,
+        executable: str = seal.EXECUTABLE_NAME,
+    ) -> None:
+        info = self.macos / seal.APP_NAME / "Contents/Info.plist"
+        payload: dict[str, object] = {
+            "CFBundleIdentifier": identifier,
+            "CFBundleExecutable": executable,
+        }
+        if version is not None:
+            payload["CFBundleShortVersionString"] = version
+        info.write_bytes(plistlib.dumps(payload))
+
+    def make_repo_fixture(self, content: str | None) -> Path:
+        self._repo_counter += 1
+        repo = self.root / f"repo-{self._repo_counter}"
+        config = repo / "desktop/src-tauri/tauri.conf.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        if content is not None:
+            config.write_text(content, encoding="utf-8")
+        return repo
 
     def fake_run(self, command: list[str], *, env=None):
         self.commands.append(command)
@@ -114,7 +138,7 @@ class BundleSealingTests(unittest.TestCase):
         info = self.macos / seal.APP_NAME / "Contents/Info.plist"
         info.write_bytes(plistlib.dumps({
             "CFBundleIdentifier": "wrong.identifier",
-            "CFBundleShortVersionString": seal.APP_VERSION,
+            "CFBundleShortVersionString": self.expected_version,
             "CFBundleExecutable": seal.EXECUTABLE_NAME,
         }))
         with mock.patch.object(seal, "run", side_effect=self.fake_run):
@@ -123,6 +147,170 @@ class BundleSealingTests(unittest.TestCase):
         self.assertEqual(self.commands, [])
         self.assertEqual(self.archive.read_bytes(), b"old archive")
         self.assertEqual(self.dmg.read_bytes(), b"old disk image")
+
+    def test_expected_app_version_derived_from_repo_tauri_config(self) -> None:
+        config = json.loads((REPO_ROOT / "desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+        self.assertEqual(seal.expected_app_version(), config["version"])
+        self.assertFalse(hasattr(seal, "APP_VERSION"))
+
+    def test_rejects_stale_and_new_version_mismatch_and_accepts_bumped_release(self) -> None:
+        bumped_repo = self.make_repo_fixture(json.dumps({
+            "productName": "ARC Node",
+            "identifier": seal.APP_IDENTIFIER,
+            "version": "0.8.24",
+        }))
+        stale_repo = self.make_repo_fixture(json.dumps({
+            "productName": "ARC Node",
+            "identifier": seal.APP_IDENTIFIER,
+            "version": "0.8.23",
+        }))
+
+        for label, repo, bundle_version in (
+            ("stale-bundle-vs-new-config", bumped_repo, "0.8.23"),
+            ("new-bundle-vs-stale-config", stale_repo, "0.8.24"),
+            ("ahead-bundle-vs-new-config", bumped_repo, "0.8.25"),
+            ("missing-bundle-version", bumped_repo, None),
+        ):
+            with self.subTest(case=label):
+                self.commands.clear()
+                self.write_info_plist(version=bundle_version)
+                with mock.patch.object(seal, "REPO_ROOT", repo):
+                    with mock.patch.object(seal, "run", side_effect=self.fake_run):
+                        with self.assertRaisesRegex(RuntimeError, "identity/version/executable"):
+                            seal.seal_and_repackage(self.bundle)
+                self.assertEqual(self.commands, [])
+                self.assertEqual(self.archive.read_bytes(), b"old archive")
+                self.assertEqual(self.dmg.read_bytes(), b"old disk image")
+
+        self.commands.clear()
+        self.write_info_plist(version="0.8.24")
+        with mock.patch.object(seal, "REPO_ROOT", bumped_repo):
+            with mock.patch.object(seal, "run", side_effect=self.fake_run):
+                receipt = seal.seal_and_repackage(self.bundle)
+        self.assertEqual(receipt["executable_sha256"], hashlib.sha256(b"fixture executable").hexdigest())
+        self.assertNotEqual(self.archive.read_bytes(), b"old archive")
+        self.assertNotEqual(self.dmg.read_bytes(), b"old disk image")
+
+    def test_invalid_release_version_configuration_fails_closed(self) -> None:
+        invalid_versions: list[tuple[str, object]] = [
+            ("missing", ...),
+            ("none", None),
+            ("empty", ""),
+            ("integer", 824),
+            ("v-prefix", "v0.8.24"),
+            ("two-part", "0.8"),
+            ("four-part", "0.8.24.1"),
+            ("prerelease", "0.8.24-rc.1"),
+            ("build-metadata", "0.8.24+build.1"),
+            ("leading-zero", "0.08.24"),
+            ("trailing-newline", "0.8.24\n"),
+            ("whitespace", " 0.8.24 "),
+        ]
+        for label, bad_version in invalid_versions:
+            with self.subTest(version_case=label):
+                self.commands.clear()
+                document: dict[str, object] = {
+                    "productName": "ARC Node",
+                    "identifier": seal.APP_IDENTIFIER,
+                }
+                if bad_version is not ...:
+                    document["version"] = bad_version
+                repo = self.make_repo_fixture(json.dumps(document))
+                self.write_info_plist(version=bad_version if isinstance(bad_version, str) else "0.8.24")
+                with mock.patch.object(seal, "REPO_ROOT", repo):
+                    with mock.patch.object(seal, "run", side_effect=self.fake_run):
+                        with self.assertRaisesRegex(RuntimeError, "strict MAJOR.MINOR.PATCH"):
+                            seal.seal_and_repackage(self.bundle)
+                self.assertEqual(self.commands, [])
+                self.assertEqual(self.archive.read_bytes(), b"old archive")
+                self.assertEqual(self.dmg.read_bytes(), b"old disk image")
+
+        self.write_info_plist(version="0.8.24")
+        invalid_configs: list[tuple[str, str | None, str]] = [
+            ("missing-file", None, "missing or symlinked"),
+            ("invalid-json", "{invalid", "invalid JSON"),
+            ("non-object-json", "[]", "JSON object"),
+            ("missing-identifier", json.dumps({"productName": "ARC Node", "version": "0.8.24"}), "identity"),
+            ("wrong-identifier", json.dumps({
+                "productName": "ARC Node",
+                "identifier": "network.arc.other",
+                "version": "0.8.24",
+            }), "identity"),
+            ("missing-product-name", json.dumps({"identifier": seal.APP_IDENTIFIER, "version": "0.8.24"}), "identity"),
+            ("wrong-product-name", json.dumps({
+                "productName": "Other App",
+                "identifier": seal.APP_IDENTIFIER,
+                "version": "0.8.24",
+            }), "identity"),
+        ]
+        for label, raw_content, pattern in invalid_configs:
+            with self.subTest(config_case=label):
+                self.commands.clear()
+                repo = self.make_repo_fixture(raw_content)
+                with mock.patch.object(seal, "REPO_ROOT", repo):
+                    with mock.patch.object(seal, "run", side_effect=self.fake_run):
+                        with self.assertRaisesRegex(RuntimeError, pattern):
+                            seal.seal_and_repackage(self.bundle)
+                self.assertEqual(self.commands, [])
+                self.assertEqual(self.archive.read_bytes(), b"old archive")
+                self.assertEqual(self.dmg.read_bytes(), b"old disk image")
+
+        external_dir = self.root / "external-src-tauri"
+        external_dir.mkdir()
+        external_config = external_dir / "tauri.conf.json"
+        external_config.write_text(json.dumps({
+            "productName": "ARC Node",
+            "identifier": seal.APP_IDENTIFIER,
+            "version": "0.8.24",
+        }), encoding="utf-8")
+
+        symlink_file_repo = self.make_repo_fixture(None)
+        (symlink_file_repo / "desktop/src-tauri/tauri.conf.json").symlink_to(external_config)
+
+        symlink_dir_repo = self.root / "repo-symlink-dir"
+        (symlink_dir_repo / "desktop").mkdir(parents=True)
+        (symlink_dir_repo / "desktop/src-tauri").symlink_to(external_dir)
+
+        for label, repo, pattern in (
+            ("symlinked-config-file", symlink_file_repo, "missing or symlinked"),
+            ("symlinked-config-parent", symlink_dir_repo, "repository boundary"),
+        ):
+            with self.subTest(symlink_case=label):
+                self.commands.clear()
+                with mock.patch.object(seal, "REPO_ROOT", repo):
+                    with mock.patch.object(seal, "run", side_effect=self.fake_run):
+                        with self.assertRaisesRegex(RuntimeError, pattern):
+                            seal.seal_and_repackage(self.bundle)
+                self.assertEqual(self.commands, [])
+                self.assertEqual(self.archive.read_bytes(), b"old archive")
+                self.assertEqual(self.dmg.read_bytes(), b"old disk image")
+
+        with self.assertRaisesRegex(RuntimeError, "strict MAJOR.MINOR.PATCH"):
+            seal.app_identity(self.macos / seal.APP_NAME, "v0.8.24")
+
+    def test_malformed_or_symlinked_info_plist_fails_closed(self) -> None:
+        info = self.macos / seal.APP_NAME / "Contents/Info.plist"
+        external_plist = self.root / "external-Info.plist"
+        external_plist.write_bytes(plistlib.dumps({
+            "CFBundleIdentifier": seal.APP_IDENTIFIER,
+            "CFBundleShortVersionString": self.expected_version,
+            "CFBundleExecutable": seal.EXECUTABLE_NAME,
+        }))
+
+        for label, setup in (
+            ("invalid-plist", lambda: info.write_bytes(b"not a plist")),
+            ("non-dict-plist", lambda: info.write_bytes(plistlib.dumps([self.expected_version]))),
+            ("symlinked-plist", lambda: (info.unlink(), info.symlink_to(external_plist))),
+        ):
+            with self.subTest(plist_case=label):
+                self.commands.clear()
+                setup()
+                with mock.patch.object(seal, "run", side_effect=self.fake_run):
+                    with self.assertRaisesRegex(RuntimeError, "Info.plist is missing or invalid"):
+                        seal.seal_and_repackage(self.bundle)
+                self.assertEqual(self.commands, [])
+                self.assertEqual(self.archive.read_bytes(), b"old archive")
+                self.assertEqual(self.dmg.read_bytes(), b"old disk image")
 
     def test_signing_failure_keeps_existing_package_outputs(self) -> None:
         def fail_sign(command: list[str], *, env=None):

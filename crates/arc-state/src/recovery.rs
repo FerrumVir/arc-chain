@@ -1,7 +1,6 @@
 use crate::wal::{
     ContractStorage, RepairableWalSummary, RepairableWalTail, Snapshot,
-    hash_wal_identity_and_prefix, quarantine_and_truncate_wal_tail, verify_wal_file_identity,
-    visit_repairable_wal_prefix,
+    hash_wal_identity_and_prefix, quarantine_and_truncate_wal_tail, visit_repairable_wal_prefix,
 };
 use crate::{StateDB, StateError, WalEntry, WalOp, read_wal_strict};
 use arc_crypto::{Hash256, IncrementalMerkle, KeyPair, MerkleTree, Signature, hash_bytes};
@@ -2266,22 +2265,6 @@ fn verify_post_recovery_wal_reread(
     Ok(())
 }
 
-fn verify_post_recovery_prefix_reread(
-    summary: RepairableWalSummary,
-    plan: &PostRecoveryWalPlan,
-) -> Result<(), StateError> {
-    if summary.entry_count != plan.accepted_entry_count
-        || summary.original_bytes != plan.report.recovery_wal_accepted_prefix_bytes
-        || summary.original_hash != plan.accepted_prefix_hash
-        || summary.torn_tail.is_some()
-    {
-        return Err(StateError::PersistenceError(
-            "repaired recovery WAL differs from its validated accepted prefix".into(),
-        ));
-    }
-    Ok(())
-}
-
 #[derive(Default)]
 struct VerifiedRecoveryWalReplay {
     verified_root: Option<Hash256>,
@@ -3082,6 +3065,28 @@ impl StateDB {
         network: RecoveryNetworkPolicy,
         import: Option<RecoveryImport>,
     ) -> Result<Self, StateError> {
+        Self::with_genesis_persistent_recovery_in_prepared_directory_with_hooks(
+            prefunded,
+            namespace_lock,
+            network,
+            import,
+            || Ok(()),
+            || Ok(()),
+        )
+    }
+
+    fn with_genesis_persistent_recovery_in_prepared_directory_with_hooks<F1, F2>(
+        prefunded: &[(Address, u64)],
+        namespace_lock: &arc_crypto::secret_file::PreparedPrivateDirectoryNamespaceLock,
+        network: RecoveryNetworkPolicy,
+        import: Option<RecoveryImport>,
+        before_quarantine_or_attach: F1,
+        before_writer_attach: F2,
+    ) -> Result<Self, StateError>
+    where
+        F1: FnOnce() -> Result<(), StateError>,
+        F2: FnOnce() -> Result<(), StateError>,
+    {
         let wal_dir = namespace_lock.target();
         crate::cleanup_state_staging_files(wal_dir)?;
         cleanup_recovery_staging_files(wal_dir)?;
@@ -3128,7 +3133,7 @@ impl StateDB {
         };
         checkpoint.verify(&trust)?;
 
-        let staged = StateDB::new();
+        let mut staged = StateDB::new();
         staged.install_verified_checkpoint(&checkpoint)?;
         if staged.height() != checkpoint.manifest.source_height + 1 {
             return Err(StateError::PersistenceError(
@@ -3235,25 +3240,41 @@ impl StateDB {
             }
         };
         if wal_existed {
-            wal_plan.accepted_prefix_hash = hash_wal_identity_and_prefix(
-                &wal_path,
-                wal_plan.report.recovery_wal_original_bytes,
-                wal_plan.original_hash,
-                wal_plan.report.recovery_wal_accepted_prefix_bytes,
-            )
-            .map_err(|error| {
-                StateError::PersistenceError(format!(
-                    "recovery WAL changed after planning; refusing replay: {error}"
-                ))
-            })?;
+            wal_plan.accepted_prefix_hash =
+                if wal_plan.report.recovery_wal_quarantined_tail_bytes == 0 {
+                    wal_plan.original_hash
+                } else if wal_plan.report.recovery_wal_accepted_prefix_bytes == 0 {
+                    blake3::hash(&[])
+                } else {
+                    hash_wal_identity_and_prefix(
+                        &wal_path,
+                        wal_plan.report.recovery_wal_original_bytes,
+                        wal_plan.original_hash,
+                        wal_plan.report.recovery_wal_accepted_prefix_bytes,
+                    )
+                    .map_err(|error| {
+                        StateError::PersistenceError(format!(
+                            "recovery WAL changed after planning; refusing replay: {error}"
+                        ))
+                    })?
+                };
         }
 
         if wal_existed {
-            staged.apply_verified_recovery_wal_stream(&wal_path, &wal_plan, true)?;
+            staged.apply_verified_recovery_wal_stream(&wal_path, &wal_plan)?;
         }
         staged.rebuild_recovery_transaction_indexes(&checkpoint.payload)?;
         staged.verify_recovery_restart(&wal_plan, &checkpoint)?;
-        drop(staged);
+        if wal_plan.report.recovery_wal_quarantined_tail_bytes == 0
+            && (wal_plan.source_torn_tail.is_some()
+                || wal_plan.source_entry_count != wal_plan.accepted_entry_count)
+        {
+            return Err(StateError::PersistenceError(
+                "post-recovery WAL plan has unquarantined tail metadata".into(),
+            ));
+        }
+
+        before_quarantine_or_attach()?;
 
         if wal_plan.report.recovery_wal_quarantined_tail_bytes != 0 {
             let quarantine_path = quarantine_and_truncate_wal_tail(
@@ -3278,17 +3299,30 @@ impl StateDB {
                 recovery_wal_quarantine_path = ?quarantine_path,
                 "quarantined post-recovery state WAL suffix before replay"
             );
-        } else if wal_existed {
-            verify_wal_file_identity(
-                &wal_path,
-                wal_plan.report.recovery_wal_original_bytes,
-                wal_plan.original_hash,
-            )
-            .map_err(|error| {
+        }
+
+        before_writer_attach()?;
+
+        let wal = crate::WalWriter::attach_verified_recovery_wal(
+            &wal_path,
+            wal_existed,
+            wal_plan.report.recovery_wal_accepted_prefix_bytes,
+            wal_plan.accepted_prefix_hash,
+            wal_plan.accepted_entry_count,
+        )
+        .map_err(|error| {
+            if wal_existed && wal_plan.report.recovery_wal_quarantined_tail_bytes == 0 {
                 StateError::PersistenceError(format!(
                     "recovery WAL changed after checkpoint validation; refusing replay: {error}"
                 ))
-            })?;
+            } else {
+                StateError::PersistenceError(format!(
+                    "failed to attach verified post-recovery WAL: {error}"
+                ))
+            }
+        })?;
+
+        if wal_existed && wal_plan.report.recovery_wal_quarantined_tail_bytes == 0 {
             tracing::info!(
                 recovery_wal_original_bytes = wal_plan.report.recovery_wal_original_bytes,
                 recovery_wal_accepted_prefix_bytes =
@@ -3299,14 +3333,9 @@ impl StateDB {
             );
         }
 
-        let state = StateDB::with_persistence(&wal_path)?;
-        state.install_verified_checkpoint(&checkpoint)?;
-        let expect_original_file = wal_plan.report.recovery_wal_quarantined_tail_bytes == 0;
-        state.apply_verified_recovery_wal_stream(&wal_path, &wal_plan, expect_original_file)?;
-        state.rebuild_recovery_transaction_indexes(&checkpoint.payload)?;
-        state.verify_recovery_restart(&wal_plan, &checkpoint)?;
-        state.restore_native_inference_context()?;
-        Ok(state)
+        staged.wal = wal;
+        staged.restore_native_inference_context()?;
+        Ok(staged)
     }
 
     fn rebuild_transaction_indexes(&self) {
@@ -3389,7 +3418,6 @@ impl StateDB {
         &self,
         path: &Path,
         plan: &PostRecoveryWalPlan,
-        expect_original_file: bool,
     ) -> Result<usize, StateError> {
         let mut replay = VerifiedRecoveryWalReplay::default();
         let mut replay_error = None;
@@ -3407,11 +3435,7 @@ impl StateDB {
                 StateError::PersistenceError(format!("failed to stream post-recovery WAL: {error}"))
             })
         })?;
-        if expect_original_file {
-            verify_post_recovery_wal_reread(summary, plan)?;
-        } else {
-            verify_post_recovery_prefix_reread(summary, plan)?;
-        }
+        verify_post_recovery_wal_reread(summary, plan)?;
         Ok(replay.root_computations)
     }
 
@@ -3763,7 +3787,6 @@ mod tests {
             torn_tail: None,
         };
         assert!(verify_post_recovery_wal_reread(changed, &plan).is_err());
-        assert!(verify_post_recovery_prefix_reread(changed, &plan).is_err());
 
         let empty_plan = PostRecoveryWalPlan {
             accepted_entry_count: 0,
@@ -3787,7 +3810,6 @@ mod tests {
             torn_tail: None,
         };
         assert!(verify_post_recovery_wal_reread(added, &empty_plan).is_err());
-        assert!(verify_post_recovery_prefix_reread(added, &empty_plan).is_err());
     }
 
     #[test]
@@ -5442,6 +5464,462 @@ mod tests {
 
         fs::remove_dir_all(source_dir).unwrap();
         fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn staged_attach_clean_and_quarantined_restart_supports_subsequent_commits_and_restarts() {
+        let (state, checkpoint, keys, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("staged-attach-clean-and-quarantined");
+        let approved_hash = checkpoint.manifest_hash();
+        let expected_wal_dir = state.wal.directory().map(Path::to_path_buf);
+        let block_1 = commit_empty_recovery_block(
+            &state,
+            keys[0].address(),
+            1_787_777_001_000,
+            b"staged-attach-block-1",
+        );
+        state.try_sync_wal().unwrap();
+        let seq_1 = state.wal.sequence();
+        assert!(seq_1 > 0);
+        let blocks_1 = bincode::serialize(&state.export_recovery_payload().blocks).unwrap();
+        drop(state);
+
+        let restarted_1 =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy.clone(), None)
+                .unwrap();
+        assert!(restarted_1.is_persistent());
+        assert_eq!(
+            restarted_1.wal.directory().map(Path::to_path_buf),
+            expected_wal_dir
+        );
+        assert_eq!(restarted_1.height(), block_1.header.height);
+        assert_eq!(restarted_1.get_state_root(), block_1.header.state_root);
+        assert_eq!(restarted_1.wal.sequence(), seq_1);
+        assert_eq!(restarted_1.recovery_manifest_hash(), Some(approved_hash));
+        assert_eq!(
+            read_active_marker(&active_dir.join(ACTIVE_RECOVERY_MARKER)).unwrap(),
+            Some(approved_hash)
+        );
+        assert_eq!(
+            bincode::serialize(&restarted_1.export_recovery_payload().blocks).unwrap(),
+            blocks_1
+        );
+        let block_2 = commit_empty_recovery_block(
+            &restarted_1,
+            keys[0].address(),
+            1_787_777_002_000,
+            b"staged-attach-block-2",
+        );
+        restarted_1.try_sync_wal().unwrap();
+        let seq_2 = restarted_1.wal.sequence();
+        assert!(seq_2 > seq_1);
+        let blocks_2 = bincode::serialize(&restarted_1.export_recovery_payload().blocks).unwrap();
+        drop(restarted_1);
+
+        let restarted_2 =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy.clone(), None)
+                .unwrap();
+        assert_eq!(restarted_2.height(), block_2.header.height);
+        assert_eq!(restarted_2.get_state_root(), block_2.header.state_root);
+        assert_eq!(restarted_2.wal.sequence(), seq_2);
+        assert_eq!(
+            bincode::serialize(&restarted_2.export_recovery_payload().blocks).unwrap(),
+            blocks_2
+        );
+        drop(restarted_2);
+
+        let wal_path = active_dir.join("state.wal");
+        let accepted_prefix = fs::read(&wal_path).unwrap();
+        let mut wal_file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        wal_file.write_all(&[0xAB, 0xCD]).unwrap();
+        wal_file.sync_all().unwrap();
+        drop(wal_file);
+
+        let quarantined =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy.clone(), None)
+                .unwrap();
+        assert_eq!(quarantined.height(), block_2.header.height);
+        assert_eq!(quarantined.get_state_root(), block_2.header.state_root);
+        assert_eq!(quarantined.wal.sequence(), seq_2);
+        assert_eq!(fs::read(&wal_path).unwrap(), accepted_prefix);
+        let quarantines = recovery_wal_quarantines(&active_dir);
+        assert_eq!(quarantines.len(), 1);
+        assert_eq!(fs::read(&quarantines[0]).unwrap(), vec![0xAB, 0xCD]);
+        let block_3 = commit_empty_recovery_block(
+            &quarantined,
+            keys[0].address(),
+            1_787_777_003_000,
+            b"staged-attach-block-3",
+        );
+        quarantined.try_sync_wal().unwrap();
+        let seq_3 = quarantined.wal.sequence();
+        assert!(seq_3 > seq_2);
+        let blocks_3 = bincode::serialize(&quarantined.export_recovery_payload().blocks).unwrap();
+        drop(quarantined);
+
+        let restarted_3 =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restarted_3.height(), block_3.header.height);
+        assert_eq!(restarted_3.get_state_root(), block_3.header.state_root);
+        assert_eq!(restarted_3.wal.sequence(), seq_3);
+        assert_eq!(
+            bincode::serialize(&restarted_3.export_recovery_payload().blocks).unwrap(),
+            blocks_3
+        );
+        assert_eq!(recovery_wal_quarantines(&active_dir), quarantines);
+        drop(restarted_3);
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn staged_attach_rejects_wal_mutation_deletion_and_path_replacement_before_binding() {
+        let (state_a, checkpoint_a, keys_a, policy, source_a, active_a) =
+            persistent_recovery_fixture("staged-attach-mut-a");
+        let block_a = commit_empty_recovery_block(
+            &state_a,
+            keys_a[0].address(),
+            1_787_777_001_000,
+            b"staged-attach-branch-a",
+        );
+        state_a.try_sync_wal().unwrap();
+        let seq_a = state_a.wal.sequence();
+        drop(state_a);
+
+        let (state_b, _, keys_b, _, source_b, active_b) =
+            persistent_recovery_fixture("staged-attach-mut-b");
+        commit_empty_recovery_block(
+            &state_b,
+            keys_b[0].address(),
+            1_787_777_001_000,
+            b"staged-attach-branch-b",
+        );
+        state_b.try_sync_wal().unwrap();
+        drop(state_b);
+
+        let wal_a = active_a.join("state.wal");
+        let original_bytes = fs::read(&wal_a).unwrap();
+        let alternate_valid_wal = fs::read(active_b.join("state.wal")).unwrap();
+        assert_eq!(original_bytes.len(), alternate_valid_wal.len());
+        assert_ne!(original_bytes, alternate_valid_wal);
+
+        let namespace_lock =
+            arc_crypto::secret_file::acquire_private_directory_namespace_lock(&active_a)
+                .unwrap()
+                .rebarrier_into_prepared()
+                .unwrap();
+
+        let wal_for_flip = wal_a.clone();
+        let flip_err = StateDB::with_genesis_persistent_recovery_in_prepared_directory_with_hooks(
+            &[],
+            &namespace_lock,
+            policy.clone(),
+            None,
+            || Ok(()),
+            move || {
+                let mut mutated = fs::read(&wal_for_flip).unwrap();
+                mutated[0] ^= 0xFF;
+                fs::write(&wal_for_flip, mutated).unwrap();
+                Ok(())
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(
+            flip_err
+                .to_string()
+                .contains("recovery WAL changed after checkpoint validation")
+        );
+        assert!(
+            flip_err
+                .to_string()
+                .contains("digest mismatch before writer attach")
+        );
+        fs::write(&wal_a, &original_bytes).unwrap();
+
+        let wal_for_replace = wal_a.clone();
+        let replacement_tmp = active_a.join(".wal-replace-test.tmp");
+        let alt_bytes = alternate_valid_wal.clone();
+        let replace_err =
+            StateDB::with_genesis_persistent_recovery_in_prepared_directory_with_hooks(
+                &[],
+                &namespace_lock,
+                policy.clone(),
+                None,
+                || Ok(()),
+                move || {
+                    fs::write(&replacement_tmp, &alt_bytes).unwrap();
+                    fs::remove_file(&wal_for_replace).unwrap();
+                    fs::rename(&replacement_tmp, &wal_for_replace).unwrap();
+                    Ok(())
+                },
+            )
+            .err()
+            .unwrap();
+        assert!(
+            replace_err
+                .to_string()
+                .contains("recovery WAL changed after checkpoint validation")
+        );
+        assert!(
+            replace_err
+                .to_string()
+                .contains("digest mismatch before writer attach")
+        );
+        fs::write(&wal_a, &original_bytes).unwrap();
+
+        let wal_for_delete = wal_a.clone();
+        let delete_err =
+            StateDB::with_genesis_persistent_recovery_in_prepared_directory_with_hooks(
+                &[],
+                &namespace_lock,
+                policy.clone(),
+                None,
+                || Ok(()),
+                move || {
+                    fs::remove_file(&wal_for_delete).unwrap();
+                    Ok(())
+                },
+            )
+            .err()
+            .unwrap();
+        assert!(
+            delete_err
+                .to_string()
+                .contains("recovery WAL changed after checkpoint validation")
+        );
+        assert!(!wal_a.exists());
+        assert_eq!(
+            read_active_marker(&active_a.join(ACTIVE_RECOVERY_MARKER)).unwrap(),
+            Some(checkpoint_a.manifest_hash())
+        );
+        fs::write(&wal_a, &original_bytes).unwrap();
+
+        #[cfg(unix)]
+        {
+            let symlink_target = source_a.join("symlink-wal-copy.bin");
+            fs::write(&symlink_target, &original_bytes).unwrap();
+            let wal_for_symlink = wal_a.clone();
+            let symlink_err =
+                StateDB::with_genesis_persistent_recovery_in_prepared_directory_with_hooks(
+                    &[],
+                    &namespace_lock,
+                    policy.clone(),
+                    None,
+                    || Ok(()),
+                    move || {
+                        fs::remove_file(&wal_for_symlink).unwrap();
+                        std::os::unix::fs::symlink(&symlink_target, &wal_for_symlink).unwrap();
+                        Ok(())
+                    },
+                )
+                .err()
+                .unwrap();
+            assert!(
+                symlink_err
+                    .to_string()
+                    .contains("recovery WAL changed after checkpoint validation")
+            );
+            fs::remove_file(&wal_a).unwrap();
+            fs::write(&wal_a, &original_bytes).unwrap();
+        }
+
+        let mut wal_file = OpenOptions::new().append(true).open(&wal_a).unwrap();
+        wal_file.write_all(&[0xDE, 0xAD]).unwrap();
+        wal_file.sync_all().unwrap();
+        drop(wal_file);
+        let wal_post_quarantine = wal_a.clone();
+        let post_quarantine_err =
+            StateDB::with_genesis_persistent_recovery_in_prepared_directory_with_hooks(
+                &[],
+                &namespace_lock,
+                policy.clone(),
+                None,
+                || Ok(()),
+                move || {
+                    let mut mutated = fs::read(&wal_post_quarantine).unwrap();
+                    mutated[0] ^= 0x01;
+                    fs::write(&wal_post_quarantine, mutated).unwrap();
+                    Ok(())
+                },
+            )
+            .err()
+            .unwrap();
+        assert!(
+            post_quarantine_err
+                .to_string()
+                .contains("failed to attach verified post-recovery WAL")
+        );
+        fs::write(&wal_a, &original_bytes).unwrap();
+
+        let reopened = StateDB::with_genesis_persistent_recovery_in_prepared_directory(
+            &[],
+            &namespace_lock,
+            policy,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reopened.height(), block_a.header.height);
+        assert_eq!(reopened.get_state_root(), block_a.header.state_root);
+        assert_eq!(reopened.wal.sequence(), seq_a);
+        drop(reopened);
+        drop(namespace_lock);
+        fs::remove_dir_all(source_a).unwrap();
+        fs::remove_dir_all(active_a).unwrap();
+        fs::remove_dir_all(source_b).unwrap();
+        fs::remove_dir_all(active_b).unwrap();
+    }
+
+    #[test]
+    fn staged_attach_enforces_new_empty_wal_discipline_and_pre_attach_failure_isolation() {
+        let (checkpoint, _, policy) = checkpoint();
+        let directory = temp_dir("staged-attach-empty-new");
+        let checkpoint_path = directory.join("candidate.arcchkpt");
+        checkpoint.write_to(&checkpoint_path).unwrap();
+        let active_dir = directory.join("active");
+        let approved_manifest_hash = checkpoint.manifest_hash();
+        let import = RecoveryImport {
+            checkpoint_path,
+            approved_manifest_hash,
+        };
+        let namespace_lock = crate::prepare_persistent_state_directory(&active_dir).unwrap();
+
+        let pre_attach_err =
+            StateDB::with_genesis_persistent_recovery_in_prepared_directory_with_hooks(
+                &[],
+                &namespace_lock,
+                policy.clone(),
+                Some(import),
+                || Ok(()),
+                || {
+                    Err(StateError::PersistenceError(
+                        "injected pre-attach failure".into(),
+                    ))
+                },
+            )
+            .err()
+            .unwrap();
+        assert!(
+            pre_attach_err
+                .to_string()
+                .contains("injected pre-attach failure")
+        );
+        let wal_path = active_dir.join("state.wal");
+        assert!(!wal_path.exists());
+        assert_eq!(
+            read_active_marker(&active_dir.join(ACTIVE_RECOVERY_MARKER)).unwrap(),
+            Some(approved_manifest_hash)
+        );
+
+        let rogue_wal = wal_path.clone();
+        let rogue_err = StateDB::with_genesis_persistent_recovery_in_prepared_directory_with_hooks(
+            &[],
+            &namespace_lock,
+            policy.clone(),
+            None,
+            || Ok(()),
+            move || {
+                fs::write(&rogue_wal, b"").unwrap();
+                Ok(())
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(
+            rogue_err
+                .to_string()
+                .contains("failed to attach verified post-recovery WAL")
+        );
+        fs::remove_file(&wal_path).unwrap();
+
+        let activated = StateDB::with_genesis_persistent_recovery_in_prepared_directory(
+            &[],
+            &namespace_lock,
+            policy.clone(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(activated.wal.sequence(), 0);
+        assert!(activated.is_persistent());
+        assert!(fs::read(&wal_path).unwrap().is_empty());
+        drop(activated);
+
+        let empty_restarted = StateDB::with_genesis_persistent_recovery_in_prepared_directory(
+            &[],
+            &namespace_lock,
+            policy.clone(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(empty_restarted.wal.sequence(), 0);
+        assert_eq!(
+            empty_restarted.height(),
+            checkpoint.manifest.source_height + 1
+        );
+        assert_eq!(
+            empty_restarted.get_state_root(),
+            checkpoint.manifest.full_state_root
+        );
+        let producer = empty_restarted.active_validators().first().unwrap().0;
+        let timestamp = empty_restarted
+            .get_block(empty_restarted.height())
+            .unwrap()
+            .header
+            .timestamp
+            + 1;
+        let first_block = commit_empty_recovery_block(
+            &empty_restarted,
+            producer,
+            timestamp,
+            b"first-block-after-empty-wal-restart",
+        );
+        empty_restarted.try_sync_wal().unwrap();
+        let seq_after_first = empty_restarted.wal.sequence();
+        assert!(seq_after_first > 0);
+        drop(empty_restarted);
+
+        let mut wal_file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        wal_file.write_all(&[0x01, 0x02, 0x03]).unwrap();
+        wal_file.sync_all().unwrap();
+        drop(wal_file);
+        let torn_bytes = fs::read(&wal_path).unwrap();
+        let pre_quarantine_err =
+            StateDB::with_genesis_persistent_recovery_in_prepared_directory_with_hooks(
+                &[],
+                &namespace_lock,
+                policy.clone(),
+                None,
+                || {
+                    Err(StateError::PersistenceError(
+                        "injected pre-quarantine failure".into(),
+                    ))
+                },
+                || Ok(()),
+            )
+            .err()
+            .unwrap();
+        assert!(
+            pre_quarantine_err
+                .to_string()
+                .contains("injected pre-quarantine failure")
+        );
+        assert_eq!(fs::read(&wal_path).unwrap(), torn_bytes);
+        assert!(recovery_wal_quarantines(&active_dir).is_empty());
+
+        let recovered = StateDB::with_genesis_persistent_recovery_in_prepared_directory(
+            &[],
+            &namespace_lock,
+            policy,
+            None,
+        )
+        .unwrap();
+        assert_eq!(recovered.height(), first_block.header.height);
+        assert_eq!(recovered.get_state_root(), first_block.header.state_root);
+        assert_eq!(recovered.wal.sequence(), seq_after_first);
+        assert_eq!(recovery_wal_quarantines(&active_dir).len(), 1);
+        drop(recovered);
+        drop(namespace_lock);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

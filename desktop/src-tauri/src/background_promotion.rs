@@ -724,7 +724,7 @@ mod tests {
             tokio::spawn(async move {
                 flight
                     .run_or_join(
-                        || std::future::pending::<Result<u32, String>>(),
+                        std::future::pending::<Result<u32, String>>,
                         || Err("interrupted".into()),
                     )
                     .await

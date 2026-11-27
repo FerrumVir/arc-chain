@@ -2,6 +2,17 @@ name: Linux candidate artifacts
 
 on:
   workflow_dispatch:
+    inputs:
+      qualification:
+        description: Full candidate qualification or focused recovery and sharding tests
+        type: choice
+        required: true
+        default: full
+        options:
+          - full
+          - recovery-peer
+          - desktop-shard
+          - desktop-ui
   push:
     branches: [arc-chain-v2-implementation-20260919, arc-native-low-residency-20260927, arc-desktop-unattended-availability-20260927]
 
@@ -9,7 +20,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: linux-candidate-${{ github.ref }}
+  group: linux-candidate-${{ github.ref }}-${{ inputs.qualification || 'full' }}
   cancel-in-progress: true
 
 env:
@@ -17,7 +28,94 @@ env:
   CARGO_BUILD_JOBS: 2
 
 jobs:
+  desktop-ui:
+    if: inputs.qualification == 'desktop-ui'
+    name: Desktop worker status and rendered states
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.20.0
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Verify source and build desktop frontend
+        working-directory: desktop
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          npm ci
+          npm run build
+      - name: Check worker and recovery state transitions
+        working-directory: desktop
+        run: |
+          test "$(CI='' npx playwright test --list | sed -n 's/^Total: //p' | tail -n 1)" = '464 tests in 35 files'
+          npm run test:unit
+      - name: Render partial worker states
+        working-directory: desktop
+        run: |
+          npx playwright install --with-deps chromium
+          npx playwright test --config playwright.shard.config.ts --workers=1 --retries=0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: desktop-worker-status-${{ github.sha }}-${{ github.run_id }}
+          path: |
+            desktop/test-results/
+            desktop/playwright-report/
+          if-no-files-found: error
+          retention-days: 14
+
+  recovery-peer:
+    if: inputs.qualification == 'recovery-peer'
+    name: Signed recovery and community sharding
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: nightly-2026-03-16
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+        with:
+          shared-key: recovery-peer
+          cache-on-failure: true
+      - name: Verify source identity and run every selected test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 scripts/ci/no_comments.py
+          python3 -m unittest scripts.recovery.test_recovery_rollout
+          python3 -m unittest scripts.recovery.test_wal_precopy scripts.recovery.test_peer_capture scripts.recovery.test_peer_capture_boundaries scripts.recovery.test_peer_capture_watchdog scripts.recovery.test_peer_capture_publish
+          python3 scripts/qualification/run-recovery-peer-tests.py \
+            --evidence-dir "$RUNNER_TEMP/recovery-peer-evidence"
+      - name: Lint recovery and sharding targets
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cargo clippy --locked --keep-going -p arc-node -p arc-inference -p arc-state --features candle --lib --bin arc-node --tests -- -D warnings \
+            2>&1 | tee "$RUNNER_TEMP/recovery-peer-evidence/clippy.log"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: recovery-peer-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/recovery-peer-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
   recovered-v3-paid-lifecycle:
+    if: inputs.qualification != 'desktop-ui' && inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard'
     name: Recovered-v3 paid lifecycle (isolated Linux process test)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -159,11 +257,13 @@ jobs:
           retention-days: 14
 
   desktop-native-paid-test:
-    name: Desktop native paid Rust tests (macOS)
+    if: inputs.qualification != 'desktop-ui' && inputs.qualification != 'recovery-peer'
+    name: Desktop lifecycle and native paid Rust tests (macOS)
     runs-on: ${{ startsWith(vars.ARC_MACOS_ARM_RUNNER, '[') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) && fromJSON(vars.ARC_MACOS_ARM_RUNNER) || 'macos-15' }}
     timeout-minutes: 45
     env:
       RUSTUP_TOOLCHAIN: stable
+      CARGO_BUILD_JOBS: 1
     steps:
       - name: Prepare self-hosted runner
         if: runner.environment == 'self-hosted'
@@ -219,7 +319,20 @@ jobs:
           shared-key: desktop-native-paid-macos
 
       - name: Test desktop native paid request Rust code
-        run: 'cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib native_paid::'
+        run: |
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib native_paid:: -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib node_manager:: -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib partial_worker_status_tests:: -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib below_floor_config_roundtrip_preserves_choices_and_launches_only_observer -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib community_shard_route_tests:: -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib inference_retry_tests:: -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib shard_dispatch_readiness_parser_enforces_exact_contract_and_invariants -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib community_sharded_response_parser_validates_non_settling_quorum_and_rejects_violations -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib shard_readiness_enforces_streaming_body_cap_without_content_length -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib settlement_write_gate_explains_why_it_is_closed -- --test-threads=1
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --lib inference_parser_accepts_flat_community_sharded_response_without_inventing_settlement -- --test-threads=1
+      - name: Lint desktop lifecycle and worker integration
+        run: cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --locked --lib --tests -- -D warnings
 
       - name: Clean up self-hosted runner
         if: always() && runner.environment == 'self-hosted'
@@ -236,6 +349,7 @@ jobs:
           exit 0
 
   linux-candidate:
+    if: inputs.qualification != 'desktop-ui' && inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard'
     name: Linux production candidate
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -288,6 +402,7 @@ jobs:
         run: |
           cargo build --locked --release -p arc-node --features candle --bin arc-node \
             --example qualify_recovered_native_boundary --example production_partial_row_conformance
+          cargo build --locked --release -p arc-cli --bin arc
           cargo build --locked --release -p arc-inference \
             --example tensor_row_stdio_worker --example tensor_row_low_residency_export \
             --example tensor_row_shared_worker --example low_residency_conformance --features candle
@@ -322,6 +437,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/linux-candidate"
           cp target/release/arc-node "$RUNNER_TEMP/linux-candidate/"
+          cp target/release/arc "$RUNNER_TEMP/linux-candidate/"
           cp target/release/examples/qualify_recovered_native_boundary \
             "$RUNNER_TEMP/linux-candidate/"
           cp target/release/examples/tensor_row_stdio_worker \
@@ -342,6 +458,7 @@ jobs:
             printf 'workflow_run_attempt=%s\n' "$GITHUB_RUN_ATTEMPT"
             printf 'runner=%s\n' "$ImageOS $ImageVersion"
             printf 'build= cargo build --locked --release -p arc-node --features candle --bin arc-node --example qualify_recovered_native_boundary --example production_partial_row_conformance\n'
+            printf 'build= cargo build --locked --release -p arc-cli --bin arc\n'
             printf 'build= cargo build --locked --release -p arc-inference --example tensor_row_stdio_worker --example tensor_row_low_residency_export --example tensor_row_shared_worker --example low_residency_conformance --features candle\n'
             printf 'check= cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node\n'
             printf 'check= cargo check --locked --all-targets -p arc-assign -p arc-inference -p arc-node --features candle\n'
@@ -374,7 +491,7 @@ jobs:
 
   real-model-conformance:
     name: Fresh-runner real-model conformance (${{ matrix.layout }})
-    if: github.ref == 'refs/heads/arc-native-low-residency-20260927'
+    if: inputs.qualification != 'desktop-ui' && inputs.qualification != 'recovery-peer' && inputs.qualification != 'desktop-shard' && github.ref == 'refs/heads/arc-native-low-residency-20260927'
     strategy:
       fail-fast: false
       matrix:

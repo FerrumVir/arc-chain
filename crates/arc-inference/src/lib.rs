@@ -2,6 +2,7 @@ pub mod block_i8;
 pub mod cached_integer_model;
 pub mod candle_backend;
 pub mod canonical_prefill;
+pub mod canonical_shard_admission;
 pub mod canonical_simd;
 pub mod committee;
 pub mod distributed;

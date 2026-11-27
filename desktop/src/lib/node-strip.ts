@@ -4,6 +4,11 @@ import { CONNECTING_LONG_SECS, isUnreachableMessage } from "./connection";
 import { formatBytes, modelDownloadStatus } from "./format";
 import type { ModelDownloadProgress, ModelDownloadWait, NodeStatus, WorkerStatus, WorkerNetwork } from "./types";
 import type { UpdateSnapshot } from "./update-controller";
+import {
+  describeWorkerStatus,
+  type InvalidWorkerView,
+  type PartialShardWorkerView,
+} from "./worker-status";
 
 export type NodeStripAction =
   | "close-copy"
@@ -39,6 +44,7 @@ export interface NodeStripInput {
   sharingPending?: boolean;
   worker?: WorkerStatus;
   network?: WorkerNetwork | null;
+  nowMs?: number;
 }
 
 export const MODEL_PROGRESS_STALE_MS = 150_000;
@@ -77,6 +83,80 @@ export function isUnfinishedUpdate(
     (update.phase === "ready" && update.error !== null) ||
     (update.phase === "error" && update.restartRequired)
   );
+}
+
+function nonWholeWorkerStripView(
+  view: PartialShardWorkerView | InvalidWorkerView,
+  network: WorkerNetwork | null | undefined,
+): NodeStripView {
+  const copy = PLAIN_COPY.nodeStrip;
+  const suffix = networkSentence(network);
+  if (view.kind === "invalid") {
+    return {
+      sentence: copy.workerStatusUnavailable + suffix,
+      action: null,
+      tone: "attention",
+      details: null,
+    };
+  }
+  if (view.phase === "failed") {
+    return {
+      sentence: copy.partialFailed + suffix,
+      action: null,
+      tone: "attention",
+      details: view.lastError,
+    };
+  }
+  if (view.phase === "stopped") {
+    return {
+      sentence: copy.partialStopped + suffix,
+      action: null,
+      tone: "idle",
+      details: view.lastError,
+    };
+  }
+  if (view.phase === "computing") {
+    return {
+      sentence: copy.partialComputing + suffix,
+      action: null,
+      tone: "busy",
+      details: null,
+    };
+  }
+  if (view.phase === "reconnecting") {
+    return {
+      sentence: copy.partialReconnecting + suffix,
+      action: null,
+      tone: "busy",
+      details: null,
+    };
+  }
+  if (view.phase === "loading") {
+    return {
+      sentence: copy.partialLoading + suffix,
+      action: null,
+      tone: "busy",
+      details: null,
+    };
+  }
+  if (view.phase === "starting") {
+    return {
+      sentence: copy.partialStarting + suffix,
+      action: null,
+      tone: "busy",
+      details: null,
+    };
+  }
+  const readySentence =
+    view.stepsSubmitted !== null && view.stepsSubmitted > 0
+      ? copy.partialSteps(view.stepsSubmitted)
+      : copy.partialReady;
+  return {
+    sentence: readySentence + suffix,
+    action: null,
+    tone: "ok",
+    details: null,
+  };
 }
 
 export function describeNodeStrip(input: NodeStripInput): NodeStripView {
@@ -160,9 +240,22 @@ export function describeNodeStrip(input: NodeStripInput): NodeStripView {
       if (input.sharing === undefined) {
         return { sentence: copy.runningConnected, action: null, tone: "ok", details: null };
       }
+      if (!input.sharing) {
+        return {
+          sentence: copy.sharingOff + networkSentence(input.network),
+          action: "share-computer",
+          tone: "ok",
+          details: null,
+        };
+      }
       const worker = input.worker;
-      const sentence = !input.sharing ? copy.sharingOff
-        : worker?.running && worker.state === "computing" ? copy.computing
+      if (worker !== undefined) {
+        const view = describeWorkerStatus(worker, input.nowMs);
+        if (view.kind !== "whole") {
+          return nonWholeWorkerStripView(view, input.network);
+        }
+      }
+      const sentence = worker?.running && worker.state === "computing" ? copy.computing
         : worker?.running && worker.state === "reconnecting" ? copy.reconnectingWorker
         : worker?.running && worker.state === "polling"
           ? worker.jobsCompleted != null && worker.jobsCompleted > 0
@@ -170,8 +263,8 @@ export function describeNodeStrip(input: NodeStripInput): NodeStripView {
           : copy.preparing;
       return {
         sentence: sentence + networkSentence(input.network),
-        action: input.sharing ? null : "share-computer",
-        tone: input.sharing && (!worker?.running || worker.state !== "polling") ? "busy" : "ok",
+        action: null,
+        tone: !worker?.running || worker.state !== "polling" ? "busy" : "ok",
         details: null,
       };
     }
@@ -180,6 +273,15 @@ export function describeNodeStrip(input: NodeStripInput): NodeStripView {
         return { sentence: copy.runningUnreachable, action: null, tone: "idle", details: null };
       }
       return { sentence: copy.runningConnecting, action: null, tone: "busy", details: null };
+    }
+    if (input.sharing === true && input.sharingEligible === true && input.worker !== undefined) {
+      const view = describeWorkerStatus(input.worker, input.nowMs);
+      if (
+        view.kind === "invalid" ||
+        (view.kind === "partial_shard" && (view.phase === "failed" || view.phase === "stopped"))
+      ) {
+        return nonWholeWorkerStripView(view, input.network);
+      }
     }
     return { sentence: copy.running, action: null, tone: "ok", details: null };
   }

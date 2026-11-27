@@ -23,6 +23,8 @@ use std::time::{Duration, Instant};
 use tower_http::cors::CorsLayer;
 
 mod community_routing;
+pub mod community_shard_dispatch;
+pub mod community_shard_http;
 mod teacher_forced;
 mod twin_dispatch;
 use teacher_forced::try_teacher_forced_community_output;
@@ -107,6 +109,8 @@ const INFERENCE_RESULT_CAP: usize = 512;
 const INFERENCE_RESULT_TTL_MS: u64 = 60 * 60 * 1_000;
 const INFERENCE_ACTIVITY_PAGE_MAX: usize = 100;
 const PUBLIC_INFERENCE_CONCURRENCY: usize = 2;
+const COMMUNITY_SHARD_DISPATCH_CONCURRENCY_HARD_CAP: usize =
+    crate::community_sharding::MAX_ACTIVE_SESSIONS_HARD_CAP;
 const VALIDATOR_SHARD_CONCURRENCY: usize = 3;
 const VALIDATOR_SHARD_QUEUE_CAP: usize = 36;
 const VALIDATOR_SHARD_QUEUE_TIMEOUT_SECS: u64 = 120;
@@ -137,6 +141,11 @@ const COMMUNITY_AUTH_REPLAY_CACHE_MAX: usize = 65_536;
 const COMMUNITY_VALIDATOR_REPLAY_CACHE_MAX: usize = 98_304;
 const COMMUNITY_AUTH_REPLAYS_PER_IDENTITY_MAX: usize = 64;
 const COMMUNITY_VALIDATOR_REPLAYS_PER_IDENTITY_MAX: usize = 16_384;
+const COMMUNITY_SHARD_AUTH_MAX_CLOCK_SKEW_MS: u64 = 30_000;
+const COMMUNITY_SHARD_AUTH_REPLAY_RETENTION_MS: u64 =
+    COMMUNITY_SHARD_AUTH_MAX_CLOCK_SKEW_MS * 2 + 1;
+const COMMUNITY_SHARD_REPLAY_CACHE_MAX: usize = 524_288;
+const COMMUNITY_SHARD_REPLAYS_PER_IDENTITY_MAX: usize = 4_096;
 const COMMUNITY_MUTATION_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const COMMUNITY_SUBMIT_BODY_LIMIT_BYTES: usize = 128 * 1024;
 const COMMUNITY_APPROVAL_BODY_LIMIT_BYTES: usize = 256 * 1024;
@@ -234,13 +243,28 @@ pub fn validate_community_rpc_bases(
     Ok(canonical.into_iter().collect())
 }
 
+fn is_community_shard_authenticated_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/community/shards/lease"
+            | "/community/shards/heartbeat"
+            | "/community/shards/claim_step"
+            | "/community/shards/submit_step"
+            | "/community/shards/release"
+    )
+}
+
 struct CommunityReplayCache {
     seen: HashMap<(Hash256, Hash256), u64>,
-    next_prune_unix_ms: u64,
+    per_identity: HashMap<Hash256, usize>,
+    expiry_queue: std::collections::VecDeque<(u64, Hash256, Hash256)>,
+    last_queued_expiry_unix_ms: u64,
+    retention_ms: u64,
     max_entries: usize,
     max_per_identity: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommunityReplayError {
     Replay,
     Capacity,
@@ -249,21 +273,63 @@ enum CommunityReplayError {
 
 impl Default for CommunityReplayCache {
     fn default() -> Self {
-        Self {
-            seen: HashMap::new(),
-            next_prune_unix_ms: 0,
-            max_entries: COMMUNITY_AUTH_REPLAY_CACHE_MAX,
-            max_per_identity: COMMUNITY_AUTH_REPLAYS_PER_IDENTITY_MAX,
-        }
+        Self::with_limits(
+            COMMUNITY_AUTH_REPLAY_CACHE_MAX,
+            COMMUNITY_AUTH_REPLAYS_PER_IDENTITY_MAX,
+            COMMUNITY_AUTH_REPLAY_RETENTION_MS,
+        )
     }
 }
 
 impl CommunityReplayCache {
-    fn validator_domain() -> Self {
+    fn with_limits(max_entries: usize, max_per_identity: usize, retention_ms: u64) -> Self {
         Self {
-            max_entries: COMMUNITY_VALIDATOR_REPLAY_CACHE_MAX,
-            max_per_identity: COMMUNITY_VALIDATOR_REPLAYS_PER_IDENTITY_MAX,
-            ..Self::default()
+            seen: HashMap::new(),
+            per_identity: HashMap::new(),
+            expiry_queue: std::collections::VecDeque::new(),
+            last_queued_expiry_unix_ms: 0,
+            retention_ms,
+            max_entries,
+            max_per_identity,
+        }
+    }
+
+    fn validator_domain() -> Self {
+        Self::with_limits(
+            COMMUNITY_VALIDATOR_REPLAY_CACHE_MAX,
+            COMMUNITY_VALIDATOR_REPLAYS_PER_IDENTITY_MAX,
+            COMMUNITY_AUTH_REPLAY_RETENTION_MS,
+        )
+    }
+
+    fn shard_domain() -> Self {
+        Self::with_limits(
+            COMMUNITY_SHARD_REPLAY_CACHE_MAX,
+            COMMUNITY_SHARD_REPLAYS_PER_IDENTITY_MAX,
+            COMMUNITY_SHARD_AUTH_REPLAY_RETENTION_MS,
+        )
+    }
+
+    fn prune_expired(&mut self, now_unix_ms: u64) {
+        while let Some(&(expiry, worker, nonce)) = self.expiry_queue.front() {
+            if expiry > now_unix_ms {
+                break;
+            }
+            self.expiry_queue.pop_front();
+            let removed = self.seen.remove(&(worker, nonce));
+            debug_assert_eq!(removed, Some(expiry));
+            if removed.is_none() {
+                continue;
+            }
+            if let std::collections::hash_map::Entry::Occupied(mut entry) =
+                self.per_identity.entry(worker)
+            {
+                if *entry.get() <= 1 {
+                    entry.remove();
+                } else {
+                    *entry.get_mut() -= 1;
+                }
+            }
         }
     }
 
@@ -273,30 +339,44 @@ impl CommunityReplayCache {
         nonce: Hash256,
         now_unix_ms: u64,
     ) -> Result<(), CommunityReplayError> {
-        if now_unix_ms >= self.next_prune_unix_ms || self.seen.len() >= self.max_entries {
-            self.seen.retain(|_, expiry| *expiry > now_unix_ms);
-            self.next_prune_unix_ms = now_unix_ms.saturating_add(30_000);
-        }
+        self.prune_expired(now_unix_ms);
         if self.seen.contains_key(&(worker, nonce)) {
             return Err(CommunityReplayError::Replay);
         }
-        if self
-            .seen
-            .keys()
-            .filter(|(address, _)| *address == worker)
-            .count()
-            >= self.max_per_identity
-        {
+        if self.per_identity.get(&worker).copied().unwrap_or(0) >= self.max_per_identity {
             return Err(CommunityReplayError::IdentityCapacity);
         }
         if self.seen.len() >= self.max_entries {
             return Err(CommunityReplayError::Capacity);
         }
-        self.seen.insert(
-            (worker, nonce),
-            now_unix_ms.saturating_add(COMMUNITY_AUTH_REPLAY_RETENTION_MS),
-        );
+        let expiry_unix_ms = now_unix_ms
+            .saturating_add(self.retention_ms)
+            .max(self.last_queued_expiry_unix_ms);
+        self.last_queued_expiry_unix_ms = expiry_unix_ms;
+        self.seen.insert((worker, nonce), expiry_unix_ms);
+        *self.per_identity.entry(worker).or_insert(0) += 1;
+        self.expiry_queue.push_back((expiry_unix_ms, worker, nonce));
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn assert_invariants(&self) {
+        assert_eq!(self.seen.len(), self.expiry_queue.len());
+        assert!(self.seen.len() <= self.max_entries);
+        assert!(self.per_identity.len() <= self.seen.len());
+        let mut expected_counts: HashMap<Hash256, usize> = HashMap::new();
+        let mut prev_expiry = 0u64;
+        for &(expiry, worker, nonce) in &self.expiry_queue {
+            assert!(expiry >= prev_expiry);
+            assert!(expiry <= self.last_queued_expiry_unix_ms);
+            assert_eq!(self.seen.get(&(worker, nonce)), Some(&expiry));
+            *expected_counts.entry(worker).or_insert(0) += 1;
+            prev_expiry = expiry;
+        }
+        assert_eq!(self.per_identity, expected_counts);
+        for &count in self.per_identity.values() {
+            assert!(count > 0 && count <= self.max_per_identity);
+        }
     }
 }
 
@@ -365,6 +445,7 @@ pub struct NodeState {
     community_registration_gate: Arc<parking_lot::Mutex<()>>,
     community_request_replays: Arc<parking_lot::Mutex<CommunityReplayCache>>,
     community_validator_request_replays: Arc<parking_lot::Mutex<CommunityReplayCache>>,
+    community_shard_request_replays: Arc<parking_lot::Mutex<CommunityReplayCache>>,
     community_reward_approval_jobs: Arc<dashmap::DashMap<Hash256, Hash256>>,
     community_reward_approval_certificates: Arc<dashmap::DashMap<Hash256, Hash256>>,
     community_reward_submissions: Arc<dashmap::DashMap<Hash256, CommunityRewardSubmission>>,
@@ -381,6 +462,11 @@ pub struct NodeState {
     pub community_active_jobs: Arc<dashmap::DashMap<String, String>>,
     community_routing: Arc<parking_lot::Mutex<community_routing::RoutingState>>,
     community_twin: Arc<twin_dispatch::CommunityTwinState>,
+    community_shard_coordinator:
+        Arc<parking_lot::Mutex<Option<crate::community_sharding::CommunityShardCoordinator>>>,
+    community_shard_notify: Arc<tokio::sync::Notify>,
+    community_shard_dispatch_permits: Arc<tokio::sync::Semaphore>,
+    community_shard_dispatch_in_flight: Arc<std::sync::atomic::AtomicUsize>,
     pub inference_http: reqwest::Client,
     pub sharded_cache_hits: Arc<AtomicU64>,
     pub sharded_run_meta: Arc<dashmap::DashMap<String, Value>>,
@@ -1336,6 +1422,9 @@ pub fn build_node_state(
         community_validator_request_replays: Arc::new(parking_lot::Mutex::new(
             CommunityReplayCache::validator_domain(),
         )),
+        community_shard_request_replays: Arc::new(parking_lot::Mutex::new(
+            CommunityReplayCache::shard_domain(),
+        )),
         community_reward_approval_jobs: Arc::new(dashmap::DashMap::new()),
         community_reward_approval_certificates: Arc::new(dashmap::DashMap::new()),
         community_reward_submissions: Arc::new(dashmap::DashMap::new()),
@@ -1350,6 +1439,12 @@ pub fn build_node_state(
         community_twin: Arc::new(twin_dispatch::CommunityTwinState::new(
             crate::twin::TwinConfig::default(),
         )),
+        community_shard_coordinator: Arc::new(parking_lot::Mutex::new(None)),
+        community_shard_notify: Arc::new(tokio::sync::Notify::new()),
+        community_shard_dispatch_permits: Arc::new(tokio::sync::Semaphore::new(
+            COMMUNITY_SHARD_DISPATCH_CONCURRENCY_HARD_CAP,
+        )),
+        community_shard_dispatch_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         inference_http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::none())
@@ -1671,6 +1766,7 @@ pub async fn serve(
     community_twin: crate::twin::TwinConfig,
     community_release_on_verification: bool,
     community_profiles: CommunityProfileServing,
+    community_shard_coordinator: bool,
 ) -> anyhow::Result<()> {
     if community_rewards_v1_enabled && state.community_rewards_v1_activation_height().is_none() {
         anyhow::bail!(
@@ -1711,6 +1807,7 @@ pub async fn serve(
             "community release on verification enabled: verified answers are returned before reward approvals, which continue on the settlement retry path"
         );
     }
+    community_shard_http::init_community_shard_coordinator(&node, community_shard_coordinator)?;
     if let Some(dv) = dag_validators {
         node.dag_validators = dv;
     }
@@ -2030,6 +2127,8 @@ pub async fn serve(
             post(community_submit_work_signed)
                 .layer(DefaultBodyLimit::max(COMMUNITY_SUBMIT_BODY_LIMIT_BYTES)),
         )
+        .merge(community_shard_http::routes())
+        .merge(community_shard_dispatch::routes())
         .route(
             COMMUNITY_REWARD_APPROVE_PATH,
             post(community_reward_approve_signed)
@@ -2163,6 +2262,14 @@ async fn join_node_runtime_tasks(node: &NodeState) -> anyhow::Result<()> {
 }
 
 async fn wait_for_inference_compute_barrier(node: &NodeState) -> anyhow::Result<()> {
+    let community_shard_dispatch = node
+        .community_shard_dispatch_permits
+        .clone()
+        .acquire_many_owned(COMMUNITY_SHARD_DISPATCH_CONCURRENCY_HARD_CAP as u32)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("community shard dispatch semaphore closed during shutdown")
+        })?;
     let public = node
         .public_inference_permits
         .clone()
@@ -2181,7 +2288,7 @@ async fn wait_for_inference_compute_barrier(node: &NodeState) -> anyhow::Result<
         .acquire_many_owned(VALIDATOR_SHARD_CONCURRENCY as u32)
         .await
         .map_err(|_| anyhow::anyhow!("validator shard semaphore closed during shutdown"))?;
-    drop((public, approvals, shards));
+    drop((community_shard_dispatch, public, approvals, shards));
     Ok(())
 }
 
@@ -6431,6 +6538,8 @@ struct InferenceReadinessResponse {
     mutation_free_observation: bool,
     #[serde(skip)]
     community_dispatch_blocked: Option<CommunityDispatchBlocked>,
+    #[serde(skip)]
+    community_sharded_ready: bool,
 }
 
 impl InferenceReadinessResponse {
@@ -6500,7 +6609,9 @@ fn inference_readiness_snapshot(node: &NodeState) -> InferenceReadinessResponse 
             (node.candle_engine.is_some() && node.candle_model_id == exact_model)
                 || model.has_all_transformer_layers()
         });
-    let sharded_pipeline_ready = exact_model.is_some_and(|model_id| {
+    let community_sharded_ready =
+        exact_model.is_some() && community_shard_dispatch::is_ready_pipeline_available(node);
+    let seed_sharded_pipeline_ready = exact_model.is_some_and(|model_id| {
         node.inference_model.is_some()
             && !local_model_ready
             && assemble_profile_bound_pipeline_for_model_with_identity_policy(
@@ -6512,6 +6623,7 @@ fn inference_readiness_snapshot(node: &NodeState) -> InferenceReadinessResponse 
             )
             .is_ok()
     });
+    let sharded_pipeline_ready = community_sharded_ready || seed_sharded_pipeline_ready;
     let safe_to_dispatch = community_dispatch_ready || local_model_ready || sharded_pipeline_ready;
 
     InferenceReadinessResponse {
@@ -6526,6 +6638,103 @@ fn inference_readiness_snapshot(node: &NodeState) -> InferenceReadinessResponse 
             arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
         mutation_free_observation: true,
         community_dispatch_blocked,
+        community_sharded_ready,
+    }
+}
+
+fn should_route_to_community_sharded(
+    force_local: bool,
+    public_demo: bool,
+    has_recovery_probe: bool,
+    readiness: &InferenceReadinessResponse,
+    dispatched_input: &str,
+    max_tokens: u32,
+) -> bool {
+    !force_local
+        && !public_demo
+        && !has_recovery_probe
+        && readiness.community_sharded_ready
+        && community_shard_dispatch::is_request_within_dispatch_bounds(dispatched_input, max_tokens)
+}
+
+#[cfg(test)]
+mod community_sharded_routing_tests {
+    use super::*;
+
+    fn ready_sharded_snapshot(community_sharded_ready: bool) -> InferenceReadinessResponse {
+        InferenceReadinessResponse {
+            schema: "arc.inference.readiness.v1",
+            safe_to_dispatch: community_sharded_ready,
+            community_dispatch_ready: false,
+            local_model_ready: false,
+            sharded_pipeline_ready: community_sharded_ready,
+            live_community_workers: 0,
+            model_id: Some(format!("0x{}", "11".repeat(32))),
+            required_community_execution_profile:
+                arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
+            mutation_free_observation: true,
+            community_dispatch_blocked: Some(CommunityDispatchBlocked::NoEligibleWorkers),
+            community_sharded_ready,
+        }
+    }
+
+    #[test]
+    fn readiness_v1_preserves_exact_nine_keys_when_community_sharded_ready() {
+        let value = serde_json::to_value(ready_sharded_snapshot(true)).expect("readiness json");
+        let object = value.as_object().expect("readiness object");
+        assert_eq!(object.len(), 9);
+        assert!(object.get("community_sharded_ready").is_none());
+        assert!(object.get("community_dispatch_blocked").is_none());
+        assert_eq!(object["schema"], json!("arc.inference.readiness.v1"));
+        assert_eq!(object["safe_to_dispatch"], json!(true));
+        assert_eq!(object["sharded_pipeline_ready"], json!(true));
+        assert_eq!(object["community_dispatch_ready"], json!(false));
+        assert_eq!(object["live_community_workers"], json!(0));
+        assert_eq!(object["mutation_free_observation"], json!(true));
+    }
+
+    #[test]
+    fn community_sharded_route_guards_enforce_eligibility_and_caps() {
+        let mut ready = ready_sharded_snapshot(true);
+        ready.community_dispatch_ready = true;
+        ready.local_model_ready = true;
+        let (prompt_cap, token_cap) = community_shard_dispatch::dispatch_caps();
+        let at_cap = "a".repeat(prompt_cap);
+        let over_cap = "a".repeat(prompt_cap + 1);
+        assert!(should_route_to_community_sharded(
+            false, false, false, &ready, &at_cap, token_cap
+        ));
+        assert!(!should_route_to_community_sharded(
+            true, false, false, &ready, "hi", 1
+        ));
+        assert!(!should_route_to_community_sharded(
+            false, true, false, &ready, "hi", 1
+        ));
+        assert!(!should_route_to_community_sharded(
+            false, false, true, &ready, "hi", 1
+        ));
+        assert!(!should_route_to_community_sharded(
+            false,
+            false,
+            false,
+            &ready_sharded_snapshot(false),
+            "hi",
+            1
+        ));
+        assert!(!should_route_to_community_sharded(
+            false, false, false, &ready, "", 1
+        ));
+        assert!(!should_route_to_community_sharded(
+            false, false, false, &ready, &over_cap, 1
+        ));
+        assert!(!should_route_to_community_sharded(
+            false,
+            false,
+            false,
+            &ready,
+            "hi",
+            token_cap + 1
+        ));
     }
 }
 
@@ -6846,6 +7055,24 @@ async fn inference_run(
             reason = blocked.code(),
             "community results cannot be verified now; serving this request without community dispatch"
         );
+    }
+    if should_route_to_community_sharded(
+        force_local,
+        public_demo,
+        recovery_probe_id.is_some(),
+        &readiness,
+        dispatched_input,
+        max_tokens,
+    ) {
+        let response = community_shard_dispatch::run_community_sharded_for_inference_run(
+            node.clone(),
+            input_text,
+            dispatched_input.to_string(),
+            max_tokens,
+        )
+        .await
+        .map_err(|(status, message)| api_error(status, message))?;
+        return Ok(Json(report_token_budget(response)));
     }
     if !force_local && readiness.community_dispatch_ready {
         let dispatched_at = std::time::Instant::now();
@@ -11721,7 +11948,14 @@ where
             format!("cannot validate request time: {error}"),
         )
     })?;
-    if now_unix_ms.abs_diff(signed.timestamp_unix_ms) > COMMUNITY_AUTH_MAX_CLOCK_SKEW_MS {
+    let validator_domain = is_validator_authenticated_path(path);
+    let shard_domain = !validator_domain && is_community_shard_authenticated_path(path);
+    let max_clock_skew_ms = if shard_domain {
+        COMMUNITY_SHARD_AUTH_MAX_CLOCK_SKEW_MS
+    } else {
+        COMMUNITY_AUTH_MAX_CLOCK_SKEW_MS
+    };
+    if now_unix_ms.abs_diff(signed.timestamp_unix_ms) > max_clock_skew_ms {
         return Err((
             StatusCode::UNAUTHORIZED,
             "community request timestamp is stale or too far in the future".to_string(),
@@ -11784,7 +12018,6 @@ where
         .validate_for_auth()
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
 
-    let validator_domain = is_validator_authenticated_path(path);
     if validator_domain {
         if !node.state.is_validator(&worker_address) {
             return Err((
@@ -11811,6 +12044,8 @@ where
 
     let replay_cache = if validator_domain {
         &node.community_validator_request_replays
+    } else if shard_domain {
+        &node.community_shard_request_replays
     } else {
         &node.community_request_replays
     };
@@ -11948,6 +12183,16 @@ async fn community_register(
     let serves_inference = capabilities
         .iter()
         .any(|capability| capability == "inference");
+    let serves_shard_inference = capabilities
+        .iter()
+        .any(|capability| capability == community_shard_http::COMMUNITY_SHARD_CAPABILITY);
+    if serves_inference && serves_shard_inference {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "worker cannot combine whole-model 'inference' and 'shard-inference-v1' capabilities"
+                .to_string(),
+        ));
+    }
     let model = req.model.and_then(|value| {
         let trimmed = value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -11968,14 +12213,16 @@ async fn community_register(
         let trimmed = value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     });
-    if serves_inference && (model.is_none() || model_id.is_none() || execution_profile.is_none()) {
+    if (serves_inference || serves_shard_inference)
+        && (model.is_none() || model_id.is_none() || execution_profile.is_none())
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             "inference workers must register a display model, exact model_id, and execution_profile"
                 .to_string(),
         ));
     }
-    if serves_inference
+    if (serves_inference || serves_shard_inference)
         && execution_profile.as_deref()
             != Some(arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE)
     {
@@ -12722,6 +12969,62 @@ async fn verify_community_result_with_quorum(
         execution_profile: recomputed.execution_profile,
         range_replicas: recomputed.range_replicas,
     })
+}
+
+struct CommunityVerificationCandidate<'a> {
+    verification_id: String,
+    input: &'a str,
+    max_tokens: u32,
+    model_id: Hash256,
+    execution_profile: &'a str,
+    submitted_at_unix_ms: i64,
+    expires_at_unix_ms: u64,
+    candidate_tokens: &'a [u32],
+    candidate_output: &'a str,
+    candidate_output_hash: Hash256,
+}
+
+fn build_community_verification_work_item(
+    node: &NodeState,
+    candidate: &CommunityVerificationCandidate<'_>,
+) -> WorkItem {
+    WorkItem {
+        job_id: candidate.verification_id.clone(),
+        input: candidate.input.to_string(),
+        max_tokens: candidate.max_tokens,
+        model_id: Some(format!("0x{}", candidate.model_id.to_hex())),
+        execution_profile: candidate.execution_profile.to_string(),
+        transaction_domain: node
+            .state
+            .transaction_domain_hash()
+            .map(|domain| format!("0x{}", domain.to_hex())),
+        expected_worker_id: None,
+        submitted_at_unix_ms: candidate.submitted_at_unix_ms,
+        expires_at_unix_ms: candidate.expires_at_unix_ms,
+    }
+}
+
+async fn verify_community_candidate_with_quorum(
+    node: &NodeState,
+    candidate: &CommunityVerificationCandidate<'_>,
+) -> Result<CommunityResultVerification, CommunityResultVerificationError> {
+    let work_item = build_community_verification_work_item(node, candidate);
+    let result = WorkResult {
+        output_tokens: Some(candidate.candidate_tokens.to_vec()),
+        job_id: candidate.verification_id.clone(),
+        worker_id: String::new(),
+        success: true,
+        declined: false,
+        output: candidate.candidate_output.to_string(),
+        output_hash: format!("0x{}", candidate.candidate_output_hash.to_hex()),
+        tokens_generated: candidate.candidate_tokens.len() as u64,
+        total_ms: 0,
+        ms_per_token: 0,
+        engine: candidate.execution_profile.to_string(),
+        error: None,
+        signed_attestation_hex: None,
+    };
+    verify_community_result_with_quorum(node, &work_item, &result).await
 }
 
 struct CommunityCanonicalRecompute {
@@ -20724,7 +21027,7 @@ mod tests {
         assert_same_body(&submitted, &expected_submit);
     }
 
-    fn recovered_six_validator_state() -> (
+    pub(super) fn recovered_six_validator_state() -> (
         Vec<arc_crypto::KeyPair>,
         Arc<arc_state::StateDB>,
         std::path::PathBuf,
@@ -22262,6 +22565,9 @@ mod tests {
             community_validator_request_replays: Arc::new(parking_lot::Mutex::new(
                 CommunityReplayCache::validator_domain(),
             )),
+            community_shard_request_replays: Arc::new(parking_lot::Mutex::new(
+                CommunityReplayCache::shard_domain(),
+            )),
             community_reward_approval_jobs: Arc::new(dashmap::DashMap::new()),
             community_reward_approval_certificates: Arc::new(dashmap::DashMap::new()),
             community_reward_submissions: Arc::new(dashmap::DashMap::new()),
@@ -22276,6 +22582,12 @@ mod tests {
             community_twin: Arc::new(twin_dispatch::CommunityTwinState::new(
                 crate::twin::TwinConfig::default(),
             )),
+            community_shard_coordinator: Arc::new(parking_lot::Mutex::new(None)),
+            community_shard_notify: Arc::new(tokio::sync::Notify::new()),
+            community_shard_dispatch_permits: Arc::new(tokio::sync::Semaphore::new(
+                COMMUNITY_SHARD_DISPATCH_CONCURRENCY_HARD_CAP,
+            )),
+            community_shard_dispatch_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             attestation_nonce: Arc::new(AtomicU64::new(0)),
             latency_stats: Arc::new(dashmap::DashMap::new()),
 
@@ -22959,6 +23271,305 @@ mod tests {
                 .1
                 .contains("do not reproduce their committed hash")
         );
+    }
+
+    fn replay_test_hash(tag: u8, value: u64) -> Hash256 {
+        let mut bytes = [0u8; 32];
+        bytes[0] = tag;
+        bytes[24..].copy_from_slice(&value.to_be_bytes());
+        Hash256(bytes)
+    }
+
+    fn sign_community_request_at_timestamp<T: Serialize>(
+        path: &str,
+        payload: T,
+        keypair: &arc_crypto::KeyPair,
+        target_coordinator: Hash256,
+        transaction_domain: Option<Hash256>,
+        timestamp_unix_ms: u64,
+    ) -> CommunitySignedRequest<T> {
+        let mut signed = super::sign_community_request(
+            path,
+            payload,
+            keypair,
+            target_coordinator,
+            transaction_domain,
+        )
+        .unwrap();
+        signed.timestamp_unix_ms = timestamp_unix_ms;
+        let commitment = super::community_request_commitment(
+            path,
+            signed.version,
+            signed.target_coordinator,
+            signed.transaction_domain,
+            signed.payload_hash,
+            signed.timestamp_unix_ms,
+            signed.nonce,
+        );
+        signed.signature = keypair.sign(&commitment).unwrap();
+        signed
+    }
+
+    #[test]
+    fn community_auth_replay_cache_capacity_expiry_and_clock_rollback() {
+        let ordinary = CommunityReplayCache::default();
+        assert_eq!(ordinary.max_entries, 65_536);
+        assert_eq!(ordinary.max_per_identity, 64);
+        assert_eq!(ordinary.retention_ms, 240_001);
+        let validator = CommunityReplayCache::validator_domain();
+        assert_eq!(validator.max_entries, 98_304);
+        assert_eq!(validator.max_per_identity, 16_384);
+        assert_eq!(validator.retention_ms, 240_001);
+        let shard = CommunityReplayCache::shard_domain();
+        assert_eq!(shard.max_entries, 524_288);
+        assert_eq!(shard.max_per_identity, 4_096);
+        assert_eq!(shard.retention_ms, 60_001);
+
+        let mut cache = CommunityReplayCache::with_limits(5, 2, 60_001);
+        let (w1, w2, w3, w4) = (
+            replay_test_hash(1, 1),
+            replay_test_hash(1, 2),
+            replay_test_hash(1, 3),
+            replay_test_hash(1, 4),
+        );
+        let (n1, n2, n3) = (
+            replay_test_hash(2, 1),
+            replay_test_hash(2, 2),
+            replay_test_hash(2, 3),
+        );
+
+        assert_eq!(cache.accept(w1, n1, 100_000), Ok(()));
+        assert_eq!(cache.accept(w1, n2, 100_010), Ok(()));
+        assert_eq!(
+            cache.accept(w1, n1, 100_010),
+            Err(CommunityReplayError::Replay)
+        );
+        assert_eq!(
+            cache.accept(w1, n3, 100_010),
+            Err(CommunityReplayError::IdentityCapacity)
+        );
+        assert_eq!(cache.accept(w2, n1, 100_020), Ok(()));
+        assert_eq!(cache.accept(w2, n2, 100_020), Ok(()));
+        assert_eq!(cache.accept(w3, n1, 100_030), Ok(()));
+        assert_eq!(
+            cache.accept(w3, n1, 100_030),
+            Err(CommunityReplayError::Replay)
+        );
+        assert_eq!(
+            cache.accept(w4, n1, 100_030),
+            Err(CommunityReplayError::Capacity)
+        );
+        assert_eq!(
+            cache.accept(w1, n3, 160_000),
+            Err(CommunityReplayError::IdentityCapacity)
+        );
+        assert_eq!(
+            cache.accept(w4, n1, 160_000),
+            Err(CommunityReplayError::Capacity)
+        );
+        assert_eq!(
+            cache.accept(w1, n1, 160_000),
+            Err(CommunityReplayError::Replay)
+        );
+        cache.assert_invariants();
+
+        assert_eq!(cache.accept(w1, n3, 160_001), Ok(()));
+        assert_eq!(
+            cache.accept(w1, n2, 160_001),
+            Err(CommunityReplayError::Replay)
+        );
+        cache.assert_invariants();
+
+        assert_eq!(cache.accept(w4, n1, 160_031), Ok(()));
+        assert_eq!(cache.seen.len(), 2);
+        assert_eq!(cache.per_identity.len(), 2);
+        cache.assert_invariants();
+
+        let mut rollback = CommunityReplayCache::with_limits(8, 4, 60_001);
+        assert_eq!(rollback.accept(w1, n1, 1_000_000), Ok(()));
+        assert_eq!(
+            rollback.accept(w1, n1, 950_000),
+            Err(CommunityReplayError::Replay)
+        );
+        assert_eq!(rollback.accept(w1, n2, 950_000), Ok(()));
+        assert_eq!(rollback.seen.get(&(w1, n2)), Some(&1_060_001));
+        assert_eq!(
+            rollback.accept(w1, n1, 1_010_001),
+            Err(CommunityReplayError::Replay)
+        );
+        assert_eq!(
+            rollback.accept(w1, n2, 1_010_001),
+            Err(CommunityReplayError::Replay)
+        );
+        assert_eq!(
+            rollback.accept(w1, n2, 1_060_000),
+            Err(CommunityReplayError::Replay)
+        );
+        rollback.assert_invariants();
+
+        assert_eq!(rollback.accept(w1, n3, 1_060_001), Ok(()));
+        assert_eq!(rollback.seen.len(), 1);
+        assert_eq!(rollback.per_identity.get(&w1), Some(&1));
+        rollback.assert_invariants();
+    }
+
+    #[test]
+    fn community_auth_replay_cache_many_identities_bounded_counts() {
+        let mut cache = CommunityReplayCache::with_limits(10_000, 100, 60_001);
+        for id in 0u64..100 {
+            let worker = replay_test_hash(3, id);
+            for seq in 0u64..100 {
+                let nonce = replay_test_hash(4, id * 1_000 + seq + 1);
+                assert_eq!(cache.accept(worker, nonce, 1_000_000 + id), Ok(()));
+            }
+            assert_eq!(
+                cache.accept(worker, replay_test_hash(5, id), 1_000_000 + id),
+                Err(CommunityReplayError::IdentityCapacity)
+            );
+        }
+        assert_eq!(cache.seen.len(), 10_000);
+        assert_eq!(cache.per_identity.len(), 100);
+        assert_eq!(
+            cache.accept(
+                replay_test_hash(3, 100),
+                replay_test_hash(5, 100),
+                1_000_099
+            ),
+            Err(CommunityReplayError::Capacity)
+        );
+        cache.assert_invariants();
+
+        assert_eq!(
+            cache.accept(
+                replay_test_hash(3, 100),
+                replay_test_hash(5, 100),
+                1_060_051
+            ),
+            Ok(())
+        );
+        assert_eq!(cache.seen.len(), 4_901);
+        assert_eq!(cache.per_identity.len(), 50);
+        cache.assert_invariants();
+
+        assert_eq!(
+            cache.accept(
+                replay_test_hash(3, 101),
+                replay_test_hash(5, 101),
+                1_200_000
+            ),
+            Ok(())
+        );
+        assert_eq!(cache.seen.len(), 1);
+        assert_eq!(cache.per_identity.len(), 1);
+        cache.assert_invariants();
+
+        let mut rotating = CommunityReplayCache::with_limits(100, 4, 1_000);
+        for id in 0u64..1_000 {
+            assert_eq!(
+                rotating.accept(
+                    replay_test_hash(6, id),
+                    replay_test_hash(7, id),
+                    10_000 + id * 20
+                ),
+                Ok(())
+            );
+            assert!(rotating.per_identity.len() <= 51);
+            assert!(rotating.seen.len() <= 51);
+        }
+        rotating.assert_invariants();
+    }
+
+    #[test]
+    fn community_auth_ordinary_paths_keep_64_cap_and_accept_31s_skew() {
+        for path in [
+            COMMUNITY_REGISTER_PATH,
+            COMMUNITY_HEARTBEAT_PATH,
+            COMMUNITY_CLAIM_WORK_PATH,
+            COMMUNITY_SUBMIT_WORK_PATH,
+            "/community/shards/status",
+            "/community/shards/",
+            "/community/shards/lease/",
+            "/community/shards/unknown",
+        ] {
+            assert!(!is_community_shard_authenticated_path(path));
+        }
+
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let node = fake_node_with_workers(Vec::new());
+        let domain = node.state.transaction_domain_hash();
+        let now = community_unix_ms().unwrap();
+
+        let past_31s = sign_community_request_at_timestamp(
+            COMMUNITY_REGISTER_PATH,
+            community_register_payload(&worker),
+            &worker,
+            node.validator_address,
+            domain,
+            now.saturating_sub(31_000),
+        );
+        authenticate_community_request(&node, COMMUNITY_REGISTER_PATH, past_31s.clone()).unwrap();
+
+        let future_31s = sign_community_request_at_timestamp(
+            COMMUNITY_REGISTER_PATH,
+            community_register_payload(&worker),
+            &worker,
+            node.validator_address,
+            domain,
+            now.saturating_add(31_000),
+        );
+        authenticate_community_request(&node, COMMUNITY_REGISTER_PATH, future_31s).unwrap();
+
+        for skew_ts in [now.saturating_sub(121_000), now.saturating_add(121_000)] {
+            let out_of_window = sign_community_request_at_timestamp(
+                COMMUNITY_REGISTER_PATH,
+                community_register_payload(&worker),
+                &worker,
+                node.validator_address,
+                domain,
+                skew_ts,
+            );
+            assert_eq!(
+                authenticate_community_request(&node, COMMUNITY_REGISTER_PATH, out_of_window)
+                    .unwrap_err()
+                    .0,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        for _ in 2..COMMUNITY_AUTH_REPLAYS_PER_IDENTITY_MAX {
+            let req = super::sign_community_request(
+                COMMUNITY_REGISTER_PATH,
+                community_register_payload(&worker),
+                &worker,
+                node.validator_address,
+                domain,
+            )
+            .unwrap();
+            authenticate_community_request(&node, COMMUNITY_REGISTER_PATH, req).unwrap();
+        }
+        assert_eq!(
+            authenticate_community_request(&node, COMMUNITY_REGISTER_PATH, past_31s)
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        let over_cap = super::sign_community_request(
+            COMMUNITY_REGISTER_PATH,
+            community_register_payload(&worker),
+            &worker,
+            node.validator_address,
+            domain,
+        )
+        .unwrap();
+        assert_eq!(
+            authenticate_community_request(&node, COMMUNITY_REGISTER_PATH, over_cap)
+                .unwrap_err()
+                .0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(node.community_request_replays.lock().seen.len(), 64);
+        assert!(node.community_shard_request_replays.lock().seen.is_empty());
+        node.community_request_replays.lock().assert_invariants();
     }
 
     fn community_register_payload(keypair: &arc_crypto::KeyPair) -> CommunityRegisterRequest {
@@ -28659,6 +29270,7 @@ mod tests {
                     crate::twin::TwinConfig::default(),
                     false,
                     CommunityProfileServing::default(),
+                    false,
                 )
                 .await
                 .unwrap();
@@ -28746,6 +29358,7 @@ mod tests {
                 crate::twin::TwinConfig::default(),
                 false,
                 CommunityProfileServing::default(),
+                false,
             )
             .await
         });

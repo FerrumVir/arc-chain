@@ -255,6 +255,161 @@ the unit tests (`scripts/ci_check.sh:219-242`), so it is heavy too.
 
 The full account is [docs/HOW-SHARDING-WORKS.md](docs/HOW-SHARDING-WORKS.md).
 
+`crates/arc-node/src/community_sharding.rs` supplies a bounded community
+layer-pipeline coordinator with expiring leases, fixed partial-layer tiles,
+session ownership, and idle-worker reassignment. Ready transitions rebalance
+idle workers toward uncovered or underrepresented tiles without reducing the
+current complete-pipeline floor; rejoining identities enter the current fairness
+sequence. Bounded capacity-aware reassignment can first move an idle replacement
+to free a stronger worker for a missing range. An exhaustive small-state check
+compares convergence with feasible pipeline capacity and protects busy workers,
+ready capacity, and lease acknowledgement fences. Its outputs require independent
+verification and cannot authorize rewards. Its integer-model tests exercise
+different partial models, including a 100-identity fairness simulation. This
+simulation is not evidence of 100 connected operators. The module alone does not connect desktop workers
+or replace the existing whole-job runtime described below.
+
+`--community-shard-coordinator` enables signed lease, heartbeat, claim, submit,
+and release routes under `/community/shards/`. Workers must register the
+`shard-inference-v1` capability, an exact model commitment, and the canonical
+execution profile. Whole-model and shard capabilities cannot be combined.
+Requests bind the worker identity, coordinator, network domain, timestamp, and
+nonce. Shard mutations use a separate bounded replay cache with a 30-second
+clock window; ordinary-worker and validator authentication keep their existing
+limits. Expiry uses a queue and per-identity counts. The coordinator requires a
+loaded canonical model; it is off by default.
+The status route reports verified dispatch available only with the enabled
+coordinator, canonical model, and an independent validator verification plan.
+`POST /inference/run_community_sharded` owns and cancels its shard session, checks
+its exact result digest, coverage, token limits and EOS, then uses the existing
+validator quorum verification before returning output. Public shard admission follows complete ready pipelines, with a default cap of
+24 sessions and a hard cap of 64. Independent verification alone holds the shared
+public compute permits; queued verification and shutdown stay bounded. Rewards
+remain disabled for these multi-worker results.
+This transport alone does not activate desktop nodes.
+`--community-shard-worker` integrates the pinned partial worker into a managed
+stake-zero node while preserving local RPC and the shutdown durability barrier.
+It excludes whole-model and validator roles, requires explicit model and network
+pins and a memory budget, and defaults to one compute thread. Existing local
+recovery domains must match the supplied pin. Stop closes worker admission before
+the lifecycle waits for drained tasks and acknowledges the WAL receipt.
+Integrated workers retry exhausted transient connection failures with bounded,
+cancellable backoff while retaining lease fences. Authentication, model and
+protocol errors still stop the worker; the local RPC remaining up is not proof
+that the worker is serving.
+The desktop derives partial-worker mode from existing compute consent and typed
+release pins, preserving managed identity and update rollback. The release pins
+Singapore's verified coordinator identity, recovered domain and canonical model.
+Eligible desktop workers use partial shards; explicit compute opt-outs and
+unresolved shutdown recovery retain observer mode. An absent pin preserves the
+whole-worker path for rollback tests.
+Settings reads preserve saved compute choices and model selection. Memory limits
+apply to the launch configuration without inventing a saved compute opt-out.
+The rollout manifest's optional `gateway.community_sharding` boolean adds the
+exact shard routes and coordinator flag only when enabled. Disabled rendering
+preserves the sealed gateway bytes. Metadata and public requests are capped at
+16 KiB, step submissions at 2 MiB, with a separate worker rate limit. The
+validator IP restrictions and interlock remain required for every upstream.
+
+`community_shard_executor.rs` executes only the assigned canonical partial
+model with per-session KV limits, exact-retry caching, cancellation retention,
+and lease/boot fences. It rejects full-model residency and non-owned weights.
+Hidden activations are limited to ±2^30 in Q16 at coordinator and executor
+boundaries; values outside that envelope are refused before arithmetic. The
+coordinator follows the canonical legacy generation sequence, including BOS,
+prompt prefill, repeating the final prompt token for first decode, and retaining
+the EOS output token. The outbound `community_shard_worker` runtime registers a
+signed shard identity, maintains leases during blocking model loads and execution,
+and retries identical submissions using fresh request nonces. Shutdown drains
+blocking work before release; reassignment drops the previous partial model before
+loading the next. TLS coordinator identity and transaction domain are pinned by
+the caller. `arc-node community-shard-worker` runs without chain state or inbound
+listeners. It requires coordinator, recovered-domain and full-artifact identity
+pins, a private worker key, and an explicit RAM budget. `--check-only` inspects
+admission without keys, network registration or tensor loading. Run mode uses one
+compute thread by default and drains work on shutdown. Its conservative admission
+requires capacity for all shard roles because role-aware placement is not yet
+implemented. Desktop activation still needs integration. Network tests use small
+canonical fixtures; they do not establish deployed capacity or operator availability.
+
+`load_cached_model_shard_canonical_i8` reads only its assigned layer weights
+from a GGUF, without preparing optional quantizations. It validates a strict
+partial range before reading tensor weights. Its GGUF tests execute two partial
+models across prefill and decoding and compare tokens and logits hashes with
+the full canonical engine. It does not define downloadable partial artifacts.
+Validator range loading uses the same canonical-only preparation without transient
+optional quantizations. Clamped terminal ranges retain their output head; golden
+checks cover full, split and disjoint ranges against the canonical engine.
+
+`canonical_shard_admission` inspects one bounded, captured GGUF header before
+canonical config allocation. It checks geometry and estimates partial-model
+residency, first-shard embeddings, last-shard output weights, temporary loading
+buffers, metadata heap storage, and reserved KV bytes. Admission rejects a range
+that exceeds the caller's explicit RAM budget. This estimate is conservative
+payload accounting, not a guarantee of process RSS; artifact identity still
+requires the full-file commitment. Worker timing and reconnect limits are bounded,
+and active heartbeats run even under a continuous stream of work. A network test
+exercises 100 signed worker identities using tiny canonical models; it does not
+prove 100 independent live operators or production-model speed.
+
+`arc-node recovery qualify-peer-state` opens an already copied,
+disposable `peer-recovery-candidate-*` directory. Its hash-pinned manifest binds
+the target signing record, genesis, state WAL, recovery domain, and raw finality
+certificate. It replays persistent state and signed DAG records without opening
+listeners, loading models, signing, or activating a validator. The command may
+write inside the disposable candidate; it does not establish capture atomicity
+or completeness of the operator's supplied prior signing high-water marks.
+`recovery inspect-peer-capture` inspects a disposable copied DAG generation and
+preserved target signing record to locate candidate certificate heights before
+full WAL replay. It does not verify the state WAL, DAG signatures, finality, or
+complete prior signing history; `qualify-peer-state` remains required.
+Qualification requires both restored proposal and commit cursors above the
+target's supplied prior signing bound, preventing resumed skip voting on old
+rounds even when the proposal cursor is newer.
+`scripts/recovery/wal_precopy.py` streams a bounded append-only WAL prefix into
+a create-only candidate. Its receipt is explicitly unqualified: capture of the
+remaining state, signed finality checks and full peer qualification are still
+required. It neither stops a service nor replaces any live state.
+
+`scripts/recovery/peer_capture.py` captures a bounded WAL tail and recovery files
+under a short cgroup-v2 freeze with an independent parent-death thaw watchdog.
+Its target publisher rejects stale destinations, verifies the whole pre-copy
+before and after appending, and retains the advisory lock through durable
+publication. Capture and publication receipts remain unqualified; finality and
+both signing-cursor bounds must pass the offline qualifier before activation.
+Recovery startup retains its verified replayed state and binds the WAL writer
+to the exact opened file bytes and accepted sequence before returning it. It
+rejects missing or changed WALs and preserves tail quarantine and native-context
+restoration; it does not bypass replay, checkpoint roots, or signed DAG checks.
+
+Normal `POST /inference/run` prefers an eligible complete community partial
+pipeline before whole-worker dispatch. It preserves forced-local, public-demo,
+and recovery-probe paths and forwards a selected partial pipeline's error
+without a second dispatch. Readiness includes this capacity through the existing
+v1 sharded flag, preserving its nine wire fields. Partial results retain their
+verification and participant evidence without inventing rewards or settlement.
+Desktop direct inference first checks the compiled partial coordinator through a
+bounded, read-only, uncached readiness endpoint that binds coordinator, domain,
+model and prompt capabilities. Its dedicated compute-only POST cannot change
+wallet or receipt origins; explicit custom origins retain their existing path.
+Sharding-enabled gateway generation admits this exact GET route with the same
+interlock, method and resource bounds as shard status. Preflight failures may continue the existing route selection. Once a POST is
+attempted, errors are terminal and cannot trigger another inference dispatch.
+
+The optional `partial_shard` worker status reports loading, lease expiry,
+reconnects, and partial steps separately from whole jobs. Expired ready or
+computing leases clear their displayed range; partial steps do not count as
+whole answers or rewards. Legacy whole-worker payloads omit these fields.
+The desktop rejects unknown or contradictory worker payloads, displays partial
+steps separately, and clears expired assignments. The Linux candidate workflow's
+`desktop-ui` mode builds the frontend, checks state transitions and captures the
+ready, computing, failed and stopped views in a single browser worker.
+
+`scripts/qualification/run-recovery-peer-tests.py` runs the exact mandatory
+recovery and sharding tests on a single build worker and rejects missing cases
+or ignored tests. Use the `recovery-peer` mode of the Linux candidate workflow
+when local resource limits prohibit compilation.
+
 - A coordinator receives `POST /inference/run` (`rpc.rs:2763`, `8212`) and
   runs at most 2 public jobs at once (`rpc.rs:179`).
 - A community job is never split. One stake-0 worker runs every layer
@@ -300,17 +455,21 @@ The full account is [docs/HOW-SHARDING-WORKS.md](docs/HOW-SHARDING-WORKS.md).
 
 ## Releases and versions
 
+The macOS bundle sealer reads the release version from the repository Tauri
+configuration and rejects mismatched app identity or version before modifying
+packages. Archive and DMG verification use the same captured version.
+
 - The version is in `Cargo.toml:28`, `desktop/package.json:4`,
   `desktop/src-tauri/tauri.conf.json:4` and `desktop/src-tauri/Cargo.toml:3`
   (0.8.20 at 8949910b).
 - List tags by date with `git for-each-ref --sort=-creatordate refs/tags`. An
   older pre-release tag sorts above v0.8.x under version sort.
-- `CHANGELOG.md` is newest first. Its v0.8.20 entry (line 21) is marked as a
-  release-preparation snapshot (lines 23-24).
+- `CHANGELOG.md` is newest first. Its v0.8.24 entry is a release-preparation
+  snapshot dated 2026-11-26 and makes no publication or fleet-activation claim.
 - `.github/workflows/release.yml` runs on a `v*.*.*` tag push or a manual
   dispatch (lines 8-12). The current procedures are
   `scripts/release/EXISTING-CHAIN-UPDATE.md` and `scripts/recovery/README.md`.
-- The doc contract test pins the published (0.8.16) and candidate (0.8.20)
+- The doc contract test pins the published (0.8.16) and candidate (0.8.24)
   versions (`tests/release/documentation_contract_test.sh:41`, `47`). README
   install steps name the published one. The test's comment (lines 42-46) says
   they move to a newer release in the documentation change that follows its

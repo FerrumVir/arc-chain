@@ -71,6 +71,11 @@
               }
             }
           },
+          "gateway": {
+            "properties": {
+              "mode": { "const": "caddy-nginx" }
+            }
+          },
           "validators": {
             "items": {
               "required": [
@@ -86,6 +91,11 @@
         }
       },
       "else": {
+        "properties": {
+          "gateway": {
+            "properties": { "mode": { "const": "none" } }
+          }
+        },
         "not": {
           "anyOf": [
             { "required": ["archive"] },
@@ -567,6 +577,7 @@
           "properties": {
             "mode": { "const": "caddy-nginx" },
             "acme_email": { "type": "string", "format": "email" },
+            "community_sharding": { "const": false },
             "public_get_paths": {
               "const": [
                 "/health",
@@ -599,6 +610,64 @@
                 "/tx/submit_signed",
                 "/tx/submit_batch",
                 "/faucet/claim"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "acme_email",
+            "community_sharding",
+            "public_get_paths",
+            "public_post_paths"
+          ],
+          "properties": {
+            "mode": { "const": "caddy-nginx" },
+            "acme_email": { "type": "string", "format": "email" },
+            "community_sharding": { "const": true },
+            "public_get_paths": {
+              "const": [
+                "/health",
+                "/info",
+                "/network/info",
+                "/stats",
+                "/validators",
+                "/block/latest",
+                "/blocks",
+                "/inference/readiness",
+                "/inference/attestations",
+                "/economics/rewards",
+                "/faucet/status",
+                "/community/reward_policy",
+                "/workers/scoreboard",
+                "/shards",
+                "/models",
+                "/models/shards",
+                "/community/shards/status",
+                "/inference/community_shards/dispatch_readiness"
+              ]
+            },
+            "public_post_paths": {
+              "const": [
+                "/inference/run",
+                "/inference/run_consensus",
+                "/community/register",
+                "/community/heartbeat",
+                "/community/claim_work",
+                "/community/submit_work",
+                "/tx/submit",
+                "/tx/submit_signed",
+                "/tx/submit_batch",
+                "/faucet/claim",
+                "/inference/run_community_sharded",
+                "/community/shards/lease",
+                "/community/shards/heartbeat",
+                "/community/shards/claim_step",
+                "/community/shards/submit_step",
+                "/community/shards/release"
               ]
             }
           }

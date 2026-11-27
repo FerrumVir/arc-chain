@@ -246,7 +246,7 @@ async fn save_webview_config(
     config: NodeConfig,
     save: ConfigSave,
 ) -> CmdResult<()> {
-    require_settings_owner(&state).await?;
+    require_settings_owner(state).await?;
     let auto_start;
     {
         let mut store = state.store.lock().await;
@@ -344,17 +344,11 @@ pub async fn update_location_block() -> CmdResult<Option<String>> {
 
 #[tauri::command]
 pub async fn load_config(state: State<'_, AppState>) -> CmdResult<Option<NodeConfig>> {
-    let (ram_gb, _) = crate::hardware::compute_capacity();
-    let store = state.store.lock().await;
-    let mut config = store.config.clone();
-    if tier_for_ram_gb(ram_gb) == "none" {
-        if let Some(config) = &mut config {
-            config.compute_consent = Some(false);
-            config.role = "observer".into();
-            config.model_path = None;
-        }
-    }
-    Ok(config)
+    Ok(load_config_inner(&state).await)
+}
+
+async fn load_config_inner(state: &AppState) -> Option<NodeConfig> {
+    state.store.lock().await.config.clone()
 }
 
 #[tauri::command]
@@ -907,7 +901,7 @@ async fn update_stored_config(
     state: &AppState,
     update: impl FnOnce(&mut NodeConfig) + Send,
 ) -> Result<NodeConfig, String> {
-    require_settings_owner(&state).await?;
+    require_settings_owner(state).await?;
     let mut store = state.store.lock().await;
     let config = update_stored_config_in(&mut store, update);
     let dir = state.data_dir.lock().await.clone();
@@ -929,7 +923,7 @@ async fn persist_promotion_if_still_consented(
     state: &AppState,
     model_path: String,
 ) -> Result<Option<NodeConfig>, String> {
-    require_settings_owner(&state).await?;
+    require_settings_owner(state).await?;
     let mut store = state.store.lock().await;
     let latest = store.config.clone().unwrap_or_default();
     if !compute_contribution_enabled(&latest) {
@@ -1312,8 +1306,8 @@ async fn node_status_inner(state: &AppState, closing: bool) -> CmdResult<NodeSta
     };
 
     let local = paths::local_host(port);
-    let chain = chain_host(&state).await;
-    let chain_choice = cached_chain_choice(&state).await;
+    let chain = chain_host(state).await;
+    let chain_choice = cached_chain_choice(state).await;
 
     let mut status =
         rpc_client::fetch_status(&state.http, &local, &chain, port, pid, address, crash).await;
@@ -1325,7 +1319,7 @@ async fn node_status_inner(state: &AppState, closing: bool) -> CmdResult<NodeSta
     status.cpu_cores = Some(cached_hardware().cpu_cores);
     status.model_unavailable = model_unavailable;
     status.crash_retry_in_secs = crash_retry_in_secs;
-    let config = current_config(&state).await;
+    let config = current_config(state).await;
     if needs_promotion(&config, cached_hardware().ram_gb) {
         status.model_download_wait = crate::background_promotion::waiting_status();
     }
@@ -1664,14 +1658,22 @@ impl ChainHostChoice {
     }
 }
 
+fn explicit_chain_origin_with(mut lookup: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    ["ARC_WALLET_HOST", "ARC_TIER1_RPC"]
+        .into_iter()
+        .find_map(|key| {
+            lookup(key)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn explicit_chain_origin() -> Option<String> {
+    explicit_chain_origin_with(|key| std::env::var(key).ok())
+}
 pub(crate) async fn chain_host(state: &AppState) -> String {
-    for key in ["ARC_WALLET_HOST", "ARC_TIER1_RPC"] {
-        if let Ok(env) = std::env::var(key) {
-            let trimmed = env.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
+    if let Some(origin) = explicit_chain_origin() {
+        return origin;
     }
 
     if let Some(host) = state.community_chain_host.lock().await.clone() {
@@ -2079,7 +2081,7 @@ async fn run_inference_local_inner(
     .await
     .map_err(inference_post_outcome_ambiguous)?;
     result.served_locally = true;
-    pin_community_receipt_route(&state, &host, &result).await;
+    pin_community_receipt_route(state, &host, &result).await;
     Ok(result)
 }
 
@@ -2140,7 +2142,7 @@ async fn run_inference_via_coordinator_inner(
     .await
     .map_err(inference_post_outcome_ambiguous)?;
     result.served_locally = *host == local_prefix;
-    pin_community_receipt_route(&state, host, &result).await;
+    pin_community_receipt_route(state, host, &result).await;
     Ok(result)
 }
 
@@ -2684,6 +2686,20 @@ pub async fn run_inference_via_coordinator_direct(
     max_tokens: Option<u32>,
     chat_template: Option<bool>,
 ) -> CmdResult<InferenceResult> {
+    let explicit_origin = explicit_chain_origin();
+    if let Some(result) = try_run_pinned_shard_inference(
+        &state,
+        crate::node_manager::PRODUCTION_SHARD_COORDINATOR,
+        explicit_origin.as_deref(),
+        &prompt,
+        max_tokens.unwrap_or(32),
+        chat_template.unwrap_or(true),
+        InferenceProxyPolicy::Configured,
+    )
+    .await?
+    {
+        return Ok(result);
+    }
     let candidates = coordinator_candidates(&state).await;
     if candidates.is_empty() {
         return Err(inference_pre_dispatch_unavailable(
@@ -2699,6 +2715,373 @@ pub async fn run_inference_via_coordinator_direct(
         InferenceProxyPolicy::Configured,
     )
     .await
+}
+
+async fn try_run_pinned_shard_inference(
+    state: &AppState,
+    pin: Option<crate::node_manager::PinnedShardCoordinator>,
+    explicit_origin: Option<&str>,
+    prompt: &str,
+    max_tokens: u32,
+    chat_template: bool,
+    proxy_policy: InferenceProxyPolicy,
+) -> CmdResult<Option<InferenceResult>> {
+    let _write_guard = state.community_inference_write.lock().await;
+    let Some(pin) = pin else {
+        return Ok(None);
+    };
+    if pin.validate().is_err() || prompt.trim().is_empty() || max_tokens == 0 {
+        return Ok(None);
+    }
+    let origin = pin.coordinator_url.trim_end_matches('/');
+    if (!pin.allow_insecure_for_loopback && !COORDINATOR_HOSTS.contains(&origin))
+        || explicit_origin
+            .map(|custom| custom.trim().trim_end_matches('/'))
+            .filter(|custom| !custom.is_empty())
+            .is_some_and(|custom| custom != origin)
+    {
+        return Ok(None);
+    }
+    if established_chain_origin(state)
+        .await
+        .is_some_and(|established| {
+            let established = established.trim_end_matches('/');
+            established != origin && !COORDINATOR_HOSTS.contains(&established)
+        })
+    {
+        return Ok(None);
+    }
+    let client = inference_client(prompt, max_tokens, proxy_policy)
+        .map_err(inference_pre_dispatch_unavailable)?;
+    let Ok(Ok(readiness)) = tokio::time::timeout(
+        COORDINATOR_HEALTH_TIMEOUT,
+        rpc_client::community_shard_dispatch_readiness(&client, origin),
+    )
+    .await
+    else {
+        return Ok(None);
+    };
+    let coordinator_id = format!("0x{}", pin.coordinator_id);
+    let transaction_domain = format!("0x{}", pin.transaction_domain);
+    let model_id = format!("0x{}", pin.expected_model_id);
+    let overhead = if chat_template {
+        readiness.chat_template_overhead_bytes
+    } else {
+        0
+    };
+    if !readiness.safe_to_dispatch
+        || !readiness.chat_template_supported
+        || readiness.protocol_version != rpc_client::COMMUNITY_SHARD_PROTOCOL_VERSION_V1
+        || readiness.coordinator_id.as_deref() != Some(coordinator_id.as_str())
+        || readiness.transaction_domain.as_deref() != Some(transaction_domain.as_str())
+        || readiness.model_id.as_deref() != Some(model_id.as_str())
+        || prompt.len().saturating_add(overhead) > readiness.max_prompt_bytes.min(1000)
+        || max_tokens > readiness.max_tokens_cap.min(64)
+    {
+        return Ok(None);
+    }
+    rpc_client::run_community_sharded_inference(
+        &client,
+        origin,
+        prompt,
+        max_tokens,
+        chat_template,
+        &model_id,
+    )
+    .await
+    .map(Some)
+    .map_err(inference_post_outcome_ambiguous)
+}
+
+#[cfg(test)]
+mod community_shard_route_tests {
+    use super::*;
+    use crate::node_manager::PinnedShardCoordinator;
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn loopback_pin(origin: String) -> PinnedShardCoordinator {
+        PinnedShardCoordinator {
+            coordinator_url: Box::leak(origin.into_boxed_str()),
+            coordinator_id: "1111111111111111111111111111111111111111111111111111111111111111",
+            transaction_domain: "2222222222222222222222222222222222222222222222222222222222222222",
+            expected_model_id: "3333333333333333333333333333333333333333333333333333333333333333",
+            allow_insecure_for_loopback: true,
+        }
+    }
+
+    fn readiness(pin: PinnedShardCoordinator) -> Value {
+        json!({
+            "schema": "arc.community_shard.dispatch_readiness.v1",
+            "mutation_free_observation": true,
+            "enabled": true,
+            "protocol_version": 1,
+            "verified_dispatch_enabled": true,
+            "sharded_pipeline_ready": true,
+            "safe_to_dispatch": true,
+            "rewards_enabled": false,
+            "chat_template_supported": true,
+            "coordinator_id": format!("0x{}", pin.coordinator_id),
+            "transaction_domain": format!("0x{}", pin.transaction_domain),
+            "model_id": format!("0x{}", pin.expected_model_id),
+            "execution_profile": arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE,
+            "max_prompt_bytes": 1000,
+            "chat_template_overhead_bytes": 15,
+            "max_tokens_cap": 64
+        })
+    }
+
+    fn verified_result(pin: PinnedShardCoordinator) -> Value {
+        let lease = json!({"boot_nonce": format!("0x{}", "44".repeat(32)), "seq": 1});
+        json!({
+            "protocol_version": 1,
+            "session_id": lease,
+            "model_name": "test-model",
+            "model_id": format!("0x{}", pin.expected_model_id),
+            "execution_profile": arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE,
+            "generated_tokens": [2],
+            "tokens_generated": 1,
+            "output": "answer",
+            "output_hash": format!("0x{}", "55".repeat(32)),
+            "stopped_by_eos": true,
+            "total_ms": 123,
+            "participants": [{"worker_id": format!("0x{}", "66".repeat(32)),
+                "lease_id": lease, "lease_epoch": 1, "range": {"start_layer": 0, "end_layer": 2}}],
+            "participant_identity_basis": "node_key_not_proof_of_independent_operator",
+            "verification": {"profile_bound": true, "quorum_verified": true,
+                "execution_profile": arc_types::transaction::CANONICAL_REWARD_INFERENCE_PROFILE},
+            "rewards_enabled": false,
+            "reward_eligible": false
+        })
+    }
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0; 2048];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0 && bytes.len() + count <= 16 * 1024);
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= end + 4 + length {
+                        return String::from_utf8(bytes).unwrap();
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn serve(
+        listener: tokio::net::TcpListener,
+        observation: Value,
+        expect_post: bool,
+        answer: Option<Value>,
+    ) -> usize {
+        let (mut stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(read_request(&mut stream)
+            .await
+            .starts_with("GET /inference/community_shards/dispatch_readiness "));
+        let body = observation.to_string();
+        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        drop(stream);
+        if !expect_post {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
+            return 0;
+        }
+        let (mut stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let request = read_request(&mut stream).await;
+        assert!(request.starts_with("POST /inference/run_community_sharded "));
+        let sent: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            sent,
+            json!({"input":"hello", "max_tokens":1, "chat_template":true})
+        );
+        if let Some(answer) = answer {
+            let body = answer.to_string();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+        drop(stream);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        1
+    }
+
+    #[test]
+    fn explicit_origin_ignores_blank_values_and_keeps_wallet_precedence() {
+        for (wallet, tier, expected) in [
+            (None, None, None),
+            (Some(""), None, None),
+            (Some(" \t "), Some(""), None),
+            (None, Some(" \t "), None),
+            (
+                Some(""),
+                Some("https://tier.example"),
+                Some("https://tier.example"),
+            ),
+            (
+                Some(" \t "),
+                Some(" https://tier.example "),
+                Some("https://tier.example"),
+            ),
+            (
+                Some(" https://wallet.example "),
+                Some("https://tier.example"),
+                Some("https://wallet.example"),
+            ),
+        ] {
+            let actual = explicit_chain_origin_with(|key| match key {
+                "ARC_WALLET_HOST" => wallet.map(str::to_owned),
+                "ARC_TIER1_RPC" => tier.map(str::to_owned),
+                _ => panic!("unexpected origin variable {key}"),
+            });
+            assert_eq!(actual.as_deref(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn compute_only_route_reaches_shards_without_changing_chain_or_receipt_origins() {
+        for drop_response in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let pin = loopback_pin(format!("http://{}", listener.local_addr().unwrap()));
+            let server = tokio::spawn(serve(
+                listener,
+                readiness(pin),
+                true,
+                (!drop_response).then(|| verified_result(pin)),
+            ));
+            let state = super::inference_retry_tests::test_state();
+            *state.community_chain_host.lock().await = Some(COORDINATOR_HOSTS[0].into());
+            let result = try_run_pinned_shard_inference(
+                &state,
+                Some(pin),
+                Some(" \t "),
+                "hello",
+                1,
+                true,
+                InferenceProxyPolicy::AcceptanceDirect,
+            )
+            .await;
+            if drop_response {
+                assert!(result
+                    .unwrap_err()
+                    .starts_with(INFERENCE_POST_OUTCOME_AMBIGUOUS));
+            } else {
+                let result = result.unwrap().unwrap();
+                assert_eq!(result.routed_via, "community_sharded_pipeline");
+                assert!(result.quorum_verified && result.settlement.is_none());
+                assert!(result.tx_hash.is_empty());
+            }
+            assert_eq!(server.await.unwrap(), 1);
+            assert_eq!(
+                state.community_chain_host.lock().await.as_deref(),
+                Some(COORDINATOR_HOSTS[0])
+            );
+            assert!(state.chain_host.lock().await.is_none());
+            assert!(state.community_receipt_routes.lock().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn shard_readiness_mismatches_and_request_caps_never_dispatch() {
+        for case in 0..8 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let pin = loopback_pin(format!("http://{}", listener.local_addr().unwrap()));
+            let mut observation = readiness(pin);
+            let mut prompt = "hello".to_string();
+            match case {
+                0 => observation["coordinator_id"] = json!(format!("0x{}", "99".repeat(32))),
+                1 => observation["transaction_domain"] = json!(format!("0x{}", "99".repeat(32))),
+                2 => observation["model_id"] = json!(format!("0x{}", "99".repeat(32))),
+                3 => observation["protocol_version"] = json!(2),
+                4 => observation["chat_template_supported"] = json!(false),
+                5 => observation["rewards_enabled"] = json!(true),
+                6 => observation["safe_to_dispatch"] = json!(false),
+                7 => prompt = "a".repeat(986),
+                _ => unreachable!(),
+            }
+            let server = tokio::spawn(serve(listener, observation, false, None));
+            let state = super::inference_retry_tests::test_state();
+            assert!(try_run_pinned_shard_inference(
+                &state,
+                Some(pin),
+                None,
+                &prompt,
+                1,
+                true,
+                InferenceProxyPolicy::AcceptanceDirect
+            )
+            .await
+            .unwrap()
+            .is_none());
+            assert_eq!(server.await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn shard_route_preserves_custom_origins_and_disabled_pins_without_network_io() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pin = loopback_pin(format!("http://{}", listener.local_addr().unwrap()));
+        let state = super::inference_retry_tests::test_state();
+        for candidate in [None, Some(pin)] {
+            assert!(try_run_pinned_shard_inference(
+                &state,
+                candidate,
+                Some("https://custom.invalid"),
+                "hello",
+                1,
+                true,
+                InferenceProxyPolicy::AcceptanceDirect
+            )
+            .await
+            .unwrap()
+            .is_none());
+        }
+        *state.community_chain_host.lock().await = Some("https://custom.invalid".into());
+        assert!(try_run_pinned_shard_inference(
+            &state,
+            Some(pin),
+            None,
+            "hello",
+            1,
+            true,
+            InferenceProxyPolicy::AcceptanceDirect
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+    }
 }
 
 async fn run_inference_via_coordinator_direct_inner(
@@ -2783,7 +3166,7 @@ pub(crate) async fn run_inference_via_exact_production_coordinator_inner(
     .await
 }
 
-const SETTLEMENT_WRITE_UNAVAILABLE: &str = "is unavailable in the v0.8.23 recovery candidate before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not production-ready. VRF selection and server-derived replica labels are not validator approval. Free/community inference remains available.";
+const SETTLEMENT_WRITE_UNAVAILABLE: &str = concat!("is unavailable in the v", env!("CARGO_PKG_VERSION"), " recovery candidate before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not production-ready. VRF selection and server-derived replica labels are not validator approval. Free/community inference remains available.");
 
 fn settlement_write_unavailable<T>(flow: &str) -> CmdResult<T> {
     Err(format!("{} {}", flow, SETTLEMENT_WRITE_UNAVAILABLE))
@@ -5541,6 +5924,11 @@ mod release_binary_tests {
     fn settlement_write_gate_explains_why_it_is_closed() {
         let error = settlement_write_unavailable::<()>("Paid inference escrow")
             .expect_err("recovery candidate must reject settlement writes");
+        assert!(error.contains(concat!(
+            "v",
+            env!("CARGO_PKG_VERSION"),
+            " recovery candidate"
+        )));
         assert!(error.contains("before any transaction is signed or submitted"));
         assert!(error.contains("exact model-artifact binding"));
         assert!(error.contains("validator-authenticated authorization"));
@@ -6816,6 +7204,55 @@ mod start_fence_tests {
     use tokio::sync::Mutex;
 
     #[tokio::test]
+    async fn below_floor_config_roundtrip_preserves_choices_and_launches_only_observer() {
+        for consent in [None, Some(false), Some(true)] {
+            for save in [
+                super::ConfigSave::Preferences,
+                super::ConfigSave::Onboarding,
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let state = state_with(None);
+                *state.data_dir.lock().await = directory.path().to_path_buf();
+                let original = NodeConfig {
+                    role: "worker".into(),
+                    model_path: Some("/models/standard.gguf".into()),
+                    compute_consent: consent,
+                    worker_threads: Some(3),
+                    ..NodeConfig::default()
+                };
+                state.store.lock().await.config = Some(original.clone());
+                let mut displayed = super::load_config_inner(&state).await.unwrap();
+                assert_eq!(displayed.compute_consent, consent);
+                assert_eq!(displayed.model_path, original.model_path);
+                assert_eq!(displayed.role, original.role);
+                let launched = crate::node_manager::effective_launch_config_for_ram(&displayed, 12);
+                assert_eq!(launched.role, "observer");
+                assert_eq!(launched.model_path, None);
+                assert!(!super::needs_promotion(&displayed, 12));
+                displayed.rpc_port = 29_195;
+                {
+                    let mut store = state.store.lock().await;
+                    super::apply_webview_config_save(&mut store, displayed, save);
+                    store.save_to(directory.path()).unwrap();
+                }
+                let reopened = crate::store::Store::load_from(directory.path());
+                let persisted = reopened.config.as_ref().unwrap();
+                assert_eq!(persisted.rpc_port, 29_195);
+                assert_eq!(persisted.compute_consent, consent);
+                assert_eq!(persisted.model_path, original.model_path);
+                assert_eq!(persisted.worker_threads, Some(3));
+                let launched = crate::node_manager::effective_launch_config_for_ram(persisted, 12);
+                assert_eq!(launched.role, "observer");
+                assert_eq!(launched.model_path, None);
+                *state.store.lock().await = reopened;
+                let displayed = super::load_config_inner(&state).await.unwrap();
+                assert_eq!(displayed.compute_consent, consent);
+                assert_eq!(displayed.model_path, original.model_path);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn other_desktop_cannot_save_contribution_or_preferences() {
         let state = state_with(Some(StartFence::OtherDesktop));
         assert!(state.another_desktop_owns_node().await);
@@ -6996,8 +7433,7 @@ mod start_fence_tests {
 
         let skipped = run_inference_local_inner(&state, "The largest planet is", 1, true)
             .await
-            .err()
-            .expect("a busy node mutex skips the local node");
+            .expect_err("a busy node mutex skips the local node");
         assert!(skipped.starts_with(INFERENCE_PRE_DISPATCH_UNAVAILABLE));
         assert_eq!(try_local_rpc_port(&state), None);
         let candidates = body_between(
