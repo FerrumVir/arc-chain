@@ -88,7 +88,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Download exact publication evidence by immutable artifact ID
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           artifact-ids: ${{ steps.select.outputs.artifact_id }}
           path: release-published-download
