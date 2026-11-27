@@ -2495,6 +2495,10 @@ impl NodeManager {
             self.child = None;
             self.active_recovery_launch = false;
             self.shutdown_control = None;
+            self.started_at = None;
+            self.active_worker_threads = None;
+            self.active_model_unavailable = None;
+            self.active_launch_plan = None;
             if let Some(reason) = outcome.forced_reason {
                 push_log(
                     &self.logs,
@@ -2508,10 +2512,6 @@ impl NodeManager {
             }
             stopped += 1;
             self.refresh_durability_failure()?;
-            self.started_at = None;
-            self.active_worker_threads = None;
-            self.active_model_unavailable = None;
-            self.active_launch_plan = None;
             *self.crash_info.lock().await = None;
         }
         Ok(stopped)
@@ -2607,6 +2607,9 @@ impl NodeManager {
             .await;
         }
         let lifecycle_lock = self.lifecycle_lock.take();
+        if self.child.is_none() {
+            self.active_launch_plan = None;
+        }
         self.refresh_durability_failure()?;
         if let Some(error) = self.durability_failure.as_deref() {
             return Err(ManagedDurabilityRecoveryRequired {
@@ -7717,6 +7720,26 @@ mod tests {
         manager.child = None;
         manager.shutdown_control = None;
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_pending_crash_retry_clears_cached_plan_and_lifecycle() {
+        let (root, configured, mut manager, mut plan) =
+            updater_resume_fixture("stopped-pending-crash-plan");
+        manager.lifecycle_lock = manager.update_lifecycle_lock.take();
+        manager.update_restart_plan = None;
+        plan.compute_mode = ManagedComputeLaunchMode::FullIntegerWorker;
+        manager.active_launch_plan = Some(plan);
+        manager.desired_running = true;
+        assert!(manager.has_pending_or_running_compute());
+        manager.stop().await.unwrap();
+        assert!(!manager.has_pending_or_running_compute());
+        assert!(manager.active_launch_plan.is_none());
+        assert!(manager.lifecycle_lock.is_none());
+        drop(acquire_managed_lifecycle_lock(&configured).unwrap());
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
