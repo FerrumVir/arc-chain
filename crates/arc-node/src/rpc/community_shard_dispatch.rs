@@ -3782,7 +3782,7 @@ mod tests {
                     break;
                 }
                 assert!(
-                    !handles.last().unwrap().is_finished(),
+                    handles.iter().all(|handle| !handle.is_finished()),
                     "idle workers must accept bounded work while earlier results await verification"
                 );
                 assert!(
@@ -3860,24 +3860,25 @@ mod tests {
             );
         }
 
-        let over_capacity_while_verify_queued = client
-            .post(&url)
-            .json(&CommunityShardedInferenceRequest {
-                input: prompt.to_string(),
-                max_tokens,
-                chat_template: false,
-            })
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            over_capacity_while_verify_queued.status(),
-            StatusCode::TOO_MANY_REQUESTS
-        );
-
         if shutdown {
+            tokio::task::yield_now().await;
+            assert!(!shutdown_barrier.as_ref().unwrap().is_finished());
             shutdown_tx.send(true).unwrap();
         } else {
+            let over_capacity_while_verify_queued = client
+                .post(&url)
+                .json(&CommunityShardedInferenceRequest {
+                    input: prompt.to_string(),
+                    max_tokens,
+                    chat_template: false,
+                })
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                over_capacity_while_verify_queued.status(),
+                StatusCode::TOO_MANY_REQUESTS
+            );
             held_public_permits.clear();
         }
 
