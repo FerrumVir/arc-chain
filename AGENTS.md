@@ -260,7 +260,10 @@ layer-pipeline coordinator with expiring leases, fixed partial-layer tiles,
 session ownership, and idle-worker reassignment. Ready transitions rebalance
 idle workers toward uncovered or underrepresented tiles without reducing the
 current complete-pipeline floor; rejoining identities enter the current fairness
-sequence. Its outputs require independent
+sequence. Bounded capacity-aware reassignment can first move an idle replacement
+to free a stronger worker for a missing range. An exhaustive small-state check
+compares convergence with feasible pipeline capacity and protects busy workers,
+ready capacity, and lease acknowledgement fences. Its outputs require independent
 verification and cannot authorize rewards. Its integer-model tests exercise
 different partial models, including a 100-identity fairness simulation. This
 simulation is not evidence of 100 connected operators. The module alone does not connect desktop workers

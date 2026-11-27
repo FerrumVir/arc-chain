@@ -55,6 +55,7 @@ EXPECTED_LIBRARY_TESTS = {
     'community_sharding::tests::heartbeat_ready_transition_heals_coverage_gap_without_deadlock',
     'community_sharding::tests::rebalance_recovers_post_churn_throughput_and_heterogeneous_tile_balance',
     'community_sharding::tests::rejoining_worker_cannot_jump_lru_fairness_queue',
+    'community_sharding::tests::rebalance_state_model_preserves_invariants_across_homogeneous_heterogeneous_and_ack_retries',
     'rpc::community_shard_dispatch::tests::four_concurrent_sharded_sessions_scale_past_verifier_cap_two',
     'rpc::community_shard_dispatch::tests::shutdown_cancels_in_flight_and_verification_queued_sharded_requests',
     'rpc::community_shard_dispatch::tests::verification_wait_deadline_exhaustion_fails_bounded_and_releases_slot',
