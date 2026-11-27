@@ -9358,7 +9358,7 @@ mod managed_shard_launch_tests {
         );
         let lock = ManagedLifecycleLock {
             data_dir: canonical_data_dir,
-            _file: std::fs::File::open(&binary).unwrap(),
+            owner_lock: ManagedLifecycleOwnerLock::acquire(tempfile::tempfile().unwrap()).unwrap(),
             namespace_guard: None,
             namespace_prepared: true,
             session_nonce: Some([0x55; 32]),
