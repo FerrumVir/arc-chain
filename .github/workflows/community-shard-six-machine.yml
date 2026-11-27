@@ -1,0 +1,486 @@
+name: Community Shard Six-Machine 7B Qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Completed FerrumVir/arc-chain linux-candidate workflow run ID
+        required: true
+        type: string
+      candidate_run_attempt:
+        description: Completed linux-candidate workflow run attempt
+        required: true
+        type: string
+      candidate_sha:
+        description: Exact 40-char git SHA of the linux-candidate build
+        required: true
+        type: string
+  push:
+    branches:
+      - "audit/live-six-shard-proof-20261126"
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: community-shard-six-machine-qual
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate candidate and SGP baseline
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      candidate_run_id: ${{ steps.resolve_inputs.outputs.candidate_run_id }}
+      candidate_run_attempt: ${{ steps.resolve_inputs.outputs.candidate_run_attempt }}
+      candidate_sha: ${{ steps.resolve_inputs.outputs.candidate_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check qualification harness before remote inference
+        run: |
+          python3 -m unittest discover -s scripts/qualification/tests -p 'test_community_shard_six_machine.py' -v
+          python3 scripts/ci/no_comments.py scripts/qualification/community_shard_six_machine.py scripts/qualification/tests/test_community_shard_six_machine.py .github/workflows/community-shard-six-machine.yml
+
+      - name: Resolve pinned candidate inputs
+        id: resolve_inputs
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF_FULL: ${{ github.ref }}
+          IN_RUN_ID: ${{ inputs.candidate_run_id }}
+          IN_RUN_ATTEMPT: ${{ inputs.candidate_run_attempt }}
+          IN_SHA: ${{ inputs.candidate_sha }}
+          PIN_BRANCH_REF: refs/heads/audit/live-six-shard-proof-20261126
+          PIN_RUN_ID: "45921473787"
+          PIN_RUN_ATTEMPT: "1"
+          PIN_SHA: "7145f682d5b688b9b4e2805d0cb6d351b61863c6"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            RUN_ID="$IN_RUN_ID"
+            RUN_ATTEMPT="$IN_RUN_ATTEMPT"
+            SHA="$IN_SHA"
+          elif [ "$EVENT_NAME" = "push" ] && [ "$GITHUB_REF_FULL" = "$PIN_BRANCH_REF" ]; then
+            RUN_ID="$PIN_RUN_ID"
+            RUN_ATTEMPT="$PIN_RUN_ATTEMPT"
+            SHA="$PIN_SHA"
+          else
+            echo "unsupported trigger event=$EVENT_NAME ref=$GITHUB_REF_FULL" >&2
+            exit 1
+          fi
+          if [[ ! "$RUN_ID" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            echo "invalid candidate_run_id" >&2
+            exit 1
+          fi
+          if [[ ! "$RUN_ATTEMPT" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            echo "invalid candidate_run_attempt" >&2
+            exit 1
+          fi
+          if [[ ! "$SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "invalid candidate_sha" >&2
+            exit 1
+          fi
+          SHA="${SHA,,}"
+          {
+            printf 'candidate_run_id=%s\n' "$RUN_ID"
+            printf 'candidate_run_attempt=%s\n' "$RUN_ATTEMPT"
+            printf 'candidate_sha=%s\n' "$SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ steps.resolve_inputs.outputs.candidate_sha }}
+          path: candidate-source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate candidate run and SGP readiness baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN_ID: ${{ steps.resolve_inputs.outputs.candidate_run_id }}
+          CANDIDATE_RUN_ATTEMPT: ${{ steps.resolve_inputs.outputs.candidate_run_attempt }}
+          CANDIDATE_SHA: ${{ steps.resolve_inputs.outputs.candidate_sha }}
+          OUT_DIR: ${{ runner.temp }}/validate-evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/qualification/community_shard_six_machine.py validate \
+            --candidate-run-id "$CANDIDATE_RUN_ID" \
+            --candidate-run-attempt "$CANDIDATE_RUN_ATTEMPT" \
+            --candidate-sha "$CANDIDATE_SHA" \
+            --candidate-source-dir candidate-source \
+            --output-dir "$OUT_DIR"
+
+      - name: Verify public artifact before upload
+        id: verify_public_0
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_DIR: ${{ runner.temp }}/validate-evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/qualification/community_shard_six_machine.py verify-public-evidence \
+            --evidence-dir "$EVIDENCE_DIR"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ always() && steps.verify_public_0.outcome == 'success' }}
+        with:
+          name: qual-validate-r${{ github.run_id }}-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/validate-evidence
+          retention-days: 7
+          if-no-files-found: ignore
+
+  shard-worker:
+    name: Ephemeral shard worker (slot ${{ matrix.slot }})
+    needs: [validate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check runner memory and disk floor
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/worker-evidence-slot-${{ matrix.slot }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/qualification/community_shard_six_machine.py check-resources \
+            --runner-temp "$RUNNER_TEMP" \
+            --output-dir "$EVIDENCE_DIR"
+
+      - name: Download and verify candidate binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN_ID: ${{ needs.validate.outputs.candidate_run_id }}
+          CANDIDATE_RUN_ATTEMPT: ${{ needs.validate.outputs.candidate_run_attempt }}
+          CANDIDATE_SHA: ${{ needs.validate.outputs.candidate_sha }}
+          CANDIDATE_DIR: ${{ runner.temp }}/linux-candidate
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/qualification/community_shard_six_machine.py download-candidate \
+            --candidate-run-id "$CANDIDATE_RUN_ID" \
+            --candidate-run-attempt "$CANDIDATE_RUN_ATTEMPT" \
+            --candidate-sha "$CANDIDATE_SHA" \
+            --dest-dir "$CANDIDATE_DIR"
+
+      - name: Download and verify pinned 7B GGUF
+        env:
+          MODEL_PATH: ${{ runner.temp }}/model/llama-2-7b-chat.Q4_K_M.gguf
+          GGUF_URL: https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/191239b3e26b2882fb562ffccdd1cf0f65402adb/llama-2-7b-chat.Q4_K_M.gguf
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$(dirname "$MODEL_PATH")"
+          curl --silent --show-error --fail --location --retry 2 --retry-all-errors --retry-max-time 360 \
+            --connect-timeout 15 --max-time 240 --max-filesize 4081004224 --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --output "$MODEL_PATH" "$GGUF_URL"
+          python3 scripts/qualification/community_shard_six_machine.py verify-gguf \
+            --model-path "$MODEL_PATH"
+
+      - name: Run worker --check-only preflight before key creation
+        env:
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          SLOT: ${{ matrix.slot }}
+          CANDIDATE_DIR: ${{ runner.temp }}/linux-candidate
+          MODEL_PATH: ${{ runner.temp }}/model/llama-2-7b-chat.Q4_K_M.gguf
+          EVIDENCE_DIR: ${{ runner.temp }}/worker-evidence-slot-${{ matrix.slot }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/qualification/community_shard_six_machine.py worker-preflight \
+            --workflow-run-id "$WORKFLOW_RUN_ID" \
+            --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" \
+            --slot "$SLOT" \
+            --candidate-dir "$CANDIDATE_DIR" \
+            --model-path "$MODEL_PATH" \
+            --evidence-dir "$EVIDENCE_DIR"
+
+      - name: Generate ephemeral Ed25519 keyfile and public identity JSON
+        env:
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CANDIDATE_RUN_ID: ${{ needs.validate.outputs.candidate_run_id }}
+          CANDIDATE_RUN_ATTEMPT: ${{ needs.validate.outputs.candidate_run_attempt }}
+          CANDIDATE_SHA: ${{ needs.validate.outputs.candidate_sha }}
+          SLOT: ${{ matrix.slot }}
+          CANDIDATE_DIR: ${{ runner.temp }}/linux-candidate
+          PRIVATE_KEY_PATH: ${{ runner.temp }}/private-worker-key/worker-key.json
+          IDENTITY_DIR: ${{ runner.temp }}/worker-identity-slot-${{ matrix.slot }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/qualification/community_shard_six_machine.py worker-create-identity \
+            --workflow-run-id "$WORKFLOW_RUN_ID" \
+            --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" \
+            --candidate-run-id "$CANDIDATE_RUN_ID" \
+            --candidate-run-attempt "$CANDIDATE_RUN_ATTEMPT" \
+            --candidate-sha "$CANDIDATE_SHA" \
+            --slot "$SLOT" \
+            --candidate-dir "$CANDIDATE_DIR" \
+            --private-key-path "$PRIVATE_KEY_PATH" \
+            --identity-dir "$IDENTITY_DIR"
+
+      - name: Verify public artifact before upload
+        id: verify_public_1
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_DIR: ${{ runner.temp }}/worker-identity-slot-${{ matrix.slot }}
+          PRIVATE_KEY_PATH: ${{ runner.temp }}/private-worker-key/worker-key.json
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/qualification/community_shard_six_machine.py verify-public-evidence \
+            --evidence-dir "$EVIDENCE_DIR" \
+            --private-key-path "$PRIVATE_KEY_PATH"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ always() && steps.verify_public_1.outcome == 'success' }}
+        with:
+          name: qual-worker-identity-r${{ github.run_id }}-a${{ github.run_attempt }}-slot-${{ matrix.slot }}
+          path: ${{ runner.temp }}/worker-identity-slot-${{ matrix.slot }}
+          retention-days: 7
+
+      - name: Run bounded systemd community shard worker
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          SLOT: ${{ matrix.slot }}
+          CANDIDATE_DIR: ${{ runner.temp }}/linux-candidate
+          MODEL_PATH: ${{ runner.temp }}/model/llama-2-7b-chat.Q4_K_M.gguf
+          PRIVATE_KEY_PATH: ${{ runner.temp }}/private-worker-key/worker-key.json
+          IDENTITY_DIR: ${{ runner.temp }}/worker-identity-slot-${{ matrix.slot }}
+          WORK_DIR: ${{ runner.temp }}/worker-runtime-slot-${{ matrix.slot }}
+          EVIDENCE_DIR: ${{ runner.temp }}/worker-evidence-slot-${{ matrix.slot }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/qualification/community_shard_six_machine.py worker-run \
+            --workflow-run-id "$WORKFLOW_RUN_ID" \
+            --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" \
+            --slot "$SLOT" \
+            --candidate-dir "$CANDIDATE_DIR" \
+            --model-path "$MODEL_PATH" \
+            --private-key-path "$PRIVATE_KEY_PATH" \
+            --identity-dir "$IDENTITY_DIR" \
+            --work-dir "$WORK_DIR" \
+            --evidence-dir "$EVIDENCE_DIR" \
+            --max-seconds 1620
+
+      - name: Stop owned transient systemd worker unit on all paths
+        if: always()
+        env:
+          UNIT_NAME: arc-qual-worker-${{ github.run_id }}-${{ github.run_attempt }}-s${{ matrix.slot }}.service
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ ! "$UNIT_NAME" =~ ^arc-qual-worker-[1-9][0-9]*-[1-9][0-9]*-s[1-6]\.service$ ]]; then
+            echo "invalid owned unit name: $UNIT_NAME" >&2
+            exit 1
+          fi
+          timeout 60 sudo -n systemctl stop -- "$UNIT_NAME" || true
+          if sudo -n systemctl is-active --quiet -- "$UNIT_NAME"; then
+            timeout 15 sudo -n systemctl kill --signal=SIGKILL -- "$UNIT_NAME" || true
+          fi
+
+      - name: Verify public artifact before upload
+        id: verify_public_2
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_DIR: ${{ runner.temp }}/worker-evidence-slot-${{ matrix.slot }}
+          PRIVATE_KEY_PATH: ${{ runner.temp }}/private-worker-key/worker-key.json
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/qualification/community_shard_six_machine.py verify-public-evidence \
+            --evidence-dir "$EVIDENCE_DIR" \
+            --private-key-path "$PRIVATE_KEY_PATH"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ always() && steps.verify_public_2.outcome == 'success' }}
+        with:
+          name: qual-worker-evidence-r${{ github.run_id }}-a${{ github.run_attempt }}-slot-${{ matrix.slot }}
+          path: ${{ runner.temp }}/worker-evidence-slot-${{ matrix.slot }}
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Ensure private key directory removed on all paths
+        if: always()
+        env:
+          PRIVATE_DIR: ${{ runner.temp }}/private-worker-key
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf "$PRIVATE_DIR"
+
+  controller:
+    name: Dispatch controller (2 sequential requests)
+    needs: [validate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 32
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Wait for 6 identities, readiness, and run two verified dispatches
+        id: run_controller
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CANDIDATE_RUN_ID: ${{ needs.validate.outputs.candidate_run_id }}
+          CANDIDATE_RUN_ATTEMPT: ${{ needs.validate.outputs.candidate_run_attempt }}
+          CANDIDATE_SHA: ${{ needs.validate.outputs.candidate_sha }}
+          DOWNLOADS_DIR: ${{ runner.temp }}/controller-identities
+          EVIDENCE_DIR: ${{ runner.temp }}/controller-evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/qualification/community_shard_six_machine.py controller \
+            --workflow-run-id "$WORKFLOW_RUN_ID" \
+            --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" \
+            --candidate-run-id "$CANDIDATE_RUN_ID" \
+            --candidate-run-attempt "$CANDIDATE_RUN_ATTEMPT" \
+            --candidate-sha "$CANDIDATE_SHA" \
+            --downloads-dir "$DOWNLOADS_DIR" \
+            --evidence-dir "$EVIDENCE_DIR"
+
+      - name: Write controller-finished signal artifact
+        if: always()
+        env:
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CONTROLLER_OUTCOME: ${{ steps.run_controller.outcome }}
+          OUT_DIR: ${{ runner.temp }}/controller-finished
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/qualification/community_shard_six_machine.py write-controller-finished \
+            --workflow-run-id "$WORKFLOW_RUN_ID" \
+            --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" \
+            --controller-outcome "$CONTROLLER_OUTCOME" \
+            --output-dir "$OUT_DIR"
+
+      - name: Verify public artifact before upload
+        id: verify_public_3
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_DIR: ${{ runner.temp }}/controller-finished
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/qualification/community_shard_six_machine.py verify-public-evidence \
+            --evidence-dir "$EVIDENCE_DIR"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ always() && steps.verify_public_3.outcome == 'success' }}
+        with:
+          name: qual-controller-finished-r${{ github.run_id }}-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/controller-finished
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: Verify public artifact before upload
+        id: verify_public_4
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_DIR: ${{ runner.temp }}/controller-evidence
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/qualification/community_shard_six_machine.py verify-public-evidence \
+            --evidence-dir "$EVIDENCE_DIR"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ always() && steps.verify_public_4.outcome == 'success' }}
+        with:
+          name: qual-controller-evidence-r${{ github.run_id }}-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/controller-evidence
+          retention-days: 7
+          if-no-files-found: ignore
+
+  aggregate:
+    name: Aggregate proof and verify post-cleanup zero state
+    needs: [validate, shard-worker, controller]
+    if: ${{ always() && needs.validate.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: qual-*-r${{ github.run_id }}-a${{ github.run_attempt }}*
+          path: ${{ runner.temp }}/qual-artifacts
+
+      - name: Verify full 6-machine proof and coordinator cleanup
+        env:
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CANDIDATE_RUN_ID: ${{ needs.validate.outputs.candidate_run_id }}
+          CANDIDATE_RUN_ATTEMPT: ${{ needs.validate.outputs.candidate_run_attempt }}
+          CANDIDATE_SHA: ${{ needs.validate.outputs.candidate_sha }}
+          ARTIFACTS_DIR: ${{ runner.temp }}/qual-artifacts
+          OUT_DIR: ${{ runner.temp }}/aggregate-summary
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/qualification/community_shard_six_machine.py aggregate \
+            --workflow-run-id "$WORKFLOW_RUN_ID" \
+            --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" \
+            --candidate-run-id "$CANDIDATE_RUN_ID" \
+            --candidate-run-attempt "$CANDIDATE_RUN_ATTEMPT" \
+            --candidate-sha "$CANDIDATE_SHA" \
+            --artifacts-dir "$ARTIFACTS_DIR" \
+            --output-dir "$OUT_DIR" \
+            --cleanup-wait-seconds 65
+
+      - name: Verify public artifact before upload
+        id: verify_public_5
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_DIR: ${{ runner.temp }}/aggregate-summary
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/qualification/community_shard_six_machine.py verify-public-evidence \
+            --evidence-dir "$EVIDENCE_DIR"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ always() && steps.verify_public_5.outcome == 'success' }}
+        with:
+          name: qual-summary-r${{ github.run_id }}-a${{ github.run_attempt }}
+          path: ${{ runner.temp }}/aggregate-summary
+          retention-days: 30
+          if-no-files-found: ignore
