@@ -207,7 +207,7 @@ jobs:
 
       - name: Upload this leg's evidence (never the model)
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: determinism-proof-leg-${{ matrix.runner }}-${{ matrix.kernel }}-${{ matrix.shard_tag }}
           path: ${{ runner.temp }}/determinism-proof/
@@ -253,7 +253,7 @@ jobs:
 
       - name: Upload the cross-platform evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: determinism-proof-evidence
           path: |

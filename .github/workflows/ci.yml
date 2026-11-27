@@ -572,7 +572,7 @@ jobs:
           ./tests/desktop/windows-single-instance.ps1 -MsiPath $packages[0].FullName -EvidenceDirectory windows-instance-evidence
       - name: Upload candidate Windows instance evidence
         if: always() && runner.os == 'Windows'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: windows-candidate-single-instance
           path: |
@@ -624,7 +624,7 @@ jobs:
             echo '::error::Playwright changed tracked or untracked source.'
             exit 1
           fi
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
           name: playwright-report
