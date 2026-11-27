@@ -630,6 +630,9 @@ fn acquire_shard_dispatch_slot(
 fn shard_dispatch_request_capacity(
     capacity: crate::community_sharding::ShardPipelineCapacity,
 ) -> usize {
+    if capacity.effective_session_capacity == 0 {
+        return 0;
+    }
     capacity
         .effective_session_capacity
         .saturating_add(super::PUBLIC_INFERENCE_CONCURRENCY)
@@ -3544,6 +3547,7 @@ mod tests {
     #[test]
     fn verification_overlap_capacity_preserves_configured_and_hard_bounds() {
         for (pipelines, configured, expected) in [
+            (0, 24, 0),
             (1, 24, 3),
             (4, 24, 6),
             (4, 5, 5),
@@ -3653,7 +3657,7 @@ mod tests {
             })
         };
         let mut handles = Vec::with_capacity(expected_requests);
-        for _ in 0..pipelines {
+        for _ in 0..(pipelines + 4) {
             handles.push(spawn_request());
         }
 
@@ -3672,7 +3676,10 @@ mod tests {
                 .coordinator
                 .community_shard_dispatch_in_flight
                 .load(Ordering::Acquire);
-            if active == pipelines && in_flight == pipelines {
+            if active == pipelines
+                && in_flight == pipelines
+                && handles.iter().filter(|handle| handle.is_finished()).count() == 4
+            {
                 break;
             }
             assert!(
@@ -3681,6 +3688,17 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        let mut accepted = Vec::with_capacity(expected_requests);
+        for handle in handles {
+            if handle.is_finished() {
+                let (status, body) = handle.await.unwrap();
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+            } else {
+                accepted.push(handle);
+            }
+        }
+        assert_eq!(accepted.len(), pipelines);
+        let mut handles = accepted;
 
         let fifth_while_executing = client
             .post(&url)
@@ -3735,8 +3753,14 @@ mod tests {
 
         stop.store(true, Ordering::Release);
         driver.await.unwrap();
-        for queued in (pipelines + 1)..=expected_requests {
-            handles.push(spawn_request());
+        let mut queued = pipelines;
+        let mut shutdown_barrier = None;
+        while queued < expected_requests {
+            let wave_size = (expected_requests - queued).min(pipelines);
+            for _ in 0..wave_size {
+                handles.push(spawn_request());
+            }
+            queued += wave_size;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             loop {
                 let now_ms = crate::rpc::community_unix_ms().unwrap();
@@ -3752,8 +3776,8 @@ mod tests {
                     .community_shard_dispatch_in_flight
                     .load(Ordering::Acquire);
                 if in_flight == queued
-                    && capacity.active_sessions == 1
-                    && capacity.idle_complete_pipelines == pipelines - 1
+                    && capacity.active_sessions == wave_size
+                    && capacity.idle_complete_pipelines == pipelines - wave_size
                 {
                     break;
                 }
@@ -3779,6 +3803,13 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+            }
+            if shutdown && queued == expected_requests {
+                let node = fixture.coordinator.clone();
+                shutdown_barrier = Some(tokio::spawn(async move {
+                    super::super::wait_for_inference_compute_barrier(&node).await
+                }));
+                break;
             }
             let wave_stop = Arc::new(AtomicBool::new(false));
             let wave_driver = spawn_partial_worker_driver(
@@ -3808,6 +3839,25 @@ mod tests {
             }
             wave_stop.store(true, Ordering::Release);
             wave_driver.await.unwrap();
+            assert!(handles.iter().all(|handle| !handle.is_finished()));
+            assert_eq!(
+                fixture
+                    .coordinator
+                    .community_shard_dispatch_in_flight
+                    .load(Ordering::Acquire),
+                queued
+            );
+            assert_eq!(
+                fixture
+                    .coordinator
+                    .community_shard_coordinator
+                    .lock()
+                    .as_ref()
+                    .unwrap()
+                    .pipeline_capacity(crate::rpc::community_unix_ms().unwrap())
+                    .idle_complete_pipelines,
+                pipelines
+            );
         }
 
         let over_capacity_while_verify_queued = client
@@ -3852,7 +3902,21 @@ mod tests {
             assert_eq!(json["reward_eligible"], false);
         }
 
+        assert_eq!(
+            fixture
+                .coordinator
+                .community_shard_dispatch_in_flight
+                .load(Ordering::Acquire),
+            0
+        );
         held_public_permits.clear();
+        if let Some(barrier) = shutdown_barrier {
+            tokio::time::timeout(Duration::from_secs(3), barrier)
+                .await
+                .expect("concurrent shutdown barrier must drain active and queued work")
+                .unwrap()
+                .unwrap();
+        }
         tokio::time::timeout(
             Duration::from_secs(3),
             super::super::wait_for_inference_compute_barrier(&fixture.coordinator),
