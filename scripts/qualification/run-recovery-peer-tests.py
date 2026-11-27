@@ -64,6 +64,7 @@ EXPECTED_LIBRARY_TESTS = {
     'rpc::community_shard_dispatch::tests::verification_overlap_respects_configured_request_cap',
     'rpc::community_shard_dispatch::tests::single_pipeline_overlaps_bounded_verification_and_drains_on_shutdown',
     'rpc::community_shard_dispatch::tests::verification_overlap_capacity_preserves_configured_and_hard_bounds',
+    'rpc::community_shard_dispatch::tests::shard_execution_phase_telemetry_records_abort_status_without_leaking_sensitive_fields',
     'rpc::community_shard_dispatch::tests::shutdown_cancels_in_flight_and_verification_queued_sharded_requests',
     'rpc::community_shard_dispatch::tests::verification_wait_deadline_exhaustion_fails_bounded_and_releases_slot',
     'community_shard_worker::tests::auto_reconnect_stops_during_backoff_without_extra_http_and_fails_closed_on_auth',

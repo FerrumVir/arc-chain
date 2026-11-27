@@ -293,6 +293,9 @@ quorum verification under the public coordinator boot nonce and session sequence
 The events contain no prompt, output, tokens, or keys. They record returned awaits;
 an interrupted future can leave an incomplete trace, which must not be counted as
 zero-duration work or a successful request.
+Coordinator abort events include the same HTTP status returned to the caller. A
+captured-event regression fixes the allowed field set and rejects private failure
+details or model data in timing records.
 This transport alone does not activate desktop nodes.
 `--community-shard-worker` integrates the pinned partial worker into a managed
 stake-zero node while preserving local RPC and the shutdown durability barrier.

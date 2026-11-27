@@ -390,6 +390,30 @@ fn log_community_shard_phase(
     );
 }
 
+fn log_shard_execution_outcome(
+    boot_nonce: &str,
+    session_id: SessionId,
+    started_at: Instant,
+    outcome: &Result<SessionOutcome, (StatusCode, String)>,
+) {
+    let (returned_ok, error_status) = match outcome {
+        Ok(SessionOutcome::PendingVerification(_)) => (true, None),
+        Ok(SessionOutcome::Aborted(aborted)) => {
+            let (status, _) = map_abort_reason(&aborted.reason);
+            (false, Some(status.as_u16()))
+        }
+        Err((status, _)) => (false, Some(status.as_u16())),
+    };
+    log_community_shard_phase(
+        boot_nonce,
+        session_id,
+        "shard_execution",
+        started_at,
+        returned_ok,
+        error_status,
+    );
+}
+
 pub(crate) async fn run_community_sharded(
     AxumState(node): AxumState<super::NodeState>,
     Json(req): Json<CommunityShardedInferenceRequest>,
@@ -455,13 +479,11 @@ pub(crate) async fn run_community_sharded(
 
     let shard_execution_started = Instant::now();
     let outcome = wait_for_session_outcome(&node, session_id, monotonic_deadline).await;
-    log_community_shard_phase(
+    log_shard_execution_outcome(
         &session_boot_nonce,
         session_id,
-        "shard_execution",
         shard_execution_started,
-        matches!(&outcome, Ok(SessionOutcome::PendingVerification(_))),
-        outcome.as_ref().err().map(|(status, _)| status.as_u16()),
+        &outcome,
     );
     let outcome = outcome?;
     session_guard.disarm();
@@ -3625,6 +3647,263 @@ mod tests {
             };
             assert_eq!(shard_dispatch_request_capacity(capacity), expected);
         }
+    }
+
+    #[test]
+    fn shard_execution_phase_telemetry_records_abort_status_without_leaking_sensitive_fields() {
+        use crate::community_sharding::{AbortedSessionResult, PendingVerificationResult};
+        use std::collections::BTreeSet;
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        enum CapturedField {
+            Str(String),
+            U64(u64),
+            Bool(bool),
+            Debug(String),
+        }
+
+        #[derive(Debug, Clone)]
+        struct CapturedPhaseEvent {
+            level: tracing::Level,
+            metadata_fields: BTreeSet<&'static str>,
+            fields: BTreeMap<String, CapturedField>,
+        }
+
+        #[derive(Default)]
+        struct PhaseFieldVisitor {
+            fields: BTreeMap<String, CapturedField>,
+        }
+
+        impl Visit for PhaseFieldVisitor {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                let val = CapturedField::Str(value.to_string());
+                self.fields.insert(field.name().to_string(), val);
+            }
+
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                let val = CapturedField::U64(value);
+                self.fields.insert(field.name().to_string(), val);
+            }
+
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                let val = CapturedField::Bool(value);
+                self.fields.insert(field.name().to_string(), val);
+            }
+
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let val = CapturedField::Debug(format!("{value:?}"));
+                self.fields.insert(field.name().to_string(), val);
+            }
+        }
+
+        struct PhaseCaptureLayer {
+            events: Arc<parking_lot::Mutex<Vec<CapturedPhaseEvent>>>,
+        }
+
+        impl<S: tracing::Subscriber> Layer<S> for PhaseCaptureLayer {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+                if event.metadata().target() != "arc::community_shard_phase" {
+                    return;
+                }
+                let mut visitor = PhaseFieldVisitor::default();
+                event.record(&mut visitor);
+                let field_set = event.metadata().fields();
+                let metadata_fields = field_set.iter().map(|field| field.name()).collect();
+                let captured_event = CapturedPhaseEvent {
+                    level: *event.metadata().level(),
+                    metadata_fields,
+                    fields: visitor.fields,
+                };
+                self.events.lock().push(captured_event);
+            }
+        }
+
+        fn assert_phase_event(
+            event: &CapturedPhaseEvent,
+            expected_nonce: &str,
+            expected_seq: u64,
+            expected_ok: bool,
+            expected_status: Option<u16>,
+            min_duration_ms: u64,
+        ) {
+            let mut expected_keys = BTreeSet::from([
+                "boot_nonce",
+                "duration_ms",
+                "message",
+                "phase",
+                "returned_ok",
+                "session_seq",
+            ]);
+            if expected_status.is_some() {
+                expected_keys.insert("error_status");
+            }
+            let actual_keys: BTreeSet<&str> = event.fields.keys().map(String::as_str).collect();
+            assert_eq!(actual_keys, expected_keys);
+            assert_eq!(
+                event.fields.get("boot_nonce"),
+                Some(&CapturedField::Str(expected_nonce.to_string()))
+            );
+            assert_eq!(
+                event.fields.get("session_seq"),
+                Some(&CapturedField::U64(expected_seq))
+            );
+            assert_eq!(
+                event.fields.get("phase"),
+                Some(&CapturedField::Str("shard_execution".to_string()))
+            );
+            assert_eq!(
+                event.fields.get("returned_ok"),
+                Some(&CapturedField::Bool(expected_ok))
+            );
+            let expected_error = expected_status.map(|code| CapturedField::U64(u64::from(code)));
+            assert_eq!(event.fields.get("error_status"), expected_error.as_ref());
+            assert_eq!(
+                event.fields.get("message"),
+                Some(&CapturedField::Debug(
+                    "community shard phase timing".to_string()
+                ))
+            );
+            let Some(CapturedField::U64(duration_ms)) = event.fields.get("duration_ms") else {
+                panic!("duration_ms must be recorded as u64");
+            };
+            assert!(
+                (min_duration_ms..=5_000).contains(duration_ms),
+                "unexpected duration_ms={duration_ms}, min={min_duration_ms}"
+            );
+        }
+
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let layer = PhaseCaptureLayer {
+            events: events.clone(),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let ok_session = SessionId {
+            boot_nonce: Hash256([0xab; 32]),
+            seq: 7,
+        };
+        let ok_boot_nonce = ok_session.boot_nonce.to_hex();
+        let pending = PendingVerificationResult {
+            session_id: ok_session,
+            model_id: Hash256([0x11; 32]),
+            execution_profile: CANONICAL_REWARD_INFERENCE_PROFILE.to_string(),
+            prompt_tokens: vec![41001, 41002],
+            unverified_generated_tokens: vec![52003, 52004],
+            unverified_output_digest: Hash256([0x22; 32]),
+            terminal_logits_hashes: vec![Hash256([0x33; 32])],
+            stopped_by_eos: true,
+            participants: Vec::new(),
+            verification_required: true,
+            reward_eligible: false,
+        };
+        let ok_outcome = Ok(SessionOutcome::PendingVerification(Box::new(pending)));
+
+        let aborted_session = SessionId {
+            boot_nonce: Hash256([0xcd; 32]),
+            seq: 42,
+        };
+        let aborted_boot_nonce = aborted_session.boot_nonce.to_hex();
+        let abort_detail = "abort-sentinel prompt=alpha output=beta token=98765 key-sentinel";
+        let abort_reason = SessionAbortReason::WorkerFailed {
+            worker_id: Hash256([0xef; 32]),
+            detail: abort_detail.to_string(),
+        };
+        let aborted = AbortedSessionResult {
+            session_id: aborted_session,
+            reason: abort_reason,
+            completed_tokens_before_abort: 1,
+            participants: Vec::new(),
+        };
+        let aborted_outcome = Ok(SessionOutcome::Aborted(aborted));
+
+        let err_session = SessionId {
+            boot_nonce: Hash256([0x55; 32]),
+            seq: 99,
+        };
+        let err_boot_nonce = err_session.boot_nonce.to_hex();
+        let err_detail = "error-sentinel prompt=gamma output=delta token=65432 key-sentinel";
+        let err_outcome = Err((StatusCode::GATEWAY_TIMEOUT, err_detail.to_string()));
+
+        let now = Instant::now();
+        let aborted_started = now.checked_sub(Duration::from_millis(25)).unwrap();
+        let err_started = now.checked_sub(Duration::from_millis(10)).unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            log_shard_execution_outcome(&ok_boot_nonce, ok_session, now, &ok_outcome);
+            log_shard_execution_outcome(
+                &aborted_boot_nonce,
+                aborted_session,
+                aborted_started,
+                &aborted_outcome,
+            );
+            log_shard_execution_outcome(&err_boot_nonce, err_session, err_started, &err_outcome);
+        });
+
+        let captured = events.lock().clone();
+        assert_eq!(captured.len(), 3);
+
+        let allowed_metadata = BTreeSet::from([
+            "boot_nonce",
+            "duration_ms",
+            "error_status",
+            "message",
+            "phase",
+            "returned_ok",
+            "session_seq",
+        ]);
+        let worker_hex = "ef".repeat(32);
+        let model_hex = "11".repeat(32);
+        let digest_hex = "22".repeat(32);
+        let logits_hex = "33".repeat(32);
+        let forbidden_fragments = [
+            "abort-sentinel",
+            "error-sentinel",
+            "prompt=alpha",
+            "output=beta",
+            "prompt=gamma",
+            "output=delta",
+            "98765",
+            "65432",
+            "key-sentinel",
+            "41001",
+            "41002",
+            "52003",
+            "52004",
+            worker_hex.as_str(),
+            model_hex.as_str(),
+            digest_hex.as_str(),
+            logits_hex.as_str(),
+        ];
+        for event in &captured {
+            assert_eq!(event.level, tracing::Level::INFO);
+            assert_eq!(event.metadata_fields, allowed_metadata);
+            let serialized = format!("{:?}", event.fields);
+            for fragment in forbidden_fragments {
+                assert!(
+                    !serialized.contains(fragment),
+                    "phase telemetry leaked forbidden fragment {fragment:?}: {serialized}"
+                );
+            }
+        }
+
+        assert_phase_event(&captured[0], &ok_boot_nonce, 7, true, None, 0);
+        assert_phase_event(
+            &captured[1],
+            &aborted_boot_nonce,
+            42,
+            false,
+            Some(StatusCode::SERVICE_UNAVAILABLE.as_u16()),
+            25,
+        );
+        assert_phase_event(
+            &captured[2],
+            &err_boot_nonce,
+            99,
+            false,
+            Some(StatusCode::GATEWAY_TIMEOUT.as_u16()),
+            10,
+        );
     }
 
     async fn assert_bounded_verification_overlap(
