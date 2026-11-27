@@ -32,6 +32,7 @@ EXPECTED_BINARY_TESTS = {
     'community_shard_cli::tests::cli_requires_pins_and_allows_missing_keyfile_only_for_check_only',
     'community_shard_cli::tests::cli_parses_top_level_subcommand_and_rejects_operator_prefix',
     "tests::recovery_peer_qualify_command_accepts_persistent_candidate_and_rejects_mutations",
+    "tests::recovery_peer_fixture_copy_preserves_private_permissions",
     "tests::recovery_peer_generation_replays_for_different_absent_validator_compacts_and_restarts",
     "tests::recovery_peer_replay_rejects_unsigned_forged_and_wrong_domain_blocks",
     "tests::recovery_peer_replay_rejects_subquorum_forged_and_wrong_domain_skip_certificates",

@@ -364,8 +364,19 @@ impl PeerReplayFixture {
     }
 }
 
+fn peer_replay_copy_private_file(src: &std::path::Path, dst: &std::path::Path) {
+    let contents = std::fs::read(src).unwrap();
+    let parent = dst.parent().unwrap();
+    arc_crypto::secret_file::create_private_directory_tree(parent).unwrap();
+    let destination = parent
+        .canonicalize()
+        .unwrap()
+        .join(dst.file_name().unwrap());
+    arc_crypto::secret_file::durably_replace_private(&destination, &contents).unwrap();
+}
+
 fn peer_replay_copy_dir(src: &std::path::Path, dst: &std::path::Path) {
-    std::fs::create_dir_all(dst).unwrap();
+    arc_crypto::secret_file::create_private_directory_tree(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap() {
         let entry = entry.unwrap();
         let file_type = entry.file_type().unwrap();
@@ -378,9 +389,54 @@ fn peer_replay_copy_dir(src: &std::path::Path, dst: &std::path::Path) {
                 "unexpected non-file entry in generation store: {:?}",
                 entry.path()
             );
-            std::fs::copy(entry.path(), target_path).unwrap();
+            peer_replay_copy_private_file(&entry.path(), &target_path);
         }
     }
+}
+
+#[test]
+fn recovery_peer_fixture_copy_preserves_private_permissions() {
+    use arc_crypto::secret_file::{
+        acquire_private_directory_namespace_lock, create_private_directory_tree,
+        durably_replace_private, open_private, validate_private, validate_private_directory,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let root_path = root.path().canonicalize().unwrap();
+    let source = root_path.join("source");
+    let target = root_path.join("target");
+    create_private_directory_tree(&source.join("nested")).unwrap();
+    create_private_directory_tree(&target.join("nested")).unwrap();
+    durably_replace_private(&source.join("nested/state.bin"), b"short").unwrap();
+    durably_replace_private(&target.join("nested/state.bin"), b"longer old bytes").unwrap();
+    drop(acquire_private_directory_namespace_lock(&source.join("dag-store")).unwrap());
+
+    peer_replay_copy_dir(&source, &target);
+
+    validate_private_directory(&target).unwrap();
+    validate_private_directory(&target.join("nested")).unwrap();
+    assert_eq!(
+        std::fs::read(target.join("nested/state.bin")).unwrap(),
+        b"short"
+    );
+    for entry in std::fs::read_dir(&source).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            let copied = target.join(entry.file_name());
+            let file = open_private(&copied).unwrap();
+            validate_private(&file, &copied).unwrap();
+            drop(file);
+            assert_eq!(
+                std::fs::read(&copied).unwrap(),
+                std::fs::read(entry.path()).unwrap()
+            );
+        }
+    }
+    let nested = target.join("nested/state.bin");
+    let file = open_private(&nested).unwrap();
+    validate_private(&file, &nested).unwrap();
+    drop(file);
+    drop(acquire_private_directory_namespace_lock(&target.join("dag-store")).unwrap());
 }
 
 fn peer_replay_write_signing_record(
@@ -2443,7 +2499,7 @@ fn recovery_peer_qualify_command_accepts_persistent_candidate_and_rejects_mutati
             .join(format!("dag-wal-recovery-{manifest_hex}"))
             .join("recovery-dag.binding.json");
         let mutation_binding = mut_dag_dir.join("recovery-dag.binding.json");
-        std::fs::copy(&original_binding, &mutation_binding).unwrap();
+        peer_replay_copy_private_file(&original_binding, &mutation_binding);
         assert_eq!(
             peer_qualify_file_snapshot(&mutation_binding),
             peer_qualify_file_snapshot(&original_binding),
