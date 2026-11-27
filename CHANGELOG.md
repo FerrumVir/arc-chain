@@ -18,6 +18,21 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.26 - Release-preparation snapshot (2026-11-27)
+
+> **Candidate note:** This entry records the v0.8.26 release-preparation
+> snapshot. It does not claim deployment, measured acceleration, or 100 operators.
+
+- Shard dispatch can begin new work while completed shard sessions wait for
+  independent validator verification, within complete ready pipeline capacity
+  plus two verification slots and the existing configured and hard limits.
+- Admission still requires an idle complete pipeline; overload is rejected before
+  shard execution, and shutdown retains ownership until in-flight work drains.
+- Bounded phase events identify shard execution, verifier queue wait, and quorum
+  verification by public session identity without recording prompts or output.
+- Aborted shard execution records its mapped HTTP status, with tests for event
+  fields, admission bursts, configured limits, and shutdown during active work.
+
 ## v0.8.25 - Release-preparation snapshot (2026-11-27)
 
 > **Candidate note:** This entry records the v0.8.25 release-preparation
