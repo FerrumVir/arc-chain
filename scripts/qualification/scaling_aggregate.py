@@ -30,12 +30,23 @@ def download_one(workflow, name, artifacts, destination, token, maximum=8 * 1024
     matches = [item for item in artifacts if item.get('name') == name and item.get('expired') is False]
     run.need(len(matches) == 1, 'expected exactly one complete artifact: ' + name)
     qual.download_validated_artifact_by_id(workflow, name, matches[0], destination, maximum, token, timeout_seconds=60, max_files=128)
+    qual.verify_evidence_dir_no_secrets(destination)
     return {'name': name, 'id': matches[0]['id'], 'digest': matches[0]['digest']}
+
+
+def prepare_aggregation_paths(output_dir, artifacts_dir):
+    output = Path(output_dir).resolve()
+    artifacts = Path(artifacts_dir).resolve()
+    run.need(not output.is_relative_to(artifacts) and not artifacts.is_relative_to(output),
+             'aggregate summary and downloaded evidence require separate directories')
+    output.mkdir(parents=True, exist_ok=False)
+    artifacts.mkdir(parents=True, exist_ok=False)
+    return output, artifacts
 
 
 def main():
     parser = argparse.ArgumentParser()
-    for key in ('workflow-run-id', 'workflow-run-attempt', 'candidate-run-id', 'candidate-run-attempt', 'candidate-sha', 'output-dir'):
+    for key in ('workflow-run-id', 'workflow-run-attempt', 'candidate-run-id', 'candidate-run-attempt', 'candidate-sha', 'output-dir', 'artifacts-dir'):
         parser.add_argument('--' + key, required=True)
     args = parser.parse_args()
     workflow = qual.validate_positive_id(args.workflow_run_id, 'workflow')
@@ -44,11 +55,10 @@ def main():
     args.candidate_run_attempt = qual.validate_positive_id(args.candidate_run_attempt, 'candidate attempt')
     args.candidate_sha = qual.normalize_git_sha(args.candidate_sha)
     token = os.environ.get('GH_TOKEN', '')
-    directory = Path(args.output_dir)
-    directory.mkdir(parents=True, exist_ok=True)
+    directory, artifacts_dir = prepare_aggregation_paths(args.output_dir, args.artifacts_dir)
     metadata = run.list_artifacts(workflow, token, time.monotonic() + 120)
     provenance = []
-    controller_dir = directory / 'controller'
+    controller_dir = artifacts_dir / 'controller'
     name = qual.make_controller_evidence_artifact_name(workflow, attempt)
     provenance.append(download_one(workflow, name, metadata, controller_dir, token))
     cohort, identities, digest, measurement = verify_measurements(controller_dir)
@@ -56,7 +66,7 @@ def main():
         run.need(cohort[field] == value, 'cohort provenance mismatch: ' + field)
     workers = []
     for slot in qual.SCALING_SLOTS:
-        target = directory / ('worker-' + str(slot))
+        target = artifacts_dir / ('worker-' + str(slot))
         name = qual.make_worker_evidence_artifact_name(workflow, attempt, slot)
         provenance.append(download_one(workflow, name, metadata, target, token))
         supervisor = qual.read_bounded_json_file(target / 'scaling-supervisor.json')
@@ -72,7 +82,7 @@ def main():
                         'steps_submitted': summary['steps_submitted'], 'clean_release_sent': True,
                         'systemd_memory_peak_bytes': evidence['systemd_memory_peak_bytes']})
     for kind in ('cohort', 'expand', 'stop-added', 'done'):
-        target = directory / ('marker-' + kind)
+        target = artifacts_dir / ('marker-' + kind)
         provenance.append(download_one(workflow, phase.artifact_name(workflow, attempt, kind), metadata, target, token))
         phase.validate_marker(qual.read_bounded_json_file(target / 'phase.json'), workflow, attempt, kind, digest)
     readiness, status, error = qual.poll_coordinator_zero_after_cleanup(65)

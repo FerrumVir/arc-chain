@@ -511,7 +511,8 @@ jobs:
         python3 scripts/qualification/scaling_aggregate.py \
           --workflow-run-id "$WORKFLOW_RUN_ID" --workflow-run-attempt "$WORKFLOW_RUN_ATTEMPT" \
           --candidate-run-id "$CANDIDATE_RUN_ID" --candidate-run-attempt "$CANDIDATE_RUN_ATTEMPT" \
-          --candidate-sha "$CANDIDATE_SHA" --output-dir "$OUT_DIR"
+          --candidate-sha "$CANDIDATE_SHA" --output-dir "$OUT_DIR" \
+          --artifacts-dir "$ARTIFACTS_DIR"
     - name: Verify public artifact before upload
       id: verify_public_5
       if: always()

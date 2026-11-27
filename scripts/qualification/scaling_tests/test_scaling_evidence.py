@@ -69,12 +69,52 @@ class EvidenceTests(unittest.TestCase):
 
     def test_artifact_helper_receives_exact_metadata_from_api(self):
         metadata = {'name': 'evidence', 'expired': False, 'id': 12, 'digest': 'sha256:' + 'a' * 64}
-        with patch.object(qual, 'download_validated_artifact_by_id') as download:
+        with patch.object(qual, 'download_validated_artifact_by_id') as download, patch.object(qual, 'verify_evidence_dir_no_secrets') as verify:
             value = aggregate.download_one('9001', 'evidence', [metadata], Path('unused'), 'test-token')
         self.assertEqual(value['digest'], metadata['digest'])
         self.assertEqual(download.call_args.args[2], metadata)
+        verify.assert_called_once_with(Path('unused'))
         with self.assertRaises(qual.QualificationError):
             aggregate.download_one('9001', 'evidence', [metadata, metadata], Path('unused'), 'test-token')
+
+    def test_twelve_worker_aggregate_keeps_per_artifact_bounds_and_publishes_compact_summary(self):
+        def transfer(workflow, name, metadata, destination, maximum, token, **kwargs):
+            destination.mkdir()
+            for index in range(6):
+                (destination / f'evidence-{index}.json').write_text('{}')
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output, artifacts = aggregate.prepare_aggregation_paths(root / 'summary', root / 'artifacts')
+            with patch.object(qual, 'download_validated_artifact_by_id', side_effect=transfer):
+                for index in range(13):
+                    name = f'artifact-{index}'
+                    metadata = {'name': name, 'expired': False, 'id': index + 1, 'digest': 'sha256:' + 'a' * 64}
+                    aggregate.download_one('9001', name, [metadata], artifacts / name, 'test-token')
+            with self.assertRaisesRegex(qual.QualificationError, 'file count exceeded 64'):
+                qual.inspect_tree_bounds(artifacts, qual.MAX_EVIDENCE_DIR_BYTES)
+            run.write_new(output / 'qualification-summary.json', {'overall_status': 'passed'})
+            qual.verify_evidence_dir_no_secrets(output)
+            self.assertTrue((output / 'qualification-summary.json').is_file())
+            self.assertEqual(len(list(artifacts.rglob('*.json'))), 78)
+
+    def test_aggregate_rejects_overlapping_directories_and_secret_bearing_downloads(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for output, artifacts in [(root, root), (root / 'summary', root), (root, root / 'artifacts')]:
+                with self.subTest(output=output, artifacts=artifacts), self.assertRaisesRegex(qual.QualificationError, 'separate directories'):
+                    aggregate.prepare_aggregation_paths(output, artifacts)
+            metadata = {'name': 'evidence', 'expired': False, 'id': 1, 'digest': 'sha256:' + 'a' * 64}
+            target = root / 'download'
+
+            def transfer(*args, **kwargs):
+                target.mkdir()
+                (target / 'worker-key.json').write_text('{}')
+
+            with patch.object(qual, 'download_validated_artifact_by_id', side_effect=transfer):
+                with self.assertRaisesRegex(qual.QualificationError, 'forbidden file'):
+                    aggregate.download_one('9001', 'evidence', [metadata], target, '')
+            self.assertFalse(list(target.glob('*')))
 
 
 if __name__ == '__main__':
