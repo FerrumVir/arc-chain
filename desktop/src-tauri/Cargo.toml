@@ -1,6 +1,6 @@
 [package]
 name = "arc-desktop"
-version = "0.8.24"
+version = "0.8.25"
 description = "ARC Node - desktop app"
 authors = ["FerrumVir"]
 edition = "2021"

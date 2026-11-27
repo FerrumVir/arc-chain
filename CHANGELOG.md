@@ -18,6 +18,22 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.8.25 - Release-preparation snapshot (2026-11-27)
+
+> **Candidate note:** This entry records the v0.8.25 release-preparation
+> snapshot. It does not claim publication, deployment, or 100 active operators.
+
+- Desktop shutdown keeps ownership of a child and its lifecycle guard across
+  cancellation, then completes recovery before a new launch.
+- Launch and restart read current persisted compute settings and respect newer
+  Stop actions, including changes made while a model is downloading.
+- Compute opt-out reconciles live workers and cached crash-recovery plans under
+  the same node guard, preventing a process restart from bypassing the change.
+- Consenting installations continue bounded reconciliation after becoming ready,
+  so a recovered observer can resume compute with an available verified model.
+- Existing verified model files can activate without waiting for download power
+  or network conditions; explicit opt-outs and the memory floor remain enforced.
+
 ## v0.8.24 - Release-preparation snapshot (2026-11-26)
 
 > **Candidate note:** This entry records the v0.8.24 release-preparation

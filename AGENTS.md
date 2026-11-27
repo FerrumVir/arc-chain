@@ -472,12 +472,12 @@ packages. Archive and DMG verification use the same captured version.
   (0.8.20 at 8949910b).
 - List tags by date with `git for-each-ref --sort=-creatordate refs/tags`. An
   older pre-release tag sorts above v0.8.x under version sort.
-- `CHANGELOG.md` is newest first. Its v0.8.24 entry is a release-preparation
-  snapshot dated 2026-11-26 and makes no publication or fleet-activation claim.
+- `CHANGELOG.md` is newest first. Its v0.8.25 entry is a release-preparation
+  snapshot dated 2026-11-27 and makes no publication or fleet-activation claim.
 - `.github/workflows/release.yml` runs on a `v*.*.*` tag push or a manual
   dispatch (lines 8-12). The current procedures are
   `scripts/release/EXISTING-CHAIN-UPDATE.md` and `scripts/recovery/README.md`.
-- The doc contract test pins the published (0.8.16) and candidate (0.8.24)
+- The doc contract test pins the published (0.8.16) and candidate (0.8.25)
   versions (`tests/release/documentation_contract_test.sh:41`, `47`). README
   install steps name the published one. The test's comment (lines 42-46) says
   they move to a newer release in the documentation change that follows its
